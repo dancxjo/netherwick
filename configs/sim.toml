@@ -1,0 +1,5 @@
+seed = 7
+arena = "rect"
+width_m = 6.0
+height_m = 6.0
+charger_patch = [0.5, 0.5]

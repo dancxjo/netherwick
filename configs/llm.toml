@@ -1,0 +1,3 @@
+provider = "disabled"
+allow_commands = true
+allow_teaching = true
