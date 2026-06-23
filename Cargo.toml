@@ -1,0 +1,56 @@
+[workspace]
+members = [
+    "crates/netherwick-core",
+    "crates/netherwick-now",
+    "crates/netherwick-ledger",
+    "crates/netherwick-body",
+    "crates/netherwick-create1",
+    "crates/netherwick-sim",
+    "crates/netherwick-sensors",
+    "crates/netherwick-autonomic",
+    "crates/netherwick-actions",
+    "crates/netherwick-behaviors",
+    "crates/netherwick-models",
+    "crates/netherwick-experience",
+    "crates/netherwick-memory",
+    "crates/netherwick-llm",
+    "crates/netherwick-conductor",
+    "crates/netherwick-runtime",
+    "crates/netherwick-server",
+    "crates/netherwick-ui",
+    "crates/netherwick-tools",
+    "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+rand = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+
+burn = { version = "0.21", features = ["ndarray", "autodiff"] }
+burn-cuda = { version = "0.21", default-features = false, features = ["std", "autotune"] }
+
+axum = { version = "0.8", features = ["macros", "json", "tokio", "ws"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+hound = "3"
+cpal = "0.15"
+reqwest = { version = "0.11", features = ["json", "stream"] }

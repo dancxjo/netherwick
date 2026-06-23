@@ -1,0 +1,34 @@
+[behavior.eye_next]
+mode = "shadow_train"
+hardcoded = "eye.copy_current"
+model = "eye.burn.future_v0"
+checkpoint = "data/models/eye_future_v0"
+fallback = "hardcoded_on_error"
+
+[behavior.ear_next]
+mode = "hardcoded"
+hardcoded = "ear.silence_or_current"
+model = "ear.burn.future_v0"
+checkpoint = "data/models/ear_future_v0"
+fallback = "hardcoded_on_error"
+
+[behavior.danger]
+mode = "shadow_train"
+hardcoded = "danger.range_bumper"
+model = "danger.burn.v0"
+checkpoint = "data/models/danger_v0"
+fallback = "hardcoded_on_error"
+
+[behavior.charge]
+mode = "shadow_train"
+hardcoded = "charge.sensor_battery_delta"
+model = "charge.burn.v0"
+checkpoint = "data/models/charge_v0"
+fallback = "hardcoded_on_error"
+
+[behavior.conductor]
+mode = "hardcoded"
+hardcoded = "conductor.simple_v0"
+model = "conductor.burn.v0"
+checkpoint = "data/models/conductor_v0"
+fallback = "stop_on_error"

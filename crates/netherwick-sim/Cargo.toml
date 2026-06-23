@@ -1,0 +1,13 @@
+[package]
+name = "netherwick-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+rand.workspace = true
+serde.workspace = true
+netherwick-body = { path = "../netherwick-body" }

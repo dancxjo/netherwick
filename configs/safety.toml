@@ -1,0 +1,7 @@
+max_forward = 0.6
+max_turn = 1.0
+critical_battery = 0.10
+low_battery = 0.20
+stale_sensor_ms = 500
+lost_body_timeout_ms = 1000
+allow_llm_raw_motor = false

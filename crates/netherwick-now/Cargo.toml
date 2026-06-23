@@ -1,0 +1,14 @@
+[package]
+name = "netherwick-now"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+netherwick-actions = { path = "../netherwick-actions" }
+netherwick-body = { path = "../netherwick-body" }
+netherwick-core = { path = "../netherwick-core" }

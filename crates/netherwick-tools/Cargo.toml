@@ -1,0 +1,14 @@
+[package]
+name = "netherwick-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "netherwick"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+netherwick-runtime = { path = "../netherwick-runtime" }
