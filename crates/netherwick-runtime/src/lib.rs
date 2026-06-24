@@ -23,14 +23,14 @@ use netherwick_experience::{
     action_features, action_value_input_from_transition_like, charge_input_from_transition_like,
     charge_target_from_transition_like, danger_input_from_transition_like,
     danger_target_from_transition_like, ear_next_input_from_transition_like,
-    ear_next_target_from_now, experience_decode_target_from_now, experience_encode_input_from_now,
+    ear_next_target_from_now, experience_decode_target_from_now,
     eye_next_input_from_transition_like, eye_next_target_from_now, ActionValueInput,
     ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput,
     DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience, ExperienceDecodeOutput,
-    ExperienceEncodeInput, ExperienceEncodeOutput, ExperienceEncoder, ExperienceLatent,
+    ExperienceEncodeInput, ExperienceEncoder, ExperienceLatent,
     EyeNextInput, EyeNextOutput, FeatureExperienceEncoder, FutureInput, FuturePrediction,
     FuturePredictor, Impression, RewardComputer, Sensation, StasisFuturePredictor,
-    SurpriseComputer,
+    SurpriseComputer, ExperienceBehaviorInput, ExperienceBehaviorOutput,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -41,7 +41,7 @@ use netherwick_models::{
     read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
     read_experience_autoencoder_metadata, read_eye_next_metadata, read_future_metadata,
     ActionValueNetTrainer, ChargeNetTrainer, CopyCurrentEarPredictor, CopyCurrentEyePredictor,
-    DangerNetTrainer, EarNextNetTrainer, ExperienceAutoencoderPrediction,
+    DangerNetTrainer, EarNextNetTrainer,
     ExperienceAutoencoderTrainer, EyeNextNetTrainer, FutureNetTrainer,
     HardcodedActionValuePredictor, HardcodedChargePredictor, HardcodedDangerPredictor,
 };
@@ -336,7 +336,7 @@ impl RuntimeModelStack {
 }
 
 pub struct BehaviorRegistry {
-    pub experience: ReplaceableBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>,
+    pub experience: ReplaceableBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput>,
     pub danger: ReplaceableBehavior<SituatedDangerInput, DangerOutput>,
     pub charge: ReplaceableBehavior<SituatedChargeInput, ChargeOutput>,
     pub future: ReplaceableBehavior<FutureInput, FuturePrediction>,
@@ -615,12 +615,6 @@ impl TargetExtractor<ExperienceTransition, EarNextInput, EarNextOutput> for EarN
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SituatedExperienceInput {
-    pub input: ExperienceEncodeInput,
-    pub target: ExperienceDecodeOutput,
-    pub now: Now,
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SituatedDangerInput {
@@ -652,9 +646,11 @@ pub struct SituatedEarNextInput {
     pub now: Now,
 }
 
-struct HardcodedExperienceBehavior;
+struct HardcodedExperienceBehavior {
+    pub encoder: FeatureExperienceEncoder,
+}
 
-impl FunctionBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>
+impl FunctionBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput>
     for HardcodedExperienceBehavior
 {
     fn id(&self) -> &'static str {
@@ -663,26 +659,24 @@ impl FunctionBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>
 
     fn infer(
         &mut self,
-        input: &SituatedExperienceInput,
-    ) -> Result<ExperienceAutoencoderPrediction> {
-        let mut encoder = FeatureExperienceEncoder::new();
-        let latent = encoder.encode(&input.now)?;
-        Ok(ExperienceAutoencoderPrediction {
-            encoded: ExperienceEncodeOutput {
-                z: latent.z,
-                confidence: latent.confidence,
-            },
-            decoded: input.target.clone(),
+        input: &ExperienceBehaviorInput,
+    ) -> Result<ExperienceBehaviorOutput> {
+        let latent = self.encoder.encode(&input.now)?;
+        Ok(ExperienceBehaviorOutput {
+            latent,
+            reconstruction: None,
+            reconstruction_loss: None,
+            confidence: 1.0,
         })
     }
 }
 
-struct ExperienceModelBehavior {
-    trainer: ExperienceAutoencoderTrainer,
+struct LearnedExperienceBehavior {
+    model: ExperienceAutoencoderTrainer,
 }
 
-impl FunctionBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>
-    for ExperienceModelBehavior
+impl FunctionBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput>
+    for LearnedExperienceBehavior
 {
     fn id(&self) -> &'static str {
         "experience.autoencoder.v0"
@@ -690,17 +684,38 @@ impl FunctionBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>
 
     fn infer(
         &mut self,
-        input: &SituatedExperienceInput,
-    ) -> Result<ExperienceAutoencoderPrediction> {
-        self.trainer.predict(&input.input)
+        input: &ExperienceBehaviorInput,
+    ) -> Result<ExperienceBehaviorOutput> {
+        let encode_input = ExperienceEncodeInput {
+            sense_vectors: input.sense_vectors.clone(),
+        };
+        let prediction = self.model.predict(&encode_input)?;
+        let target = experience_decode_target_from_now(&input.now);
+        let reconstruction_loss = experience_reconstruction_loss_flat(&prediction.decoded, &target);
+        let latent = ExperienceLatent {
+            t_ms: input.now.t_ms,
+            z: prediction.encoded.z.clone(),
+            reconstruction_error: reconstruction_loss,
+            prediction_error: 0.0,
+            confidence: prediction.encoded.confidence,
+        };
+        Ok(ExperienceBehaviorOutput {
+            latent,
+            reconstruction: Some(prediction.decoded),
+            reconstruction_loss: Some(reconstruction_loss),
+            confidence: prediction.encoded.confidence,
+        })
     }
 
     fn observe(
         &mut self,
-        sample: &TrainingSample<SituatedExperienceInput, ExperienceAutoencoderPrediction>,
+        sample: &TrainingSample<ExperienceBehaviorInput, ExperienceBehaviorOutput>,
     ) -> Result<()> {
-        self.trainer
-            .train_step(&sample.input.input, &sample.input.target)?;
+        let encode_input = ExperienceEncodeInput {
+            sense_vectors: sample.input.sense_vectors.clone(),
+        };
+        let target = experience_decode_target_from_now(&sample.input.now);
+        self.model.train_step(&encode_input, &target)?;
         Ok(())
     }
 }
@@ -968,12 +983,14 @@ fn experience_behavior(
     regime: BehaviorRegime,
     trainer: Option<ExperienceAutoencoderTrainer>,
     fallback: FallbackPolicy,
-) -> ReplaceableBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction> {
+) -> ReplaceableBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput> {
     ReplaceableBehavior::new(
         "experience",
         regime,
-        Box::new(HardcodedExperienceBehavior),
-        trainer.map(|trainer| Box::new(ExperienceModelBehavior { trainer }) as Box<_>),
+        Box::new(HardcodedExperienceBehavior {
+            encoder: FeatureExperienceEncoder::new(),
+        }),
+        trainer.map(|trainer| Box::new(LearnedExperienceBehavior { model: trainer }) as Box<_>),
         fallback,
     )
 }
@@ -1153,14 +1170,6 @@ fn load_experience_behavior_trainer(
     )?))
 }
 
-fn experience_behavior_input(now: &Now) -> SituatedExperienceInput {
-    SituatedExperienceInput {
-        input: experience_encode_input_from_now(now),
-        target: experience_decode_target_from_now(now),
-        now: now.clone(),
-    }
-}
-
 fn danger_behavior_input(
     now: &Now,
     latent: &ExperienceLatent,
@@ -1279,11 +1288,11 @@ fn ear_next_disagreement(left: &EarNextOutput, right: &EarNextOutput) -> f32 {
         / len as f32
 }
 
-fn experience_reconstruction_loss(
-    output: &ExperienceAutoencoderPrediction,
+fn experience_reconstruction_loss_flat(
+    output: &ExperienceDecodeOutput,
     target: &ExperienceDecodeOutput,
 ) -> f32 {
-    let output = output.decoded.flat_features();
+    let output = output.flat_features();
     let target = target.flat_features();
     let len = output.len().max(target.len());
     if len == 0 {
@@ -1298,6 +1307,25 @@ fn experience_reconstruction_loss(
         })
         .sum::<f32>()
         / len as f32
+}
+
+fn experience_disagreement(
+    left: &ExperienceBehaviorOutput,
+    right: &ExperienceBehaviorOutput,
+) -> f32 {
+    let a = &left.latent.z;
+    let b = &right.latent.z;
+    let len = a.len().max(b.len());
+    if len == 0 {
+        return 0.0;
+    }
+    let sum: f32 = (0..len)
+        .map(|idx| {
+            let delta = a.get(idx).copied().unwrap_or_default() - b.get(idx).copied().unwrap_or_default();
+            delta * delta
+        })
+        .sum();
+    sum.sqrt()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1462,36 +1490,33 @@ where
             .as_ref()
             .and_then(|input| input.command.to_action());
 
-        if latent.z.is_empty() {
-            latent = self.encoder.encode(&now)?;
-        }
         let mut behavior_runs: Vec<ErasedBehaviorRunRecord> = Vec::new();
-        let experience_input = experience_behavior_input(&now);
+        let experience_input = ExperienceBehaviorInput::from_now(&now);
         let experience_run = self
             .models
             .behaviors
             .experience
             .infer(&experience_input, now.t_ms)?;
         let mut experience_record = experience_run.record;
-        let reconstruction_loss = experience_record
-            .model_output
-            .as_ref()
-            .map(|model| experience_reconstruction_loss(model, &experience_input.target));
-        experience_record.disagreement = reconstruction_loss;
-        if let Some(loss) = reconstruction_loss {
-            now.extensions.insert(
-                "experience.autoencoder".to_string(),
-                serde_json::json!({
-                    "reconstruction_loss": loss,
-                    "z_dim": experience_record
-                        .model_output
-                        .as_ref()
-                        .map(|output| output.encoded.z.len())
-                        .unwrap_or_default(),
-                }),
-            );
+        if let (Some(hard), Some(model)) = (
+            experience_record.hardcoded_output.as_ref(),
+            experience_record.model_output.as_ref(),
+        ) {
+            experience_record.disagreement = Some(experience_disagreement(hard, model));
+        }
+        if let Some(model_output) = experience_record.model_output.as_ref() {
+            if let Some(loss) = model_output.reconstruction_loss {
+                now.extensions.insert(
+                    "experience.autoencoder".to_string(),
+                    serde_json::json!({
+                        "reconstruction_loss": loss,
+                        "z_dim": model_output.latent.z.len(),
+                    }),
+                );
+            }
         }
         behavior_runs.push(experience_record.erase());
+        latent = experience_run.chosen.latent.clone();
         if futures.is_empty() {
             let (predicted, records) =
                 predict_baseline_futures(&mut self.models.behaviors.future, &latent, now.t_ms)?;
@@ -2749,7 +2774,7 @@ mod tests {
             .unwrap();
         let experience = registry
             .experience
-            .infer(&experience_behavior_input(&now), 100)
+            .infer(&ExperienceBehaviorInput::from_now(&now), 100)
             .unwrap();
 
         assert_eq!(experience.record.behavior_id, "experience");
@@ -3242,7 +3267,7 @@ mod tests {
         let run = stack
             .behaviors
             .experience
-            .infer(&experience_behavior_input(&now), now.t_ms)
+            .infer(&ExperienceBehaviorInput::from_now(&now), now.t_ms)
             .unwrap();
 
         assert_eq!(run.record.regime, BehaviorRegime::ShadowInfer);

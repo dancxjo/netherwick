@@ -46,3 +46,10 @@ hardcoded = "conductor.simple_v0"
 model = "conductor.burn.v0"
 checkpoint = "data/models/conductor_v0"
 fallback = "return_error"
+
+[behavior.experience]
+regime = "hardcoded"
+hardcoded = "experience.feature_encoder"
+model = "experience.autoencoder.v0"
+checkpoint = "data/models/experience_v0"
+fallback = "use_hardcoded"

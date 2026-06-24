@@ -134,12 +134,12 @@ pub struct ExperienceAutoencoderTrainStats {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExperienceAutoencoderShadowMetric {
-    pub observed_at_ms: u64,
-    pub hardcoded: ExperienceDecodeOutput,
-    pub model: ExperienceDecodeOutput,
-    pub target: ExperienceDecodeOutput,
-    pub z: ExperienceEncodeOutput,
-    pub loss: f32,
+    pub t_ms: TimeMs,
+    pub baseline_z_norm: f32,
+    pub model_z_norm: f32,
+    pub z_disagreement: f32,
+    pub reconstruction_loss: f32,
+    pub selected: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1954,19 +1954,46 @@ impl<B: AutodiffBackend> ExperienceAutoencoderTrainer<B> {
 
     pub fn shadow_compare(
         &mut self,
-        observed_at_ms: u64,
+        t_ms: TimeMs,
         input: &ExperienceEncodeInput,
         target: &ExperienceDecodeOutput,
+        baseline_z: &[f32],
+        selected: String,
     ) -> Result<ExperienceAutoencoderShadowMetric> {
         let prediction = self.predict(input)?;
         let loss = mse_experience_decode_output_target(&prediction.decoded, target);
+
+        fn l2_norm(z: &[f32]) -> f32 {
+            let sum: f32 = z.iter().map(|&x| x * x).sum();
+            sum.sqrt()
+        }
+
+        fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
+            let len = a.len().max(b.len());
+            if len == 0 {
+                return 0.0;
+            }
+            let sum: f32 = (0..len)
+                .map(|idx| {
+                    let delta = a.get(idx).copied().unwrap_or_default() - b.get(idx).copied().unwrap_or_default();
+                    delta * delta
+                })
+                .sum();
+            sum.sqrt()
+        }
+
+        let baseline_z_norm = l2_norm(baseline_z);
+        let model_z = &prediction.encoded.z;
+        let model_z_norm = l2_norm(model_z);
+        let z_disagreement = euclidean_distance(baseline_z, model_z);
+
         Ok(ExperienceAutoencoderShadowMetric {
-            observed_at_ms,
-            hardcoded: target.clone(),
-            model: prediction.decoded,
-            target: target.clone(),
-            z: prediction.encoded,
-            loss,
+            t_ms,
+            baseline_z_norm,
+            model_z_norm,
+            z_disagreement,
+            reconstruction_loss: loss,
+            selected,
         })
     }
 

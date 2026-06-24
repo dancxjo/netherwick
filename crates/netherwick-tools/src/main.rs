@@ -1175,16 +1175,16 @@ async fn train_experience(args: TrainExperienceArgs) -> Result<()> {
 
     let mut samples = Vec::new();
     for transition in &transitions {
-        for (observed_at_ms, now) in [
-            (transition.created_at_ms, &transition.before),
-            (transition.created_at_ms, &transition.after),
+        for (observed_at_ms, now, baseline_z) in [
+            (transition.created_at_ms, &transition.before, transition.before_z.z.clone()),
+            (transition.created_at_ms, &transition.after, transition.after_z.z.clone()),
         ] {
             let input = experience_encode_input_from_now(now);
             let target = experience_decode_target_from_now(now);
             if input.flat_features().is_empty() || target.flat_features().is_empty() {
                 continue;
             }
-            samples.push((observed_at_ms, input, target));
+            samples.push((observed_at_ms, input, target, baseline_z));
         }
     }
     if samples.is_empty() {
@@ -1197,7 +1197,7 @@ async fn train_experience(args: TrainExperienceArgs) -> Result<()> {
 
     let (input_dim, decode_lengths) = samples
         .first()
-        .map(|(_, input, target)| (input.flat_features().len(), target.feature_lengths()))
+        .map(|(_, input, target, _)| (input.flat_features().len(), target.feature_lengths()))
         .unwrap_or_default();
     let z_dim = input_dim.clamp(8, 32);
     let mut trainer = ExperienceAutoencoderTrainer::new(input_dim, z_dim, decode_lengths);
@@ -1212,13 +1212,13 @@ async fn train_experience(args: TrainExperienceArgs) -> Result<()> {
     let mut last_loss = 0.0;
     let mut seen = 0_u64;
     for _ in 0..args.epochs {
-        for (observed_at_ms, input, target) in &samples {
+        for (observed_at_ms, input, target, baseline_z) in &samples {
             if input.flat_features().len() != trainer.input_dim()
                 || target.feature_lengths() != trainer.decode_lengths()
             {
                 continue;
             }
-            let metric = trainer.shadow_compare(*observed_at_ms, input, target)?;
+            let metric = trainer.shadow_compare(*observed_at_ms, input, target, baseline_z, "baseline".to_string())?;
             let line = serde_json::to_string(&metric)?;
             metrics_file.write_all(line.as_bytes()).await?;
             metrics_file.write_all(b"\n").await?;

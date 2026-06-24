@@ -1827,3 +1827,27 @@ pub struct RecalledExperience {
     pub experience: Experience,
     pub sensation: Sensation,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceBehaviorInput {
+    pub now: Now,
+    pub sense_vectors: Vec<Vec<f32>>,
+}
+
+impl ExperienceBehaviorInput {
+    pub fn from_now(now: &Now) -> Self {
+        let encode_input = experience_encode_input_from_now(now);
+        Self {
+            now: now.clone(),
+            sense_vectors: encode_input.sense_vectors,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceBehaviorOutput {
+    pub latent: ExperienceLatent,
+    pub reconstruction: Option<ExperienceDecodeOutput>,
+    pub reconstruction_loss: Option<f32>,
+    pub confidence: f32,
+}
