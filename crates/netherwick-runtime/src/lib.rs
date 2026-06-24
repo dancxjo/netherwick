@@ -81,6 +81,8 @@ where
     pub transition_builder: TransitionBuilder,
     pub behavior_training_hub: BehaviorTrainingHub,
     pub inline_learning: InlineLearningConfig,
+    pub nudge_policy: NudgePolicy,
+    nudge: NudgeController,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +191,283 @@ pub struct InlineLearningTickStatus {
     pub mode: InlineLearningMode,
     pub samples_observed: usize,
     pub train_steps_used: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NudgePolicy {
+    pub enabled: bool,
+    pub idle_after_ms: u64,
+    pub max_nudges_per_minute: u32,
+    pub max_forward_intensity: f32,
+    pub max_turn_intensity: f32,
+    pub require_clearance_m: f32,
+    pub prefer_turn_when_clearance_low: bool,
+    pub cooldown_ms: u64,
+}
+
+impl Default for NudgePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_after_ms: 4_000,
+            max_nudges_per_minute: 6,
+            max_forward_intensity: 0.15,
+            max_turn_intensity: 0.25,
+            require_clearance_m: 0.35,
+            prefer_turn_when_clearance_low: true,
+            cooldown_ms: 5_000,
+        }
+    }
+}
+
+impl NudgePolicy {
+    pub fn virtual_default() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NudgeStatus {
+    pub idle_ms: u64,
+    pub last_nudge_ms: Option<u64>,
+    pub nudge_count_recent: u32,
+    pub nudge_blocked_reason: Option<String>,
+    pub active_nudge: bool,
+}
+
+#[derive(Clone, Debug)]
+struct NudgeController {
+    status: NudgeStatus,
+    last_pose: Option<netherwick_core::Pose2>,
+    idle_started_at_ms: Option<u64>,
+    recent_nudges: VecDeque<u64>,
+    last_motor: MotorCommand,
+}
+
+impl Default for NudgeController {
+    fn default() -> Self {
+        Self {
+            status: NudgeStatus::default(),
+            last_pose: None,
+            idle_started_at_ms: None,
+            recent_nudges: VecDeque::new(),
+            last_motor: MotorCommand::stop(),
+        }
+    }
+}
+
+impl NudgeController {
+    fn propose(&mut self, now: &Now, policy: NudgePolicy) -> Option<ActionPrimitive> {
+        self.prune_recent(now.t_ms);
+        self.status.nudge_count_recent = self.recent_nudges.len() as u32;
+        self.status.active_nudge = self
+            .status
+            .last_nudge_ms
+            .map(|last| now.t_ms.saturating_sub(last) < 1_500)
+            .unwrap_or(false);
+
+        let low_motion = is_near_zero_motor(self.last_motor)
+            && now.body.velocity.forward_m_s.abs() < 0.02
+            && now.body.velocity.turn_rad_s.abs() < 0.04;
+        let low_pose_delta = self
+            .last_pose
+            .map(|pose| pose_delta_small(pose, now.body.odometry))
+            .unwrap_or(true);
+        if !low_motion || !low_pose_delta {
+            self.idle_started_at_ms = Some(now.t_ms);
+            self.status.idle_ms = 0;
+            self.status.nudge_blocked_reason = None;
+            self.last_pose = Some(now.body.odometry);
+            return None;
+        }
+
+        let idle_started_at = *self.idle_started_at_ms.get_or_insert(now.t_ms);
+        self.status.idle_ms = now.t_ms.saturating_sub(idle_started_at);
+        self.last_pose = Some(now.body.odometry);
+
+        if !policy.enabled {
+            self.status.nudge_blocked_reason = Some("prod mode disabled".to_string());
+            return None;
+        }
+        if let Some(last) = self.status.last_nudge_ms {
+            if now.t_ms.saturating_sub(last) < policy.cooldown_ms {
+                self.status.nudge_blocked_reason = Some("prod cooldown active".to_string());
+                return None;
+            }
+        }
+        if self.status.idle_ms < policy.idle_after_ms {
+            self.status.nudge_blocked_reason = Some("not idle long enough".to_string());
+            return None;
+        }
+        if self.recent_nudges.len() as u32 >= policy.max_nudges_per_minute {
+            self.status.nudge_blocked_reason = Some("prod rate limit active".to_string());
+            return None;
+        }
+        if let Some(reason) = nudge_general_block_reason(now) {
+            self.status.nudge_blocked_reason = Some(reason);
+            return None;
+        }
+
+        let action = choose_nudge_action(now, policy, self.recent_nudges.len());
+        if let Some(reason) = nudge_action_block_reason(now, &action, policy) {
+            self.status.nudge_blocked_reason = Some(reason);
+            return None;
+        }
+        self.record_nudge(now.t_ms);
+        self.status.nudge_blocked_reason = None;
+        Some(action)
+    }
+
+    fn observe_motor(&mut self, motor: MotorCommand) {
+        self.last_motor = motor;
+    }
+
+    fn record_nudge(&mut self, t_ms: u64) {
+        self.status.last_nudge_ms = Some(t_ms);
+        self.status.active_nudge = true;
+        self.recent_nudges.push_back(t_ms);
+        self.prune_recent(t_ms);
+        self.status.nudge_count_recent = self.recent_nudges.len() as u32;
+        self.idle_started_at_ms = Some(t_ms);
+        self.status.idle_ms = 0;
+    }
+
+    fn prune_recent(&mut self, t_ms: u64) {
+        while self
+            .recent_nudges
+            .front()
+            .map(|stamp| t_ms.saturating_sub(*stamp) > 60_000)
+            .unwrap_or(false)
+        {
+            self.recent_nudges.pop_front();
+        }
+    }
+}
+
+pub fn nudge_action_block_reason(
+    now: &Now,
+    action: &ActionPrimitive,
+    policy: NudgePolicy,
+) -> Option<String> {
+    if let Some(reason) = nudge_general_block_reason(now) {
+        return Some(reason);
+    }
+    let motor = action_to_motor_command(Some(action));
+    if motor.forward > 0.0 && !forward_clear(now, policy.require_clearance_m) {
+        return Some(format!(
+            "forward path clearance is below {:.2} m",
+            policy.require_clearance_m
+        ));
+    }
+    None
+}
+
+pub fn nudge_action_block_reason_for_snapshot(
+    snapshot: &WorldSnapshot,
+    action: &ActionPrimitive,
+    policy: NudgePolicy,
+) -> Option<String> {
+    nudge_action_block_reason(
+        &snapshot.to_now(snapshot.body.last_update_ms),
+        action,
+        policy,
+    )
+}
+
+fn choose_nudge_action(now: &Now, policy: NudgePolicy, recent_count: usize) -> ActionPrimitive {
+    let turn_intensity = 0.20_f32.min(policy.max_turn_intensity);
+    if !forward_clear(now, policy.require_clearance_m) && policy.prefer_turn_when_clearance_low {
+        return ActionPrimitive::Turn {
+            direction: clearer_turn_direction(now),
+            intensity: turn_intensity,
+            duration_ms: 600,
+        };
+    }
+
+    match recent_count % 3 {
+        0 => ActionPrimitive::Turn {
+            direction: clearer_turn_direction(now),
+            intensity: turn_intensity,
+            duration_ms: 600,
+        },
+        1 => ActionPrimitive::Explore {
+            style: ExploreStyle::RandomWalk,
+            duration_ms: 1_000,
+        },
+        _ => ActionPrimitive::Go {
+            intensity: 0.12_f32.min(policy.max_forward_intensity),
+            duration_ms: 500,
+        },
+    }
+}
+
+fn nudge_general_block_reason(now: &Now) -> Option<String> {
+    if now.body.flags.wheel_drop {
+        return Some("wheel drop detected".to_string());
+    }
+    if now.body.battery_level <= SafetyConfigForNudge::CRITICAL_BATTERY {
+        return Some("battery is critical".to_string());
+    }
+    if now
+        .extensions
+        .get("safety.vetoed")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return Some("active safety override".to_string());
+    }
+    if sim_stuck_active(now) {
+        return Some("stuck recovery active".to_string());
+    }
+    None
+}
+
+struct SafetyConfigForNudge;
+
+impl SafetyConfigForNudge {
+    const CRITICAL_BATTERY: f32 = 0.10;
+}
+
+fn is_near_zero_motor(motor: MotorCommand) -> bool {
+    motor.forward.abs() < 0.02 && motor.turn.abs() < 0.04
+}
+
+fn pose_delta_small(left: netherwick_core::Pose2, right: netherwick_core::Pose2) -> bool {
+    let dx = left.x_m - right.x_m;
+    let dy = left.y_m - right.y_m;
+    let distance = (dx * dx + dy * dy).sqrt();
+    let heading = (left.heading_rad - right.heading_rad).abs();
+    distance < 0.025 && heading < 0.05
+}
+
+fn forward_clear(now: &Now, clearance_m: f32) -> bool {
+    now.range
+        .nearest_m
+        .map(|nearest| nearest >= clearance_m)
+        .unwrap_or(true)
+}
+
+fn clearer_turn_direction(now: &Now) -> TurnDir {
+    let (left, _center, right) = beam_clearance_buckets(&now.range.beams);
+    if right > left {
+        TurnDir::Right
+    } else {
+        TurnDir::Left
+    }
+}
+
+fn sim_stuck_active(now: &Now) -> bool {
+    now.extensions
+        .get("sim.stuck")
+        .and_then(|value| value.get("values"))
+        .and_then(|value| value.as_array())
+        .and_then(|values| values.first())
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        > 0.0
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1574,6 +1853,8 @@ where
             transition_builder: TransitionBuilder::new(),
             behavior_training_hub: BehaviorTrainingHub::default(),
             inline_learning: InlineLearningConfig::default(),
+            nudge_policy: NudgePolicy::default(),
+            nudge: NudgeController::default(),
         }
     }
 
@@ -1605,6 +1886,8 @@ where
             transition_builder: TransitionBuilder::new(),
             behavior_training_hub: BehaviorTrainingHub::default(),
             inline_learning: InlineLearningConfig::default(),
+            nudge_policy: NudgePolicy::default(),
+            nudge: NudgeController::default(),
         }
     }
 
@@ -1632,6 +1915,15 @@ where
     pub fn with_inline_learning(mut self, config: InlineLearningConfig) -> Self {
         self.inline_learning = config;
         self
+    }
+
+    pub fn with_nudge_policy(mut self, policy: NudgePolicy) -> Self {
+        self.nudge_policy = policy;
+        self
+    }
+
+    pub fn nudge_status(&self) -> NudgeStatus {
+        self.nudge.status.clone()
     }
 
     pub async fn tick(
@@ -1831,6 +2123,14 @@ where
             &mut experiences,
             &mut teachings,
         );
+
+        let nudge_proposal = self.nudge.propose(&now, self.nudge_policy);
+        if let Some(action) = nudge_proposal.clone() {
+            notes.push(format!("ProdNudge: proposed {:?}", action));
+            proposed_actions.push(action);
+        } else if let Some(reason) = self.nudge.status.nudge_blocked_reason.clone() {
+            notes.push(format!("ProdNudgeBlocked: {reason}"));
+        }
 
         let mut proposals = proposed_actions.clone();
         if let Some(action) = llm_tick
@@ -2070,6 +2370,11 @@ where
         let safety = self
             .safety
             .filter(&now, action_to_motor_command(Some(&chosen_action)));
+        self.nudge.observe_motor(safety.command);
+        now.extensions.insert(
+            "prod.nudge".to_string(),
+            serde_json::to_value(&self.nudge.status)?,
+        );
         if safety.vetoed {
             now.extensions
                 .insert("safety.vetoed".to_string(), serde_json::Value::Bool(true));
@@ -4071,6 +4376,102 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn idle_now(t_ms: u64) -> Now {
+        let mut body = BodySense::default();
+        body.last_update_ms = t_ms;
+        let mut now = Now::blank(t_ms, body);
+        now.range.nearest_m = Some(1.0);
+        now.range.beams = vec![1.0, 1.0, 1.0];
+        now
+    }
+
+    fn prime_idle(controller: &mut NudgeController, now: &Now, policy: NudgePolicy) {
+        let mut first = now.clone();
+        first.t_ms = now.t_ms.saturating_sub(policy.idle_after_ms);
+        first.body.last_update_ms = first.t_ms;
+        assert!(controller.propose(&first, policy).is_none());
+    }
+
+    #[test]
+    fn nudge_refuses_wheel_drop() {
+        let policy = NudgePolicy::virtual_default();
+        let mut controller = NudgeController::default();
+        let mut now = idle_now(5_000);
+        now.body.flags.wheel_drop = true;
+        prime_idle(&mut controller, &now, policy);
+
+        assert!(controller.propose(&now, policy).is_none());
+        assert_eq!(
+            controller.status.nudge_blocked_reason.as_deref(),
+            Some("wheel drop detected")
+        );
+    }
+
+    #[test]
+    fn nudge_refuses_critical_battery() {
+        let policy = NudgePolicy::virtual_default();
+        let mut controller = NudgeController::default();
+        let mut now = idle_now(5_000);
+        now.body.battery_level = 0.05;
+        prime_idle(&mut controller, &now, policy);
+
+        assert!(controller.propose(&now, policy).is_none());
+        assert_eq!(
+            controller.status.nudge_blocked_reason.as_deref(),
+            Some("battery is critical")
+        );
+    }
+
+    #[test]
+    fn nudge_avoids_forward_when_obstacle_too_close() {
+        let policy = NudgePolicy::virtual_default();
+        let mut now = idle_now(5_000);
+        now.range.nearest_m = Some(0.2);
+        let action = ActionPrimitive::Go {
+            intensity: 0.12,
+            duration_ms: 500,
+        };
+
+        assert!(nudge_action_block_reason(&now, &action, policy)
+            .unwrap()
+            .contains("clearance"));
+    }
+
+    #[test]
+    fn turn_nudge_allowed_when_forward_path_blocked() {
+        let policy = NudgePolicy::virtual_default();
+        let mut controller = NudgeController::default();
+        let mut now = idle_now(5_000);
+        now.range.nearest_m = Some(0.2);
+        now.range.beams = vec![0.2, 0.2, 0.8];
+        prime_idle(&mut controller, &now, policy);
+
+        let action = controller.propose(&now, policy).unwrap();
+        assert!(matches!(
+            action,
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nudge_cooldown_prevents_repeated_twitching() {
+        let policy = NudgePolicy::virtual_default();
+        let mut controller = NudgeController::default();
+        let now = idle_now(5_000);
+        prime_idle(&mut controller, &now, policy);
+        assert!(controller.propose(&now, policy).is_some());
+
+        let later = idle_now(6_000);
+        assert!(controller.propose(&later, policy).is_none());
+        assert_eq!(
+            controller.status.nudge_blocked_reason.as_deref(),
+            Some("prod cooldown active")
+        );
+    }
 
     struct StubRuntime;
 

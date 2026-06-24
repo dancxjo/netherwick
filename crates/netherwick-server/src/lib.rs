@@ -15,10 +15,13 @@ use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
-use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource};
+use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir};
 use netherwick_core::TimeMs;
 use netherwick_now::{KinectSkeletonSense, ReignSense};
-use netherwick_runtime::{InlineLearningConfig, InlineLearningMode, ReignQueue};
+use netherwick_runtime::{
+    nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
+    NudgeStatus, ReignQueue,
+};
 use netherwick_sensors::{EyeFrameFormat, WorldSnapshot};
 use netherwick_worldlab::CaptureReader;
 use serde::{Deserialize, Serialize};
@@ -34,6 +37,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/mode",
     "/reign",
     "/reign/command",
+    "/reign/prod",
     "/reign/state",
     "/reign/clear",
     "/stream/now",
@@ -51,11 +55,32 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct ReignServerState {
     queue: Arc<Mutex<ReignQueue>>,
+    latest_snapshot: Option<Arc<Mutex<Option<WorldSnapshot>>>>,
 }
 
 impl ReignServerState {
     pub fn new(queue: Arc<Mutex<ReignQueue>>) -> Self {
-        Self { queue }
+        Self {
+            queue,
+            latest_snapshot: None,
+        }
+    }
+
+    pub fn with_live_view(queue: Arc<Mutex<ReignQueue>>, live_view: &LiveViewState) -> Self {
+        Self {
+            queue,
+            latest_snapshot: Some(Arc::clone(&live_view.latest)),
+        }
+    }
+
+    pub fn with_latest_snapshot(
+        queue: Arc<Mutex<ReignQueue>>,
+        latest_snapshot: Arc<Mutex<Option<WorldSnapshot>>>,
+    ) -> Self {
+        Self {
+            queue,
+            latest_snapshot: Some(latest_snapshot),
+        }
     }
 
     pub fn standalone() -> Self {
@@ -64,6 +89,12 @@ impl ReignServerState {
 
     pub fn queue(&self) -> Arc<Mutex<ReignQueue>> {
         Arc::clone(&self.queue)
+    }
+
+    fn latest_snapshot(&self) -> Option<WorldSnapshot> {
+        self.latest_snapshot
+            .as_ref()
+            .and_then(|latest| latest.lock().expect("live snapshot mutex poisoned").clone())
     }
 }
 
@@ -78,10 +109,24 @@ pub struct ReignCommandRequest {
     pub source: Option<ReignSource>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ProdRequest {
+    pub kind: Option<String>,
+    pub intensity: Option<f32>,
+    pub duration_ms: Option<TimeMs>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProdResponse {
+    pub accepted: bool,
+    pub input: ReignInput,
+}
+
 pub fn reign_router(state: ReignServerState) -> Router {
     Router::new()
         .route("/reign", get(reign_page))
         .route("/reign/command", post(post_reign_command))
+        .route("/reign/prod", post(post_reign_prod))
         .route("/reign/state", get(get_reign_state))
         .route("/reign/clear", post(post_reign_clear))
         .with_state(state)
@@ -94,6 +139,7 @@ pub struct LiveViewState {
     session: Arc<Mutex<Option<SceneSession>>>,
     training_status: Arc<Mutex<LiveTrainingStatus>>,
     inline_learning: Arc<Mutex<InlineLearningConfig>>,
+    prod_state: Arc<Mutex<NudgeStatus>>,
     pub virtual_retina: bool,
     pub retina_width: u32,
     pub retina_height: u32,
@@ -120,6 +166,7 @@ impl Default for LiveViewState {
             session: Arc::new(Mutex::new(None)),
             training_status: Arc::new(Mutex::new(LiveTrainingStatus::default())),
             inline_learning: Arc::new(Mutex::new(InlineLearningConfig::default())),
+            prod_state: Arc::new(Mutex::new(NudgeStatus::default())),
             virtual_retina: false,
             retina_width: 160,
             retina_height: 90,
@@ -241,6 +288,17 @@ impl LiveViewState {
             .expect("inline learning mutex poisoned")
             .clone()
     }
+
+    pub fn update_prod_state(&self, status: NudgeStatus) {
+        *self.prod_state.lock().expect("prod state mutex poisoned") = status;
+    }
+
+    pub fn prod_state(&self) -> NudgeStatus {
+        self.prod_state
+            .lock()
+            .expect("prod state mutex poisoned")
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -320,6 +378,12 @@ pub struct LiveSceneResponse {
     pub arena: Option<SceneArena>,
     pub sensor_calibration: Option<SceneSensorCalibration>,
     pub action: SceneAction,
+    pub prod: SceneProd,
+    pub idle_ms: u64,
+    pub last_nudge_ms: Option<u64>,
+    pub nudge_count_recent: u32,
+    pub nudge_blocked_reason: Option<String>,
+    pub active_nudge: bool,
     pub stuck: bool,
     pub dead_battery: bool,
     pub recovery_mode: Option<String>,
@@ -431,6 +495,15 @@ pub struct SceneAudio {
 pub struct SceneAction {
     pub latest: Option<String>,
     pub safety_override: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SceneProd {
+    pub idle_ms: u64,
+    pub last_nudge_ms: Option<u64>,
+    pub nudge_count_recent: u32,
+    pub nudge_blocked_reason: Option<String>,
+    pub active_nudge: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -563,6 +636,16 @@ pub async fn serve_live_view(addr: SocketAddr, state: LiveViewState) -> std::io:
     axum::serve(listener, live_view_router(state)).await
 }
 
+pub async fn serve_live_view_with_reign(
+    addr: SocketAddr,
+    live_state: LiveViewState,
+    reign_state: ReignServerState,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let router = live_view_router(live_state).merge(reign_router(reign_state));
+    axum::serve(listener, router).await
+}
+
 pub async fn serve_live_view_tls(
     addr: SocketAddr,
     state: LiveViewState,
@@ -572,6 +655,21 @@ pub async fn serve_live_view_tls(
     let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
     axum_server::bind_rustls(addr, config)
         .serve(live_view_router(state).into_make_service())
+        .await
+        .map_err(std::io::Error::other)
+}
+
+pub async fn serve_live_view_with_reign_tls(
+    addr: SocketAddr,
+    live_state: LiveViewState,
+    reign_state: ReignServerState,
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+) -> std::io::Result<()> {
+    let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+    let router = live_view_router(live_state).merge(reign_router(reign_state));
+    axum_server::bind_rustls(addr, config)
+        .serve(router.into_make_service())
         .await
         .map_err(std::io::Error::other)
 }
@@ -620,6 +718,7 @@ async fn get_live_scene(
         state.scene_metadata().as_ref(),
         state.session(),
         state.training_status(),
+        state.prod_state(),
         retina_status,
     )))
 }
@@ -1272,6 +1371,7 @@ async fn get_capture_scene(
         metadata.as_ref(),
         None,
         LiveTrainingStatus::default(),
+        NudgeStatus::default(),
         None,
     );
     scene.t_ms = record.t_ms;
@@ -1374,6 +1474,7 @@ pub fn snapshot_to_scene(
     metadata: Option<&LiveSceneMetadata>,
     session: Option<SceneSession>,
     training: LiveTrainingStatus,
+    prod_state: NudgeStatus,
     retina_status: Option<RetinaStatusInfo>,
 ) -> LiveSceneResponse {
     let mut warnings = Vec::new();
@@ -1464,6 +1565,18 @@ pub fn snapshot_to_scene(
         arena: metadata.and_then(|metadata| metadata.arena),
         sensor_calibration,
         action: SceneAction::default(),
+        prod: SceneProd {
+            idle_ms: prod_state.idle_ms,
+            last_nudge_ms: prod_state.last_nudge_ms,
+            nudge_count_recent: prod_state.nudge_count_recent,
+            nudge_blocked_reason: prod_state.nudge_blocked_reason.clone(),
+            active_nudge: prod_state.active_nudge,
+        },
+        idle_ms: prod_state.idle_ms,
+        last_nudge_ms: prod_state.last_nudge_ms,
+        nudge_count_recent: prod_state.nudge_count_recent,
+        nudge_blocked_reason: prod_state.nudge_blocked_reason.clone(),
+        active_nudge: prod_state.active_nudge,
         stuck: stuck.active,
         dead_battery: stuck.dead_battery,
         recovery_mode: stuck.recovery_phase.clone(),
@@ -1983,6 +2096,46 @@ async fn post_reign_command(
     Ok(Json(input))
 }
 
+async fn post_reign_prod(
+    State(state): State<ReignServerState>,
+    request: Option<Json<ProdRequest>>,
+) -> Result<Json<ProdResponse>, ReignApiError> {
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let snapshot = state.latest_snapshot().ok_or_else(|| {
+        ReignApiError::bad_request("cannot prod before a live scene snapshot exists")
+    })?;
+    let command = prod_command_from_request(request)?;
+    let action = command
+        .to_action()
+        .ok_or_else(|| ReignApiError::bad_request("prod command cannot be converted to action"))?;
+    let policy = NudgePolicy::virtual_default();
+    if let Some(reason) = nudge_action_block_reason_for_snapshot(&snapshot, &action, policy) {
+        return Err(ReignApiError::forbidden(format!("prod refused: {reason}")));
+    }
+
+    let now_ms = wall_now_ms();
+    let ttl_ms = command.default_ttl_ms().clamp(500, 5_000);
+    let input = ReignInput {
+        id: Uuid::new_v4(),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(ttl_ms),
+        source: ReignSource::HumanSupervisor,
+        mode: ReignMode::Assist,
+        command,
+        priority: 0.8,
+        note: Some("manual prod".to_string()),
+    };
+    state
+        .queue
+        .lock()
+        .map_err(|_| ReignApiError::internal("reign queue lock poisoned"))?
+        .push(input.clone());
+    Ok(Json(ProdResponse {
+        accepted: true,
+        input,
+    }))
+}
+
 async fn get_reign_state(
     State(state): State<ReignServerState>,
 ) -> Result<Json<ReignSense>, ReignApiError> {
@@ -1993,6 +2146,45 @@ async fn get_reign_state(
         .map_err(|_| ReignApiError::internal("reign queue lock poisoned"))?;
     queue.drain_expired(now_ms);
     Ok(Json(queue.sense(now_ms)))
+}
+
+fn prod_command_from_request(request: ProdRequest) -> Result<ReignCommand, ReignApiError> {
+    let duration_ms = request.duration_ms.unwrap_or(1_500).clamp(250, 3_000);
+    let intensity = match request.intensity {
+        Some(value) if value.is_finite() => value,
+        Some(_) => return Err(ReignApiError::bad_request("intensity must be finite")),
+        None => 0.12,
+    };
+    let intensity = intensity.clamp(0.0, 0.25);
+    let kind = request
+        .kind
+        .as_deref()
+        .unwrap_or("explore")
+        .trim()
+        .to_ascii_lowercase();
+    let command = match kind.as_str() {
+        "" | "explore" | "random_walk" | "random-walk" => ReignCommand::Explore { duration_ms },
+        "go" | "forward" => ReignCommand::Go {
+            intensity: intensity.min(0.15),
+            duration_ms: duration_ms.min(1_000),
+        },
+        "turn" | "left" => ReignCommand::Turn {
+            direction: TurnDir::Left,
+            intensity: intensity.min(0.25),
+            duration_ms: duration_ms.min(1_000),
+        },
+        "right" => ReignCommand::Turn {
+            direction: TurnDir::Right,
+            intensity: intensity.min(0.25),
+            duration_ms: duration_ms.min(1_000),
+        },
+        other => {
+            return Err(ReignApiError::bad_request(format!(
+                "unsupported prod kind '{other}'"
+            )))
+        }
+    };
+    sanitize_command(command)
 }
 
 async fn post_reign_clear(
@@ -2028,6 +2220,13 @@ impl ReignApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }
@@ -2407,18 +2606,44 @@ const LIVE_VIEW_3D_PAGE: &str = r#"<!doctype html>
 <style>
 :root{color-scheme:dark;background:#0b0d10;color:#eef1f3;font:13px system-ui}
 html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
+.panel-window{position:fixed;box-sizing:border-box;display:flex;flex-direction:column;min-width:220px;min-height:84px;padding:0;border:1px solid #34414d;background:rgba(10,13,17,.86);backdrop-filter:blur(10px);border-radius:7px;color:#e7eef5;resize:both;overflow:hidden;box-shadow:0 16px 40px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.05);transition:height .24s ease,min-height .24s ease,border-color .18s ease,box-shadow .18s ease,background .18s ease}
+.panel-window:hover{border-color:#4d6275;box-shadow:0 18px 48px rgba(0,0,0,.34),0 0 0 1px rgba(121,190,242,.08),inset 0 1px 0 rgba(255,255,255,.07)}
+.panel-titlebar{flex:0 0 auto;display:flex;align-items:center;min-height:31px;padding:0 10px;border-bottom:1px solid rgba(118,144,166,.28);background:linear-gradient(180deg,rgba(38,55,68,.92),rgba(18,27,36,.9));color:#c6e6ff;font-weight:700;font-size:12px;letter-spacing:0;cursor:move;user-select:none;touch-action:none}
+.panel-titlebar::before{content:"";width:8px;height:8px;margin-right:8px;border-radius:50%;background:#6fc1ff;box-shadow:0 0 12px rgba(111,193,255,.5)}
+.panel-titlebar::after{content:"double-click to shade";margin-left:auto;color:#8fa1b2;font-size:10px;font-weight:500;opacity:0;transition:opacity .16s ease}
+.panel-window:hover .panel-titlebar::after{opacity:.72}
+.panel-content{flex:1 1 auto;min-height:0;padding:10px;overflow:auto;transition:max-height .24s ease,opacity .2s ease,padding .24s ease}
+.panel-window.is-shaded{height:32px!important;min-height:32px;resize:none;background:rgba(12,18,24,.92)}
+.panel-window.is-shaded .panel-content{max-height:0;opacity:0;padding-top:0;padding-bottom:0;pointer-events:none;overflow:hidden}
+.panel-window.is-shaded .panel-titlebar{border-bottom-color:transparent}
 .drag-handle{cursor:move;user-select:none}
-#hud{position:fixed;left:12px;top:12px;display:grid;gap:6px;min-width:240px;padding:10px;border:1px solid #2b3138;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px;resize:both;overflow:auto}
+#hud{left:12px;top:12px;min-width:240px;border-color:#2b3138}
+#hud .panel-content{display:grid;gap:6px}
 #hud h1{font-size:14px;margin:0}
+#hud .panel-content>h1,#reign .panel-content>strong,#virtual-pipeline-section .panel-content>h2,#model-graph-window .panel-content>section>h2{display:none}
 #hud dl{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;margin:0}
 #hud dt{color:#aab4bd}
 #hud dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 #hud dd.active-learning{color:#8df0b2;font-weight:700}
 #status{color:#ffd083}
-#reign{position:fixed;right:12px;top:12px;min-width:220px;padding:10px;border:1px solid #36424d;background:rgba(11,16,22,.84);backdrop-filter:blur(8px);border-radius:6px;color:#dce8f2;resize:both;overflow:auto}
+#reign{right:12px;top:12px;width:236px;min-width:220px;border-color:#36424d;background:rgba(11,16,22,.84);color:#dce8f2}
+#reign .panel-content{display:grid;gap:8px}
 #reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
 #reign div{font-variant-numeric:tabular-nums}
-#llm{position:fixed;right:12px;top:96px;width:320px;height:300px;min-width:200px;min-height:150px;display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;padding:10px;border:1px solid #3f4c58;background:rgba(9,12,16,.88);backdrop-filter:blur(10px);border-radius:6px;color:#e7eef5;resize:both;overflow:hidden}
+#reign-state{min-height:17px;color:#ffd083}
+.reign-pad{display:grid;grid-template-columns:92px 1fr;gap:10px;align-items:center}
+#reign-joystick{position:relative;width:92px;aspect-ratio:1;border:1px solid #455565;border-radius:50%;background:radial-gradient(circle at 50% 50%,rgba(79,149,188,.24),rgba(15,23,31,.72) 64%);touch-action:none;cursor:pointer}
+#reign-joystick::before,#reign-joystick::after{content:"";position:absolute;background:rgba(170,196,216,.22)}
+#reign-joystick::before{left:12px;right:12px;top:50%;height:1px}
+#reign-joystick::after{top:12px;bottom:12px;left:50%;width:1px}
+#reign-stick{position:absolute;left:50%;top:50%;width:34px;height:34px;border-radius:50%;background:#dce8f2;border:1px solid #8ec9ef;box-shadow:0 0 18px rgba(111,191,242,.42);transform:translate(-50%,-50%)}
+.reign-buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.reign-buttons button{min-height:34px;border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer}
+.reign-buttons button:hover,.reign-buttons button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
+.reign-buttons .stop{grid-column:1/-1;background:#5b1720;border-color:#9a3443;color:#fff}
+.reign-hint{color:#9fb0bf;font-size:11px;line-height:1.25}
+#llm{right:12px;top:96px;width:320px;height:300px;min-width:200px;min-height:150px;border-color:#3f4c58;background:rgba(9,12,16,.88)}
+#llm .panel-content{display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;overflow:hidden}
 #llm header{display:flex;align-items:center;justify-content:space-between;gap:12px}
 #llm h2{font-size:12px;margin:0;color:#b6e0ff}
 #llm-status{color:#ffcf7a;font-size:12px;font-variant-numeric:tabular-nums}
@@ -2432,9 +2657,14 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .llm-block{display:grid;gap:3px;min-width:0}
 .llm-label{color:#8fa1b2;font-size:11px;text-transform:uppercase}
 .llm-text{max-height:112px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;line-height:1.35;color:#dbe7f1;background:rgba(4,7,10,.38);border-radius:4px;padding:6px}
-#models{position:fixed;left:12px;bottom:40px;width:640px;height:320px;min-width:320px;min-height:200px;display:grid;grid-template-columns:minmax(200px,.92fr) minmax(260px,1fr);gap:10px;padding:10px;border:1px solid #37424c;background:rgba(8,11,15,.88);backdrop-filter:blur(10px);border-radius:6px;color:#e7eef5;resize:both;overflow:hidden}
-#models section{display:flex;flex-direction:column;min-height:0}
-#models h2{font-size:12px;margin:0 0 8px;color:#c6e6ff}
+#virtual-pipeline-section{left:374px;top:318px;width:300px;height:230px;min-width:260px;min-height:140px;border-color:#37424c;background:rgba(8,11,15,.88)}
+#virtual-pipeline-section .panel-content{display:grid;gap:8px}
+#models{left:12px;bottom:40px;width:310px;height:320px;min-width:260px;min-height:180px;border-color:#37424c;background:rgba(8,11,15,.88)}
+#models .panel-content{display:flex;flex-direction:column;gap:8px;overflow:hidden}
+#model-graph-window{left:336px;bottom:40px;width:360px;height:320px;min-width:280px;min-height:220px;border-color:#37424c;background:rgba(8,11,15,.88)}
+#model-graph-window .panel-content{display:flex;flex-direction:column;gap:8px;overflow:hidden}
+#models section,#model-graph-window section{display:flex;flex-direction:column;min-height:0;flex:1}
+#models h2,#model-graph-window h2,#virtual-pipeline-section h2{font-size:12px;margin:0 0 8px;color:#c6e6ff}
 #model-status{color:#ffcf7a;font-size:12px;font-variant-numeric:tabular-nums}
 #model-list{flex:1;display:grid;gap:6px;min-height:0;overflow-y:auto;scrollbar-width:thin}
 .model-row{display:grid;grid-template-columns:1fr auto;gap:3px 8px;padding:6px;border:1px solid #27313b;background:rgba(18,24,30,.72);border-radius:5px}
@@ -2448,13 +2678,15 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #model-graph .node rect{fill:#17222b;stroke:#52687b;stroke-width:1.2;rx:5}
 #model-graph .node.model rect{stroke:#81c995}
 #model-graph .node.core rect{stroke:#8bd3ff}
-#calibration{position:fixed;left:12px;top:540px;width:340px;padding:10px;border:1px solid #3c4854;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px;color:#e7eef5;resize:both;overflow:auto;display:grid;gap:6px}
+#calibration{left:12px;top:540px;width:340px;border-color:#3c4854}
+#calibration .panel-content{display:grid;gap:6px}
 #calibration header{display:flex;align-items:center;justify-content:space-between;gap:12px}
 #calibration h2{font-size:12px;margin:0;color:#c6e6ff}
 #calibration label{color:#8fa1b2;font-size:11px}
 #calibration span{color:#ffd083;font-size:11px;font-variant-numeric:tabular-nums}
 #calibration input[type="range"]{width:100%;accent-color:#52a9ff;background:#242a32;height:4px;border-radius:2px;outline:none}
-#learning{position:fixed;left:12px;top:318px;width:340px;padding:10px;border:1px solid #3c4854;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px;color:#e7eef5;resize:both;overflow:auto;display:grid;gap:8px}
+#learning{left:12px;top:318px;width:340px;border-color:#3c4854}
+#learning .panel-content{display:grid;gap:8px}
 #learning header{display:flex;align-items:center;justify-content:space-between;gap:12px}
 #learning h2{font-size:12px;margin:0;color:#c6e6ff}
 #learning-status{color:#ffcf7a;font-size:11px;font-variant-numeric:tabular-nums}
@@ -2467,11 +2699,11 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
 #xr[disabled]{opacity:.55}
 #fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
-@media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{grid-template-columns:1fr;bottom:98px;max-height:46vh}#model-graph{height:220px}#learning{left:12px;right:12px;top:220px;width:auto;max-height:34vh}#calibration{display:none}}
+@media(max-width:820px){.panel-window{max-width:calc(100vw - 24px)}#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{bottom:98px;max-height:46vh}#model-graph-window{display:none}#virtual-pipeline-section{left:12px;right:12px;top:128px;width:auto;max-height:28vh}#model-graph{height:220px}#learning{left:12px;right:12px;top:220px;width:auto;max-height:34vh}#calibration{display:none}}
 canvas{display:block}
 </style>
 <canvas id="scene"></canvas>
-<aside id="hud">
+<aside id="hud" data-window-title="Sensorium 3D">
   <h1>Sensorium 3D</h1>
   <div id="status">connecting...</div>
   <dl>
@@ -2502,7 +2734,7 @@ canvas{display:block}
     <dt>WebXR</dt><dd id="webxr">checking...</dd>
   </dl>
 </aside>
-<aside id="learning">
+<aside id="learning" data-window-title="Live learning">
   <header>
     <h2>Live learning</h2>
     <div id="learning-status">loading...</div>
@@ -2530,33 +2762,46 @@ canvas{display:block}
   </div>
   <button id="learning-apply">Apply</button>
 </aside>
-<aside id="reign">
-  <strong>XR reigns</strong>
-  <div id="reign-state">enter VR to enable controller reigns</div>
+<aside id="reign" data-window-title="Reign controls">
+  <strong>Reign controls</strong>
+  <div class="reign-pad">
+    <div id="reign-joystick" role="application" aria-label="Hold and drag to steer">
+      <div id="reign-stick"></div>
+    </div>
+    <div class="reign-buttons">
+      <button class="stop" id="reign-stop" type="button">Stop</button>
+      <button id="reign-dock" type="button">Dock</button>
+      <button id="reign-explore" type="button">Explore</button>
+    </div>
+  </div>
+  <div id="reign-state">web reign ready</div>
+  <div class="reign-hint">Drag up to go, left or right to turn. Release to stop.</div>
 </aside>
-<aside id="llm">
+<aside id="llm" data-window-title="LLM streams">
   <header>
     <h2>LLM streams</h2>
     <div id="llm-status">connecting...</div>
   </header>
   <div id="llm-streams"></div>
 </aside>
-<aside id="models">
-  <section id="virtual-pipeline-section" style="display: none; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 10px;">
-    <h2>Dream World Training</h2>
-    <div id="virtual-report-summary" style="font-size: 0.85em; opacity: 0.9; margin-bottom: 8px; line-height: 1.4;"></div>
-    <div id="virtual-model-recommendations" style="font-size: 0.85em;"></div>
-  </section>
+<aside id="virtual-pipeline-section" data-window-title="Dream World Training" style="display:none">
+  <h2>Dream World Training</h2>
+  <div id="virtual-report-summary" style="font-size: 0.85em; opacity: 0.9; margin-bottom: 8px; line-height: 1.4;"></div>
+  <div id="virtual-model-recommendations" style="font-size: 0.85em;"></div>
+</aside>
+<aside id="models" data-window-title="Training stats">
   <section>
     <h2>Training stats <span id="model-status">loading...</span></h2>
     <div id="model-list"></div>
   </section>
+</aside>
+<aside id="model-graph-window" data-window-title="Connections">
   <section>
     <h2>Connections</h2>
     <svg id="model-graph" viewBox="0 0 560 260" role="img" aria-label="Model connection diagram"></svg>
   </section>
 </aside>
-<aside id="calibration">
+<aside id="calibration" data-window-title="Sensor Calibration">
   <header>
     <h2>Sensor Calibration</h2>
     <button id="reset-calibration" style="font-size:11px;padding:2px 6px;background:#243646;border:1px solid #36424d;color:#b8e1ff;border-radius:4px;cursor:pointer">Reset</button>
@@ -2621,6 +2866,11 @@ const canvas = document.getElementById('scene');
 const statusEl = document.getElementById('status');
 const xrButton = document.getElementById('xr');
 const reignState = document.getElementById('reign-state');
+const reignJoystick = document.getElementById('reign-joystick');
+const reignStick = document.getElementById('reign-stick');
+const reignStop = document.getElementById('reign-stop');
+const reignDock = document.getElementById('reign-dock');
+const reignExplore = document.getElementById('reign-explore');
 const llmStatus = document.getElementById('llm-status');
 const llmStreams = document.getElementById('llm-streams');
 const modelStatus = document.getElementById('model-status');
@@ -2794,6 +3044,8 @@ let xrSession = null;
 let lastReignKey = '';
 let lastReignSentAt = 0;
 let lastReignText = 'idle';
+let webReignPointerId = null;
+let webReignVector = {x: 0, y: 0};
 const llmCards = new Map();
 
 function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
@@ -3180,7 +3432,7 @@ function stickAxes(gamepad){
   return {x: 0, y: 0};
 }
 
-async function postReign(command, ttl_ms, label, priority=.95){
+async function postReign(command, ttl_ms, label, priority=.95, source='Gamepad', note='WebXR controller reign'){
   const key = JSON.stringify(command);
   const now = performance.now();
   if(key === lastReignKey && now - lastReignSentAt < 220) return;
@@ -3196,8 +3448,8 @@ async function postReign(command, ttl_ms, label, priority=.95){
         mode:'Direct',
         priority,
         ttl_ms,
-        source:'Gamepad',
-        note:'WebXR controller reign',
+        source,
+        note,
         command
       })
     });
@@ -3207,6 +3459,85 @@ async function postReign(command, ttl_ms, label, priority=.95){
     reignState.textContent = 'reign send failed';
   }
 }
+
+function postWebReign(command, ttl_ms, label, priority=.95){
+  return postReign(command, ttl_ms, label, priority, 'WebRemote', 'Web panel reign');
+}
+
+function resetWebJoystick(){
+  webReignVector = {x: 0, y: 0};
+  reignStick.style.transform = 'translate(-50%,-50%)';
+}
+
+function updateWebJoystick(event){
+  const rect = reignJoystick.getBoundingClientRect();
+  const radius = rect.width / 2;
+  const cx = rect.left + radius;
+  const cy = rect.top + radius;
+  const dx = event.clientX - cx;
+  const dy = event.clientY - cy;
+  const distance = Math.min(radius - 17, Math.hypot(dx, dy));
+  const angle = Math.atan2(dy, dx);
+  const knobX = Math.cos(angle) * distance;
+  const knobY = Math.sin(angle) * distance;
+  reignStick.style.transform = `translate(calc(-50% + ${knobX}px), calc(-50% + ${knobY}px))`;
+  webReignVector = {
+    x: Math.max(-1, Math.min(1, dx / radius)),
+    y: Math.max(-1, Math.min(1, dy / radius))
+  };
+}
+
+function commandForWebJoystick(){
+  const {x, y} = webReignVector;
+  if(Math.hypot(x, y) < .28) return null;
+  if(y < -.32 && Math.abs(y) >= Math.abs(x) * .85){
+    const intensity = Math.min(1, Math.max(.25, -y));
+    return {command:{type:'Go', intensity, duration_ms:350}, ttl:700, label:`forward ${fmt(intensity, 2)}`, priority:.95};
+  }
+  if(Math.abs(x) > .32){
+    const intensity = Math.min(1, Math.max(.25, Math.abs(x)));
+    return {command:{type:'Turn', direction:x < 0 ? 'Left' : 'Right', intensity, duration_ms:300}, ttl:650, label:`turn ${x < 0 ? 'left' : 'right'} ${fmt(intensity, 2)}`, priority:.95};
+  }
+  if(y > .52) return {command:{type:'Stop'}, ttl:900, label:'stop', priority:1};
+  return null;
+}
+
+function pollWebReigns(){
+  if(webReignPointerId == null) return false;
+  const next = commandForWebJoystick();
+  if(next){
+    postWebReign(next.command, next.ttl, next.label, next.priority);
+    return true;
+  }
+  if(performance.now() - lastReignSentAt > 900) reignState.textContent = 'hold and drag to reign';
+  return true;
+}
+
+reignJoystick.addEventListener('pointerdown', event => {
+  webReignPointerId = event.pointerId;
+  reignJoystick.setPointerCapture(event.pointerId);
+  updateWebJoystick(event);
+  event.preventDefault();
+});
+
+reignJoystick.addEventListener('pointermove', event => {
+  if(event.pointerId !== webReignPointerId) return;
+  updateWebJoystick(event);
+  event.preventDefault();
+});
+
+function endWebJoystick(event){
+  if(event.pointerId !== webReignPointerId) return;
+  webReignPointerId = null;
+  resetWebJoystick();
+  postWebReign({type:'Stop'}, 900, 'stop', 1);
+}
+
+reignJoystick.addEventListener('pointerup', endWebJoystick);
+reignJoystick.addEventListener('pointercancel', endWebJoystick);
+reignStop.addEventListener('click', () => postWebReign({type:'Stop'}, 2000, 'stop', 1));
+reignDock.addEventListener('click', () => postWebReign({type:'Dock'}, 5000, 'dock', .9));
+reignExplore.addEventListener('click', () => postWebReign({type:'Explore', duration_ms:3000}, 5000, 'explore', .85));
 
 function commandForInputSource(inputSource){
   const gamepad = inputSource.gamepad;
@@ -3236,8 +3567,12 @@ function commandForInputSource(inputSource){
 }
 
 function pollXrReigns(){
+  if(pollWebReigns()) return;
   if(!xrSession){
-    reignState.textContent = 'enter VR to enable controller reigns';
+    if(performance.now() - lastReignSentAt > 1200){
+      lastReignKey = '';
+      reignState.textContent = lastReignText === 'idle' ? 'web reign ready' : `ready, last ${lastReignText}`;
+    }
     return;
   }
   let activeSources = 0;
@@ -3469,23 +3804,49 @@ async function setupXr(){
       }
     });
     xrSession = xrHelper.baseExperience.sessionManager.session;
-    reignState.textContent = 'controller reigns ready';
+    reignState.textContent = 'controller and web reigns ready';
     xrHelper.baseExperience.sessionManager.onXRSessionEnded.add(() => {
       xrSession = null;
       lastReignKey = '';
       lastReignText = 'idle';
-      reignState.textContent = 'enter VR to enable controller reigns';
+      reignState.textContent = 'web reign ready';
     });
   };
 }
 
 let isInitialized = false;
 let maxZIndex = 100;
+const panelIds = ['hud', 'learning', 'reign', 'llm', 'virtual-pipeline-section', 'models', 'model-graph-window', 'calibration'];
+
+function preparePanelWindow(el) {
+  if (el.classList.contains('panel-window')) return el.querySelector('.panel-titlebar');
+  const title = el.dataset.windowTitle || el.id;
+  el.classList.add('panel-window');
+
+  const titlebar = document.createElement('div');
+  titlebar.className = 'panel-titlebar drag-handle';
+  titlebar.textContent = title;
+  titlebar.title = 'Drag to move. Double-click to shade.';
+
+  const content = document.createElement('div');
+  content.className = 'panel-content';
+  while (el.firstChild) content.appendChild(el.firstChild);
+  el.append(titlebar, content);
+
+  titlebar.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    el.classList.toggle('is-shaded');
+    bringToFront(el);
+    savePanelLayouts();
+  });
+
+  return titlebar;
+}
 
 function savePanelLayouts() {
   if (!isInitialized) return;
   const layouts = {};
-  ['hud', 'reign', 'llm', 'models', 'calibration'].forEach(id => {
+  panelIds.forEach(id => {
     const el = document.getElementById(id);
     if (el) {
       const rect = el.getBoundingClientRect();
@@ -3494,7 +3855,8 @@ function savePanelLayouts() {
         top: rect.top,
         width: rect.width,
         height: rect.height,
-        zIndex: el.style.zIndex ? parseInt(el.style.zIndex, 10) : 100
+        zIndex: el.style.zIndex ? parseInt(el.style.zIndex, 10) : 100,
+        shaded: el.classList.contains('is-shaded')
       };
     }
   });
@@ -3528,6 +3890,7 @@ function loadPanelLayouts() {
             el.style.zIndex = layout.zIndex;
             if (layout.zIndex > highestZ) highestZ = layout.zIndex;
           }
+          el.classList.toggle('is-shaded', !!layout.shaded);
         }
       }
       maxZIndex = highestZ;
@@ -3540,7 +3903,7 @@ function loadPanelLayouts() {
 
 function applyOrClearLayouts() {
   if (window.innerWidth < 820) {
-    ['hud', 'reign', 'llm', 'models', 'calibration'].forEach(id => {
+    panelIds.forEach(id => {
       const el = document.getElementById(id);
       if (el) {
         el.style.left = '';
@@ -3550,13 +3913,14 @@ function applyOrClearLayouts() {
         el.style.right = '';
         el.style.bottom = '';
         el.style.zIndex = '';
+        el.classList.remove('is-shaded');
       }
     });
   } else {
     if (!isInitialized) {
       loadPanelLayouts();
     } else {
-      ['hud', 'reign', 'llm', 'models', 'calibration'].forEach(id => {
+      panelIds.forEach(id => {
         const el = document.getElementById(id);
         if (el && el.style.left) {
           const rect = el.getBoundingClientRect();
@@ -3577,17 +3941,10 @@ function bringToFront(el) {
 }
 
 function setupDraggableAndResizable() {
-  const panels = [
-    { id: 'hud', handleQuery: 'h1' },
-    { id: 'reign', handleQuery: 'strong' },
-    { id: 'llm', handleQuery: 'header' },
-    { id: 'models', handleQuery: 'h2' },
-    { id: 'calibration', handleQuery: 'h2' }
-  ];
-
-  panels.forEach(({ id, handleQuery }) => {
+  panelIds.forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
+    const handle = preparePanelWindow(el);
 
     el.addEventListener('mousedown', () => bringToFront(el));
     el.addEventListener('touchstart', () => bringToFront(el));
@@ -3597,14 +3954,10 @@ function setupDraggableAndResizable() {
     });
     resizeObserver.observe(el);
 
-    const handles = el.querySelectorAll(handleQuery);
-    handles.forEach(handle => {
-      handle.classList.add('drag-handle');
+    handle.addEventListener('mousedown', dragStart);
+    handle.addEventListener('touchstart', dragStart, { passive: false });
 
-      handle.addEventListener('mousedown', dragStart);
-      handle.addEventListener('touchstart', dragStart, { passive: false });
-
-      function dragStart(e) {
+    function dragStart(e) {
         if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'A') {
           return;
         }
@@ -3651,8 +4004,7 @@ function setupDraggableAndResizable() {
         window.addEventListener('mouseup', onMouseUp);
         window.addEventListener('touchmove', onMouseMove, { passive: false });
         window.addEventListener('touchend', onMouseUp);
-      }
-    });
+    }
   });
 
   applyOrClearLayouts();
@@ -3760,7 +4112,7 @@ async function pollVirtualTraining() {
     if (data.status === 'none') {
       virtualPipelineSection.style.display = 'none';
     } else {
-      virtualPipelineSection.style.display = 'block';
+      virtualPipelineSection.style.display = '';
       const rr = data.run_report || {};
       virtualReportSummary.innerHTML = `
         <strong>Latest Session Metrics:</strong><br>
@@ -3998,6 +4350,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_prod_enqueues_bounded_assist_command() {
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        let latest = Arc::new(Mutex::new(Some(WorldSnapshot::default())));
+        let state = ReignServerState::with_latest_snapshot(Arc::clone(&queue), latest);
+
+        let Json(response) = post_reign_prod(
+            State(state),
+            Some(Json(ProdRequest {
+                kind: Some("go".to_string()),
+                intensity: Some(0.9),
+                duration_ms: Some(10_000),
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert!(response.accepted);
+        assert_eq!(response.input.mode, ReignMode::Assist);
+        assert!(matches!(
+            response.input.command,
+            ReignCommand::Go {
+                intensity,
+                duration_ms
+            } if intensity <= 0.15 && duration_ms <= 1_000
+        ));
+        let sense = queue.lock().unwrap().sense(response.input.issued_at_ms);
+        assert_eq!(
+            sense.latest.as_ref().map(|input| input.id),
+            Some(response.input.id)
+        );
+    }
+
+    #[tokio::test]
     async fn posted_reign_command_is_seen_by_runtime_tick() {
         let queue = Arc::new(Mutex::new(ReignQueue::default()));
         let state = ReignServerState::new(Arc::clone(&queue));
@@ -4145,6 +4530,13 @@ mod tests {
             action_selector_mode: "baseline".to_string(),
             weights_updating: false,
         });
+        state.update_prod_state(NudgeStatus {
+            idle_ms: 4_200,
+            last_nudge_ms: Some(1_000),
+            nudge_count_recent: 1,
+            nudge_blocked_reason: Some("prod cooldown active".to_string()),
+            active_nudge: false,
+        });
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.odometry.x_m = 0.5;
         snapshot.body.odometry.y_m = 0.75;
@@ -4194,6 +4586,14 @@ mod tests {
         assert_eq!(scene.models_loaded, vec!["danger"]);
         assert!(!scene.weights_updating);
         assert!(scene.stuck);
+        assert_eq!(scene.idle_ms, 4_200);
+        assert_eq!(scene.last_nudge_ms, Some(1_000));
+        assert_eq!(scene.nudge_count_recent, 1);
+        assert_eq!(
+            scene.nudge_blocked_reason.as_deref(),
+            Some("prod cooldown active")
+        );
+        assert_eq!(scene.prod.idle_ms, 4_200);
         assert!(scene.dead_battery);
         assert_eq!(scene.recovery_mode.as_deref(), Some("turn-away"));
         assert_eq!(scene.stuck_ticks, 6);
@@ -4218,7 +4618,14 @@ mod tests {
     fn missing_eye_kinect_and_audio_serialize_as_empty_or_null() {
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.battery_level = 0.0;
-        let scene = snapshot_to_scene(&snapshot, None, None, LiveTrainingStatus::default(), None);
+        let scene = snapshot_to_scene(
+            &snapshot,
+            None,
+            None,
+            LiveTrainingStatus::default(),
+            NudgeStatus::default(),
+            None,
+        );
         let value = serde_json::to_value(scene).unwrap();
 
         assert!(value["eye"].is_null());

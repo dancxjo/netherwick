@@ -26,8 +26,8 @@ use netherwick_models::MODEL_REGISTRY;
 use netherwick_now::{EarSense, KinectSense, RangeSense};
 use netherwick_runtime::{
     ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
-    InlineLearningMode, MinimalRuntime, RealRobotRunner, RobotMode, RuntimeLoop, RuntimeModelStack,
-    RuntimeTick, SimRunner,
+    InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, RobotMode, RuntimeLoop,
+    RuntimeModelStack, RuntimeTick, SimRunner,
 };
 use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
@@ -831,7 +831,8 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         llm,
     )
     .with_action_selector_mode(action_selector_mode)
-    .with_inline_learning(inline_learning.clone());
+    .with_inline_learning(inline_learning.clone())
+    .with_nudge_policy(NudgePolicy::virtual_default());
     if let Some(models) = models {
         runtime = runtime.with_models(models);
     }
@@ -864,14 +865,19 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             weights_updating: inline_learning.is_enabled(),
         });
         let server_state = live_state.clone();
+        let reign_state = netherwick_server::ReignServerState::with_live_view(
+            runner.runtime.reign_queue.clone(),
+            &live_state,
+        );
         let live_addr = args.live_addr;
         if args.live_tls {
             let cert_path = args.live_tls_cert.clone();
             let key_path = args.live_tls_key.clone();
             tokio::spawn(async move {
-                if let Err(error) = netherwick_server::serve_live_view_tls(
+                if let Err(error) = netherwick_server::serve_live_view_with_reign_tls(
                     live_addr,
                     server_state,
+                    reign_state,
                     cert_path,
                     key_path,
                 )
@@ -882,8 +888,12 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             });
         } else {
             tokio::spawn(async move {
-                if let Err(error) =
-                    netherwick_server::serve_live_view(live_addr, server_state).await
+                if let Err(error) = netherwick_server::serve_live_view_with_reign(
+                    live_addr,
+                    server_state,
+                    reign_state,
+                )
+                .await
                 {
                     eprintln!("live robot view server stopped: {error}");
                 }
@@ -930,6 +940,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             runner
                 .run_steps_observing(1, |snapshot| live_state.update(snapshot.clone()))
                 .await?;
+            live_state.update_prod_state(runner.runtime.nudge_status());
             live_state.update_training_status(netherwick_server::LiveTrainingStatus {
                 training_mode: current_inline_learning.training_mode_label().to_string(),
                 ledger_path: Some(args.ledger.clone()),

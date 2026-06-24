@@ -242,9 +242,9 @@ pub fn action_to_motor_command(action: Option<&ActionPrimitive>) -> MotorCommand
             },
         },
         ActionPrimitive::Inspect { target } => match target {
-            InspectTarget::Sound | InspectTarget::Person => MotorCommand {
+            InspectTarget::Novelty | InspectTarget::Sound | InspectTarget::Person => MotorCommand {
                 forward: 0.0,
-                turn: 0.2,
+                turn: 0.16,
             },
             _ => MotorCommand::stop(),
         },
@@ -271,5 +271,20 @@ pub fn action_to_motor_command(action: Option<&ActionPrimitive>) -> MotorCommand
             },
         },
         ActionPrimitive::Speak { .. } | ActionPrimitive::Chirp { .. } => MotorCommand::stop(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspect_novelty_scans_instead_of_stopping() {
+        let motor = action_to_motor_command(Some(&ActionPrimitive::Inspect {
+            target: InspectTarget::Novelty,
+        }));
+
+        assert_eq!(motor.forward, 0.0);
+        assert!(motor.turn.abs() > 0.0);
     }
 }
