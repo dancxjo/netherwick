@@ -15,3 +15,5 @@
 !/data/models/danger_obstacle_smoke/.gitkeep
 !/data/recordings/.gitkeep
 !/data/snapshots/.gitkeep
+certs/
+.gitignore

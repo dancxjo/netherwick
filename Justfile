@@ -88,6 +88,87 @@ clippy:
 sim:
     cargo run -p netherwick-tools -- sim
 
+go target="virtual":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{target}}" != "virtual" ]; then
+        echo "usage: just go virtual"
+        exit 2
+    fi
+    just dev-cert
+    PORT="${NETHERWICK_LIVE_PORT:-8787}"
+    LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    if [ -z "$LAN_IP" ]; then LAN_IP="127.0.0.1"; fi
+    echo
+    echo "Netherwick virtual theater is starting."
+    echo
+    echo "Desktop:"
+    echo "  https://127.0.0.1:$PORT/view/3d"
+    echo
+    echo "Headset/LAN:"
+    echo "  https://$LAN_IP:$PORT/view/3d"
+    echo
+    echo "Scene JSON:"
+    echo "  https://$LAN_IP:$PORT/view/scene"
+    echo
+    echo "This serves robot/sim sensor data on the LAN. Use only on trusted networks."
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t ANSIUTF8 "https://$LAN_IP:$PORT/view/3d" || true
+    fi
+    if [ "${NETHERWICK_OPEN_BROWSER:-0}" = "1" ] && command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "https://127.0.0.1:$PORT/view/3d" >/dev/null 2>&1 || true
+    fi
+    cargo run -p netherwick-tools -- sim \
+        --live \
+        --live-tls \
+        --live-addr "0.0.0.0:$PORT" \
+        --live-tls-cert certs/netherwick-dev.crt \
+        --live-tls-key certs/netherwick-dev.key \
+        --scenario "${NETHERWICK_SCENARIO:-mixed-room}" \
+        --steps "${NETHERWICK_SIM_STEPS:-1000000000}" \
+        --tick-delay-ms "${NETHERWICK_TICK_DELAY_MS:-100}" \
+        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}"
+
+go-virtual:
+    just go virtual
+
+virtual:
+    just go virtual
+
+virtual-https:
+    just go virtual
+
+dev-cert:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p certs
+    LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    if [ -z "$LAN_IP" ]; then
+        LAN_SAN=""
+        echo "warning: could not detect LAN IP; certificate will cover localhost only"
+    else
+        LAN_SAN=",IP:$LAN_IP"
+    fi
+    if [ ! -f certs/netherwick-dev.crt ] || [ ! -f certs/netherwick-dev.key ]; then
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout certs/netherwick-dev.key \
+            -out certs/netherwick-dev.crt \
+            -days 365 \
+            -subj "/CN=netherwick.local" \
+            -addext "subjectAltName=DNS:localhost,DNS:netherwick.local,IP:127.0.0.1$LAN_SAN"
+        echo "generated certs/netherwick-dev.crt and certs/netherwick-dev.key"
+    else
+        echo "using existing certs/netherwick-dev.crt and certs/netherwick-dev.key"
+    fi
+
+virtual-url:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PORT="${NETHERWICK_LIVE_PORT:-8787}"
+    LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    if [ -z "$LAN_IP" ]; then LAN_IP="127.0.0.1"; fi
+    echo "https://$LAN_IP:$PORT/view/3d"
+
 run *args:
     cargo run -p netherwick-tools -- {{args}}
 

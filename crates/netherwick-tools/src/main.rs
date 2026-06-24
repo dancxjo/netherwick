@@ -32,7 +32,7 @@ use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
     MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, WorldSnapshot,
 };
-use netherwick_server::{LiveSceneMetadata, LiveViewState, SceneArena, SceneObject};
+use netherwick_server::{LiveSceneMetadata, LiveViewState, SceneArena, SceneObject, SceneSession};
 use netherwick_sim::{build_scenario, ScenarioConfig, ScenarioKind, SimObjectKind};
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
@@ -117,6 +117,8 @@ struct SimArgs {
     steps: usize,
     #[arg(long, default_value_t = 7)]
     seed: u64,
+    #[arg(long, value_enum, default_value = "mixed-room")]
+    scenario: ScenarioArg,
     #[arg(long, default_value = "data/ledger")]
     ledger: String,
     #[arg(long)]
@@ -153,6 +155,12 @@ struct SimArgs {
     live: bool,
     #[arg(long, default_value = "127.0.0.1:8787")]
     live_addr: SocketAddr,
+    #[arg(long)]
+    live_tls: bool,
+    #[arg(long, default_value = "certs/netherwick-dev.crt")]
+    live_tls_cert: String,
+    #[arg(long, default_value = "certs/netherwick-dev.key")]
+    live_tls_key: String,
     #[arg(long, default_value_t = 100)]
     tick_delay_ms: u64,
     #[command(flatten)]
@@ -730,7 +738,8 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         runtime = runtime.with_models(models);
     }
 
-    let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::MixedRoom, args.seed));
+    let scenario_kind: ScenarioKind = args.scenario.into();
+    let scenario = build_scenario(ScenarioConfig::new(scenario_kind, args.seed));
     let live_metadata = live_scene_metadata_from_scenario(&scenario.metadata);
     let world = scenario.world;
     let motors = scenario.motors;
@@ -738,15 +747,56 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     if args.live {
         let live_state = LiveViewState::new();
         live_state.update_scene_metadata(live_metadata);
+        live_state.update_session(SceneSession {
+            mode: "virtual-live".to_string(),
+            scenario: Some(scenario_kind.slug().to_string()),
+            seed: Some(args.seed),
+            source: "sim".to_string(),
+            tick_ms: Some(args.tick_delay_ms),
+        });
         let server_state = live_state.clone();
         let live_addr = args.live_addr;
-        tokio::spawn(async move {
-            if let Err(error) = netherwick_server::serve_live_view(live_addr, server_state).await {
-                eprintln!("live robot view server stopped: {error}");
-            }
-        });
-        println!("live robot view: http://{}/view", args.live_addr);
-        println!("live robot 3D view: http://{}/view/3d", args.live_addr);
+        if args.live_tls {
+            let cert_path = args.live_tls_cert.clone();
+            let key_path = args.live_tls_key.clone();
+            tokio::spawn(async move {
+                if let Err(error) = netherwick_server::serve_live_view_tls(
+                    live_addr,
+                    server_state,
+                    cert_path,
+                    key_path,
+                )
+                .await
+                {
+                    eprintln!("live robot HTTPS view server stopped: {error}");
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(error) =
+                    netherwick_server::serve_live_view(live_addr, server_state).await
+                {
+                    eprintln!("live robot view server stopped: {error}");
+                }
+            });
+        }
+        let scheme = if args.live_tls { "https" } else { "http" };
+        println!();
+        println!("Netherwick virtual theater is running.");
+        println!();
+        println!("Desktop:");
+        println!("  {scheme}://127.0.0.1:{}/view/3d", args.live_addr.port());
+        println!();
+        println!("Bound address:");
+        println!("  {scheme}://{}/view/3d", args.live_addr);
+        println!();
+        println!("Scene JSON:");
+        println!("  {scheme}://{}/view/scene", args.live_addr);
+        if args.live_tls {
+            println!();
+            println!("If your headset warns about the certificate, trust the local dev certificate or install the generated CA/cert.");
+            println!("This serves robot/sim sensor data on the LAN. Use only on trusted networks.");
+        }
         for _ in 0..args.steps {
             runner
                 .run_steps_observing(1, |snapshot| live_state.update(snapshot.clone()))
@@ -5001,6 +5051,55 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn sim_args_parse_virtual_live_tls_flags() {
+        let cli = Cli::try_parse_from([
+            "netherwick",
+            "sim",
+            "--live",
+            "--live-tls",
+            "--live-addr",
+            "0.0.0.0:9443",
+            "--live-tls-cert",
+            "certs/test.crt",
+            "--live-tls-key",
+            "certs/test.key",
+            "--scenario",
+            "charger-seeking",
+            "--steps",
+            "123",
+        ])
+        .unwrap();
+
+        let Command::Sim(args) = cli.command else {
+            panic!("expected sim command");
+        };
+        assert!(args.live);
+        assert!(args.live_tls);
+        assert_eq!(args.live_addr.port(), 9443);
+        assert_eq!(args.live_tls_cert, "certs/test.crt");
+        assert_eq!(args.live_tls_key, "certs/test.key");
+        assert_eq!(args.scenario, ScenarioArg::ChargerSeeking);
+        assert_eq!(args.steps, 123);
+    }
+
+    #[test]
+    fn scenario_arg_parses_all_public_slugs() {
+        for (slug, expected) in [
+            ("empty-room", ScenarioArg::EmptyRoom),
+            ("obstacle-avoidance", ScenarioArg::ObstacleAvoidance),
+            ("charger-seeking", ScenarioArg::ChargerSeeking),
+            ("person-speaker-room", ScenarioArg::PersonSpeakerRoom),
+            ("mixed-room", ScenarioArg::MixedRoom),
+        ] {
+            let cli = Cli::try_parse_from(["netherwick", "sim", "--scenario", slug]).unwrap();
+            let Command::Sim(args) = cli.command else {
+                panic!("expected sim command");
+            };
+            assert_eq!(args.scenario, expected);
+        }
     }
 
     fn eval_args(

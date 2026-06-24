@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 axum.workspace = true
 base64.workspace = true
 image.workspace = true

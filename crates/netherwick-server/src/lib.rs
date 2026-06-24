@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
@@ -18,6 +19,7 @@ use netherwick_runtime::ReignQueue;
 use netherwick_sensors::{EyeFrameFormat, WorldSnapshot};
 use netherwick_worldlab::CaptureReader;
 use serde::{Deserialize, Serialize};
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 pub const HTTP_ENDPOINTS: &[&str] = &[
@@ -84,6 +86,7 @@ pub fn reign_router(state: ReignServerState) -> Router {
 pub struct LiveViewState {
     latest: Arc<Mutex<Option<WorldSnapshot>>>,
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
+    session: Arc<Mutex<Option<SceneSession>>>,
 }
 
 impl LiveViewState {
@@ -116,6 +119,20 @@ impl LiveViewState {
         self.scene_metadata
             .lock()
             .expect("live view scene metadata mutex poisoned")
+            .clone()
+    }
+
+    pub fn update_session(&self, session: SceneSession) {
+        *self
+            .session
+            .lock()
+            .expect("live view session mutex poisoned") = Some(session);
+    }
+
+    pub fn session(&self) -> Option<SceneSession> {
+        self.session
+            .lock()
+            .expect("live view session mutex poisoned")
             .clone()
     }
 }
@@ -157,6 +174,7 @@ pub struct SceneObject {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LiveSceneResponse {
     pub schema_version: u32,
+    pub session: Option<SceneSession>,
     pub t_ms: TimeMs,
     pub body: SceneBody,
     pub range: SceneRange,
@@ -168,6 +186,15 @@ pub struct LiveSceneResponse {
     pub action: SceneAction,
     pub mind: SceneMind,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneSession {
+    pub mode: String,
+    pub scenario: Option<String>,
+    pub seed: Option<u64>,
+    pub source: String,
+    pub tick_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -250,12 +277,29 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view/scene", get(get_live_scene))
         .route("/view/3d", get(live_view_3d_page))
         .route("/view/capture-scene", get(get_capture_scene))
+        .nest_service(
+            "/static",
+            ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),
+        )
         .with_state(state)
 }
 
 pub async fn serve_live_view(addr: SocketAddr, state: LiveViewState) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, live_view_router(state)).await
+}
+
+pub async fn serve_live_view_tls(
+    addr: SocketAddr,
+    state: LiveViewState,
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+) -> std::io::Result<()> {
+    let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+    axum_server::bind_rustls(addr, config)
+        .serve(live_view_router(state).into_make_service())
+        .await
+        .map_err(std::io::Error::other)
 }
 
 async fn get_live_snapshot(
@@ -283,6 +327,7 @@ async fn get_live_scene(
     Ok(Json(snapshot_to_scene(
         &snapshot,
         state.scene_metadata().as_ref(),
+        state.session(),
     )))
 }
 
@@ -321,7 +366,7 @@ async fn get_capture_scene(
                 })
                 .collect(),
         });
-    let mut scene = snapshot_to_scene(&record.snapshot, metadata.as_ref());
+    let mut scene = snapshot_to_scene(&record.snapshot, metadata.as_ref(), None);
     scene.t_ms = record.t_ms;
     if let Some(pointcloud) = &record.assets.pointcloud {
         scene.warnings.push(format!(
@@ -351,6 +396,7 @@ async fn live_view_3d_page() -> Html<&'static str> {
 pub fn snapshot_to_scene(
     snapshot: &WorldSnapshot,
     metadata: Option<&LiveSceneMetadata>,
+    session: Option<SceneSession>,
 ) -> LiveSceneResponse {
     let mut warnings = Vec::new();
     let body = &snapshot.body;
@@ -378,6 +424,7 @@ pub fn snapshot_to_scene(
     }
     LiveSceneResponse {
         schema_version: 1,
+        session,
         t_ms: body.last_update_ms,
         body: SceneBody {
             x_m: body.odometry.x_m,
@@ -970,6 +1017,9 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #hud dt{color:#aab4bd}
 #hud dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 #status{color:#ffd083}
+#reign{position:fixed;right:12px;top:12px;min-width:220px;max-width:min(320px,calc(100vw - 24px));padding:10px;border:1px solid #36424d;background:rgba(11,16,22,.84);backdrop-filter:blur(8px);border-radius:6px;color:#dce8f2}
+#reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
+#reign div{font-variant-numeric:tabular-nums}
 #xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
 #xr[disabled]{opacity:.55}
 #fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
@@ -980,6 +1030,10 @@ canvas{display:block}
   <h1>Sensorium 3D</h1>
   <div id="status">connecting...</div>
   <dl>
+    <dt>mode</dt><dd id="mode">-</dd>
+    <dt>scenario</dt><dd id="scenario">-</dd>
+    <dt>seed</dt><dd id="seed">-</dd>
+    <dt>tick</dt><dd id="tick">-</dd>
     <dt>t</dt><dd id="t">-</dd>
     <dt>pose</dt><dd id="pose">-</dd>
     <dt>battery</dt><dd id="battery">-</dd>
@@ -987,18 +1041,26 @@ canvas{display:block}
     <dt>points</dt><dd id="points">-</dd>
     <dt>audio</dt><dd id="audio">-</dd>
     <dt>mind</dt><dd id="mind">-</dd>
+    <dt>scheme</dt><dd id="scheme">-</dd>
+    <dt>secure</dt><dd id="secure">-</dd>
+    <dt>WebXR</dt><dd id="webxr">checking...</dd>
   </dl>
 </aside>
+<aside id="reign">
+  <strong>XR reigns</strong>
+  <div id="reign-state">enter VR to enable controller reigns</div>
+</aside>
 <button id="xr" disabled>VR unavailable</button>
-<div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. WebXR appears when the browser and device support immersive VR on a secure origin.</div>
+<div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers, squeeze stops, A/B dock or explore.</div>
 <script type="module">
-import * as THREE from 'https://unpkg.com/three@0.166.1/build/three.module.js';
-import { OrbitControls } from 'https://unpkg.com/three@0.166.1/examples/jsm/controls/OrbitControls.js';
+import * as THREE from '/static/vendor/three/three.module.js';
+import { OrbitControls } from '/static/vendor/three/OrbitControls.js';
 
 const root = document.getElementById('scene');
 const statusEl = document.getElementById('status');
 const xrButton = document.getElementById('xr');
-const fields = Object.fromEntries(['t','pose','battery','nearest','points','audio','mind'].map(id => [id, document.getElementById(id)]));
+const reignState = document.getElementById('reign-state');
+const fields = Object.fromEntries(['mode','scenario','seed','tick','t','pose','battery','nearest','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d10);
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
@@ -1042,6 +1104,10 @@ const beams = new THREE.Group();
 scene.add(beams);
 const objects = new THREE.Group();
 scene.add(objects);
+const controller0 = renderer.xr.getController(0);
+const controller1 = renderer.xr.getController(1);
+scene.add(controller0);
+scene.add(controller1);
 
 const eyeCanvas = document.createElement('canvas');
 eyeCanvas.width = 2; eyeCanvas.height = 2;
@@ -1065,9 +1131,19 @@ robot.add(frustum);
 
 let pointCloud = null;
 let lastScene = null;
+let xrSession = null;
+let lastReignKey = '';
+let lastReignSentAt = 0;
+let lastReignText = 'idle';
 function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
 function world(x, y, up=0){ return new THREE.Vector3(x, up, y); }
 function clear(group){ while(group.children.length) group.remove(group.children.pop()); }
+function xrReason(message){
+  xrButton.textContent = 'VR unavailable';
+  xrButton.disabled = true;
+  fields.webxr.textContent = message;
+  return message;
+}
 function materialFor(kind, color){
   const hex = color ? (color[0]<<16) | (color[1]<<8) | color[2] : ({charger:0x45d483, person:0xe8c08c, speaker:0x778cff, obstacle:0xd67666}[kind] || 0xb0b8c0);
   return new THREE.MeshStandardMaterial({color:hex, roughness:.7});
@@ -1154,6 +1230,11 @@ function updateScene(packet){
   renderBeams(packet);
   renderPoints(packet.kinect?.points || []);
   renderEye(packet.eye);
+  const session = packet.session || {};
+  fields.mode.textContent = session.mode || '-';
+  fields.scenario.textContent = session.scenario || '-';
+  fields.seed.textContent = session.seed == null ? '-' : String(session.seed);
+  fields.tick.textContent = session.tick_ms == null ? '-' : `${session.tick_ms} ms`;
   fields.t.textContent = `${packet.t_ms} ms`;
   fields.pose.textContent = `${fmt(packet.body.x_m)}, ${fmt(packet.body.y_m)}, ${fmt(packet.body.heading_rad)} rad`;
   fields.battery.textContent = `${fmt(packet.body.battery_level * 100, 1)}%${packet.body.charging ? ' charging' : ''}`;
@@ -1161,6 +1242,93 @@ function updateScene(packet){
   fields.points.textContent = String(packet.kinect?.points?.length || 0);
   fields.audio.textContent = packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio.bearing_rad)} rad`;
   fields.mind.textContent = packet.mind?.combobulation || packet.warnings?.[0] || '-';
+  fields.scheme.textContent = location.protocol.replace(':', '');
+  fields.secure.textContent = window.isSecureContext ? 'yes' : 'no';
+}
+function buttonPressed(gamepad, index){
+  const button = gamepad?.buttons?.[index];
+  return !!button && (button.pressed || button.value > .6);
+}
+function stickAxes(gamepad){
+  const axes = gamepad?.axes || [];
+  if(axes.length >= 4) return {x: axes[2], y: axes[3]};
+  if(axes.length >= 2) return {x: axes[0], y: axes[1]};
+  return {x: 0, y: 0};
+}
+async function postReign(command, ttl_ms, label, priority=.95){
+  const key = JSON.stringify(command);
+  const now = performance.now();
+  if(key === lastReignKey && now - lastReignSentAt < 220) return;
+  lastReignKey = key;
+  lastReignSentAt = now;
+  lastReignText = label;
+  reignState.textContent = `sending ${label}`;
+  try{
+    const res = await fetch('/reign/command', {
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({
+        mode:'Direct',
+        priority,
+        ttl_ms,
+        source:'Gamepad',
+        note:'WebXR controller reign',
+        command
+      })
+    });
+    if(!res.ok) throw new Error(await res.text());
+    reignState.textContent = label;
+  }catch(error){
+    reignState.textContent = 'reign send failed';
+  }
+}
+function commandForInputSource(inputSource){
+  const gamepad = inputSource.gamepad;
+  if(!gamepad) return null;
+  if(buttonPressed(gamepad, 1) || buttonPressed(gamepad, 3)) {
+    return {command:{type:'Stop'}, ttl:900, label:'stop', priority:1};
+  }
+  if(buttonPressed(gamepad, 4)) {
+    return {command:{type:'Dock'}, ttl:5000, label:'dock', priority:.9};
+  }
+  if(buttonPressed(gamepad, 5)) {
+    return {command:{type:'Explore', duration_ms:3000}, ttl:5000, label:'explore', priority:.85};
+  }
+  const {x, y} = stickAxes(gamepad);
+  if(y < -.35) {
+    const intensity = Math.min(1, Math.max(.25, -y));
+    return {command:{type:'Go', intensity, duration_ms:350}, ttl:700, label:`forward ${fmt(intensity, 2)}`, priority:.95};
+  }
+  if(Math.abs(x) > .35) {
+    const intensity = Math.min(1, Math.max(.25, Math.abs(x)));
+    return {command:{type:'Turn', direction:x < 0 ? 'Left' : 'Right', intensity, duration_ms:300}, ttl:650, label:`turn ${x < 0 ? 'left' : 'right'} ${fmt(intensity, 2)}`, priority:.95};
+  }
+  if(buttonPressed(gamepad, 0)) {
+    return {command:{type:'Go', intensity:.45, duration_ms:350}, ttl:700, label:'trigger forward', priority:.9};
+  }
+  return null;
+}
+function pollXrReigns(){
+  if(!xrSession){
+    reignState.textContent = 'enter VR to enable controller reigns';
+    return;
+  }
+  let activeSources = 0;
+  for(const inputSource of xrSession.inputSources){
+    if(!inputSource.gamepad) continue;
+    activeSources += 1;
+    const next = commandForInputSource(inputSource);
+    if(next){
+      postReign(next.command, next.ttl, next.label, next.priority);
+      return;
+    }
+  }
+  if(activeSources === 0){
+    reignState.textContent = 'no XR gamepad found';
+  }else if(performance.now() - lastReignSentAt > 900){
+    lastReignKey = '';
+    reignState.textContent = lastReignText === 'idle' ? 'ready' : `ready, last ${lastReignText}`;
+  }
 }
 async function poll(){
   try{
@@ -1175,17 +1343,35 @@ async function poll(){
   }
 }
 async function setupXr(){
+  fields.scheme.textContent = location.protocol.replace(':', '');
+  fields.secure.textContent = window.isSecureContext ? 'yes' : 'no';
+  if(!window.isSecureContext){
+    xrReason('HTTPS required');
+    return;
+  }
   if(!navigator.xr){
-    xrButton.disabled = true;
+    xrReason('navigator.xr missing');
     return;
   }
   const ok = await navigator.xr.isSessionSupported('immersive-vr').catch(() => false);
-  if(!ok) return;
+  if(!ok){
+    xrReason('immersive-vr unsupported');
+    return;
+  }
   xrButton.textContent = 'Enter VR';
   xrButton.disabled = false;
+  fields.webxr.textContent = 'immersive-vr supported';
   xrButton.onclick = async () => {
     const session = await navigator.xr.requestSession('immersive-vr', {optionalFeatures:['local-floor','bounded-floor']});
-    renderer.xr.setSession(session);
+    xrSession = session;
+    reignState.textContent = 'controller reigns ready';
+    session.addEventListener('end', () => {
+      xrSession = null;
+      lastReignKey = '';
+      lastReignText = 'idle';
+      reignState.textContent = 'enter VR to enable controller reigns';
+    });
+    await renderer.xr.setSession(session);
   };
 }
 addEventListener('resize', () => {
@@ -1195,6 +1381,7 @@ addEventListener('resize', () => {
 });
 renderer.setAnimationLoop(() => {
   controls.update();
+  pollXrReigns();
   renderer.render(scene, camera);
 });
 setupXr();
@@ -1369,6 +1556,13 @@ mod tests {
                 color_rgb: Some([80, 220, 130]),
             }],
         });
+        state.update_session(SceneSession {
+            mode: "virtual-live".to_string(),
+            scenario: Some("charger-seeking".to_string()),
+            seed: Some(99),
+            source: "sim".to_string(),
+            tick_ms: Some(100),
+        });
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.odometry.x_m = 0.5;
         snapshot.body.odometry.y_m = 0.75;
@@ -1389,6 +1583,11 @@ mod tests {
         let Json(scene) = get_live_scene(State(state)).await.unwrap();
 
         assert_eq!(scene.schema_version, 1);
+        assert_eq!(scene.session.as_ref().unwrap().mode, "virtual-live");
+        assert_eq!(
+            scene.session.as_ref().unwrap().scenario.as_deref(),
+            Some("charger-seeking")
+        );
         assert_eq!(scene.t_ms, 1234);
         assert_eq!(scene.body.x_m, 0.5);
         assert_eq!(scene.body.y_m, 0.75);
@@ -1406,7 +1605,7 @@ mod tests {
 
     #[test]
     fn missing_eye_kinect_and_audio_serialize_as_empty_or_null() {
-        let scene = snapshot_to_scene(&WorldSnapshot::default(), None);
+        let scene = snapshot_to_scene(&WorldSnapshot::default(), None, None);
         let value = serde_json::to_value(scene).unwrap();
 
         assert!(value["eye"].is_null());
@@ -1446,11 +1645,17 @@ mod tests {
 
     #[tokio::test]
     async fn live_routes_include_3d_and_scene_endpoints() {
+        assert!(HTTP_ENDPOINTS.contains(&"/view"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/3d"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/scene"));
         let Html(page) = live_view_3d_page().await;
         assert!(page.contains("Sensorium 3D"));
         assert!(page.contains("/view/scene"));
+        assert!(page.contains("navigator.xr"));
+        assert!(page.contains("window.isSecureContext"));
+        assert!(page.contains("/reign/command"));
+        assert!(page.contains("source:'Gamepad'"));
+        assert!(page.contains("renderer.xr.getController"));
     }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {

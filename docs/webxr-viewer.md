@@ -1,6 +1,6 @@
 # WebXR Sensorium Viewer
 
-Netherwick serves a read-only browser sensorium for live sessions at `/view/3d`. The existing 2D page at `/view` remains available.
+Netherwick serves a browser sensorium for live sessions at `/view/3d`. The existing 2D page at `/view` remains available.
 
 ## Start The Live Server
 
@@ -18,6 +18,14 @@ cargo run -p netherwick-tools -- sim \
   --tick-delay-ms 100
 ```
 
+For a LAN headset-friendly HTTPS virtual theater:
+
+```bash
+just go virtual
+```
+
+See [go-virtual.md](go-virtual.md) for certificate and headset setup.
+
 Open:
 
 - `http://127.0.0.1:8787/view` for the original 2D panel.
@@ -28,9 +36,16 @@ Open:
 
 The 3D page runs in desktop mode everywhere WebGL and module scripts are available. Drag to orbit, scroll to zoom, and right-drag to pan.
 
-If `navigator.xr` reports `immersive-vr` support, the page enables an Enter VR button. Most browsers require a secure origin for WebXR. Localhost is normally treated as secure; LAN IPs may require HTTPS or browser/device-specific setup.
+If `navigator.xr` reports `immersive-vr` support, the page enables an Enter VR button. Most browsers require a secure origin for WebXR. Localhost is normally treated as secure; LAN IPs usually need HTTPS or browser/device-specific certificate setup.
 
-The page does not expose motor commands, WebXR controller driving, or other actuation controls.
+In immersive VR, WebXR controllers can feed the Reign queue through `/reign/command`:
+
+- Thumbstick up sends a short Direct `Go` lease.
+- Thumbstick left or right sends a short Direct `Turn` lease.
+- Squeeze or secondary button sends `Stop`.
+- Primary auxiliary buttons request `Dock` or `Explore` where supported by the controller mapping.
+
+Commands are sent with `source: "Gamepad"` and short TTLs so steering expires quickly when the controller returns to neutral.
 
 ## Coordinate System
 
@@ -53,7 +68,8 @@ The v0 viewer renders:
 - coarse Kinect/depth point cloud when compact depth values exist
 - Kinect skeleton records in the scene JSON
 - audio bearing from Kinect, or from a simulated speaker when metadata is available
-- HUD text for pose, battery, nearest obstacle, points, audio, and available warnings
+- HUD text for session mode, scenario, seed, tick, URL scheme, secure-context status, WebXR support, pose, battery, nearest obstacle, points, audio, and available warnings
+- XR Reign status while immersive controller input is available
 
 If a field is unavailable, `/view/scene` returns `null`, an empty array, or a warning rather than failing.
 
@@ -73,4 +89,4 @@ The schema has room for richer action state, safety state, memory heatmaps, pred
 
 ## Privacy
 
-This view exposes robot sensor data over the HTTP address it is bound to. If the server binds to `0.0.0.0`, anyone on the network who can reach the port may see the robot's sensor view.
+This view exposes robot sensor data over the HTTP address it is bound to. If the server binds to `0.0.0.0`, anyone on the network who can reach the port may see the robot's sensor view. When a VR session is active, controller input can also submit Reign commands to the same server.
