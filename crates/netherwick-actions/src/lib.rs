@@ -1,3 +1,4 @@
+use netherwick_body::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -201,4 +202,74 @@ pub struct CommandLease {
     pub expires_at_ms: TimeMs,
     pub interruptible: bool,
     pub safety_class: SafetyClass,
+}
+
+pub fn action_to_motion(action: Option<&ActionPrimitive>) -> MotionCommand {
+    match action_to_motor_command(action) {
+        MotorCommand { forward, turn } if forward == 0.0 && turn == 0.0 => MotionCommand::Stop,
+        MotorCommand { forward, turn } if turn == 0.0 => {
+            MotionCommand::Forward { speed_m_s: forward }
+        }
+        MotorCommand { forward, turn } if forward == 0.0 => {
+            MotionCommand::Turn { turn_rad_s: turn }
+        }
+        MotorCommand { forward, turn } => MotionCommand::Drive {
+            forward_m_s: forward,
+            turn_rad_s: turn,
+        },
+    }
+}
+
+pub fn action_to_motor_command(action: Option<&ActionPrimitive>) -> MotorCommand {
+    let Some(action) = action else {
+        return MotorCommand::stop();
+    };
+    match action {
+        ActionPrimitive::Stop => MotorCommand::stop(),
+        ActionPrimitive::Go { intensity, .. } => MotorCommand {
+            forward: *intensity,
+            turn: 0.0,
+        },
+        ActionPrimitive::Turn {
+            direction,
+            intensity,
+            ..
+        } => MotorCommand {
+            forward: 0.0,
+            turn: match direction {
+                TurnDir::Left => *intensity,
+                TurnDir::Right => -*intensity,
+            },
+        },
+        ActionPrimitive::Inspect { target } => match target {
+            InspectTarget::Sound | InspectTarget::Person => MotorCommand {
+                forward: 0.0,
+                turn: 0.2,
+            },
+            _ => MotorCommand::stop(),
+        },
+        ActionPrimitive::Approach { target } => match target {
+            ApproachTarget::Charger | ApproachTarget::Person | ApproachTarget::Sound => {
+                MotorCommand {
+                    forward: 0.2,
+                    turn: 0.0,
+                }
+            }
+        },
+        ActionPrimitive::Dock => MotorCommand {
+            forward: 0.15,
+            turn: 0.0,
+        },
+        ActionPrimitive::Explore { style, .. } => match style {
+            ExploreStyle::Wander | ExploreStyle::RandomWalk => MotorCommand {
+                forward: 0.2,
+                turn: 0.1,
+            },
+            ExploreStyle::WallFollow => MotorCommand {
+                forward: 0.15,
+                turn: 0.2,
+            },
+        },
+        ActionPrimitive::Speak { .. } | ActionPrimitive::Chirp { .. } => MotorCommand::stop(),
+    }
 }

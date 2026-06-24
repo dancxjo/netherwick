@@ -163,6 +163,8 @@ impl VirtualWorld {
     pub fn new_with_motor(seed: u64, arena: ArenaConfig) -> (Self, SimMotorComplex) {
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.last_update_ms = seed;
+        snapshot.body.odometry.x_m = arena.width_m * 0.5;
+        snapshot.body.odometry.y_m = arena.height_m * 0.5;
         let state = Arc::new(Mutex::new(VirtualWorldState {
             snapshot,
             arena,
@@ -189,6 +191,14 @@ impl VirtualWorld {
             .lock()
             .expect("virtual world mutex poisoned")
             .objects = objects;
+    }
+
+    pub fn set_body(&mut self, body: BodySense) {
+        self.state
+            .lock()
+            .expect("virtual world mutex poisoned")
+            .snapshot
+            .body = body;
     }
 
     fn project_snapshot(state: &mut VirtualWorldState) {
@@ -839,7 +849,7 @@ mod tests {
         let (mut world, mut motor) = VirtualWorld::new_with_motor(0, arena());
         world.add_object(SimObject {
             charge_rate: 0.5,
-            ..SimObject::charger("dock", "dock", 0.0, 0.0, 0.5)
+            ..SimObject::charger("dock", "dock", 2.0, 2.0, 0.5)
         });
         {
             let mut guard = motor.state.lock().unwrap();
@@ -874,8 +884,8 @@ mod tests {
             kind: SimObjectKind::Person {
                 identity: Some("Jes".to_string()),
             },
-            x_m: 1.0,
-            y_m: 0.0,
+            x_m: 3.0,
+            y_m: 2.0,
             radius_m: 0.2,
             color_rgb: [220, 180, 140],
             emits_sound: false,

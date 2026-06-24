@@ -4528,6 +4528,7 @@ dependencies = [
 name = "netherwick-actions"
 version = "0.1.0"
 dependencies = [
+ "netherwick-body",
  "netherwick-core",
  "serde",
  "uuid",
@@ -4719,6 +4720,7 @@ dependencies = [
  "netherwick-memory",
  "netherwick-now",
  "netherwick-sensors",
+ "netherwick-sim",
  "serde_json",
  "tokio",
  "tracing",

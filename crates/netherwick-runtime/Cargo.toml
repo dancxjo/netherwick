@@ -25,3 +25,4 @@ netherwick-llm = { path = "../netherwick-llm" }
 netherwick-memory = { path = "../netherwick-memory" }
 netherwick-now = { path = "../netherwick-now" }
 netherwick-sensors = { path = "../netherwick-sensors" }
+netherwick-sim = { path = "../netherwick-sim" }

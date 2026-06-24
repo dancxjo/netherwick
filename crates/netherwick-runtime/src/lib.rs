@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use netherwick_actions::{
-    ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, ReignInput, ReignOutcome, TurnDir,
+    action_to_motion, action_to_motor_command, ActionPrimitive, ExploreStyle, ReignInput,
+    ReignOutcome,
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
-use netherwick_body::MotorCommand;
+use netherwick_body::MotorComplex;
 use netherwick_conductor::{Conductor, ConductorInput};
 use netherwick_core::{Provenance, Reward, TimeMs};
 use netherwick_events::{
@@ -21,6 +22,8 @@ use netherwick_ledger::{ExperienceFrame, LedgerWriter, PendingFrame, TransitionB
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
 use netherwick_now::{DriveSense, Now, ReignSense, SafetySense};
+use netherwick_sensors::World;
+use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use uuid::Uuid;
 
 pub struct MinimalRuntime<L, M, R, C, S, A>
@@ -292,7 +295,7 @@ where
 
         let safety = self
             .safety
-            .filter(&now, action_to_motor_command(&chosen_action));
+            .filter(&now, action_to_motor_command(Some(&chosen_action)));
         if safety.vetoed {
             now.extensions
                 .insert("safety.vetoed".to_string(), serde_json::Value::Bool(true));
@@ -454,6 +457,74 @@ pub struct RuntimeTick {
     pub recall: RecallBundle,
     pub llm: LlmTickResult,
     pub combobulation: Option<Combobulation>,
+}
+
+#[async_trait::async_trait]
+pub trait RuntimeLoop {
+    async fn tick(
+        &mut self,
+        now: Now,
+        latent: ExperienceLatent,
+        futures: Vec<FuturePrediction>,
+    ) -> Result<RuntimeTick>;
+}
+
+#[async_trait::async_trait]
+impl<L, M, R, C, S, A> RuntimeLoop for MinimalRuntime<L, M, R, C, S, A>
+where
+    L: LedgerWriter + Sync + Send,
+    M: MemoryStore + Send,
+    R: Recall + Send,
+    C: Conductor + Send,
+    S: SafetyLayer + Send,
+    A: LlmAgent + Send,
+{
+    async fn tick(
+        &mut self,
+        now: Now,
+        latent: ExperienceLatent,
+        futures: Vec<FuturePrediction>,
+    ) -> Result<RuntimeTick> {
+        MinimalRuntime::tick(self, now, latent, futures).await
+    }
+}
+
+pub struct SimRunner<R> {
+    pub runtime: R,
+    pub world: VirtualWorld,
+    pub motors: SimMotorComplex,
+    pub tick_count: usize,
+    pub tick_ms: u64,
+}
+
+impl<R> SimRunner<R>
+where
+    R: RuntimeLoop + Send,
+{
+    pub fn new(runtime: R, world: VirtualWorld, motors: SimMotorComplex) -> Self {
+        Self {
+            runtime,
+            world,
+            motors,
+            tick_count: 0,
+            tick_ms: 100,
+        }
+    }
+
+    pub async fn run_steps(&mut self, steps: usize) -> Result<()> {
+        for _ in 0..steps {
+            let snapshot = self.world.snapshot().await?;
+            let now = snapshot.to_now(snapshot.body.last_update_ms);
+            let tick = self
+                .runtime
+                .tick(now, ExperienceLatent::default(), Vec::new())
+                .await?;
+            let motion = action_to_motion(tick.chosen_action.as_ref());
+            self.motors.send(motion).await?;
+            self.tick_count = self.tick_count.saturating_add(1);
+        }
+        Ok(())
+    }
 }
 
 fn predict_baseline_futures(
@@ -705,57 +776,6 @@ fn set_drive(drives: &mut DriveSense, name: &DriveName, value: f32) {
     }
 }
 
-fn action_to_motor_command(action: &ActionPrimitive) -> MotorCommand {
-    match action {
-        ActionPrimitive::Stop => MotorCommand::stop(),
-        ActionPrimitive::Go { intensity, .. } => MotorCommand {
-            forward: *intensity,
-            turn: 0.0,
-        },
-        ActionPrimitive::Turn {
-            direction,
-            intensity,
-            ..
-        } => MotorCommand {
-            forward: 0.0,
-            turn: match direction {
-                TurnDir::Left => *intensity,
-                TurnDir::Right => -*intensity,
-            },
-        },
-        ActionPrimitive::Inspect { target } => match target {
-            InspectTarget::Sound | InspectTarget::Person => MotorCommand {
-                forward: 0.0,
-                turn: 0.2,
-            },
-            _ => MotorCommand::stop(),
-        },
-        ActionPrimitive::Approach { target } => match target {
-            ApproachTarget::Charger | ApproachTarget::Person | ApproachTarget::Sound => {
-                MotorCommand {
-                    forward: 0.2,
-                    turn: 0.0,
-                }
-            }
-        },
-        ActionPrimitive::Dock => MotorCommand {
-            forward: 0.15,
-            turn: 0.0,
-        },
-        ActionPrimitive::Explore { style, .. } => match style {
-            ExploreStyle::Wander | ExploreStyle::RandomWalk => MotorCommand {
-                forward: 0.2,
-                turn: 0.1,
-            },
-            ExploreStyle::WallFollow => MotorCommand {
-                forward: 0.15,
-                turn: 0.2,
-            },
-        },
-        ActionPrimitive::Speak { .. } | ActionPrimitive::Chirp { .. } => MotorCommand::stop(),
-    }
-}
-
 fn describe_safety_reason(reason: Option<SafetyReason>) -> &'static str {
     match reason {
         Some(SafetyReason::WheelDrop) => "wheel drop",
@@ -776,10 +796,14 @@ mod tests {
     use netherwick_actions::{ReignCommand, ReignMode, ReignSource};
     use netherwick_autonomic::SimpleSafety;
     use netherwick_body::BodySense;
-    use netherwick_conductor::SimpleConductor;
-    use netherwick_ledger::JsonlLedger;
+    use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
+    use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_now::Now;
+    use netherwick_sensors::World;
+    use netherwick_sim::{ArenaConfig, SimObject, VirtualWorld};
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[tokio::test]
     async fn tick_adds_combobulated_experience() {
@@ -944,6 +968,241 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("Safety vetoed")));
+    }
+
+    #[tokio::test]
+    async fn sim_runner_writes_frames_and_transitions() {
+        let root = test_ledger_root("sim-runner-writes");
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), SimpleConductor::default());
+        let (world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(10).await.unwrap();
+
+        let frames = ledger.recent(20).await.unwrap();
+        let transitions = read_transitions(&root);
+        assert!(frames.len() >= 10);
+        assert!(transitions.len() >= 9);
+        assert!(transitions.iter().any(|transition| {
+            transition.before.body.odometry.x_m != transition.after.body.odometry.x_m
+                || transition.before.body.odometry.y_m != transition.after.body.odometry.y_m
+        }));
+    }
+
+    #[tokio::test]
+    async fn sim_runner_applies_chosen_action_to_world() {
+        let ledger = JsonlLedger::new(test_ledger_root("sim-runner-action-world"));
+        let runtime = test_runtime(
+            ledger,
+            FixedConductor::new(ActionPrimitive::Go {
+                intensity: 0.4,
+                duration_ms: 1_000,
+            }),
+        );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.5, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let snapshot = runner.world.snapshot().await.unwrap();
+
+        assert!(snapshot.body.odometry.x_m > 1.0);
+        assert_eq!(runner.tick_count, 1);
+    }
+
+    #[tokio::test]
+    async fn sim_runner_reaches_charger_gets_positive_reward() {
+        let root = test_ledger_root("sim-runner-charger-reward");
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(
+            ledger,
+            FixedConductor::new(ActionPrimitive::Go {
+                intensity: 0.4,
+                duration_ms: 1_000,
+            }),
+        );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let mut body = test_body(1.0, 1.0, 0.2, 7);
+        body.battery_level = 0.2;
+        world.set_body(body);
+        world.add_object(SimObject::charger("charger", "charger", 1.38, 1.0, 0.18));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(2).await.unwrap();
+        let transitions = read_transitions(&root);
+
+        let transition = transitions.last().unwrap();
+        assert!(transition.after.body.charging);
+        assert!(transition.reward.value > 0.0);
+        assert!(transition.surprise.total > 0.0);
+    }
+
+    #[tokio::test]
+    async fn sim_runner_collision_sets_bump_and_negative_reward() {
+        let root = test_ledger_root("sim-runner-collision-reward");
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(
+            ledger,
+            FixedConductor::new(ActionPrimitive::Go {
+                intensity: 0.4,
+                duration_ms: 1_000,
+            }),
+        );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.8, 7));
+        world.add_object(SimObject::obstacle("box", "box", 1.31, 1.0, 0.1));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(2).await.unwrap();
+        let transitions = read_transitions(&root);
+
+        let transition = transitions.last().unwrap();
+        assert!(transition.after.body.flags.bump_left || transition.after.body.flags.bump_right);
+        assert!(transition.reward.value < 0.0);
+        assert!(transition.surprise.total > 0.0);
+    }
+
+    #[tokio::test]
+    async fn shared_reign_queue_controls_next_sim_tick() {
+        let root = test_ledger_root("sim-runner-shared-reign");
+        let ledger = JsonlLedger::new(&root);
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        queue.lock().unwrap().push(test_reign_input(
+            7,
+            ReignMode::Direct,
+            ReignCommand::Turn {
+                direction: netherwick_actions::TurnDir::Left,
+                intensity: 0.5,
+                duration_ms: 500,
+            },
+            2_000,
+        ));
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let runtime = MinimalRuntime::with_reign_queue(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+            queue,
+        );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.8, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let snapshot = runner.world.snapshot().await.unwrap();
+        let frames = JsonlLedger::new(&root).recent(5).await.unwrap();
+        let frame = frames.last().unwrap();
+
+        assert!(snapshot.body.odometry.heading_rad > 0.0);
+        assert!(frame.now.reign.active);
+        assert!(frame
+            .sensations
+            .iter()
+            .any(|sensation| sensation.kind == "reign.command"));
+        assert!(frame.reign_input.is_some());
+        assert!(frame
+            .reign_outcome
+            .as_ref()
+            .map(|outcome| outcome.accepted_by_conductor)
+            .unwrap_or(false));
+    }
+
+    #[derive(Clone, Debug)]
+    struct FixedConductor {
+        action: ActionPrimitive,
+    }
+
+    impl FixedConductor {
+        fn new(action: ActionPrimitive) -> Self {
+            Self { action }
+        }
+    }
+
+    impl Conductor for FixedConductor {
+        fn choose(&mut self, _input: ConductorInput) -> Result<ActionPrimitive> {
+            Ok(self.action.clone())
+        }
+    }
+
+    fn test_runtime<C>(
+        ledger: JsonlLedger,
+        conductor: C,
+    ) -> MinimalRuntime<
+        JsonlLedger,
+        InMemoryExperienceStore,
+        InMemoryExperienceStore,
+        C,
+        SimpleSafety,
+        netherwick_llm::NoopLlmAgent,
+    >
+    where
+        C: Conductor,
+    {
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            conductor,
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+        )
+    }
+
+    fn arena() -> ArenaConfig {
+        ArenaConfig {
+            width_m: 4.0,
+            height_m: 4.0,
+        }
+    }
+
+    fn test_body(x_m: f32, y_m: f32, battery_level: f32, last_update_ms: u64) -> BodySense {
+        let mut body = BodySense::default();
+        body.odometry.x_m = x_m;
+        body.odometry.y_m = y_m;
+        body.battery_level = battery_level;
+        body.last_update_ms = last_update_ms;
+        body
+    }
+
+    fn test_ledger_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("netherwick-{name}-{}", Uuid::new_v4()));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn read_transitions(root: &Path) -> Vec<ExperienceTransition> {
+        let mut out = Vec::new();
+        read_transition_paths(root, &mut out);
+        out
+    }
+
+    fn read_transition_paths(path: &Path, out: &mut Vec<ExperienceTransition>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                read_transition_paths(&path, out);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("transitions.jsonl") {
+                let Ok(contents) = fs::read_to_string(path) else {
+                    continue;
+                };
+                out.extend(
+                    contents
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .filter_map(|line| serde_json::from_str(line).ok()),
+                );
+            }
+        }
     }
 
     fn test_reign_input(
