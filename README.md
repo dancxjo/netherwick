@@ -62,10 +62,10 @@ just live-server  # Neo4j + Qdrant + live sim server
 
 The live view is at `http://localhost:8787/view`, with a 3D/WebXR sensorium at `http://localhost:8787/view/3d` and compact scene JSON at `http://localhost:8787/view/scene`. In immersive VR, supported controllers can feed short-lived Reign commands into the virtual session. Neo4j Browser is at `http://localhost:7474` with the default `.env.example` credentials.
 
-For a one-command HTTPS virtual training theater, run:
+For a one-command HTTPS Dream World training run, run:
 
 ```bash
 just go virtual
 ```
 
-It starts a long-running virtual sim, serves HTTPS on `0.0.0.0`, and prints desktop/headset URLs for `/view/3d` plus `/view/scene`. See [docs/go-virtual.md](docs/go-virtual.md) for certificate, headset, scenario, and LAN security notes. See [docs/webxr-viewer.md](docs/webxr-viewer.md) for desktop controls, WebXR caveats, capture replay hooks, and sensor-view privacy notes.
+It starts a long-running Dream World, serves HTTPS on `0.0.0.0`, and prints desktop/headset URLs for `/view/3d` plus `/view/scene`. See [docs/go-virtual.md](docs/go-virtual.md) for certificate, headset, scenario, and LAN security notes. See [docs/webxr-viewer.md](docs/webxr-viewer.md) for desktop controls, WebXR caveats, capture replay hooks, and sensor-view privacy notes.

@@ -100,10 +100,10 @@ go target="virtual":
     LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     if [ -z "$LAN_IP" ]; then LAN_IP="127.0.0.1"; fi
     echo
-    echo "Netherwick virtual theater is starting."
+    echo "Netherwick Dream World is starting."
     echo "Virtual training theater is collecting experience."
-    echo "Models are not updated online in this run."
-    echo 'Train later with `cargo run --bin netherwick -- train behavior ...`'
+    echo "Inline learning defaults to world-outcome. Set NETHERWICK_INLINE_LEARNING_MODE=off for collect-only."
+    echo 'Offline training still exists: `cargo run --bin netherwick -- train behavior ...`'
     echo
     echo "Desktop:"
     echo "  https://127.0.0.1:$PORT/view/3d"
@@ -114,7 +114,7 @@ go target="virtual":
     echo "Scene JSON:"
     echo "  https://$LAN_IP:$PORT/view/scene"
     echo
-    echo "This serves robot/sim sensor data on the LAN. Use only on trusted networks."
+    echo "This serves robot/dream-world sensor data on the LAN. Use only on trusted networks."
     if command -v qrencode >/dev/null 2>&1; then
         qrencode -t ANSIUTF8 "https://$LAN_IP:$PORT/view/3d" || true
     fi

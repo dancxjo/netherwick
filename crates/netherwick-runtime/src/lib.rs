@@ -5282,6 +5282,7 @@ mod tests {
             radius_m: 0.12,
             color_rgb: [80, 80, 220],
             emits_sound: true,
+            spoken_text: Some("listen to the room".to_string()),
             charge_rate: 0.0,
         });
         let mut runner = SimRunner::new(runtime, world, motors);
@@ -5361,6 +5362,7 @@ mod tests {
             radius_m: 0.12,
             color_rgb: [80, 80, 220],
             emits_sound: true,
+            spoken_text: Some("the walls are awake".to_string()),
             charge_rate: 0.0,
         });
         let mut runner = SimRunner::new(runtime, world, motors);

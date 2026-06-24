@@ -164,7 +164,7 @@ struct SimArgs {
     #[arg(
         long,
         value_enum,
-        default_value = "off",
+        default_value = "world-outcome",
         env = "NETHERWICK_INLINE_LEARNING_MODE"
     )]
     inline_learning_mode: InlineLearningModeArg,
@@ -889,14 +889,14 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         }
         let scheme = if args.live_tls { "https" } else { "http" };
         println!();
-        println!("Netherwick virtual theater is running.");
+        println!("Netherwick Dream World is running.");
         if inline_learning.is_enabled() {
             println!(
-                "Virtual training theater is collecting experience and running {} inline learning.",
+                "Dream World is collecting experience and running {} inline learning.",
                 inline_learning.mode.as_str()
             );
         } else {
-            println!("Virtual training theater is collecting experience.");
+            println!("Dream World is collecting experience.");
             println!("Models are not updated online in this run.");
             println!("Train later with `cargo run --bin netherwick -- train behavior ...`");
         }
@@ -912,7 +912,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         if args.live_tls {
             println!();
             println!("If your headset warns about the certificate, trust the local dev certificate or install the generated CA/cert.");
-            println!("This serves robot/sim sensor data on the LAN. Use only on trusted networks.");
+            println!("This serves robot/dream-world sensor data on the LAN. Use only on trusted networks.");
         }
         for _ in 0..args.steps {
             let current_inline_learning = live_state.inline_learning();

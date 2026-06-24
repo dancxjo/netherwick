@@ -75,14 +75,12 @@ impl ScenarioConfig {
             }
             ScenarioKind::PersonAndSpeaker => {
                 config.person_count = 1;
-                config.speaker_count = 1;
                 config.obstacle_count = 2;
             }
             ScenarioKind::MixedRoom => {
                 config.charger_count = 1;
                 config.obstacle_count = 5;
                 config.person_count = 1;
-                config.speaker_count = 1;
             }
         }
         config.object_count = config.charger_count
@@ -233,17 +231,19 @@ fn add_kind_objects(
         } else {
             random_free_position(config.arena, rng, body, objects, 0.24)
         };
+        let name = dream_person_name(index);
         objects.push(SimObject {
             id: format!("person-{index}"),
-            label: format!("person {index}"),
+            label: name.to_string(),
             kind: SimObjectKind::Person {
-                identity: Some(format!("sim-person-{index}")),
+                identity: Some(name.to_string()),
             },
             x_m,
             y_m,
             radius_m: 0.22,
             color_rgb: [220, 180, 140],
-            emits_sound: false,
+            emits_sound: true,
+            spoken_text: Some(dream_person_phrase(index).to_string()),
             charge_rate: 0.0,
         });
     }
@@ -265,9 +265,36 @@ fn add_kind_objects(
             radius_m: 0.12,
             color_rgb: [80, 80, 220],
             emits_sound: true,
+            spoken_text: Some(dream_voice_phrase(index).to_string()),
             charge_rate: 0.0,
         });
     }
+}
+
+fn dream_person_name(index: usize) -> &'static str {
+    const NAMES: &[&str] = &["Mara", "Ivo", "Sable", "Noor", "Elian", "Vesper"];
+    NAMES[index % NAMES.len()]
+}
+
+fn dream_person_phrase(index: usize) -> &'static str {
+    const PHRASES: &[&str] = &[
+        "The hallway keeps changing when you look away.",
+        "Follow the warm light if you want to wake the charger.",
+        "I remember this room from someone else's sleep.",
+        "There is a safe path between the red shapes.",
+        "Listen closely; the floor is telling us where to turn.",
+        "The dream world is softer near the center.",
+    ];
+    PHRASES[index % PHRASES.len()]
+}
+
+fn dream_voice_phrase(index: usize) -> &'static str {
+    const PHRASES: &[&str] = &[
+        "A voice drifts through the walls.",
+        "Something far away is humming your name.",
+        "The room is not empty; it is waiting.",
+    ];
+    PHRASES[index % PHRASES.len()]
 }
 
 fn random_free_position(
@@ -371,6 +398,9 @@ mod tests {
         assert!(snapshot.eye_frame.is_some());
         assert!(!snapshot.eye.frames.is_empty());
         assert!(!snapshot.ear.features.is_empty());
+        let transcript = snapshot.ear.transcript.as_deref().unwrap_or_default();
+        assert!(transcript.contains("Mara says"));
+        assert!(!transcript.contains("person 0 sound"));
         assert!(snapshot.ear_pcm.is_some());
         assert!(!snapshot.voice.embeddings.is_empty());
         assert!(!snapshot.face.embeddings.is_empty());

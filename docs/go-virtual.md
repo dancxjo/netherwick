@@ -1,29 +1,29 @@
 # `just go virtual`
 
-`just go virtual` starts Netherwick as a virtual live training theater: a simulated scenario updates the live view state, the server binds to `0.0.0.0`, and HTTPS pages are served for desktop browsers and LAN headset browsers.
+`just go virtual` starts Netherwick's Dream World: a simulated dream scenario updates the live view state, the server binds to `0.0.0.0`, and HTTPS pages are served for desktop browsers and LAN headset browsers.
 
-By default this mode collects experience into the ledger without updating model weights online. Startup prints:
+By default this mode collects experience into the ledger and runs inline world-outcome learning. Startup prints:
 
 ```text
 Virtual training theater is collecting experience.
-Models are not updated online in this run.
-Train later with `cargo run --bin netherwick -- train behavior ...`
+Inline learning defaults to world-outcome. Set NETHERWICK_INLINE_LEARNING_MODE=off for collect-only.
+Offline training still exists: `cargo run --bin netherwick -- train behavior ...`
 ```
 
-The `/view/scene` packet and `/view/3d` HUD expose `training_mode`, `ledger_path`, written frame/transition counts, loaded models, model modes, action selector mode, and `weights_updating`. For the default virtual run, expect `training_mode: "collecting"` and `weights_updating: false`.
+The `/view/scene` packet and `/view/3d` HUD expose `training_mode`, `ledger_path`, written frame/transition counts, loaded models, model modes, action selector mode, and `weights_updating`. For the default virtual run, expect `training_mode: "inline-world-outcome"` and `weights_updating: true`.
 
-Inline learning can be enabled for virtual live runs. Ledger writing remains on; Pete still writes memory while learning from the stream.
+Ledger writing remains on; Pete still writes memory while learning from the stream.
 
 Collect-only:
 
 ```bash
+NETHERWICK_INLINE_LEARNING_MODE=off \
 just go virtual
 ```
 
 Inline world-outcome learning:
 
 ```bash
-NETHERWICK_INLINE_LEARNING=1 \
 NETHERWICK_INLINE_LEARNING_MODE=world-outcome \
 NETHERWICK_INLINE_TRAIN_STEPS_PER_TICK=1 \
 NETHERWICK_INLINE_BEHAVIORS=future,action_value \
@@ -38,7 +38,7 @@ NETHERWICK_INLINE_BEHAVIORS=danger,charge,future \
 just go virtual
 ```
 
-Offline training still exists and is still useful. Use `train virtual` or behavior training commands when you want repeatable batches, more epochs, promotion checks, and registry updates from a collected ledger.
+Offline training still exists and is still useful. Use `train virtual` or behavior training commands when you want repeatable batches, more epochs, promotion checks, and registry updates from a collected Dream World ledger.
 
 Open:
 
@@ -112,7 +112,7 @@ You can also run `ip addr` and use the address assigned to your Wi-Fi or Etherne
 
 ## Security
 
-`just go virtual` intentionally binds to `0.0.0.0` so a headset on the LAN can connect. This serves robot/sim sensor data to any device that can reach the port, and the same origin exposes Reign command endpoints. Use only on trusted networks.
+`just go virtual` intentionally binds to `0.0.0.0` so a headset on the LAN can connect. This serves robot/dream-world sensor data to any device that can reach the port, and the same origin exposes Reign command endpoints. Use only on trusted networks.
 
 ## Static Viewer Assets
 

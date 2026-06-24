@@ -105,6 +105,8 @@ pub struct SimObject {
     pub radius_m: f32,
     pub color_rgb: [u8; 3],
     pub emits_sound: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoken_text: Option<String>,
     pub charge_rate: f32,
 }
 
@@ -125,6 +127,7 @@ impl SimObject {
             radius_m,
             color_rgb: [180, 90, 80],
             emits_sound: false,
+            spoken_text: None,
             charge_rate: 0.0,
         }
     }
@@ -145,6 +148,7 @@ impl SimObject {
             radius_m,
             color_rgb: [80, 220, 130],
             emits_sound: false,
+            spoken_text: None,
             charge_rate: 0.25,
         }
     }
@@ -756,7 +760,7 @@ fn project_ear_sense(body: &BodySense, objects: &[SimObject]) -> (EarSense, Opti
     let audible = audible_objects(body, objects);
     let transcript = audible
         .first()
-        .map(|(object, _)| format!("{} sound", object.label));
+        .map(|(object, _)| dream_speech_transcript(object));
     let features = audible
         .iter()
         .map(|(object, distance)| {
@@ -771,9 +775,22 @@ fn project_ear_sense(body: &BodySense, objects: &[SimObject]) -> (EarSense, Opti
     let pcm = if audible.is_empty() {
         None
     } else {
+        let phrase = audible
+            .first()
+            .map(|(object, _)| dream_speech_text(object))
+            .unwrap_or_default();
+        let seed = phrase.bytes().fold(0u32, |acc, byte| {
+            acc.wrapping_mul(31).wrapping_add(byte as u32)
+        });
+        let frequency = 5.0 + (seed % 17) as f32;
+        let wobble = 1.0 + ((seed / 17) % 5) as f32 * 0.07;
         let samples = (0..256)
             .map(|index| {
-                let wave = ((index as f32 / 8.0).sin() * 10_000.0) as i16;
+                let envelope = 1.0 - index as f32 / 256.0;
+                let wave = (((index as f32 / frequency).sin()
+                    * (index as f32 / 19.0 * wobble).cos())
+                    * 10_000.0
+                    * envelope) as i16;
                 wave
             })
             .collect();
@@ -793,6 +810,26 @@ fn project_ear_sense(body: &BodySense, objects: &[SimObject]) -> (EarSense, Opti
         },
         pcm,
     )
+}
+
+fn dream_speech_transcript(object: &SimObject) -> String {
+    let speech = dream_speech_text(object);
+    if matches!(object.kind, SimObjectKind::Person { .. }) {
+        format!("{} says \"{speech}\"", object.label)
+    } else {
+        format!("{} whispers \"{speech}\"", object.label)
+    }
+}
+
+fn dream_speech_text(object: &SimObject) -> String {
+    object
+        .spoken_text
+        .clone()
+        .unwrap_or_else(|| match &object.kind {
+            SimObjectKind::Person { .. } => "I saw you in the dream world.".to_string(),
+            SimObjectKind::SoundSource { label } => format!("{label} is calling from far away."),
+            _ => format!("{} is making a sound.", object.label),
+        })
 }
 
 fn audible_objects<'a>(body: &BodySense, objects: &'a [SimObject]) -> Vec<(&'a SimObject, f32)> {
@@ -910,7 +947,6 @@ mod tests {
         body
     }
 
-
     #[tokio::test]
     async fn robot_cannot_pass_through_walls_and_sets_bump() {
         let (_world, mut motor) = VirtualWorld::new_with_motor(0, arena());
@@ -1009,7 +1045,6 @@ mod tests {
         assert_eq!(frame.bytes.len(), EYE_WIDTH * EYE_HEIGHT * 3);
     }
 
-
     #[tokio::test]
     async fn visible_person_projects_face_and_kinect_skeleton() {
         let (mut world, _motor) = VirtualWorld::new_with_motor(0, arena());
@@ -1024,6 +1059,7 @@ mod tests {
             radius_m: 0.2,
             color_rgb: [220, 180, 140],
             emits_sound: false,
+            spoken_text: None,
             charge_rate: 0.0,
         });
 
@@ -1047,6 +1083,7 @@ mod tests {
             radius_m: 0.1,
             color_rgb: [80, 80, 220],
             emits_sound: true,
+            spoken_text: Some("the door is dreaming".to_string()),
             charge_rate: 0.0,
         });
 
@@ -1058,7 +1095,7 @@ mod tests {
             .transcript
             .as_deref()
             .unwrap_or_default()
-            .contains("speaker"));
+            .contains("the door is dreaming"));
         assert_eq!(snapshot.voice.embeddings.len(), 1);
     }
 }

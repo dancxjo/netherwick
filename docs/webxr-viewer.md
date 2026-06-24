@@ -63,11 +63,11 @@ The v0 viewer renders:
 - ground plane and arena when scenario metadata is available
 - robot body marker and heading arrow
 - range beams as 3D rays with hit markers
-- scenario objects such as obstacles, chargers, people, and speakers
+- scenario objects such as obstacles, chargers, speaking dream people, and distant voices
 - RGB eye frame as a floating textured panel
 - coarse Kinect/depth point cloud when compact depth values exist
 - Kinect skeleton records in the scene JSON
-- audio bearing from Kinect, or from a simulated speaker when metadata is available
+- audio bearing from Kinect, or from a speaking dream person when metadata is available
 - HUD text for session mode, scenario, seed, tick, URL scheme, secure-context status, WebXR support, pose, battery, nearest obstacle, points, audio, and available warnings
 - XR Reign status while immersive controller input is available
 

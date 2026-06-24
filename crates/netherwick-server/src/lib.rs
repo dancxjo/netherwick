@@ -1880,7 +1880,9 @@ fn audio_bearing_from_objects(
     metadata
         .into_iter()
         .flat_map(|metadata| metadata.objects.iter())
-        .find(|object| object.kind == "speaker" || object.kind == "sound_source")
+        .find(|object| {
+            object.kind == "person" || object.kind == "speaker" || object.kind == "sound_source"
+        })
         .map(|object| (object.y_m - robot_y_m).atan2(object.x_m - robot_x_m))
 }
 
@@ -2401,7 +2403,7 @@ refresh();
 const LIVE_VIEW_3D_PAGE: &str = r#"<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Netherwick Sensorium 3D</title>
+<title>Netherwick Dream World</title>
 <style>
 :root{color-scheme:dark;background:#0b0d10;color:#eef1f3;font:13px system-ui}
 html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
@@ -2541,7 +2543,7 @@ canvas{display:block}
 </aside>
 <aside id="models">
   <section id="virtual-pipeline-section" style="display: none; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 10px;">
-    <h2>Virtual Training Pipeline</h2>
+    <h2>Dream World Training</h2>
     <div id="virtual-report-summary" style="font-size: 0.85em; opacity: 0.9; margin-bottom: 8px; line-height: 1.4;"></div>
     <div id="virtual-model-recommendations" style="font-size: 0.85em;"></div>
   </section>
