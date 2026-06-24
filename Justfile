@@ -88,6 +88,20 @@ clippy:
 sim:
     cargo run -p netherwick-tools -- sim
 
+run *args:
+    cargo run -p netherwick-tools -- {{args}}
+
+rehearse-models:
+    just run sim --steps 200 --ledger data/ledger/sim1
+    just run train behavior danger --ledger data/ledger/sim1
+    just run train behavior charge --ledger data/ledger/sim1
+    just run train behavior future --ledger data/ledger/sim1
+    just run evaluate behavior danger --ledger data/ledger/sim1
+    just run model-status
+    just run sim --steps 200 --danger-checkpoint data/models/danger_v0 --danger-mode shadow-infer
+    just run robot --mode read-only --create-port mock --steps 20 --capture data/captures/mock-readonly
+    just run replay-capture --capture data/captures/mock-readonly
+
 inspect-ledger:
     cargo run -p netherwick-tools -- inspect-ledger
 

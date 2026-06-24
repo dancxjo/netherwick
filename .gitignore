@@ -1,2 +1,14 @@
 /target
 **/*.rs.bk
+
+# Runtime/generated data. Keep only directory placeholders in Git.
+/data/captures/**
+/data/ledger/**
+/data/models/**
+/data/recordings/**
+/data/snapshots/**
+
+!/data/ledger/.gitkeep
+!/data/models/.gitkeep
+!/data/recordings/.gitkeep
+!/data/snapshots/.gitkeep

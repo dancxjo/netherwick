@@ -1,3 +1,4 @@
+use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -24,10 +25,11 @@ use netherwick_sensors::{
 use netherwick_server::LiveViewState;
 use netherwick_sim::{ArenaConfig, SimMotorComplex, SimObject, SimObjectKind, VirtualWorld};
 use netherwick_training::{
-    evaluate_behavior, promote_behavior_config, train_behavior, EvaluateBehaviorRequest,
-    TrainBehaviorRequest, TrainableBehavior,
+    evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
+    EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
 };
 use netherwick_worldlab::{CaptureReader, CaptureReplayRunner, CaptureSource, CaptureWriter};
+use serde_json::Value;
 
 #[derive(Parser)]
 #[command(name = "netherwick")]
@@ -555,7 +557,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     }
 
     if let Some(device) = &args.mic {
-        let pref_name = if device == "default" { None } else { Some(device.as_str()) };
+        let pref_name = if device == "default" {
+            None
+        } else {
+            Some(device.as_str())
+        };
         match MicrophoneSenseProvider::new(pref_name) {
             Ok(provider) => sensors.push(Box::new(provider)),
             Err(err) => {
@@ -673,7 +679,6 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     );
     Ok(())
 }
-
 
 #[derive(Clone, Debug, Default)]
 struct NoopLedger;
@@ -849,9 +854,7 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
                 None
             }
             None => {
-                println!(
-                    "experience inference disabled: no --experience-checkpoint provided"
-                );
+                println!("experience inference disabled: no --experience-checkpoint provided");
                 None
             }
         }
@@ -1108,27 +1111,217 @@ fn model_status() -> Result<()> {
     for model in MODEL_REGISTRY {
         println!("  - {model}");
     }
+
+    let config_path = Path::new("configs/models.toml");
+    println!();
+    println!("models config: {}", config_path.display());
+    let config = match load_models_config(config_path) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            println!("  unavailable: {error}");
+            None
+        }
+    };
+
+    println!();
+    println!("behaviors:");
+    for behavior in trainable_behaviors() {
+        let key = behavior.config_key();
+        let configured = config.as_ref().and_then(|config| config.behavior.get(key));
+        let checkpoint = configured
+            .and_then(|entry| entry.checkpoint.as_deref())
+            .unwrap_or_else(|| default_checkpoint(behavior));
+        let checkpoint_path = Path::new(checkpoint);
+
+        println!("  - {}", behavior);
+        match configured {
+            Some(entry) => {
+                println!("      regime: {:?}", entry.regime);
+                println!("      hardcoded: {}", entry.hardcoded);
+                println!("      model: {}", entry.model.as_deref().unwrap_or("none"));
+                println!("      fallback: {:?}", entry.fallback);
+            }
+            None => {
+                println!("      regime: unconfigured");
+                println!("      hardcoded: {}", behavior.default_hardcoded_id());
+                println!("      model: {}", behavior.default_model_id());
+                println!("      fallback: UseHardcoded");
+            }
+        }
+        println!("      checkpoint: {}", checkpoint_path.display());
+        print_checkpoint_status(checkpoint_path)?;
+    }
+
+    println!();
+    println!("checkpoint directories:");
+    print_model_directories(Path::new("data/models"))?;
+    Ok(())
+}
+
+fn trainable_behaviors() -> &'static [TrainableBehavior] {
+    &[
+        TrainableBehavior::Danger,
+        TrainableBehavior::Charge,
+        TrainableBehavior::ActionValue,
+        TrainableBehavior::Future,
+        TrainableBehavior::EyeNext,
+        TrainableBehavior::EarNext,
+        TrainableBehavior::Experience,
+    ]
+}
+
+fn print_checkpoint_status(path: &Path) -> Result<()> {
+    if !path.exists() {
+        println!("      status: missing");
+        return Ok(());
+    }
+    if !path.is_dir() {
+        println!("      status: present but not a directory");
+        return Ok(());
+    }
+    println!("      status: present");
+    print_json_summary("metadata", &path.join("metadata.json"))?;
+    print_evaluation_summary(&path.join("evaluation.json"))?;
+    print_metrics_summary(&path.join("metrics.jsonl"))?;
+    Ok(())
+}
+
+fn print_json_summary(label: &str, path: &Path) -> Result<()> {
+    if !path.exists() {
+        println!("      {label}: missing");
+        return Ok(());
+    }
+    let json: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let fields = [
+        "input_dim",
+        "output_dim",
+        "latent_dim",
+        "z_dim",
+        "width",
+        "height",
+        "sample_rate_hz",
+        "channels",
+        "samples_seen",
+        "best_loss",
+        "created_at_ms",
+    ];
+    let summary = fields
+        .iter()
+        .filter_map(|field| json.get(*field).map(|value| format!("{field}={value}")))
+        .collect::<Vec<_>>();
+    if summary.is_empty() {
+        println!("      {label}: present");
+    } else {
+        println!("      {label}: {}", summary.join(", "));
+    }
+    Ok(())
+}
+
+fn print_evaluation_summary(path: &Path) -> Result<()> {
+    if !path.exists() {
+        println!("      evaluation: missing");
+        return Ok(());
+    }
+    let json: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let recommendation = json
+        .get("recommendation")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let sample_count = json
+        .get("sample_count")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_loss = json
+        .get("model_loss_mean")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    let hardcoded_loss = json
+        .get("hardcoded_loss_mean")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "null".to_string());
     println!(
-        "DangerPredictor: shadow-train ready; metrics: data/ledger/danger-shadow-metrics.jsonl; checkpoint: data/models/danger_v0"
+        "      evaluation: samples={}, model_loss={}, hardcoded_loss={}, recommendation={}",
+        sample_count, model_loss, hardcoded_loss, recommendation
     );
-    println!(
-        "ChargePredictor: shadow-train ready; metrics: data/ledger/charge-shadow-metrics.jsonl; checkpoint: data/models/charge_v0"
-    );
-    println!(
-        "ActionValueNet: shadow-train ready; metrics: data/ledger/action-value-shadow-metrics.jsonl; checkpoint: data/models/action_value_v0"
-    );
-    println!(
-        "FuturePredictor: hardcoded stasis; train ready with transitions; metrics: data/models/future_v0/future-shadow-metrics.jsonl; checkpoint: data/models/future_v0; behavior-regime: hardcoded/shadow-infer/model-infer"
-    );
-    println!(
-        "EyeNextPredictor: shadow-train ready; metrics: data/ledger/eye-next-shadow-metrics.jsonl; checkpoint: data/models/eye_next_v0"
-    );
-    println!(
-        "EarNextPredictor: shadow-train ready; metrics: data/ledger/ear-next-shadow-metrics.jsonl; checkpoint: data/models/ear_next_v0"
-    );
-    println!(
-        "ExperienceAutoencoder: shadow-train ready; metrics: data/ledger/experience-autoencoder-shadow-metrics.jsonl; checkpoint: data/models/experience_v0"
-    );
+    if let Some(warnings) = json.get("warnings").and_then(Value::as_array) {
+        for warning in warnings.iter().filter_map(Value::as_str) {
+            println!("      evaluation warning: {warning}");
+        }
+    }
+    Ok(())
+}
+
+fn print_metrics_summary(path: &Path) -> Result<()> {
+    if !path.exists() {
+        println!("      metrics: missing");
+        return Ok(());
+    }
+    let text = fs::read_to_string(path)?;
+    let count = text.lines().filter(|line| !line.trim().is_empty()).count();
+    let latest = text.lines().rev().find(|line| !line.trim().is_empty());
+    println!("      metrics: {} records at {}", count, path.display());
+    if let Some(line) = latest {
+        match serde_json::from_str::<Value>(line) {
+            Ok(json) => {
+                let epoch = json
+                    .get("epoch")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let train_loss = json
+                    .get("train_loss")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "null".to_string());
+                let model_loss = json
+                    .get("model_loss")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "null".to_string());
+                let hardcoded_loss = json
+                    .get("hardcoded_loss")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "null".to_string());
+                println!(
+                    "      latest metric: epoch={}, train_loss={}, model_loss={}, hardcoded_loss={}",
+                    epoch, train_loss, model_loss, hardcoded_loss
+                );
+            }
+            Err(error) => println!("      latest metric: unreadable JSON: {error}"),
+        }
+    }
+    Ok(())
+}
+
+fn print_model_directories(path: &Path) -> Result<()> {
+    if !path.exists() {
+        println!("  missing {}", path.display());
+        return Ok(());
+    }
+    let mut directories = fs::read_dir(path)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.path())
+        })
+        .collect::<Vec<_>>();
+    directories.sort();
+    if directories.is_empty() {
+        println!("  none below {}", path.display());
+        return Ok(());
+    }
+    for directory in directories {
+        let metadata = directory.join("metadata.json").exists();
+        let evaluation = directory.join("evaluation.json").exists();
+        let metrics = directory.join("metrics.jsonl").exists();
+        println!(
+            "  - {} (metadata={}, evaluation={}, metrics={})",
+            directory.display(),
+            metadata,
+            evaluation,
+            metrics
+        );
+    }
     Ok(())
 }
 
