@@ -904,6 +904,58 @@ mod tests {
     }
 
     #[test]
+    fn extractor_emits_reign_commanded_once_then_expired() {
+        let mut extractor = EventExtractor::default();
+        let mut now = Now::blank(20, BodySense::default());
+        let input = test_reign_input(20);
+        now.reign.active = true;
+        now.reign.latest = Some(input.clone());
+
+        let first = extractor.events_from_now(&now, None);
+        let second = extractor.events_from_now(&now, None);
+        now.t_ms = 1_200;
+        now.reign.active = false;
+        now.reign.latest = None;
+        let expired = extractor.events_from_now(&now, None);
+
+        assert!(first
+            .iter()
+            .any(|event| event.kind == EventKind::ReignCommanded));
+        assert!(!second
+            .iter()
+            .any(|event| event.kind == EventKind::ReignCommanded));
+        assert!(expired.iter().any(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ReignExpired { input: expired_input }
+                    if expired_input.id == input.id
+            )
+        }));
+    }
+
+    #[test]
+    fn extractor_emits_reign_cleared_without_expired() {
+        let mut extractor = EventExtractor::default();
+        let mut now = Now::blank(20, BodySense::default());
+        now.reign.active = true;
+        now.reign.latest = Some(test_reign_input(20));
+        let _ = extractor.events_from_now(&now, None);
+
+        now.t_ms = 30;
+        now.reign.active = false;
+        now.reign.latest = None;
+        now.reign.clear_sequence = 1;
+        let events = extractor.events_from_now(&now, None);
+
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::ReignCleared));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == EventKind::ReignExpired));
+    }
+
+    #[test]
     fn battery_low_responder_proposes_dock() {
         let mut bus = EventBus::new();
         bus.on(responders::BatteryLowResponder);
@@ -1128,5 +1180,18 @@ mod tests {
                 })
             )
         }));
+    }
+
+    fn test_reign_input(issued_at_ms: TimeMs) -> ReignInput {
+        ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms,
+            expires_at_ms: issued_at_ms + 1_000,
+            source: netherwick_actions::ReignSource::WebRemote,
+            mode: netherwick_actions::ReignMode::Direct,
+            command: netherwick_actions::ReignCommand::Stop,
+            priority: 1.0,
+            note: None,
+        }
     }
 }
