@@ -1757,6 +1757,11 @@ impl Impression {
         self.confidence = confidence;
         self
     }
+
+    pub fn with_payload(mut self, payload: Value) -> Self {
+        self.payload = payload;
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

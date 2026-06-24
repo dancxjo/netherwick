@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, io};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -283,6 +284,76 @@ pub struct SceneMind {
     pub surprise: Option<f32>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ModelsResponse {
+    pub schema_version: u32,
+    pub root: String,
+    pub models: Vec<ModelSummary>,
+    pub registry: Vec<ModelRegistrySummary>,
+    pub connections: Vec<ModelConnection>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ModelSummary {
+    pub name: String,
+    pub behavior: Option<String>,
+    pub checkpoint_path: String,
+    pub samples_seen: Option<u64>,
+    pub best_loss: Option<f32>,
+    pub input_dim: Option<u64>,
+    pub output_dim: Option<u64>,
+    pub latent_dim: Option<u64>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub evaluation: Option<ModelEvaluationSummary>,
+    pub metrics: Option<ModelTrainingMetricSummary>,
+    pub registered_status: Option<String>,
+    pub allowed_modes: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ModelEvaluationSummary {
+    pub sample_count: Option<u64>,
+    pub model_loss_mean: Option<f32>,
+    pub hardcoded_loss_mean: Option<f32>,
+    pub selected_loss_mean: Option<f32>,
+    pub model_better_than_hardcoded: Option<bool>,
+    pub improvement_ratio: Option<f32>,
+    pub recommendation: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ModelTrainingMetricSummary {
+    pub record_count: usize,
+    pub last_epoch: Option<u64>,
+    pub last_sample_index: Option<u64>,
+    pub last_train_loss: Option<f32>,
+    pub last_model_loss: Option<f32>,
+    pub last_hardcoded_loss: Option<f32>,
+    pub last_selected_loss: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ModelRegistrySummary {
+    pub name: String,
+    pub behavior: String,
+    pub checkpoint_path: String,
+    pub status: String,
+    pub allowed_modes: Vec<String>,
+    pub scenario_success_rate: Option<f32>,
+    pub collision_rate: Option<f32>,
+    pub episodes: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ModelConnection {
+    pub from: String,
+    pub to: String,
+    pub label: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct CaptureSceneQuery {
     pub capture: PathBuf,
@@ -294,6 +365,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
     Router::new()
         .route("/", get(live_view_page))
         .route("/now", get(get_live_now))
+        .route("/models", get(get_models))
         .route("/view", get(live_view_page))
         .route("/view/snapshot", get(get_live_snapshot))
         .route("/view/scene", get(get_live_scene))
@@ -352,6 +424,292 @@ async fn get_live_scene(
         state.scene_metadata().as_ref(),
         state.session(),
     )))
+}
+
+async fn get_models() -> Json<ModelsResponse> {
+    Json(read_models_response(&default_model_root()))
+}
+
+fn default_model_root() -> PathBuf {
+    let root = PathBuf::from("data/models");
+    if root.exists() {
+        root
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/models")
+    }
+}
+
+fn read_models_response(root: &Path) -> ModelsResponse {
+    let mut response = ModelsResponse {
+        schema_version: 1,
+        root: root.display().to_string(),
+        connections: model_connections(),
+        ..ModelsResponse::default()
+    };
+    let registry = read_model_registry_summary(&root.join("registry.json"), &mut response.warnings);
+    response.registry = registry.clone();
+
+    let mut models = Vec::new();
+    match fs::read_dir(root) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if let Some(summary) = read_model_summary(&path, &registry) {
+                    models.push(summary);
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => response
+            .warnings
+            .push(format!("model root {} was not found", root.display())),
+        Err(error) => response.warnings.push(format!(
+            "failed to read model root {}: {error}",
+            root.display()
+        )),
+    }
+
+    for registered in &registry {
+        if models
+            .iter()
+            .all(|model| model.checkpoint_path != registered.checkpoint_path)
+        {
+            models.push(ModelSummary {
+                name: registered.name.clone(),
+                behavior: Some(registered.behavior.clone()),
+                checkpoint_path: registered.checkpoint_path.clone(),
+                registered_status: Some(registered.status.clone()),
+                allowed_modes: registered.allowed_modes.clone(),
+                warnings: vec!["registered checkpoint has no local metadata summary".to_string()],
+                ..ModelSummary::default()
+            });
+        }
+    }
+
+    models.sort_by(|left, right| {
+        left.behavior
+            .cmp(&right.behavior)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    response.models = models;
+    response
+}
+
+fn read_model_summary(path: &Path, registry: &[ModelRegistrySummary]) -> Option<ModelSummary> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    let checkpoint_path = path.display().to_string();
+    let metadata = read_json_value(&path.join("metadata.json")).ok();
+    let evaluation = read_json_value(&path.join("evaluation.json")).ok();
+    let registry_entry = registry
+        .iter()
+        .find(|entry| same_path_text(&entry.checkpoint_path, &checkpoint_path));
+
+    let behavior = evaluation
+        .as_ref()
+        .and_then(|value| value.get("behavior"))
+        .and_then(|value| value.as_str())
+        .or_else(|| registry_entry.map(|entry| entry.behavior.as_str()))
+        .or_else(|| behavior_from_checkpoint_name(&name))
+        .map(str::to_string);
+
+    let mut warnings = Vec::new();
+    if metadata.is_none() {
+        warnings.push("metadata.json missing".to_string());
+    }
+    if evaluation.is_none() {
+        warnings.push("evaluation.json missing".to_string());
+    }
+
+    Some(ModelSummary {
+        name,
+        behavior,
+        checkpoint_path,
+        samples_seen: metadata
+            .as_ref()
+            .and_then(|value| json_u64(value, "samples_seen")),
+        best_loss: metadata
+            .as_ref()
+            .and_then(|value| json_f32(value, "best_loss")),
+        input_dim: metadata
+            .as_ref()
+            .and_then(|value| json_u64(value, "input_dim")),
+        output_dim: metadata
+            .as_ref()
+            .and_then(|value| json_u64(value, "output_dim")),
+        latent_dim: metadata
+            .as_ref()
+            .and_then(|value| json_u64(value, "latent_dim")),
+        width: metadata.as_ref().and_then(|value| json_u64(value, "width")),
+        height: metadata
+            .as_ref()
+            .and_then(|value| json_u64(value, "height")),
+        evaluation: evaluation.as_ref().map(model_evaluation_summary),
+        metrics: read_metric_summary(&path.join("metrics.jsonl")),
+        registered_status: registry_entry.map(|entry| entry.status.clone()),
+        allowed_modes: registry_entry
+            .map(|entry| entry.allowed_modes.clone())
+            .unwrap_or_default(),
+        warnings,
+    })
+}
+
+fn model_evaluation_summary(value: &serde_json::Value) -> ModelEvaluationSummary {
+    ModelEvaluationSummary {
+        sample_count: json_u64(value, "sample_count"),
+        model_loss_mean: json_f32(value, "model_loss_mean"),
+        hardcoded_loss_mean: json_f32(value, "hardcoded_loss_mean"),
+        selected_loss_mean: json_f32(value, "selected_loss_mean"),
+        model_better_than_hardcoded: value
+            .get("model_better_than_hardcoded")
+            .and_then(|value| value.as_bool()),
+        improvement_ratio: json_f32(value, "improvement_ratio"),
+        recommendation: value
+            .get("recommendation")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }
+}
+
+fn read_metric_summary(path: &Path) -> Option<ModelTrainingMetricSummary> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut summary = ModelTrainingMetricSummary::default();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        summary.record_count += 1;
+        summary.last_epoch = json_u64(&value, "epoch");
+        summary.last_sample_index = json_u64(&value, "sample_index");
+        summary.last_train_loss = json_f32(&value, "train_loss");
+        summary.last_model_loss = json_f32(&value, "model_loss");
+        summary.last_hardcoded_loss = json_f32(&value, "hardcoded_loss");
+        summary.last_selected_loss = json_f32(&value, "selected_loss");
+    }
+    (summary.record_count > 0).then_some(summary)
+}
+
+fn read_model_registry_summary(
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> Vec<ModelRegistrySummary> {
+    let Ok(value) = read_json_value(path) else {
+        warnings.push(format!(
+            "model registry {} was not readable",
+            path.display()
+        ));
+        return Vec::new();
+    };
+    value
+        .get("entries")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(ModelRegistrySummary {
+                        name: entry.get("name")?.as_str()?.to_string(),
+                        behavior: entry.get("behavior")?.as_str()?.to_string(),
+                        checkpoint_path: entry.get("checkpoint")?.as_str()?.to_string(),
+                        status: entry
+                            .get("status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        allowed_modes: entry
+                            .get("allowed_modes")
+                            .and_then(|value| value.as_array())
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(|value| value.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        scenario_success_rate: entry
+                            .get("metrics")
+                            .and_then(|value| json_f32(value, "scenario_success_rate")),
+                        collision_rate: entry
+                            .get("metrics")
+                            .and_then(|value| json_f32(value, "collision_rate")),
+                        episodes: entry
+                            .get("metrics")
+                            .and_then(|value| json_u64(value, "episodes")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn model_connections() -> Vec<ModelConnection> {
+    [
+        ("Sensors", "Now", "snapshot"),
+        ("Now", "Experience", "encode"),
+        ("Now", "Danger", "range/body/action"),
+        ("Now", "Charge", "battery/dock cues"),
+        ("Now", "EyeNext", "vision context"),
+        ("Now", "EarNext", "audio context"),
+        ("Experience", "Future", "latent z"),
+        ("Danger", "Conductor", "risk"),
+        ("Charge", "Conductor", "dock value"),
+        ("Future", "Conductor", "imagined state"),
+        ("Conductor", "ActionValue", "candidate actions"),
+        ("ActionValue", "Autonomic", "ranked action"),
+        ("Autonomic", "Body", "safe command"),
+        ("Body", "Ledger", "transition"),
+        ("Ledger", "Training", "replay"),
+        ("Training", "Models", "checkpoints"),
+    ]
+    .into_iter()
+    .map(|(from, to, label)| ModelConnection {
+        from: from.to_string(),
+        to: to.to_string(),
+        label: label.to_string(),
+    })
+    .collect()
+}
+
+fn read_json_value(path: &Path) -> Result<serde_json::Value, io::Error> {
+    let text = fs::read_to_string(path)?;
+    serde_json::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn json_f32(value: &serde_json::Value, key: &str) -> Option<f32> {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64())
+        .filter(|value| value.is_finite())
+        .map(|value| value as f32)
+}
+
+fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|value| value.as_u64())
+}
+
+fn same_path_text(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+}
+
+fn behavior_from_checkpoint_name(name: &str) -> Option<&'static str> {
+    if name.starts_with("action_value") {
+        Some("action_value")
+    } else if name.starts_with("eye") {
+        Some("eye_next")
+    } else if name.starts_with("ear") {
+        Some("ear_next")
+    } else if name.starts_with("danger") {
+        Some("danger")
+    } else if name.starts_with("charge") {
+        Some("charge")
+    } else if name.starts_with("future") {
+        Some("future")
+    } else if name.starts_with("experience") {
+        Some("experience")
+    } else {
+        None
+    }
 }
 
 async fn get_capture_scene(
@@ -1323,10 +1681,25 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .llm-block{display:grid;gap:3px;min-width:0}
 .llm-label{color:#8fa1b2;font-size:11px;text-transform:uppercase}
 .llm-text{max-height:112px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;line-height:1.35;color:#dbe7f1;background:rgba(4,7,10,.38);border-radius:4px;padding:6px}
+#models{position:fixed;left:12px;bottom:40px;width:min(680px,calc(100vw - 24px));max-height:44vh;display:grid;grid-template-columns:minmax(260px,.92fr) minmax(300px,1fr);gap:10px;padding:10px;border:1px solid #37424c;background:rgba(8,11,15,.88);backdrop-filter:blur(10px);border-radius:6px;color:#e7eef5}
+#models h2{font-size:12px;margin:0 0 8px;color:#c6e6ff}
+#model-status{color:#ffcf7a;font-size:12px;font-variant-numeric:tabular-nums}
+#model-list{display:grid;gap:6px;min-height:0;overflow:auto;scrollbar-width:thin}
+.model-row{display:grid;grid-template-columns:1fr auto;gap:3px 8px;padding:6px;border:1px solid #27313b;background:rgba(18,24,30,.72);border-radius:5px}
+.model-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-pill{padding:1px 5px;border-radius:999px;background:#243646;color:#b8e1ff;font-size:11px;white-space:nowrap}
+.model-line{grid-column:1/-1;color:#aeb9c3;font-size:11px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+#model-graph{width:100%;height:260px;min-height:220px;border:1px solid #27313b;border-radius:5px;background:rgba(4,7,10,.32)}
+#model-graph text{font:10px system-ui;fill:#e7eef5}
+#model-graph .edge{stroke:#627384;stroke-width:1.2;fill:none;marker-end:url(#arrow)}
+#model-graph .edge-label{fill:#99a8b5;font-size:8px}
+#model-graph .node rect{fill:#17222b;stroke:#52687b;stroke-width:1.2;rx:5}
+#model-graph .node.model rect{stroke:#81c995}
+#model-graph .node.core rect{stroke:#8bd3ff}
 #xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
 #xr[disabled]{opacity:.55}
 #fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
-@media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}}
+@media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{grid-template-columns:1fr;bottom:98px;max-height:46vh}#model-graph{height:220px}}
 canvas{display:block}
 </style>
 <div id="scene"></div>
@@ -1366,6 +1739,16 @@ canvas{display:block}
   </header>
   <div id="llm-streams"></div>
 </aside>
+<aside id="models">
+  <section>
+    <h2>Training stats <span id="model-status">loading...</span></h2>
+    <div id="model-list"></div>
+  </section>
+  <section>
+    <h2>Connections</h2>
+    <svg id="model-graph" viewBox="0 0 560 260" role="img" aria-label="Model connection diagram"></svg>
+  </section>
+</aside>
 <button id="xr" disabled>VR unavailable</button>
 <div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers, squeeze stops, A/B dock or explore.</div>
 <script type="module">
@@ -1378,6 +1761,9 @@ const xrButton = document.getElementById('xr');
 const reignState = document.getElementById('reign-state');
 const llmStatus = document.getElementById('llm-status');
 const llmStreams = document.getElementById('llm-streams');
+const modelStatus = document.getElementById('model-status');
+const modelList = document.getElementById('model-list');
+const modelGraph = document.getElementById('model-graph');
 const fields = Object.fromEntries(['mode','scenario','seed','tick','t','pose','battery','stuck','dead_battery','recovery_mode','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d10);
@@ -1542,6 +1928,84 @@ function panelColorFor(item){
   if(item.color_rgb) return `rgb(${item.color_rgb[0]},${item.color_rgb[1]},${item.color_rgb[2]})`;
   return {charger:'#45d483', person:'#e8c08c', speaker:'#778cff', obstacle:'#d67666', landmark:'#b0b8c0'}[item.kind] || '#b0b8c0';
 }
+function frameFormatIs(format, name){
+  return format === name || (typeof format === 'object' && format?.[name] !== undefined);
+}
+function frameFormatText(format){
+  return typeof format === 'string' ? format : JSON.stringify(format || '');
+}
+function yuvToRgb(y, u, v){
+  const c = y - 16, d = u - 128, e = v - 128;
+  return [
+    Math.max(0, Math.min(255, (298 * c + 409 * e + 128) >> 8)),
+    Math.max(0, Math.min(255, (298 * c - 100 * d - 208 * e + 128) >> 8)),
+    Math.max(0, Math.min(255, (298 * c + 516 * d + 128) >> 8))
+  ];
+}
+function writeYuvPixel(data, target, y, u, v){
+  const [r, g, b] = yuvToRgb(y, u, v);
+  data[target] = r; data[target + 1] = g; data[target + 2] = b; data[target + 3] = 255;
+}
+function renderRawEyeFrame(frame){
+  if(!frame) return false;
+  const fmt = frame.format;
+  const isRgb = frameFormatIs(fmt, 'Rgb8');
+  const isBgr = frameFormatIs(fmt, 'Bgr8');
+  const isGray = frameFormatIs(fmt, 'Gray8');
+  const isYuyv = frameFormatIs(fmt, 'Yuyv422');
+  const isMjpg = frameFormatIs(fmt, 'Mjpeg') || frameFormatText(fmt).includes('MJPG');
+  if(isRgb || isBgr || isGray || isYuyv){
+    eyeCanvas.width = frame.width; eyeCanvas.height = frame.height;
+    const image = eyeCanvas.getContext('2d').createImageData(frame.width, frame.height);
+    if(isGray){
+      for(let source = 0, target = 0; target < image.data.length && source < frame.bytes.length; source += 1, target += 4){
+        const value = frame.bytes[source];
+        image.data[target] = value; image.data[target + 1] = value; image.data[target + 2] = value; image.data[target + 3] = 255;
+      }
+    }else if(isYuyv){
+      for(let source = 0, target = 0; target + 7 < image.data.length && source + 3 < frame.bytes.length; source += 4, target += 8){
+        const y0 = frame.bytes[source], u = frame.bytes[source + 1], y1 = frame.bytes[source + 2], v = frame.bytes[source + 3];
+        writeYuvPixel(image.data, target, y0, u, v);
+        writeYuvPixel(image.data, target + 4, y1, u, v);
+      }
+    }else{
+      for(let source = 0, target = 0; target < image.data.length && source + 2 < frame.bytes.length; source += 3, target += 4){
+        image.data[target] = isBgr ? frame.bytes[source + 2] : frame.bytes[source];
+        image.data[target + 1] = frame.bytes[source + 1];
+        image.data[target + 2] = isBgr ? frame.bytes[source] : frame.bytes[source + 2];
+        image.data[target + 3] = 255;
+      }
+    }
+    eyeCanvas.getContext('2d').putImageData(image, 0, 0);
+    eyeTexture.needsUpdate = true;
+    return true;
+  }
+  if(isMjpg){
+    const blob = new Blob([new Uint8Array(frame.bytes)], {type:'image/jpeg'});
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      eyeCanvas.width = img.width; eyeCanvas.height = img.height;
+      eyeCanvas.getContext('2d').drawImage(img, 0, 0);
+      eyeTexture.needsUpdate = true;
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => URL.revokeObjectURL(url);
+    img.src = url;
+    return true;
+  }
+  return false;
+}
+async function renderSnapshotEyeFallback(packet){
+  try{
+    const res = await fetch('/view/snapshot', {cache:'no-store'});
+    if(!res.ok) throw new Error(await res.text());
+    const snapshot = await res.json();
+    if(!renderRawEyeFrame(snapshot.eye_frame)) renderGeneratedEye(packet);
+  }catch(_error){
+    renderGeneratedEye(packet);
+  }
+}
 function renderGeneratedEye(packet){
   if(!packet?.body) return;
   const width = 160, height = 120, horizon = 54;
@@ -1604,12 +2068,17 @@ function renderEye(packet){
     return;
   }
   const eye = packet.eye;
+  if(!eye?.data_url){
+    renderSnapshotEyeFallback(packet);
+    return;
+  }
   const img = new Image();
   img.onload = () => {
     eyeCanvas.width = img.width; eyeCanvas.height = img.height;
     eyeCanvas.getContext('2d').drawImage(img, 0, 0);
     eyeTexture.needsUpdate = true;
   };
+  img.onerror = () => renderSnapshotEyeFallback(packet);
   img.src = eye.data_url;
 }
 function updateScene(packet){
@@ -1810,6 +2279,94 @@ function connectLlmStream(){
   });
   socket.addEventListener('error', () => { llmStatus.textContent = 'socket error'; });
 }
+function compactNumber(value, digits=3){
+  if(value == null || !Number.isFinite(Number(value))) return '-';
+  const n = Number(value);
+  if(Math.abs(n) >= 1000) return n.toExponential(2);
+  if(Math.abs(n) > 0 && Math.abs(n) < .001) return n.toExponential(2);
+  return n.toFixed(digits).replace(/\.?0+$/, '');
+}
+function modelLabel(model){
+  return model.behavior || model.name.replace(/_v\d+$/, '');
+}
+function renderModelStats(packet){
+  const models = packet.models || [];
+  modelStatus.textContent = `${models.length} models`;
+  modelList.replaceChildren(...models.map(model => {
+    const row = document.createElement('article');
+    row.className = 'model-row';
+    const evalStats = model.evaluation || {};
+    const metrics = model.metrics || {};
+    const best = model.best_loss != null ? model.best_loss : evalStats.model_loss_mean;
+    const latest = metrics.last_train_loss != null ? metrics.last_train_loss : evalStats.model_loss_mean;
+    const status = model.registered_status || evalStats.recommendation || 'local';
+    const dims = [
+      model.input_dim != null ? `in ${model.input_dim}` : null,
+      model.output_dim != null ? `out ${model.output_dim}` : null,
+      model.latent_dim != null ? `z ${model.latent_dim}` : null,
+      model.width && model.height ? `${model.width}x${model.height}` : null
+    ].filter(Boolean).join(' · ');
+    row.innerHTML = `
+      <div class="model-name"></div>
+      <div class="model-pill"></div>
+      <div class="model-line"></div>
+      <div class="model-line"></div>`;
+    row.querySelector('.model-name').textContent = model.name;
+    row.querySelector('.model-pill').textContent = status;
+    const lines = row.querySelectorAll('.model-line');
+    lines[0].textContent = `${modelLabel(model)} · samples ${model.samples_seen ?? evalStats.sample_count ?? '-'} · best ${compactNumber(best)} · latest ${compactNumber(latest)}`;
+    lines[1].textContent = `${dims || 'dims -'} · model ${compactNumber(evalStats.model_loss_mean)} · hardcoded ${compactNumber(evalStats.hardcoded_loss_mean)} · ${evalStats.model_better_than_hardcoded === true ? 'beats hardcoded' : evalStats.model_better_than_hardcoded === false ? 'hardcoded ahead' : 'no comparison'}`;
+    return row;
+  }));
+}
+function renderModelGraph(packet){
+  const nodes = {
+    Sensors:[28,18,'core'], Now:[148,18,'core'], Experience:[268,18,'model'], Future:[396,18,'model'],
+    Danger:[28,92,'model'], Charge:[148,92,'model'], EyeNext:[268,92,'model'], EarNext:[396,92,'model'],
+    Conductor:[148,166,'core'], ActionValue:[282,166,'model'], Autonomic:[416,166,'core'],
+    Body:[28,226,'core'], Ledger:[148,226,'core'], Training:[282,226,'core'], Models:[416,226,'model']
+  };
+  const w = 94, h = 26;
+  const cx = name => nodes[name] ? nodes[name][0] + w / 2 : 0;
+  const cy = name => nodes[name] ? nodes[name][1] + h / 2 : 0;
+  const edges = (packet.connections || []).filter(edge => nodes[edge.from] && nodes[edge.to]);
+  modelGraph.innerHTML = `<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill='#627384'></path></marker></defs>`;
+  for(const edge of edges){
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const x1 = cx(edge.from), y1 = cy(edge.from), x2 = cx(edge.to), y2 = cy(edge.to);
+    const bend = Math.max(22, Math.abs(x2 - x1) * .35);
+    line.setAttribute('class', 'edge');
+    line.setAttribute('d', `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`);
+    modelGraph.appendChild(line);
+    if(edge.label && Math.abs(y2 - y1) < 95){
+      const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      label.setAttribute('class', 'edge-label');
+      label.setAttribute('x', String((x1 + x2) / 2 - 18));
+      label.setAttribute('y', String((y1 + y2) / 2 - 4));
+      label.textContent = edge.label;
+      modelGraph.appendChild(label);
+    }
+  }
+  for(const [name, [x, y, kind]] of Object.entries(nodes)){
+    const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    group.setAttribute('class', `node ${kind}`);
+    group.innerHTML = `<rect x="${x}" y="${y}" width="${w}" height="${h}"></rect><text x="${x + w / 2}" y="${y + 17}" text-anchor="middle">${name}</text>`;
+    modelGraph.appendChild(group);
+  }
+}
+async function refreshModels(){
+  try{
+    const res = await fetch('/models', {cache:'no-store'});
+    if(!res.ok) throw new Error(await res.text());
+    const packet = await res.json();
+    renderModelStats(packet);
+    renderModelGraph(packet);
+  }catch(error){
+    modelStatus.textContent = 'unavailable';
+  }finally{
+    setTimeout(refreshModels, 5000);
+  }
+}
 async function setupXr(){
   fields.scheme.textContent = location.protocol.replace(':', '');
   fields.secure.textContent = window.isSecureContext ? 'yes' : 'no';
@@ -1854,6 +2411,7 @@ renderer.setAnimationLoop(() => {
 });
 setupXr();
 connectLlmStream();
+refreshModels();
 poll();
 </script>"#;
 
@@ -2134,10 +2692,14 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/view"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/3d"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/scene"));
+        assert!(HTTP_ENDPOINTS.contains(&"/models"));
         assert!(HTTP_ENDPOINTS.contains(&"/stream/llm"));
         let Html(page) = live_view_3d_page().await;
         assert!(page.contains("Sensorium 3D"));
         assert!(page.contains("/view/scene"));
+        assert!(page.contains("/models"));
+        assert!(page.contains("Training stats"));
+        assert!(page.contains("Connections"));
         assert!(page.contains("/stream/llm"));
         assert!(page.contains("LLM streams"));
         assert!(page.contains("navigator.xr"));
@@ -2145,6 +2707,25 @@ mod tests {
         assert!(page.contains("/reign/command"));
         assert!(page.contains("source:'Gamepad'"));
         assert!(page.contains("renderer.xr.getController"));
+        assert!(page.contains("if(!eye?.data_url)"));
+    }
+
+    #[test]
+    fn model_summary_reads_training_artifacts() {
+        let model_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/models");
+        let packet = read_models_response(&model_root);
+
+        assert_eq!(packet.schema_version, 1);
+        assert!(packet
+            .connections
+            .iter()
+            .any(|edge| edge.from == "Ledger" && edge.to == "Training"));
+        assert!(packet.models.iter().any(|model| {
+            model.name == "danger_v0"
+                && model.samples_seen.is_some()
+                && model.evaluation.is_some()
+                && model.metrics.is_some()
+        }));
     }
 
     #[tokio::test]

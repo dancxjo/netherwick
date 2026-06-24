@@ -1607,8 +1607,7 @@ where
             }),
         );
 
-        let mut sensations = derive_direct_sensations(&now);
-        let mut impressions = derive_direct_impressions(&sensations, now.t_ms);
+        let (mut sensations, mut impressions) = derive_direct_impressions_from_now(&now);
         let mut experiences = derive_direct_experiences(&impressions, &sensations, now.t_ms);
         let mut teachings = Vec::new();
         let mut notes = Vec::new();
@@ -1706,7 +1705,13 @@ where
 
         let combobulation = self
             .llm
-            .combobulate(&now, &latent, &futures, &recall.first_person_summary)
+            .combobulate(
+                &now,
+                &impressions,
+                &latent,
+                &futures,
+                &recall.first_person_summary,
+            )
             .await?;
 
         let awareness_summary = combobulation.as_ref().map(|value| value.summary.as_str());
@@ -3166,46 +3171,402 @@ fn append_combobulation(
     experiences.push(experience);
 }
 
-fn derive_direct_sensations(now: &Now) -> Vec<Sensation> {
-    let mut out = Vec::new();
-    if let Some(transcript) = &now.ear.transcript {
+fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impression>) {
+    let mut sensations = Vec::new();
+    let mut impressions = Vec::new();
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "body.state",
+        "body",
+        format!(
+            "My body has battery at {:.0}%, charging is {}, bumps left/right are {}:{}, wall is {}, virtual wall is {}, wheel drop is {}, cliffs L/FL/FR/R are {}:{}:{}:{}, cliff levels are {:.2}/{:.2}/{:.2}/{:.2}, I am moving forward {:.2} m/s, turning {:.2} rad/s, and my odometry is ({:.2}, {:.2}, {:.2}).",
+            now.body.battery_level * 100.0,
+            now.body.charging,
+            now.body.flags.bump_left,
+            now.body.flags.bump_right,
+            now.body.flags.wall,
+            now.body.flags.virtual_wall,
+            now.body.flags.wheel_drop,
+            now.body.flags.cliff_left,
+            now.body.flags.cliff_front_left,
+            now.body.flags.cliff_front_right,
+            now.body.flags.cliff_right,
+            now.body.cliff_sensors.left,
+            now.body.cliff_sensors.front_left,
+            now.body.cliff_sensors.front_right,
+            now.body.cliff_sensors.right,
+            now.body.velocity.forward_m_s,
+            now.body.velocity.turn_rad_s,
+            now.body.odometry.x_m,
+            now.body.odometry.y_m,
+            now.body.odometry.heading_rad,
+        ),
+        0.9,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "eye.state",
+        "eye",
+        format!(
+            "I am seeing through {} frame feature sets, with {} image vectors, {} image-description vectors, and {} scene vectors available.",
+            now.eye.frames.len(),
+            now.eye.image_vectors.len(),
+            now.eye.image_description_vectors.len(),
+            now.eye.scene_vectors.len(),
+        ),
+        0.6,
+    );
+    let transcript = now
+        .ear
+        .asr
+        .transcript
+        .as_deref()
+        .or(now.ear.transcript.as_deref());
+    if let Some(transcript) = transcript {
         let transcript = transcript.trim();
         if !transcript.is_empty() {
-            out.push(
-                Sensation::new(
-                    "audio.transcript",
-                    "ear",
-                    now.t_ms,
-                    now.t_ms,
-                    serde_json::json!({ "transcript": transcript }),
-                )
-                .with_summary(format!("I hear: {transcript}")),
+            push_now_input_impression(
+                &mut sensations,
+                &mut impressions,
+                now.t_ms,
+                "audio.transcript",
+                "ear",
+                asr_hearing_impression_text(
+                    transcript,
+                    now.ear.asr.is_final,
+                    now.ear.asr.confidence,
+                ),
+                now.ear.asr.confidence.max(0.35),
             );
         }
     }
-    out
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "ear.state",
+        "ear",
+        format!(
+            "I am hearing through {} audio feature sets; my speech recognition final state is {}, confidence is {:.2}, word count is {:?}, and sequence is {:?}-{:?}.",
+            now.ear.features.len(),
+            now.ear.asr.is_final,
+            now.ear.asr.confidence,
+            now.ear.asr.word_count,
+            now.ear.asr.sequence_start,
+            now.ear.asr.sequence_end,
+        ),
+        0.6,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "range.state",
+        "range",
+        format!(
+            "I sense the nearest obstacle at {:?} meters, from {} range beam samples.",
+            now.range.nearest_m,
+            now.range.beams.len(),
+        ),
+        0.7,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "imu.state",
+        "imu",
+        format!(
+            "I feel my orientation through {} values, acceleration through {} values, and angular velocity through {} values.",
+            now.imu.orientation.len(),
+            now.imu.acceleration.len(),
+            now.imu.angular_velocity.len(),
+        ),
+        0.5,
+    );
+    if let Some(gps) = &now.gps {
+        push_now_input_impression(
+            &mut sensations,
+            &mut impressions,
+            now.t_ms,
+            "gps.state",
+            "gps",
+            format!(
+                "I am located near latitude {:.6}, longitude {:.6}, altitude {:?} meters.",
+                gps.lat, gps.lon, gps.altitude_m
+            ),
+            0.6,
+        );
+    }
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "identity.state",
+        "identity",
+        format!(
+            "I have {} face embeddings, {} face vectors, {} voice embeddings, and {} voice vectors available for recognizing who may be present.",
+            now.face.embeddings.len(),
+            now.face.vectors.len(),
+            now.voice.embeddings.len(),
+            now.voice.vectors.len(),
+        ),
+        0.5,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "kinect.state",
+        "kinect",
+        format!(
+            "I sense the room with {} Kinect color feature sets, {} depth samples, {} IR samples, {} skeletons, and audio angle {:?} at confidence {:.2}.",
+            now.kinect.color_features.len(),
+            now.kinect.depth_m.len(),
+            now.kinect.ir.len(),
+            now.kinect.skeletons.len(),
+            now.kinect.audio_angle_rad,
+            now.kinect.audio_confidence,
+        ),
+        0.5,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "memory.state",
+        "memory",
+        format!(
+            "I remember this place with familiarity {:.2}, danger {:.2}, charge value {:.2}, social value {:.2}, novelty {:.2}, {} similar situations, warning {:?}, and graph summary {:?}.",
+            now.memory.place_familiarity,
+            now.memory.place_danger,
+            now.memory.place_charge_value,
+            now.memory.place_social_value,
+            now.memory.place_novelty,
+            now.memory.similar_situation_count,
+            now.memory.remembered_warning,
+            now.memory.graph_context_summary,
+        ),
+        0.7,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "prediction.state",
+        "predictions",
+        format!(
+            "I expect events {:?} with uncertainty {:.2}; my danger model says {:?}, hardcoded danger says {:?}, charge model says {:?}, hardcoded charge says {:?}, and I have {} model action values plus {} hardcoded action values.",
+            now.predictions.expected_events,
+            now.predictions.uncertainty,
+            now.predictions.danger_model,
+            now.predictions.danger_hardcoded,
+            now.predictions.charge_model,
+            now.predictions.charge_hardcoded,
+            now.predictions.action_values_model.len(),
+            now.predictions.action_values_hardcoded.len(),
+        ),
+        0.7,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "surprise.state",
+        "surprise",
+        format!(
+            "I feel surprise at {:.2}, with prediction error {:.2}.",
+            now.surprise.total, now.surprise.prediction_error
+        ),
+        0.7,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "drive.state",
+        "drives",
+        format!(
+            "I feel battery hunger {:.2}, danger avoidance {:.2}, curiosity {:.2}, social interest {:.2}, fatigue {:.2}, and uncertainty pressure {:.2}.",
+            now.drives.battery_hunger,
+            now.drives.danger_avoidance,
+            now.drives.curiosity,
+            now.drives.social_interest,
+            now.drives.fatigue,
+            now.drives.uncertainty_pressure,
+        ),
+        0.7,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "reign.state",
+        "reign",
+        format!(
+            "I am under human reign control active {}, mode {:?}, with {} pending commands, age {:?} ms, override pressure {:.2}, and latest command {}.",
+            now.reign.active,
+            now.reign.mode,
+            now.reign.pending_count,
+            now.reign.last_command_age_ms,
+            now.reign.human_override_pressure,
+            now.reign
+                .latest
+                .as_ref()
+                .map(summarize_reign_command_for_runtime)
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        0.7,
+    );
+    push_now_input_impression(
+        &mut sensations,
+        &mut impressions,
+        now.t_ms,
+        "self.state",
+        "self",
+        format!(
+            "I am pursuing active goal {:?}, and my mode is {:?}.",
+            now.self_sense.active_goal, now.self_sense.mode
+        ),
+        0.6,
+    );
+    if !now.extensions.is_empty() {
+        push_now_input_impression(
+            &mut sensations,
+            &mut impressions,
+            now.t_ms,
+            "extension.state",
+            "extensions",
+            format!(
+                "I have extension context from {}.",
+                now.extensions
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            0.5,
+        );
+    }
+    (sensations, impressions)
 }
 
-fn derive_direct_impressions(sensations: &[Sensation], t_ms: u64) -> Vec<Impression> {
-    sensations
-        .iter()
-        .filter_map(|sensation| {
-            if sensation.kind == "audio.transcript" {
-                Some(
-                    Impression::new(
-                        "audio.transcript.observation",
-                        sensation.summary.clone().unwrap_or_default(),
-                        vec![sensation.id],
-                        t_ms,
-                        t_ms,
-                    )
-                    .with_confidence(0.8),
-                )
-            } else {
-                None
-            }
-        })
-        .collect()
+fn push_now_input_impression(
+    sensations: &mut Vec<Sensation>,
+    impressions: &mut Vec<Impression>,
+    t_ms: u64,
+    kind: &str,
+    source: &str,
+    text: String,
+    confidence: f32,
+) {
+    let text = ensure_natural_confidence_text(&text, confidence);
+    let sensation = Sensation::new(
+        kind,
+        source,
+        t_ms,
+        t_ms,
+        serde_json::json!({ "text": text }),
+    )
+    .with_summary(text.clone())
+    .with_provenance(Provenance::direct().with_stage("now"));
+    let impression = Impression::new(
+        format!("{kind}.impression"),
+        text,
+        vec![sensation.id],
+        t_ms,
+        t_ms,
+    )
+    .with_confidence(confidence)
+    .with_payload(serde_json::json!({
+        "generator": "mechanical",
+        "faculty": format!("{source}.mechanical_impression"),
+        "source_experience_kind": kind,
+        "source": source,
+    }));
+    sensations.push(sensation);
+    impressions.push(impression);
+}
+
+fn asr_hearing_impression_text(transcript: &str, is_final: bool, confidence: f32) -> String {
+    let transcript = transcript.trim();
+    let confidence = confidence.clamp(0.0, 1.0);
+    if is_final {
+        if confidence >= 0.85 {
+            format!("I'm confident I finally heard \"{transcript}\".")
+        } else if confidence >= 0.60 {
+            format!("I'm pretty sure I finally heard \"{transcript}\".")
+        } else {
+            format!("I think I finally heard \"{transcript}\".")
+        }
+    } else if confidence >= 0.85 {
+        format!("I'm pretty sure I'm hearing \"{transcript}\".")
+    } else if confidence >= 0.45 {
+        format!("I think I heard \"{transcript}\".")
+    } else {
+        format!("I may have heard \"{transcript}\".")
+    }
+}
+
+fn ensure_natural_confidence_text(text: &str, confidence: f32) -> String {
+    if starts_with_natural_confidence(text) {
+        return text.to_string();
+    }
+
+    let claim = lower_first_char(text.trim());
+    match confidence.clamp(0.0, 1.0) {
+        value if value >= 0.85 => format!("I'm confident that {claim}"),
+        value if value >= 0.65 => format!("I'm pretty sure that {claim}"),
+        value if value >= 0.40 => format!("I think {claim}"),
+        _ => format!("I'm not sure, but I think {claim}"),
+    }
+}
+
+fn starts_with_natural_confidence(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("I'm confident")
+        || text.starts_with("I'm pretty sure")
+        || text.starts_with("I think")
+        || text.starts_with("I may have")
+        || text.starts_with("I'm not sure")
+}
+
+fn lower_first_char(text: &str) -> String {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_lowercase().chain(chars).collect()
+}
+
+fn summarize_reign_command_for_runtime(input: &netherwick_actions::ReignInput) -> String {
+    match &input.command {
+        netherwick_actions::ReignCommand::Stop => "Stop".to_string(),
+        netherwick_actions::ReignCommand::Go {
+            intensity,
+            duration_ms,
+        } => format!("Go intensity {:.2} for {}ms", intensity, duration_ms),
+        netherwick_actions::ReignCommand::Turn {
+            direction,
+            intensity,
+            duration_ms,
+        } => format!(
+            "Turn {:?} intensity {:.2} for {}ms",
+            direction, intensity, duration_ms
+        ),
+        netherwick_actions::ReignCommand::Inspect { target } => format!("Inspect {:?}", target),
+        netherwick_actions::ReignCommand::Approach { target } => format!("Approach {:?}", target),
+        netherwick_actions::ReignCommand::Dock => "Dock".to_string(),
+        netherwick_actions::ReignCommand::Explore { duration_ms } => {
+            format!("Explore for {}ms", duration_ms)
+        }
+        netherwick_actions::ReignCommand::Speak { text } => format!("Speak {text}"),
+        netherwick_actions::ReignCommand::SetMode { mode } => format!("Set mode {:?}", mode),
+    }
 }
 
 fn derive_direct_experiences(
@@ -3219,9 +3580,10 @@ fn derive_direct_experiences(
     vec![Experience::new(
         "realtime.situation",
         impressions
-            .last()
-            .map(|value| value.text.clone())
-            .unwrap_or_default(),
+            .iter()
+            .map(|value| value.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
         impressions.iter().map(|value| value.id).collect(),
         sensations.iter().map(|value| value.id).collect(),
         t_ms,
@@ -3398,6 +3760,81 @@ mod tests {
             .experiences
             .iter()
             .any(|experience| experience.text.contains("hello world")));
+    }
+
+    #[test]
+    fn direct_now_impressions_are_first_person_present() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.ear.transcript = Some("hello world".to_string());
+        now.extensions.insert(
+            "test.context".to_string(),
+            serde_json::json!({ "ok": true }),
+        );
+
+        let (_sensations, impressions) = derive_direct_impressions_from_now(&now);
+
+        assert!(!impressions.is_empty());
+        for impression in impressions {
+            assert!(
+                impression.text.starts_with("I ")
+                    || impression.text.starts_with("I'm ")
+                    || impression.text.starts_with("My "),
+                "impression should manifest embodiment in first person: {}",
+                impression.text
+            );
+            assert!(
+                impression.text.contains("confident")
+                    || impression.text.contains("pretty sure")
+                    || impression.text.contains("I think")
+                    || impression.text.contains("may have")
+                    || impression.text.contains("not sure"),
+                "impression should express confidence in natural language: {}",
+                impression.text
+            );
+            assert_eq!(
+                impression
+                    .payload
+                    .get("generator")
+                    .and_then(|value| value.as_str()),
+                Some("mechanical")
+            );
+        }
+    }
+
+    #[test]
+    fn asr_impressions_phrase_partial_and_final_confidence_naturally() {
+        let mut partial = Now::blank(100, BodySense::default());
+        partial.ear.asr = netherwick_now::AsrSense {
+            transcript: Some("come over here".to_string()),
+            is_final: false,
+            confidence: 0.52,
+            ..netherwick_now::AsrSense::default()
+        };
+        let (_sensations, partial_impressions) = derive_direct_impressions_from_now(&partial);
+        let partial_text = partial_impressions
+            .iter()
+            .find(|impression| impression.kind == "audio.transcript.impression")
+            .map(|impression| impression.text.as_str())
+            .unwrap();
+        assert_eq!(partial_text, "I think I heard \"come over here\".");
+
+        let mut final_now = Now::blank(100, BodySense::default());
+        final_now.ear.asr = netherwick_now::AsrSense {
+            transcript: Some("come over here".to_string()),
+            is_final: true,
+            confidence: 0.93,
+            ..netherwick_now::AsrSense::default()
+        };
+        let (_sensations, final_impressions) = derive_direct_impressions_from_now(&final_now);
+        let final_text = final_impressions
+            .iter()
+            .find(|impression| impression.kind == "audio.transcript.impression")
+            .map(|impression| impression.text.as_str())
+            .unwrap();
+        assert_eq!(
+            final_text,
+            "I'm confident I finally heard \"come over here\"."
+        );
     }
 
     #[test]

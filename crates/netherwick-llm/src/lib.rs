@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{Local, SecondsFormat, TimeZone};
 use futures_util::StreamExt;
 use netherwick_actions::{
     ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle, InspectTarget, TurnDir,
 };
-use netherwick_experience::{ExperienceLatent, FuturePrediction};
+use netherwick_experience::{ExperienceLatent, FuturePrediction, Impression};
 use netherwick_now::{LlmSense, Now, ReignSense};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -21,9 +22,11 @@ pub const IMAGE_CAPTION_PROMPT: &str = "The attached visual input is what I am s
 
 const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, not the sensor stream. Interpret images, audio, motion, location, body state, memory-derived entries, and other sensor-derived entries as the robot's own vision, hearing, body sense, position sense, and memory sense, not as media files or external sensor artifacts. Do not summarize the amount, density, cadence, or mix of input modalities as if that were the situation. Repeated frames, repeated detections, image embeddings, pending audio clips, and heartbeat-like status records are usually evidence to compress or ignore, not events to report. If people are visible, do not assume any visible person is me unless the vision is clearly a mirror or reflection. If the evidence does not reveal what is happening, say that I cannot tell what is happening yet. Do not infer emotional tone or words like chaotic, intense, overwhelming, anxious, or ominous from sensor volume alone.";
 
-const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation, not as the topic to describe. Try to infer what is going on in the real world from those fragments. Sort meaning by time: occurred time first, observed time second. Consume the timeline in order; do not group by faculty or source. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as sensations; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, recordings, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, edges, or detections unless they are the point.";
+const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation, not as the topic to describe. Try to infer what is going on in the real world from those fragments. Sort meaning by time: occurred time first, observed time second. Consume the timeline in order; do not group by faculty or source. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as impressions; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, recordings, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, edges, or detections unless they are the point.";
 
 const LIVE_EVENT_RULES: &str = "Live events may arrive while generation is happening. Treat them as observations from outside. Do not assume a human is currently present or addressing me; there may be nobody nearby. Clock and status events help track timing, pauses, and elapsed time, but do not narrate every tick, quiet moment, or idle thought.";
+const COMBOBULATOR_CLUSTER_GAP_MS: u64 = 1_000;
+const MILLIS_PER_SECOND: f64 = 1_000.0;
 
 static LLM_STREAM_BUS: OnceLock<broadcast::Sender<LlmStreamEvent>> = OnceLock::new();
 static LLM_STREAM_ID: AtomicU64 = AtomicU64::new(1);
@@ -137,6 +140,7 @@ pub trait LlmAgent: Send {
     async fn combobulate(
         &mut self,
         now: &Now,
+        impressions: &[Impression],
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
@@ -160,6 +164,7 @@ impl LlmAgent for NoopLlmAgent {
     async fn combobulate(
         &mut self,
         _now: &Now,
+        _impressions: &[Impression],
         _z: &ExperienceLatent,
         _futures: &[FuturePrediction],
         _recall_summary: &str,
@@ -212,7 +217,7 @@ impl Default for LlmConfig {
             allow_commands: true,
             allow_teaching: true,
             endpoint: "http://127.0.0.1:11434".to_string(),
-            agent_model: "qwen2.5:7b-instruct".to_string(),
+            agent_model: "llama3.2".to_string(),
             combobulator_model: None,
             temperature: 0.2,
             timeout_ms: 20_000,
@@ -349,13 +354,22 @@ impl LlmAgent for ConfiguredLlmAgent {
     async fn combobulate(
         &mut self,
         now: &Now,
+        impressions: &[Impression],
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
     ) -> Result<Option<Combobulation>> {
         match self {
-            Self::Disabled(agent) => agent.combobulate(now, z, futures, recall_summary).await,
-            Self::Ollama(agent) => agent.combobulate(now, z, futures, recall_summary).await,
+            Self::Disabled(agent) => {
+                agent
+                    .combobulate(now, impressions, z, futures, recall_summary)
+                    .await
+            }
+            Self::Ollama(agent) => {
+                agent
+                    .combobulate(now, impressions, z, futures, recall_summary)
+                    .await
+            }
         }
     }
 
@@ -552,11 +566,12 @@ impl LlmAgent for OllamaLlmAgent {
     async fn combobulate(
         &mut self,
         now: &Now,
+        impressions: &[Impression],
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
     ) -> Result<Option<Combobulation>> {
-        let prompt = build_combobulator_prompt(now, z, futures, recall_summary);
+        let prompt = build_combobulator_prompt(now, impressions, z, futures, recall_summary);
         let model = self
             .config
             .combobulator_model
@@ -734,18 +749,19 @@ struct CounterfactualSpec {
 
 fn build_combobulator_prompt(
     now: &Now,
+    impressions: &[Impression],
     z: &ExperienceLatent,
     futures: &[FuturePrediction],
     recall_summary: &str,
 ) -> String {
-    let timeline = render_combobulator_timeline(now);
+    let timeline = render_combobulator_timeline(impressions);
     let futures = summarize_futures(futures);
     format!(
         "You are the combobulator for an embodied robot.\n\
-Given recent sensations, impressions, memories, and predicted futures in timeline order, distill what appears to be happening right now.\n\
+Given recent impressions and predicted futures in timeline order, distill what appears to be happening right now.\n\
 You run continuously over the recent timeline; each pass tries to understand what is going on right now. Write from first-person lived experience from the robot's point of view, using I/my/me naturally.\n\
 This summary will be used as a basic understanding of the current situation for a system that may need to act immediately. Think of it as telling someone with amnesia as quickly as possible, but as thoroughly as needed for them to act reasonably.\n\
-Use only the evidence below. Prefer concrete body facts, nearby people or speech, visible scene details, memory, safety, and immediate context. Explain what appears to be happening right now, not a redundant list of events.\n\
+Use only the evidence below. The impressions are first-person present-tense embodied claims such as \"I see...\", \"I hear...\", or \"My body...\"; preserve that lived point of view. Prefer concrete body facts, nearby people or speech, visible scene details, memory, safety, and immediate context. Explain what appears to be happening right now, not a redundant list of events.\n\
 {SENSOR_GROUNDING_RULES}\n\
 {COMBOBULATOR_DISTILLATION_RULES}\n\
 {LIVE_EVENT_RULES}\n\
@@ -755,7 +771,7 @@ CONTEXT FRAME\n\
 WHO\n\
 - embodied robot\n\
 WHAT\n\
-- current awareness synthesis\n\
+- current awareness synthesis from impressions\n\
 WHERE\n\
 - current body location if sensors or memory reveal it; otherwise unknown\n\
 WHEN\n\
@@ -763,7 +779,7 @@ WHEN\n\
 WHY\n\
 - produce a compact awareness statement useful to the next action decision\n\
 HOW\n\
-- distill body sense, hearing, range, memory, predictions, surprise, and human reign controls\n\n\
+- distill text impressions produced from body, hearing, vision, range, memory, predictions, surprise, and human reign controls\n\n\
 Latent confidence: {:.2}\n\
 Latent prediction error: {:.2}\n\
 Recall summary: {}\n\
@@ -881,16 +897,116 @@ fn summarize_futures(futures: &[FuturePrediction]) -> String {
         .join("\n")
 }
 
-fn render_combobulator_timeline(now: &Now) -> String {
-    let senses = summarized_senses(now);
-    if senses.is_empty() {
-        return "- no direct sensory evidence".to_string();
+fn render_combobulator_timeline(impressions: &[Impression]) -> String {
+    if impressions.is_empty() {
+        return "- no impressions".to_string();
     }
-    senses
-        .into_iter()
-        .map(|line| format!("[{} ms observed]\nSENSE\n  {line}", now.t_ms))
-        .collect::<Vec<_>>()
-        .join("\n")
+
+    let mut ordered = impressions.to_vec();
+    ordered.sort_by_key(|impression| (impression.occurred_at_ms, impression.observed_at_ms));
+    let start_ms = ordered
+        .first()
+        .map(|impression| impression.occurred_at_ms)
+        .unwrap_or_default();
+    let clusters = impression_clusters(&ordered, COMBOBULATOR_CLUSTER_GAP_MS);
+    let mut out = String::new();
+    for (index, cluster) in clusters.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format_impression_cluster(cluster, start_ms));
+        for impression in *cluster {
+            out.push_str(&format_impression_timeline_entry(impression, start_ms));
+        }
+    }
+    out
+}
+
+fn local_iso_ms(t_ms: u64) -> String {
+    match Local.timestamp_millis_opt(t_ms as i64).single() {
+        Some(value) => value.to_rfc3339_opts(SecondsFormat::Millis, false),
+        None => format!("{t_ms}ms"),
+    }
+}
+
+fn impression_clusters(impressions: &[Impression], max_gap_ms: u64) -> Vec<&[Impression]> {
+    if impressions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut clusters = Vec::new();
+    let mut start = 0usize;
+    let mut previous_ms = impressions[0].occurred_at_ms;
+    for (index, impression) in impressions.iter().enumerate().skip(1) {
+        if impression.occurred_at_ms.saturating_sub(previous_ms) > max_gap_ms {
+            clusters.push(&impressions[start..index]);
+            start = index;
+        }
+        previous_ms = impression.occurred_at_ms;
+    }
+    clusters.push(&impressions[start..]);
+    clusters
+}
+
+fn format_impression_cluster(cluster: &[Impression], start_ms: u64) -> String {
+    let first_ms = cluster
+        .first()
+        .map(|impression| impression.occurred_at_ms)
+        .unwrap_or(start_ms);
+    let last_ms = cluster
+        .last()
+        .map(|impression| impression.occurred_at_ms)
+        .unwrap_or(first_ms);
+    format!(
+        "[T+{:06.3} - T+{:06.3} | {} to {}]\n",
+        elapsed_seconds(start_ms, first_ms),
+        elapsed_seconds(start_ms, last_ms),
+        local_iso_ms(first_ms),
+        local_iso_ms(last_ms)
+    )
+}
+
+fn format_impression_timeline_entry(impression: &Impression, start_ms: u64) -> String {
+    let generator = impression
+        .payload
+        .get("generator")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let faculty = impression
+        .payload
+        .get("faculty")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    format!(
+        "T+{:06.3} occurred_at={}\n  IMPRESSION id={} kind={} generator={} faculty={} observed_at={} confidence={:.3} about=[{}] payload={} text={}\n",
+        elapsed_seconds(start_ms, impression.occurred_at_ms),
+        local_iso_ms(impression.occurred_at_ms),
+        impression.id,
+        impression.kind,
+        prompt_json_string(generator),
+        prompt_json_string(faculty),
+        local_iso_ms(impression.observed_at_ms),
+        impression.confidence,
+        impression
+            .about
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        prompt_json_string(&impression.payload.to_string()),
+        prompt_json_string(&impression.text)
+    )
+}
+
+fn elapsed_seconds(start_ms: u64, t_ms: u64) -> f64 {
+    t_ms.saturating_sub(start_ms) as f64 / MILLIS_PER_SECOND
+}
+
+fn prompt_json_string(text: &str) -> String {
+    serde_json::to_string(text)
+        .expect("prompt string fragment is serializable")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
 }
 
 fn heuristic_combobulation(now: &Now, recall_summary: &str) -> Combobulation {
@@ -1130,24 +1246,49 @@ mod tests {
         let mut now = Now::blank(250, BodySense::default());
         now.ear.transcript = Some("hello there".to_string());
 
-        let prompt =
-            build_combobulator_prompt(&now, &ExperienceLatent::default(), &[], "I remember Tim.");
+        let impression = Impression::new(
+            "audio.transcript.impression",
+            "I hear: <hello there>",
+            Vec::new(),
+            now.t_ms,
+            now.t_ms,
+        )
+        .with_confidence(0.8)
+        .with_payload(serde_json::json!({
+            "generator": "mechanical",
+            "faculty": "ear.mechanical_impression",
+        }));
+        let prompt = build_combobulator_prompt(
+            &now,
+            &[impression],
+            &ExperienceLatent::default(),
+            &[],
+            "I remember Tim.",
+        );
 
         assert!(prompt.contains("Timeline evidence:"));
-        assert!(prompt.contains("[250 ms observed]"));
+        assert!(prompt.contains("[T+00.000 - T+00.000 | "));
+        assert!(prompt.contains("IMPRESSION id="));
+        assert!(prompt.contains("kind=audio.transcript.impression"));
+        assert!(prompt.contains("generator=\"mechanical\""));
+        assert!(prompt.contains("faculty=\"ear.mechanical_impression\""));
+        assert!(prompt.contains("confidence=0.800"));
+        assert!(prompt.contains("occurred_at="));
+        assert!(prompt.contains("observed_at="));
+        assert!(prompt.contains(".250"));
+        assert!(prompt.contains(":00 to "));
         assert!(prompt.contains("what is going on right now"));
         assert!(prompt.contains("first-person lived experience"));
         assert!(prompt.contains("telling someone with amnesia"));
         assert!(prompt.contains("Distill what matters, not what the records said."));
         assert!(prompt.contains("Treat the entries as fragmentary, possibly contradictory"));
         assert!(prompt.contains("not as the topic to describe"));
-        assert!(prompt.contains("prior combobulation summaries looping back as sensations"));
         assert!(prompt.contains("do not group by faculty or source"));
         assert!(prompt.contains("Do not infer emotional tone"));
         assert!(prompt.contains("do not enumerate ids"));
         assert!(prompt.contains("Do not assume a human is currently present"));
         assert!(prompt.contains("CONTEXT FRAME"));
-        assert!(prompt.contains("I hear: hello there"));
+        assert!(prompt.contains("text=\"I hear: \\u003chello there\\u003e\""));
     }
 
     #[test]
