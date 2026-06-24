@@ -1160,6 +1160,78 @@ function writeYuvPixel(data, target, y, u, v){
   data[target + 2] = Math.max(0, Math.min(255, (298 * c + 516 * d + 128) >> 8));
   data[target + 3] = 255;
 }
+function shouldGenerateEye(scenePacket){
+  const session = scenePacket?.session || {};
+  const virtualMode = session.source === 'sim' || String(session.mode || '').includes('virtual');
+  if(!virtualMode) return false;
+  const eye = scenePacket?.eye;
+  return !eye || !eye.data_url || eye.mean_luma < .08 || eye.non_background_ratio < .01;
+}
+function colorForObject(item){
+  if(item.color_rgb) return `rgb(${item.color_rgb[0]},${item.color_rgb[1]},${item.color_rgb[2]})`;
+  return {charger:'#45d483', person:'#e8c08c', speaker:'#778cff', obstacle:'#d67666', landmark:'#b0b8c0'}[item.kind] || '#b0b8c0';
+}
+function drawGeneratedEye(scenePacket){
+  if(!scenePacket?.body) return false;
+  const width = 160, height = 120, horizon = 54;
+  if(canvas.width !== width || canvas.height !== height){
+    canvas.width = width; canvas.height = height;
+  }
+  const g = ctx.createLinearGradient(0, 0, 0, horizon);
+  g.addColorStop(0, '#253646');
+  g.addColorStop(1, '#55636d');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, width, horizon);
+  const floor = ctx.createLinearGradient(0, horizon, 0, height);
+  floor.addColorStop(0, '#555954');
+  floor.addColorStop(1, '#262b29');
+  ctx.fillStyle = floor;
+  ctx.fillRect(0, horizon, width, height - horizon);
+  ctx.strokeStyle = 'rgba(255,255,255,.16)';
+  ctx.lineWidth = 1;
+  for(let y = horizon + 10; y < height; y += Math.max(5, (y - horizon) * .22)){
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+  }
+  const body = scenePacket.body;
+  const fov = Math.PI * .62;
+  const visible = (scenePacket.objects || []).map(item => {
+    const dx = item.x_m - body.x_m, dy = item.y_m - body.y_m;
+    const forward = dx * Math.cos(body.heading_rad) + dy * Math.sin(body.heading_rad);
+    const lateral = -dx * Math.sin(body.heading_rad) + dy * Math.cos(body.heading_rad);
+    const angle = Math.atan2(lateral, forward);
+    return {...item, forward, angle};
+  }).filter(item => item.forward > .05 && Math.abs(item.angle) < fov * .55)
+    .sort((a, b) => b.forward - a.forward);
+  for(const item of visible){
+    const cx = width * .5 + (item.angle / (fov * .5)) * width * .5;
+    const near = Math.max(.18, item.forward);
+    const radiusPx = Math.max(5, item.radius_m / near * 58);
+    const h = Math.max(8, radiusPx * ({person:4.2, speaker:2.0, charger:.9, landmark:2.4}[item.kind] || 2.2));
+    const y = horizon + Math.min(45, 28 / near);
+    ctx.fillStyle = colorForObject(item);
+    ctx.strokeStyle = 'rgba(0,0,0,.45)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    if(item.kind === 'person'){
+      ctx.ellipse(cx, y - h * .45, radiusPx * .8, h * .5, 0, 0, Math.PI * 2);
+    }else if(item.kind === 'speaker'){
+      ctx.moveTo(cx, y - h);
+      ctx.lineTo(cx + radiusPx * 1.3, y);
+      ctx.lineTo(cx - radiusPx * 1.3, y);
+      ctx.closePath();
+    }else{
+      ctx.ellipse(cx, y - h * .45, radiusPx, h * .5, 0, 0, Math.PI * 2);
+    }
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(255,207,102,.9)';
+  ctx.beginPath();
+  ctx.moveTo(width / 2 - 8, height / 2); ctx.lineTo(width / 2 + 8, height / 2);
+  ctx.moveTo(width / 2, height / 2 - 8); ctx.lineTo(width / 2, height / 2 + 8);
+  ctx.stroke();
+  return true;
+}
 function drawBeams(values){
   beams.replaceChildren(...(values || []).map(value => {
     const bar = document.createElement('div');
@@ -1171,9 +1243,13 @@ function drawBeams(values){
 }
 async function refresh(){
   try{
-    const response = await fetch('/view/snapshot', {cache:'no-store'});
+    const [response, sceneResponse] = await Promise.all([
+      fetch('/view/snapshot', {cache:'no-store'}),
+      fetch('/view/scene', {cache:'no-store'})
+    ]);
     if(!response.ok) throw new Error(await response.text());
     const snapshot = await response.json();
+    const scenePacket = sceneResponse.ok ? await sceneResponse.json() : null;
     const body = snapshot.body;
     fields.t.textContent = `${snapshot.t_ms} ms`;
     fields.x.textContent = `${fmt(body.odometry.x_m)} m`;
@@ -1205,8 +1281,9 @@ async function refresh(){
       fields.ear_age.textContent = '-';
     }
     drawEye(snapshot.eye_frame);
+    const generated = shouldGenerateEye(scenePacket) && drawGeneratedEye(scenePacket);
     drawBeams(snapshot.range.beams);
-    status.textContent = 'live';
+    status.textContent = generated ? 'live generated eye' : 'live';
   }catch(error){
     status.textContent = 'waiting for frames...';
   }finally{
@@ -1454,8 +1531,79 @@ function renderPoints(points){
   pointCloud = new THREE.Points(geo, new THREE.PointsMaterial({size:.035, vertexColors:true}));
   scene.add(pointCloud);
 }
-function renderEye(eye){
-  if(!eye?.data_url) return;
+function shouldUseGeneratedEye(packet){
+  const session = packet?.session || {};
+  const virtualMode = session.source === 'sim' || String(session.mode || '').includes('virtual');
+  if(!virtualMode) return false;
+  const eye = packet?.eye;
+  return !eye || !eye.data_url || eye.mean_luma < .08 || eye.non_background_ratio < .01;
+}
+function panelColorFor(item){
+  if(item.color_rgb) return `rgb(${item.color_rgb[0]},${item.color_rgb[1]},${item.color_rgb[2]})`;
+  return {charger:'#45d483', person:'#e8c08c', speaker:'#778cff', obstacle:'#d67666', landmark:'#b0b8c0'}[item.kind] || '#b0b8c0';
+}
+function renderGeneratedEye(packet){
+  if(!packet?.body) return;
+  const width = 160, height = 120, horizon = 54;
+  eyeCanvas.width = width; eyeCanvas.height = height;
+  const ctx2 = eyeCanvas.getContext('2d');
+  const sky = ctx2.createLinearGradient(0, 0, 0, horizon);
+  sky.addColorStop(0, '#253646');
+  sky.addColorStop(1, '#55636d');
+  ctx2.fillStyle = sky;
+  ctx2.fillRect(0, 0, width, horizon);
+  const floor = ctx2.createLinearGradient(0, horizon, 0, height);
+  floor.addColorStop(0, '#555954');
+  floor.addColorStop(1, '#262b29');
+  ctx2.fillStyle = floor;
+  ctx2.fillRect(0, horizon, width, height - horizon);
+  ctx2.strokeStyle = 'rgba(255,255,255,.16)';
+  for(let y = horizon + 10; y < height; y += Math.max(5, (y - horizon) * .22)){
+    ctx2.beginPath(); ctx2.moveTo(0, y); ctx2.lineTo(width, y); ctx2.stroke();
+  }
+  const body = packet.body;
+  const fov = Math.PI * .62;
+  const visible = (packet.objects || []).map(item => {
+    const dx = item.x_m - body.x_m, dy = item.y_m - body.y_m;
+    const forward = dx * Math.cos(body.heading_rad) + dy * Math.sin(body.heading_rad);
+    const lateral = -dx * Math.sin(body.heading_rad) + dy * Math.cos(body.heading_rad);
+    return {...item, forward, angle: Math.atan2(lateral, forward)};
+  }).filter(item => item.forward > .05 && Math.abs(item.angle) < fov * .55)
+    .sort((a, b) => b.forward - a.forward);
+  for(const item of visible){
+    const cx = width * .5 + (item.angle / (fov * .5)) * width * .5;
+    const near = Math.max(.18, item.forward);
+    const radiusPx = Math.max(5, item.radius_m / near * 58);
+    const h = Math.max(8, radiusPx * ({person:4.2, speaker:2.0, charger:.9, landmark:2.4}[item.kind] || 2.2));
+    const y = horizon + Math.min(45, 28 / near);
+    ctx2.fillStyle = panelColorFor(item);
+    ctx2.strokeStyle = 'rgba(0,0,0,.45)';
+    ctx2.lineWidth = 2;
+    ctx2.beginPath();
+    if(item.kind === 'speaker'){
+      ctx2.moveTo(cx, y - h);
+      ctx2.lineTo(cx + radiusPx * 1.3, y);
+      ctx2.lineTo(cx - radiusPx * 1.3, y);
+      ctx2.closePath();
+    }else{
+      ctx2.ellipse(cx, y - h * .45, radiusPx, h * .5, 0, 0, Math.PI * 2);
+    }
+    ctx2.fill();
+    ctx2.stroke();
+  }
+  ctx2.strokeStyle = 'rgba(255,207,102,.9)';
+  ctx2.beginPath();
+  ctx2.moveTo(width / 2 - 8, height / 2); ctx2.lineTo(width / 2 + 8, height / 2);
+  ctx2.moveTo(width / 2, height / 2 - 8); ctx2.lineTo(width / 2, height / 2 + 8);
+  ctx2.stroke();
+  eyeTexture.needsUpdate = true;
+}
+function renderEye(packet){
+  if(shouldUseGeneratedEye(packet)){
+    renderGeneratedEye(packet);
+    return;
+  }
+  const eye = packet.eye;
   const img = new Image();
   img.onload = () => {
     eyeCanvas.width = img.width; eyeCanvas.height = img.height;
@@ -1471,7 +1619,7 @@ function updateScene(packet){
   renderObjects(packet);
   renderBeams(packet);
   renderPoints(packet.kinect?.points || []);
-  renderEye(packet.eye);
+  renderEye(packet);
   const session = packet.session || {};
   fields.mode.textContent = session.mode || '-';
   fields.scenario.textContent = session.scenario || '-';
@@ -2007,6 +2155,10 @@ mod tests {
         assert!(page.contains("isGray"));
         assert!(page.contains("isYuyv"));
         assert!(page.contains("writeYuvPixel"));
+        assert!(page.contains("drawGeneratedEye"));
+        assert!(page.contains("/view/scene"));
+        assert!(page.contains("session.source === 'sim'"));
+        assert!(page.contains("includes('virtual')"));
     }
 
     #[test]
