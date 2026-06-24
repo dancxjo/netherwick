@@ -1278,14 +1278,37 @@ pub fn snapshot_to_scene(
 ) -> LiveSceneResponse {
     let mut warnings = Vec::new();
     let body = &snapshot.body;
-    let eye = match snapshot.eye_frame.as_ref().map(|f| scene_eye_from_frame(f, retina_status.as_ref(), snapshot.body.last_update_ms)) {
-        Some((eye, frame_warnings)) => {
+    let eye = match snapshot.eye_frame.as_ref() {
+        Some(f) => {
+            let (eye, frame_warnings) = scene_eye_from_frame(f, retina_status.as_ref(), snapshot.body.last_update_ms);
             warnings.extend(frame_warnings);
             Some(eye)
         }
         None => {
-            warnings.push("no eye frame stream".to_string());
-            None
+            if let Some(rs) = retina_status.as_ref() {
+                if rs.connected {
+                    Some(SceneEye {
+                        width: 0,
+                        height: 0,
+                        format: "None".to_string(),
+                        data_url: None,
+                        mean_luma: 1.0,
+                        non_background_ratio: 1.0,
+                        source: "babylon-robot-eye".to_string(),
+                        authoritative: false,
+                        retina_connected: true,
+                        retina_last_frame_age_ms: None,
+                        frames_received: rs.frames_received,
+                        frames_written_to_ledger: rs.frames_written_to_ledger,
+                    })
+                } else {
+                    warnings.push("no eye frame stream".to_string());
+                    None
+                }
+            } else {
+                warnings.push("no eye frame stream".to_string());
+                None
+            }
         }
     };
     let sensor_calibration = metadata.and_then(|metadata| metadata.sensor_calibration);
@@ -3469,7 +3492,10 @@ async function sendRetinaFrame() {
     retinaCanvas.height = retinaHeight;
     const retinaCtx = retinaCanvas.getContext('2d');
     
+    retinaCtx.translate(0, retinaHeight);
+    retinaCtx.scale(1, -1);
     retinaCtx.drawImage(tempCanvas, 0, 0, 256, 256, 0, 0, retinaWidth, retinaHeight);
+    retinaCtx.setTransform(1, 0, 0, 1, 0, 0);
 
     const dataUrl = retinaCanvas.toDataURL('image/png');
 
