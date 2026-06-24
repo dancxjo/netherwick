@@ -300,6 +300,7 @@ impl FrameProcessor {
         let Some(processed) = self.process_frame(t_ms, frame) else {
             return;
         };
+        let summary_values = summary_extension_values(&processed);
         packets.push(SensePacket::Eye(processed.eye));
         if !processed.face.embeddings.is_empty() || !processed.face.vectors.is_empty() {
             packets.push(SensePacket::Face(processed.face));
@@ -307,7 +308,7 @@ impl FrameProcessor {
         packets.push(SensePacket::Extension(ExtensionSense {
             schema_version: 1,
             name: "vision.frame_summary".to_string(),
-            values: summary_extension_values(&processed),
+            values: summary_values,
         }));
     }
 
@@ -318,6 +319,7 @@ impl FrameProcessor {
         let Some(processed) = self.process_frame(t_ms, &frame) else {
             return;
         };
+        let summary_values = summary_extension_values(&processed);
         snapshot.eye = processed.eye;
         if !processed.face.embeddings.is_empty() || !processed.face.vectors.is_empty() {
             snapshot.face = processed.face;
@@ -325,7 +327,7 @@ impl FrameProcessor {
         snapshot.extensions.push(ExtensionSense {
             schema_version: 1,
             name: "vision.frame_summary".to_string(),
-            values: summary_extension_values(&processed),
+            values: summary_values,
         });
     }
 
@@ -337,6 +339,110 @@ impl FrameProcessor {
         self.last_processed_frame_key = Some(key);
         Some(process_eye_frame(t_ms, frame))
     }
+}
+
+fn process_eye_frame(t_ms: TimeMs, frame: &EyeFrame) -> ProcessedFrame {
+    let source_frame_id = format!(
+        "eye-{}-{}x{}-{}",
+        frame.captured_at_ms,
+        frame.width,
+        frame.height,
+        frame.bytes.len()
+    );
+    let signal = bytes_to_unit_signal(&frame.bytes);
+    let mut eye = EyeSense {
+        schema_version: 1,
+        frames: vec![signal.clone()],
+        ..EyeSense::default()
+    };
+    eye.image_vectors.push(
+        VectorArtifact::new(
+            IMAGE_VECTOR_COLLECTION,
+            source_frame_id.clone(),
+            signal.clone(),
+        )
+        .with_model("raw-byte-unit-signal-v0")
+        .with_source_frame_id(source_frame_id.clone())
+        .with_occurred_at_ms(t_ms),
+    );
+    eye.image_description_vectors.push(
+        VectorArtifact::new(
+            IMAGE_DESCRIPTION_VECTOR_COLLECTION,
+            format!("{source_frame_id}-summary"),
+            frame_summary_vector(frame, &signal),
+        )
+        .with_model("frame-summary-v0")
+        .with_source_frame_id(source_frame_id.clone())
+        .with_occurred_at_ms(t_ms),
+    );
+    eye.scene_vectors.push(
+        VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            format!("{source_frame_id}-scene"),
+            frame_summary_vector(frame, &signal),
+        )
+        .with_model("scene-summary-v0")
+        .with_source_frame_id(source_frame_id.clone())
+        .with_occurred_at_ms(t_ms),
+    );
+
+    ProcessedFrame {
+        eye,
+        face: FaceSense {
+            schema_version: 1,
+            embeddings: Vec::new(),
+            vectors: vec![VectorArtifact::new(
+                FACE_VECTOR_COLLECTION,
+                format!("{source_frame_id}-no-face"),
+                Vec::new(),
+            )
+            .with_model("no-face-detected-v0")
+            .with_source_frame_id(source_frame_id.clone())
+            .with_occurred_at_ms(t_ms)],
+        },
+        summary: format!(
+            "{:?} frame {}x{}, {} bytes",
+            frame.format,
+            frame.width,
+            frame.height,
+            frame.bytes.len()
+        ),
+        source_frame_id,
+    }
+}
+
+fn summary_extension_values(processed: &ProcessedFrame) -> Vec<f32> {
+    let signal = processed
+        .eye
+        .frames
+        .first()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mean = if signal.is_empty() {
+        0.0
+    } else {
+        signal.iter().sum::<f32>() / signal.len() as f32
+    };
+    vec![
+        signal.len() as f32,
+        mean,
+        processed.eye.image_vectors.len() as f32,
+        processed.face.vectors.len() as f32,
+    ]
+}
+
+fn frame_summary_vector(frame: &EyeFrame, signal: &[f32]) -> Vec<f32> {
+    let mean = if signal.is_empty() {
+        0.0
+    } else {
+        signal.iter().sum::<f32>() / signal.len() as f32
+    };
+    vec![
+        frame.width as f32,
+        frame.height as f32,
+        frame.bytes.len() as f32,
+        mean,
+    ]
 }
 
 impl SensorUpdateTimes {
