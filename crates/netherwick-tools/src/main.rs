@@ -87,6 +87,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     match cli.command {
         Command::Sim(args) => run_sim(args).await,

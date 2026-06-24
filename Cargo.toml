@@ -46,6 +46,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 rand = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
+dotenvy = "0.15"
 
 burn = { version = "0.21", features = ["ndarray", "autodiff"] }
 burn-cuda = { version = "0.21", default-features = false, features = ["std", "autotune"] }

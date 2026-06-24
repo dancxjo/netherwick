@@ -212,12 +212,18 @@ pub struct LlmConfig {
 
 impl Default for LlmConfig {
     fn default() -> Self {
+        let endpoint = std::env::var("NETHERWICK_LLM_ENDPOINT")
+            .or_else(|_| std::env::var("OLLAMA_HOST"))
+            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let agent_model = std::env::var("NETHERWICK_LLM_MODEL")
+            .or_else(|_| std::env::var("OLLAMA_MODEL"))
+            .unwrap_or_else(|_| "llama3.2".to_string());
         Self {
             provider: LlmProvider::Ollama,
             allow_commands: true,
             allow_teaching: true,
-            endpoint: "http://127.0.0.1:11434".to_string(),
-            agent_model: "llama3.2".to_string(),
+            endpoint,
+            agent_model,
             combobulator_model: None,
             temperature: 0.2,
             timeout_ms: 20_000,
