@@ -1226,7 +1226,7 @@ fn scene_kinect_from_snapshot(snapshot: &WorldSnapshot, warnings: &mut Vec<Strin
 fn depth_points(depth_m: &[f32]) -> Vec<ScenePoint> {
     const MAX_POINTS: usize = 2_000;
     const COMPACT_RANGE_BEAM_COUNT: usize = 32;
-    const COMPACT_RANGE_FOV_RAD: f32 = std::f32::consts::PI;
+    const COMPACT_RANGE_FOV_RAD: f32 = std::f32::consts::PI * 0.75;
     if depth_m.is_empty() {
         return Vec::new();
     }
@@ -2846,10 +2846,10 @@ mod tests {
         let points = depth_points(&depths);
 
         assert_eq!(points.len(), 32);
-        assert!((points[0].x + 2.0).abs() < 0.001);
-        assert!(points[0].z.abs() < 0.001);
-        assert!((points[31].x - 2.0).abs() < 0.001);
-        assert!(points[31].z.abs() < 0.001);
+        assert!((points[0].x + 1.847759).abs() < 0.001);
+        assert!((points[0].z - 0.765367).abs() < 0.001);
+        assert!((points[31].x - 1.847759).abs() < 0.001);
+        assert!((points[31].z - 0.765367).abs() < 0.001);
 
         let near_center = &points[15];
         assert!(near_center.z > 1.99);
