@@ -2,9 +2,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use netherwick_actions::ActionPrimitive;
 use netherwick_autonomic::SimpleSafety;
@@ -57,7 +59,10 @@ enum Command {
     Evaluate(EvaluateCommand),
     Promote(PromoteCommand),
     InspectLedger,
+    ModelRegister(ModelRegisterArgs),
     ModelStatus,
+    ModelPromote(ModelPromoteArgs),
+    CompareScenarioReports(CompareScenarioReportsArgs),
     Dashboard,
 }
 
@@ -75,7 +80,10 @@ async fn main() -> Result<()> {
         Command::Train(command) => run_train(command).await,
         Command::Evaluate(command) => run_evaluate(command).await,
         Command::Promote(command) => run_promote(command),
+        Command::ModelRegister(args) => model_register(args),
         Command::ModelStatus => model_status(),
+        Command::ModelPromote(args) => model_promote(args),
+        Command::CompareScenarioReports(args) => compare_scenario_reports_command(args),
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -479,6 +487,60 @@ enum PromoteMode {
     ShadowInfer,
     ModelInfer,
     ShadowTrain,
+}
+
+#[derive(Debug, Parser)]
+struct ModelRegisterArgs {
+    #[arg(long)]
+    behavior: String,
+    #[arg(long)]
+    checkpoint: String,
+    #[arg(long)]
+    training_ledger: Option<String>,
+    #[arg(long)]
+    training_command: Option<String>,
+    #[arg(long)]
+    behavior_report: Option<String>,
+    #[arg(long)]
+    scenario_report: Option<String>,
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    notes: Vec<String>,
+    #[arg(long)]
+    parent: Option<String>,
+    #[arg(long, default_value = "data/models/registry.json")]
+    registry: String,
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ModelPromoteArgs {
+    #[arg(long)]
+    behavior: String,
+    #[arg(long)]
+    name: String,
+    #[arg(long, value_enum)]
+    target: ModelStatus,
+    #[arg(long)]
+    baseline_report: Option<String>,
+    #[arg(long)]
+    candidate_report: Option<String>,
+    #[arg(long, default_value = "data/models/registry.json")]
+    registry: String,
+    #[arg(long)]
+    allow_safety_critical_inference: bool,
+    #[arg(long)]
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct CompareScenarioReportsArgs {
+    #[arg(long)]
+    baseline: String,
+    #[arg(long)]
+    candidate: String,
 }
 
 async fn run_sim(args: SimArgs) -> Result<()> {
@@ -2014,7 +2076,557 @@ fn print_evaluation_report(report: &netherwick_training::BehaviorEvaluationRepor
     Ok(())
 }
 
+const DEFAULT_REGISTRY_PATH: &str = "data/models/registry.json";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ModelRegistry {
+    schema_version: u32,
+    entries: Vec<ModelRegistryEntry>,
+}
+
+impl Default for ModelRegistry {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ModelRegistryEntry {
+    schema_version: u32,
+    name: String,
+    behavior: TrainableBehavior,
+    checkpoint: String,
+    created_at: Option<String>,
+    training: ModelTrainingRecord,
+    reports: ModelReportRecord,
+    scenario_names: Vec<String>,
+    metrics: ModelMetricsSummary,
+    allowed_modes: Vec<String>,
+    status: ModelStatus,
+    warnings: Vec<String>,
+    notes: Vec<String>,
+    parent_model: Option<String>,
+    git_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ModelTrainingRecord {
+    ledger: Option<String>,
+    command: Option<String>,
+    epochs: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ModelReportRecord {
+    behavior: Option<String>,
+    scenario: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ModelMetricsSummary {
+    behavior_loss: Option<f32>,
+    scenario_success_rate: Option<f32>,
+    collision_rate: Option<f32>,
+    battery_delta: Option<f32>,
+    fallback_count: Option<usize>,
+    episodes: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum ModelStatus {
+    Registered,
+    Shadow,
+    Inference,
+    Retired,
+    Rejected,
+}
+
+impl ModelStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::Shadow => "shadow",
+            Self::Inference => "inference",
+            Self::Retired => "retired",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScenarioReportComparison {
+    outcome: ComparisonOutcome,
+    success_rate_delta: f32,
+    collision_rate_delta: f32,
+    battery_delta_delta: f32,
+    fallback_delta: isize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComparisonOutcome {
+    Improved,
+    Regressed,
+    Inconclusive,
+}
+
+impl ComparisonOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Improved => "improved",
+            Self::Regressed => "regressed",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+fn model_register(args: ModelRegisterArgs) -> Result<()> {
+    let behavior: TrainableBehavior = args.behavior.parse()?;
+    let mut registry = load_model_registry(Path::new(&args.registry))?;
+    if registry
+        .entries
+        .iter()
+        .any(|entry| entry.name == args.name && entry.behavior == behavior)
+        && !args.overwrite
+    {
+        anyhow::bail!(
+            "model {} for {} already exists; pass --overwrite to replace it",
+            args.name,
+            behavior
+        );
+    }
+
+    let behavior_report = args
+        .behavior_report
+        .as_deref()
+        .map(load_behavior_report)
+        .transpose()?;
+    let scenario_report = args
+        .scenario_report
+        .as_deref()
+        .map(load_scenario_report)
+        .transpose()?;
+    let mut warnings = Vec::new();
+    if !Path::new(&args.checkpoint).exists() {
+        warnings.push(format!("checkpoint missing: {}", args.checkpoint));
+    }
+    if let Some(path) = &args.behavior_report {
+        if !Path::new(path).exists() {
+            warnings.push(format!("behavior report missing: {path}"));
+        }
+    } else if behavior == TrainableBehavior::Danger {
+        warnings.push("danger registration lacks a behavior evaluation report".to_string());
+    }
+    if let Some(path) = &args.scenario_report {
+        if !Path::new(path).exists() {
+            warnings.push(format!("scenario report missing: {path}"));
+        }
+    }
+
+    let metrics = ModelMetricsSummary {
+        behavior_loss: behavior_report
+            .as_ref()
+            .map(|report| report.model_loss_mean),
+        scenario_success_rate: scenario_report
+            .as_ref()
+            .map(|report| report.summary.success_rate),
+        collision_rate: scenario_report
+            .as_ref()
+            .map(|report| report.summary.collision_rate),
+        battery_delta: scenario_report
+            .as_ref()
+            .map(|report| report.summary.mean_battery_delta),
+        fallback_count: scenario_report
+            .as_ref()
+            .map(|report| report.summary.model_fallbacks),
+        episodes: scenario_report.as_ref().map(|report| report.episodes),
+    };
+    let entry = ModelRegistryEntry {
+        schema_version: 1,
+        name: args.name.clone(),
+        behavior: behavior.clone(),
+        checkpoint: args.checkpoint,
+        created_at: Some(Utc::now().to_rfc3339()),
+        training: ModelTrainingRecord {
+            ledger: args.training_ledger,
+            command: args.training_command.or_else(|| Some(command_summary())),
+            epochs: None,
+        },
+        reports: ModelReportRecord {
+            behavior: args.behavior_report,
+            scenario: args.scenario_report,
+        },
+        scenario_names: scenario_report
+            .as_ref()
+            .map(|report| vec![report.scenario.clone()])
+            .unwrap_or_default(),
+        metrics,
+        allowed_modes: allowed_modes_for_status(&behavior, ModelStatus::Registered),
+        status: ModelStatus::Registered,
+        warnings,
+        notes: args.notes,
+        parent_model: args.parent,
+        git_commit: current_git_commit(),
+    };
+
+    registry
+        .entries
+        .retain(|entry| !(entry.name == args.name && entry.behavior == behavior));
+    registry.entries.push(entry);
+    write_model_registry(Path::new(&args.registry), &registry)?;
+    println!(
+        "registered {} model {} in {}",
+        behavior, args.name, args.registry
+    );
+    Ok(())
+}
+
+fn model_promote(args: ModelPromoteArgs) -> Result<()> {
+    let behavior: TrainableBehavior = args.behavior.parse()?;
+    let path = Path::new(&args.registry);
+    let mut registry = load_model_registry(path)?;
+    let Some(index) = registry
+        .entries
+        .iter()
+        .position(|entry| entry.name == args.name && entry.behavior == behavior)
+    else {
+        anyhow::bail!("model {} for {} is not registered", args.name, behavior);
+    };
+
+    let candidate_path = args
+        .candidate_report
+        .clone()
+        .or_else(|| registry.entries[index].reports.scenario.clone());
+    let baseline_report = args
+        .baseline_report
+        .as_deref()
+        .map(load_scenario_report)
+        .transpose()?;
+    let candidate_report = candidate_path
+        .as_deref()
+        .map(load_scenario_report)
+        .transpose()?;
+    let comparison = match (&baseline_report, &candidate_report) {
+        (Some(baseline), Some(candidate)) => Some(compare_scenario_reports(baseline, candidate)),
+        _ => None,
+    };
+    let decision = promotion_gate(
+        &registry.entries[index],
+        args.target,
+        baseline_report.as_ref(),
+        candidate_report.as_ref(),
+        comparison.as_ref(),
+        args.allow_safety_critical_inference,
+    );
+
+    if !decision.allowed {
+        for warning in decision.warnings {
+            println!("warning: {warning}");
+        }
+        anyhow::bail!(
+            "promotion refused: {} {} -> {}",
+            behavior,
+            args.name,
+            args.target.as_str()
+        );
+    }
+
+    {
+        let entry = &mut registry.entries[index];
+        entry.status = args.target;
+        entry.allowed_modes = allowed_modes_for_status(&behavior, args.target);
+        entry.warnings = merge_warnings(&entry.warnings, &decision.warnings);
+        entry.notes.extend(args.notes);
+        if let Some(path) = args.candidate_report {
+            entry.reports.scenario = Some(path);
+        }
+        if let Some(report) = candidate_report {
+            entry.scenario_names = vec![report.scenario.clone()];
+            entry.metrics.scenario_success_rate = Some(report.summary.success_rate);
+            entry.metrics.collision_rate = Some(report.summary.collision_rate);
+            entry.metrics.battery_delta = Some(report.summary.mean_battery_delta);
+            entry.metrics.fallback_count = Some(report.summary.model_fallbacks);
+            entry.metrics.episodes = Some(report.episodes);
+        }
+    }
+    write_model_registry(path, &registry)?;
+    println!(
+        "promoted {} model {} to {}",
+        behavior,
+        args.name,
+        args.target.as_str()
+    );
+    if let Some(comparison) = comparison {
+        print_scenario_comparison(&comparison);
+    }
+    Ok(())
+}
+
+fn compare_scenario_reports_command(args: CompareScenarioReportsArgs) -> Result<()> {
+    let baseline = load_scenario_report(&args.baseline)?;
+    let candidate = load_scenario_report(&args.candidate)?;
+    let comparison = compare_scenario_reports(&baseline, &candidate);
+    print_scenario_comparison(&comparison);
+    Ok(())
+}
+
+fn load_model_registry(path: &Path) -> Result<ModelRegistry> {
+    if !path.exists() {
+        return Ok(ModelRegistry::default());
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_model_registry(path: &Path, registry: &ModelRegistry) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, serde_json::to_vec_pretty(registry)?)?;
+    fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+fn load_behavior_report(path: &str) -> Result<netherwick_training::BehaviorEvaluationReport> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn load_scenario_report(path: &str) -> Result<ScenarioEvaluationReport> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn compare_scenario_reports(
+    baseline: &ScenarioEvaluationReport,
+    candidate: &ScenarioEvaluationReport,
+) -> ScenarioReportComparison {
+    let success_rate_delta = candidate.summary.success_rate - baseline.summary.success_rate;
+    let collision_rate_delta = candidate.summary.collision_rate - baseline.summary.collision_rate;
+    let battery_delta_delta =
+        candidate.summary.mean_battery_delta - baseline.summary.mean_battery_delta;
+    let fallback_delta =
+        candidate.summary.model_fallbacks as isize - baseline.summary.model_fallbacks as isize;
+    let outcome =
+        if baseline.scenario != candidate.scenario || baseline.episodes != candidate.episodes {
+            ComparisonOutcome::Inconclusive
+        } else if success_rate_delta < -0.01
+            || collision_rate_delta > 0.005
+            || battery_delta_delta < -0.02
+            || fallback_delta > 0
+        {
+            ComparisonOutcome::Regressed
+        } else if success_rate_delta > 0.01
+            || collision_rate_delta < -0.005
+            || battery_delta_delta > 0.02
+        {
+            ComparisonOutcome::Improved
+        } else {
+            ComparisonOutcome::Inconclusive
+        };
+    ScenarioReportComparison {
+        outcome,
+        success_rate_delta,
+        collision_rate_delta,
+        battery_delta_delta,
+        fallback_delta,
+    }
+}
+
+fn print_scenario_comparison(comparison: &ScenarioReportComparison) {
+    println!("comparison: {}", comparison.outcome.as_str());
+    println!("success_rate_delta: {:.6}", comparison.success_rate_delta);
+    println!(
+        "collision_rate_delta: {:.6}",
+        comparison.collision_rate_delta
+    );
+    println!("battery_delta_delta: {:.6}", comparison.battery_delta_delta);
+    println!("fallback_delta: {}", comparison.fallback_delta);
+}
+
+#[derive(Clone, Debug)]
+struct PromotionGateDecision {
+    allowed: bool,
+    warnings: Vec<String>,
+}
+
+fn promotion_gate(
+    entry: &ModelRegistryEntry,
+    target: ModelStatus,
+    baseline: Option<&ScenarioEvaluationReport>,
+    candidate: Option<&ScenarioEvaluationReport>,
+    comparison: Option<&ScenarioReportComparison>,
+    allow_safety_critical_inference: bool,
+) -> PromotionGateDecision {
+    let mut warnings = Vec::new();
+    if !Path::new(&entry.checkpoint).exists() {
+        warnings.push(format!("checkpoint missing: {}", entry.checkpoint));
+    }
+    if matches!(
+        target,
+        ModelStatus::Retired | ModelStatus::Rejected | ModelStatus::Registered
+    ) {
+        return PromotionGateDecision {
+            allowed: true,
+            warnings,
+        };
+    }
+    if target == ModelStatus::Shadow {
+        if entry.reports.scenario.is_none() {
+            warnings.push("shadow requires a scenario evaluation report".to_string());
+        }
+        return PromotionGateDecision {
+            allowed: warnings.is_empty(),
+            warnings,
+        };
+    }
+    if target != ModelStatus::Inference {
+        return PromotionGateDecision {
+            allowed: false,
+            warnings: vec!["unknown promotion target".to_string()],
+        };
+    }
+    if is_safety_critical_behavior(&entry.behavior) && !allow_safety_critical_inference {
+        warnings.push(
+            "safety-critical inference requires --allow-safety-critical-inference".to_string(),
+        );
+    }
+    let Some(candidate) = candidate else {
+        warnings.push("inference promotion requires a candidate scenario report".to_string());
+        return PromotionGateDecision {
+            allowed: false,
+            warnings,
+        };
+    };
+    if candidate.episodes < 10 {
+        warnings.push(format!(
+            "not enough scenario episodes for inference: {} < 10",
+            candidate.episodes
+        ));
+    }
+    if candidate.summary.model_fallbacks > 0 {
+        warnings.push(format!(
+            "model fallback count is not zero: {}",
+            candidate.summary.model_fallbacks
+        ));
+    }
+    if candidate.summary.collision_rate > 0.05 {
+        warnings.push(format!(
+            "candidate collision rate too high: {:.4}",
+            candidate.summary.collision_rate
+        ));
+    }
+    if let Some(comparison) = comparison {
+        if comparison.outcome == ComparisonOutcome::Regressed {
+            warnings.push("candidate scenario report regressed against baseline".to_string());
+        }
+    } else if baseline.is_none() && is_safety_critical_behavior(&entry.behavior) {
+        warnings
+            .push("safety-critical inference requires baseline comparison evidence".to_string());
+    }
+    match entry.behavior {
+        TrainableBehavior::Danger => {
+            if let Some(comparison) = comparison {
+                if comparison.collision_rate_delta > 0.002 {
+                    warnings.push(format!(
+                        "danger collision rate worse than baseline by {:.4}",
+                        comparison.collision_rate_delta
+                    ));
+                }
+            }
+        }
+        TrainableBehavior::Charge => {
+            if candidate.summary.success_rate < 0.70 {
+                warnings.push(format!(
+                    "charger success rate below threshold: {:.3}",
+                    candidate.summary.success_rate
+                ));
+            }
+            if candidate.summary.mean_battery_delta < -0.05 {
+                warnings.push(format!(
+                    "charger battery delta unacceptable: {:.3}",
+                    candidate.summary.mean_battery_delta
+                ));
+            }
+        }
+        TrainableBehavior::ActionValue => {
+            if candidate.scenario != "mixed-room" {
+                warnings
+                    .push("action-value inference requires mixed-room scenario eval".to_string());
+            }
+        }
+        TrainableBehavior::Future => {
+            warnings.push(
+                "future inference is not a direct motor-control promotion; keep hardcoded fallback available"
+                    .to_string(),
+            );
+        }
+        TrainableBehavior::EyeNext | TrainableBehavior::EarNext | TrainableBehavior::Experience => {
+            if entry.behavior == TrainableBehavior::Experience {
+                warnings.push(
+                    "experience inference changes latent encoding; only use where it cannot directly command motors"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    PromotionGateDecision {
+        allowed: warnings.is_empty(),
+        warnings,
+    }
+}
+
+fn allowed_modes_for_status(behavior: &TrainableBehavior, status: ModelStatus) -> Vec<String> {
+    let mut modes = vec!["off".to_string(), "hardcoded".to_string()];
+    if matches!(status, ModelStatus::Shadow | ModelStatus::Inference) {
+        modes.push("shadow-infer".to_string());
+    }
+    if status == ModelStatus::Inference
+        && matches!(
+            behavior,
+            TrainableBehavior::Future
+                | TrainableBehavior::EyeNext
+                | TrainableBehavior::EarNext
+                | TrainableBehavior::Experience
+        )
+    {
+        modes.push("model-infer".to_string());
+    }
+    modes
+}
+
+fn merge_warnings(left: &[String], right: &[String]) -> Vec<String> {
+    let mut warnings = left.to_vec();
+    for warning in right {
+        if !warnings.contains(warning) {
+            warnings.push(warning.clone());
+        }
+    }
+    warnings
+}
+
+fn command_summary() -> String {
+    std::env::args().collect::<Vec<_>>().join(" ")
+}
+
+fn current_git_commit() -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
 fn model_status() -> Result<()> {
+    print_registry_status(Path::new(DEFAULT_REGISTRY_PATH))?;
+    println!();
     println!("registered models:");
     for model in MODEL_REGISTRY {
         println!("  - {model}");
@@ -2041,6 +2653,52 @@ fn model_status() -> Result<()> {
     println!("checkpoint directories:");
     print_model_directories(Path::new("data/models"))?;
     Ok(())
+}
+
+fn print_registry_status(path: &Path) -> Result<()> {
+    let registry = load_model_registry(path)?;
+    println!("model registry: {}", path.display());
+    if registry.entries.is_empty() {
+        println!("  no registry entries");
+        return Ok(());
+    }
+    println!(
+        "{:<14} {:<24} {:<10} {:<32} {:<32} recommendation/warnings",
+        "behavior", "name", "status", "checkpoint", "scenario report"
+    );
+    for entry in registry.entries {
+        let report = entry.reports.scenario.as_deref().unwrap_or("-");
+        let recommendation = registry_recommendation(&entry);
+        println!(
+            "{:<14} {:<24} {:<10} {:<32} {:<32} {}",
+            entry.behavior,
+            entry.name,
+            entry.status.as_str(),
+            entry.checkpoint,
+            report,
+            recommendation
+        );
+    }
+    Ok(())
+}
+
+fn registry_recommendation(entry: &ModelRegistryEntry) -> String {
+    if !entry.warnings.is_empty() {
+        return entry.warnings.join("; ");
+    }
+    match entry.status {
+        ModelStatus::Registered => "run scenario eval, then promote to shadow".to_string(),
+        ModelStatus::Shadow => {
+            if is_safety_critical_behavior(&entry.behavior) {
+                "collect baseline comparison before inference".to_string()
+            } else {
+                "eligible for cautious inference review".to_string()
+            }
+        }
+        ModelStatus::Inference => "allowed for configured inference surfaces".to_string(),
+        ModelStatus::Retired => "retired".to_string(),
+        ModelStatus::Rejected => "rejected".to_string(),
+    }
 }
 
 fn trainable_behaviors() -> &'static [TrainableBehavior] {

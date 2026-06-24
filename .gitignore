@@ -10,5 +10,8 @@
 
 !/data/ledger/.gitkeep
 !/data/models/.gitkeep
+!/data/models/registry.json
+!/data/models/danger_obstacle_smoke/
+!/data/models/danger_obstacle_smoke/.gitkeep
 !/data/recordings/.gitkeep
 !/data/snapshots/.gitkeep

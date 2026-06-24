@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "scenario": "obstacle-avoidance",
+  "base_seed": 7,
+  "episodes": 3,
+  "steps_per_episode": 10,
+  "tick_ms": 100,
+  "model_modes": {
+    "danger": "off",
+    "charge": "off",
+    "action_value": "off",
+    "future": "hardcoded",
+    "eye_next": "off",
+    "ear_next": "off",
+    "experience": "off"
+  },
+  "model_loading": {
+    "requested_checkpoints": {},
+    "loaded_checkpoints": {},
+    "active_modes": {},
+    "blocked_model_infer": [],
+    "warnings": []
+  },
+  "ledger": null,
+  "capture_root": null,
+  "summary": {
+    "success_rate": 1.0,
+    "collision_rate": 0.0,
+    "mean_collisions_per_episode": 0.0,
+    "mean_battery_delta": -0.01,
+    "mean_final_battery": 0.99,
+    "mean_distance_to_charger_final_m": null,
+    "mean_nearest_obstacle_m": 1.0,
+    "mean_distance_traveled_m": 0.2,
+    "mean_ticks_survived": 10.0,
+    "mean_safety_interventions": 0.0,
+    "behavior_run_records": 0,
+    "model_fallbacks": 0
+  },
+  "episodes_detail": [],
+  "recommendation": "candidate_for_more_eval",
+  "warnings": []
+}

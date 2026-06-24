@@ -29,11 +29,13 @@ just check
 just test
 just sim
 just eval-scenario-smoke
+just run model-status
+just run compare-scenario-reports --baseline data/reports/scenario/obstacle-baseline-smoke.json --candidate data/reports/scenario/obstacle-baseline-smoke.json
 just inspect-ledger
 just hardware-env
 ```
 
-Scenario reports can be generated with `just run eval-scenario --scenario empty-room --episodes 2 --steps 10 --out data/reports/scenario/empty-smoke.json`. See [docs/scenario-evaluation.md](docs/scenario-evaluation.md) for baseline-vs-checkpoint comparison notes.
+Scenario reports can be generated with `just run eval-scenario --scenario empty-room --episodes 2 --steps 10 --out data/reports/scenario/empty-smoke.json`. See [docs/scenario-evaluation.md](docs/scenario-evaluation.md) for baseline-vs-checkpoint comparison notes and [docs/model-registry.md](docs/model-registry.md) for checkpoint registration and promotion gates.
 
 ## Docker services
 
