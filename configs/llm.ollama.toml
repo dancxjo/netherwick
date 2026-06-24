@@ -5,4 +5,4 @@ combobulator_model = "llama3.2"
 allow_commands = false
 allow_teaching = true
 temperature = 0.2
-timeout_ms = 120000
+timeout_ms = 300000

@@ -31,7 +31,7 @@ use netherwick_runtime::{
 };
 use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
-    MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, WorldSnapshot,
+    MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World, WorldSnapshot,
 };
 use netherwick_server::{
     LiveSceneMetadata, LiveViewState, SceneArena, SceneObject, SceneSensorCalibration, SceneSession,
@@ -845,6 +845,8 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let mut runner = SimRunner::new(runtime, world, motors);
     if args.live {
         let live_state = LiveViewState::new().with_virtual_retina(true);
+        let initial_snapshot = runner.world.snapshot().await?;
+        live_state.update(initial_snapshot);
         live_state.update_inline_learning(inline_learning.clone());
         live_state.update_scene_metadata(live_metadata);
         live_state.update_session(SceneSession {

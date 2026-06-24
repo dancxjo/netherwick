@@ -118,9 +118,6 @@ go target="virtual":
     if command -v qrencode >/dev/null 2>&1; then
         qrencode -t ANSIUTF8 "https://$LAN_IP:$PORT/view/3d" || true
     fi
-    if [ "${NETHERWICK_OPEN_BROWSER:-0}" = "1" ] && command -v xdg-open >/dev/null 2>&1; then
-        xdg-open "https://127.0.0.1:$PORT/view/3d" >/dev/null 2>&1 || true
-    fi
     cargo run -p netherwick-tools -- sim \
         --live \
         --live-tls \
@@ -130,7 +127,32 @@ go target="virtual":
         --scenario "${NETHERWICK_SCENARIO:-dream}" \
         --steps "${NETHERWICK_SIM_STEPS:-1000000000}" \
         --tick-delay-ms "${NETHERWICK_TICK_DELAY_MS:-100}" \
-        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}"
+        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" &
+    PID="$!"
+    trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' INT TERM EXIT
+    if [ "${NETHERWICK_OPEN_BROWSER:-0}" = "1" ] && command -v xdg-open >/dev/null 2>&1; then
+        if command -v curl >/dev/null 2>&1; then
+            for _ in $(seq 1 80); do
+                if curl -kfsS "https://127.0.0.1:$PORT/view/scene" >/dev/null 2>&1; then
+                    xdg-open "https://127.0.0.1:$PORT/view/3d" >/dev/null 2>&1 || true
+                    break
+                fi
+                if ! kill -0 "$PID" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 0.25
+            done
+        else
+            sleep 2
+            xdg-open "https://127.0.0.1:$PORT/view/3d" >/dev/null 2>&1 || true
+        fi
+    fi
+    set +e
+    wait "$PID"
+    STATUS="$?"
+    set -e
+    trap - INT TERM EXIT
+    exit "$STATUS"
 
 go-virtual:
     just go virtual

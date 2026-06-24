@@ -2613,7 +2613,7 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .panel-titlebar::after{content:"double-click to shade";margin-left:auto;color:#8fa1b2;font-size:10px;font-weight:500;opacity:0;transition:opacity .16s ease}
 .panel-window:hover .panel-titlebar::after{opacity:.72}
 .panel-content{flex:1 1 auto;min-height:0;padding:10px;overflow:auto;transition:max-height .24s ease,opacity .2s ease,padding .24s ease}
-.panel-window.is-shaded{height:32px!important;min-height:32px;resize:none;background:rgba(12,18,24,.92)}
+.panel-window.is-shaded{height:32px!important;min-height:32px!important;max-height:32px!important;resize:none;background:rgba(12,18,24,.92)}
 .panel-window.is-shaded .panel-content{max-height:0;opacity:0;padding-top:0;padding-bottom:0;pointer-events:none;overflow:hidden}
 .panel-window.is-shaded .panel-titlebar{border-bottom-color:transparent}
 .drag-handle{cursor:move;user-select:none}
@@ -4698,9 +4698,12 @@ mod tests {
         assert!(page.contains("navigator.xr"));
         assert!(page.contains("window.isSecureContext"));
         assert!(page.contains("/reign/command"));
-        assert!(page.contains("source:'Gamepad'"));
+        assert!(page.contains("source='Gamepad'"));
         assert!(page.contains("createDefaultXRExperienceAsync"));
         assert!(page.contains("if(!eye?.data_url)"));
+        assert!(page.contains(
+            ".panel-window.is-shaded{height:32px!important;min-height:32px!important;max-height:32px!important;"
+        ));
     }
 
     #[test]
