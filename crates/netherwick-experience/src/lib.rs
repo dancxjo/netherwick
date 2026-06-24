@@ -294,6 +294,103 @@ pub struct ActionValueTarget {
     pub value: f32,
 }
 
+pub const EYE_NEXT_WIDTH: u32 = 64;
+pub const EYE_NEXT_HEIGHT: u32 = 48;
+pub const EYE_NEXT_RGB_LEN: usize = EYE_NEXT_WIDTH as usize * EYE_NEXT_HEIGHT as usize * 3;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EyeNextInput {
+    pub z: Vec<f32>,
+    pub action_features: Vec<f32>,
+    pub eye_features: Vec<f32>,
+    pub body_features: Vec<f32>,
+    pub offset_ms: TimeMs,
+}
+
+impl EyeNextInput {
+    pub fn from_parts(
+        z: Vec<f32>,
+        action: Option<&ActionPrimitive>,
+        now: &Now,
+        offset_ms: TimeMs,
+    ) -> Self {
+        Self {
+            z,
+            action_features: danger_action_features(action),
+            eye_features: eye_next_features(now),
+            body_features: action_value_body_features(now),
+            offset_ms,
+        }
+    }
+
+    pub fn flat_features(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(
+            self.z.len()
+                + self.action_features.len()
+                + self.eye_features.len()
+                + self.body_features.len()
+                + 1,
+        );
+        out.extend(self.z.iter().copied().map(sanitize_feature));
+        out.extend(self.action_features.iter().copied().map(sanitize_feature));
+        out.extend(self.eye_features.iter().copied().map(sanitize_feature));
+        out.extend(self.body_features.iter().copied().map(sanitize_feature));
+        out.push((self.offset_ms as f32 / 5_000.0).clamp(0.0, 1.0));
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EyeNextOutput {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: Vec<u8>,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EyeNextTarget {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: Vec<u8>,
+}
+
+pub fn eye_next_input_from_transition_like(
+    before_z: &ExperienceLatent,
+    action: Option<&ActionPrimitive>,
+    before: &Now,
+    offset_ms: TimeMs,
+) -> EyeNextInput {
+    EyeNextInput::from_parts(before_z.z.clone(), action, before, offset_ms)
+}
+
+pub fn eye_next_target_from_now(after: &Now) -> Option<EyeNextTarget> {
+    eye_frame_rgb(after).map(|(width, height, rgb)| EyeNextTarget { width, height, rgb })
+}
+
+pub fn eye_frame_rgb(now: &Now) -> Option<(u32, u32, Vec<u8>)> {
+    let frame = now.eye.frames.last()?;
+    let mut rgb = Vec::with_capacity(EYE_NEXT_RGB_LEN);
+    if frame.len() >= EYE_NEXT_RGB_LEN {
+        rgb.extend(
+            frame
+                .iter()
+                .take(EYE_NEXT_RGB_LEN)
+                .map(|value| unit_to_u8(*value)),
+        );
+    } else {
+        for index in 0..(EYE_NEXT_WIDTH as usize * EYE_NEXT_HEIGHT as usize) {
+            let value = frame
+                .get(index % frame.len().max(1))
+                .copied()
+                .unwrap_or_default();
+            let byte = unit_to_u8(value / 3.0);
+            rgb.extend([byte, byte, byte]);
+        }
+    }
+    Some((EYE_NEXT_WIDTH, EYE_NEXT_HEIGHT, rgb))
+}
+
 pub fn action_value_input_from_transition_like(
     before_z: &ExperienceLatent,
     action: Option<&ActionPrimitive>,
@@ -893,6 +990,23 @@ fn action_value_prediction_features_from_outputs(
     ]
 }
 
+fn eye_next_features(now: &Now) -> Vec<f32> {
+    let Some(frame) = now.eye.frames.last() else {
+        return vec![0.0; 16];
+    };
+    if frame.is_empty() {
+        return vec![0.0; 16];
+    }
+    let mut out = Vec::with_capacity(16);
+    let chunk = (frame.len() / 16).max(1);
+    for part in frame.chunks(chunk).take(16) {
+        let avg = part.iter().copied().map(sanitize_feature).sum::<f32>() / part.len() as f32;
+        out.push(avg.clamp(0.0, 1.0));
+    }
+    out.resize(16, 0.0);
+    out
+}
+
 fn kinect_ir_features(now: &Now) -> Vec<f32> {
     if now.kinect.ir.is_empty() {
         return vec![0.0, 0.0, 0.0, 0.0];
@@ -938,6 +1052,10 @@ fn sanitize_feature(value: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+fn unit_to_u8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 trait PredictionSummaryExt {

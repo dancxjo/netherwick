@@ -22,9 +22,10 @@ use netherwick_events::{
 use netherwick_experience::{
     action_value_input_from_transition_like, charge_input_from_transition_like,
     charge_target_from_transition_like, danger_input_from_transition_like,
-    danger_target_from_transition_like, ActionValueInput, ActionValueOutput,
-    BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput, DangerInput,
-    DangerOutput, Experience, ExperienceEncoder, ExperienceLatent, FeatureExperienceEncoder,
+    danger_target_from_transition_like, eye_next_input_from_transition_like,
+    eye_next_target_from_now, ActionValueInput, ActionValueOutput, BaselineRewardComputer,
+    BaselineSurpriseComputer, ChargeInput, ChargeOutput, DangerInput, DangerOutput, Experience,
+    ExperienceEncoder, ExperienceLatent, EyeNextInput, EyeNextOutput, FeatureExperienceEncoder,
     FuturePrediction, FuturePredictor, Impression, RewardComputer, Sensation,
     StasisFuturePredictor, SurpriseComputer,
 };
@@ -34,13 +35,14 @@ use netherwick_ledger::{
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
 use netherwick_models::{
-    read_action_value_metadata, read_charge_metadata, read_danger_metadata, ActionValueNetTrainer,
-    ChargeNetTrainer, DangerNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
+    read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_eye_next_metadata,
+    ActionValueNetTrainer, ChargeNetTrainer, CopyCurrentEyePredictor, DangerNetTrainer,
+    EyeNextNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
     HardcodedDangerPredictor,
 };
 use netherwick_now::{
-    ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, Now, ReignSense,
-    SafetySense,
+    ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EyePrediction, Now,
+    ReignSense, SafetySense,
 };
 use netherwick_sensors::World;
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
@@ -118,10 +120,26 @@ impl RuntimeModelStack {
         Ok(stack)
     }
 
+    pub fn with_eye_next_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_eye_next_metadata(path)?;
+        let mut stack = Self::default();
+        stack.behaviors.eye_next = eye_next_behavior(
+            BehaviorRegime::ShadowInfer,
+            Some(EyeNextNetTrainer::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?),
+            FallbackPolicy::UseHardcoded,
+        );
+        Ok(stack)
+    }
+
     pub fn with_shadow_checkpoints(
         danger_path: Option<&Path>,
         charge_path: Option<&Path>,
         action_value_path: Option<&Path>,
+        eye_next_path: Option<&Path>,
     ) -> Result<Self> {
         let mut stack = Self::default();
         if let Some(path) = danger_path {
@@ -145,6 +163,17 @@ impl RuntimeModelStack {
             stack.behaviors.action_value = action_value_behavior(
                 BehaviorRegime::ShadowInfer,
                 Some(ActionValueNetTrainer::load_checkpoint(
+                    path,
+                    metadata.input_dim,
+                )?),
+                FallbackPolicy::UseHardcoded,
+            );
+        }
+        if let Some(path) = eye_next_path {
+            let metadata = read_eye_next_metadata(path)?;
+            stack.behaviors.eye_next = eye_next_behavior(
+                BehaviorRegime::ShadowInfer,
+                Some(EyeNextNetTrainer::load_checkpoint(
                     path,
                     metadata.input_dim,
                 )?),
@@ -185,6 +214,13 @@ impl RuntimeModelStack {
                 behavior.fallback,
             );
         }
+        if let Some(behavior) = config.behavior.get("eye_next") {
+            stack.behaviors.eye_next = eye_next_behavior(
+                behavior.regime,
+                load_eye_next_behavior_trainer(behavior)?,
+                behavior.fallback,
+            );
+        }
         Ok(stack)
     }
 }
@@ -194,6 +230,7 @@ pub struct BehaviorRegistry {
     pub charge: ReplaceableBehavior<SituatedChargeInput, ChargeOutput>,
     pub future: ReplaceableBehavior<FutureInput, FuturePrediction>,
     pub action_value: ReplaceableBehavior<SituatedActionValueInput, ActionValueOutput>,
+    pub eye_next: ReplaceableBehavior<SituatedEyeNextInput, EyeNextOutput>,
 }
 
 impl Default for BehaviorRegistry {
@@ -215,6 +252,11 @@ impl Default for BehaviorRegistry {
                 None,
                 FallbackPolicy::UseHardcoded,
             ),
+            eye_next: eye_next_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
         }
     }
 }
@@ -226,6 +268,8 @@ pub struct BehaviorTrainingHub {
         Box<dyn TargetExtractor<ExperienceTransition, FutureInput, FuturePrediction>>,
     pub action_value_extractor:
         Box<dyn TargetExtractor<ExperienceTransition, ActionValueInput, ActionValueOutput>>,
+    pub eye_next_extractor:
+        Box<dyn TargetExtractor<ExperienceTransition, EyeNextInput, EyeNextOutput>>,
 }
 
 impl Default for BehaviorTrainingHub {
@@ -235,6 +279,7 @@ impl Default for BehaviorTrainingHub {
             charge_extractor: Box::new(ChargeTargetExtractor),
             future_extractor: Box::new(FutureTargetExtractor { offset_ms: 1_000 }),
             action_value_extractor: Box::new(ActionValueTargetExtractor),
+            eye_next_extractor: Box::new(EyeNextTargetExtractor { offset_ms: 100 }),
         }
     }
 }
@@ -372,6 +417,40 @@ impl TargetExtractor<ExperienceTransition, ActionValueInput, ActionValueOutput>
     }
 }
 
+pub struct EyeNextTargetExtractor {
+    pub offset_ms: TimeMs,
+}
+
+impl TargetExtractor<ExperienceTransition, EyeNextInput, EyeNextOutput> for EyeNextTargetExtractor {
+    fn extract(
+        &self,
+        transition: &ExperienceTransition,
+    ) -> Result<Option<TrainingSample<EyeNextInput, EyeNextOutput>>> {
+        let Some(target) = eye_next_target_from_now(&transition.after) else {
+            return Ok(None);
+        };
+        Ok(Some(TrainingSample {
+            input: eye_next_input_from_transition_like(
+                &transition.before_z,
+                transition.action.as_ref(),
+                &transition.before,
+                self.offset_ms,
+            ),
+            expected: EyeNextOutput {
+                width: target.width,
+                height: target.height,
+                rgb: target.rgb,
+                confidence: 1.0,
+            },
+            actual: None,
+            reward: Some(transition.reward.value),
+            weight: 1.0,
+            source: TrainingSource::WorldOutcome,
+            t_ms: transition.created_at_ms,
+        }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SituatedDangerInput {
     pub input: DangerInput,
@@ -387,6 +466,12 @@ pub struct SituatedChargeInput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SituatedActionValueInput {
     pub input: ActionValueInput,
+    pub now: Now,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SituatedEyeNextInput {
+    pub input: EyeNextInput,
     pub now: Now,
 }
 
@@ -515,6 +600,45 @@ impl FunctionBehavior<SituatedActionValueInput, ActionValueOutput> for ActionVal
     }
 }
 
+struct HardcodedEyeNextBehavior;
+
+impl FunctionBehavior<SituatedEyeNextInput, EyeNextOutput> for HardcodedEyeNextBehavior {
+    fn id(&self) -> &'static str {
+        "eye.copy_current"
+    }
+
+    fn infer(&mut self, input: &SituatedEyeNextInput) -> Result<EyeNextOutput> {
+        Ok(CopyCurrentEyePredictor.predict_from_now(&input.now, &input.input))
+    }
+}
+
+struct EyeNextModelBehavior {
+    trainer: EyeNextNetTrainer,
+}
+
+impl FunctionBehavior<SituatedEyeNextInput, EyeNextOutput> for EyeNextModelBehavior {
+    fn id(&self) -> &'static str {
+        "eye.burn.next_v0"
+    }
+
+    fn infer(&mut self, input: &SituatedEyeNextInput) -> Result<EyeNextOutput> {
+        self.trainer.predict(&input.input)
+    }
+
+    fn observe(
+        &mut self,
+        sample: &TrainingSample<SituatedEyeNextInput, EyeNextOutput>,
+    ) -> Result<()> {
+        let target = netherwick_experience::EyeNextTarget {
+            width: sample.expected.width,
+            height: sample.expected.height,
+            rgb: sample.expected.rgb.clone(),
+        };
+        self.trainer.train_step(&sample.input.input, &target)?;
+        Ok(())
+    }
+}
+
 struct StasisFutureBehavior {
     predictor: StasisFuturePredictor,
 }
@@ -587,6 +711,20 @@ fn action_value_behavior(
     )
 }
 
+fn eye_next_behavior(
+    regime: BehaviorRegime,
+    trainer: Option<EyeNextNetTrainer>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<SituatedEyeNextInput, EyeNextOutput> {
+    ReplaceableBehavior::new(
+        "eye_next",
+        regime,
+        Box::new(HardcodedEyeNextBehavior),
+        trainer.map(|trainer| Box::new(EyeNextModelBehavior { trainer }) as Box<_>),
+        fallback,
+    )
+}
+
 fn load_danger_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<DangerNetTrainer>> {
     let Some(checkpoint) = behavior.checkpoint.as_deref() else {
         return Ok(None);
@@ -626,6 +764,20 @@ fn load_action_value_behavior_trainer(
     }
     let metadata = read_action_value_metadata(checkpoint)?;
     Ok(Some(ActionValueNetTrainer::load_checkpoint(
+        checkpoint,
+        metadata.input_dim,
+    )?))
+}
+
+fn load_eye_next_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<EyeNextNetTrainer>> {
+    let Some(checkpoint) = behavior.checkpoint.as_deref() else {
+        return Ok(None);
+    };
+    if !Path::new(checkpoint).exists() {
+        return Ok(None);
+    }
+    let metadata = read_eye_next_metadata(checkpoint)?;
+    Ok(Some(EyeNextNetTrainer::load_checkpoint(
         checkpoint,
         metadata.input_dim,
     )?))
@@ -672,6 +824,18 @@ fn action_value_behavior_input(
     }
 }
 
+fn eye_next_behavior_input(
+    now: &Now,
+    latent: &ExperienceLatent,
+    action: Option<&ActionPrimitive>,
+    offset_ms: TimeMs,
+) -> SituatedEyeNextInput {
+    SituatedEyeNextInput {
+        input: EyeNextInput::from_parts(latent.z.clone(), action, now, offset_ms),
+        now: now.clone(),
+    }
+}
+
 fn danger_disagreement(left: &DangerOutput, right: &DangerOutput) -> f32 {
     let deltas = [
         (left.bump_risk - right.bump_risk).abs(),
@@ -693,6 +857,21 @@ fn charge_disagreement(left: &ChargeOutput, right: &ChargeOutput) -> f32 {
         (left.dock_likelihood - right.dock_likelihood).abs(),
     ];
     deltas.iter().sum::<f32>() / deltas.len() as f32
+}
+
+fn eye_next_disagreement(left: &EyeNextOutput, right: &EyeNextOutput) -> f32 {
+    let len = left.rgb.len().max(right.rgb.len());
+    if len == 0 {
+        return 0.0;
+    }
+    (0..len)
+        .map(|idx| {
+            let left = left.rgb.get(idx).copied().unwrap_or_default() as f32 / 255.0;
+            let right = right.rgb.get(idx).copied().unwrap_or_default() as f32 / 255.0;
+            (left - right).abs()
+        })
+        .sum::<f32>()
+        / len as f32
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1065,6 +1244,27 @@ where
         now.predictions.action_values_model = model_predictions;
         now.predictions.action_values_hardcoded = hardcoded_predictions;
 
+        let eye_next_input = eye_next_behavior_input(&now, &latent, Some(&chosen_action), 100);
+        let eye_next_run = self
+            .models
+            .behaviors
+            .eye_next
+            .infer(&eye_next_input, now.t_ms)?;
+        let mut eye_next_record = eye_next_run.record;
+        if let (Some(hard), Some(model)) = (
+            eye_next_record.hardcoded_output.as_ref(),
+            eye_next_record.model_output.as_ref(),
+        ) {
+            eye_next_record.disagreement = Some(eye_next_disagreement(hard, model));
+        }
+        if let Some(model) = eye_next_record.model_output.as_ref() {
+            now.predictions.eye_next_model = Some(eye_prediction(model));
+        }
+        if let Some(hardcoded) = eye_next_record.hardcoded_output.as_ref() {
+            now.predictions.eye_next_hardcoded = Some(eye_prediction(hardcoded));
+        }
+        behavior_runs.push(eye_next_record.erase());
+
         let safety = self
             .safety
             .filter(&now, action_to_motor_command(Some(&chosen_action)));
@@ -1249,6 +1449,15 @@ fn action_value_prediction(
     ActionValuePrediction {
         action,
         value: output.value,
+        confidence: output.confidence,
+    }
+}
+
+fn eye_prediction(output: &EyeNextOutput) -> EyePrediction {
+    EyePrediction {
+        width: output.width,
+        height: output.height,
+        rgb: output.rgb.clone(),
         confidence: output.confidence,
     }
 }
@@ -1856,7 +2065,7 @@ mod tests {
             .await
             .unwrap();
 
-        for behavior_id in ["danger", "charge", "future", "action_value"] {
+        for behavior_id in ["danger", "charge", "future", "action_value", "eye_next"] {
             assert!(
                 tick.frame
                     .behavior_runs
@@ -1883,6 +2092,7 @@ mod tests {
         after.body.flags.bump_left = true;
         after.body.battery_level = 0.55;
         after.body.charging = true;
+        after.eye.frames = vec![vec![0.25, 0.5, 0.75]];
         let transition = ExperienceTransition {
             id: Uuid::new_v4(),
             before_frame_id: Uuid::new_v4(),
@@ -1931,6 +2141,15 @@ mod tests {
         assert_eq!(action_value.source, TrainingSource::WorldOutcome);
         assert_eq!(action_value.expected.value, 0.25);
         assert_eq!(action_value.expected.confidence, 1.0);
+
+        let eye_next = EyeNextTargetExtractor { offset_ms: 100 }
+            .extract(&transition)
+            .unwrap()
+            .unwrap();
+        assert_eq!(eye_next.source, TrainingSource::WorldOutcome);
+        assert_eq!(eye_next.expected.width, 64);
+        assert_eq!(eye_next.expected.height, 48);
+        assert_eq!(eye_next.expected.rgb.len(), 64 * 48 * 3);
     }
 
     #[test]
@@ -1972,15 +2191,24 @@ mod tests {
                 100,
             )
             .unwrap();
+        let eye_next = registry
+            .eye_next
+            .infer(
+                &eye_next_behavior_input(&now, &latent, Some(&action), 100),
+                100,
+            )
+            .unwrap();
 
         assert_eq!(danger.record.behavior_id, "danger");
         assert_eq!(charge.record.behavior_id, "charge");
         assert_eq!(future.record.behavior_id, "future");
         assert_eq!(action_value.record.behavior_id, "action_value");
+        assert_eq!(eye_next.record.behavior_id, "eye_next");
         assert!(danger.record.hardcoded_output.is_some());
         assert!(charge.record.hardcoded_output.is_some());
         assert!(future.record.hardcoded_output.is_some());
         assert!(action_value.record.hardcoded_output.is_some());
+        assert!(eye_next.record.hardcoded_output.is_some());
     }
 
     #[test]

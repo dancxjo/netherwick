@@ -55,6 +55,8 @@ pub struct PredictionSense {
     pub charge_hardcoded: Option<ChargePrediction>,
     pub action_values_model: Vec<ActionValuePrediction>,
     pub action_values_hardcoded: Vec<ActionValuePrediction>,
+    pub eye_next_model: Option<EyePrediction>,
+    pub eye_next_hardcoded: Option<EyePrediction>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -78,6 +80,14 @@ pub struct ChargePrediction {
 pub struct ActionValuePrediction {
     pub action: ActionPrimitive,
     pub value: f32,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EyePrediction {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: Vec<u8>,
     pub confidence: f32,
 }
 

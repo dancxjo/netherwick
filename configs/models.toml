@@ -1,8 +1,8 @@
 [behavior.eye_next]
 regime = "shadow_train"
 hardcoded = "eye.copy_current"
-model = "eye.burn.future_v0"
-checkpoint = "data/models/eye_future_v0"
+model = "eye.burn.next_v0"
+checkpoint = "data/models/eye_next_v0"
 fallback = "use_hardcoded"
 
 [behavior.ear_next]

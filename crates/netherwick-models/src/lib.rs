@@ -11,7 +11,8 @@ use burn::tensor::{activation, backend::AutodiffBackend, backend::Backend, Tenso
 use netherwick_behaviors::TrainingSample;
 use netherwick_experience::{
     ActionValueInput, ActionValueOutput, ActionValueTarget, ChargeInput, ChargeOutput,
-    ChargeTarget, DangerInput, DangerOutput, DangerTarget,
+    ChargeTarget, DangerInput, DangerOutput, DangerTarget, EyeNextInput, EyeNextOutput,
+    EyeNextTarget, EYE_NEXT_HEIGHT, EYE_NEXT_RGB_LEN, EYE_NEXT_WIDTH,
 };
 use netherwick_now::Now;
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,22 @@ pub struct ActionValueShadowMetric {
     pub hardcoded: ActionValueOutput,
     pub model: ActionValueOutput,
     pub target: ActionValueTarget,
+    pub loss: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EyeNextTrainStats {
+    pub loss: f32,
+    pub samples_seen: u64,
+    pub improved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EyeNextShadowMetric {
+    pub observed_at_ms: u64,
+    pub hardcoded: EyeNextOutput,
+    pub model: EyeNextOutput,
+    pub target: EyeNextTarget,
     pub loss: f32,
 }
 
@@ -286,6 +303,34 @@ impl NeuralModel<(ActionValueInput, Now), ActionValueOutput> for HardcodedAction
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CopyCurrentEyePredictor;
+
+impl CopyCurrentEyePredictor {
+    pub fn predict_from_now(&self, now: &Now, _input: &EyeNextInput) -> EyeNextOutput {
+        match netherwick_experience::eye_frame_rgb(now) {
+            Some((width, height, rgb)) => EyeNextOutput {
+                width,
+                height,
+                rgb,
+                confidence: 0.75,
+            },
+            None => EyeNextOutput {
+                width: EYE_NEXT_WIDTH,
+                height: EYE_NEXT_HEIGHT,
+                rgb: vec![0; EYE_NEXT_RGB_LEN],
+                confidence: 0.0,
+            },
+        }
+    }
+}
+
+impl NeuralModel<(EyeNextInput, Now), EyeNextOutput> for CopyCurrentEyePredictor {
+    fn predict(&self, input: (EyeNextInput, Now)) -> Result<EyeNextOutput> {
+        Ok(self.predict_from_now(&input.1, &input.0))
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct DangerNet<B: Backend> {
     input: Linear<B>,
@@ -302,6 +347,13 @@ pub struct ChargeNet<B: Backend> {
 
 #[derive(Module, Debug)]
 pub struct ActionValueNet<B: Backend> {
+    input: Linear<B>,
+    hidden: Linear<B>,
+    output: Linear<B>,
+}
+
+#[derive(Module, Debug)]
+pub struct EyeNextNet<B: Backend> {
     input: Linear<B>,
     hidden: Linear<B>,
     output: Linear<B>,
@@ -355,12 +407,30 @@ impl<B: Backend> ActionValueNet<B> {
     }
 }
 
+impl<B: Backend> EyeNextNet<B> {
+    pub fn init(input_dim: usize, output_dim: usize, device: &B::Device) -> Self {
+        Self {
+            input: LinearConfig::new(input_dim, 128).init(device),
+            hidden: LinearConfig::new(128, 128).init(device),
+            output: LinearConfig::new(128, output_dim).init(device),
+        }
+    }
+
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let x = activation::relu(self.input.forward(input));
+        let x = activation::relu(self.hidden.forward(x));
+        activation::sigmoid(self.output.forward(x))
+    }
+}
+
 pub type DangerBackend = NdArray<f32>;
 pub type DangerAutodiffBackend = Autodiff<DangerBackend>;
 pub type ChargeBackend = NdArray<f32>;
 pub type ChargeAutodiffBackend = Autodiff<ChargeBackend>;
 pub type ActionValueBackend = NdArray<f32>;
 pub type ActionValueAutodiffBackend = Autodiff<ActionValueBackend>;
+pub type EyeNextBackend = NdArray<f32>;
+pub type EyeNextAutodiffBackend = Autodiff<EyeNextBackend>;
 
 pub struct DangerNetTrainer<B: AutodiffBackend = DangerAutodiffBackend> {
     model: DangerNet<B>,
@@ -392,6 +462,19 @@ pub struct ActionValueNetTrainer<B: AutodiffBackend = ActionValueAutodiffBackend
     best_loss: Option<f32>,
 }
 
+pub struct EyeNextNetTrainer<B: AutodiffBackend = EyeNextAutodiffBackend> {
+    model: EyeNextNet<B>,
+    optimizer: OptimizerAdaptor<Sgd<B::InnerBackend>, EyeNextNet<B>, B>,
+    device: B::Device,
+    input_dim: usize,
+    output_dim: usize,
+    width: u32,
+    height: u32,
+    learning_rate: f64,
+    samples_seen: u64,
+    best_loss: Option<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DangerModelMetadata {
     pub input_dim: usize,
@@ -411,6 +494,17 @@ pub struct ChargeModelMetadata {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionValueModelMetadata {
     pub input_dim: usize,
+    pub samples_seen: u64,
+    pub best_loss: Option<f32>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EyeNextModelMetadata {
+    pub input_dim: usize,
+    pub output_dim: usize,
+    pub width: u32,
+    pub height: u32,
     pub samples_seen: u64,
     pub best_loss: Option<f32>,
     pub created_at_ms: u64,
@@ -896,6 +990,180 @@ impl<B: AutodiffBackend> ActionValueNetTrainer<B> {
     }
 }
 
+impl EyeNextNetTrainer<EyeNextAutodiffBackend> {
+    pub fn new(input_dim: usize, width: u32, height: u32) -> Self {
+        Self::with_device(input_dim, width, height, Default::default())
+    }
+
+    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_eye_next_metadata(path)?;
+        if metadata.input_dim != input_dim {
+            return Err(anyhow!(
+                "eye-next checkpoint input dimension mismatch at {}: metadata has {}, runtime expected {}",
+                path.display(),
+                metadata.input_dim,
+                input_dim
+            ));
+        }
+
+        let device = Default::default();
+        let model = EyeNextNet::init(input_dim, metadata.output_dim, &device).load_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+            &device,
+        )?;
+        Ok(Self {
+            model,
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            output_dim: metadata.output_dim,
+            width: metadata.width,
+            height: metadata.height,
+            learning_rate: 0.01,
+            samples_seen: metadata.samples_seen,
+            best_loss: metadata.best_loss,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> EyeNextNetTrainer<B> {
+    pub fn with_device(input_dim: usize, width: u32, height: u32, device: B::Device) -> Self {
+        let output_dim = width as usize * height as usize * 3;
+        Self {
+            model: EyeNextNet::init(input_dim, output_dim, &device),
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            output_dim,
+            width,
+            height,
+            learning_rate: 0.01,
+            samples_seen: 0,
+            best_loss: None,
+        }
+    }
+
+    pub fn input_dim(&self) -> usize {
+        self.input_dim
+    }
+
+    pub fn output_dim(&self) -> usize {
+        self.output_dim
+    }
+
+    pub fn samples_seen(&self) -> u64 {
+        self.samples_seen
+    }
+
+    pub fn best_loss(&self) -> Option<f32> {
+        self.best_loss
+    }
+
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create eye-next checkpoint dir {}", path.display()))?;
+        self.model.clone().save_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+        )?;
+        let metadata = EyeNextModelMetadata {
+            input_dim: self.input_dim,
+            output_dim: self.output_dim,
+            width: self.width,
+            height: self.height,
+            samples_seen: self.samples_seen,
+            best_loss: self.best_loss,
+            created_at_ms: now_ms(),
+        };
+        std::fs::write(
+            path.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )
+        .with_context(|| format!("write eye-next checkpoint metadata {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn predict(&self, input: &EyeNextInput) -> Result<EyeNextOutput> {
+        let features = self.checked_features(input)?;
+        let tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let output = self.model.forward(tensor).inner();
+        tensor_to_eye_next_output(output, self.width, self.height)
+    }
+
+    pub fn train_step(
+        &mut self,
+        input: &EyeNextInput,
+        target: &EyeNextTarget,
+    ) -> Result<EyeNextTrainStats> {
+        let features = self.checked_features(input)?;
+        let target_values = eye_target_train_values(target, self.output_dim);
+        let input_tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let target_tensor = Tensor::<B, 2>::from_data(
+            TensorData::new(target_values, [1, self.output_dim]),
+            &self.device,
+        );
+        let output = self.model.forward(input_tensor);
+        let loss = MseLoss::new().forward(output, target_tensor, Reduction::Mean);
+        let loss_value = loss.clone().inner().into_data().to_vec::<f32>()?[0];
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &self.model);
+        self.model = self
+            .optimizer
+            .step(self.learning_rate, self.model.clone(), grads);
+        self.samples_seen = self.samples_seen.saturating_add(1);
+        let improved = self.best_loss.map(|best| loss_value < best).unwrap_or(true);
+        if improved {
+            self.best_loss = Some(loss_value);
+        }
+        Ok(EyeNextTrainStats {
+            loss: loss_value,
+            samples_seen: self.samples_seen,
+            improved,
+        })
+    }
+
+    pub fn shadow_compare(
+        &mut self,
+        observed_at_ms: u64,
+        now: &Now,
+        input: &EyeNextInput,
+        target: &EyeNextTarget,
+    ) -> Result<EyeNextShadowMetric> {
+        let hardcoded = CopyCurrentEyePredictor.predict_from_now(now, input);
+        let model = self.predict(input)?;
+        let loss = mse_eye_next_output_target(&model, target);
+        Ok(EyeNextShadowMetric {
+            observed_at_ms,
+            hardcoded,
+            model,
+            target: target.clone(),
+            loss,
+        })
+    }
+
+    fn checked_features(&self, input: &EyeNextInput) -> Result<Vec<f32>> {
+        let mut features = input.flat_features();
+        if features.len() != self.input_dim {
+            return Err(anyhow!(
+                "eye-next input dimension mismatch: got {}, expected {}",
+                features.len(),
+                self.input_dim
+            ));
+        }
+        for value in &mut features {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+        Ok(features)
+    }
+}
+
 pub fn read_danger_metadata(path: impl AsRef<Path>) -> Result<DangerModelMetadata> {
     let path = path.as_ref();
     let bytes = std::fs::read(path.join("metadata.json"))
@@ -918,6 +1186,14 @@ pub fn read_action_value_metadata(path: impl AsRef<Path>) -> Result<ActionValueM
         .with_context(|| format!("read action-value checkpoint metadata {}", path.display()))?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse action-value checkpoint metadata {}", path.display()))
+}
+
+pub fn read_eye_next_metadata(path: impl AsRef<Path>) -> Result<EyeNextModelMetadata> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path.join("metadata.json"))
+        .with_context(|| format!("read eye-next checkpoint metadata {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse eye-next checkpoint metadata {}", path.display()))
 }
 
 fn now_ms() -> u64 {
@@ -973,6 +1249,20 @@ impl<B: AutodiffBackend> OnlineTrainer<ActionValueInput, ActionValueTarget>
     }
 }
 
+impl<B: AutodiffBackend> OnlineTrainer<EyeNextInput, EyeNextTarget> for EyeNextNetTrainer<B> {
+    fn train_step(
+        &mut self,
+        sample: TrainingSample<EyeNextInput, EyeNextTarget>,
+    ) -> Result<TrainStats> {
+        let stats = EyeNextNetTrainer::train_step(self, &sample.input, &sample.expected)?;
+        Ok(TrainStats {
+            loss: stats.loss,
+            samples_seen: stats.samples_seen,
+            improved: stats.improved,
+        })
+    }
+}
+
 fn tensor_to_danger_output<B: Backend>(tensor: Tensor<B, 2>) -> Result<DangerOutput> {
     let values = tensor.into_data().to_vec::<f32>()?;
     if values.len() != 4 {
@@ -1020,6 +1310,31 @@ fn tensor_to_action_value_output<B: Backend>(tensor: Tensor<B, 2>) -> Result<Act
     })
 }
 
+fn tensor_to_eye_next_output<B: Backend>(
+    tensor: Tensor<B, 2>,
+    width: u32,
+    height: u32,
+) -> Result<EyeNextOutput> {
+    let values = tensor.into_data().to_vec::<f32>()?;
+    let expected_len = width as usize * height as usize * 3;
+    if values.len() != expected_len {
+        return Err(anyhow!(
+            "eye-next net emitted {} outputs, expected {}",
+            values.len(),
+            expected_len
+        ));
+    }
+    Ok(EyeNextOutput {
+        width,
+        height,
+        rgb: values
+            .into_iter()
+            .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect(),
+        confidence: 0.5,
+    })
+}
+
 fn charge_target_train_values(target: &ChargeTarget) -> [f32; 3] {
     [
         target.charging_started.clamp(0.0, 1.0),
@@ -1033,6 +1348,17 @@ fn action_value_target_train_values(target: &ActionValueTarget) -> [f32; 2] {
         ((target.value.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0),
         1.0,
     ]
+}
+
+fn eye_target_train_values(target: &EyeNextTarget, output_dim: usize) -> Vec<f32> {
+    let mut values = target
+        .rgb
+        .iter()
+        .take(output_dim)
+        .map(|byte| *byte as f32 / 255.0)
+        .collect::<Vec<_>>();
+    values.resize(output_dim, 0.0);
+    values
 }
 
 fn mse_output_target(output: DangerOutput, target: DangerTarget) -> f32 {
@@ -1068,6 +1394,22 @@ fn mse_action_value_output_target(output: ActionValueOutput, target: ActionValue
     delta * delta
 }
 
+fn mse_eye_next_output_target(output: &EyeNextOutput, target: &EyeNextTarget) -> f32 {
+    let len = output.rgb.len().max(target.rgb.len());
+    if len == 0 {
+        return 0.0;
+    }
+    (0..len)
+        .map(|idx| {
+            let actual = output.rgb.get(idx).copied().unwrap_or_default() as f32 / 255.0;
+            let expected = target.rgb.get(idx).copied().unwrap_or_default() as f32 / 255.0;
+            let delta = actual - expected;
+            delta * delta
+        })
+        .sum::<f32>()
+        / len as f32
+}
+
 pub const MODEL_REGISTRY: &[&str] = &[
     "ExperienceEncoder",
     "ExperienceDecoder",
@@ -1091,7 +1433,8 @@ mod tests {
     use netherwick_actions::ActionPrimitive;
     use netherwick_body::BodySense;
     use netherwick_experience::{
-        ActionValueInput, ActionValueTarget, ChargeInput, ChargeTarget, DangerInput,
+        ActionValueInput, ActionValueTarget, ChargeInput, ChargeTarget, DangerInput, EyeNextInput,
+        EyeNextTarget,
     };
 
     #[test]
@@ -1289,6 +1632,35 @@ mod tests {
         assert!(dir.join("metadata.json").exists());
         assert_eq!(loaded.samples_seen(), 1);
         assert!(output.value.is_finite());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn eye_next_checkpoint_round_trips_prediction_shape() {
+        let dir = std::env::temp_dir().join(format!("netherwick-eye-next-checkpoint-{}", now_ms()));
+        let mut now = Now::blank(1, BodySense::default());
+        now.eye.frames = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        let input =
+            EyeNextInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Stop), &now, 100);
+        let mut trainer = EyeNextNetTrainer::new(input.flat_features().len(), 4, 4);
+        let target = EyeNextTarget {
+            width: 4,
+            height: 4,
+            rgb: vec![128; 4 * 4 * 3],
+        };
+        trainer.train_step(&input, &target).unwrap();
+
+        trainer.save_checkpoint(&dir).unwrap();
+        let loaded = EyeNextNetTrainer::load_checkpoint(&dir, input.flat_features().len()).unwrap();
+        let output = loaded.predict(&input).unwrap();
+
+        assert!(dir.join("model.bin").exists());
+        assert!(dir.join("metadata.json").exists());
+        assert_eq!(loaded.samples_seen(), 1);
+        assert_eq!(output.width, 4);
+        assert_eq!(output.height, 4);
+        assert_eq!(output.rgb.len(), 4 * 4 * 3);
 
         let _ = std::fs::remove_dir_all(dir);
     }
