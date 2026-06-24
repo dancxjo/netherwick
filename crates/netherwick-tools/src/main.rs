@@ -297,6 +297,7 @@ impl From<CliLlmProvider> for LlmProvider {
 enum ScenarioArg {
     EmptyRoom,
     ObstacleAvoidance,
+    CornerTrap,
     ChargerSeeking,
     PersonSpeakerRoom,
     MixedRoom,
@@ -307,6 +308,7 @@ impl From<ScenarioArg> for ScenarioKind {
         match value {
             ScenarioArg::EmptyRoom => ScenarioKind::EmptyRoom,
             ScenarioArg::ObstacleAvoidance => ScenarioKind::ObstacleAvoidance,
+            ScenarioArg::CornerTrap => ScenarioKind::CornerTrap,
             ScenarioArg::ChargerSeeking => ScenarioKind::ChargerSeeking,
             ScenarioArg::PersonSpeakerRoom => ScenarioKind::PersonAndSpeaker,
             ScenarioArg::MixedRoom => ScenarioKind::MixedRoom,
@@ -1044,6 +1046,16 @@ struct ScenarioEvaluationSummary {
     mean_nearest_obstacle_m: Option<f32>,
     mean_distance_traveled_m: f32,
     mean_ticks_survived: f32,
+    #[serde(default)]
+    stuck_count: usize,
+    #[serde(default)]
+    stuck_duration: Option<f32>,
+    #[serde(default)]
+    mean_stuck_duration: Option<f32>,
+    #[serde(default)]
+    recovery_success_rate: Option<f32>,
+    #[serde(default)]
+    dead_battery_tick: Option<usize>,
     mean_safety_interventions: f32,
     behavior_run_records: usize,
     model_fallbacks: usize,
@@ -1074,7 +1086,18 @@ struct ScenarioEpisodeReport {
     final_distance_to_person_m: Option<f32>,
     final_distance_to_speaker_m: Option<f32>,
     distance_traveled_m: f32,
+    #[serde(default)]
     stuck_ticks: usize,
+    #[serde(default)]
+    stuck_count: usize,
+    #[serde(default)]
+    stuck_duration: Option<f32>,
+    #[serde(default)]
+    mean_stuck_duration: Option<f32>,
+    #[serde(default)]
+    recovery_success_rate: Option<f32>,
+    #[serde(default)]
+    dead_battery_tick: Option<usize>,
     unique_actions: Vec<String>,
     safety_interventions: usize,
     behavior_run_records: usize,
@@ -1148,6 +1171,12 @@ struct EpisodeMetricBuilder {
     last_position: Option<(f32, f32)>,
     distance_traveled_m: f32,
     stuck_ticks: usize,
+    stuck_count: usize,
+    stuck_duration_sum_ms: f32,
+    stuck_duration_count: usize,
+    active_stuck_duration_ms: Option<f32>,
+    recovery_successes: usize,
+    dead_battery_tick: Option<usize>,
     unique_actions: BTreeSet<String>,
     safety_interventions: usize,
     behavior_run_records: usize,
@@ -1200,6 +1229,12 @@ impl EpisodeMetricBuilder {
             last_position: None,
             distance_traveled_m: 0.0,
             stuck_ticks: 0,
+            stuck_count: 0,
+            stuck_duration_sum_ms: 0.0,
+            stuck_duration_count: 0,
+            active_stuck_duration_ms: None,
+            recovery_successes: 0,
+            dead_battery_tick: None,
             unique_actions: BTreeSet::new(),
             safety_interventions: 0,
             behavior_run_records: 0,
@@ -1226,6 +1261,10 @@ impl EpisodeMetricBuilder {
         let body = &snapshot.body;
         self.started_battery.get_or_insert(body.battery_level);
         self.final_battery = body.battery_level;
+        if self.dead_battery_tick.is_none() && body.battery_level <= f32::EPSILON && !body.charging
+        {
+            self.dead_battery_tick = Some(self.ticks.saturating_sub(1));
+        }
         let position = (body.odometry.x_m, body.odometry.y_m);
         if self.start_position.is_none() {
             self.start_position = Some(position);
@@ -1233,14 +1272,6 @@ impl EpisodeMetricBuilder {
         if let Some(last) = self.last_position.replace(position) {
             let step_distance = distance_between(last, position);
             self.distance_traveled_m += step_distance;
-            if step_distance < 0.002
-                && matches!(
-                    tick.chosen_action,
-                    Some(ActionPrimitive::Go { .. } | ActionPrimitive::Explore { .. })
-                )
-            {
-                self.stuck_ticks = self.stuck_ticks.saturating_add(1);
-            }
         }
 
         let bumper = body.flags.bump_left || body.flags.bump_right;
@@ -1279,6 +1310,7 @@ impl EpisodeMetricBuilder {
         if let Some(action) = &tick.chosen_action {
             self.unique_actions.insert(format!("{action:?}"));
         }
+        self.observe_stuck(snapshot);
         if tick
             .frame
             .now
@@ -1311,6 +1343,36 @@ impl EpisodeMetricBuilder {
                 self.ticks_with_future_predictions.saturating_add(1);
         }
         self.memory.observe(snapshot, tick);
+    }
+
+    fn observe_stuck(&mut self, snapshot: &WorldSnapshot) {
+        let Some(extension) = snapshot
+            .extensions
+            .iter()
+            .find(|extension| extension.name == "sim.stuck")
+        else {
+            return;
+        };
+        let values = &extension.values;
+        let active = values.first().copied().unwrap_or(0.0) > 0.0;
+        let duration_ms = values.get(3).copied().unwrap_or(0.0).max(0.0);
+        let event_started = values.get(6).copied().unwrap_or(0.0) > 0.0;
+        let recovered = values.get(7).copied().unwrap_or(0.0) > 0.0;
+        if event_started {
+            self.stuck_count = self.stuck_count.saturating_add(1);
+            self.active_stuck_duration_ms = Some(duration_ms);
+        }
+        if active {
+            self.stuck_ticks = self.stuck_ticks.saturating_add(1);
+            self.active_stuck_duration_ms = Some(duration_ms);
+        }
+        if recovered {
+            self.recovery_successes = self.recovery_successes.saturating_add(1);
+            if let Some(duration) = self.active_stuck_duration_ms.take() {
+                self.stuck_duration_sum_ms += duration;
+                self.stuck_duration_count = self.stuck_duration_count.saturating_add(1);
+            }
+        }
     }
 
     fn observe_behavior_runs(&mut self, records: &[ErasedBehaviorRunRecord]) {
@@ -1387,6 +1449,14 @@ impl EpisodeMetricBuilder {
         } else {
             Some(self.nearest_obstacle_sum / self.nearest_obstacle_count as f32)
         };
+        let mut stuck_duration_sum_ms = self.stuck_duration_sum_ms;
+        let mut stuck_duration_count = self.stuck_duration_count;
+        if let Some(duration) = self.active_stuck_duration_ms {
+            stuck_duration_sum_ms += duration;
+            stuck_duration_count = stuck_duration_count.saturating_add(1);
+        }
+        let stuck_duration = (stuck_duration_count > 0)
+            .then_some(stuck_duration_sum_ms / stuck_duration_count as f32);
         let mut report = ScenarioEpisodeReport {
             index: self.index,
             seed: self.seed,
@@ -1408,6 +1478,12 @@ impl EpisodeMetricBuilder {
             final_distance_to_speaker_m,
             distance_traveled_m: self.distance_traveled_m,
             stuck_ticks: self.stuck_ticks,
+            stuck_count: self.stuck_count,
+            stuck_duration,
+            mean_stuck_duration: stuck_duration,
+            recovery_success_rate: (self.stuck_count > 0)
+                .then_some(self.recovery_successes as f32 / self.stuck_count as f32),
+            dead_battery_tick: self.dead_battery_tick,
             unique_actions: self.unique_actions.into_iter().collect(),
             safety_interventions: self.safety_interventions,
             behavior_run_records: self.behavior_run_records,
@@ -1717,6 +1793,11 @@ fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool 
                 && episode.stuck_ticks < episode.ticks / 2
                 && episode.distance_traveled_m > 0.05
         }
+        ScenarioKind::CornerTrap => {
+            episode.stuck_count > 0
+                && episode.recovery_success_rate.unwrap_or(0.0) > 0.0
+                && episode.distance_traveled_m > 0.02
+        }
         ScenarioKind::ChargerSeeking => episode.charging_ticks > 0 || episode.battery_delta > 0.03,
         ScenarioKind::PersonAndSpeaker => {
             episode.ticks > 0
@@ -1765,6 +1846,22 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
         ),
         mean_distance_traveled_m: mean(episodes.iter().map(|episode| episode.distance_traveled_m)),
         mean_ticks_survived: mean(episodes.iter().map(|episode| episode.ticks as f32)),
+        stuck_count: episodes.iter().map(|episode| episode.stuck_count).sum(),
+        stuck_duration: mean_optional(episodes.iter().filter_map(|episode| episode.stuck_duration)),
+        mean_stuck_duration: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_stuck_duration),
+        ),
+        recovery_success_rate: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.recovery_success_rate),
+        ),
+        dead_battery_tick: episodes
+            .iter()
+            .filter_map(|episode| episode.dead_battery_tick)
+            .min(),
         mean_safety_interventions: mean(
             episodes
                 .iter()
@@ -5040,7 +5137,7 @@ mod tests {
     use netherwick_body::BodySense;
     use netherwick_core::Reward;
     use netherwick_experience::ExperienceLatent;
-    use netherwick_now::{Now, SurpriseSense};
+    use netherwick_now::{ExtensionSense, Now, SurpriseSense};
     use netherwick_sensors::World;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5090,6 +5187,7 @@ mod tests {
         for (slug, expected) in [
             ("empty-room", ScenarioArg::EmptyRoom),
             ("obstacle-avoidance", ScenarioArg::ObstacleAvoidance),
+            ("corner-trap", ScenarioArg::CornerTrap),
             ("charger-seeking", ScenarioArg::ChargerSeeking),
             ("person-speaker-room", ScenarioArg::PersonSpeakerRoom),
             ("mixed-room", ScenarioArg::MixedRoom),
@@ -5418,6 +5516,71 @@ mod tests {
         assert_eq!(report.bumper_hits, 1);
         assert_eq!(report.cliff_hits, 1);
         assert_eq!(report.min_nearest_obstacle_m, Some(0.2));
+    }
+
+    #[test]
+    fn stuck_metrics_count_recovery_events() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::CornerTrap, 11));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::CornerTrap,
+            scenario.metadata,
+            0,
+            11,
+            None,
+            None,
+        );
+        let mut started = WorldSnapshot::default();
+        started.extensions.push(ExtensionSense {
+            schema_version: 1,
+            name: "sim.stuck".to_string(),
+            values: vec![1.0, 1.0, 6.0, 100.0, 1.0, -1.0, 1.0, 0.0],
+        });
+        metrics.observe(
+            &started,
+            &tick_with_action(ActionPrimitive::Explore {
+                style: netherwick_actions::ExploreStyle::RandomWalk,
+                duration_ms: 100,
+            }),
+        );
+        let mut recovered = started.clone();
+        recovered.body.odometry.x_m = 0.1;
+        recovered.extensions[0].values = vec![0.0, 0.0, 0.0, 900.0, 0.0, -1.0, 0.0, 1.0];
+        metrics.observe(
+            &recovered,
+            &tick_with_action(ActionPrimitive::Explore {
+                style: netherwick_actions::ExploreStyle::RandomWalk,
+                duration_ms: 100,
+            }),
+        );
+
+        let report = metrics.finish();
+        assert_eq!(report.stuck_count, 1);
+        assert_eq!(report.stuck_ticks, 1);
+        assert_eq!(report.stuck_duration, Some(100.0));
+        assert_eq!(report.mean_stuck_duration, Some(100.0));
+        assert_eq!(report.recovery_success_rate, Some(1.0));
+    }
+
+    #[test]
+    fn metrics_record_dead_battery_tick() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 12));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            12,
+            None,
+            None,
+        );
+        let mut alive = WorldSnapshot::default();
+        alive.body.battery_level = 0.01;
+        metrics.observe(&alive, &tick_with_action(ActionPrimitive::Stop));
+        let mut dead = alive.clone();
+        dead.body.battery_level = 0.0;
+        metrics.observe(&dead, &tick_with_action(ActionPrimitive::Stop));
+
+        let report = metrics.finish();
+        assert_eq!(report.dead_battery_tick, Some(1));
     }
 
     #[test]

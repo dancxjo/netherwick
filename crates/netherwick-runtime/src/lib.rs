@@ -13,7 +13,7 @@ use netherwick_behaviors::{
     FallbackPolicy, FunctionBehavior, ReplaceableBehavior, TargetExtractor, TrainingSample,
     TrainingSource,
 };
-use netherwick_body::{MotorCommand, MotorComplex, RobotBody};
+use netherwick_body::{MotionCommand, MotorCommand, MotorComplex, RobotBody};
 use netherwick_conductor::{Conductor, ConductorInput};
 use netherwick_core::{Provenance, Reward, TimeMs};
 use netherwick_events::{
@@ -47,7 +47,7 @@ use netherwick_models::{
 };
 use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
-    EyePrediction, Now, ReignSense, SafetySense,
+    ExtensionSense, EyePrediction, Now, ReignSense, SafetySense,
 };
 use netherwick_sensors::{NowBuilder, SenseProducer, World, WorldSnapshot};
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
@@ -1612,6 +1612,64 @@ where
         let mut experiences = derive_direct_experiences(&impressions, &sensations, now.t_ms);
         let mut teachings = Vec::new();
         let mut notes = Vec::new();
+        if let Some(stuck_values) = now
+            .extensions
+            .get("sim.stuck")
+            .and_then(|value| value.get("values"))
+            .and_then(|value| value.as_array())
+        {
+            let active = stuck_values
+                .first()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+                > 0.0;
+            let corner = stuck_values
+                .get(1)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+                > 0.0;
+            let duration_ms = stuck_values
+                .get(3)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            let phase = stuck_values
+                .get(4)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            let started = stuck_values
+                .get(6)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+                > 0.0;
+            let recovered = stuck_values
+                .get(7)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+                > 0.0;
+            let dead_battery = stuck_values
+                .get(8)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+                > 0.0;
+            if dead_battery {
+                notes.push(
+                    "VirtualDeadBattery: battery reached 0%; virtual motion stopped".to_string(),
+                );
+            }
+            if started {
+                notes.push("StuckDetected: classified as stuck/corner-trap".to_string());
+            }
+            if active {
+                notes.push(format!(
+                    "StuckRecovery: class={}, phase={}, duration_ms={duration_ms:.0}",
+                    if corner { "corner-trap" } else { "stuck" },
+                    stuck_phase_label(phase),
+                ));
+            }
+            if recovered {
+                notes.push("StuckRecovery: recovered and resumed exploration".to_string());
+            }
+        }
         if now
             .extensions
             .get("safety/read_only_veto")
@@ -2084,6 +2142,15 @@ fn charge_prediction(output: ChargeOutput) -> ChargePrediction {
     }
 }
 
+fn stuck_phase_label(code: f64) -> &'static str {
+    match code.round() as i32 {
+        1 => "stop",
+        2 => "reverse",
+        3 => "turn-away",
+        _ => "none",
+    }
+}
+
 fn action_value_prediction(
     action: ActionPrimitive,
     output: ActionValueOutput,
@@ -2274,6 +2341,293 @@ pub struct SimRunner<R> {
     pub motors: SimMotorComplex,
     pub tick_count: usize,
     pub tick_ms: u64,
+    stuck: StuckRecoveryController,
+}
+
+const STUCK_LOW_DISPLACEMENT_TICKS: usize = 6;
+const STUCK_WINDOW_DISPLACEMENT_EPSILON_M: f32 = 0.015;
+const NEAR_ARENA_WALL_M: f32 = 0.32;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RecoveryPhase {
+    #[default]
+    None,
+    Stop,
+    Reverse,
+    Turn,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StuckStatus {
+    active: bool,
+    corner_trap: bool,
+    stuck_ticks: usize,
+    duration_ticks: usize,
+    phase: RecoveryPhase,
+    turn_sign: f32,
+    event_started: bool,
+    recovered: bool,
+    dead_battery: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StuckRecoveryController {
+    last_position: Option<(f32, f32)>,
+    displacement_window: VecDeque<f32>,
+    commanded_window: VecDeque<bool>,
+    stuck_ticks: usize,
+    active: bool,
+    corner_trap: bool,
+    duration_ticks: usize,
+    phase: RecoveryPhase,
+    phase_ticks_remaining: usize,
+    turn_sign: f32,
+    event_started: bool,
+    recovered: bool,
+    dead_battery: bool,
+}
+
+impl StuckRecoveryController {
+    fn annotate_snapshot(&mut self, snapshot: &mut WorldSnapshot, tick_ms: u64) {
+        self.dead_battery = is_dead_battery(snapshot);
+        snapshot
+            .extensions
+            .retain(|extension| extension.name != "sim.stuck");
+        snapshot.extensions.push(self.extension(tick_ms));
+        self.event_started = false;
+        self.recovered = false;
+    }
+
+    fn observe(&mut self, snapshot: &WorldSnapshot, action: Option<&ActionPrimitive>) {
+        let position = (snapshot.body.odometry.x_m, snapshot.body.odometry.y_m);
+        let step_distance = self
+            .last_position
+            .map(|last| distance_between_points(last, position))
+            .unwrap_or(f32::INFINITY);
+        let commanded_motion = action_is_commanded_motion(action);
+        self.dead_battery = is_dead_battery(snapshot);
+        self.push_motion_sample(step_distance, commanded_motion);
+        let low_displacement = self.rolling_low_displacement() && !snapshot.body.charging;
+        self.stuck_ticks = if low_displacement {
+            self.stuck_ticks
+                .saturating_add(1)
+                .max(STUCK_LOW_DISPLACEMENT_TICKS)
+        } else {
+            0
+        };
+
+        let corner_trap = classify_corner_trap(snapshot);
+        if !self.active
+            && commanded_motion
+            && self.stuck_ticks >= STUCK_LOW_DISPLACEMENT_TICKS
+            && corner_trap
+            && !self.dead_battery
+        {
+            self.active = true;
+            self.corner_trap = true;
+            self.duration_ticks = 0;
+            self.phase = RecoveryPhase::Stop;
+            self.phase_ticks_remaining = 1;
+            self.turn_sign = turn_away_sign(snapshot);
+            self.event_started = true;
+        }
+
+        self.last_position = Some(position);
+    }
+
+    fn recovery_motion(&mut self) -> Option<MotionCommand> {
+        if !self.active {
+            return None;
+        }
+        self.duration_ticks = self.duration_ticks.saturating_add(1);
+        let motion = match self.phase {
+            RecoveryPhase::Stop => MotionCommand::Stop,
+            RecoveryPhase::Reverse => MotionCommand::Forward { speed_m_s: -0.18 },
+            RecoveryPhase::Turn => MotionCommand::Turn {
+                turn_rad_s: self.turn_sign * 0.8,
+            },
+            RecoveryPhase::None => return None,
+        };
+        self.advance_phase();
+        Some(motion)
+    }
+
+    fn advance_phase(&mut self) {
+        self.phase_ticks_remaining = self.phase_ticks_remaining.saturating_sub(1);
+        if self.phase_ticks_remaining > 0 {
+            return;
+        }
+        match self.phase {
+            RecoveryPhase::Stop => {
+                self.phase = RecoveryPhase::Reverse;
+                self.phase_ticks_remaining = 4;
+            }
+            RecoveryPhase::Reverse => {
+                self.phase = RecoveryPhase::Turn;
+                self.phase_ticks_remaining = 8;
+            }
+            RecoveryPhase::Turn | RecoveryPhase::None => {
+                self.active = false;
+                self.corner_trap = false;
+                self.stuck_ticks = 0;
+                self.duration_ticks = 0;
+                self.phase = RecoveryPhase::None;
+                self.phase_ticks_remaining = 0;
+                self.recovered = true;
+                self.displacement_window.clear();
+                self.commanded_window.clear();
+            }
+        }
+    }
+
+    fn push_motion_sample(&mut self, step_distance: f32, commanded_motion: bool) {
+        if step_distance.is_finite() {
+            self.displacement_window.push_back(step_distance.max(0.0));
+            self.commanded_window.push_back(commanded_motion);
+        }
+        while self.displacement_window.len() > STUCK_LOW_DISPLACEMENT_TICKS {
+            self.displacement_window.pop_front();
+        }
+        while self.commanded_window.len() > STUCK_LOW_DISPLACEMENT_TICKS {
+            self.commanded_window.pop_front();
+        }
+    }
+
+    fn rolling_low_displacement(&self) -> bool {
+        self.displacement_window.len() >= STUCK_LOW_DISPLACEMENT_TICKS
+            && self.commanded_window.len() >= STUCK_LOW_DISPLACEMENT_TICKS
+            && self.commanded_window.iter().all(|commanded| *commanded)
+            && self.displacement_window.iter().sum::<f32>() < STUCK_WINDOW_DISPLACEMENT_EPSILON_M
+    }
+
+    fn extension(&self, tick_ms: u64) -> ExtensionSense {
+        let status = self.status();
+        ExtensionSense {
+            schema_version: 1,
+            name: "sim.stuck".to_string(),
+            values: vec![
+                status.active as u8 as f32,
+                status.corner_trap as u8 as f32,
+                status.stuck_ticks as f32,
+                (status.duration_ticks as u64).saturating_mul(tick_ms) as f32,
+                recovery_phase_code(status.phase),
+                status.turn_sign,
+                status.event_started as u8 as f32,
+                status.recovered as u8 as f32,
+                status.dead_battery as u8 as f32,
+            ],
+        }
+    }
+
+    fn status(&self) -> StuckStatus {
+        StuckStatus {
+            active: self.active,
+            corner_trap: self.corner_trap,
+            stuck_ticks: self.stuck_ticks,
+            duration_ticks: self.duration_ticks,
+            phase: self.phase,
+            turn_sign: self.turn_sign,
+            event_started: self.event_started,
+            recovered: self.recovered,
+            dead_battery: self.dead_battery,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn recovery_phase_code(phase: RecoveryPhase) -> f32 {
+    match phase {
+        RecoveryPhase::None => 0.0,
+        RecoveryPhase::Stop => 1.0,
+        RecoveryPhase::Reverse => 2.0,
+        RecoveryPhase::Turn => 3.0,
+    }
+}
+
+fn action_is_commanded_motion(action: Option<&ActionPrimitive>) -> bool {
+    let motor = action_to_motor_command(action);
+    motor.forward.abs() > 0.05 || motor.turn.abs() > 0.05
+}
+
+fn classify_corner_trap(snapshot: &WorldSnapshot) -> bool {
+    let body = &snapshot.body;
+    let collision = body.flags.wall
+        || body.flags.bump_left
+        || body.flags.bump_right
+        || body.flags.cliff_front_left
+        || body.flags.cliff_front_right;
+    let near = snapshot.range.nearest_m.unwrap_or(10.0) < NEAR_ARENA_WALL_M;
+    let near_arena_wall = arena_bounds(snapshot)
+        .map(|(width_m, height_m)| {
+            snapshot.body.odometry.x_m < NEAR_ARENA_WALL_M
+                || snapshot.body.odometry.y_m < NEAR_ARENA_WALL_M
+                || width_m - snapshot.body.odometry.x_m < NEAR_ARENA_WALL_M
+                || height_m - snapshot.body.odometry.y_m < NEAR_ARENA_WALL_M
+        })
+        .unwrap_or(false);
+    let beams = &snapshot.range.beams;
+    let constrained = if beams.len() >= 3 {
+        let left = beams[..beams.len() / 2].iter().copied().fold(1.0, f32::min);
+        let right = beams[beams.len().div_ceil(2)..]
+            .iter()
+            .copied()
+            .fold(1.0, f32::min);
+        left < 0.12 && right < 0.12
+    } else {
+        false
+    };
+    collision || near || near_arena_wall || constrained
+}
+
+fn turn_away_sign(snapshot: &WorldSnapshot) -> f32 {
+    let beams = &snapshot.range.beams;
+    if beams.len() < 2 {
+        return 1.0;
+    }
+    let left = beams[..beams.len() / 2].iter().copied().fold(1.0, f32::min);
+    let right = beams[beams.len().div_ceil(2)..]
+        .iter()
+        .copied()
+        .fold(1.0, f32::min);
+    if left <= right {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+fn arena_bounds(snapshot: &WorldSnapshot) -> Option<(f32, f32)> {
+    let world = snapshot
+        .extensions
+        .iter()
+        .find(|extension| extension.name == "sim.world")?;
+    let width_m = world.values.first().copied()?;
+    let height_m = world.values.get(1).copied()?;
+    (width_m > 0.0 && height_m > 0.0).then_some((width_m, height_m))
+}
+
+fn is_dead_battery(snapshot: &WorldSnapshot) -> bool {
+    snapshot.body.battery_level <= f32::EPSILON && !snapshot.body.charging
+}
+
+fn sim_stuck_started(snapshot: &WorldSnapshot) -> bool {
+    snapshot
+        .extensions
+        .iter()
+        .find(|extension| extension.name == "sim.stuck")
+        .and_then(|extension| extension.values.get(6))
+        .copied()
+        .unwrap_or(0.0)
+        > 0.0
+}
+
+fn distance_between_points(left: (f32, f32), right: (f32, f32)) -> f32 {
+    let dx = left.0 - right.0;
+    let dy = left.1 - right.1;
+    (dx * dx + dy * dy).sqrt()
 }
 
 impl<R> SimRunner<R>
@@ -2287,6 +2641,7 @@ where
             motors,
             tick_count: 0,
             tick_ms: 100,
+            stuck: StuckRecoveryController::default(),
         }
     }
 
@@ -2307,15 +2662,26 @@ where
         F: FnMut(&WorldSnapshot, &RuntimeTick),
     {
         for _ in 0..steps {
-            let snapshot = self.world.snapshot().await?;
+            let mut snapshot = self.world.snapshot().await?;
+            self.stuck.annotate_snapshot(&mut snapshot, self.tick_ms);
+            let reset_after_tick = sim_stuck_started(&snapshot);
             let now = snapshot.to_now(snapshot.body.last_update_ms);
             let tick = self
                 .runtime
                 .tick(now, ExperienceLatent::default(), Vec::new())
                 .await?;
             observe(&snapshot, &tick);
-            let motion = action_to_motion(tick.chosen_action.as_ref());
-            self.motors.send(motion).await?;
+            self.stuck.observe(&snapshot, tick.chosen_action.as_ref());
+            if is_dead_battery(&snapshot) || reset_after_tick {
+                self.world.reset_body_to_spawn();
+                self.stuck.reset();
+            } else {
+                let motion = self
+                    .stuck
+                    .recovery_motion()
+                    .unwrap_or_else(|| action_to_motion(tick.chosen_action.as_ref()));
+                self.motors.send(motion).await?;
+            };
             self.tick_count = self.tick_count.saturating_add(1);
         }
         Ok(())
@@ -3700,6 +4066,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sim_runner_resets_dead_uncharging_battery_and_records_critique() {
+        let root = test_ledger_root("sim-runner-dead-battery-reset");
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(
+            ledger.clone(),
+            FixedConductor::new(ActionPrimitive::Go {
+                intensity: 0.4,
+                duration_ms: 1_000,
+            }),
+        );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.0, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let snapshot = runner.world.snapshot().await.unwrap();
+        let frames = ledger.recent(5).await.unwrap();
+        let frame = frames.last().unwrap();
+
+        assert_eq!(snapshot.body.battery_level, 1.0);
+        assert!(!snapshot.body.charging);
+        assert_eq!(snapshot.body.odometry.x_m, 2.0);
+        assert_eq!(snapshot.body.odometry.y_m, 2.0);
+        assert!(frame.llm_teaching.iter().any(|teaching| teaching
+            .critique
+            .as_deref()
+            .is_some_and(|critique| { critique.contains("Dead battery away from the charger") })));
+        assert!(frame
+            .notes
+            .iter()
+            .any(|note| note.contains("VirtualDeadBattery")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sim_runner_resets_stuck_body_and_records_critique() {
+        let root = test_ledger_root("sim-runner-stuck-reset");
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(
+            ledger.clone(),
+            FixedConductor::new(ActionPrimitive::Go {
+                intensity: 0.4,
+                duration_ms: 1_000,
+            }),
+        );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let mut body = test_body(0.2, 0.2, 1.0, 7);
+        body.odometry.heading_rad = std::f32::consts::PI;
+        world.set_body(body);
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner
+            .run_steps(STUCK_LOW_DISPLACEMENT_TICKS + 2)
+            .await
+            .unwrap();
+        let snapshot = runner.world.snapshot().await.unwrap();
+        let frames = ledger.recent(10).await.unwrap();
+        let frame = frames.last().unwrap();
+
+        assert_eq!(snapshot.body.battery_level, 1.0);
+        assert_eq!(snapshot.body.odometry.x_m, 2.0);
+        assert_eq!(snapshot.body.odometry.y_m, 2.0);
+        assert!(frame.llm_teaching.iter().any(|teaching| teaching
+            .critique
+            .as_deref()
+            .is_some_and(|critique| critique.contains("Getting corner trap ends the run"))));
+        assert!(frame.notes.iter().any(|note| note.contains("VirtualStuck")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn sim_with_danger_checkpoint_writes_shadow_predictions() {
         let root = test_ledger_root("sim-runner-danger-shadow");
         let checkpoint = danger_checkpoint_root("sim-runner-danger-shadow");
@@ -4128,6 +4567,94 @@ mod tests {
         body.battery_level = battery_level;
         body.last_update_ms = last_update_ms;
         body
+    }
+
+    fn stuck_test_snapshot(x_m: f32, y_m: f32, battery_level: f32) -> WorldSnapshot {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body = test_body(x_m, y_m, battery_level, 100);
+        snapshot.range.nearest_m = Some(0.12);
+        snapshot.range.beams = vec![0.05, 0.08, 0.10, 0.09, 0.05];
+        snapshot.extensions.push(ExtensionSense {
+            schema_version: 1,
+            name: "sim.world".to_string(),
+            values: vec![4.0, 4.0, 0.0],
+        });
+        snapshot
+    }
+
+    #[test]
+    fn stuck_detector_uses_rolling_low_displacement_window() {
+        let mut detector = StuckRecoveryController::default();
+        let action = ActionPrimitive::Explore {
+            style: ExploreStyle::RandomWalk,
+            duration_ms: 1_000,
+        };
+
+        for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
+            detector.observe(&stuck_test_snapshot(0.2, 0.2, 1.0), Some(&action));
+        }
+
+        let status = detector.status();
+        assert!(status.active);
+        assert!(status.corner_trap);
+        assert_eq!(status.stuck_ticks, STUCK_LOW_DISPLACEMENT_TICKS);
+        assert!(status.event_started);
+    }
+
+    #[test]
+    fn dead_battery_state_is_reported_without_starting_recovery() {
+        let mut detector = StuckRecoveryController::default();
+        let action = ActionPrimitive::Explore {
+            style: ExploreStyle::RandomWalk,
+            duration_ms: 1_000,
+        };
+
+        for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
+            detector.observe(&stuck_test_snapshot(0.2, 0.2, 0.0), Some(&action));
+        }
+        let mut snapshot = stuck_test_snapshot(0.2, 0.2, 0.0);
+        detector.annotate_snapshot(&mut snapshot, 100);
+
+        let status = detector.status();
+        assert!(status.dead_battery);
+        assert!(!status.active);
+        let values = &snapshot
+            .extensions
+            .iter()
+            .find(|extension| extension.name == "sim.stuck")
+            .unwrap()
+            .values;
+        assert_eq!(values.get(8).copied(), Some(1.0));
+    }
+
+    #[test]
+    fn recovery_transition_runs_stop_reverse_turn_then_releases() {
+        let mut detector = StuckRecoveryController::default();
+        detector.active = true;
+        detector.corner_trap = true;
+        detector.phase = RecoveryPhase::Stop;
+        detector.phase_ticks_remaining = 1;
+        detector.turn_sign = -1.0;
+
+        assert_eq!(detector.recovery_motion(), Some(MotionCommand::Stop));
+        assert_eq!(detector.phase, RecoveryPhase::Reverse);
+        for _ in 0..4 {
+            assert_eq!(
+                detector.recovery_motion(),
+                Some(MotionCommand::Forward { speed_m_s: -0.18 })
+            );
+        }
+        assert_eq!(detector.phase, RecoveryPhase::Turn);
+        for _ in 0..8 {
+            assert_eq!(
+                detector.recovery_motion(),
+                Some(MotionCommand::Turn { turn_rad_s: -0.8 })
+            );
+        }
+
+        assert!(!detector.status().active);
+        assert!(detector.status().recovered);
+        assert_eq!(detector.recovery_motion(), None);
     }
 
     fn test_ledger_root(name: &str) -> PathBuf {

@@ -27,6 +27,11 @@ const RANGE_FOV_RAD: f32 = std::f32::consts::PI;
 const RANGE_MAX_M: f32 = 4.0;
 const VISIBLE_FOV_RAD: f32 = std::f32::consts::FRAC_PI_2;
 const VISIBLE_MAX_M: f32 = 4.0;
+const EYE_WIDTH: usize = 160;
+const EYE_HEIGHT: usize = 90;
+const EYE_HORIZONTAL_FOV_RAD: f32 = 70.0_f32.to_radians();
+const EYE_CAMERA_HEIGHT_M: f32 = 0.25;
+const EYE_NEAR_PLANE_M: f32 = 0.05;
 
 #[derive(Debug)]
 pub struct SimBody {
@@ -225,6 +230,18 @@ impl VirtualWorld {
             .clone()
     }
 
+    pub fn reset_body_to_spawn(&mut self) -> BodySense {
+        let mut guard = self.state.lock().expect("virtual world mutex poisoned");
+        let previous_update_ms = guard.snapshot.body.last_update_ms;
+        let mut body = BodySense::default();
+        body.last_update_ms = previous_update_ms.saturating_add(100);
+        body.odometry.x_m = guard.arena.width_m * 0.5;
+        body.odometry.y_m = guard.arena.height_m * 0.5;
+        guard.snapshot.body = body.clone();
+        Self::project_snapshot(&mut guard);
+        body
+    }
+
     pub fn objects(&self) -> Vec<SimObject> {
         self.state
             .lock()
@@ -386,6 +403,485 @@ impl RobotBody for SimMotorComplex {
 }
 
 fn project_eye_frame(body: &BodySense, objects: &[SimObject], arena: ArenaConfig) -> EyeFrame {
+    let width = EYE_WIDTH;
+    let height = EYE_HEIGHT;
+    let mut bytes = vec![0u8; width * height * 3];
+    let mut depth = vec![f32::INFINITY; width * height];
+    let focal_x = width as f32 * 0.5 / (EYE_HORIZONTAL_FOV_RAD * 0.5).tan();
+    let focal_y = focal_x;
+
+    draw_eye_background(&mut bytes, width, height);
+    draw_eye_walls(
+        &mut bytes, &mut depth, width, height, focal_x, focal_y, body, arena,
+    );
+
+    let heading = body.odometry.heading_rad;
+    let mut visible = objects
+        .iter()
+        .filter_map(|object| {
+            let dx = object.x_m - body.odometry.x_m;
+            let dy = object.y_m - body.odometry.y_m;
+            let forward = dx * heading.cos() + dy * heading.sin();
+            let lateral = -dx * heading.sin() + dy * heading.cos();
+            (forward > EYE_NEAR_PLANE_M).then_some((object, forward, lateral))
+        })
+        .filter(|(object, forward, lateral)| {
+            let angular_half_width = (object.radius_m / *forward).atan();
+            let angle = lateral.atan2(*forward);
+            angle.abs() - angular_half_width <= EYE_HORIZONTAL_FOV_RAD * 0.5
+        })
+        .collect::<Vec<_>>();
+    visible.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for (object, forward, lateral) in visible {
+        draw_projected_object(
+            &mut bytes, &mut depth, width, height, focal_x, focal_y, object, forward, lateral,
+        );
+    }
+
+    draw_reticle(&mut bytes, width, height);
+
+    EyeFrame {
+        captured_at_ms: body.last_update_ms,
+        width: width as u32,
+        height: height as u32,
+        format: EyeFrameFormat::Rgb8,
+        bytes,
+    }
+}
+
+fn draw_eye_background(bytes: &mut [u8], width: usize, height: usize) {
+    let horizon = (height as f32 * 0.48) as usize;
+    for y in 0..height {
+        let color = if y < horizon {
+            let t = y as f32 / horizon.max(1) as f32;
+            lerp_color([33, 45, 58], [72, 84, 94], t)
+        } else {
+            let t = (y - horizon) as f32 / (height - horizon).max(1) as f32;
+            lerp_color([69, 72, 70], [39, 43, 42], t)
+        };
+        for x in 0..width {
+            set_pixel(bytes, width, x, y, color);
+        }
+    }
+    for x in 0..width {
+        set_pixel(bytes, width, x, horizon.min(height - 1), [106, 111, 112]);
+    }
+}
+
+fn draw_eye_walls(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    focal_x: f32,
+    focal_y: f32,
+    body: &BodySense,
+    arena: ArenaConfig,
+) {
+    let samples = ((arena.width_m.max(arena.height_m) / 0.08).ceil() as usize).max(16);
+    for index in 0..=samples {
+        let t = index as f32 / samples as f32;
+        let x = arena.width_m * t;
+        draw_wall_sample(bytes, depth, width, height, focal_x, focal_y, body, x, 0.0);
+        draw_wall_sample(
+            bytes,
+            depth,
+            width,
+            height,
+            focal_x,
+            focal_y,
+            body,
+            x,
+            arena.height_m,
+        );
+        let y = arena.height_m * t;
+        draw_wall_sample(bytes, depth, width, height, focal_x, focal_y, body, 0.0, y);
+        draw_wall_sample(
+            bytes,
+            depth,
+            width,
+            height,
+            focal_x,
+            focal_y,
+            body,
+            arena.width_m,
+            y,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_wall_sample(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    focal_x: f32,
+    focal_y: f32,
+    body: &BodySense,
+    world_x: f32,
+    world_y: f32,
+) {
+    let Some((screen_x, floor_y, forward)) =
+        project_world_point(body, world_x, world_y, 0.0, width, height, focal_x, focal_y)
+    else {
+        return;
+    };
+    let Some((_, top_y, _)) = project_world_point(
+        body, world_x, world_y, 0.65, width, height, focal_x, focal_y,
+    ) else {
+        return;
+    };
+    if screen_x < -2.0 || screen_x > width as f32 + 2.0 {
+        return;
+    }
+    let x = screen_x.round() as i32;
+    let y0 = top_y.round().min(floor_y.round()) as i32;
+    let y1 = top_y.round().max(floor_y.round()) as i32;
+    let shade = (165.0 - forward * 18.0).clamp(72.0, 150.0) as u8;
+    for dx in -1..=1 {
+        draw_depth_line(
+            bytes,
+            depth,
+            width,
+            height,
+            x + dx,
+            y0,
+            x + dx,
+            y1,
+            forward,
+            [shade, shade.saturating_add(6), shade.saturating_add(10)],
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_projected_object(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    focal_x: f32,
+    focal_y: f32,
+    object: &SimObject,
+    forward: f32,
+    lateral: f32,
+) {
+    let center_x = focal_x * lateral / forward + width as f32 * 0.5;
+    let bottom_y = height as f32 * 0.5 + focal_y * EYE_CAMERA_HEIGHT_M / forward;
+    let visual_height = object_visual_height(object);
+    let top_y = height as f32 * 0.5 - focal_y * (visual_height - EYE_CAMERA_HEIGHT_M) / forward;
+    let half_width = (focal_x * object.radius_m / forward).max(1.5);
+    let min_x = (center_x - half_width).floor().max(0.0) as i32;
+    let max_x = (center_x + half_width).ceil().min(width as f32 - 1.0) as i32;
+    let min_y = top_y.floor().max(0.0) as i32;
+    let max_y = bottom_y.ceil().min(height as f32 - 1.0) as i32;
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+    let color = shade_object_color(object.color_rgb, forward);
+    match object.kind {
+        SimObjectKind::Charger => {
+            let pad_top = (bottom_y - (bottom_y - top_y).abs().max(3.0)).max(0.0) as i32;
+            draw_depth_ellipse(
+                bytes,
+                depth,
+                width,
+                height,
+                center_x,
+                (pad_top as f32 + bottom_y) * 0.5,
+                half_width * 1.35,
+                ((bottom_y - pad_top as f32) * 0.5).max(2.0),
+                forward,
+                color,
+            );
+        }
+        SimObjectKind::Person { .. } => draw_depth_capsule(
+            bytes, depth, width, height, min_x, max_x, min_y, max_y, forward, color,
+        ),
+        SimObjectKind::SoundSource { .. } => draw_depth_triangle(
+            bytes, depth, width, height, center_x, min_y, max_y, half_width, forward, color,
+        ),
+        SimObjectKind::Obstacle | SimObjectKind::Landmark { .. } => draw_depth_ellipse(
+            bytes,
+            depth,
+            width,
+            height,
+            center_x,
+            (top_y + bottom_y) * 0.5,
+            half_width,
+            ((bottom_y - top_y) * 0.5).max(2.0),
+            forward,
+            color,
+        ),
+    }
+}
+
+fn object_visual_height(object: &SimObject) -> f32 {
+    match object.kind {
+        SimObjectKind::Obstacle => 0.45,
+        SimObjectKind::Charger => 0.08,
+        SimObjectKind::Person { .. } => 1.2,
+        SimObjectKind::SoundSource { .. } => 0.35,
+        SimObjectKind::Landmark { .. } => 0.6,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_world_point(
+    body: &BodySense,
+    world_x: f32,
+    world_y: f32,
+    world_z: f32,
+    width: usize,
+    height: usize,
+    focal_x: f32,
+    focal_y: f32,
+) -> Option<(f32, f32, f32)> {
+    let heading = body.odometry.heading_rad;
+    let dx = world_x - body.odometry.x_m;
+    let dy = world_y - body.odometry.y_m;
+    let forward = dx * heading.cos() + dy * heading.sin();
+    if forward <= EYE_NEAR_PLANE_M {
+        return None;
+    }
+    let lateral = -dx * heading.sin() + dy * heading.cos();
+    Some((
+        focal_x * lateral / forward + width as f32 * 0.5,
+        height as f32 * 0.5 - focal_y * (world_z - EYE_CAMERA_HEIGHT_M) / forward,
+        forward,
+    ))
+}
+
+fn shade_object_color(color: [u8; 3], forward: f32) -> [u8; 3] {
+    let light = (1.0 - forward / 8.0).clamp(0.45, 1.0);
+    [
+        (color[0] as f32 * light) as u8,
+        (color[1] as f32 * light) as u8,
+        (color[2] as f32 * light) as u8,
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_depth_capsule(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+    z: f32,
+    color: [u8; 3],
+) {
+    let radius = ((max_x - min_x) as f32 * 0.5).max(1.0);
+    let center_x = (min_x + max_x) as f32 * 0.5;
+    let cap_center_y = min_y as f32 + radius;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 - center_x;
+            let inside = if y as f32 <= cap_center_y {
+                let dy = y as f32 - cap_center_y;
+                dx * dx + dy * dy <= radius * radius
+            } else {
+                dx.abs() <= radius
+            };
+            if inside {
+                put_depth_pixel(bytes, depth, width, height, x, y, z, color);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_depth_ellipse(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    center_x: f32,
+    center_y: f32,
+    radius_x: f32,
+    radius_y: f32,
+    z: f32,
+    color: [u8; 3],
+) {
+    let min_x = (center_x - radius_x).floor().max(0.0) as i32;
+    let max_x = (center_x + radius_x).ceil().min(width as f32 - 1.0) as i32;
+    let min_y = (center_y - radius_y).floor().max(0.0) as i32;
+    let max_y = (center_y + radius_y).ceil().min(height as f32 - 1.0) as i32;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = (x as f32 - center_x) / radius_x.max(1.0);
+            let dy = (y as f32 - center_y) / radius_y.max(1.0);
+            if dx * dx + dy * dy <= 1.0 {
+                put_depth_pixel(bytes, depth, width, height, x, y, z, color);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_depth_triangle(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    center_x: f32,
+    min_y: i32,
+    max_y: i32,
+    half_width: f32,
+    z: f32,
+    color: [u8; 3],
+) {
+    let span_y = (max_y - min_y).max(1) as f32;
+    for y in min_y..=max_y {
+        let t = (y - min_y) as f32 / span_y;
+        let row_half_width = half_width * (0.25 + t * 0.9);
+        for x in
+            (center_x - row_half_width).floor() as i32..=(center_x + row_half_width).ceil() as i32
+        {
+            put_depth_pixel(bytes, depth, width, height, x, y, z, color);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_depth_line(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    z: f32,
+    color: [u8; 3],
+) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut x = x0;
+    let mut y = y0;
+    loop {
+        put_depth_pixel(bytes, depth, width, height, x, y, z, color);
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+fn draw_reticle(bytes: &mut [u8], width: usize, height: usize) {
+    let center_x = width as i32 / 2;
+    let center_y = height as i32 / 2;
+    for offset in -4i32..=4 {
+        if offset.abs() > 1 {
+            put_pixel_i32(
+                bytes,
+                width,
+                height,
+                center_x + offset,
+                center_y,
+                [220, 226, 214],
+            );
+            put_pixel_i32(
+                bytes,
+                width,
+                height,
+                center_x,
+                center_y + offset,
+                [220, 226, 214],
+            );
+        }
+    }
+}
+
+fn put_depth_pixel(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    z: f32,
+    color: [u8; 3],
+) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let index = y as usize * width + x as usize;
+    if z <= depth[index] {
+        depth[index] = z;
+        bytes[index * 3..index * 3 + 3].copy_from_slice(&color);
+    }
+}
+
+fn put_pixel_i32(bytes: &mut [u8], width: usize, height: usize, x: i32, y: i32, color: [u8; 3]) {
+    if x >= 0 && y >= 0 && x < width as i32 && y < height as i32 {
+        set_pixel(bytes, width, x as usize, y as usize, color);
+    }
+}
+
+fn set_pixel(bytes: &mut [u8], width: usize, x: usize, y: usize, color: [u8; 3]) {
+    let index = (y * width + x) * 3;
+    bytes[index..index + 3].copy_from_slice(&color);
+}
+
+fn lerp_color(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    [
+        (a[0] as f32 + (b[0] as f32 - a[0] as f32) * t) as u8,
+        (a[1] as f32 + (b[1] as f32 - a[1] as f32) * t) as u8,
+        (a[2] as f32 + (b[2] as f32 - a[2] as f32) * t) as u8,
+    ]
+}
+
+fn draw_disc(
+    bytes: &mut [u8],
+    width: usize,
+    height: usize,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+    color: [u8; 3],
+) {
+    for y in (center_y - radius).max(0)..=(center_y + radius).min(height as i32 - 1) {
+        for x in (center_x - radius).max(0)..=(center_x + radius).min(width as i32 - 1) {
+            let dx = x - center_x;
+            let dy = y - center_y;
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let index = ((y as usize * width) + x as usize) * 3;
+            bytes[index..index + 3].copy_from_slice(&color);
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn project_symbolic_eye_frame(
+    body: &BodySense,
+    objects: &[SimObject],
+    arena: ArenaConfig,
+) -> EyeFrame {
     let width = 64usize;
     let height = 48usize;
     let mut bytes = vec![20u8; width * height * 3];
@@ -417,28 +913,6 @@ fn project_eye_frame(body: &BodySense, objects: &[SimObject], arena: ArenaConfig
         height: height as u32,
         format: EyeFrameFormat::Rgb8,
         bytes,
-    }
-}
-
-fn draw_disc(
-    bytes: &mut [u8],
-    width: usize,
-    height: usize,
-    center_x: i32,
-    center_y: i32,
-    radius: i32,
-    color: [u8; 3],
-) {
-    for y in (center_y - radius).max(0)..=(center_y + radius).min(height as i32 - 1) {
-        for x in (center_x - radius).max(0)..=(center_x + radius).min(width as i32 - 1) {
-            let dx = x - center_x;
-            let dy = y - center_y;
-            if dx * dx + dy * dy > radius * radius {
-                continue;
-            }
-            let index = ((y as usize * width) + x as usize) * 3;
-            bytes[index..index + 3].copy_from_slice(&color);
-        }
     }
 }
 
@@ -918,6 +1392,58 @@ mod tests {
         }
     }
 
+    fn centered_body() -> BodySense {
+        let mut body = BodySense::default();
+        body.odometry.x_m = 2.0;
+        body.odometry.y_m = 2.0;
+        body.odometry.heading_rad = 0.0;
+        body.last_update_ms = 42;
+        body
+    }
+
+    fn changed_pixels(left: &EyeFrame, right: &EyeFrame) -> usize {
+        left.bytes
+            .chunks_exact(3)
+            .zip(right.bytes.chunks_exact(3))
+            .filter(|(a, b)| a != b)
+            .count()
+    }
+
+    fn color_like_pixels(frame: &EyeFrame, color: [u8; 3]) -> usize {
+        frame
+            .bytes
+            .chunks_exact(3)
+            .filter(|pixel| {
+                pixel[0].abs_diff(color[0]) < 45
+                    && pixel[1].abs_diff(color[1]) < 45
+                    && pixel[2].abs_diff(color[2]) < 45
+            })
+            .count()
+    }
+
+    fn colored_bbox(frame: &EyeFrame, color: [u8; 3]) -> Option<(usize, usize, usize, usize)> {
+        let mut min_x = frame.width as usize;
+        let mut min_y = frame.height as usize;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        let mut found = false;
+        for (index, pixel) in frame.bytes.chunks_exact(3).enumerate() {
+            if pixel[0].abs_diff(color[0]) < 45
+                && pixel[1].abs_diff(color[1]) < 45
+                && pixel[2].abs_diff(color[2]) < 45
+            {
+                let x = index % frame.width as usize;
+                let y = index / frame.width as usize;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                found = true;
+            }
+        }
+        found.then_some((min_x, min_y, max_x, max_y))
+    }
+
     #[tokio::test]
     async fn robot_cannot_pass_through_walls_and_sets_bump() {
         let (_world, mut motor) = VirtualWorld::new_with_motor(0, arena());
@@ -1004,6 +1530,116 @@ mod tests {
 
         assert!(beams[2] < beams[0]);
         assert!(beams[2] < beams[4]);
+    }
+
+    #[test]
+    fn eye_frame_has_camera_dimensions_and_rgb8_format() {
+        let frame = project_eye_frame(&centered_body(), &[], arena());
+
+        assert_eq!(frame.width, EYE_WIDTH as u32);
+        assert_eq!(frame.height, EYE_HEIGHT as u32);
+        assert_eq!(frame.format, EyeFrameFormat::Rgb8);
+        assert_eq!(frame.bytes.len(), EYE_WIDTH * EYE_HEIGHT * 3);
+    }
+
+    #[test]
+    fn empty_room_eye_shows_floor_and_horizon() {
+        let frame = project_eye_frame(&centered_body(), &[], arena());
+        let unique = frame
+            .bytes
+            .chunks_exact(3)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect::<std::collections::BTreeSet<_>>();
+        let mean_luma = frame
+            .bytes
+            .chunks_exact(3)
+            .map(|pixel| (pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32) / 3)
+            .sum::<u32>() as f32
+            / (frame.width * frame.height) as f32;
+
+        assert!(unique.len() > 20);
+        assert!(mean_luma > 35.0);
+    }
+
+    #[test]
+    fn object_in_front_changes_eye_pixels() {
+        let body = centered_body();
+        let empty = project_eye_frame(&body, &[], arena());
+        let object = SimObject::obstacle("front", "front", 3.0, 2.0, 0.25);
+        let with_object = project_eye_frame(&body, &[object], arena());
+
+        assert!(changed_pixels(&empty, &with_object) > 100);
+    }
+
+    #[test]
+    fn object_behind_robot_does_not_render() {
+        let body = centered_body();
+        let empty = project_eye_frame(&body, &[], arena());
+        let object = SimObject::obstacle("behind", "behind", 1.0, 2.0, 0.25);
+        let with_object = project_eye_frame(&body, &[object], arena());
+
+        assert_eq!(changed_pixels(&empty, &with_object), 0);
+    }
+
+    #[test]
+    fn object_outside_horizontal_fov_does_not_render() {
+        let body = centered_body();
+        let empty = project_eye_frame(&body, &[], arena());
+        let object = SimObject::obstacle("side", "side", 2.6, 3.8, 0.2);
+        let with_object = project_eye_frame(&body, &[object], arena());
+
+        assert_eq!(changed_pixels(&empty, &with_object), 0);
+    }
+
+    #[test]
+    fn nearer_object_appears_larger_than_farther_object() {
+        let body = centered_body();
+        let near = SimObject::obstacle("near", "near", 2.9, 2.0, 0.25);
+        let far = SimObject::obstacle("far", "far", 3.7, 2.0, 0.25);
+        let near_frame = project_eye_frame(&body, &[near], arena());
+        let far_frame = project_eye_frame(&body, &[far], arena());
+        let near_bbox = colored_bbox(&near_frame, [180, 90, 80]).unwrap();
+        let far_bbox = colored_bbox(&far_frame, [180, 90, 80]).unwrap();
+        let near_area = (near_bbox.2 - near_bbox.0 + 1) * (near_bbox.3 - near_bbox.1 + 1);
+        let far_area = (far_bbox.2 - far_bbox.0 + 1) * (far_bbox.3 - far_bbox.1 + 1);
+
+        assert!(near_area > far_area);
+    }
+
+    #[test]
+    fn charger_person_and_obstacle_colors_render_in_front() {
+        let body = centered_body();
+        let objects = vec![
+            SimObject::charger("dock", "dock", 3.0, 1.4, 0.25),
+            SimObject {
+                id: "person".to_string(),
+                label: "person".to_string(),
+                kind: SimObjectKind::Person { identity: None },
+                x_m: 3.0,
+                y_m: 2.0,
+                radius_m: 0.2,
+                color_rgb: [220, 180, 140],
+                emits_sound: false,
+                charge_rate: 0.0,
+            },
+            SimObject::obstacle("box", "box", 3.0, 2.6, 0.25),
+        ];
+        let frame = project_eye_frame(&body, &objects, arena());
+
+        assert!(color_like_pixels(&frame, [80, 220, 130]) > 8);
+        assert!(color_like_pixels(&frame, [220, 180, 140]) > 20);
+        assert!(color_like_pixels(&frame, [180, 90, 80]) > 20);
+    }
+
+    #[test]
+    fn eye_projection_is_deterministic() {
+        let body = centered_body();
+        let objects = vec![SimObject::obstacle("front", "front", 3.0, 2.0, 0.25)];
+
+        let left = project_eye_frame(&body, &objects, arena());
+        let right = project_eye_frame(&body, &objects, arena());
+
+        assert_eq!(left, right);
     }
 
     #[tokio::test]

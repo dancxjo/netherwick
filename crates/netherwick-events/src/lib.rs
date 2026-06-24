@@ -48,6 +48,8 @@ pub enum EventKind {
     LlmCommanded,
     LlmCritiqued,
     SafetyVetoed,
+    SimDeadBatteryReset,
+    SimStuckReset,
     ReignCommanded,
     ReignExpired,
     ReignCleared,
@@ -102,6 +104,13 @@ pub enum EventPayload {
     SafetyVetoed {
         desired_action: ActionPrimitive,
         reason: String,
+    },
+    SimDeadBatteryReset {
+        battery_level: f32,
+    },
+    SimStuckReset {
+        corner_trap: bool,
+        stuck_ticks: usize,
     },
     ReignCommanded {
         input: ReignInput,
@@ -329,6 +338,53 @@ impl EventExtractor {
                         battery_level: now.body.battery_level,
                     }),
             );
+        }
+
+        if now.body.battery_level <= f32::EPSILON && !now.body.charging {
+            events.push(
+                Event::new(now.t_ms, EventKind::SimDeadBatteryReset)
+                    .with_summary(
+                        "Virtual battery is dead while not charging; simulation reset needed.",
+                    )
+                    .with_payload(EventPayload::SimDeadBatteryReset {
+                        battery_level: now.body.battery_level,
+                    })
+                    .with_provenance(Provenance::direct().with_stage("sim")),
+            );
+        }
+
+        if let Some(stuck_values) = now
+            .extensions
+            .get("sim.stuck")
+            .and_then(|value| value.get("values"))
+            .and_then(|value| value.as_array())
+        {
+            let started = stuck_values
+                .get(6)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+                > 0.0;
+            if started {
+                let corner_trap = stuck_values
+                    .get(1)
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0)
+                    > 0.0;
+                let stuck_ticks = stuck_values
+                    .get(2)
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0)
+                    .max(0.0) as usize;
+                events.push(
+                    Event::new(now.t_ms, EventKind::SimStuckReset)
+                        .with_summary("Virtual body is stuck; simulation reset needed.")
+                        .with_payload(EventPayload::SimStuckReset {
+                            corner_trap,
+                            stuck_ticks,
+                        })
+                        .with_provenance(Provenance::direct().with_stage("sim")),
+                );
+            }
         }
 
         if now.body.charging && previous.map(|prior| !prior.body.charging).unwrap_or(false) {
@@ -762,6 +818,88 @@ pub mod responders {
     }
 
     #[derive(Default)]
+    pub struct SimDeadBatteryResponder;
+
+    impl EventResponder for SimDeadBatteryResponder {
+        fn id(&self) -> &'static str {
+            "sim-dead-battery"
+        }
+
+        fn matches(&self, event: &Event) -> bool {
+            event.kind == EventKind::SimDeadBatteryReset
+        }
+
+        fn respond(&mut self, _ctx: &EventContext, event: &Event) -> Result<Vec<Response>> {
+            Ok(vec![
+                Response::AddMemoryNote(
+                    "VirtualDeadBattery: battery hit 0 while not charging; simulation reset queued."
+                        .to_string(),
+                ),
+                Response::Teach(LlmTeaching {
+                    t_ms: event.t_ms,
+                    summary:
+                        "The virtual body ran out of battery away from charge, so the simulation reset."
+                            .to_string(),
+                    critique: Some(
+                        "Dead battery away from the charger ends the run; seek charge earlier."
+                            .to_string(),
+                    ),
+                    counterfactuals: Vec::new(),
+                    memory_notes: vec![
+                        "When battery is critical and not charging, prioritize docking immediately."
+                            .to_string(),
+                    ],
+                    confidence: 0.95,
+                }),
+            ])
+        }
+    }
+
+    #[derive(Default)]
+    pub struct SimStuckResponder;
+
+    impl EventResponder for SimStuckResponder {
+        fn id(&self) -> &'static str {
+            "sim-stuck"
+        }
+
+        fn matches(&self, event: &Event) -> bool {
+            event.kind == EventKind::SimStuckReset
+        }
+
+        fn respond(&mut self, _ctx: &EventContext, event: &Event) -> Result<Vec<Response>> {
+            let (corner_trap, stuck_ticks) = match &event.payload {
+                EventPayload::SimStuckReset {
+                    corner_trap,
+                    stuck_ticks,
+                } => (*corner_trap, *stuck_ticks),
+                _ => (false, 0),
+            };
+            let class = if corner_trap { "corner trap" } else { "stuck" };
+            Ok(vec![
+                Response::AddMemoryNote(format!(
+                    "VirtualStuck: {class} after {stuck_ticks} low-displacement ticks; simulation reset queued."
+                )),
+                Response::Teach(LlmTeaching {
+                    t_ms: event.t_ms,
+                    summary: format!(
+                        "The virtual body got {class}, so the simulation reset."
+                    ),
+                    critique: Some(format!(
+                        "Getting {class} ends the run; avoid repeated motion into blocked space."
+                    )),
+                    counterfactuals: Vec::new(),
+                    memory_notes: vec![
+                        "When motion produces no displacement near obstacles, back off and choose a new route."
+                            .to_string(),
+                    ],
+                    confidence: 0.95,
+                }),
+            ])
+        }
+    }
+
+    #[derive(Default)]
     pub struct ReignResponder;
 
     impl EventResponder for ReignResponder {
@@ -855,6 +993,8 @@ pub fn default_event_bus() -> EventBus {
     bus.on(responders::MemoryRecalledResponder);
     bus.on(responders::SurpriseHighResponder);
     bus.on(responders::SafetyVetoResponder);
+    bus.on(responders::SimDeadBatteryResponder);
+    bus.on(responders::SimStuckResponder);
     bus.on(responders::FaceRecognizedResponder);
     bus
 }

@@ -10,6 +10,7 @@ pub const ROBOT_SPAWN_CLEARANCE_M: f32 = 0.45;
 pub enum ScenarioKind {
     EmptyRoom,
     ObstacleAvoidance,
+    CornerTrap,
     ChargerSeeking,
     PersonAndSpeaker,
     MixedRoom,
@@ -20,6 +21,7 @@ impl ScenarioKind {
         match self {
             Self::EmptyRoom => "empty-room",
             Self::ObstacleAvoidance => "obstacle-avoidance",
+            Self::CornerTrap => "corner-trap",
             Self::ChargerSeeking => "charger-seeking",
             Self::PersonAndSpeaker => "person-speaker-room",
             Self::MixedRoom => "mixed-room",
@@ -58,6 +60,9 @@ impl ScenarioConfig {
             ScenarioKind::EmptyRoom => {}
             ScenarioKind::ObstacleAvoidance => {
                 config.obstacle_count = 7;
+            }
+            ScenarioKind::CornerTrap => {
+                config.obstacle_count = 3;
             }
             ScenarioKind::ChargerSeeking => {
                 config.charger_count = 2;
@@ -137,6 +142,11 @@ fn spawn_body(config: &ScenarioConfig, rng: &mut StdRng) -> BodySense {
             body.odometry.y_m = config.arena.height_m * 0.5;
             body.odometry.heading_rad = 0.0;
         }
+        ScenarioKind::CornerTrap => {
+            body.odometry.x_m = 0.42;
+            body.odometry.y_m = 0.42;
+            body.odometry.heading_rad = -2.35;
+        }
         ScenarioKind::ChargerSeeking => {
             body.battery_level = 0.18;
             body.odometry.x_m = rng.gen_range(0.8..config.arena.width_m * 0.35);
@@ -165,6 +175,12 @@ fn add_kind_objects(
     for index in 0..config.obstacle_count {
         let (x_m, y_m) = if config.kind == ScenarioKind::ObstacleAvoidance && index == 0 {
             (body.odometry.x_m + 0.55, body.odometry.y_m)
+        } else if config.kind == ScenarioKind::CornerTrap {
+            match index {
+                0 => (0.42, 1.02),
+                1 => (1.02, 0.42),
+                _ => (0.92, 0.92),
+            }
         } else {
             random_free_position(config.arena, rng, body, objects, 0.35)
         };
@@ -321,6 +337,14 @@ mod tests {
         let snapshot = scenario.world.snapshot().await.unwrap();
 
         assert!(snapshot.range.nearest_m.unwrap_or(10.0) < 0.5);
+    }
+
+    #[tokio::test]
+    async fn corner_trap_scenario_starts_constrained() {
+        let mut scenario = build_scenario(ScenarioConfig::new(ScenarioKind::CornerTrap, 7));
+        let snapshot = scenario.world.snapshot().await.unwrap();
+
+        assert!(snapshot.range.nearest_m.unwrap_or(10.0) < 0.35);
     }
 
     #[tokio::test]

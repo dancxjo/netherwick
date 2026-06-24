@@ -184,6 +184,11 @@ pub struct LiveSceneResponse {
     pub objects: Vec<SceneObject>,
     pub arena: Option<SceneArena>,
     pub action: SceneAction,
+    pub stuck: bool,
+    pub dead_battery: bool,
+    pub recovery_mode: Option<String>,
+    pub stuck_ticks: usize,
+    pub stuck_detail: SceneStuck,
     pub mind: SceneMind,
     pub warnings: Vec<String>,
 }
@@ -225,6 +230,8 @@ pub struct SceneEye {
     pub height: u32,
     pub format: String,
     pub data_url: Option<String>,
+    pub mean_luma: f32,
+    pub non_background_ratio: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -253,6 +260,19 @@ pub struct SceneAudio {
 pub struct SceneAction {
     pub latest: Option<String>,
     pub safety_override: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SceneStuck {
+    pub active: bool,
+    pub class: Option<String>,
+    pub stuck_ticks: usize,
+    pub duration_ms: u64,
+    pub recovery_phase: Option<String>,
+    pub turn_direction: Option<String>,
+    pub event_started: bool,
+    pub recovered: bool,
+    pub dead_battery: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -422,6 +442,7 @@ pub fn snapshot_to_scene(
     if audio.is_none() {
         warnings.push("no audio bearing stream".to_string());
     }
+    let stuck = scene_stuck_from_snapshot(snapshot);
     LiveSceneResponse {
         schema_version: 1,
         session,
@@ -442,6 +463,11 @@ pub fn snapshot_to_scene(
             .unwrap_or_default(),
         arena: metadata.and_then(|metadata| metadata.arena),
         action: SceneAction::default(),
+        stuck: stuck.active,
+        dead_battery: stuck.dead_battery,
+        recovery_mode: stuck.recovery_phase.clone(),
+        stuck_ticks: stuck.stuck_ticks,
+        stuck_detail: stuck,
         mind: SceneMind {
             combobulation: snapshot
                 .extensions
@@ -456,6 +482,47 @@ pub fn snapshot_to_scene(
             surprise: None,
         },
         warnings,
+    }
+}
+
+fn scene_stuck_from_snapshot(snapshot: &WorldSnapshot) -> SceneStuck {
+    let Some(extension) = snapshot
+        .extensions
+        .iter()
+        .find(|extension| extension.name == "sim.stuck")
+    else {
+        return SceneStuck {
+            dead_battery: snapshot.body.battery_level <= f32::EPSILON && !snapshot.body.charging,
+            ..SceneStuck::default()
+        };
+    };
+    let values = &extension.values;
+    let active = values.first().copied().unwrap_or(0.0) > 0.0;
+    let corner_trap = values.get(1).copied().unwrap_or(0.0) > 0.0;
+    let phase_code = values.get(4).copied().unwrap_or(0.0).round() as i32;
+    SceneStuck {
+        active,
+        class: if active || corner_trap {
+            Some(if corner_trap { "corner-trap" } else { "stuck" }.to_string())
+        } else {
+            None
+        },
+        stuck_ticks: values.get(2).copied().unwrap_or(0.0).max(0.0) as usize,
+        duration_ms: values.get(3).copied().unwrap_or(0.0).max(0.0) as u64,
+        recovery_phase: match phase_code {
+            1 => Some("stop".to_string()),
+            2 => Some("reverse".to_string()),
+            3 => Some("turn-away".to_string()),
+            _ => None,
+        },
+        turn_direction: match values.get(5).copied().unwrap_or(0.0) {
+            value if value < 0.0 => Some("right".to_string()),
+            value if value > 0.0 => Some("left".to_string()),
+            _ => None,
+        },
+        event_started: values.get(6).copied().unwrap_or(0.0) > 0.0,
+        recovered: values.get(7).copied().unwrap_or(0.0) > 0.0,
+        dead_battery: values.get(8).copied().unwrap_or(0.0) > 0.0,
     }
 }
 
@@ -496,15 +563,68 @@ fn scene_eye_from_frame(frame: &netherwick_sensors::EyeFrame) -> (SceneEye, Vec<
     if let Some(warning) = encode_warning {
         warnings.push(warning);
     }
+    let stats = eye_frame_stats(frame);
+    if stats.mean_luma < 0.08 {
+        warnings.push(format!(
+            "eye frame is very dim (mean luma {:.3})",
+            stats.mean_luma
+        ));
+    }
     (
         SceneEye {
             width: frame.width,
             height: frame.height,
             format: format!("{:?}", frame.format),
             data_url,
+            mean_luma: stats.mean_luma,
+            non_background_ratio: stats.non_background_ratio,
         },
         warnings,
     )
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct EyeFrameStats {
+    mean_luma: f32,
+    non_background_ratio: f32,
+}
+
+fn eye_frame_stats(frame: &netherwick_sensors::EyeFrame) -> EyeFrameStats {
+    let pixels = frame.width as usize * frame.height as usize;
+    if pixels == 0 {
+        return EyeFrameStats::default();
+    }
+    let mut luma_sum = 0.0f32;
+    let mut non_background = 0usize;
+    match frame.format {
+        EyeFrameFormat::Gray8 => {
+            for value in frame.bytes.iter().take(pixels) {
+                let luma = *value as f32 / 255.0;
+                luma_sum += luma;
+                if luma > 0.08 {
+                    non_background += 1;
+                }
+            }
+        }
+        EyeFrameFormat::Rgb8 | EyeFrameFormat::Bgr8 => {
+            for pixel in frame.bytes.chunks_exact(3).take(pixels) {
+                let (r, g, b) = match frame.format {
+                    EyeFrameFormat::Bgr8 => (pixel[2], pixel[1], pixel[0]),
+                    _ => (pixel[0], pixel[1], pixel[2]),
+                };
+                let luma = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
+                luma_sum += luma;
+                if luma > 0.08 || r.abs_diff(g) > 8 || g.abs_diff(b) > 8 {
+                    non_background += 1;
+                }
+            }
+        }
+        EyeFrameFormat::Mjpeg | EyeFrameFormat::Unknown(_) => {}
+    }
+    EyeFrameStats {
+        mean_luma: luma_sum / pixels as f32,
+        non_background_ratio: non_background as f32 / pixels as f32,
+    }
 }
 
 fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>, Option<String>) {
@@ -897,6 +1017,7 @@ dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
     <dt>y</dt><dd id="y">-</dd>
     <dt>heading</dt><dd id="heading">-</dd>
     <dt>battery</dt><dd id="battery">-</dd>
+    <dt>stuck</dt><dd id="stuck">-</dd>
     <dt>nearest</dt><dd id="nearest">-</dd>
     <dt>gps lat</dt><dd id="gps_lat">-</dd>
     <dt>gps lon</dt><dd id="gps_lon">-</dd>
@@ -1037,7 +1158,12 @@ canvas{display:block}
     <dt>t</dt><dd id="t">-</dd>
     <dt>pose</dt><dd id="pose">-</dd>
     <dt>battery</dt><dd id="battery">-</dd>
+    <dt>stuck</dt><dd id="stuck">-</dd>
+    <dt>dead battery</dt><dd id="dead_battery">-</dd>
+    <dt>recovery</dt><dd id="recovery_mode">-</dd>
+    <dt>stuck ticks</dt><dd id="stuck_ticks">-</dd>
     <dt>nearest</dt><dd id="nearest">-</dd>
+    <dt>eye</dt><dd id="eye">-</dd>
     <dt>points</dt><dd id="points">-</dd>
     <dt>audio</dt><dd id="audio">-</dd>
     <dt>mind</dt><dd id="mind">-</dd>
@@ -1060,7 +1186,7 @@ const root = document.getElementById('scene');
 const statusEl = document.getElementById('status');
 const xrButton = document.getElementById('xr');
 const reignState = document.getElementById('reign-state');
-const fields = Object.fromEntries(['mode','scenario','seed','tick','t','pose','battery','nearest','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
+const fields = Object.fromEntries(['mode','scenario','seed','tick','t','pose','battery','stuck','dead_battery','recovery_mode','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d10);
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
@@ -1238,7 +1364,13 @@ function updateScene(packet){
   fields.t.textContent = `${packet.t_ms} ms`;
   fields.pose.textContent = `${fmt(packet.body.x_m)}, ${fmt(packet.body.y_m)}, ${fmt(packet.body.heading_rad)} rad`;
   fields.battery.textContent = `${fmt(packet.body.battery_level * 100, 1)}%${packet.body.charging ? ' charging' : ''}`;
+  const detail = packet.stuck_detail || {};
+  fields.stuck.textContent = packet.stuck ? (detail.class || 'stuck') : (detail.recovered ? 'recovered' : 'clear');
+  fields.dead_battery.textContent = packet.dead_battery ? 'yes' : 'no';
+  fields.recovery_mode.textContent = packet.recovery_mode || '-';
+  fields.stuck_ticks.textContent = String(packet.stuck_ticks || 0);
   fields.nearest.textContent = packet.range?.nearest_m == null ? '-' : `${fmt(packet.range.nearest_m)} m`;
+  fields.eye.textContent = packet.eye ? `${packet.eye.width}x${packet.eye.height} luma ${fmt(packet.eye.mean_luma, 2)}` : '-';
   fields.points.textContent = String(packet.kinect?.points?.length || 0);
   fields.audio.textContent = packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio.bearing_rad)} rad`;
   fields.mind.textContent = packet.mind?.combobulation || packet.warnings?.[0] || '-';
@@ -1571,6 +1703,11 @@ mod tests {
         snapshot.body.last_update_ms = 1234;
         snapshot.range.beams = vec![1.0, 2.0, 3.0];
         snapshot.range.nearest_m = Some(1.0);
+        snapshot.extensions.push(netherwick_now::ExtensionSense {
+            schema_version: 1,
+            name: "sim.stuck".to_string(),
+            values: vec![1.0, 1.0, 6.0, 300.0, 3.0, -1.0, 1.0, 0.0, 1.0],
+        });
         snapshot.eye_frame = Some(EyeFrame {
             captured_at_ms: 1200,
             width: 1,
@@ -1594,6 +1731,15 @@ mod tests {
         assert_eq!(scene.body.heading_rad, 1.25);
         assert_eq!(scene.range.nearest_m, Some(1.0));
         assert_eq!(scene.range.beams.len(), 3);
+        assert!(scene.stuck);
+        assert!(scene.dead_battery);
+        assert_eq!(scene.recovery_mode.as_deref(), Some("turn-away"));
+        assert_eq!(scene.stuck_ticks, 6);
+        assert_eq!(scene.stuck_detail.class.as_deref(), Some("corner-trap"));
+        assert_eq!(
+            scene.stuck_detail.recovery_phase.as_deref(),
+            Some("turn-away")
+        );
         assert_eq!(scene.objects[0].kind, "charger");
         assert!(scene
             .eye
@@ -1605,10 +1751,13 @@ mod tests {
 
     #[test]
     fn missing_eye_kinect_and_audio_serialize_as_empty_or_null() {
-        let scene = snapshot_to_scene(&WorldSnapshot::default(), None, None);
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.battery_level = 0.0;
+        let scene = snapshot_to_scene(&snapshot, None, None);
         let value = serde_json::to_value(scene).unwrap();
 
         assert!(value["eye"].is_null());
+        assert_eq!(value["dead_battery"].as_bool(), Some(true));
         assert_eq!(value["kinect"]["points"].as_array().unwrap().len(), 0);
         assert!(value["audio"].is_null());
         assert!(value["warnings"].as_array().unwrap().len() >= 3);
