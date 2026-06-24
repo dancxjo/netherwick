@@ -221,6 +221,97 @@ pub fn charge_target_from_transition_like(
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ActionValueInput {
+    pub z: Vec<f32>,
+    pub action_features: Vec<f32>,
+    pub body_features: Vec<f32>,
+    pub drive_features: Vec<f32>,
+    pub memory_features: Vec<f32>,
+    pub prediction_features: Vec<f32>,
+}
+
+impl ActionValueInput {
+    pub fn from_parts(z: Vec<f32>, action: Option<&ActionPrimitive>, now: &Now) -> Self {
+        Self {
+            z,
+            action_features: danger_action_features(action),
+            body_features: action_value_body_features(now),
+            drive_features: action_value_drive_features(now),
+            memory_features: action_value_memory_features(now, action),
+            prediction_features: action_value_prediction_features(now),
+        }
+    }
+
+    pub fn from_parts_with_predictions(
+        z: Vec<f32>,
+        action: Option<&ActionPrimitive>,
+        now: &Now,
+        danger: Option<DangerOutput>,
+        charge: Option<ChargeOutput>,
+    ) -> Self {
+        Self {
+            z,
+            action_features: danger_action_features(action),
+            body_features: action_value_body_features(now),
+            drive_features: action_value_drive_features(now),
+            memory_features: action_value_memory_features(now, action),
+            prediction_features: action_value_prediction_features_from_outputs(now, danger, charge),
+        }
+    }
+
+    pub fn flat_features(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(
+            self.z.len()
+                + self.action_features.len()
+                + self.body_features.len()
+                + self.drive_features.len()
+                + self.memory_features.len()
+                + self.prediction_features.len(),
+        );
+        out.extend(self.z.iter().copied().map(sanitize_feature));
+        out.extend(self.action_features.iter().copied().map(sanitize_feature));
+        out.extend(self.body_features.iter().copied().map(sanitize_feature));
+        out.extend(self.drive_features.iter().copied().map(sanitize_feature));
+        out.extend(self.memory_features.iter().copied().map(sanitize_feature));
+        out.extend(
+            self.prediction_features
+                .iter()
+                .copied()
+                .map(sanitize_feature),
+        );
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ActionValueOutput {
+    pub value: f32,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ActionValueTarget {
+    pub value: f32,
+}
+
+pub fn action_value_input_from_transition_like(
+    before_z: &ExperienceLatent,
+    action: Option<&ActionPrimitive>,
+    before: &Now,
+) -> ActionValueInput {
+    ActionValueInput::from_parts(before_z.z.clone(), action, before)
+}
+
+pub fn action_value_target_from_reward_surprise(
+    reward: &Reward,
+    surprise: &SurpriseSense,
+) -> ActionValueTarget {
+    ActionValueTarget {
+        value: reward.value - surprise.total * 0.1,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NowReconstruction {
     pub t_ms: TimeMs,
     pub body: Option<BodySense>,
@@ -723,6 +814,85 @@ fn charge_memory_features(now: &Now) -> Vec<f32> {
     ]
 }
 
+fn action_value_body_features(now: &Now) -> Vec<f32> {
+    let mut out = danger_body_features(now);
+    out.extend(charge_body_features(now));
+    out
+}
+
+fn action_value_drive_features(now: &Now) -> Vec<f32> {
+    vec![
+        now.drives.battery_hunger.clamp(0.0, 1.0),
+        now.drives.danger_avoidance.clamp(0.0, 1.0),
+        now.drives.curiosity.clamp(0.0, 1.0),
+        now.drives.social_interest.clamp(0.0, 1.0),
+        now.drives.fatigue.clamp(0.0, 1.0),
+        now.drives.uncertainty_pressure.clamp(0.0, 1.0),
+    ]
+}
+
+fn action_value_memory_features(now: &Now, action: Option<&ActionPrimitive>) -> Vec<f32> {
+    let best_matches = match (&now.memory.best_remembered_action, action) {
+        (Some(best), Some(action)) => best == action,
+        _ => false,
+    };
+    vec![
+        now.memory.place_familiarity.clamp(0.0, 1.0),
+        now.memory.place_danger.clamp(0.0, 1.0),
+        now.memory.place_charge_value.clamp(0.0, 1.0),
+        now.memory.face_familiarity.clamp(0.0, 1.0),
+        now.memory.voice_familiarity.clamp(0.0, 1.0),
+        (now.memory.similar_situation_count as f32 / 32.0).clamp(0.0, 1.0),
+        bool01(best_matches),
+        bool01(now.memory.remembered_warning.is_some()),
+    ]
+}
+
+fn action_value_prediction_features(now: &Now) -> Vec<f32> {
+    let danger = now.predictions.danger_model.map(|value| DangerOutput {
+        bump_risk: value.bump_risk,
+        cliff_risk: value.cliff_risk,
+        wheel_drop_risk: value.wheel_drop_risk,
+        stuck_risk: value.stuck_risk,
+        confidence: value.confidence,
+    });
+    let charge = now.predictions.charge_model.map(|value| ChargeOutput {
+        charge_probability: value.charge_probability,
+        expected_battery_delta: value.expected_battery_delta,
+        dock_likelihood: value.dock_likelihood,
+        confidence: value.confidence,
+    });
+    action_value_prediction_features_from_outputs(now, danger, charge)
+}
+
+fn action_value_prediction_features_from_outputs(
+    now: &Now,
+    danger: Option<DangerOutput>,
+    charge: Option<ChargeOutput>,
+) -> Vec<f32> {
+    let danger = danger.unwrap_or_default();
+    let charge = charge.unwrap_or_default();
+    vec![
+        danger.bump_risk.clamp(0.0, 1.0),
+        danger.cliff_risk.clamp(0.0, 1.0),
+        danger.wheel_drop_risk.clamp(0.0, 1.0),
+        danger.stuck_risk.clamp(0.0, 1.0),
+        danger.confidence.clamp(0.0, 1.0),
+        charge.charge_probability.clamp(0.0, 1.0),
+        charge.expected_battery_delta.clamp(-1.0, 1.0),
+        charge.dock_likelihood.clamp(0.0, 1.0),
+        charge.confidence.clamp(0.0, 1.0),
+        now.predictions.uncertainty.clamp(0.0, 1.0),
+        (now.predictions.expected_events.len() as f32 / 8.0).clamp(0.0, 1.0),
+        bool01(
+            now.extensions
+                .get("safety.vetoed")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        ),
+    ]
+}
+
 fn kinect_ir_features(now: &Now) -> Vec<f32> {
     if now.kinect.ir.is_empty() {
         return vec![0.0, 0.0, 0.0, 0.0];
@@ -959,6 +1129,65 @@ mod tests {
         let input = ChargeInput::from_parts(vec![0.0], Some(&ActionPrimitive::Dock), &now);
 
         assert!(input.body_features.iter().any(|value| *value >= 0.8));
+    }
+
+    #[test]
+    fn action_value_input_includes_input_sensor_channels() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.body.cliff_sensors.front_right = 0.7;
+        now.kinect.ir = vec![0.1, 0.8, 0.9, 0.2];
+
+        let input = ActionValueInput::from_parts(vec![0.0], Some(&ActionPrimitive::Dock), &now);
+
+        assert!(input.body_features.contains(&0.7));
+        assert!(input.body_features.iter().any(|value| *value >= 0.8));
+    }
+
+    #[test]
+    fn action_value_target_positive_for_charging_reward() {
+        let reward = Reward { value: 0.35 };
+        let surprise = SurpriseSense {
+            total: 0.2,
+            ..SurpriseSense::default()
+        };
+
+        let target = action_value_target_from_reward_surprise(&reward, &surprise);
+
+        assert!(target.value > 0.0);
+    }
+
+    #[test]
+    fn action_value_target_negative_for_bump_or_cliff_transition() {
+        let reward = Reward { value: -0.8 };
+        let surprise = SurpriseSense {
+            total: 0.4,
+            ..SurpriseSense::default()
+        };
+
+        let target = action_value_target_from_reward_surprise(&reward, &surprise);
+
+        assert!(target.value < 0.0);
+    }
+
+    #[test]
+    fn action_value_input_uses_prediction_channels() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.predictions.danger_model = Some(netherwick_now::DangerPrediction {
+            bump_risk: 0.7,
+            confidence: 0.8,
+            ..netherwick_now::DangerPrediction::default()
+        });
+        now.predictions.charge_model = Some(netherwick_now::ChargePrediction {
+            charge_probability: 0.6,
+            expected_battery_delta: 0.1,
+            dock_likelihood: 0.5,
+            confidence: 0.9,
+        });
+
+        let input = ActionValueInput::from_parts(vec![0.0], Some(&ActionPrimitive::Dock), &now);
+
+        assert!(input.prediction_features.contains(&0.7));
+        assert!(input.prediction_features.contains(&0.6));
     }
 }
 

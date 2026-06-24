@@ -53,6 +53,8 @@ pub struct PredictionSense {
     pub danger_hardcoded: Option<DangerPrediction>,
     pub charge_model: Option<ChargePrediction>,
     pub charge_hardcoded: Option<ChargePrediction>,
+    pub action_values_model: Vec<ActionValuePrediction>,
+    pub action_values_hardcoded: Vec<ActionValuePrediction>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -69,6 +71,13 @@ pub struct ChargePrediction {
     pub charge_probability: f32,
     pub expected_battery_delta: f32,
     pub dock_likelihood: f32,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionValuePrediction {
+    pub action: ActionPrimitive,
+    pub value: f32,
     pub confidence: f32,
 }
 

@@ -178,11 +178,31 @@ pub fn summarized_senses(now: &Now) -> Vec<String> {
     if now.body.flags.bump_left || now.body.flags.bump_right {
         lines.push("My bump sensors are pressed.".to_string());
     }
-    if now.body.flags.cliff_left || now.body.flags.cliff_right {
+    if now.body.flags.cliff_left
+        || now.body.flags.cliff_front_left
+        || now.body.flags.cliff_front_right
+        || now.body.flags.cliff_right
+        || now.body.cliff_sensors.max() >= 0.5
+    {
         lines.push("I detect a cliff edge.".to_string());
+    }
+    if now.body.cliff_sensors.max() > 0.0 {
+        lines.push(format!(
+            "Cliff sensor levels are left {:.2}, front-left {:.2}, front-right {:.2}, right {:.2}.",
+            now.body.cliff_sensors.left,
+            now.body.cliff_sensors.front_left,
+            now.body.cliff_sensors.front_right,
+            now.body.cliff_sensors.right
+        ));
     }
     if now.body.flags.wheel_drop {
         lines.push("My wheel is dropped.".to_string());
+    }
+    if now.body.flags.wall {
+        lines.push("My wall sensor is active.".to_string());
+    }
+    if now.body.flags.virtual_wall {
+        lines.push("I detect a virtual wall.".to_string());
     }
     if let Some(transcript) = &now.ear.transcript {
         let transcript = transcript.trim();
@@ -192,6 +212,23 @@ pub fn summarized_senses(now: &Now) -> Vec<String> {
     }
     if let Some(nearest_m) = now.range.nearest_m {
         lines.push(format!("Nearest obstacle is {:.2} meters away.", nearest_m));
+    }
+    if !now.kinect.ir.is_empty() {
+        let count = now.kinect.ir.len();
+        let mean = now.kinect.ir.iter().copied().sum::<f32>() / count as f32;
+        let max = now
+            .kinect
+            .ir
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bright = now.kinect.ir.iter().filter(|value| **value >= 0.7).count();
+        lines.push(format!(
+            "Kinect IR has {count} samples, mean {:.2}, max {:.2}, bright fraction {:.2}.",
+            mean,
+            max,
+            bright as f32 / count as f32
+        ));
     }
     if !now.predictions.expected_events.is_empty() {
         lines.push(format!(
@@ -773,7 +810,7 @@ fn extract_json_object(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource};
-    use netherwick_body::BodySense;
+    use netherwick_body::{BodySense, CliffSensors};
     use netherwick_now::Now;
     use uuid::Uuid;
 
@@ -832,5 +869,32 @@ mod tests {
         assert!(senses.contains("Remote control active: Direct"));
         assert!(senses.contains("Latest human reign command: Turn Left"));
         assert!(senses.contains("Human note: turn toward charger"));
+    }
+
+    #[test]
+    fn summarized_senses_include_input_sensor_channels() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.body.flags.cliff_front_left = true;
+        now.body.flags.wall = true;
+        now.body.flags.virtual_wall = true;
+        now.body.cliff_sensors = CliffSensors {
+            left: 0.10,
+            front_left: 0.80,
+            front_right: 0.40,
+            right: 0.20,
+        };
+        now.kinect.ir = vec![0.1, 0.8, 0.9, 0.2];
+
+        let senses = summarized_senses(&now).join("\n");
+
+        assert!(senses.contains("I detect a cliff edge."));
+        assert!(senses.contains(
+            "Cliff sensor levels are left 0.10, front-left 0.80, front-right 0.40, right 0.20."
+        ));
+        assert!(senses.contains("My wall sensor is active."));
+        assert!(senses.contains("I detect a virtual wall."));
+        assert!(
+            senses.contains("Kinect IR has 4 samples, mean 0.50, max 0.90, bright fraction 0.50.")
+        );
     }
 }

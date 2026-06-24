@@ -1,0 +1,10 @@
+{"observed_at_ms":107,"hardcoded":{"value":0.12,"confidence":0.45},"model":{"value":0.042625666,"confidence":0.50542754},"target":{"value":0.005508608},"loss":0.0013776759}
+{"observed_at_ms":207,"hardcoded":{"value":0.24,"confidence":0.45},"model":{"value":0.044011474,"confidence":0.51195294},"target":{"value":0.009616268},"loss":0.0011830302}
+{"observed_at_ms":107,"hardcoded":{"value":0.12,"confidence":0.45},"model":{"value":0.04252529,"confidence":0.5084681},"target":{"value":0.005508608},"loss":0.0013702348}
+{"observed_at_ms":207,"hardcoded":{"value":0.24,"confidence":0.45},"model":{"value":0.043937445,"confidence":0.5149365},"target":{"value":0.009616268},"loss":0.0011779432}
+{"observed_at_ms":107,"hardcoded":{"value":0.12,"confidence":0.45},"model":{"value":0.042416334,"confidence":0.51148355},"target":{"value":0.005508608},"loss":0.0013621802}
+{"observed_at_ms":207,"hardcoded":{"value":0.24,"confidence":0.45},"model":{"value":0.0438565,"confidence":0.5178954},"target":{"value":0.009616268},"loss":0.0011723937}
+{"observed_at_ms":107,"hardcoded":{"value":0.12,"confidence":0.45},"model":{"value":0.042299032,"confidence":0.51447517},"target":{"value":0.005508608},"loss":0.0013535352}
+{"observed_at_ms":207,"hardcoded":{"value":0.24,"confidence":0.45},"model":{"value":0.04376781,"confidence":0.5208322},"target":{"value":0.009616268},"loss":0.0011663279}
+{"observed_at_ms":107,"hardcoded":{"value":0.12,"confidence":0.45},"model":{"value":0.042173624,"confidence":0.51744395},"target":{"value":0.005508608},"loss":0.0013443233}
+{"observed_at_ms":207,"hardcoded":{"value":0.24,"confidence":0.45},"model":{"value":0.043671608,"confidence":0.5237479},"target":{"value":0.009616268},"loss":0.0011597662}

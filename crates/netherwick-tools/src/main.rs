@@ -6,13 +6,16 @@ use netherwick_autonomic::SimpleSafety;
 use netherwick_body::BodySense;
 use netherwick_conductor::SimpleConductor;
 use netherwick_experience::{
+    action_value_input_from_transition_like, action_value_target_from_reward_surprise,
     charge_input_from_transition_like, charge_target_from_transition_like,
     danger_input_from_transition_like, danger_target_from_transition_like,
 };
 use netherwick_ledger::{ExperienceFrame, JsonlLedger, LedgerReader};
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
-use netherwick_models::{ChargeNetTrainer, DangerNetTrainer, MODEL_REGISTRY};
+use netherwick_models::{
+    ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, MODEL_REGISTRY,
+};
 use netherwick_runtime::{MinimalRuntime, RuntimeModelStack, SimRunner};
 use netherwick_sim::{ArenaConfig, SimObject, SimObjectKind, VirtualWorld};
 use tokio::fs::OpenOptions;
@@ -68,6 +71,10 @@ struct SimArgs {
     charge_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     charge_mode: ChargeMode,
+    #[arg(long)]
+    action_value_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    action_value_mode: ActionValueMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -82,6 +89,12 @@ enum ChargeMode {
     ShadowInfer,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ActionValueMode {
+    Off,
+    ShadowInfer,
+}
+
 #[derive(Debug, Parser)]
 struct TrainCommand {
     #[command(subcommand)]
@@ -92,6 +105,7 @@ struct TrainCommand {
 enum TrainModel {
     Danger(TrainDangerArgs),
     Charge(TrainChargeArgs),
+    ActionValue(TrainActionValueArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -111,6 +125,16 @@ struct TrainChargeArgs {
     #[arg(long, default_value_t = 5)]
     epochs: usize,
     #[arg(long, default_value = "data/models/charge_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainActionValueArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/action_value_v0")]
     checkpoint: String,
 }
 
@@ -174,14 +198,22 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let mut runner = SimRunner::new(runtime, world, motors);
     runner.run_steps(args.steps).await?;
     println!(
-        "sim complete: {} ticks, seed {}, ledger {}, danger_mode {:?}",
-        runner.tick_count, args.seed, args.ledger, args.danger_mode
+        "sim complete: {} ticks, seed {}, ledger {}, danger_mode {:?}, charge_mode {:?}, action_value_mode {:?}",
+        runner.tick_count,
+        args.seed,
+        args.ledger,
+        args.danger_mode,
+        args.charge_mode,
+        args.action_value_mode
     );
     Ok(())
 }
 
 fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
-    if args.danger_mode != DangerMode::ShadowInfer && args.charge_mode != ChargeMode::ShadowInfer {
+    if args.danger_mode != DangerMode::ShadowInfer
+        && args.charge_mode != ChargeMode::ShadowInfer
+        && args.action_value_mode != ActionValueMode::ShadowInfer
+    {
         return Ok(None);
     }
     let danger_path = if args.danger_mode == DangerMode::ShadowInfer {
@@ -228,11 +260,36 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
     } else {
         None
     };
-    if danger_path.is_none() && charge_path.is_none() {
+    let action_value_path = if args.action_value_mode == ActionValueMode::ShadowInfer {
+        match &args.action_value_checkpoint {
+            Some(checkpoint) if Path::new(checkpoint).exists() => {
+                let path = Path::new(checkpoint);
+                println!("loaded action-value checkpoint: {}", path.display());
+                Some(path)
+            }
+            Some(checkpoint) => {
+                println!(
+                    "action-value shadow inference disabled: checkpoint not found at {}",
+                    checkpoint
+                );
+                None
+            }
+            None => {
+                println!(
+                    "action-value shadow inference disabled: no --action-value-checkpoint provided"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if danger_path.is_none() && charge_path.is_none() && action_value_path.is_none() {
         return Ok(None);
     }
 
-    let models = RuntimeModelStack::with_shadow_checkpoints(danger_path, charge_path)?;
+    let models =
+        RuntimeModelStack::with_shadow_checkpoints(danger_path, charge_path, action_value_path)?;
     Ok(Some(models))
 }
 
@@ -254,6 +311,7 @@ async fn run_train(command: TrainCommand) -> Result<()> {
     match command.model {
         TrainModel::Danger(args) => train_danger(args).await,
         TrainModel::Charge(args) => train_charge(args).await,
+        TrainModel::ActionValue(args) => train_action_value(args).await,
     }
 }
 
@@ -411,6 +469,80 @@ async fn train_charge(args: TrainChargeArgs) -> Result<()> {
     Ok(())
 }
 
+async fn train_action_value(args: TrainActionValueArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let transitions = ledger.transitions().await?;
+    if transitions.is_empty() {
+        println!(
+            "action-value training skipped: no transitions found in {}",
+            args.ledger
+        );
+        return Ok(());
+    }
+
+    let mut samples = Vec::new();
+    for transition in &transitions {
+        let input = action_value_input_from_transition_like(
+            &transition.before_z,
+            transition.action.as_ref(),
+            &transition.before,
+        );
+        let target =
+            action_value_target_from_reward_surprise(&transition.reward, &transition.surprise);
+        samples.push((
+            transition.created_at_ms,
+            transition.before.clone(),
+            input,
+            target,
+        ));
+    }
+
+    let input_dim = samples
+        .first()
+        .map(|(_, _, input, _)| input.flat_features().len())
+        .unwrap_or(0);
+    let mut trainer = ActionValueNetTrainer::new(input_dim);
+    let metrics_path = std::path::Path::new(&args.ledger).join("action-value-shadow-metrics.jsonl");
+    let mut metrics_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&metrics_path)
+        .await?;
+
+    let mut last_loss = 0.0;
+    let mut seen = 0_u64;
+    for _ in 0..args.epochs {
+        for (observed_at_ms, before, input, target) in &samples {
+            if input.flat_features().len() != trainer.input_dim() {
+                continue;
+            }
+            let metric = trainer.shadow_compare(*observed_at_ms, before, input, target)?;
+            let line = serde_json::to_string(&metric)?;
+            metrics_file.write_all(line.as_bytes()).await?;
+            metrics_file.write_all(b"\n").await?;
+
+            let stats = trainer.train_step(input, target)?;
+            last_loss = stats.loss;
+            seen = stats.samples_seen;
+        }
+    }
+
+    println!(
+        "action-value training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
+        samples.len(),
+        args.epochs,
+        seen,
+        last_loss,
+        metrics_path.display()
+    );
+    trainer.save_checkpoint(&args.checkpoint)?;
+    println!("saved action-value checkpoint: {}", args.checkpoint);
+    println!("samples_seen: {}", trainer.samples_seen());
+    println!("last_loss: {:.6}", last_loss);
+    println!("best_loss: {:?}", trainer.best_loss());
+    Ok(())
+}
+
 fn model_status() -> Result<()> {
     println!("registered models:");
     for model in MODEL_REGISTRY {
@@ -421,6 +553,9 @@ fn model_status() -> Result<()> {
     );
     println!(
         "ChargePredictor: shadow-train ready; metrics: data/ledger/charge-shadow-metrics.jsonl; checkpoint: data/models/charge_v0"
+    );
+    println!(
+        "ActionValueNet: shadow-train ready; metrics: data/ledger/action-value-shadow-metrics.jsonl; checkpoint: data/models/action_value_v0"
     );
     Ok(())
 }

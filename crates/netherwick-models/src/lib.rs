@@ -10,7 +10,8 @@ use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn::tensor::{activation, backend::AutodiffBackend, backend::Backend, Tensor, TensorData};
 use netherwick_behaviors::TrainingSample;
 use netherwick_experience::{
-    ChargeInput, ChargeOutput, ChargeTarget, DangerInput, DangerOutput, DangerTarget,
+    ActionValueInput, ActionValueOutput, ActionValueTarget, ChargeInput, ChargeOutput,
+    ChargeTarget, DangerInput, DangerOutput, DangerTarget,
 };
 use netherwick_now::Now;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,22 @@ pub struct ChargeShadowMetric {
     pub hardcoded: ChargeOutput,
     pub model: ChargeOutput,
     pub target: ChargeTarget,
+    pub loss: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionValueTrainStats {
+    pub loss: f32,
+    pub samples_seen: u64,
+    pub improved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionValueShadowMetric {
+    pub observed_at_ms: u64,
+    pub hardcoded: ActionValueOutput,
+    pub model: ActionValueOutput,
+    pub target: ActionValueTarget,
     pub loss: f32,
 }
 
@@ -192,6 +209,83 @@ impl NeuralModel<(ChargeInput, Now), ChargeOutput> for HardcodedChargePredictor 
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct HardcodedActionValuePredictor;
+
+impl HardcodedActionValuePredictor {
+    pub fn predict_from_now(&self, now: &Now, input: &ActionValueInput) -> ActionValueOutput {
+        let battery_low = now.body.battery_level < 0.35;
+        let dock_action = input.action_features.get(6).copied().unwrap_or(0.0) > 0.5;
+        let go_action = input.action_features.get(2).copied().unwrap_or(0.0) > 0.5;
+        let turn_action = input.action_features.get(3).copied().unwrap_or(0.0) > 0.5;
+        let explore_action = input.action_features.get(4).copied().unwrap_or(0.0) > 0.5;
+        let approach_action = input.action_features.get(5).copied().unwrap_or(0.0) > 0.5;
+        let stop_action = input.action_features.get(1).copied().unwrap_or(0.0) > 0.5;
+        let forward = input
+            .action_features
+            .get(10)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        let bump_risk = input.prediction_features.first().copied().unwrap_or(0.0);
+        let cliff_risk = input.prediction_features.get(1).copied().unwrap_or(0.0);
+        let wheel_drop_risk = input.prediction_features.get(2).copied().unwrap_or(0.0);
+        let stuck_risk = input.prediction_features.get(3).copied().unwrap_or(0.0);
+        let danger_confidence = input.prediction_features.get(4).copied().unwrap_or(0.0);
+        let charge_probability = input.prediction_features.get(5).copied().unwrap_or(0.0);
+        let expected_battery_delta = input.prediction_features.get(6).copied().unwrap_or(0.0);
+        let dock_likelihood = input.prediction_features.get(7).copied().unwrap_or(0.0);
+        let prediction_uncertainty = input.prediction_features.get(9).copied().unwrap_or(0.0);
+        let safety_veto_likely = input.prediction_features.get(11).copied().unwrap_or(0.0);
+        let memory_danger = input.memory_features.get(1).copied().unwrap_or(0.0);
+        let memory_charge = input.memory_features.get(2).copied().unwrap_or(0.0);
+        let remembered_best = input.memory_features.get(6).copied().unwrap_or(0.0);
+        let has_warning = input.memory_features.get(7).copied().unwrap_or(0.0);
+
+        let mut value = 0.0_f32;
+        value += charge_probability * if battery_low { 0.75 } else { 0.25 };
+        value += expected_battery_delta * if battery_low { 0.85 } else { 0.35 };
+        value += dock_likelihood * if dock_action { 0.35 } else { 0.12 };
+        if dock_action && (battery_low || memory_charge > 0.5) {
+            value += 0.25;
+        }
+        if (explore_action || turn_action) && !battery_low {
+            value += 0.12 + prediction_uncertainty * 0.08;
+        }
+        if approach_action && memory_charge > 0.5 {
+            value += 0.12;
+        }
+        if remembered_best > 0.5 {
+            value += 0.12;
+        }
+        if battery_low && (go_action || explore_action) && charge_probability < 0.25 {
+            value -= 0.35;
+        }
+        value -= bump_risk * (0.45 + forward * 0.25);
+        value -= cliff_risk * 0.9;
+        value -= wheel_drop_risk * 0.95;
+        value -= stuck_risk * 0.25;
+        value -= memory_danger * 0.2;
+        value -= has_warning * 0.15;
+        value -= safety_veto_likely * 0.55;
+        if stop_action && (cliff_risk > 0.5 || wheel_drop_risk > 0.5 || safety_veto_likely > 0.5) {
+            value += 0.18;
+        }
+
+        ActionValueOutput {
+            value: value.clamp(-1.0, 1.0),
+            confidence: (0.45 + danger_confidence * 0.25 + charge_probability * 0.1)
+                .clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl NeuralModel<(ActionValueInput, Now), ActionValueOutput> for HardcodedActionValuePredictor {
+    fn predict(&self, input: (ActionValueInput, Now)) -> Result<ActionValueOutput> {
+        Ok(self.predict_from_now(&input.1, &input.0))
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct DangerNet<B: Backend> {
     input: Linear<B>,
@@ -201,6 +295,13 @@ pub struct DangerNet<B: Backend> {
 
 #[derive(Module, Debug)]
 pub struct ChargeNet<B: Backend> {
+    input: Linear<B>,
+    hidden: Linear<B>,
+    output: Linear<B>,
+}
+
+#[derive(Module, Debug)]
+pub struct ActionValueNet<B: Backend> {
     input: Linear<B>,
     hidden: Linear<B>,
     output: Linear<B>,
@@ -238,10 +339,28 @@ impl<B: Backend> DangerNet<B> {
     }
 }
 
+impl<B: Backend> ActionValueNet<B> {
+    pub fn init(input_dim: usize, device: &B::Device) -> Self {
+        Self {
+            input: LinearConfig::new(input_dim, 64).init(device),
+            hidden: LinearConfig::new(64, 32).init(device),
+            output: LinearConfig::new(32, 2).init(device),
+        }
+    }
+
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let x = activation::relu(self.input.forward(input));
+        let x = activation::relu(self.hidden.forward(x));
+        activation::sigmoid(self.output.forward(x))
+    }
+}
+
 pub type DangerBackend = NdArray<f32>;
 pub type DangerAutodiffBackend = Autodiff<DangerBackend>;
 pub type ChargeBackend = NdArray<f32>;
 pub type ChargeAutodiffBackend = Autodiff<ChargeBackend>;
+pub type ActionValueBackend = NdArray<f32>;
+pub type ActionValueAutodiffBackend = Autodiff<ActionValueBackend>;
 
 pub struct DangerNetTrainer<B: AutodiffBackend = DangerAutodiffBackend> {
     model: DangerNet<B>,
@@ -263,6 +382,16 @@ pub struct ChargeNetTrainer<B: AutodiffBackend = ChargeAutodiffBackend> {
     best_loss: Option<f32>,
 }
 
+pub struct ActionValueNetTrainer<B: AutodiffBackend = ActionValueAutodiffBackend> {
+    model: ActionValueNet<B>,
+    optimizer: OptimizerAdaptor<Sgd<B::InnerBackend>, ActionValueNet<B>, B>,
+    device: B::Device,
+    input_dim: usize,
+    learning_rate: f64,
+    samples_seen: u64,
+    best_loss: Option<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DangerModelMetadata {
     pub input_dim: usize,
@@ -273,6 +402,14 @@ pub struct DangerModelMetadata {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChargeModelMetadata {
+    pub input_dim: usize,
+    pub samples_seen: u64,
+    pub best_loss: Option<f32>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionValueModelMetadata {
     pub input_dim: usize,
     pub samples_seen: u64,
     pub best_loss: Option<f32>,
@@ -599,6 +736,166 @@ impl<B: AutodiffBackend> ChargeNetTrainer<B> {
     }
 }
 
+impl ActionValueNetTrainer<ActionValueAutodiffBackend> {
+    pub fn new(input_dim: usize) -> Self {
+        Self::with_device(input_dim, Default::default())
+    }
+
+    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_action_value_metadata(path)?;
+        if metadata.input_dim != input_dim {
+            return Err(anyhow!(
+                "action-value checkpoint input dimension mismatch at {}: metadata has {}, runtime expected {}",
+                path.display(),
+                metadata.input_dim,
+                input_dim
+            ));
+        }
+
+        let device = Default::default();
+        let model = ActionValueNet::init(input_dim, &device).load_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+            &device,
+        )?;
+        Ok(Self {
+            model,
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            learning_rate: 0.03,
+            samples_seen: metadata.samples_seen,
+            best_loss: metadata.best_loss,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> ActionValueNetTrainer<B> {
+    pub fn with_device(input_dim: usize, device: B::Device) -> Self {
+        Self {
+            model: ActionValueNet::init(input_dim, &device),
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            learning_rate: 0.03,
+            samples_seen: 0,
+            best_loss: None,
+        }
+    }
+
+    pub fn input_dim(&self) -> usize {
+        self.input_dim
+    }
+
+    pub fn samples_seen(&self) -> u64 {
+        self.samples_seen
+    }
+
+    pub fn best_loss(&self) -> Option<f32> {
+        self.best_loss
+    }
+
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create action-value checkpoint dir {}", path.display()))?;
+        self.model.clone().save_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+        )?;
+        let metadata = ActionValueModelMetadata {
+            input_dim: self.input_dim,
+            samples_seen: self.samples_seen,
+            best_loss: self.best_loss,
+            created_at_ms: now_ms(),
+        };
+        std::fs::write(
+            path.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )
+        .with_context(|| format!("write action-value checkpoint metadata {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn predict(&self, input: &ActionValueInput) -> Result<ActionValueOutput> {
+        let features = self.checked_features(input)?;
+        let tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let output = self.model.forward(tensor).inner();
+        tensor_to_action_value_output(output)
+    }
+
+    pub fn train_step(
+        &mut self,
+        input: &ActionValueInput,
+        target: &ActionValueTarget,
+    ) -> Result<ActionValueTrainStats> {
+        let features = self.checked_features(input)?;
+        let target_values = action_value_target_train_values(target);
+        let input_tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let target_tensor = Tensor::<B, 2>::from_data(
+            TensorData::new(target_values.to_vec(), [1, 2]),
+            &self.device,
+        );
+        let output = self.model.forward(input_tensor);
+        let loss = MseLoss::new().forward(output, target_tensor, Reduction::Mean);
+        let loss_value = loss.clone().inner().into_data().to_vec::<f32>()?[0];
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &self.model);
+        self.model = self
+            .optimizer
+            .step(self.learning_rate, self.model.clone(), grads);
+        self.samples_seen = self.samples_seen.saturating_add(1);
+        let improved = self.best_loss.map(|best| loss_value < best).unwrap_or(true);
+        if improved {
+            self.best_loss = Some(loss_value);
+        }
+        Ok(ActionValueTrainStats {
+            loss: loss_value,
+            samples_seen: self.samples_seen,
+            improved,
+        })
+    }
+
+    pub fn shadow_compare(
+        &mut self,
+        observed_at_ms: u64,
+        now: &Now,
+        input: &ActionValueInput,
+        target: &ActionValueTarget,
+    ) -> Result<ActionValueShadowMetric> {
+        let hardcoded = HardcodedActionValuePredictor.predict_from_now(now, input);
+        let model = self.predict(input)?;
+        let loss = mse_action_value_output_target(model, *target);
+        Ok(ActionValueShadowMetric {
+            observed_at_ms,
+            hardcoded,
+            model,
+            target: *target,
+            loss,
+        })
+    }
+
+    fn checked_features(&self, input: &ActionValueInput) -> Result<Vec<f32>> {
+        let mut features = input.flat_features();
+        if features.len() != self.input_dim {
+            return Err(anyhow!(
+                "action-value input dimension mismatch: got {}, expected {}",
+                features.len(),
+                self.input_dim
+            ));
+        }
+        for value in &mut features {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+        Ok(features)
+    }
+}
+
 pub fn read_danger_metadata(path: impl AsRef<Path>) -> Result<DangerModelMetadata> {
     let path = path.as_ref();
     let bytes = std::fs::read(path.join("metadata.json"))
@@ -613,6 +910,14 @@ pub fn read_charge_metadata(path: impl AsRef<Path>) -> Result<ChargeModelMetadat
         .with_context(|| format!("read charge checkpoint metadata {}", path.display()))?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse charge checkpoint metadata {}", path.display()))
+}
+
+pub fn read_action_value_metadata(path: impl AsRef<Path>) -> Result<ActionValueModelMetadata> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path.join("metadata.json"))
+        .with_context(|| format!("read action-value checkpoint metadata {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse action-value checkpoint metadata {}", path.display()))
 }
 
 fn now_ms() -> u64 {
@@ -644,6 +949,22 @@ impl<B: AutodiffBackend> OnlineTrainer<ChargeInput, ChargeTarget> for ChargeNetT
         sample: TrainingSample<ChargeInput, ChargeTarget>,
     ) -> Result<TrainStats> {
         let stats = ChargeNetTrainer::train_step(self, &sample.input, &sample.expected)?;
+        Ok(TrainStats {
+            loss: stats.loss,
+            samples_seen: stats.samples_seen,
+            improved: stats.improved,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> OnlineTrainer<ActionValueInput, ActionValueTarget>
+    for ActionValueNetTrainer<B>
+{
+    fn train_step(
+        &mut self,
+        sample: TrainingSample<ActionValueInput, ActionValueTarget>,
+    ) -> Result<TrainStats> {
+        let stats = ActionValueNetTrainer::train_step(self, &sample.input, &sample.expected)?;
         Ok(TrainStats {
             loss: stats.loss,
             samples_seen: stats.samples_seen,
@@ -685,11 +1006,32 @@ fn tensor_to_charge_output<B: Backend>(tensor: Tensor<B, 2>) -> Result<ChargeOut
     })
 }
 
+fn tensor_to_action_value_output<B: Backend>(tensor: Tensor<B, 2>) -> Result<ActionValueOutput> {
+    let values = tensor.into_data().to_vec::<f32>()?;
+    if values.len() != 2 {
+        return Err(anyhow!(
+            "action-value net emitted {} outputs, expected 2",
+            values.len()
+        ));
+    }
+    Ok(ActionValueOutput {
+        value: (values[0] * 2.0 - 1.0).clamp(-1.0, 1.0),
+        confidence: values[1].clamp(0.0, 1.0),
+    })
+}
+
 fn charge_target_train_values(target: &ChargeTarget) -> [f32; 3] {
     [
         target.charging_started.clamp(0.0, 1.0),
         ((target.battery_delta.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0),
         target.charging_after.clamp(0.0, 1.0),
+    ]
+}
+
+fn action_value_target_train_values(target: &ActionValueTarget) -> [f32; 2] {
+    [
+        ((target.value.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0),
+        1.0,
     ]
 }
 
@@ -721,6 +1063,11 @@ fn mse_charge_output_target(output: ChargeOutput, target: ChargeTarget) -> f32 {
         / 3.0
 }
 
+fn mse_action_value_output_target(output: ActionValueOutput, target: ActionValueTarget) -> f32 {
+    let delta = output.value - target.value;
+    delta * delta
+}
+
 pub const MODEL_REGISTRY: &[&str] = &[
     "ExperienceEncoder",
     "ExperienceDecoder",
@@ -743,7 +1090,9 @@ mod tests {
     use super::*;
     use netherwick_actions::ActionPrimitive;
     use netherwick_body::BodySense;
-    use netherwick_experience::{ChargeInput, ChargeTarget, DangerInput};
+    use netherwick_experience::{
+        ActionValueInput, ActionValueTarget, ChargeInput, ChargeTarget, DangerInput,
+    };
 
     #[test]
     fn hardcoded_uses_current_now_for_body_danger() {
@@ -900,6 +1249,46 @@ mod tests {
         assert!(dir.join("metadata.json").exists());
         assert_eq!(loaded.samples_seen(), 1);
         assert!((0.0..=1.0).contains(&output.charge_probability));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn action_value_net_forward_returns_finite_value() {
+        let now = Now::blank(1, BodySense::default());
+        let input =
+            ActionValueInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Dock), &now);
+        let trainer = ActionValueNetTrainer::new(input.flat_features().len());
+
+        let output = trainer.predict(&input).unwrap();
+
+        assert!(output.value.is_finite());
+        assert!(output.confidence.is_finite());
+        assert!((-1.0..=1.0).contains(&output.value));
+        assert!((0.0..=1.0).contains(&output.confidence));
+    }
+
+    #[test]
+    fn action_value_checkpoint_round_trips_prediction_shape() {
+        let dir =
+            std::env::temp_dir().join(format!("netherwick-action-value-checkpoint-{}", now_ms()));
+        let now = Now::blank(1, BodySense::default());
+        let input =
+            ActionValueInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Dock), &now);
+        let mut trainer = ActionValueNetTrainer::new(input.flat_features().len());
+        trainer
+            .train_step(&input, &ActionValueTarget { value: 0.4 })
+            .unwrap();
+
+        trainer.save_checkpoint(&dir).unwrap();
+        let loaded =
+            ActionValueNetTrainer::load_checkpoint(&dir, input.flat_features().len()).unwrap();
+        let output = loaded.predict(&input).unwrap();
+
+        assert!(dir.join("model.bin").exists());
+        assert!(dir.join("metadata.json").exists());
+        assert_eq!(loaded.samples_seen(), 1);
+        assert!(output.value.is_finite());
 
         let _ = std::fs::remove_dir_all(dir);
     }

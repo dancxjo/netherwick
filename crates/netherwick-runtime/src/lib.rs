@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use netherwick_actions::{
     action_to_motion, action_to_motor_command, ActionPrimitive, ExploreStyle, ReignInput,
-    ReignOutcome,
+    ReignOutcome, TurnDir,
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_body::MotorComplex;
@@ -15,20 +15,22 @@ use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
 use netherwick_experience::{
-    BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput, DangerInput,
-    DangerOutput, Experience, ExperienceEncoder, ExperienceLatent, FeatureExperienceEncoder,
-    FuturePrediction, FuturePredictor, Impression, RewardComputer, Sensation,
-    StasisFuturePredictor, SurpriseComputer,
+    ActionValueInput, ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer,
+    ChargeInput, ChargeOutput, DangerInput, DangerOutput, Experience, ExperienceEncoder,
+    ExperienceLatent, FeatureExperienceEncoder, FuturePrediction, FuturePredictor, Impression,
+    RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{ExperienceFrame, LedgerWriter, PendingFrame, TransitionBuilder};
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
 use netherwick_models::{
-    read_charge_metadata, read_danger_metadata, ChargeNetTrainer, DangerNetTrainer,
-    HardcodedChargePredictor, HardcodedDangerPredictor,
+    read_action_value_metadata, read_charge_metadata, read_danger_metadata, ActionValueNetTrainer,
+    ChargeNetTrainer, DangerNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
+    HardcodedDangerPredictor,
 };
 use netherwick_now::{
-    ChargePrediction, DangerPrediction, DriveSense, Now, ReignSense, SafetySense,
+    ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, Now, ReignSense,
+    SafetySense,
 };
 use netherwick_sensors::World;
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
@@ -64,6 +66,7 @@ where
 pub struct RuntimeModelStack {
     pub danger: Option<DangerRuntimePredictor>,
     pub charge: Option<ChargeRuntimePredictor>,
+    pub action_value: Option<ActionValueRuntimePredictor>,
 }
 
 impl RuntimeModelStack {
@@ -76,6 +79,7 @@ impl RuntimeModelStack {
                 metadata.input_dim,
             )?),
             charge: None,
+            action_value: None,
         })
     }
 
@@ -88,12 +92,27 @@ impl RuntimeModelStack {
                 path,
                 metadata.input_dim,
             )?),
+            action_value: None,
+        })
+    }
+
+    pub fn with_action_value_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_action_value_metadata(path)?;
+        Ok(Self {
+            danger: None,
+            charge: None,
+            action_value: Some(ActionValueRuntimePredictor::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?),
         })
     }
 
     pub fn with_shadow_checkpoints(
         danger_path: Option<&Path>,
         charge_path: Option<&Path>,
+        action_value_path: Option<&Path>,
     ) -> Result<Self> {
         let mut stack = Self::default();
         if let Some(path) = danger_path {
@@ -110,6 +129,13 @@ impl RuntimeModelStack {
                 metadata.input_dim,
             )?);
         }
+        if let Some(path) = action_value_path {
+            let metadata = read_action_value_metadata(path)?;
+            stack.action_value = Some(ActionValueRuntimePredictor::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?);
+        }
         Ok(stack)
     }
 }
@@ -117,6 +143,49 @@ impl RuntimeModelStack {
 pub struct DangerRuntimePredictor {
     trainer: DangerNetTrainer,
     hardcoded: HardcodedDangerPredictor,
+}
+
+pub struct ActionValueRuntimePredictor {
+    trainer: ActionValueNetTrainer,
+    hardcoded: HardcodedActionValuePredictor,
+}
+
+impl ActionValueRuntimePredictor {
+    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
+        Ok(Self {
+            trainer: ActionValueNetTrainer::load_checkpoint(path, input_dim)?,
+            hardcoded: HardcodedActionValuePredictor,
+        })
+    }
+
+    pub fn predict_shadow(
+        &self,
+        now: &Now,
+        latent: &ExperienceLatent,
+        action: Option<&ActionPrimitive>,
+        model_danger: Option<DangerOutput>,
+        model_charge: Option<ChargeOutput>,
+        hardcoded_danger: Option<DangerOutput>,
+        hardcoded_charge: Option<ChargeOutput>,
+    ) -> Result<(ActionValueOutput, ActionValueOutput)> {
+        let model_input = ActionValueInput::from_parts_with_predictions(
+            latent.z.clone(),
+            action,
+            now,
+            model_danger,
+            model_charge,
+        );
+        let hardcoded_input = ActionValueInput::from_parts_with_predictions(
+            latent.z.clone(),
+            action,
+            now,
+            hardcoded_danger,
+            hardcoded_charge,
+        );
+        let model = self.trainer.predict(&model_input)?;
+        let hardcoded = self.hardcoded.predict_from_now(now, &hardcoded_input);
+        Ok((model, hardcoded))
+    }
 }
 
 impl DangerRuntimePredictor {
@@ -401,6 +470,8 @@ where
         {
             proposals.push(action);
         }
+        let action_value_candidates =
+            action_value_candidate_actions(&proposals, reign_action.as_ref(), &llm_tick);
 
         let chosen_action = self.conductor.choose(ConductorInput {
             latent: latent.clone(),
@@ -424,6 +495,43 @@ where
             let (model, hardcoded) = charge.predict_shadow(&now, &latent, Some(&chosen_action))?;
             now.predictions.charge_model = Some(charge_prediction(model));
             now.predictions.charge_hardcoded = Some(charge_prediction(hardcoded));
+        }
+        if let Some(action_value) = &self.models.action_value {
+            let hardcoded_danger = HardcodedDangerPredictor;
+            let hardcoded_charge = HardcodedChargePredictor;
+            let mut model_predictions = Vec::new();
+            let mut hardcoded_predictions = Vec::new();
+            for action in &action_value_candidates {
+                let danger_input = DangerInput::from_parts(latent.z.clone(), Some(action), &now);
+                let charge_input = ChargeInput::from_parts(latent.z.clone(), Some(action), &now);
+                let model_danger = self
+                    .models
+                    .danger
+                    .as_ref()
+                    .and_then(|danger| danger.trainer.predict(&danger_input).ok());
+                let model_charge = self
+                    .models
+                    .charge
+                    .as_ref()
+                    .and_then(|charge| charge.trainer.predict(&charge_input).ok());
+                let hardcoded_danger_output =
+                    hardcoded_danger.predict_from_now(&now, &danger_input);
+                let hardcoded_charge_output =
+                    hardcoded_charge.predict_from_now(&now, &charge_input);
+                let (model, hardcoded) = action_value.predict_shadow(
+                    &now,
+                    &latent,
+                    Some(action),
+                    model_danger.or(Some(hardcoded_danger_output)),
+                    model_charge.or(Some(hardcoded_charge_output)),
+                    Some(hardcoded_danger_output),
+                    Some(hardcoded_charge_output),
+                )?;
+                model_predictions.push(action_value_prediction(action.clone(), model));
+                hardcoded_predictions.push(action_value_prediction(action.clone(), hardcoded));
+            }
+            now.predictions.action_values_model = model_predictions;
+            now.predictions.action_values_hardcoded = hardcoded_predictions;
         }
 
         let safety = self
@@ -602,6 +710,17 @@ fn charge_prediction(output: ChargeOutput) -> ChargePrediction {
     }
 }
 
+fn action_value_prediction(
+    action: ActionPrimitive,
+    output: ActionValueOutput,
+) -> ActionValuePrediction {
+    ActionValuePrediction {
+        action,
+        value: output.value,
+        confidence: output.confidence,
+    }
+}
+
 pub struct RuntimeTick {
     pub frame: ExperienceFrame,
     pub experience: Experience,
@@ -695,16 +814,54 @@ fn predict_baseline_futures(
 fn default_candidate_actions() -> Vec<ActionPrimitive> {
     vec![
         ActionPrimitive::Stop,
-        ActionPrimitive::Explore {
-            style: ExploreStyle::Wander,
-            duration_ms: 2_000,
-        },
         ActionPrimitive::Go {
             intensity: 0.15,
             duration_ms: 1_000,
         },
+        ActionPrimitive::Turn {
+            direction: TurnDir::Left,
+            intensity: 0.25,
+            duration_ms: 750,
+        },
+        ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.25,
+            duration_ms: 750,
+        },
         ActionPrimitive::Dock,
+        ActionPrimitive::Explore {
+            style: ExploreStyle::Wander,
+            duration_ms: 2_000,
+        },
     ]
+}
+
+fn action_value_candidate_actions(
+    proposals: &[ActionPrimitive],
+    reign_action: Option<&ActionPrimitive>,
+    llm_tick: &LlmTickResult,
+) -> Vec<ActionPrimitive> {
+    let mut candidates = default_candidate_actions();
+    if let Some(action) = reign_action {
+        push_unique_action(&mut candidates, action.clone());
+    }
+    if let Some(action) = llm_tick
+        .conscious_command
+        .as_ref()
+        .and_then(|cmd| cmd.action.clone())
+    {
+        push_unique_action(&mut candidates, action);
+    }
+    for action in proposals {
+        push_unique_action(&mut candidates, action.clone());
+    }
+    candidates
+}
+
+fn push_unique_action(actions: &mut Vec<ActionPrimitive>, action: ActionPrimitive) {
+    if !actions.iter().any(|existing| existing == &action) {
+        actions.push(action);
+    }
 }
 
 fn apply_responses(
@@ -951,7 +1108,7 @@ mod tests {
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_memory::InMemoryExperienceStore;
-    use netherwick_models::{ChargeNetTrainer, DangerNetTrainer};
+    use netherwick_models::{ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer};
     use netherwick_now::Now;
     use netherwick_sensors::World;
     use netherwick_sim::{ArenaConfig, SimObject, VirtualWorld};
@@ -1306,6 +1463,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sim_with_action_value_checkpoint_writes_shadow_predictions() {
+        let root = test_ledger_root("sim-runner-action-value-shadow");
+        let checkpoint = danger_checkpoint_root("sim-runner-action-value-shadow");
+        let action = ActionPrimitive::Dock;
+        write_test_action_value_checkpoint(&checkpoint, action.clone());
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(action)).with_models(
+            RuntimeModelStack::with_action_value_shadow_checkpoint(&checkpoint).unwrap(),
+        );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.2, 7));
+        world.add_object(SimObject::charger("charger", "charger", 1.2, 1.0, 0.18));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let frames = ledger.recent(5).await.unwrap();
+        let frame = frames.last().unwrap();
+
+        assert!(!frame.now.predictions.action_values_model.is_empty());
+        assert!(!frame.now.predictions.action_values_hardcoded.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn action_value_shadow_mode_does_not_override_conductor() {
+        let root = test_ledger_root("sim-runner-action-value-shadow-choice");
+        let checkpoint = danger_checkpoint_root("sim-runner-action-value-shadow-choice");
+        write_test_action_value_checkpoint(&checkpoint, ActionPrimitive::Dock);
+        let chosen = ActionPrimitive::Stop;
+        let ledger = JsonlLedger::new(&root);
+        let mut runtime = test_runtime(ledger, FixedConductor::new(chosen.clone())).with_models(
+            RuntimeModelStack::with_action_value_shadow_checkpoint(&checkpoint).unwrap(),
+        );
+
+        let tick = runtime
+            .tick(
+                Now::blank(100, test_body(1.0, 1.0, 0.8, 100)),
+                ExperienceLatent::default(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, Some(chosen));
+        assert!(!tick.frame.now.predictions.action_values_model.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
     async fn shared_reign_queue_controls_next_sim_tick() {
         let root = test_ledger_root("sim-runner-shared-reign");
         let ledger = JsonlLedger::new(&root);
@@ -1462,6 +1672,23 @@ mod tests {
                     battery_delta: 0.03,
                     charging_after: 1.0,
                 },
+            )
+            .unwrap();
+        trainer.save_checkpoint(root).unwrap();
+    }
+
+    fn write_test_action_value_checkpoint(root: &Path, action: ActionPrimitive) {
+        let mut body = test_body(1.0, 1.0, 0.2, 7);
+        body.charging = false;
+        let now = Now::blank(100, body);
+        let mut encoder = FeatureExperienceEncoder::new();
+        let latent = encoder.encode(&now).unwrap();
+        let input = ActionValueInput::from_parts(latent.z, Some(&action), &now);
+        let mut trainer = ActionValueNetTrainer::new(input.flat_features().len());
+        trainer
+            .train_step(
+                &input,
+                &netherwick_experience::ActionValueTarget { value: 0.25 },
             )
             .unwrap();
         trainer.save_checkpoint(root).unwrap();
