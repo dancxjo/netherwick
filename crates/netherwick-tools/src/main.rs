@@ -298,6 +298,7 @@ enum ScenarioArg {
     EmptyRoom,
     ObstacleAvoidance,
     CornerTrap,
+    ColumnTrap,
     ChargerSeeking,
     PersonSpeakerRoom,
     MixedRoom,
@@ -309,6 +310,7 @@ impl From<ScenarioArg> for ScenarioKind {
             ScenarioArg::EmptyRoom => ScenarioKind::EmptyRoom,
             ScenarioArg::ObstacleAvoidance => ScenarioKind::ObstacleAvoidance,
             ScenarioArg::CornerTrap => ScenarioKind::CornerTrap,
+            ScenarioArg::ColumnTrap => ScenarioKind::ColumnTrap,
             ScenarioArg::ChargerSeeking => ScenarioKind::ChargerSeeking,
             ScenarioArg::PersonSpeakerRoom => ScenarioKind::PersonAndSpeaker,
             ScenarioArg::MixedRoom => ScenarioKind::MixedRoom,
@@ -724,6 +726,9 @@ struct CompareScenarioReportsArgs {
 
 async fn run_sim(args: SimArgs) -> Result<()> {
     let ledger = JsonlLedger::new(&args.ledger);
+    let flags = RuntimeModelFlags::from(&args);
+    let (models, model_loading) = load_runtime_models_from_flags(&flags)?;
+    let action_selector_mode = ActionSelectorMode::from(args.action_selector);
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
     let llm = configured_llm_agent(&args.llm)?;
@@ -735,8 +740,8 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         SimpleSafety::default(),
         llm,
     )
-    .with_action_selector_mode(args.action_selector.into());
-    if let Some(models) = load_runtime_models(&args)? {
+    .with_action_selector_mode(action_selector_mode);
+    if let Some(models) = models {
         runtime = runtime.with_models(models);
     }
 
@@ -755,6 +760,16 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             seed: Some(args.seed),
             source: "sim".to_string(),
             tick_ms: Some(args.tick_delay_ms),
+        });
+        live_state.update_training_status(netherwick_server::LiveTrainingStatus {
+            training_mode: "collecting".to_string(),
+            ledger_path: Some(args.ledger.clone()),
+            frames_written: 0,
+            transitions_written: 0,
+            models_loaded: loaded_model_names(&model_loading),
+            model_modes: model_modes_from_flags(&flags),
+            action_selector_mode: action_selector_mode.as_str().to_string(),
+            weights_updating: false,
         });
         let server_state = live_state.clone();
         let live_addr = args.live_addr;
@@ -785,6 +800,9 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         let scheme = if args.live_tls { "https" } else { "http" };
         println!();
         println!("Netherwick virtual theater is running.");
+        println!("Virtual training theater is collecting experience.");
+        println!("Models are not updated online in this run.");
+        println!("Train later with `cargo run --bin netherwick -- train behavior ...`");
         println!();
         println!("Desktop:");
         println!("  {scheme}://127.0.0.1:{}/view/3d", args.live_addr.port());
@@ -803,6 +821,16 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             runner
                 .run_steps_observing(1, |snapshot| live_state.update(snapshot.clone()))
                 .await?;
+            live_state.update_training_status(netherwick_server::LiveTrainingStatus {
+                training_mode: "collecting".to_string(),
+                ledger_path: Some(args.ledger.clone()),
+                frames_written: runner.tick_count,
+                transitions_written: runner.tick_count.saturating_sub(1),
+                models_loaded: loaded_model_names(&model_loading),
+                model_modes: model_modes_from_flags(&flags),
+                action_selector_mode: action_selector_mode.as_str().to_string(),
+                weights_updating: false,
+            });
             tokio::time::sleep(Duration::from_millis(args.tick_delay_ms)).await;
         }
     } else {
@@ -822,6 +850,16 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         args.experience_mode
     );
     Ok(())
+}
+
+fn loaded_model_names(report: &RuntimeModelLoadReport) -> Vec<String> {
+    let mut names = report
+        .loaded_checkpoints
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 fn live_scene_metadata_from_scenario(
@@ -1049,13 +1087,23 @@ struct ScenarioEvaluationSummary {
     #[serde(default)]
     stuck_count: usize,
     #[serde(default)]
+    trap_kind_counts: HashMap<String, usize>,
+    #[serde(default)]
+    recovery_attempts: usize,
+    #[serde(default)]
     stuck_duration: Option<f32>,
     #[serde(default)]
     mean_stuck_duration: Option<f32>,
     #[serde(default)]
     recovery_success_rate: Option<f32>,
     #[serde(default)]
+    mean_recovery_ticks: Option<f32>,
+    #[serde(default)]
+    repeated_trap_count: usize,
+    #[serde(default)]
     dead_battery_tick: Option<usize>,
+    #[serde(default)]
+    distance_after_recovery_m: Option<f32>,
     mean_safety_interventions: f32,
     behavior_run_records: usize,
     model_fallbacks: usize,
@@ -1091,13 +1139,23 @@ struct ScenarioEpisodeReport {
     #[serde(default)]
     stuck_count: usize,
     #[serde(default)]
+    trap_kind_counts: HashMap<String, usize>,
+    #[serde(default)]
+    recovery_attempts: usize,
+    #[serde(default)]
     stuck_duration: Option<f32>,
     #[serde(default)]
     mean_stuck_duration: Option<f32>,
     #[serde(default)]
     recovery_success_rate: Option<f32>,
     #[serde(default)]
+    mean_recovery_ticks: Option<f32>,
+    #[serde(default)]
+    repeated_trap_count: usize,
+    #[serde(default)]
     dead_battery_tick: Option<usize>,
+    #[serde(default)]
+    distance_after_recovery_m: Option<f32>,
     unique_actions: Vec<String>,
     safety_interventions: usize,
     behavior_run_records: usize,
@@ -1172,10 +1230,16 @@ struct EpisodeMetricBuilder {
     distance_traveled_m: f32,
     stuck_ticks: usize,
     stuck_count: usize,
+    trap_kind_counts: HashMap<String, usize>,
+    recovery_attempts: usize,
     stuck_duration_sum_ms: f32,
     stuck_duration_count: usize,
     active_stuck_duration_ms: Option<f32>,
     recovery_successes: usize,
+    recovery_ticks_sum: usize,
+    recovery_tick_count: usize,
+    repeated_trap_count: usize,
+    distance_at_last_recovery_m: Option<f32>,
     dead_battery_tick: Option<usize>,
     unique_actions: BTreeSet<String>,
     safety_interventions: usize,
@@ -1230,10 +1294,16 @@ impl EpisodeMetricBuilder {
             distance_traveled_m: 0.0,
             stuck_ticks: 0,
             stuck_count: 0,
+            trap_kind_counts: HashMap::new(),
+            recovery_attempts: 0,
             stuck_duration_sum_ms: 0.0,
             stuck_duration_count: 0,
             active_stuck_duration_ms: None,
             recovery_successes: 0,
+            recovery_ticks_sum: 0,
+            recovery_tick_count: 0,
+            repeated_trap_count: 0,
+            distance_at_last_recovery_m: None,
             dead_battery_tick: None,
             unique_actions: BTreeSet::new(),
             safety_interventions: 0,
@@ -1358,20 +1428,33 @@ impl EpisodeMetricBuilder {
         let duration_ms = values.get(3).copied().unwrap_or(0.0).max(0.0);
         let event_started = values.get(6).copied().unwrap_or(0.0) > 0.0;
         let recovered = values.get(7).copied().unwrap_or(0.0) > 0.0;
+        let trap_kind = trap_kind_label(values.get(10).copied().unwrap_or(0.0));
+        let attempts = values.get(11).copied().unwrap_or(0.0).max(0.0) as usize;
+        let repeated = values.get(12).copied().unwrap_or(0.0).max(0.0) as usize;
         if event_started {
             self.stuck_count = self.stuck_count.saturating_add(1);
             self.active_stuck_duration_ms = Some(duration_ms);
+            if let Some(kind) = trap_kind {
+                *self.trap_kind_counts.entry(kind.to_string()).or_default() += 1;
+            }
         }
         if active {
             self.stuck_ticks = self.stuck_ticks.saturating_add(1);
             self.active_stuck_duration_ms = Some(duration_ms);
         }
+        self.recovery_attempts = self.recovery_attempts.max(attempts);
+        self.repeated_trap_count = self.repeated_trap_count.max(repeated);
         if recovered {
             self.recovery_successes = self.recovery_successes.saturating_add(1);
             if let Some(duration) = self.active_stuck_duration_ms.take() {
                 self.stuck_duration_sum_ms += duration;
                 self.stuck_duration_count = self.stuck_duration_count.saturating_add(1);
+                self.recovery_ticks_sum = self
+                    .recovery_ticks_sum
+                    .saturating_add((duration / 100.0).round().max(0.0) as usize);
+                self.recovery_tick_count = self.recovery_tick_count.saturating_add(1);
             }
+            self.distance_at_last_recovery_m = Some(self.distance_traveled_m);
         }
     }
 
@@ -1479,11 +1562,19 @@ impl EpisodeMetricBuilder {
             distance_traveled_m: self.distance_traveled_m,
             stuck_ticks: self.stuck_ticks,
             stuck_count: self.stuck_count,
+            trap_kind_counts: self.trap_kind_counts,
+            recovery_attempts: self.recovery_attempts,
             stuck_duration,
             mean_stuck_duration: stuck_duration,
             recovery_success_rate: (self.stuck_count > 0)
                 .then_some(self.recovery_successes as f32 / self.stuck_count as f32),
+            mean_recovery_ticks: (self.recovery_tick_count > 0)
+                .then_some(self.recovery_ticks_sum as f32 / self.recovery_tick_count as f32),
+            repeated_trap_count: self.repeated_trap_count,
             dead_battery_tick: self.dead_battery_tick,
+            distance_after_recovery_m: self
+                .distance_at_last_recovery_m
+                .map(|distance| (self.distance_traveled_m - distance).max(0.0)),
             unique_actions: self.unique_actions.into_iter().collect(),
             safety_interventions: self.safety_interventions,
             behavior_run_records: self.behavior_run_records,
@@ -1798,6 +1889,11 @@ fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool 
                 && episode.recovery_success_rate.unwrap_or(0.0) > 0.0
                 && episode.distance_traveled_m > 0.02
         }
+        ScenarioKind::ColumnTrap => {
+            episode.stuck_count > 0
+                && episode.recovery_success_rate.unwrap_or(0.0) > 0.0
+                && episode.distance_after_recovery_m.unwrap_or(0.0) > 0.08
+        }
         ScenarioKind::ChargerSeeking => episode.charging_ticks > 0 || episode.battery_delta > 0.03,
         ScenarioKind::PersonAndSpeaker => {
             episode.ticks > 0
@@ -1824,6 +1920,12 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
     let count = episodes.len() as f32;
     let total_ticks: usize = episodes.iter().map(|episode| episode.ticks).sum();
     let total_collisions: usize = episodes.iter().map(|episode| episode.collisions).sum();
+    let mut trap_kind_counts = HashMap::new();
+    for episode in episodes {
+        for (kind, count) in &episode.trap_kind_counts {
+            *trap_kind_counts.entry(kind.clone()).or_default() += count;
+        }
+    }
     ScenarioEvaluationSummary {
         success_rate: episodes.iter().filter(|episode| episode.success).count() as f32 / count,
         collision_rate: if total_ticks == 0 {
@@ -1847,6 +1949,11 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
         mean_distance_traveled_m: mean(episodes.iter().map(|episode| episode.distance_traveled_m)),
         mean_ticks_survived: mean(episodes.iter().map(|episode| episode.ticks as f32)),
         stuck_count: episodes.iter().map(|episode| episode.stuck_count).sum(),
+        trap_kind_counts,
+        recovery_attempts: episodes
+            .iter()
+            .map(|episode| episode.recovery_attempts)
+            .sum(),
         stuck_duration: mean_optional(episodes.iter().filter_map(|episode| episode.stuck_duration)),
         mean_stuck_duration: mean_optional(
             episodes
@@ -1858,10 +1965,24 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
                 .iter()
                 .filter_map(|episode| episode.recovery_success_rate),
         ),
+        mean_recovery_ticks: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_recovery_ticks),
+        ),
+        repeated_trap_count: episodes
+            .iter()
+            .map(|episode| episode.repeated_trap_count)
+            .sum(),
         dead_battery_tick: episodes
             .iter()
             .filter_map(|episode| episode.dead_battery_tick)
             .min(),
+        distance_after_recovery_m: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.distance_after_recovery_m),
+        ),
         mean_safety_interventions: mean(
             episodes
                 .iter()
@@ -1890,6 +2011,15 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
                 .iter()
                 .filter_map(|episode| episode.mean_candidate_score),
         ),
+    }
+}
+
+fn trap_kind_label(code: f32) -> Option<&'static str> {
+    match code.round() as i32 {
+        1 => Some("wall"),
+        2 => Some("corner"),
+        3 => Some("column"),
+        _ => None,
     }
 }
 
@@ -3843,10 +3973,6 @@ struct RuntimeModelLoadReport {
     warnings: Vec<String>,
 }
 
-fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
-    Ok(load_runtime_models_from_flags(&RuntimeModelFlags::from(args))?.0)
-}
-
 fn load_runtime_models_from_flags(
     flags: &RuntimeModelFlags<'_>,
 ) -> Result<(Option<RuntimeModelStack>, RuntimeModelLoadReport)> {
@@ -5188,6 +5314,7 @@ mod tests {
             ("empty-room", ScenarioArg::EmptyRoom),
             ("obstacle-avoidance", ScenarioArg::ObstacleAvoidance),
             ("corner-trap", ScenarioArg::CornerTrap),
+            ("column-trap", ScenarioArg::ColumnTrap),
             ("charger-seeking", ScenarioArg::ChargerSeeking),
             ("person-speaker-room", ScenarioArg::PersonSpeakerRoom),
             ("mixed-room", ScenarioArg::MixedRoom),

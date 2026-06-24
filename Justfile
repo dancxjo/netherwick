@@ -101,6 +101,9 @@ go target="virtual":
     if [ -z "$LAN_IP" ]; then LAN_IP="127.0.0.1"; fi
     echo
     echo "Netherwick virtual theater is starting."
+    echo "Virtual training theater is collecting experience."
+    echo "Models are not updated online in this run."
+    echo 'Train later with `cargo run --bin netherwick -- train behavior ...`'
     echo
     echo "Desktop:"
     echo "  https://127.0.0.1:$PORT/view/3d"

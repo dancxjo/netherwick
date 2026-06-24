@@ -2,6 +2,16 @@
 
 `just go virtual` starts Netherwick as a virtual live training theater: a simulated scenario updates the live view state, the server binds to `0.0.0.0`, and HTTPS pages are served for desktop browsers and LAN headset browsers.
 
+This mode collects experience into the ledger. It does not update model weights online. Startup prints:
+
+```text
+Virtual training theater is collecting experience.
+Models are not updated online in this run.
+Train later with `cargo run --bin netherwick -- train behavior ...`
+```
+
+The `/view/scene` packet and `/view/3d` HUD expose `training_mode`, `ledger_path`, written frame/transition counts, loaded models, model modes, action selector mode, and `weights_updating`. For the default virtual run, expect `training_mode: "collecting"` and `weights_updating: false`.
+
 Open:
 
 - Desktop: `https://127.0.0.1:8787/view/3d`
@@ -36,6 +46,8 @@ Useful scenario slugs:
 
 - `empty-room`
 - `obstacle-avoidance`
+- `corner-trap`
+- `column-trap`
 - `charger-seeking`
 - `person-speaker-room`
 - `mixed-room`

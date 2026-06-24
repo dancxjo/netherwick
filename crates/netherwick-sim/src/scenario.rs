@@ -11,6 +11,7 @@ pub enum ScenarioKind {
     EmptyRoom,
     ObstacleAvoidance,
     CornerTrap,
+    ColumnTrap,
     ChargerSeeking,
     PersonAndSpeaker,
     MixedRoom,
@@ -22,6 +23,7 @@ impl ScenarioKind {
             Self::EmptyRoom => "empty-room",
             Self::ObstacleAvoidance => "obstacle-avoidance",
             Self::CornerTrap => "corner-trap",
+            Self::ColumnTrap => "column-trap",
             Self::ChargerSeeking => "charger-seeking",
             Self::PersonAndSpeaker => "person-speaker-room",
             Self::MixedRoom => "mixed-room",
@@ -63,6 +65,9 @@ impl ScenarioConfig {
             }
             ScenarioKind::CornerTrap => {
                 config.obstacle_count = 3;
+            }
+            ScenarioKind::ColumnTrap => {
+                config.obstacle_count = 1;
             }
             ScenarioKind::ChargerSeeking => {
                 config.charger_count = 2;
@@ -147,6 +152,11 @@ fn spawn_body(config: &ScenarioConfig, rng: &mut StdRng) -> BodySense {
             body.odometry.y_m = 0.42;
             body.odometry.heading_rad = -2.35;
         }
+        ScenarioKind::ColumnTrap => {
+            body.odometry.x_m = 1.0;
+            body.odometry.y_m = config.arena.height_m * 0.5;
+            body.odometry.heading_rad = 0.0;
+        }
         ScenarioKind::ChargerSeeking => {
             body.battery_level = 0.18;
             body.odometry.x_m = rng.gen_range(0.8..config.arena.width_m * 0.35);
@@ -175,6 +185,8 @@ fn add_kind_objects(
     for index in 0..config.obstacle_count {
         let (x_m, y_m) = if config.kind == ScenarioKind::ObstacleAvoidance && index == 0 {
             (body.odometry.x_m + 0.55, body.odometry.y_m)
+        } else if config.kind == ScenarioKind::ColumnTrap {
+            (body.odometry.x_m + 0.50, body.odometry.y_m)
         } else if config.kind == ScenarioKind::CornerTrap {
             match index {
                 0 => (0.42, 1.02),
@@ -189,7 +201,11 @@ fn add_kind_objects(
             format!("obstacle {index}"),
             x_m,
             y_m,
-            rng.gen_range(0.22..0.42),
+            if config.kind == ScenarioKind::ColumnTrap {
+                0.28
+            } else {
+                rng.gen_range(0.22..0.42)
+            },
         ));
     }
 

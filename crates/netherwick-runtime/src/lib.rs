@@ -2352,6 +2352,8 @@ pub struct SimRunner<R> {
 const STUCK_LOW_DISPLACEMENT_TICKS: usize = 6;
 const STUCK_WINDOW_DISPLACEMENT_EPSILON_M: f32 = 0.015;
 const NEAR_ARENA_WALL_M: f32 = 0.32;
+const RECOVERY_CLEARANCE_M: f32 = 0.18;
+const SAME_TRAP_RADIUS_M: f32 = 0.18;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RecoveryPhase {
@@ -2360,17 +2362,30 @@ enum RecoveryPhase {
     Stop,
     Reverse,
     Turn,
+    Probe,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TrapKind {
+    #[default]
+    Unknown,
+    Wall,
+    Corner,
+    Column,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct StuckStatus {
     active: bool,
     corner_trap: bool,
+    trap_kind: TrapKind,
     stuck_ticks: usize,
     duration_ticks: usize,
     phase: RecoveryPhase,
     turn_sign: f32,
     recovery_attempts: usize,
+    repeated_trap_count: usize,
+    clearance_m: Option<f32>,
     event_started: bool,
     recovered: bool,
     dead_battery: bool,
@@ -2385,11 +2400,16 @@ struct StuckRecoveryController {
     stuck_ticks: usize,
     active: bool,
     corner_trap: bool,
+    trap_kind: TrapKind,
     duration_ticks: usize,
     phase: RecoveryPhase,
     phase_ticks_remaining: usize,
     turn_sign: f32,
     recovery_attempts: usize,
+    repeated_trap_count: usize,
+    trap_anchor: Option<(f32, f32)>,
+    last_failed_turn_sign: Option<f32>,
+    clearance_m: Option<f32>,
     event_started: bool,
     recovered: bool,
     dead_battery: bool,
@@ -2428,26 +2448,34 @@ impl StuckRecoveryController {
             0
         };
 
-        let corner_trap = classify_corner_trap(snapshot);
+        self.clearance_m = snapshot.range.nearest_m;
+        let trap_kind = classify_trap_kind(snapshot);
+        let trapped = trap_kind != TrapKind::Unknown;
         if !self.active
             && commanded_motion
             && self.stuck_ticks >= STUCK_LOW_DISPLACEMENT_TICKS
-            && corner_trap
+            && trapped
             && !self.dead_battery
         {
-            if self.recovery_attempts > 0 {
-                self.reset_due = true;
-                self.corner_trap = corner_trap;
-                self.event_started = true;
-                self.last_position = Some(position);
-                return;
-            }
             self.active = true;
-            self.corner_trap = true;
+            self.corner_trap = trap_kind == TrapKind::Corner;
+            self.trap_kind = trap_kind;
             self.duration_ticks = 0;
             self.phase = RecoveryPhase::Stop;
             self.phase_ticks_remaining = 1;
-            self.turn_sign = turn_away_sign(snapshot);
+            if self
+                .trap_anchor
+                .map(|anchor| distance_between_points(anchor, position) <= SAME_TRAP_RADIUS_M)
+                .unwrap_or(false)
+            {
+                self.repeated_trap_count = self.repeated_trap_count.saturating_add(1);
+            } else {
+                self.repeated_trap_count = 0;
+                self.trap_anchor = Some(position);
+                self.recovery_attempts = 0;
+                self.last_failed_turn_sign = None;
+            }
+            self.turn_sign = recovery_turn_sign(snapshot, self.last_failed_turn_sign);
             self.event_started = true;
         }
 
@@ -2461,9 +2489,15 @@ impl StuckRecoveryController {
         self.duration_ticks = self.duration_ticks.saturating_add(1);
         let motion = match self.phase {
             RecoveryPhase::Stop => MotionCommand::Stop,
-            RecoveryPhase::Reverse => MotionCommand::Forward { speed_m_s: -0.18 },
+            RecoveryPhase::Reverse => MotionCommand::Forward {
+                speed_m_s: -reverse_speed(self.recovery_attempts),
+            },
             RecoveryPhase::Turn => MotionCommand::Turn {
-                turn_rad_s: self.turn_sign * 0.8,
+                turn_rad_s: self.turn_sign * turn_speed(self.recovery_attempts),
+            },
+            RecoveryPhase::Probe => MotionCommand::Drive {
+                forward_m_s: 0.04,
+                turn_rad_s: self.turn_sign * 0.25,
             },
             RecoveryPhase::None => return None,
         };
@@ -2479,25 +2513,53 @@ impl StuckRecoveryController {
         match self.phase {
             RecoveryPhase::Stop => {
                 self.phase = RecoveryPhase::Reverse;
-                self.phase_ticks_remaining = 4;
+                self.phase_ticks_remaining = reverse_ticks(self.recovery_attempts);
             }
             RecoveryPhase::Reverse => {
                 self.phase = RecoveryPhase::Turn;
-                self.phase_ticks_remaining = 8;
+                self.phase_ticks_remaining = turn_ticks(self.recovery_attempts);
             }
-            RecoveryPhase::Turn | RecoveryPhase::None => {
-                self.active = false;
-                self.corner_trap = false;
-                self.stuck_ticks = 0;
-                self.duration_ticks = 0;
-                self.phase = RecoveryPhase::None;
-                self.phase_ticks_remaining = 0;
-                self.recovery_attempts = self.recovery_attempts.saturating_add(1);
-                self.recovered = true;
-                self.displacement_window.clear();
-                self.commanded_window.clear();
+            RecoveryPhase::Turn => {
+                self.phase = RecoveryPhase::Probe;
+                self.phase_ticks_remaining = 1;
             }
+            RecoveryPhase::Probe => {
+                if self.clearance_achieved() {
+                    self.finish_recovery_success();
+                } else {
+                    self.last_failed_turn_sign = Some(self.turn_sign);
+                    self.recovery_attempts = self.recovery_attempts.saturating_add(1);
+                    self.repeated_trap_count = self.repeated_trap_count.saturating_add(1);
+                    self.turn_sign = -self.turn_sign;
+                    self.phase = RecoveryPhase::Stop;
+                    self.phase_ticks_remaining = 1;
+                }
+            }
+            RecoveryPhase::None => {}
         }
+    }
+
+    fn clearance_achieved(&self) -> bool {
+        self.clearance_m
+            .map(|nearest| nearest > RECOVERY_CLEARANCE_M)
+            .unwrap_or(true)
+    }
+
+    fn finish_recovery_success(&mut self) {
+        self.active = false;
+        self.corner_trap = false;
+        self.trap_kind = TrapKind::Unknown;
+        self.stuck_ticks = 0;
+        self.duration_ticks = 0;
+        self.phase = RecoveryPhase::None;
+        self.phase_ticks_remaining = 0;
+        self.recovery_attempts = 0;
+        self.repeated_trap_count = 0;
+        self.trap_anchor = None;
+        self.last_failed_turn_sign = None;
+        self.recovered = true;
+        self.displacement_window.clear();
+        self.commanded_window.clear();
     }
 
     fn push_motion_sample(&mut self, step_distance: f32, commanded_motion: bool) {
@@ -2536,6 +2598,10 @@ impl StuckRecoveryController {
                 status.recovered as u8 as f32,
                 status.dead_battery as u8 as f32,
                 status.reset_due as u8 as f32,
+                trap_kind_code(status.trap_kind),
+                status.recovery_attempts as f32,
+                status.repeated_trap_count as f32,
+                status.clearance_m.unwrap_or(-1.0),
             ],
         }
     }
@@ -2544,11 +2610,14 @@ impl StuckRecoveryController {
         StuckStatus {
             active: self.active,
             corner_trap: self.corner_trap,
+            trap_kind: self.trap_kind,
             stuck_ticks: self.stuck_ticks,
             duration_ticks: self.duration_ticks,
             phase: self.phase,
             turn_sign: self.turn_sign,
             recovery_attempts: self.recovery_attempts,
+            repeated_trap_count: self.repeated_trap_count,
+            clearance_m: self.clearance_m,
             event_started: self.event_started,
             recovered: self.recovered,
             dead_battery: self.dead_battery,
@@ -2567,6 +2636,16 @@ fn recovery_phase_code(phase: RecoveryPhase) -> f32 {
         RecoveryPhase::Stop => 1.0,
         RecoveryPhase::Reverse => 2.0,
         RecoveryPhase::Turn => 3.0,
+        RecoveryPhase::Probe => 4.0,
+    }
+}
+
+fn trap_kind_code(kind: TrapKind) -> f32 {
+    match kind {
+        TrapKind::Unknown => 0.0,
+        TrapKind::Wall => 1.0,
+        TrapKind::Corner => 2.0,
+        TrapKind::Column => 3.0,
     }
 }
 
@@ -2575,7 +2654,7 @@ fn action_is_commanded_motion(action: Option<&ActionPrimitive>) -> bool {
     motor.forward.abs() > 0.05 || motor.turn.abs() > 0.05
 }
 
-fn classify_corner_trap(snapshot: &WorldSnapshot) -> bool {
+fn classify_trap_kind(snapshot: &WorldSnapshot) -> TrapKind {
     let body = &snapshot.body;
     let collision = body.flags.wall
         || body.flags.bump_left
@@ -2592,34 +2671,87 @@ fn classify_corner_trap(snapshot: &WorldSnapshot) -> bool {
         })
         .unwrap_or(false);
     let beams = &snapshot.range.beams;
-    let constrained = if beams.len() >= 3 {
-        let left = beams[..beams.len() / 2].iter().copied().fold(1.0, f32::min);
-        let right = beams[beams.len().div_ceil(2)..]
-            .iter()
-            .copied()
-            .fold(1.0, f32::min);
-        left < 0.12 && right < 0.12
+    let (left, _center, right) = beam_clearance_buckets(beams);
+    let side_constrained = left < 0.16 && right < 0.16;
+    if near_arena_wall && side_constrained {
+        TrapKind::Corner
+    } else if near_arena_wall || body.flags.wall {
+        TrapKind::Wall
+    } else if collision || near {
+        TrapKind::Column
     } else {
-        false
-    };
-    collision || near || near_arena_wall || constrained
+        TrapKind::Unknown
+    }
 }
 
-fn turn_away_sign(snapshot: &WorldSnapshot) -> f32 {
+fn recovery_turn_sign(snapshot: &WorldSnapshot, last_failed_turn_sign: Option<f32>) -> f32 {
+    if let Some(sign) = bump_escape_turn_sign(snapshot) {
+        return sign;
+    }
+    if let Some(last_failed) = last_failed_turn_sign {
+        return -last_failed;
+    }
+    turn_toward_clearer_side(snapshot)
+}
+
+fn bump_escape_turn_sign(snapshot: &WorldSnapshot) -> Option<f32> {
+    match (
+        snapshot.body.flags.bump_left,
+        snapshot.body.flags.bump_right,
+        snapshot.body.flags.wall,
+    ) {
+        (true, false, _) => Some(-1.0),
+        (false, true, _) => Some(1.0),
+        (_, _, true) | (true, true, _) => Some(turn_toward_clearer_side(snapshot)),
+        _ => None,
+    }
+}
+
+fn turn_toward_clearer_side(snapshot: &WorldSnapshot) -> f32 {
     let beams = &snapshot.range.beams;
     if beams.len() < 2 {
         return 1.0;
     }
-    let left = beams[..beams.len() / 2].iter().copied().fold(1.0, f32::min);
-    let right = beams[beams.len().div_ceil(2)..]
-        .iter()
-        .copied()
-        .fold(1.0, f32::min);
+    let (left, _, right) = beam_clearance_buckets(beams);
     if left <= right {
         -1.0
     } else {
         1.0
     }
+}
+
+fn beam_clearance_buckets(beams: &[f32]) -> (f32, f32, f32) {
+    if beams.is_empty() {
+        return (1.0, 1.0, 1.0);
+    }
+    let third = (beams.len() / 3).max(1);
+    let left_end = third.min(beams.len());
+    let right_start = beams.len().saturating_sub(third);
+    let center_start = left_end.saturating_sub(1).min(beams.len());
+    let center_end = (right_start + 1).min(beams.len()).max(center_start + 1);
+    let left = beams[..left_end].iter().copied().fold(1.0, f32::min);
+    let center = beams[center_start..center_end]
+        .iter()
+        .copied()
+        .fold(1.0, f32::min);
+    let right = beams[right_start..].iter().copied().fold(1.0, f32::min);
+    (left, center, right)
+}
+
+fn reverse_ticks(attempt: usize) -> usize {
+    (6 + attempt.saturating_mul(2)).min(12)
+}
+
+fn turn_ticks(attempt: usize) -> usize {
+    (12 + attempt.saturating_mul(4)).min(24)
+}
+
+fn reverse_speed(attempt: usize) -> f32 {
+    (0.18 + attempt as f32 * 0.03).min(0.28)
+}
+
+fn turn_speed(attempt: usize) -> f32 {
+    (0.8 + attempt as f32 * 0.1).min(1.0)
 }
 
 fn arena_bounds(snapshot: &WorldSnapshot) -> Option<(f32, f32)> {
@@ -2932,10 +3064,19 @@ fn hard_safety_action(now: &Now) -> Option<ActionPrimitive> {
         });
     }
     if now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall {
+        let direction = if now.body.flags.bump_left && !now.body.flags.bump_right {
+            TurnDir::Right
+        } else if now.body.flags.bump_right && !now.body.flags.bump_left {
+            TurnDir::Left
+        } else if range_clearer_on_right(&now.range.beams) {
+            TurnDir::Right
+        } else {
+            TurnDir::Left
+        };
         return Some(ActionPrimitive::Turn {
-            direction: TurnDir::Left,
-            intensity: 0.5,
-            duration_ms: 1_000,
+            direction,
+            intensity: 0.7,
+            duration_ms: 1_200,
         });
     }
     if now.body.battery_level <= 0.10 {
@@ -2961,6 +3102,14 @@ fn hard_safety_action(now: &Now) -> Option<ActionPrimitive> {
         });
     }
     None
+}
+
+fn range_clearer_on_right(beams: &[f32]) -> bool {
+    if beams.len() < 2 {
+        return false;
+    }
+    let (left, _, right) = beam_clearance_buckets(beams);
+    right > left
 }
 
 fn max_danger_risk(output: DangerOutput) -> f32 {
@@ -3634,7 +3783,9 @@ mod tests {
     };
     use netherwick_now::{Now, SurpriseSense};
     use netherwick_sensors::World;
-    use netherwick_sim::{ArenaConfig, SimObject, VirtualWorld};
+    use netherwick_sim::{
+        build_scenario, ArenaConfig, ScenarioConfig, ScenarioKind, SimObject, VirtualWorld,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4961,6 +5112,47 @@ mod tests {
             .unwrap_or(false));
     }
 
+    #[tokio::test]
+    async fn column_trap_scenario_recovers_within_budget() {
+        let root = test_ledger_root("sim-runner-column-trap-recovery");
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(
+            ledger,
+            FixedConductor::new(ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 1_000,
+            }),
+        );
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ColumnTrap, 7));
+        let start = (
+            scenario.metadata.body.odometry.x_m,
+            scenario.metadata.body.odometry.y_m,
+        );
+        let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
+        let mut saw_column = false;
+        let mut recovered = false;
+
+        runner
+            .run_steps_observing(90, |snapshot| {
+                if let Some(stuck) = snapshot
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.name == "sim.stuck")
+                {
+                    saw_column |= stuck.values.get(10).copied() == Some(3.0);
+                    recovered |= stuck.values.get(7).copied() == Some(1.0);
+                }
+            })
+            .await
+            .unwrap();
+        let end = runner.world.body();
+        let distance = distance_between_points(start, (end.odometry.x_m, end.odometry.y_m));
+
+        assert!(saw_column);
+        assert!(recovered);
+        assert!(distance > 0.10, "distance after recovery was {distance}");
+    }
+
     #[derive(Clone, Debug)]
     struct FixedConductor {
         action: ActionPrimitive,
@@ -5054,7 +5246,7 @@ mod tests {
     }
 
     #[test]
-    fn stuck_detector_marks_reset_due_after_failed_recovery_attempt() {
+    fn repeated_stuck_escalates_recovery_instead_of_resetting() {
         let mut detector = StuckRecoveryController::default();
         let action = ActionPrimitive::Explore {
             style: ExploreStyle::RandomWalk,
@@ -5064,8 +5256,11 @@ mod tests {
         for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
             detector.observe(&stuck_test_snapshot(0.2, 0.2, 1.0), Some(&action));
         }
+        detector.clearance_m = Some(0.8);
         while detector.recovery_motion().is_some() {}
-        assert_eq!(detector.status().recovery_attempts, 1);
+        detector.clearance_m = Some(0.10);
+        detector.recovery_attempts = 1;
+        detector.trap_anchor = Some((0.2, 0.2));
 
         for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
             detector.observe(&stuck_test_snapshot(0.2, 0.2, 1.0), Some(&action));
@@ -5074,15 +5269,17 @@ mod tests {
         detector.annotate_snapshot(&mut snapshot, 100);
 
         let status = detector.status();
-        assert!(status.reset_due);
-        assert!(!status.active);
+        assert!(!status.reset_due);
+        assert!(status.active);
+        assert_eq!(status.repeated_trap_count, 1);
         let values = &snapshot
             .extensions
             .iter()
             .find(|extension| extension.name == "sim.stuck")
             .unwrap()
             .values;
-        assert_eq!(values.get(9).copied(), Some(1.0));
+        assert_eq!(values.get(9).copied(), Some(0.0));
+        assert_eq!(values.get(12).copied(), Some(1.0));
     }
 
     #[test]
@@ -5112,33 +5309,113 @@ mod tests {
     }
 
     #[test]
-    fn recovery_transition_runs_stop_reverse_turn_then_releases() {
+    fn recovery_transition_runs_stop_reverse_turn_probe_then_releases() {
         let mut detector = StuckRecoveryController::default();
         detector.active = true;
         detector.corner_trap = true;
         detector.phase = RecoveryPhase::Stop;
         detector.phase_ticks_remaining = 1;
         detector.turn_sign = -1.0;
+        detector.clearance_m = Some(0.8);
 
         assert_eq!(detector.recovery_motion(), Some(MotionCommand::Stop));
         assert_eq!(detector.phase, RecoveryPhase::Reverse);
-        for _ in 0..4 {
+        for _ in 0..6 {
             assert_eq!(
                 detector.recovery_motion(),
                 Some(MotionCommand::Forward { speed_m_s: -0.18 })
             );
         }
         assert_eq!(detector.phase, RecoveryPhase::Turn);
-        for _ in 0..8 {
+        for _ in 0..12 {
             assert_eq!(
                 detector.recovery_motion(),
                 Some(MotionCommand::Turn { turn_rad_s: -0.8 })
             );
         }
+        assert_eq!(
+            detector.recovery_motion(),
+            Some(MotionCommand::Drive {
+                forward_m_s: 0.04,
+                turn_rad_s: -0.25
+            })
+        );
 
         assert!(!detector.status().active);
         assert!(detector.status().recovered);
         assert_eq!(detector.recovery_motion(), None);
+    }
+
+    #[test]
+    fn failed_left_recovery_tries_right_next() {
+        let mut detector = StuckRecoveryController {
+            active: true,
+            phase: RecoveryPhase::Stop,
+            phase_ticks_remaining: 1,
+            turn_sign: 1.0,
+            clearance_m: Some(0.10),
+            ..StuckRecoveryController::default()
+        };
+
+        while detector.phase != RecoveryPhase::Probe {
+            assert!(detector.recovery_motion().is_some());
+        }
+        assert!(detector.recovery_motion().is_some());
+
+        let status = detector.status();
+        assert!(status.active);
+        assert_eq!(status.turn_sign, -1.0);
+        assert_eq!(status.recovery_attempts, 1);
+    }
+
+    #[test]
+    fn recovery_does_not_resume_while_clearance_is_too_low() {
+        let mut detector = StuckRecoveryController {
+            active: true,
+            phase: RecoveryPhase::Probe,
+            phase_ticks_remaining: 1,
+            turn_sign: -1.0,
+            clearance_m: Some(0.12),
+            ..StuckRecoveryController::default()
+        };
+
+        assert!(detector.recovery_motion().is_some());
+
+        assert!(detector.status().active);
+        assert_eq!(detector.status().phase, RecoveryPhase::Stop);
+        assert!(!detector.status().recovered);
+    }
+
+    #[test]
+    fn bump_left_chooses_rightward_escape() {
+        let mut body = test_body(1.0, 1.0, 1.0, 100);
+        body.flags.bump_left = true;
+        let now = Now::blank(100, body);
+
+        assert_eq!(
+            hard_safety_action(&now),
+            Some(ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.7,
+                duration_ms: 1_200
+            })
+        );
+    }
+
+    #[test]
+    fn bump_right_chooses_leftward_escape() {
+        let mut body = test_body(1.0, 1.0, 1.0, 100);
+        body.flags.bump_right = true;
+        let now = Now::blank(100, body);
+
+        assert_eq!(
+            hard_safety_action(&now),
+            Some(ActionPrimitive::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.7,
+                duration_ms: 1_200
+            })
+        );
     }
 
     fn test_ledger_root(name: &str) -> PathBuf {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -90,6 +91,7 @@ pub struct LiveViewState {
     latest: Arc<Mutex<Option<WorldSnapshot>>>,
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
     session: Arc<Mutex<Option<SceneSession>>>,
+    training_status: Arc<Mutex<LiveTrainingStatus>>,
 }
 
 impl LiveViewState {
@@ -138,6 +140,20 @@ impl LiveViewState {
             .expect("live view session mutex poisoned")
             .clone()
     }
+
+    pub fn update_training_status(&self, status: LiveTrainingStatus) {
+        *self
+            .training_status
+            .lock()
+            .expect("live view training status mutex poisoned") = status;
+    }
+
+    pub fn training_status(&self) -> LiveTrainingStatus {
+        self.training_status
+            .lock()
+            .expect("live view training status mutex poisoned")
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -178,6 +194,15 @@ pub struct SceneObject {
 pub struct LiveSceneResponse {
     pub schema_version: u32,
     pub session: Option<SceneSession>,
+    pub training: LiveTrainingStatus,
+    pub training_mode: String,
+    pub ledger_path: Option<String>,
+    pub frames_written: usize,
+    pub transitions_written: usize,
+    pub models_loaded: Vec<String>,
+    pub model_modes: HashMap<String, String>,
+    pub action_selector_mode: String,
+    pub weights_updating: bool,
     pub t_ms: TimeMs,
     pub body: SceneBody,
     pub range: SceneRange,
@@ -203,6 +228,33 @@ pub struct SceneSession {
     pub seed: Option<u64>,
     pub source: String,
     pub tick_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LiveTrainingStatus {
+    pub training_mode: String,
+    pub ledger_path: Option<String>,
+    pub frames_written: usize,
+    pub transitions_written: usize,
+    pub models_loaded: Vec<String>,
+    pub model_modes: HashMap<String, String>,
+    pub action_selector_mode: String,
+    pub weights_updating: bool,
+}
+
+impl Default for LiveTrainingStatus {
+    fn default() -> Self {
+        Self {
+            training_mode: "none".to_string(),
+            ledger_path: None,
+            frames_written: 0,
+            transitions_written: 0,
+            models_loaded: Vec::new(),
+            model_modes: HashMap::new(),
+            action_selector_mode: "baseline".to_string(),
+            weights_updating: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -269,10 +321,14 @@ pub struct SceneAction {
 pub struct SceneStuck {
     pub active: bool,
     pub class: Option<String>,
+    pub trap_kind: Option<String>,
     pub stuck_ticks: usize,
     pub duration_ms: u64,
     pub recovery_phase: Option<String>,
     pub turn_direction: Option<String>,
+    pub recovery_attempts: usize,
+    pub repeated_trap_count: usize,
+    pub clearance_m: Option<f32>,
     pub event_started: bool,
     pub recovered: bool,
     pub dead_battery: bool,
@@ -423,6 +479,7 @@ async fn get_live_scene(
         &snapshot,
         state.scene_metadata().as_ref(),
         state.session(),
+        state.training_status(),
     )))
 }
 
@@ -747,7 +804,12 @@ async fn get_capture_scene(
                 })
                 .collect(),
         });
-    let mut scene = snapshot_to_scene(&record.snapshot, metadata.as_ref(), None);
+    let mut scene = snapshot_to_scene(
+        &record.snapshot,
+        metadata.as_ref(),
+        None,
+        LiveTrainingStatus::default(),
+    );
     scene.t_ms = record.t_ms;
     if let Some(pointcloud) = &record.assets.pointcloud {
         scene.warnings.push(format!(
@@ -800,6 +862,7 @@ pub fn snapshot_to_scene(
     snapshot: &WorldSnapshot,
     metadata: Option<&LiveSceneMetadata>,
     session: Option<SceneSession>,
+    training: LiveTrainingStatus,
 ) -> LiveSceneResponse {
     let mut warnings = Vec::new();
     let body = &snapshot.body;
@@ -826,9 +889,26 @@ pub fn snapshot_to_scene(
         warnings.push("no audio bearing stream".to_string());
     }
     let stuck = scene_stuck_from_snapshot(snapshot);
+    let training_mode = training.training_mode.clone();
+    let ledger_path = training.ledger_path.clone();
+    let frames_written = training.frames_written;
+    let transitions_written = training.transitions_written;
+    let models_loaded = training.models_loaded.clone();
+    let model_modes = training.model_modes.clone();
+    let action_selector_mode = training.action_selector_mode.clone();
+    let weights_updating = training.weights_updating;
     LiveSceneResponse {
         schema_version: 1,
         session,
+        training,
+        training_mode,
+        ledger_path,
+        frames_written,
+        transitions_written,
+        models_loaded,
+        model_modes,
+        action_selector_mode,
+        weights_updating,
         t_ms: body.last_update_ms,
         body: SceneBody {
             x_m: body.odometry.x_m,
@@ -883,19 +963,32 @@ fn scene_stuck_from_snapshot(snapshot: &WorldSnapshot) -> SceneStuck {
     let active = values.first().copied().unwrap_or(0.0) > 0.0;
     let corner_trap = values.get(1).copied().unwrap_or(0.0) > 0.0;
     let phase_code = values.get(4).copied().unwrap_or(0.0).round() as i32;
+    let trap_kind = trap_kind_name(values.get(10).copied().unwrap_or(0.0));
     SceneStuck {
         active,
-        class: if active || corner_trap {
-            Some(if corner_trap { "corner-trap" } else { "stuck" }.to_string())
+        class: if active || corner_trap || trap_kind.is_some() {
+            Some(
+                trap_kind
+                    .map(|kind| format!("{kind}-trap"))
+                    .unwrap_or_else(|| {
+                        if corner_trap {
+                            "corner-trap".to_string()
+                        } else {
+                            "stuck".to_string()
+                        }
+                    }),
+            )
         } else {
             None
         },
+        trap_kind: trap_kind.map(str::to_string),
         stuck_ticks: values.get(2).copied().unwrap_or(0.0).max(0.0) as usize,
         duration_ms: values.get(3).copied().unwrap_or(0.0).max(0.0) as u64,
         recovery_phase: match phase_code {
             1 => Some("stop".to_string()),
             2 => Some("reverse".to_string()),
             3 => Some("turn-away".to_string()),
+            4 => Some("probe".to_string()),
             _ => None,
         },
         turn_direction: match values.get(5).copied().unwrap_or(0.0) {
@@ -903,9 +996,21 @@ fn scene_stuck_from_snapshot(snapshot: &WorldSnapshot) -> SceneStuck {
             value if value > 0.0 => Some("left".to_string()),
             _ => None,
         },
+        recovery_attempts: values.get(11).copied().unwrap_or(0.0).max(0.0) as usize,
+        repeated_trap_count: values.get(12).copied().unwrap_or(0.0).max(0.0) as usize,
+        clearance_m: values.get(13).copied().filter(|value| *value >= 0.0),
         event_started: values.get(6).copied().unwrap_or(0.0) > 0.0,
         recovered: values.get(7).copied().unwrap_or(0.0) > 0.0,
         dead_battery: values.get(8).copied().unwrap_or(0.0) > 0.0,
+    }
+}
+
+fn trap_kind_name(code: f32) -> Option<&'static str> {
+    match code.round() as i32 {
+        1 => Some("wall"),
+        2 => Some("corner"),
+        3 => Some("column"),
+        _ => None,
     }
 }
 
@@ -1120,8 +1225,13 @@ fn scene_kinect_from_snapshot(snapshot: &WorldSnapshot, warnings: &mut Vec<Strin
 
 fn depth_points(depth_m: &[f32]) -> Vec<ScenePoint> {
     const MAX_POINTS: usize = 2_000;
+    const COMPACT_RANGE_BEAM_COUNT: usize = 32;
+    const COMPACT_RANGE_FOV_RAD: f32 = std::f32::consts::PI;
     if depth_m.is_empty() {
         return Vec::new();
+    }
+    if depth_m.len() == COMPACT_RANGE_BEAM_COUNT {
+        return range_beam_points(depth_m, COMPACT_RANGE_FOV_RAD);
     }
     let width = (depth_m.len() as f32).sqrt().ceil().max(1.0) as usize;
     let height = depth_m.len().div_ceil(width).max(1);
@@ -1144,6 +1254,36 @@ fn depth_points(depth_m: &[f32]) -> Vec<ScenePoint> {
                 x: nx * z,
                 y: -ny * z + 0.25,
                 z,
+                r: shade,
+                g: shade,
+                b: shade,
+            })
+        })
+        .collect()
+}
+
+fn range_beam_points(depth_m: &[f32], fov_rad: f32) -> Vec<ScenePoint> {
+    let beam_count = depth_m.len().max(1);
+    let start = if beam_count == 1 { 0.0 } else { -fov_rad * 0.5 };
+    let step = if beam_count == 1 {
+        0.0
+    } else {
+        fov_rad / (beam_count - 1) as f32
+    };
+    depth_m
+        .iter()
+        .enumerate()
+        .filter_map(|(index, depth)| {
+            if !depth.is_finite() || *depth <= 0.0 {
+                return None;
+            }
+            let distance = depth.clamp(0.0, 8.0);
+            let angle = start + step * index as f32;
+            let shade = ((1.0 - (distance / 8.0)).clamp(0.15, 1.0) * 255.0) as u8;
+            Some(ScenePoint {
+                x: angle.sin() * distance,
+                y: 0.18,
+                z: angle.cos() * distance,
                 r: shade,
                 g: shade,
                 b: shade,
@@ -1709,14 +1849,20 @@ canvas{display:block}
   <dl>
     <dt>mode</dt><dd id="mode">-</dd>
     <dt>scenario</dt><dd id="scenario">-</dd>
+    <dt>training</dt><dd id="training_mode">-</dd>
+    <dt>weights</dt><dd id="weights_updating">-</dd>
+    <dt>ledger</dt><dd id="ledger_counts">-</dd>
+    <dt>selector</dt><dd id="action_selector_mode">-</dd>
     <dt>seed</dt><dd id="seed">-</dd>
     <dt>tick</dt><dd id="tick">-</dd>
     <dt>t</dt><dd id="t">-</dd>
     <dt>pose</dt><dd id="pose">-</dd>
     <dt>battery</dt><dd id="battery">-</dd>
     <dt>stuck</dt><dd id="stuck">-</dd>
+    <dt>trap</dt><dd id="trap_kind">-</dd>
     <dt>dead battery</dt><dd id="dead_battery">-</dd>
     <dt>recovery</dt><dd id="recovery_mode">-</dd>
+    <dt>attempts</dt><dd id="recovery_attempts">-</dd>
     <dt>stuck ticks</dt><dd id="stuck_ticks">-</dd>
     <dt>nearest</dt><dd id="nearest">-</dd>
     <dt>eye</dt><dd id="eye">-</dd>
@@ -1764,7 +1910,7 @@ const llmStreams = document.getElementById('llm-streams');
 const modelStatus = document.getElementById('model-status');
 const modelList = document.getElementById('model-list');
 const modelGraph = document.getElementById('model-graph');
-const fields = Object.fromEntries(['mode','scenario','seed','tick','t','pose','battery','stuck','dead_battery','recovery_mode','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
+const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d10);
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
@@ -1895,6 +2041,11 @@ function renderBeams(packet){
     }
   }
 }
+function pointWorldPosition(p){
+  const local = new THREE.Vector3(p.x, p.y, -p.z);
+  robot.updateMatrixWorld();
+  return robot.localToWorld(local);
+}
 function renderPoints(points){
   if(pointCloud){
     scene.remove(pointCloud);
@@ -1906,9 +2057,10 @@ function renderPoints(points){
   const positions = new Float32Array(points.length * 3);
   const colors = new Float32Array(points.length * 3);
   points.forEach((p, i) => {
-    positions[i*3] = robot.position.x + p.x;
-    positions[i*3+1] = p.y;
-    positions[i*3+2] = robot.position.z - p.z;
+    const pos = pointWorldPosition(p);
+    positions[i*3] = pos.x;
+    positions[i*3+1] = pos.y;
+    positions[i*3+2] = pos.z;
     colors[i*3] = p.r / 255; colors[i*3+1] = p.g / 255; colors[i*3+2] = p.b / 255;
   });
   const geo = new THREE.BufferGeometry();
@@ -2092,6 +2244,10 @@ function updateScene(packet){
   const session = packet.session || {};
   fields.mode.textContent = session.mode || '-';
   fields.scenario.textContent = session.scenario || '-';
+  fields.training_mode.textContent = packet.training_mode || packet.training?.training_mode || '-';
+  fields.weights_updating.textContent = packet.weights_updating ? 'updating' : 'not updating';
+  fields.ledger_counts.textContent = `${packet.frames_written || 0}f / ${packet.transitions_written || 0}t`;
+  fields.action_selector_mode.textContent = packet.action_selector_mode || '-';
   fields.seed.textContent = session.seed == null ? '-' : String(session.seed);
   fields.tick.textContent = session.tick_ms == null ? '-' : `${session.tick_ms} ms`;
   fields.t.textContent = `${packet.t_ms} ms`;
@@ -2099,8 +2255,10 @@ function updateScene(packet){
   fields.battery.textContent = `${fmt(packet.body.battery_level * 100, 1)}%${packet.body.charging ? ' charging' : ''}`;
   const detail = packet.stuck_detail || {};
   fields.stuck.textContent = packet.stuck ? (detail.class || 'stuck') : (detail.recovered ? 'recovered' : 'clear');
+  fields.trap_kind.textContent = detail.trap_kind || '-';
   fields.dead_battery.textContent = packet.dead_battery ? 'yes' : 'no';
   fields.recovery_mode.textContent = packet.recovery_mode || '-';
+  fields.recovery_attempts.textContent = `${detail.recovery_attempts || 0} (${detail.repeated_trap_count || 0} repeat)`;
   fields.stuck_ticks.textContent = String(packet.stuck_ticks || 0);
   fields.nearest.textContent = packet.range?.nearest_m == null ? '-' : `${fmt(packet.range.nearest_m)} m`;
   fields.eye.textContent = packet.eye ? `${packet.eye.width}x${packet.eye.height} luma ${fmt(packet.eye.mean_luma, 2)}` : '-';
@@ -2590,6 +2748,16 @@ mod tests {
             source: "sim".to_string(),
             tick_ms: Some(100),
         });
+        state.update_training_status(LiveTrainingStatus {
+            training_mode: "collecting".to_string(),
+            ledger_path: Some("data/ledger/virtual-live".to_string()),
+            frames_written: 12,
+            transitions_written: 11,
+            models_loaded: vec!["danger".to_string()],
+            model_modes: HashMap::from([("danger".to_string(), "shadow-infer".to_string())]),
+            action_selector_mode: "baseline".to_string(),
+            weights_updating: false,
+        });
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.odometry.x_m = 0.5;
         snapshot.body.odometry.y_m = 0.75;
@@ -2601,7 +2769,9 @@ mod tests {
         snapshot.extensions.push(netherwick_now::ExtensionSense {
             schema_version: 1,
             name: "sim.stuck".to_string(),
-            values: vec![1.0, 1.0, 6.0, 300.0, 3.0, -1.0, 1.0, 0.0, 1.0],
+            values: vec![
+                1.0, 1.0, 6.0, 300.0, 3.0, -1.0, 1.0, 0.0, 1.0, 0.0, 3.0, 2.0, 1.0, 0.2,
+            ],
         });
         snapshot.eye_frame = Some(EyeFrame {
             captured_at_ms: 1200,
@@ -2626,11 +2796,23 @@ mod tests {
         assert_eq!(scene.body.heading_rad, 1.25);
         assert_eq!(scene.range.nearest_m, Some(1.0));
         assert_eq!(scene.range.beams.len(), 3);
+        assert_eq!(scene.training_mode, "collecting");
+        assert_eq!(
+            scene.ledger_path.as_deref(),
+            Some("data/ledger/virtual-live")
+        );
+        assert_eq!(scene.frames_written, 12);
+        assert_eq!(scene.transitions_written, 11);
+        assert_eq!(scene.models_loaded, vec!["danger"]);
+        assert!(!scene.weights_updating);
         assert!(scene.stuck);
         assert!(scene.dead_battery);
         assert_eq!(scene.recovery_mode.as_deref(), Some("turn-away"));
         assert_eq!(scene.stuck_ticks, 6);
-        assert_eq!(scene.stuck_detail.class.as_deref(), Some("corner-trap"));
+        assert_eq!(scene.stuck_detail.class.as_deref(), Some("column-trap"));
+        assert_eq!(scene.stuck_detail.trap_kind.as_deref(), Some("column"));
+        assert_eq!(scene.stuck_detail.recovery_attempts, 2);
+        assert_eq!(scene.stuck_detail.repeated_trap_count, 1);
         assert_eq!(
             scene.stuck_detail.recovery_phase.as_deref(),
             Some("turn-away")
@@ -2648,7 +2830,7 @@ mod tests {
     fn missing_eye_kinect_and_audio_serialize_as_empty_or_null() {
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.battery_level = 0.0;
-        let scene = snapshot_to_scene(&snapshot, None, None);
+        let scene = snapshot_to_scene(&snapshot, None, None, LiveTrainingStatus::default());
         let value = serde_json::to_value(scene).unwrap();
 
         assert!(value["eye"].is_null());
@@ -2656,6 +2838,22 @@ mod tests {
         assert_eq!(value["kinect"]["points"].as_array().unwrap().len(), 0);
         assert!(value["audio"].is_null());
         assert!(value["warnings"].as_array().unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn compact_kinect_depth_projects_as_meter_range_fan() {
+        let depths = vec![2.0; 32];
+        let points = depth_points(&depths);
+
+        assert_eq!(points.len(), 32);
+        assert!((points[0].x + 2.0).abs() < 0.001);
+        assert!(points[0].z.abs() < 0.001);
+        assert!((points[31].x - 2.0).abs() < 0.001);
+        assert!(points[31].z.abs() < 0.001);
+
+        let near_center = &points[15];
+        assert!(near_center.z > 1.99);
+        assert!(near_center.x.abs() < 0.11);
     }
 
     #[tokio::test]
