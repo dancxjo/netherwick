@@ -524,6 +524,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view/retina/status", get(get_retina_status))
         .route("/view/retina/latest.png", get(get_retina_latest))
         .route("/view/training/latest", get(get_latest_training))
+        .route("/view/calibration", post(post_calibration))
         .nest_service(
             "/static",
             ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),
@@ -674,6 +675,16 @@ async fn post_retina_frame(
         rstate.frames_received += 1;
     }
 
+    Ok(StatusCode::OK)
+}
+
+async fn post_calibration(
+    State(state): State<LiveViewState>,
+    Json(calibration): Json<SceneSensorCalibration>,
+) -> Result<StatusCode, LiveViewError> {
+    let mut metadata = state.scene_metadata().unwrap_or_default();
+    metadata.sensor_calibration = Some(calibration);
+    state.update_scene_metadata(metadata);
     Ok(StatusCode::OK)
 }
 
@@ -2251,10 +2262,16 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #model-graph .node rect{fill:#17222b;stroke:#52687b;stroke-width:1.2;rx:5}
 #model-graph .node.model rect{stroke:#81c995}
 #model-graph .node.core rect{stroke:#8bd3ff}
+#calibration{position:fixed;left:12px;top:400px;width:340px;padding:10px;border:1px solid #3c4854;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px;color:#e7eef5;resize:both;overflow:auto;display:grid;gap:6px}
+#calibration header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+#calibration h2{font-size:12px;margin:0;color:#c6e6ff}
+#calibration label{color:#8fa1b2;font-size:11px}
+#calibration span{color:#ffd083;font-size:11px;font-variant-numeric:tabular-nums}
+#calibration input[type="range"]{width:100%;accent-color:#52a9ff;background:#242a32;height:4px;border-radius:2px;outline:none}
 #xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
 #xr[disabled]{opacity:.55}
 #fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
-@media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{grid-template-columns:1fr;bottom:98px;max-height:46vh}#model-graph{height:220px}}
+@media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{grid-template-columns:1fr;bottom:98px;max-height:46vh}#model-graph{height:220px}#calibration{display:none}}
 canvas{display:block}
 </style>
 <canvas id="scene"></canvas>
@@ -2314,6 +2331,53 @@ canvas{display:block}
     <h2>Connections</h2>
     <svg id="model-graph" viewBox="0 0 560 260" role="img" aria-label="Model connection diagram"></svg>
   </section>
+</aside>
+<aside id="calibration">
+  <header>
+    <h2>Sensor Calibration</h2>
+    <button id="reset-calibration" style="font-size:11px;padding:2px 6px;background:#243646;border:1px solid #36424d;color:#b8e1ff;border-radius:4px;cursor:pointer">Reset</button>
+  </header>
+  <div style="display:grid;gap:8px;margin-top:8px">
+    <div style="border-bottom:1px solid #2b3138;padding-bottom:4px;font-weight:bold;color:#ffd083">Point Cloud</div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-depth-scale" style="width:90px">Depth Scale</label>
+      <input type="range" id="cal-depth-scale" min="0.5" max="2.0" step="0.01" value="1.0">
+      <span id="val-depth-scale" style="width:40px;text-align:right;font-family:monospace">1.00</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-point-y" style="width:90px">Depth Height</label>
+      <input type="range" id="cal-point-y" min="-0.50" max="1.00" step="0.01" value="0.18">
+      <span id="val-point-y" style="width:40px;text-align:right;font-family:monospace">0.18m</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-depth-fov" style="width:90px">Depth FOV</label>
+      <input type="range" id="cal-depth-fov" min="30" max="180" step="1" value="122">
+      <span id="val-depth-fov" style="width:40px;text-align:right;font-family:monospace">122°</span>
+    </div>
+    
+    <div style="border-bottom:1px solid #2b3138;padding-bottom:4px;font-weight:bold;color:#ffd083;margin-top:6px">Vision / Camera</div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-camera-fov" style="width:90px">Camera FOV</label>
+      <input type="range" id="cal-camera-fov" min="30" max="120" step="1" value="62">
+      <span id="val-camera-fov" style="width:40px;text-align:right;font-family:monospace">62°</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-camera-y" style="width:90px">Cam Height (Y)</label>
+      <input type="range" id="cal-camera-y" min="0.10" max="1.00" step="0.01" value="0.46">
+      <span id="val-camera-y" style="width:40px;text-align:right;font-family:monospace">0.46m</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-camera-z" style="width:90px">Cam Depth (Z)</label>
+      <input type="range" id="cal-camera-z" min="-0.50" max="0.50" step="0.01" value="-0.18">
+      <span id="val-camera-z" style="width:40px;text-align:right;font-family:monospace">-0.18m</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-camera-pitch" style="width:90px">Cam Tilt</label>
+      <input type="range" id="cal-camera-pitch" min="-45" max="45" step="1" value="0">
+      <span id="val-camera-pitch" style="width:40px;text-align:right;font-family:monospace">0°</span>
+    </div>
+  </div>
+  <div id="calibration-status" style="margin-top:6px;font-size:11px;color:#aab4bd;text-align:right">status: synced</div>
 </aside>
 <button id="xr" disabled>VR unavailable</button>
 <div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers, squeeze stops, A/B dock or explore.</div>
@@ -2436,16 +2500,28 @@ eyePanelMat.backFaceCulling = false;
 eyePanel.material = eyePanelMat;
 
 // Frustum Helper Lines
-const frustumPoints = [
-  [new BABYLON.Vector3(0, 0.46, -0.18), new BABYLON.Vector3(-0.48, 0.28, -0.78)],
-  [new BABYLON.Vector3(0, 0.46, -0.18), new BABYLON.Vector3(0.48, 0.28, -0.78)],
-  [new BABYLON.Vector3(0, 0.46, -0.18), new BABYLON.Vector3(-0.48, 1.02, -0.78)],
-  [new BABYLON.Vector3(0, 0.46, -0.18), new BABYLON.Vector3(0.48, 1.02, -0.78)]
-];
-const frustum = BABYLON.MeshBuilder.CreateLineSystem("frustum", {lines: frustumPoints}, scene);
-frustum.color = new BABYLON.Color3(0.565, 0.643, 0.722); // 0x90a4b8
-frustum.parent = robot;
-frustum.layerMask = 0x10000000;
+let frustum = null;
+function updateFrustum() {
+  if (frustum) {
+    frustum.dispose();
+  }
+  const camPos = new BABYLON.Vector3(0, eyeCamera.position.y, eyeCamera.position.z);
+  const halfW = 0.96 / 2;
+  const halfH = 0.72 / 2;
+  const panelY = 0.65;
+  const panelZ = -0.78;
+  const frustumPoints = [
+    [camPos, new BABYLON.Vector3(-halfW, panelY - halfH, panelZ)],
+    [camPos, new BABYLON.Vector3(halfW, panelY - halfH, panelZ)],
+    [camPos, new BABYLON.Vector3(-halfW, panelY + halfH, panelZ)],
+    [camPos, new BABYLON.Vector3(halfW, panelY + halfH, panelZ)]
+  ];
+  frustum = BABYLON.MeshBuilder.CreateLineSystem("frustum", {lines: frustumPoints}, scene);
+  frustum.color = new BABYLON.Color3(0.565, 0.643, 0.722);
+  frustum.parent = robot;
+  frustum.layerMask = 0x10000000;
+}
+updateFrustum();
 
 // Textures
 const eyeCanvas = document.createElement('canvas');
@@ -3099,7 +3175,7 @@ let maxZIndex = 100;
 function savePanelLayouts() {
   if (!isInitialized) return;
   const layouts = {};
-  ['hud', 'reign', 'llm', 'models'].forEach(id => {
+  ['hud', 'reign', 'llm', 'models', 'calibration'].forEach(id => {
     const el = document.getElementById(id);
     if (el) {
       const rect = el.getBoundingClientRect();
@@ -3154,7 +3230,7 @@ function loadPanelLayouts() {
 
 function applyOrClearLayouts() {
   if (window.innerWidth < 820) {
-    ['hud', 'reign', 'llm', 'models'].forEach(id => {
+    ['hud', 'reign', 'llm', 'models', 'calibration'].forEach(id => {
       const el = document.getElementById(id);
       if (el) {
         el.style.left = '';
@@ -3170,7 +3246,7 @@ function applyOrClearLayouts() {
     if (!isInitialized) {
       loadPanelLayouts();
     } else {
-      ['hud', 'reign', 'llm', 'models'].forEach(id => {
+      ['hud', 'reign', 'llm', 'models', 'calibration'].forEach(id => {
         const el = document.getElementById(id);
         if (el && el.style.left) {
           const rect = el.getBoundingClientRect();
@@ -3195,7 +3271,8 @@ function setupDraggableAndResizable() {
     { id: 'hud', handleQuery: 'h1' },
     { id: 'reign', handleQuery: 'strong' },
     { id: 'llm', handleQuery: 'header' },
-    { id: 'models', handleQuery: 'h2' }
+    { id: 'models', handleQuery: 'h2' },
+    { id: 'calibration', handleQuery: 'h2' }
   ];
 
   panels.forEach(({ id, handleQuery }) => {
@@ -3403,6 +3480,138 @@ async function pollVirtualTraining() {
   }
 }
 pollVirtualTraining();
+
+// Sensor Calibration Panel Wiring
+const defaults = {
+  depthScale: 1.0,
+  pointY: 0.18,
+  depthFov: 122,
+  cameraFov: 62,
+  cameraY: 0.46,
+  cameraZ: -0.18,
+  cameraPitch: 0
+};
+
+let cal = { ...defaults };
+
+const depthScaleEl = document.getElementById('cal-depth-scale');
+const pointYEl = document.getElementById('cal-point-y');
+const depthFovEl = document.getElementById('cal-depth-fov');
+const cameraFovEl = document.getElementById('cal-camera-fov');
+const cameraYEl = document.getElementById('cal-camera-y');
+const cameraZEl = document.getElementById('cal-camera-z');
+const cameraPitchEl = document.getElementById('cal-camera-pitch');
+const resetBtn = document.getElementById('reset-calibration');
+const statusEl2 = document.getElementById('calibration-status');
+
+const valDepthScale = document.getElementById('val-depth-scale');
+const valPointY = document.getElementById('val-point-y');
+const valDepthFov = document.getElementById('val-depth-fov');
+const valCameraFov = document.getElementById('val-camera-fov');
+const valCameraY = document.getElementById('val-camera-y');
+const valCameraZ = document.getElementById('val-camera-z');
+const valCameraPitch = document.getElementById('val-camera-pitch');
+
+function loadCalibration() {
+  const stored = localStorage.getItem('netherwick-sensor-calibration');
+  if (stored) {
+    try {
+      cal = { ...defaults, ...JSON.parse(stored) };
+    } catch (e) {
+      console.error('Failed to parse calibration:', e);
+    }
+  }
+}
+
+function saveCalibration() {
+  localStorage.setItem('netherwick-sensor-calibration', JSON.stringify(cal));
+}
+
+function applyCalibrationToUI() {
+  depthScaleEl.value = cal.depthScale;
+  pointYEl.value = cal.pointY;
+  depthFovEl.value = cal.depthFov;
+  cameraFovEl.value = cal.cameraFov;
+  cameraYEl.value = cal.cameraY;
+  cameraZEl.value = cal.cameraZ;
+  cameraPitchEl.value = cal.cameraPitch;
+
+  valDepthScale.textContent = cal.depthScale.toFixed(2);
+  valPointY.textContent = cal.pointY.toFixed(2) + 'm';
+  valDepthFov.textContent = cal.depthFov + '°';
+  valCameraFov.textContent = cal.cameraFov + '°';
+  valCameraY.textContent = cal.cameraY.toFixed(2) + 'm';
+  valCameraZ.textContent = cal.cameraZ.toFixed(2) + 'm';
+  valCameraPitch.textContent = cal.cameraPitch + '°';
+}
+
+function applyVisionCalibration() {
+  eyeCamera.position.y = cal.cameraY;
+  eyeCamera.position.z = cal.cameraZ;
+  eyeCamera.fov = cal.cameraFov * Math.PI / 180;
+  eyeCamera.rotation.x = cal.cameraPitch * Math.PI / 180;
+  updateFrustum();
+}
+
+let sendCalTimeout = null;
+function sendCalibrationToServer() {
+  statusEl2.textContent = 'status: syncing...';
+  if (sendCalTimeout) clearTimeout(sendCalTimeout);
+  
+  sendCalTimeout = setTimeout(async () => {
+    try {
+      const res = await fetch('/view/calibration', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          compact_depth_beam_count: (lastScene && lastScene.sensor_calibration) ? lastScene.sensor_calibration.compact_depth_beam_count : 32,
+          compact_depth_fov_rad: cal.depthFov * Math.PI / 180,
+          depth_scale: cal.depthScale,
+          point_y_m: cal.pointY
+        })
+      });
+      if (res.ok) {
+        statusEl2.textContent = 'status: synced';
+      } else {
+        statusEl2.textContent = 'status: sync failed';
+      }
+    } catch (e) {
+      statusEl2.textContent = 'status: network error';
+    }
+  }, 150);
+}
+
+function onCalChange() {
+  cal.depthScale = parseFloat(depthScaleEl.value);
+  cal.pointY = parseFloat(pointYEl.value);
+  cal.depthFov = parseInt(depthFovEl.value, 10);
+  cal.cameraFov = parseInt(cameraFovEl.value, 10);
+  cal.cameraY = parseFloat(cameraYEl.value);
+  cal.cameraZ = parseFloat(cameraZEl.value);
+  cal.cameraPitch = parseInt(cameraPitchEl.value, 10);
+
+  applyCalibrationToUI();
+  applyVisionCalibration();
+  saveCalibration();
+  sendCalibrationToServer();
+}
+
+[depthScaleEl, pointYEl, depthFovEl, cameraFovEl, cameraYEl, cameraZEl, cameraPitchEl].forEach(el => {
+  el.addEventListener('input', onCalChange);
+});
+
+resetBtn.onclick = () => {
+  cal = { ...defaults };
+  applyCalibrationToUI();
+  applyVisionCalibration();
+  saveCalibration();
+  sendCalibrationToServer();
+};
+
+loadCalibration();
+applyCalibrationToUI();
+applyVisionCalibration();
+sendCalibrationToServer();
 
 setupDraggableAndResizable();
 </script>"#;

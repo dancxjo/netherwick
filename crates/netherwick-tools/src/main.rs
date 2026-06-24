@@ -81,6 +81,7 @@ enum Command {
     CompareScenarioReports(CompareScenarioReportsArgs),
     Dashboard,
     VirtualReport(VirtualReportArgs),
+    TrainVirtual(TrainVirtualArgs),
     RetinaMockSend(RetinaMockSendArgs),
 }
 
@@ -109,6 +110,7 @@ async fn main() -> Result<()> {
         Command::ModelPromote(args) => model_promote(args),
         Command::CompareScenarioReports(args) => compare_scenario_reports_command(args),
         Command::VirtualReport(args) => run_virtual_report(args).await,
+        Command::TrainVirtual(args) => run_train_virtual(args).await,
         Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
         other => {
             println!("selected command: {:?}", other);
