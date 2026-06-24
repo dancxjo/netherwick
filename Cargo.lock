@@ -4691,6 +4691,7 @@ dependencies = [
  "netherwick-experience",
  "netherwick-now",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4722,6 +4723,7 @@ dependencies = [
  "netherwick-ledger",
  "netherwick-llm",
  "netherwick-memory",
+ "netherwick-models",
  "netherwick-now",
  "netherwick-sensors",
  "netherwick-sim",

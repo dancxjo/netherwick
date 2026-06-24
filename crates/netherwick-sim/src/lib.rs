@@ -1,6 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use netherwick_body::{BodySense, MotionCommand, MotorCommand, MotorComplex, RobotBody};
+use netherwick_body::{
+    BodySense, CliffSensors, MotionCommand, MotorCommand, MotorComplex, RobotBody,
+};
 use netherwick_now::{
     EarSense, ExtensionSense, FaceSense, GpsSense, ImuSense, KinectJointSense, KinectSense,
     KinectSkeletonSense, RangeSense, VoiceSense,
@@ -202,6 +204,7 @@ impl VirtualWorld {
     }
 
     fn project_snapshot(state: &mut VirtualWorldState) {
+        apply_cliff_projection(&mut state.snapshot.body, state.arena);
         let body = &state.snapshot.body;
         state.snapshot.range = RangeSense {
             schema_version: 1,
@@ -294,6 +297,10 @@ impl MotorComplex for SimMotorComplex {
         body.odometry.heading_rad += motor.turn * 0.1;
         body.flags.bump_left = false;
         body.flags.bump_right = false;
+        body.flags.cliff_left = false;
+        body.flags.cliff_front_left = false;
+        body.flags.cliff_front_right = false;
+        body.flags.cliff_right = false;
         body.flags.wall = false;
 
         let proposed_x =
@@ -318,6 +325,7 @@ impl MotorComplex for SimMotorComplex {
         if body.charging {
             body.battery_level = (body.battery_level + charge_rate * SIM_DT_S).clamp(0.0, 1.0);
         }
+        apply_cliff_projection(body, arena);
         body.last_update_ms = body.last_update_ms.saturating_add(100);
         Ok(body.clone())
     }
@@ -506,6 +514,41 @@ fn blocks_motion(object: &SimObject) -> bool {
         object.kind,
         SimObjectKind::Obstacle | SimObjectKind::Person { .. } | SimObjectKind::Landmark { .. }
     )
+}
+
+fn apply_cliff_projection(body: &mut BodySense, arena: ArenaConfig) {
+    let sensors = project_cliff_sensors(body, arena);
+    body.cliff_sensors = sensors;
+    body.flags.cliff_left = sensors.left >= 0.5;
+    body.flags.cliff_front_left = sensors.front_left >= 0.5;
+    body.flags.cliff_front_right = sensors.front_right >= 0.5;
+    body.flags.cliff_right = sensors.right >= 0.5;
+}
+
+fn project_cliff_sensors(body: &BodySense, arena: ArenaConfig) -> CliffSensors {
+    let radius = ROBOT_RADIUS_M;
+    CliffSensors {
+        left: cliff_sensor_at(body, 0.0, radius * 0.75, arena),
+        front_left: cliff_sensor_at(body, radius * 0.85, radius * 0.45, arena),
+        front_right: cliff_sensor_at(body, radius * 0.85, -radius * 0.45, arena),
+        right: cliff_sensor_at(body, 0.0, -radius * 0.75, arena),
+    }
+}
+
+fn cliff_sensor_at(body: &BodySense, local_x: f32, local_y: f32, arena: ArenaConfig) -> f32 {
+    let heading = body.odometry.heading_rad;
+    let x = body.odometry.x_m + local_x * heading.cos() - local_y * heading.sin();
+    let y = body.odometry.y_m + local_x * heading.sin() + local_y * heading.cos();
+    let edge_distance = x.min(arena.width_m - x).min(y).min(arena.height_m - y);
+    if edge_distance < 0.0 {
+        1.0
+    } else if edge_distance < 0.04 {
+        0.75
+    } else if edge_distance < 0.08 {
+        0.4
+    } else {
+        0.0
+    }
 }
 
 fn charger_contact_rate(body: &BodySense, objects: &[SimObject]) -> f32 {
@@ -860,6 +903,24 @@ mod tests {
 
         assert!(body.charging);
         assert!(body.battery_level > 0.4);
+    }
+
+    #[tokio::test]
+    async fn edge_projects_front_cliff_sensors() {
+        let (mut world, _motor) = VirtualWorld::new_with_motor(0, arena());
+        {
+            let mut guard = world.state.lock().unwrap();
+            guard.snapshot.body.odometry.x_m = 3.95;
+            guard.snapshot.body.odometry.y_m = 2.0;
+            guard.snapshot.body.odometry.heading_rad = 0.0;
+        }
+
+        let snapshot = world.snapshot().await.unwrap();
+
+        assert!(snapshot.body.cliff_sensors.front_left >= 0.5);
+        assert!(snapshot.body.cliff_sensors.front_right >= 0.5);
+        assert!(snapshot.body.flags.cliff_front_left);
+        assert!(snapshot.body.flags.cliff_front_right);
     }
 
     #[test]

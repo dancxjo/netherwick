@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -14,14 +15,16 @@ use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
 use netherwick_experience::{
-    BaselineRewardComputer, BaselineSurpriseComputer, Experience, ExperienceEncoder,
-    ExperienceLatent, FeatureExperienceEncoder, FuturePrediction, FuturePredictor, Impression,
-    RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
+    BaselineRewardComputer, BaselineSurpriseComputer, DangerInput, DangerOutput, Experience,
+    ExperienceEncoder, ExperienceLatent, FeatureExperienceEncoder, FuturePrediction,
+    FuturePredictor, Impression, RewardComputer, Sensation, StasisFuturePredictor,
+    SurpriseComputer,
 };
 use netherwick_ledger::{ExperienceFrame, LedgerWriter, PendingFrame, TransitionBuilder};
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
-use netherwick_now::{DriveSense, Now, ReignSense, SafetySense};
+use netherwick_models::{read_danger_metadata, DangerNetTrainer, HardcodedDangerPredictor};
+use netherwick_now::{DangerPrediction, DriveSense, Now, ReignSense, SafetySense};
 use netherwick_sensors::World;
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use uuid::Uuid;
@@ -46,9 +49,54 @@ where
     pub reign_queue: Arc<Mutex<ReignQueue>>,
     pub encoder: FeatureExperienceEncoder,
     pub predictor: StasisFuturePredictor,
+    pub models: RuntimeModelStack,
     pub surprise_computer: BaselineSurpriseComputer,
     pub reward_computer: BaselineRewardComputer,
     pub transition_builder: TransitionBuilder,
+}
+
+#[derive(Default)]
+pub struct RuntimeModelStack {
+    pub danger: Option<DangerRuntimePredictor>,
+}
+
+impl RuntimeModelStack {
+    pub fn with_danger_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_danger_metadata(path)?;
+        Ok(Self {
+            danger: Some(DangerRuntimePredictor::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?),
+        })
+    }
+}
+
+pub struct DangerRuntimePredictor {
+    trainer: DangerNetTrainer,
+    hardcoded: HardcodedDangerPredictor,
+}
+
+impl DangerRuntimePredictor {
+    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
+        Ok(Self {
+            trainer: DangerNetTrainer::load_checkpoint(path, input_dim)?,
+            hardcoded: HardcodedDangerPredictor,
+        })
+    }
+
+    pub fn predict_shadow(
+        &self,
+        now: &Now,
+        latent: &ExperienceLatent,
+        action: Option<&ActionPrimitive>,
+    ) -> Result<(DangerOutput, DangerOutput)> {
+        let input = DangerInput::from_parts(latent.z.clone(), action, now);
+        let model = self.trainer.predict(&input)?;
+        let hardcoded = self.hardcoded.predict_from_now(now, &input);
+        Ok((model, hardcoded))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -143,6 +191,7 @@ where
             reign_queue: Arc::new(Mutex::new(ReignQueue::default())),
             encoder: FeatureExperienceEncoder::new(),
             predictor: StasisFuturePredictor,
+            models: RuntimeModelStack::default(),
             surprise_computer: BaselineSurpriseComputer,
             reward_computer: BaselineRewardComputer,
             transition_builder: TransitionBuilder::new(),
@@ -170,6 +219,7 @@ where
             reign_queue,
             encoder: FeatureExperienceEncoder::new(),
             predictor: StasisFuturePredictor,
+            models: RuntimeModelStack::default(),
             surprise_computer: BaselineSurpriseComputer,
             reward_computer: BaselineRewardComputer,
             transition_builder: TransitionBuilder::new(),
@@ -185,6 +235,11 @@ where
         llm: A,
     ) -> Self {
         Self::new(ledger, memory_store, memory_recall, conductor, safety, llm)
+    }
+
+    pub fn with_models(mut self, models: RuntimeModelStack) -> Self {
+        self.models = models;
+        self
     }
 
     pub async fn tick(
@@ -292,6 +347,12 @@ where
             body: now.body.clone(),
             proposals,
         })?;
+
+        if let Some(danger) = &self.models.danger {
+            let (model, hardcoded) = danger.predict_shadow(&now, &latent, Some(&chosen_action))?;
+            now.predictions.danger_model = Some(danger_prediction(model));
+            now.predictions.danger_hardcoded = Some(danger_prediction(hardcoded));
+        }
 
         let safety = self
             .safety
@@ -447,6 +508,16 @@ where
             llm: llm_tick,
             combobulation,
         })
+    }
+}
+
+fn danger_prediction(output: DangerOutput) -> DangerPrediction {
+    DangerPrediction {
+        bump_risk: output.bump_risk,
+        cliff_risk: output.cliff_risk,
+        wheel_drop_risk: output.wheel_drop_risk,
+        stuck_risk: output.stuck_risk,
+        confidence: output.confidence,
     }
 }
 
@@ -799,6 +870,7 @@ mod tests {
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_memory::InMemoryExperienceStore;
+    use netherwick_models::DangerNetTrainer;
     use netherwick_now::Now;
     use netherwick_sensors::World;
     use netherwick_sim::{ArenaConfig, SimObject, VirtualWorld};
@@ -1064,6 +1136,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sim_with_danger_checkpoint_writes_shadow_predictions() {
+        let root = test_ledger_root("sim-runner-danger-shadow");
+        let checkpoint = danger_checkpoint_root("sim-runner-danger-shadow");
+        let action = ActionPrimitive::Go {
+            intensity: 0.4,
+            duration_ms: 1_000,
+        };
+        write_test_danger_checkpoint(&checkpoint, action.clone());
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(action))
+            .with_models(RuntimeModelStack::with_danger_shadow_checkpoint(&checkpoint).unwrap());
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.8, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let frames = ledger.recent(5).await.unwrap();
+        let frame = frames.last().unwrap();
+
+        assert!(frame.now.predictions.danger_model.is_some());
+        assert!(frame.now.predictions.danger_hardcoded.is_some());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn danger_shadow_prediction_does_not_bypass_safety() {
+        let root = test_ledger_root("sim-runner-danger-shadow-safety");
+        let checkpoint = danger_checkpoint_root("sim-runner-danger-shadow-safety");
+        let action = ActionPrimitive::Go {
+            intensity: 0.5,
+            duration_ms: 500,
+        };
+        write_test_danger_checkpoint(&checkpoint, action.clone());
+        let ledger = JsonlLedger::new(&root);
+        let mut runtime = test_runtime(ledger, FixedConductor::new(action.clone()))
+            .with_models(RuntimeModelStack::with_danger_shadow_checkpoint(&checkpoint).unwrap());
+        let mut body = BodySense::default();
+        body.flags.cliff_left = true;
+        body.last_update_ms = 100;
+
+        let tick = runtime
+            .tick(
+                Now::blank(100, body),
+                ExperienceLatent::default(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, Some(action));
+        assert!(tick.frame.now.predictions.danger_model.is_some());
+        assert!(tick
+            .frame
+            .notes
+            .iter()
+            .any(|note| note.contains("Safety vetoed")));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
     async fn shared_reign_queue_controls_next_sim_tick() {
         let root = test_ledger_root("sim-runner-shared-reign");
         let ledger = JsonlLedger::new(&root);
@@ -1175,6 +1311,33 @@ mod tests {
         let root = std::env::temp_dir().join(format!("netherwick-{name}-{}", Uuid::new_v4()));
         let _ = fs::remove_dir_all(&root);
         root
+    }
+
+    fn danger_checkpoint_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("netherwick-{name}-checkpoint-{}", Uuid::new_v4()));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn write_test_danger_checkpoint(root: &Path, action: ActionPrimitive) {
+        let mut body = test_body(1.0, 1.0, 0.8, 7);
+        body.velocity.forward_m_s = 0.05;
+        let now = Now::blank(100, body);
+        let mut encoder = FeatureExperienceEncoder::new();
+        let latent = encoder.encode(&now).unwrap();
+        let input = DangerInput::from_parts(latent.z, Some(&action), &now);
+        let mut trainer = DangerNetTrainer::new(input.flat_features().len());
+        trainer
+            .train_step(
+                &input,
+                &netherwick_experience::DangerTarget {
+                    bump: 0.2,
+                    ..netherwick_experience::DangerTarget::default()
+                },
+            )
+            .unwrap();
+        trainer.save_checkpoint(root).unwrap();
     }
 
     fn read_transitions(root: &Path) -> Vec<ExperienceTransition> {

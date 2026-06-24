@@ -49,6 +49,17 @@ pub struct PredictionSense {
     pub schema_version: u32,
     pub expected_events: Vec<String>,
     pub uncertainty: f32,
+    pub danger_model: Option<DangerPrediction>,
+    pub danger_hardcoded: Option<DangerPrediction>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DangerPrediction {
+    pub bump_risk: f32,
+    pub cliff_risk: f32,
+    pub wheel_drop_risk: f32,
+    pub stuck_risk: f32,
+    pub confidence: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

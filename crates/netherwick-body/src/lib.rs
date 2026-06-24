@@ -71,14 +71,35 @@ impl MotionCommand {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BodyFlags {
     pub bump_left: bool,
     pub bump_right: bool,
     pub cliff_left: bool,
+    pub cliff_front_left: bool,
+    pub cliff_front_right: bool,
     pub cliff_right: bool,
     pub wheel_drop: bool,
     pub wall: bool,
     pub virtual_wall: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CliffSensors {
+    pub left: f32,
+    pub front_left: f32,
+    pub front_right: f32,
+    pub right: f32,
+}
+
+impl CliffSensors {
+    pub fn max(self) -> f32 {
+        self.left
+            .max(self.front_left)
+            .max(self.front_right)
+            .max(self.right)
+            .clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -97,6 +118,8 @@ pub struct BodyHealth {
 pub struct BodySense {
     pub battery_level: f32,
     pub charging: bool,
+    #[serde(default)]
+    pub cliff_sensors: CliffSensors,
     pub flags: BodyFlags,
     pub odometry: Pose2,
     pub velocity: Velocity,
@@ -109,6 +132,7 @@ impl Default for BodySense {
         Self {
             battery_level: 1.0,
             charging: false,
+            cliff_sensors: CliffSensors::default(),
             flags: BodyFlags::default(),
             odometry: Pose2::default(),
             velocity: Velocity::default(),

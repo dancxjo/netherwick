@@ -1,8 +1,12 @@
-use anyhow::{anyhow, Result};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Context, Result};
 use burn::backend::{Autodiff, NdArray};
 use burn::module::Module;
 use burn::nn::{loss::MseLoss, loss::Reduction, Linear, LinearConfig};
 use burn::optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, Sgd, SgdConfig};
+use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn::tensor::{activation, backend::AutodiffBackend, backend::Backend, Tensor, TensorData};
 use netherwick_behaviors::TrainingSample;
 use netherwick_experience::{DangerInput, DangerOutput, DangerTarget};
@@ -60,7 +64,12 @@ impl HardcodedDangerPredictor {
             bump_risk = 1.0;
         }
 
-        let cliff_risk = if now.body.flags.cliff_left || now.body.flags.cliff_right {
+        let cliff_risk = if now.body.flags.cliff_left
+            || now.body.flags.cliff_front_left
+            || now.body.flags.cliff_front_right
+            || now.body.flags.cliff_right
+            || now.body.cliff_sensors.max() >= 0.5
+        {
             1.0
         } else {
             0.0
@@ -138,9 +147,46 @@ pub struct DangerNetTrainer<B: AutodiffBackend = DangerAutodiffBackend> {
     best_loss: Option<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DangerModelMetadata {
+    pub input_dim: usize,
+    pub samples_seen: u64,
+    pub best_loss: Option<f32>,
+    pub created_at_ms: u64,
+}
+
 impl DangerNetTrainer<DangerAutodiffBackend> {
     pub fn new(input_dim: usize) -> Self {
         Self::with_device(input_dim, Default::default())
+    }
+
+    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_danger_metadata(path)?;
+        if metadata.input_dim != input_dim {
+            return Err(anyhow!(
+                "danger checkpoint input dimension mismatch at {}: metadata has {}, runtime expected {}",
+                path.display(),
+                metadata.input_dim,
+                input_dim
+            ));
+        }
+
+        let device = Default::default();
+        let model = DangerNet::init(input_dim, &device).load_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+            &device,
+        )?;
+        Ok(Self {
+            model,
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            learning_rate: 0.03,
+            samples_seen: metadata.samples_seen,
+            best_loss: metadata.best_loss,
+        })
     }
 }
 
@@ -163,6 +209,32 @@ impl<B: AutodiffBackend> DangerNetTrainer<B> {
 
     pub fn samples_seen(&self) -> u64 {
         self.samples_seen
+    }
+
+    pub fn best_loss(&self) -> Option<f32> {
+        self.best_loss
+    }
+
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create danger checkpoint dir {}", path.display()))?;
+        self.model.clone().save_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+        )?;
+        let metadata = DangerModelMetadata {
+            input_dim: self.input_dim,
+            samples_seen: self.samples_seen,
+            best_loss: self.best_loss,
+            created_at_ms: now_ms(),
+        };
+        std::fs::write(
+            path.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )
+        .with_context(|| format!("write danger checkpoint metadata {}", path.display()))?;
+        Ok(())
     }
 
     pub fn predict(&self, input: &DangerInput) -> Result<DangerOutput> {
@@ -241,6 +313,23 @@ impl<B: AutodiffBackend> DangerNetTrainer<B> {
         }
         Ok(features)
     }
+}
+
+pub fn read_danger_metadata(path: impl AsRef<Path>) -> Result<DangerModelMetadata> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path.join("metadata.json"))
+        .with_context(|| format!("read danger checkpoint metadata {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse danger checkpoint metadata {}", path.display()))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 impl<B: AutodiffBackend> OnlineTrainer<DangerInput, DangerTarget> for DangerNetTrainer<B> {
@@ -364,5 +453,56 @@ mod tests {
 
         assert_eq!(metric.observed_at_ms, 10);
         assert!(metric.loss.is_finite());
+    }
+
+    #[test]
+    fn danger_checkpoint_round_trips_prediction_shape() {
+        let dir = std::env::temp_dir().join(format!("netherwick-danger-checkpoint-{}", now_ms()));
+        let now = Now::blank(1, BodySense::default());
+        let input = DangerInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Stop), &now);
+        let mut trainer = DangerNetTrainer::new(input.flat_features().len());
+        trainer
+            .train_step(
+                &input,
+                &DangerTarget {
+                    bump: 1.0,
+                    ..DangerTarget::default()
+                },
+            )
+            .unwrap();
+
+        trainer.save_checkpoint(&dir).unwrap();
+        let loaded = DangerNetTrainer::load_checkpoint(&dir, input.flat_features().len()).unwrap();
+        let output = loaded.predict(&input).unwrap();
+
+        assert!(dir.join("model.bin").exists());
+        assert!(dir.join("metadata.json").exists());
+        assert_eq!(loaded.samples_seen(), 1);
+        for risk in output.risks() {
+            assert!((0.0..=1.0).contains(&risk));
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn danger_checkpoint_rejects_dimension_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "netherwick-danger-checkpoint-mismatch-{}",
+            now_ms()
+        ));
+        let trainer = DangerNetTrainer::new(3);
+
+        trainer.save_checkpoint(&dir).unwrap();
+        let err = match DangerNetTrainer::load_checkpoint(&dir, 4) {
+            Ok(_) => panic!("expected dimension mismatch"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("danger checkpoint input dimension mismatch"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

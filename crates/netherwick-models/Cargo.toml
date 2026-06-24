@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 burn.workspace = true
 netherwick-behaviors = { path = "../netherwick-behaviors" }
 netherwick-experience = { path = "../netherwick-experience" }

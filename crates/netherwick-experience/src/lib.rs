@@ -126,7 +126,7 @@ pub fn danger_target_from_transition_like(
     let no_odometry = odom_delta < 0.005;
     DangerTarget {
         bump: bool01(after.body.flags.bump_left || after.body.flags.bump_right),
-        cliff: bool01(after.body.flags.cliff_left || after.body.flags.cliff_right),
+        cliff: bool01(cliff_detected(after)),
         wheel_drop: bool01(after.body.flags.wheel_drop),
         stuck: bool01(commanded_motion && no_forward_velocity && no_odometry),
     }
@@ -194,40 +194,40 @@ impl ExperienceDecoder for PartialExperienceDecoder {
             charging: latent.z.get(1).copied().unwrap_or(0.0) >= 0.5,
             ..BodySense::default()
         });
-        let drives = (latent.z.len() >= 23).then(|| DriveSense {
+        let drives = (latent.z.len() >= 27).then(|| DriveSense {
             battery_hunger: latent
-                .z
-                .get(17)
-                .copied()
-                .unwrap_or_default()
-                .clamp(0.0, 1.0),
-            danger_avoidance: latent
-                .z
-                .get(18)
-                .copied()
-                .unwrap_or_default()
-                .clamp(0.0, 1.0),
-            curiosity: latent
-                .z
-                .get(19)
-                .copied()
-                .unwrap_or_default()
-                .clamp(0.0, 1.0),
-            social_interest: latent
-                .z
-                .get(20)
-                .copied()
-                .unwrap_or_default()
-                .clamp(0.0, 1.0),
-            fatigue: latent
                 .z
                 .get(21)
                 .copied()
                 .unwrap_or_default()
                 .clamp(0.0, 1.0),
-            uncertainty_pressure: latent
+            danger_avoidance: latent
                 .z
                 .get(22)
+                .copied()
+                .unwrap_or_default()
+                .clamp(0.0, 1.0),
+            curiosity: latent
+                .z
+                .get(23)
+                .copied()
+                .unwrap_or_default()
+                .clamp(0.0, 1.0),
+            social_interest: latent
+                .z
+                .get(24)
+                .copied()
+                .unwrap_or_default()
+                .clamp(0.0, 1.0),
+            fatigue: latent
+                .z
+                .get(25)
+                .copied()
+                .unwrap_or_default()
+                .clamp(0.0, 1.0),
+            uncertainty_pressure: latent
+                .z
+                .get(26)
                 .copied()
                 .unwrap_or_default()
                 .clamp(0.0, 1.0),
@@ -295,10 +295,7 @@ impl SurpriseComputer for BaselineSurpriseComputer {
         if actual_now.body.flags.bump_left || actual_now.body.flags.bump_right {
             total += 0.25;
         }
-        if actual_now.body.flags.cliff_left
-            || actual_now.body.flags.cliff_right
-            || actual_now.body.flags.wheel_drop
-        {
+        if cliff_detected(actual_now) || actual_now.body.flags.wheel_drop {
             total += 0.45;
         }
         if actual_now.body.charging
@@ -352,8 +349,7 @@ impl RewardComputer for BaselineRewardComputer {
         }
         if !after.body.flags.bump_left
             && !after.body.flags.bump_right
-            && !after.body.flags.cliff_left
-            && !after.body.flags.cliff_right
+            && !cliff_detected(after)
             && !after.body.flags.wheel_drop
         {
             value += 0.01;
@@ -361,10 +357,7 @@ impl RewardComputer for BaselineRewardComputer {
         if after.body.flags.bump_left || after.body.flags.bump_right {
             value -= 0.25;
         }
-        if after.body.flags.cliff_left
-            || after.body.flags.cliff_right
-            || after.body.flags.wheel_drop
-        {
+        if cliff_detected(after) || after.body.flags.wheel_drop {
             value -= 0.8;
         }
         if battery_delta < 0.0 {
@@ -429,13 +422,17 @@ impl SenseVectorizer for BaselineSenseVectorizer {
                 now.body.battery_level.clamp(0.0, 1.0),
                 bool01(now.body.charging),
                 bool01(now.body.flags.bump_left || now.body.flags.bump_right),
-                bool01(now.body.flags.cliff_left || now.body.flags.cliff_right),
+                bool01(cliff_detected(now)),
                 bool01(now.body.flags.wheel_drop),
                 bool01(now.body.flags.wall || now.body.flags.virtual_wall),
                 now.body.velocity.forward_m_s.clamp(-1.0, 1.0),
                 now.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
                 now.body.health.strain.clamp(0.0, 1.0),
                 now.body.health.health.clamp(0.0, 1.0),
+                now.body.cliff_sensors.left.clamp(0.0, 1.0),
+                now.body.cliff_sensors.front_left.clamp(0.0, 1.0),
+                now.body.cliff_sensors.front_right.clamp(0.0, 1.0),
+                now.body.cliff_sensors.right.clamp(0.0, 1.0),
             ],
             Self::Memory => vec![
                 now.memory.place_familiarity.clamp(0.0, 1.0),
@@ -572,13 +569,17 @@ fn danger_body_features(now: &Now) -> Vec<f32> {
         now.body.battery_level.clamp(0.0, 1.0),
         bool01(now.body.charging),
         bool01(now.body.flags.bump_left || now.body.flags.bump_right),
-        bool01(now.body.flags.cliff_left || now.body.flags.cliff_right),
+        bool01(cliff_detected(now)),
         bool01(now.body.flags.wheel_drop),
         bool01(now.body.flags.wall || now.body.flags.virtual_wall),
         now.body.velocity.forward_m_s.clamp(-1.0, 1.0),
         now.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
         now.body.health.strain.clamp(0.0, 1.0),
         now.body.health.health.clamp(0.0, 1.0),
+        now.body.cliff_sensors.left.clamp(0.0, 1.0),
+        now.body.cliff_sensors.front_left.clamp(0.0, 1.0),
+        now.body.cliff_sensors.front_right.clamp(0.0, 1.0),
+        now.body.cliff_sensors.right.clamp(0.0, 1.0),
         now.range
             .nearest_m
             .map(|m| (1.0 / (1.0 + m)).clamp(0.0, 1.0))
@@ -593,6 +594,14 @@ fn danger_body_features(now: &Now) -> Vec<f32> {
                 .unwrap_or(false),
         ),
     ]
+}
+
+fn cliff_detected(now: &Now) -> bool {
+    now.body.flags.cliff_left
+        || now.body.flags.cliff_front_left
+        || now.body.flags.cliff_front_right
+        || now.body.flags.cliff_right
+        || now.body.cliff_sensors.max() >= 0.5
 }
 
 fn sanitize_feature(value: f32) -> f32 {
@@ -740,6 +749,17 @@ mod tests {
 
         assert_eq!(stop.action_features.len(), go.action_features.len());
         assert_eq!(go.action_features.len(), turn.action_features.len());
+    }
+
+    #[test]
+    fn danger_input_includes_cliff_sensor_channels() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.body.cliff_sensors.front_left = 0.8;
+
+        let input = DangerInput::from_parts(vec![0.0], Some(&ActionPrimitive::Stop), &now);
+
+        assert!(input.body_features.contains(&0.8));
+        assert_eq!(input.body_features[3], 1.0);
     }
 }
 

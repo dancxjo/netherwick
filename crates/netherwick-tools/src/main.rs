@@ -1,5 +1,7 @@
+use std::path::Path;
+
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_body::BodySense;
 use netherwick_conductor::SimpleConductor;
@@ -10,7 +12,7 @@ use netherwick_ledger::{ExperienceFrame, JsonlLedger, LedgerReader};
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
 use netherwick_models::{DangerNetTrainer, MODEL_REGISTRY};
-use netherwick_runtime::{MinimalRuntime, SimRunner};
+use netherwick_runtime::{MinimalRuntime, RuntimeModelStack, SimRunner};
 use netherwick_sim::{ArenaConfig, SimObject, SimObjectKind, VirtualWorld};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -57,6 +59,16 @@ struct SimArgs {
     seed: u64,
     #[arg(long, default_value = "data/ledger")]
     ledger: String,
+    #[arg(long)]
+    danger_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    danger_mode: DangerMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DangerMode {
+    Off,
+    ShadowInfer,
 }
 
 #[derive(Debug, Parser)]
@@ -76,13 +88,15 @@ struct TrainDangerArgs {
     ledger: String,
     #[arg(long, default_value_t = 5)]
     epochs: usize,
+    #[arg(long, default_value = "data/models/danger_v0")]
+    checkpoint: String,
 }
 
 async fn run_sim(args: SimArgs) -> Result<()> {
     let ledger = JsonlLedger::new(&args.ledger);
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
-    let runtime = MinimalRuntime::with_default_events(
+    let mut runtime = MinimalRuntime::with_default_events(
         ledger,
         memory,
         recall,
@@ -90,6 +104,9 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         SimpleSafety::default(),
         NoopLlmAgent,
     );
+    if let Some(models) = load_runtime_models(&args)? {
+        runtime = runtime.with_models(models);
+    }
 
     let (mut world, motors) = VirtualWorld::new_with_motor(
         args.seed,
@@ -135,10 +152,32 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let mut runner = SimRunner::new(runtime, world, motors);
     runner.run_steps(args.steps).await?;
     println!(
-        "sim complete: {} ticks, seed {}, ledger {}",
-        runner.tick_count, args.seed, args.ledger
+        "sim complete: {} ticks, seed {}, ledger {}, danger_mode {:?}",
+        runner.tick_count, args.seed, args.ledger, args.danger_mode
     );
     Ok(())
+}
+
+fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
+    if args.danger_mode != DangerMode::ShadowInfer {
+        return Ok(None);
+    }
+    let Some(checkpoint) = &args.danger_checkpoint else {
+        println!("danger shadow inference disabled: no --danger-checkpoint provided");
+        return Ok(None);
+    };
+    let path = Path::new(checkpoint);
+    if !path.exists() {
+        println!(
+            "danger shadow inference disabled: checkpoint not found at {}",
+            path.display()
+        );
+        return Ok(None);
+    }
+
+    let models = RuntimeModelStack::with_danger_shadow_checkpoint(path)?;
+    println!("loaded danger checkpoint: {}", path.display());
+    Ok(Some(models))
 }
 
 async fn inspect_ledger() -> Result<()> {
@@ -230,6 +269,11 @@ async fn train_danger(args: TrainDangerArgs) -> Result<()> {
         last_loss,
         metrics_path.display()
     );
+    trainer.save_checkpoint(&args.checkpoint)?;
+    println!("saved danger checkpoint: {}", args.checkpoint);
+    println!("samples_seen: {}", trainer.samples_seen());
+    println!("last_loss: {:.6}", last_loss);
+    println!("best_loss: {:?}", trainer.best_loss());
     Ok(())
 }
 
@@ -239,7 +283,7 @@ fn model_status() -> Result<()> {
         println!("  - {model}");
     }
     println!(
-        "DangerPredictor: shadow-train ready; metrics: data/ledger/danger-shadow-metrics.jsonl"
+        "DangerPredictor: shadow-train ready; metrics: data/ledger/danger-shadow-metrics.jsonl; checkpoint: data/models/danger_v0"
     );
     Ok(())
 }

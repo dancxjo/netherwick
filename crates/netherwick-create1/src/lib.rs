@@ -1,11 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use netherwick_body::{BodySense, MotionCommand, MotorCommand, MotorComplex, RobotBody};
+#[cfg(feature = "serial")]
+use netherwick_body::CliffSensors;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serial")]
 use serialport::SerialPort;
 #[cfg(feature = "serial")]
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(feature = "serial")]
 use std::time::Duration;
 
@@ -113,11 +115,55 @@ impl Create1Body {
         packet.extend_from_slice(&left_mm_s.to_be_bytes());
         self.write_bytes(&packet)
     }
+
+    #[cfg(feature = "serial")]
+    fn refresh_sensors(&mut self) -> Result<()> {
+        let Some(port) = self.port.as_mut() else {
+            return Ok(());
+        };
+        const PACKETS: [u8; 12] = [7, 8, 9, 10, 11, 12, 13, 21, 28, 29, 30, 31];
+        let mut query = vec![149, PACKETS.len() as u8];
+        query.extend_from_slice(&PACKETS);
+        port.write_all(&query)?;
+        port.flush()?;
+
+        let mut bytes = [0u8; 16];
+        port.read_exact(&mut bytes)?;
+        let bumps = bytes[0];
+        self.body.flags.bump_right = bumps & 0b0000_0001 != 0;
+        self.body.flags.bump_left = bumps & 0b0000_0010 != 0;
+        self.body.flags.wheel_drop = bumps & 0b0001_1100 != 0;
+        self.body.flags.wall = bytes[1] != 0;
+        self.body.flags.cliff_left = bytes[2] != 0;
+        self.body.flags.cliff_front_left = bytes[3] != 0;
+        self.body.flags.cliff_front_right = bytes[4] != 0;
+        self.body.flags.cliff_right = bytes[5] != 0;
+        self.body.flags.virtual_wall = bytes[6] != 0;
+        self.body.charging = bytes[7] != 0;
+
+        let left_signal = u16::from_be_bytes([bytes[8], bytes[9]]);
+        let front_left_signal = u16::from_be_bytes([bytes[10], bytes[11]]);
+        let front_right_signal = u16::from_be_bytes([bytes[12], bytes[13]]);
+        let right_signal = u16::from_be_bytes([bytes[14], bytes[15]]);
+        self.body.cliff_sensors = CliffSensors {
+            left: create1_cliff_risk(left_signal, self.body.flags.cliff_left),
+            front_left: create1_cliff_risk(front_left_signal, self.body.flags.cliff_front_left),
+            front_right: create1_cliff_risk(front_right_signal, self.body.flags.cliff_front_right),
+            right: create1_cliff_risk(right_signal, self.body.flags.cliff_right),
+        };
+        Ok(())
+    }
+
+    #[cfg(not(feature = "serial"))]
+    fn refresh_sensors(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl RobotBody for Create1Body {
     async fn read_body(&mut self) -> Result<BodySense> {
+        self.refresh_sensors()?;
         Ok(self.body.clone())
     }
 
@@ -142,4 +188,13 @@ impl MotorComplex for Create1Body {
 fn meters_per_second_to_mm_per_second(value: f32) -> i16 {
     let scaled = (value * 1000.0).round();
     scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+#[cfg(feature = "serial")]
+fn create1_cliff_risk(signal: u16, tripped: bool) -> f32 {
+    if tripped {
+        1.0
+    } else {
+        (1.0 - signal as f32 / 4095.0).clamp(0.0, 1.0)
+    }
 }
