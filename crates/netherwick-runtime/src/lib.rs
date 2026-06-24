@@ -20,12 +20,13 @@ use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
 use netherwick_experience::{
-    charge_input_from_transition_like, charge_target_from_transition_like,
-    danger_input_from_transition_like, danger_target_from_transition_like, ActionValueInput,
-    ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput,
-    DangerInput, DangerOutput, Experience, ExperienceEncoder, ExperienceLatent,
-    FeatureExperienceEncoder, FuturePrediction, FuturePredictor, Impression, RewardComputer,
-    Sensation, StasisFuturePredictor, SurpriseComputer,
+    action_value_input_from_transition_like, charge_input_from_transition_like,
+    charge_target_from_transition_like, danger_input_from_transition_like,
+    danger_target_from_transition_like, ActionValueInput, ActionValueOutput,
+    BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput, DangerInput,
+    DangerOutput, Experience, ExperienceEncoder, ExperienceLatent, FeatureExperienceEncoder,
+    FuturePrediction, FuturePredictor, Impression, RewardComputer, Sensation,
+    StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -75,7 +76,6 @@ where
 #[derive(Default)]
 pub struct RuntimeModelStack {
     pub behaviors: BehaviorRegistry,
-    pub action_value: Option<ActionValueRuntimePredictor>,
 }
 
 impl RuntimeModelStack {
@@ -106,13 +106,16 @@ impl RuntimeModelStack {
     pub fn with_action_value_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let metadata = read_action_value_metadata(path)?;
-        Ok(Self {
-            behaviors: BehaviorRegistry::default(),
-            action_value: Some(ActionValueRuntimePredictor::load_checkpoint(
+        let mut stack = Self::default();
+        stack.behaviors.action_value = action_value_behavior(
+            BehaviorRegime::ShadowInfer,
+            Some(ActionValueNetTrainer::load_checkpoint(
                 path,
                 metadata.input_dim,
             )?),
-        })
+            FallbackPolicy::UseHardcoded,
+        );
+        Ok(stack)
     }
 
     pub fn with_shadow_checkpoints(
@@ -139,10 +142,14 @@ impl RuntimeModelStack {
         }
         if let Some(path) = action_value_path {
             let metadata = read_action_value_metadata(path)?;
-            stack.action_value = Some(ActionValueRuntimePredictor::load_checkpoint(
-                path,
-                metadata.input_dim,
-            )?);
+            stack.behaviors.action_value = action_value_behavior(
+                BehaviorRegime::ShadowInfer,
+                Some(ActionValueNetTrainer::load_checkpoint(
+                    path,
+                    metadata.input_dim,
+                )?),
+                FallbackPolicy::UseHardcoded,
+            );
         }
         Ok(stack)
     }
@@ -172,15 +179,11 @@ impl RuntimeModelStack {
             stack.behaviors.future = future_behavior(behavior.regime, behavior.fallback);
         }
         if let Some(behavior) = config.behavior.get("action_value") {
-            if let Some(checkpoint) = behavior.checkpoint.as_deref() {
-                if Path::new(checkpoint).exists() {
-                    let metadata = read_action_value_metadata(checkpoint)?;
-                    stack.action_value = Some(ActionValueRuntimePredictor::load_checkpoint(
-                        checkpoint,
-                        metadata.input_dim,
-                    )?);
-                }
-            }
+            stack.behaviors.action_value = action_value_behavior(
+                behavior.regime,
+                load_action_value_behavior_trainer(behavior)?,
+                behavior.fallback,
+            );
         }
         Ok(stack)
     }
@@ -190,14 +193,28 @@ pub struct BehaviorRegistry {
     pub danger: ReplaceableBehavior<SituatedDangerInput, DangerOutput>,
     pub charge: ReplaceableBehavior<SituatedChargeInput, ChargeOutput>,
     pub future: ReplaceableBehavior<FutureInput, FuturePrediction>,
+    pub action_value: ReplaceableBehavior<SituatedActionValueInput, ActionValueOutput>,
 }
 
 impl Default for BehaviorRegistry {
     fn default() -> Self {
         Self {
-            danger: danger_behavior(BehaviorRegime::Hardcoded, None, FallbackPolicy::UseHardcoded),
-            charge: charge_behavior(BehaviorRegime::Hardcoded, None, FallbackPolicy::UseHardcoded),
+            danger: danger_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
+            charge: charge_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
             future: future_behavior(BehaviorRegime::Hardcoded, FallbackPolicy::UseHardcoded),
+            action_value: action_value_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
         }
     }
 }
@@ -207,6 +224,8 @@ pub struct BehaviorTrainingHub {
     pub charge_extractor: Box<dyn TargetExtractor<ExperienceTransition, ChargeInput, ChargeOutput>>,
     pub future_extractor:
         Box<dyn TargetExtractor<ExperienceTransition, FutureInput, FuturePrediction>>,
+    pub action_value_extractor:
+        Box<dyn TargetExtractor<ExperienceTransition, ActionValueInput, ActionValueOutput>>,
 }
 
 impl Default for BehaviorTrainingHub {
@@ -215,6 +234,7 @@ impl Default for BehaviorTrainingHub {
             danger_extractor: Box::new(DangerTargetExtractor),
             charge_extractor: Box::new(ChargeTargetExtractor),
             future_extractor: Box::new(FutureTargetExtractor { offset_ms: 1_000 }),
+            action_value_extractor: Box::new(ActionValueTargetExtractor),
         }
     }
 }
@@ -324,46 +344,31 @@ impl TargetExtractor<ExperienceTransition, FutureInput, FuturePrediction>
     }
 }
 
-pub struct ActionValueRuntimePredictor {
-    trainer: ActionValueNetTrainer,
-    hardcoded: HardcodedActionValuePredictor,
-}
+pub struct ActionValueTargetExtractor;
 
-impl ActionValueRuntimePredictor {
-    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
-        Ok(Self {
-            trainer: ActionValueNetTrainer::load_checkpoint(path, input_dim)?,
-            hardcoded: HardcodedActionValuePredictor,
-        })
-    }
-
-    pub fn predict_shadow(
+impl TargetExtractor<ExperienceTransition, ActionValueInput, ActionValueOutput>
+    for ActionValueTargetExtractor
+{
+    fn extract(
         &self,
-        now: &Now,
-        latent: &ExperienceLatent,
-        action: Option<&ActionPrimitive>,
-        model_danger: Option<DangerOutput>,
-        model_charge: Option<ChargeOutput>,
-        hardcoded_danger: Option<DangerOutput>,
-        hardcoded_charge: Option<ChargeOutput>,
-    ) -> Result<(ActionValueOutput, ActionValueOutput)> {
-        let model_input = ActionValueInput::from_parts_with_predictions(
-            latent.z.clone(),
-            action,
-            now,
-            model_danger,
-            model_charge,
-        );
-        let hardcoded_input = ActionValueInput::from_parts_with_predictions(
-            latent.z.clone(),
-            action,
-            now,
-            hardcoded_danger,
-            hardcoded_charge,
-        );
-        let model = self.trainer.predict(&model_input)?;
-        let hardcoded = self.hardcoded.predict_from_now(now, &hardcoded_input);
-        Ok((model, hardcoded))
+        transition: &ExperienceTransition,
+    ) -> Result<Option<TrainingSample<ActionValueInput, ActionValueOutput>>> {
+        Ok(Some(TrainingSample {
+            input: action_value_input_from_transition_like(
+                &transition.before_z,
+                transition.action.as_ref(),
+                &transition.before,
+            ),
+            expected: ActionValueOutput {
+                value: transition.reward.value.clamp(-1.0, 1.0),
+                confidence: 1.0,
+            },
+            actual: None,
+            reward: Some(transition.reward.value),
+            weight: 1.0,
+            source: TrainingSource::WorldOutcome,
+            t_ms: transition.created_at_ms,
+        }))
     }
 }
 
@@ -376,6 +381,12 @@ pub struct SituatedDangerInput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SituatedChargeInput {
     pub input: ChargeInput,
+    pub now: Now,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SituatedActionValueInput {
+    pub input: ActionValueInput,
     pub now: Now,
 }
 
@@ -465,6 +476,45 @@ impl FunctionBehavior<SituatedChargeInput, ChargeOutput> for ChargeModelBehavior
     }
 }
 
+struct HardcodedActionValueBehavior;
+
+impl FunctionBehavior<SituatedActionValueInput, ActionValueOutput>
+    for HardcodedActionValueBehavior
+{
+    fn id(&self) -> &'static str {
+        "action_value.handcoded"
+    }
+
+    fn infer(&mut self, input: &SituatedActionValueInput) -> Result<ActionValueOutput> {
+        Ok(HardcodedActionValuePredictor.predict_from_now(&input.now, &input.input))
+    }
+}
+
+struct ActionValueModelBehavior {
+    trainer: ActionValueNetTrainer,
+}
+
+impl FunctionBehavior<SituatedActionValueInput, ActionValueOutput> for ActionValueModelBehavior {
+    fn id(&self) -> &'static str {
+        "action_value.burn.v0"
+    }
+
+    fn infer(&mut self, input: &SituatedActionValueInput) -> Result<ActionValueOutput> {
+        self.trainer.predict(&input.input)
+    }
+
+    fn observe(
+        &mut self,
+        sample: &TrainingSample<SituatedActionValueInput, ActionValueOutput>,
+    ) -> Result<()> {
+        let target = netherwick_experience::ActionValueTarget {
+            value: sample.expected.value,
+        };
+        self.trainer.train_step(&sample.input.input, &target)?;
+        Ok(())
+    }
+}
+
 struct StasisFutureBehavior {
     predictor: StasisFuturePredictor,
 }
@@ -523,6 +573,20 @@ fn future_behavior(
     )
 }
 
+fn action_value_behavior(
+    regime: BehaviorRegime,
+    trainer: Option<ActionValueNetTrainer>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<SituatedActionValueInput, ActionValueOutput> {
+    ReplaceableBehavior::new(
+        "action_value",
+        regime,
+        Box::new(HardcodedActionValueBehavior),
+        trainer.map(|trainer| Box::new(ActionValueModelBehavior { trainer }) as Box<_>),
+        fallback,
+    )
+}
+
 fn load_danger_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<DangerNetTrainer>> {
     let Some(checkpoint) = behavior.checkpoint.as_deref() else {
         return Ok(None);
@@ -551,6 +615,22 @@ fn load_charge_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<Char
     )?))
 }
 
+fn load_action_value_behavior_trainer(
+    behavior: &BehaviorConfig,
+) -> Result<Option<ActionValueNetTrainer>> {
+    let Some(checkpoint) = behavior.checkpoint.as_deref() else {
+        return Ok(None);
+    };
+    if !Path::new(checkpoint).exists() {
+        return Ok(None);
+    }
+    let metadata = read_action_value_metadata(checkpoint)?;
+    Ok(Some(ActionValueNetTrainer::load_checkpoint(
+        checkpoint,
+        metadata.input_dim,
+    )?))
+}
+
 fn danger_behavior_input(
     now: &Now,
     latent: &ExperienceLatent,
@@ -573,6 +653,25 @@ fn charge_behavior_input(
     }
 }
 
+fn action_value_behavior_input(
+    now: &Now,
+    latent: &ExperienceLatent,
+    action: Option<&ActionPrimitive>,
+    danger: Option<DangerOutput>,
+    charge: Option<ChargeOutput>,
+) -> SituatedActionValueInput {
+    SituatedActionValueInput {
+        input: ActionValueInput::from_parts_with_predictions(
+            latent.z.clone(),
+            action,
+            now,
+            danger,
+            charge,
+        ),
+        now: now.clone(),
+    }
+}
+
 fn danger_disagreement(left: &DangerOutput, right: &DangerOutput) -> f32 {
     let deltas = [
         (left.bump_risk - right.bump_risk).abs(),
@@ -581,6 +680,10 @@ fn danger_disagreement(left: &DangerOutput, right: &DangerOutput) -> f32 {
         (left.stuck_risk - right.stuck_risk).abs(),
     ];
     deltas.iter().sum::<f32>() / deltas.len() as f32
+}
+
+fn action_value_disagreement(left: &ActionValueOutput, right: &ActionValueOutput) -> f32 {
+    (left.value - right.value).abs()
 }
 
 fn charge_disagreement(left: &ChargeOutput, right: &ChargeOutput) -> f32 {
@@ -889,69 +992,78 @@ where
         }
         behavior_runs.push(charge_record.erase());
 
-        if let Some(action_value) = &self.models.action_value {
-            let mut model_predictions = Vec::new();
-            let mut hardcoded_predictions = Vec::new();
-            for action in &action_value_candidates {
-                let candidate_danger_input = danger_behavior_input(&now, &latent, Some(action));
-                let candidate_danger = self
-                    .models
-                    .behaviors
-                    .danger
-                    .infer(&candidate_danger_input, now.t_ms)?;
-                let mut candidate_danger_record = candidate_danger.record;
-                if let (Some(hard), Some(model)) = (
-                    candidate_danger_record.hardcoded_output.as_ref(),
-                    candidate_danger_record.model_output.as_ref(),
-                ) {
-                    candidate_danger_record.disagreement = Some(danger_disagreement(hard, model));
-                }
-                let model_danger = candidate_danger_record
-                    .model_output
-                    .as_ref()
-                    .copied()
-                    .or(candidate_danger_record.selected_output.as_ref().copied());
-                let hardcoded_danger_output =
-                    candidate_danger_record.hardcoded_output.as_ref().copied();
-                behavior_runs.push(candidate_danger_record.erase());
-
-                let candidate_charge_input = charge_behavior_input(&now, &latent, Some(action));
-                let candidate_charge = self
-                    .models
-                    .behaviors
-                    .charge
-                    .infer(&candidate_charge_input, now.t_ms)?;
-                let mut candidate_charge_record = candidate_charge.record;
-                if let (Some(hard), Some(model)) = (
-                    candidate_charge_record.hardcoded_output.as_ref(),
-                    candidate_charge_record.model_output.as_ref(),
-                ) {
-                    candidate_charge_record.disagreement = Some(charge_disagreement(hard, model));
-                }
-                let model_charge = candidate_charge_record
-                    .model_output
-                    .as_ref()
-                    .copied()
-                    .or(candidate_charge_record.selected_output.as_ref().copied());
-                let hardcoded_charge_output =
-                    candidate_charge_record.hardcoded_output.as_ref().copied();
-                behavior_runs.push(candidate_charge_record.erase());
-
-                let (model, hardcoded) = action_value.predict_shadow(
-                    &now,
-                    &latent,
-                    Some(action),
-                    model_danger,
-                    model_charge,
-                    hardcoded_danger_output,
-                    hardcoded_charge_output,
-                )?;
-                model_predictions.push(action_value_prediction(action.clone(), model));
-                hardcoded_predictions.push(action_value_prediction(action.clone(), hardcoded));
+        let mut model_predictions = Vec::new();
+        let mut hardcoded_predictions = Vec::new();
+        for action in &action_value_candidates {
+            let candidate_danger_input = danger_behavior_input(&now, &latent, Some(action));
+            let candidate_danger = self
+                .models
+                .behaviors
+                .danger
+                .infer(&candidate_danger_input, now.t_ms)?;
+            let mut candidate_danger_record = candidate_danger.record;
+            if let (Some(hard), Some(model)) = (
+                candidate_danger_record.hardcoded_output.as_ref(),
+                candidate_danger_record.model_output.as_ref(),
+            ) {
+                candidate_danger_record.disagreement = Some(danger_disagreement(hard, model));
             }
-            now.predictions.action_values_model = model_predictions;
-            now.predictions.action_values_hardcoded = hardcoded_predictions;
+            let candidate_danger_output = candidate_danger_record
+                .model_output
+                .as_ref()
+                .copied()
+                .or(candidate_danger_record.selected_output.as_ref().copied());
+            behavior_runs.push(candidate_danger_record.erase());
+
+            let candidate_charge_input = charge_behavior_input(&now, &latent, Some(action));
+            let candidate_charge = self
+                .models
+                .behaviors
+                .charge
+                .infer(&candidate_charge_input, now.t_ms)?;
+            let mut candidate_charge_record = candidate_charge.record;
+            if let (Some(hard), Some(model)) = (
+                candidate_charge_record.hardcoded_output.as_ref(),
+                candidate_charge_record.model_output.as_ref(),
+            ) {
+                candidate_charge_record.disagreement = Some(charge_disagreement(hard, model));
+            }
+            let candidate_charge_output = candidate_charge_record
+                .model_output
+                .as_ref()
+                .copied()
+                .or(candidate_charge_record.selected_output.as_ref().copied());
+            behavior_runs.push(candidate_charge_record.erase());
+
+            let candidate_action_value_input = action_value_behavior_input(
+                &now,
+                &latent,
+                Some(action),
+                candidate_danger_output,
+                candidate_charge_output,
+            );
+            let action_value_run = self
+                .models
+                .behaviors
+                .action_value
+                .infer(&candidate_action_value_input, now.t_ms)?;
+            let mut action_value_record = action_value_run.record;
+            if let (Some(hard), Some(model)) = (
+                action_value_record.hardcoded_output.as_ref(),
+                action_value_record.model_output.as_ref(),
+            ) {
+                action_value_record.disagreement = Some(action_value_disagreement(hard, model));
+            }
+            if let Some(model) = action_value_record.model_output.as_ref() {
+                model_predictions.push(action_value_prediction(action.clone(), *model));
+            }
+            if let Some(hardcoded) = action_value_record.hardcoded_output.as_ref() {
+                hardcoded_predictions.push(action_value_prediction(action.clone(), *hardcoded));
+            }
+            behavior_runs.push(action_value_record.erase());
         }
+        now.predictions.action_values_model = model_predictions;
+        now.predictions.action_values_hardcoded = hardcoded_predictions;
 
         let safety = self
             .safety
@@ -1729,8 +1841,36 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn tick_records_erased_behavior_runs() {
+        let root = test_ledger_root("runtime-behavior-runs");
+        let ledger = JsonlLedger::new(&root);
+        let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
+
+        let tick = runtime
+            .tick(
+                Now::blank(100, test_body(1.0, 1.0, 0.8, 100)),
+                ExperienceLatent::default(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        for behavior_id in ["danger", "charge", "future", "action_value"] {
+            assert!(
+                tick.frame
+                    .behavior_runs
+                    .iter()
+                    .any(|run| run.behavior_id == behavior_id),
+                "missing behavior run for {behavior_id}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
-    fn target_extractors_create_danger_charge_and_future_samples() {
+    fn target_extractors_create_danger_charge_future_and_action_value_samples() {
         let action = ActionPrimitive::Go {
             intensity: 0.4,
             duration_ms: 1_000,
@@ -1783,10 +1923,18 @@ mod tests {
             .unwrap();
         assert_eq!(future.input.action, action);
         assert_eq!(future.expected.predicted_z, vec![0.3, 0.4]);
+
+        let action_value = ActionValueTargetExtractor
+            .extract(&transition)
+            .unwrap()
+            .unwrap();
+        assert_eq!(action_value.source, TrainingSource::WorldOutcome);
+        assert_eq!(action_value.expected.value, 0.25);
+        assert_eq!(action_value.expected.confidence, 1.0);
     }
 
     #[test]
-    fn behavior_registry_runs_danger_and_charge_through_same_wrapper() {
+    fn behavior_registry_default_has_all_replaceable_slots() {
         let mut registry = BehaviorRegistry::default();
         let now = Now::blank(100, test_body(1.0, 1.0, 0.0, 100));
         let latent = ExperienceLatent {
@@ -1806,11 +1954,120 @@ mod tests {
             .charge
             .infer(&charge_behavior_input(&now, &latent, Some(&action)), 100)
             .unwrap();
+        let future = registry
+            .future
+            .infer(
+                &FutureInput {
+                    latent: latent.clone(),
+                    action: action.clone(),
+                    offset_ms: 1_000,
+                },
+                100,
+            )
+            .unwrap();
+        let action_value = registry
+            .action_value
+            .infer(
+                &action_value_behavior_input(&now, &latent, Some(&action), None, None),
+                100,
+            )
+            .unwrap();
 
         assert_eq!(danger.record.behavior_id, "danger");
         assert_eq!(charge.record.behavior_id, "charge");
+        assert_eq!(future.record.behavior_id, "future");
+        assert_eq!(action_value.record.behavior_id, "action_value");
         assert!(danger.record.hardcoded_output.is_some());
         assert!(charge.record.hardcoded_output.is_some());
+        assert!(future.record.hardcoded_output.is_some());
+        assert!(action_value.record.hardcoded_output.is_some());
+    }
+
+    #[test]
+    fn action_value_hardcoded_regime_returns_hardcoded_output() {
+        let now = Now::blank(100, test_body(1.0, 1.0, 0.2, 100));
+        let latent = ExperienceLatent {
+            t_ms: 100,
+            z: vec![0.0; 4],
+            confidence: 0.8,
+            ..ExperienceLatent::default()
+        };
+        let input =
+            action_value_behavior_input(&now, &latent, Some(&ActionPrimitive::Dock), None, None);
+        let mut behavior = action_value_behavior(
+            BehaviorRegime::Hardcoded,
+            None,
+            FallbackPolicy::UseHardcoded,
+        );
+
+        let run = behavior.infer(&input, 100).unwrap();
+
+        assert!(run.record.hardcoded_output.is_some());
+        assert!(run.record.model_output.is_none());
+        assert_eq!(run.record.selected_output, run.record.hardcoded_output);
+    }
+
+    #[test]
+    fn action_value_shadow_infer_records_model_and_selects_hardcoded() {
+        let now = Now::blank(100, test_body(1.0, 1.0, 0.2, 100));
+        let latent = ExperienceLatent {
+            t_ms: 100,
+            z: vec![0.0; 4],
+            confidence: 0.8,
+            ..ExperienceLatent::default()
+        };
+        let input =
+            action_value_behavior_input(&now, &latent, Some(&ActionPrimitive::Dock), None, None);
+        let trainer = ActionValueNetTrainer::new(input.input.flat_features().len());
+        let mut behavior = action_value_behavior(
+            BehaviorRegime::ShadowInfer,
+            Some(trainer),
+            FallbackPolicy::UseHardcoded,
+        );
+
+        let run = behavior.infer(&input, 100).unwrap();
+
+        assert!(run.record.hardcoded_output.is_some());
+        assert!(run.record.model_output.is_some());
+        assert_eq!(run.record.selected_output, run.record.hardcoded_output);
+    }
+
+    #[test]
+    fn action_value_config_with_missing_checkpoint_falls_back_cleanly() {
+        let config: BehaviorRegistryConfig = toml::from_str(
+            r#"
+            [behavior.action_value]
+            regime = "shadow_infer"
+            hardcoded = "action_value.handcoded"
+            model = "action_value.burn.v0"
+            checkpoint = "/tmp/netherwick-missing-action-value-checkpoint"
+            fallback = "use_hardcoded"
+            "#,
+        )
+        .unwrap();
+        let mut stack = RuntimeModelStack::from_behavior_config(&config).unwrap();
+        assert_eq!(
+            stack.behaviors.action_value.regime,
+            BehaviorRegime::ShadowInfer
+        );
+
+        let now = Now::blank(100, test_body(1.0, 1.0, 0.2, 100));
+        let latent = ExperienceLatent {
+            t_ms: 100,
+            z: vec![0.0; 4],
+            confidence: 0.8,
+            ..ExperienceLatent::default()
+        };
+        let input =
+            action_value_behavior_input(&now, &latent, Some(&ActionPrimitive::Dock), None, None);
+        let run = stack
+            .behaviors
+            .action_value
+            .infer(&input, now.t_ms)
+            .unwrap();
+
+        assert!(run.record.hardcoded_output.is_some());
+        assert!(run.record.model_output.is_none());
     }
 
     #[tokio::test]
