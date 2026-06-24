@@ -12,8 +12,9 @@ use netherwick_behaviors::TrainingSample;
 use netherwick_experience::{
     ActionValueInput, ActionValueOutput, ActionValueTarget, ChargeInput, ChargeOutput,
     ChargeTarget, DangerInput, DangerOutput, DangerTarget, EarNextInput, EarNextOutput,
-    EarNextTarget, EyeNextInput, EyeNextOutput, EyeNextTarget, EYE_NEXT_HEIGHT, EYE_NEXT_RGB_LEN,
-    EYE_NEXT_WIDTH,
+    EarNextTarget, ExperienceDecodeFeatureLengths, ExperienceDecodeOutput, ExperienceEncodeInput,
+    ExperienceEncodeOutput, EyeNextInput, EyeNextOutput, EyeNextTarget, EYE_NEXT_HEIGHT,
+    EYE_NEXT_RGB_LEN, EYE_NEXT_WIDTH,
 };
 use netherwick_now::Now;
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,29 @@ pub struct EarNextShadowMetric {
     pub model: EarNextOutput,
     pub target: EarNextTarget,
     pub loss: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceAutoencoderTrainStats {
+    pub loss: f32,
+    pub samples_seen: u64,
+    pub improved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceAutoencoderShadowMetric {
+    pub observed_at_ms: u64,
+    pub hardcoded: ExperienceDecodeOutput,
+    pub model: ExperienceDecodeOutput,
+    pub target: ExperienceDecodeOutput,
+    pub z: ExperienceEncodeOutput,
+    pub loss: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceAutoencoderPrediction {
+    pub encoded: ExperienceEncodeOutput,
+    pub decoded: ExperienceDecodeOutput,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -413,6 +437,15 @@ pub struct EarNextNet<B: Backend> {
     output: Linear<B>,
 }
 
+#[derive(Module, Debug)]
+pub struct ExperienceAutoencoderNet<B: Backend> {
+    encoder_input: Linear<B>,
+    encoder_hidden: Linear<B>,
+    z: Linear<B>,
+    decoder_hidden: Linear<B>,
+    decoder_output: Linear<B>,
+}
+
 impl<B: Backend> ChargeNet<B> {
     pub fn init(input_dim: usize, device: &B::Device) -> Self {
         Self {
@@ -493,6 +526,27 @@ impl<B: Backend> EarNextNet<B> {
     }
 }
 
+impl<B: Backend> ExperienceAutoencoderNet<B> {
+    pub fn init(input_dim: usize, z_dim: usize, output_dim: usize, device: &B::Device) -> Self {
+        Self {
+            encoder_input: LinearConfig::new(input_dim, 96).init(device),
+            encoder_hidden: LinearConfig::new(96, 48).init(device),
+            z: LinearConfig::new(48, z_dim).init(device),
+            decoder_hidden: LinearConfig::new(z_dim, 48).init(device),
+            decoder_output: LinearConfig::new(48, output_dim).init(device),
+        }
+    }
+
+    pub fn forward(&self, input: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let x = activation::relu(self.encoder_input.forward(input));
+        let x = activation::relu(self.encoder_hidden.forward(x));
+        let z = activation::sigmoid(self.z.forward(x));
+        let decoded = activation::relu(self.decoder_hidden.forward(z.clone()));
+        let decoded = activation::sigmoid(self.decoder_output.forward(decoded));
+        (z, decoded)
+    }
+}
+
 pub type DangerBackend = NdArray<f32>;
 pub type DangerAutodiffBackend = Autodiff<DangerBackend>;
 pub type ChargeBackend = NdArray<f32>;
@@ -503,6 +557,8 @@ pub type EyeNextBackend = NdArray<f32>;
 pub type EyeNextAutodiffBackend = Autodiff<EyeNextBackend>;
 pub type EarNextBackend = NdArray<f32>;
 pub type EarNextAutodiffBackend = Autodiff<EarNextBackend>;
+pub type ExperienceAutoencoderBackend = NdArray<f32>;
+pub type ExperienceAutoencoderAutodiffBackend = Autodiff<ExperienceAutoencoderBackend>;
 
 pub struct DangerNetTrainer<B: AutodiffBackend = DangerAutodiffBackend> {
     model: DangerNet<B>,
@@ -560,6 +616,19 @@ pub struct EarNextNetTrainer<B: AutodiffBackend = EarNextAutodiffBackend> {
     best_loss: Option<f32>,
 }
 
+pub struct ExperienceAutoencoderTrainer<B: AutodiffBackend = ExperienceAutoencoderAutodiffBackend> {
+    model: ExperienceAutoencoderNet<B>,
+    optimizer: OptimizerAdaptor<Sgd<B::InnerBackend>, ExperienceAutoencoderNet<B>, B>,
+    device: B::Device,
+    input_dim: usize,
+    z_dim: usize,
+    output_dim: usize,
+    decode_lengths: ExperienceDecodeFeatureLengths,
+    learning_rate: f64,
+    samples_seen: u64,
+    best_loss: Option<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DangerModelMetadata {
     pub input_dim: usize,
@@ -601,6 +670,17 @@ pub struct EarNextModelMetadata {
     pub output_dim: usize,
     pub sample_rate_hz: u32,
     pub channels: u16,
+    pub samples_seen: u64,
+    pub best_loss: Option<f32>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceAutoencoderMetadata {
+    pub input_dim: usize,
+    pub z_dim: usize,
+    pub output_dim: usize,
+    pub decode_lengths: ExperienceDecodeFeatureLengths,
     pub samples_seen: u64,
     pub best_loss: Option<f32>,
     pub created_at_ms: u64,
@@ -1454,6 +1534,226 @@ impl<B: AutodiffBackend> EarNextNetTrainer<B> {
     }
 }
 
+impl ExperienceAutoencoderTrainer<ExperienceAutoencoderAutodiffBackend> {
+    pub fn new(
+        input_dim: usize,
+        z_dim: usize,
+        decode_lengths: ExperienceDecodeFeatureLengths,
+    ) -> Self {
+        Self::with_device(input_dim, z_dim, decode_lengths, Default::default())
+    }
+
+    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_experience_autoencoder_metadata(path)?;
+        if metadata.input_dim != input_dim {
+            return Err(anyhow!(
+                "experience autoencoder checkpoint input dimension mismatch at {}: metadata has {}, runtime expected {}",
+                path.display(),
+                metadata.input_dim,
+                input_dim
+            ));
+        }
+
+        let device = Default::default();
+        let model =
+            ExperienceAutoencoderNet::init(input_dim, metadata.z_dim, metadata.output_dim, &device)
+                .load_file(
+                    path.join("model"),
+                    &BinFileRecorder::<FullPrecisionSettings>::default(),
+                    &device,
+                )?;
+        Ok(Self {
+            model,
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            z_dim: metadata.z_dim,
+            output_dim: metadata.output_dim,
+            decode_lengths: metadata.decode_lengths,
+            learning_rate: 0.01,
+            samples_seen: metadata.samples_seen,
+            best_loss: metadata.best_loss,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> ExperienceAutoencoderTrainer<B> {
+    pub fn with_device(
+        input_dim: usize,
+        z_dim: usize,
+        decode_lengths: ExperienceDecodeFeatureLengths,
+        device: B::Device,
+    ) -> Self {
+        let output_dim = decode_lengths.body
+            + decode_lengths.memory
+            + decode_lengths.drive
+            + decode_lengths.prediction
+            + decode_lengths.eye
+            + decode_lengths.ear;
+        Self {
+            model: ExperienceAutoencoderNet::init(input_dim, z_dim, output_dim, &device),
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            z_dim,
+            output_dim,
+            decode_lengths,
+            learning_rate: 0.01,
+            samples_seen: 0,
+            best_loss: None,
+        }
+    }
+
+    pub fn input_dim(&self) -> usize {
+        self.input_dim
+    }
+
+    pub fn z_dim(&self) -> usize {
+        self.z_dim
+    }
+
+    pub fn output_dim(&self) -> usize {
+        self.output_dim
+    }
+
+    pub fn samples_seen(&self) -> u64 {
+        self.samples_seen
+    }
+
+    pub fn best_loss(&self) -> Option<f32> {
+        self.best_loss
+    }
+
+    pub fn decode_lengths(&self) -> ExperienceDecodeFeatureLengths {
+        self.decode_lengths
+    }
+
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path).with_context(|| {
+            format!(
+                "create experience autoencoder checkpoint dir {}",
+                path.display()
+            )
+        })?;
+        self.model.clone().save_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+        )?;
+        let metadata = ExperienceAutoencoderMetadata {
+            input_dim: self.input_dim,
+            z_dim: self.z_dim,
+            output_dim: self.output_dim,
+            decode_lengths: self.decode_lengths,
+            samples_seen: self.samples_seen,
+            best_loss: self.best_loss,
+            created_at_ms: now_ms(),
+        };
+        std::fs::write(
+            path.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )
+        .with_context(|| {
+            format!(
+                "write experience autoencoder checkpoint metadata {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn predict(
+        &self,
+        input: &ExperienceEncodeInput,
+    ) -> Result<ExperienceAutoencoderPrediction> {
+        let features = self.checked_features(input)?;
+        let tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let (z, decoded) = self.model.forward(tensor);
+        Ok(ExperienceAutoencoderPrediction {
+            encoded: tensor_to_experience_encode_output(z.inner(), self.z_dim)?,
+            decoded: tensor_to_experience_decode_output(
+                decoded.inner(),
+                self.output_dim,
+                self.decode_lengths,
+            )?,
+        })
+    }
+
+    pub fn encode(&self, input: &ExperienceEncodeInput) -> Result<ExperienceEncodeOutput> {
+        Ok(self.predict(input)?.encoded)
+    }
+
+    pub fn train_step(
+        &mut self,
+        input: &ExperienceEncodeInput,
+        target: &ExperienceDecodeOutput,
+    ) -> Result<ExperienceAutoencoderTrainStats> {
+        let features = self.checked_features(input)?;
+        let target_values = experience_decode_target_values(target, self.output_dim);
+        let input_tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let target_tensor = Tensor::<B, 2>::from_data(
+            TensorData::new(target_values, [1, self.output_dim]),
+            &self.device,
+        );
+        let (_z, decoded) = self.model.forward(input_tensor);
+        let loss = MseLoss::new().forward(decoded, target_tensor, Reduction::Mean);
+        let loss_value = loss.clone().inner().into_data().to_vec::<f32>()?[0];
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &self.model);
+        self.model = self
+            .optimizer
+            .step(self.learning_rate, self.model.clone(), grads);
+        self.samples_seen = self.samples_seen.saturating_add(1);
+        let improved = self.best_loss.map(|best| loss_value < best).unwrap_or(true);
+        if improved {
+            self.best_loss = Some(loss_value);
+        }
+        Ok(ExperienceAutoencoderTrainStats {
+            loss: loss_value,
+            samples_seen: self.samples_seen,
+            improved,
+        })
+    }
+
+    pub fn shadow_compare(
+        &mut self,
+        observed_at_ms: u64,
+        input: &ExperienceEncodeInput,
+        target: &ExperienceDecodeOutput,
+    ) -> Result<ExperienceAutoencoderShadowMetric> {
+        let prediction = self.predict(input)?;
+        let loss = mse_experience_decode_output_target(&prediction.decoded, target);
+        Ok(ExperienceAutoencoderShadowMetric {
+            observed_at_ms,
+            hardcoded: target.clone(),
+            model: prediction.decoded,
+            target: target.clone(),
+            z: prediction.encoded,
+            loss,
+        })
+    }
+
+    fn checked_features(&self, input: &ExperienceEncodeInput) -> Result<Vec<f32>> {
+        let mut features = input.flat_features();
+        if features.len() != self.input_dim {
+            return Err(anyhow!(
+                "experience autoencoder input dimension mismatch: got {}, expected {}",
+                features.len(),
+                self.input_dim
+            ));
+        }
+        for value in &mut features {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+        Ok(features)
+    }
+}
+
 pub fn read_danger_metadata(path: impl AsRef<Path>) -> Result<DangerModelMetadata> {
     let path = path.as_ref();
     let bytes = std::fs::read(path.join("metadata.json"))
@@ -1492,6 +1792,24 @@ pub fn read_ear_next_metadata(path: impl AsRef<Path>) -> Result<EarNextModelMeta
         .with_context(|| format!("read ear-next checkpoint metadata {}", path.display()))?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse ear-next checkpoint metadata {}", path.display()))
+}
+
+pub fn read_experience_autoencoder_metadata(
+    path: impl AsRef<Path>,
+) -> Result<ExperienceAutoencoderMetadata> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path.join("metadata.json")).with_context(|| {
+        format!(
+            "read experience autoencoder checkpoint metadata {}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parse experience autoencoder checkpoint metadata {}",
+            path.display()
+        )
+    })
 }
 
 fn now_ms() -> u64 {
@@ -1567,6 +1885,23 @@ impl<B: AutodiffBackend> OnlineTrainer<EarNextInput, EarNextTarget> for EarNextN
         sample: TrainingSample<EarNextInput, EarNextTarget>,
     ) -> Result<TrainStats> {
         let stats = EarNextNetTrainer::train_step(self, &sample.input, &sample.expected)?;
+        Ok(TrainStats {
+            loss: stats.loss,
+            samples_seen: stats.samples_seen,
+            improved: stats.improved,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> OnlineTrainer<ExperienceEncodeInput, ExperienceDecodeOutput>
+    for ExperienceAutoencoderTrainer<B>
+{
+    fn train_step(
+        &mut self,
+        sample: TrainingSample<ExperienceEncodeInput, ExperienceDecodeOutput>,
+    ) -> Result<TrainStats> {
+        let stats =
+            ExperienceAutoencoderTrainer::train_step(self, &sample.input, &sample.expected)?;
         Ok(TrainStats {
             loss: stats.loss,
             samples_seen: stats.samples_seen,
@@ -1673,6 +2008,49 @@ fn tensor_to_ear_next_output<B: Backend>(
     })
 }
 
+fn tensor_to_experience_encode_output<B: Backend>(
+    tensor: Tensor<B, 2>,
+    z_dim: usize,
+) -> Result<ExperienceEncodeOutput> {
+    let values = tensor.into_data().to_vec::<f32>()?;
+    if values.len() != z_dim {
+        return Err(anyhow!(
+            "experience autoencoder emitted {} z outputs, expected {}",
+            values.len(),
+            z_dim
+        ));
+    }
+    Ok(ExperienceEncodeOutput {
+        z: values
+            .into_iter()
+            .map(|value| value.clamp(0.0, 1.0))
+            .collect(),
+        confidence: 0.5,
+    })
+}
+
+fn tensor_to_experience_decode_output<B: Backend>(
+    tensor: Tensor<B, 2>,
+    output_dim: usize,
+    lengths: ExperienceDecodeFeatureLengths,
+) -> Result<ExperienceDecodeOutput> {
+    let values = tensor.into_data().to_vec::<f32>()?;
+    if values.len() != output_dim {
+        return Err(anyhow!(
+            "experience autoencoder emitted {} reconstruction outputs, expected {}",
+            values.len(),
+            output_dim
+        ));
+    }
+    Ok(split_experience_decode_values(
+        values
+            .into_iter()
+            .map(|value| value.clamp(0.0, 1.0))
+            .collect(),
+        lengths,
+    ))
+}
+
 fn charge_target_train_values(target: &ChargeTarget) -> [f32; 3] {
     [
         target.charging_started.clamp(0.0, 1.0),
@@ -1708,6 +2086,38 @@ fn ear_target_train_values(target: &EarNextTarget, output_dim: usize) -> Vec<f32
         .collect::<Vec<_>>();
     values.resize(output_dim, 0.0);
     values
+}
+
+fn experience_decode_target_values(target: &ExperienceDecodeOutput, output_dim: usize) -> Vec<f32> {
+    let mut values = target.flat_features();
+    values.resize(output_dim, 0.0);
+    values.truncate(output_dim);
+    values
+        .into_iter()
+        .map(|value| value.clamp(0.0, 1.0))
+        .collect()
+}
+
+fn split_experience_decode_values(
+    values: Vec<f32>,
+    lengths: ExperienceDecodeFeatureLengths,
+) -> ExperienceDecodeOutput {
+    let mut cursor = 0;
+    let mut take = |len: usize| {
+        let end = (cursor + len).min(values.len());
+        let mut out = values[cursor..end].to_vec();
+        out.resize(len, 0.0);
+        cursor = cursor.saturating_add(len);
+        out
+    };
+    ExperienceDecodeOutput {
+        body_features: take(lengths.body),
+        memory_features: take(lengths.memory),
+        drive_features: take(lengths.drive),
+        prediction_features: take(lengths.prediction),
+        eye_features: take(lengths.eye),
+        ear_features: take(lengths.ear),
+    }
 }
 
 fn mse_output_target(output: DangerOutput, target: DangerTarget) -> f32 {
@@ -1775,9 +2185,31 @@ fn mse_ear_next_output_target(output: &EarNextOutput, target: &EarNextTarget) ->
         / len as f32
 }
 
+fn mse_experience_decode_output_target(
+    output: &ExperienceDecodeOutput,
+    target: &ExperienceDecodeOutput,
+) -> f32 {
+    let output = output.flat_features();
+    let target = target.flat_features();
+    let len = output.len().max(target.len());
+    if len == 0 {
+        return 0.0;
+    }
+    (0..len)
+        .map(|idx| {
+            let actual = output.get(idx).copied().unwrap_or_default();
+            let expected = target.get(idx).copied().unwrap_or_default();
+            let delta = actual - expected;
+            delta * delta
+        })
+        .sum::<f32>()
+        / len as f32
+}
+
 pub const MODEL_REGISTRY: &[&str] = &[
     "ExperienceEncoder",
     "ExperienceDecoder",
+    "ExperienceAutoencoder",
     "FuturePredictor",
     "EyeNextPredictor",
     "EarNextPredictor",
@@ -1798,8 +2230,9 @@ mod tests {
     use netherwick_actions::ActionPrimitive;
     use netherwick_body::BodySense;
     use netherwick_experience::{
-        ActionValueInput, ActionValueTarget, ChargeInput, ChargeTarget, DangerInput, EarNextInput,
-        EarNextTarget, EyeNextInput, EyeNextTarget,
+        experience_decode_target_from_now, experience_encode_input_from_now, ActionValueInput,
+        ActionValueTarget, ChargeInput, ChargeTarget, DangerInput, EarNextInput, EarNextTarget,
+        EyeNextInput, EyeNextTarget,
     };
 
     #[test]
@@ -2097,6 +2530,89 @@ mod tests {
         assert_eq!(loaded.samples_seen(), 1);
         assert_eq!(output.features.len(), 4);
         assert!(output.pcm.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn experience_autoencoder_forward_returns_fixed_size_z_and_decode_lengths() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.eye.frames = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        let input = experience_encode_input_from_now(&now);
+        let target = experience_decode_target_from_now(&now);
+        let trainer = ExperienceAutoencoderTrainer::new(
+            input.flat_features().len(),
+            12,
+            target.feature_lengths(),
+        );
+
+        let prediction = trainer.predict(&input).unwrap();
+
+        assert_eq!(prediction.encoded.z.len(), 12);
+        assert_eq!(
+            prediction.decoded.feature_lengths(),
+            target.feature_lengths()
+        );
+        assert_eq!(
+            prediction.decoded.eye_features.len(),
+            target.eye_features.len()
+        );
+        assert_eq!(
+            prediction.decoded.ear_features.len(),
+            target.ear_features.len()
+        );
+    }
+
+    #[test]
+    fn experience_autoencoder_train_step_records_loss() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.memory.place_familiarity = 0.7;
+        now.drives.curiosity = 0.5;
+        let input = experience_encode_input_from_now(&now);
+        let target = experience_decode_target_from_now(&now);
+        let mut trainer = ExperienceAutoencoderTrainer::new(
+            input.flat_features().len(),
+            8,
+            target.feature_lengths(),
+        );
+
+        let stats = trainer.train_step(&input, &target).unwrap();
+
+        assert_eq!(stats.samples_seen, 1);
+        assert!(stats.loss.is_finite());
+    }
+
+    #[test]
+    fn experience_autoencoder_checkpoint_round_trips_prediction_shape() {
+        let dir =
+            std::env::temp_dir().join(format!("netherwick-experience-checkpoint-{}", now_ms()));
+        let mut now = Now::blank(1, BodySense::default());
+        now.eye.frames = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        let input = experience_encode_input_from_now(&now);
+        let target = experience_decode_target_from_now(&now);
+        let mut trainer = ExperienceAutoencoderTrainer::new(
+            input.flat_features().len(),
+            10,
+            target.feature_lengths(),
+        );
+        trainer.train_step(&input, &target).unwrap();
+
+        trainer.save_checkpoint(&dir).unwrap();
+        let loaded =
+            ExperienceAutoencoderTrainer::load_checkpoint(&dir, input.flat_features().len())
+                .unwrap();
+        let prediction = loaded.predict(&input).unwrap();
+
+        assert!(dir.join("model.bin").exists());
+        assert!(dir.join("metadata.json").exists());
+        assert_eq!(loaded.samples_seen(), 1);
+        assert_eq!(prediction.encoded.z.len(), 10);
+        assert_eq!(
+            prediction.decoded.feature_lengths(),
+            target.feature_lengths()
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

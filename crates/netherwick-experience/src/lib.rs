@@ -414,6 +414,107 @@ pub struct EarNextTarget {
     pub features: Vec<f32>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceEncodeInput {
+    pub sense_vectors: Vec<Vec<f32>>,
+}
+
+impl ExperienceEncodeInput {
+    pub fn flat_features(&self) -> Vec<f32> {
+        self.sense_vectors
+            .iter()
+            .flat_map(|sense| sense.iter().copied().map(sanitize_feature))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceEncodeOutput {
+    pub z: Vec<f32>,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceDecodeOutput {
+    pub body_features: Vec<f32>,
+    pub memory_features: Vec<f32>,
+    pub drive_features: Vec<f32>,
+    pub prediction_features: Vec<f32>,
+    pub eye_features: Vec<f32>,
+    pub ear_features: Vec<f32>,
+}
+
+impl ExperienceDecodeOutput {
+    pub fn flat_features(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(
+            self.body_features.len()
+                + self.memory_features.len()
+                + self.drive_features.len()
+                + self.prediction_features.len()
+                + self.eye_features.len()
+                + self.ear_features.len(),
+        );
+        out.extend(self.body_features.iter().copied().map(sanitize_feature));
+        out.extend(self.memory_features.iter().copied().map(sanitize_feature));
+        out.extend(self.drive_features.iter().copied().map(sanitize_feature));
+        out.extend(
+            self.prediction_features
+                .iter()
+                .copied()
+                .map(sanitize_feature),
+        );
+        out.extend(self.eye_features.iter().copied().map(sanitize_feature));
+        out.extend(self.ear_features.iter().copied().map(sanitize_feature));
+        out
+    }
+
+    pub fn feature_lengths(&self) -> ExperienceDecodeFeatureLengths {
+        ExperienceDecodeFeatureLengths {
+            body: self.body_features.len(),
+            memory: self.memory_features.len(),
+            drive: self.drive_features.len(),
+            prediction: self.prediction_features.len(),
+            eye: self.eye_features.len(),
+            ear: self.ear_features.len(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperienceDecodeFeatureLengths {
+    pub body: usize,
+    pub memory: usize,
+    pub drive: usize,
+    pub prediction: usize,
+    pub eye: usize,
+    pub ear: usize,
+}
+
+pub fn experience_encode_input_from_now(now: &Now) -> ExperienceEncodeInput {
+    let target = experience_decode_target_from_now(now);
+    ExperienceEncodeInput {
+        sense_vectors: vec![
+            target.body_features,
+            target.memory_features,
+            target.drive_features,
+            target.prediction_features,
+            target.eye_features,
+            target.ear_features,
+        ],
+    }
+}
+
+pub fn experience_decode_target_from_now(now: &Now) -> ExperienceDecodeOutput {
+    ExperienceDecodeOutput {
+        body_features: action_value_body_features(now),
+        memory_features: action_value_memory_features(now, None),
+        drive_features: action_value_drive_features(now),
+        prediction_features: action_value_prediction_features(now),
+        eye_features: eye_next_features(now),
+        ear_features: ear_next_features(now),
+    }
+}
+
 pub fn eye_next_input_from_transition_like(
     before_z: &ExperienceLatent,
     action: Option<&ActionPrimitive>,
@@ -1199,6 +1300,24 @@ mod tests {
         assert_eq!(latent.t_ms, 42);
         assert!(!latent.z.is_empty());
         assert!(latent.z.iter().any(|value| *value > 0.0));
+    }
+
+    #[test]
+    fn now_with_sensors_produces_non_empty_experience_encoder_input() {
+        let mut now = Now::blank(42, BodySense::default());
+        now.eye.frames = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        now.ear.features = vec![vec![0.1, 0.3, 0.5, 0.7]];
+        now.memory.place_familiarity = 0.7;
+        now.drives.curiosity = 0.5;
+
+        let input = experience_encode_input_from_now(&now);
+        let target = experience_decode_target_from_now(&now);
+
+        assert_eq!(input.sense_vectors.len(), 6);
+        assert!(!input.flat_features().is_empty());
+        assert_eq!(input.flat_features().len(), target.flat_features().len());
+        assert_eq!(target.eye_features.len(), 16);
+        assert_eq!(target.ear_features.len(), 16);
     }
 
     #[test]

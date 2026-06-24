@@ -23,12 +23,13 @@ use netherwick_experience::{
     action_value_input_from_transition_like, charge_input_from_transition_like,
     charge_target_from_transition_like, danger_input_from_transition_like,
     danger_target_from_transition_like, ear_next_input_from_transition_like,
-    ear_next_target_from_now, eye_next_input_from_transition_like, eye_next_target_from_now,
-    ActionValueInput, ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer,
-    ChargeInput, ChargeOutput, DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience,
-    ExperienceEncoder, ExperienceLatent, EyeNextInput, EyeNextOutput, FeatureExperienceEncoder,
-    FuturePrediction, FuturePredictor, Impression, RewardComputer, Sensation,
-    StasisFuturePredictor, SurpriseComputer,
+    ear_next_target_from_now, experience_decode_target_from_now, experience_encode_input_from_now,
+    eye_next_input_from_transition_like, eye_next_target_from_now, ActionValueInput,
+    ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput,
+    DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience, ExperienceDecodeOutput,
+    ExperienceEncodeInput, ExperienceEncodeOutput, ExperienceEncoder, ExperienceLatent,
+    EyeNextInput, EyeNextOutput, FeatureExperienceEncoder, FuturePrediction, FuturePredictor,
+    Impression, RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -37,9 +38,11 @@ use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
 use netherwick_models::{
     read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
-    read_eye_next_metadata, ActionValueNetTrainer, ChargeNetTrainer, CopyCurrentEarPredictor,
-    CopyCurrentEyePredictor, DangerNetTrainer, EarNextNetTrainer, EyeNextNetTrainer,
-    HardcodedActionValuePredictor, HardcodedChargePredictor, HardcodedDangerPredictor,
+    read_experience_autoencoder_metadata, read_eye_next_metadata, ActionValueNetTrainer,
+    ChargeNetTrainer, CopyCurrentEarPredictor, CopyCurrentEyePredictor, DangerNetTrainer,
+    EarNextNetTrainer, ExperienceAutoencoderPrediction, ExperienceAutoencoderTrainer,
+    EyeNextNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
+    HardcodedDangerPredictor,
 };
 use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
@@ -151,12 +154,28 @@ impl RuntimeModelStack {
         Ok(stack)
     }
 
+    pub fn with_experience_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_experience_autoencoder_metadata(path)?;
+        let mut stack = Self::default();
+        stack.behaviors.experience = experience_behavior(
+            BehaviorRegime::ShadowInfer,
+            Some(ExperienceAutoencoderTrainer::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?),
+            FallbackPolicy::UseHardcoded,
+        );
+        Ok(stack)
+    }
+
     pub fn with_shadow_checkpoints(
         danger_path: Option<&Path>,
         charge_path: Option<&Path>,
         action_value_path: Option<&Path>,
         eye_next_path: Option<&Path>,
         ear_next_path: Option<&Path>,
+        experience_path: Option<&Path>,
     ) -> Result<Self> {
         let mut stack = Self::default();
         if let Some(path) = danger_path {
@@ -202,6 +221,17 @@ impl RuntimeModelStack {
             stack.behaviors.ear_next = ear_next_behavior(
                 BehaviorRegime::ShadowInfer,
                 Some(EarNextNetTrainer::load_checkpoint(
+                    path,
+                    metadata.input_dim,
+                )?),
+                FallbackPolicy::UseHardcoded,
+            );
+        }
+        if let Some(path) = experience_path {
+            let metadata = read_experience_autoencoder_metadata(path)?;
+            stack.behaviors.experience = experience_behavior(
+                BehaviorRegime::ShadowInfer,
+                Some(ExperienceAutoencoderTrainer::load_checkpoint(
                     path,
                     metadata.input_dim,
                 )?),
@@ -256,11 +286,19 @@ impl RuntimeModelStack {
                 behavior.fallback,
             );
         }
+        if let Some(behavior) = config.behavior.get("experience") {
+            stack.behaviors.experience = experience_behavior(
+                behavior.regime,
+                load_experience_behavior_trainer(behavior)?,
+                behavior.fallback,
+            );
+        }
         Ok(stack)
     }
 }
 
 pub struct BehaviorRegistry {
+    pub experience: ReplaceableBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>,
     pub danger: ReplaceableBehavior<SituatedDangerInput, DangerOutput>,
     pub charge: ReplaceableBehavior<SituatedChargeInput, ChargeOutput>,
     pub future: ReplaceableBehavior<FutureInput, FuturePrediction>,
@@ -272,6 +310,11 @@ pub struct BehaviorRegistry {
 impl Default for BehaviorRegistry {
     fn default() -> Self {
         Self {
+            experience: experience_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
             danger: danger_behavior(
                 BehaviorRegime::Hardcoded,
                 None,
@@ -531,6 +574,13 @@ impl TargetExtractor<ExperienceTransition, EarNextInput, EarNextOutput> for EarN
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SituatedExperienceInput {
+    pub input: ExperienceEncodeInput,
+    pub target: ExperienceDecodeOutput,
+    pub now: Now,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SituatedDangerInput {
     pub input: DangerInput,
     pub now: Now,
@@ -565,6 +615,59 @@ pub struct FutureInput {
     pub latent: ExperienceLatent,
     pub action: ActionPrimitive,
     pub offset_ms: TimeMs,
+}
+
+struct HardcodedExperienceBehavior;
+
+impl FunctionBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>
+    for HardcodedExperienceBehavior
+{
+    fn id(&self) -> &'static str {
+        "experience.feature_encoder"
+    }
+
+    fn infer(
+        &mut self,
+        input: &SituatedExperienceInput,
+    ) -> Result<ExperienceAutoencoderPrediction> {
+        let mut encoder = FeatureExperienceEncoder::new();
+        let latent = encoder.encode(&input.now)?;
+        Ok(ExperienceAutoencoderPrediction {
+            encoded: ExperienceEncodeOutput {
+                z: latent.z,
+                confidence: latent.confidence,
+            },
+            decoded: input.target.clone(),
+        })
+    }
+}
+
+struct ExperienceModelBehavior {
+    trainer: ExperienceAutoencoderTrainer,
+}
+
+impl FunctionBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>
+    for ExperienceModelBehavior
+{
+    fn id(&self) -> &'static str {
+        "experience.autoencoder.v0"
+    }
+
+    fn infer(
+        &mut self,
+        input: &SituatedExperienceInput,
+    ) -> Result<ExperienceAutoencoderPrediction> {
+        self.trainer.predict(&input.input)
+    }
+
+    fn observe(
+        &mut self,
+        sample: &TrainingSample<SituatedExperienceInput, ExperienceAutoencoderPrediction>,
+    ) -> Result<()> {
+        self.trainer
+            .train_step(&sample.input.input, &sample.input.target)?;
+        Ok(())
+    }
 }
 
 struct HardcodedDangerBehavior;
@@ -793,6 +896,20 @@ fn danger_behavior(
     )
 }
 
+fn experience_behavior(
+    regime: BehaviorRegime,
+    trainer: Option<ExperienceAutoencoderTrainer>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction> {
+    ReplaceableBehavior::new(
+        "experience",
+        regime,
+        Box::new(HardcodedExperienceBehavior),
+        trainer.map(|trainer| Box::new(ExperienceModelBehavior { trainer }) as Box<_>),
+        fallback,
+    )
+}
+
 fn charge_behavior(
     regime: BehaviorRegime,
     trainer: Option<ChargeNetTrainer>,
@@ -936,6 +1053,30 @@ fn load_ear_next_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<Ea
     )?))
 }
 
+fn load_experience_behavior_trainer(
+    behavior: &BehaviorConfig,
+) -> Result<Option<ExperienceAutoencoderTrainer>> {
+    let Some(checkpoint) = behavior.checkpoint.as_deref() else {
+        return Ok(None);
+    };
+    if !Path::new(checkpoint).exists() {
+        return Ok(None);
+    }
+    let metadata = read_experience_autoencoder_metadata(checkpoint)?;
+    Ok(Some(ExperienceAutoencoderTrainer::load_checkpoint(
+        checkpoint,
+        metadata.input_dim,
+    )?))
+}
+
+fn experience_behavior_input(now: &Now) -> SituatedExperienceInput {
+    SituatedExperienceInput {
+        input: experience_encode_input_from_now(now),
+        target: experience_decode_target_from_now(now),
+        now: now.clone(),
+    }
+}
+
 fn danger_behavior_input(
     now: &Now,
     latent: &ExperienceLatent,
@@ -1049,6 +1190,27 @@ fn ear_next_disagreement(left: &EarNextOutput, right: &EarNextOutput) -> f32 {
             let left = left.features.get(idx).copied().unwrap_or_default();
             let right = right.features.get(idx).copied().unwrap_or_default();
             (left - right).abs()
+        })
+        .sum::<f32>()
+        / len as f32
+}
+
+fn experience_reconstruction_loss(
+    output: &ExperienceAutoencoderPrediction,
+    target: &ExperienceDecodeOutput,
+) -> f32 {
+    let output = output.decoded.flat_features();
+    let target = target.flat_features();
+    let len = output.len().max(target.len());
+    if len == 0 {
+        return 0.0;
+    }
+    (0..len)
+        .map(|idx| {
+            let actual = output.get(idx).copied().unwrap_or_default();
+            let expected = target.get(idx).copied().unwrap_or_default();
+            let delta = actual - expected;
+            delta * delta
         })
         .sum::<f32>()
         / len as f32
@@ -1220,6 +1382,32 @@ where
             latent = self.encoder.encode(&now)?;
         }
         let mut behavior_runs: Vec<ErasedBehaviorRunRecord> = Vec::new();
+        let experience_input = experience_behavior_input(&now);
+        let experience_run = self
+            .models
+            .behaviors
+            .experience
+            .infer(&experience_input, now.t_ms)?;
+        let mut experience_record = experience_run.record;
+        let reconstruction_loss = experience_record
+            .model_output
+            .as_ref()
+            .map(|model| experience_reconstruction_loss(model, &experience_input.target));
+        experience_record.disagreement = reconstruction_loss;
+        if let Some(loss) = reconstruction_loss {
+            now.extensions.insert(
+                "experience.autoencoder".to_string(),
+                serde_json::json!({
+                    "reconstruction_loss": loss,
+                    "z_dim": experience_record
+                        .model_output
+                        .as_ref()
+                        .map(|output| output.encoded.z.len())
+                        .unwrap_or_default(),
+                }),
+            );
+        }
+        behavior_runs.push(experience_record.erase());
         if futures.is_empty() {
             let (predicted, records) =
                 predict_baseline_futures(&mut self.models.behaviors.future, &latent, now.t_ms)?;
@@ -2071,6 +2259,7 @@ mod tests {
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_models::{
         ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
+        ExperienceAutoencoderTrainer,
     };
     use netherwick_now::{Now, SurpriseSense};
     use netherwick_sensors::World;
@@ -2466,13 +2655,19 @@ mod tests {
                 100,
             )
             .unwrap();
+        let experience = registry
+            .experience
+            .infer(&experience_behavior_input(&now), 100)
+            .unwrap();
 
+        assert_eq!(experience.record.behavior_id, "experience");
         assert_eq!(danger.record.behavior_id, "danger");
         assert_eq!(charge.record.behavior_id, "charge");
         assert_eq!(future.record.behavior_id, "future");
         assert_eq!(action_value.record.behavior_id, "action_value");
         assert_eq!(eye_next.record.behavior_id, "eye_next");
         assert_eq!(ear_next.record.behavior_id, "ear_next");
+        assert!(experience.record.hardcoded_output.is_some());
         assert!(danger.record.hardcoded_output.is_some());
         assert!(charge.record.hardcoded_output.is_some());
         assert!(future.record.hardcoded_output.is_some());
@@ -2860,6 +3055,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sim_with_experience_checkpoint_records_autoencoder_behavior_run() {
+        let root = test_ledger_root("sim-runner-experience-shadow");
+        let checkpoint = danger_checkpoint_root("sim-runner-experience-shadow");
+        write_test_experience_checkpoint(&checkpoint);
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(ActionPrimitive::Stop))
+            .with_models(
+                RuntimeModelStack::with_experience_shadow_checkpoint(&checkpoint).unwrap(),
+            );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let mut body = test_body(1.0, 1.0, 0.8, 7);
+        body.velocity.forward_m_s = 0.1;
+        world.set_body(body);
+        world.add_object(SimObject {
+            id: "speaker".to_string(),
+            label: "speaker".to_string(),
+            kind: netherwick_sim::SimObjectKind::SoundSource {
+                label: "speaker".to_string(),
+            },
+            x_m: 1.5,
+            y_m: 1.2,
+            radius_m: 0.12,
+            color_rgb: [80, 80, 220],
+            emits_sound: true,
+            charge_rate: 0.0,
+        });
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let frames = ledger.recent(5).await.unwrap();
+        let frame = frames.last().unwrap();
+        let run = frame
+            .behavior_runs
+            .iter()
+            .find(|run| run.behavior_id == "experience")
+            .unwrap();
+
+        assert_eq!(run.regime, BehaviorRegime::ShadowInfer);
+        assert!(run.hardcoded_json.is_some());
+        assert!(run.model_json.is_some());
+        assert!(run.disagreement.unwrap_or_default().is_finite());
+        assert!(frame.now.extensions.contains_key("experience.autoencoder"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[test]
+    fn missing_experience_checkpoint_falls_back_to_feature_encoder() {
+        let config: BehaviorRegistryConfig = toml::from_str(
+            r#"
+            [behavior.experience]
+            regime = "shadow_infer"
+            hardcoded = "experience.feature_encoder"
+            model = "experience.autoencoder.v0"
+            checkpoint = "/tmp/netherwick-missing-experience-checkpoint"
+            fallback = "use_hardcoded"
+            "#,
+        )
+        .unwrap();
+        let mut stack = RuntimeModelStack::from_behavior_config(&config).unwrap();
+        let now = Now::blank(100, test_body(1.0, 1.0, 0.8, 100));
+        let run = stack
+            .behaviors
+            .experience
+            .infer(&experience_behavior_input(&now), now.t_ms)
+            .unwrap();
+
+        assert_eq!(run.record.regime, BehaviorRegime::ShadowInfer);
+        assert!(run.record.hardcoded_output.is_some());
+        assert!(run.record.model_output.is_none());
+        assert_eq!(run.chosen, run.record.hardcoded_output.unwrap());
+    }
+
+    #[tokio::test]
     async fn shared_reign_queue_controls_next_sim_tick() {
         let root = test_ledger_root("sim-runner-shared-reign");
         let ledger = JsonlLedger::new(&root);
@@ -3055,6 +3325,25 @@ mod tests {
                 },
             )
             .unwrap();
+        trainer.save_checkpoint(root).unwrap();
+    }
+
+    fn write_test_experience_checkpoint(root: &Path) {
+        let mut body = test_body(1.0, 1.0, 0.8, 7);
+        body.velocity.forward_m_s = 0.1;
+        let mut now = Now::blank(100, body);
+        now.eye.frames = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        now.memory.place_familiarity = 0.6;
+        now.drives.curiosity = 0.4;
+        let input = experience_encode_input_from_now(&now);
+        let target = experience_decode_target_from_now(&now);
+        let mut trainer = ExperienceAutoencoderTrainer::new(
+            input.flat_features().len(),
+            8,
+            target.feature_lengths(),
+        );
+        trainer.train_step(&input, &target).unwrap();
         trainer.save_checkpoint(root).unwrap();
     }
 
