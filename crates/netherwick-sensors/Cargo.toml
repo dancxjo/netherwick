@@ -20,6 +20,7 @@ serialport = { version = "4", optional = true }
 v4l = { version = "0.14", optional = true }
 netherwick-now = { path = "../netherwick-now" }
 netherwick-body = { path = "../netherwick-body" }
+netherwick-core = { path = "../netherwick-core" }
 
 [dev-dependencies]
 tokio.workspace = true

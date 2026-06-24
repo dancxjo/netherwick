@@ -13,7 +13,7 @@ use netherwick_behaviors::{
     FallbackPolicy, FunctionBehavior, ReplaceableBehavior, TargetExtractor, TrainingSample,
     TrainingSource,
 };
-use netherwick_body::MotorComplex;
+use netherwick_body::{MotorCommand, MotorComplex, RobotBody};
 use netherwick_conductor::{Conductor, ConductorInput};
 use netherwick_core::{Provenance, Reward, TimeMs};
 use netherwick_events::{
@@ -26,11 +26,11 @@ use netherwick_experience::{
     ear_next_target_from_now, experience_decode_target_from_now,
     eye_next_input_from_transition_like, eye_next_target_from_now, ActionValueInput,
     ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput,
-    DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience, ExperienceDecodeOutput,
-    ExperienceEncodeInput, ExperienceEncoder, ExperienceLatent,
-    EyeNextInput, EyeNextOutput, FeatureExperienceEncoder, FutureInput, FuturePrediction,
-    FuturePredictor, Impression, RewardComputer, Sensation, StasisFuturePredictor,
-    SurpriseComputer, ExperienceBehaviorInput, ExperienceBehaviorOutput,
+    DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience, ExperienceBehaviorInput,
+    ExperienceBehaviorOutput, ExperienceDecodeOutput, ExperienceEncodeInput, ExperienceEncoder,
+    ExperienceLatent, EyeNextInput, EyeNextOutput, FeatureExperienceEncoder, FutureInput,
+    FuturePrediction, FuturePredictor, Impression, RewardComputer, Sensation,
+    StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -41,15 +41,15 @@ use netherwick_models::{
     read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
     read_experience_autoencoder_metadata, read_eye_next_metadata, read_future_metadata,
     ActionValueNetTrainer, ChargeNetTrainer, CopyCurrentEarPredictor, CopyCurrentEyePredictor,
-    DangerNetTrainer, EarNextNetTrainer,
-    ExperienceAutoencoderTrainer, EyeNextNetTrainer, FutureNetTrainer,
-    HardcodedActionValuePredictor, HardcodedChargePredictor, HardcodedDangerPredictor,
+    DangerNetTrainer, EarNextNetTrainer, ExperienceAutoencoderTrainer, EyeNextNetTrainer,
+    FutureNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
+    HardcodedDangerPredictor,
 };
 use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
     EyePrediction, Now, ReignSense, SafetySense,
 };
-use netherwick_sensors::{World, WorldSnapshot};
+use netherwick_sensors::{NowBuilder, SenseProducer, World, WorldSnapshot};
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -615,7 +615,6 @@ impl TargetExtractor<ExperienceTransition, EarNextInput, EarNextOutput> for EarN
     }
 }
 
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SituatedDangerInput {
     pub input: DangerInput,
@@ -657,10 +656,7 @@ impl FunctionBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput>
         "experience.feature_encoder"
     }
 
-    fn infer(
-        &mut self,
-        input: &ExperienceBehaviorInput,
-    ) -> Result<ExperienceBehaviorOutput> {
+    fn infer(&mut self, input: &ExperienceBehaviorInput) -> Result<ExperienceBehaviorOutput> {
         let latent = self.encoder.encode(&input.now)?;
         Ok(ExperienceBehaviorOutput {
             latent,
@@ -682,10 +678,7 @@ impl FunctionBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput>
         "experience.autoencoder.v0"
     }
 
-    fn infer(
-        &mut self,
-        input: &ExperienceBehaviorInput,
-    ) -> Result<ExperienceBehaviorOutput> {
+    fn infer(&mut self, input: &ExperienceBehaviorInput) -> Result<ExperienceBehaviorOutput> {
         let encode_input = ExperienceEncodeInput {
             sense_vectors: input.sense_vectors.clone(),
         };
@@ -1321,7 +1314,8 @@ fn experience_disagreement(
     }
     let sum: f32 = (0..len)
         .map(|idx| {
-            let delta = a.get(idx).copied().unwrap_or_default() - b.get(idx).copied().unwrap_or_default();
+            let delta =
+                a.get(idx).copied().unwrap_or_default() - b.get(idx).copied().unwrap_or_default();
             delta * delta
         })
         .sum();
@@ -1534,6 +1528,17 @@ where
         let mut experiences = derive_direct_experiences(&impressions, &sensations, now.t_ms);
         let mut teachings = Vec::new();
         let mut notes = Vec::new();
+        if now
+            .extensions
+            .get("safety/read_only_veto")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            notes.push("source = real_robot_read_only".to_string());
+            notes.push("mode = read_only".to_string());
+            notes.push("motor_applied = false".to_string());
+            notes.push("ReadOnlyActionSuppressed: motion suppressed by read-only mode".to_string());
+        }
         let mut proposed_actions = Vec::new();
 
         let events = self.extractor.events_from_now(&now, Some(&recall));
@@ -2009,6 +2014,121 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RobotMode {
+    ReadOnly,
+    Slow,
+    Disabled,
+}
+
+pub struct RealRobotRunner<R> {
+    pub mode: RobotMode,
+    pub body: Box<dyn RobotBody + Send>,
+    pub sensors: Vec<Box<dyn SenseProducer + Send>>,
+    pub runtime: R,
+    pub tick_ms: u64,
+    pub tick_count: usize,
+    now_builder: NowBuilder,
+}
+
+impl<R> RealRobotRunner<R>
+where
+    R: RuntimeLoop + Send,
+{
+    pub fn new(
+        mode: RobotMode,
+        body: Box<dyn RobotBody + Send>,
+        sensors: Vec<Box<dyn SenseProducer + Send>>,
+        runtime: R,
+    ) -> Self {
+        Self {
+            mode,
+            body,
+            sensors,
+            runtime,
+            tick_ms: 100,
+            tick_count: 0,
+            now_builder: NowBuilder::new(),
+        }
+    }
+
+    pub async fn run_read_only(&mut self, steps: Option<usize>) -> Result<()> {
+        self.run_read_only_observing(steps, |_, _| {}).await
+    }
+
+    pub async fn run_read_only_observing<F>(
+        &mut self,
+        steps: Option<usize>,
+        mut observe: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&WorldSnapshot, &RuntimeTick),
+    {
+        if self.mode != RobotMode::ReadOnly {
+            anyhow::bail!("only read-only robot mode is implemented");
+        }
+
+        while steps.map(|limit| self.tick_count < limit).unwrap_or(true) {
+            let (snapshot, tick) = self.tick_read_only().await?;
+            observe(&snapshot, &tick);
+            tokio::time::sleep(std::time::Duration::from_millis(self.tick_ms)).await;
+        }
+        Ok(())
+    }
+
+    pub async fn tick_read_only(&mut self) -> Result<(WorldSnapshot, RuntimeTick)> {
+        if self.mode != RobotMode::ReadOnly {
+            anyhow::bail!("only read-only robot mode is implemented");
+        }
+
+        let body = self.body.read_body().await?;
+        let mut packets = Vec::new();
+        for sensor in &mut self.sensors {
+            packets.push(sensor.poll().await?);
+        }
+        let t_ms = body.last_update_ms.max(wall_time_ms());
+        let mut now = self.now_builder.build(t_ms, body, packets)?;
+        now.self_sense.mode = Some("read-only".to_string());
+        now.extensions.insert(
+            "source".to_string(),
+            serde_json::Value::String("real_robot_read_only".to_string()),
+        );
+        now.extensions.insert(
+            "mode".to_string(),
+            serde_json::Value::String("read_only".to_string()),
+        );
+        now.extensions.insert(
+            "safety/read_only_veto".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        now.extensions.insert(
+            "read_only_motor_gate".to_string(),
+            serde_json::json!({
+                "motor_applied": false,
+                "final_motor": MotorCommand::stop(),
+                "safety_reason": "ReadOnlyMode",
+            }),
+        );
+
+        let tick = self
+            .runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await?;
+        let snapshot = self.now_builder.snapshot();
+        self.tick_count = self.tick_count.saturating_add(1);
+        Ok((snapshot, tick))
+    }
+}
+
+fn wall_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 pub struct SimRunner<R> {
     pub runtime: R,
     pub world: VirtualWorld,
@@ -2361,6 +2481,7 @@ fn describe_safety_reason(reason: Option<SafetyReason>) -> &'static str {
         Some(SafetyReason::MotorOutOfRange) => "motor out of range",
         Some(SafetyReason::HighDanger) => "high danger",
         Some(SafetyReason::RawLlmMotorRejected) => "raw llm motor rejected",
+        Some(SafetyReason::ReadOnlyMode) => "read-only mode",
         None => "unknown reason",
     }
 }
@@ -2370,9 +2491,11 @@ mod tests {
     use super::*;
     use netherwick_actions::{ReignCommand, ReignMode, ReignSource};
     use netherwick_autonomic::SimpleSafety;
-    use netherwick_body::BodySense;
+    use netherwick_body::{BodySense, MotorCommand, RobotBody};
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
+    use netherwick_experience::experience_encode_input_from_now;
     use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
+    use netherwick_llm::LlmTickResult;
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_models::{
         ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
@@ -2383,6 +2506,102 @@ mod tests {
     use netherwick_sim::{ArenaConfig, SimObject, VirtualWorld};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct StubRuntime;
+
+    #[async_trait::async_trait]
+    impl RuntimeLoop for StubRuntime {
+        async fn tick(
+            &mut self,
+            now: Now,
+            _latent: ExperienceLatent,
+            _futures: Vec<FuturePrediction>,
+        ) -> Result<RuntimeTick> {
+            let action = ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 100,
+            };
+            let experience =
+                Experience::new("test", "test", Vec::new(), Vec::new(), now.t_ms, now.t_ms);
+            Ok(RuntimeTick {
+                frame: ExperienceFrame {
+                    id: Uuid::new_v4(),
+                    t_ms: now.t_ms,
+                    now,
+                    sensations: Vec::new(),
+                    impressions: Vec::new(),
+                    experiences: vec![experience.clone()],
+                    z: Some(ExperienceLatent::default()),
+                    chosen_action: Some(action.clone()),
+                    conscious_command: None,
+                    reign_input: None,
+                    reign_outcome: None,
+                    predicted_futures: Vec::new(),
+                    behavior_runs: Vec::new(),
+                    actual_next: None,
+                    reward: Reward::default(),
+                    surprise: SurpriseSense::default(),
+                    memory_recall: Vec::new(),
+                    recollections: Vec::new(),
+                    llm_teaching: Vec::new(),
+                    counterfactuals: Vec::new(),
+                    notes: Vec::new(),
+                },
+                experience,
+                chosen_action: Some(action),
+                recall: RecallBundle::default(),
+                llm: LlmTickResult::default(),
+                combobulation: None,
+            })
+        }
+    }
+
+    struct CountingBody {
+        motor_attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RobotBody for CountingBody {
+        async fn read_body(&mut self) -> Result<BodySense> {
+            Ok(BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            })
+        }
+
+        async fn apply_motor(&mut self, _cmd: MotorCommand) -> Result<()> {
+            self.motor_attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn real_robot_read_only_runner_never_applies_motor() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let body = CountingBody {
+            motor_attempts: Arc::clone(&motor_attempts),
+        };
+        let mut runner =
+            RealRobotRunner::new(RobotMode::ReadOnly, Box::new(body), Vec::new(), StubRuntime);
+
+        let (_snapshot, tick) = runner.tick_read_only().await.unwrap();
+
+        assert!(matches!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go { .. })
+        ));
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tick.frame
+                .now
+                .extensions
+                .get("safety/read_only_veto")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
 
     #[tokio::test]
     async fn tick_adds_combobulated_experience() {

@@ -6,33 +6,26 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::BehaviorRegime;
-use netherwick_body::BodySense;
+use netherwick_body::{BodySense, RobotBody};
 use netherwick_conductor::SimpleConductor;
-use netherwick_experience::{
-    action_value_input_from_transition_like, action_value_target_from_reward_surprise,
-    charge_input_from_transition_like, charge_target_from_transition_like,
-    danger_input_from_transition_like, danger_target_from_transition_like,
-    ear_next_input_from_transition_like, ear_next_target_from_now,
-    experience_decode_target_from_now, experience_encode_input_from_now,
-    eye_next_input_from_transition_like, eye_next_target_from_now, FuturePredictor,
-    StasisFuturePredictor,
-};
+use netherwick_create1::{Create1Body, MockCreate1Body};
 use netherwick_ledger::{
-    future_input_from_transition, future_target_from_transition, ExperienceFrame,
-    ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
+    ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
-use netherwick_models::{
-    ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
-    ExperienceAutoencoderTrainer, EyeNextNetTrainer, FutureNetTrainer, MODEL_REGISTRY,
+use netherwick_models::MODEL_REGISTRY;
+use netherwick_runtime::{
+    MinimalRuntime, RealRobotRunner, RobotMode, RuntimeModelStack, SimRunner,
 };
-use netherwick_runtime::{MinimalRuntime, RuntimeModelStack, SimRunner};
+use netherwick_sensors::SenseProducer;
 use netherwick_server::LiveViewState;
 use netherwick_sim::{ArenaConfig, SimMotorComplex, SimObject, SimObjectKind, VirtualWorld};
+use netherwick_training::{
+    evaluate_behavior, promote_behavior_config, train_behavior, EvaluateBehaviorRequest,
+    TrainBehaviorRequest, TrainableBehavior,
+};
 use netherwick_worldlab::{CaptureReader, CaptureReplayRunner, CaptureSource, CaptureWriter};
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 
 #[derive(Parser)]
 #[command(name = "netherwick")]
@@ -45,11 +38,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Sim(SimArgs),
-    Robot,
+    Robot(RobotArgs),
     Replay,
     CaptureSim(CaptureSimArgs),
     ReplayCapture(ReplayCaptureArgs),
     Train(TrainCommand),
+    Evaluate(EvaluateCommand),
+    Promote(PromoteCommand),
     InspectLedger,
     ModelStatus,
     Dashboard,
@@ -60,10 +55,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Sim(args) => run_sim(args).await,
+        Command::Robot(args) => run_robot(args).await,
         Command::CaptureSim(args) => capture_sim(args).await,
         Command::ReplayCapture(args) => replay_capture(args).await,
         Command::InspectLedger => inspect_ledger().await,
         Command::Train(command) => run_train(command).await,
+        Command::Evaluate(command) => run_evaluate(command).await,
+        Command::Promote(command) => run_promote(command),
         Command::ModelStatus => model_status(),
         other => {
             println!("selected command: {:?}", other);
@@ -114,6 +112,49 @@ struct SimArgs {
     live_addr: SocketAddr,
     #[arg(long, default_value_t = 100)]
     tick_delay_ms: u64,
+}
+
+#[derive(Debug, Parser)]
+struct RobotArgs {
+    #[arg(long, value_enum, default_value = "read-only")]
+    mode: RobotModeArg,
+    #[arg(long, default_value = "mock")]
+    create_port: String,
+    #[arg(long, default_value_t = 57_600)]
+    create_baud: u32,
+    #[arg(long, default_value = "data/ledger/robot-readonly")]
+    ledger: String,
+    #[arg(long)]
+    camera: Option<String>,
+    #[arg(long)]
+    mic: Option<String>,
+    #[arg(long)]
+    imu: Option<String>,
+    #[arg(long)]
+    gps: Option<String>,
+    #[arg(long)]
+    capture: Option<String>,
+    #[arg(long)]
+    dashboard: Option<SocketAddr>,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[arg(long)]
+    steps: Option<usize>,
+    #[arg(long)]
+    require_camera: bool,
+    #[arg(long)]
+    require_mic: bool,
+    #[arg(long)]
+    require_imu: bool,
+    #[arg(long)]
+    require_gps: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RobotModeArg {
+    ReadOnly,
+    Slow,
+    Disabled,
 }
 
 #[derive(Debug, Parser)]
@@ -187,6 +228,7 @@ struct TrainCommand {
 
 #[derive(Debug, Subcommand)]
 enum TrainModel {
+    Behavior(TrainBehaviorArgs),
     Danger(TrainDangerArgs),
     Charge(TrainChargeArgs),
     ActionValue(TrainActionValueArgs),
@@ -194,6 +236,21 @@ enum TrainModel {
     EyeNext(TrainEyeNextArgs),
     EarNext(TrainEarNextArgs),
     Experience(TrainExperienceArgs),
+}
+
+#[derive(Debug, Parser)]
+struct TrainBehaviorArgs {
+    behavior: String,
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long)]
+    checkpoint: Option<String>,
+    #[arg(long, default_value_t = 0.2)]
+    validation_split: f32,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -264,6 +321,57 @@ struct TrainExperienceArgs {
     epochs: usize,
     #[arg(long, default_value = "data/models/experience_v0")]
     checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct EvaluateCommand {
+    #[command(subcommand)]
+    model: EvaluateModel,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvaluateModel {
+    Behavior(EvaluateBehaviorArgs),
+}
+
+#[derive(Debug, Parser)]
+struct EvaluateBehaviorArgs {
+    behavior: String,
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long)]
+    checkpoint: Option<String>,
+    #[arg(long)]
+    max_samples: Option<usize>,
+}
+
+#[derive(Debug, Parser)]
+struct PromoteCommand {
+    #[command(subcommand)]
+    model: PromoteModel,
+}
+
+#[derive(Debug, Subcommand)]
+enum PromoteModel {
+    Behavior(PromoteBehaviorArgs),
+}
+
+#[derive(Debug, Parser)]
+struct PromoteBehaviorArgs {
+    behavior: String,
+    #[arg(long)]
+    checkpoint: Option<String>,
+    #[arg(long, default_value = "configs/models.toml")]
+    config: String,
+    #[arg(long, value_enum)]
+    mode: PromoteMode,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PromoteMode {
+    ShadowInfer,
+    ModelInfer,
+    ShadowTrain,
 }
 
 async fn run_sim(args: SimArgs) -> Result<()> {
@@ -420,6 +528,108 @@ fn default_sim_world(seed: u64) -> (VirtualWorld, SimMotorComplex) {
         charge_rate: 0.0,
     });
     (world, motors)
+}
+
+async fn run_robot(args: RobotArgs) -> Result<()> {
+    if args.mode != RobotModeArg::ReadOnly {
+        anyhow::bail!("only --mode read-only is implemented for real robot bring-up");
+    }
+    validate_optional_sensor("camera", args.camera.as_deref(), args.require_camera)?;
+    validate_optional_sensor("mic", args.mic.as_deref(), args.require_mic)?;
+    validate_optional_sensor("imu", args.imu.as_deref(), args.require_imu)?;
+    validate_optional_sensor("gps", args.gps.as_deref(), args.require_gps)?;
+
+    let body: Box<dyn RobotBody + Send> = if args.create_port == "mock" {
+        Box::new(MockCreate1Body::new())
+    } else {
+        Box::new(Create1Body::connect(&args.create_port, args.create_baud).await?)
+    };
+    let sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
+    let ledger = JsonlLedger::new(&args.ledger);
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    let runtime = MinimalRuntime::with_default_events(
+        ledger.clone(),
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        NoopLlmAgent,
+    );
+    let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, body, sensors, runtime);
+    runner.tick_ms = args.tick_ms;
+
+    let live_state = args.dashboard.map(|addr| {
+        let live_state = LiveViewState::new();
+        let server_state = live_state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = netherwick_server::serve_live_view(addr, server_state).await {
+                eprintln!("live robot view server stopped: {error}");
+            }
+        });
+        println!("read-only robot dashboard: http://{addr}/view");
+        live_state
+    });
+
+    let mut capture = match &args.capture {
+        Some(path) => {
+            Some(CaptureWriter::create(path, CaptureSource::RealRobot, Some(args.tick_ms)).await?)
+        }
+        None => None,
+    };
+
+    while args
+        .steps
+        .map(|limit| runner.tick_count < limit)
+        .unwrap_or(true)
+    {
+        let (snapshot, tick) = runner.tick_read_only().await?;
+        if let Some(live_state) = &live_state {
+            live_state.update(snapshot.clone());
+        }
+        if let Some(writer) = capture.as_mut() {
+            writer
+                .append_snapshot(snapshot.body.last_update_ms, snapshot.clone(), Vec::new())
+                .await?;
+        }
+        println!(
+            "robot read-only tick {}: battery {:.2}, chosen {:?}, motor_applied false",
+            runner.tick_count, tick.frame.now.body.battery_level, tick.chosen_action
+        );
+        tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+    }
+
+    let capture_summary = if let Some(writer) = capture {
+        let manifest = writer.finish().await?;
+        format!(
+            ", capture {}, {} frames",
+            args.capture.as_deref().unwrap_or_default(),
+            manifest.frame_count
+        )
+    } else {
+        String::new()
+    };
+    let transitions = ledger.transitions().await?;
+    println!(
+        "robot read-only complete: {} ticks, ledger {}, {} transitions{}, motor_applied false",
+        runner.tick_count,
+        args.ledger,
+        transitions.len(),
+        capture_summary
+    );
+    Ok(())
+}
+
+fn validate_optional_sensor(kind: &str, device: Option<&str>, required: bool) -> Result<()> {
+    if device.is_none() {
+        return Ok(());
+    }
+    let message = format!("{kind} provider is not wired into this build yet");
+    if required {
+        anyhow::bail!(message);
+    }
+    println!("{message}; continuing without it");
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -664,585 +874,198 @@ async fn inspect_ledger() -> Result<()> {
 
 async fn run_train(command: TrainCommand) -> Result<()> {
     match command.model {
-        TrainModel::Danger(args) => train_danger(args).await,
-        TrainModel::Charge(args) => train_charge(args).await,
-        TrainModel::ActionValue(args) => train_action_value(args).await,
-        TrainModel::Future(args) => train_future(args).await,
-        TrainModel::EyeNext(args) => train_eye_next(args).await,
-        TrainModel::EarNext(args) => train_ear_next(args).await,
-        TrainModel::Experience(args) => train_experience(args).await,
+        TrainModel::Behavior(args) => train_behavior_command(args).await,
+        TrainModel::Danger(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "danger".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::Charge(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "charge".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::ActionValue(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "action-value".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::Future(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "future".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::EyeNext(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "eye-next".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::EarNext(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "ear-next".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::Experience(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "experience".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
     }
 }
 
-async fn train_danger(args: TrainDangerArgs) -> Result<()> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let transitions = ledger.transitions().await?;
-    if transitions.is_empty() {
-        println!(
-            "danger training skipped: no transitions found in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let mut samples = Vec::new();
-    for transition in &transitions {
-        let input = danger_input_from_transition_like(
-            &transition.before_z,
-            transition.action.as_ref(),
-            &transition.before,
-        );
-        let target = danger_target_from_transition_like(
-            &transition.before,
-            transition.action.as_ref(),
-            &transition.after,
-        );
-        samples.push((
-            transition.created_at_ms,
-            transition.before.clone(),
-            input,
-            target,
-        ));
-    }
-
-    let input_dim = samples
-        .first()
-        .map(|(_, _, input, _)| input.flat_features().len())
-        .unwrap_or(0);
-    let mut trainer = DangerNetTrainer::new(input_dim);
-    let metrics_path = std::path::Path::new(&args.ledger).join("danger-shadow-metrics.jsonl");
-    let mut metrics_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&metrics_path)
-        .await?;
-
-    let mut last_loss = 0.0;
-    let mut seen = 0_u64;
-    for _ in 0..args.epochs {
-        for (observed_at_ms, before, input, target) in &samples {
-            if input.flat_features().len() != trainer.input_dim() {
-                continue;
-            }
-            let metric = trainer.shadow_compare(*observed_at_ms, before, input, target)?;
-            let line = serde_json::to_string(&metric)?;
-            metrics_file.write_all(line.as_bytes()).await?;
-            metrics_file.write_all(b"\n").await?;
-
-            let stats = trainer.train_step(input, target)?;
-            last_loss = stats.loss;
-            seen = stats.samples_seen;
-        }
-    }
-
+async fn train_behavior_command(args: TrainBehaviorArgs) -> Result<()> {
+    let behavior: TrainableBehavior = args.behavior.parse()?;
+    let checkpoint = args
+        .checkpoint
+        .unwrap_or_else(|| default_checkpoint(&behavior).to_string());
+    let summary = train_behavior(TrainBehaviorRequest {
+        behavior: behavior.clone(),
+        ledger_path: args.ledger.into(),
+        checkpoint_path: checkpoint.clone().into(),
+        epochs: args.epochs,
+        validation_split: args.validation_split,
+        seed: args.seed,
+    })
+    .await?;
     println!(
-        "danger training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
-        samples.len(),
-        args.epochs,
-        seen,
-        last_loss,
-        metrics_path.display()
+        "{} training complete: {} transitions, {} train samples, {} eval samples, {} epochs, {} samples seen, metrics {}",
+        behavior,
+        summary.transition_count,
+        summary.train_sample_count,
+        summary.eval_sample_count,
+        summary.epochs,
+        summary.samples_seen,
+        summary.metrics_path.display()
     );
-    trainer.save_checkpoint(&args.checkpoint)?;
-    println!("saved danger checkpoint: {}", args.checkpoint);
-    println!("samples_seen: {}", trainer.samples_seen());
-    println!("last_loss: {:.6}", last_loss);
-    println!("best_loss: {:?}", trainer.best_loss());
+    println!(
+        "saved {} checkpoint: {}",
+        behavior,
+        summary.checkpoint_path.display()
+    );
+    if let Some(last_loss) = summary.last_loss {
+        println!("last_loss: {:.6}", last_loss);
+    }
+    println!("best_loss: {:?}", summary.best_loss);
+    print_evaluation_report(&summary.evaluation)?;
     Ok(())
 }
 
-async fn train_charge(args: TrainChargeArgs) -> Result<()> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let transitions = ledger.transitions().await?;
-    if transitions.is_empty() {
-        println!(
-            "charge training skipped: no transitions found in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let mut samples = Vec::new();
-    for transition in &transitions {
-        let input = charge_input_from_transition_like(
-            &transition.before_z,
-            transition.action.as_ref(),
-            &transition.before,
-        );
-        let target = charge_target_from_transition_like(
-            &transition.before,
-            transition.action.as_ref(),
-            &transition.after,
-        );
-        samples.push((
-            transition.created_at_ms,
-            transition.before.clone(),
-            input,
-            target,
-        ));
-    }
-
-    let input_dim = samples
-        .first()
-        .map(|(_, _, input, _)| input.flat_features().len())
-        .unwrap_or(0);
-    let mut trainer = ChargeNetTrainer::new(input_dim);
-    let metrics_path = std::path::Path::new(&args.ledger).join("charge-shadow-metrics.jsonl");
-    let mut metrics_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&metrics_path)
-        .await?;
-
-    let mut last_loss = 0.0;
-    let mut seen = 0_u64;
-    for _ in 0..args.epochs {
-        for (observed_at_ms, before, input, target) in &samples {
-            if input.flat_features().len() != trainer.input_dim() {
-                continue;
-            }
-            let metric = trainer.shadow_compare(*observed_at_ms, before, input, target)?;
-            let line = serde_json::to_string(&metric)?;
-            metrics_file.write_all(line.as_bytes()).await?;
-            metrics_file.write_all(b"\n").await?;
-
-            let stats = trainer.train_step(input, target)?;
-            last_loss = stats.loss;
-            seen = stats.samples_seen;
+async fn run_evaluate(command: EvaluateCommand) -> Result<()> {
+    match command.model {
+        EvaluateModel::Behavior(args) => {
+            let behavior: TrainableBehavior = args.behavior.parse()?;
+            let checkpoint = args
+                .checkpoint
+                .unwrap_or_else(|| default_checkpoint(&behavior).to_string());
+            let report = evaluate_behavior(EvaluateBehaviorRequest {
+                behavior,
+                ledger_path: args.ledger.into(),
+                checkpoint_path: checkpoint.into(),
+                max_samples: args.max_samples,
+            })
+            .await?;
+            print_evaluation_report(&report)
         }
     }
-
-    println!(
-        "charge training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
-        samples.len(),
-        args.epochs,
-        seen,
-        last_loss,
-        metrics_path.display()
-    );
-    trainer.save_checkpoint(&args.checkpoint)?;
-    println!("saved charge checkpoint: {}", args.checkpoint);
-    println!("samples_seen: {}", trainer.samples_seen());
-    println!("last_loss: {:.6}", last_loss);
-    println!("best_loss: {:?}", trainer.best_loss());
-    Ok(())
 }
 
-async fn train_action_value(args: TrainActionValueArgs) -> Result<()> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let transitions = ledger.transitions().await?;
-    if transitions.is_empty() {
-        println!(
-            "action-value training skipped: no transitions found in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let mut samples = Vec::new();
-    for transition in &transitions {
-        let input = action_value_input_from_transition_like(
-            &transition.before_z,
-            transition.action.as_ref(),
-            &transition.before,
-        );
-        let target =
-            action_value_target_from_reward_surprise(&transition.reward, &transition.surprise);
-        samples.push((
-            transition.created_at_ms,
-            transition.before.clone(),
-            input,
-            target,
-        ));
-    }
-
-    let input_dim = samples
-        .first()
-        .map(|(_, _, input, _)| input.flat_features().len())
-        .unwrap_or(0);
-    let mut trainer = ActionValueNetTrainer::new(input_dim);
-    let metrics_path = std::path::Path::new(&args.ledger).join("action-value-shadow-metrics.jsonl");
-    let mut metrics_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&metrics_path)
-        .await?;
-
-    let mut last_loss = 0.0;
-    let mut seen = 0_u64;
-    for _ in 0..args.epochs {
-        for (observed_at_ms, before, input, target) in &samples {
-            if input.flat_features().len() != trainer.input_dim() {
-                continue;
-            }
-            let metric = trainer.shadow_compare(*observed_at_ms, before, input, target)?;
-            let line = serde_json::to_string(&metric)?;
-            metrics_file.write_all(line.as_bytes()).await?;
-            metrics_file.write_all(b"\n").await?;
-
-            let stats = trainer.train_step(input, target)?;
-            last_loss = stats.loss;
-            seen = stats.samples_seen;
+fn run_promote(command: PromoteCommand) -> Result<()> {
+    match command.model {
+        PromoteModel::Behavior(args) => {
+            let behavior: TrainableBehavior = args.behavior.parse()?;
+            let checkpoint = args
+                .checkpoint
+                .unwrap_or_else(|| default_checkpoint(&behavior).to_string());
+            let regime = match args.mode {
+                PromoteMode::ShadowInfer => BehaviorRegime::ShadowInfer,
+                PromoteMode::ModelInfer => BehaviorRegime::ModelInfer,
+                PromoteMode::ShadowTrain => BehaviorRegime::ShadowTrain,
+            };
+            promote_behavior_config(
+                behavior.clone(),
+                checkpoint.clone().into(),
+                Path::new(&args.config),
+                regime,
+            )?;
+            println!(
+                "promoted {} in {}: regime {:?}, checkpoint {}",
+                behavior, args.config, regime, checkpoint
+            );
+            Ok(())
         }
     }
-
-    println!(
-        "action-value training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
-        samples.len(),
-        args.epochs,
-        seen,
-        last_loss,
-        metrics_path.display()
-    );
-    trainer.save_checkpoint(&args.checkpoint)?;
-    println!("saved action-value checkpoint: {}", args.checkpoint);
-    println!("samples_seen: {}", trainer.samples_seen());
-    println!("last_loss: {:.6}", last_loss);
-    println!("best_loss: {:?}", trainer.best_loss());
-    Ok(())
 }
 
-async fn train_future(args: TrainFutureArgs) -> Result<()> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let transitions = ledger.transitions().await?;
-    if transitions.is_empty() {
-        println!(
-            "future training skipped: no transitions found in {}",
-            args.ledger
-        );
-        return Ok(());
+fn default_checkpoint(behavior: &TrainableBehavior) -> &'static str {
+    match behavior {
+        TrainableBehavior::Danger => "data/models/danger_v0",
+        TrainableBehavior::Charge => "data/models/charge_v0",
+        TrainableBehavior::ActionValue => "data/models/action_value_v0",
+        TrainableBehavior::EyeNext => "data/models/eye_next_v0",
+        TrainableBehavior::EarNext => "data/models/ear_next_v0",
+        TrainableBehavior::Experience => "data/models/experience_v0",
+        TrainableBehavior::Future => "data/models/future_v0",
     }
-
-    let mut samples = Vec::new();
-    for transition in &transitions {
-        let Some(input) = future_input_from_transition(transition, 1_000) else {
-            continue;
-        };
-        let target = future_target_from_transition(transition);
-        if target.is_empty() {
-            continue;
-        }
-        samples.push((transition.created_at_ms, input, target));
-    }
-    if samples.is_empty() {
-        println!(
-            "future training skipped: no usable transitions with actions and after_z in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let input_dim = samples
-        .first()
-        .map(|(_, input, _)| input.flat_features().len())
-        .unwrap_or(0);
-    let latent_dim = samples
-        .first()
-        .map(|(_, _, target)| target.len())
-        .unwrap_or(0);
-    let mut trainer = FutureNetTrainer::new(input_dim, latent_dim);
-    let checkpoint_dir = std::path::Path::new(&args.checkpoint);
-    tokio::fs::create_dir_all(checkpoint_dir).await?;
-    let metrics_path = checkpoint_dir.join("future-shadow-metrics.jsonl");
-    let mut metrics_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&metrics_path)
-        .await?;
-
-    let mut last_loss = 0.0;
-    let mut seen = 0_u64;
-    let mut stasis = StasisFuturePredictor;
-    for _ in 0..args.epochs {
-        for (_, input, target) in &samples {
-            if input.flat_features().len() != trainer.input_dim() || target.len() != latent_dim {
-                continue;
-            }
-            let hardcoded = stasis.predict(&input.latent, &input.action, input.offset_ms)?;
-            let metric = trainer.shadow_compare(input, &hardcoded, target)?;
-            let line = serde_json::to_string(&metric)?;
-            metrics_file.write_all(line.as_bytes()).await?;
-            metrics_file.write_all(b"\n").await?;
-
-            let stats = trainer.train_step(input, target)?;
-            last_loss = stats.loss;
-            seen = stats.samples_seen;
-        }
-    }
-
-    println!(
-        "future training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
-        samples.len(),
-        args.epochs,
-        seen,
-        last_loss,
-        metrics_path.display()
-    );
-    trainer.save_checkpoint(&args.checkpoint)?;
-    println!("saved future checkpoint: {}", args.checkpoint);
-    println!("samples_seen: {}", trainer.samples_seen());
-    println!("last_loss: {:.6}", last_loss);
-    println!("best_loss: {:?}", trainer.best_loss());
-    Ok(())
 }
 
-async fn train_eye_next(args: TrainEyeNextArgs) -> Result<()> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let transitions = ledger.transitions().await?;
-    if transitions.is_empty() {
-        println!(
-            "eye-next training skipped: no transitions found in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let mut samples = Vec::new();
-    for transition in &transitions {
-        let Some(target) = eye_next_target_from_now(&transition.after) else {
-            continue;
-        };
-        let input = eye_next_input_from_transition_like(
-            &transition.before_z,
-            transition.action.as_ref(),
-            &transition.before,
-            100,
-        );
-        samples.push((
-            transition.created_at_ms,
-            transition.before.clone(),
-            input,
-            target,
-        ));
-    }
-    if samples.is_empty() {
-        println!(
-            "eye-next training skipped: no transitions with eye frames found in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let (input_dim, width, height) = samples
-        .first()
-        .map(|(_, _, input, target)| (input.flat_features().len(), target.width, target.height))
-        .unwrap_or((0, 64, 48));
-    let mut trainer = EyeNextNetTrainer::new(input_dim, width, height);
-    let metrics_path = std::path::Path::new(&args.ledger).join("eye-next-shadow-metrics.jsonl");
-    let mut metrics_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&metrics_path)
-        .await?;
-
-    let mut last_loss = 0.0;
-    let mut seen = 0_u64;
-    for _ in 0..args.epochs {
-        for (observed_at_ms, before, input, target) in &samples {
-            if input.flat_features().len() != trainer.input_dim() {
-                continue;
-            }
-            let metric = trainer.shadow_compare(*observed_at_ms, before, input, target)?;
-            let line = serde_json::to_string(&metric)?;
-            metrics_file.write_all(line.as_bytes()).await?;
-            metrics_file.write_all(b"\n").await?;
-
-            let stats = trainer.train_step(input, target)?;
-            last_loss = stats.loss;
-            seen = stats.samples_seen;
-        }
-    }
-
+fn print_evaluation_report(report: &netherwick_training::BehaviorEvaluationReport) -> Result<()> {
+    println!("evaluation behavior: {}", report.behavior);
+    println!("checkpoint: {}", report.checkpoint_path.display());
+    println!("sample_count: {}", report.sample_count);
+    println!("model_loss_mean: {:.6}", report.model_loss_mean);
+    println!("hardcoded_loss_mean: {:?}", report.hardcoded_loss_mean);
+    println!("selected_loss_mean: {:?}", report.selected_loss_mean);
     println!(
-        "eye-next training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
-        samples.len(),
-        args.epochs,
-        seen,
-        last_loss,
-        metrics_path.display()
+        "model_better_than_hardcoded: {:?}",
+        report.model_better_than_hardcoded
     );
-    trainer.save_checkpoint(&args.checkpoint)?;
-    println!("saved eye-next checkpoint: {}", args.checkpoint);
-    println!("samples_seen: {}", trainer.samples_seen());
-    println!("last_loss: {:.6}", last_loss);
-    println!("best_loss: {:?}", trainer.best_loss());
-    Ok(())
-}
-
-async fn train_ear_next(args: TrainEarNextArgs) -> Result<()> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let transitions = ledger.transitions().await?;
-    if transitions.is_empty() {
-        println!(
-            "ear-next training skipped: no transitions found in {}",
-            args.ledger
-        );
-        return Ok(());
+    println!("improvement_ratio: {:?}", report.improvement_ratio);
+    println!("recommendation: {:?}", report.recommendation);
+    for warning in &report.warnings {
+        println!("warning: {warning}");
     }
-
-    let mut samples = Vec::new();
-    for transition in &transitions {
-        let Some(target) = ear_next_target_from_now(&transition.after) else {
-            continue;
-        };
-        let input = ear_next_input_from_transition_like(
-            &transition.before_z,
-            transition.action.as_ref(),
-            &transition.before,
-            100,
-        );
-        samples.push((
-            transition.created_at_ms,
-            transition.before.clone(),
-            input,
-            target,
-        ));
-    }
-    if samples.is_empty() {
-        println!(
-            "ear-next training skipped: no transitions with ear features found in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let (input_dim, output_dim, sample_rate_hz, channels) = samples
-        .first()
-        .map(|(_, _, input, target)| {
-            (
-                input.flat_features().len(),
-                target.features.len(),
-                target.sample_rate_hz,
-                target.channels,
-            )
-        })
-        .unwrap_or((0, 0, 0, 0));
-    let mut trainer =
-        EarNextNetTrainer::with_audio_shape(input_dim, output_dim, sample_rate_hz, channels);
-    let metrics_path = std::path::Path::new(&args.ledger).join("ear-next-shadow-metrics.jsonl");
-    let mut metrics_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&metrics_path)
-        .await?;
-
-    let mut last_loss = 0.0;
-    let mut seen = 0_u64;
-    for _ in 0..args.epochs {
-        for (observed_at_ms, before, input, target) in &samples {
-            if input.flat_features().len() != trainer.input_dim()
-                || target.features.len() != trainer.output_dim()
-            {
-                continue;
-            }
-            let metric = trainer.shadow_compare(*observed_at_ms, before, input, target)?;
-            let line = serde_json::to_string(&metric)?;
-            metrics_file.write_all(line.as_bytes()).await?;
-            metrics_file.write_all(b"\n").await?;
-
-            let stats = trainer.train_step(input, target)?;
-            last_loss = stats.loss;
-            seen = stats.samples_seen;
-        }
-    }
-
-    println!(
-        "ear-next training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
-        samples.len(),
-        args.epochs,
-        seen,
-        last_loss,
-        metrics_path.display()
-    );
-    trainer.save_checkpoint(&args.checkpoint)?;
-    println!("saved ear-next checkpoint: {}", args.checkpoint);
-    println!("samples_seen: {}", trainer.samples_seen());
-    println!("last_loss: {:.6}", last_loss);
-    println!("best_loss: {:?}", trainer.best_loss());
-    Ok(())
-}
-
-async fn train_experience(args: TrainExperienceArgs) -> Result<()> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let transitions = ledger.transitions().await?;
-    if transitions.is_empty() {
-        println!(
-            "experience training skipped: no transitions found in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let mut samples = Vec::new();
-    for transition in &transitions {
-        for (observed_at_ms, now, baseline_z) in [
-            (transition.created_at_ms, &transition.before, transition.before_z.z.clone()),
-            (transition.created_at_ms, &transition.after, transition.after_z.z.clone()),
-        ] {
-            let input = experience_encode_input_from_now(now);
-            let target = experience_decode_target_from_now(now);
-            if input.flat_features().is_empty() || target.flat_features().is_empty() {
-                continue;
-            }
-            samples.push((observed_at_ms, input, target, baseline_z));
-        }
-    }
-    if samples.is_empty() {
-        println!(
-            "experience training skipped: no vectorized frames found in {}",
-            args.ledger
-        );
-        return Ok(());
-    }
-
-    let (input_dim, decode_lengths) = samples
-        .first()
-        .map(|(_, input, target, _)| (input.flat_features().len(), target.feature_lengths()))
-        .unwrap_or_default();
-    let z_dim = input_dim.clamp(8, 32);
-    let mut trainer = ExperienceAutoencoderTrainer::new(input_dim, z_dim, decode_lengths);
-    let metrics_path =
-        std::path::Path::new(&args.ledger).join("experience-autoencoder-shadow-metrics.jsonl");
-    let mut metrics_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&metrics_path)
-        .await?;
-
-    let mut last_loss = 0.0;
-    let mut seen = 0_u64;
-    for _ in 0..args.epochs {
-        for (observed_at_ms, input, target, baseline_z) in &samples {
-            if input.flat_features().len() != trainer.input_dim()
-                || target.feature_lengths() != trainer.decode_lengths()
-            {
-                continue;
-            }
-            let metric = trainer.shadow_compare(*observed_at_ms, input, target, baseline_z, "baseline".to_string())?;
-            let line = serde_json::to_string(&metric)?;
-            metrics_file.write_all(line.as_bytes()).await?;
-            metrics_file.write_all(b"\n").await?;
-
-            let stats = trainer.train_step(input, target)?;
-            last_loss = stats.loss;
-            seen = stats.samples_seen;
-        }
-    }
-
-    println!(
-        "experience training complete: {} examples, {} epochs, {} samples, last_loss {:.6}, metrics {}",
-        samples.len(),
-        args.epochs,
-        seen,
-        last_loss,
-        metrics_path.display()
-    );
-    trainer.save_checkpoint(&args.checkpoint)?;
-    println!("saved experience checkpoint: {}", args.checkpoint);
-    println!("samples_seen: {}", trainer.samples_seen());
-    println!("z_dim: {}", trainer.z_dim());
-    println!("last_loss: {:.6}", last_loss);
-    println!("best_loss: {:?}", trainer.best_loss());
     Ok(())
 }
 

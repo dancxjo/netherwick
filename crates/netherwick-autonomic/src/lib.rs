@@ -16,6 +16,7 @@ pub enum SafetyReason {
     MotorOutOfRange,
     HighDanger,
     RawLlmMotorRejected,
+    ReadOnlyMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

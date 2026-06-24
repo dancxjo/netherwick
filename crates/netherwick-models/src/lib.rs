@@ -1975,7 +1975,8 @@ impl<B: AutodiffBackend> ExperienceAutoencoderTrainer<B> {
             }
             let sum: f32 = (0..len)
                 .map(|idx| {
-                    let delta = a.get(idx).copied().unwrap_or_default() - b.get(idx).copied().unwrap_or_default();
+                    let delta = a.get(idx).copied().unwrap_or_default()
+                        - b.get(idx).copied().unwrap_or_default();
                     delta * delta
                 })
                 .sum();

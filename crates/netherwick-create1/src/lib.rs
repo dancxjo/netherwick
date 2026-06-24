@@ -82,6 +82,15 @@ impl Create1Body {
         Ok(body)
     }
 
+    pub async fn connect(path: &str, baud: u32) -> Result<Self> {
+        Self::new(Create1Config {
+            port: Some(path.to_string()),
+            baud_rate: baud,
+            use_safe_mode: false,
+            ..Create1Config::default()
+        })
+    }
+
     #[cfg(feature = "serial")]
     fn initialize(&mut self) -> Result<()> {
         self.write_bytes(&[128])?;
@@ -157,6 +166,41 @@ impl Create1Body {
     #[cfg(not(feature = "serial"))]
     fn refresh_sensors(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MockCreate1Body {
+    body: BodySense,
+    pub motor_attempts: usize,
+}
+
+impl MockCreate1Body {
+    pub fn new() -> Self {
+        Self {
+            body: BodySense::default(),
+            motor_attempts: 0,
+        }
+    }
+
+    pub fn with_body(body: BodySense) -> Self {
+        Self {
+            body,
+            motor_attempts: 0,
+        }
+    }
+}
+
+#[async_trait]
+impl RobotBody for MockCreate1Body {
+    async fn read_body(&mut self) -> Result<BodySense> {
+        self.body.last_update_ms = self.body.last_update_ms.saturating_add(100);
+        Ok(self.body.clone())
+    }
+
+    async fn apply_motor(&mut self, _cmd: MotorCommand) -> Result<()> {
+        self.motor_attempts = self.motor_attempts.saturating_add(1);
+        anyhow::bail!("MockCreate1Body refuses motor commands in read-only bring-up")
     }
 }
 

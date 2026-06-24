@@ -12,6 +12,7 @@ members = [
     "crates/netherwick-actions",
     "crates/netherwick-behaviors",
     "crates/netherwick-models",
+    "crates/netherwick-training",
     "crates/netherwick-experience",
     "crates/netherwick-memory",
     "crates/netherwick-events",

@@ -12,6 +12,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+type TimeMs = u64;
+
 #[cfg(feature = "linux-hardware")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[cfg(feature = "linux-hardware")]
@@ -149,6 +151,113 @@ pub enum SensePacket {
     Face(FaceSense),
     Voice(VoiceSense),
     Extension(ExtensionSense),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NowBuilder {
+    last_snapshot: WorldSnapshot,
+    last_updates: SensorUpdateTimes,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensorUpdateTimes {
+    pub body: Option<TimeMs>,
+    pub eye: Option<TimeMs>,
+    pub ear: Option<TimeMs>,
+    pub range: Option<TimeMs>,
+    pub imu: Option<TimeMs>,
+    pub gps: Option<TimeMs>,
+    pub kinect: Option<TimeMs>,
+    pub face: Option<TimeMs>,
+    pub voice: Option<TimeMs>,
+}
+
+impl NowBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn build(
+        &mut self,
+        t_ms: TimeMs,
+        mut body: BodySense,
+        packets: Vec<SensePacket>,
+    ) -> Result<Now> {
+        body.last_update_ms = body.last_update_ms.max(t_ms);
+        self.last_updates.body = Some(body.last_update_ms);
+        self.last_snapshot.body = body;
+        self.last_snapshot.extensions.clear();
+
+        for packet in packets {
+            match packet {
+                SensePacket::Eye(eye) => {
+                    self.last_snapshot.eye = eye;
+                    self.last_updates.eye = Some(t_ms);
+                }
+                SensePacket::Ear(ear) => {
+                    self.last_snapshot.ear = ear;
+                    self.last_updates.ear = Some(t_ms);
+                }
+                SensePacket::Range(range) => {
+                    self.last_snapshot.range = range;
+                    self.last_updates.range = Some(t_ms);
+                }
+                SensePacket::Imu(imu) => {
+                    self.last_snapshot.imu = imu;
+                    self.last_updates.imu = Some(t_ms);
+                }
+                SensePacket::Gps(gps) => {
+                    self.last_snapshot.gps = Some(gps);
+                    self.last_updates.gps = Some(t_ms);
+                }
+                SensePacket::Kinect(kinect) => {
+                    self.last_snapshot.kinect = kinect;
+                    self.last_updates.kinect = Some(t_ms);
+                }
+                SensePacket::Face(face) => {
+                    self.last_snapshot.face = face;
+                    self.last_updates.face = Some(t_ms);
+                }
+                SensePacket::Voice(voice) => {
+                    self.last_snapshot.voice = voice;
+                    self.last_updates.voice = Some(t_ms);
+                }
+                SensePacket::Extension(extension) => {
+                    self.last_snapshot.extensions.push(extension);
+                }
+            }
+        }
+
+        let mut now = self.last_snapshot.to_now(t_ms);
+        now.extensions.insert(
+            "sensor_status".to_string(),
+            serde_json::json!({
+                "last_update_ms": self.last_updates,
+                "age_ms": self.last_updates.age_ms(t_ms),
+            }),
+        );
+        Ok(now)
+    }
+
+    pub fn snapshot(&self) -> WorldSnapshot {
+        self.last_snapshot.clone()
+    }
+}
+
+impl SensorUpdateTimes {
+    fn age_ms(&self, t_ms: TimeMs) -> serde_json::Value {
+        serde_json::json!({
+            "body": self.body.map(|value| t_ms.saturating_sub(value)),
+            "eye": self.eye.map(|value| t_ms.saturating_sub(value)),
+            "ear": self.ear.map(|value| t_ms.saturating_sub(value)),
+            "range": self.range.map(|value| t_ms.saturating_sub(value)),
+            "imu": self.imu.map(|value| t_ms.saturating_sub(value)),
+            "gps": self.gps.map(|value| t_ms.saturating_sub(value)),
+            "kinect": self.kinect.map(|value| t_ms.saturating_sub(value)),
+            "face": self.face.map(|value| t_ms.saturating_sub(value)),
+            "voice": self.voice.map(|value| t_ms.saturating_sub(value)),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,5 +930,45 @@ mod tests {
         );
         assert!(matches!(second, SensePacket::Eye(EyeSense { frames, .. }) if frames.len() == 1));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn now_builder_maps_packets_and_marks_stale_sensor_ages() {
+        let mut builder = NowBuilder::new();
+        let first = builder
+            .build(
+                100,
+                BodySense::default(),
+                vec![
+                    SensePacket::Ear(EarSense {
+                        transcript: Some("hello".to_string()),
+                        ..EarSense::default()
+                    }),
+                    SensePacket::Range(RangeSense {
+                        beams: vec![0.4],
+                        nearest_m: Some(0.4),
+                        ..RangeSense::default()
+                    }),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(first.ear.transcript.as_deref(), Some("hello"));
+        assert_eq!(first.range.nearest_m, Some(0.4));
+
+        let second = builder
+            .build(250, BodySense::default(), Vec::new())
+            .unwrap();
+        assert_eq!(second.ear.transcript.as_deref(), Some("hello"));
+        assert_eq!(second.range.nearest_m, Some(0.4));
+        assert_eq!(
+            second
+                .extensions
+                .get("sensor_status")
+                .and_then(|status| status.get("age_ms"))
+                .and_then(|age| age.get("ear"))
+                .and_then(|age| age.as_u64()),
+            Some(150)
+        );
     }
 }
