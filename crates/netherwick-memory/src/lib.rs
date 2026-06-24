@@ -9,8 +9,13 @@ use netherwick_now::{
     SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+
+const DEFAULT_CELL_SIZE_M: f32 = 0.5;
+const SCORE_DECAY_PER_TICK: f32 = 0.995;
+const CELL_CONFIDENCE_DECAY_PER_TICK: f32 = 0.999;
+const RECALL_RADIUS_CELLS: i32 = 4;
 
 #[async_trait]
 pub trait MemoryStore {
@@ -19,6 +24,10 @@ pub trait MemoryStore {
 
 #[async_trait]
 pub trait Recall {
+    async fn observe_now(&self, _now: &Now) -> Result<()> {
+        Ok(())
+    }
+
     async fn recall(&self, query: RecallQuery) -> Result<RecallBundle>;
 }
 
@@ -82,6 +91,243 @@ pub struct RecallBundle {
     pub recollections: Vec<RecalledExperience>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlaceCellKey {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaceCell {
+    pub key: PlaceCellKey,
+    pub center_x_m: f32,
+    pub center_y_m: f32,
+    pub visit_count: u32,
+    pub last_seen_tick: u64,
+    pub danger_score: f32,
+    pub charge_score: f32,
+    pub social_score: f32,
+    pub novelty_score: f32,
+    pub confidence: f32,
+    #[serde(default)]
+    pub last_observed_objects: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlaceMemoryConfig {
+    pub cell_size_m: f32,
+}
+
+impl Default for PlaceMemoryConfig {
+    fn default() -> Self {
+        Self {
+            cell_size_m: DEFAULT_CELL_SIZE_M,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaceMemoryFeatures {
+    pub current_place_danger: f32,
+    pub current_place_charge: f32,
+    pub current_place_social: f32,
+    pub current_place_novelty: f32,
+    pub current_place_familiarity: f32,
+    pub nearby_best_charge_direction_rad: Option<f32>,
+    pub nearby_best_safe_direction_rad: Option<f32>,
+    pub places_visited: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaceCellSummary {
+    pub x: i32,
+    pub y: i32,
+    pub center_x_m: f32,
+    pub center_y_m: f32,
+    pub score: f32,
+    pub visit_count: u32,
+    pub last_seen_tick: u64,
+    pub confidence: f32,
+    #[serde(default)]
+    pub last_observed_objects: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaceMemoryReport {
+    pub places_visited: usize,
+    pub coverage_m2: f32,
+    pub top_danger_cells: Vec<PlaceCellSummary>,
+    pub top_charge_cells: Vec<PlaceCellSummary>,
+    pub top_social_cells: Vec<PlaceCellSummary>,
+    pub novelty_mean: f32,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlaceMemory {
+    pub config: PlaceMemoryConfig,
+    pub cells: BTreeMap<PlaceCellKey, PlaceCell>,
+    last_tick: Option<u64>,
+}
+
+impl Default for PlaceMemory {
+    fn default() -> Self {
+        Self {
+            config: PlaceMemoryConfig::default(),
+            cells: BTreeMap::new(),
+            last_tick: None,
+        }
+    }
+}
+
+impl PlaceMemory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn quantize(&self, x_m: f32, y_m: f32) -> PlaceCellKey {
+        let cell_size = self.config.cell_size_m.max(0.01);
+        PlaceCellKey {
+            x: (x_m / cell_size).floor() as i32,
+            y: (y_m / cell_size).floor() as i32,
+        }
+    }
+
+    pub fn observe_now(&mut self, now: &Now) -> PlaceMemoryFeatures {
+        let elapsed_ticks = self
+            .last_tick
+            .map(|last| now.t_ms.saturating_sub(last) / 100)
+            .unwrap_or(1)
+            .max(1);
+        self.decay(elapsed_ticks);
+        self.last_tick = Some(now.t_ms);
+
+        let key = self.quantize(now.body.odometry.x_m, now.body.odometry.y_m);
+        let was_known = self.cells.contains_key(&key);
+        let cell_size = self.config.cell_size_m.max(0.01);
+        let danger_signal = danger_signal(now);
+        let charge_signal = charge_signal(now);
+        let social_signal = social_signal(now);
+        let objects = observed_object_summary(now);
+        let cell = self.cells.entry(key).or_insert_with(|| PlaceCell {
+            key,
+            center_x_m: (key.x as f32 + 0.5) * cell_size,
+            center_y_m: (key.y as f32 + 0.5) * cell_size,
+            novelty_score: 1.0,
+            ..PlaceCell::default()
+        });
+        cell.visit_count = cell.visit_count.saturating_add(1);
+        cell.last_seen_tick = now.t_ms;
+        cell.danger_score = cell.danger_score.max(danger_signal).clamp(0.0, 1.0);
+        cell.charge_score = cell.charge_score.max(charge_signal).clamp(0.0, 1.0);
+        cell.social_score = cell.social_score.max(social_signal).clamp(0.0, 1.0);
+        cell.novelty_score = if was_known {
+            (cell.novelty_score * 0.75).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        cell.confidence = (cell.confidence + 0.2).clamp(0.0, 1.0);
+        if !objects.is_empty() {
+            cell.last_observed_objects = objects;
+        }
+        self.features_at(now.body.odometry.x_m, now.body.odometry.y_m)
+    }
+
+    pub fn features_at(&self, x_m: f32, y_m: f32) -> PlaceMemoryFeatures {
+        let key = self.quantize(x_m, y_m);
+        let current = self.cells.get(&key);
+        PlaceMemoryFeatures {
+            current_place_danger: current.map(|cell| cell.danger_score).unwrap_or(0.0),
+            current_place_charge: current.map(|cell| cell.charge_score).unwrap_or(0.0),
+            current_place_social: current.map(|cell| cell.social_score).unwrap_or(0.0),
+            current_place_novelty: current.map(|cell| cell.novelty_score).unwrap_or(1.0),
+            current_place_familiarity: current
+                .map(|cell| (cell.visit_count as f32 / 5.0).clamp(0.0, 1.0))
+                .unwrap_or(0.0),
+            nearby_best_charge_direction_rad: self
+                .best_direction_from(key, x_m, y_m, |cell| cell.charge_score * cell.confidence),
+            nearby_best_safe_direction_rad: self.best_direction_from(key, x_m, y_m, |cell| {
+                (1.0 - cell.danger_score) * cell.confidence * (0.25 + cell.visit_count as f32)
+            }),
+            places_visited: self.cells.len().try_into().unwrap_or(u32::MAX),
+        }
+    }
+
+    pub fn report(&self) -> PlaceMemoryReport {
+        let places_visited = self.cells.len();
+        let coverage_m2 = places_visited as f32 * self.config.cell_size_m * self.config.cell_size_m;
+        let novelty_mean = if places_visited == 0 {
+            0.0
+        } else {
+            self.cells
+                .values()
+                .map(|cell| cell.novelty_score)
+                .sum::<f32>()
+                / places_visited as f32
+        };
+        let mut warnings = Vec::new();
+        if places_visited == 0 {
+            warnings.push("no place memory cells observed".to_string());
+        }
+        if !self.cells.values().any(|cell| cell.charge_score >= 0.5) {
+            warnings.push("no strong charge memory cells".to_string());
+        }
+        if !self.cells.values().any(|cell| cell.danger_score >= 0.5) {
+            warnings.push("no strong danger memory cells".to_string());
+        }
+        if !self.cells.values().any(|cell| cell.social_score >= 0.5) {
+            warnings.push("no strong social memory cells".to_string());
+        }
+        PlaceMemoryReport {
+            places_visited,
+            coverage_m2,
+            top_danger_cells: top_cells(&self.cells, |cell| cell.danger_score),
+            top_charge_cells: top_cells(&self.cells, |cell| cell.charge_score),
+            top_social_cells: top_cells(&self.cells, |cell| cell.social_score),
+            novelty_mean,
+            warnings,
+        }
+    }
+
+    fn decay(&mut self, ticks: u64) {
+        let score_factor = SCORE_DECAY_PER_TICK.powi(ticks.min(i32::MAX as u64) as i32);
+        let confidence_factor =
+            CELL_CONFIDENCE_DECAY_PER_TICK.powi(ticks.min(i32::MAX as u64) as i32);
+        for cell in self.cells.values_mut() {
+            cell.danger_score *= score_factor;
+            cell.charge_score *= score_factor;
+            cell.social_score *= score_factor;
+            cell.confidence *= confidence_factor;
+        }
+    }
+
+    fn best_direction_from(
+        &self,
+        key: PlaceCellKey,
+        x_m: f32,
+        y_m: f32,
+        score: impl Fn(&PlaceCell) -> f32,
+    ) -> Option<f32> {
+        self.cells
+            .values()
+            .filter(|cell| {
+                (cell.key.x - key.x).abs() <= RECALL_RADIUS_CELLS
+                    && (cell.key.y - key.y).abs() <= RECALL_RADIUS_CELLS
+                    && cell.key != key
+            })
+            .filter_map(|cell| {
+                let value = score(cell);
+                (value > 0.05).then_some((value, cell))
+            })
+            .max_by(|left, right| {
+                left.0
+                    .partial_cmp(&right.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(_, cell)| (cell.center_y_m - y_m).atan2(cell.center_x_m - x_m))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {
     pub frame_id: uuid::Uuid,
@@ -107,6 +353,7 @@ pub struct MemoryRecord {
 #[derive(Clone, Default)]
 pub struct InMemoryExperienceStore {
     records: Arc<Mutex<Vec<MemoryRecord>>>,
+    places: Arc<Mutex<PlaceMemory>>,
 }
 
 impl InMemoryExperienceStore {
@@ -116,6 +363,17 @@ impl InMemoryExperienceStore {
 
     pub fn snapshot(&self) -> Vec<MemoryRecord> {
         self.records.lock().expect("memory mutex poisoned").clone()
+    }
+
+    pub fn place_snapshot(&self) -> PlaceMemory {
+        self.places
+            .lock()
+            .expect("place memory mutex poisoned")
+            .clone()
+    }
+
+    pub fn place_report(&self) -> PlaceMemoryReport {
+        self.place_snapshot().report()
     }
 }
 
@@ -169,7 +427,24 @@ impl MemoryStore for InMemoryExperienceStore {
 
 #[async_trait]
 impl Recall for InMemoryExperienceStore {
+    async fn observe_now(&self, now: &Now) -> Result<()> {
+        self.places
+            .lock()
+            .expect("place memory mutex poisoned")
+            .observe_now(now);
+        Ok(())
+    }
+
     async fn recall(&self, query: RecallQuery) -> Result<RecallBundle> {
+        let place_features = query
+            .pose
+            .map(|pose| {
+                self.places
+                    .lock()
+                    .expect("place memory mutex poisoned")
+                    .features_at(pose.x_m, pose.y_m)
+            })
+            .unwrap_or_default();
         let records = self.snapshot();
         let mut scored = records
             .into_iter()
@@ -261,9 +536,14 @@ impl Recall for InMemoryExperienceStore {
         let graph_context_summary = graph_context_summary(&remembered_entities);
 
         let sense = MemorySense {
-            place_familiarity,
-            place_danger,
-            place_charge_value,
+            place_familiarity: place_familiarity.max(place_features.current_place_familiarity),
+            place_danger: place_danger.max(place_features.current_place_danger),
+            place_charge_value: place_charge_value.max(place_features.current_place_charge),
+            place_social_value: place_features.current_place_social,
+            place_novelty: place_features.current_place_novelty,
+            nearby_best_charge_direction_rad: place_features.nearby_best_charge_direction_rad,
+            nearby_best_safe_direction_rad: place_features.nearby_best_safe_direction_rad,
+            places_visited: place_features.places_visited,
             face_familiarity,
             voice_familiarity,
             similar_situation_count: hits.len().try_into().unwrap_or(u16::MAX),
@@ -290,6 +570,120 @@ impl Recall for InMemoryExperienceStore {
             recollections,
         })
     }
+}
+
+pub fn place_memory_report_from_frames(frames: &[ExperienceFrame]) -> PlaceMemoryReport {
+    let mut memory = PlaceMemory::new();
+    for frame in frames {
+        memory.observe_now(&frame.now);
+    }
+    memory.report()
+}
+
+fn danger_signal(now: &Now) -> f32 {
+    let body = &now.body;
+    let bumper = body.flags.bump_left || body.flags.bump_right;
+    let cliff = body.flags.cliff_left
+        || body.flags.cliff_front_left
+        || body.flags.cliff_front_right
+        || body.flags.cliff_right;
+    let cliff_sensor = body.cliff_sensors.max();
+    let nearest = now.range.nearest_m.unwrap_or(10.0);
+    let range_risk = (1.0 - nearest / 0.7).clamp(0.0, 1.0);
+    [
+        if bumper { 1.0 } else { 0.0 },
+        if body.flags.wall { 0.85 } else { 0.0 },
+        if cliff {
+            1.0
+        } else {
+            cliff_sensor.clamp(0.0, 1.0)
+        },
+        range_risk,
+    ]
+    .into_iter()
+    .fold(0.0, f32::max)
+}
+
+fn charge_signal(now: &Now) -> f32 {
+    let sim_score = now
+        .extensions
+        .get("sim.world")
+        .and_then(|value| value.get("values"))
+        .and_then(|value| value.as_array())
+        .and_then(|values| {
+            let near = values
+                .get(3)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0) as f32;
+            let visible = values
+                .get(4)
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0) as f32;
+            Some(near.max(visible))
+        })
+        .unwrap_or(0.0);
+    [if now.body.charging { 1.0 } else { 0.0 }, sim_score]
+        .into_iter()
+        .fold(0.0, f32::max)
+}
+
+fn social_signal(now: &Now) -> f32 {
+    let visual = (!now.face.embeddings.is_empty() || !now.face.vectors.is_empty()) as u8 as f32;
+    let voice = (!now.voice.embeddings.is_empty() || !now.voice.vectors.is_empty()) as u8 as f32;
+    let skeleton = (!now.kinect.skeletons.is_empty()) as u8 as f32;
+    let transcript = now
+        .ear
+        .transcript
+        .as_ref()
+        .map(|text| (!text.trim().is_empty()) as u8 as f32)
+        .unwrap_or(0.0);
+    visual.max(voice).max(skeleton).max(transcript)
+}
+
+fn observed_object_summary(now: &Now) -> Vec<String> {
+    let mut objects = Vec::new();
+    if danger_signal(now) >= 0.5 {
+        objects.push("danger".to_string());
+    }
+    if charge_signal(now) >= 0.5 {
+        objects.push("charger".to_string());
+    }
+    if social_signal(now) >= 0.5 {
+        objects.push("person_or_speaker".to_string());
+    }
+    objects
+}
+
+fn top_cells(
+    cells: &BTreeMap<PlaceCellKey, PlaceCell>,
+    score: impl Fn(&PlaceCell) -> f32,
+) -> Vec<PlaceCellSummary> {
+    let mut scored = cells
+        .values()
+        .map(|cell| (score(cell), cell))
+        .filter(|(score, _)| *score > 0.0)
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    scored
+        .into_iter()
+        .take(5)
+        .map(|(score, cell)| PlaceCellSummary {
+            x: cell.key.x,
+            y: cell.key.y,
+            center_x_m: cell.center_x_m,
+            center_y_m: cell.center_y_m,
+            score,
+            visit_count: cell.visit_count,
+            last_seen_tick: cell.last_seen_tick,
+            confidence: cell.confidence,
+            last_observed_objects: cell.last_observed_objects.clone(),
+        })
+        .collect()
 }
 
 fn score_record(query: &RecallQuery, record: MemoryRecord) -> Option<(f32, MemoryRecord)> {
@@ -836,5 +1230,109 @@ mod tests {
         );
 
         assert!((score - 1.0).abs() < f32::EPSILON);
+    }
+
+    fn now_at(t_ms: u64, x_m: f32, y_m: f32) -> Now {
+        let mut body = BodySense::default();
+        body.odometry.x_m = x_m;
+        body.odometry.y_m = y_m;
+        Now::blank(t_ms, body)
+    }
+
+    fn add_sim_world_extension(now: &mut Now, charger_near: f32, charger_visible: f32) {
+        now.extensions.insert(
+            "sim.world".to_string(),
+            serde_json::json!({
+                "schema_version": 1,
+                "values": [8.0, 8.0, 1.0, charger_near, charger_visible],
+            }),
+        );
+    }
+
+    #[test]
+    fn place_quantization_is_stable_inside_cell() {
+        let memory = PlaceMemory::new();
+
+        assert_eq!(memory.quantize(1.01, 2.01), memory.quantize(1.49, 2.49));
+        assert_ne!(memory.quantize(1.49, 2.49), memory.quantize(1.51, 2.49));
+    }
+
+    #[test]
+    fn danger_update_increases_danger_score() {
+        let mut memory = PlaceMemory::new();
+        let mut now = now_at(100, 1.0, 1.0);
+        now.body.flags.bump_left = true;
+
+        let features = memory.observe_now(&now);
+
+        assert!(features.current_place_danger >= 0.9);
+        assert_eq!(features.places_visited, 1);
+    }
+
+    #[test]
+    fn charge_update_increases_charge_score() {
+        let mut memory = PlaceMemory::new();
+        let mut now = now_at(100, 1.0, 1.0);
+        add_sim_world_extension(&mut now, 0.8, 0.2);
+
+        let features = memory.observe_now(&now);
+
+        assert!(features.current_place_charge >= 0.8);
+    }
+
+    #[test]
+    fn social_update_increases_social_score() {
+        let mut memory = PlaceMemory::new();
+        let mut now = now_at(100, 1.0, 1.0);
+        now.face.embeddings.push(vec![1.0, 0.0]);
+
+        let features = memory.observe_now(&now);
+
+        assert!(features.current_place_social >= 1.0);
+    }
+
+    #[test]
+    fn scores_decay_between_observations() {
+        let mut memory = PlaceMemory::new();
+        let mut now = now_at(100, 1.0, 1.0);
+        now.body.flags.bump_left = true;
+        let first = memory.observe_now(&now);
+
+        let second = memory.observe_now(&now_at(10_100, 1.0, 1.0));
+
+        assert!(second.current_place_danger < first.current_place_danger);
+    }
+
+    #[test]
+    fn recall_returns_nearby_charger_direction() {
+        let mut memory = PlaceMemory::new();
+        let mut charge_now = now_at(100, 1.0, 0.0);
+        add_sim_world_extension(&mut charge_now, 1.0, 0.0);
+        memory.observe_now(&charge_now);
+
+        let features = memory.features_at(0.0, 0.0);
+
+        let direction = features.nearby_best_charge_direction_rad.unwrap();
+        assert!(direction.abs() < 0.4);
+    }
+
+    #[test]
+    fn compact_memory_features_serialize() {
+        let features = PlaceMemoryFeatures {
+            current_place_danger: 0.2,
+            current_place_charge: 0.7,
+            current_place_social: 0.3,
+            current_place_novelty: 0.4,
+            current_place_familiarity: 0.5,
+            nearby_best_charge_direction_rad: Some(1.0),
+            nearby_best_safe_direction_rad: None,
+            places_visited: 3,
+        };
+
+        let json = serde_json::to_value(&features).unwrap();
+
+        let charge = json["current_place_charge"].as_f64().unwrap();
+        assert!((charge - 0.7).abs() < 0.000_001);
+        assert_eq!(json["places_visited"], 3);
     }
 }

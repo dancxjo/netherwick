@@ -4770,6 +4770,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "image",
  "netherwick-actions",
  "netherwick-autonomic",
  "netherwick-body",
@@ -4782,6 +4784,7 @@ dependencies = [
  "netherwick-now",
  "netherwick-runtime",
  "netherwick-sensors",
+ "netherwick-worldlab",
  "serde",
  "serde_json",
  "tokio",

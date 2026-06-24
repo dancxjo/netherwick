@@ -19,19 +19,21 @@ use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
 use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
-use netherwick_memory::InMemoryExperienceStore;
+use netherwick_memory::{
+    place_memory_report_from_frames, InMemoryExperienceStore, PlaceMemoryReport,
+};
 use netherwick_models::MODEL_REGISTRY;
 use netherwick_now::{EarSense, KinectSense, RangeSense};
 use netherwick_runtime::{
-    MinimalRuntime, RealRobotRunner, RobotMode, RuntimeLoop, RuntimeModelStack, RuntimeTick,
-    SimRunner,
+    ActionSelectionDecision, ActionSelectorMode, MinimalRuntime, RealRobotRunner, RobotMode,
+    RuntimeLoop, RuntimeModelStack, RuntimeTick, SimRunner,
 };
 use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
     MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, WorldSnapshot,
 };
-use netherwick_server::LiveViewState;
-use netherwick_sim::{build_scenario, default_sim_world, ScenarioConfig, ScenarioKind};
+use netherwick_server::{LiveSceneMetadata, LiveViewState, SceneArena, SceneObject};
+use netherwick_sim::{build_scenario, ScenarioConfig, ScenarioKind, SimObjectKind};
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
     EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
@@ -57,6 +59,7 @@ enum Command {
     Sim(SimArgs),
     SimCurriculum(SimCurriculumArgs),
     EvalScenario(EvalScenarioArgs),
+    MemoryInspect(MemoryInspectArgs),
     Robot(RobotArgs),
     HardwareEnv(HardwareEnvArgs),
     Replay,
@@ -84,6 +87,7 @@ async fn main() -> Result<()> {
         Command::Sim(args) => run_sim(args).await,
         Command::SimCurriculum(args) => run_sim_curriculum(args).await,
         Command::EvalScenario(args) => run_eval_scenario(args).await,
+        Command::MemoryInspect(args) => memory_inspect(args).await,
         Command::Robot(args) => run_robot(args).await,
         Command::HardwareEnv(args) => hardware_env(args).await,
         Command::CaptureSim(args) => capture_sim(args).await,
@@ -143,6 +147,8 @@ struct SimArgs {
     experience_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     experience_mode: ExperienceMode,
+    #[arg(long, value_enum, default_value = "baseline")]
+    action_selector: CliActionSelectorMode,
     #[arg(long)]
     live: bool,
     #[arg(long, default_value = "127.0.0.1:8787")]
@@ -196,6 +202,8 @@ struct EvalScenarioArgs {
     #[arg(long)]
     capture_root: Option<String>,
     #[arg(long)]
+    memory_report: bool,
+    #[arg(long)]
     danger_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     danger_mode: DangerMode,
@@ -223,8 +231,35 @@ struct EvalScenarioArgs {
     experience_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     experience_mode: ExperienceMode,
+    #[arg(long, value_enum, default_value = "baseline")]
+    action_selector: CliActionSelectorMode,
     #[command(flatten)]
     llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct MemoryInspectArgs {
+    #[arg(long)]
+    ledger: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliActionSelectorMode {
+    Baseline,
+    Random,
+    ModelAssisted,
+    Scripted,
+}
+
+impl From<CliActionSelectorMode> for ActionSelectorMode {
+    fn from(value: CliActionSelectorMode) -> Self {
+        match value {
+            CliActionSelectorMode::Baseline => ActionSelectorMode::Baseline,
+            CliActionSelectorMode::Random => ActionSelectorMode::Random,
+            CliActionSelectorMode::ModelAssisted => ActionSelectorMode::ModelAssisted,
+            CliActionSelectorMode::Scripted => ActionSelectorMode::Scripted,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Parser)]
@@ -689,15 +724,20 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         SimpleConductor::default(),
         SimpleSafety::default(),
         llm,
-    );
+    )
+    .with_action_selector_mode(args.action_selector.into());
     if let Some(models) = load_runtime_models(&args)? {
         runtime = runtime.with_models(models);
     }
 
-    let (world, motors) = default_sim_world(args.seed);
+    let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::MixedRoom, args.seed));
+    let live_metadata = live_scene_metadata_from_scenario(&scenario.metadata);
+    let world = scenario.world;
+    let motors = scenario.motors;
     let mut runner = SimRunner::new(runtime, world, motors);
     if args.live {
         let live_state = LiveViewState::new();
+        live_state.update_scene_metadata(live_metadata);
         let server_state = live_state.clone();
         let live_addr = args.live_addr;
         tokio::spawn(async move {
@@ -706,6 +746,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             }
         });
         println!("live robot view: http://{}/view", args.live_addr);
+        println!("live robot 3D view: http://{}/view/3d", args.live_addr);
         for _ in 0..args.steps {
             runner
                 .run_steps_observing(1, |snapshot| live_state.update(snapshot.clone()))
@@ -716,10 +757,11 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         runner.run_steps(args.steps).await?;
     }
     println!(
-        "sim complete: {} ticks, seed {}, ledger {}, danger_mode {:?}, charge_mode {:?}, action_value_mode {:?}, eye_next_mode {:?}, ear_next_mode {:?}, experience_mode {:?}",
+        "sim complete: {} ticks, seed {}, ledger {}, action_selector {:?}, danger_mode {:?}, charge_mode {:?}, action_value_mode {:?}, eye_next_mode {:?}, ear_next_mode {:?}, experience_mode {:?}",
         runner.tick_count,
         args.seed,
         args.ledger,
+        args.action_selector,
         args.danger_mode,
         args.charge_mode,
         args.action_value_mode,
@@ -728,6 +770,37 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         args.experience_mode
     );
     Ok(())
+}
+
+fn live_scene_metadata_from_scenario(
+    metadata: &netherwick_sim::ScenarioMetadata,
+) -> LiveSceneMetadata {
+    LiveSceneMetadata {
+        arena: Some(SceneArena {
+            width_m: metadata.arena.width_m,
+            height_m: metadata.arena.height_m,
+        }),
+        objects: metadata
+            .objects
+            .iter()
+            .map(|object| SceneObject {
+                id: object.id.clone(),
+                kind: match &object.kind {
+                    SimObjectKind::Obstacle => "obstacle",
+                    SimObjectKind::Charger => "charger",
+                    SimObjectKind::Person { .. } => "person",
+                    SimObjectKind::SoundSource { .. } => "speaker",
+                    SimObjectKind::Landmark { .. } => "landmark",
+                }
+                .to_string(),
+                x_m: object.x_m,
+                y_m: object.y_m,
+                radius_m: object.radius_m,
+                label: Some(object.label.clone()),
+                color_rgb: Some(object.color_rgb),
+            })
+            .collect(),
+    }
 }
 
 async fn run_sim_curriculum(args: SimCurriculumArgs) -> Result<()> {
@@ -897,11 +970,14 @@ struct ScenarioEvaluationReport {
     episodes: usize,
     steps_per_episode: usize,
     tick_ms: u64,
+    action_selector_mode: String,
     model_modes: HashMap<String, String>,
     model_loading: RuntimeModelLoadReport,
     ledger: Option<String>,
     capture_root: Option<String>,
     summary: ScenarioEvaluationSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<ScenarioMemorySummary>,
     episodes_detail: Vec<ScenarioEpisodeReport>,
     recommendation: String,
     warnings: Vec<String>,
@@ -921,6 +997,10 @@ struct ScenarioEvaluationSummary {
     mean_safety_interventions: f32,
     behavior_run_records: usize,
     model_fallbacks: usize,
+    model_assisted_decisions: usize,
+    action_selector_safety_overrides: usize,
+    mean_chosen_score: Option<f32>,
+    mean_candidate_score: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -949,14 +1029,49 @@ struct ScenarioEpisodeReport {
     safety_interventions: usize,
     behavior_run_records: usize,
     model_fallbacks: usize,
+    model_assisted_decisions: usize,
+    action_selector_safety_overrides: usize,
+    action_selector_fallbacks: usize,
+    mean_chosen_score: Option<f32>,
+    mean_candidate_score: Option<f32>,
     ticks_with_eye_frames: usize,
     ticks_with_ear_features: usize,
     ticks_with_voice_embeddings: usize,
     ticks_with_face_embeddings: usize,
     ticks_with_kinect_skeletons: usize,
     ticks_with_future_predictions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<ScenarioEpisodeMemoryReport>,
     capture: Option<String>,
     ledger: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioMemorySummary {
+    places_visited: usize,
+    mean_places_visited_per_episode: f32,
+    charge_memory_hit_rate: Option<f32>,
+    danger_memory_hit_rate: Option<f32>,
+    social_memory_hit_rate: Option<f32>,
+    novelty_decay_sane: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioEpisodeMemoryReport {
+    places_visited: usize,
+    charge_memory_ticks: usize,
+    charge_opportunity_ticks: usize,
+    charge_memory_hit_rate: Option<f32>,
+    danger_memory_ticks: usize,
+    danger_opportunity_ticks: usize,
+    danger_memory_hit_rate: Option<f32>,
+    social_memory_ticks: usize,
+    social_opportunity_ticks: usize,
+    social_memory_hit_rate: Option<f32>,
+    first_novelty: Option<f32>,
+    final_novelty: Option<f32>,
+    novelty_decayed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -987,12 +1102,20 @@ struct EpisodeMetricBuilder {
     safety_interventions: usize,
     behavior_run_records: usize,
     model_fallbacks: usize,
+    model_assisted_decisions: usize,
+    action_selector_safety_overrides: usize,
+    action_selector_fallbacks: usize,
+    chosen_score_sum: f32,
+    chosen_score_count: usize,
+    candidate_score_sum: f32,
+    candidate_score_count: usize,
     ticks_with_eye_frames: usize,
     ticks_with_ear_features: usize,
     ticks_with_voice_embeddings: usize,
     ticks_with_face_embeddings: usize,
     ticks_with_kinect_skeletons: usize,
     ticks_with_future_predictions: usize,
+    memory: ScenarioEpisodeMemoryBuilder,
 }
 
 impl EpisodeMetricBuilder {
@@ -1031,12 +1154,20 @@ impl EpisodeMetricBuilder {
             safety_interventions: 0,
             behavior_run_records: 0,
             model_fallbacks: 0,
+            model_assisted_decisions: 0,
+            action_selector_safety_overrides: 0,
+            action_selector_fallbacks: 0,
+            chosen_score_sum: 0.0,
+            chosen_score_count: 0,
+            candidate_score_sum: 0.0,
+            candidate_score_count: 0,
             ticks_with_eye_frames: 0,
             ticks_with_ear_features: 0,
             ticks_with_voice_embeddings: 0,
             ticks_with_face_embeddings: 0,
             ticks_with_kinect_skeletons: 0,
             ticks_with_future_predictions: 0,
+            memory: ScenarioEpisodeMemoryBuilder::default(),
         }
     }
 
@@ -1109,6 +1240,7 @@ impl EpisodeMetricBuilder {
             self.safety_interventions = self.safety_interventions.saturating_add(1);
         }
         self.observe_behavior_runs(&tick.frame.behavior_runs);
+        self.observe_action_selector(tick);
         if snapshot.eye_frame.is_some() || !snapshot.eye.frames.is_empty() {
             self.ticks_with_eye_frames = self.ticks_with_eye_frames.saturating_add(1);
         }
@@ -1128,6 +1260,7 @@ impl EpisodeMetricBuilder {
             self.ticks_with_future_predictions =
                 self.ticks_with_future_predictions.saturating_add(1);
         }
+        self.memory.observe(snapshot, tick);
     }
 
     fn observe_behavior_runs(&mut self, records: &[ErasedBehaviorRunRecord]) {
@@ -1143,6 +1276,38 @@ impl EpisodeMetricBuilder {
                 })
                 .count(),
         );
+    }
+
+    fn observe_action_selector(&mut self, tick: &RuntimeTick) {
+        let Some(value) = tick.frame.now.extensions.get("action_selector") else {
+            return;
+        };
+        let Ok(decision) = serde_json::from_value::<ActionSelectionDecision>(value.clone()) else {
+            return;
+        };
+        if decision.mode == ActionSelectorMode::ModelAssisted {
+            self.model_assisted_decisions = self.model_assisted_decisions.saturating_add(1);
+        }
+        if decision.safety_overrode {
+            self.action_selector_safety_overrides =
+                self.action_selector_safety_overrides.saturating_add(1);
+        }
+        if !decision.fallback_warnings.is_empty()
+            || decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate.fallback_used)
+        {
+            self.action_selector_fallbacks = self.action_selector_fallbacks.saturating_add(1);
+        }
+        if let Some(score) = decision.selected_score {
+            self.chosen_score_sum += score;
+            self.chosen_score_count = self.chosen_score_count.saturating_add(1);
+        }
+        for candidate in decision.candidates {
+            self.candidate_score_sum += candidate.score;
+            self.candidate_score_count = self.candidate_score_count.saturating_add(1);
+        }
     }
 
     fn finish(self) -> ScenarioEpisodeReport {
@@ -1197,17 +1362,116 @@ impl EpisodeMetricBuilder {
             safety_interventions: self.safety_interventions,
             behavior_run_records: self.behavior_run_records,
             model_fallbacks: self.model_fallbacks,
+            model_assisted_decisions: self.model_assisted_decisions,
+            action_selector_safety_overrides: self.action_selector_safety_overrides,
+            action_selector_fallbacks: self.action_selector_fallbacks,
+            mean_chosen_score: (self.chosen_score_count > 0)
+                .then_some(self.chosen_score_sum / self.chosen_score_count as f32),
+            mean_candidate_score: (self.candidate_score_count > 0)
+                .then_some(self.candidate_score_sum / self.candidate_score_count as f32),
             ticks_with_eye_frames: self.ticks_with_eye_frames,
             ticks_with_ear_features: self.ticks_with_ear_features,
             ticks_with_voice_embeddings: self.ticks_with_voice_embeddings,
             ticks_with_face_embeddings: self.ticks_with_face_embeddings,
             ticks_with_kinect_skeletons: self.ticks_with_kinect_skeletons,
             ticks_with_future_predictions: self.ticks_with_future_predictions,
+            memory: Some(self.memory.finish()),
             capture: self.capture,
             ledger: self.ledger,
         };
         report.success = episode_success(self.kind, &report);
         report
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScenarioEpisodeMemoryBuilder {
+    max_places_visited: usize,
+    charge_memory_ticks: usize,
+    charge_opportunity_ticks: usize,
+    danger_memory_ticks: usize,
+    danger_opportunity_ticks: usize,
+    social_memory_ticks: usize,
+    social_opportunity_ticks: usize,
+    first_novelty: Option<f32>,
+    final_novelty: Option<f32>,
+}
+
+impl ScenarioEpisodeMemoryBuilder {
+    fn observe(&mut self, snapshot: &WorldSnapshot, tick: &RuntimeTick) {
+        let memory = &tick.frame.now.memory;
+        self.max_places_visited = self.max_places_visited.max(memory.places_visited as usize);
+        self.first_novelty.get_or_insert(memory.place_novelty);
+        self.final_novelty = Some(memory.place_novelty);
+
+        let charger_near = snapshot.body.charging
+            || sim_world_score(snapshot, 3).max(sim_world_score(snapshot, 4)) >= 0.3;
+        if charger_near {
+            self.charge_opportunity_ticks = self.charge_opportunity_ticks.saturating_add(1);
+        }
+        if memory.place_charge_value >= 0.3 {
+            self.charge_memory_ticks = self.charge_memory_ticks.saturating_add(1);
+        }
+
+        let danger_near = snapshot.body.flags.bump_left
+            || snapshot.body.flags.bump_right
+            || snapshot.body.flags.wall
+            || snapshot.body.flags.cliff_left
+            || snapshot.body.flags.cliff_front_left
+            || snapshot.body.flags.cliff_front_right
+            || snapshot.body.flags.cliff_right
+            || snapshot
+                .range
+                .nearest_m
+                .map(|nearest| nearest <= 0.35)
+                .unwrap_or(false);
+        if danger_near {
+            self.danger_opportunity_ticks = self.danger_opportunity_ticks.saturating_add(1);
+        }
+        if memory.place_danger >= 0.3 {
+            self.danger_memory_ticks = self.danger_memory_ticks.saturating_add(1);
+        }
+
+        let social_seen = !snapshot.face.embeddings.is_empty()
+            || !snapshot.voice.embeddings.is_empty()
+            || !snapshot.kinect.skeletons.is_empty();
+        if social_seen {
+            self.social_opportunity_ticks = self.social_opportunity_ticks.saturating_add(1);
+        }
+        if memory.place_social_value >= 0.3 {
+            self.social_memory_ticks = self.social_memory_ticks.saturating_add(1);
+        }
+    }
+
+    fn finish(self) -> ScenarioEpisodeMemoryReport {
+        ScenarioEpisodeMemoryReport {
+            places_visited: self.max_places_visited,
+            charge_memory_ticks: self.charge_memory_ticks,
+            charge_opportunity_ticks: self.charge_opportunity_ticks,
+            charge_memory_hit_rate: hit_rate(
+                self.charge_memory_ticks,
+                self.charge_opportunity_ticks,
+            ),
+            danger_memory_ticks: self.danger_memory_ticks,
+            danger_opportunity_ticks: self.danger_opportunity_ticks,
+            danger_memory_hit_rate: hit_rate(
+                self.danger_memory_ticks,
+                self.danger_opportunity_ticks,
+            ),
+            social_memory_ticks: self.social_memory_ticks,
+            social_opportunity_ticks: self.social_opportunity_ticks,
+            social_memory_hit_rate: hit_rate(
+                self.social_memory_ticks,
+                self.social_opportunity_ticks,
+            ),
+            first_novelty: self.first_novelty,
+            final_novelty: self.final_novelty,
+            novelty_decayed: self
+                .first_novelty
+                .zip(self.final_novelty)
+                .map(|(first, final_value)| final_value <= first)
+                .unwrap_or(false),
+        }
     }
 }
 
@@ -1248,12 +1512,14 @@ async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {
         );
         let (episode, warnings) = if let Some(ledger_path) = &args.ledger {
             let mut runtime = default_runtime(JsonlLedger::new(ledger_path), &args.llm)?;
+            runtime = runtime.with_action_selector_mode(args.action_selector.into());
             if let Some(models) = load_runtime_models_from_flags(&flags)?.0 {
                 runtime = runtime.with_models(models);
             }
             run_eval_episode(runtime, scenario.world, scenario.motors, &args, builder).await?
         } else {
             let mut runtime = default_noop_runtime(&args.llm)?;
+            runtime = runtime.with_action_selector_mode(args.action_selector.into());
             if let Some(models) = load_runtime_models_from_flags(&flags)?.0 {
                 runtime = runtime.with_models(models);
             }
@@ -1273,6 +1539,9 @@ async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {
     }
 
     let summary = summarize_episodes(&episodes_detail);
+    let memory = args
+        .memory_report
+        .then(|| summarize_episode_memory(&episodes_detail));
     let recommendation = scenario_recommendation(args.episodes, &summary);
     let report = ScenarioEvaluationReport {
         schema_version: 1,
@@ -1281,11 +1550,15 @@ async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {
         episodes: args.episodes,
         steps_per_episode: args.steps,
         tick_ms: args.tick_ms,
+        action_selector_mode: ActionSelectorMode::from(args.action_selector)
+            .as_str()
+            .to_string(),
         model_modes: model_modes_from_flags(&flags),
         model_loading: model_loading.clone(),
         ledger: args.ledger.clone(),
         capture_root: args.capture_root.clone(),
         summary,
+        memory,
         episodes_detail,
         recommendation,
         warnings: model_loading.warnings.clone(),
@@ -1452,6 +1725,76 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
             .map(|episode| episode.behavior_run_records)
             .sum(),
         model_fallbacks: episodes.iter().map(|episode| episode.model_fallbacks).sum(),
+        model_assisted_decisions: episodes
+            .iter()
+            .map(|episode| episode.model_assisted_decisions)
+            .sum(),
+        action_selector_safety_overrides: episodes
+            .iter()
+            .map(|episode| episode.action_selector_safety_overrides)
+            .sum(),
+        mean_chosen_score: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_chosen_score),
+        ),
+        mean_candidate_score: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_candidate_score),
+        ),
+    }
+}
+
+fn summarize_episode_memory(episodes: &[ScenarioEpisodeReport]) -> ScenarioMemorySummary {
+    let memory_reports = episodes
+        .iter()
+        .filter_map(|episode| episode.memory.as_ref())
+        .collect::<Vec<_>>();
+    if memory_reports.is_empty() {
+        return ScenarioMemorySummary {
+            novelty_decay_sane: false,
+            warnings: vec!["no episode memory reports".to_string()],
+            ..ScenarioMemorySummary::default()
+        };
+    }
+    let places_visited = memory_reports
+        .iter()
+        .map(|memory| memory.places_visited)
+        .max()
+        .unwrap_or(0);
+    let mut warnings = Vec::new();
+    if places_visited == 0 {
+        warnings.push("memory observed zero places".to_string());
+    }
+    let novelty_decay_sane = memory_reports.iter().any(|memory| memory.novelty_decayed);
+    if !novelty_decay_sane {
+        warnings.push("novelty did not decay in any episode".to_string());
+    }
+    ScenarioMemorySummary {
+        places_visited,
+        mean_places_visited_per_episode: mean(
+            memory_reports
+                .iter()
+                .map(|memory| memory.places_visited as f32),
+        ),
+        charge_memory_hit_rate: aggregate_hit_rate(
+            memory_reports
+                .iter()
+                .map(|memory| (memory.charge_memory_ticks, memory.charge_opportunity_ticks)),
+        ),
+        danger_memory_hit_rate: aggregate_hit_rate(
+            memory_reports
+                .iter()
+                .map(|memory| (memory.danger_memory_ticks, memory.danger_opportunity_ticks)),
+        ),
+        social_memory_hit_rate: aggregate_hit_rate(
+            memory_reports
+                .iter()
+                .map(|memory| (memory.social_memory_ticks, memory.social_opportunity_ticks)),
+        ),
+        novelty_decay_sane,
+        warnings,
     }
 }
 
@@ -1488,6 +1831,26 @@ fn distance_between(left: (f32, f32), right: (f32, f32)) -> f32 {
     let dx = left.0 - right.0;
     let dy = left.1 - right.1;
     ((dx * dx) + (dy * dy)).sqrt()
+}
+
+fn hit_rate(hits: usize, opportunities: usize) -> Option<f32> {
+    (opportunities > 0).then_some(hits as f32 / opportunities as f32)
+}
+
+fn aggregate_hit_rate(pairs: impl Iterator<Item = (usize, usize)>) -> Option<f32> {
+    let (hits, opportunities) = pairs.fold((0usize, 0usize), |acc, pair| {
+        (acc.0.saturating_add(pair.0), acc.1.saturating_add(pair.1))
+    });
+    hit_rate(hits, opportunities)
+}
+
+fn sim_world_score(snapshot: &WorldSnapshot, index: usize) -> f32 {
+    snapshot
+        .extensions
+        .iter()
+        .find(|extension| extension.name == "sim.world")
+        .and_then(|extension| extension.values.get(index).copied())
+        .unwrap_or(0.0)
 }
 
 fn mean(values: impl Iterator<Item = f32>) -> f32 {
@@ -3531,6 +3894,53 @@ async fn inspect_ledger() -> Result<()> {
     Ok(())
 }
 
+async fn memory_inspect(args: MemoryInspectArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let frames = ledger.range(0, u64::MAX).await?;
+    let report = place_memory_report_from_frames(&frames);
+    print_memory_report(&args.ledger, frames.len(), &report);
+    Ok(())
+}
+
+fn print_memory_report(source: &str, frame_count: usize, report: &PlaceMemoryReport) {
+    println!("memory report: {source}");
+    println!("  frames: {frame_count}");
+    println!("  places_visited: {}", report.places_visited);
+    println!("  coverage_m2: {:.2}", report.coverage_m2);
+    println!("  novelty_mean: {:.3}", report.novelty_mean);
+    print_place_cells("top danger cells", &report.top_danger_cells);
+    print_place_cells("top charge cells", &report.top_charge_cells);
+    print_place_cells("top social cells", &report.top_social_cells);
+    if report.warnings.is_empty() {
+        println!("  warnings: none");
+    } else {
+        println!("  warnings:");
+        for warning in &report.warnings {
+            println!("    - {warning}");
+        }
+    }
+}
+
+fn print_place_cells(label: &str, cells: &[netherwick_memory::PlaceCellSummary]) {
+    println!("  {label}:");
+    if cells.is_empty() {
+        println!("    none");
+        return;
+    }
+    for cell in cells {
+        println!(
+            "    - cell=({}, {}) center=({:.2}, {:.2}) score={:.3} visits={} confidence={:.3}",
+            cell.x,
+            cell.y,
+            cell.center_x_m,
+            cell.center_y_m,
+            cell.score,
+            cell.visit_count,
+            cell.confidence
+        );
+    }
+}
+
 async fn run_train(command: TrainCommand) -> Result<()> {
     match command.model {
         TrainModel::Behavior(args) => train_behavior_command(args).await,
@@ -4608,6 +5018,7 @@ mod tests {
             out,
             ledger: None,
             capture_root: None,
+            memory_report: false,
             danger_checkpoint: None,
             danger_mode: DangerMode::Off,
             charge_checkpoint: None,
@@ -4622,6 +5033,7 @@ mod tests {
             ear_next_mode: EarNextMode::Off,
             experience_checkpoint: None,
             experience_mode: ExperienceMode::Off,
+            action_selector: CliActionSelectorMode::Baseline,
             llm: LlmArgs::default(),
         }
     }
@@ -4861,11 +5273,13 @@ mod tests {
             episodes: 1,
             steps_per_episode: 2,
             tick_ms: 100,
+            action_selector_mode: "baseline".to_string(),
             model_modes: HashMap::new(),
             model_loading: RuntimeModelLoadReport::default(),
             ledger: None,
             capture_root: None,
             summary: ScenarioEvaluationSummary::default(),
+            memory: None,
             episodes_detail: Vec::new(),
             recommendation: "insufficient_data".to_string(),
             warnings: Vec::new(),
@@ -5132,17 +5546,52 @@ mod tests {
     async fn eval_scenario_obstacle_writes_report() {
         let temp_dir = temp_path("netherwick_eval_scenario_obstacle");
         let out = temp_dir.join("obstacle.json");
-        let args = eval_args(
+        let mut args = eval_args(
             ScenarioArg::ObstacleAvoidance,
             3,
             5,
             Some(out.to_string_lossy().to_string()),
         );
+        args.memory_report = true;
         run_eval_scenario(args).await.unwrap();
         let report: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
         assert_eq!(report["scenario"], "obstacle-avoidance");
+        assert_eq!(report["action_selector_mode"], "baseline");
         assert_eq!(report["episodes_detail"].as_array().unwrap().len(), 3);
+        assert!(report["memory"]["places_visited"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            report["episodes_detail"][0]["memory"]["danger_memory_ticks"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_model_assisted_empty_room_runs_and_reports_stats() {
+        let temp_dir = temp_path("netherwick_eval_scenario_model_assisted_empty");
+        let out = temp_dir.join("empty-model-assisted.json");
+        let mut args = eval_args(
+            ScenarioArg::EmptyRoom,
+            1,
+            3,
+            Some(out.to_string_lossy().to_string()),
+        );
+        args.action_selector = CliActionSelectorMode::ModelAssisted;
+        run_eval_scenario(args).await.unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+        assert_eq!(report["action_selector_mode"], "model-assisted");
+        assert_eq!(report["summary"]["model_assisted_decisions"], 3);
+        assert!(report["summary"]["mean_candidate_score"].is_number());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_model_assisted_charger_seeking_runs() {
+        let mut args = eval_args(ScenarioArg::ChargerSeeking, 1, 3, None);
+        args.action_selector = CliActionSelectorMode::ModelAssisted;
+        run_eval_scenario(args).await.unwrap();
     }
 
     #[tokio::test]

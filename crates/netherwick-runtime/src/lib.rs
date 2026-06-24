@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use netherwick_actions::{
-    action_to_motion, action_to_motor_command, ActionPrimitive, ExploreStyle, ReignInput,
-    ReignOutcome, TurnDir,
+    action_to_motion, action_to_motor_command, ActionPrimitive, ApproachTarget, ExploreStyle,
+    ReignInput, ReignMode, ReignOutcome, TurnDir,
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_behaviors::{
@@ -58,7 +58,7 @@ pub struct MinimalRuntime<L, M, R, C, S, A>
 where
     L: LedgerWriter + Sync,
     M: MemoryStore,
-    R: Recall,
+    R: Recall + Sync,
     C: Conductor,
     S: SafetyLayer,
     A: LlmAgent,
@@ -75,9 +75,73 @@ where
     pub encoder: FeatureExperienceEncoder,
     pub predictor: StasisFuturePredictor,
     pub models: RuntimeModelStack,
+    pub action_selector_mode: ActionSelectorMode,
     pub surprise_computer: BaselineSurpriseComputer,
     pub reward_computer: BaselineRewardComputer,
     pub transition_builder: TransitionBuilder,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActionSelectorMode {
+    #[default]
+    Baseline,
+    Random,
+    ModelAssisted,
+    Scripted,
+}
+
+impl ActionSelectorMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Random => "random",
+            Self::ModelAssisted => "model-assisted",
+            Self::Scripted => "scripted",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ActionSelectionDecision {
+    pub mode: ActionSelectorMode,
+    pub candidates: Vec<ActionSelectionCandidateScore>,
+    pub selected_action: Option<ActionPrimitive>,
+    pub baseline_action: Option<ActionPrimitive>,
+    pub selected_score: Option<f32>,
+    pub safety_overrode: bool,
+    pub fallback_warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionSelectionCandidateScore {
+    pub action: ActionPrimitive,
+    pub score: f32,
+    pub danger: f32,
+    pub charge: f32,
+    pub action_value: f32,
+    pub curiosity: f32,
+    pub collision_risk: f32,
+    pub low_battery_risk: f32,
+    pub repeat_penalty: f32,
+    pub fallback_used: bool,
+}
+
+impl Default for ActionSelectionCandidateScore {
+    fn default() -> Self {
+        Self {
+            action: ActionPrimitive::Stop,
+            score: 0.0,
+            danger: 0.0,
+            charge: 0.0,
+            action_value: 0.0,
+            curiosity: 0.0,
+            collision_risk: 0.0,
+            low_battery_risk: 0.0,
+            repeat_penalty: 0.0,
+            fallback_used: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1389,7 +1453,7 @@ impl<L, M, R, C, S, A> MinimalRuntime<L, M, R, C, S, A>
 where
     L: LedgerWriter + Sync,
     M: MemoryStore,
-    R: Recall,
+    R: Recall + Sync,
     C: Conductor,
     S: SafetyLayer,
     A: LlmAgent,
@@ -1415,6 +1479,7 @@ where
             encoder: FeatureExperienceEncoder::new(),
             predictor: StasisFuturePredictor,
             models: RuntimeModelStack::default(),
+            action_selector_mode: ActionSelectorMode::Baseline,
             surprise_computer: BaselineSurpriseComputer,
             reward_computer: BaselineRewardComputer,
             transition_builder: TransitionBuilder::new(),
@@ -1443,6 +1508,7 @@ where
             encoder: FeatureExperienceEncoder::new(),
             predictor: StasisFuturePredictor,
             models: RuntimeModelStack::default(),
+            action_selector_mode: ActionSelectorMode::Baseline,
             surprise_computer: BaselineSurpriseComputer,
             reward_computer: BaselineRewardComputer,
             transition_builder: TransitionBuilder::new(),
@@ -1465,10 +1531,15 @@ where
         self
     }
 
+    pub fn with_action_selector_mode(mut self, mode: ActionSelectorMode) -> Self {
+        self.action_selector_mode = mode;
+        self
+    }
+
     pub async fn tick(
         &mut self,
         mut now: Now,
-        mut latent: ExperienceLatent,
+        _latent: ExperienceLatent,
         mut futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick> {
         {
@@ -1510,7 +1581,7 @@ where
             }
         }
         behavior_runs.push(experience_record.erase());
-        latent = experience_run.chosen.latent.clone();
+        let latent = experience_run.chosen.latent.clone();
         if futures.is_empty() {
             let (predicted, records) =
                 predict_baseline_futures(&mut self.models.behaviors.future, &latent, now.t_ms)?;
@@ -1522,6 +1593,19 @@ where
             .memory_recall
             .recall(RecallQuery::from_now(&now))
             .await?;
+        now.memory = recall.sense.clone();
+        now.extensions.insert(
+            "memory.place".to_string(),
+            serde_json::json!({
+                "danger": now.memory.place_danger,
+                "charge": now.memory.place_charge_value,
+                "social": now.memory.place_social_value,
+                "novelty": now.memory.place_novelty,
+                "places_visited": now.memory.places_visited,
+                "nearby_best_charge_direction_rad": now.memory.nearby_best_charge_direction_rad,
+                "nearby_best_safe_direction_rad": now.memory.nearby_best_safe_direction_rad,
+            }),
+        );
 
         let mut sensations = derive_direct_sensations(&now);
         let mut impressions = derive_direct_impressions(&sensations, now.t_ms);
@@ -1598,7 +1682,7 @@ where
         let action_value_candidates =
             action_value_candidate_actions(&proposals, reign_action.as_ref(), &llm_tick);
 
-        let chosen_action = self.conductor.choose(ConductorInput {
+        let mut baseline_action = self.conductor.choose(ConductorInput {
             latent: latent.clone(),
             drives: now.drives.clone(),
             memory: now.memory.clone(),
@@ -1610,6 +1694,133 @@ where
             body: now.body.clone(),
             proposals,
         })?;
+        if self.action_selector_mode == ActionSelectorMode::Baseline {
+            if let Some(action) = reign_action.as_ref() {
+                if reign_input
+                    .as_ref()
+                    .map(|input| input.mode == ReignMode::Direct)
+                    .unwrap_or(false)
+                {
+                    baseline_action = action.clone();
+                }
+            }
+        }
+
+        let mut model_predictions = Vec::new();
+        let mut hardcoded_predictions = Vec::new();
+        let mut candidate_scores = Vec::new();
+        for action in &action_value_candidates {
+            let candidate_danger_input = danger_behavior_input(&now, &latent, Some(action));
+            let candidate_danger = self
+                .models
+                .behaviors
+                .danger
+                .infer(&candidate_danger_input, now.t_ms)?;
+            let mut candidate_danger_record = candidate_danger.record;
+            if let (Some(hard), Some(model)) = (
+                candidate_danger_record.hardcoded_output.as_ref(),
+                candidate_danger_record.model_output.as_ref(),
+            ) {
+                candidate_danger_record.disagreement = Some(danger_disagreement(hard, model));
+            }
+            let candidate_danger_output = candidate_danger_record
+                .model_output
+                .as_ref()
+                .copied()
+                .or(candidate_danger_record.selected_output.as_ref().copied());
+            let candidate_danger_had_fallback = candidate_danger_record.model_output.is_none();
+            behavior_runs.push(candidate_danger_record.erase());
+
+            let candidate_charge_input = charge_behavior_input(&now, &latent, Some(action));
+            let candidate_charge = self
+                .models
+                .behaviors
+                .charge
+                .infer(&candidate_charge_input, now.t_ms)?;
+            let mut candidate_charge_record = candidate_charge.record;
+            if let (Some(hard), Some(model)) = (
+                candidate_charge_record.hardcoded_output.as_ref(),
+                candidate_charge_record.model_output.as_ref(),
+            ) {
+                candidate_charge_record.disagreement = Some(charge_disagreement(hard, model));
+            }
+            let candidate_charge_output = candidate_charge_record
+                .model_output
+                .as_ref()
+                .copied()
+                .or(candidate_charge_record.selected_output.as_ref().copied());
+            let candidate_charge_had_fallback = candidate_charge_record.model_output.is_none();
+            behavior_runs.push(candidate_charge_record.erase());
+
+            let candidate_action_value_input = action_value_behavior_input(
+                &now,
+                &latent,
+                Some(action),
+                candidate_danger_output,
+                candidate_charge_output,
+            );
+            let action_value_run = self
+                .models
+                .behaviors
+                .action_value
+                .infer(&candidate_action_value_input, now.t_ms)?;
+            let mut action_value_record = action_value_run.record;
+            if let (Some(hard), Some(model)) = (
+                action_value_record.hardcoded_output.as_ref(),
+                action_value_record.model_output.as_ref(),
+            ) {
+                action_value_record.disagreement = Some(action_value_disagreement(hard, model));
+            }
+            if let Some(model) = action_value_record.model_output.as_ref() {
+                model_predictions.push(action_value_prediction(action.clone(), *model));
+            }
+            if let Some(hardcoded) = action_value_record.hardcoded_output.as_ref() {
+                hardcoded_predictions.push(action_value_prediction(action.clone(), *hardcoded));
+            }
+            let action_value_output = action_value_record
+                .model_output
+                .as_ref()
+                .copied()
+                .or(action_value_record.selected_output.as_ref().copied());
+            let action_value_had_fallback = action_value_record.model_output.is_none();
+            behavior_runs.push(action_value_record.erase());
+
+            let mut candidate_score = score_action_candidate(
+                &now,
+                action,
+                CandidateModelSignals {
+                    danger: candidate_danger_output,
+                    charge: candidate_charge_output,
+                    action_value: action_value_output,
+                },
+                Some(&baseline_action),
+            );
+            candidate_score.fallback_used = candidate_score.fallback_used
+                || candidate_danger_had_fallback
+                || candidate_charge_had_fallback
+                || action_value_had_fallback;
+            candidate_scores.push(candidate_score);
+        }
+        now.predictions.action_values_model = model_predictions;
+        now.predictions.action_values_hardcoded = hardcoded_predictions;
+
+        let action_selection = select_action_from_scores(
+            self.action_selector_mode,
+            &now,
+            baseline_action.clone(),
+            candidate_scores,
+        );
+        for warning in &action_selection.fallback_warnings {
+            notes.push(warning.clone());
+        }
+        now.extensions.insert(
+            "action_selector".to_string(),
+            serde_json::to_value(&action_selection)?,
+        );
+        let chosen_action = action_selection
+            .selected_action
+            .clone()
+            .unwrap_or(baseline_action);
 
         let danger_input = danger_behavior_input(&now, &latent, Some(&chosen_action));
         let danger_run = self
@@ -1652,79 +1863,6 @@ where
             now.predictions.charge_hardcoded = Some(charge_prediction(*hardcoded));
         }
         behavior_runs.push(charge_record.erase());
-
-        let mut model_predictions = Vec::new();
-        let mut hardcoded_predictions = Vec::new();
-        for action in &action_value_candidates {
-            let candidate_danger_input = danger_behavior_input(&now, &latent, Some(action));
-            let candidate_danger = self
-                .models
-                .behaviors
-                .danger
-                .infer(&candidate_danger_input, now.t_ms)?;
-            let mut candidate_danger_record = candidate_danger.record;
-            if let (Some(hard), Some(model)) = (
-                candidate_danger_record.hardcoded_output.as_ref(),
-                candidate_danger_record.model_output.as_ref(),
-            ) {
-                candidate_danger_record.disagreement = Some(danger_disagreement(hard, model));
-            }
-            let candidate_danger_output = candidate_danger_record
-                .model_output
-                .as_ref()
-                .copied()
-                .or(candidate_danger_record.selected_output.as_ref().copied());
-            behavior_runs.push(candidate_danger_record.erase());
-
-            let candidate_charge_input = charge_behavior_input(&now, &latent, Some(action));
-            let candidate_charge = self
-                .models
-                .behaviors
-                .charge
-                .infer(&candidate_charge_input, now.t_ms)?;
-            let mut candidate_charge_record = candidate_charge.record;
-            if let (Some(hard), Some(model)) = (
-                candidate_charge_record.hardcoded_output.as_ref(),
-                candidate_charge_record.model_output.as_ref(),
-            ) {
-                candidate_charge_record.disagreement = Some(charge_disagreement(hard, model));
-            }
-            let candidate_charge_output = candidate_charge_record
-                .model_output
-                .as_ref()
-                .copied()
-                .or(candidate_charge_record.selected_output.as_ref().copied());
-            behavior_runs.push(candidate_charge_record.erase());
-
-            let candidate_action_value_input = action_value_behavior_input(
-                &now,
-                &latent,
-                Some(action),
-                candidate_danger_output,
-                candidate_charge_output,
-            );
-            let action_value_run = self
-                .models
-                .behaviors
-                .action_value
-                .infer(&candidate_action_value_input, now.t_ms)?;
-            let mut action_value_record = action_value_run.record;
-            if let (Some(hard), Some(model)) = (
-                action_value_record.hardcoded_output.as_ref(),
-                action_value_record.model_output.as_ref(),
-            ) {
-                action_value_record.disagreement = Some(action_value_disagreement(hard, model));
-            }
-            if let Some(model) = action_value_record.model_output.as_ref() {
-                model_predictions.push(action_value_prediction(action.clone(), *model));
-            }
-            if let Some(hardcoded) = action_value_record.hardcoded_output.as_ref() {
-                hardcoded_predictions.push(action_value_prediction(action.clone(), *hardcoded));
-            }
-            behavior_runs.push(action_value_record.erase());
-        }
-        now.predictions.action_values_model = model_predictions;
-        now.predictions.action_values_hardcoded = hardcoded_predictions;
 
         let eye_next_input = eye_next_behavior_input(&now, &latent, Some(&chosen_action), 100);
         let eye_next_run = self
@@ -1875,6 +2013,7 @@ where
         };
 
         self.ledger.append(&frame).await?;
+        self.memory_recall.observe_now(&frame.now).await?;
         let surprise_computer = self.surprise_computer.clone();
         let reward_computer = self.reward_computer.clone();
         if let Some(transition) = self.transition_builder.observe(
@@ -1999,7 +2138,7 @@ impl<L, M, R, C, S, A> RuntimeLoop for MinimalRuntime<L, M, R, C, S, A>
 where
     L: LedgerWriter + Sync + Send,
     M: MemoryStore + Send,
-    R: Recall + Send,
+    R: Recall + Send + Sync,
     C: Conductor + Send,
     S: SafetyLayer + Send,
     A: LlmAgent + Send,
@@ -2212,6 +2351,10 @@ fn default_candidate_actions() -> Vec<ActionPrimitive> {
             intensity: 0.15,
             duration_ms: 1_000,
         },
+        ActionPrimitive::Go {
+            intensity: -0.12,
+            duration_ms: 750,
+        },
         ActionPrimitive::Turn {
             direction: TurnDir::Left,
             intensity: 0.25,
@@ -2228,6 +2371,240 @@ fn default_candidate_actions() -> Vec<ActionPrimitive> {
             duration_ms: 2_000,
         },
     ]
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CandidateModelSignals {
+    danger: Option<DangerOutput>,
+    charge: Option<ChargeOutput>,
+    action_value: Option<ActionValueOutput>,
+}
+
+fn score_action_candidate(
+    now: &Now,
+    action: &ActionPrimitive,
+    signals: CandidateModelSignals,
+    previous_action: Option<&ActionPrimitive>,
+) -> ActionSelectionCandidateScore {
+    let danger = signals
+        .danger
+        .map(max_danger_risk)
+        .unwrap_or_else(|| fallback_collision_risk(now, action));
+    let charge = signals.charge.map(charge_score).unwrap_or_else(|| {
+        if matches!(
+            action,
+            ActionPrimitive::Dock
+                | ActionPrimitive::Approach {
+                    target: ApproachTarget::Charger
+                }
+        ) {
+            now.memory.place_charge_value.max(0.1)
+        } else {
+            0.0
+        }
+    });
+    let action_value = signals.action_value.map(|value| value.value).unwrap_or(0.0);
+    let curiosity = if matches!(action, ActionPrimitive::Explore { .. }) {
+        now.drives.curiosity * 0.2
+    } else {
+        0.0
+    };
+    let collision_risk = fallback_collision_risk(now, action).max(danger);
+    let low_battery_risk = if now.body.battery_level <= 0.2
+        && matches!(
+            action,
+            ActionPrimitive::Go { .. } | ActionPrimitive::Explore { .. }
+        ) {
+        0.25
+    } else {
+        0.0
+    };
+    let repeat_penalty = if previous_action == Some(action) {
+        0.03
+    } else {
+        0.0
+    };
+    let fallback_used =
+        signals.danger.is_none() || signals.charge.is_none() || signals.action_value.is_none();
+    let score = (-1.6 * danger) + (1.2 * charge) + action_value + curiosity
+        - (0.8 * collision_risk)
+        - low_battery_risk
+        - repeat_penalty;
+
+    ActionSelectionCandidateScore {
+        action: action.clone(),
+        score,
+        danger,
+        charge,
+        action_value,
+        curiosity,
+        collision_risk,
+        low_battery_risk,
+        repeat_penalty,
+        fallback_used,
+    }
+}
+
+fn select_action_from_scores(
+    mode: ActionSelectorMode,
+    now: &Now,
+    baseline_action: ActionPrimitive,
+    candidates: Vec<ActionSelectionCandidateScore>,
+) -> ActionSelectionDecision {
+    if mode != ActionSelectorMode::Baseline {
+        if let Some(action) = hard_safety_action(now) {
+            return ActionSelectionDecision {
+                mode,
+                candidates,
+                selected_action: Some(action),
+                baseline_action: Some(baseline_action),
+                selected_score: None,
+                safety_overrode: true,
+                fallback_warnings: fallback_warnings_for_mode(mode),
+            };
+        }
+    }
+
+    let selected = match mode {
+        ActionSelectorMode::Baseline => Some(ActionSelectionCandidateScore {
+            action: baseline_action.clone(),
+            score: 0.0,
+            ..ActionSelectionCandidateScore::default()
+        }),
+        ActionSelectorMode::Scripted => candidates
+            .iter()
+            .find(|candidate| {
+                matches!(
+                    candidate.action,
+                    ActionPrimitive::Approach {
+                        target: ApproachTarget::Charger
+                    } | ActionPrimitive::Dock
+                )
+            })
+            .cloned()
+            .or_else(|| candidates.first().cloned()),
+        ActionSelectorMode::Random => {
+            if candidates.is_empty() {
+                None
+            } else {
+                candidates
+                    .get(now.t_ms as usize % candidates.len())
+                    .cloned()
+            }
+        }
+        ActionSelectorMode::ModelAssisted => candidates
+            .iter()
+            .max_by(|left, right| {
+                left.score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned(),
+    };
+    let fallback_warnings = if candidates.iter().any(|candidate| candidate.fallback_used) {
+        fallback_warnings_for_mode(mode)
+    } else {
+        Vec::new()
+    };
+    ActionSelectionDecision {
+        mode,
+        selected_action: selected
+            .as_ref()
+            .map(|candidate| candidate.action.clone())
+            .or(Some(baseline_action.clone())),
+        selected_score: selected.as_ref().map(|candidate| candidate.score),
+        candidates,
+        baseline_action: Some(baseline_action),
+        safety_overrode: false,
+        fallback_warnings,
+    }
+}
+
+fn fallback_warnings_for_mode(mode: ActionSelectorMode) -> Vec<String> {
+    if mode == ActionSelectorMode::ModelAssisted {
+        vec!["model-assisted selector used hardcoded fallback estimates".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn hard_safety_action(now: &Now) -> Option<ActionPrimitive> {
+    if now.body.flags.wheel_drop {
+        return Some(ActionPrimitive::Stop);
+    }
+    if now.body.flags.cliff_left
+        || now.body.flags.cliff_front_left
+        || now.body.flags.cliff_front_right
+        || now.body.flags.cliff_right
+    {
+        return Some(ActionPrimitive::Go {
+            intensity: -0.12,
+            duration_ms: 750,
+        });
+    }
+    if now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall {
+        return Some(ActionPrimitive::Turn {
+            direction: TurnDir::Left,
+            intensity: 0.5,
+            duration_ms: 1_000,
+        });
+    }
+    if now.body.battery_level <= 0.10 {
+        return Some(ActionPrimitive::Stop);
+    }
+    let danger = now
+        .predictions
+        .danger_model
+        .or(now.predictions.danger_hardcoded)
+        .map(|prediction| {
+            prediction
+                .bump_risk
+                .max(prediction.cliff_risk)
+                .max(prediction.wheel_drop_risk)
+                .max(prediction.stuck_risk)
+        })
+        .unwrap_or(0.0);
+    if danger >= 0.70 {
+        return Some(ActionPrimitive::Turn {
+            direction: TurnDir::Left,
+            intensity: 0.5,
+            duration_ms: 1_000,
+        });
+    }
+    None
+}
+
+fn max_danger_risk(output: DangerOutput) -> f32 {
+    output
+        .bump_risk
+        .max(output.cliff_risk)
+        .max(output.wheel_drop_risk)
+        .max(output.stuck_risk)
+        .clamp(0.0, 1.0)
+}
+
+fn charge_score(output: ChargeOutput) -> f32 {
+    (output.charge_probability + output.dock_likelihood + output.expected_battery_delta.max(0.0))
+        .clamp(0.0, 1.0)
+}
+
+fn fallback_collision_risk(now: &Now, action: &ActionPrimitive) -> f32 {
+    let forward = action_to_motor_command(Some(action)).forward;
+    if forward <= 0.0 {
+        return 0.0;
+    }
+    let nearest_risk = now
+        .range
+        .nearest_m
+        .map(|nearest| ((0.35 - nearest) / 0.35).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let contact_risk =
+        if now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall {
+            1.0
+        } else {
+            0.0
+        };
+    nearest_risk.max(contact_risk)
 }
 
 fn action_value_candidate_actions(
@@ -2637,6 +3014,148 @@ mod tests {
             .experiences
             .iter()
             .any(|experience| experience.text.contains("hello world")));
+    }
+
+    #[test]
+    fn model_assisted_safety_override_beats_high_score_candidate() {
+        let mut body = BodySense::default();
+        body.flags.wheel_drop = true;
+        let now = Now::blank(100, body);
+        let baseline = ActionPrimitive::Go {
+            intensity: 0.15,
+            duration_ms: 1_000,
+        };
+        let decision = select_action_from_scores(
+            ActionSelectorMode::ModelAssisted,
+            &now,
+            baseline,
+            vec![ActionSelectionCandidateScore {
+                action: ActionPrimitive::Go {
+                    intensity: 0.15,
+                    duration_ms: 1_000,
+                },
+                score: 10.0,
+                ..ActionSelectionCandidateScore::default()
+            }],
+        );
+
+        assert_eq!(decision.selected_action, Some(ActionPrimitive::Stop));
+        assert!(decision.safety_overrode);
+    }
+
+    #[test]
+    fn scoring_prefers_charger_when_charge_value_is_high() {
+        let now = Now::blank(100, BodySense::default());
+        let stop = score_action_candidate(
+            &now,
+            &ActionPrimitive::Stop,
+            CandidateModelSignals::default(),
+            None,
+        );
+        let charger = score_action_candidate(
+            &now,
+            &ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            },
+            CandidateModelSignals {
+                charge: Some(ChargeOutput {
+                    charge_probability: 0.8,
+                    expected_battery_delta: 0.1,
+                    dock_likelihood: 0.7,
+                    confidence: 1.0,
+                }),
+                ..CandidateModelSignals::default()
+            },
+            None,
+        );
+
+        assert!(charger.score > stop.score);
+    }
+
+    #[test]
+    fn scoring_avoids_high_danger_candidate() {
+        let now = Now::blank(100, BodySense::default());
+        let safe = score_action_candidate(
+            &now,
+            &ActionPrimitive::Stop,
+            CandidateModelSignals::default(),
+            None,
+        );
+        let dangerous = score_action_candidate(
+            &now,
+            &ActionPrimitive::Go {
+                intensity: 0.15,
+                duration_ms: 1_000,
+            },
+            CandidateModelSignals {
+                danger: Some(DangerOutput {
+                    bump_risk: 0.95,
+                    confidence: 1.0,
+                    ..DangerOutput::default()
+                }),
+                ..CandidateModelSignals::default()
+            },
+            None,
+        );
+
+        assert!(safe.score > dangerous.score);
+    }
+
+    #[test]
+    fn missing_model_signals_fall_back_with_warning() {
+        let now = Now::blank(100, BodySense::default());
+        let candidate = score_action_candidate(
+            &now,
+            &ActionPrimitive::Stop,
+            CandidateModelSignals::default(),
+            None,
+        );
+        let decision = select_action_from_scores(
+            ActionSelectorMode::ModelAssisted,
+            &now,
+            ActionPrimitive::Stop,
+            vec![candidate],
+        );
+
+        assert!(!decision.fallback_warnings.is_empty());
+        assert!(decision.candidates[0].fallback_used);
+    }
+
+    #[tokio::test]
+    async fn model_assisted_tick_logs_compact_decision_info() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-action-selector-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+        )
+        .with_action_selector_mode(ActionSelectorMode::ModelAssisted);
+
+        let tick = runtime
+            .tick(
+                Now::blank(100, BodySense::default()),
+                ExperienceLatent::default(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let decision = tick
+            .frame
+            .now
+            .extensions
+            .get("action_selector")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ActionSelectionDecision>(value).ok())
+            .unwrap();
+
+        assert_eq!(decision.mode, ActionSelectorMode::ModelAssisted);
+        assert!(!decision.candidates.is_empty());
+        assert!(decision.selected_action.is_some());
     }
 
     #[tokio::test]

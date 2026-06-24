@@ -1,17 +1,22 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
+use image::codecs::png::PngEncoder;
+use image::{ColorType, ImageEncoder};
 use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource};
 use netherwick_core::TimeMs;
-use netherwick_now::ReignSense;
+use netherwick_now::{KinectSkeletonSense, ReignSense};
 use netherwick_runtime::ReignQueue;
-use netherwick_sensors::WorldSnapshot;
+use netherwick_sensors::{EyeFrameFormat, WorldSnapshot};
+use netherwick_worldlab::CaptureReader;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -31,6 +36,9 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/stream/logs",
     "/view",
     "/view/snapshot",
+    "/view/scene",
+    "/view/3d",
+    "/view/capture-scene",
 ];
 
 #[derive(Clone, Debug)]
@@ -75,6 +83,7 @@ pub fn reign_router(state: ReignServerState) -> Router {
 #[derive(Clone, Debug, Default)]
 pub struct LiveViewState {
     latest: Arc<Mutex<Option<WorldSnapshot>>>,
+    scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
 }
 
 impl LiveViewState {
@@ -95,6 +104,20 @@ impl LiveViewState {
             .expect("live view snapshot mutex poisoned")
             .clone()
     }
+
+    pub fn update_scene_metadata(&self, metadata: LiveSceneMetadata) {
+        *self
+            .scene_metadata
+            .lock()
+            .expect("live view scene metadata mutex poisoned") = Some(metadata);
+    }
+
+    pub fn scene_metadata(&self) -> Option<LiveSceneMetadata> {
+        self.scene_metadata
+            .lock()
+            .expect("live view scene metadata mutex poisoned")
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -107,12 +130,126 @@ pub struct LiveSnapshotResponse {
     pub ear_pcm: Option<netherwick_sensors::PcmAudioFrame>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LiveSceneMetadata {
+    pub arena: Option<SceneArena>,
+    #[serde(default)]
+    pub objects: Vec<SceneObject>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneArena {
+    pub width_m: f32,
+    pub height_m: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneObject {
+    pub id: String,
+    pub kind: String,
+    pub x_m: f32,
+    pub y_m: f32,
+    pub radius_m: f32,
+    pub label: Option<String>,
+    pub color_rgb: Option<[u8; 3]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LiveSceneResponse {
+    pub schema_version: u32,
+    pub t_ms: TimeMs,
+    pub body: SceneBody,
+    pub range: SceneRange,
+    pub eye: Option<SceneEye>,
+    pub kinect: SceneKinect,
+    pub audio: Option<SceneAudio>,
+    pub objects: Vec<SceneObject>,
+    pub arena: Option<SceneArena>,
+    pub action: SceneAction,
+    pub mind: SceneMind,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SceneBody {
+    pub x_m: f32,
+    pub y_m: f32,
+    pub heading_rad: f32,
+    pub battery_level: f32,
+    pub charging: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SceneRange {
+    pub nearest_m: Option<f32>,
+    pub beams: Vec<SceneRangeBeam>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SceneRangeBeam {
+    pub angle_rad: f32,
+    pub distance_m: f32,
+    pub hit: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SceneEye {
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub data_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SceneKinect {
+    pub points: Vec<ScenePoint>,
+    pub skeletons: Vec<KinectSkeletonSense>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ScenePoint {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SceneAudio {
+    pub bearing_rad: Option<f32>,
+    pub energy: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SceneAction {
+    pub latest: Option<String>,
+    pub safety_override: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SceneMind {
+    pub combobulation: Option<String>,
+    pub surprise: Option<f32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CaptureSceneQuery {
+    pub capture: PathBuf,
+    #[serde(default)]
+    pub frame: usize,
+}
+
 pub fn live_view_router(state: LiveViewState) -> Router {
     Router::new()
         .route("/", get(live_view_page))
         .route("/now", get(get_live_now))
         .route("/view", get(live_view_page))
         .route("/view/snapshot", get(get_live_snapshot))
+        .route("/view/scene", get(get_live_scene))
+        .route("/view/3d", get(live_view_3d_page))
+        .route("/view/capture-scene", get(get_capture_scene))
         .with_state(state)
 }
 
@@ -137,6 +274,63 @@ async fn get_live_snapshot(
     }))
 }
 
+async fn get_live_scene(
+    State(state): State<LiveViewState>,
+) -> Result<Json<LiveSceneResponse>, LiveViewError> {
+    let snapshot = state
+        .latest()
+        .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
+    Ok(Json(snapshot_to_scene(
+        &snapshot,
+        state.scene_metadata().as_ref(),
+    )))
+}
+
+async fn get_capture_scene(
+    Query(query): Query<CaptureSceneQuery>,
+) -> Result<Json<LiveSceneResponse>, LiveViewError> {
+    let reader = CaptureReader::open(&query.capture)
+        .await
+        .map_err(|error| LiveViewError::bad_request(format!("failed to open capture: {error}")))?;
+    let frames = reader.read_frames().await.map_err(|error| {
+        LiveViewError::bad_request(format!("failed to read capture frames: {error}"))
+    })?;
+    let record = frames.get(query.frame).ok_or_else(|| {
+        LiveViewError::not_found(format!("capture frame {} was not found", query.frame))
+    })?;
+    let metadata = reader
+        .manifest()
+        .scenario
+        .as_ref()
+        .map(|scenario| LiveSceneMetadata {
+            arena: Some(SceneArena {
+                width_m: scenario.arena.width_m,
+                height_m: scenario.arena.height_m,
+            }),
+            objects: scenario
+                .objects
+                .iter()
+                .map(|object| SceneObject {
+                    id: object.id.clone(),
+                    kind: scene_object_kind(&format!("{:?}", object.kind)),
+                    x_m: object.x_m,
+                    y_m: object.y_m,
+                    radius_m: object.radius_m,
+                    label: Some(object.label.clone()),
+                    color_rgb: Some(object.color_rgb),
+                })
+                .collect(),
+        });
+    let mut scene = snapshot_to_scene(&record.snapshot, metadata.as_ref());
+    scene.t_ms = record.t_ms;
+    if let Some(pointcloud) = &record.assets.pointcloud {
+        scene.warnings.push(format!(
+            "capture point cloud asset available at {pointcloud}; PLY loading is planned"
+        ));
+    }
+    Ok(Json(scene))
+}
+
 async fn get_live_now(
     State(state): State<LiveViewState>,
 ) -> Result<Json<netherwick_now::Now>, LiveViewError> {
@@ -150,6 +344,260 @@ async fn live_view_page() -> Html<&'static str> {
     Html(LIVE_VIEW_PAGE)
 }
 
+async fn live_view_3d_page() -> Html<&'static str> {
+    Html(LIVE_VIEW_3D_PAGE)
+}
+
+pub fn snapshot_to_scene(
+    snapshot: &WorldSnapshot,
+    metadata: Option<&LiveSceneMetadata>,
+) -> LiveSceneResponse {
+    let mut warnings = Vec::new();
+    let body = &snapshot.body;
+    let eye = match snapshot.eye_frame.as_ref().map(scene_eye_from_frame) {
+        Some((eye, frame_warnings)) => {
+            warnings.extend(frame_warnings);
+            Some(eye)
+        }
+        None => {
+            warnings.push("no eye frame stream".to_string());
+            None
+        }
+    };
+    let kinect = scene_kinect_from_snapshot(snapshot, &mut warnings);
+    let audio = snapshot
+        .kinect
+        .audio_angle_rad
+        .or_else(|| audio_bearing_from_objects(body.odometry.x_m, body.odometry.y_m, metadata))
+        .map(|bearing_rad| SceneAudio {
+            bearing_rad: Some(bearing_rad),
+            energy: snapshot.kinect.audio_confidence.clamp(0.0, 1.0),
+        });
+    if audio.is_none() {
+        warnings.push("no audio bearing stream".to_string());
+    }
+    LiveSceneResponse {
+        schema_version: 1,
+        t_ms: body.last_update_ms,
+        body: SceneBody {
+            x_m: body.odometry.x_m,
+            y_m: body.odometry.y_m,
+            heading_rad: body.odometry.heading_rad,
+            battery_level: body.battery_level,
+            charging: body.charging,
+        },
+        range: scene_range_from_snapshot(snapshot),
+        eye,
+        kinect,
+        audio,
+        objects: metadata
+            .map(|metadata| metadata.objects.clone())
+            .unwrap_or_default(),
+        arena: metadata.and_then(|metadata| metadata.arena),
+        action: SceneAction::default(),
+        mind: SceneMind {
+            combobulation: snapshot
+                .extensions
+                .iter()
+                .find(|extension| extension.name == "vision.frame_summary")
+                .map(|extension| {
+                    format!(
+                        "vision summary vector with {} values",
+                        extension.values.len()
+                    )
+                }),
+            surprise: None,
+        },
+        warnings,
+    }
+}
+
+fn scene_range_from_snapshot(snapshot: &WorldSnapshot) -> SceneRange {
+    let beam_count = snapshot.range.beams.len().max(1);
+    let fov_rad = std::f32::consts::PI;
+    SceneRange {
+        nearest_m: snapshot.range.nearest_m,
+        beams: snapshot
+            .range
+            .beams
+            .iter()
+            .enumerate()
+            .map(|(index, distance_m)| {
+                let ratio = if beam_count <= 1 {
+                    0.5
+                } else {
+                    index as f32 / (beam_count - 1) as f32
+                };
+                let angle_rad = -fov_rad * 0.5 + ratio * fov_rad;
+                SceneRangeBeam {
+                    angle_rad,
+                    distance_m: finite_or_zero(*distance_m),
+                    hit: snapshot
+                        .range
+                        .nearest_m
+                        .map(|nearest| (*distance_m - nearest).abs() < 0.05)
+                        .unwrap_or(false),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn scene_eye_from_frame(frame: &netherwick_sensors::EyeFrame) -> (SceneEye, Vec<String>) {
+    let mut warnings = Vec::new();
+    let (data_url, encode_warning) = encode_eye_data_url(frame);
+    if let Some(warning) = encode_warning {
+        warnings.push(warning);
+    }
+    (
+        SceneEye {
+            width: frame.width,
+            height: frame.height,
+            format: format!("{:?}", frame.format),
+            data_url,
+        },
+        warnings,
+    )
+}
+
+fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>, Option<String>) {
+    match frame.format {
+        EyeFrameFormat::Mjpeg => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&frame.bytes);
+            (Some(format!("data:image/jpeg;base64,{encoded}")), None)
+        }
+        EyeFrameFormat::Rgb8 | EyeFrameFormat::Bgr8 | EyeFrameFormat::Gray8 => {
+            let expected_len = match frame.format {
+                EyeFrameFormat::Gray8 => frame.width as usize * frame.height as usize,
+                _ => frame.width as usize * frame.height as usize * 3,
+            };
+            if frame.bytes.len() < expected_len {
+                return (
+                    None,
+                    Some(format!(
+                        "eye frame has {} bytes, expected at least {}",
+                        frame.bytes.len(),
+                        expected_len
+                    )),
+                );
+            }
+            let mut rgb = Vec::with_capacity(frame.width as usize * frame.height as usize * 3);
+            match frame.format {
+                EyeFrameFormat::Rgb8 => rgb.extend_from_slice(&frame.bytes[..expected_len]),
+                EyeFrameFormat::Bgr8 => {
+                    for pixel in frame.bytes[..expected_len].chunks_exact(3) {
+                        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+                    }
+                }
+                EyeFrameFormat::Gray8 => {
+                    for value in &frame.bytes[..expected_len] {
+                        rgb.extend_from_slice(&[*value, *value, *value]);
+                    }
+                }
+                _ => {}
+            }
+            let mut png = Vec::new();
+            let result = PngEncoder::new(&mut png).write_image(
+                &rgb,
+                frame.width,
+                frame.height,
+                ColorType::Rgb8.into(),
+            );
+            match result {
+                Ok(()) => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+                    (Some(format!("data:image/png;base64,{encoded}")), None)
+                }
+                Err(error) => (None, Some(format!("failed to encode eye PNG: {error}"))),
+            }
+        }
+        EyeFrameFormat::Unknown(ref format) => {
+            (None, Some(format!("unsupported eye frame format {format}")))
+        }
+    }
+}
+
+fn scene_kinect_from_snapshot(snapshot: &WorldSnapshot, warnings: &mut Vec<String>) -> SceneKinect {
+    let points = depth_points(&snapshot.kinect.depth_m);
+    if points.is_empty() {
+        warnings.push("no point cloud stream".to_string());
+    }
+    SceneKinect {
+        points,
+        skeletons: snapshot.kinect.skeletons.clone(),
+    }
+}
+
+fn depth_points(depth_m: &[f32]) -> Vec<ScenePoint> {
+    const MAX_POINTS: usize = 2_000;
+    if depth_m.is_empty() {
+        return Vec::new();
+    }
+    let width = (depth_m.len() as f32).sqrt().ceil().max(1.0) as usize;
+    let height = depth_m.len().div_ceil(width).max(1);
+    let stride = (depth_m.len().div_ceil(MAX_POINTS)).max(1);
+    depth_m
+        .iter()
+        .enumerate()
+        .step_by(stride)
+        .filter_map(|(index, depth)| {
+            if !depth.is_finite() || *depth <= 0.0 {
+                return None;
+            }
+            let x = index % width;
+            let y = index / width;
+            let nx = (x as f32 / width as f32) - 0.5;
+            let ny = (y as f32 / height as f32) - 0.5;
+            let z = depth.clamp(0.0, 8.0);
+            let shade = ((1.0 - (z / 8.0)).clamp(0.15, 1.0) * 255.0) as u8;
+            Some(ScenePoint {
+                x: nx * z,
+                y: -ny * z + 0.25,
+                z,
+                r: shade,
+                g: shade,
+                b: shade,
+            })
+        })
+        .collect()
+}
+
+fn audio_bearing_from_objects(
+    robot_x_m: f32,
+    robot_y_m: f32,
+    metadata: Option<&LiveSceneMetadata>,
+) -> Option<f32> {
+    metadata
+        .into_iter()
+        .flat_map(|metadata| metadata.objects.iter())
+        .find(|object| object.kind == "speaker" || object.kind == "sound_source")
+        .map(|object| (object.y_m - robot_y_m).atan2(object.x_m - robot_x_m))
+}
+
+fn scene_object_kind(debug_kind: &str) -> String {
+    let lower = debug_kind.to_ascii_lowercase();
+    if lower.contains("charger") {
+        "charger"
+    } else if lower.contains("person") {
+        "person"
+    } else if lower.contains("sound") || lower.contains("speaker") {
+        "speaker"
+    } else if lower.contains("landmark") {
+        "landmark"
+    } else {
+        "obstacle"
+    }
+    .to_string()
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 #[derive(Debug)]
 pub struct LiveViewError {
     status: StatusCode,
@@ -160,6 +608,20 @@ impl LiveViewError {
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }
@@ -368,6 +830,7 @@ main{display:grid;place-items:center;background:#070809}
 canvas{width:min(100vw,calc((100vh - 28px)*1.333));height:auto;image-rendering:pixelated;background:#111;border:1px solid #34383c}
 aside{border-left:1px solid #2f3337;padding:16px;background:#171a1d}
 h1{font-size:16px;margin:0 0 14px}
+a{color:#8bd3ff}
 dl{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;margin:0 0 18px}
 dt{color:#9aa4ad}
 dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
@@ -379,6 +842,7 @@ dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
 <main><canvas id="eye" width="64" height="48"></canvas></main>
 <aside>
   <h1>Robot View</h1>
+  <p><a href="/view/3d">Open 3D sensorium</a></p>
   <div id="status">waiting for frames...</div>
   <dl>
     <dt>t</dt><dd id="t">-</dd>
@@ -493,6 +957,250 @@ async function refresh(){
 refresh();
 </script>"#;
 
+const LIVE_VIEW_3D_PAGE: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Netherwick Sensorium 3D</title>
+<style>
+:root{color-scheme:dark;background:#0b0d10;color:#eef1f3;font:13px system-ui}
+html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
+#hud{position:fixed;left:12px;top:12px;display:grid;gap:6px;min-width:240px;max-width:min(360px,calc(100vw - 24px));padding:10px;border:1px solid #2b3138;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px}
+#hud h1{font-size:14px;margin:0}
+#hud dl{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;margin:0}
+#hud dt{color:#aab4bd}
+#hud dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+#status{color:#ffd083}
+#xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
+#xr[disabled]{opacity:.55}
+#fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
+canvas{display:block}
+</style>
+<div id="scene"></div>
+<aside id="hud">
+  <h1>Sensorium 3D</h1>
+  <div id="status">connecting...</div>
+  <dl>
+    <dt>t</dt><dd id="t">-</dd>
+    <dt>pose</dt><dd id="pose">-</dd>
+    <dt>battery</dt><dd id="battery">-</dd>
+    <dt>nearest</dt><dd id="nearest">-</dd>
+    <dt>points</dt><dd id="points">-</dd>
+    <dt>audio</dt><dd id="audio">-</dd>
+    <dt>mind</dt><dd id="mind">-</dd>
+  </dl>
+</aside>
+<button id="xr" disabled>VR unavailable</button>
+<div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. WebXR appears when the browser and device support immersive VR on a secure origin.</div>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.166.1/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.166.1/examples/jsm/controls/OrbitControls.js';
+
+const root = document.getElementById('scene');
+const statusEl = document.getElementById('status');
+const xrButton = document.getElementById('xr');
+const fields = Object.fromEntries(['t','pose','battery','nearest','points','audio','mind'].map(id => [id, document.getElementById(id)]));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0d10);
+const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
+camera.position.set(3.8, 4.0, 5.2);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+root.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xeef6ff, 0x253040, 1.8));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(3, 6, 2);
+scene.add(sun);
+
+// Coordinate convention: Netherwick sim/world x maps to Three.js x, sim/world y maps to Three.js z,
+// and Three.js y is up. heading_rad rotates around the y axis.
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(10, 10, 10, 10),
+  new THREE.MeshStandardMaterial({color:0x171d22, roughness:.8, metalness:0})
+);
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+scene.add(new THREE.GridHelper(10, 20, 0x35414d, 0x24303a));
+
+const robot = new THREE.Group();
+const bodyMesh = new THREE.Mesh(
+  new THREE.CylinderGeometry(.18, .18, .18, 32),
+  new THREE.MeshStandardMaterial({color:0x8bd3ff, roughness:.55})
+);
+bodyMesh.position.y = .09;
+robot.add(bodyMesh);
+const heading = new THREE.ArrowHelper(new THREE.Vector3(0,0,-1), new THREE.Vector3(0,.22,0), .55, 0xffcf66, .16, .08);
+robot.add(heading);
+scene.add(robot);
+
+const beams = new THREE.Group();
+scene.add(beams);
+const objects = new THREE.Group();
+scene.add(objects);
+
+const eyeCanvas = document.createElement('canvas');
+eyeCanvas.width = 2; eyeCanvas.height = 2;
+const eyeTexture = new THREE.CanvasTexture(eyeCanvas);
+const eyePanel = new THREE.Mesh(
+  new THREE.PlaneGeometry(.96, .72),
+  new THREE.MeshBasicMaterial({map: eyeTexture, side: THREE.DoubleSide})
+);
+eyePanel.position.set(0, .65, -.78);
+robot.add(eyePanel);
+const frustum = new THREE.LineSegments(
+  new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0,.46,-.18), new THREE.Vector3(-.48,.28,-.78),
+    new THREE.Vector3(0,.46,-.18), new THREE.Vector3(.48,.28,-.78),
+    new THREE.Vector3(0,.46,-.18), new THREE.Vector3(-.48,1.02,-.78),
+    new THREE.Vector3(0,.46,-.18), new THREE.Vector3(.48,1.02,-.78)
+  ]),
+  new THREE.LineBasicMaterial({color:0x90a4b8})
+);
+robot.add(frustum);
+
+let pointCloud = null;
+let lastScene = null;
+function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
+function world(x, y, up=0){ return new THREE.Vector3(x, up, y); }
+function clear(group){ while(group.children.length) group.remove(group.children.pop()); }
+function materialFor(kind, color){
+  const hex = color ? (color[0]<<16) | (color[1]<<8) | color[2] : ({charger:0x45d483, person:0xe8c08c, speaker:0x778cff, obstacle:0xd67666}[kind] || 0xb0b8c0);
+  return new THREE.MeshStandardMaterial({color:hex, roughness:.7});
+}
+function renderObjects(scenePacket){
+  clear(objects);
+  const arena = scenePacket.arena;
+  if(arena){
+    ground.scale.set(arena.width_m / 10, arena.height_m / 10, 1);
+    ground.position.set(arena.width_m / 2, 0, arena.height_m / 2);
+    controls.target.set(arena.width_m / 2, 0, arena.height_m / 2);
+  }
+  for(const item of scenePacket.objects || []){
+    let mesh;
+    if(item.kind === 'person'){
+      mesh = new THREE.Mesh(new THREE.CapsuleGeometry(item.radius_m, .8, 8, 16), materialFor(item.kind, item.color_rgb));
+      mesh.position.copy(world(item.x_m, item.y_m, .55));
+    }else if(item.kind === 'speaker'){
+      mesh = new THREE.Mesh(new THREE.ConeGeometry(item.radius_m * 1.8, .35, 24), materialFor(item.kind, item.color_rgb));
+      mesh.rotation.x = Math.PI / 2;
+      mesh.position.copy(world(item.x_m, item.y_m, .25));
+    }else{
+      mesh = new THREE.Mesh(new THREE.CylinderGeometry(item.radius_m, item.radius_m, item.kind === 'charger' ? .08 : .45, 28), materialFor(item.kind, item.color_rgb));
+      mesh.position.copy(world(item.x_m, item.y_m, item.kind === 'charger' ? .04 : .225));
+    }
+    mesh.userData.id = item.id;
+    objects.add(mesh);
+  }
+}
+function renderBeams(packet){
+  clear(beams);
+  const b = packet.body;
+  for(const beam of packet.range?.beams || []){
+    const angle = b.heading_rad + beam.angle_rad;
+    const start = world(b.x_m, b.y_m, .12);
+    const end = world(b.x_m + Math.cos(angle) * beam.distance_m, b.y_m + Math.sin(angle) * beam.distance_m, .12);
+    const geo = new THREE.BufferGeometry().setFromPoints([start, end]);
+    const mat = new THREE.LineBasicMaterial({color:beam.hit ? 0xff6e5c : 0x62d394, transparent:true, opacity:beam.hit ? .95 : .55});
+    beams.add(new THREE.Line(geo, mat));
+    if(beam.hit){
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(.055, 12, 12), new THREE.MeshBasicMaterial({color:0xff6e5c}));
+      dot.position.copy(end);
+      beams.add(dot);
+    }
+  }
+}
+function renderPoints(points){
+  if(pointCloud){
+    scene.remove(pointCloud);
+    pointCloud.geometry.dispose();
+    pointCloud.material.dispose();
+    pointCloud = null;
+  }
+  if(!points || !points.length) return;
+  const positions = new Float32Array(points.length * 3);
+  const colors = new Float32Array(points.length * 3);
+  points.forEach((p, i) => {
+    positions[i*3] = robot.position.x + p.x;
+    positions[i*3+1] = p.y;
+    positions[i*3+2] = robot.position.z - p.z;
+    colors[i*3] = p.r / 255; colors[i*3+1] = p.g / 255; colors[i*3+2] = p.b / 255;
+  });
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  pointCloud = new THREE.Points(geo, new THREE.PointsMaterial({size:.035, vertexColors:true}));
+  scene.add(pointCloud);
+}
+function renderEye(eye){
+  if(!eye?.data_url) return;
+  const img = new Image();
+  img.onload = () => {
+    eyeCanvas.width = img.width; eyeCanvas.height = img.height;
+    eyeCanvas.getContext('2d').drawImage(img, 0, 0);
+    eyeTexture.needsUpdate = true;
+  };
+  img.src = eye.data_url;
+}
+function updateScene(packet){
+  lastScene = packet;
+  robot.position.copy(world(packet.body.x_m, packet.body.y_m, 0));
+  robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
+  renderObjects(packet);
+  renderBeams(packet);
+  renderPoints(packet.kinect?.points || []);
+  renderEye(packet.eye);
+  fields.t.textContent = `${packet.t_ms} ms`;
+  fields.pose.textContent = `${fmt(packet.body.x_m)}, ${fmt(packet.body.y_m)}, ${fmt(packet.body.heading_rad)} rad`;
+  fields.battery.textContent = `${fmt(packet.body.battery_level * 100, 1)}%${packet.body.charging ? ' charging' : ''}`;
+  fields.nearest.textContent = packet.range?.nearest_m == null ? '-' : `${fmt(packet.range.nearest_m)} m`;
+  fields.points.textContent = String(packet.kinect?.points?.length || 0);
+  fields.audio.textContent = packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio.bearing_rad)} rad`;
+  fields.mind.textContent = packet.mind?.combobulation || packet.warnings?.[0] || '-';
+}
+async function poll(){
+  try{
+    const res = await fetch('/view/scene', {cache:'no-store'});
+    if(!res.ok) throw new Error(await res.text());
+    updateScene(await res.json());
+    statusEl.textContent = 'live';
+  }catch(error){
+    statusEl.textContent = 'waiting for scene packets...';
+  }finally{
+    setTimeout(poll, 100);
+  }
+}
+async function setupXr(){
+  if(!navigator.xr){
+    xrButton.disabled = true;
+    return;
+  }
+  const ok = await navigator.xr.isSessionSupported('immersive-vr').catch(() => false);
+  if(!ok) return;
+  xrButton.textContent = 'Enter VR';
+  xrButton.disabled = false;
+  xrButton.onclick = async () => {
+    const session = await navigator.xr.requestSession('immersive-vr', {optionalFeatures:['local-floor','bounded-floor']});
+    renderer.xr.setSession(session);
+  };
+}
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+renderer.setAnimationLoop(() => {
+  controls.update();
+  renderer.render(scene, camera);
+});
+setupXr();
+poll();
+</script>"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +1216,8 @@ mod tests {
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_now::Now;
     use netherwick_runtime::{MinimalRuntime, ReignQueue};
+    use netherwick_sensors::{EyeFrame, EyeFrameFormat};
+    use netherwick_worldlab::{CaptureSource, CaptureWriter};
 
     #[derive(Clone, Debug, Default)]
     struct RecordingConductor {
@@ -630,5 +1340,126 @@ mod tests {
             .as_ref()
             .map(|outcome| outcome.accepted_by_conductor)
             .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn live_scene_returns_503_before_first_snapshot() {
+        let err = get_live_scene(State(LiveViewState::new()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn live_scene_returns_body_pose_and_range_beams() {
+        let state = LiveViewState::new();
+        state.update_scene_metadata(LiveSceneMetadata {
+            arena: Some(SceneArena {
+                width_m: 4.0,
+                height_m: 3.0,
+            }),
+            objects: vec![SceneObject {
+                id: "charger-0".to_string(),
+                kind: "charger".to_string(),
+                x_m: 1.2,
+                y_m: 0.4,
+                radius_m: 0.25,
+                label: Some("charger".to_string()),
+                color_rgb: Some([80, 220, 130]),
+            }],
+        });
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.odometry.x_m = 0.5;
+        snapshot.body.odometry.y_m = 0.75;
+        snapshot.body.odometry.heading_rad = 1.25;
+        snapshot.body.battery_level = 0.82;
+        snapshot.body.last_update_ms = 1234;
+        snapshot.range.beams = vec![1.0, 2.0, 3.0];
+        snapshot.range.nearest_m = Some(1.0);
+        snapshot.eye_frame = Some(EyeFrame {
+            captured_at_ms: 1200,
+            width: 1,
+            height: 1,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![255, 0, 0],
+        });
+        state.update(snapshot);
+
+        let Json(scene) = get_live_scene(State(state)).await.unwrap();
+
+        assert_eq!(scene.schema_version, 1);
+        assert_eq!(scene.t_ms, 1234);
+        assert_eq!(scene.body.x_m, 0.5);
+        assert_eq!(scene.body.y_m, 0.75);
+        assert_eq!(scene.body.heading_rad, 1.25);
+        assert_eq!(scene.range.nearest_m, Some(1.0));
+        assert_eq!(scene.range.beams.len(), 3);
+        assert_eq!(scene.objects[0].kind, "charger");
+        assert!(scene
+            .eye
+            .unwrap()
+            .data_url
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn missing_eye_kinect_and_audio_serialize_as_empty_or_null() {
+        let scene = snapshot_to_scene(&WorldSnapshot::default(), None);
+        let value = serde_json::to_value(scene).unwrap();
+
+        assert!(value["eye"].is_null());
+        assert_eq!(value["kinect"]["points"].as_array().unwrap().len(), 0);
+        assert!(value["audio"].is_null());
+        assert!(value["warnings"].as_array().unwrap().len() >= 3);
+    }
+
+    #[tokio::test]
+    async fn capture_frame_to_scene_conversion_works_for_tiny_capture() {
+        let root = unique_test_dir("capture-scene");
+        let mut writer = CaptureWriter::create(&root, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.last_update_ms = 99;
+        snapshot.body.odometry.x_m = 1.0;
+        snapshot.range.beams = vec![0.5];
+        writer
+            .append_snapshot(99, snapshot, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let Json(scene) = get_capture_scene(Query(CaptureSceneQuery {
+            capture: root.clone(),
+            frame: 0,
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(scene.t_ms, 99);
+        assert_eq!(scene.body.x_m, 1.0);
+        assert_eq!(scene.range.beams.len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn live_routes_include_3d_and_scene_endpoints() {
+        assert!(HTTP_ENDPOINTS.contains(&"/view/3d"));
+        assert!(HTTP_ENDPOINTS.contains(&"/view/scene"));
+        let Html(page) = live_view_3d_page().await;
+        assert!(page.contains("Sensorium 3D"));
+        assert!(page.contains("/view/scene"));
+    }
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "netherwick-server-{name}-{}-{}",
+            std::process::id(),
+            wall_now_ms()
+        ));
+        std::fs::remove_dir_all(&path).ok();
+        path
     }
 }

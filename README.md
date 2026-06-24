@@ -59,4 +59,6 @@ just servers      # Neo4j + Qdrant
 just live-server  # Neo4j + Qdrant + live sim server
 ```
 
-The live view is at `http://localhost:8787/view`. Neo4j Browser is at `http://localhost:7474` with the default `.env.example` credentials.
+The live view is at `http://localhost:8787/view`, with a read-only 3D/WebXR sensorium at `http://localhost:8787/view/3d` and compact scene JSON at `http://localhost:8787/view/scene`. Neo4j Browser is at `http://localhost:7474` with the default `.env.example` credentials.
+
+See [docs/webxr-viewer.md](docs/webxr-viewer.md) for desktop controls, WebXR caveats, capture replay hooks, and sensor-view privacy notes.

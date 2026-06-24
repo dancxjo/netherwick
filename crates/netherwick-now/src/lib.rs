@@ -133,7 +133,9 @@ pub struct PredictionSense {
     pub danger_hardcoded: Option<DangerPrediction>,
     pub charge_model: Option<ChargePrediction>,
     pub charge_hardcoded: Option<ChargePrediction>,
+    #[serde(default)]
     pub action_values_model: Vec<ActionValuePrediction>,
+    #[serde(default)]
     pub action_values_hardcoded: Vec<ActionValuePrediction>,
     pub eye_next_model: Option<EyePrediction>,
     pub eye_next_hardcoded: Option<EyePrediction>,
@@ -238,9 +240,22 @@ pub struct GraphEdge {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemorySense {
+    #[serde(default)]
     pub place_familiarity: f32,
+    #[serde(default)]
     pub place_danger: f32,
+    #[serde(default)]
     pub place_charge_value: f32,
+    #[serde(default)]
+    pub place_social_value: f32,
+    #[serde(default)]
+    pub place_novelty: f32,
+    #[serde(default)]
+    pub nearby_best_charge_direction_rad: Option<f32>,
+    #[serde(default)]
+    pub nearby_best_safe_direction_rad: Option<f32>,
+    #[serde(default)]
+    pub places_visited: u32,
     pub face_familiarity: f32,
     pub voice_familiarity: f32,
     pub similar_situation_count: u16,
@@ -337,21 +352,37 @@ pub struct RecallHit {
 pub struct Now {
     pub t_ms: u64,
     pub body: BodySense,
+    #[serde(default)]
     pub eye: EyeSense,
+    #[serde(default)]
     pub ear: EarSense,
+    #[serde(default)]
     pub face: FaceSense,
+    #[serde(default)]
     pub voice: VoiceSense,
+    #[serde(default)]
     pub range: RangeSense,
+    #[serde(default)]
     pub imu: ImuSense,
+    #[serde(default)]
     pub gps: Option<GpsSense>,
+    #[serde(default)]
     pub kinect: KinectSense,
+    #[serde(default)]
     pub memory: MemorySense,
+    #[serde(default)]
     pub predictions: PredictionSense,
+    #[serde(default)]
     pub surprise: SurpriseSense,
+    #[serde(default)]
     pub drives: DriveSense,
+    #[serde(default)]
     pub llm: LlmSense,
+    #[serde(default)]
     pub reign: ReignSense,
+    #[serde(default)]
     pub self_sense: SelfSense,
+    #[serde(default)]
     pub extensions: ExtensionMap,
 }
 
