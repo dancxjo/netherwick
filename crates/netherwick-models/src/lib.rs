@@ -9,12 +9,13 @@ use burn::optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, Sgd, Sg
 use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn::tensor::{activation, backend::AutodiffBackend, backend::Backend, Tensor, TensorData};
 use netherwick_behaviors::TrainingSample;
+use netherwick_core::TimeMs;
 use netherwick_experience::{
     ActionValueInput, ActionValueOutput, ActionValueTarget, ChargeInput, ChargeOutput,
     ChargeTarget, DangerInput, DangerOutput, DangerTarget, EarNextInput, EarNextOutput,
     EarNextTarget, ExperienceDecodeFeatureLengths, ExperienceDecodeOutput, ExperienceEncodeInput,
-    ExperienceEncodeOutput, EyeNextInput, EyeNextOutput, EyeNextTarget, EYE_NEXT_HEIGHT,
-    EYE_NEXT_RGB_LEN, EYE_NEXT_WIDTH,
+    ExperienceEncodeOutput, EyeNextInput, EyeNextOutput, EyeNextTarget, FutureInput,
+    FuturePrediction, EYE_NEXT_HEIGHT, EYE_NEXT_RGB_LEN, EYE_NEXT_WIDTH,
 };
 use netherwick_now::Now;
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,16 @@ pub struct ActionValueShadowMetric {
     pub model: ActionValueOutput,
     pub target: ActionValueTarget,
     pub loss: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FutureShadowMetric {
+    pub t_ms: TimeMs,
+    pub offset_ms: TimeMs,
+    pub hardcoded_error: f32,
+    pub model_error: f32,
+    pub selected_error: f32,
+    pub model_loss: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -424,6 +435,13 @@ pub struct ActionValueNet<B: Backend> {
 }
 
 #[derive(Module, Debug)]
+pub struct FutureNet<B: Backend> {
+    input: Linear<B>,
+    hidden: Linear<B>,
+    output: Linear<B>,
+}
+
+#[derive(Module, Debug)]
 pub struct EyeNextNet<B: Backend> {
     input: Linear<B>,
     hidden: Linear<B>,
@@ -494,6 +512,22 @@ impl<B: Backend> ActionValueNet<B> {
     }
 }
 
+impl<B: Backend> FutureNet<B> {
+    pub fn init(input_dim: usize, latent_dim: usize, device: &B::Device) -> Self {
+        Self {
+            input: LinearConfig::new(input_dim, 128).init(device),
+            hidden: LinearConfig::new(128, 64).init(device),
+            output: LinearConfig::new(64, latent_dim).init(device),
+        }
+    }
+
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let x = activation::relu(self.input.forward(input));
+        let x = activation::relu(self.hidden.forward(x));
+        activation::sigmoid(self.output.forward(x))
+    }
+}
+
 impl<B: Backend> EyeNextNet<B> {
     pub fn init(input_dim: usize, output_dim: usize, device: &B::Device) -> Self {
         Self {
@@ -553,6 +587,8 @@ pub type ChargeBackend = NdArray<f32>;
 pub type ChargeAutodiffBackend = Autodiff<ChargeBackend>;
 pub type ActionValueBackend = NdArray<f32>;
 pub type ActionValueAutodiffBackend = Autodiff<ActionValueBackend>;
+pub type FutureBackend = NdArray<f32>;
+pub type FutureAutodiffBackend = Autodiff<FutureBackend>;
 pub type EyeNextBackend = NdArray<f32>;
 pub type EyeNextAutodiffBackend = Autodiff<EyeNextBackend>;
 pub type EarNextBackend = NdArray<f32>;
@@ -585,6 +621,17 @@ pub struct ActionValueNetTrainer<B: AutodiffBackend = ActionValueAutodiffBackend
     optimizer: OptimizerAdaptor<Sgd<B::InnerBackend>, ActionValueNet<B>, B>,
     device: B::Device,
     input_dim: usize,
+    learning_rate: f64,
+    samples_seen: u64,
+    best_loss: Option<f32>,
+}
+
+pub struct FutureNetTrainer<B: AutodiffBackend = FutureAutodiffBackend> {
+    model: FutureNet<B>,
+    optimizer: OptimizerAdaptor<Sgd<B::InnerBackend>, FutureNet<B>, B>,
+    device: B::Device,
+    input_dim: usize,
+    latent_dim: usize,
     learning_rate: f64,
     samples_seen: u64,
     best_loss: Option<f32>,
@@ -648,6 +695,16 @@ pub struct ChargeModelMetadata {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionValueModelMetadata {
     pub input_dim: usize,
+    pub samples_seen: u64,
+    pub best_loss: Option<f32>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FutureModelMetadata {
+    pub input_dim: usize,
+    pub output_dim: usize,
+    pub latent_dim: usize,
     pub samples_seen: u64,
     pub best_loss: Option<f32>,
     pub created_at_ms: u64,
@@ -1153,6 +1210,183 @@ impl<B: AutodiffBackend> ActionValueNetTrainer<B> {
         if features.len() != self.input_dim {
             return Err(anyhow!(
                 "action-value input dimension mismatch: got {}, expected {}",
+                features.len(),
+                self.input_dim
+            ));
+        }
+        for value in &mut features {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+        Ok(features)
+    }
+}
+
+impl FutureNetTrainer<FutureAutodiffBackend> {
+    pub fn new(input_dim: usize, latent_dim: usize) -> Self {
+        Self::with_device(input_dim, latent_dim, Default::default())
+    }
+
+    pub fn load_checkpoint(
+        path: impl AsRef<Path>,
+        input_dim: usize,
+        latent_dim: usize,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_future_metadata(path)?;
+        if metadata.input_dim != input_dim {
+            return Err(anyhow!(
+                "future checkpoint input dimension mismatch at {}: metadata has {}, runtime expected {}",
+                path.display(),
+                metadata.input_dim,
+                input_dim
+            ));
+        }
+        if metadata.latent_dim != latent_dim || metadata.output_dim != latent_dim {
+            return Err(anyhow!(
+                "future checkpoint latent dimension mismatch at {}: metadata has latent/output {}/{}, runtime expected {}",
+                path.display(),
+                metadata.latent_dim,
+                metadata.output_dim,
+                latent_dim
+            ));
+        }
+
+        let device = Default::default();
+        let model = FutureNet::init(input_dim, latent_dim, &device).load_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+            &device,
+        )?;
+        Ok(Self {
+            model,
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            latent_dim,
+            learning_rate: 0.03,
+            samples_seen: metadata.samples_seen,
+            best_loss: metadata.best_loss,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> FutureNetTrainer<B> {
+    pub fn with_device(input_dim: usize, latent_dim: usize, device: B::Device) -> Self {
+        Self {
+            model: FutureNet::init(input_dim, latent_dim, &device),
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            latent_dim,
+            learning_rate: 0.03,
+            samples_seen: 0,
+            best_loss: None,
+        }
+    }
+
+    pub fn input_dim(&self) -> usize {
+        self.input_dim
+    }
+
+    pub fn latent_dim(&self) -> usize {
+        self.latent_dim
+    }
+
+    pub fn samples_seen(&self) -> u64 {
+        self.samples_seen
+    }
+
+    pub fn best_loss(&self) -> Option<f32> {
+        self.best_loss
+    }
+
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create future checkpoint dir {}", path.display()))?;
+        self.model.clone().save_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+        )?;
+        let metadata = FutureModelMetadata {
+            input_dim: self.input_dim,
+            output_dim: self.latent_dim,
+            latent_dim: self.latent_dim,
+            samples_seen: self.samples_seen,
+            best_loss: self.best_loss,
+            created_at_ms: now_ms(),
+        };
+        std::fs::write(
+            path.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )
+        .with_context(|| format!("write future checkpoint metadata {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn predict(&self, input: &FutureInput) -> Result<FuturePrediction> {
+        let features = self.checked_features(input)?;
+        let tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let output = self.model.forward(tensor).inner();
+        tensor_to_future_prediction(output, input.offset_ms, self.latent_dim)
+    }
+
+    pub fn train_step(&mut self, input: &FutureInput, target_z: &[f32]) -> Result<TrainStats> {
+        let features = self.checked_features(input)?;
+        let target_values = future_target_train_values(target_z, self.latent_dim);
+        let input_tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let target_tensor = Tensor::<B, 2>::from_data(
+            TensorData::new(target_values, [1, self.latent_dim]),
+            &self.device,
+        );
+        let output = self.model.forward(input_tensor);
+        let loss = MseLoss::new().forward(output, target_tensor, Reduction::Mean);
+        let loss_value = loss.clone().inner().into_data().to_vec::<f32>()?[0];
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &self.model);
+        self.model = self
+            .optimizer
+            .step(self.learning_rate, self.model.clone(), grads);
+        self.samples_seen = self.samples_seen.saturating_add(1);
+        let improved = self.best_loss.map(|best| loss_value < best).unwrap_or(true);
+        if improved {
+            self.best_loss = Some(loss_value);
+        }
+        Ok(TrainStats {
+            loss: loss_value,
+            samples_seen: self.samples_seen,
+            improved,
+        })
+    }
+
+    pub fn shadow_compare(
+        &self,
+        input: &FutureInput,
+        hardcoded: &FuturePrediction,
+        target_z: &[f32],
+    ) -> Result<FutureShadowMetric> {
+        let model = self.predict(input)?;
+        let hardcoded_error = mse_vec_target(&hardcoded.predicted_z, target_z);
+        let model_error = mse_vec_target(&model.predicted_z, target_z);
+        Ok(FutureShadowMetric {
+            t_ms: input.latent.t_ms,
+            offset_ms: input.offset_ms,
+            hardcoded_error,
+            model_error,
+            selected_error: hardcoded_error,
+            model_loss: model_error,
+        })
+    }
+
+    fn checked_features(&self, input: &FutureInput) -> Result<Vec<f32>> {
+        let mut features = input.flat_features();
+        if features.len() != self.input_dim {
+            return Err(anyhow!(
+                "future input dimension mismatch: got {}, expected {}",
                 features.len(),
                 self.input_dim
             ));
@@ -1778,6 +2012,14 @@ pub fn read_action_value_metadata(path: impl AsRef<Path>) -> Result<ActionValueM
         .with_context(|| format!("parse action-value checkpoint metadata {}", path.display()))
 }
 
+pub fn read_future_metadata(path: impl AsRef<Path>) -> Result<FutureModelMetadata> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path.join("metadata.json"))
+        .with_context(|| format!("read future checkpoint metadata {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse future checkpoint metadata {}", path.display()))
+}
+
 pub fn read_eye_next_metadata(path: impl AsRef<Path>) -> Result<EyeNextModelMetadata> {
     let path = path.as_ref();
     let bytes = std::fs::read(path.join("metadata.json"))
@@ -1862,6 +2104,12 @@ impl<B: AutodiffBackend> OnlineTrainer<ActionValueInput, ActionValueTarget>
             samples_seen: stats.samples_seen,
             improved: stats.improved,
         })
+    }
+}
+
+impl<B: AutodiffBackend> OnlineTrainer<FutureInput, Vec<f32>> for FutureNetTrainer<B> {
+    fn train_step(&mut self, sample: TrainingSample<FutureInput, Vec<f32>>) -> Result<TrainStats> {
+        FutureNetTrainer::train_step(self, &sample.input, &sample.expected)
     }
 }
 
@@ -1954,6 +2202,30 @@ fn tensor_to_action_value_output<B: Backend>(tensor: Tensor<B, 2>) -> Result<Act
     Ok(ActionValueOutput {
         value: (values[0] * 2.0 - 1.0).clamp(-1.0, 1.0),
         confidence: values[1].clamp(0.0, 1.0),
+    })
+}
+
+fn tensor_to_future_prediction<B: Backend>(
+    tensor: Tensor<B, 2>,
+    offset_ms: TimeMs,
+    latent_dim: usize,
+) -> Result<FuturePrediction> {
+    let values = tensor.into_data().to_vec::<f32>()?;
+    if values.len() != latent_dim {
+        return Err(anyhow!(
+            "future net emitted {} outputs, expected {}",
+            values.len(),
+            latent_dim
+        ));
+    }
+    Ok(FuturePrediction {
+        offset_ms,
+        predicted_z: values
+            .into_iter()
+            .map(|value| value.clamp(0.0, 1.0))
+            .collect(),
+        confidence: 0.5,
+        summary: Some("Learned latent future prediction.".to_string()),
     })
 }
 
@@ -2066,6 +2338,17 @@ fn action_value_target_train_values(target: &ActionValueTarget) -> [f32; 2] {
     ]
 }
 
+fn future_target_train_values(target_z: &[f32], latent_dim: usize) -> Vec<f32> {
+    let mut values = target_z
+        .iter()
+        .take(latent_dim)
+        .copied()
+        .map(|value| value.clamp(0.0, 1.0))
+        .collect::<Vec<_>>();
+    values.resize(latent_dim, 0.0);
+    values
+}
+
 fn eye_target_train_values(target: &EyeNextTarget, output_dim: usize) -> Vec<f32> {
     let mut values = target
         .rgb
@@ -2153,6 +2436,22 @@ fn mse_action_value_output_target(output: ActionValueOutput, target: ActionValue
     delta * delta
 }
 
+fn mse_vec_target(output: &[f32], target: &[f32]) -> f32 {
+    let len = output.len().max(target.len());
+    if len == 0 {
+        return 0.0;
+    }
+    (0..len)
+        .map(|idx| {
+            let actual = output.get(idx).copied().unwrap_or_default();
+            let expected = target.get(idx).copied().unwrap_or_default();
+            let delta = actual - expected;
+            delta * delta
+        })
+        .sum::<f32>()
+        / len as f32
+}
+
 fn mse_eye_next_output_target(output: &EyeNextOutput, target: &EyeNextTarget) -> f32 {
     let len = output.rgb.len().max(target.rgb.len());
     if len == 0 {
@@ -2232,7 +2531,7 @@ mod tests {
     use netherwick_experience::{
         experience_decode_target_from_now, experience_encode_input_from_now, ActionValueInput,
         ActionValueTarget, ChargeInput, ChargeTarget, DangerInput, EarNextInput, EarNextTarget,
-        EyeNextInput, EyeNextTarget,
+        EyeNextInput, EyeNextTarget, FutureInput, FuturePrediction,
     };
 
     #[test]
@@ -2430,6 +2729,114 @@ mod tests {
         assert!(dir.join("metadata.json").exists());
         assert_eq!(loaded.samples_seen(), 1);
         assert!(output.value.is_finite());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn future_net_forward_returns_latent_dim_outputs() {
+        let input = FutureInput {
+            latent: netherwick_experience::ExperienceLatent {
+                t_ms: 10,
+                z: vec![0.1, 0.2, 0.3],
+                confidence: 0.8,
+                ..netherwick_experience::ExperienceLatent::default()
+            },
+            action: ActionPrimitive::Stop,
+            offset_ms: 1_000,
+        };
+        let trainer = FutureNetTrainer::new(input.flat_features().len(), input.latent.z.len());
+
+        let output = trainer.predict(&input).unwrap();
+
+        assert_eq!(output.predicted_z.len(), input.latent.z.len());
+        assert_eq!(output.offset_ms, input.offset_ms);
+        assert!(output.predicted_z.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn future_train_step_and_shadow_compare_record_finite_loss() {
+        let input = FutureInput {
+            latent: netherwick_experience::ExperienceLatent {
+                t_ms: 10,
+                z: vec![0.1, 0.2],
+                confidence: 0.8,
+                ..netherwick_experience::ExperienceLatent::default()
+            },
+            action: ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 500,
+            },
+            offset_ms: 1_000,
+        };
+        let target = vec![0.2, 0.4];
+        let mut trainer = FutureNetTrainer::new(input.flat_features().len(), target.len());
+        let hardcoded = FuturePrediction {
+            offset_ms: input.offset_ms,
+            predicted_z: input.latent.z.clone(),
+            confidence: 0.7,
+            summary: None,
+        };
+
+        let metric = trainer.shadow_compare(&input, &hardcoded, &target).unwrap();
+        let stats = trainer.train_step(&input, &target).unwrap();
+
+        assert_eq!(metric.offset_ms, 1_000);
+        assert!(metric.model_loss.is_finite());
+        assert_eq!(stats.samples_seen, 1);
+        assert!(stats.loss.is_finite());
+    }
+
+    #[test]
+    fn future_checkpoint_round_trips_prediction_shape() {
+        let dir = std::env::temp_dir().join(format!("netherwick-future-checkpoint-{}", now_ms()));
+        let input = FutureInput {
+            latent: netherwick_experience::ExperienceLatent {
+                t_ms: 10,
+                z: vec![0.1, 0.2, 0.3],
+                confidence: 0.8,
+                ..netherwick_experience::ExperienceLatent::default()
+            },
+            action: ActionPrimitive::Stop,
+            offset_ms: 1_000,
+        };
+        let mut trainer = FutureNetTrainer::new(input.flat_features().len(), input.latent.z.len());
+        trainer.train_step(&input, &[0.3, 0.2, 0.1]).unwrap();
+
+        trainer.save_checkpoint(&dir).unwrap();
+        let loaded = FutureNetTrainer::load_checkpoint(
+            &dir,
+            input.flat_features().len(),
+            input.latent.z.len(),
+        )
+        .unwrap();
+        let output = loaded.predict(&input).unwrap();
+
+        assert!(dir.join("model.bin").exists());
+        assert!(dir.join("metadata.json").exists());
+        assert_eq!(loaded.samples_seen(), 1);
+        assert_eq!(output.predicted_z.len(), input.latent.z.len());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn future_checkpoint_rejects_dimension_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "netherwick-future-checkpoint-mismatch-{}",
+            now_ms()
+        ));
+        let trainer = FutureNetTrainer::new(4, 2);
+
+        trainer.save_checkpoint(&dir).unwrap();
+        let err = match FutureNetTrainer::load_checkpoint(&dir, 5, 2) {
+            Ok(_) => panic!("expected dimension mismatch"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("future checkpoint input dimension mismatch"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -12,6 +12,10 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, not the sensor stream. Interpret images, audio, motion, location, body state, and memory-derived entries as the robot's own senses, not as media files or external sensor artifacts. Do not summarize the amount, density, cadence, or mix of input modalities as if that were the situation. Repeated frames, repeated detections, embeddings, and heartbeat-like status records are usually evidence to compress or ignore, not events to report. If the evidence does not reveal what is happening, say that I cannot tell what is happening yet.";
+
+const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation. Sort meaning by time: occurred time first, observed time second. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as sensation; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, or each detection unless they are the point.";
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConsciousCommand {
     pub summary: String,
@@ -552,25 +556,35 @@ fn build_combobulator_prompt(
     futures: &[FuturePrediction],
     recall_summary: &str,
 ) -> String {
-    let senses = summarized_senses(now)
-        .into_iter()
-        .map(|line| format!("- {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let timeline = render_combobulator_timeline(now);
     let futures = summarize_futures(futures);
     format!(
         "You are the combobulator for an embodied robot.\n\
-Summarize what is happening right now in one short first-person sentence.\n\
-Use only the evidence below. Prefer concrete sensor facts, memory, and immediate context.\n\
+Given recent sensations, impressions, memories, and predicted futures in timeline order, distill what appears to be happening right now.\n\
+Write one short grounded first-person sentence using I/my/me. Use only the evidence below. Prefer concrete body facts, nearby people or speech, memory, safety, and immediate context.\n\
+{SENSOR_GROUNDING_RULES}\n\
+{COMBOBULATOR_DISTILLATION_RULES}\n\
 Return JSON only with this schema:\n\
 {{\"summary\":\"...\",\"confidence\":0.0}}\n\n\
-Current time: {} ms\n\
+CONTEXT FRAME\n\
+WHO\n\
+- embodied robot\n\
+WHAT\n\
+- current awareness synthesis\n\
+WHERE\n\
+- current body location if sensors or memory reveal it; otherwise unknown\n\
+WHEN\n\
+- now at {} ms\n\
+WHY\n\
+- produce a compact awareness statement useful to the next action decision\n\
+HOW\n\
+- distill body sense, hearing, range, memory, predictions, surprise, and human reign controls\n\n\
 Latent confidence: {:.2}\n\
 Latent prediction error: {:.2}\n\
 Recall summary: {}\n\
-Summarized senses:\n{}\n\
+Timeline evidence:\n{}\n\
 Predicted futures:\n{}\n",
-        now.t_ms, z.confidence, z.prediction_error, recall_summary, senses, futures
+        now.t_ms, z.confidence, z.prediction_error, recall_summary, timeline, futures
     )
 }
 
@@ -681,15 +695,42 @@ fn summarize_futures(futures: &[FuturePrediction]) -> String {
         .join("\n")
 }
 
-fn heuristic_combobulation(now: &Now, recall_summary: &str) -> Combobulation {
-    let mut parts = summarized_senses(now);
-    if !recall_summary.trim().is_empty() {
-        parts.push(recall_summary.trim().to_string());
+fn render_combobulator_timeline(now: &Now) -> String {
+    let senses = summarized_senses(now);
+    if senses.is_empty() {
+        return "- no direct sensory evidence".to_string();
     }
-    let summary = if parts.is_empty() {
-        format!("I am active at t={}ms.", now.t_ms)
+    senses
+        .into_iter()
+        .map(|line| format!("[{} ms observed]\nSENSE\n  {line}", now.t_ms))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn heuristic_combobulation(now: &Now, recall_summary: &str) -> Combobulation {
+    let summary = if let Some(transcript) = now
+        .ear
+        .transcript
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        format!("I hear: {transcript}")
+    } else if now.body.flags.bump_left || now.body.flags.bump_right {
+        "My bump sensors are pressed.".to_string()
+    } else if now.body.flags.cliff_left
+        || now.body.flags.cliff_front_left
+        || now.body.flags.cliff_front_right
+        || now.body.flags.cliff_right
+        || now.body.cliff_sensors.max() >= 0.5
+    {
+        "I detect a cliff edge.".to_string()
+    } else if let Some(nearest_m) = now.range.nearest_m {
+        format!("Nearest obstacle is {:.2} meters away.", nearest_m)
+    } else if !recall_summary.trim().is_empty() {
+        recall_summary.trim().to_string()
     } else {
-        parts.into_iter().take(3).collect::<Vec<_>>().join(" ")
+        format!("I am active at t={}ms.", now.t_ms)
     };
     Combobulation {
         summary,
@@ -896,5 +937,33 @@ mod tests {
         assert!(
             senses.contains("Kinect IR has 4 samples, mean 0.50, max 0.90, bright fraction 0.50.")
         );
+    }
+
+    #[test]
+    fn combobulator_prompt_uses_timeline_distillation_rules() {
+        let mut now = Now::blank(250, BodySense::default());
+        now.ear.transcript = Some("hello there".to_string());
+
+        let prompt =
+            build_combobulator_prompt(&now, &ExperienceLatent::default(), &[], "I remember Tim.");
+
+        assert!(prompt.contains("Timeline evidence:"));
+        assert!(prompt.contains("[250 ms observed]"));
+        assert!(prompt.contains("Distill what matters, not what the records said."));
+        assert!(prompt.contains("prior combobulation summaries looping back as sensation"));
+        assert!(prompt.contains("CONTEXT FRAME"));
+        assert!(prompt.contains("I hear: hello there"));
+    }
+
+    #[test]
+    fn heuristic_combobulation_prefers_concrete_present_evidence() {
+        let mut now = Now::blank(500, BodySense::default());
+        now.ear.transcript = Some("come over here".to_string());
+        now.body.flags.bump_left = true;
+
+        let combobulation = heuristic_combobulation(&now, "A stale memory.");
+
+        assert_eq!(combobulation.summary, "I hear: come over here");
+        assert_eq!(combobulation.confidence, 0.35);
     }
 }

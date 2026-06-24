@@ -11,6 +11,7 @@ serde.workspace = true
 serde_json.workspace = true
 burn.workspace = true
 netherwick-behaviors = { path = "../netherwick-behaviors" }
+netherwick-core = { path = "../netherwick-core" }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-now = { path = "../netherwick-now" }
 

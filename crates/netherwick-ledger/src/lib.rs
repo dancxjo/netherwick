@@ -8,7 +8,8 @@ use netherwick_actions::{ActionPrimitive, ReignInput, ReignOutcome};
 use netherwick_behaviors::ErasedBehaviorRunRecord;
 use netherwick_core::Reward;
 use netherwick_experience::{
-    Experience, ExperienceLatent, FuturePrediction, Impression, RecalledExperience, Sensation,
+    Experience, ExperienceLatent, FutureInput, FuturePrediction, Impression, RecalledExperience,
+    Sensation,
 };
 use netherwick_llm::{ConsciousCommand, CounterfactualAction, LlmTeaching};
 use netherwick_now::{Now, RecallHit, SurpriseSense};
@@ -56,6 +57,21 @@ pub struct ExperienceTransition {
     pub reward: Reward,
     pub surprise: SurpriseSense,
     pub created_at_ms: u64,
+}
+
+pub fn future_input_from_transition(
+    transition: &ExperienceTransition,
+    offset_ms: u64,
+) -> Option<FutureInput> {
+    Some(FutureInput {
+        latent: transition.before_z.clone(),
+        action: transition.action.clone()?,
+        offset_ms,
+    })
+}
+
+pub fn future_target_from_transition(transition: &ExperienceTransition) -> Vec<f32> {
+    transition.after_z.z.clone()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -362,5 +378,44 @@ mod tests {
         assert_eq!(transition.after_z.z, vec![0.2]);
         assert_eq!(transition.action, Some(ActionPrimitive::Stop));
         assert_eq!(transition.reward.value, 0.25);
+    }
+
+    #[test]
+    fn future_helpers_use_before_latent_action_offset_and_after_target() {
+        let transition = ExperienceTransition {
+            id: Uuid::new_v4(),
+            before_frame_id: Uuid::new_v4(),
+            before: Now::blank(100, BodySense::default()),
+            before_z: ExperienceLatent {
+                t_ms: 100,
+                z: vec![0.1, 0.2],
+                confidence: 0.8,
+                ..ExperienceLatent::default()
+            },
+            action: Some(ActionPrimitive::Dock),
+            predicted_futures: Vec::new(),
+            after: Now::blank(200, BodySense::default()),
+            after_z: ExperienceLatent {
+                t_ms: 200,
+                z: vec![0.3, 0.4],
+                confidence: 0.9,
+                ..ExperienceLatent::default()
+            },
+            reward: Reward { value: 0.0 },
+            surprise: SurpriseSense::default(),
+            created_at_ms: 200,
+        };
+
+        let input = future_input_from_transition(&transition, 500).unwrap();
+        let target = future_target_from_transition(&transition);
+
+        assert_eq!(input.latent.z, vec![0.1, 0.2]);
+        assert_eq!(input.action, ActionPrimitive::Dock);
+        assert_eq!(input.offset_ms, 500);
+        assert_eq!(target, vec![0.3, 0.4]);
+        assert_eq!(
+            input.flat_features().len(),
+            transition.before_z.z.len() + netherwick_experience::action_features(None).len() + 1
+        );
     }
 }

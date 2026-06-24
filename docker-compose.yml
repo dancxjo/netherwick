@@ -1,0 +1,73 @@
+x-netherwick-env: &netherwick-env
+  RUST_LOG: ${RUST_LOG:-info}
+  NETHERWICK_NEO4J_URI: ${NETHERWICK_NEO4J_URI:-bolt://neo4j:7687}
+  NETHERWICK_NEO4J_USER: ${NETHERWICK_NEO4J_USER:-neo4j}
+  NETHERWICK_NEO4J_PASSWORD: ${NETHERWICK_NEO4J_PASSWORD:-password}
+  NETHERWICK_QDRANT_URL: ${NETHERWICK_QDRANT_URL:-http://qdrant:6333}
+
+services:
+  netherwick-live:
+    image: netherwick/live:latest
+    build:
+      context: .
+      dockerfile: docker/netherwick/Dockerfile
+    init: true
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    environment:
+      <<: *netherwick-env
+    command:
+      - sim
+      - --live
+      - --live-addr
+      - 0.0.0.0:8787
+      - --steps
+      - ${NETHERWICK_SIM_STEPS:-1000000000}
+      - --ledger
+      - /app/data/ledger
+      - --tick-delay-ms
+      - ${NETHERWICK_TICK_DELAY_MS:-100}
+    ports:
+      - "${NETHERWICK_LIVE_PORT:-8787}:8787"
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs:ro
+    profiles: ["netherwick"]
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: ${NETHERWICK_NEO4J_USER:-neo4j}/${NETHERWICK_NEO4J_PASSWORD:-password}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-512m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-1G}
+    ports:
+      - "${NETHERWICK_NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NETHERWICK_NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -u ${NETHERWICK_NEO4J_USER:-neo4j} -p ${NETHERWICK_NEO4J_PASSWORD:-password} 'RETURN 1' >/dev/null"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    ports:
+      - "${NETHERWICK_QDRANT_HTTP_PORT:-6333}:6333"
+      - "${NETHERWICK_QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:

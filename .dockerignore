@@ -1,0 +1,9 @@
+target
+.git
+.vendor
+data
+neo4j_data
+qdrant_data
+logs
+*.log
+**/*.rs.bk

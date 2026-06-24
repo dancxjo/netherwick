@@ -5,8 +5,8 @@ use netherwick_core::{Goal, Pose2};
 use netherwick_experience::{Experience, RecalledExperience};
 use netherwick_ledger::ExperienceFrame;
 use netherwick_now::{
-    MemorySense, Now, RecallHit, VectorArtifact, FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
-    VOICE_VECTOR_COLLECTION,
+    GraphEdge, GraphEntity, MemorySense, Now, RecallHit, VectorArtifact, FACE_VECTOR_COLLECTION,
+    SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -88,6 +88,10 @@ pub struct MemoryRecord {
     pub t_ms: u64,
     pub summary: String,
     #[serde(default)]
+    pub graph_entities: Vec<GraphEntity>,
+    #[serde(default)]
+    pub graph_relationships: Vec<GraphEdge>,
+    #[serde(default)]
     pub scene_vectors: Vec<VectorArtifact>,
     #[serde(default)]
     pub face_vectors: Vec<VectorArtifact>,
@@ -123,25 +127,32 @@ impl MemoryStore for InMemoryExperienceStore {
             .iter()
             .find_map(|hit| hit.warning.clone())
             .or_else(|| frame.now.memory.remembered_warning.clone());
+        let scene_vectors = scene_vectors_from_now(&frame.now, frame.id, frame.t_ms);
+        let face_vectors = vector_artifacts_from_now(
+            FACE_VECTOR_COLLECTION,
+            &frame.now.face.vectors,
+            &frame.now.face.embeddings,
+            frame.id,
+            frame.t_ms,
+        );
+        let voice_vectors = vector_artifacts_from_now(
+            VOICE_VECTOR_COLLECTION,
+            &frame.now.voice.vectors,
+            &frame.now.voice.embeddings,
+            frame.id,
+            frame.t_ms,
+        );
+        let (graph_entities, graph_relationships) =
+            graph_context_from_frame(frame, &scene_vectors, &face_vectors, &voice_vectors);
         let record = MemoryRecord {
             frame_id: frame.id,
             t_ms: frame.t_ms,
             summary: frame.summary_text(),
-            scene_vectors: scene_vectors_from_now(&frame.now, frame.id, frame.t_ms),
-            face_vectors: vector_artifacts_from_now(
-                FACE_VECTOR_COLLECTION,
-                &frame.now.face.vectors,
-                &frame.now.face.embeddings,
-                frame.id,
-                frame.t_ms,
-            ),
-            voice_vectors: vector_artifacts_from_now(
-                VOICE_VECTOR_COLLECTION,
-                &frame.now.voice.vectors,
-                &frame.now.voice.embeddings,
-                frame.id,
-                frame.t_ms,
-            ),
+            graph_entities,
+            graph_relationships,
+            scene_vectors,
+            face_vectors,
+            voice_vectors,
             battery: frame.now.body.battery_level,
             active_goal: RecallQuery::from_now(&frame.now).active_goal,
             chosen_action: frame.chosen_action.clone(),
@@ -182,6 +193,8 @@ impl Recall for InMemoryExperienceStore {
         let mut voice_familiarity = 0.0f32;
         let mut remembered_warning = None;
         let mut best_remembered_action = None;
+        let mut remembered_entities = Vec::new();
+        let mut remembered_relationships = Vec::new();
 
         for (index, (score, record)) in scored.into_iter().take(5).enumerate() {
             hits.push(RecallHit {
@@ -189,6 +202,7 @@ impl Recall for InMemoryExperienceStore {
                 score,
                 summary: record.summary.clone(),
                 warning: record.warning.clone(),
+                graph_context: scored_entities(&record, score),
             });
             let scene_score = max_vector_similarity(
                 query_scene_vectors(&query),
@@ -227,6 +241,8 @@ impl Recall for InMemoryExperienceStore {
                     }
                 }
             }
+            remembered_entities.extend(scored_entities(&record, score));
+            remembered_relationships.extend(record.graph_relationships.clone());
             if let Some(experience) = record.experience {
                 let sensation = experience.to_recall_sensation(
                     query_pose_time_hint(&query, index as u64),
@@ -240,6 +256,9 @@ impl Recall for InMemoryExperienceStore {
                 });
             }
         }
+        remembered_entities = dedupe_entities(remembered_entities, 12);
+        remembered_relationships = dedupe_relationships(remembered_relationships, 16);
+        let graph_context_summary = graph_context_summary(&remembered_entities);
 
         let sense = MemorySense {
             place_familiarity,
@@ -250,6 +269,9 @@ impl Recall for InMemoryExperienceStore {
             similar_situation_count: hits.len().try_into().unwrap_or(u16::MAX),
             best_remembered_action,
             remembered_warning,
+            remembered_entities,
+            remembered_relationships,
+            graph_context_summary,
         };
         let first_person_summary = if hits.is_empty() {
             "I do not remember a similar situation yet.".to_string()
@@ -297,6 +319,205 @@ fn score_record(query: &RecallQuery, record: MemoryRecord) -> Option<(f32, Memor
         return None;
     }
     Some((score, record))
+}
+
+fn graph_context_from_frame(
+    frame: &ExperienceFrame,
+    scene_vectors: &[VectorArtifact],
+    face_vectors: &[VectorArtifact],
+    voice_vectors: &[VectorArtifact],
+) -> (Vec<GraphEntity>, Vec<GraphEdge>) {
+    let frame_id = frame.id.to_string();
+    let experience_id = format!("experience:{frame_id}");
+    let mut entities = vec![GraphEntity {
+        id: experience_id.clone(),
+        labels: vec!["Experience".to_string(), "Memory".to_string()],
+        summary: frame.summary_text(),
+        score: 1.0,
+    }];
+    let mut relationships = Vec::new();
+
+    let pose = frame.now.body.odometry;
+    let place_id = place_id_for_pose(pose);
+    entities.push(GraphEntity {
+        id: place_id.clone(),
+        labels: vec!["Place".to_string()],
+        summary: format!("place near x={:.1}m y={:.1}m", pose.x_m, pose.y_m),
+        score: 1.0,
+    });
+    relationships.push(GraphEdge {
+        from: experience_id.clone(),
+        to: place_id,
+        relationship: "OCCURRED_AT".to_string(),
+        summary: None,
+    });
+
+    for artifact in scene_vectors {
+        let vector_id = vector_node_id(artifact);
+        entities.push(vector_entity(artifact, "scene"));
+        relationships.push(GraphEdge {
+            from: experience_id.clone(),
+            to: vector_id,
+            relationship: "HAS_SCENE_VECTOR".to_string(),
+            summary: None,
+        });
+    }
+
+    for (index, artifact) in face_vectors.iter().enumerate() {
+        let person_id = artifact
+            .source_id
+            .clone()
+            .unwrap_or_else(|| format!("person:face:{frame_id}:{index}"));
+        entities.push(GraphEntity {
+            id: person_id.clone(),
+            labels: vec![
+                "Person".to_string(),
+                "FaceInstance".to_string(),
+                "Entity".to_string(),
+            ],
+            summary: "person seen by face vector".to_string(),
+            score: 1.0,
+        });
+        entities.push(vector_entity(artifact, "face"));
+        relationships.push(GraphEdge {
+            from: experience_id.clone(),
+            to: person_id.clone(),
+            relationship: "SAW_PERSON".to_string(),
+            summary: None,
+        });
+        relationships.push(GraphEdge {
+            from: person_id,
+            to: vector_node_id(artifact),
+            relationship: "HAS_FACE_VECTOR".to_string(),
+            summary: None,
+        });
+    }
+
+    for (index, artifact) in voice_vectors.iter().enumerate() {
+        let person_id = artifact
+            .source_id
+            .clone()
+            .unwrap_or_else(|| format!("person:voice:{frame_id}:{index}"));
+        entities.push(GraphEntity {
+            id: person_id.clone(),
+            labels: vec![
+                "Person".to_string(),
+                "VoiceSignature".to_string(),
+                "Entity".to_string(),
+            ],
+            summary: "person heard by voice vector".to_string(),
+            score: 1.0,
+        });
+        entities.push(vector_entity(artifact, "voice"));
+        relationships.push(GraphEdge {
+            from: experience_id.clone(),
+            to: person_id.clone(),
+            relationship: "HEARD_PERSON".to_string(),
+            summary: None,
+        });
+        relationships.push(GraphEdge {
+            from: person_id,
+            to: vector_node_id(artifact),
+            relationship: "HAS_VOICE_VECTOR".to_string(),
+            summary: None,
+        });
+    }
+
+    (
+        dedupe_entities(entities, usize::MAX),
+        dedupe_relationships(relationships, usize::MAX),
+    )
+}
+
+fn place_id_for_pose(pose: Pose2) -> String {
+    format!(
+        "place:grid:{:.0}:{:.0}",
+        (pose.x_m * 2.0).round(),
+        (pose.y_m * 2.0).round()
+    )
+}
+
+fn vector_node_id(artifact: &VectorArtifact) -> String {
+    format!("vector:{}:{}", artifact.collection, artifact.point_id)
+}
+
+fn vector_entity(artifact: &VectorArtifact, kind: &str) -> GraphEntity {
+    GraphEntity {
+        id: vector_node_id(artifact),
+        labels: vec!["Vector".to_string()],
+        summary: format!(
+            "{kind} vector in {} with {} dimensions",
+            artifact.collection,
+            artifact.vector.len()
+        ),
+        score: 1.0,
+    }
+}
+
+fn scored_entities(record: &MemoryRecord, score: f32) -> Vec<GraphEntity> {
+    record
+        .graph_entities
+        .iter()
+        .filter(|entity| !entity.has_label("Vector"))
+        .map(|entity| {
+            let mut entity = entity.clone();
+            entity.score = score;
+            entity
+        })
+        .collect()
+}
+
+fn dedupe_entities(entities: Vec<GraphEntity>, limit: usize) -> Vec<GraphEntity> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for entity in entities {
+        if seen.insert(entity.id.clone()) {
+            out.push(entity);
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn dedupe_relationships(relationships: Vec<GraphEdge>, limit: usize) -> Vec<GraphEdge> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for relationship in relationships {
+        let key = format!(
+            "{}:{}:{}",
+            relationship.from, relationship.relationship, relationship.to
+        );
+        if seen.insert(key) {
+            out.push(relationship);
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn graph_context_summary(entities: &[GraphEntity]) -> Option<String> {
+    let people = entities
+        .iter()
+        .filter(|entity| entity.has_label("Person"))
+        .count();
+    let places = entities
+        .iter()
+        .filter(|entity| entity.has_label("Place"))
+        .count();
+    let experiences = entities
+        .iter()
+        .filter(|entity| entity.has_label("Experience"))
+        .count();
+    if people == 0 && places == 0 && experiences == 0 {
+        return None;
+    }
+    Some(format!(
+        "Graph recall: {people} person nodes, {places} place nodes, {experiences} experience nodes."
+    ))
 }
 
 fn scene_vectors_from_now(now: &Now, frame_id: uuid::Uuid, t_ms: u64) -> Vec<VectorArtifact> {
@@ -524,6 +745,60 @@ mod tests {
             snapshot[0].scene_vectors[0].collection,
             SCENE_VECTOR_COLLECTION
         );
+        assert!(snapshot[0]
+            .graph_entities
+            .iter()
+            .any(|entity| entity.has_label("Person")));
+        assert!(snapshot[0]
+            .graph_entities
+            .iter()
+            .any(|entity| entity.has_label("Place")));
+        assert!(snapshot[0]
+            .graph_relationships
+            .iter()
+            .any(|edge| edge.relationship == "HAS_FACE_VECTOR"));
+    }
+
+    #[tokio::test]
+    async fn recall_returns_graph_context_as_memory_sense() {
+        let mut now = Now::blank(123, BodySense::default());
+        now.face.vectors =
+            vec![
+                VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-1", vec![1.0, 0.0])
+                    .with_source_id("person:ada"),
+            ];
+
+        let store = InMemoryExperienceStore::new();
+        store.store(&empty_frame(now)).await.unwrap();
+
+        let recall = store
+            .recall(RecallQuery {
+                face_vector_artifacts: vec![VectorArtifact::new(
+                    FACE_VECTOR_COLLECTION,
+                    "query-face",
+                    vec![1.0, 0.0],
+                )],
+                battery: 1.0,
+                ..RecallQuery::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(recall
+            .sense
+            .remembered_entities
+            .iter()
+            .any(|entity| entity.id == "person:ada" && entity.has_label("Person")));
+        assert!(recall
+            .sense
+            .remembered_entities
+            .iter()
+            .any(|entity| entity.has_label("Place")));
+        assert!(recall.sense.graph_context_summary.is_some());
+        assert!(recall.hits[0]
+            .graph_context
+            .iter()
+            .any(|entity| entity.has_label("Person")));
     }
 
     #[test]

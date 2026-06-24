@@ -41,6 +41,28 @@ pub trait FuturePredictor {
     ) -> Result<FuturePrediction>;
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FutureInput {
+    pub latent: ExperienceLatent,
+    pub action: ActionPrimitive,
+    pub offset_ms: TimeMs,
+}
+
+impl FutureInput {
+    pub fn flat_features(&self) -> Vec<f32> {
+        let mut out =
+            Vec::with_capacity(self.latent.z.len() + action_features(Some(&self.action)).len() + 1);
+        out.extend(self.latent.z.iter().copied().map(sanitize_feature));
+        out.extend(
+            action_features(Some(&self.action))
+                .into_iter()
+                .map(sanitize_feature),
+        );
+        out.push((self.offset_ms as f32 / 1_000.0).clamp(0.0, 60.0));
+        out
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DangerInput {
     pub z: Vec<f32>,
@@ -629,6 +651,7 @@ impl FeatureExperienceEncoder {
                 BaselineSenseVectorizer::Safety,
                 BaselineSenseVectorizer::Reign,
                 BaselineSenseVectorizer::Audio,
+                BaselineSenseVectorizer::Asr,
                 BaselineSenseVectorizer::Range,
                 BaselineSenseVectorizer::KinectIr,
             ],
@@ -865,6 +888,7 @@ enum BaselineSenseVectorizer {
     Safety,
     Reign,
     Audio,
+    Asr,
     Range,
     KinectIr,
 }
@@ -880,6 +904,7 @@ impl SenseVectorizer for BaselineSenseVectorizer {
             Self::Safety => "safety",
             Self::Reign => "reign",
             Self::Audio => "audio",
+            Self::Asr => "asr",
             Self::Range => "range",
             Self::KinectIr => "kinect_ir",
         }
@@ -915,6 +940,11 @@ impl SenseVectorizer for BaselineSenseVectorizer {
                 now.memory.voice_familiarity.clamp(0.0, 1.0),
                 (now.memory.similar_situation_count as f32 / 32.0).clamp(0.0, 1.0),
                 bool01(now.memory.remembered_warning.is_some()),
+                graph_label_pressure(now, "Person"),
+                graph_label_pressure(now, "Place"),
+                graph_label_pressure(now, "Experience"),
+                (now.memory.remembered_relationships.len() as f32 / 32.0).clamp(0.0, 1.0),
+                bool01(now.memory.graph_context_summary.is_some()),
             ],
             Self::Drives => vec![
                 now.drives.battery_hunger.clamp(0.0, 1.0),
@@ -950,6 +980,7 @@ impl SenseVectorizer for BaselineSenseVectorizer {
                     .map(|text| !text.trim().is_empty())
                     .unwrap_or(false),
             )],
+            Self::Asr => asr_features(now),
             Self::Range => vec![now
                 .range
                 .nearest_m
@@ -981,6 +1012,19 @@ fn bool01(value: bool) -> f32 {
     } else {
         0.0
     }
+}
+
+fn graph_label_pressure(now: &Now, label: &str) -> f32 {
+    now.memory
+        .remembered_entities
+        .iter()
+        .filter(|entity| entity.has_label(label))
+        .map(|entity| entity.score.clamp(0.0, 1.0))
+        .fold(0.0f32, f32::max)
+}
+
+pub fn action_features(action: Option<&ActionPrimitive>) -> Vec<f32> {
+    danger_action_features(action)
 }
 
 fn danger_action_features(action: Option<&ActionPrimitive>) -> Vec<f32> {
@@ -1202,20 +1246,71 @@ fn eye_next_features(now: &Now) -> Vec<f32> {
 }
 
 fn ear_next_features(now: &Now) -> Vec<f32> {
-    let Some(features) = ear_frame_features(now) else {
-        return vec![0.0; 16];
-    };
-    if features.is_empty() {
-        return vec![0.0; 16];
-    }
     let mut out = Vec::with_capacity(16);
-    let chunk = (features.len() / 16).max(1);
-    for part in features.chunks(chunk).take(16) {
-        let avg = part.iter().copied().map(sanitize_feature).sum::<f32>() / part.len() as f32;
-        out.push(avg.clamp(-1.0, 1.0));
+    if let Some(features) = ear_frame_features(now) {
+        let chunk = (features.len() / 8).max(1);
+        for part in features.chunks(chunk).take(8) {
+            let avg = part.iter().copied().map(sanitize_feature).sum::<f32>() / part.len() as f32;
+            out.push(avg.clamp(-1.0, 1.0));
+        }
     }
-    out.resize(16, 0.0);
+    out.resize(8, 0.0);
+    out.extend(asr_features(now));
     out
+}
+
+fn asr_features(now: &Now) -> Vec<f32> {
+    let transcript = now
+        .ear
+        .asr
+        .transcript
+        .as_deref()
+        .or(now.ear.transcript.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let Some(transcript) = transcript else {
+        return vec![0.0; 8];
+    };
+
+    let word_count = now
+        .ear
+        .asr
+        .word_count
+        .map(f32::from)
+        .unwrap_or_else(|| count_transcript_words(transcript) as f32);
+    let char_count = transcript.chars().count() as f32;
+    let punctuation_count = transcript
+        .chars()
+        .filter(|ch| matches!(ch, '.' | ',' | '?' | '!' | ';' | ':'))
+        .count() as f32;
+    let duration_ms = now
+        .ear
+        .asr
+        .duration_ms
+        .or_else(|| Some(now.ear.asr.end_ms?.saturating_sub(now.ear.asr.start_ms?)))
+        .unwrap_or_default();
+    let sequence_span = match (now.ear.asr.sequence_start, now.ear.asr.sequence_end) {
+        (Some(start), Some(end)) => end.saturating_sub(start).saturating_add(1),
+        _ => 0,
+    };
+
+    vec![
+        1.0,
+        bool01(now.ear.asr.is_final),
+        now.ear.asr.confidence.clamp(0.0, 1.0),
+        (word_count / 32.0).clamp(0.0, 1.0),
+        (char_count / 160.0).clamp(0.0, 1.0),
+        (duration_ms as f32 / 20_000.0).clamp(0.0, 1.0),
+        (sequence_span as f32 / 128.0).clamp(0.0, 1.0),
+        (punctuation_count / 8.0).clamp(0.0, 1.0),
+    ]
+}
+
+fn count_transcript_words(transcript: &str) -> usize {
+    transcript
+        .split_whitespace()
+        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
+        .count()
 }
 
 fn kinect_ir_features(now: &Now) -> Vec<f32> {
@@ -1286,7 +1381,7 @@ impl PredictionSummaryExt for FuturePrediction {
 mod tests {
     use super::*;
     use netherwick_body::BodySense;
-    use netherwick_now::Now;
+    use netherwick_now::{AsrSense, Now};
 
     #[test]
     fn feature_encoder_produces_non_empty_latent() {
@@ -1318,6 +1413,51 @@ mod tests {
         assert_eq!(input.flat_features().len(), target.flat_features().len());
         assert_eq!(target.eye_features.len(), 16);
         assert_eq!(target.ear_features.len(), 16);
+    }
+
+    #[test]
+    fn ear_features_include_finalized_asr_metadata() {
+        let mut now = Now::blank(42, BodySense::default());
+        now.ear.features = vec![vec![0.1, 0.3, 0.5, 0.7]];
+        now.ear.asr = AsrSense {
+            transcript: Some("hello world again".to_string()),
+            is_final: true,
+            confidence: 0.72,
+            sequence_start: Some(10),
+            sequence_end: Some(13),
+            start_ms: Some(100),
+            end_ms: Some(1_100),
+            duration_ms: Some(1_000),
+            sample_rate_hz: Some(16_000),
+            word_count: Some(3),
+            speaker_confidence: Some(0.6),
+        };
+
+        let features = ear_next_features(&now);
+
+        assert_eq!(features.len(), 16);
+        assert_eq!(&features[..4], &[0.1, 0.3, 0.5, 0.7]);
+        assert_eq!(features[8], 1.0);
+        assert_eq!(features[9], 1.0);
+        assert_eq!(features[10], 0.72);
+        assert!(features[11] > 0.0);
+        assert!(features[13] > 0.0);
+        assert!(features[14] > 0.0);
+    }
+
+    #[test]
+    fn transcript_only_asr_still_reaches_now_vector() {
+        let mut now = Now::blank(42, BodySense::default());
+        now.ear.transcript = Some("come over here".to_string());
+
+        let target = experience_decode_target_from_now(&now);
+        let asr = asr_features(&now);
+
+        assert_eq!(target.ear_features.len(), 16);
+        assert_eq!(target.ear_features[8], 1.0);
+        assert_eq!(asr[0], 1.0);
+        assert!(asr[3] > 0.0);
+        assert!(target.flat_features().iter().any(|value| *value > 0.0));
     }
 
     #[test]

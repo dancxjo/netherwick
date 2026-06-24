@@ -776,6 +776,7 @@ fn project_ear_sense(body: &BodySense, objects: &[SimObject]) -> (EarSense, Opti
             schema_version: 1,
             features,
             transcript,
+            ..EarSense::default()
         },
         pcm,
     )

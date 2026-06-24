@@ -61,6 +61,24 @@ fmt:
 check:
     cargo check --workspace
 
+compose-config:
+    docker compose config
+
+compose-build:
+    docker compose build netherwick-live
+
+servers:
+    docker compose up -d neo4j qdrant
+
+live-server:
+    docker compose --profile netherwick up -d neo4j qdrant netherwick-live
+
+server-logs service="netherwick-live":
+    docker compose logs -f {{service}}
+
+stop-servers:
+    docker compose down
+
 test:
     cargo test --workspace
 

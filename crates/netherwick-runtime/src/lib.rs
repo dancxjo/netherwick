@@ -20,7 +20,7 @@ use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
 use netherwick_experience::{
-    action_value_input_from_transition_like, charge_input_from_transition_like,
+    action_features, action_value_input_from_transition_like, charge_input_from_transition_like,
     charge_target_from_transition_like, danger_input_from_transition_like,
     danger_target_from_transition_like, ear_next_input_from_transition_like,
     ear_next_target_from_now, experience_decode_target_from_now, experience_encode_input_from_now,
@@ -28,8 +28,9 @@ use netherwick_experience::{
     ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput,
     DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience, ExperienceDecodeOutput,
     ExperienceEncodeInput, ExperienceEncodeOutput, ExperienceEncoder, ExperienceLatent,
-    EyeNextInput, EyeNextOutput, FeatureExperienceEncoder, FuturePrediction, FuturePredictor,
-    Impression, RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
+    EyeNextInput, EyeNextOutput, FeatureExperienceEncoder, FutureInput, FuturePrediction,
+    FuturePredictor, Impression, RewardComputer, Sensation, StasisFuturePredictor,
+    SurpriseComputer,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -38,11 +39,11 @@ use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
 use netherwick_models::{
     read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
-    read_experience_autoencoder_metadata, read_eye_next_metadata, ActionValueNetTrainer,
-    ChargeNetTrainer, CopyCurrentEarPredictor, CopyCurrentEyePredictor, DangerNetTrainer,
-    EarNextNetTrainer, ExperienceAutoencoderPrediction, ExperienceAutoencoderTrainer,
-    EyeNextNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
-    HardcodedDangerPredictor,
+    read_experience_autoencoder_metadata, read_eye_next_metadata, read_future_metadata,
+    ActionValueNetTrainer, ChargeNetTrainer, CopyCurrentEarPredictor, CopyCurrentEyePredictor,
+    DangerNetTrainer, EarNextNetTrainer, ExperienceAutoencoderPrediction,
+    ExperienceAutoencoderTrainer, EyeNextNetTrainer, FutureNetTrainer,
+    HardcodedActionValuePredictor, HardcodedChargePredictor, HardcodedDangerPredictor,
 };
 use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
@@ -169,10 +170,31 @@ impl RuntimeModelStack {
         Ok(stack)
     }
 
+    pub fn with_future_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_future_checkpoint(path, BehaviorRegime::ShadowInfer)
+    }
+
+    pub fn with_future_checkpoint(path: impl AsRef<Path>, mode: BehaviorRegime) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_future_metadata(path)?;
+        let mut stack = Self::default();
+        stack.behaviors.future = future_behavior(
+            mode,
+            Some(FutureNetTrainer::load_checkpoint(
+                path,
+                metadata.input_dim,
+                metadata.latent_dim,
+            )?),
+            FallbackPolicy::UseHardcoded,
+        );
+        Ok(stack)
+    }
+
     pub fn with_shadow_checkpoints(
         danger_path: Option<&Path>,
         charge_path: Option<&Path>,
         action_value_path: Option<&Path>,
+        future_path: Option<&Path>,
         eye_next_path: Option<&Path>,
         ear_next_path: Option<&Path>,
         experience_path: Option<&Path>,
@@ -201,6 +223,18 @@ impl RuntimeModelStack {
                 Some(ActionValueNetTrainer::load_checkpoint(
                     path,
                     metadata.input_dim,
+                )?),
+                FallbackPolicy::UseHardcoded,
+            );
+        }
+        if let Some(path) = future_path {
+            let metadata = read_future_metadata(path)?;
+            stack.behaviors.future = future_behavior(
+                BehaviorRegime::ShadowInfer,
+                Some(FutureNetTrainer::load_checkpoint(
+                    path,
+                    metadata.input_dim,
+                    metadata.latent_dim,
                 )?),
                 FallbackPolicy::UseHardcoded,
             );
@@ -263,7 +297,11 @@ impl RuntimeModelStack {
             );
         }
         if let Some(behavior) = config.behavior.get("future") {
-            stack.behaviors.future = future_behavior(behavior.regime, behavior.fallback);
+            stack.behaviors.future = future_behavior(
+                behavior.regime,
+                load_future_behavior_trainer(behavior)?,
+                behavior.fallback,
+            );
         }
         if let Some(behavior) = config.behavior.get("action_value") {
             stack.behaviors.action_value = action_value_behavior(
@@ -325,7 +363,11 @@ impl Default for BehaviorRegistry {
                 None,
                 FallbackPolicy::UseHardcoded,
             ),
-            future: future_behavior(BehaviorRegime::Hardcoded, FallbackPolicy::UseHardcoded),
+            future: future_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
             action_value: action_value_behavior(
                 BehaviorRegime::Hardcoded,
                 None,
@@ -610,13 +652,6 @@ pub struct SituatedEarNextInput {
     pub now: Now,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FutureInput {
-    pub latent: ExperienceLatent,
-    pub action: ActionPrimitive,
-    pub offset_ms: TimeMs,
-}
-
 struct HardcodedExperienceBehavior;
 
 impl FunctionBehavior<SituatedExperienceInput, ExperienceAutoencoderPrediction>
@@ -882,6 +917,39 @@ impl FunctionBehavior<FutureInput, FuturePrediction> for StasisFutureBehavior {
     }
 }
 
+struct FutureModelBehavior {
+    trainer: FutureNetTrainer,
+}
+
+impl FunctionBehavior<FutureInput, FuturePrediction> for FutureModelBehavior {
+    fn id(&self) -> &'static str {
+        "future.burn.v0"
+    }
+
+    fn infer(&mut self, input: &FutureInput) -> Result<FuturePrediction> {
+        let mut input = input.clone();
+        if input.flat_features().len() != self.trainer.input_dim() {
+            input.latent.z.resize(self.trainer.latent_dim(), 0.0);
+            input.latent.z.truncate(self.trainer.latent_dim());
+            let expected_input_dim = self.trainer.latent_dim() + action_features(None).len() + 1;
+            if expected_input_dim != self.trainer.input_dim() {
+                return Err(anyhow::anyhow!(
+                    "future checkpoint input dimension mismatch: checkpoint expects {}, adapted runtime input would be {}",
+                    self.trainer.input_dim(),
+                    expected_input_dim
+                ));
+            }
+        }
+        self.trainer.predict(&input)
+    }
+
+    fn observe(&mut self, sample: &TrainingSample<FutureInput, FuturePrediction>) -> Result<()> {
+        self.trainer
+            .train_step(&sample.input, &sample.expected.predicted_z)?;
+        Ok(())
+    }
+}
+
 fn danger_behavior(
     regime: BehaviorRegime,
     trainer: Option<DangerNetTrainer>,
@@ -926,6 +994,7 @@ fn charge_behavior(
 
 fn future_behavior(
     regime: BehaviorRegime,
+    trainer: Option<FutureNetTrainer>,
     fallback: FallbackPolicy,
 ) -> ReplaceableBehavior<FutureInput, FuturePrediction> {
     ReplaceableBehavior::new(
@@ -934,7 +1003,7 @@ fn future_behavior(
         Box::new(StasisFutureBehavior {
             predictor: StasisFuturePredictor,
         }),
-        None,
+        trainer.map(|trainer| Box::new(FutureModelBehavior { trainer }) as Box<_>),
         fallback,
     )
 }
@@ -1022,6 +1091,21 @@ fn load_action_value_behavior_trainer(
     Ok(Some(ActionValueNetTrainer::load_checkpoint(
         checkpoint,
         metadata.input_dim,
+    )?))
+}
+
+fn load_future_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<FutureNetTrainer>> {
+    let Some(checkpoint) = behavior.checkpoint.as_deref() else {
+        return Ok(None);
+    };
+    if !Path::new(checkpoint).exists() {
+        return Ok(None);
+    }
+    let metadata = read_future_metadata(checkpoint)?;
+    Ok(Some(FutureNetTrainer::load_checkpoint(
+        checkpoint,
+        metadata.input_dim,
+        metadata.latent_dim,
     )?))
 }
 
@@ -1954,7 +2038,7 @@ fn predict_baseline_futures(
     let mut out = Vec::new();
     let mut records = Vec::new();
     for action in default_candidate_actions() {
-        for offset_ms in [1_000, 5_000] {
+        for offset_ms in [100, 500, 1_000, 5_000] {
             let input = FutureInput {
                 latent: latent.clone(),
                 action: action.clone(),
@@ -2267,7 +2351,7 @@ mod tests {
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_models::{
         ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
-        ExperienceAutoencoderTrainer,
+        ExperienceAutoencoderTrainer, FutureNetTrainer,
     };
     use netherwick_now::{Now, SurpriseSense};
     use netherwick_sensors::World;
@@ -2987,6 +3071,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sim_with_future_checkpoint_records_shadow_future_runs() {
+        let root = test_ledger_root("sim-runner-future-shadow");
+        let checkpoint = danger_checkpoint_root("sim-runner-future-shadow");
+        write_test_future_checkpoint(&checkpoint, ActionPrimitive::Stop);
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(ActionPrimitive::Stop))
+            .with_models(RuntimeModelStack::with_future_shadow_checkpoint(&checkpoint).unwrap());
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.8, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let frames = ledger.recent(5).await.unwrap();
+        let frame = frames.last().unwrap();
+        let run = frame
+            .behavior_runs
+            .iter()
+            .find(|run| run.behavior_id == "future" && run.model_json.is_some())
+            .unwrap();
+
+        assert_eq!(run.regime, BehaviorRegime::ShadowInfer);
+        assert!(run.hardcoded_json.is_some());
+        assert!(run.selected_json.is_some());
+        assert!(!frame.predicted_futures.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
     async fn sim_with_ear_next_checkpoint_writes_shadow_prediction() {
         let root = test_ledger_root("sim-runner-ear-next-shadow");
         let checkpoint = danger_checkpoint_root("sim-runner-ear-next-shadow");
@@ -3313,6 +3427,20 @@ mod tests {
                 &netherwick_experience::ActionValueTarget { value: 0.25 },
             )
             .unwrap();
+        trainer.save_checkpoint(root).unwrap();
+    }
+
+    fn write_test_future_checkpoint(root: &Path, action: ActionPrimitive) {
+        let now = Now::blank(100, test_body(1.0, 1.0, 0.8, 100));
+        let mut encoder = FeatureExperienceEncoder::new();
+        let latent = encoder.encode(&now).unwrap();
+        let input = FutureInput {
+            latent: latent.clone(),
+            action,
+            offset_ms: 100,
+        };
+        let mut trainer = FutureNetTrainer::new(input.flat_features().len(), input.latent.z.len());
+        trainer.train_step(&input, &latent.z).unwrap();
         trainer.save_checkpoint(root).unwrap();
     }
 

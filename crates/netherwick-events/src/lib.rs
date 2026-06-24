@@ -892,6 +892,7 @@ mod tests {
                 score: 0.9,
                 summary: "danger".to_string(),
                 warning: None,
+                graph_context: Vec::new(),
             }],
             ..RecallBundle::default()
         };
@@ -1079,6 +1080,7 @@ mod tests {
                 score: 0.7,
                 summary: "remembered danger".to_string(),
                 warning: Some("danger".to_string()),
+                graph_context: Vec::new(),
             }],
             sense: MemorySense {
                 place_danger: 0.9,

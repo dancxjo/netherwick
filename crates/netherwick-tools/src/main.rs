@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use netherwick_autonomic::SimpleSafety;
+use netherwick_behaviors::BehaviorRegime;
 use netherwick_body::BodySense;
 use netherwick_conductor::SimpleConductor;
 use netherwick_experience::{
@@ -13,16 +14,18 @@ use netherwick_experience::{
     danger_input_from_transition_like, danger_target_from_transition_like,
     ear_next_input_from_transition_like, ear_next_target_from_now,
     experience_decode_target_from_now, experience_encode_input_from_now,
-    eye_next_input_from_transition_like, eye_next_target_from_now,
+    eye_next_input_from_transition_like, eye_next_target_from_now, FuturePredictor,
+    StasisFuturePredictor,
 };
 use netherwick_ledger::{
-    ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
+    future_input_from_transition, future_target_from_transition, ExperienceFrame,
+    ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
 use netherwick_models::{
     ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
-    ExperienceAutoencoderTrainer, EyeNextNetTrainer, MODEL_REGISTRY,
+    ExperienceAutoencoderTrainer, EyeNextNetTrainer, FutureNetTrainer, MODEL_REGISTRY,
 };
 use netherwick_runtime::{MinimalRuntime, RuntimeModelStack, SimRunner};
 use netherwick_server::LiveViewState;
@@ -90,6 +93,10 @@ struct SimArgs {
     #[arg(long, value_enum, default_value = "off")]
     action_value_mode: ActionValueMode,
     #[arg(long)]
+    future_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "hardcoded")]
+    future_mode: FutureMode,
+    #[arg(long)]
     eye_next_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     eye_next_mode: EyeNextMode,
@@ -148,6 +155,13 @@ enum ActionValueMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FutureMode {
+    Hardcoded,
+    ShadowInfer,
+    ModelInfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum EyeNextMode {
     Off,
     ShadowInfer,
@@ -176,6 +190,7 @@ enum TrainModel {
     Danger(TrainDangerArgs),
     Charge(TrainChargeArgs),
     ActionValue(TrainActionValueArgs),
+    Future(TrainFutureArgs),
     EyeNext(TrainEyeNextArgs),
     EarNext(TrainEarNextArgs),
     Experience(TrainExperienceArgs),
@@ -208,6 +223,16 @@ struct TrainActionValueArgs {
     #[arg(long, default_value_t = 5)]
     epochs: usize,
     #[arg(long, default_value = "data/models/action_value_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainFutureArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/future_v0")]
     checkpoint: String,
 }
 
@@ -415,6 +440,7 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
     if args.danger_mode != DangerMode::ShadowInfer
         && args.charge_mode != ChargeMode::ShadowInfer
         && args.action_value_mode != ActionValueMode::ShadowInfer
+        && args.future_mode == FutureMode::Hardcoded
         && args.eye_next_mode != EyeNextMode::ShadowInfer
         && args.ear_next_mode != EarNextMode::ShadowInfer
         && args.experience_mode != ExperienceMode::ShadowInfer
@@ -483,6 +509,28 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
                 println!(
                     "action-value shadow inference disabled: no --action-value-checkpoint provided"
                 );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let future_path = if args.future_mode != FutureMode::Hardcoded {
+        match &args.future_checkpoint {
+            Some(checkpoint) if Path::new(checkpoint).exists() => {
+                let path = Path::new(checkpoint);
+                println!("loaded future checkpoint: {}", path.display());
+                Some(path)
+            }
+            Some(checkpoint) => {
+                println!(
+                    "future inference disabled: checkpoint not found at {}",
+                    checkpoint
+                );
+                None
+            }
+            None => {
+                println!("future inference disabled: no --future-checkpoint provided");
                 None
             }
         }
@@ -560,6 +608,7 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
     if danger_path.is_none()
         && charge_path.is_none()
         && action_value_path.is_none()
+        && future_path.is_none()
         && eye_next_path.is_none()
         && ear_next_path.is_none()
         && experience_path.is_none()
@@ -571,10 +620,31 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
         danger_path,
         charge_path,
         action_value_path,
+        future_path,
         eye_next_path,
         ear_next_path,
         experience_path,
     )?;
+    let models = if future_path.is_some() && args.future_mode == FutureMode::ModelInfer {
+        if danger_path.is_none()
+            && charge_path.is_none()
+            && action_value_path.is_none()
+            && eye_next_path.is_none()
+            && ear_next_path.is_none()
+            && experience_path.is_none()
+        {
+            RuntimeModelStack::with_future_checkpoint(
+                future_path.unwrap(),
+                BehaviorRegime::ModelInfer,
+            )?
+        } else {
+            let mut models = models;
+            models.behaviors.future.regime = BehaviorRegime::ModelInfer;
+            models
+        }
+    } else {
+        models
+    };
     Ok(Some(models))
 }
 
@@ -597,6 +667,7 @@ async fn run_train(command: TrainCommand) -> Result<()> {
         TrainModel::Danger(args) => train_danger(args).await,
         TrainModel::Charge(args) => train_charge(args).await,
         TrainModel::ActionValue(args) => train_action_value(args).await,
+        TrainModel::Future(args) => train_future(args).await,
         TrainModel::EyeNext(args) => train_eye_next(args).await,
         TrainModel::EarNext(args) => train_ear_next(args).await,
         TrainModel::Experience(args) => train_experience(args).await,
@@ -825,6 +896,90 @@ async fn train_action_value(args: TrainActionValueArgs) -> Result<()> {
     );
     trainer.save_checkpoint(&args.checkpoint)?;
     println!("saved action-value checkpoint: {}", args.checkpoint);
+    println!("samples_seen: {}", trainer.samples_seen());
+    println!("last_loss: {:.6}", last_loss);
+    println!("best_loss: {:?}", trainer.best_loss());
+    Ok(())
+}
+
+async fn train_future(args: TrainFutureArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let transitions = ledger.transitions().await?;
+    if transitions.is_empty() {
+        println!(
+            "future training skipped: no transitions found in {}",
+            args.ledger
+        );
+        return Ok(());
+    }
+
+    let mut samples = Vec::new();
+    for transition in &transitions {
+        let Some(input) = future_input_from_transition(transition, 1_000) else {
+            continue;
+        };
+        let target = future_target_from_transition(transition);
+        if target.is_empty() {
+            continue;
+        }
+        samples.push((transition.created_at_ms, input, target));
+    }
+    if samples.is_empty() {
+        println!(
+            "future training skipped: no usable transitions with actions and after_z in {}",
+            args.ledger
+        );
+        return Ok(());
+    }
+
+    let input_dim = samples
+        .first()
+        .map(|(_, input, _)| input.flat_features().len())
+        .unwrap_or(0);
+    let latent_dim = samples
+        .first()
+        .map(|(_, _, target)| target.len())
+        .unwrap_or(0);
+    let mut trainer = FutureNetTrainer::new(input_dim, latent_dim);
+    let checkpoint_dir = std::path::Path::new(&args.checkpoint);
+    tokio::fs::create_dir_all(checkpoint_dir).await?;
+    let metrics_path = checkpoint_dir.join("future-shadow-metrics.jsonl");
+    let mut metrics_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&metrics_path)
+        .await?;
+
+    let mut last_loss = 0.0;
+    let mut seen = 0_u64;
+    let mut stasis = StasisFuturePredictor;
+    for _ in 0..args.epochs {
+        for (_, input, target) in &samples {
+            if input.flat_features().len() != trainer.input_dim() || target.len() != latent_dim {
+                continue;
+            }
+            let hardcoded = stasis.predict(&input.latent, &input.action, input.offset_ms)?;
+            let metric = trainer.shadow_compare(input, &hardcoded, target)?;
+            let line = serde_json::to_string(&metric)?;
+            metrics_file.write_all(line.as_bytes()).await?;
+            metrics_file.write_all(b"\n").await?;
+
+            let stats = trainer.train_step(input, target)?;
+            last_loss = stats.loss;
+            seen = stats.samples_seen;
+        }
+    }
+
+    println!(
+        "future training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
+        samples.len(),
+        args.epochs,
+        seen,
+        last_loss,
+        metrics_path.display()
+    );
+    trainer.save_checkpoint(&args.checkpoint)?;
+    println!("saved future checkpoint: {}", args.checkpoint);
     println!("samples_seen: {}", trainer.samples_seen());
     println!("last_loss: {:.6}", last_loss);
     println!("best_loss: {:?}", trainer.best_loss());
@@ -1104,6 +1259,9 @@ fn model_status() -> Result<()> {
     );
     println!(
         "ActionValueNet: shadow-train ready; metrics: data/ledger/action-value-shadow-metrics.jsonl; checkpoint: data/models/action_value_v0"
+    );
+    println!(
+        "FuturePredictor: hardcoded stasis; train ready with transitions; metrics: data/models/future_v0/future-shadow-metrics.jsonl; checkpoint: data/models/future_v0; behavior-regime: hardcoded/shadow-infer/model-infer"
     );
     println!(
         "EyeNextPredictor: shadow-train ready; metrics: data/ledger/eye-next-shadow-metrics.jsonl; checkpoint: data/models/eye_next_v0"

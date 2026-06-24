@@ -31,3 +31,14 @@ just sim
 just inspect-ledger
 just hardware-env
 ```
+
+## Docker services
+
+Copy `.env.example` to `.env` if you want to override ports or passwords. Then:
+
+```bash
+just servers      # Neo4j + Qdrant
+just live-server  # Neo4j + Qdrant + live sim server
+```
+
+The live view is at `http://localhost:8787/view`. Neo4j Browser is at `http://localhost:7474` with the default `.env.example` credentials.

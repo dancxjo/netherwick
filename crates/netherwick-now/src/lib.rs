@@ -82,6 +82,23 @@ pub struct EarSense {
     pub schema_version: u32,
     pub features: Vec<Vec<f32>>,
     pub transcript: Option<String>,
+    #[serde(default)]
+    pub asr: AsrSense,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AsrSense {
+    pub transcript: Option<String>,
+    pub is_final: bool,
+    pub confidence: f32,
+    pub sequence_start: Option<u64>,
+    pub sequence_end: Option<u64>,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub sample_rate_hz: Option<u32>,
+    pub word_count: Option<u16>,
+    pub speaker_confidence: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -198,6 +215,28 @@ pub struct SelfSense {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GraphEntity {
+    pub id: String,
+    pub labels: Vec<String>,
+    pub summary: String,
+    pub score: f32,
+}
+
+impl GraphEntity {
+    pub fn has_label(&self, label: &str) -> bool {
+        self.labels.iter().any(|candidate| candidate == label)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub relationship: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemorySense {
     pub place_familiarity: f32,
     pub place_danger: f32,
@@ -207,6 +246,12 @@ pub struct MemorySense {
     pub similar_situation_count: u16,
     pub best_remembered_action: Option<ActionPrimitive>,
     pub remembered_warning: Option<String>,
+    #[serde(default)]
+    pub remembered_entities: Vec<GraphEntity>,
+    #[serde(default)]
+    pub remembered_relationships: Vec<GraphEdge>,
+    #[serde(default)]
+    pub graph_context_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -284,6 +329,8 @@ pub struct RecallHit {
     pub score: f32,
     pub summary: String,
     pub warning: Option<String>,
+    #[serde(default)]
+    pub graph_context: Vec<GraphEntity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -318,7 +365,7 @@ impl Now {
                 ..EyeSense::default()
             },
             ear: EarSense {
-                schema_version: 1,
+                schema_version: 2,
                 ..EarSense::default()
             },
             face: FaceSense {
