@@ -63,14 +63,10 @@ async fn run_sim_tick() -> Result<()> {
             height_m: 8.0,
         },
     );
-    world.add_object(SimObject {
-        label: "charger".to_string(),
-        x_m: 2.0,
-        y_m: 1.0,
-        radius_m: 0.25,
-        color_rgb: [32, 200, 32],
-    });
-    let _ = motors.send(MotionCommand::Forward { speed_m_s: 0.15 }).await?;
+    world.add_object(SimObject::charger("charger", "charger", 2.0, 1.0, 0.25));
+    let _ = motors
+        .send(MotionCommand::Forward { speed_m_s: 0.15 })
+        .await?;
     let snapshot = world.snapshot().await?;
     let mut now = snapshot.to_now(100);
     now.ear.transcript = Some("hello from the simulator".to_string());

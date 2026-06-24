@@ -5,9 +5,13 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+serial = ["dep:serialport"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
-serialport = "4"
+serialport = { version = "4", optional = true }
 netherwick-body = { path = "../netherwick-body" }

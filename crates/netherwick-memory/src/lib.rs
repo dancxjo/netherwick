@@ -111,7 +111,10 @@ impl MemoryStore for InMemoryExperienceStore {
             warning,
             experience: frame.experiences.last().cloned(),
         };
-        self.records.lock().expect("memory mutex poisoned").push(record);
+        self.records
+            .lock()
+            .expect("memory mutex poisoned")
+            .push(record);
         Ok(())
     }
 }
@@ -151,9 +154,7 @@ impl Recall for InMemoryExperienceStore {
                 warning: record.warning.clone(),
             });
             place_familiarity = place_familiarity.max(score);
-            if record.summary.to_ascii_lowercase().contains("danger")
-                || record.warning.is_some()
-            {
+            if record.summary.to_ascii_lowercase().contains("danger") || record.warning.is_some() {
                 place_danger = place_danger.max(score);
             }
             if matches!(record.active_goal, Some(Goal::Dock)) || record.summary.contains("charge") {
@@ -230,12 +231,12 @@ fn score_record(query: &RecallQuery, record: MemoryRecord) -> Option<(f32, Memor
     } else {
         0.0
     };
-    let action_score = if query.proposed_action.is_some() && query.proposed_action == record.chosen_action
-    {
-        0.8
-    } else {
-        0.0
-    };
+    let action_score =
+        if query.proposed_action.is_some() && query.proposed_action == record.chosen_action {
+            0.8
+        } else {
+            0.0
+        };
     let score = (overlap * 0.5) + (battery_score * 0.2) + (goal_score * 0.2) + (action_score * 0.1);
     if score <= 0.05 {
         return None;

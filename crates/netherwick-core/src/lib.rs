@@ -71,9 +71,7 @@ impl Provenance {
         Self::default()
     }
 
-    pub fn derived_from_sensations(
-        sensation_ids: impl IntoIterator<Item = SensationId>,
-    ) -> Self {
+    pub fn derived_from_sensations(sensation_ids: impl IntoIterator<Item = SensationId>) -> Self {
         Self {
             kind: ProvenanceKind::DerivedFromSensations {
                 sensation_ids: sensation_ids.into_iter().collect(),

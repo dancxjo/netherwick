@@ -1,6 +1,5 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use netherwick_body::BodySense;
 use netherwick_now::{
     EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense, RangeSense,
@@ -8,13 +7,28 @@ use netherwick_now::{
 };
 use netherwick_now::{Now, PredictionSense, SurpriseSense};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+
+#[cfg(feature = "linux-hardware")]
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(feature = "linux-hardware")]
 use serialport::SerialPort;
+#[cfg(feature = "linux-hardware")]
 use std::io::{ErrorKind, Read};
+#[cfg(feature = "linux-hardware")]
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "linux-hardware")]
+use std::time::Duration;
+#[cfg(feature = "linux-hardware")]
 use v4l::buffer::Type;
+#[cfg(feature = "linux-hardware")]
 use v4l::io::traits::CaptureStream;
+#[cfg(feature = "linux-hardware")]
 use v4l::prelude::{MmapStream, *};
+#[cfg(feature = "linux-hardware")]
 use v4l::video::Capture;
 
 #[async_trait]
@@ -318,6 +332,7 @@ pub struct LinuxWorldConfig {
     pub audio_channels: u16,
 }
 
+#[cfg(feature = "linux-hardware")]
 pub struct LinuxWorld {
     snapshot: WorldSnapshot,
     microphone: Option<CpalMicrophone>,
@@ -325,6 +340,7 @@ pub struct LinuxWorld {
     gps: Option<Ublox7Gps>,
 }
 
+#[cfg(feature = "linux-hardware")]
 impl LinuxWorld {
     pub fn new(config: LinuxWorldConfig) -> Result<Self> {
         let microphone = CpalMicrophone::new(
@@ -380,6 +396,7 @@ impl LinuxWorld {
     }
 }
 
+#[cfg(feature = "linux-hardware")]
 #[async_trait]
 impl World for LinuxWorld {
     async fn snapshot(&mut self) -> Result<WorldSnapshot> {
@@ -393,17 +410,15 @@ impl World for LinuxWorld {
     }
 }
 
+#[cfg(feature = "linux-hardware")]
 pub struct CpalMicrophone {
     latest: Arc<Mutex<Option<PcmAudioFrame>>>,
     _stream: cpal::Stream,
 }
 
+#[cfg(feature = "linux-hardware")]
 impl CpalMicrophone {
-    pub fn new(
-        preferred_name: Option<&str>,
-        sample_rate_hz: u32,
-        channels: u16,
-    ) -> Result<Self> {
+    pub fn new(preferred_name: Option<&str>, sample_rate_hz: u32, channels: u16) -> Result<Self> {
         let host = cpal::default_host();
         let device = select_input_device(&host, preferred_name)?;
         let config = cpal::StreamConfig {
@@ -425,7 +440,10 @@ impl CpalMicrophone {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &config,
                 move |data: &[u16], _| {
-                    let pcm = data.iter().map(|sample| (*sample as i32 - 32_768) as i16).collect::<Vec<_>>();
+                    let pcm = data
+                        .iter()
+                        .map(|sample| (*sample as i32 - 32_768) as i16)
+                        .collect::<Vec<_>>();
                     store_i16_pcm_frame(&shared, &pcm, sample_rate_hz, channels);
                 },
                 err_fn,
@@ -459,10 +477,12 @@ impl CpalMicrophone {
     }
 }
 
+#[cfg(feature = "linux-hardware")]
 pub struct V4lCamera {
     device: Device,
 }
 
+#[cfg(feature = "linux-hardware")]
 impl V4lCamera {
     pub fn new(path: &str) -> Result<Self> {
         Ok(Self {
@@ -484,11 +504,13 @@ impl V4lCamera {
     }
 }
 
+#[cfg(feature = "linux-hardware")]
 pub struct Ublox7Gps {
     port: Box<dyn SerialPort>,
     buffer: Vec<u8>,
 }
 
+#[cfg(feature = "linux-hardware")]
 impl Ublox7Gps {
     pub fn new(path: &str, baud_rate: u32) -> Result<Self> {
         let port = serialport::new(path, baud_rate)
@@ -521,10 +543,8 @@ impl Ublox7Gps {
     }
 }
 
-fn select_input_device(
-    host: &cpal::Host,
-    preferred_name: Option<&str>,
-) -> Result<cpal::Device> {
+#[cfg(feature = "linux-hardware")]
+fn select_input_device(host: &cpal::Host, preferred_name: Option<&str>) -> Result<cpal::Device> {
     if let Some(name) = preferred_name {
         for device in host.input_devices()? {
             if device.name().ok().as_deref() == Some(name) {
@@ -536,6 +556,7 @@ fn select_input_device(
         .ok_or_else(|| anyhow::anyhow!("no CPAL input device available"))
 }
 
+#[cfg(feature = "linux-hardware")]
 fn store_i16_pcm_frame(
     shared: &Arc<Mutex<Option<PcmAudioFrame>>>,
     samples: &[i16],
@@ -553,12 +574,14 @@ fn store_i16_pcm_frame(
 }
 
 fn bytes_to_unit_signal(bytes: &[u8]) -> Vec<f32> {
-    bytes.iter()
+    bytes
+        .iter()
         .take(256)
         .map(|byte| *byte as f32 / 255.0)
         .collect()
 }
 
+#[cfg(feature = "linux-hardware")]
 fn pcm_to_unit_signal(samples: &[i16]) -> Vec<f32> {
     samples
         .iter()
@@ -567,6 +590,7 @@ fn pcm_to_unit_signal(samples: &[i16]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(feature = "linux-hardware")]
 fn parse_nmea_fix(line: &str) -> Option<GpsSense> {
     if line.starts_with("$GPGGA") || line.starts_with("$GNGGA") {
         let fields = line.split(',').collect::<Vec<_>>();
@@ -600,6 +624,7 @@ fn parse_nmea_fix(line: &str) -> Option<GpsSense> {
     None
 }
 
+#[cfg(feature = "linux-hardware")]
 fn parse_nmea_coord(value: &str, hemi: &str) -> Option<f64> {
     let dot = value.find('.')?;
     let degrees_len = if dot > 4 { 3 } else { 2 };
@@ -613,11 +638,185 @@ fn parse_nmea_coord(value: &str, hemi: &str) -> Option<f64> {
     Some(decimal)
 }
 
+#[cfg(any(feature = "linux-hardware", test))]
 fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KinectReplayFrame {
+    pub t_ms: u64,
+    pub rgb_path: Option<String>,
+    pub depth_path: Option<String>,
+    pub color_features: Option<Vec<Vec<f32>>>,
+    pub depth_m: Option<Vec<f32>>,
+    pub audio_angle_rad: Option<f32>,
+    pub audio_confidence: Option<f32>,
+}
+
+pub struct KinectReplayProvider {
+    root: PathBuf,
+    frames: Vec<KinectReplayFrame>,
+    cursor: usize,
+    pending: VecDeque<SensePacket>,
+}
+
+impl KinectReplayProvider {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        let manifest_path = root.join("timestamps.jsonl");
+        let manifest = File::open(&manifest_path)?;
+        let frames = BufReader::new(manifest)
+            .lines()
+            .filter_map(|line| match line {
+                Ok(line) if !line.trim().is_empty() => {
+                    Some(serde_json::from_str(&line).map_err(anyhow::Error::from))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error.into())),
+            })
+            .collect::<Result<Vec<KinectReplayFrame>>>()?;
+        Ok(Self {
+            root,
+            frames,
+            cursor: 0,
+            pending: VecDeque::new(),
+        })
+    }
+
+    fn packet_for_frame(
+        &self,
+        frame: &KinectReplayFrame,
+    ) -> Result<(SensePacket, Option<SensePacket>)> {
+        let rgb_bytes = frame
+            .rgb_path
+            .as_ref()
+            .map(|path| std::fs::read(self.root.join(path)))
+            .transpose()?;
+        let depth_m = match &frame.depth_m {
+            Some(depth) => depth.clone(),
+            None => frame
+                .depth_path
+                .as_ref()
+                .map(|path| read_depth_values(&self.root.join(path)))
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        let color_features = frame
+            .color_features
+            .clone()
+            .or_else(|| {
+                rgb_bytes
+                    .as_deref()
+                    .map(|bytes| vec![bytes_to_unit_signal(bytes)])
+            })
+            .unwrap_or_default();
+        let eye = rgb_bytes.map(|bytes| {
+            SensePacket::Eye(EyeSense {
+                schema_version: 1,
+                frames: vec![bytes_to_unit_signal(&bytes)],
+            })
+        });
+        let kinect = KinectSense {
+            schema_version: 1,
+            color_features,
+            depth_m,
+            audio_angle_rad: frame.audio_angle_rad,
+            audio_confidence: frame.audio_confidence.unwrap_or(0.0),
+            ..KinectSense::default()
+        };
+        Ok((SensePacket::Kinect(kinect), eye))
+    }
+}
+
+#[async_trait]
+impl SenseProducer for KinectReplayProvider {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        if let Some(packet) = self.pending.pop_front() {
+            return Ok(packet);
+        }
+        if self.frames.is_empty() {
+            anyhow::bail!("kinect replay has no frames");
+        }
+        let frame = &self.frames[self.cursor % self.frames.len()];
+        self.cursor += 1;
+        let (kinect, eye) = self.packet_for_frame(frame)?;
+        if let Some(eye) = eye {
+            self.pending.push_back(eye);
+        }
+        Ok(kinect)
+    }
+}
+
+#[cfg(feature = "kinect-freenect")]
+pub struct FreenectKinectProvider;
+
+#[cfg(feature = "kinect-freenect")]
+impl FreenectKinectProvider {
+    pub fn new() -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[cfg(feature = "kinect-freenect")]
+#[async_trait]
+impl SenseProducer for FreenectKinectProvider {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        anyhow::bail!(
+            "FreenectKinectProvider is a feature-gated skeleton; wire libfreenect FFI or a freenect subprocess here"
+        )
+    }
+}
+
+fn read_depth_values(path: &Path) -> Result<Vec<f32>> {
+    let bytes = std::fs::read(path)?;
+    if let Ok(values) = serde_json::from_slice::<Vec<f32>>(&bytes) {
+        return Ok(values);
+    }
+    let text = String::from_utf8(bytes)?;
+    text.split_whitespace()
+        .map(|value| value.parse::<f32>().map_err(anyhow::Error::from))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn kinect_replay_emits_kinect_then_eye_packet() {
+        let root =
+            std::env::temp_dir().join(format!("netherwick-kinect-replay-{}", unix_time_ms()));
+        std::fs::create_dir_all(root.join("rgb")).unwrap();
+        std::fs::create_dir_all(root.join("depth")).unwrap();
+        std::fs::write(root.join("rgb/frame.raw"), [0u8, 128, 255]).unwrap();
+        std::fs::write(root.join("depth/frame.json"), "[1.0,2.0]").unwrap();
+        let mut manifest = File::create(root.join("timestamps.jsonl")).unwrap();
+        writeln!(
+            manifest,
+            "{}",
+            serde_json::json!({
+                "t_ms": 1,
+                "rgb_path": "rgb/frame.raw",
+                "depth_path": "depth/frame.json"
+            })
+        )
+        .unwrap();
+
+        let mut provider = KinectReplayProvider::new(&root).unwrap();
+        let first = provider.poll().await.unwrap();
+        let second = provider.poll().await.unwrap();
+
+        assert!(
+            matches!(first, SensePacket::Kinect(KinectSense { depth_m, .. }) if depth_m == vec![1.0, 2.0])
+        );
+        assert!(matches!(second, SensePacket::Eye(EyeSense { frames, .. }) if frames.len() == 1));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -161,7 +161,10 @@ impl LlmConfig {
 
 pub fn summarized_senses(now: &Now) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push(format!("Battery level is {:.0}%.", now.body.battery_level * 100.0));
+    lines.push(format!(
+        "Battery level is {:.0}%.",
+        now.body.battery_level * 100.0
+    ));
     if now.body.charging {
         lines.push("I am charging.".to_string());
     }
@@ -287,7 +290,10 @@ impl OllamaLlmAgent {
         };
         let response = self
             .client
-            .post(format!("{}/api/generate", self.config.endpoint.trim_end_matches('/')))
+            .post(format!(
+                "{}/api/generate",
+                self.config.endpoint.trim_end_matches('/')
+            ))
             .json(&request)
             .send()
             .await
@@ -340,7 +346,14 @@ impl LlmAgent for OllamaLlmAgent {
             return Ok(LlmTickResult::default());
         }
 
-        let prompt = build_agent_prompt(now, z, futures, recall_summary, awareness_summary, &self.config);
+        let prompt = build_agent_prompt(
+            now,
+            z,
+            futures,
+            recall_summary,
+            awareness_summary,
+            &self.config,
+        );
         let reply = match self
             .generate_json::<AgentReply>(&self.config.agent_model, prompt)
             .await
@@ -358,20 +371,18 @@ impl LlmAgent for OllamaLlmAgent {
             .critique
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let summary = reply
-            .summary
-            .trim()
-            .to_string();
+        let summary = reply.summary.trim().to_string();
         let confidence = reply.confidence.clamp(0.0, 1.0);
 
-        let conscious_command = if self.config.allow_commands && (action.is_some() || !summary.is_empty()) {
-            Some(ConsciousCommand {
-                summary: summary.clone(),
-                action: action.clone(),
-            })
-        } else {
-            None
-        };
+        let conscious_command =
+            if self.config.allow_commands && (action.is_some() || !summary.is_empty()) {
+                Some(ConsciousCommand {
+                    summary: summary.clone(),
+                    action: action.clone(),
+                })
+            } else {
+                None
+            };
 
         let teaching = if self.config.allow_teaching
             && (critique.is_some()
@@ -505,12 +516,7 @@ Latent prediction error: {:.2}\n\
 Recall summary: {}\n\
 Summarized senses:\n{}\n\
 Predicted futures:\n{}\n",
-        now.t_ms,
-        z.confidence,
-        z.prediction_error,
-        recall_summary,
-        senses,
-        futures
+        now.t_ms, z.confidence, z.prediction_error, recall_summary, senses, futures
     )
 }
 
@@ -647,7 +653,13 @@ fn parse_action_spec(spec: ActionSpec) -> Option<ActionPrimitive> {
         }),
         "dock" => Some(ActionPrimitive::Dock),
         "explore" => Some(ActionPrimitive::Explore {
-            style: match spec.style.as_deref().unwrap_or("random_walk").to_ascii_lowercase().as_str() {
+            style: match spec
+                .style
+                .as_deref()
+                .unwrap_or("random_walk")
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "wander" => ExploreStyle::Wander,
                 "random_walk" => ExploreStyle::RandomWalk,
                 "wall_follow" => ExploreStyle::WallFollow,
@@ -659,7 +671,13 @@ fn parse_action_spec(spec: ActionSpec) -> Option<ActionPrimitive> {
             text: spec.text.unwrap_or_default(),
         }),
         "chirp" => Some(ActionPrimitive::Chirp {
-            pattern: match spec.pattern.as_deref().unwrap_or("confirm").to_ascii_lowercase().as_str() {
+            pattern: match spec
+                .pattern
+                .as_deref()
+                .unwrap_or("confirm")
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "confirm" => ChirpPattern::Confirm,
                 "warning" => ChirpPattern::Warning,
                 "curious" => ChirpPattern::Curious,

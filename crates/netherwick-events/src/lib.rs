@@ -4,7 +4,9 @@ use anyhow::Result;
 use netherwick_actions::{ActionPrimitive, ApproachTarget, InspectTarget, TurnDir};
 use netherwick_autonomic::{SafetyDecision, SafetyReason};
 use netherwick_core::{Provenance, TimeMs};
-use netherwick_experience::{Experience, ExperienceLatent, Impression, FuturePrediction, Sensation};
+use netherwick_experience::{
+    Experience, ExperienceLatent, FuturePrediction, Impression, Sensation,
+};
 use netherwick_llm::LlmTeaching;
 use netherwick_memory::RecallBundle;
 use netherwick_now::{LlmSense, MemorySense, Now};
@@ -39,6 +41,7 @@ pub enum EventKind {
     FaceDetected,
     FaceRecognized,
     VoiceRecognized,
+    NearWall,
     MemoryRecalled,
     PredictionMade,
     SurpriseHigh,
@@ -60,6 +63,12 @@ pub enum EventPayload {
     ChargingStopped,
     Bump {
         side: String,
+    },
+    SoundHeard {
+        sources: usize,
+    },
+    FaceDetected {
+        face_embeddings: usize,
     },
     Cliff,
     WheelDrop,
@@ -90,6 +99,9 @@ pub enum EventPayload {
     SafetyVetoed {
         desired_action: ActionPrimitive,
         reason: String,
+    },
+    NearWall {
+        distance_norm: f32,
     },
 }
 
@@ -215,7 +227,10 @@ impl EventBus {
             responses.extend(emitted);
         }
 
-        Ok(DispatchOutput { events: seen, responses })
+        Ok(DispatchOutput {
+            events: seen,
+            responses,
+        })
     }
 }
 
@@ -229,6 +244,7 @@ pub struct EventExtractorConfig {
     pub low_battery_threshold: f32,
     pub face_familiarity_threshold: f32,
     pub surprise_threshold: f32,
+    pub near_wall_threshold: f32,
 }
 
 impl Default for EventExtractorConfig {
@@ -237,6 +253,7 @@ impl Default for EventExtractorConfig {
             low_battery_threshold: 0.20,
             face_familiarity_threshold: 0.70,
             surprise_threshold: 0.75,
+            near_wall_threshold: 0.18,
         }
     }
 }
@@ -289,6 +306,24 @@ impl EventExtractor {
             );
         }
 
+        if now
+            .range
+            .beams
+            .iter()
+            .copied()
+            .any(|beam| beam <= self.config.near_wall_threshold)
+        {
+            let distance_norm = now.range.beams.iter().copied().fold(1.0_f32, f32::min);
+            events.push(
+                Event::new(now.t_ms, EventKind::NearWall)
+                    .with_summary(format!(
+                        "Near wall at normalized range {:.2}.",
+                        distance_norm
+                    ))
+                    .with_payload(EventPayload::NearWall { distance_norm }),
+            );
+        }
+
         if now.body.flags.cliff_left || now.body.flags.cliff_right {
             events.push(
                 Event::new(now.t_ms, EventKind::Cliff)
@@ -318,10 +353,31 @@ impl EventExtractor {
             }
         }
 
+        if !now.ear.features.is_empty() {
+            events.push(
+                Event::new(now.t_ms, EventKind::SoundHeard)
+                    .with_summary("Sound heard.")
+                    .with_payload(EventPayload::SoundHeard {
+                        sources: now.ear.features.len(),
+                    }),
+            );
+        }
+
         let face_familiarity = recall
             .map(|bundle| bundle.sense.face_familiarity)
             .unwrap_or(now.memory.face_familiarity);
-        if !now.face.embeddings.is_empty() && face_familiarity >= self.config.face_familiarity_threshold {
+        if !now.face.embeddings.is_empty() {
+            events.push(
+                Event::new(now.t_ms, EventKind::FaceDetected)
+                    .with_summary("Face detected.")
+                    .with_payload(EventPayload::FaceDetected {
+                        face_embeddings: now.face.embeddings.len(),
+                    }),
+            );
+        }
+        if !now.face.embeddings.is_empty()
+            && face_familiarity >= self.config.face_familiarity_threshold
+        {
             events.push(
                 Event::new(now.t_ms, EventKind::FaceRecognized)
                     .with_summary("Recognized a familiar face.")
@@ -644,7 +700,9 @@ pub mod responders {
                     summary: format!("Safety vetoed an action because {reason}."),
                     critique: Some("Body safety overrode the chosen action.".to_string()),
                     counterfactuals: Vec::new(),
-                    memory_notes: vec![format!("Avoid repeating action after safety veto: {reason}")],
+                    memory_notes: vec![format!(
+                        "Avoid repeating action after safety veto: {reason}"
+                    )],
                     confidence: 0.9,
                 }),
             ])
@@ -748,7 +806,9 @@ mod tests {
 
         let events = extractor.events_from_now(&now, Some(&recall));
 
-        assert!(events.iter().any(|event| event.kind == EventKind::MemoryRecalled));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::MemoryRecalled));
     }
 
     #[test]
@@ -766,15 +826,37 @@ mod tests {
             llm: None,
             safety: None,
         };
-        let event = Event::new(5, EventKind::BatteryLow).with_payload(EventPayload::BatteryLow {
-            battery_level: 0.1,
-        });
+        let event = Event::new(5, EventKind::BatteryLow)
+            .with_payload(EventPayload::BatteryLow { battery_level: 0.1 });
 
         let output = bus.dispatch(&ctx, &event).unwrap();
 
         assert!(output
             .iter()
             .any(|response| matches!(response, Response::ProposeAction(ActionPrimitive::Dock))));
+    }
+
+    #[test]
+    fn extractor_emits_near_wall_face_and_sound_events() {
+        let mut extractor = EventExtractor::default();
+        let mut now = Now::blank(12, BodySense::default());
+        now.range.beams = vec![0.12, 0.8];
+        now.ear.features = vec![vec![0.7]];
+        now.face.embeddings = vec![vec![0.1, 0.2, 0.3]];
+        now.memory.face_familiarity = 0.9;
+
+        let events = extractor.events_from_now(&now, None);
+
+        assert!(events.iter().any(|event| event.kind == EventKind::NearWall));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::SoundHeard));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::FaceDetected));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::FaceRecognized));
     }
 
     #[test]
@@ -792,11 +874,8 @@ mod tests {
             llm: None,
             safety: None,
         };
-        let event = Event::new(8, EventKind::ChargingStarted).with_payload(
-            EventPayload::ChargingStarted {
-                battery_level: 0.8,
-            },
-        );
+        let event = Event::new(8, EventKind::ChargingStarted)
+            .with_payload(EventPayload::ChargingStarted { battery_level: 0.8 });
 
         let output = bus.dispatch(&ctx, &event).unwrap();
 
@@ -808,9 +887,9 @@ mod tests {
                 .contains("sweet"),
             _ => false,
         }));
-        assert!(output
-            .iter()
-            .any(|response| matches!(response, Response::AddMemoryNote(note) if note.contains("sweet"))));
+        assert!(output.iter().any(
+            |response| matches!(response, Response::AddMemoryNote(note) if note.contains("sweet"))
+        ));
     }
 
     #[test]
@@ -873,9 +952,8 @@ mod tests {
             llm: None,
             safety: None,
         };
-        let event = Event::new(10, EventKind::MemoryRecalled).with_payload(
-            EventPayload::MemoryRecalled { hits: 1 },
-        );
+        let event = Event::new(10, EventKind::MemoryRecalled)
+            .with_payload(EventPayload::MemoryRecalled { hits: 1 });
 
         let output = bus.dispatch(&ctx, &event).unwrap();
 
@@ -898,12 +976,11 @@ mod tests {
             llm: None,
             safety: None,
         };
-        let event = Event::new(11, EventKind::SafetyVetoed).with_payload(
-            EventPayload::SafetyVetoed {
+        let event =
+            Event::new(11, EventKind::SafetyVetoed).with_payload(EventPayload::SafetyVetoed {
                 desired_action: ActionPrimitive::Dock,
                 reason: "Cliff".to_string(),
-            },
-        );
+            });
 
         let output = bus.dispatch(&ctx, &event).unwrap();
 

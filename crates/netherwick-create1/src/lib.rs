@@ -2,8 +2,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use netherwick_body::{BodySense, MotionCommand, MotorCommand, MotorComplex, RobotBody};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "serial")]
 use serialport::SerialPort;
+#[cfg(feature = "serial")]
 use std::io::Write;
+#[cfg(feature = "serial")]
 use std::time::Duration;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -33,6 +36,7 @@ impl Create1Config {
 #[derive(Debug)]
 pub struct Create1Body {
     body: BodySense,
+    #[cfg(feature = "serial")]
     port: Option<Box<dyn SerialPort>>,
     config: Create1Config,
 }
@@ -41,6 +45,7 @@ impl Default for Create1Body {
     fn default() -> Self {
         Self {
             body: BodySense::default(),
+            #[cfg(feature = "serial")]
             port: None,
             config: Create1Config::default().normalized(),
         }
@@ -50,11 +55,15 @@ impl Default for Create1Body {
 impl Create1Body {
     pub fn new(config: Create1Config) -> Result<Self> {
         let config = config.normalized();
-        let mut body = Self {
+        let body = Self {
             body: BodySense::default(),
+            #[cfg(feature = "serial")]
             port: None,
             config,
         };
+        #[cfg(feature = "serial")]
+        let mut body = body;
+        #[cfg(feature = "serial")]
         if let Some(path) = body.config.port.clone() {
             let port = serialport::new(path, body.config.baud_rate)
                 .timeout(Duration::from_millis(100))
@@ -62,20 +71,33 @@ impl Create1Body {
             body.port = Some(port);
             body.initialize()?;
         }
+        #[cfg(not(feature = "serial"))]
+        if body.config.port.is_some() {
+            anyhow::bail!(
+                "Create1 serial port support requires the netherwick-create1 `serial` feature"
+            );
+        }
         Ok(body)
     }
 
+    #[cfg(feature = "serial")]
     fn initialize(&mut self) -> Result<()> {
         self.write_bytes(&[128])?;
         self.write_bytes(&[if self.config.use_safe_mode { 131 } else { 132 }])?;
         Ok(())
     }
 
+    #[cfg(feature = "serial")]
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         if let Some(port) = self.port.as_mut() {
             port.write_all(bytes)?;
             port.flush()?;
         }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "serial"))]
+    fn write_bytes(&mut self, _bytes: &[u8]) -> Result<()> {
         Ok(())
     }
 

@@ -7,7 +7,9 @@ use netherwick_core::{Provenance, Reward};
 use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
-use netherwick_experience::{Experience, ExperienceLatent, FuturePrediction, Impression, Sensation};
+use netherwick_experience::{
+    Experience, ExperienceLatent, FuturePrediction, Impression, Sensation,
+};
 use netherwick_ledger::{ExperienceFrame, LedgerWriter};
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
@@ -42,7 +44,14 @@ where
     S: SafetyLayer,
     A: LlmAgent,
 {
-    pub fn new(ledger: L, memory_store: M, memory_recall: R, conductor: C, safety: S, llm: A) -> Self {
+    pub fn new(
+        ledger: L,
+        memory_store: M,
+        memory_recall: R,
+        conductor: C,
+        safety: S,
+        llm: A,
+    ) -> Self {
         Self {
             ledger,
             memory_store,
@@ -122,10 +131,20 @@ where
             )
             .await?;
         now.llm = llm_tick.sense.clone();
-        apply_llm_tick(&llm_tick, &mut sensations, &mut impressions, &mut experiences, &mut teachings);
+        apply_llm_tick(
+            &llm_tick,
+            &mut sensations,
+            &mut impressions,
+            &mut experiences,
+            &mut teachings,
+        );
 
         let mut proposals = proposed_actions.clone();
-        if let Some(action) = llm_tick.conscious_command.as_ref().and_then(|cmd| cmd.action.clone()) {
+        if let Some(action) = llm_tick
+            .conscious_command
+            .as_ref()
+            .and_then(|cmd| cmd.action.clone())
+        {
             proposals.push(action);
         }
 
@@ -153,7 +172,9 @@ where
                 llm: Some(&now.llm),
                 safety: Some(&safety),
             };
-            let veto_events = self.extractor.events_from_safety(&now, &chosen_action, &safety);
+            let veto_events = self
+                .extractor
+                .events_from_safety(&now, &chosen_action, &safety);
             let veto_output = self.bus.dispatch_all(&veto_ctx, veto_events)?;
             apply_responses(
                 &mut now,
@@ -185,7 +206,10 @@ where
         if experiences.is_empty() {
             experiences.push(Experience::new(
                 "realtime.state",
-                format!("I am at t={}ms with battery {:.2}.", now.t_ms, now.body.battery_level),
+                format!(
+                    "I am at t={}ms with battery {:.2}.",
+                    now.t_ms, now.body.battery_level
+                ),
                 Vec::new(),
                 Vec::new(),
                 now.t_ms,
@@ -222,10 +246,16 @@ where
 
         Ok(RuntimeTick {
             frame,
-            experience: experiences
-                .last()
-                .cloned()
-                .unwrap_or_else(|| Experience::new("realtime.state", "I am active.", Vec::new(), Vec::new(), now.t_ms, now.t_ms)),
+            experience: experiences.last().cloned().unwrap_or_else(|| {
+                Experience::new(
+                    "realtime.state",
+                    "I am active.",
+                    Vec::new(),
+                    Vec::new(),
+                    now.t_ms,
+                    now.t_ms,
+                )
+            }),
             chosen_action: Some(chosen_action),
             recall,
             llm: llm_tick,
