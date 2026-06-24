@@ -2365,9 +2365,11 @@ struct StuckStatus {
     duration_ticks: usize,
     phase: RecoveryPhase,
     turn_sign: f32,
+    recovery_attempts: usize,
     event_started: bool,
     recovered: bool,
     dead_battery: bool,
+    reset_due: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2382,9 +2384,11 @@ struct StuckRecoveryController {
     phase: RecoveryPhase,
     phase_ticks_remaining: usize,
     turn_sign: f32,
+    recovery_attempts: usize,
     event_started: bool,
     recovered: bool,
     dead_battery: bool,
+    reset_due: bool,
 }
 
 impl StuckRecoveryController {
@@ -2413,6 +2417,9 @@ impl StuckRecoveryController {
                 .saturating_add(1)
                 .max(STUCK_LOW_DISPLACEMENT_TICKS)
         } else {
+            if !self.active && step_distance > STUCK_WINDOW_DISPLACEMENT_EPSILON_M {
+                self.recovery_attempts = 0;
+            }
             0
         };
 
@@ -2423,6 +2430,13 @@ impl StuckRecoveryController {
             && corner_trap
             && !self.dead_battery
         {
+            if self.recovery_attempts > 0 {
+                self.reset_due = true;
+                self.corner_trap = corner_trap;
+                self.event_started = true;
+                self.last_position = Some(position);
+                return;
+            }
             self.active = true;
             self.corner_trap = true;
             self.duration_ticks = 0;
@@ -2473,6 +2487,7 @@ impl StuckRecoveryController {
                 self.duration_ticks = 0;
                 self.phase = RecoveryPhase::None;
                 self.phase_ticks_remaining = 0;
+                self.recovery_attempts = self.recovery_attempts.saturating_add(1);
                 self.recovered = true;
                 self.displacement_window.clear();
                 self.commanded_window.clear();
@@ -2515,6 +2530,7 @@ impl StuckRecoveryController {
                 status.event_started as u8 as f32,
                 status.recovered as u8 as f32,
                 status.dead_battery as u8 as f32,
+                status.reset_due as u8 as f32,
             ],
         }
     }
@@ -2527,9 +2543,11 @@ impl StuckRecoveryController {
             duration_ticks: self.duration_ticks,
             phase: self.phase,
             turn_sign: self.turn_sign,
+            recovery_attempts: self.recovery_attempts,
             event_started: self.event_started,
             recovered: self.recovered,
             dead_battery: self.dead_battery,
+            reset_due: self.reset_due,
         }
     }
 
@@ -2613,12 +2631,12 @@ fn is_dead_battery(snapshot: &WorldSnapshot) -> bool {
     snapshot.body.battery_level <= f32::EPSILON && !snapshot.body.charging
 }
 
-fn sim_stuck_started(snapshot: &WorldSnapshot) -> bool {
+fn sim_stuck_reset_due(snapshot: &WorldSnapshot) -> bool {
     snapshot
         .extensions
         .iter()
         .find(|extension| extension.name == "sim.stuck")
-        .and_then(|extension| extension.values.get(6))
+        .and_then(|extension| extension.values.get(9))
         .copied()
         .unwrap_or(0.0)
         > 0.0
@@ -2664,7 +2682,7 @@ where
         for _ in 0..steps {
             let mut snapshot = self.world.snapshot().await?;
             self.stuck.annotate_snapshot(&mut snapshot, self.tick_ms);
-            let reset_after_tick = sim_stuck_started(&snapshot);
+            let reset_after_tick = sim_stuck_reset_due(&snapshot);
             let now = snapshot.to_now(snapshot.body.last_update_ms);
             let tick = self
                 .runtime
@@ -4102,8 +4120,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sim_runner_resets_stuck_body_and_records_critique() {
-        let root = test_ledger_root("sim-runner-stuck-reset");
+    async fn sim_runner_gives_stuck_body_recovery_time_before_reset() {
+        let root = test_ledger_root("sim-runner-stuck-recovery-time");
         let ledger = JsonlLedger::new(&root);
         let runtime = test_runtime(
             ledger.clone(),
@@ -4124,16 +4142,12 @@ mod tests {
             .unwrap();
         let snapshot = runner.world.snapshot().await.unwrap();
         let frames = ledger.recent(10).await.unwrap();
-        let frame = frames.last().unwrap();
 
-        assert_eq!(snapshot.body.battery_level, 1.0);
-        assert_eq!(snapshot.body.odometry.x_m, 2.0);
-        assert_eq!(snapshot.body.odometry.y_m, 2.0);
-        assert!(frame.llm_teaching.iter().any(|teaching| teaching
-            .critique
-            .as_deref()
-            .is_some_and(|critique| critique.contains("Getting corner trap ends the run"))));
-        assert!(frame.notes.iter().any(|note| note.contains("VirtualStuck")));
+        assert_ne!(snapshot.body.odometry.x_m, 2.0);
+        assert_ne!(snapshot.body.odometry.y_m, 2.0);
+        assert!(!frames
+            .iter()
+            .any(|frame| frame.notes.iter().any(|note| note.contains("VirtualStuck"))));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4599,6 +4613,39 @@ mod tests {
         assert!(status.corner_trap);
         assert_eq!(status.stuck_ticks, STUCK_LOW_DISPLACEMENT_TICKS);
         assert!(status.event_started);
+        assert!(!status.reset_due);
+    }
+
+    #[test]
+    fn stuck_detector_marks_reset_due_after_failed_recovery_attempt() {
+        let mut detector = StuckRecoveryController::default();
+        let action = ActionPrimitive::Explore {
+            style: ExploreStyle::RandomWalk,
+            duration_ms: 1_000,
+        };
+
+        for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
+            detector.observe(&stuck_test_snapshot(0.2, 0.2, 1.0), Some(&action));
+        }
+        while detector.recovery_motion().is_some() {}
+        assert_eq!(detector.status().recovery_attempts, 1);
+
+        for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
+            detector.observe(&stuck_test_snapshot(0.2, 0.2, 1.0), Some(&action));
+        }
+        let mut snapshot = stuck_test_snapshot(0.2, 0.2, 1.0);
+        detector.annotate_snapshot(&mut snapshot, 100);
+
+        let status = detector.status();
+        assert!(status.reset_due);
+        assert!(!status.active);
+        let values = &snapshot
+            .extensions
+            .iter()
+            .find(|extension| extension.name == "sim.stuck")
+            .unwrap()
+            .values;
+        assert_eq!(values.get(9).copied(), Some(1.0));
     }
 
     #[test]

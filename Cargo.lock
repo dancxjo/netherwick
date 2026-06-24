@@ -4744,6 +4744,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures-util",
  "netherwick-actions",
  "netherwick-body",
  "netherwick-experience",
@@ -4751,6 +4752,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
+ "tokio",
  "toml 0.8.23",
  "uuid",
 ]

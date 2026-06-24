@@ -359,12 +359,12 @@ impl EventExtractor {
             .and_then(|value| value.get("values"))
             .and_then(|value| value.as_array())
         {
-            let started = stuck_values
-                .get(6)
+            let reset_due = stuck_values
+                .get(9)
                 .and_then(|value| value.as_f64())
                 .unwrap_or(0.0)
                 > 0.0;
-            if started {
+            if reset_due {
                 let corner_trap = stuck_values
                     .get(1)
                     .and_then(|value| value.as_f64())
@@ -377,7 +377,9 @@ impl EventExtractor {
                     .max(0.0) as usize;
                 events.push(
                     Event::new(now.t_ms, EventKind::SimStuckReset)
-                        .with_summary("Virtual body is stuck; simulation reset needed.")
+                        .with_summary(
+                            "Virtual body is still stuck after recovery; simulation reset needed.",
+                        )
                         .with_payload(EventPayload::SimStuckReset {
                             corner_trap,
                             stuck_ticks,
@@ -878,15 +880,15 @@ pub mod responders {
             let class = if corner_trap { "corner trap" } else { "stuck" };
             Ok(vec![
                 Response::AddMemoryNote(format!(
-                    "VirtualStuck: {class} after {stuck_ticks} low-displacement ticks; simulation reset queued."
+                    "VirtualStuck: {class} persisted after recovery and {stuck_ticks} low-displacement ticks; simulation reset queued."
                 )),
                 Response::Teach(LlmTeaching {
                     t_ms: event.t_ms,
                     summary: format!(
-                        "The virtual body got {class}, so the simulation reset."
+                        "The virtual body stayed in {class} after recovery, so the simulation reset."
                     ),
                     critique: Some(format!(
-                        "Getting {class} ends the run; avoid repeated motion into blocked space."
+                        "Getting {class} after recovery ends the run; avoid repeated motion into blocked space."
                     )),
                     counterfactuals: Vec::new(),
                     memory_notes: vec![

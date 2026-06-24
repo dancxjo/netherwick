@@ -466,6 +466,7 @@ pub enum EyeFrameFormat {
     Gray8,
     Rgb8,
     Bgr8,
+    Yuyv422,
     Mjpeg,
     Unknown(String),
 }
@@ -825,9 +826,21 @@ impl V4lCamera {
             captured_at_ms: unix_time_ms(),
             width: format.width,
             height: format.height,
-            format: EyeFrameFormat::Unknown(format!("{:?}", format.fourcc)),
+            format: eye_frame_format_from_fourcc(format.fourcc.str().unwrap_or_default()),
             bytes: bytes.to_vec(),
         })
+    }
+}
+
+#[cfg(feature = "linux-hardware")]
+fn eye_frame_format_from_fourcc(fourcc: &str) -> EyeFrameFormat {
+    match fourcc.trim_end_matches('\0') {
+        "GREY" | "Y800" => EyeFrameFormat::Gray8,
+        "RGB3" => EyeFrameFormat::Rgb8,
+        "BGR3" => EyeFrameFormat::Bgr8,
+        "YUYV" | "YUY2" => EyeFrameFormat::Yuyv422,
+        "MJPG" | "JPEG" => EyeFrameFormat::Mjpeg,
+        other => EyeFrameFormat::Unknown(other.to_string()),
     }
 }
 

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
@@ -36,6 +37,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/stream/now",
     "/stream/mind",
     "/stream/logs",
+    "/stream/llm",
     "/view",
     "/view/snapshot",
     "/view/scene",
@@ -297,6 +299,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view/scene", get(get_live_scene))
         .route("/view/3d", get(live_view_3d_page))
         .route("/view/capture-scene", get(get_capture_scene))
+        .route("/stream/llm", get(get_llm_stream))
         .nest_service(
             "/static",
             ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),
@@ -411,6 +414,28 @@ async fn live_view_page() -> Html<&'static str> {
 
 async fn live_view_3d_page() -> Html<&'static str> {
     Html(LIVE_VIEW_3D_PAGE)
+}
+
+async fn get_llm_stream(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(stream_llm_events)
+}
+
+async fn stream_llm_events(mut socket: WebSocket) {
+    let mut rx = netherwick_llm::subscribe_llm_streams();
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let Ok(text) = serde_json::to_string(&event) else {
+                    continue;
+                };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 pub fn snapshot_to_scene(
@@ -619,6 +644,17 @@ fn eye_frame_stats(frame: &netherwick_sensors::EyeFrame) -> EyeFrameStats {
                 }
             }
         }
+        EyeFrameFormat::Yuyv422 => {
+            for pair in frame.bytes.chunks_exact(4).take(pixels.div_ceil(2)) {
+                for value in [pair[0], pair[2]] {
+                    let luma = value as f32 / 255.0;
+                    luma_sum += luma;
+                    if luma > 0.08 {
+                        non_background += 1;
+                    }
+                }
+            }
+        }
         EyeFrameFormat::Mjpeg | EyeFrameFormat::Unknown(_) => {}
     }
     EyeFrameStats {
@@ -633,9 +669,13 @@ fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>,
             let encoded = base64::engine::general_purpose::STANDARD.encode(&frame.bytes);
             (Some(format!("data:image/jpeg;base64,{encoded}")), None)
         }
-        EyeFrameFormat::Rgb8 | EyeFrameFormat::Bgr8 | EyeFrameFormat::Gray8 => {
+        EyeFrameFormat::Rgb8
+        | EyeFrameFormat::Bgr8
+        | EyeFrameFormat::Gray8
+        | EyeFrameFormat::Yuyv422 => {
             let expected_len = match frame.format {
                 EyeFrameFormat::Gray8 => frame.width as usize * frame.height as usize,
+                EyeFrameFormat::Yuyv422 => frame.width as usize * frame.height as usize * 2,
                 _ => frame.width as usize * frame.height as usize * 3,
             };
             if frame.bytes.len() < expected_len {
@@ -661,6 +701,9 @@ fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>,
                         rgb.extend_from_slice(&[*value, *value, *value]);
                     }
                 }
+                EyeFrameFormat::Yuyv422 => {
+                    rgb.extend(yuyv422_to_rgb(&frame.bytes[..expected_len]));
+                }
                 _ => {}
             }
             let mut png = Vec::new();
@@ -682,6 +725,28 @@ fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>,
             (None, Some(format!("unsupported eye frame format {format}")))
         }
     }
+}
+
+fn yuyv422_to_rgb(bytes: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(bytes.len() / 2 * 3);
+    for pair in bytes.chunks_exact(4) {
+        let y0 = pair[0];
+        let u = pair[1];
+        let y1 = pair[2];
+        let v = pair[3];
+        push_yuv_rgb(&mut rgb, y0, u, v);
+        push_yuv_rgb(&mut rgb, y1, u, v);
+    }
+    rgb
+}
+
+fn push_yuv_rgb(rgb: &mut Vec<u8>, y: u8, u: u8, v: u8) {
+    let c = y as i32 - 16;
+    let d = u as i32 - 128;
+    let e = v as i32 - 128;
+    rgb.push(((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8);
+    rgb.push(((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8);
+    rgb.push(((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8);
 }
 
 fn scene_kinect_from_snapshot(snapshot: &WorldSnapshot, warnings: &mut Vec<String>) -> SceneKinect {
@@ -1042,17 +1107,36 @@ function drawEye(frame){
   if(!frame) return;
   const fmt = frame.format;
   const isRgb = fmt === 'Rgb8' || (typeof fmt === 'object' && fmt.Rgb8 !== undefined);
+  const isBgr = fmt === 'Bgr8' || (typeof fmt === 'object' && fmt.Bgr8 !== undefined);
+  const isGray = fmt === 'Gray8' || (typeof fmt === 'object' && fmt.Gray8 !== undefined);
+  const isYuyv = fmt === 'Yuyv422' || (typeof fmt === 'object' && fmt.Yuyv422 !== undefined);
   const isMjpg = fmt === 'Mjpeg' || (typeof fmt === 'object' && fmt.Mjpeg !== undefined) || (typeof fmt === 'object' && JSON.stringify(fmt).includes('MJPG'));
-  if(isRgb){
+  if(isRgb || isBgr || isGray || isYuyv){
     if(canvas.width !== frame.width || canvas.height !== frame.height){
       canvas.width = frame.width; canvas.height = frame.height;
     }
     const image = ctx.createImageData(frame.width, frame.height);
-    for(let source = 0, target = 0; source < frame.bytes.length; source += 3, target += 4){
-      image.data[target] = frame.bytes[source];
-      image.data[target + 1] = frame.bytes[source + 1];
-      image.data[target + 2] = frame.bytes[source + 2];
-      image.data[target + 3] = 255;
+    if(isGray){
+      for(let source = 0, target = 0; target < image.data.length && source < frame.bytes.length; source += 1, target += 4){
+        const value = frame.bytes[source];
+        image.data[target] = value;
+        image.data[target + 1] = value;
+        image.data[target + 2] = value;
+        image.data[target + 3] = 255;
+      }
+    }else if(isYuyv){
+      for(let source = 0, target = 0; target + 7 < image.data.length && source + 3 < frame.bytes.length; source += 4, target += 8){
+        const y0 = frame.bytes[source], u = frame.bytes[source + 1], y1 = frame.bytes[source + 2], v = frame.bytes[source + 3];
+        writeYuvPixel(image.data, target, y0, u, v);
+        writeYuvPixel(image.data, target + 4, y1, u, v);
+      }
+    }else{
+      for(let source = 0, target = 0; target < image.data.length && source + 2 < frame.bytes.length; source += 3, target += 4){
+        image.data[target] = isBgr ? frame.bytes[source + 2] : frame.bytes[source];
+        image.data[target + 1] = frame.bytes[source + 1];
+        image.data[target + 2] = isBgr ? frame.bytes[source] : frame.bytes[source + 2];
+        image.data[target + 3] = 255;
+      }
     }
     ctx.putImageData(image, 0, 0);
   } else if(isMjpg){
@@ -1068,6 +1152,13 @@ function drawEye(frame){
     };
     img.src = url;
   }
+}
+function writeYuvPixel(data, target, y, u, v){
+  const c = y - 16, d = u - 128, e = v - 128;
+  data[target] = Math.max(0, Math.min(255, (298 * c + 409 * e + 128) >> 8));
+  data[target + 1] = Math.max(0, Math.min(255, (298 * c - 100 * d - 208 * e + 128) >> 8));
+  data[target + 2] = Math.max(0, Math.min(255, (298 * c + 516 * d + 128) >> 8));
+  data[target + 3] = 255;
 }
 function drawBeams(values){
   beams.replaceChildren(...(values || []).map(value => {
@@ -1141,9 +1232,24 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #reign{position:fixed;right:12px;top:12px;min-width:220px;max-width:min(320px,calc(100vw - 24px));padding:10px;border:1px solid #36424d;background:rgba(11,16,22,.84);backdrop-filter:blur(8px);border-radius:6px;color:#dce8f2}
 #reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
 #reign div{font-variant-numeric:tabular-nums}
+#llm{position:fixed;right:12px;top:96px;width:min(420px,calc(100vw - 24px));max-height:calc(100vh - 164px);display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;padding:10px;border:1px solid #3f4c58;background:rgba(9,12,16,.88);backdrop-filter:blur(10px);border-radius:6px;color:#e7eef5}
+#llm header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+#llm h2{font-size:12px;margin:0;color:#b6e0ff}
+#llm-status{color:#ffcf7a;font-size:12px;font-variant-numeric:tabular-nums}
+#llm-streams{display:grid;gap:8px;min-height:0;overflow:auto;scrollbar-width:thin}
+.llm-card{display:grid;gap:6px;padding:8px;border:1px solid #2c3640;background:rgba(19,25,32,.78);border-radius:5px}
+.llm-card.live{border-color:#5a7892}
+.llm-card.error{border-color:#a65454}
+.llm-top{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px}
+.llm-title{color:#ffffff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.llm-phase{color:#9fb0bf;font-variant-numeric:tabular-nums;white-space:nowrap}
+.llm-block{display:grid;gap:3px;min-width:0}
+.llm-label{color:#8fa1b2;font-size:11px;text-transform:uppercase}
+.llm-text{max-height:112px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;line-height:1.35;color:#dbe7f1;background:rgba(4,7,10,.38);border-radius:4px;padding:6px}
 #xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
 #xr[disabled]{opacity:.55}
 #fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
+@media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}}
 canvas{display:block}
 </style>
 <div id="scene"></div>
@@ -1176,6 +1282,13 @@ canvas{display:block}
   <strong>XR reigns</strong>
   <div id="reign-state">enter VR to enable controller reigns</div>
 </aside>
+<aside id="llm">
+  <header>
+    <h2>LLM streams</h2>
+    <div id="llm-status">connecting...</div>
+  </header>
+  <div id="llm-streams"></div>
+</aside>
 <button id="xr" disabled>VR unavailable</button>
 <div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers, squeeze stops, A/B dock or explore.</div>
 <script type="module">
@@ -1186,6 +1299,8 @@ const root = document.getElementById('scene');
 const statusEl = document.getElementById('status');
 const xrButton = document.getElementById('xr');
 const reignState = document.getElementById('reign-state');
+const llmStatus = document.getElementById('llm-status');
+const llmStreams = document.getElementById('llm-streams');
 const fields = Object.fromEntries(['mode','scenario','seed','tick','t','pose','battery','stuck','dead_battery','recovery_mode','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d10);
@@ -1261,6 +1376,7 @@ let xrSession = null;
 let lastReignKey = '';
 let lastReignSentAt = 0;
 let lastReignText = 'idle';
+const llmCards = new Map();
 function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
 function world(x, y, up=0){ return new THREE.Vector3(x, up, y); }
 function clear(group){ while(group.children.length) group.remove(group.children.pop()); }
@@ -1474,6 +1590,78 @@ async function poll(){
     setTimeout(poll, 100);
   }
 }
+function llmText(value){
+  return value && value.trim() ? value : '-';
+}
+function phaseLabel(event){
+  if(event.phase === 'start') return 'prompt';
+  if(event.phase === 'delta') return 'streaming';
+  if(event.phase === 'done') return 'done';
+  if(event.phase === 'error') return 'error';
+  return event.phase || '-';
+}
+function createLlmCard(event){
+  const card = document.createElement('article');
+  card.className = 'llm-card live';
+  card.innerHTML = `
+    <div class="llm-top">
+      <div class="llm-title"></div>
+      <div class="llm-phase"></div>
+    </div>
+    <div class="llm-block">
+      <div class="llm-label">Prompt</div>
+      <div class="llm-text prompt"></div>
+    </div>
+    <div class="llm-block">
+      <div class="llm-label">Live output</div>
+      <div class="llm-text output"></div>
+    </div>`;
+  const state = {event, card, output:''};
+  llmCards.set(event.id, state);
+  llmStreams.prepend(card);
+  while(llmStreams.children.length > 5){
+    const last = llmStreams.lastElementChild;
+    const id = Number(last?.dataset?.id);
+    if(Number.isFinite(id)) llmCards.delete(id);
+    last?.remove();
+  }
+  card.dataset.id = String(event.id);
+  return state;
+}
+function renderLlmEvent(event){
+  let state = llmCards.get(event.id);
+  if(!state) state = createLlmCard(event);
+  state.event = {...state.event, ...event};
+  if(event.delta) state.output += event.delta;
+  if(event.response != null) state.output = event.response;
+  if(event.error) state.output = event.error;
+  const card = state.card;
+  card.classList.toggle('live', event.phase === 'start' || event.phase === 'delta');
+  card.classList.toggle('error', event.phase === 'error');
+  card.querySelector('.llm-title').textContent = `${event.purpose || 'llm'} · ${event.model || 'model'} #${event.id}`;
+  card.querySelector('.llm-phase').textContent = phaseLabel(event);
+  const promptEl = card.querySelector('.prompt');
+  if(event.prompt != null) promptEl.textContent = llmText(event.prompt);
+  else if(!promptEl.textContent) promptEl.textContent = '-';
+  const outputEl = card.querySelector('.output');
+  outputEl.textContent = llmText(state.output);
+  outputEl.scrollTop = outputEl.scrollHeight;
+  llmStatus.textContent = `${phaseLabel(event)} #${event.id}`;
+}
+function connectLlmStream(){
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${protocol}//${location.host}/stream/llm`);
+  socket.addEventListener('open', () => { llmStatus.textContent = 'listening'; });
+  socket.addEventListener('message', event => {
+    try{ renderLlmEvent(JSON.parse(event.data)); }
+    catch(_error){ llmStatus.textContent = 'bad stream packet'; }
+  });
+  socket.addEventListener('close', () => {
+    llmStatus.textContent = 'reconnecting...';
+    setTimeout(connectLlmStream, 1000);
+  });
+  socket.addEventListener('error', () => { llmStatus.textContent = 'socket error'; });
+}
 async function setupXr(){
   fields.scheme.textContent = location.protocol.replace(':', '');
   fields.secure.textContent = window.isSecureContext ? 'yes' : 'no';
@@ -1517,6 +1705,7 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 setupXr();
+connectLlmStream();
 poll();
 </script>"#;
 
@@ -1797,14 +1986,49 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/view"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/3d"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/scene"));
+        assert!(HTTP_ENDPOINTS.contains(&"/stream/llm"));
         let Html(page) = live_view_3d_page().await;
         assert!(page.contains("Sensorium 3D"));
         assert!(page.contains("/view/scene"));
+        assert!(page.contains("/stream/llm"));
+        assert!(page.contains("LLM streams"));
         assert!(page.contains("navigator.xr"));
         assert!(page.contains("window.isSecureContext"));
         assert!(page.contains("/reign/command"));
         assert!(page.contains("source:'Gamepad'"));
         assert!(page.contains("renderer.xr.getController"));
+    }
+
+    #[tokio::test]
+    async fn live_view_page_draws_common_camera_formats() {
+        let Html(page) = live_view_page().await;
+
+        assert!(page.contains("isBgr"));
+        assert!(page.contains("isGray"));
+        assert!(page.contains("isYuyv"));
+        assert!(page.contains("writeYuvPixel"));
+    }
+
+    #[test]
+    fn yuyv_eye_frame_encodes_to_png_data_url() {
+        let frame = EyeFrame {
+            captured_at_ms: 1,
+            width: 2,
+            height: 1,
+            format: EyeFrameFormat::Yuyv422,
+            bytes: vec![82, 90, 145, 240],
+        };
+
+        let (eye, warnings) = scene_eye_from_frame(&frame);
+
+        assert!(warnings.is_empty());
+        assert_eq!(eye.width, 2);
+        assert_eq!(eye.height, 1);
+        assert!(eye
+            .data_url
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("data:image/png;base64,"));
     }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {

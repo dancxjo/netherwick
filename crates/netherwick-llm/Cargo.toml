@@ -12,6 +12,8 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 reqwest.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
 netherwick-actions = { path = "../netherwick-actions" }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-now = { path = "../netherwick-now" }

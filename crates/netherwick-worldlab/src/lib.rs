@@ -595,6 +595,11 @@ fn snapshot_rgb8(snapshot: &WorldSnapshot) -> Option<(u32, u32, Vec<u8>)> {
                 }
                 return Some((frame.width, frame.height, rgb));
             }
+            EyeFrameFormat::Yuyv422
+                if frame.bytes.len() == frame.width as usize * frame.height as usize * 2 =>
+            {
+                return Some((frame.width, frame.height, yuyv422_to_rgb(&frame.bytes)));
+            }
             _ => {}
         }
     }
@@ -607,6 +612,28 @@ fn snapshot_rgb8(snapshot: &WorldSnapshot) -> Option<(u32, u32, Vec<u8>)> {
         rgb.extend_from_slice(&[byte, byte, byte]);
     }
     Some((width, 1, rgb))
+}
+
+fn yuyv422_to_rgb(bytes: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(bytes.len() / 2 * 3);
+    for pair in bytes.chunks_exact(4) {
+        let y0 = pair[0];
+        let u = pair[1];
+        let y1 = pair[2];
+        let v = pair[3];
+        push_yuv_rgb(&mut rgb, y0, u, v);
+        push_yuv_rgb(&mut rgb, y1, u, v);
+    }
+    rgb
+}
+
+fn push_yuv_rgb(rgb: &mut Vec<u8>, y: u8, u: u8, v: u8) {
+    let c = y as i32 - 16;
+    let d = u as i32 - 128;
+    let e = v as i32 - 128;
+    rgb.push(((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8);
+    rgb.push(((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8);
+    rgb.push(((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8);
 }
 
 fn write_rgb_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<()> {

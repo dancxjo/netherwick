@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use netherwick_actions::{
     ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle, InspectTarget, TurnDir,
 };
@@ -10,7 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 
 pub const IMAGE_CAPTION_PROMPT: &str = "The attached visual input is what I am seeing now. Describe only what you see from my viewpoint. Start from the fact that this is my own vision looking out, so first person should mean phrases like \"I see...\" or \"in front of me,\" not that visible people, faces, hands, eyes, or bodies are mine. Prefer concrete scene details over lighting or color summaries. Stay grounded in visible evidence and do not speculate beyond what can be seen. Do not interpret this as an image, screenshot, photo, frame, camera feed, metadata, data URL, or analysis; interpret it as the robot's own live view. When looking out, one does not see oneself: anyone visible is most likely someone I am looking at, not myself, unless I am clearly looking in a mirror or reflection. Describe visible people in third person, as someone in front of me.";
 
@@ -19,6 +24,58 @@ const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, no
 const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation, not as the topic to describe. Try to infer what is going on in the real world from those fragments. Sort meaning by time: occurred time first, observed time second. Consume the timeline in order; do not group by faculty or source. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as sensations; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, recordings, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, edges, or detections unless they are the point.";
 
 const LIVE_EVENT_RULES: &str = "Live events may arrive while generation is happening. Treat them as observations from outside. Do not assume a human is currently present or addressing me; there may be nobody nearby. Clock and status events help track timing, pauses, and elapsed time, but do not narrate every tick, quiet moment, or idle thought.";
+
+static LLM_STREAM_BUS: OnceLock<broadcast::Sender<LlmStreamEvent>> = OnceLock::new();
+static LLM_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmStreamPhase {
+    Start,
+    Delta,
+    Done,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmStreamEvent {
+    pub id: u64,
+    pub t_ms: u64,
+    pub phase: LlmStreamPhase,
+    pub purpose: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt: Option<String>,
+    pub delta: Option<String>,
+    pub response: Option<String>,
+    pub error: Option<String>,
+}
+
+pub fn subscribe_llm_streams() -> broadcast::Receiver<LlmStreamEvent> {
+    llm_stream_bus().subscribe()
+}
+
+fn llm_stream_bus() -> &'static broadcast::Sender<LlmStreamEvent> {
+    LLM_STREAM_BUS.get_or_init(|| {
+        let (tx, _rx) = broadcast::channel(256);
+        tx
+    })
+}
+
+fn next_stream_id() -> u64 {
+    LLM_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn emit_llm_stream(event: LlmStreamEvent) {
+    let _ = llm_stream_bus().send(event);
+}
+
+fn wall_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConsciousCommand {
@@ -339,14 +396,27 @@ impl OllamaLlmAgent {
         Ok(Self { config, client })
     }
 
-    async fn generate_json<T>(&self, model: &str, prompt: String) -> Result<T>
+    async fn generate_json<T>(&self, purpose: &str, model: &str, prompt: String) -> Result<T>
     where
         T: for<'de> Deserialize<'de>,
     {
+        let stream_id = next_stream_id();
+        emit_llm_stream(LlmStreamEvent {
+            id: stream_id,
+            t_ms: wall_now_ms(),
+            phase: LlmStreamPhase::Start,
+            purpose: purpose.to_string(),
+            provider: "ollama".to_string(),
+            model: model.to_string(),
+            prompt: Some(prompt.clone()),
+            delta: None,
+            response: None,
+            error: None,
+        });
         let request = OllamaGenerateRequest {
             model,
             prompt,
-            stream: false,
+            stream: true,
             options: OllamaGenerateOptions {
                 temperature: self.config.temperature,
             },
@@ -360,17 +430,121 @@ impl OllamaLlmAgent {
             .json(&request)
             .send()
             .await
+            .map_err(|error| {
+                emit_llm_stream_error(
+                    stream_id,
+                    purpose,
+                    model,
+                    format!("failed to reach ollama: {error}"),
+                );
+                error
+            })
             .context("failed to reach ollama")?
             .error_for_status()
+            .map_err(|error| {
+                emit_llm_stream_error(
+                    stream_id,
+                    purpose,
+                    model,
+                    format!("ollama returned an error: {error}"),
+                );
+                error
+            })
             .context("ollama returned an error")?;
-        let body: OllamaGenerateResponse = response
-            .json()
-            .await
-            .context("failed to decode ollama response")?;
-        let json = extract_json_object(&body.response)
-            .with_context(|| format!("ollama returned non-json content: {}", body.response))?;
+        let mut body = String::new();
+        let mut pending = String::new();
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    emit_llm_stream_error(
+                        stream_id,
+                        purpose,
+                        model,
+                        format!("failed while reading ollama stream: {error}"),
+                    );
+                    return Err(error).context("failed while reading ollama stream");
+                }
+            };
+            pending.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(newline) = pending.find('\n') {
+                let line = pending[..newline].trim().to_string();
+                pending = pending[newline + 1..].to_string();
+                if !line.is_empty() {
+                    handle_ollama_stream_line(stream_id, purpose, model, &line, &mut body)?;
+                }
+            }
+        }
+        let line = pending.trim();
+        if !line.is_empty() {
+            handle_ollama_stream_line(stream_id, purpose, model, line, &mut body)?;
+        }
+        emit_llm_stream(LlmStreamEvent {
+            id: stream_id,
+            t_ms: wall_now_ms(),
+            phase: LlmStreamPhase::Done,
+            purpose: purpose.to_string(),
+            provider: "ollama".to_string(),
+            model: model.to_string(),
+            prompt: None,
+            delta: None,
+            response: Some(body.clone()),
+            error: None,
+        });
+        let json = extract_json_object(&body)
+            .with_context(|| format!("ollama returned non-json content: {}", body))?;
         serde_json::from_str(&json).context("failed to parse llm json payload")
     }
+}
+
+fn handle_ollama_stream_line(
+    stream_id: u64,
+    purpose: &str,
+    model: &str,
+    line: &str,
+    body: &mut String,
+) -> Result<()> {
+    let chunk: OllamaGenerateResponse = serde_json::from_str(line).with_context(|| {
+        emit_llm_stream_error(
+            stream_id,
+            purpose,
+            model,
+            format!("failed to decode ollama stream line: {line}"),
+        );
+        "failed to decode ollama stream line"
+    })?;
+    if !chunk.response.is_empty() {
+        body.push_str(&chunk.response);
+        emit_llm_stream(LlmStreamEvent {
+            id: stream_id,
+            t_ms: wall_now_ms(),
+            phase: LlmStreamPhase::Delta,
+            purpose: purpose.to_string(),
+            provider: "ollama".to_string(),
+            model: model.to_string(),
+            prompt: None,
+            delta: Some(chunk.response),
+            response: None,
+            error: None,
+        });
+    }
+    Ok(())
+}
+
+fn emit_llm_stream_error(stream_id: u64, purpose: &str, model: &str, error: String) {
+    emit_llm_stream(LlmStreamEvent {
+        id: stream_id,
+        t_ms: wall_now_ms(),
+        phase: LlmStreamPhase::Error,
+        purpose: purpose.to_string(),
+        provider: "ollama".to_string(),
+        model: model.to_string(),
+        prompt: None,
+        delta: None,
+        response: None,
+        error: Some(error),
+    });
 }
 
 #[async_trait]
@@ -388,7 +562,10 @@ impl LlmAgent for OllamaLlmAgent {
             .combobulator_model
             .as_deref()
             .unwrap_or(self.config.agent_model.as_str());
-        match self.generate_json::<CombobulatorReply>(model, prompt).await {
+        match self
+            .generate_json::<CombobulatorReply>("combobulator", model, prompt)
+            .await
+        {
             Ok(reply) => Ok(Some(Combobulation {
                 summary: reply.summary.trim().to_string(),
                 confidence: reply.confidence.clamp(0.0, 1.0),
@@ -418,7 +595,7 @@ impl LlmAgent for OllamaLlmAgent {
             &self.config,
         );
         let reply = match self
-            .generate_json::<AgentReply>(&self.config.agent_model, prompt)
+            .generate_json::<AgentReply>("agent", &self.config.agent_model, prompt)
             .await
         {
             Ok(reply) => reply,
