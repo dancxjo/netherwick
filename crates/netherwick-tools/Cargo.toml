@@ -19,6 +19,9 @@ serde.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+reqwest.workspace = true
+image.workspace = true
+base64.workspace = true
 netherwick-actions = { path = "../netherwick-actions" }
 netherwick-autonomic = { path = "../netherwick-autonomic" }
 netherwick-behaviors = { path = "../netherwick-behaviors" }

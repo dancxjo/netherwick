@@ -141,6 +141,22 @@ virtual:
 virtual-https:
     just go virtual
 
+train target="virtual":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{target}}" != "virtual" ]; then
+        echo "usage: just train virtual"
+        exit 2
+    fi
+    cargo run -p netherwick-tools -- train-virtual \
+        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" \
+        --out-dir "${NETHERWICK_MODEL_OUT:-data/models/virtual/latest}" \
+        --report-out "${NETHERWICK_REPORT_OUT:-data/reports/virtual/latest.json}" \
+        --epochs "${NETHERWICK_EPOCHS:-5}"
+
+train-virtual:
+    just train virtual
+
 dev-cert:
     #!/usr/bin/env bash
     set -euo pipefail

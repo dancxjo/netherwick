@@ -258,6 +258,10 @@ impl JsonlLedger {
         }
         Ok(transitions)
     }
+
+    pub async fn frames(&self) -> Result<Vec<ExperienceFrame>> {
+        self.read_all().await
+    }
 }
 
 #[async_trait]

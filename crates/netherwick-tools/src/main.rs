@@ -80,6 +80,8 @@ enum Command {
     ModelPromote(ModelPromoteArgs),
     CompareScenarioReports(CompareScenarioReportsArgs),
     Dashboard,
+    VirtualReport(VirtualReportArgs),
+    RetinaMockSend(RetinaMockSendArgs),
 }
 
 #[tokio::main]
@@ -106,6 +108,8 @@ async fn main() -> Result<()> {
         Command::ModelStatus => model_status(),
         Command::ModelPromote(args) => model_promote(args),
         Command::CompareScenarioReports(args) => compare_scenario_reports_command(args),
+        Command::VirtualReport(args) => run_virtual_report(args).await,
+        Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -532,6 +536,7 @@ enum TrainModel {
     EyeNext(TrainEyeNextArgs),
     EarNext(TrainEarNextArgs),
     Experience(TrainExperienceArgs),
+    Virtual(TrainVirtualArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -617,6 +622,28 @@ struct TrainExperienceArgs {
     epochs: usize,
     #[arg(long, default_value = "data/models/experience_v0")]
     checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct VirtualReportArgs {
+    #[arg(long, default_value = "data/ledger/virtual-live", env = "NETHERWICK_LEDGER")]
+    ledger: String,
+    #[arg(long, default_value = "data/reports/virtual/latest.json")]
+    out: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainVirtualArgs {
+    #[arg(long, default_value = "data/ledger/virtual-live", env = "NETHERWICK_LEDGER")]
+    ledger: String,
+    #[arg(long, default_value = "data/models/virtual/latest", env = "NETHERWICK_MODEL_OUT")]
+    out_dir: String,
+    #[arg(long, default_value = "data/reports/virtual/latest.json")]
+    report_out: String,
+    #[arg(long, default_value_t = 5, env = "NETHERWICK_EPOCHS")]
+    epochs: usize,
+    #[arg(long)]
+    allow_safety_critical_inference: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -3362,6 +3389,7 @@ impl SenseProducer for MockEyeProducer {
             height: 2,
             format: EyeFrameFormat::Rgb8,
             bytes: vec![b, 64, 128, 128, b, 64, 64, 128, b, 255, 255, 255],
+            source: None,
         }))
     }
 }
@@ -4300,6 +4328,7 @@ async fn run_train(command: TrainCommand) -> Result<()> {
             })
             .await
         }
+        TrainModel::Virtual(args) => run_train_virtual(args).await,
     }
 }
 
@@ -5259,6 +5288,478 @@ fn print_frame(frame: &ExperienceFrame) {
     }
     if let Some(transcript) = &frame.now.ear.transcript {
         println!("  heard: {}", transcript);
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VirtualRunReport {
+    pub total_frames: usize,
+    pub total_transitions: usize,
+    pub total_eye_frames: usize,
+    pub total_ear_frames: usize,
+    pub total_stuck_trap_events: usize,
+    pub battery_delta: f32,
+    pub duration_seconds: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VirtualTrainingReport {
+    pub timestamp: String,
+    pub run_report: VirtualRunReport,
+    pub models: HashMap<String, ModelTrainingStatus>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ModelTrainingStatus {
+    pub name: String,
+    pub trained: bool,
+    pub previous_status: String,
+    pub new_status: String,
+    pub recommended_action: String,
+    pub warnings: Vec<String>,
+    pub loss: Option<f32>,
+    pub baseline_collision_rate: Option<f32>,
+    pub candidate_collision_rate: Option<f32>,
+    pub baseline_success_rate: Option<f32>,
+    pub candidate_success_rate: Option<f32>,
+}
+
+async fn run_virtual_report(args: VirtualReportArgs) -> Result<()> {
+    let report = generate_virtual_report(&args.ledger).await?;
+    let parent = Path::new(&args.out).parent();
+    if let Some(p) = parent {
+        if !p.as_os_str().is_empty() {
+            fs::create_dir_all(p)?;
+        }
+    }
+    let content = serde_json::to_string_pretty(&report)?;
+    fs::write(&args.out, content)?;
+    println!("virtual run report written to {}", args.out);
+    Ok(())
+}
+
+async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> {
+    let ledger = JsonlLedger::new(ledger_path);
+    let frames = ledger.frames().await?;
+    let transitions = ledger.transitions().await?;
+
+    let total_frames = frames.len();
+    let total_transitions = transitions.len();
+
+    let mut total_eye_frames = 0;
+    let mut total_ear_frames = 0;
+    let mut total_stuck_trap_events = 0;
+
+    for frame in &frames {
+        if !frame.now.eye.frames.is_empty() || !frame.now.eye.image_vectors.is_empty() {
+            total_eye_frames += 1;
+        }
+        if !frame.now.ear.features.is_empty() || frame.now.ear.transcript.is_some() {
+            total_ear_frames += 1;
+        }
+        if let Some(val) = frame.now.extensions.get("sim.stuck") {
+            if let Ok(values) = serde_json::from_value::<Vec<f32>>(val.clone()) {
+                let event_started = values.get(6).copied().unwrap_or(0.0) > 0.0;
+                if event_started {
+                    total_stuck_trap_events += 1;
+                }
+            }
+        }
+    }
+
+    let battery_delta = if let (Some(first), Some(last)) = (frames.first(), frames.last()) {
+        first.now.body.battery_level - last.now.body.battery_level
+    } else {
+        0.0
+    };
+
+    let duration_seconds = if let (Some(first), Some(last)) = (frames.first(), frames.last()) {
+        (last.t_ms.saturating_sub(first.t_ms) as f64) / 1000.0
+    } else {
+        0.0
+    };
+
+    Ok(VirtualRunReport {
+        total_frames,
+        total_transitions,
+        total_eye_frames,
+        total_ear_frames,
+        total_stuck_trap_events,
+        battery_delta,
+        duration_seconds,
+    })
+}
+
+async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
+    println!("Starting virtual training pipeline...");
+    println!("Ledger: {}", args.ledger);
+    println!("Out Dir: {}", args.out_dir);
+
+    // 1. Generate run report
+    let run_report = generate_virtual_report(&args.ledger).await?;
+    println!("Run report generated successfully.");
+
+    // Create out_dir
+    fs::create_dir_all(&args.out_dir)?;
+
+    // 2. Train selected behaviors
+    let behaviors = vec![
+        TrainableBehavior::Danger,
+        TrainableBehavior::Charge,
+        TrainableBehavior::EyeNext,
+        TrainableBehavior::EarNext,
+        TrainableBehavior::Future,
+    ];
+
+    let mut trained_summaries = HashMap::new();
+    for behavior in &behaviors {
+        let checkpoint_path = Path::new(&args.out_dir).join(behavior.config_key());
+        println!("Training behavior model: {:?}", behavior);
+        let summary = train_behavior(TrainBehaviorRequest {
+            behavior: behavior.clone(),
+            ledger_path: PathBuf::from(&args.ledger),
+            checkpoint_path,
+            epochs: args.epochs,
+            validation_split: 0.2,
+            seed: 7,
+        }).await?;
+        trained_summaries.insert(behavior.clone(), summary);
+    }
+
+    // 3. Run scenario evaluations
+    println!("Running baseline scenario evaluation (all models Off)...");
+    let baseline_report_path = Path::new(&args.out_dir).join("baseline-scenario.json");
+    let baseline_args = EvalScenarioArgs {
+        scenario: ScenarioArg::MixedRoom,
+        episodes: 5,
+        steps: 100,
+        seed: 7,
+        tick_ms: 100,
+        out: Some(baseline_report_path.to_string_lossy().to_string()),
+        ledger: None,
+        capture_root: None,
+        memory_report: false,
+        danger_checkpoint: None,
+        danger_mode: DangerMode::Off,
+        charge_checkpoint: None,
+        charge_mode: ChargeMode::Off,
+        action_value_checkpoint: None,
+        action_value_mode: ActionValueMode::Off,
+        future_checkpoint: None,
+        future_mode: FutureMode::Hardcoded,
+        eye_next_checkpoint: None,
+        eye_next_mode: EyeNextMode::Off,
+        ear_next_checkpoint: None,
+        ear_next_mode: EarNextMode::Off,
+        experience_checkpoint: None,
+        experience_mode: ExperienceMode::Off,
+        action_selector: CliActionSelectorMode::Baseline,
+        llm: LlmArgs::default(),
+    };
+    run_eval_scenario(baseline_args).await?;
+    let baseline_report = load_scenario_report(&baseline_report_path.to_string_lossy())?;
+
+    println!("Running candidate scenario evaluation (new models ShadowInfer)...");
+    let candidate_report_path = Path::new(&args.out_dir).join("candidate-scenario.json");
+    let candidate_args = EvalScenarioArgs {
+        scenario: ScenarioArg::MixedRoom,
+        episodes: 5,
+        steps: 100,
+        seed: 7,
+        tick_ms: 100,
+        out: Some(candidate_report_path.to_string_lossy().to_string()),
+        ledger: None,
+        capture_root: None,
+        memory_report: false,
+        danger_checkpoint: Some(Path::new(&args.out_dir).join("danger").to_string_lossy().to_string()),
+        danger_mode: DangerMode::ShadowInfer,
+        charge_checkpoint: Some(Path::new(&args.out_dir).join("charge").to_string_lossy().to_string()),
+        charge_mode: ChargeMode::ShadowInfer,
+        action_value_checkpoint: None,
+        action_value_mode: ActionValueMode::Off,
+        future_checkpoint: Some(Path::new(&args.out_dir).join("future").to_string_lossy().to_string()),
+        future_mode: FutureMode::ShadowInfer,
+        eye_next_checkpoint: Some(Path::new(&args.out_dir).join("eye_next").to_string_lossy().to_string()),
+        eye_next_mode: EyeNextMode::ShadowInfer,
+        ear_next_checkpoint: Some(Path::new(&args.out_dir).join("ear_next").to_string_lossy().to_string()),
+        ear_next_mode: EarNextMode::ShadowInfer,
+        experience_checkpoint: None,
+        experience_mode: ExperienceMode::Off,
+        action_selector: CliActionSelectorMode::Baseline,
+        llm: LlmArgs::default(),
+    };
+    run_eval_scenario(candidate_args).await?;
+    let candidate_report = load_scenario_report(&candidate_report_path.to_string_lossy())?;
+
+    // Compare scenario reports
+    let comparison = compare_scenario_reports(&baseline_report, &candidate_report);
+    println!("Evaluation comparison result: {:?}", comparison.outcome);
+
+    // 4. Update/register models and run promotion gates
+    let registry_path = Path::new("data/models/registry.json");
+    let mut model_statuses = HashMap::new();
+    let timestamp = Utc::now().format("%Y%m%d_%H%M").to_string();
+
+    for behavior in &behaviors {
+        let name = format!("{}_virtual_{}", behavior.config_key(), timestamp);
+        let checkpoint = Path::new(&args.out_dir).join(behavior.config_key()).to_string_lossy().to_string();
+        let behavior_report = Path::new(&checkpoint).join("evaluation.json");
+
+        println!("Registering candidate model {}...", name);
+        model_register(ModelRegisterArgs {
+            behavior: behavior.cli_name().to_string(),
+            checkpoint: checkpoint.clone(),
+            training_ledger: Some(args.ledger.clone()),
+            training_command: Some("just train virtual".to_string()),
+            behavior_report: Some(behavior_report.to_string_lossy().to_string()),
+            scenario_report: Some(candidate_report_path.to_string_lossy().to_string()),
+            name: name.clone(),
+            notes: vec!["Automatically trained via virtual pipeline".to_string()],
+            parent: None,
+            registry: registry_path.to_string_lossy().to_string(),
+            overwrite: true,
+        })?;
+
+        // Load the registry to get the entry we just registered
+        let registry = load_model_registry(registry_path)?;
+        let entry = registry.entries.iter().find(|e| e.name == name && e.behavior == *behavior).unwrap().clone();
+
+        // Determine recommended promotion status
+        // First test Inference promotion
+        let inference_decision = promotion_gate(
+            &entry,
+            ModelStatus::Inference,
+            Some(&baseline_report),
+            Some(&candidate_report),
+            Some(&comparison),
+            args.allow_safety_critical_inference,
+        );
+
+        let mut new_status = ModelStatus::Registered;
+        let mut recommended_action = "keep hardcoded".to_string();
+        let mut warnings = Vec::new();
+
+        if inference_decision.allowed {
+            new_status = ModelStatus::Inference;
+            recommended_action = "inference".to_string();
+        } else {
+            // Test Shadow promotion
+            let shadow_decision = promotion_gate(
+                &entry,
+                ModelStatus::Shadow,
+                Some(&baseline_report),
+                Some(&candidate_report),
+                Some(&comparison),
+                args.allow_safety_critical_inference,
+            );
+            if shadow_decision.allowed {
+                new_status = ModelStatus::Shadow;
+                recommended_action = "shadow".to_string();
+            } else {
+                // Collect warnings for why promotion failed
+                warnings.extend(inference_decision.warnings);
+                warnings.extend(shadow_decision.warnings);
+            }
+        }
+
+        // Apply promotion if recommended status is higher than Registered
+        if new_status != ModelStatus::Registered {
+            println!("Promoting model {} to {}...", name, new_status.as_str());
+            model_promote(ModelPromoteArgs {
+                behavior: behavior.cli_name().to_string(),
+                name: name.clone(),
+                target: new_status,
+                baseline_report: Some(baseline_report_path.to_string_lossy().to_string()),
+                candidate_report: Some(candidate_report_path.to_string_lossy().to_string()),
+                registry: registry_path.to_string_lossy().to_string(),
+                allow_safety_critical_inference: args.allow_safety_critical_inference,
+                notes: vec!["Automatically promoted via virtual pipeline".to_string()],
+            })?;
+        }
+
+        let loss = trained_summaries.get(behavior).and_then(|s| s.last_loss);
+
+        model_statuses.insert(behavior.config_key().to_string(), ModelTrainingStatus {
+            name,
+            trained: true,
+            previous_status: "registered".to_string(),
+            new_status: new_status.as_str().to_string(),
+            recommended_action,
+            warnings,
+            loss,
+            baseline_collision_rate: Some(baseline_report.summary.collision_rate),
+            candidate_collision_rate: Some(candidate_report.summary.collision_rate),
+            baseline_success_rate: Some(baseline_report.summary.success_rate),
+            candidate_success_rate: Some(candidate_report.summary.success_rate),
+        });
+    }
+
+    // 5. Write final consolidated training report
+    let final_report = VirtualTrainingReport {
+        timestamp: Utc::now().to_rfc3339(),
+        run_report,
+        models: model_statuses,
+        warnings: if comparison.outcome == ComparisonOutcome::Regressed {
+            vec!["Candidate models overall regressed on MixedRoom scenario against baseline".to_string()]
+        } else {
+            Vec::new()
+        },
+    };
+
+    let parent = Path::new(&args.report_out).parent();
+    if let Some(p) = parent {
+        fs::create_dir_all(p)?;
+    }
+    fs::write(&args.report_out, serde_json::to_string_pretty(&final_report)?)?;
+    println!("Consolidated training report written to {}", args.report_out);
+
+    Ok(())
+}
+
+#[derive(Debug, Parser)]
+struct RetinaMockSendArgs {
+    /// Server URL
+    #[arg(long, default_value = "https://localhost:8443")]
+    url: String,
+
+    /// Frame rate (FPS)
+    #[arg(long, default_value = "5")]
+    fps: u64,
+
+    /// Width of mock image
+    #[arg(long, default_value = "160")]
+    width: u32,
+
+    /// Height of mock image
+    #[arg(long, default_value = "90")]
+    height: u32,
+
+    /// Color pattern: "solid-red", "solid-green", "solid-blue", "gradient", or "noise"
+    #[arg(long, default_value = "gradient")]
+    pattern: String,
+}
+
+fn generate_mock_image_base64(width: u32, height: u32, pattern: &str, frame_index: usize) -> Result<String> {
+    use image::{Rgb, RgbImage};
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder;
+    use base64::Engine;
+
+    let mut img = RgbImage::new(width, height);
+
+    match pattern {
+        "solid-red" => {
+            for pixel in img.pixels_mut() {
+                *pixel = Rgb([255, 0, 0]);
+            }
+        }
+        "solid-green" => {
+            for pixel in img.pixels_mut() {
+                *pixel = Rgb([0, 255, 0]);
+            }
+        }
+        "solid-blue" => {
+            for pixel in img.pixels_mut() {
+                *pixel = Rgb([0, 0, 255]);
+            }
+        }
+        "gradient" => {
+            for (x, y, pixel) in img.enumerate_pixels_mut() {
+                let r = ((x as f32 / width as f32) * 255.0) as u8;
+                let g = ((y as f32 / height as f32) * 255.0) as u8;
+                let b = ((frame_index * 10) % 256) as u8;
+                *pixel = Rgb([r, g, b]);
+            }
+        }
+        "noise" => {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            for pixel in img.pixels_mut() {
+                *pixel = Rgb([rng.gen(), rng.gen(), rng.gen()]);
+            }
+        }
+        _ => {
+            for (x, y, pixel) in img.enumerate_pixels_mut() {
+                let g = ((x as f32 / width as f32) * 255.0) as u8;
+                let b = ((y as f32 / height as f32) * 255.0) as u8;
+                *pixel = Rgb([0, g, b]);
+            }
+        }
+    }
+
+    let mut png_bytes = Vec::new();
+    PngEncoder::new(&mut png_bytes).write_image(
+        &img,
+        width,
+        height,
+        image::ColorType::Rgb8.into(),
+    ).context("failed to encode mock image as PNG")?;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    Ok(encoded)
+}
+
+async fn run_retina_mock_send(args: RetinaMockSendArgs) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("failed to build reqwest client")?;
+
+    let url = format!("{}/view/retina-frame", args.url.trim_end_matches('/'));
+    println!("Starting mock retina stream to {url} at {} FPS ({}x{})...", args.fps, args.width, args.height);
+
+    let interval = Duration::from_millis(1000 / args.fps.max(1));
+    let mut interval_timer = tokio::time::interval(interval);
+    let mut frame_index = 0;
+    
+    let start_time = std::time::Instant::now();
+
+    loop {
+        interval_timer.tick().await;
+        
+        let t_ms = start_time.elapsed().as_millis() as u64;
+        let base64_str = match generate_mock_image_base64(args.width, args.height, &args.pattern, frame_index) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error generating mock image: {e}");
+                continue;
+            }
+        };
+
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "source": "babylon-robot-eye",
+            "t_ms": t_ms,
+            "frame_index": frame_index,
+            "width": args.width,
+            "height": args.height,
+            "format": "Rgb8",
+            "encoding": "base64",
+            "data": format!("data:image/png;base64,{base64_str}")
+        });
+
+        let res = client.post(&url)
+            .json(&payload)
+            .send()
+            .await;
+
+        match res {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    println!("[frame {}] Sent successfully (t_ms = {})", frame_index, t_ms);
+                } else {
+                    let err_text = response.text().await.unwrap_or_else(|_| "unknown error".to_string());
+                    eprintln!("[frame {}] FAILED with status {}: {}", frame_index, status, err_text);
+                }
+            }
+            Err(e) => {
+                eprintln!("[frame {}] Request error: {}", frame_index, e);
+            }
+        }
+
+        frame_index += 1;
     }
 }
 

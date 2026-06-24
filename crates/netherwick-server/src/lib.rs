@@ -45,6 +45,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/view/scene",
     "/view/3d",
     "/view/capture-scene",
+    "/view/training/latest",
 ];
 
 #[derive(Clone, Debug)]
@@ -86,17 +87,81 @@ pub fn reign_router(state: ReignServerState) -> Router {
         .with_state(state)
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct LiveViewState {
     latest: Arc<Mutex<Option<WorldSnapshot>>>,
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
     session: Arc<Mutex<Option<SceneSession>>>,
     training_status: Arc<Mutex<LiveTrainingStatus>>,
+    pub virtual_retina: bool,
+    pub retina_width: u32,
+    pub retina_height: u32,
+    pub retina_fps: f32,
+    retina_state: Arc<Mutex<RetinaState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RetinaState {
+    latest_frame: Option<netherwick_sensors::EyeFrame>,
+    has_new_frame: bool,
+    last_received_at: Option<std::time::Instant>,
+    frames_received: usize,
+    frames_attached_to_snapshots: usize,
+    frames_written_to_ledger: usize,
+    warnings: Vec<String>,
+}
+
+impl Default for LiveViewState {
+    fn default() -> Self {
+        Self {
+            latest: Arc::new(Mutex::new(None)),
+            scene_metadata: Arc::new(Mutex::new(None)),
+            session: Arc::new(Mutex::new(None)),
+            training_status: Arc::new(Mutex::new(LiveTrainingStatus::default())),
+            virtual_retina: false,
+            retina_width: 160,
+            retina_height: 90,
+            retina_fps: 5.0,
+            retina_state: Arc::new(Mutex::new(RetinaState::default())),
+        }
+    }
 }
 
 impl LiveViewState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_virtual_retina(mut self, enabled: bool) -> Self {
+        self.virtual_retina = enabled;
+        self
+    }
+
+    pub fn with_retina_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.retina_width = width;
+        self.retina_height = height;
+        self
+    }
+
+    pub fn with_retina_fps(mut self, fps: f32) -> Self {
+        self.retina_fps = fps;
+        self
+    }
+
+    pub fn take_pending_retina_frame(&self) -> Option<netherwick_sensors::EyeFrame> {
+        let mut state = self.retina_state.lock().expect("retina state mutex poisoned");
+        if state.has_new_frame {
+            state.has_new_frame = false;
+            state.frames_attached_to_snapshots += 1;
+            state.latest_frame.clone()
+        } else {
+            None
+        }
+    }
+
+    pub fn record_ledger_write(&self) {
+        let mut state = self.retina_state.lock().expect("retina state mutex poisoned");
+        state.frames_written_to_ledger += 1;
     }
 
     pub fn update(&self, snapshot: WorldSnapshot) {
@@ -308,6 +373,12 @@ pub struct SceneEye {
     pub data_url: Option<String>,
     pub mean_luma: f32,
     pub non_background_ratio: f32,
+    pub source: String,
+    pub authoritative: bool,
+    pub retina_connected: bool,
+    pub retina_last_frame_age_ms: Option<u64>,
+    pub frames_received: usize,
+    pub frames_written_to_ledger: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -449,6 +520,10 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view/3d", get(live_view_3d_page))
         .route("/view/capture-scene", get(get_capture_scene))
         .route("/stream/llm", get(get_llm_stream))
+        .route("/view/retina-frame", post(post_retina_frame))
+        .route("/view/retina/status", get(get_retina_status))
+        .route("/view/retina/latest.png", get(get_retina_latest))
+        .route("/view/training/latest", get(get_latest_training))
         .nest_service(
             "/static",
             ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),
@@ -496,16 +571,271 @@ async fn get_live_scene(
     let snapshot = state
         .latest()
         .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
+    
+    let rstate = state.retina_state.lock().expect("retina state mutex poisoned");
+    let connected = state.virtual_retina && rstate.last_received_at.map(|t| t.elapsed() < std::time::Duration::from_millis(1500)).unwrap_or(false);
+    let retina_status = Some(RetinaStatusInfo {
+        enabled: state.virtual_retina,
+        connected,
+        frames_received: rstate.frames_received,
+        frames_written_to_ledger: rstate.frames_written_to_ledger,
+    });
+    
     Ok(Json(snapshot_to_scene(
         &snapshot,
         state.scene_metadata().as_ref(),
         state.session(),
         state.training_status(),
+        retina_status,
     )))
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RetinaStatusInfo {
+    pub enabled: bool,
+    pub connected: bool,
+    pub frames_received: usize,
+    pub frames_written_to_ledger: usize,
+}
+
+#[derive(Deserialize)]
+pub struct RetinaFramePayload {
+    pub schema_version: u32,
+    pub source: String,
+    pub t_ms: u64,
+    pub frame_index: usize,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub encoding: String,
+    pub data: String,
+}
+
+async fn post_retina_frame(
+    State(state): State<LiveViewState>,
+    Json(payload): Json<RetinaFramePayload>,
+) -> Result<StatusCode, LiveViewError> {
+    let session = state.session();
+    let is_virtual_live = session.as_ref().map(|s| s.mode == "virtual-live").unwrap_or(false);
+    if !is_virtual_live {
+        return Err(LiveViewError::forbidden("retina frames are only accepted in virtual-live mode"));
+    }
+
+    let mut base64_str = payload.data.as_str();
+    if let Some(pos) = base64_str.find(',') {
+        base64_str = &base64_str[pos + 1..];
+    }
+    let decoded_bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_str)
+        .map_err(|e| LiveViewError::bad_request(format!("invalid base64 image data: {e}")))?;
+
+    let img = image::load_from_memory(&decoded_bytes)
+        .map_err(|e| LiveViewError::bad_request(format!("failed to decode image format: {e}")))?;
+
+    let width = img.width();
+    let height = img.height();
+
+    if width > state.retina_width || height > state.retina_height {
+        return Err(LiveViewError::bad_request(format!(
+            "retina frame dimensions ({}x{}) exceed configured limits ({}x{})",
+            width, height, state.retina_width, state.retina_height
+        )));
+    }
+
+    let sim_t_ms = state.latest().map(|snap| snap.body.last_update_ms).unwrap_or(0);
+    if sim_t_ms > 0 && payload.t_ms + 1500 < sim_t_ms {
+        return Err(LiveViewError::bad_request("retina frame is too stale"));
+    }
+
+    let raw_rgb = img.to_rgb8().into_raw();
+
+    let format = match payload.format.as_str() {
+        "Rgb8" => netherwick_sensors::EyeFrameFormat::Rgb8,
+        "Bgr8" => netherwick_sensors::EyeFrameFormat::Bgr8,
+        "Gray8" => netherwick_sensors::EyeFrameFormat::Gray8,
+        "Mjpeg" => netherwick_sensors::EyeFrameFormat::Mjpeg,
+        other => netherwick_sensors::EyeFrameFormat::Unknown(other.to_string()),
+    };
+
+    let eye_frame = netherwick_sensors::EyeFrame {
+        captured_at_ms: payload.t_ms,
+        width,
+        height,
+        format,
+        bytes: raw_rgb,
+        source: Some(payload.source.clone()),
+    };
+
+    {
+        let mut rstate = state.retina_state.lock().expect("retina state mutex poisoned");
+        rstate.latest_frame = Some(eye_frame);
+        rstate.has_new_frame = true;
+        rstate.last_received_at = Some(std::time::Instant::now());
+        rstate.frames_received += 1;
+    }
+
+    Ok(StatusCode::OK)
+}
+
+#[derive(Serialize)]
+pub struct RetinaStatusResponse {
+    pub enabled: bool,
+    pub connected: bool,
+    pub source: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    pub frames_received: usize,
+    pub frames_attached_to_snapshots: usize,
+    pub frames_written_to_ledger: usize,
+    pub latest_age_ms: Option<u64>,
+    pub latest_luma: Option<f32>,
+    pub warnings: Vec<String>,
+}
+
+async fn get_retina_status(
+    State(state): State<LiveViewState>,
+) -> Json<RetinaStatusResponse> {
+    let rstate = state.retina_state.lock().expect("retina state mutex poisoned");
+    let connected = state.virtual_retina && rstate.last_received_at.map(|t| t.elapsed() < std::time::Duration::from_millis(1500)).unwrap_or(false);
+    let latest_age_ms = rstate.last_received_at.map(|t| t.elapsed().as_millis() as u64);
+    let latest_luma = rstate.latest_frame.as_ref().map(|frame| {
+        let stats = eye_frame_stats(frame);
+        stats.mean_luma
+    });
+    let source = rstate.latest_frame.as_ref()
+        .and_then(|f| f.source.clone())
+        .unwrap_or_else(|| "none".to_string());
+
+    let mut warnings = rstate.warnings.clone();
+    if state.virtual_retina {
+        if rstate.frames_received == 0 {
+            warnings.push("no retina frame received yet".to_string());
+        } else if !connected {
+            warnings.push("retina frame stream is stale/disconnected".to_string());
+        }
+    }
+
+    Json(RetinaStatusResponse {
+        enabled: state.virtual_retina,
+        connected,
+        source,
+        width: state.retina_width,
+        height: state.retina_height,
+        fps: state.retina_fps,
+        frames_received: rstate.frames_received,
+        frames_attached_to_snapshots: rstate.frames_attached_to_snapshots,
+        frames_written_to_ledger: rstate.frames_written_to_ledger,
+        latest_age_ms,
+        latest_luma,
+        warnings,
+    })
+}
+
+fn encode_eye_png_bytes(frame: &netherwick_sensors::EyeFrame) -> Result<Vec<u8>, String> {
+    match frame.format {
+        EyeFrameFormat::Mjpeg => Ok(frame.bytes.clone()),
+        EyeFrameFormat::Rgb8
+        | EyeFrameFormat::Bgr8
+        | EyeFrameFormat::Gray8
+        | EyeFrameFormat::Yuyv422 => {
+            let expected_len = match frame.format {
+                EyeFrameFormat::Gray8 => frame.width as usize * frame.height as usize,
+                EyeFrameFormat::Yuyv422 => frame.width as usize * frame.height as usize * 2,
+                _ => frame.width as usize * frame.height as usize * 3,
+            };
+            if frame.bytes.len() < expected_len {
+                return Err(format!(
+                    "eye frame has {} bytes, expected at least {}",
+                    frame.bytes.len(),
+                    expected_len
+                ));
+            }
+            let mut rgb = Vec::with_capacity(frame.width as usize * frame.height as usize * 3);
+            match frame.format {
+                EyeFrameFormat::Rgb8 => rgb.extend_from_slice(&frame.bytes[..expected_len]),
+                EyeFrameFormat::Bgr8 => {
+                    for pixel in frame.bytes[..expected_len].chunks_exact(3) {
+                        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+                    }
+                }
+                EyeFrameFormat::Gray8 => {
+                    for value in &frame.bytes[..expected_len] {
+                        rgb.extend_from_slice(&[*value, *value, *value]);
+                    }
+                }
+                EyeFrameFormat::Yuyv422 => {
+                    rgb.extend(yuyv422_to_rgb(&frame.bytes[..expected_len]));
+                }
+                _ => {}
+            }
+            let mut png = Vec::new();
+            let result = PngEncoder::new(&mut png).write_image(
+                &rgb,
+                frame.width,
+                frame.height,
+                ColorType::Rgb8.into(),
+            );
+            match result {
+                Ok(()) => Ok(png),
+                Err(error) => Err(format!("failed to encode eye PNG: {error}")),
+            }
+        }
+        EyeFrameFormat::Unknown(ref format) => {
+            Err(format!("unsupported eye frame format {format}"))
+        }
+    }
+}
+
+async fn get_retina_latest(
+    State(state): State<LiveViewState>,
+) -> impl IntoResponse {
+    let rstate = state.retina_state.lock().expect("retina state mutex poisoned");
+    if let Some(ref frame) = rstate.latest_frame {
+        match encode_eye_png_bytes(frame) {
+            Ok(bytes) => {
+                let content_type = match frame.format {
+                    EyeFrameFormat::Mjpeg => "image/jpeg",
+                    _ => "image/png",
+                };
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, content_type)],
+                    bytes,
+                ).into_response()
+            }
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to encode frame: {err}"),
+            ).into_response(),
+        }
+    } else {
+        (StatusCode::NOT_FOUND, "no retina frame received yet").into_response()
+    }
 }
 
 async fn get_models() -> Json<ModelsResponse> {
     Json(read_models_response(&default_model_root()))
+}
+
+async fn get_latest_training() -> impl IntoResponse {
+    let report_path = Path::new("data/reports/virtual/latest.json");
+    if report_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(report_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                return (StatusCode::OK, Json(json)).into_response();
+            }
+        }
+    }
+    let alt_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/reports/virtual/latest.json");
+    if alt_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&alt_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                return (StatusCode::OK, Json(json)).into_response();
+            }
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "status": "none" }))).into_response()
 }
 
 fn default_model_root() -> PathBuf {
@@ -831,6 +1161,7 @@ async fn get_capture_scene(
         metadata.as_ref(),
         None,
         LiveTrainingStatus::default(),
+        None,
     );
     scene.t_ms = record.t_ms;
     if let Some(pointcloud) = &record.assets.pointcloud {
@@ -885,10 +1216,11 @@ pub fn snapshot_to_scene(
     metadata: Option<&LiveSceneMetadata>,
     session: Option<SceneSession>,
     training: LiveTrainingStatus,
+    retina_status: Option<RetinaStatusInfo>,
 ) -> LiveSceneResponse {
     let mut warnings = Vec::new();
     let body = &snapshot.body;
-    let eye = match snapshot.eye_frame.as_ref().map(scene_eye_from_frame) {
+    let eye = match snapshot.eye_frame.as_ref().map(|f| scene_eye_from_frame(f, retina_status.as_ref(), snapshot.body.last_update_ms)) {
         Some((eye, frame_warnings)) => {
             warnings.extend(frame_warnings);
             Some(eye)
@@ -1069,7 +1401,11 @@ fn scene_range_from_snapshot(snapshot: &WorldSnapshot) -> SceneRange {
     }
 }
 
-fn scene_eye_from_frame(frame: &netherwick_sensors::EyeFrame) -> (SceneEye, Vec<String>) {
+fn scene_eye_from_frame(
+    frame: &netherwick_sensors::EyeFrame,
+    retina_status: Option<&RetinaStatusInfo>,
+    current_t_ms: u64,
+) -> (SceneEye, Vec<String>) {
     let mut warnings = Vec::new();
     let (data_url, encode_warning) = encode_eye_data_url(frame);
     if let Some(warning) = encode_warning {
@@ -1082,6 +1418,20 @@ fn scene_eye_from_frame(frame: &netherwick_sensors::EyeFrame) -> (SceneEye, Vec<
             stats.mean_luma
         ));
     }
+
+    let source = frame.source.clone().unwrap_or_else(|| "none".to_string());
+    let authoritative = source == "babylon-robot-eye" || source == "real-camera";
+    let retina_connected = retina_status.map(|s| s.connected).unwrap_or(false);
+    
+    let retina_last_frame_age_ms = if source == "babylon-robot-eye" {
+        Some(current_t_ms.saturating_sub(frame.captured_at_ms))
+    } else {
+        None
+    };
+
+    let frames_received = retina_status.map(|s| s.frames_received).unwrap_or(0);
+    let frames_written_to_ledger = retina_status.map(|s| s.frames_written_to_ledger).unwrap_or(0);
+
     (
         SceneEye {
             width: frame.width,
@@ -1090,6 +1440,12 @@ fn scene_eye_from_frame(frame: &netherwick_sensors::EyeFrame) -> (SceneEye, Vec<
             data_url,
             mean_luma: stats.mean_luma,
             non_background_ratio: stats.non_background_ratio,
+            source,
+            authoritative,
+            retina_connected,
+            retina_last_frame_age_ms,
+            frames_received,
+            frames_written_to_ledger,
         },
         warnings,
     )
@@ -1382,6 +1738,13 @@ impl LiveViewError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }
@@ -1692,6 +2055,7 @@ function shouldGenerateEye(scenePacket){
   const session = scenePacket?.session || {};
   const virtualMode = session.source === 'sim' || String(session.mode || '').includes('virtual');
   if(!virtualMode) return false;
+  if(scenePacket?.eye?.source === 'babylon-robot-eye') return false;
   const eye = scenePacket?.eye;
   return !eye || !eye.data_url || eye.mean_luma < .08 || eye.non_background_ratio < .01;
 }
@@ -1797,10 +2161,29 @@ async function refresh(){
     }
     if(snapshot.eye_frame){
       let fmt_str = typeof snapshot.eye_frame.format === 'string' ? snapshot.eye_frame.format : JSON.stringify(snapshot.eye_frame.format);
-      fields.eye_format.textContent = fmt_str;
+      if(scenePacket && scenePacket.eye){
+        const eye = scenePacket.eye;
+        const isAuth = eye.authoritative ? " (auth)" : " (symbolic)";
+        const statusText = eye.retina_connected ? `connected, age ${eye.retina_last_frame_age_ms}ms` : "disconnected";
+        fields.eye_format.textContent = `${eye.width}x${eye.height} luma ${fmt(eye.mean_luma, 2)} | source: ${eye.source}${isAuth} | retina: ${statusText} | rx: ${eye.frames_received} tx: ${eye.frames_written_to_ledger}`;
+        if (eye.source === 'babylon-robot-eye' && !eye.retina_connected) {
+          fields.eye_format.style.color = '#ff4444';
+          fields.eye_format.style.fontWeight = 'bold';
+        } else {
+          fields.eye_format.style.color = '';
+          fields.eye_format.style.fontWeight = '';
+        }
+      } else {
+        const src = snapshot.eye_frame.source || 'none';
+        fields.eye_format.textContent = `${fmt_str} (src: ${src})`;
+        fields.eye_format.style.color = '';
+        fields.eye_format.style.fontWeight = '';
+      }
       fields.eye_age.textContent = `${snapshot.t_ms - snapshot.eye_frame.captured_at_ms} ms`;
     }else{
       fields.eye_format.textContent = '-';
+      fields.eye_format.style.color = '';
+      fields.eye_format.style.fontWeight = '';
       fields.eye_age.textContent = '-';
     }
     if(snapshot.ear_pcm){
@@ -1918,6 +2301,11 @@ canvas{display:block}
   <div id="llm-streams"></div>
 </aside>
 <aside id="models">
+  <section id="virtual-pipeline-section" style="display: none; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 10px;">
+    <h2>Virtual Training Pipeline</h2>
+    <div id="virtual-report-summary" style="font-size: 0.85em; opacity: 0.9; margin-bottom: 8px; line-height: 1.4;"></div>
+    <div id="virtual-model-recommendations" style="font-size: 0.85em;"></div>
+  </section>
   <section>
     <h2>Training stats <span id="model-status">loading...</span></h2>
     <div id="model-list"></div>
@@ -1941,6 +2329,9 @@ const llmStreams = document.getElementById('llm-streams');
 const modelStatus = document.getElementById('model-status');
 const modelList = document.getElementById('model-list');
 const modelGraph = document.getElementById('model-graph');
+const virtualPipelineSection = document.getElementById('virtual-pipeline-section');
+const virtualReportSummary = document.getElementById('virtual-report-summary');
+const virtualModelRecommendations = document.getElementById('virtual-model-recommendations');
 const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 
 // Initialize Babylon Engine & Scene
@@ -2228,6 +2619,7 @@ function shouldUseGeneratedEye(packet){
   const session = packet?.session || {};
   const virtualMode = session.source === 'sim' || String(session.mode || '').includes('virtual');
   if(!virtualMode) return false;
+  if(session.mode === 'virtual-live') return true;
   const eye = packet?.eye;
   return !eye || !eye.data_url || eye.mean_luma < .08 || eye.non_background_ratio < .01;
 }
@@ -2367,7 +2759,22 @@ function updateScene(packet){
   fields.recovery_attempts.textContent = `${detail.recovery_attempts || 0} (${detail.repeated_trap_count || 0} repeat)`;
   fields.stuck_ticks.textContent = String(packet.stuck_ticks || 0);
   fields.nearest.textContent = packet.range?.nearest_m == null ? '-' : `${fmt(packet.range.nearest_m)} m`;
-  fields.eye.textContent = packet.eye ? `${packet.eye.width}x${packet.eye.height} luma ${fmt(packet.eye.mean_luma, 2)}` : '-';
+  if (packet.eye) {
+    const isAuth = packet.eye.authoritative ? " (auth)" : " (symbolic)";
+    const statusText = packet.eye.retina_connected ? `connected, age ${packet.eye.retina_last_frame_age_ms}ms` : "disconnected";
+    fields.eye.textContent = `${packet.eye.width}x${packet.eye.height} luma ${fmt(packet.eye.mean_luma, 2)} | source: ${packet.eye.source}${isAuth} | retina: ${statusText} | rx: ${packet.eye.frames_received} tx: ${packet.eye.frames_written_to_ledger}`;
+    if (packet.eye.source === 'babylon-robot-eye' && !packet.eye.retina_connected) {
+      fields.eye.style.color = '#ff4444';
+      fields.eye.style.fontWeight = 'bold';
+    } else {
+      fields.eye.style.color = '';
+      fields.eye.style.fontWeight = '';
+    }
+  } else {
+    fields.eye.textContent = '-';
+    fields.eye.style.color = '';
+    fields.eye.style.fontWeight = '';
+  }
   fields.points.textContent = String(packet.kinect?.points?.length || 0);
   fields.audio.textContent = packet.audio?.heading_rad == null && packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio?.bearing_rad ?? packet.audio?.heading_rad)} rad`;
   fields.mind.textContent = packet.mind?.combobulation || packet.warnings?.[0] || '-';
@@ -2869,15 +3276,134 @@ addEventListener('resize', () => {
   applyOrClearLayouts();
 });
 
+let retinaFrameIndex = 0;
+let lastRetinaSendTime = 0;
+let isSendingRetina = false;
+
+async function sendRetinaFrame() {
+  if (!lastScene || !lastScene.session || lastScene.session.mode !== 'virtual-live') {
+    return;
+  }
+  if (isSendingRetina) return;
+
+  const fps = lastScene.eye?.fps || 5.0;
+  const interval = 1000 / fps;
+  const now = performance.now();
+  if (now - lastRetinaSendTime < interval) {
+    return;
+  }
+  
+  isSendingRetina = true;
+  lastRetinaSendTime = now;
+
+  try {
+    const rgbaData = await eyeRTT.readPixels();
+    if (!rgbaData || rgbaData.length === 0) {
+      isSendingRetina = false;
+      return;
+    }
+
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = 256;
+    tempCanvas.height = 256;
+    const tempCtx = tempCanvas.getContext('2d');
+    const imgData = tempCtx.createImageData(256, 256);
+    imgData.data.set(rgbaData);
+    tempCtx.putImageData(imgData, 0, 0);
+
+    const retinaWidth = lastScene.eye?.width || 160;
+    const retinaHeight = lastScene.eye?.height || 90;
+
+    const retinaCanvas = document.createElement('canvas');
+    retinaCanvas.width = retinaWidth;
+    retinaCanvas.height = retinaHeight;
+    const retinaCtx = retinaCanvas.getContext('2d');
+    
+    retinaCtx.drawImage(tempCanvas, 0, 0, 256, 256, 0, 0, retinaWidth, retinaHeight);
+
+    const dataUrl = retinaCanvas.toDataURL('image/png');
+
+    const payload = {
+      schema_version: 1,
+      source: 'babylon-robot-eye',
+      t_ms: lastScene.t_ms || Date.now(),
+      frame_index: retinaFrameIndex++,
+      width: retinaWidth,
+      height: retinaHeight,
+      format: 'Rgb8',
+      encoding: 'base64',
+      data: dataUrl
+    };
+
+    const res = await fetch('/view/retina-frame', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      console.warn('Failed to post retina frame:', await res.text());
+    }
+  } catch (err) {
+    console.error('Error posting retina frame:', err);
+  } finally {
+    isSendingRetina = false;
+  }
+}
+
 engine.runRenderLoop(() => {
   pollXrReigns();
   scene.render();
+  sendRetinaFrame();
 });
 
 setupXr();
 connectLlmStream();
 refreshModels();
 poll();
+async function pollVirtualTraining() {
+  try {
+    const res = await fetch('/view/training/latest', {cache:'no-store'});
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    if (data.status === 'none') {
+      virtualPipelineSection.style.display = 'none';
+    } else {
+      virtualPipelineSection.style.display = 'block';
+      const rr = data.run_report || {};
+      virtualReportSummary.innerHTML = `
+        <strong>Latest Session Metrics:</strong><br>
+        • Duration: ${rr.duration_seconds ? rr.duration_seconds.toFixed(1) : 0}s (${rr.total_frames || 0} frames)<br>
+        • Transitions: ${rr.total_transitions || 0} · Eye frames: ${rr.total_eye_frames || 0}<br>
+        • Stuck events: ${rr.total_stuck_trap_events || 0}<br>
+        • Battery Delta: ${rr.battery_delta ? (rr.battery_delta * 100).toFixed(1) : 0}%
+      `;
+      let recsHtml = '<strong>Model Recommendations & status:</strong><br>';
+      if (data.models) {
+        for (const [behavior, info] of Object.entries(data.models)) {
+          const lossStr = info.loss != null ? info.loss.toFixed(4) : 'N/A';
+          let warningText = '';
+          if (info.warnings && info.warnings.length > 0) {
+            warningText = ` <span style="color: #ff6b6b;" title="${info.warnings.join(', ')}">⚠️</span>`;
+          }
+          recsHtml += `
+            <div style="margin-bottom: 4px; padding-left: 6px; border-left: 2px solid #52a9ff;">
+              <strong>${behavior}</strong>: ${info.name}<br>
+              Status: ${info.new_status} (Rec: ${info.recommended_action})${warningText}<br>
+              Loss: ${lossStr} · Collisions: ${info.candidate_collision_rate != null ? info.candidate_collision_rate.toFixed(3) : 'N/A'} (vs ${info.baseline_collision_rate != null ? info.baseline_collision_rate.toFixed(3) : 'N/A'})
+            </div>
+          `;
+        }
+      }
+      virtualModelRecommendations.innerHTML = recsHtml;
+    }
+  } catch (error) {
+    console.error("Error polling virtual training:", error);
+  } finally {
+    setTimeout(pollVirtualTraining, 5000);
+  }
+}
+pollVirtualTraining();
+
 setupDraggableAndResizable();
 </script>"#;
 
@@ -3088,6 +3614,7 @@ mod tests {
             height: 1,
             format: EyeFrameFormat::Rgb8,
             bytes: vec![255, 0, 0],
+            source: None,
         });
         state.update(snapshot);
 
@@ -3139,7 +3666,7 @@ mod tests {
     fn missing_eye_kinect_and_audio_serialize_as_empty_or_null() {
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.battery_level = 0.0;
-        let scene = snapshot_to_scene(&snapshot, None, None, LiveTrainingStatus::default());
+        let scene = snapshot_to_scene(&snapshot, None, None, LiveTrainingStatus::default(), None);
         let value = serde_json::to_value(scene).unwrap();
 
         assert!(value["eye"].is_null());
@@ -3257,9 +3784,10 @@ mod tests {
             height: 1,
             format: EyeFrameFormat::Yuyv422,
             bytes: vec![82, 90, 145, 240],
+            source: None,
         };
 
-        let (eye, warnings) = scene_eye_from_frame(&frame);
+        let (eye, warnings) = scene_eye_from_frame(&frame, None, 1);
 
         assert!(warnings.is_empty());
         assert_eq!(eye.width, 2);

@@ -478,6 +478,8 @@ pub struct EyeFrame {
     pub height: u32,
     pub format: EyeFrameFormat,
     pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -828,6 +830,7 @@ impl V4lCamera {
             height: format.height,
             format: eye_frame_format_from_fourcc(format.fourcc.str().unwrap_or_default()),
             bytes: bytes.to_vec(),
+            source: None,
         })
     }
 }

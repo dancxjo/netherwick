@@ -155,6 +155,7 @@ struct VirtualWorldState {
     snapshot: WorldSnapshot,
     arena: ArenaConfig,
     objects: Vec<SimObject>,
+    retina_frame: Option<EyeFrame>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +183,7 @@ impl VirtualWorld {
             snapshot,
             arena,
             objects: Vec::new(),
+            retina_frame: None,
         }));
         (
             Self {
@@ -197,6 +199,11 @@ impl VirtualWorld {
             .expect("virtual world mutex poisoned")
             .objects
             .push(object);
+    }
+
+    pub fn set_retina_frame(&mut self, frame: Option<EyeFrame>) {
+        let mut guard = self.state.lock().expect("virtual world mutex poisoned");
+        guard.retina_frame = frame;
     }
 
     pub fn set_objects(&mut self, objects: Vec<SimObject>) {
@@ -277,7 +284,13 @@ impl VirtualWorld {
             lon: -122.0 + body.odometry.x_m as f64 / 111_111.0,
             altitude_m: Some(0.0),
         });
-        state.snapshot.eye_frame = Some(project_eye_frame(body, &state.objects, state.arena));
+        if let Some(ref retina) = state.retina_frame {
+            state.snapshot.eye_frame = Some(retina.clone());
+        } else {
+            let mut fallback = project_eye_frame(body, &state.objects, state.arena);
+            fallback.source = Some("rust-sim-symbolic".to_string());
+            state.snapshot.eye_frame = Some(fallback);
+        }
         state.snapshot.eye.frames = state
             .snapshot
             .eye_frame
@@ -452,6 +465,7 @@ fn project_eye_frame(body: &BodySense, objects: &[SimObject], arena: ArenaConfig
         height: height as u32,
         format: EyeFrameFormat::Rgb8,
         bytes,
+        source: Some("rust-sim-symbolic".to_string()),
     }
 }
 
@@ -924,6 +938,7 @@ fn project_symbolic_eye_frame(
         height: height as u32,
         format: EyeFrameFormat::Rgb8,
         bytes,
+        source: Some("rust-sim-symbolic".to_string()),
     }
 }
 
