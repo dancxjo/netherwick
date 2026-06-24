@@ -4179,7 +4179,7 @@ fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impress
         "reign.state",
         "reign",
         format!(
-            "I am under human reign control active {}, mode {:?}, with {} pending commands, age {:?} ms, override pressure {:.2}, and latest command {}.",
+            "Remote reign control active {}, mode {:?}, with {} pending commands, age {:?} ms, override pressure {:.2}, and latest command {}.",
             now.reign.active,
             now.reign.mode,
             now.reign.pending_count,

@@ -319,11 +319,11 @@ pub fn summarized_senses(now: &Now) -> Vec<String> {
     if let Some(input) = &now.reign.latest {
         lines.push(format!("Remote control active: {:?}.", input.mode));
         lines.push(format!(
-            "Latest human reign command: {}.",
+            "Latest remote command: {}.",
             summarize_reign_command(input)
         ));
         if let Some(note) = &input.note {
-            lines.push(format!("Human note: {note}"));
+            lines.push(format!("Remote note: {note}"));
         }
     }
     if now.memory.similar_situation_count > 0 {
@@ -779,7 +779,7 @@ WHEN\n\
 WHY\n\
 - produce a compact awareness statement useful to the next action decision\n\
 HOW\n\
-- distill text impressions produced from body, hearing, vision, range, memory, predictions, surprise, and human reign controls\n\n\
+- distill text impressions produced from body, hearing, vision, range, memory, predictions, surprise, and remote controls\n\n\
 Latent confidence: {:.2}\n\
 Latent prediction error: {:.2}\n\
 Recall summary: {}\n\
@@ -807,7 +807,7 @@ fn build_agent_prompt(
         "You are the conscious LLM layer for an embodied robot.\n\
 You may suggest a high-level action primitive, critique the situation, and record memory notes.\n\
 Never output raw motor control.\n\
-A human may be steering you. Treat Reign controls as important present-tense input. Do not override active Direct reign unless there is a safety or coherence reason. You may comment on it, remember it, or learn from it.\n\
+Treat Reign controls as present-tense input. You may comment on them, remember them, or learn from them.\n\
 {LIVE_EVENT_RULES}\n\
 Allowed action kinds: stop, go, turn, inspect, approach, dock, explore, speak, chirp.\n\
 If commands are disabled, leave action null. Commands enabled: {}. Teaching enabled: {}.\n\
@@ -1218,8 +1218,8 @@ mod tests {
         let senses = summarized_senses(&now).join("\n");
 
         assert!(senses.contains("Remote control active: Direct"));
-        assert!(senses.contains("Latest human reign command: Turn Left"));
-        assert!(senses.contains("Human note: turn toward charger"));
+        assert!(senses.contains("Latest remote command: Turn Left"));
+        assert!(senses.contains("Remote note: turn toward charger"));
     }
 
     #[test]
