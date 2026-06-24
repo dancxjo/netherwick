@@ -1957,7 +1957,7 @@ viewerCamera.inertia = 0.9;
 viewerCamera.layerMask = 0xFFFFFFFF;
 
 // Hemispheric Light (ambient)
-const hemiLight = new BABYLON.HemisphereLight("hemiLight", new BABYLON.Vector3(0, 1, 0), scene);
+const hemiLight = new BABYLON.HemisphericLight("hemiLight", new BABYLON.Vector3(0, 1, 0), scene);
 hemiLight.diffuse = new BABYLON.Color3(0.937, 0.965, 1.0); // 0xeef6ff
 hemiLight.groundColor = new BABYLON.Color3(0.145, 0.188, 0.251); // 0x253040
 hemiLight.intensity = 1.8;
