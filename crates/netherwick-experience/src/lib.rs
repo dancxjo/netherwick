@@ -1,5 +1,5 @@
 use anyhow::Result;
-use netherwick_actions::ActionPrimitive;
+use netherwick_actions::{action_to_motor_command, ActionPrimitive, ExploreStyle, TurnDir};
 use netherwick_body::BodySense;
 use netherwick_core::{ExperienceId, ImpressionId, Provenance, Reward, SensationId, TimeMs};
 use netherwick_now::{DriveSense, MemorySense, Now, SenseVectorizer, SurpriseSense};
@@ -39,6 +39,97 @@ pub trait FuturePredictor {
         action: &ActionPrimitive,
         offset_ms: TimeMs,
     ) -> Result<FuturePrediction>;
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DangerInput {
+    pub z: Vec<f32>,
+    pub action_features: Vec<f32>,
+    pub body_features: Vec<f32>,
+}
+
+impl DangerInput {
+    pub fn from_parts(z: Vec<f32>, action: Option<&ActionPrimitive>, now: &Now) -> Self {
+        Self {
+            z,
+            action_features: danger_action_features(action),
+            body_features: danger_body_features(now),
+        }
+    }
+
+    pub fn flat_features(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(
+            self.z.len() + self.action_features.len() + self.body_features.len(),
+        );
+        out.extend(self.z.iter().copied().map(sanitize_feature));
+        out.extend(self.action_features.iter().copied().map(sanitize_feature));
+        out.extend(self.body_features.iter().copied().map(sanitize_feature));
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DangerOutput {
+    pub bump_risk: f32,
+    pub cliff_risk: f32,
+    pub wheel_drop_risk: f32,
+    pub stuck_risk: f32,
+    pub confidence: f32,
+}
+
+impl DangerOutput {
+    pub fn risks(&self) -> [f32; 4] {
+        [
+            self.bump_risk,
+            self.cliff_risk,
+            self.wheel_drop_risk,
+            self.stuck_risk,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DangerTarget {
+    pub bump: f32,
+    pub cliff: f32,
+    pub wheel_drop: f32,
+    pub stuck: f32,
+}
+
+impl DangerTarget {
+    pub fn risks(&self) -> [f32; 4] {
+        [self.bump, self.cliff, self.wheel_drop, self.stuck]
+    }
+}
+
+pub fn danger_input_from_transition_like(
+    before_z: &ExperienceLatent,
+    action: Option<&ActionPrimitive>,
+    before: &Now,
+) -> DangerInput {
+    DangerInput::from_parts(before_z.z.clone(), action, before)
+}
+
+pub fn danger_target_from_transition_like(
+    before: &Now,
+    action: Option<&ActionPrimitive>,
+    after: &Now,
+) -> DangerTarget {
+    let commanded_motion = matches!(
+        action,
+        Some(ActionPrimitive::Go { .. } | ActionPrimitive::Explore { .. })
+    );
+    let odom_delta = ((after.body.odometry.x_m - before.body.odometry.x_m).powi(2)
+        + (after.body.odometry.y_m - before.body.odometry.y_m).powi(2))
+    .sqrt();
+    let no_forward_velocity = after.body.velocity.forward_m_s.abs() < 0.01;
+    let no_odometry = odom_delta < 0.005;
+    DangerTarget {
+        bump: bool01(after.body.flags.bump_left || after.body.flags.bump_right),
+        cliff: bool01(after.body.flags.cliff_left || after.body.flags.cliff_right),
+        wheel_drop: bool01(after.body.flags.wheel_drop),
+        stuck: bool01(commanded_motion && no_forward_velocity && no_odometry),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -421,6 +512,97 @@ fn bool01(value: bool) -> f32 {
     }
 }
 
+fn danger_action_features(action: Option<&ActionPrimitive>) -> Vec<f32> {
+    let motor = action_to_motor_command(action);
+    let mut out = vec![
+        bool01(action.is_none()),
+        bool01(matches!(action, Some(ActionPrimitive::Stop))),
+        bool01(matches!(action, Some(ActionPrimitive::Go { .. }))),
+        bool01(matches!(action, Some(ActionPrimitive::Turn { .. }))),
+        bool01(matches!(action, Some(ActionPrimitive::Explore { .. }))),
+        bool01(matches!(action, Some(ActionPrimitive::Approach { .. }))),
+        bool01(matches!(action, Some(ActionPrimitive::Dock))),
+        bool01(matches!(action, Some(ActionPrimitive::Inspect { .. }))),
+        bool01(matches!(action, Some(ActionPrimitive::Speak { .. }))),
+        bool01(matches!(action, Some(ActionPrimitive::Chirp { .. }))),
+        motor.forward.clamp(-1.0, 1.0),
+        motor.turn.clamp(-1.0, 1.0),
+    ];
+    match action {
+        Some(ActionPrimitive::Go {
+            intensity,
+            duration_ms,
+        }) => {
+            out.push(intensity.clamp(0.0, 1.0));
+            out.push((*duration_ms as f32 / 5_000.0).clamp(0.0, 1.0));
+            out.push(0.0);
+        }
+        Some(ActionPrimitive::Turn {
+            direction,
+            intensity,
+            duration_ms,
+        }) => {
+            out.push(intensity.clamp(0.0, 1.0));
+            out.push((*duration_ms as f32 / 5_000.0).clamp(0.0, 1.0));
+            out.push(match direction {
+                TurnDir::Left => 1.0,
+                TurnDir::Right => -1.0,
+            });
+        }
+        Some(ActionPrimitive::Explore { style, duration_ms }) => {
+            out.push(match style {
+                ExploreStyle::Wander => 0.25,
+                ExploreStyle::RandomWalk => 0.5,
+                ExploreStyle::WallFollow => 0.9,
+            });
+            out.push((*duration_ms as f32 / 5_000.0).clamp(0.0, 1.0));
+            out.push(0.0);
+        }
+        _ => {
+            out.push(0.0);
+            out.push(0.0);
+            out.push(0.0);
+        }
+    }
+    out
+}
+
+fn danger_body_features(now: &Now) -> Vec<f32> {
+    vec![
+        now.body.battery_level.clamp(0.0, 1.0),
+        bool01(now.body.charging),
+        bool01(now.body.flags.bump_left || now.body.flags.bump_right),
+        bool01(now.body.flags.cliff_left || now.body.flags.cliff_right),
+        bool01(now.body.flags.wheel_drop),
+        bool01(now.body.flags.wall || now.body.flags.virtual_wall),
+        now.body.velocity.forward_m_s.clamp(-1.0, 1.0),
+        now.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
+        now.body.health.strain.clamp(0.0, 1.0),
+        now.body.health.health.clamp(0.0, 1.0),
+        now.range
+            .nearest_m
+            .map(|m| (1.0 / (1.0 + m)).clamp(0.0, 1.0))
+            .unwrap_or(0.0),
+        now.memory.place_danger.clamp(0.0, 1.0),
+        now.surprise.total.clamp(0.0, 1.0),
+        now.surprise.prediction_error.clamp(0.0, 1.0),
+        bool01(
+            now.extensions
+                .get("safety.vetoed")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        ),
+    ]
+}
+
+fn sanitize_feature(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 trait PredictionSummaryExt {
     fn summary_contains(&self, needle: &str) -> bool;
 }
@@ -499,6 +681,65 @@ mod tests {
         );
 
         assert!(reward.value > 0.0);
+    }
+
+    #[test]
+    fn danger_target_marks_bump_and_cliff_labels() {
+        let before = Now::blank(1, BodySense::default());
+        let mut after = before.clone();
+        after.body.flags.bump_left = true;
+        after.body.flags.cliff_right = true;
+
+        let target =
+            danger_target_from_transition_like(&before, Some(&ActionPrimitive::Stop), &after);
+
+        assert_eq!(target.bump, 1.0);
+        assert_eq!(target.cliff, 1.0);
+        assert_eq!(target.wheel_drop, 0.0);
+    }
+
+    #[test]
+    fn danger_target_marks_go_with_no_movement_as_stuck() {
+        let before = Now::blank(1, BodySense::default());
+        let mut after = before.clone();
+        after.t_ms = 2;
+
+        let target = danger_target_from_transition_like(
+            &before,
+            Some(&ActionPrimitive::Go {
+                intensity: 0.4,
+                duration_ms: 1_000,
+            }),
+            &after,
+        );
+
+        assert_eq!(target.stuck, 1.0);
+    }
+
+    #[test]
+    fn danger_action_features_are_fixed_width() {
+        let now = Now::blank(1, BodySense::default());
+        let stop = DangerInput::from_parts(vec![0.0], Some(&ActionPrimitive::Stop), &now);
+        let go = DangerInput::from_parts(
+            vec![0.0],
+            Some(&ActionPrimitive::Go {
+                intensity: 0.4,
+                duration_ms: 1_000,
+            }),
+            &now,
+        );
+        let turn = DangerInput::from_parts(
+            vec![0.0],
+            Some(&ActionPrimitive::Turn {
+                direction: netherwick_actions::TurnDir::Left,
+                intensity: 0.4,
+                duration_ms: 1_000,
+            }),
+            &now,
+        );
+
+        assert_eq!(stop.action_features.len(), go.action_features.len());
+        assert_eq!(go.action_features.len(), turn.action_features.len());
     }
 }
 

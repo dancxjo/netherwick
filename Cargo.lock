@@ -4685,7 +4685,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
+ "netherwick-actions",
  "netherwick-behaviors",
+ "netherwick-body",
+ "netherwick-experience",
+ "netherwick-now",
  "serde",
 ]
 
@@ -4795,6 +4799,7 @@ dependencies = [
  "netherwick-ledger",
  "netherwick-llm",
  "netherwick-memory",
+ "netherwick-models",
  "netherwick-now",
  "netherwick-runtime",
  "netherwick-sensors",

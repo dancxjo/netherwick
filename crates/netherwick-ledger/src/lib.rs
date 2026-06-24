@@ -162,7 +162,7 @@ impl JsonlLedger {
         self.session_dir().join("transitions.jsonl")
     }
 
-    fn collect_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    fn collect_frame_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         if !root.exists() {
             return Ok(());
         }
@@ -170,7 +170,7 @@ impl JsonlLedger {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                Self::collect_paths(&path, out)?;
+                Self::collect_frame_paths(&path, out)?;
             } else if path.file_name().and_then(|name| name.to_str()) == Some("frames.jsonl")
                 || path.file_name().and_then(|name| name.to_str()) == Some("session.jsonl")
             {
@@ -180,9 +180,25 @@ impl JsonlLedger {
         Ok(())
     }
 
+    fn collect_transition_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        if !root.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                Self::collect_transition_paths(&path, out)?;
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("transitions.jsonl") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
     async fn read_all(&self) -> Result<Vec<ExperienceFrame>> {
         let mut paths = Vec::new();
-        Self::collect_paths(&self.root, &mut paths)?;
+        Self::collect_frame_paths(&self.root, &mut paths)?;
         paths.sort();
 
         let mut frames = Vec::new();
@@ -200,6 +216,28 @@ impl JsonlLedger {
             }
         }
         Ok(frames)
+    }
+
+    pub async fn transitions(&self) -> Result<Vec<ExperienceTransition>> {
+        let mut paths = Vec::new();
+        Self::collect_transition_paths(&self.root, &mut paths)?;
+        paths.sort();
+
+        let mut transitions = Vec::new();
+        for path in paths {
+            let file = match tokio::fs::File::open(&path).await {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            let mut lines = BufReader::new(file).lines();
+            while let Some(line) = lines.next_line().await? {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                transitions.push(serde_json::from_str(&line)?);
+            }
+        }
+        Ok(transitions)
     }
 }
 

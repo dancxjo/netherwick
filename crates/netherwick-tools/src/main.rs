@@ -3,11 +3,17 @@ use clap::{Parser, Subcommand};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_body::BodySense;
 use netherwick_conductor::SimpleConductor;
+use netherwick_experience::{
+    danger_input_from_transition_like, danger_target_from_transition_like,
+};
 use netherwick_ledger::{ExperienceFrame, JsonlLedger, LedgerReader};
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
+use netherwick_models::{DangerNetTrainer, MODEL_REGISTRY};
 use netherwick_runtime::{MinimalRuntime, SimRunner};
 use netherwick_sim::{ArenaConfig, SimObject, SimObjectKind, VirtualWorld};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Parser)]
 #[command(name = "netherwick")]
@@ -22,7 +28,7 @@ enum Command {
     Sim(SimArgs),
     Robot,
     Replay,
-    Train,
+    Train(TrainCommand),
     InspectLedger,
     ModelStatus,
     Dashboard,
@@ -34,6 +40,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Sim(args) => run_sim(args).await,
         Command::InspectLedger => inspect_ledger().await,
+        Command::Train(command) => run_train(command).await,
+        Command::ModelStatus => model_status(),
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -49,6 +57,25 @@ struct SimArgs {
     seed: u64,
     #[arg(long, default_value = "data/ledger")]
     ledger: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainCommand {
+    #[command(subcommand)]
+    model: TrainModel,
+}
+
+#[derive(Debug, Subcommand)]
+enum TrainModel {
+    Danger(TrainDangerArgs),
+}
+
+#[derive(Debug, Parser)]
+struct TrainDangerArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
 }
 
 async fn run_sim(args: SimArgs) -> Result<()> {
@@ -125,6 +152,95 @@ async fn inspect_ledger() -> Result<()> {
     for frame in frames {
         print_frame(&frame);
     }
+    Ok(())
+}
+
+async fn run_train(command: TrainCommand) -> Result<()> {
+    match command.model {
+        TrainModel::Danger(args) => train_danger(args).await,
+    }
+}
+
+async fn train_danger(args: TrainDangerArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let transitions = ledger.transitions().await?;
+    if transitions.is_empty() {
+        println!(
+            "danger training skipped: no transitions found in {}",
+            args.ledger
+        );
+        return Ok(());
+    }
+
+    let mut samples = Vec::new();
+    for transition in &transitions {
+        let input = danger_input_from_transition_like(
+            &transition.before_z,
+            transition.action.as_ref(),
+            &transition.before,
+        );
+        let target = danger_target_from_transition_like(
+            &transition.before,
+            transition.action.as_ref(),
+            &transition.after,
+        );
+        samples.push((
+            transition.created_at_ms,
+            transition.before.clone(),
+            input,
+            target,
+        ));
+    }
+
+    let input_dim = samples
+        .first()
+        .map(|(_, _, input, _)| input.flat_features().len())
+        .unwrap_or(0);
+    let mut trainer = DangerNetTrainer::new(input_dim);
+    let metrics_path = std::path::Path::new(&args.ledger).join("danger-shadow-metrics.jsonl");
+    let mut metrics_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&metrics_path)
+        .await?;
+
+    let mut last_loss = 0.0;
+    let mut seen = 0_u64;
+    for _ in 0..args.epochs {
+        for (observed_at_ms, before, input, target) in &samples {
+            if input.flat_features().len() != trainer.input_dim() {
+                continue;
+            }
+            let metric = trainer.shadow_compare(*observed_at_ms, before, input, target)?;
+            let line = serde_json::to_string(&metric)?;
+            metrics_file.write_all(line.as_bytes()).await?;
+            metrics_file.write_all(b"\n").await?;
+
+            let stats = trainer.train_step(input, target)?;
+            last_loss = stats.loss;
+            seen = stats.samples_seen;
+        }
+    }
+
+    println!(
+        "danger training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
+        samples.len(),
+        args.epochs,
+        seen,
+        last_loss,
+        metrics_path.display()
+    );
+    Ok(())
+}
+
+fn model_status() -> Result<()> {
+    println!("registered models:");
+    for model in MODEL_REGISTRY {
+        println!("  - {model}");
+    }
+    println!(
+        "DangerPredictor: shadow-train ready; metrics: data/ledger/danger-shadow-metrics.jsonl"
+    );
     Ok(())
 }
 
