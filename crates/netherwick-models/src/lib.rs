@@ -352,13 +352,13 @@ impl NeuralModel<(EyeNextInput, Now), EyeNextOutput> for CopyCurrentEyePredictor
 pub struct CopyCurrentEarPredictor;
 
 impl CopyCurrentEarPredictor {
-    pub fn predict_from_now(&self, now: &Now, _input: &EarNextInput) -> EarNextOutput {
+    pub fn predict_from_now(&self, now: &Now, input: &EarNextInput) -> EarNextOutput {
         let Some(features) = netherwick_experience::ear_frame_features(now) else {
             return EarNextOutput {
                 sample_rate_hz: 0,
                 channels: 0,
                 pcm: Vec::new(),
-                features: Vec::new(),
+                features: vec![0.0; input.ear_features.len()],
                 confidence: 0.0,
             };
         };
@@ -481,8 +481,8 @@ impl<B: Backend> EarNextNet<B> {
     pub fn init(input_dim: usize, output_dim: usize, device: &B::Device) -> Self {
         Self {
             input: LinearConfig::new(input_dim, 64).init(device),
-            hidden: LinearConfig::new(64, 64).init(device),
-            output: LinearConfig::new(64, output_dim).init(device),
+            hidden: LinearConfig::new(64, 32).init(device),
+            output: LinearConfig::new(32, output_dim).init(device),
         }
     }
 
@@ -2042,6 +2042,19 @@ mod tests {
         assert_eq!(output.features, vec![0.2, 0.4, 0.6, 0.8]);
         assert!(output.pcm.is_empty());
         assert!(output.confidence > 0.0);
+    }
+
+    #[test]
+    fn copy_current_ear_predictor_returns_zero_features_without_audio() {
+        let now = Now::blank(1, BodySense::default());
+        let input =
+            EarNextInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Stop), &now, 100);
+
+        let output = CopyCurrentEarPredictor.predict_from_now(&now, &input);
+
+        assert_eq!(output.features, vec![0.0; input.ear_features.len()]);
+        assert!(output.pcm.is_empty());
+        assert_eq!(output.confidence, 0.0);
     }
 
     #[test]

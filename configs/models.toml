@@ -6,7 +6,7 @@ checkpoint = "data/models/eye_next_v0"
 fallback = "use_hardcoded"
 
 [behavior.ear_next]
-regime = "shadow_infer"
+regime = "hardcoded"
 hardcoded = "ear.copy_current"
 model = "ear.burn.next_v0"
 checkpoint = "data/models/ear_next_v0"
