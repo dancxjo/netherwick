@@ -12,9 +12,11 @@ use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
 use netherwick_experience::{
-    Experience, ExperienceLatent, FuturePrediction, Impression, Sensation,
+    BaselineRewardComputer, BaselineSurpriseComputer, Experience, ExperienceEncoder,
+    ExperienceLatent, FeatureExperienceEncoder, FuturePrediction, FuturePredictor, Impression,
+    RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
 };
-use netherwick_ledger::{ExperienceFrame, LedgerWriter};
+use netherwick_ledger::{ExperienceFrame, LedgerWriter, PendingFrame, TransitionBuilder};
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
 use netherwick_now::{DriveSense, Now, ReignSense, SafetySense};
@@ -22,7 +24,7 @@ use uuid::Uuid;
 
 pub struct MinimalRuntime<L, M, R, C, S, A>
 where
-    L: LedgerWriter,
+    L: LedgerWriter + Sync,
     M: MemoryStore,
     R: Recall,
     C: Conductor,
@@ -38,6 +40,11 @@ where
     pub extractor: EventExtractor,
     pub bus: EventBus,
     pub reign_queue: ReignQueue,
+    pub encoder: FeatureExperienceEncoder,
+    pub predictor: StasisFuturePredictor,
+    pub surprise_computer: BaselineSurpriseComputer,
+    pub reward_computer: BaselineRewardComputer,
+    pub transition_builder: TransitionBuilder,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,7 +109,7 @@ impl ReignQueue {
 
 impl<L, M, R, C, S, A> MinimalRuntime<L, M, R, C, S, A>
 where
-    L: LedgerWriter,
+    L: LedgerWriter + Sync,
     M: MemoryStore,
     R: Recall,
     C: Conductor,
@@ -127,6 +134,11 @@ where
             extractor: EventExtractor::default(),
             bus: default_event_bus(),
             reign_queue: ReignQueue::default(),
+            encoder: FeatureExperienceEncoder::new(),
+            predictor: StasisFuturePredictor,
+            surprise_computer: BaselineSurpriseComputer,
+            reward_computer: BaselineRewardComputer,
+            transition_builder: TransitionBuilder::new(),
         }
     }
 
@@ -144,8 +156,8 @@ where
     pub async fn tick(
         &mut self,
         mut now: Now,
-        latent: ExperienceLatent,
-        futures: Vec<FuturePrediction>,
+        mut latent: ExperienceLatent,
+        mut futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick> {
         self.reign_queue.drain_expired(now.t_ms);
         now.reign = self.reign_queue.sense(now.t_ms);
@@ -153,6 +165,13 @@ where
         let reign_action = reign_input
             .as_ref()
             .and_then(|input| input.command.to_action());
+
+        if latent.z.is_empty() {
+            latent = self.encoder.encode(&now)?;
+        }
+        if futures.is_empty() {
+            futures = predict_baseline_futures(&mut self.predictor, &latent)?;
+        }
 
         let recall = self
             .memory_recall
@@ -238,6 +257,8 @@ where
             .safety
             .filter(&now, action_to_motor_command(&chosen_action));
         if safety.vetoed {
+            now.extensions
+                .insert("safety.vetoed".to_string(), serde_json::Value::Bool(true));
             let veto_ctx = EventContext {
                 now: &now,
                 latent: Some(&latent),
@@ -338,6 +359,35 @@ where
         };
 
         self.ledger.append(&frame).await?;
+        let surprise_computer = self.surprise_computer.clone();
+        let reward_computer = self.reward_computer.clone();
+        if let Some(transition) = self.transition_builder.observe(
+            PendingFrame {
+                frame_id: frame.id,
+                now: frame.now.clone(),
+                z: latent,
+                action: frame.chosen_action.clone(),
+                predicted_futures: frame.predicted_futures.clone(),
+            },
+            |previous, current| {
+                let surprise = surprise_computer.compute(
+                    &previous.predicted_futures,
+                    &current.z,
+                    &current.now,
+                );
+                reward_computer.compute(
+                    &previous.now,
+                    previous.action.as_ref(),
+                    &current.now,
+                    &surprise,
+                )
+            },
+            |previous, current| {
+                surprise_computer.compute(&previous.predicted_futures, &current.z, &current.now)
+            },
+        ) {
+            self.ledger.append_transition(&transition).await?;
+        }
         self.memory_store.store(&frame).await?;
 
         Ok(RuntimeTick {
@@ -367,6 +417,34 @@ pub struct RuntimeTick {
     pub recall: RecallBundle,
     pub llm: LlmTickResult,
     pub combobulation: Option<Combobulation>,
+}
+
+fn predict_baseline_futures(
+    predictor: &mut impl FuturePredictor,
+    latent: &ExperienceLatent,
+) -> Result<Vec<FuturePrediction>> {
+    let mut out = Vec::new();
+    for action in default_candidate_actions() {
+        for offset_ms in [1_000, 5_000] {
+            out.push(predictor.predict(latent, &action, offset_ms)?);
+        }
+    }
+    Ok(out)
+}
+
+fn default_candidate_actions() -> Vec<ActionPrimitive> {
+    vec![
+        ActionPrimitive::Stop,
+        ActionPrimitive::Explore {
+            style: ExploreStyle::Wander,
+            duration_ms: 2_000,
+        },
+        ActionPrimitive::Go {
+            intensity: 0.15,
+            duration_ms: 1_000,
+        },
+        ActionPrimitive::Dock,
+    ]
 }
 
 fn apply_responses(

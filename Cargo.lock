@@ -4615,7 +4615,11 @@ dependencies = [
 name = "netherwick-experience"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "netherwick-actions",
+ "netherwick-body",
  "netherwick-core",
+ "netherwick-now",
  "serde",
  "serde_json",
  "uuid",
@@ -4629,6 +4633,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "netherwick-actions",
+ "netherwick-body",
  "netherwick-core",
  "netherwick-experience",
  "netherwick-llm",
