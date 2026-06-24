@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 
 pub const IMAGE_CAPTION_PROMPT: &str = "The attached visual input is what I am seeing now. Describe only what you see from my viewpoint. Start from the fact that this is my own vision looking out, so first person should mean phrases like \"I see...\" or \"in front of me,\" not that visible people, faces, hands, eyes, or bodies are mine. Prefer concrete scene details over lighting or color summaries. Stay grounded in visible evidence and do not speculate beyond what can be seen. Do not interpret this as an image, screenshot, photo, frame, camera feed, metadata, data URL, or analysis; interpret it as the robot's own live view. When looking out, one does not see oneself: anyone visible is most likely someone I am looking at, not myself, unless I am clearly looking in a mirror or reflection. Describe visible people in third person, as someone in front of me.";
 
-const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, not the sensor stream. Interpret images, audio, motion, location, body state, memory-derived entries, and other sensor-derived entries as the robot's own vision, hearing, body sense, position sense, and memory sense, not as media files or external sensor artifacts. Do not summarize the amount, density, cadence, or mix of input modalities as if that were the situation. Repeated frames, repeated detections, image embeddings, pending audio clips, and heartbeat-like status records are usually evidence to compress or ignore, not events to report. If people are visible, do not assume any visible person is me unless the vision is clearly a mirror or reflection. If the evidence does not reveal what is happening, say that I cannot tell what is happening yet. Do not infer emotional tone or words like chaotic, intense, overwhelming, anxious, or ominous from sensor volume alone.";
+const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, not the sensor stream. Interpret images, audio, motion, location, body state, memory-derived entries, and other sensor-derived entries as the robot's own vision, hearing, body sense, position sense, and memory sense, not as media files or external sensor artifacts. Convert raw body data into feeling-centered first-person interpretations from inside the robot: say things like \"I feel steady,\" \"I feel the floor fall away ahead,\" or \"my body feels blocked,\" instead of naming raw flags, sensor booleans, channel levels, or detector states. Do not summarize the amount, density, cadence, or mix of input modalities as if that were the situation. Repeated frames, repeated detections, image embeddings, pending audio clips, and heartbeat-like status records are usually evidence to compress or ignore, not events to report. If people are visible, do not assume any visible person is me unless the vision is clearly a mirror or reflection. If the evidence does not reveal what is happening, say that I cannot tell what is happening yet. Do not infer emotional tone or words like chaotic, intense, overwhelming, anxious, or ominous from sensor volume alone.";
 
 const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation, not as the topic to describe. Try to infer what is going on in the real world from those fragments. Sort meaning by time: occurred time first, observed time second. Consume the timeline in order; do not group by faculty or source. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as impressions; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, recordings, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, edges, or detections unless they are the point.";
 
@@ -254,7 +254,7 @@ pub fn summarized_senses(now: &Now) -> Vec<String> {
         lines.push("I am charging.".to_string());
     }
     if now.body.flags.bump_left || now.body.flags.bump_right {
-        lines.push("My bump sensors are pressed.".to_string());
+        lines.push("My body feels blocked by contact.".to_string());
     }
     if now.body.flags.cliff_left
         || now.body.flags.cliff_front_left
@@ -262,16 +262,9 @@ pub fn summarized_senses(now: &Now) -> Vec<String> {
         || now.body.flags.cliff_right
         || now.body.cliff_sensors.max() >= 0.5
     {
-        lines.push("I detect a cliff edge.".to_string());
-    }
-    if now.body.cliff_sensors.max() > 0.0 {
-        lines.push(format!(
-            "Cliff sensor levels are left {:.2}, front-left {:.2}, front-right {:.2}, right {:.2}.",
-            now.body.cliff_sensors.left,
-            now.body.cliff_sensors.front_left,
-            now.body.cliff_sensors.front_right,
-            now.body.cliff_sensors.right
-        ));
+        lines.push("I feel the floor fall away near me.".to_string());
+    } else if now.body.cliff_sensors.max() > 0.0 {
+        lines.push("I feel steady, with only a faint edge-sense under me.".to_string());
     }
     if now.body.flags.wheel_drop {
         lines.push("My wheel is dropped.".to_string());
@@ -1026,14 +1019,14 @@ fn heuristic_combobulation(now: &Now, recall_summary: &str) -> Combobulation {
     {
         format!("I hear: {transcript}")
     } else if now.body.flags.bump_left || now.body.flags.bump_right {
-        "My bump sensors are pressed.".to_string()
+        "My body feels blocked by contact.".to_string()
     } else if now.body.flags.cliff_left
         || now.body.flags.cliff_front_left
         || now.body.flags.cliff_front_right
         || now.body.flags.cliff_right
         || now.body.cliff_sensors.max() >= 0.5
     {
-        "I detect a cliff edge.".to_string()
+        "I feel the floor fall away near me.".to_string()
     } else if let Some(nearest_m) = now.range.nearest_m {
         format!("Nearest obstacle is {:.2} meters away.", nearest_m)
     } else if !recall_summary.trim().is_empty() {
@@ -1245,10 +1238,8 @@ mod tests {
 
         let senses = summarized_senses(&now).join("\n");
 
-        assert!(senses.contains("I detect a cliff edge."));
-        assert!(senses.contains(
-            "Cliff sensor levels are left 0.10, front-left 0.80, front-right 0.40, right 0.20."
-        ));
+        assert!(senses.contains("I feel the floor fall away near me."));
+        assert!(!senses.contains("Cliff sensor levels"));
         assert!(senses.contains("My wall sensor is active."));
         assert!(senses.contains("I detect a virtual wall."));
         assert!(
@@ -1294,6 +1285,9 @@ mod tests {
         assert!(prompt.contains(":00 to "));
         assert!(prompt.contains("what is going on right now"));
         assert!(prompt.contains("first-person lived experience"));
+        assert!(prompt
+            .contains("Convert raw body data into feeling-centered first-person interpretations"));
+        assert!(prompt.contains("I feel steady"));
         assert!(prompt.contains("telling someone with amnesia"));
         assert!(prompt.contains("Distill what matters, not what the records said."));
         assert!(prompt.contains("Treat the entries as fragmentary, possibly contradictory"));

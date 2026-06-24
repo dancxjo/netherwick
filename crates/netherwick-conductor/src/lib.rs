@@ -53,6 +53,9 @@ pub struct SimpleConductor {
 
 impl Conductor for SimpleConductor {
     fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
+        if let Some(action) = direct_reign_action(&input) {
+            return Ok(action);
+        }
         if input.body.flags.wheel_drop {
             return Ok(ActionPrimitive::Stop);
         }
@@ -80,7 +83,7 @@ impl Conductor for SimpleConductor {
                 target: InspectTarget::Novelty,
             });
         }
-        if let Some(action) = preferred_reign_action(&input) {
+        if let Some(action) = assisted_reign_action(&input) {
             return Ok(action);
         }
         if let Some(action) = input.proposals.last() {
@@ -93,18 +96,25 @@ impl Conductor for SimpleConductor {
     }
 }
 
-fn preferred_reign_action(input: &ConductorInput) -> Option<ActionPrimitive> {
+fn direct_reign_action(input: &ConductorInput) -> Option<ActionPrimitive> {
     let reign_input = input.reign.latest.as_ref()?;
     let action = reign_input.command.to_action()?;
-    if matches!(reign_input.command, ReignCommand::Stop) {
+    if matches!(reign_input.command, ReignCommand::Stop) || reign_input.mode == ReignMode::Direct {
         return Some(action);
     }
-    match reign_input.mode {
-        ReignMode::Direct => Some(action),
-        ReignMode::Assist if input.proposals.iter().any(|proposal| proposal == &action) => {
-            Some(action)
-        }
-        _ => None,
+
+    None
+}
+
+fn assisted_reign_action(input: &ConductorInput) -> Option<ActionPrimitive> {
+    let reign_input = input.reign.latest.as_ref()?;
+    let action = reign_input.command.to_action()?;
+    if reign_input.mode == ReignMode::Assist
+        && input.proposals.iter().any(|proposal| proposal == &action)
+    {
+        Some(action)
+    } else {
+        None
     }
 }
 
@@ -131,5 +141,47 @@ mod tests {
         };
 
         assert_eq!(conductor.choose(input).unwrap(), ActionPrimitive::Dock);
+    }
+
+    #[test]
+    fn direct_reign_overrides_default_curiosity_drive() {
+        let mut conductor = SimpleConductor::default();
+        let command = ReignCommand::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.4,
+            duration_ms: 500,
+        };
+        let mut reign = ReignSense::default();
+        reign.active = true;
+        reign.mode = Some(ReignMode::Direct);
+        reign.latest = Some(netherwick_actions::ReignInput {
+            id: Default::default(),
+            issued_at_ms: 100,
+            expires_at_ms: 1_000,
+            source: netherwick_actions::ReignSource::WebRemote,
+            mode: ReignMode::Direct,
+            command: command.clone(),
+            priority: 1.0,
+            note: None,
+        });
+        let mut drives = DriveSense::default();
+        drives.curiosity = 1.0;
+        let input = ConductorInput {
+            latent: ExperienceLatent::default(),
+            drives,
+            memory: MemorySense::default(),
+            predictions: PredictionSense::default(),
+            surprise: SurpriseSense::default(),
+            llm: LlmSense::default(),
+            safety: SafetySense::default(),
+            reign,
+            body: BodySense::default(),
+            proposals: Vec::new(),
+        };
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            command.to_action().unwrap()
+        );
     }
 }

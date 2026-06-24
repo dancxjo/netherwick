@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use netherwick_actions::{
     action_to_motion, action_to_motor_command, ActionPrimitive, ApproachTarget, ExploreStyle,
-    ReignInput, ReignMode, ReignOutcome, TurnDir,
+    InspectTarget, ReignCommand, ReignInput, ReignMode, ReignOutcome, TurnDir,
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_behaviors::{
@@ -1817,6 +1817,15 @@ impl ReignQueue {
     }
 }
 
+fn direct_reign_action(input: &Option<ReignInput>) -> Option<ActionPrimitive> {
+    let input = input.as_ref()?;
+    if matches!(input.command, ReignCommand::Stop) || input.mode == ReignMode::Direct {
+        input.command.to_action()
+    } else {
+        None
+    }
+}
+
 impl<L, M, R, C, S, A> MinimalRuntime<L, M, R, C, S, A>
 where
     L: LedgerWriter + Sync,
@@ -1944,6 +1953,7 @@ where
         let reign_action = reign_input
             .as_ref()
             .and_then(|input| input.command.to_action());
+        let direct_reign_action = direct_reign_action(&reign_input);
 
         let mut behavior_runs: Vec<ErasedBehaviorRunRecord> = Vec::new();
         let experience_input = ExperienceBehaviorInput::from_now(&now);
@@ -2155,16 +2165,8 @@ where
             body: now.body.clone(),
             proposals,
         })?;
-        if self.action_selector_mode == ActionSelectorMode::Baseline {
-            if let Some(action) = reign_action.as_ref() {
-                if reign_input
-                    .as_ref()
-                    .map(|input| input.mode == ReignMode::Direct)
-                    .unwrap_or(false)
-                {
-                    baseline_action = action.clone();
-                }
-            }
+        if let Some(action) = direct_reign_action.as_ref() {
+            baseline_action = action.clone();
         }
 
         let mut model_predictions = Vec::new();
@@ -2265,12 +2267,17 @@ where
         now.predictions.action_values_model = model_predictions;
         now.predictions.action_values_hardcoded = hardcoded_predictions;
 
-        let action_selection = select_action_from_scores(
+        let mut action_selection = select_action_from_scores(
             self.action_selector_mode,
             &now,
             baseline_action.clone(),
             candidate_scores,
         );
+        if let Some(action) = direct_reign_action.as_ref() {
+            action_selection.selected_action = Some(action.clone());
+            action_selection.selected_score = None;
+            action_selection.safety_overrode = false;
+        }
         for warning in &action_selection.fallback_warnings {
             notes.push(warning.clone());
         }
@@ -3472,6 +3479,9 @@ fn default_candidate_actions() -> Vec<ActionPrimitive> {
             intensity: 0.25,
             duration_ms: 750,
         },
+        ActionPrimitive::Inspect {
+            target: InspectTarget::Novelty,
+        },
         ActionPrimitive::Dock,
         ActionPrimitive::Explore {
             style: ExploreStyle::Wander,
@@ -3511,11 +3521,7 @@ fn score_action_candidate(
         }
     });
     let action_value = signals.action_value.map(|value| value.value).unwrap_or(0.0);
-    let curiosity = if matches!(action, ActionPrimitive::Explore { .. }) {
-        now.drives.curiosity * 0.2
-    } else {
-        0.0
-    };
+    let curiosity = curiosity_action_bonus(now, action);
     let collision_risk = fallback_collision_risk(now, action).max(danger);
     let low_battery_risk = if now.body.battery_level <= 0.2
         && matches!(
@@ -3549,6 +3555,21 @@ fn score_action_candidate(
         low_battery_risk,
         repeat_penalty,
         fallback_used,
+    }
+}
+
+fn curiosity_action_bonus(now: &Now, action: &ActionPrimitive) -> f32 {
+    let curiosity = now.drives.curiosity.clamp(0.0, 1.0);
+    let novelty = now.memory.place_novelty.clamp(0.0, 1.0);
+    let pressure = curiosity.max(novelty * 0.75);
+    match action {
+        ActionPrimitive::Explore { .. } => pressure * 0.24,
+        ActionPrimitive::Inspect {
+            target: InspectTarget::Novelty,
+        } => pressure * 0.22,
+        ActionPrimitive::Turn { .. } => pressure * 0.10,
+        ActionPrimitive::Go { intensity, .. } if *intensity > 0.0 => pressure * 0.06,
+        _ => 0.0,
     }
 }
 
@@ -3909,6 +3930,35 @@ fn append_combobulation(
 fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impression>) {
     let mut sensations = Vec::new();
     let mut impressions = Vec::new();
+    let floor_feel = if now.body.flags.cliff_left
+        || now.body.flags.cliff_front_left
+        || now.body.flags.cliff_front_right
+        || now.body.flags.cliff_right
+        || now.body.cliff_sensors.max() >= 0.5
+    {
+        "the floor feels like it falls away near me"
+    } else if now.body.cliff_sensors.max() > 0.0 {
+        "the floor feels mostly steady with a faint edge-sense"
+    } else {
+        "the floor feels steady under me"
+    };
+    let contact_feel = if now.body.flags.bump_left || now.body.flags.bump_right {
+        "my body feels blocked by contact"
+    } else if now.body.flags.wall || now.body.flags.virtual_wall {
+        "I feel a boundary close to me"
+    } else {
+        "my body feels unblocked"
+    };
+    let wheel_feel = if now.body.flags.wheel_drop {
+        "one wheel feels unsupported"
+    } else {
+        "my wheels feel supported"
+    };
+    let charging_feel = if now.body.charging {
+        "charging feels present"
+    } else {
+        "I do not feel charging contact"
+    };
     push_now_input_impression(
         &mut sensations,
         &mut impressions,
@@ -3916,22 +3966,8 @@ fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impress
         "body.state",
         "body",
         format!(
-            "My body has battery at {:.0}%, charging is {}, bumps left/right are {}:{}, wall is {}, virtual wall is {}, wheel drop is {}, cliffs L/FL/FR/R are {}:{}:{}:{}, cliff levels are {:.2}/{:.2}/{:.2}/{:.2}, I am moving forward {:.2} m/s, turning {:.2} rad/s, and my odometry is ({:.2}, {:.2}, {:.2}).",
+            "My body feels {:.0}% full of power; {charging_feel}, {contact_feel}, {wheel_feel}, and {floor_feel}. I feel myself moving forward {:.2} m/s and turning {:.2} rad/s, with my body centered near ({:.2}, {:.2}) and facing {:.2} radians.",
             now.body.battery_level * 100.0,
-            now.body.charging,
-            now.body.flags.bump_left,
-            now.body.flags.bump_right,
-            now.body.flags.wall,
-            now.body.flags.virtual_wall,
-            now.body.flags.wheel_drop,
-            now.body.flags.cliff_left,
-            now.body.flags.cliff_front_left,
-            now.body.flags.cliff_front_right,
-            now.body.flags.cliff_right,
-            now.body.cliff_sensors.left,
-            now.body.cliff_sensors.front_left,
-            now.body.cliff_sensors.front_right,
-            now.body.cliff_sensors.right,
             now.body.velocity.forward_m_s,
             now.body.velocity.turn_rad_s,
             now.body.odometry.x_m,
@@ -4473,6 +4509,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_candidates_include_novelty_inspection() {
+        assert!(default_candidate_actions().iter().any(|action| {
+            matches!(
+                action,
+                ActionPrimitive::Inspect {
+                    target: InspectTarget::Novelty
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn curiosity_scores_inspection_above_stopping() {
+        let mut now = idle_now(1_000);
+        now.drives.curiosity = 0.8;
+        now.memory.place_novelty = 0.7;
+
+        let stop = score_action_candidate(
+            &now,
+            &ActionPrimitive::Stop,
+            CandidateModelSignals::default(),
+            None,
+        );
+        let inspect = score_action_candidate(
+            &now,
+            &ActionPrimitive::Inspect {
+                target: InspectTarget::Novelty,
+            },
+            CandidateModelSignals::default(),
+            None,
+        );
+
+        assert!(inspect.score > stop.score);
+        assert!(inspect.curiosity > 0.0);
+    }
+
     struct StubRuntime;
 
     #[async_trait::async_trait]
@@ -4600,12 +4673,22 @@ mod tests {
     fn direct_now_impressions_are_first_person_present() {
         let mut now = Now::blank(100, BodySense::default());
         now.ear.transcript = Some("hello world".to_string());
+        now.body.flags.cliff_front_left = true;
+        now.body.cliff_sensors.front_left = 0.8;
         now.extensions.insert(
             "test.context".to_string(),
             serde_json::json!({ "ok": true }),
         );
 
         let (_sensations, impressions) = derive_direct_impressions_from_now(&now);
+        let body_text = impressions
+            .iter()
+            .find(|impression| impression.kind == "body.state.impression")
+            .map(|impression| impression.text.as_str())
+            .unwrap();
+        assert!(body_text.contains("floor feels like it falls away near me"));
+        assert!(!body_text.contains("cliffs L/FL/FR/R"));
+        assert!(!body_text.contains("cliff levels"));
 
         assert!(!impressions.is_empty());
         for impression in impressions {
@@ -4811,6 +4894,57 @@ mod tests {
         assert_eq!(decision.mode, ActionSelectorMode::ModelAssisted);
         assert!(!decision.candidates.is_empty());
         assert!(decision.selected_action.is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_reign_overrides_model_assisted_selector() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-reign-model-assisted-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+        )
+        .with_action_selector_mode(ActionSelectorMode::ModelAssisted);
+        let command = ReignCommand::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.5,
+            duration_ms: 500,
+        };
+        runtime.reign_queue.lock().unwrap().push(test_reign_input(
+            100,
+            ReignMode::Direct,
+            command.clone(),
+            2_000,
+        ));
+        let mut now = idle_now(100);
+        now.drives.curiosity = 1.0;
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, command.to_action());
+        let decision = tick
+            .frame
+            .now
+            .extensions
+            .get("action_selector")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ActionSelectionDecision>(value).ok())
+            .unwrap();
+        assert_eq!(decision.selected_action, command.to_action());
+        assert!(tick
+            .frame
+            .reign_outcome
+            .as_ref()
+            .map(|outcome| outcome.accepted_by_conductor)
+            .unwrap_or(false));
     }
 
     #[tokio::test]

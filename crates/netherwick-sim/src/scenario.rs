@@ -100,14 +100,19 @@ impl ScenarioConfig {
             dream: None,
         };
         match kind {
-            ScenarioKind::EmptyRoom => {}
+            ScenarioKind::EmptyRoom => {
+                config.charger_count = 1;
+            }
             ScenarioKind::ObstacleAvoidance => {
+                config.charger_count = 1;
                 config.obstacle_count = 7;
             }
             ScenarioKind::CornerTrap => {
+                config.charger_count = 1;
                 config.obstacle_count = 3;
             }
             ScenarioKind::ColumnTrap => {
+                config.charger_count = 1;
                 config.obstacle_count = 1;
             }
             ScenarioKind::ChargerSeeking => {
@@ -115,6 +120,7 @@ impl ScenarioConfig {
                 config.obstacle_count = 4;
             }
             ScenarioKind::PersonAndSpeaker => {
+                config.charger_count = 1;
                 config.person_count = 1;
                 config.obstacle_count = 2;
             }
@@ -1014,6 +1020,29 @@ mod tests {
             .objects
             .iter()
             .any(|object| matches!(object.kind, SimObjectKind::Charger)));
+    }
+
+    #[test]
+    fn room_scenarios_contain_a_charger() {
+        for kind in [
+            ScenarioKind::EmptyRoom,
+            ScenarioKind::ObstacleAvoidance,
+            ScenarioKind::CornerTrap,
+            ScenarioKind::ColumnTrap,
+            ScenarioKind::PersonAndSpeaker,
+            ScenarioKind::MixedRoom,
+        ] {
+            let scenario = build_scenario(ScenarioConfig::new(kind, 7));
+
+            assert!(
+                scenario
+                    .metadata
+                    .objects
+                    .iter()
+                    .any(|object| matches!(object.kind, SimObjectKind::Charger)),
+                "{kind:?} should include a charger"
+            );
+        }
     }
 
     #[tokio::test]

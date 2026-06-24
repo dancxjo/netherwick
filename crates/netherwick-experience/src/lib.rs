@@ -619,8 +619,9 @@ pub fn action_value_target_from_reward_surprise(
     reward: &Reward,
     surprise: &SurpriseSense,
 ) -> ActionValueTarget {
+    let hazard_surprise = (surprise.total - surprise.prediction_error).max(0.0);
     ActionValueTarget {
-        value: reward.value - surprise.total * 0.1,
+        value: reward.value + surprise.prediction_error * 0.05 - hazard_surprise * 0.15,
     }
 }
 
@@ -838,14 +839,14 @@ impl RewardComputer for BaselineRewardComputer {
     ) -> Reward {
         let battery_delta = after.body.battery_level - before.body.battery_level;
         let mut value = battery_delta.max(0.0) * (1.0 - before.body.battery_level).clamp(0.0, 1.0);
+        let hazard = after.body.flags.bump_left
+            || after.body.flags.bump_right
+            || cliff_detected(after)
+            || after.body.flags.wheel_drop;
         if !before.body.charging && after.body.charging && before.body.battery_level < 0.35 {
             value += 0.35;
         }
-        if !after.body.flags.bump_left
-            && !after.body.flags.bump_right
-            && !cliff_detected(after)
-            && !after.body.flags.wheel_drop
-        {
+        if !hazard {
             value += 0.01;
         }
         if after.body.flags.bump_left || after.body.flags.bump_right {
@@ -873,9 +874,66 @@ impl RewardComputer for BaselineRewardComputer {
         {
             value -= 0.12;
         }
-        value -= surprise.total * 0.02;
+        let hazard_surprise = (surprise.total - surprise.prediction_error).max(0.0);
+        value -= hazard_surprise * 0.03;
+        if !hazard {
+            value += discovery_bonus(before, action, after, surprise);
+        }
         Reward { value }
     }
+}
+
+fn discovery_bonus(
+    before: &Now,
+    action: Option<&ActionPrimitive>,
+    after: &Now,
+    surprise: &SurpriseSense,
+) -> f32 {
+    let novelty = after.memory.place_novelty.clamp(0.0, 1.0);
+    let novelty_delta = (after.memory.place_novelty - before.memory.place_novelty)
+        .max(0.0)
+        .clamp(0.0, 1.0);
+    let newly_visited_places = after
+        .memory
+        .places_visited
+        .saturating_sub(before.memory.places_visited)
+        .min(3) as f32;
+    let dx = after.body.odometry.x_m - before.body.odometry.x_m;
+    let dy = after.body.odometry.y_m - before.body.odometry.y_m;
+    let distance_m = (dx * dx + dy * dy).sqrt().clamp(0.0, 0.25);
+    let motion_bonus = if matches!(
+        action,
+        Some(
+            ActionPrimitive::Go { .. }
+                | ActionPrimitive::Turn { .. }
+                | ActionPrimitive::Inspect { .. }
+                | ActionPrimitive::Explore { .. }
+        )
+    ) {
+        distance_m * 0.16
+    } else {
+        0.0
+    };
+    let prediction_bonus = if matches!(
+        action,
+        Some(
+            ActionPrimitive::Go { .. }
+                | ActionPrimitive::Turn { .. }
+                | ActionPrimitive::Inspect { .. }
+                | ActionPrimitive::Explore { .. }
+        )
+    ) {
+        surprise.prediction_error.clamp(0.0, 1.0) * 0.03
+    } else {
+        0.0
+    };
+
+    (novelty * 0.04
+        + novelty_delta * 0.06
+        + newly_visited_places * 0.03
+        + motion_bonus
+        + prediction_bonus)
+        .clamp(0.0, 0.12)
 }
 
 #[derive(Clone, Debug)]
@@ -1508,6 +1566,61 @@ mod tests {
     }
 
     #[test]
+    fn reward_tastes_safe_discovery_as_good() {
+        let computer = BaselineRewardComputer;
+        let mut before = Now::blank(1, BodySense::default());
+        before.memory.place_novelty = 0.1;
+        before.memory.places_visited = 1;
+        let mut after = before.clone();
+        after.t_ms = 2;
+        after.memory.place_novelty = 0.8;
+        after.memory.places_visited = 2;
+        after.body.odometry.x_m = 0.12;
+        after.body.velocity.forward_m_s = 0.12;
+
+        let reward = computer.compute(
+            &before,
+            Some(&ActionPrimitive::Explore {
+                style: ExploreStyle::Wander,
+                duration_ms: 1_000,
+            }),
+            &after,
+            &SurpriseSense {
+                total: 0.4,
+                prediction_error: 0.4,
+                ..SurpriseSense::default()
+            },
+        );
+
+        assert!(reward.value > 0.08);
+    }
+
+    #[test]
+    fn reward_keeps_hazard_surprise_negative() {
+        let computer = BaselineRewardComputer;
+        let before = Now::blank(1, BodySense::default());
+        let mut after = before.clone();
+        after.t_ms = 2;
+        after.body.flags.bump_left = true;
+
+        let reward = computer.compute(
+            &before,
+            Some(&ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 1_000,
+            }),
+            &after,
+            &SurpriseSense {
+                total: 0.6,
+                prediction_error: 0.1,
+                ..SurpriseSense::default()
+            },
+        );
+
+        assert!(reward.value < -0.2);
+    }
+
+    #[test]
     fn danger_target_marks_bump_and_cliff_labels() {
         let before = Now::blank(1, BodySense::default());
         let mut after = before.clone();
@@ -1635,6 +1748,20 @@ mod tests {
         let reward = Reward { value: 0.35 };
         let surprise = SurpriseSense {
             total: 0.2,
+            ..SurpriseSense::default()
+        };
+
+        let target = action_value_target_from_reward_surprise(&reward, &surprise);
+
+        assert!(target.value > 0.0);
+    }
+
+    #[test]
+    fn action_value_target_values_safe_prediction_error() {
+        let reward = Reward { value: 0.0 };
+        let surprise = SurpriseSense {
+            total: 0.5,
+            prediction_error: 0.5,
             ..SurpriseSense::default()
         };
 
