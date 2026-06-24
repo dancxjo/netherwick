@@ -4745,9 +4745,17 @@ dependencies = [
 name = "netherwick-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "netherwick-actions",
+ "netherwick-autonomic",
+ "netherwick-body",
+ "netherwick-conductor",
  "netherwick-core",
+ "netherwick-experience",
+ "netherwick-ledger",
+ "netherwick-llm",
+ "netherwick-memory",
  "netherwick-now",
  "netherwick-runtime",
  "serde",

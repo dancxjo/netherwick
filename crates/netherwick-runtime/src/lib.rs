@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use netherwick_actions::{
@@ -39,7 +40,7 @@ where
     pub llm: A,
     pub extractor: EventExtractor,
     pub bus: EventBus,
-    pub reign_queue: ReignQueue,
+    pub reign_queue: Arc<Mutex<ReignQueue>>,
     pub encoder: FeatureExperienceEncoder,
     pub predictor: StasisFuturePredictor,
     pub surprise_computer: BaselineSurpriseComputer,
@@ -136,7 +137,34 @@ where
             llm,
             extractor: EventExtractor::default(),
             bus: default_event_bus(),
-            reign_queue: ReignQueue::default(),
+            reign_queue: Arc::new(Mutex::new(ReignQueue::default())),
+            encoder: FeatureExperienceEncoder::new(),
+            predictor: StasisFuturePredictor,
+            surprise_computer: BaselineSurpriseComputer,
+            reward_computer: BaselineRewardComputer,
+            transition_builder: TransitionBuilder::new(),
+        }
+    }
+
+    pub fn with_reign_queue(
+        ledger: L,
+        memory_store: M,
+        memory_recall: R,
+        conductor: C,
+        safety: S,
+        llm: A,
+        reign_queue: Arc<Mutex<ReignQueue>>,
+    ) -> Self {
+        Self {
+            ledger,
+            memory_store,
+            memory_recall,
+            conductor,
+            safety,
+            llm,
+            extractor: EventExtractor::default(),
+            bus: default_event_bus(),
+            reign_queue,
             encoder: FeatureExperienceEncoder::new(),
             predictor: StasisFuturePredictor,
             surprise_computer: BaselineSurpriseComputer,
@@ -162,8 +190,14 @@ where
         mut latent: ExperienceLatent,
         mut futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick> {
-        self.reign_queue.drain_expired(now.t_ms);
-        now.reign = self.reign_queue.sense(now.t_ms);
+        {
+            let mut reign_queue = self
+                .reign_queue
+                .lock()
+                .map_err(|_| anyhow::anyhow!("reign queue lock poisoned"))?;
+            reign_queue.drain_expired(now.t_ms);
+            now.reign = reign_queue.sense(now.t_ms);
+        }
         let reign_input = now.reign.latest.clone();
         let reign_action = reign_input
             .as_ref()
@@ -788,7 +822,7 @@ mod tests {
             SimpleSafety::default(),
             netherwick_llm::NoopLlmAgent,
         );
-        runtime.reign_queue.push(test_reign_input(
+        runtime.reign_queue.lock().unwrap().push(test_reign_input(
             100,
             ReignMode::Direct,
             ReignCommand::Stop,
@@ -873,7 +907,7 @@ mod tests {
             SimpleSafety::default(),
             netherwick_llm::NoopLlmAgent,
         );
-        runtime.reign_queue.push(test_reign_input(
+        runtime.reign_queue.lock().unwrap().push(test_reign_input(
             100,
             ReignMode::Direct,
             ReignCommand::Go {

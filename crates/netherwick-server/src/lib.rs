@@ -251,6 +251,41 @@ refresh(); setInterval(refresh, 1000);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use netherwick_actions::{ActionPrimitive, TurnDir};
+    use netherwick_autonomic::SimpleSafety;
+    use netherwick_body::BodySense;
+    use netherwick_conductor::{Conductor, ConductorInput};
+    use netherwick_experience::ExperienceLatent;
+    use netherwick_ledger::JsonlLedger;
+    use netherwick_memory::InMemoryExperienceStore;
+    use netherwick_now::Now;
+    use netherwick_runtime::{MinimalRuntime, ReignQueue};
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingConductor {
+        last_input: Arc<Mutex<Option<ConductorInput>>>,
+    }
+
+    impl RecordingConductor {
+        fn last_input(&self) -> Option<ConductorInput> {
+            self.last_input.lock().unwrap().clone()
+        }
+    }
+
+    impl Conductor for RecordingConductor {
+        fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
+            let chosen = input
+                .proposals
+                .last()
+                .cloned()
+                .unwrap_or(ActionPrimitive::Stop);
+            *self.last_input.lock().unwrap() = Some(input);
+            Ok(chosen)
+        }
+    }
 
     #[tokio::test]
     async fn post_stop_pushes_active_reign_state() {
@@ -275,5 +310,80 @@ mod tests {
             sense.latest.as_ref().map(|value| &value.command),
             Some(ReignCommand::Stop)
         ));
+    }
+
+    #[tokio::test]
+    async fn posted_reign_command_is_seen_by_runtime_tick() {
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        let state = ReignServerState::new(Arc::clone(&queue));
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.5,
+                duration_ms: 500,
+            },
+            priority: 1.0,
+            ttl_ms: Some(2_000),
+            note: None,
+            source: None,
+        };
+
+        let Json(input) = post_reign_command(State(state), Json(request))
+            .await
+            .unwrap();
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let conductor = RecordingConductor::default();
+        let conductor_probe = conductor.clone();
+        let mut runtime = MinimalRuntime::with_reign_queue(
+            JsonlLedger::new("/tmp/netherwick-server-runtime-shared-reign-test"),
+            memory,
+            recall,
+            conductor,
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+            Arc::clone(&queue),
+        );
+        let now = Now::blank(input.issued_at_ms, BodySense::default());
+        let expected_action = ActionPrimitive::Turn {
+            direction: TurnDir::Left,
+            intensity: 0.5,
+            duration_ms: 500,
+        };
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert!(tick.frame.now.reign.active);
+        assert_eq!(
+            tick.frame.now.reign.latest.as_ref().map(|value| value.id),
+            Some(input.id)
+        );
+        assert_eq!(
+            tick.frame.reign_input.as_ref().map(|value| value.id),
+            Some(input.id)
+        );
+        assert!(tick
+            .frame
+            .sensations
+            .iter()
+            .any(|sensation| sensation.kind == "reign.command"));
+        let conductor_input = conductor_probe.last_input().unwrap();
+        assert_eq!(
+            conductor_input.reign.latest.as_ref().map(|value| value.id),
+            Some(input.id)
+        );
+        assert!(conductor_input.proposals.contains(&expected_action));
+        assert_eq!(tick.chosen_action, Some(expected_action.clone()));
+        assert_eq!(tick.frame.chosen_action, Some(expected_action));
+        assert!(tick
+            .frame
+            .reign_outcome
+            .as_ref()
+            .map(|outcome| outcome.accepted_by_conductor)
+            .unwrap_or(false));
     }
 }

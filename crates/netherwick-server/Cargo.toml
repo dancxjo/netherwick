@@ -18,4 +18,12 @@ tower-http.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
+netherwick-autonomic = { path = "../netherwick-autonomic" }
+netherwick-body = { path = "../netherwick-body" }
+netherwick-conductor = { path = "../netherwick-conductor" }
+netherwick-experience = { path = "../netherwick-experience" }
+netherwick-ledger = { path = "../netherwick-ledger" }
+netherwick-llm = { path = "../netherwick-llm" }
+netherwick-memory = { path = "../netherwick-memory" }
 tokio.workspace = true
