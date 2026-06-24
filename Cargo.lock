@@ -4831,6 +4831,7 @@ dependencies = [
  "netherwick-sim",
  "netherwick-training",
  "netherwick-worldlab",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tokio",

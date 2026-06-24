@@ -7,6 +7,7 @@ use image::{ImageBuffer, Luma, RgbImage};
 use netherwick_experience::{ExperienceLatent, FuturePrediction};
 use netherwick_runtime::{RuntimeLoop, RuntimeTick};
 use netherwick_sensors::{EyeFrameFormat, PcmAudioFrame, WorldSnapshot};
+use netherwick_sim::ScenarioMetadata;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs::{self, File, OpenOptions};
@@ -46,6 +47,8 @@ pub struct CaptureManifest {
     pub warnings: Vec<String>,
     #[serde(default = "default_asset_layout")]
     pub asset_layout: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<ScenarioMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +142,7 @@ impl CaptureWriter {
             ended_at_ms: None,
             warnings: Vec::new(),
             asset_layout: default_asset_layout(),
+            scenario: None,
         };
         write_manifest_atomic(&root, &manifest).await?;
 
@@ -675,6 +679,7 @@ mod tests {
             ended_at_ms: Some(456),
             warnings: Vec::new(),
             asset_layout: default_asset_layout(),
+            scenario: None,
         };
 
         let encoded = serde_json::to_string(&manifest).unwrap();

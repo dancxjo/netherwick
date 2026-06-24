@@ -8,7 +8,7 @@ The v0 loop is:
 VirtualWorld or sensors -> WorldSnapshot stream -> capture session -> replay -> Now stream -> MinimalRuntime.tick -> ledger
 ```
 
-Replay mode observes the recorded world as-is. It does not apply chosen robot actions back into the capture, edit objects, or run counterfactual branches. Counterfactual replay is a later layer.
+Replay mode observes the recorded world as-is. Counterfactual replay is now available for sim captures with reconstructable scenario metadata; see [counterfactual-replay.md](counterfactual-replay.md).
 
 ## Capture Layout
 

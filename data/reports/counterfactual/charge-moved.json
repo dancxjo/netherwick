@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "source_capture": "data/captures/counterfactual/source/episode-000",
+  "reconstructable": true,
+  "edits": [
+    "move-charger:x=1.0,y=1.0"
+  ],
+  "policy": "seek-charge",
+  "steps": 100,
+  "summary": {
+    "collisions": 0,
+    "charging_ticks": 0,
+    "battery_delta": -0.0990002,
+    "distance_traveled": 1.9799974,
+    "final_distance_to_charger_m": 1.5850918
+  },
+  "warnings": [
+    "charger edit used first matching object because no id was provided"
+  ]
+}

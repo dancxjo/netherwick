@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use netherwick_actions::ActionPrimitive;
+use netherwick_actions::{ApproachTarget, ExploreStyle, TurnDir};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use netherwick_body::RobotBody;
-use netherwick_conductor::SimpleConductor;
+use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
 use netherwick_create1::{Create1Body, MockCreate1Body};
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
@@ -39,6 +40,7 @@ use netherwick_worldlab::{
     export_pointcloud_for_frame, export_snapshot_assets, rewrite_frames, update_manifest,
     CaptureReader, CaptureReplayRunner, CaptureSource, CaptureStreams, CaptureWriter,
 };
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -63,6 +65,7 @@ enum Command {
     CaptureAssets(CaptureAssetsArgs),
     InspectCapture(InspectCaptureArgs),
     ReplayCapture(ReplayCaptureArgs),
+    ReplayCounterfactual(ReplayCounterfactualArgs),
     Train(TrainCommand),
     Evaluate(EvaluateCommand),
     Promote(PromoteCommand),
@@ -88,6 +91,7 @@ async fn main() -> Result<()> {
         Command::CaptureAssets(args) => capture_assets(args).await,
         Command::InspectCapture(args) => inspect_capture(args).await,
         Command::ReplayCapture(args) => replay_capture(args).await,
+        Command::ReplayCounterfactual(args) => replay_counterfactual(args).await,
         Command::InspectLedger => inspect_ledger().await,
         Command::Train(command) => run_train(command).await,
         Command::Evaluate(command) => run_evaluate(command).await,
@@ -395,6 +399,26 @@ struct ReplayCaptureArgs {
     capture: String,
     #[arg(long, default_value = "data/ledger/replay-test")]
     ledger: String,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct ReplayCounterfactualArgs {
+    #[arg(long)]
+    capture: String,
+    #[arg(long)]
+    edit: Vec<String>,
+    #[arg(long, default_value = "baseline")]
+    policy: String,
+    #[arg(long)]
+    actions: Option<String>,
+    #[arg(long)]
+    steps: Option<usize>,
+    #[arg(long)]
+    out_ledger: Option<String>,
+    #[arg(long)]
+    out_report: Option<String>,
     #[command(flatten)]
     llm: LlmArgs,
 }
@@ -735,11 +759,12 @@ async fn run_sim_curriculum(args: SimCurriculumArgs) -> Result<()> {
             runner
                 .run_steps_observing(args.steps, |snapshot| snapshots.push(snapshot.clone()))
                 .await?;
-            let capture_path = Path::new(root).join(format!("episode-{episode_index:05}"));
+            let capture_path = Path::new(root).join(format!("episode-{episode_index:03}"));
             capture_path_for_manifest = Some(capture_path.to_string_lossy().to_string());
             let mut writer =
                 CaptureWriter::create(&capture_path, CaptureSource::Sim, Some(args.tick_ms))
                     .await?;
+            writer.manifest_mut().scenario = Some(scenario.metadata.clone());
             for snapshot in snapshots {
                 writer
                     .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
@@ -1209,7 +1234,7 @@ async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {
         let scenario = build_scenario(ScenarioConfig::new(kind, episode_seed));
         let capture = args.capture_root.as_ref().map(|root| {
             Path::new(root)
-                .join(format!("episode-{episode_index:05}"))
+                .join(format!("episode-{episode_index:03}"))
                 .to_string_lossy()
                 .to_string()
         });
@@ -1307,6 +1332,7 @@ where
     if let Some(capture_path) = &metrics.capture {
         let mut writer =
             CaptureWriter::create(capture_path, CaptureSource::Sim, Some(args.tick_ms)).await?;
+        writer.manifest_mut().scenario = Some(metrics.metadata.clone());
         for snapshot in snapshots {
             writer
                 .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
@@ -1499,7 +1525,9 @@ async fn capture_sim(args: CaptureSimArgs) -> Result<()> {
         SimpleSafety::default(),
         configured_llm_agent(&args.llm)?,
     );
-    let (world, motors) = default_sim_world(args.seed);
+    let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::MixedRoom, args.seed));
+    let world = scenario.world;
+    let motors = scenario.motors;
     let mut runner = SimRunner::new(runtime, world, motors);
     let mut snapshots = Vec::new();
     runner
@@ -1508,6 +1536,7 @@ async fn capture_sim(args: CaptureSimArgs) -> Result<()> {
 
     let mut writer =
         CaptureWriter::create(&args.out, CaptureSource::Sim, Some(args.tick_ms)).await?;
+    writer.manifest_mut().scenario = Some(scenario.metadata);
     for snapshot in snapshots {
         let t_ms = snapshot.body.last_update_ms;
         writer.append_snapshot(t_ms, snapshot, Vec::new()).await?;
@@ -1546,6 +1575,535 @@ async fn replay_capture(args: ReplayCaptureArgs) -> Result<()> {
         transitions.len()
     );
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CounterfactualEdit {
+    MoveObject {
+        kind: CounterfactualObjectKind,
+        id: Option<String>,
+        x_m: f32,
+        y_m: f32,
+    },
+    RemoveObstacle {
+        id: Option<String>,
+    },
+    AddObstacle {
+        x_m: f32,
+        y_m: f32,
+        radius_m: f32,
+    },
+    SetBattery {
+        value: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CounterfactualObjectKind {
+    Charger,
+    Person,
+    Speaker,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CounterfactualPolicy {
+    Baseline,
+    Stop,
+    TurnLeftOnDanger,
+    TurnRightOnDanger,
+    SeekCharge,
+    RandomWalk { seed: u64 },
+    Scripted(Vec<ActionPrimitive>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct CounterfactualReport {
+    schema_version: u32,
+    source_capture: String,
+    reconstructable: bool,
+    edits: Vec<String>,
+    policy: String,
+    steps: usize,
+    summary: CounterfactualSummary,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct CounterfactualSummary {
+    collisions: usize,
+    charging_ticks: usize,
+    battery_delta: f32,
+    distance_traveled: f32,
+    final_distance_to_charger_m: Option<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct CounterfactualConductor {
+    policy: CounterfactualPolicy,
+    baseline: SimpleConductor,
+    rng: StdRng,
+    scripted_index: usize,
+}
+
+impl CounterfactualConductor {
+    fn new(policy: CounterfactualPolicy) -> Self {
+        let seed = match policy {
+            CounterfactualPolicy::RandomWalk { seed } => seed,
+            _ => 0,
+        };
+        Self {
+            policy,
+            baseline: SimpleConductor::default(),
+            rng: StdRng::seed_from_u64(seed),
+            scripted_index: 0,
+        }
+    }
+}
+
+impl Conductor for CounterfactualConductor {
+    fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
+        match &self.policy {
+            CounterfactualPolicy::Baseline => self.baseline.choose(input),
+            CounterfactualPolicy::Stop => Ok(ActionPrimitive::Stop),
+            CounterfactualPolicy::TurnLeftOnDanger => {
+                if danger_present(&input) {
+                    Ok(turn_action(TurnDir::Left))
+                } else {
+                    self.baseline.choose(input)
+                }
+            }
+            CounterfactualPolicy::TurnRightOnDanger => {
+                if danger_present(&input) {
+                    Ok(turn_action(TurnDir::Right))
+                } else {
+                    self.baseline.choose(input)
+                }
+            }
+            CounterfactualPolicy::SeekCharge => Ok(ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            }),
+            CounterfactualPolicy::RandomWalk { .. } => {
+                if self.rng.gen_bool(0.25) || danger_present(&input) {
+                    let direction = if self.rng.gen_bool(0.5) {
+                        TurnDir::Left
+                    } else {
+                        TurnDir::Right
+                    };
+                    Ok(turn_action(direction))
+                } else {
+                    Ok(ActionPrimitive::Go {
+                        intensity: 0.25,
+                        duration_ms: 1_000,
+                    })
+                }
+            }
+            CounterfactualPolicy::Scripted(actions) => {
+                let action = actions
+                    .get(self.scripted_index)
+                    .cloned()
+                    .unwrap_or(ActionPrimitive::Stop);
+                self.scripted_index = self.scripted_index.saturating_add(1);
+                Ok(action)
+            }
+        }
+    }
+}
+
+async fn replay_counterfactual(args: ReplayCounterfactualArgs) -> Result<()> {
+    let reader = CaptureReader::open(&args.capture).await?;
+    let manifest = reader.manifest().clone();
+    let Some(mut metadata) = manifest.scenario.clone() else {
+        anyhow::bail!(
+            "passive captures without reconstructable sim metadata cannot yet be counterfactually replayed"
+        );
+    };
+    let frames = reader.read_frames().await?;
+    let steps = args.steps.unwrap_or(frames.len()).max(1);
+    let edits = args
+        .edit
+        .iter()
+        .map(|edit| parse_counterfactual_edit(edit))
+        .collect::<Result<Vec<_>>>()?;
+    let mut warnings = Vec::new();
+    apply_counterfactual_edits(&mut metadata, &edits, &mut warnings)?;
+    let policy = parse_counterfactual_policy(&args.policy, args.actions.as_deref())?;
+
+    let (mut world, motors) =
+        netherwick_sim::VirtualWorld::new_with_motor(metadata.seed, metadata.arena);
+    world.set_body(metadata.body.clone());
+    world.set_objects(metadata.objects.clone());
+
+    if let Some(ledger_path) = &args.out_ledger {
+        let runtime =
+            counterfactual_runtime(JsonlLedger::new(ledger_path), policy.clone(), &args.llm)?;
+        let report = run_counterfactual_sim(
+            runtime, world, motors, &metadata, &manifest, &args, steps, policy, warnings,
+        )
+        .await?;
+        write_or_print_counterfactual_report(&args, &report)?;
+        let transitions = JsonlLedger::new(ledger_path).transitions().await?;
+        println!(
+            "counterfactual replay complete: {} steps, ledger {}, transitions {}, report {}",
+            steps,
+            ledger_path,
+            transitions.len(),
+            args.out_report.as_deref().unwrap_or("stdout")
+        );
+    } else {
+        let runtime = counterfactual_runtime(NoopLedger, policy.clone(), &args.llm)?;
+        let report = run_counterfactual_sim(
+            runtime, world, motors, &metadata, &manifest, &args, steps, policy, warnings,
+        )
+        .await?;
+        write_or_print_counterfactual_report(&args, &report)?;
+        println!(
+            "counterfactual replay complete: {} steps, report {}",
+            steps,
+            args.out_report.as_deref().unwrap_or("stdout")
+        );
+    }
+    Ok(())
+}
+
+fn counterfactual_runtime<L>(
+    ledger: L,
+    policy: CounterfactualPolicy,
+    llm: &LlmArgs,
+) -> Result<
+    MinimalRuntime<
+        L,
+        InMemoryExperienceStore,
+        InMemoryExperienceStore,
+        CounterfactualConductor,
+        SimpleSafety,
+        ConfiguredLlmAgent,
+    >,
+>
+where
+    L: LedgerWriter + Sync + Send,
+{
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    Ok(MinimalRuntime::with_default_events(
+        ledger,
+        memory,
+        recall,
+        CounterfactualConductor::new(policy),
+        SimpleSafety::default(),
+        configured_llm_agent(llm)?,
+    ))
+}
+
+async fn run_counterfactual_sim<R>(
+    runtime: R,
+    world: netherwick_sim::VirtualWorld,
+    motors: netherwick_sim::SimMotorComplex,
+    metadata: &netherwick_sim::ScenarioMetadata,
+    manifest: &netherwick_worldlab::CaptureManifest,
+    args: &ReplayCounterfactualArgs,
+    steps: usize,
+    policy: CounterfactualPolicy,
+    warnings: Vec<String>,
+) -> Result<CounterfactualReport>
+where
+    R: RuntimeLoop + Send,
+{
+    let mut metrics = EpisodeMetricBuilder::new(
+        metadata.kind,
+        metadata.clone(),
+        0,
+        metadata.seed,
+        args.out_ledger.clone(),
+        Some(args.capture.clone()),
+    );
+    let mut runner = SimRunner::new(runtime, world, motors);
+    runner.tick_ms = manifest.tick_ms.unwrap_or(100);
+    runner
+        .run_steps_observing_ticks(steps, |snapshot, tick| metrics.observe(snapshot, tick))
+        .await?;
+    let episode = metrics.finish();
+    Ok(CounterfactualReport {
+        schema_version: 1,
+        source_capture: args.capture.clone(),
+        reconstructable: true,
+        edits: args.edit.clone(),
+        policy: counterfactual_policy_label(&policy),
+        steps: episode.ticks,
+        summary: CounterfactualSummary {
+            collisions: episode.collisions,
+            charging_ticks: episode.charging_ticks,
+            battery_delta: episode.battery_delta,
+            distance_traveled: episode.distance_traveled_m,
+            final_distance_to_charger_m: episode.final_distance_to_charger_m,
+        },
+        warnings,
+    })
+}
+
+fn write_or_print_counterfactual_report(
+    args: &ReplayCounterfactualArgs,
+    report: &CounterfactualReport,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(report)?;
+    if let Some(out) = &args.out_report {
+        if let Some(parent) = Path::new(out).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(out, bytes)?;
+    } else {
+        println!("{}", String::from_utf8_lossy(&bytes));
+    }
+    Ok(())
+}
+
+fn parse_counterfactual_policy(
+    policy: &str,
+    actions: Option<&str>,
+) -> Result<CounterfactualPolicy> {
+    if let Some(actions) = actions {
+        return Ok(CounterfactualPolicy::Scripted(parse_scripted_actions(
+            actions,
+        )?));
+    }
+    if policy == "baseline" {
+        Ok(CounterfactualPolicy::Baseline)
+    } else if policy == "stop" {
+        Ok(CounterfactualPolicy::Stop)
+    } else if policy == "turn-left-on-danger" {
+        Ok(CounterfactualPolicy::TurnLeftOnDanger)
+    } else if policy == "turn-right-on-danger" {
+        Ok(CounterfactualPolicy::TurnRightOnDanger)
+    } else if policy == "seek-charge" {
+        Ok(CounterfactualPolicy::SeekCharge)
+    } else if policy == "random-walk" {
+        Ok(CounterfactualPolicy::RandomWalk { seed: 0 })
+    } else if let Some(rest) = policy.strip_prefix("random-walk:seed=") {
+        Ok(CounterfactualPolicy::RandomWalk {
+            seed: rest.parse().context("invalid random-walk seed")?,
+        })
+    } else {
+        anyhow::bail!("unknown counterfactual policy '{policy}'")
+    }
+}
+
+fn counterfactual_policy_label(policy: &CounterfactualPolicy) -> String {
+    match policy {
+        CounterfactualPolicy::Baseline => "baseline".to_string(),
+        CounterfactualPolicy::Stop => "stop".to_string(),
+        CounterfactualPolicy::TurnLeftOnDanger => "turn-left-on-danger".to_string(),
+        CounterfactualPolicy::TurnRightOnDanger => "turn-right-on-danger".to_string(),
+        CounterfactualPolicy::SeekCharge => "seek-charge".to_string(),
+        CounterfactualPolicy::RandomWalk { seed } => format!("random-walk:seed={seed}"),
+        CounterfactualPolicy::Scripted(_) => "scripted".to_string(),
+    }
+}
+
+fn parse_scripted_actions(actions: &str) -> Result<Vec<ActionPrimitive>> {
+    actions
+        .split(',')
+        .map(|token| match token.trim() {
+            "forward" | "go" => Ok(ActionPrimitive::Go {
+                intensity: 0.25,
+                duration_ms: 1_000,
+            }),
+            "left" => Ok(turn_action(TurnDir::Left)),
+            "right" => Ok(turn_action(TurnDir::Right)),
+            "stop" => Ok(ActionPrimitive::Stop),
+            "dock" => Ok(ActionPrimitive::Dock),
+            "wander" | "random-walk" => Ok(ActionPrimitive::Explore {
+                style: ExploreStyle::RandomWalk,
+                duration_ms: 1_000,
+            }),
+            other => anyhow::bail!("unknown scripted action '{other}'"),
+        })
+        .collect()
+}
+
+fn turn_action(direction: TurnDir) -> ActionPrimitive {
+    ActionPrimitive::Turn {
+        direction,
+        intensity: 0.6,
+        duration_ms: 1_000,
+    }
+}
+
+fn danger_present(input: &ConductorInput) -> bool {
+    input.body.flags.bump_left
+        || input.body.flags.bump_right
+        || input.body.flags.wall
+        || input.body.flags.cliff_left
+        || input.body.flags.cliff_front_left
+        || input.body.flags.cliff_front_right
+        || input.body.flags.cliff_right
+        || input.drives.danger_avoidance >= 0.5
+}
+
+fn parse_counterfactual_edit(input: &str) -> Result<CounterfactualEdit> {
+    let (name, rest) = input
+        .split_once(':')
+        .map(|(name, rest)| (name.trim(), rest.trim()))
+        .unwrap_or((input.trim(), ""));
+    let fields = parse_edit_fields(rest)?;
+    match name {
+        "move-charger" => parse_move_edit(CounterfactualObjectKind::Charger, fields),
+        "move-person" => parse_move_edit(CounterfactualObjectKind::Person, fields),
+        "move-speaker" => parse_move_edit(CounterfactualObjectKind::Speaker, fields),
+        "remove-obstacle" => Ok(CounterfactualEdit::RemoveObstacle {
+            id: fields.get("id").cloned(),
+        }),
+        "add-obstacle" => Ok(CounterfactualEdit::AddObstacle {
+            x_m: required_f32(&fields, "x")?,
+            y_m: required_f32(&fields, "y")?,
+            radius_m: required_f32(&fields, "radius")?,
+        }),
+        "set-battery" => Ok(CounterfactualEdit::SetBattery {
+            value: required_f32(&fields, "value")?.clamp(0.0, 1.0),
+        }),
+        _ => anyhow::bail!("unknown counterfactual edit '{name}'"),
+    }
+}
+
+fn parse_move_edit(
+    kind: CounterfactualObjectKind,
+    fields: HashMap<String, String>,
+) -> Result<CounterfactualEdit> {
+    Ok(CounterfactualEdit::MoveObject {
+        kind,
+        id: fields.get("id").cloned(),
+        x_m: required_f32(&fields, "x")?,
+        y_m: required_f32(&fields, "y")?,
+    })
+}
+
+fn parse_edit_fields(input: &str) -> Result<HashMap<String, String>> {
+    let mut fields = HashMap::new();
+    if input.trim().is_empty() {
+        return Ok(fields);
+    }
+    for part in input.split(',') {
+        let (key, value) = part
+            .split_once('=')
+            .with_context(|| format!("invalid edit field '{part}', expected key=value"))?;
+        fields.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    Ok(fields)
+}
+
+fn required_f32(fields: &HashMap<String, String>, key: &str) -> Result<f32> {
+    fields
+        .get(key)
+        .with_context(|| format!("missing required edit field '{key}'"))?
+        .parse()
+        .with_context(|| format!("invalid float for edit field '{key}'"))
+}
+
+fn apply_counterfactual_edits(
+    metadata: &mut netherwick_sim::ScenarioMetadata,
+    edits: &[CounterfactualEdit],
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    for edit in edits {
+        match edit {
+            CounterfactualEdit::MoveObject { kind, id, x_m, y_m } => {
+                let object = find_counterfactual_object_mut(&mut metadata.objects, *kind, id)?;
+                object.x_m = *x_m;
+                object.y_m = *y_m;
+                if id.is_none() {
+                    warnings.push(format!(
+                        "{} edit used first matching object because no id was provided",
+                        object_kind_label(*kind)
+                    ));
+                }
+            }
+            CounterfactualEdit::RemoveObstacle { id } => {
+                let index = metadata
+                    .objects
+                    .iter()
+                    .position(|object| {
+                        matches!(object.kind, netherwick_sim::SimObjectKind::Obstacle)
+                            && id.as_ref().map(|id| id == &object.id).unwrap_or(true)
+                    })
+                    .with_context(|| {
+                        if let Some(id) = id {
+                            format!("obstacle '{id}' not found")
+                        } else {
+                            "no obstacle found to remove".to_string()
+                        }
+                    })?;
+                metadata.objects.remove(index);
+                if id.is_none() {
+                    warnings.push(
+                        "remove-obstacle edit used first obstacle because no id was provided"
+                            .to_string(),
+                    );
+                }
+            }
+            CounterfactualEdit::AddObstacle { x_m, y_m, radius_m } => {
+                let index = metadata
+                    .objects
+                    .iter()
+                    .filter(|object| matches!(object.kind, netherwick_sim::SimObjectKind::Obstacle))
+                    .count();
+                metadata.objects.push(netherwick_sim::SimObject::obstacle(
+                    format!("counterfactual-obstacle-{index}"),
+                    format!("counterfactual obstacle {index}"),
+                    *x_m,
+                    *y_m,
+                    *radius_m,
+                ));
+            }
+            CounterfactualEdit::SetBattery { value } => {
+                metadata.body.battery_level = *value;
+                metadata.body.charging = false;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_counterfactual_object_mut<'a>(
+    objects: &'a mut [netherwick_sim::SimObject],
+    kind: CounterfactualObjectKind,
+    id: &Option<String>,
+) -> Result<&'a mut netherwick_sim::SimObject> {
+    objects
+        .iter_mut()
+        .find(|object| {
+            object_matches_counterfactual_kind(&object.kind, kind)
+                && id.as_ref().map(|id| id == &object.id).unwrap_or(true)
+        })
+        .with_context(|| {
+            if let Some(id) = id {
+                format!("{} '{id}' not found", object_kind_label(kind))
+            } else {
+                format!("no {} found", object_kind_label(kind))
+            }
+        })
+}
+
+fn object_matches_counterfactual_kind(
+    kind: &netherwick_sim::SimObjectKind,
+    edit_kind: CounterfactualObjectKind,
+) -> bool {
+    match edit_kind {
+        CounterfactualObjectKind::Charger => matches!(kind, netherwick_sim::SimObjectKind::Charger),
+        CounterfactualObjectKind::Person => {
+            matches!(kind, netherwick_sim::SimObjectKind::Person { .. })
+        }
+        CounterfactualObjectKind::Speaker => {
+            matches!(kind, netherwick_sim::SimObjectKind::SoundSource { .. })
+        }
+    }
+}
+
+fn object_kind_label(kind: CounterfactualObjectKind) -> &'static str {
+    match kind {
+        CounterfactualObjectKind::Charger => "charger",
+        CounterfactualObjectKind::Person => "person",
+        CounterfactualObjectKind::Speaker => "speaker",
+    }
 }
 
 async fn hardware_env(args: HardwareEnvArgs) -> Result<()> {
@@ -4023,6 +4581,7 @@ mod tests {
     use netherwick_core::Reward;
     use netherwick_experience::ExperienceLatent;
     use netherwick_now::{Now, SurpriseSense};
+    use netherwick_sensors::World;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4065,6 +4624,191 @@ mod tests {
             experience_mode: ExperienceMode::Off,
             llm: LlmArgs::default(),
         }
+    }
+
+    fn replay_counterfactual_args(
+        capture: String,
+        out_ledger: Option<String>,
+        out_report: Option<String>,
+    ) -> ReplayCounterfactualArgs {
+        ReplayCounterfactualArgs {
+            capture,
+            edit: Vec::new(),
+            policy: "baseline".to_string(),
+            actions: None,
+            steps: Some(4),
+            out_ledger,
+            out_report,
+            llm: LlmArgs::default(),
+        }
+    }
+
+    #[test]
+    fn counterfactual_edit_parser_parses_supported_edits() {
+        assert_eq!(
+            parse_counterfactual_edit("move-charger:x=1.0,y=2.0").unwrap(),
+            CounterfactualEdit::MoveObject {
+                kind: CounterfactualObjectKind::Charger,
+                id: None,
+                x_m: 1.0,
+                y_m: 2.0,
+            }
+        );
+        assert_eq!(
+            parse_counterfactual_edit("set-battery:value=0.42").unwrap(),
+            CounterfactualEdit::SetBattery { value: 0.42 }
+        );
+        assert!(parse_counterfactual_edit("move-moon:x=1,y=2")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown counterfactual edit"));
+    }
+
+    #[test]
+    fn counterfactual_edits_move_charger_and_set_battery() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 9));
+        let mut metadata = scenario.metadata;
+        let edits = vec![
+            parse_counterfactual_edit("move-charger:x=1.0,y=1.0").unwrap(),
+            parse_counterfactual_edit("set-battery:value=0.75").unwrap(),
+        ];
+        let mut warnings = Vec::new();
+
+        apply_counterfactual_edits(&mut metadata, &edits, &mut warnings).unwrap();
+
+        let charger = metadata
+            .objects
+            .iter()
+            .find(|object| matches!(object.kind, netherwick_sim::SimObjectKind::Charger))
+            .unwrap();
+        assert_eq!((charger.x_m, charger.y_m), (1.0, 1.0));
+        assert_eq!(metadata.body.battery_level, 0.75);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("first matching object")));
+    }
+
+    #[test]
+    fn counterfactual_report_serializes_schema() {
+        let report = CounterfactualReport {
+            schema_version: 1,
+            source_capture: "capture".to_string(),
+            reconstructable: true,
+            edits: vec!["set-battery:value=0.5".to_string()],
+            policy: "stop".to_string(),
+            steps: 3,
+            summary: CounterfactualSummary {
+                collisions: 0,
+                charging_ticks: 1,
+                battery_delta: 0.1,
+                distance_traveled: 0.2,
+                final_distance_to_charger_m: Some(0.3),
+            },
+            warnings: Vec::new(),
+        };
+
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["summary"]["charging_ticks"], 1);
+    }
+
+    #[tokio::test]
+    async fn replay_counterfactual_baseline_writes_ledger_and_report() {
+        let temp_dir = temp_path("netherwick_counterfactual_baseline");
+        let capture_dir = temp_dir.join("capture");
+        let ledger_dir = temp_dir.join("ledger");
+        let report_path = temp_dir.join("report.json");
+        let mut scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 77));
+        let snapshot = scenario.world.snapshot().await.unwrap();
+        let mut writer = CaptureWriter::create(&capture_dir, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        writer.manifest_mut().scenario = Some(scenario.metadata);
+        writer
+            .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let args = replay_counterfactual_args(
+            capture_dir.to_string_lossy().to_string(),
+            Some(ledger_dir.to_string_lossy().to_string()),
+            Some(report_path.to_string_lossy().to_string()),
+        );
+        replay_counterfactual(args).await.unwrap();
+
+        let transitions = JsonlLedger::new(&ledger_dir).transitions().await.unwrap();
+        assert!(!transitions.is_empty());
+        let report: CounterfactualReport =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert!(report.reconstructable);
+        assert_eq!(report.steps, 4);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_counterfactual_with_moved_charger_writes_report() {
+        let temp_dir = temp_path("netherwick_counterfactual_moved_charger");
+        let capture_dir = temp_dir.join("capture");
+        let report_path = temp_dir.join("report.json");
+        let mut scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 78));
+        let snapshot = scenario.world.snapshot().await.unwrap();
+        let mut writer = CaptureWriter::create(&capture_dir, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        writer.manifest_mut().scenario = Some(scenario.metadata);
+        writer
+            .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let mut args = replay_counterfactual_args(
+            capture_dir.to_string_lossy().to_string(),
+            None,
+            Some(report_path.to_string_lossy().to_string()),
+        );
+        args.edit = vec!["move-charger:x=1.0,y=1.0".to_string()];
+        args.policy = "seek-charge".to_string();
+        replay_counterfactual(args).await.unwrap();
+
+        let report: CounterfactualReport =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report.edits, vec!["move-charger:x=1.0,y=1.0"]);
+        assert_eq!(report.policy, "seek-charge");
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("first matching object")));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_counterfactual_passive_capture_fails_clearly() {
+        let temp_dir = temp_path("netherwick_counterfactual_passive");
+        let capture_dir = temp_dir.join("capture");
+        let mut writer = CaptureWriter::create(&capture_dir, CaptureSource::Replay, Some(100))
+            .await
+            .unwrap();
+        writer
+            .append_snapshot(0, WorldSnapshot::default(), Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let err = replay_counterfactual(replay_counterfactual_args(
+            capture_dir.to_string_lossy().to_string(),
+            None,
+            None,
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(
+            "passive captures without reconstructable sim metadata cannot yet be counterfactually replayed"
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     fn tick_with_action(action: ActionPrimitive) -> RuntimeTick {
@@ -4456,16 +5200,16 @@ mod tests {
         assert_eq!(
             manifest["episodes_detail"][0]["capture"],
             capture_root
-                .join("episode-00000")
+                .join("episode-000")
                 .to_string_lossy()
                 .to_string()
         );
         assert!(capture_root
-            .join("episode-00000")
+            .join("episode-000")
             .join("manifest.json")
             .exists());
         assert!(capture_root
-            .join("episode-00001")
+            .join("episode-001")
             .join("manifest.json")
             .exists());
         let transitions = JsonlLedger::new(&ledger_dir).transitions().await.unwrap();
