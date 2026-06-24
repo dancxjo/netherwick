@@ -4550,6 +4550,8 @@ dependencies = [
  "anyhow",
  "netherwick-core",
  "serde",
+ "serde_json",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -4634,6 +4636,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "netherwick-actions",
+ "netherwick-behaviors",
  "netherwick-body",
  "netherwick-core",
  "netherwick-experience",
@@ -4727,8 +4730,10 @@ dependencies = [
  "netherwick-now",
  "netherwick-sensors",
  "netherwick-sim",
+ "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]

@@ -1,34 +1,48 @@
 [behavior.eye_next]
-mode = "shadow_train"
+regime = "shadow_train"
 hardcoded = "eye.copy_current"
 model = "eye.burn.future_v0"
 checkpoint = "data/models/eye_future_v0"
-fallback = "hardcoded_on_error"
+fallback = "use_hardcoded"
 
 [behavior.ear_next]
-mode = "hardcoded"
+regime = "hardcoded"
 hardcoded = "ear.silence_or_current"
 model = "ear.burn.future_v0"
 checkpoint = "data/models/ear_future_v0"
-fallback = "hardcoded_on_error"
+fallback = "use_hardcoded"
 
 [behavior.danger]
-mode = "shadow_train"
+regime = "shadow_train"
 hardcoded = "danger.range_bumper"
 model = "danger.burn.v0"
 checkpoint = "data/models/danger_v0"
-fallback = "hardcoded_on_error"
+fallback = "use_hardcoded"
 
 [behavior.charge]
-mode = "shadow_train"
+regime = "shadow_train"
 hardcoded = "charge.sensor_battery_delta"
 model = "charge.burn.v0"
 checkpoint = "data/models/charge_v0"
-fallback = "hardcoded_on_error"
+fallback = "use_hardcoded"
+
+[behavior.future]
+regime = "hardcoded"
+hardcoded = "future.stasis"
+model = "future.burn.v0"
+checkpoint = "data/models/future_v0"
+fallback = "use_hardcoded"
+
+[behavior.action_value]
+regime = "shadow_train"
+hardcoded = "action_value.handcoded"
+model = "action_value.burn.v0"
+checkpoint = "data/models/action_value_v0"
+fallback = "use_hardcoded"
 
 [behavior.conductor]
-mode = "hardcoded"
+regime = "hardcoded"
 hardcoded = "conductor.simple_v0"
 model = "conductor.burn.v0"
 checkpoint = "data/models/conductor_v0"
-fallback = "stop_on_error"
+fallback = "return_error"

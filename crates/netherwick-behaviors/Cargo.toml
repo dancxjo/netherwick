@@ -8,4 +8,8 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 netherwick-core = { path = "../netherwick-core" }
+
+[dev-dependencies]
+toml.workspace = true
