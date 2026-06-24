@@ -2159,14 +2159,22 @@ where
     where
         F: FnMut(&WorldSnapshot),
     {
+        self.run_steps_observing_ticks(steps, |snapshot, _tick| observe(snapshot))
+            .await
+    }
+
+    pub async fn run_steps_observing_ticks<F>(&mut self, steps: usize, mut observe: F) -> Result<()>
+    where
+        F: FnMut(&WorldSnapshot, &RuntimeTick),
+    {
         for _ in 0..steps {
             let snapshot = self.world.snapshot().await?;
-            observe(&snapshot);
             let now = snapshot.to_now(snapshot.body.last_update_ms);
             let tick = self
                 .runtime
                 .tick(now, ExperienceLatent::default(), Vec::new())
                 .await?;
+            observe(&snapshot, &tick);
             let motion = action_to_motion(tick.chosen_action.as_ref());
             self.motors.send(motion).await?;
             self.tick_count = self.tick_count.saturating_add(1);

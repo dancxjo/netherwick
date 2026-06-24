@@ -28,9 +28,12 @@ Useful commands:
 just check
 just test
 just sim
+just eval-scenario-smoke
 just inspect-ledger
 just hardware-env
 ```
+
+Scenario reports can be generated with `just run eval-scenario --scenario empty-room --episodes 2 --steps 10 --out data/reports/scenario/empty-smoke.json`. See [docs/scenario-evaluation.md](docs/scenario-evaluation.md) for baseline-vs-checkpoint comparison notes.
 
 ## Docker services
 

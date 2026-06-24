@@ -102,6 +102,11 @@ rehearse-models:
     just run robot --mode read-only --create-port mock --steps 20 --capture data/captures/mock-readonly
     just run replay-capture --capture data/captures/mock-readonly
 
+eval-scenario-smoke:
+    just run eval-scenario --scenario empty-room --episodes 2 --steps 10 --out data/reports/scenario/empty-smoke.json
+    just run eval-scenario --scenario obstacle-avoidance --episodes 2 --steps 10 --out data/reports/scenario/obstacle-smoke.json
+    just run eval-scenario --scenario charger-seeking --episodes 2 --steps 10 --out data/reports/scenario/charge-smoke.json
+
 inspect-ledger:
     cargo run -p netherwick-tools -- inspect-ledger
 

@@ -1,12 +1,14 @@
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use netherwick_actions::ActionPrimitive;
 use netherwick_autonomic::SimpleSafety;
-use netherwick_behaviors::BehaviorRegime;
+use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use netherwick_body::RobotBody;
 use netherwick_conductor::SimpleConductor;
 use netherwick_create1::{Create1Body, MockCreate1Body};
@@ -17,10 +19,12 @@ use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
 use netherwick_models::MODEL_REGISTRY;
 use netherwick_runtime::{
-    MinimalRuntime, RealRobotRunner, RobotMode, RuntimeModelStack, SimRunner,
+    MinimalRuntime, RealRobotRunner, RobotMode, RuntimeLoop, RuntimeModelStack, RuntimeTick,
+    SimRunner,
 };
 use netherwick_sensors::{
-    CameraSenseProvider, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider, SenseProducer,
+    CameraSenseProvider, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider,
+    SenseProducer, WorldSnapshot,
 };
 use netherwick_server::LiveViewState;
 use netherwick_sim::{build_scenario, default_sim_world, ScenarioConfig, ScenarioKind};
@@ -29,6 +33,7 @@ use netherwick_training::{
     EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
 };
 use netherwick_worldlab::{CaptureReader, CaptureReplayRunner, CaptureSource, CaptureWriter};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Parser)]
@@ -43,6 +48,7 @@ struct Cli {
 enum Command {
     Sim(SimArgs),
     SimCurriculum(SimCurriculumArgs),
+    EvalScenario(EvalScenarioArgs),
     Robot(RobotArgs),
     Replay,
     CaptureSim(CaptureSimArgs),
@@ -61,6 +67,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Sim(args) => run_sim(args).await,
         Command::SimCurriculum(args) => run_sim_curriculum(args).await,
+        Command::EvalScenario(args) => run_eval_scenario(args).await,
         Command::Robot(args) => run_robot(args).await,
         Command::CaptureSim(args) => capture_sim(args).await,
         Command::ReplayCapture(args) => replay_capture(args).await,
@@ -140,6 +147,54 @@ struct SimCurriculumArgs {
     validation_ratio: f32,
     #[arg(long, default_value_t = 0.1)]
     test_ratio: f32,
+}
+
+#[derive(Debug, Parser)]
+struct EvalScenarioArgs {
+    #[arg(long, value_enum)]
+    scenario: ScenarioArg,
+    #[arg(long, default_value_t = 20)]
+    episodes: usize,
+    #[arg(long, default_value_t = 300)]
+    steps: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[arg(long)]
+    out: Option<String>,
+    #[arg(long)]
+    ledger: Option<String>,
+    #[arg(long)]
+    capture_root: Option<String>,
+    #[arg(long)]
+    danger_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    danger_mode: DangerMode,
+    #[arg(long)]
+    charge_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    charge_mode: ChargeMode,
+    #[arg(long)]
+    action_value_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    action_value_mode: ActionValueMode,
+    #[arg(long)]
+    future_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "hardcoded")]
+    future_mode: FutureMode,
+    #[arg(long)]
+    eye_next_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    eye_next_mode: EyeNextMode,
+    #[arg(long)]
+    ear_next_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    ear_next_mode: EarNextMode,
+    #[arg(long)]
+    experience_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    experience_mode: ExperienceMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -636,6 +691,615 @@ fn scenario_object_summary(objects: &[netherwick_sim::SimObject]) -> serde_json:
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ScenarioEvaluationReport {
+    schema_version: u32,
+    scenario: String,
+    base_seed: u64,
+    episodes: usize,
+    steps_per_episode: usize,
+    tick_ms: u64,
+    model_modes: HashMap<String, String>,
+    model_loading: RuntimeModelLoadReport,
+    ledger: Option<String>,
+    capture_root: Option<String>,
+    summary: ScenarioEvaluationSummary,
+    episodes_detail: Vec<ScenarioEpisodeReport>,
+    recommendation: String,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioEvaluationSummary {
+    success_rate: f32,
+    collision_rate: f32,
+    mean_collisions_per_episode: f32,
+    mean_battery_delta: f32,
+    mean_final_battery: f32,
+    mean_distance_to_charger_final_m: Option<f32>,
+    mean_nearest_obstacle_m: Option<f32>,
+    mean_distance_traveled_m: f32,
+    mean_ticks_survived: f32,
+    mean_safety_interventions: f32,
+    behavior_run_records: usize,
+    model_fallbacks: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ScenarioEpisodeReport {
+    index: usize,
+    seed: u64,
+    success: bool,
+    ticks: usize,
+    collisions: usize,
+    wall_hits: usize,
+    bumper_hits: usize,
+    cliff_hits: usize,
+    charging_ticks: usize,
+    first_charge_tick: Option<usize>,
+    started_battery: f32,
+    final_battery: f32,
+    battery_delta: f32,
+    min_nearest_obstacle_m: Option<f32>,
+    mean_nearest_obstacle_m: Option<f32>,
+    final_distance_to_charger_m: Option<f32>,
+    final_distance_to_person_m: Option<f32>,
+    final_distance_to_speaker_m: Option<f32>,
+    distance_traveled_m: f32,
+    stuck_ticks: usize,
+    unique_actions: Vec<String>,
+    safety_interventions: usize,
+    behavior_run_records: usize,
+    model_fallbacks: usize,
+    ticks_with_eye_frames: usize,
+    ticks_with_ear_features: usize,
+    ticks_with_voice_embeddings: usize,
+    ticks_with_face_embeddings: usize,
+    ticks_with_kinect_skeletons: usize,
+    ticks_with_future_predictions: usize,
+    capture: Option<String>,
+    ledger: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct EpisodeMetricBuilder {
+    kind: ScenarioKind,
+    metadata: netherwick_sim::ScenarioMetadata,
+    index: usize,
+    seed: u64,
+    ledger: Option<String>,
+    capture: Option<String>,
+    ticks: usize,
+    collisions: usize,
+    wall_hits: usize,
+    bumper_hits: usize,
+    cliff_hits: usize,
+    charging_ticks: usize,
+    first_charge_tick: Option<usize>,
+    started_battery: Option<f32>,
+    final_battery: f32,
+    min_nearest_obstacle_m: Option<f32>,
+    nearest_obstacle_sum: f32,
+    nearest_obstacle_count: usize,
+    start_position: Option<(f32, f32)>,
+    last_position: Option<(f32, f32)>,
+    distance_traveled_m: f32,
+    stuck_ticks: usize,
+    unique_actions: BTreeSet<String>,
+    safety_interventions: usize,
+    behavior_run_records: usize,
+    model_fallbacks: usize,
+    ticks_with_eye_frames: usize,
+    ticks_with_ear_features: usize,
+    ticks_with_voice_embeddings: usize,
+    ticks_with_face_embeddings: usize,
+    ticks_with_kinect_skeletons: usize,
+    ticks_with_future_predictions: usize,
+}
+
+impl EpisodeMetricBuilder {
+    fn new(
+        kind: ScenarioKind,
+        metadata: netherwick_sim::ScenarioMetadata,
+        index: usize,
+        seed: u64,
+        ledger: Option<String>,
+        capture: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            metadata,
+            index,
+            seed,
+            ledger,
+            capture,
+            ticks: 0,
+            collisions: 0,
+            wall_hits: 0,
+            bumper_hits: 0,
+            cliff_hits: 0,
+            charging_ticks: 0,
+            first_charge_tick: None,
+            started_battery: None,
+            final_battery: 0.0,
+            min_nearest_obstacle_m: None,
+            nearest_obstacle_sum: 0.0,
+            nearest_obstacle_count: 0,
+            start_position: None,
+            last_position: None,
+            distance_traveled_m: 0.0,
+            stuck_ticks: 0,
+            unique_actions: BTreeSet::new(),
+            safety_interventions: 0,
+            behavior_run_records: 0,
+            model_fallbacks: 0,
+            ticks_with_eye_frames: 0,
+            ticks_with_ear_features: 0,
+            ticks_with_voice_embeddings: 0,
+            ticks_with_face_embeddings: 0,
+            ticks_with_kinect_skeletons: 0,
+            ticks_with_future_predictions: 0,
+        }
+    }
+
+    fn observe(&mut self, snapshot: &WorldSnapshot, tick: &RuntimeTick) {
+        self.ticks = self.ticks.saturating_add(1);
+        let body = &snapshot.body;
+        self.started_battery.get_or_insert(body.battery_level);
+        self.final_battery = body.battery_level;
+        let position = (body.odometry.x_m, body.odometry.y_m);
+        if self.start_position.is_none() {
+            self.start_position = Some(position);
+        }
+        if let Some(last) = self.last_position.replace(position) {
+            let step_distance = distance_between(last, position);
+            self.distance_traveled_m += step_distance;
+            if step_distance < 0.002
+                && matches!(
+                    tick.chosen_action,
+                    Some(ActionPrimitive::Go { .. } | ActionPrimitive::Explore { .. })
+                )
+            {
+                self.stuck_ticks = self.stuck_ticks.saturating_add(1);
+            }
+        }
+
+        let bumper = body.flags.bump_left || body.flags.bump_right;
+        let cliff = body.flags.cliff_left
+            || body.flags.cliff_front_left
+            || body.flags.cliff_front_right
+            || body.flags.cliff_right;
+        let collision = bumper || body.flags.wall || cliff;
+        if collision {
+            self.collisions = self.collisions.saturating_add(1);
+        }
+        if body.flags.wall {
+            self.wall_hits = self.wall_hits.saturating_add(1);
+        }
+        if bumper {
+            self.bumper_hits = self.bumper_hits.saturating_add(1);
+        }
+        if cliff {
+            self.cliff_hits = self.cliff_hits.saturating_add(1);
+        }
+        if body.charging {
+            if self.first_charge_tick.is_none() {
+                self.first_charge_tick = Some(self.ticks.saturating_sub(1));
+            }
+            self.charging_ticks = self.charging_ticks.saturating_add(1);
+        }
+        if let Some(nearest) = snapshot.range.nearest_m {
+            self.min_nearest_obstacle_m = Some(
+                self.min_nearest_obstacle_m
+                    .map(|value| value.min(nearest))
+                    .unwrap_or(nearest),
+            );
+            self.nearest_obstacle_sum += nearest;
+            self.nearest_obstacle_count = self.nearest_obstacle_count.saturating_add(1);
+        }
+        if let Some(action) = &tick.chosen_action {
+            self.unique_actions.insert(format!("{action:?}"));
+        }
+        if tick
+            .frame
+            .now
+            .extensions
+            .get("safety.vetoed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            self.safety_interventions = self.safety_interventions.saturating_add(1);
+        }
+        self.observe_behavior_runs(&tick.frame.behavior_runs);
+        if snapshot.eye_frame.is_some() || !snapshot.eye.frames.is_empty() {
+            self.ticks_with_eye_frames = self.ticks_with_eye_frames.saturating_add(1);
+        }
+        if !snapshot.ear.features.is_empty() || snapshot.ear_pcm.is_some() {
+            self.ticks_with_ear_features = self.ticks_with_ear_features.saturating_add(1);
+        }
+        if !snapshot.voice.embeddings.is_empty() {
+            self.ticks_with_voice_embeddings = self.ticks_with_voice_embeddings.saturating_add(1);
+        }
+        if !snapshot.face.embeddings.is_empty() {
+            self.ticks_with_face_embeddings = self.ticks_with_face_embeddings.saturating_add(1);
+        }
+        if !snapshot.kinect.skeletons.is_empty() {
+            self.ticks_with_kinect_skeletons = self.ticks_with_kinect_skeletons.saturating_add(1);
+        }
+        if !tick.frame.predicted_futures.is_empty() {
+            self.ticks_with_future_predictions =
+                self.ticks_with_future_predictions.saturating_add(1);
+        }
+    }
+
+    fn observe_behavior_runs(&mut self, records: &[ErasedBehaviorRunRecord]) {
+        self.behavior_run_records = self.behavior_run_records.saturating_add(records.len());
+        self.model_fallbacks = self.model_fallbacks.saturating_add(
+            records
+                .iter()
+                .filter(|record| {
+                    record.error.is_some()
+                        || (record.regime == BehaviorRegime::ModelInfer
+                            && record.model_json.is_none()
+                            && record.hardcoded_json.is_some())
+                })
+                .count(),
+        );
+    }
+
+    fn finish(self) -> ScenarioEpisodeReport {
+        let final_position = self.last_position.unwrap_or_else(|| {
+            (
+                self.metadata.body.odometry.x_m,
+                self.metadata.body.odometry.y_m,
+            )
+        });
+        let started_battery = self
+            .started_battery
+            .unwrap_or(self.metadata.body.battery_level);
+        let final_distance_to_charger_m =
+            nearest_object_distance(final_position, &self.metadata.objects, |kind| {
+                matches!(kind, netherwick_sim::SimObjectKind::Charger)
+            });
+        let final_distance_to_person_m =
+            nearest_object_distance(final_position, &self.metadata.objects, |kind| {
+                matches!(kind, netherwick_sim::SimObjectKind::Person { .. })
+            });
+        let final_distance_to_speaker_m =
+            nearest_object_distance(final_position, &self.metadata.objects, |kind| {
+                matches!(kind, netherwick_sim::SimObjectKind::SoundSource { .. })
+            });
+        let mean_nearest_obstacle_m = if self.nearest_obstacle_count == 0 {
+            None
+        } else {
+            Some(self.nearest_obstacle_sum / self.nearest_obstacle_count as f32)
+        };
+        let mut report = ScenarioEpisodeReport {
+            index: self.index,
+            seed: self.seed,
+            success: false,
+            ticks: self.ticks,
+            collisions: self.collisions,
+            wall_hits: self.wall_hits,
+            bumper_hits: self.bumper_hits,
+            cliff_hits: self.cliff_hits,
+            charging_ticks: self.charging_ticks,
+            first_charge_tick: self.first_charge_tick,
+            started_battery,
+            final_battery: self.final_battery,
+            battery_delta: self.final_battery - started_battery,
+            min_nearest_obstacle_m: self.min_nearest_obstacle_m,
+            mean_nearest_obstacle_m,
+            final_distance_to_charger_m,
+            final_distance_to_person_m,
+            final_distance_to_speaker_m,
+            distance_traveled_m: self.distance_traveled_m,
+            stuck_ticks: self.stuck_ticks,
+            unique_actions: self.unique_actions.into_iter().collect(),
+            safety_interventions: self.safety_interventions,
+            behavior_run_records: self.behavior_run_records,
+            model_fallbacks: self.model_fallbacks,
+            ticks_with_eye_frames: self.ticks_with_eye_frames,
+            ticks_with_ear_features: self.ticks_with_ear_features,
+            ticks_with_voice_embeddings: self.ticks_with_voice_embeddings,
+            ticks_with_face_embeddings: self.ticks_with_face_embeddings,
+            ticks_with_kinect_skeletons: self.ticks_with_kinect_skeletons,
+            ticks_with_future_predictions: self.ticks_with_future_predictions,
+            capture: self.capture,
+            ledger: self.ledger,
+        };
+        report.success = episode_success(self.kind, &report);
+        report
+    }
+}
+
+async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {
+    let kind = ScenarioKind::from(args.scenario);
+    let flags = RuntimeModelFlags::from(&args);
+    let mut model_loading = load_runtime_models_from_flags(&flags)?.1;
+    if args.future_mode == FutureMode::ModelInfer {
+        model_loading.blocked_model_infer.push(
+            "future model-infer is limited to prediction behavior; motor safety remains hardcoded"
+                .to_string(),
+        );
+    }
+    if args.experience_mode == ExperienceMode::ModelInfer {
+        model_loading.blocked_model_infer.push(
+            "experience model-infer changes latent encoding only; motor safety remains hardcoded"
+                .to_string(),
+        );
+    }
+
+    let mut episodes_detail = Vec::with_capacity(args.episodes);
+    for episode_index in 0..args.episodes {
+        let episode_seed = args.seed.saturating_add(episode_index as u64);
+        let scenario = build_scenario(ScenarioConfig::new(kind, episode_seed));
+        let capture = args.capture_root.as_ref().map(|root| {
+            Path::new(root)
+                .join(format!("episode-{episode_index:05}"))
+                .to_string_lossy()
+                .to_string()
+        });
+        let builder = EpisodeMetricBuilder::new(
+            kind,
+            scenario.metadata.clone(),
+            episode_index,
+            episode_seed,
+            args.ledger.clone(),
+            capture.clone(),
+        );
+        let (episode, warnings) = if let Some(ledger_path) = &args.ledger {
+            let mut runtime = default_runtime(JsonlLedger::new(ledger_path));
+            if let Some(models) = load_runtime_models_from_flags(&flags)?.0 {
+                runtime = runtime.with_models(models);
+            }
+            run_eval_episode(runtime, scenario.world, scenario.motors, &args, builder).await?
+        } else {
+            let mut runtime = default_noop_runtime();
+            if let Some(models) = load_runtime_models_from_flags(&flags)?.0 {
+                runtime = runtime.with_models(models);
+            }
+            run_eval_episode(runtime, scenario.world, scenario.motors, &args, builder).await?
+        };
+        model_loading.warnings.extend(warnings);
+        println!(
+            "eval episode {} complete: scenario {}, seed {}, ticks {}, success {}, collisions {}",
+            episode.index,
+            kind.slug(),
+            episode.seed,
+            episode.ticks,
+            episode.success,
+            episode.collisions
+        );
+        episodes_detail.push(episode);
+    }
+
+    let summary = summarize_episodes(&episodes_detail);
+    let recommendation = scenario_recommendation(args.episodes, &summary);
+    let report = ScenarioEvaluationReport {
+        schema_version: 1,
+        scenario: kind.slug().to_string(),
+        base_seed: args.seed,
+        episodes: args.episodes,
+        steps_per_episode: args.steps,
+        tick_ms: args.tick_ms,
+        model_modes: model_modes_from_flags(&flags),
+        model_loading: model_loading.clone(),
+        ledger: args.ledger.clone(),
+        capture_root: args.capture_root.clone(),
+        summary,
+        episodes_detail,
+        recommendation,
+        warnings: model_loading.warnings.clone(),
+    };
+
+    let bytes = serde_json::to_vec_pretty(&report)?;
+    if let Some(out) = &args.out {
+        if let Some(parent) = Path::new(out).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(out, &bytes)?;
+        println!("scenario evaluation report written: {out}");
+    } else {
+        println!("{}", String::from_utf8_lossy(&bytes));
+    }
+    Ok(())
+}
+
+async fn run_eval_episode<R>(
+    runtime: R,
+    world: netherwick_sim::VirtualWorld,
+    motors: netherwick_sim::SimMotorComplex,
+    args: &EvalScenarioArgs,
+    mut metrics: EpisodeMetricBuilder,
+) -> Result<(ScenarioEpisodeReport, Vec<String>)>
+where
+    R: RuntimeLoop + Send,
+{
+    let mut warnings = Vec::new();
+    let mut runner = SimRunner::new(runtime, world, motors);
+    runner.tick_ms = args.tick_ms;
+    let mut snapshots = Vec::new();
+    runner
+        .run_steps_observing_ticks(args.steps, |snapshot, tick| {
+            if metrics.capture.is_some() {
+                snapshots.push(snapshot.clone());
+            }
+            metrics.observe(snapshot, tick);
+        })
+        .await?;
+
+    if let Some(capture_path) = &metrics.capture {
+        let mut writer =
+            CaptureWriter::create(capture_path, CaptureSource::Sim, Some(args.tick_ms)).await?;
+        for snapshot in snapshots {
+            writer
+                .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+                .await?;
+        }
+        writer.finish().await?;
+    }
+
+    if runner.tick_count < args.steps {
+        warnings.push(format!(
+            "episode {} stopped after {} ticks before requested {} steps",
+            metrics.index, runner.tick_count, args.steps
+        ));
+    }
+    Ok((metrics.finish(), warnings))
+}
+
+fn default_noop_runtime() -> MinimalRuntime<
+    NoopLedger,
+    InMemoryExperienceStore,
+    InMemoryExperienceStore,
+    SimpleConductor,
+    SimpleSafety,
+    NoopLlmAgent,
+> {
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    MinimalRuntime::with_default_events(
+        NoopLedger,
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        NoopLlmAgent,
+    )
+}
+
+fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool {
+    match kind {
+        ScenarioKind::EmptyRoom => episode.ticks > 0 && episode.collisions == 0,
+        ScenarioKind::ObstacleAvoidance => {
+            episode.ticks > 0
+                && episode.collisions <= (episode.ticks / 50).max(1)
+                && episode.stuck_ticks < episode.ticks / 2
+                && episode.distance_traveled_m > 0.05
+        }
+        ScenarioKind::ChargerSeeking => episode.charging_ticks > 0 || episode.battery_delta > 0.03,
+        ScenarioKind::PersonAndSpeaker => {
+            episode.ticks > 0
+                && episode.collisions == 0
+                && (episode.ticks_with_face_embeddings > 0
+                    || episode.ticks_with_voice_embeddings > 0
+                    || episode.ticks_with_kinect_skeletons > 0
+                    || episode.ticks_with_ear_features > 0)
+        }
+        ScenarioKind::MixedRoom => {
+            episode.ticks > 0
+                && episode.collisions <= (episode.ticks / 40).max(1)
+                && (episode.charging_ticks > 0
+                    || episode.ticks_with_face_embeddings > 0
+                    || episode.ticks_with_voice_embeddings > 0)
+        }
+    }
+}
+
+fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationSummary {
+    if episodes.is_empty() {
+        return ScenarioEvaluationSummary::default();
+    }
+    let count = episodes.len() as f32;
+    let total_ticks: usize = episodes.iter().map(|episode| episode.ticks).sum();
+    let total_collisions: usize = episodes.iter().map(|episode| episode.collisions).sum();
+    ScenarioEvaluationSummary {
+        success_rate: episodes.iter().filter(|episode| episode.success).count() as f32 / count,
+        collision_rate: if total_ticks == 0 {
+            0.0
+        } else {
+            total_collisions as f32 / total_ticks as f32
+        },
+        mean_collisions_per_episode: total_collisions as f32 / count,
+        mean_battery_delta: mean(episodes.iter().map(|episode| episode.battery_delta)),
+        mean_final_battery: mean(episodes.iter().map(|episode| episode.final_battery)),
+        mean_distance_to_charger_final_m: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.final_distance_to_charger_m),
+        ),
+        mean_nearest_obstacle_m: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_nearest_obstacle_m),
+        ),
+        mean_distance_traveled_m: mean(episodes.iter().map(|episode| episode.distance_traveled_m)),
+        mean_ticks_survived: mean(episodes.iter().map(|episode| episode.ticks as f32)),
+        mean_safety_interventions: mean(
+            episodes
+                .iter()
+                .map(|episode| episode.safety_interventions as f32),
+        ),
+        behavior_run_records: episodes
+            .iter()
+            .map(|episode| episode.behavior_run_records)
+            .sum(),
+        model_fallbacks: episodes.iter().map(|episode| episode.model_fallbacks).sum(),
+    }
+}
+
+fn scenario_recommendation(episodes: usize, summary: &ScenarioEvaluationSummary) -> String {
+    if episodes < 3 {
+        "insufficient_data".to_string()
+    } else if summary.collision_rate > 0.10 || summary.mean_collisions_per_episode > 5.0 {
+        "reject_or_continue_training".to_string()
+    } else if summary.success_rate >= 0.80 && summary.collision_rate <= 0.02 {
+        "candidate_for_more_eval".to_string()
+    } else {
+        "continue_training".to_string()
+    }
+}
+
+fn nearest_object_distance<F>(
+    position: (f32, f32),
+    objects: &[netherwick_sim::SimObject],
+    matches_kind: F,
+) -> Option<f32>
+where
+    F: Fn(&netherwick_sim::SimObjectKind) -> bool,
+{
+    objects
+        .iter()
+        .filter(|object| matches_kind(&object.kind))
+        .map(|object| {
+            (distance_between(position, (object.x_m, object.y_m)) - object.radius_m).max(0.0)
+        })
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn distance_between(left: (f32, f32), right: (f32, f32)) -> f32 {
+    let dx = left.0 - right.0;
+    let dy = left.1 - right.1;
+    ((dx * dx) + (dy * dy)).sqrt()
+}
+
+fn mean(values: impl Iterator<Item = f32>) -> f32 {
+    let mut count = 0usize;
+    let mut sum = 0.0;
+    for value in values {
+        count = count.saturating_add(1);
+        sum += value;
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f32
+    }
+}
+
+fn mean_optional(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut count = 0usize;
+    let mut sum = 0.0;
+    for value in values {
+        count = count.saturating_add(1);
+        sum += value;
+    }
+    (count > 0).then_some(sum / count as f32)
+}
+
 async fn capture_sim(args: CaptureSimArgs) -> Result<()> {
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
@@ -875,173 +1539,187 @@ impl LedgerWriter for NoopLedger {
     }
 }
 
-fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
-    if args.danger_mode != DangerMode::ShadowInfer
-        && args.charge_mode != ChargeMode::ShadowInfer
-        && args.action_value_mode != ActionValueMode::ShadowInfer
-        && args.future_mode == FutureMode::Hardcoded
-        && args.eye_next_mode != EyeNextMode::ShadowInfer
-        && args.ear_next_mode != EarNextMode::ShadowInfer
-        && args.experience_mode == ExperienceMode::Off
-    {
-        return Ok(None);
+#[derive(Clone, Debug)]
+struct RuntimeModelFlags<'a> {
+    danger_checkpoint: Option<&'a str>,
+    danger_mode: DangerMode,
+    charge_checkpoint: Option<&'a str>,
+    charge_mode: ChargeMode,
+    action_value_checkpoint: Option<&'a str>,
+    action_value_mode: ActionValueMode,
+    future_checkpoint: Option<&'a str>,
+    future_mode: FutureMode,
+    eye_next_checkpoint: Option<&'a str>,
+    eye_next_mode: EyeNextMode,
+    ear_next_checkpoint: Option<&'a str>,
+    ear_next_mode: EarNextMode,
+    experience_checkpoint: Option<&'a str>,
+    experience_mode: ExperienceMode,
+}
+
+impl<'a> From<&'a SimArgs> for RuntimeModelFlags<'a> {
+    fn from(args: &'a SimArgs) -> Self {
+        Self {
+            danger_checkpoint: args.danger_checkpoint.as_deref(),
+            danger_mode: args.danger_mode,
+            charge_checkpoint: args.charge_checkpoint.as_deref(),
+            charge_mode: args.charge_mode,
+            action_value_checkpoint: args.action_value_checkpoint.as_deref(),
+            action_value_mode: args.action_value_mode,
+            future_checkpoint: args.future_checkpoint.as_deref(),
+            future_mode: args.future_mode,
+            eye_next_checkpoint: args.eye_next_checkpoint.as_deref(),
+            eye_next_mode: args.eye_next_mode,
+            ear_next_checkpoint: args.ear_next_checkpoint.as_deref(),
+            ear_next_mode: args.ear_next_mode,
+            experience_checkpoint: args.experience_checkpoint.as_deref(),
+            experience_mode: args.experience_mode,
+        }
     }
-    let danger_path = if args.danger_mode == DangerMode::ShadowInfer {
-        match &args.danger_checkpoint {
+}
+
+impl<'a> From<&'a EvalScenarioArgs> for RuntimeModelFlags<'a> {
+    fn from(args: &'a EvalScenarioArgs) -> Self {
+        Self {
+            danger_checkpoint: args.danger_checkpoint.as_deref(),
+            danger_mode: args.danger_mode,
+            charge_checkpoint: args.charge_checkpoint.as_deref(),
+            charge_mode: args.charge_mode,
+            action_value_checkpoint: args.action_value_checkpoint.as_deref(),
+            action_value_mode: args.action_value_mode,
+            future_checkpoint: args.future_checkpoint.as_deref(),
+            future_mode: args.future_mode,
+            eye_next_checkpoint: args.eye_next_checkpoint.as_deref(),
+            eye_next_mode: args.eye_next_mode,
+            ear_next_checkpoint: args.ear_next_checkpoint.as_deref(),
+            ear_next_mode: args.ear_next_mode,
+            experience_checkpoint: args.experience_checkpoint.as_deref(),
+            experience_mode: args.experience_mode,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct RuntimeModelLoadReport {
+    requested_checkpoints: HashMap<String, Option<String>>,
+    loaded_checkpoints: HashMap<String, String>,
+    active_modes: HashMap<String, String>,
+    blocked_model_infer: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
+    Ok(load_runtime_models_from_flags(&RuntimeModelFlags::from(args))?.0)
+}
+
+fn load_runtime_models_from_flags(
+    flags: &RuntimeModelFlags<'_>,
+) -> Result<(Option<RuntimeModelStack>, RuntimeModelLoadReport)> {
+    let mut report = RuntimeModelLoadReport::default();
+    report.active_modes = model_modes_from_flags(flags);
+    report.requested_checkpoints.insert(
+        "danger".to_string(),
+        flags.danger_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "charge".to_string(),
+        flags.charge_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "action_value".to_string(),
+        flags.action_value_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "future".to_string(),
+        flags.future_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "eye_next".to_string(),
+        flags.eye_next_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "ear_next".to_string(),
+        flags.ear_next_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "experience".to_string(),
+        flags.experience_checkpoint.map(ToOwned::to_owned),
+    );
+
+    if flags.danger_mode != DangerMode::ShadowInfer
+        && flags.charge_mode != ChargeMode::ShadowInfer
+        && flags.action_value_mode != ActionValueMode::ShadowInfer
+        && flags.future_mode == FutureMode::Hardcoded
+        && flags.eye_next_mode != EyeNextMode::ShadowInfer
+        && flags.ear_next_mode != EarNextMode::ShadowInfer
+        && flags.experience_mode == ExperienceMode::Off
+    {
+        return Ok((None, report));
+    }
+    let mut checkpoint_path = |behavior: &str, checkpoint: Option<&str>, enabled: bool| {
+        if !enabled {
+            return None;
+        }
+        match checkpoint {
             Some(checkpoint) if Path::new(checkpoint).exists() => {
-                let path = Path::new(checkpoint);
-                println!("loaded danger checkpoint: {}", path.display());
+                let path = PathBuf::from(checkpoint);
+                println!("loaded {behavior} checkpoint: {}", path.display());
+                report
+                    .loaded_checkpoints
+                    .insert(behavior.to_string(), checkpoint.to_string());
                 Some(path)
             }
             Some(checkpoint) => {
-                println!(
-                    "danger shadow inference disabled: checkpoint not found at {}",
-                    checkpoint
-                );
+                let warning =
+                    format!("{behavior} inference disabled: checkpoint not found at {checkpoint}");
+                println!("{warning}");
+                report.warnings.push(warning);
                 None
             }
             None => {
-                println!("danger shadow inference disabled: no --danger-checkpoint provided");
+                let warning =
+                    format!("{behavior} inference disabled: no --{behavior}-checkpoint provided");
+                println!("{warning}");
+                report.warnings.push(warning);
                 None
             }
         }
-    } else {
-        None
     };
-    let charge_path = if args.charge_mode == ChargeMode::ShadowInfer {
-        match &args.charge_checkpoint {
-            Some(checkpoint) if Path::new(checkpoint).exists() => {
-                let path = Path::new(checkpoint);
-                println!("loaded charge checkpoint: {}", path.display());
-                Some(path)
-            }
-            Some(checkpoint) => {
-                println!(
-                    "charge shadow inference disabled: checkpoint not found at {}",
-                    checkpoint
-                );
-                None
-            }
-            None => {
-                println!("charge shadow inference disabled: no --charge-checkpoint provided");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let action_value_path = if args.action_value_mode == ActionValueMode::ShadowInfer {
-        match &args.action_value_checkpoint {
-            Some(checkpoint) if Path::new(checkpoint).exists() => {
-                let path = Path::new(checkpoint);
-                println!("loaded action-value checkpoint: {}", path.display());
-                Some(path)
-            }
-            Some(checkpoint) => {
-                println!(
-                    "action-value shadow inference disabled: checkpoint not found at {}",
-                    checkpoint
-                );
-                None
-            }
-            None => {
-                println!(
-                    "action-value shadow inference disabled: no --action-value-checkpoint provided"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let future_path = if args.future_mode != FutureMode::Hardcoded {
-        match &args.future_checkpoint {
-            Some(checkpoint) if Path::new(checkpoint).exists() => {
-                let path = Path::new(checkpoint);
-                println!("loaded future checkpoint: {}", path.display());
-                Some(path)
-            }
-            Some(checkpoint) => {
-                println!(
-                    "future inference disabled: checkpoint not found at {}",
-                    checkpoint
-                );
-                None
-            }
-            None => {
-                println!("future inference disabled: no --future-checkpoint provided");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let eye_next_path = if args.eye_next_mode == EyeNextMode::ShadowInfer {
-        match &args.eye_next_checkpoint {
-            Some(checkpoint) if Path::new(checkpoint).exists() => {
-                let path = Path::new(checkpoint);
-                println!("loaded eye-next checkpoint: {}", path.display());
-                Some(path)
-            }
-            Some(checkpoint) => {
-                println!(
-                    "eye-next shadow inference disabled: checkpoint not found at {}",
-                    checkpoint
-                );
-                None
-            }
-            None => {
-                println!("eye-next shadow inference disabled: no --eye-next-checkpoint provided");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let ear_next_path = if args.ear_next_mode == EarNextMode::ShadowInfer {
-        match &args.ear_next_checkpoint {
-            Some(checkpoint) if Path::new(checkpoint).exists() => {
-                let path = Path::new(checkpoint);
-                println!("loaded ear-next checkpoint: {}", path.display());
-                Some(path)
-            }
-            Some(checkpoint) => {
-                println!(
-                    "ear-next shadow inference disabled: checkpoint not found at {}",
-                    checkpoint
-                );
-                None
-            }
-            None => {
-                println!("ear-next shadow inference disabled: no --ear-next-checkpoint provided");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let experience_path = if args.experience_mode != ExperienceMode::Off {
-        match &args.experience_checkpoint {
-            Some(checkpoint) if Path::new(checkpoint).exists() => {
-                let path = Path::new(checkpoint);
-                println!("loaded experience checkpoint: {}", path.display());
-                Some(path)
-            }
-            Some(checkpoint) => {
-                println!(
-                    "experience inference disabled: checkpoint not found at {}",
-                    checkpoint
-                );
-                None
-            }
-            None => {
-                println!("experience inference disabled: no --experience-checkpoint provided");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let danger_path = checkpoint_path(
+        "danger",
+        flags.danger_checkpoint,
+        flags.danger_mode == DangerMode::ShadowInfer,
+    );
+    let charge_path = checkpoint_path(
+        "charge",
+        flags.charge_checkpoint,
+        flags.charge_mode == ChargeMode::ShadowInfer,
+    );
+    let action_value_path = checkpoint_path(
+        "action_value",
+        flags.action_value_checkpoint,
+        flags.action_value_mode == ActionValueMode::ShadowInfer,
+    );
+    let future_path = checkpoint_path(
+        "future",
+        flags.future_checkpoint,
+        flags.future_mode != FutureMode::Hardcoded,
+    );
+    let eye_next_path = checkpoint_path(
+        "eye_next",
+        flags.eye_next_checkpoint,
+        flags.eye_next_mode == EyeNextMode::ShadowInfer,
+    );
+    let ear_next_path = checkpoint_path(
+        "ear_next",
+        flags.ear_next_checkpoint,
+        flags.ear_next_mode == EarNextMode::ShadowInfer,
+    );
+    let experience_path = checkpoint_path(
+        "experience",
+        flags.experience_checkpoint,
+        flags.experience_mode != ExperienceMode::Off,
+    );
     if danger_path.is_none()
         && charge_path.is_none()
         && action_value_path.is_none()
@@ -1050,25 +1728,68 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
         && ear_next_path.is_none()
         && experience_path.is_none()
     {
-        return Ok(None);
+        return Ok((None, report));
     }
 
     let mut models = RuntimeModelStack::with_shadow_checkpoints(
-        danger_path,
-        charge_path,
-        action_value_path,
-        future_path,
-        eye_next_path,
-        ear_next_path,
-        experience_path,
+        danger_path.as_deref(),
+        charge_path.as_deref(),
+        action_value_path.as_deref(),
+        future_path.as_deref(),
+        eye_next_path.as_deref(),
+        ear_next_path.as_deref(),
+        experience_path.as_deref(),
     )?;
-    if future_path.is_some() && args.future_mode == FutureMode::ModelInfer {
+    if future_path.is_some() && flags.future_mode == FutureMode::ModelInfer {
         models.behaviors.future.regime = BehaviorRegime::ModelInfer;
     }
-    if experience_path.is_some() && args.experience_mode == ExperienceMode::ModelInfer {
+    if experience_path.is_some() && flags.experience_mode == ExperienceMode::ModelInfer {
         models.behaviors.experience.regime = BehaviorRegime::ModelInfer;
     }
-    Ok(Some(models))
+    Ok((Some(models), report))
+}
+
+fn model_modes_from_flags(flags: &RuntimeModelFlags<'_>) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "danger".to_string(),
+            mode_name(flags.danger_mode).to_string(),
+        ),
+        (
+            "charge".to_string(),
+            mode_name(flags.charge_mode).to_string(),
+        ),
+        (
+            "action_value".to_string(),
+            mode_name(flags.action_value_mode).to_string(),
+        ),
+        (
+            "future".to_string(),
+            mode_name(flags.future_mode).to_string(),
+        ),
+        (
+            "eye_next".to_string(),
+            mode_name(flags.eye_next_mode).to_string(),
+        ),
+        (
+            "ear_next".to_string(),
+            mode_name(flags.ear_next_mode).to_string(),
+        ),
+        (
+            "experience".to_string(),
+            mode_name(flags.experience_mode).to_string(),
+        ),
+    ])
+}
+
+fn mode_name<T: std::fmt::Debug>(mode: T) -> &'static str {
+    match format!("{mode:?}").as_str() {
+        "Off" => "off",
+        "Hardcoded" => "hardcoded",
+        "ShadowInfer" => "shadow-infer",
+        "ModelInfer" => "model-infer",
+        _ => "unknown",
+    }
 }
 
 async fn inspect_ledger() -> Result<()> {
@@ -1541,6 +2262,257 @@ mod tests {
     use netherwick_now::{Now, SurpriseSense};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(prefix: &str) -> std::path::PathBuf {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    fn eval_args(
+        scenario: ScenarioArg,
+        episodes: usize,
+        steps: usize,
+        out: Option<String>,
+    ) -> EvalScenarioArgs {
+        EvalScenarioArgs {
+            scenario,
+            episodes,
+            steps,
+            seed: 7,
+            tick_ms: 100,
+            out,
+            ledger: None,
+            capture_root: None,
+            danger_checkpoint: None,
+            danger_mode: DangerMode::Off,
+            charge_checkpoint: None,
+            charge_mode: ChargeMode::Off,
+            action_value_checkpoint: None,
+            action_value_mode: ActionValueMode::Off,
+            future_checkpoint: None,
+            future_mode: FutureMode::Hardcoded,
+            eye_next_checkpoint: None,
+            eye_next_mode: EyeNextMode::Off,
+            ear_next_checkpoint: None,
+            ear_next_mode: EarNextMode::Off,
+            experience_checkpoint: None,
+            experience_mode: ExperienceMode::Off,
+        }
+    }
+
+    fn tick_with_action(action: ActionPrimitive) -> RuntimeTick {
+        let now = Now::blank(100, BodySense::default());
+        RuntimeTick {
+            frame: ExperienceFrame {
+                id: uuid::Uuid::new_v4(),
+                t_ms: 100,
+                now,
+                sensations: Vec::new(),
+                impressions: Vec::new(),
+                experiences: Vec::new(),
+                z: None,
+                chosen_action: Some(action.clone()),
+                conscious_command: None,
+                reign_input: None,
+                reign_outcome: None,
+                predicted_futures: Vec::new(),
+                behavior_runs: Vec::new(),
+                actual_next: None,
+                reward: Reward::default(),
+                surprise: SurpriseSense::default(),
+                memory_recall: Vec::new(),
+                recollections: Vec::new(),
+                llm_teaching: Vec::new(),
+                counterfactuals: Vec::new(),
+                notes: Vec::new(),
+            },
+            experience: netherwick_experience::Experience::new(
+                "test",
+                "test",
+                Vec::new(),
+                Vec::new(),
+                100,
+                100,
+            ),
+            chosen_action: Some(action),
+            recall: Default::default(),
+            llm: Default::default(),
+            combobulation: None,
+        }
+    }
+
+    #[test]
+    fn scenario_report_round_trips_json() {
+        let report = ScenarioEvaluationReport {
+            schema_version: 1,
+            scenario: "empty-room".to_string(),
+            base_seed: 7,
+            episodes: 1,
+            steps_per_episode: 2,
+            tick_ms: 100,
+            model_modes: HashMap::new(),
+            model_loading: RuntimeModelLoadReport::default(),
+            ledger: None,
+            capture_root: None,
+            summary: ScenarioEvaluationSummary::default(),
+            episodes_detail: Vec::new(),
+            recommendation: "insufficient_data".to_string(),
+            warnings: Vec::new(),
+        };
+        let encoded = serde_json::to_string(&report).unwrap();
+        let decoded: ScenarioEvaluationReport = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.scenario, "empty-room");
+        assert_eq!(decoded.schema_version, 1);
+    }
+
+    #[test]
+    fn obstacle_metrics_count_collision_flags() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ObstacleAvoidance, 11));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::ObstacleAvoidance,
+            scenario.metadata,
+            0,
+            11,
+            None,
+            None,
+        );
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.flags.bump_left = true;
+        snapshot.body.flags.wall = true;
+        snapshot.body.flags.cliff_front_left = true;
+        snapshot.range.nearest_m = Some(0.2);
+        metrics.observe(
+            &snapshot,
+            &tick_with_action(ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 100,
+            }),
+        );
+        let report = metrics.finish();
+        assert_eq!(report.collisions, 1);
+        assert_eq!(report.wall_hits, 1);
+        assert_eq!(report.bumper_hits, 1);
+        assert_eq!(report.cliff_hits, 1);
+        assert_eq!(report.min_nearest_obstacle_m, Some(0.2));
+    }
+
+    #[test]
+    fn charger_metrics_detect_success_and_battery_delta() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 12));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::ChargerSeeking,
+            scenario.metadata,
+            0,
+            12,
+            None,
+            None,
+        );
+        let mut start = WorldSnapshot::default();
+        start.body.battery_level = 0.2;
+        metrics.observe(&start, &tick_with_action(ActionPrimitive::Stop));
+        let mut charged = start.clone();
+        charged.body.battery_level = 0.26;
+        charged.body.charging = true;
+        metrics.observe(&charged, &tick_with_action(ActionPrimitive::Stop));
+        let report = metrics.finish();
+        assert_eq!(report.charging_ticks, 1);
+        assert!(report.battery_delta > 0.05);
+        assert!(report.success);
+    }
+
+    #[test]
+    fn social_metrics_detect_projected_senses() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::PersonAndSpeaker, 13));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::PersonAndSpeaker,
+            scenario.metadata,
+            0,
+            13,
+            None,
+            None,
+        );
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.eye.frames.push(vec![0.1, 0.2]);
+        snapshot.ear.features.push(vec![0.3]);
+        snapshot.voice.embeddings.push(vec![0.4]);
+        snapshot.face.embeddings.push(vec![0.5]);
+        snapshot.kinect.skeletons.push(Default::default());
+        metrics.observe(&snapshot, &tick_with_action(ActionPrimitive::Stop));
+        let report = metrics.finish();
+        assert_eq!(report.ticks_with_eye_frames, 1);
+        assert_eq!(report.ticks_with_ear_features, 1);
+        assert_eq!(report.ticks_with_voice_embeddings, 1);
+        assert_eq!(report.ticks_with_face_embeddings, 1);
+        assert_eq!(report.ticks_with_kinect_skeletons, 1);
+        assert!(report.success);
+    }
+
+    #[test]
+    fn recommendation_logic_classifies_common_outcomes() {
+        let strong = ScenarioEvaluationSummary {
+            success_rate: 0.9,
+            collision_rate: 0.01,
+            ..ScenarioEvaluationSummary::default()
+        };
+        assert_eq!(
+            scenario_recommendation(10, &strong),
+            "candidate_for_more_eval"
+        );
+        assert_eq!(scenario_recommendation(2, &strong), "insufficient_data");
+        let risky = ScenarioEvaluationSummary {
+            success_rate: 0.9,
+            collision_rate: 0.2,
+            ..ScenarioEvaluationSummary::default()
+        };
+        assert_eq!(
+            scenario_recommendation(10, &risky),
+            "reject_or_continue_training"
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_empty_room_smoke_runs() {
+        let args = eval_args(ScenarioArg::EmptyRoom, 1, 3, None);
+        run_eval_scenario(args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_obstacle_writes_report() {
+        let temp_dir = temp_path("netherwick_eval_scenario_obstacle");
+        let out = temp_dir.join("obstacle.json");
+        let args = eval_args(
+            ScenarioArg::ObstacleAvoidance,
+            3,
+            5,
+            Some(out.to_string_lossy().to_string()),
+        );
+        run_eval_scenario(args).await.unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+        assert_eq!(report["scenario"], "obstacle-avoidance");
+        assert_eq!(report["episodes_detail"].as_array().unwrap().len(), 3);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_optional_ledger_writes_transitions() {
+        let temp_dir = temp_path("netherwick_eval_scenario_ledger");
+        let ledger_dir = temp_dir.join("ledger");
+        let out = temp_dir.join("empty.json");
+        let mut args = eval_args(
+            ScenarioArg::EmptyRoom,
+            1,
+            4,
+            Some(out.to_string_lossy().to_string()),
+        );
+        args.ledger = Some(ledger_dir.to_string_lossy().to_string());
+        run_eval_scenario(args).await.unwrap();
+        let transitions = JsonlLedger::new(&ledger_dir).transitions().await.unwrap();
+        assert!(!transitions.is_empty());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[tokio::test]
     async fn sim_curriculum_writes_one_capture_per_episode() {

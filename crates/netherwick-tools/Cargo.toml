@@ -13,9 +13,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+serde.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+netherwick-actions = { path = "../netherwick-actions" }
 netherwick-autonomic = { path = "../netherwick-autonomic" }
 netherwick-behaviors = { path = "../netherwick-behaviors" }
 netherwick-body = { path = "../netherwick-body" }
@@ -34,7 +36,6 @@ netherwick-training = { path = "../netherwick-training" }
 netherwick-worldlab = { path = "../netherwick-worldlab" }
 
 [dev-dependencies]
-netherwick-actions = { path = "../netherwick-actions" }
 netherwick-core = { path = "../netherwick-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
