@@ -18,3 +18,8 @@ netherwick-experience = { path = "../netherwick-experience" }
 netherwick-ledger = { path = "../netherwick-ledger" }
 netherwick-models = { path = "../netherwick-models" }
 netherwick-now = { path = "../netherwick-now" }
+
+[dev-dependencies]
+uuid = { workspace = true, features = ["v4"] }
+netherwick-actions = { path = "../netherwick-actions" }
+netherwick-body = { path = "../netherwick-body" }

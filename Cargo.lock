@@ -4804,10 +4804,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "netherwick-actions",
  "netherwick-autonomic",
  "netherwick-behaviors",
  "netherwick-body",
  "netherwick-conductor",
+ "netherwick-core",
  "netherwick-create1",
  "netherwick-experience",
  "netherwick-ledger",
@@ -4831,7 +4833,9 @@ name = "netherwick-training"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "netherwick-actions",
  "netherwick-behaviors",
+ "netherwick-body",
  "netherwick-core",
  "netherwick-experience",
  "netherwick-ledger",
@@ -4842,6 +4846,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 0.8.23",
+ "uuid",
 ]
 
 [[package]]

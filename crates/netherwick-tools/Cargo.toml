@@ -33,3 +33,7 @@ netherwick-sensors = { path = "../netherwick-sensors" }
 netherwick-sim = { path = "../netherwick-sim" }
 netherwick-training = { path = "../netherwick-training" }
 netherwick-worldlab = { path = "../netherwick-worldlab" }
+
+[dev-dependencies]
+netherwick-actions = { path = "../netherwick-actions" }
+netherwick-core = { path = "../netherwick-core" }

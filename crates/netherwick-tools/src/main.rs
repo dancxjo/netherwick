@@ -218,6 +218,7 @@ enum EarNextMode {
 enum ExperienceMode {
     Off,
     ShadowInfer,
+    ModelInfer,
 }
 
 #[derive(Debug, Parser)]
@@ -343,6 +344,8 @@ struct EvaluateBehaviorArgs {
     checkpoint: Option<String>,
     #[arg(long)]
     max_samples: Option<usize>,
+    #[arg(long)]
+    out: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -653,7 +656,7 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
         && args.future_mode == FutureMode::Hardcoded
         && args.eye_next_mode != EyeNextMode::ShadowInfer
         && args.ear_next_mode != EarNextMode::ShadowInfer
-        && args.experience_mode != ExperienceMode::ShadowInfer
+        && args.experience_mode == ExperienceMode::Off
     {
         return Ok(None);
     }
@@ -791,7 +794,7 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
     } else {
         None
     };
-    let experience_path = if args.experience_mode == ExperienceMode::ShadowInfer {
+    let experience_path = if args.experience_mode != ExperienceMode::Off {
         match &args.experience_checkpoint {
             Some(checkpoint) if Path::new(checkpoint).exists() => {
                 let path = Path::new(checkpoint);
@@ -800,14 +803,14 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
             }
             Some(checkpoint) => {
                 println!(
-                    "experience shadow inference disabled: checkpoint not found at {}",
+                    "experience inference disabled: checkpoint not found at {}",
                     checkpoint
                 );
                 None
             }
             None => {
                 println!(
-                    "experience shadow inference disabled: no --experience-checkpoint provided"
+                    "experience inference disabled: no --experience-checkpoint provided"
                 );
                 None
             }
@@ -826,7 +829,7 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
         return Ok(None);
     }
 
-    let models = RuntimeModelStack::with_shadow_checkpoints(
+    let mut models = RuntimeModelStack::with_shadow_checkpoints(
         danger_path,
         charge_path,
         action_value_path,
@@ -835,26 +838,12 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
         ear_next_path,
         experience_path,
     )?;
-    let models = if future_path.is_some() && args.future_mode == FutureMode::ModelInfer {
-        if danger_path.is_none()
-            && charge_path.is_none()
-            && action_value_path.is_none()
-            && eye_next_path.is_none()
-            && ear_next_path.is_none()
-            && experience_path.is_none()
-        {
-            RuntimeModelStack::with_future_checkpoint(
-                future_path.unwrap(),
-                BehaviorRegime::ModelInfer,
-            )?
-        } else {
-            let mut models = models;
-            models.behaviors.future.regime = BehaviorRegime::ModelInfer;
-            models
-        }
-    } else {
-        models
-    };
+    if future_path.is_some() && args.future_mode == FutureMode::ModelInfer {
+        models.behaviors.future.regime = BehaviorRegime::ModelInfer;
+    }
+    if experience_path.is_some() && args.experience_mode == ExperienceMode::ModelInfer {
+        models.behaviors.experience.regime = BehaviorRegime::ModelInfer;
+    }
     Ok(Some(models))
 }
 
@@ -1006,6 +995,11 @@ async fn run_evaluate(command: EvaluateCommand) -> Result<()> {
                 max_samples: args.max_samples,
             })
             .await?;
+            if let Some(out_path) = &args.out {
+                let json = serde_json::to_string_pretty(&report)?;
+                std::fs::write(out_path, json)?;
+                println!("Saved evaluation report to {}", out_path);
+            }
             print_evaluation_report(&report)
         }
     }
@@ -1109,5 +1103,106 @@ fn print_frame(frame: &ExperienceFrame) {
     }
     if let Some(transcript) = &frame.now.ear.transcript {
         println!("  heard: {}", transcript);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netherwick_actions::ActionPrimitive;
+    use netherwick_body::BodySense;
+    use netherwick_core::Reward;
+    use netherwick_experience::ExperienceLatent;
+    use netherwick_now::{Now, SurpriseSense};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn test_evaluate_behavior_command_writes_json_to_out() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let temp_dir = std::env::temp_dir().join(format!("netherwick_eval_test_{}", now_ms));
+        let ledger_dir = temp_dir.join("ledger");
+        let session_dir = ledger_dir.join("2026-06-24");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let checkpoint_dir = temp_dir.join("checkpoint");
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+
+        // Write 5 mock transitions to have enough data for training and validation splits
+        let mut transitions = Vec::new();
+        for i in 0..5 {
+            let transition = ExperienceTransition {
+                id: uuid::Uuid::new_v4(),
+                before_frame_id: uuid::Uuid::new_v4(),
+                before: Now::blank(100 + i * 100, BodySense::default()),
+                before_z: ExperienceLatent {
+                    t_ms: 100 + i * 100,
+                    z: vec![0.1; 4],
+                    ..ExperienceLatent::default()
+                },
+                action: Some(ActionPrimitive::Stop),
+                predicted_futures: Vec::new(),
+                after: Now::blank(200 + i * 100, BodySense::default()),
+                after_z: ExperienceLatent {
+                    t_ms: 200 + i * 100,
+                    z: vec![0.2; 4],
+                    ..ExperienceLatent::default()
+                },
+                reward: Reward { value: 0.0 },
+                surprise: SurpriseSense::default(),
+                created_at_ms: 200 + i * 100,
+            };
+            transitions.push(transition);
+        }
+
+        let transitions_file = session_dir.join("transitions.jsonl");
+        let mut content = String::new();
+        for t in &transitions {
+            content.push_str(&serde_json::to_string(t).unwrap());
+            content.push('\n');
+        }
+        fs::write(&transitions_file, content).unwrap();
+
+        // Train first to create the checkpoint and metadata
+        netherwick_training::train_behavior(netherwick_training::TrainBehaviorRequest {
+            behavior: netherwick_training::TrainableBehavior::Danger,
+            ledger_path: ledger_dir.clone(),
+            checkpoint_path: checkpoint_dir.clone(),
+            epochs: 1,
+            validation_split: 0.2,
+            seed: 42,
+        })
+        .await
+        .unwrap();
+
+        // Prepare output path
+        let out_json_path = temp_dir.join("report.json");
+
+        let args = EvaluateBehaviorArgs {
+            behavior: "danger".to_string(),
+            ledger: ledger_dir.to_str().unwrap().to_string(),
+            checkpoint: Some(checkpoint_dir.to_str().unwrap().to_string()),
+            max_samples: None,
+            out: Some(out_json_path.to_str().unwrap().to_string()),
+        };
+
+        let cmd = EvaluateCommand {
+            model: EvaluateModel::Behavior(args),
+        };
+
+        let res = run_evaluate(cmd).await;
+        assert!(res.is_ok(), "run_evaluate failed: {:?}", res.err());
+
+        // Verify report file exists and has correct behavior name
+        assert!(out_json_path.exists());
+        let report_content = fs::read_to_string(&out_json_path).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&report_content).unwrap();
+        assert_eq!(report["behavior"], "danger");
+
+        // Clean up
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

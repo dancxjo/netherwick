@@ -558,6 +558,11 @@ pub async fn train_behavior(request: TrainBehaviorRequest) -> Result<TrainSummar
     let mut evaluation = evaluate_behavior_on_transitions(eval_request, eval_transitions)?;
     evaluation.checkpoint_path = request.checkpoint_path.clone();
 
+    let evaluation_path = request.checkpoint_path.join("evaluation.json");
+    if let Ok(json) = serde_json::to_string_pretty(&evaluation) {
+        let _ = std::fs::write(&evaluation_path, json);
+    }
+
     Ok(TrainSummary {
         behavior: request.behavior,
         transition_count,
@@ -1352,4 +1357,84 @@ fn now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netherwick_actions::ActionPrimitive;
+    use netherwick_body::BodySense;
+    use netherwick_core::Reward;
+    use netherwick_experience::ExperienceLatent;
+    use netherwick_now::SurpriseSense;
+    use std::fs;
+
+    #[tokio::test]
+    async fn test_train_behavior_writes_evaluation_json() {
+        let temp_dir = std::env::temp_dir().join(format!("netherwick_train_test_{}", now_ms()));
+        let ledger_dir = temp_dir.join("ledger");
+        let session_dir = ledger_dir.join("2026-06-24");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let checkpoint_dir = temp_dir.join("checkpoint");
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+
+        // Construct 5 mock transitions to have enough data for training and validation splits
+        let mut transitions = Vec::new();
+        for i in 0..5 {
+            let transition = ExperienceTransition {
+                id: uuid::Uuid::new_v4(),
+                before_frame_id: uuid::Uuid::new_v4(),
+                before: Now::blank(100 + i * 100, BodySense::default()),
+                before_z: ExperienceLatent {
+                    t_ms: 100 + i * 100,
+                    z: vec![0.1; 4],
+                    ..ExperienceLatent::default()
+                },
+                action: Some(ActionPrimitive::Stop),
+                predicted_futures: Vec::new(),
+                after: Now::blank(200 + i * 100, BodySense::default()),
+                after_z: ExperienceLatent {
+                    t_ms: 200 + i * 100,
+                    z: vec![0.2; 4],
+                    ..ExperienceLatent::default()
+                },
+                reward: Reward { value: 0.0 },
+                surprise: SurpriseSense::default(),
+                created_at_ms: 200 + i * 100,
+            };
+            transitions.push(transition);
+        }
+
+        let transitions_file = session_dir.join("transitions.jsonl");
+        let mut content = String::new();
+        for t in &transitions {
+            content.push_str(&serde_json::to_string(t).unwrap());
+            content.push('\n');
+        }
+        fs::write(&transitions_file, content).unwrap();
+
+        let request = TrainBehaviorRequest {
+            behavior: TrainableBehavior::Danger,
+            ledger_path: ledger_dir,
+            checkpoint_path: checkpoint_dir.clone(),
+            epochs: 1,
+            validation_split: 0.2,
+            seed: 42,
+        };
+
+        let summary = train_behavior(request).await.unwrap();
+        assert_eq!(summary.behavior, TrainableBehavior::Danger);
+
+        // Verify that evaluation.json was created
+        let eval_json_path = checkpoint_dir.join("evaluation.json");
+        assert!(eval_json_path.exists());
+
+        let eval_content = fs::read_to_string(&eval_json_path).unwrap();
+        let report: BehaviorEvaluationReport = serde_json::from_str(&eval_content).unwrap();
+        assert_eq!(report.behavior, TrainableBehavior::Danger);
+
+        // Clean up
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }
