@@ -51,6 +51,8 @@ pub struct PredictionSense {
     pub uncertainty: f32,
     pub danger_model: Option<DangerPrediction>,
     pub danger_hardcoded: Option<DangerPrediction>,
+    pub charge_model: Option<ChargePrediction>,
+    pub charge_hardcoded: Option<ChargePrediction>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -59,6 +61,14 @@ pub struct DangerPrediction {
     pub cliff_risk: f32,
     pub wheel_drop_risk: f32,
     pub stuck_risk: f32,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChargePrediction {
+    pub charge_probability: f32,
+    pub expected_battery_delta: f32,
+    pub dock_likelihood: f32,
     pub confidence: f32,
 }
 

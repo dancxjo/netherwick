@@ -15,16 +15,21 @@ use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
 use netherwick_experience::{
-    BaselineRewardComputer, BaselineSurpriseComputer, DangerInput, DangerOutput, Experience,
-    ExperienceEncoder, ExperienceLatent, FeatureExperienceEncoder, FuturePrediction,
-    FuturePredictor, Impression, RewardComputer, Sensation, StasisFuturePredictor,
-    SurpriseComputer,
+    BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput, DangerInput,
+    DangerOutput, Experience, ExperienceEncoder, ExperienceLatent, FeatureExperienceEncoder,
+    FuturePrediction, FuturePredictor, Impression, RewardComputer, Sensation,
+    StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{ExperienceFrame, LedgerWriter, PendingFrame, TransitionBuilder};
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
-use netherwick_models::{read_danger_metadata, DangerNetTrainer, HardcodedDangerPredictor};
-use netherwick_now::{DangerPrediction, DriveSense, Now, ReignSense, SafetySense};
+use netherwick_models::{
+    read_charge_metadata, read_danger_metadata, ChargeNetTrainer, DangerNetTrainer,
+    HardcodedChargePredictor, HardcodedDangerPredictor,
+};
+use netherwick_now::{
+    ChargePrediction, DangerPrediction, DriveSense, Now, ReignSense, SafetySense,
+};
 use netherwick_sensors::World;
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use uuid::Uuid;
@@ -58,6 +63,7 @@ where
 #[derive(Default)]
 pub struct RuntimeModelStack {
     pub danger: Option<DangerRuntimePredictor>,
+    pub charge: Option<ChargeRuntimePredictor>,
 }
 
 impl RuntimeModelStack {
@@ -69,7 +75,42 @@ impl RuntimeModelStack {
                 path,
                 metadata.input_dim,
             )?),
+            charge: None,
         })
+    }
+
+    pub fn with_charge_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_charge_metadata(path)?;
+        Ok(Self {
+            danger: None,
+            charge: Some(ChargeRuntimePredictor::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?),
+        })
+    }
+
+    pub fn with_shadow_checkpoints(
+        danger_path: Option<&Path>,
+        charge_path: Option<&Path>,
+    ) -> Result<Self> {
+        let mut stack = Self::default();
+        if let Some(path) = danger_path {
+            let metadata = read_danger_metadata(path)?;
+            stack.danger = Some(DangerRuntimePredictor::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?);
+        }
+        if let Some(path) = charge_path {
+            let metadata = read_charge_metadata(path)?;
+            stack.charge = Some(ChargeRuntimePredictor::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?);
+        }
+        Ok(stack)
     }
 }
 
@@ -93,6 +134,32 @@ impl DangerRuntimePredictor {
         action: Option<&ActionPrimitive>,
     ) -> Result<(DangerOutput, DangerOutput)> {
         let input = DangerInput::from_parts(latent.z.clone(), action, now);
+        let model = self.trainer.predict(&input)?;
+        let hardcoded = self.hardcoded.predict_from_now(now, &input);
+        Ok((model, hardcoded))
+    }
+}
+
+pub struct ChargeRuntimePredictor {
+    trainer: ChargeNetTrainer,
+    hardcoded: HardcodedChargePredictor,
+}
+
+impl ChargeRuntimePredictor {
+    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
+        Ok(Self {
+            trainer: ChargeNetTrainer::load_checkpoint(path, input_dim)?,
+            hardcoded: HardcodedChargePredictor,
+        })
+    }
+
+    pub fn predict_shadow(
+        &self,
+        now: &Now,
+        latent: &ExperienceLatent,
+        action: Option<&ActionPrimitive>,
+    ) -> Result<(ChargeOutput, ChargeOutput)> {
+        let input = ChargeInput::from_parts(latent.z.clone(), action, now);
         let model = self.trainer.predict(&input)?;
         let hardcoded = self.hardcoded.predict_from_now(now, &input);
         Ok((model, hardcoded))
@@ -353,6 +420,11 @@ where
             now.predictions.danger_model = Some(danger_prediction(model));
             now.predictions.danger_hardcoded = Some(danger_prediction(hardcoded));
         }
+        if let Some(charge) = &self.models.charge {
+            let (model, hardcoded) = charge.predict_shadow(&now, &latent, Some(&chosen_action))?;
+            now.predictions.charge_model = Some(charge_prediction(model));
+            now.predictions.charge_hardcoded = Some(charge_prediction(hardcoded));
+        }
 
         let safety = self
             .safety
@@ -517,6 +589,15 @@ fn danger_prediction(output: DangerOutput) -> DangerPrediction {
         cliff_risk: output.cliff_risk,
         wheel_drop_risk: output.wheel_drop_risk,
         stuck_risk: output.stuck_risk,
+        confidence: output.confidence,
+    }
+}
+
+fn charge_prediction(output: ChargeOutput) -> ChargePrediction {
+    ChargePrediction {
+        charge_probability: output.charge_probability,
+        expected_battery_delta: output.expected_battery_delta,
+        dock_likelihood: output.dock_likelihood,
         confidence: output.confidence,
     }
 }
@@ -870,7 +951,7 @@ mod tests {
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_memory::InMemoryExperienceStore;
-    use netherwick_models::DangerNetTrainer;
+    use netherwick_models::{ChargeNetTrainer, DangerNetTrainer};
     use netherwick_now::Now;
     use netherwick_sensors::World;
     use netherwick_sim::{ArenaConfig, SimObject, VirtualWorld};
@@ -1200,6 +1281,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sim_with_charge_checkpoint_writes_shadow_predictions() {
+        let root = test_ledger_root("sim-runner-charge-shadow");
+        let checkpoint = danger_checkpoint_root("sim-runner-charge-shadow");
+        let action = ActionPrimitive::Dock;
+        write_test_charge_checkpoint(&checkpoint, action.clone());
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(action))
+            .with_models(RuntimeModelStack::with_charge_shadow_checkpoint(&checkpoint).unwrap());
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.2, 7));
+        world.add_object(SimObject::charger("charger", "charger", 1.2, 1.0, 0.18));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let frames = ledger.recent(5).await.unwrap();
+        let frame = frames.last().unwrap();
+
+        assert!(frame.now.predictions.charge_model.is_some());
+        assert!(frame.now.predictions.charge_hardcoded.is_some());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
     async fn shared_reign_queue_controls_next_sim_tick() {
         let root = test_ledger_root("sim-runner-shared-reign");
         let ledger = JsonlLedger::new(&root);
@@ -1334,6 +1440,27 @@ mod tests {
                 &netherwick_experience::DangerTarget {
                     bump: 0.2,
                     ..netherwick_experience::DangerTarget::default()
+                },
+            )
+            .unwrap();
+        trainer.save_checkpoint(root).unwrap();
+    }
+
+    fn write_test_charge_checkpoint(root: &Path, action: ActionPrimitive) {
+        let mut body = test_body(1.0, 1.0, 0.2, 7);
+        body.charging = false;
+        let now = Now::blank(100, body);
+        let mut encoder = FeatureExperienceEncoder::new();
+        let latent = encoder.encode(&now).unwrap();
+        let input = ChargeInput::from_parts(latent.z, Some(&action), &now);
+        let mut trainer = ChargeNetTrainer::new(input.flat_features().len());
+        trainer
+            .train_step(
+                &input,
+                &netherwick_experience::ChargeTarget {
+                    charging_started: 1.0,
+                    battery_delta: 0.03,
+                    charging_after: 1.0,
                 },
             )
             .unwrap();

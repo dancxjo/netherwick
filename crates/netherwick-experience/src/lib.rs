@@ -133,6 +133,94 @@ pub fn danger_target_from_transition_like(
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChargeInput {
+    pub z: Vec<f32>,
+    pub action_features: Vec<f32>,
+    pub body_features: Vec<f32>,
+    pub memory_features: Vec<f32>,
+}
+
+impl ChargeInput {
+    pub fn from_parts(z: Vec<f32>, action: Option<&ActionPrimitive>, now: &Now) -> Self {
+        Self {
+            z,
+            action_features: danger_action_features(action),
+            body_features: charge_body_features(now),
+            memory_features: charge_memory_features(now),
+        }
+    }
+
+    pub fn flat_features(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(
+            self.z.len()
+                + self.action_features.len()
+                + self.body_features.len()
+                + self.memory_features.len(),
+        );
+        out.extend(self.z.iter().copied().map(sanitize_feature));
+        out.extend(self.action_features.iter().copied().map(sanitize_feature));
+        out.extend(self.body_features.iter().copied().map(sanitize_feature));
+        out.extend(self.memory_features.iter().copied().map(sanitize_feature));
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChargeOutput {
+    pub charge_probability: f32,
+    pub expected_battery_delta: f32,
+    pub dock_likelihood: f32,
+    pub confidence: f32,
+}
+
+impl ChargeOutput {
+    pub fn values(&self) -> [f32; 3] {
+        [
+            self.charge_probability,
+            self.expected_battery_delta,
+            self.dock_likelihood,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChargeTarget {
+    pub charging_started: f32,
+    pub battery_delta: f32,
+    pub charging_after: f32,
+}
+
+impl ChargeTarget {
+    pub fn values(&self) -> [f32; 3] {
+        [
+            self.charging_started,
+            self.battery_delta,
+            self.charging_after,
+        ]
+    }
+}
+
+pub fn charge_input_from_transition_like(
+    before_z: &ExperienceLatent,
+    action: Option<&ActionPrimitive>,
+    before: &Now,
+) -> ChargeInput {
+    ChargeInput::from_parts(before_z.z.clone(), action, before)
+}
+
+pub fn charge_target_from_transition_like(
+    before: &Now,
+    _action: Option<&ActionPrimitive>,
+    after: &Now,
+) -> ChargeTarget {
+    ChargeTarget {
+        charging_started: bool01(!before.body.charging && after.body.charging),
+        battery_delta: after.body.battery_level - before.body.battery_level,
+        charging_after: bool01(after.body.charging),
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NowReconstruction {
     pub t_ms: TimeMs,
     pub body: Option<BodySense>,
@@ -160,6 +248,7 @@ impl FeatureExperienceEncoder {
                 BaselineSenseVectorizer::Reign,
                 BaselineSenseVectorizer::Audio,
                 BaselineSenseVectorizer::Range,
+                BaselineSenseVectorizer::KinectIr,
             ],
         }
     }
@@ -395,6 +484,7 @@ enum BaselineSenseVectorizer {
     Reign,
     Audio,
     Range,
+    KinectIr,
 }
 
 impl SenseVectorizer for BaselineSenseVectorizer {
@@ -409,6 +499,7 @@ impl SenseVectorizer for BaselineSenseVectorizer {
             Self::Reign => "reign",
             Self::Audio => "audio",
             Self::Range => "range",
+            Self::KinectIr => "kinect_ir",
         }
     }
 
@@ -482,6 +573,7 @@ impl SenseVectorizer for BaselineSenseVectorizer {
                 .nearest_m
                 .map(|m| (1.0 / (1.0 + m)).clamp(0.0, 1.0))
                 .unwrap_or(0.0)],
+            Self::KinectIr => kinect_ir_features(now),
         }
     }
 }
@@ -594,6 +686,72 @@ fn danger_body_features(now: &Now) -> Vec<f32> {
                 .unwrap_or(false),
         ),
     ]
+}
+
+fn charge_body_features(now: &Now) -> Vec<f32> {
+    let mut out = vec![
+        now.body.battery_level.clamp(0.0, 1.0),
+        bool01(now.body.charging),
+        now.drives.battery_hunger.clamp(0.0, 1.0),
+        now.body.velocity.forward_m_s.clamp(-1.0, 1.0),
+        now.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
+        now.range
+            .nearest_m
+            .map(|m| (1.0 / (1.0 + m)).clamp(0.0, 1.0))
+            .unwrap_or(0.0),
+        extension_value(now, "sim.world", 3)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        extension_value(now, "sim.world", 4)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+    ];
+    out.extend(kinect_ir_features(now));
+    out
+}
+
+fn charge_memory_features(now: &Now) -> Vec<f32> {
+    vec![
+        now.memory.place_charge_value.clamp(0.0, 1.0),
+        now.memory.place_familiarity.clamp(0.0, 1.0),
+        now.memory.place_danger.clamp(0.0, 1.0),
+        (now.memory.similar_situation_count as f32 / 32.0).clamp(0.0, 1.0),
+        bool01(matches!(
+            now.memory.best_remembered_action,
+            Some(ActionPrimitive::Dock)
+        )),
+    ]
+}
+
+fn kinect_ir_features(now: &Now) -> Vec<f32> {
+    if now.kinect.ir.is_empty() {
+        return vec![0.0, 0.0, 0.0, 0.0];
+    }
+    let len = now.kinect.ir.len() as f32;
+    let sum = now.kinect.ir.iter().copied().sum::<f32>();
+    let max = now
+        .kinect
+        .ir
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bright = now.kinect.ir.iter().filter(|value| **value >= 0.7).count() as f32 / len;
+    vec![
+        (sum / len).clamp(0.0, 1.0),
+        max.clamp(0.0, 1.0),
+        bright.clamp(0.0, 1.0),
+        (len / 1024.0).clamp(0.0, 1.0),
+    ]
+}
+
+fn extension_value(now: &Now, name: &str, index: usize) -> Option<f32> {
+    now.extensions
+        .get(name)?
+        .get("values")?
+        .as_array()?
+        .get(index)?
+        .as_f64()
+        .map(|value| value as f32)
 }
 
 fn cliff_detected(now: &Now) -> bool {
@@ -760,6 +918,47 @@ mod tests {
 
         assert!(input.body_features.contains(&0.8));
         assert_eq!(input.body_features[3], 1.0);
+    }
+
+    #[test]
+    fn charge_target_marks_transition_onto_charger() {
+        let mut before = Now::blank(1, BodySense::default());
+        before.body.charging = false;
+        before.body.battery_level = 0.2;
+        let mut after = before.clone();
+        after.body.charging = true;
+        after.body.battery_level = 0.24;
+
+        let target =
+            charge_target_from_transition_like(&before, Some(&ActionPrimitive::Dock), &after);
+
+        assert_eq!(target.charging_started, 1.0);
+        assert_eq!(target.charging_after, 1.0);
+        assert!(target.battery_delta > 0.0);
+    }
+
+    #[test]
+    fn charge_target_marks_transition_off_charger() {
+        let mut before = Now::blank(1, BodySense::default());
+        before.body.charging = true;
+        let mut after = before.clone();
+        after.body.charging = false;
+
+        let target =
+            charge_target_from_transition_like(&before, Some(&ActionPrimitive::Stop), &after);
+
+        assert_eq!(target.charging_started, 0.0);
+        assert_eq!(target.charging_after, 0.0);
+    }
+
+    #[test]
+    fn charge_input_includes_ir_sensor_summary() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.kinect.ir = vec![0.1, 0.8, 0.9, 0.2];
+
+        let input = ChargeInput::from_parts(vec![0.0], Some(&ActionPrimitive::Dock), &now);
+
+        assert!(input.body_features.iter().any(|value| *value >= 0.8));
     }
 }
 

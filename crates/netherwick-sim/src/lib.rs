@@ -264,6 +264,8 @@ impl VirtualWorld {
                 state.arena.width_m,
                 state.arena.height_m,
                 state.objects.len() as f32,
+                charger_near_score(body, &state.objects),
+                charger_visible_score(body, &state.objects),
             ],
         }];
     }
@@ -557,6 +559,41 @@ fn charger_contact_rate(body: &BodySense, objects: &[SimObject]) -> f32 {
         .filter(|object| matches!(object.kind, SimObjectKind::Charger))
         .filter(|object| distance_to_object(body, object) <= ROBOT_RADIUS_M + object.radius_m)
         .map(|object| object.charge_rate.max(0.0))
+        .fold(0.0, f32::max)
+}
+
+fn charger_near_score(body: &BodySense, objects: &[SimObject]) -> f32 {
+    objects
+        .iter()
+        .filter(|object| matches!(object.kind, SimObjectKind::Charger))
+        .map(|object| {
+            let distance =
+                (distance_to_object(body, object) - object.radius_m - ROBOT_RADIUS_M).max(0.0);
+            (1.0 - distance / 1.0).clamp(0.0, 1.0)
+        })
+        .fold(0.0, f32::max)
+}
+
+fn charger_visible_score(body: &BodySense, objects: &[SimObject]) -> f32 {
+    let heading = body.odometry.heading_rad;
+    objects
+        .iter()
+        .filter(|object| matches!(object.kind, SimObjectKind::Charger))
+        .map(|object| {
+            let dx = object.x_m - body.odometry.x_m;
+            let dy = object.y_m - body.odometry.y_m;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance > VISIBLE_MAX_M {
+                return 0.0;
+            }
+            let angle = (dy.atan2(dx) - heading + std::f32::consts::PI)
+                .rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+            if angle.abs() > VISIBLE_FOV_RAD * 0.5 {
+                return 0.0;
+            }
+            (1.0 - distance / VISIBLE_MAX_M).clamp(0.0, 1.0)
+        })
         .fold(0.0, f32::max)
 }
 
