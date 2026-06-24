@@ -57,3 +57,19 @@ pub trait LlmAgent {
         recall_summary: &str,
     ) -> Result<LlmTickResult>;
 }
+
+#[derive(Default)]
+pub struct NoopLlmAgent;
+
+#[async_trait]
+impl LlmAgent for NoopLlmAgent {
+    async fn maybe_tick(
+        &mut self,
+        _now: &Now,
+        _z: &ExperienceLatent,
+        _futures: &[FuturePrediction],
+        _recall_summary: &str,
+    ) -> Result<LlmTickResult> {
+        Ok(LlmTickResult::default())
+    }
+}

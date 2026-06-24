@@ -4230,6 +4230,8 @@ name = "netherwick-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -4248,6 +4250,8 @@ version = "0.1.0"
 dependencies = [
  "netherwick-core",
  "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -4288,9 +4292,13 @@ dependencies = [
  "async-trait",
  "netherwick-actions",
  "netherwick-core",
+ "netherwick-experience",
  "netherwick-ledger",
  "netherwick-now",
  "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4322,16 +4330,20 @@ dependencies = [
  "anyhow",
  "netherwick-actions",
  "netherwick-autonomic",
+ "netherwick-behaviors",
  "netherwick-body",
  "netherwick-conductor",
+ "netherwick-core",
  "netherwick-experience",
  "netherwick-ledger",
  "netherwick-llm",
  "netherwick-memory",
  "netherwick-now",
  "netherwick-sensors",
+ "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4369,8 +4381,21 @@ dependencies = [
 name = "netherwick-tools"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
+ "netherwick-autonomic",
+ "netherwick-body",
+ "netherwick-conductor",
+ "netherwick-experience",
+ "netherwick-ledger",
+ "netherwick-llm",
+ "netherwick-memory",
+ "netherwick-now",
  "netherwick-runtime",
+ "netherwick-sim",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

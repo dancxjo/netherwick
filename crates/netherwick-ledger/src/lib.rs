@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use netherwick_actions::ActionPrimitive;
 use netherwick_core::Reward;
-use netherwick_experience::{ExperienceLatent, FuturePrediction};
+use netherwick_experience::{
+    Experience, ExperienceLatent, FuturePrediction, Impression, RecalledExperience, Sensation,
+};
 use netherwick_llm::{ConsciousCommand, CounterfactualAction, LlmTeaching};
 use netherwick_now::{Now, RecallHit, SurpriseSense};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,9 @@ pub struct ExperienceFrame {
     pub id: Uuid,
     pub t_ms: u64,
     pub now: Now,
+    pub sensations: Vec<Sensation>,
+    pub impressions: Vec<Impression>,
+    pub experiences: Vec<Experience>,
     pub z: Option<ExperienceLatent>,
     pub chosen_action: Option<ActionPrimitive>,
     pub conscious_command: Option<ConsciousCommand>,
@@ -27,9 +32,38 @@ pub struct ExperienceFrame {
     pub reward: Reward,
     pub surprise: SurpriseSense,
     pub memory_recall: Vec<RecallHit>,
+    pub recollections: Vec<RecalledExperience>,
     pub llm_teaching: Vec<LlmTeaching>,
     pub counterfactuals: Vec<CounterfactualAction>,
     pub notes: Vec<String>,
+}
+
+impl ExperienceFrame {
+    pub fn summary_text(&self) -> String {
+        if let Some(experience) = self.experiences.last() {
+            return experience.text.clone();
+        }
+        if let Some(impression) = self.impressions.last() {
+            return impression.text.clone();
+        }
+        if let Some(transcript) = &self.now.ear.transcript {
+            if !transcript.trim().is_empty() {
+                return format!("I hear: {}", transcript.trim());
+            }
+        }
+        if let Some(command) = &self.conscious_command {
+            if !command.summary.trim().is_empty() {
+                return command.summary.clone();
+            }
+        }
+        if !self.notes.is_empty() {
+            return self.notes.join(" ");
+        }
+        format!(
+            "I am at t={}ms with battery {:.2}.",
+            self.t_ms, self.now.body.battery_level
+        )
+    }
 }
 
 #[async_trait]
