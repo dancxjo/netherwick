@@ -11,3 +11,5 @@ async-trait.workspace = true
 rand.workspace = true
 serde.workspace = true
 netherwick-body = { path = "../netherwick-body" }
+netherwick-now = { path = "../netherwick-now" }
+netherwick-sensors = { path = "../netherwick-sensors" }

@@ -9,4 +9,5 @@ publish = false
 anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
+serialport = "4"
 netherwick-body = { path = "../netherwick-body" }

@@ -1,15 +1,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use netherwick_autonomic::SimpleSafety;
-use netherwick_body::RobotBody;
+use netherwick_body::{MotionCommand, MotorComplex, RobotBody};
 use netherwick_conductor::SimpleConductor;
 use netherwick_experience::ExperienceLatent;
 use netherwick_ledger::{ExperienceFrame, JsonlLedger, LedgerReader};
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
-use netherwick_now::Now;
 use netherwick_runtime::MinimalRuntime;
-use netherwick_sim::SimBody;
+use netherwick_sensors::World;
+use netherwick_sim::{ArenaConfig, SimObject, VirtualWorld};
 
 #[derive(Parser)]
 #[command(name = "netherwick")]
@@ -56,9 +56,23 @@ async fn run_sim_tick() -> Result<()> {
         llm: NoopLlmAgent,
     };
 
-    let mut body = SimBody::new(7);
-    let body_sense = body.read_body().await?;
-    let mut now = Now::blank(100, body_sense);
+    let (mut world, mut motors) = VirtualWorld::new_with_motor(
+        7,
+        ArenaConfig {
+            width_m: 8.0,
+            height_m: 8.0,
+        },
+    );
+    world.add_object(SimObject {
+        label: "charger".to_string(),
+        x_m: 2.0,
+        y_m: 1.0,
+        radius_m: 0.25,
+        color_rgb: [32, 200, 32],
+    });
+    let _ = motors.send(MotionCommand::Forward { speed_m_s: 0.15 }).await?;
+    let snapshot = world.snapshot().await?;
+    let mut now = snapshot.to_now(100);
     now.ear.transcript = Some("hello from the simulator".to_string());
     let latent = ExperienceLatent {
         t_ms: now.t_ms,
@@ -68,6 +82,7 @@ async fn run_sim_tick() -> Result<()> {
         confidence: 1.0,
     };
     let tick = runtime.tick(now, latent, Vec::new()).await?;
+    let _ = motors.read_body().await?;
     println!("experience: {}", tick.experience.text);
     println!("action: {:?}", tick.chosen_action);
     println!("recall: {}", tick.recall.first_person_summary);

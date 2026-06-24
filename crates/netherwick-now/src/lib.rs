@@ -115,6 +115,34 @@ pub struct VoiceSense {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KinectJointSense {
+    pub joint_name: String,
+    pub position_m: [f32; 3],
+    pub tracking_confidence: f32,
+    pub tracked: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KinectSkeletonSense {
+    pub tracking_id: u64,
+    pub lean_xy: [f32; 2],
+    pub joints: Vec<KinectJointSense>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KinectSense {
+    pub schema_version: u32,
+    pub color_features: Vec<Vec<f32>>,
+    pub depth_m: Vec<f32>,
+    pub ir: Vec<f32>,
+    pub player_index: Vec<u8>,
+    pub audio_angle_rad: Option<f32>,
+    pub audio_confidence: f32,
+    pub floor_clip_plane: Vec<f32>,
+    pub skeletons: Vec<KinectSkeletonSense>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionSense {
     pub schema_version: u32,
     pub name: String,
@@ -138,6 +166,7 @@ pub struct Now {
     pub range: RangeSense,
     pub imu: ImuSense,
     pub gps: Option<GpsSense>,
+    pub kinect: KinectSense,
     pub memory: MemorySense,
     pub predictions: PredictionSense,
     pub surprise: SurpriseSense,
@@ -169,6 +198,10 @@ impl Now {
                 ..ImuSense::default()
             },
             gps: None,
+            kinect: KinectSense {
+                schema_version: 1,
+                ..KinectSense::default()
+            },
             memory: MemorySense::default(),
             predictions: PredictionSense {
                 schema_version: 1,

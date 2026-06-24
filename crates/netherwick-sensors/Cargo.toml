@@ -8,4 +8,10 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+cpal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serialport = "4"
+v4l = "0.14"
 netherwick-now = { path = "../netherwick-now" }
+netherwick-body = { path = "../netherwick-body" }
