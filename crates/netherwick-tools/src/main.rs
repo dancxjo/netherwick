@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::BehaviorRegime;
-use netherwick_body::{BodySense, RobotBody};
+use netherwick_body::RobotBody;
 use netherwick_conductor::SimpleConductor;
 use netherwick_create1::{Create1Body, MockCreate1Body};
 use netherwick_ledger::{
@@ -23,7 +23,7 @@ use netherwick_sensors::{
     CameraSenseProvider, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider, SenseProducer,
 };
 use netherwick_server::LiveViewState;
-use netherwick_sim::{ArenaConfig, SimMotorComplex, SimObject, SimObjectKind, VirtualWorld};
+use netherwick_sim::{build_scenario, default_sim_world, ScenarioConfig, ScenarioKind};
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
     EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
@@ -42,6 +42,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Sim(SimArgs),
+    SimCurriculum(SimCurriculumArgs),
     Robot(RobotArgs),
     Replay,
     CaptureSim(CaptureSimArgs),
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Sim(args) => run_sim(args).await,
+        Command::SimCurriculum(args) => run_sim_curriculum(args).await,
         Command::Robot(args) => run_robot(args).await,
         Command::CaptureSim(args) => capture_sim(args).await,
         Command::ReplayCapture(args) => replay_capture(args).await,
@@ -116,6 +118,49 @@ struct SimArgs {
     live_addr: SocketAddr,
     #[arg(long, default_value_t = 100)]
     tick_delay_ms: u64,
+}
+
+#[derive(Debug, Parser)]
+struct SimCurriculumArgs {
+    #[arg(long, value_enum)]
+    scenario: ScenarioArg,
+    #[arg(long, default_value_t = 20)]
+    episodes: usize,
+    #[arg(long, default_value_t = 300)]
+    steps: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value = "data/ledger/curriculum")]
+    out: String,
+    #[arg(long)]
+    capture_root: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[arg(long, default_value_t = 0.1)]
+    validation_ratio: f32,
+    #[arg(long, default_value_t = 0.1)]
+    test_ratio: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ScenarioArg {
+    EmptyRoom,
+    ObstacleAvoidance,
+    ChargerSeeking,
+    PersonSpeakerRoom,
+    MixedRoom,
+}
+
+impl From<ScenarioArg> for ScenarioKind {
+    fn from(value: ScenarioArg) -> Self {
+        match value {
+            ScenarioArg::EmptyRoom => ScenarioKind::EmptyRoom,
+            ScenarioArg::ObstacleAvoidance => ScenarioKind::ObstacleAvoidance,
+            ScenarioArg::ChargerSeeking => ScenarioKind::ChargerSeeking,
+            ScenarioArg::PersonSpeakerRoom => ScenarioKind::PersonAndSpeaker,
+            ScenarioArg::MixedRoom => ScenarioKind::MixedRoom,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -433,6 +478,164 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_sim_curriculum(args: SimCurriculumArgs) -> Result<()> {
+    if args.validation_ratio < 0.0 || args.test_ratio < 0.0 {
+        anyhow::bail!("validation and test ratios must be non-negative");
+    }
+    if args.validation_ratio + args.test_ratio >= 1.0 {
+        anyhow::bail!("validation_ratio + test_ratio must be less than 1.0");
+    }
+
+    let kind = ScenarioKind::from(args.scenario);
+    let ledger = JsonlLedger::new(&args.out);
+    let mut total_ticks = 0usize;
+    let mut capture_count = 0usize;
+    let mut manifest_episodes = Vec::with_capacity(args.episodes);
+
+    for episode_index in 0..args.episodes {
+        let episode_seed = args.seed.saturating_add(episode_index as u64);
+        let scenario = build_scenario(ScenarioConfig::new(kind, episode_seed));
+        let object_count = scenario.metadata.objects.len();
+        let object_summary = scenario_object_summary(&scenario.metadata.objects);
+        let runtime = default_runtime(ledger.clone());
+        let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
+        runner.tick_ms = args.tick_ms;
+        let mut capture_path_for_manifest = None;
+
+        if let Some(root) = &args.capture_root {
+            let mut snapshots = Vec::with_capacity(args.steps);
+            runner
+                .run_steps_observing(args.steps, |snapshot| snapshots.push(snapshot.clone()))
+                .await?;
+            let capture_path = Path::new(root).join(format!("episode-{episode_index:05}"));
+            capture_path_for_manifest = Some(capture_path.to_string_lossy().to_string());
+            let mut writer =
+                CaptureWriter::create(&capture_path, CaptureSource::Sim, Some(args.tick_ms))
+                    .await?;
+            for snapshot in snapshots {
+                writer
+                    .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+                    .await?;
+            }
+            writer.finish().await?;
+            capture_count = capture_count.saturating_add(1);
+        } else {
+            runner.run_steps(args.steps).await?;
+        }
+        total_ticks = total_ticks.saturating_add(runner.tick_count);
+        manifest_episodes.push(serde_json::json!({
+            "index": episode_index,
+            "split": curriculum_split(
+                episode_index,
+                args.episodes,
+                args.validation_ratio,
+                args.test_ratio,
+            ),
+            "scenario": kind.slug(),
+            "seed": episode_seed,
+            "steps": args.steps,
+            "ticks": runner.tick_count,
+            "arena": scenario.metadata.arena,
+            "spawn": {
+                "x_m": scenario.metadata.body.odometry.x_m,
+                "y_m": scenario.metadata.body.odometry.y_m,
+                "heading_rad": scenario.metadata.body.odometry.heading_rad,
+                "battery_level": scenario.metadata.body.battery_level,
+            },
+            "object_count": object_count,
+            "objects": object_summary,
+            "capture": capture_path_for_manifest,
+        }));
+        println!(
+            "episode {} complete: scenario {}, seed {}, ticks {}, objects {}",
+            episode_index,
+            kind.slug(),
+            episode_seed,
+            runner.tick_count,
+            object_count
+        );
+    }
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "scenario": kind.slug(),
+        "base_seed": args.seed,
+        "episodes": args.episodes,
+        "steps_per_episode": args.steps,
+        "tick_ms": args.tick_ms,
+        "ledger": args.out,
+        "capture_root": args.capture_root,
+        "splits": {
+            "train": manifest_episodes.iter().filter(|episode| episode["split"] == "train").count(),
+            "validation": manifest_episodes.iter().filter(|episode| episode["split"] == "validation").count(),
+            "test": manifest_episodes.iter().filter(|episode| episode["split"] == "test").count(),
+            "validation_ratio": args.validation_ratio,
+            "test_ratio": args.test_ratio,
+        },
+        "episodes_detail": manifest_episodes,
+    });
+    fs::create_dir_all(&args.out)?;
+    let manifest_path = Path::new(&args.out).join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+
+    let transitions = ledger.transitions().await?;
+    println!(
+        "sim curriculum complete: scenario {}, episodes {}, ticks {}, ledger {}, transitions {}, captures {}, manifest {}",
+        kind.slug(),
+        args.episodes,
+        total_ticks,
+        args.out,
+        transitions.len(),
+        capture_count,
+        manifest_path.display()
+    );
+    Ok(())
+}
+
+fn curriculum_split(
+    episode_index: usize,
+    episode_count: usize,
+    validation_ratio: f32,
+    test_ratio: f32,
+) -> &'static str {
+    let validation_count = ((episode_count as f32) * validation_ratio).round() as usize;
+    let test_count = ((episode_count as f32) * test_ratio).round() as usize;
+    let train_count = episode_count.saturating_sub(validation_count + test_count);
+    if episode_index < train_count {
+        "train"
+    } else if episode_index < train_count + validation_count {
+        "validation"
+    } else {
+        "test"
+    }
+}
+
+fn scenario_object_summary(objects: &[netherwick_sim::SimObject]) -> serde_json::Value {
+    let mut chargers = 0usize;
+    let mut obstacles = 0usize;
+    let mut people = 0usize;
+    let mut speakers = 0usize;
+    let mut landmarks = 0usize;
+
+    for object in objects {
+        match &object.kind {
+            netherwick_sim::SimObjectKind::Charger => chargers += 1,
+            netherwick_sim::SimObjectKind::Obstacle => obstacles += 1,
+            netherwick_sim::SimObjectKind::Person { .. } => people += 1,
+            netherwick_sim::SimObjectKind::SoundSource { .. } => speakers += 1,
+            netherwick_sim::SimObjectKind::Landmark { .. } => landmarks += 1,
+        }
+    }
+
+    serde_json::json!({
+        "chargers": chargers,
+        "obstacles": obstacles,
+        "people": people,
+        "speakers": speakers,
+        "landmarks": landmarks,
+    })
+}
+
 async fn capture_sim(args: CaptureSimArgs) -> Result<()> {
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
@@ -491,50 +694,6 @@ async fn replay_capture(args: ReplayCaptureArgs) -> Result<()> {
         transitions.len()
     );
     Ok(())
-}
-
-fn default_sim_world(seed: u64) -> (VirtualWorld, SimMotorComplex) {
-    let (mut world, motors) = VirtualWorld::new_with_motor(
-        seed,
-        ArenaConfig {
-            width_m: 8.0,
-            height_m: 8.0,
-        },
-    );
-    let mut body = BodySense::default();
-    body.last_update_ms = seed;
-    body.odometry.x_m = 1.0;
-    body.odometry.y_m = 1.0;
-    world.set_body(body);
-    world.add_object(SimObject::charger("charger", "charger", 1.9, 1.0, 0.25));
-    world.add_object(SimObject::obstacle("crate", "crate", 3.2, 2.3, 0.35));
-    world.add_object(SimObject {
-        id: "person".to_string(),
-        label: "person".to_string(),
-        kind: SimObjectKind::Person {
-            identity: Some("sim-person".to_string()),
-        },
-        x_m: 2.4,
-        y_m: 1.6,
-        radius_m: 0.22,
-        color_rgb: [220, 180, 140],
-        emits_sound: false,
-        charge_rate: 0.0,
-    });
-    world.add_object(SimObject {
-        id: "speaker".to_string(),
-        label: "speaker".to_string(),
-        kind: SimObjectKind::SoundSource {
-            label: "speaker".to_string(),
-        },
-        x_m: 1.5,
-        y_m: 2.2,
-        radius_m: 0.12,
-        color_rgb: [80, 80, 220],
-        emits_sound: true,
-        charge_rate: 0.0,
-    });
-    (world, motors)
 }
 
 async fn run_robot(args: RobotArgs) -> Result<()> {
@@ -678,6 +837,28 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         capture_summary
     );
     Ok(())
+}
+
+fn default_runtime(
+    ledger: JsonlLedger,
+) -> MinimalRuntime<
+    JsonlLedger,
+    InMemoryExperienceStore,
+    InMemoryExperienceStore,
+    SimpleConductor,
+    SimpleSafety,
+    NoopLlmAgent,
+> {
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    MinimalRuntime::with_default_events(
+        ledger,
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        NoopLlmAgent,
+    )
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1360,6 +1541,60 @@ mod tests {
     use netherwick_now::{Now, SurpriseSense};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn sim_curriculum_writes_one_capture_per_episode() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let temp_dir = std::env::temp_dir().join(format!("netherwick_curriculum_test_{now_ms}"));
+        let ledger_dir = temp_dir.join("ledger");
+        let capture_root = temp_dir.join("captures");
+
+        let args = SimCurriculumArgs {
+            scenario: ScenarioArg::PersonSpeakerRoom,
+            episodes: 2,
+            steps: 3,
+            seed: 7,
+            out: ledger_dir.to_str().unwrap().to_string(),
+            capture_root: Some(capture_root.to_str().unwrap().to_string()),
+            tick_ms: 100,
+            validation_ratio: 0.25,
+            test_ratio: 0.25,
+        };
+
+        run_sim_curriculum(args).await.unwrap();
+
+        let manifest_path = ledger_dir.join("manifest.json");
+        assert!(manifest_path.exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["scenario"], "person-speaker-room");
+        assert_eq!(manifest["episodes"], 2);
+        assert_eq!(manifest["splits"]["train"], 0);
+        assert_eq!(manifest["splits"]["validation"], 1);
+        assert_eq!(manifest["splits"]["test"], 1);
+        assert_eq!(
+            manifest["episodes_detail"][0]["capture"],
+            capture_root
+                .join("episode-00000")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert!(capture_root
+            .join("episode-00000")
+            .join("manifest.json")
+            .exists());
+        assert!(capture_root
+            .join("episode-00001")
+            .join("manifest.json")
+            .exists());
+        let transitions = JsonlLedger::new(&ledger_dir).transitions().await.unwrap();
+        assert!(!transitions.is_empty());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[tokio::test]
     async fn test_evaluate_behavior_command_writes_json_to_out() {

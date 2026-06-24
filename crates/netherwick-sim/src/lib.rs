@@ -14,6 +14,12 @@ use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+pub mod scenario;
+pub use scenario::{
+    build_scenario, default_sim_world, ScenarioConfig, ScenarioKind, ScenarioMetadata,
+    ScenarioWorld,
+};
+
 const ROBOT_RADIUS_M: f32 = 0.18;
 const SIM_DT_S: f32 = 0.1;
 const RANGE_BEAM_COUNT: usize = 8;
@@ -201,6 +207,30 @@ impl VirtualWorld {
             .expect("virtual world mutex poisoned")
             .snapshot
             .body = body;
+    }
+
+    pub fn arena(&self) -> ArenaConfig {
+        self.state
+            .lock()
+            .expect("virtual world mutex poisoned")
+            .arena
+    }
+
+    pub fn body(&self) -> BodySense {
+        self.state
+            .lock()
+            .expect("virtual world mutex poisoned")
+            .snapshot
+            .body
+            .clone()
+    }
+
+    pub fn objects(&self) -> Vec<SimObject> {
+        self.state
+            .lock()
+            .expect("virtual world mutex poisoned")
+            .objects
+            .clone()
     }
 
     fn project_snapshot(state: &mut VirtualWorldState) {
