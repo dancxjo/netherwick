@@ -1,3 +1,5 @@
+#[cfg(any(feature = "linux-hardware", test))]
+use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use netherwick_body::BodySense;
@@ -19,7 +21,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[cfg(feature = "linux-hardware")]
 use serialport::SerialPort;
 #[cfg(feature = "linux-hardware")]
+use std::io::Write;
+#[cfg(feature = "linux-hardware")]
 use std::io::{ErrorKind, Read};
+#[cfg(feature = "linux-hardware")]
+use std::os::fd::AsRawFd;
 #[cfg(feature = "linux-hardware")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "linux-hardware")]
@@ -670,6 +676,135 @@ impl Ublox7Gps {
 }
 
 #[cfg(feature = "linux-hardware")]
+pub struct Mpu6050Imu {
+    bus: File,
+}
+
+#[cfg(feature = "linux-hardware")]
+impl Mpu6050Imu {
+    pub fn new(device: &str) -> Result<Self> {
+        let spec = parse_mpu6050_device_spec(device)?;
+        let bus = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&spec.path)?;
+        set_i2c_slave(&bus, spec.address)?;
+        let mut imu = Self { bus };
+        imu.write_register(MPU6050_PWR_MGMT_1, 0x00)?;
+        imu.write_register(MPU6050_ACCEL_CONFIG, 0x00)?;
+        imu.write_register(MPU6050_GYRO_CONFIG, 0x00)?;
+        Ok(imu)
+    }
+
+    pub fn read_sense(&mut self) -> Result<ImuSense> {
+        let mut bytes = [0u8; 14];
+        self.read_registers(MPU6050_ACCEL_XOUT_H, &mut bytes)?;
+        Ok(mpu6050_samples_to_imu(bytes))
+    }
+
+    fn write_register(&mut self, register: u8, value: u8) -> Result<()> {
+        self.bus.write_all(&[register, value])?;
+        Ok(())
+    }
+
+    fn read_registers(&mut self, register: u8, buffer: &mut [u8]) -> Result<()> {
+        self.bus.write_all(&[register])?;
+        self.bus.read_exact(buffer)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "linux-hardware")]
+fn set_i2c_slave(bus: &File, address: u16) -> Result<()> {
+    const I2C_SLAVE: libc::c_ulong = 0x0703;
+    let result = unsafe { libc::ioctl(bus.as_raw_fd(), I2C_SLAVE, libc::c_ulong::from(address)) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to select I2C slave address 0x{address:02x}"));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Mpu6050DeviceSpec {
+    path: String,
+    address: u16,
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+const MPU6050_DEFAULT_ADDRESS: u16 = 0x68;
+#[cfg(feature = "linux-hardware")]
+const MPU6050_PWR_MGMT_1: u8 = 0x6b;
+#[cfg(feature = "linux-hardware")]
+const MPU6050_ACCEL_CONFIG: u8 = 0x1c;
+#[cfg(feature = "linux-hardware")]
+const MPU6050_GYRO_CONFIG: u8 = 0x1b;
+#[cfg(feature = "linux-hardware")]
+const MPU6050_ACCEL_XOUT_H: u8 = 0x3b;
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn parse_mpu6050_device_spec(device: &str) -> Result<Mpu6050DeviceSpec> {
+    let (path, address) = device
+        .rsplit_once('@')
+        .or_else(|| device.rsplit_once(':'))
+        .map(|(path, address)| (path, Some(address)))
+        .unwrap_or((device, None));
+    let address = address
+        .map(parse_i2c_address)
+        .transpose()?
+        .unwrap_or(MPU6050_DEFAULT_ADDRESS);
+    if path.trim().is_empty() {
+        anyhow::bail!("MPU-6050 I2C device path is empty");
+    }
+    if !(0x03..=0x77).contains(&address) {
+        anyhow::bail!("I2C address 0x{address:02x} is outside the 7-bit usable range");
+    }
+    Ok(Mpu6050DeviceSpec {
+        path: path.to_string(),
+        address,
+    })
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn parse_i2c_address(value: &str) -> Result<u16> {
+    let trimmed = value.trim();
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"));
+    match digits {
+        Some(hex) => u16::from_str_radix(hex, 16).map_err(anyhow::Error::from),
+        None => trimmed.parse::<u16>().map_err(anyhow::Error::from),
+    }
+    .with_context(|| format!("invalid I2C address `{value}`"))
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn mpu6050_samples_to_imu(bytes: [u8; 14]) -> ImuSense {
+    let accel_x = read_i16_be(bytes[0], bytes[1]) as f32 / 16_384.0;
+    let accel_y = read_i16_be(bytes[2], bytes[3]) as f32 / 16_384.0;
+    let accel_z = read_i16_be(bytes[4], bytes[5]) as f32 / 16_384.0;
+    let gyro_x = read_i16_be(bytes[8], bytes[9]) as f32 / 131.0;
+    let gyro_y = read_i16_be(bytes[10], bytes[11]) as f32 / 131.0;
+    let gyro_z = read_i16_be(bytes[12], bytes[13]) as f32 / 131.0;
+
+    let roll_rad = accel_y.atan2(accel_z);
+    let pitch_rad = (-accel_x).atan2((accel_y * accel_y + accel_z * accel_z).sqrt());
+
+    ImuSense {
+        schema_version: 1,
+        orientation: vec![roll_rad, pitch_rad],
+        acceleration: vec![accel_x, accel_y, accel_z],
+        angular_velocity: vec![gyro_x, gyro_y, gyro_z],
+    }
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn read_i16_be(high: u8, low: u8) -> i16 {
+    i16::from_be_bytes([high, low])
+}
+
+#[cfg(feature = "linux-hardware")]
 fn select_input_device(host: &cpal::Host, preferred_name: Option<&str>) -> Result<cpal::Device> {
     if let Some(name) = preferred_name {
         for device in host.input_devices()? {
@@ -974,12 +1109,15 @@ impl SenseProducer for MicrophoneSenseProvider {
     async fn poll(&mut self) -> Result<SensePacket> {
         #[cfg(feature = "linux-hardware")]
         {
-            let frame = self.microphone.latest_frame().unwrap_or_else(|| PcmAudioFrame {
-                captured_at_ms: unix_time_ms(),
-                sample_rate_hz: 16000,
-                channels: 1,
-                samples: Vec::new(),
-            });
+            let frame = self
+                .microphone
+                .latest_frame()
+                .unwrap_or_else(|| PcmAudioFrame {
+                    captured_at_ms: unix_time_ms(),
+                    sample_rate_hz: 16000,
+                    channels: 1,
+                    samples: Vec::new(),
+                });
             Ok(SensePacket::EarPcm(frame))
         }
         #[cfg(not(feature = "linux-hardware"))]
@@ -1031,18 +1169,38 @@ impl SenseProducer for GpsSenseProvider {
     }
 }
 
-pub struct ImuSenseProvider;
+pub struct ImuSenseProvider {
+    #[cfg(feature = "linux-hardware")]
+    imu: Mpu6050Imu,
+}
 
 impl ImuSenseProvider {
-    pub fn new(_device: &str) -> Result<Self> {
-        Ok(Self)
+    pub fn new(device: &str) -> Result<Self> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            Ok(Self {
+                imu: Mpu6050Imu::new(device)?,
+            })
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            let _ = device;
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
     }
 }
 
 #[async_trait]
 impl SenseProducer for ImuSenseProvider {
     async fn poll(&mut self) -> Result<SensePacket> {
-        Ok(SensePacket::Imu(ImuSense::default()))
+        #[cfg(feature = "linux-hardware")]
+        {
+            Ok(SensePacket::Imu(self.imu.read_sense()?))
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
     }
 }
 
@@ -1120,5 +1278,48 @@ mod tests {
                 .and_then(|age| age.as_u64()),
             Some(150)
         );
+    }
+
+    #[test]
+    fn parses_mpu6050_device_specs() {
+        assert_eq!(
+            parse_mpu6050_device_spec("/dev/i2c-1").unwrap(),
+            Mpu6050DeviceSpec {
+                path: "/dev/i2c-1".to_string(),
+                address: 0x68,
+            }
+        );
+        assert_eq!(
+            parse_mpu6050_device_spec("/dev/i2c-1@0x69").unwrap(),
+            Mpu6050DeviceSpec {
+                path: "/dev/i2c-1".to_string(),
+                address: 0x69,
+            }
+        );
+        assert_eq!(
+            parse_mpu6050_device_spec("/dev/i2c-2:105").unwrap(),
+            Mpu6050DeviceSpec {
+                path: "/dev/i2c-2".to_string(),
+                address: 0x69,
+            }
+        );
+    }
+
+    #[test]
+    fn converts_mpu6050_raw_samples_to_imu_sense() {
+        let imu = mpu6050_samples_to_imu([
+            0x00, 0x00, // accel x = 0 g
+            0x00, 0x00, // accel y = 0 g
+            0x40, 0x00, // accel z = 1 g
+            0x00, 0x00, // temperature, ignored
+            0x00, 0x83, // gyro x = 1 deg/s
+            0xff, 0x7d, // gyro y = -1 deg/s
+            0x01, 0x06, // gyro z = 2 deg/s
+        ]);
+
+        assert_eq!(imu.schema_version, 1);
+        assert_eq!(imu.acceleration, vec![0.0, 0.0, 1.0]);
+        assert_eq!(imu.angular_velocity, vec![1.0, -1.0, 2.0]);
+        assert_eq!(imu.orientation, vec![0.0, -0.0]);
     }
 }

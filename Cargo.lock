@@ -4747,6 +4747,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cpal",
+ "libc",
  "netherwick-body",
  "netherwick-core",
  "netherwick-now",

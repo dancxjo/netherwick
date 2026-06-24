@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = []
-linux-hardware = ["dep:cpal", "dep:serialport", "dep:v4l"]
+linux-hardware = ["dep:cpal", "dep:libc", "dep:serialport", "dep:v4l"]
 kinect-freenect = []
 
 [dependencies]
@@ -16,6 +16,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 cpal = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 serialport = { version = "4", optional = true }
 v4l = { version = "0.14", optional = true }
 netherwick-now = { path = "../netherwick-now" }

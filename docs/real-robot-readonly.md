@@ -67,6 +67,18 @@ The CLI accepts `--camera`, `--mic`, `--imu`, and `--gps`. These are optional by
 
 Current minimum support is robust no-data handling plus mock/body capture. Rich camera, microphone, IMU, and GPS producers can be wired behind hardware features without changing the read-only runner.
 
+MPU-6050 IMUs are supported on Linux I2C buses when `netherwick-tools` is built with the existing `linux-hardware` sensor feature. Pass the bus path to `--imu`, for example:
+
+```bash
+cargo run -p netherwick-tools -- robot --imu /dev/i2c-1
+```
+
+The default MPU-6050 address is `0x68`. If AD0 is high, include the address in the device string:
+
+```bash
+cargo run -p netherwick-tools -- robot --imu /dev/i2c-1@0x69
+```
+
 ## Capture Output
 
 Passing `--capture <path>` creates a Worldlab capture with:
