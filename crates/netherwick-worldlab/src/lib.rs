@@ -28,6 +28,22 @@ pub struct CaptureManifest {
     pub frame_count: u64,
     pub tick_ms: Option<u64>,
     pub notes: Vec<String>,
+    #[serde(default)]
+    pub machine: Option<Value>,
+    #[serde(default)]
+    pub command_args: Vec<String>,
+    #[serde(default)]
+    pub device_availability: Value,
+    #[serde(default)]
+    pub streams: CaptureStreams,
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    #[serde(default)]
+    pub ended_at_ms: Option<u64>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default = "default_asset_layout")]
+    pub asset_layout: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +69,12 @@ pub struct RecordedEvent {
     pub payload: Value,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureStreams {
+    pub present: Vec<String>,
+    pub missing: Vec<String>,
+}
+
 pub struct CaptureWriter {
     root: PathBuf,
     manifest: CaptureManifest,
@@ -70,16 +92,26 @@ impl CaptureWriter {
         fs::create_dir_all(root.join("assets").join("rgb")).await?;
         fs::create_dir_all(root.join("assets").join("depth")).await?;
         fs::create_dir_all(root.join("assets").join("audio")).await?;
+        fs::create_dir_all(root.join("assets").join("pointcloud")).await?;
         File::create(root.join(EVENTS_FILE)).await?;
 
+        let now_ms = Utc::now().timestamp_millis().max(0) as u64;
         let manifest = CaptureManifest {
             id: capture_id_from_path(&root),
-            created_at_ms: Utc::now().timestamp_millis().max(0) as u64,
+            created_at_ms: now_ms,
             source,
             schema_version: CAPTURE_SCHEMA_VERSION,
             frame_count: 0,
             tick_ms,
             notes: Vec::new(),
+            machine: None,
+            command_args: Vec::new(),
+            device_availability: Value::Null,
+            streams: CaptureStreams::default(),
+            started_at_ms: Some(now_ms),
+            ended_at_ms: None,
+            warnings: Vec::new(),
+            asset_layout: default_asset_layout(),
         };
         write_manifest_atomic(&root, &manifest).await?;
 
@@ -120,8 +152,13 @@ impl CaptureWriter {
     pub async fn finish(mut self) -> Result<CaptureManifest> {
         self.frames.flush().await?;
         self.manifest.frame_count = self.frame_count;
+        self.manifest.ended_at_ms = Some(Utc::now().timestamp_millis().max(0) as u64);
         write_manifest_atomic(&self.root, &self.manifest).await?;
         Ok(self.manifest)
+    }
+
+    pub fn manifest_mut(&mut self) -> &mut CaptureManifest {
+        &mut self.manifest
     }
 }
 
@@ -235,6 +272,16 @@ async fn write_manifest_atomic(root: &Path, manifest: &CaptureManifest) -> Resul
     Ok(())
 }
 
+fn default_asset_layout() -> Value {
+    serde_json::json!({
+        "rgb": "assets/rgb/",
+        "depth": "assets/depth/",
+        "audio": "assets/audio/",
+        "pointcloud": "assets/pointcloud/",
+        "raw_export": "not yet saved by capture-real; compact JSON features are embedded in frames.jsonl"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +305,14 @@ mod tests {
             frame_count: 2,
             tick_ms: Some(100),
             notes: vec!["small and sturdy".to_string()],
+            machine: None,
+            command_args: Vec::new(),
+            device_availability: Value::Null,
+            streams: CaptureStreams::default(),
+            started_at_ms: Some(123),
+            ended_at_ms: Some(456),
+            warnings: Vec::new(),
+            asset_layout: default_asset_layout(),
         };
 
         let encoded = serde_json::to_string(&manifest).unwrap();

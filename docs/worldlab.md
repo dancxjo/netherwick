@@ -23,9 +23,10 @@ data/captures/<capture-id>/
     rgb/
     depth/
     audio/
+    pointcloud/
 ```
 
-`manifest.json` stores the capture id, source, schema version, tick duration, and frame count. `frames.jsonl` contains one JSON record per captured frame with `index`, `t_ms`, the serialized `WorldSnapshot`, and any recorded events. The asset directories are reserved for future RGB, depth, and audio files; v0 embeds compact sense data directly in JSON.
+`manifest.json` stores the capture id, source, schema version, tick duration, frame count, optional machine info, command args, device availability, streams present/missing, capture start/end times, warnings, and asset layout. `frames.jsonl` contains one JSON record per captured frame with `index`, `t_ms`, the serialized `WorldSnapshot`, and any recorded events. The asset directories are reserved for future RGB, depth, audio, and point-cloud files; v0 embeds compact sense data directly in JSON.
 
 ## Commands
 
@@ -48,6 +49,21 @@ cargo run -p netherwick-tools -- replay-capture \
 
 Replay output uses the existing `JsonlLedger` conventions, so ledger frames and transitions can feed the same inspection and training paths as live simulation runs.
 
+Record a bounded real read-only session:
+
+```bash
+cargo run -p netherwick-tools -- capture-real \
+  --duration-seconds 60 \
+  --out data/captures/real/rpi5-smoke
+```
+
+Inspect a capture:
+
+```bash
+cargo run -p netherwick-tools -- inspect-capture \
+  data/captures/real/rpi5-smoke
+```
+
 ## Future Path
 
-Planned layers include real robot capture, RGB/depth asset export, point-cloud reconstruction, a game-engine renderer, semantic editing, and counterfactual replay.
+Planned layers include raw RGB/depth/audio asset export, point-cloud reconstruction, a game-engine renderer, semantic editing, and counterfactual replay.

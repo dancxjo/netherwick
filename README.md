@@ -37,6 +37,19 @@ just hardware-env
 
 Scenario reports can be generated with `just run eval-scenario --scenario empty-room --episodes 2 --steps 10 --out data/reports/scenario/empty-smoke.json`. See [docs/scenario-evaluation.md](docs/scenario-evaluation.md) for baseline-vs-checkpoint comparison notes and [docs/model-registry.md](docs/model-registry.md) for checkpoint registration and promotion gates.
 
+## Hardware Bring-Up
+
+Pete's Raspberry Pi 5 hardware path starts capture-first: inspect devices, run bounded read-only body/sensor ticks, record Worldlab captures, and inspect the result. Autonomous motor movement is not enabled.
+
+```bash
+cargo run --bin netherwick -- hardware-env
+cargo run --bin netherwick -- robot --mode read-only --duration-seconds 30 --ledger data/ledger/real/read-only-smoke
+cargo run --bin netherwick -- capture-real --duration-seconds 60 --out data/captures/real/rpi5-smoke
+cargo run --bin netherwick -- inspect-capture data/captures/real/rpi5-smoke
+```
+
+See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions, device expectations, success criteria, and failure behavior.
+
 ## Docker services
 
 Copy `.env.example` to `.env` if you want to override ports or passwords. Then:

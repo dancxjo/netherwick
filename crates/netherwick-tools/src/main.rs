@@ -20,13 +20,14 @@ use netherwick_ledger::{
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
 use netherwick_models::MODEL_REGISTRY;
+use netherwick_now::{EarSense, EyeSense, KinectSense, RangeSense};
 use netherwick_runtime::{
     MinimalRuntime, RealRobotRunner, RobotMode, RuntimeLoop, RuntimeModelStack, RuntimeTick,
     SimRunner,
 };
 use netherwick_sensors::{
     CameraSenseProvider, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider,
-    SenseProducer, WorldSnapshot,
+    PcmAudioFrame, SensePacket, SenseProducer, WorldSnapshot,
 };
 use netherwick_server::LiveViewState;
 use netherwick_sim::{build_scenario, default_sim_world, ScenarioConfig, ScenarioKind};
@@ -34,7 +35,9 @@ use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
     EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
 };
-use netherwick_worldlab::{CaptureReader, CaptureReplayRunner, CaptureSource, CaptureWriter};
+use netherwick_worldlab::{
+    CaptureReader, CaptureReplayRunner, CaptureSource, CaptureStreams, CaptureWriter,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -52,8 +55,11 @@ enum Command {
     SimCurriculum(SimCurriculumArgs),
     EvalScenario(EvalScenarioArgs),
     Robot(RobotArgs),
+    HardwareEnv(HardwareEnvArgs),
     Replay,
     CaptureSim(CaptureSimArgs),
+    CaptureReal(CaptureRealArgs),
+    InspectCapture(InspectCaptureArgs),
     ReplayCapture(ReplayCaptureArgs),
     Train(TrainCommand),
     Evaluate(EvaluateCommand),
@@ -74,7 +80,10 @@ async fn main() -> Result<()> {
         Command::SimCurriculum(args) => run_sim_curriculum(args).await,
         Command::EvalScenario(args) => run_eval_scenario(args).await,
         Command::Robot(args) => run_robot(args).await,
+        Command::HardwareEnv(args) => hardware_env(args).await,
         Command::CaptureSim(args) => capture_sim(args).await,
+        Command::CaptureReal(args) => capture_real(args).await,
+        Command::InspectCapture(args) => inspect_capture(args).await,
         Command::ReplayCapture(args) => replay_capture(args).await,
         Command::InspectLedger => inspect_ledger().await,
         Command::Train(command) => run_train(command).await,
@@ -230,7 +239,7 @@ impl From<ScenarioArg> for ScenarioKind {
 struct RobotArgs {
     #[arg(long, value_enum, default_value = "read-only")]
     mode: RobotModeArg,
-    #[arg(long, default_value = "mock")]
+    #[arg(long, default_value = "auto")]
     create_port: String,
     #[arg(long, default_value_t = 57_600)]
     create_baud: u32,
@@ -253,6 +262,8 @@ struct RobotArgs {
     #[arg(long)]
     steps: Option<usize>,
     #[arg(long)]
+    duration_seconds: Option<u64>,
+    #[arg(long)]
     require_camera: bool,
     #[arg(long)]
     require_mic: bool,
@@ -260,6 +271,12 @@ struct RobotArgs {
     require_imu: bool,
     #[arg(long)]
     require_gps: bool,
+}
+
+#[derive(Debug, Parser)]
+struct HardwareEnvArgs {
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -279,6 +296,37 @@ struct CaptureSimArgs {
     seed: u64,
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
+}
+
+#[derive(Debug, Parser)]
+struct CaptureRealArgs {
+    #[arg(long, default_value_t = 60)]
+    duration_seconds: u64,
+    #[arg(long, default_value = "data/captures/real/rpi5-smoke")]
+    out: String,
+    #[arg(long)]
+    ledger: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[arg(long, default_value = "auto")]
+    create_port: String,
+    #[arg(long, default_value_t = 57_600)]
+    create_baud: u32,
+    #[arg(long)]
+    camera: Option<String>,
+    #[arg(long)]
+    mic: Option<String>,
+    #[arg(long)]
+    imu: Option<String>,
+    #[arg(long)]
+    gps: Option<String>,
+    #[arg(long)]
+    mock: bool,
+}
+
+#[derive(Debug, Parser)]
+struct InspectCaptureArgs {
+    path: String,
 }
 
 #[derive(Debug, Parser)]
@@ -1422,6 +1470,254 @@ async fn replay_capture(args: ReplayCaptureArgs) -> Result<()> {
     Ok(())
 }
 
+async fn hardware_env(args: HardwareEnvArgs) -> Result<()> {
+    let report = collect_hardware_env_report().await;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("hardware environment");
+    println!("  os: {}", report["os"].as_str().unwrap_or("unknown"));
+    println!(
+        "  architecture: {}",
+        report["architecture"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "  cpu: {}",
+        report["cpu_model"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "  memory: {} kB",
+        report["memory_total_kb"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  raspberry-pi-like: {}",
+        report["raspberry_pi_like"].as_bool().unwrap_or(false)
+    );
+    print_json_list("  create serial candidates", &report["serial_devices"]);
+    print_json_list("  cameras", &report["camera_devices"]);
+    print_json_list("  audio inputs", &report["audio_input_devices"]);
+    println!(
+        "  libfreenect/freenect: {}",
+        report["kinect"]["freenect_available"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    println!("  data dirs writable:");
+    if let Some(object) = report["data_dirs_writable"].as_object() {
+        for (path, writable) in object {
+            println!("    {path}: {}", writable.as_bool().unwrap_or(false));
+        }
+    }
+    print_json_list("  warnings", &report["warnings"]);
+    Ok(())
+}
+
+async fn capture_real(args: CaptureRealArgs) -> Result<()> {
+    if args.duration_seconds == 0 {
+        anyhow::bail!("--duration-seconds must be greater than zero");
+    }
+
+    let env_report = collect_hardware_env_report().await;
+    let mut warnings = Vec::new();
+    let mut device_availability = serde_json::json!({
+        "mock": args.mock,
+        "create": null,
+        "camera": null,
+        "microphone": null,
+        "imu": null,
+        "gps": null,
+        "kinect": env_report["kinect"].clone(),
+    });
+
+    let create_port = if args.create_port == "auto" {
+        env_report["serial_devices"]
+            .as_array()
+            .and_then(|devices| devices.first())
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    } else {
+        Some(args.create_port.clone())
+    };
+
+    let body: Box<dyn RobotBody + Send> = if args.mock || create_port.as_deref() == Some("mock") {
+        device_availability["create"] = serde_json::json!({"present": true, "source": "mock"});
+        Box::new(MockCreate1Body::new())
+    } else if let Some(create_port) = create_port {
+        match Create1Body::connect(&create_port, args.create_baud).await {
+            Ok(body) => {
+                device_availability["create"] = serde_json::json!({
+                    "present": true,
+                    "port": create_port,
+                    "baud": args.create_baud
+                });
+                Box::new(body)
+            }
+            Err(error) => {
+                anyhow::bail!("failed to open Create serial device {create_port}: {error}");
+            }
+        }
+    } else {
+        warnings
+            .push("Create serial device not found; no body hardware stream available".to_string());
+        device_availability["create"] =
+            serde_json::json!({"present": false, "reason": "no serial candidate"});
+        Box::new(MockCreate1Body::new())
+    };
+
+    let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
+    if args.mock {
+        sensors.push(Box::new(MockEyeProducer::default()));
+        sensors.push(Box::new(MockEarProducer::default()));
+        sensors.push(Box::new(MockRangeProducer::default()));
+        sensors.push(Box::new(MockKinectProducer::default()));
+        device_availability["camera"] = serde_json::json!({"present": true, "source": "mock"});
+        device_availability["microphone"] = serde_json::json!({"present": true, "source": "mock"});
+        device_availability["kinect"] = serde_json::json!({"present": true, "source": "mock"});
+    } else {
+        add_optional_real_sensors(&args, &mut sensors, &mut device_availability, &mut warnings);
+    }
+    let no_real_create = device_availability["create"]["present"].as_bool() != Some(true);
+    if !args.mock && no_real_create && sensors.is_empty() {
+        anyhow::bail!(
+            "no usable devices found: no Create serial device and no requested sensor initialized"
+        );
+    }
+
+    let requested_frames = duration_to_steps(args.duration_seconds, args.tick_ms);
+    if let Some(ledger_path) = &args.ledger {
+        let runtime = default_runtime(JsonlLedger::new(ledger_path));
+        capture_real_with_runtime(
+            args,
+            runtime,
+            body,
+            sensors,
+            env_report,
+            device_availability,
+            warnings,
+            requested_frames,
+        )
+        .await
+    } else {
+        let runtime = default_noop_runtime();
+        capture_real_with_runtime(
+            args,
+            runtime,
+            body,
+            sensors,
+            env_report,
+            device_availability,
+            warnings,
+            requested_frames,
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn capture_real_with_runtime<R>(
+    args: CaptureRealArgs,
+    runtime: R,
+    body: Box<dyn RobotBody + Send>,
+    sensors: Vec<Box<dyn SenseProducer + Send>>,
+    env_report: Value,
+    device_availability: Value,
+    mut warnings: Vec<String>,
+    requested_frames: usize,
+) -> Result<()>
+where
+    R: RuntimeLoop + Send,
+{
+    let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, body, sensors, runtime);
+    runner.tick_ms = args.tick_ms;
+    let mut writer =
+        CaptureWriter::create(&args.out, CaptureSource::RealRobot, Some(args.tick_ms)).await?;
+    {
+        let manifest = writer.manifest_mut();
+        manifest.machine = Some(machine_info_from_env(&env_report));
+        manifest.command_args = std::env::args().collect();
+        manifest.device_availability = device_availability;
+        manifest
+            .notes
+            .push("capture-real is capture-only; motors are not commanded".to_string());
+    }
+
+    let mut stream_counts = StreamCounts::default();
+    let mut events_written = 0usize;
+    for _ in 0..requested_frames {
+        let (snapshot, tick) = runner.tick_read_only().await?;
+        stream_counts.observe(&snapshot);
+        if tick
+            .frame
+            .notes
+            .iter()
+            .any(|note| note.contains("ReadOnlyActionSuppressed"))
+        {
+            events_written = events_written.saturating_add(1);
+        }
+        writer
+            .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+            .await?;
+        tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+    }
+
+    let streams = stream_counts.streams();
+    warnings.extend(stream_counts.warnings());
+    if stream_counts.useful_stream_count() == 0 {
+        anyhow::bail!("no usable body or sensor streams were captured");
+    }
+    {
+        let manifest = writer.manifest_mut();
+        manifest.streams = streams;
+        manifest.warnings = warnings.clone();
+        if let Some(ledger) = &args.ledger {
+            manifest.notes.push(format!("ledger: {ledger}"));
+        }
+    }
+    let manifest = writer.finish().await?;
+    println!(
+        "capture-real complete: {} frames, out {}, streams {:?}, warnings {}, motor_applied false",
+        manifest.frame_count,
+        args.out,
+        manifest.streams.present,
+        manifest.warnings.len()
+    );
+    if events_written > 0 {
+        println!("  read-only motor suppressions observed: {events_written}");
+    }
+    Ok(())
+}
+
+async fn inspect_capture(args: InspectCaptureArgs) -> Result<()> {
+    let report = inspect_capture_report(&args.path).await?;
+    println!("capture: {}", report.path.display());
+    println!("  frames: {}", report.frame_count);
+    println!("  duration_ms: {}", report.duration_ms.unwrap_or(0));
+    println!(
+        "  streams present: {}",
+        join_or_none(&report.streams_present)
+    );
+    println!(
+        "  streams missing: {}",
+        join_or_none(&report.streams_missing)
+    );
+    println!(
+        "  first/last timestamps: {:?} / {:?}",
+        report.first_timestamp_ms, report.last_timestamp_ms
+    );
+    println!("  events: {}", report.event_count);
+    println!("  assets:");
+    for (kind, count) in &report.asset_counts {
+        println!("    {kind}: {count}");
+    }
+    println!("  warnings: {}", report.warnings.len());
+    for warning in &report.warnings {
+        println!("    - {warning}");
+    }
+    Ok(())
+}
+
 async fn run_robot(args: RobotArgs) -> Result<()> {
     if args.mode != RobotModeArg::ReadOnly {
         anyhow::bail!("only --mode read-only is implemented for real robot bring-up");
@@ -1485,10 +1781,24 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    let body: Box<dyn RobotBody + Send> = if args.create_port == "mock" {
-        Box::new(MockCreate1Body::new())
+    let create_port = if args.create_port == "auto" {
+        let env_report = collect_hardware_env_report().await;
+        env_report["serial_devices"]
+            .as_array()
+            .and_then(|devices| devices.first())
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
     } else {
-        Box::new(Create1Body::connect(&args.create_port, args.create_baud).await?)
+        Some(args.create_port.clone())
+    };
+    let body: Box<dyn RobotBody + Send> = if create_port.as_deref() == Some("mock") {
+        Box::new(MockCreate1Body::new())
+    } else if let Some(create_port) = create_port {
+        Box::new(Create1Body::connect(&create_port, args.create_baud).await?)
+    } else {
+        anyhow::bail!(
+            "no Create serial device found; pass --create-port /dev/ttyUSB0 or --create-port mock"
+        );
     };
     let ledger = JsonlLedger::new(&args.ledger);
     let memory = InMemoryExperienceStore::new();
@@ -1523,8 +1833,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         None => None,
     };
 
-    while args
-        .steps
+    let max_steps = args.steps.or_else(|| {
+        args.duration_seconds
+            .map(|seconds| duration_to_steps(seconds, args.tick_ms))
+    });
+    while max_steps
         .map(|limit| runner.tick_count < limit)
         .unwrap_or(true)
     {
@@ -1587,6 +1900,163 @@ fn default_runtime(
     )
 }
 
+fn duration_to_steps(duration_seconds: u64, tick_ms: u64) -> usize {
+    let tick_ms = tick_ms.max(1);
+    let total_ms = duration_seconds.saturating_mul(1000);
+    total_ms.div_ceil(tick_ms).max(1) as usize
+}
+
+fn add_optional_real_sensors(
+    args: &CaptureRealArgs,
+    sensors: &mut Vec<Box<dyn SenseProducer + Send>>,
+    availability: &mut Value,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(device) = &args.camera {
+        match CameraSenseProvider::new(device) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["camera"] = serde_json::json!({"present": true, "device": device});
+            }
+            Err(error) => {
+                availability["camera"] = serde_json::json!({"present": false, "device": device, "error": error.to_string()});
+                warnings.push(format!("camera unavailable: {error}"));
+            }
+        }
+    } else {
+        availability["camera"] = serde_json::json!({"present": false, "reason": "not requested"});
+        warnings.push("camera not requested; RGB stream missing".to_string());
+    }
+
+    if let Some(device) = &args.mic {
+        let pref_name = (device != "default").then_some(device.as_str());
+        match MicrophoneSenseProvider::new(pref_name) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["microphone"] = serde_json::json!({"present": true, "device": device});
+            }
+            Err(error) => {
+                availability["microphone"] = serde_json::json!({"present": false, "device": device, "error": error.to_string()});
+                warnings.push(format!("microphone unavailable: {error}"));
+            }
+        }
+    } else {
+        availability["microphone"] =
+            serde_json::json!({"present": false, "reason": "not requested"});
+        warnings.push("microphone not requested; audio stream missing".to_string());
+    }
+
+    if let Some(device) = &args.gps {
+        match GpsSenseProvider::new(device, 9600) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["gps"] = serde_json::json!({"present": true, "device": device});
+            }
+            Err(error) => {
+                availability["gps"] = serde_json::json!({"present": false, "device": device, "error": error.to_string()});
+                warnings.push(format!("gps unavailable: {error}"));
+            }
+        }
+    } else {
+        availability["gps"] = serde_json::json!({"present": false, "reason": "not requested"});
+    }
+
+    if let Some(device) = &args.imu {
+        match ImuSenseProvider::new(device) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["imu"] = serde_json::json!({"present": true, "device": device});
+            }
+            Err(error) => {
+                availability["imu"] = serde_json::json!({"present": false, "device": device, "error": error.to_string()});
+                warnings.push(format!("imu unavailable: {error}"));
+            }
+        }
+    } else {
+        availability["imu"] = serde_json::json!({"present": false, "reason": "not requested"});
+    }
+
+    if availability["kinect"]["freenect_available"].as_bool() != Some(true) {
+        warnings.push("Kinect/libfreenect not detected; depth stream missing".to_string());
+    }
+}
+
+#[derive(Default)]
+struct MockEyeProducer {
+    tick: u64,
+}
+
+#[async_trait::async_trait]
+impl SenseProducer for MockEyeProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        self.tick = self.tick.saturating_add(1);
+        let base = (self.tick % 16) as f32 / 16.0;
+        Ok(SensePacket::Eye(EyeSense {
+            schema_version: 1,
+            frames: vec![vec![base, 0.25, 0.5, 0.75]],
+            ..EyeSense::default()
+        }))
+    }
+}
+
+#[derive(Default)]
+struct MockEarProducer {
+    tick: u64,
+}
+
+#[async_trait::async_trait]
+impl SenseProducer for MockEarProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        self.tick = self.tick.saturating_add(1);
+        Ok(if self.tick % 2 == 0 {
+            SensePacket::Ear(EarSense {
+                schema_version: 1,
+                features: vec![vec![0.1, 0.2, 0.1]],
+                transcript: None,
+                ..EarSense::default()
+            })
+        } else {
+            SensePacket::EarPcm(PcmAudioFrame {
+                captured_at_ms: Utc::now().timestamp_millis().max(0) as u64,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                samples: vec![0, 128, -128, 64],
+            })
+        })
+    }
+}
+
+#[derive(Default)]
+struct MockRangeProducer;
+
+#[async_trait::async_trait]
+impl SenseProducer for MockRangeProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        Ok(SensePacket::Range(RangeSense {
+            schema_version: 1,
+            beams: vec![1.2, 1.0, 0.8],
+            nearest_m: Some(0.8),
+        }))
+    }
+}
+
+#[derive(Default)]
+struct MockKinectProducer;
+
+#[async_trait::async_trait]
+impl SenseProducer for MockKinectProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        Ok(SensePacket::Kinect(KinectSense {
+            schema_version: 1,
+            color_features: vec![vec![0.2, 0.4, 0.6]],
+            depth_m: vec![0.8, 1.0, 1.2],
+            audio_angle_rad: Some(0.0),
+            audio_confidence: 0.75,
+            ..KinectSense::default()
+        }))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct NoopLedger;
 
@@ -1598,6 +2068,419 @@ impl LedgerWriter for NoopLedger {
 
     async fn append_transition(&self, _transition: &ExperienceTransition) -> Result<()> {
         Ok(())
+    }
+}
+
+async fn collect_hardware_env_report() -> Value {
+    let serial_devices = list_matching_paths(&["/dev/ttyUSB", "/dev/ttyACM", "/dev/serial/by-id/"]);
+    let camera_devices = list_matching_paths(&["/dev/video"]);
+    let audio_input_devices = audio_input_devices();
+    let warnings = hardware_env_warnings(&serial_devices, &camera_devices, &audio_input_devices);
+    serde_json::json!({
+        "os": std::env::consts::OS,
+        "architecture": std::env::consts::ARCH,
+        "cpu_model": cpu_model(),
+        "memory_total_kb": memory_total_kb(),
+        "serial_devices": serial_devices,
+        "camera_devices": camera_devices,
+        "audio_input_devices": audio_input_devices,
+        "kinect": {
+            "freenect_available": command_exists("freenect-glview") || command_exists("freenect-camtest") || pkg_config_exists("libfreenect"),
+            "freenect_glview": command_exists("freenect-glview"),
+            "freenect_camtest": command_exists("freenect-camtest"),
+            "pkg_config_libfreenect": pkg_config_exists("libfreenect"),
+        },
+        "permissions": {
+            "groups": current_groups(),
+            "serial_group_hint": "dialout",
+            "video_group_hint": "video",
+            "audio_group_hint": "audio",
+        },
+        "data_dirs_writable": {
+            "data": directory_writable(Path::new("data")),
+            "data/captures/real": directory_writable(Path::new("data/captures/real")),
+            "data/ledger/real": directory_writable(Path::new("data/ledger/real")),
+        },
+        "raspberry_pi_like": raspberry_pi_like(),
+        "warnings": warnings,
+    })
+}
+
+fn hardware_env_warnings(
+    serial_devices: &[String],
+    camera_devices: &[String],
+    audio_input_devices: &[String],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let groups = current_groups();
+    if serial_devices.is_empty() {
+        warnings.push("no likely Create serial devices found under /dev/ttyUSB*, /dev/ttyACM*, or /dev/serial/by-id".to_string());
+    }
+    if camera_devices.is_empty() {
+        warnings.push("no /dev/video* camera devices found".to_string());
+    }
+    if audio_input_devices.is_empty() {
+        warnings.push("no audio input devices detected by arecord or /proc/asound".to_string());
+    }
+    for group in ["dialout", "video", "audio"] {
+        if !groups.iter().any(|item| item == group) {
+            warnings.push(format!(
+                "current user is not in `{group}` group; hardware permissions may fail"
+            ));
+        }
+    }
+    warnings
+}
+
+fn machine_info_from_env(report: &Value) -> Value {
+    serde_json::json!({
+        "os": report["os"].clone(),
+        "architecture": report["architecture"].clone(),
+        "cpu_model": report["cpu_model"].clone(),
+        "memory_total_kb": report["memory_total_kb"].clone(),
+        "raspberry_pi_like": report["raspberry_pi_like"].clone(),
+    })
+}
+
+fn cpu_model() -> Option<String> {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
+    cpuinfo.lines().find_map(|line| {
+        line.strip_prefix("Model")
+            .or_else(|| line.strip_prefix("model name"))
+            .and_then(|line| {
+                line.split_once(':')
+                    .map(|(_, value)| value.trim().to_string())
+            })
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn memory_total_kb() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo.lines().find_map(|line| {
+        line.strip_prefix("MemTotal:")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+fn raspberry_pi_like() -> bool {
+    let model = fs::read_to_string("/proc/device-tree/model")
+        .or_else(|_| fs::read_to_string("/sys/firmware/devicetree/base/model"))
+        .unwrap_or_default()
+        .to_lowercase();
+    model.contains("raspberry pi")
+}
+
+fn list_matching_paths(prefixes: &[&str]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for prefix in prefixes {
+        let path = Path::new(prefix);
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    paths.push(entry.path().to_string_lossy().to_string());
+                }
+            }
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let Some(name_prefix) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.starts_with(name_prefix))
+                    .unwrap_or(false)
+                {
+                    paths.push(entry.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn audio_input_devices() -> Vec<String> {
+    if let Ok(output) = ProcessCommand::new("arecord").arg("-l").output() {
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| line.trim_start().starts_with("card "))
+                .map(|line| line.trim().to_string())
+                .collect();
+        }
+    }
+    let proc_asound = Path::new("/proc/asound/cards");
+    fs::read_to_string(proc_asound)
+        .ok()
+        .map(|text| {
+            text.lines()
+                .filter(|line| line.contains('[') && line.contains(']'))
+                .map(|line| line.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn command_exists(command: &str) -> bool {
+    ProcessCommand::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {command} >/dev/null 2>&1"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn pkg_config_exists(package: &str) -> bool {
+    ProcessCommand::new("pkg-config")
+        .arg("--exists")
+        .arg(package)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn current_groups() -> Vec<String> {
+    ProcessCommand::new("id")
+        .arg("-nG")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn directory_writable(path: &Path) -> bool {
+    if fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    let probe = path.join(".netherwick-write-test");
+    match fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn print_json_list(label: &str, value: &Value) {
+    println!("{label}:");
+    let Some(items) = value.as_array() else {
+        println!("    none");
+        return;
+    };
+    if items.is_empty() {
+        println!("    none");
+        return;
+    }
+    for item in items {
+        if let Some(text) = item.as_str() {
+            println!("    - {text}");
+        } else {
+            println!("    - {item}");
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StreamCounts {
+    body: usize,
+    rgb: usize,
+    depth: usize,
+    audio: usize,
+    range: usize,
+    imu: usize,
+    gps: usize,
+    kinect: usize,
+}
+
+impl StreamCounts {
+    fn observe(&mut self, snapshot: &WorldSnapshot) {
+        self.body = self.body.saturating_add(1);
+        if snapshot.eye_frame.is_some() || !snapshot.eye.frames.is_empty() {
+            self.rgb = self.rgb.saturating_add(1);
+        }
+        if snapshot.ear_pcm.is_some() || !snapshot.ear.features.is_empty() {
+            self.audio = self.audio.saturating_add(1);
+        }
+        if !snapshot.kinect.depth_m.is_empty() {
+            self.depth = self.depth.saturating_add(1);
+        }
+        if !snapshot.range.beams.is_empty() || snapshot.range.nearest_m.is_some() {
+            self.range = self.range.saturating_add(1);
+        }
+        if !snapshot.imu.orientation.is_empty()
+            || !snapshot.imu.acceleration.is_empty()
+            || !snapshot.imu.angular_velocity.is_empty()
+        {
+            self.imu = self.imu.saturating_add(1);
+        }
+        if snapshot.gps.is_some() {
+            self.gps = self.gps.saturating_add(1);
+        }
+        if !snapshot.kinect.color_features.is_empty()
+            || !snapshot.kinect.depth_m.is_empty()
+            || !snapshot.kinect.skeletons.is_empty()
+        {
+            self.kinect = self.kinect.saturating_add(1);
+        }
+    }
+
+    fn streams(&self) -> CaptureStreams {
+        let all = [
+            ("body", self.body),
+            ("rgb", self.rgb),
+            ("depth", self.depth),
+            ("audio", self.audio),
+            ("range", self.range),
+            ("imu", self.imu),
+            ("gps", self.gps),
+            ("kinect", self.kinect),
+        ];
+        CaptureStreams {
+            present: all
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+            missing: all
+                .iter()
+                .filter(|(_, count)| *count == 0)
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+        }
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        self.streams()
+            .missing
+            .into_iter()
+            .filter(|name| name != "gps" && name != "imu")
+            .map(|name| format!("{name} stream missing"))
+            .collect()
+    }
+
+    fn useful_stream_count(&self) -> usize {
+        [
+            self.body,
+            self.rgb,
+            self.depth,
+            self.audio,
+            self.range,
+            self.imu,
+            self.gps,
+            self.kinect,
+        ]
+        .into_iter()
+        .filter(|count| *count > 0)
+        .count()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CaptureInspectionReport {
+    path: PathBuf,
+    frame_count: usize,
+    duration_ms: Option<u64>,
+    streams_present: Vec<String>,
+    streams_missing: Vec<String>,
+    first_timestamp_ms: Option<u64>,
+    last_timestamp_ms: Option<u64>,
+    event_count: usize,
+    asset_counts: Vec<(String, usize)>,
+    warnings: Vec<String>,
+}
+
+async fn inspect_capture_report(path: impl AsRef<Path>) -> Result<CaptureInspectionReport> {
+    let path = path.as_ref().to_path_buf();
+    let reader = CaptureReader::open(&path).await?;
+    let frames = reader.read_frames().await?;
+    let mut stream_counts = StreamCounts::default();
+    let mut event_count = 0usize;
+    for frame in &frames {
+        stream_counts.observe(&frame.snapshot);
+        event_count = event_count.saturating_add(frame.events.len());
+    }
+    event_count = event_count.saturating_add(count_jsonl_lines(&path.join("events.jsonl"))?);
+    let first_timestamp_ms = frames.first().map(|frame| frame.t_ms);
+    let last_timestamp_ms = frames.last().map(|frame| frame.t_ms);
+    let duration_ms = first_timestamp_ms
+        .zip(last_timestamp_ms)
+        .map(|(first, last)| last.saturating_sub(first));
+    let streams = if reader.manifest().streams.present.is_empty()
+        && reader.manifest().streams.missing.is_empty()
+    {
+        stream_counts.streams()
+    } else {
+        reader.manifest().streams.clone()
+    };
+    Ok(CaptureInspectionReport {
+        path: path.clone(),
+        frame_count: frames.len(),
+        duration_ms,
+        streams_present: streams.present,
+        streams_missing: streams.missing,
+        first_timestamp_ms,
+        last_timestamp_ms,
+        event_count,
+        asset_counts: asset_counts(&path),
+        warnings: reader.manifest().warnings.clone(),
+    })
+}
+
+fn asset_counts(root: &Path) -> Vec<(String, usize)> {
+    ["rgb", "depth", "audio", "pointcloud"]
+        .into_iter()
+        .map(|kind| {
+            let path = root.join("assets").join(kind);
+            (kind.to_string(), count_files(&path))
+        })
+        .collect()
+}
+
+fn count_files(path: &Path) -> usize {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn count_jsonl_lines(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count())
+}
+
+fn join_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
     }
 }
 
@@ -3129,6 +4012,80 @@ mod tests {
             scenario_recommendation(10, &risky),
             "reject_or_continue_training"
         );
+    }
+
+    #[tokio::test]
+    async fn hardware_env_report_has_expected_shape() {
+        let report = collect_hardware_env_report().await;
+        assert!(report.get("os").is_some());
+        assert!(report.get("architecture").is_some());
+        assert!(report.get("serial_devices").unwrap().is_array());
+        assert!(report.get("camera_devices").unwrap().is_array());
+        assert!(report.get("audio_input_devices").unwrap().is_array());
+        assert!(report.get("kinect").unwrap().is_object());
+        assert!(report.get("data_dirs_writable").unwrap().is_object());
+    }
+
+    #[test]
+    fn missing_streams_generate_warnings() {
+        let mut counts = StreamCounts::default();
+        counts.observe(&WorldSnapshot::default());
+        let streams = counts.streams();
+        assert!(streams.present.contains(&"body".to_string()));
+        assert!(streams.missing.contains(&"rgb".to_string()));
+        assert!(counts
+            .warnings()
+            .iter()
+            .any(|warning| warning == "rgb stream missing"));
+    }
+
+    #[tokio::test]
+    async fn inspect_capture_reads_tiny_fake_capture() {
+        let temp_dir = temp_path("netherwick_inspect_capture");
+        let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::RealRobot, Some(100))
+            .await
+            .unwrap();
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.eye.frames.push(vec![0.1, 0.2]);
+        writer
+            .append_snapshot(100, snapshot, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let report = inspect_capture_report(&temp_dir).await.unwrap();
+        assert_eq!(report.frame_count, 1);
+        assert!(report.streams_present.contains(&"rgb".to_string()));
+        assert!(report.streams_missing.contains(&"audio".to_string()));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn capture_real_mock_writes_manifest_and_frames() {
+        let temp_dir = temp_path("netherwick_capture_real_mock");
+        let args = CaptureRealArgs {
+            duration_seconds: 1,
+            out: temp_dir.to_string_lossy().to_string(),
+            ledger: None,
+            tick_ms: 1000,
+            create_port: "mock".to_string(),
+            create_baud: 57_600,
+            camera: None,
+            mic: None,
+            imu: None,
+            gps: None,
+            mock: true,
+        };
+
+        capture_real(args).await.unwrap();
+        assert!(temp_dir.join("manifest.json").exists());
+        assert!(temp_dir.join("frames.jsonl").exists());
+        let report = inspect_capture_report(&temp_dir).await.unwrap();
+        assert_eq!(report.frame_count, 1);
+        assert!(report.streams_present.contains(&"body".to_string()));
+        assert!(report.streams_present.contains(&"audio".to_string()));
+        assert!(report.streams_present.contains(&"depth".to_string()));
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]

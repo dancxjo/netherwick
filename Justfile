@@ -118,9 +118,7 @@ real-create1:
     @echo "The Create 1 control path is scaffolded at the crate level but the CLI robot mode is not wired yet."
 
 hardware-env:
-    @echo "CREATE1_PORT={{create1_port}}"
-    @echo "GPS_SERIAL_PORT={{gps_serial_port}}"
-    @echo "CAMERA_DEVICE={{camera_device}}"
+    cargo run -p netherwick-tools -- hardware-env
 
 clean:
     cargo clean
