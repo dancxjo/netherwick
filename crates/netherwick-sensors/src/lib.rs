@@ -461,26 +461,7 @@ impl SensorUpdateTimes {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EyeFrameFormat {
-    Gray8,
-    Rgb8,
-    Bgr8,
-    Yuyv422,
-    Mjpeg,
-    Unknown(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EyeFrame {
-    pub captured_at_ms: u64,
-    pub width: u32,
-    pub height: u32,
-    pub format: EyeFrameFormat,
-    pub bytes: Vec<u8>,
-    #[serde(default)]
-    pub source: Option<String>,
-}
+pub use netherwick_now::{EyeFrame, EyeFrameFormat};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PcmAudioFrame {
@@ -550,6 +531,7 @@ impl WorldSnapshot {
     pub fn to_now(&self, t_ms: u64) -> Now {
         let mut now = Now::blank(t_ms, self.body.clone());
         now.eye = self.eye.clone();
+        now.eye_frame = self.eye_frame.clone();
         now.ear = self.ear.clone();
         now.face = self.face.clone();
         now.voice = self.voice.clone();

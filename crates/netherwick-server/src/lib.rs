@@ -1176,9 +1176,53 @@ async fn get_capture_scene(
     );
     scene.t_ms = record.t_ms;
     if let Some(pointcloud) = &record.assets.pointcloud {
-        scene.warnings.push(format!(
-            "capture point cloud asset available at {pointcloud}; PLY loading is planned"
-        ));
+        let ply_path = query.capture.join(pointcloud);
+        if ply_path.exists() {
+            match std::fs::read_to_string(&ply_path) {
+                Ok(content) => {
+                    let mut points = Vec::new();
+                    let mut in_header = true;
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if in_header {
+                            if line == "end_header" {
+                                in_header = false;
+                            }
+                            continue;
+                        }
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 3 {
+                            if let (Ok(x), Ok(y), Ok(z)) = (
+                                parts[0].parse::<f32>(),
+                                parts[1].parse::<f32>(),
+                                parts[2].parse::<f32>(),
+                            ) {
+                                points.push(ScenePoint {
+                                    x,
+                                    y,
+                                    z,
+                                    r: 180,
+                                    g: 180,
+                                    b: 240,
+                                });
+                            }
+                        }
+                    }
+                    scene.kinect.points = points;
+                }
+                Err(error) => {
+                    scene.warnings.push(format!(
+                        "failed to read PLY file {}: {error}",
+                        ply_path.display()
+                    ));
+                }
+            }
+        } else {
+            scene.warnings.push(format!("PLY file not found: {}", ply_path.display()));
+        }
     }
     Ok(Json(scene))
 }

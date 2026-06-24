@@ -1,0 +1,80 @@
+{
+  "timestamp": "2026-06-24T20:30:49.268627349+00:00",
+  "run_report": {
+    "total_frames": 567,
+    "total_transitions": 570,
+    "total_eye_frames": 567,
+    "total_ear_frames": 556,
+    "total_stuck_trap_events": 0,
+    "battery_delta": 0.9728503,
+    "duration_seconds": 463.5
+  },
+  "models": {
+    "ear_next": {
+      "name": "ear_next_virtual_20260624_2030",
+      "trained": true,
+      "previous_status": "registered",
+      "new_status": "shadow",
+      "recommended_action": "shadow",
+      "warnings": [],
+      "loss": 0.004576435,
+      "baseline_collision_rate": 0.018,
+      "candidate_collision_rate": 0.018,
+      "baseline_success_rate": 0.8,
+      "candidate_success_rate": 0.8
+    },
+    "danger": {
+      "name": "danger_virtual_20260624_2030",
+      "trained": true,
+      "previous_status": "registered",
+      "new_status": "shadow",
+      "recommended_action": "shadow",
+      "warnings": [],
+      "loss": 0.015744176,
+      "baseline_collision_rate": 0.018,
+      "candidate_collision_rate": 0.018,
+      "baseline_success_rate": 0.8,
+      "candidate_success_rate": 0.8
+    },
+    "charge": {
+      "name": "charge_virtual_20260624_2030",
+      "trained": true,
+      "previous_status": "registered",
+      "new_status": "shadow",
+      "recommended_action": "shadow",
+      "warnings": [],
+      "loss": 0.008737,
+      "baseline_collision_rate": 0.018,
+      "candidate_collision_rate": 0.018,
+      "baseline_success_rate": 0.8,
+      "candidate_success_rate": 0.8
+    },
+    "eye_next": {
+      "name": "eye_next_virtual_20260624_2030",
+      "trained": true,
+      "previous_status": "registered",
+      "new_status": "shadow",
+      "recommended_action": "shadow",
+      "warnings": [],
+      "loss": 0.17770593,
+      "baseline_collision_rate": 0.018,
+      "candidate_collision_rate": 0.018,
+      "baseline_success_rate": 0.8,
+      "candidate_success_rate": 0.8
+    },
+    "future": {
+      "name": "future_virtual_20260624_2030",
+      "trained": true,
+      "previous_status": "registered",
+      "new_status": "shadow",
+      "recommended_action": "shadow",
+      "warnings": [],
+      "loss": 0.0034811194,
+      "baseline_collision_rate": 0.018,
+      "candidate_collision_rate": 0.018,
+      "baseline_success_rate": 0.8,
+      "candidate_success_rate": 0.8
+    }
+  },
+  "warnings": []
+}

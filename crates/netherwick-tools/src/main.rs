@@ -74,14 +74,13 @@ enum Command {
     Train(TrainCommand),
     Evaluate(EvaluateCommand),
     Promote(PromoteCommand),
-    InspectLedger,
+    InspectLedger(InspectLedgerArgs),
     ModelRegister(ModelRegisterArgs),
     ModelStatus,
     ModelPromote(ModelPromoteArgs),
     CompareScenarioReports(CompareScenarioReportsArgs),
     Dashboard,
     VirtualReport(VirtualReportArgs),
-    TrainVirtual(TrainVirtualArgs),
     RetinaMockSend(RetinaMockSendArgs),
 }
 
@@ -101,7 +100,7 @@ async fn main() -> Result<()> {
         Command::InspectCapture(args) => inspect_capture(args).await,
         Command::ReplayCapture(args) => replay_capture(args).await,
         Command::ReplayCounterfactual(args) => replay_counterfactual(args).await,
-        Command::InspectLedger => inspect_ledger().await,
+        Command::InspectLedger(args) => inspect_ledger(args).await,
         Command::Train(command) => run_train(command).await,
         Command::Evaluate(command) => run_evaluate(command).await,
         Command::Promote(command) => run_promote(command),
@@ -110,7 +109,6 @@ async fn main() -> Result<()> {
         Command::ModelPromote(args) => model_promote(args),
         Command::CompareScenarioReports(args) => compare_scenario_reports_command(args),
         Command::VirtualReport(args) => run_virtual_report(args).await,
-        Command::TrainVirtual(args) => run_train_virtual(args).await,
         Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
         other => {
             println!("selected command: {:?}", other);
@@ -627,6 +625,12 @@ struct TrainExperienceArgs {
 }
 
 #[derive(Debug, Parser)]
+struct InspectLedgerArgs {
+    #[arg(long, default_value = "data/ledger/virtual-live", env = "NETHERWICK_LEDGER")]
+    ledger: String,
+}
+
+#[derive(Debug, Parser)]
 struct VirtualReportArgs {
     #[arg(long, default_value = "data/ledger/virtual-live", env = "NETHERWICK_LEDGER")]
     ledger: String,
@@ -849,6 +853,14 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             println!("This serves robot/sim sensor data on the LAN. Use only on trusted networks.");
         }
         for _ in 0..args.steps {
+            let eye_frame = live_state.take_pending_retina_frame();
+            if let Some(mut frame) = eye_frame {
+                frame.source = Some("babylon-robot-eye".to_string());
+                runner.world.set_retina_frame(Some(frame));
+                live_state.record_ledger_write();
+            } else {
+                runner.world.set_retina_frame(None);
+            }
             runner
                 .run_steps_observing(1, |snapshot| live_state.update(snapshot.clone()))
                 .await?;
@@ -4189,8 +4201,8 @@ fn mode_name<T: std::fmt::Debug>(mode: T) -> &'static str {
     }
 }
 
-async fn inspect_ledger() -> Result<()> {
-    let ledger = JsonlLedger::new("data/ledger");
+async fn inspect_ledger(args: InspectLedgerArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
     let frames = ledger.recent(10).await?;
     if frames.is_empty() {
         println!("ledger is empty");
@@ -5291,6 +5303,15 @@ fn print_frame(frame: &ExperienceFrame) {
     if let Some(transcript) = &frame.now.ear.transcript {
         println!("  heard: {}", transcript);
     }
+    if let Some(eye_frame) = &frame.now.eye_frame {
+        println!(
+            "  eye_frame: {}x{} ({:?}) source={:?}",
+            eye_frame.width,
+            eye_frame.height,
+            eye_frame.format,
+            eye_frame.source.as_deref().unwrap_or("none")
+        );
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5302,6 +5323,18 @@ struct VirtualRunReport {
     pub total_stuck_trap_events: usize,
     pub battery_delta: f32,
     pub duration_seconds: f64,
+    pub eye_sources: HashMap<String, usize>,
+    pub retina_coverage: f32,
+    pub collisions: usize,
+    pub collision_rate: f32,
+    pub charger_contacts: usize,
+    pub charging_ticks: usize,
+    pub battery_recovery_success: bool,
+    pub stuck_recovery_attempts: usize,
+    pub stuck_recovery_successes: usize,
+    pub trap_kinds: HashMap<String, usize>,
+    pub ledger_gaps: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5353,6 +5386,22 @@ async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> 
     let mut total_ear_frames = 0;
     let mut total_stuck_trap_events = 0;
 
+    let mut eye_sources = HashMap::new();
+    let mut babylon_eye_frames = 0;
+    let mut collisions = 0;
+    let mut charging_ticks = 0;
+    let mut charger_contacts = 0;
+    let mut was_charging = false;
+    let mut stuck_recovery_attempts = 0;
+    let mut stuck_recovery_successes = 0;
+    let mut trap_kinds = HashMap::new();
+    let mut ledger_gaps = Vec::new();
+    let mut warnings = Vec::new();
+
+    let mut min_battery = 1.0f32;
+    let mut max_after_min = 0.0f32;
+    let mut prev_t_ms = None;
+
     for frame in &frames {
         if !frame.now.eye.frames.is_empty() || !frame.now.eye.image_vectors.is_empty() {
             total_eye_frames += 1;
@@ -5360,14 +5409,72 @@ async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> 
         if !frame.now.ear.features.is_empty() || frame.now.ear.transcript.is_some() {
             total_ear_frames += 1;
         }
+
+        // 1. Eye source tracking
+        if let Some(eye_frame) = &frame.now.eye_frame {
+            let src = eye_frame.source.clone().unwrap_or_else(|| "none".to_string());
+            *eye_sources.entry(src.clone()).or_insert(0) += 1;
+            if src == "babylon-robot-eye" {
+                babylon_eye_frames += 1;
+            }
+        }
+
+        // 2. Collision tracking
+        if frame.now.body.flags.bump_left || frame.now.body.flags.bump_right {
+            collisions += 1;
+        }
+
+        // 3. Charger & Battery tracking
+        if frame.now.body.charging {
+            charging_ticks += 1;
+            if !was_charging {
+                charger_contacts += 1;
+            }
+            was_charging = true;
+        } else {
+            was_charging = false;
+        }
+
+        let bat = frame.now.body.battery_level;
+        if bat < min_battery {
+            min_battery = bat;
+            max_after_min = bat;
+        } else if bat > max_after_min {
+            max_after_min = bat;
+        }
+
+        // 4. Stuck recovery / Trap tracking
         if let Some(val) = frame.now.extensions.get("sim.stuck") {
             if let Ok(values) = serde_json::from_value::<Vec<f32>>(val.clone()) {
                 let event_started = values.get(6).copied().unwrap_or(0.0) > 0.0;
+                let recovered = values.get(7).copied().unwrap_or(0.0) > 0.0;
+                let trap_code = values.get(10).copied().unwrap_or(0.0);
+
                 if event_started {
                     total_stuck_trap_events += 1;
+                    stuck_recovery_attempts += 1;
+                    let trap_name = match trap_code {
+                        1.0 => "Wall",
+                        2.0 => "Corner",
+                        3.0 => "Column",
+                        _ => "Unknown",
+                    }.to_string();
+                    *trap_kinds.entry(trap_name).or_insert(0) += 1;
+                }
+                if recovered {
+                    stuck_recovery_successes += 1;
                 }
             }
         }
+
+        // 5. Gap tracking
+        if let Some(prev) = prev_t_ms {
+            let diff = frame.t_ms.saturating_sub(prev);
+            if diff > 500 {
+                ledger_gaps.push(format!("gap of {}ms between {}ms and {}ms", diff, prev, frame.t_ms));
+            }
+        }
+        prev_t_ms = Some(frame.t_ms);
     }
 
     let battery_delta = if let (Some(first), Some(last)) = (frames.first(), frames.last()) {
@@ -5376,11 +5483,31 @@ async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> 
         0.0
     };
 
+    let battery_recovery_success = max_after_min - min_battery >= 0.05;
+
     let duration_seconds = if let (Some(first), Some(last)) = (frames.first(), frames.last()) {
         (last.t_ms.saturating_sub(first.t_ms) as f64) / 1000.0
     } else {
         0.0
     };
+
+    let collision_rate = if total_frames > 0 {
+        collisions as f32 / total_frames as f32
+    } else {
+        0.0
+    };
+
+    let retina_coverage = if total_frames > 0 {
+        babylon_eye_frames as f32 / total_frames as f32
+    } else {
+        0.0
+    };
+
+    if total_frames == 0 {
+        warnings.push("ledger is empty".to_string());
+    } else if babylon_eye_frames == 0 {
+        warnings.push("no retina frames from babylon-robot-eye found in ledger".to_string());
+    }
 
     Ok(VirtualRunReport {
         total_frames,
@@ -5390,6 +5517,18 @@ async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> 
         total_stuck_trap_events,
         battery_delta,
         duration_seconds,
+        eye_sources,
+        retina_coverage,
+        collisions,
+        collision_rate,
+        charger_contacts,
+        charging_ticks,
+        battery_recovery_success,
+        stuck_recovery_attempts,
+        stuck_recovery_successes,
+        trap_kinds,
+        ledger_gaps,
+        warnings,
     })
 }
 
@@ -5434,7 +5573,7 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
     let baseline_report_path = Path::new(&args.out_dir).join("baseline-scenario.json");
     let baseline_args = EvalScenarioArgs {
         scenario: ScenarioArg::MixedRoom,
-        episodes: 5,
+        episodes: 10,
         steps: 100,
         seed: 7,
         tick_ms: 100,
@@ -5466,7 +5605,7 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
     let candidate_report_path = Path::new(&args.out_dir).join("candidate-scenario.json");
     let candidate_args = EvalScenarioArgs {
         scenario: ScenarioArg::MixedRoom,
-        episodes: 5,
+        episodes: 10,
         steps: 100,
         seed: 7,
         tick_ms: 100,

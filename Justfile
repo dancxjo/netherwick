@@ -148,7 +148,7 @@ train target="virtual":
         echo "usage: just train virtual"
         exit 2
     fi
-    cargo run -p netherwick-tools -- train-virtual \
+    cargo run -p netherwick-tools -- train virtual \
         --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" \
         --out-dir "${NETHERWICK_MODEL_OUT:-data/models/virtual/latest}" \
         --report-out "${NETHERWICK_REPORT_OUT:-data/reports/virtual/latest.json}" \

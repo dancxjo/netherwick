@@ -65,6 +65,27 @@ impl VectorArtifact {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EyeFrameFormat {
+    Gray8,
+    Rgb8,
+    Bgr8,
+    Yuyv422,
+    Mjpeg,
+    Unknown(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EyeFrame {
+    pub captured_at_ms: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: EyeFrameFormat,
+    pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EyeSense {
     pub schema_version: u32,
@@ -666,6 +687,8 @@ pub struct Now {
     pub body: BodySense,
     #[serde(default)]
     pub eye: EyeSense,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eye_frame: Option<EyeFrame>,
     #[serde(default)]
     pub ear: EarSense,
     #[serde(default)]
@@ -707,6 +730,7 @@ impl Now {
                 schema_version: 1,
                 ..EyeSense::default()
             },
+            eye_frame: None,
             ear: EarSense {
                 schema_version: 2,
                 ..EarSense::default()
