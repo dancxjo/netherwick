@@ -1172,7 +1172,11 @@ fn print_behavior_status(
     println!(
         "      checkpoint: {} ({})",
         checkpoint_path.display(),
-        if checkpoint_present { "present" } else { "missing" }
+        if checkpoint_present {
+            "present"
+        } else {
+            "missing"
+        }
     );
     println!(
         "      samples_seen: {}",
