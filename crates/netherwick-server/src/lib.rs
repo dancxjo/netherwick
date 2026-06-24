@@ -1828,16 +1828,17 @@ const LIVE_VIEW_3D_PAGE: &str = r#"<!doctype html>
 <style>
 :root{color-scheme:dark;background:#0b0d10;color:#eef1f3;font:13px system-ui}
 html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
-#hud{position:fixed;left:12px;top:12px;display:grid;gap:6px;min-width:240px;max-width:min(360px,calc(100vw - 24px));padding:10px;border:1px solid #2b3138;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px}
+.drag-handle{cursor:move;user-select:none}
+#hud{position:fixed;left:12px;top:12px;display:grid;gap:6px;min-width:240px;padding:10px;border:1px solid #2b3138;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px;resize:both;overflow:auto}
 #hud h1{font-size:14px;margin:0}
 #hud dl{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;margin:0}
 #hud dt{color:#aab4bd}
 #hud dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 #status{color:#ffd083}
-#reign{position:fixed;right:12px;top:12px;min-width:220px;max-width:min(320px,calc(100vw - 24px));padding:10px;border:1px solid #36424d;background:rgba(11,16,22,.84);backdrop-filter:blur(8px);border-radius:6px;color:#dce8f2}
+#reign{position:fixed;right:12px;top:12px;min-width:220px;padding:10px;border:1px solid #36424d;background:rgba(11,16,22,.84);backdrop-filter:blur(8px);border-radius:6px;color:#dce8f2;resize:both;overflow:auto}
 #reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
 #reign div{font-variant-numeric:tabular-nums}
-#llm{position:fixed;right:12px;top:96px;width:min(420px,calc(100vw - 24px));max-height:calc(100vh - 164px);display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;padding:10px;border:1px solid #3f4c58;background:rgba(9,12,16,.88);backdrop-filter:blur(10px);border-radius:6px;color:#e7eef5}
+#llm{position:fixed;right:12px;top:96px;width:320px;height:300px;min-width:200px;min-height:150px;display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;padding:10px;border:1px solid #3f4c58;background:rgba(9,12,16,.88);backdrop-filter:blur(10px);border-radius:6px;color:#e7eef5;resize:both;overflow:hidden}
 #llm header{display:flex;align-items:center;justify-content:space-between;gap:12px}
 #llm h2{font-size:12px;margin:0;color:#b6e0ff}
 #llm-status{color:#ffcf7a;font-size:12px;font-variant-numeric:tabular-nums}
@@ -1851,15 +1852,16 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .llm-block{display:grid;gap:3px;min-width:0}
 .llm-label{color:#8fa1b2;font-size:11px;text-transform:uppercase}
 .llm-text{max-height:112px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;line-height:1.35;color:#dbe7f1;background:rgba(4,7,10,.38);border-radius:4px;padding:6px}
-#models{position:fixed;left:12px;bottom:40px;width:min(680px,calc(100vw - 24px));max-height:44vh;display:grid;grid-template-columns:minmax(260px,.92fr) minmax(300px,1fr);gap:10px;padding:10px;border:1px solid #37424c;background:rgba(8,11,15,.88);backdrop-filter:blur(10px);border-radius:6px;color:#e7eef5}
+#models{position:fixed;left:12px;bottom:40px;width:640px;height:320px;min-width:320px;min-height:200px;display:grid;grid-template-columns:minmax(200px,.92fr) minmax(260px,1fr);gap:10px;padding:10px;border:1px solid #37424c;background:rgba(8,11,15,.88);backdrop-filter:blur(10px);border-radius:6px;color:#e7eef5;resize:both;overflow:hidden}
+#models section{display:flex;flex-direction:column;min-height:0}
 #models h2{font-size:12px;margin:0 0 8px;color:#c6e6ff}
 #model-status{color:#ffcf7a;font-size:12px;font-variant-numeric:tabular-nums}
-#model-list{display:grid;gap:6px;min-height:0;overflow:auto;scrollbar-width:thin}
+#model-list{flex:1;display:grid;gap:6px;min-height:0;overflow-y:auto;scrollbar-width:thin}
 .model-row{display:grid;grid-template-columns:1fr auto;gap:3px 8px;padding:6px;border:1px solid #27313b;background:rgba(18,24,30,.72);border-radius:5px}
 .model-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .model-pill{padding:1px 5px;border-radius:999px;background:#243646;color:#b8e1ff;font-size:11px;white-space:nowrap}
 .model-line{grid-column:1/-1;color:#aeb9c3;font-size:11px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
-#model-graph{width:100%;height:260px;min-height:220px;border:1px solid #27313b;border-radius:5px;background:rgba(4,7,10,.32)}
+#model-graph{width:100%;flex:1;min-height:0;border:1px solid #27313b;border-radius:5px;background:rgba(4,7,10,.32)}
 #model-graph text{font:10px system-ui;fill:#e7eef5}
 #model-graph .edge{stroke:#627384;stroke-width:1.2;fill:none;marker-end:url(#arrow)}
 #model-graph .edge-label{fill:#99a8b5;font-size:8px}
@@ -2684,8 +2686,187 @@ async function setupXr(){
   };
 }
 
+let isInitialized = false;
+let maxZIndex = 100;
+
+function savePanelLayouts() {
+  if (!isInitialized) return;
+  const layouts = {};
+  ['hud', 'reign', 'llm', 'models'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      layouts[id] = {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+        zIndex: el.style.zIndex ? parseInt(el.style.zIndex, 10) : 100
+      };
+    }
+  });
+  localStorage.setItem('netherwick-hud-layout', JSON.stringify(layouts));
+}
+
+function loadPanelLayouts() {
+  const data = localStorage.getItem('netherwick-hud-layout');
+  if (data) {
+    try {
+      const layouts = JSON.parse(data);
+      let highestZ = 100;
+      for (const id in layouts) {
+        const el = document.getElementById(id);
+        if (el && layouts[id]) {
+          const layout = layouts[id];
+          
+          const left = Math.max(0, Math.min(window.innerWidth - 100, layout.left));
+          const top = Math.max(0, Math.min(window.innerHeight - 50, layout.top));
+          const width = Math.max(100, Math.min(window.innerWidth, layout.width));
+          const height = Math.max(50, Math.min(window.innerHeight, layout.height));
+          
+          el.style.left = left + 'px';
+          el.style.top = top + 'px';
+          el.style.width = width + 'px';
+          el.style.height = height + 'px';
+          el.style.right = 'auto';
+          el.style.bottom = 'auto';
+          
+          if (layout.zIndex) {
+            el.style.zIndex = layout.zIndex;
+            if (layout.zIndex > highestZ) highestZ = layout.zIndex;
+          }
+        }
+      }
+      maxZIndex = highestZ;
+    } catch (e) {
+      console.error("Failed to load HUD layouts:", e);
+    }
+  }
+  isInitialized = true;
+}
+
+function applyOrClearLayouts() {
+  if (window.innerWidth < 820) {
+    ['hud', 'reign', 'llm', 'models'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.style.left = '';
+        el.style.top = '';
+        el.style.width = '';
+        el.style.height = '';
+        el.style.right = '';
+        el.style.bottom = '';
+        el.style.zIndex = '';
+      }
+    });
+  } else {
+    if (!isInitialized) {
+      loadPanelLayouts();
+    } else {
+      ['hud', 'reign', 'llm', 'models'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && el.style.left) {
+          const rect = el.getBoundingClientRect();
+          const left = Math.max(0, Math.min(window.innerWidth - 100, rect.left));
+          const top = Math.max(0, Math.min(window.innerHeight - 50, rect.top));
+          el.style.left = left + 'px';
+          el.style.top = top + 'px';
+        }
+      });
+    }
+  }
+}
+
+function bringToFront(el) {
+  maxZIndex += 1;
+  el.style.zIndex = maxZIndex;
+  savePanelLayouts();
+}
+
+function setupDraggableAndResizable() {
+  const panels = [
+    { id: 'hud', handleQuery: 'h1' },
+    { id: 'reign', handleQuery: 'strong' },
+    { id: 'llm', handleQuery: 'header' },
+    { id: 'models', handleQuery: 'h2' }
+  ];
+
+  panels.forEach(({ id, handleQuery }) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+
+    el.addEventListener('mousedown', () => bringToFront(el));
+    el.addEventListener('touchstart', () => bringToFront(el));
+
+    const resizeObserver = new ResizeObserver(() => {
+      savePanelLayouts();
+    });
+    resizeObserver.observe(el);
+
+    const handles = el.querySelectorAll(handleQuery);
+    handles.forEach(handle => {
+      handle.classList.add('drag-handle');
+
+      handle.addEventListener('mousedown', dragStart);
+      handle.addEventListener('touchstart', dragStart, { passive: false });
+
+      function dragStart(e) {
+        if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'A') {
+          return;
+        }
+        
+        e.preventDefault();
+
+        const isTouch = e.type === 'touchstart';
+        const clientX = isTouch ? e.touches[0].clientX : e.clientX;
+        const clientY = isTouch ? e.touches[0].clientY : e.clientY;
+
+        const rect = el.getBoundingClientRect();
+        const startLeft = rect.left;
+        const startTop = rect.top;
+
+        const onMouseMove = (moveEvent) => {
+          const moveTouch = moveEvent.type === 'touchmove';
+          const curX = moveTouch ? moveEvent.touches[0].clientX : moveEvent.clientX;
+          const curY = moveTouch ? moveEvent.touches[0].clientY : moveEvent.clientY;
+
+          const dx = curX - clientX;
+          const dy = curY - clientY;
+
+          let newLeft = startLeft + dx;
+          let newTop = startTop + dy;
+
+          newLeft = Math.max(0, Math.min(window.innerWidth - 60, newLeft));
+          newTop = Math.max(0, Math.min(window.innerHeight - 40, newTop));
+
+          el.style.left = newLeft + 'px';
+          el.style.top = newTop + 'px';
+          el.style.right = 'auto';
+          el.style.bottom = 'auto';
+        };
+
+        const onMouseUp = () => {
+          window.removeEventListener('mousemove', onMouseMove);
+          window.removeEventListener('mouseup', onMouseUp);
+          window.removeEventListener('touchmove', onMouseMove);
+          window.removeEventListener('touchend', onMouseUp);
+          savePanelLayouts();
+        };
+
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', onMouseUp);
+        window.addEventListener('touchmove', onMouseMove, { passive: false });
+        window.addEventListener('touchend', onMouseUp);
+      }
+    });
+  });
+
+  applyOrClearLayouts();
+}
+
 addEventListener('resize', () => {
   engine.resize();
+  applyOrClearLayouts();
 });
 
 engine.runRenderLoop(() => {
@@ -2697,6 +2878,7 @@ setupXr();
 connectLlmStream();
 refreshModels();
 poll();
+setupDraggableAndResizable();
 </script>"#;
 
 #[cfg(test)]
