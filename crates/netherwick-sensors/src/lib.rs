@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use netherwick_body::BodySense;
 use netherwick_now::{
     EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense, RangeSense,
-    VoiceSense,
+    VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION,
+    IMAGE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
 };
 use netherwick_now::{Now, PredictionSense, SurpriseSense};
 use serde::{Deserialize, Serialize};
@@ -167,6 +168,28 @@ pub struct NowBuilder {
     last_updates: SensorUpdateTimes,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct FrameProcessor {
+    last_processed_frame_key: Option<FrameKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameKey {
+    captured_at_ms: u64,
+    width: u32,
+    height: u32,
+    format: String,
+    byte_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessedFrame {
+    pub eye: EyeSense,
+    pub face: FaceSense,
+    pub summary: String,
+    pub source_frame_id: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SensorUpdateTimes {
     pub body: Option<TimeMs>,
@@ -259,6 +282,60 @@ impl NowBuilder {
 
     pub fn snapshot(&self) -> WorldSnapshot {
         self.last_snapshot.clone()
+    }
+}
+
+impl FrameProcessor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn process_packets(&mut self, t_ms: TimeMs, packets: &mut Vec<SensePacket>) {
+        let Some(frame) = packets.iter().rev().find_map(|packet| match packet {
+            SensePacket::EyeFrame(frame) => Some(frame),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(processed) = self.process_frame(t_ms, frame) else {
+            return;
+        };
+        packets.push(SensePacket::Eye(processed.eye));
+        if !processed.face.embeddings.is_empty() || !processed.face.vectors.is_empty() {
+            packets.push(SensePacket::Face(processed.face));
+        }
+        packets.push(SensePacket::Extension(ExtensionSense {
+            schema_version: 1,
+            name: "vision.frame_summary".to_string(),
+            values: summary_extension_values(&processed),
+        }));
+    }
+
+    pub fn process_snapshot(&mut self, t_ms: TimeMs, snapshot: &mut WorldSnapshot) {
+        let Some(frame) = snapshot.eye_frame.clone() else {
+            return;
+        };
+        let Some(processed) = self.process_frame(t_ms, &frame) else {
+            return;
+        };
+        snapshot.eye = processed.eye;
+        if !processed.face.embeddings.is_empty() || !processed.face.vectors.is_empty() {
+            snapshot.face = processed.face;
+        }
+        snapshot.extensions.push(ExtensionSense {
+            schema_version: 1,
+            name: "vision.frame_summary".to_string(),
+            values: summary_extension_values(&processed),
+        });
+    }
+
+    pub fn process_frame(&mut self, t_ms: TimeMs, frame: &EyeFrame) -> Option<ProcessedFrame> {
+        let key = FrameKey::from(frame);
+        if self.last_processed_frame_key.as_ref() == Some(&key) {
+            return None;
+        }
+        self.last_processed_frame_key = Some(key);
+        Some(process_eye_frame(t_ms, frame))
     }
 }
 
@@ -389,6 +466,18 @@ impl WorldSnapshot {
             );
         }
         now
+    }
+}
+
+impl From<&EyeFrame> for FrameKey {
+    fn from(frame: &EyeFrame) -> Self {
+        Self {
+            captured_at_ms: frame.captured_at_ms,
+            width: frame.width,
+            height: frame.height,
+            format: format!("{:?}", frame.format),
+            byte_len: frame.bytes.len(),
+        }
     }
 }
 
