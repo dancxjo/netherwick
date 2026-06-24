@@ -1034,13 +1034,19 @@ async fn run_evaluate(command: EvaluateCommand) -> Result<()> {
             let report = evaluate_behavior(EvaluateBehaviorRequest {
                 behavior,
                 ledger_path: args.ledger.into(),
-                checkpoint_path: checkpoint.into(),
+                checkpoint_path: checkpoint.clone().into(),
                 max_samples: args.max_samples,
             })
             .await?;
+            let checkpoint_evaluation_path = Path::new(&checkpoint).join("evaluation.json");
+            let json = serde_json::to_string_pretty(&report)?;
+            std::fs::write(&checkpoint_evaluation_path, &json)?;
+            println!(
+                "Saved checkpoint evaluation report to {}",
+                checkpoint_evaluation_path.display()
+            );
             if let Some(out_path) = &args.out {
-                let json = serde_json::to_string_pretty(&report)?;
-                std::fs::write(out_path, json)?;
+                std::fs::write(out_path, &json)?;
                 println!("Saved evaluation report to {}", out_path);
             }
             print_evaluation_report(&report)
@@ -1124,32 +1130,9 @@ fn model_status() -> Result<()> {
     };
 
     println!();
-    println!("behaviors:");
+    println!("behavior instrument panel:");
     for behavior in trainable_behaviors() {
-        let key = behavior.config_key();
-        let configured = config.as_ref().and_then(|config| config.behavior.get(key));
-        let checkpoint = configured
-            .and_then(|entry| entry.checkpoint.as_deref())
-            .unwrap_or_else(|| default_checkpoint(behavior));
-        let checkpoint_path = Path::new(checkpoint);
-
-        println!("  - {}", behavior);
-        match configured {
-            Some(entry) => {
-                println!("      regime: {:?}", entry.regime);
-                println!("      hardcoded: {}", entry.hardcoded);
-                println!("      model: {}", entry.model.as_deref().unwrap_or("none"));
-                println!("      fallback: {:?}", entry.fallback);
-            }
-            None => {
-                println!("      regime: unconfigured");
-                println!("      hardcoded: {}", behavior.default_hardcoded_id());
-                println!("      model: {}", behavior.default_model_id());
-                println!("      fallback: UseHardcoded");
-            }
-        }
-        println!("      checkpoint: {}", checkpoint_path.display());
-        print_checkpoint_status(checkpoint_path)?;
+        print_behavior_status(behavior, config.as_ref())?;
     }
 
     println!();
@@ -1170,124 +1153,148 @@ fn trainable_behaviors() -> &'static [TrainableBehavior] {
     ]
 }
 
-fn print_checkpoint_status(path: &Path) -> Result<()> {
-    if !path.exists() {
-        println!("      status: missing");
-        return Ok(());
-    }
-    if !path.is_dir() {
-        println!("      status: present but not a directory");
-        return Ok(());
-    }
-    println!("      status: present");
-    print_json_summary("metadata", &path.join("metadata.json"))?;
-    print_evaluation_summary(&path.join("evaluation.json"))?;
-    print_metrics_summary(&path.join("metrics.jsonl"))?;
-    Ok(())
-}
+fn print_behavior_status(
+    behavior: &TrainableBehavior,
+    config: Option<&netherwick_behaviors::BehaviorRegistryConfig>,
+) -> Result<()> {
+    let key = behavior.config_key();
+    let configured = config.and_then(|config| config.behavior.get(key));
+    let checkpoint = configured
+        .and_then(|entry| entry.checkpoint.as_deref())
+        .unwrap_or_else(|| default_checkpoint(behavior));
+    let checkpoint_path = Path::new(checkpoint);
+    let checkpoint_present = checkpoint_path.is_dir();
+    let metadata = read_json_optional(&checkpoint_path.join("metadata.json"))?;
+    let evaluation = read_json_optional(&checkpoint_path.join("evaluation.json"))?;
+    let latest_metric = read_latest_metric(&checkpoint_path.join("metrics.jsonl"))?;
 
-fn print_json_summary(label: &str, path: &Path) -> Result<()> {
-    if !path.exists() {
-        println!("      {label}: missing");
-        return Ok(());
-    }
-    let json: Value = serde_json::from_slice(&fs::read(path)?)?;
-    let fields = [
-        "input_dim",
-        "output_dim",
-        "latent_dim",
-        "z_dim",
-        "width",
-        "height",
-        "sample_rate_hz",
-        "channels",
-        "samples_seen",
-        "best_loss",
-        "created_at_ms",
-    ];
-    let summary = fields
-        .iter()
-        .filter_map(|field| json.get(*field).map(|value| format!("{field}={value}")))
-        .collect::<Vec<_>>();
-    if summary.is_empty() {
-        println!("      {label}: present");
-    } else {
-        println!("      {label}: {}", summary.join(", "));
-    }
-    Ok(())
-}
-
-fn print_evaluation_summary(path: &Path) -> Result<()> {
-    if !path.exists() {
-        println!("      evaluation: missing");
-        return Ok(());
-    }
-    let json: Value = serde_json::from_slice(&fs::read(path)?)?;
-    let recommendation = json
-        .get("recommendation")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let sample_count = json
-        .get("sample_count")
-        .map(Value::to_string)
-        .unwrap_or_else(|| "unknown".to_string());
-    let model_loss = json
-        .get("model_loss_mean")
-        .map(Value::to_string)
-        .unwrap_or_else(|| "unknown".to_string());
-    let hardcoded_loss = json
-        .get("hardcoded_loss_mean")
-        .map(Value::to_string)
-        .unwrap_or_else(|| "null".to_string());
+    println!("  - {}", behavior);
     println!(
-        "      evaluation: samples={}, model_loss={}, hardcoded_loss={}, recommendation={}",
-        sample_count, model_loss, hardcoded_loss, recommendation
+        "      checkpoint: {} ({})",
+        checkpoint_path.display(),
+        if checkpoint_present { "present" } else { "missing" }
     );
-    if let Some(warnings) = json.get("warnings").and_then(Value::as_array) {
+    println!(
+        "      samples_seen: {}",
+        json_field(&metadata, "samples_seen").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      best_loss: {}",
+        json_field(&metadata, "best_loss").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      latest_eval_loss: {}",
+        json_field(&evaluation, "model_loss_mean").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      hardcoded_loss: {}",
+        json_field(&evaluation, "hardcoded_loss_mean").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      improvement_ratio: {}",
+        json_field(&evaluation, "improvement_ratio").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      current regime: {}",
+        configured
+            .map(|entry| format!("{:?}", entry.regime))
+            .unwrap_or_else(|| "unconfigured".to_string())
+    );
+    println!(
+        "      recommended regime: {}",
+        recommended_regime(behavior, evaluation.as_ref())
+    );
+    println!(
+        "      safety-critical? {}",
+        if is_safety_critical_behavior(behavior) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "      last metrics timestamp: {}",
+        latest_metric
+            .as_ref()
+            .and_then(|metric| json_field(&Some(metric.clone()), "t_ms"))
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+
+    if let Some(entry) = configured {
+        println!("      hardcoded: {}", entry.hardcoded);
+        println!("      model: {}", entry.model.as_deref().unwrap_or("none"));
+        println!("      fallback: {:?}", entry.fallback);
+    } else {
+        println!("      hardcoded: {}", behavior.default_hardcoded_id());
+        println!("      model: {}", behavior.default_model_id());
+        println!("      fallback: UseHardcoded");
+    }
+    if let Some(warnings) = evaluation
+        .as_ref()
+        .and_then(|json| json.get("warnings"))
+        .and_then(Value::as_array)
+    {
         for warning in warnings.iter().filter_map(Value::as_str) {
-            println!("      evaluation warning: {warning}");
+            println!("      warning: {warning}");
         }
     }
     Ok(())
 }
 
-fn print_metrics_summary(path: &Path) -> Result<()> {
+fn read_json_optional(path: &Path) -> Result<Option<Value>> {
     if !path.exists() {
-        println!("      metrics: missing");
-        return Ok(());
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+fn read_latest_metric(path: &Path) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
     }
     let text = fs::read_to_string(path)?;
-    let count = text.lines().filter(|line| !line.trim().is_empty()).count();
-    let latest = text.lines().rev().find(|line| !line.trim().is_empty());
-    println!("      metrics: {} records at {}", count, path.display());
-    if let Some(line) = latest {
-        match serde_json::from_str::<Value>(line) {
-            Ok(json) => {
-                let epoch = json
-                    .get("epoch")
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let train_loss = json
-                    .get("train_loss")
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "null".to_string());
-                let model_loss = json
-                    .get("model_loss")
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "null".to_string());
-                let hardcoded_loss = json
-                    .get("hardcoded_loss")
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "null".to_string());
-                println!(
-                    "      latest metric: epoch={}, train_loss={}, model_loss={}, hardcoded_loss={}",
-                    epoch, train_loss, model_loss, hardcoded_loss
-                );
-            }
-            Err(error) => println!("      latest metric: unreadable JSON: {error}"),
+    let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(line)?))
+}
+
+fn json_field(json: &Option<Value>, field: &str) -> Option<String> {
+    json.as_ref().and_then(|json| {
+        json.get(field).map(|value| match value {
+            Value::String(text) => text.clone(),
+            Value::Null => "null".to_string(),
+            other => other.to_string(),
+        })
+    })
+}
+
+fn recommended_regime(behavior: &TrainableBehavior, evaluation: Option<&Value>) -> String {
+    let recommendation = evaluation
+        .and_then(|json| json.get("recommendation"))
+        .and_then(Value::as_str);
+    match recommendation {
+        Some("promote_to_model_infer") if is_safety_critical_behavior(behavior) => {
+            "shadow_infer (model_infer blocked for safety-critical behavior)".to_string()
         }
+        Some("promote_to_model_infer") => "model_infer".to_string(),
+        Some("shadow_infer") => "shadow_infer".to_string(),
+        Some("shadow_train") => "shadow_train".to_string(),
+        Some("keep_hardcoded") => "hardcoded".to_string(),
+        Some("reject_checkpoint") => "hardcoded (reject checkpoint)".to_string(),
+        Some(other) => format!("unknown ({other})"),
+        None => "unknown".to_string(),
     }
-    Ok(())
+}
+
+fn is_safety_critical_behavior(behavior: &TrainableBehavior) -> bool {
+    matches!(
+        behavior,
+        TrainableBehavior::Danger
+            | TrainableBehavior::ActionValue
+            | TrainableBehavior::Experience
+            | TrainableBehavior::Future
+    )
 }
 
 fn print_model_directories(path: &Path) -> Result<()> {
