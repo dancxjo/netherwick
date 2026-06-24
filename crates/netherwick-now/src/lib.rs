@@ -57,6 +57,8 @@ pub struct PredictionSense {
     pub action_values_hardcoded: Vec<ActionValuePrediction>,
     pub eye_next_model: Option<EyePrediction>,
     pub eye_next_hardcoded: Option<EyePrediction>,
+    pub ear_next_model: Option<EarPrediction>,
+    pub ear_next_hardcoded: Option<EarPrediction>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -88,6 +90,15 @@ pub struct EyePrediction {
     pub width: u32,
     pub height: u32,
     pub rgb: Vec<u8>,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EarPrediction {
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub pcm: Vec<i16>,
+    pub features: Vec<f32>,
     pub confidence: f32,
 }
 

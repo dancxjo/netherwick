@@ -11,8 +11,9 @@ use burn::tensor::{activation, backend::AutodiffBackend, backend::Backend, Tenso
 use netherwick_behaviors::TrainingSample;
 use netherwick_experience::{
     ActionValueInput, ActionValueOutput, ActionValueTarget, ChargeInput, ChargeOutput,
-    ChargeTarget, DangerInput, DangerOutput, DangerTarget, EyeNextInput, EyeNextOutput,
-    EyeNextTarget, EYE_NEXT_HEIGHT, EYE_NEXT_RGB_LEN, EYE_NEXT_WIDTH,
+    ChargeTarget, DangerInput, DangerOutput, DangerTarget, EarNextInput, EarNextOutput,
+    EarNextTarget, EyeNextInput, EyeNextOutput, EyeNextTarget, EYE_NEXT_HEIGHT, EYE_NEXT_RGB_LEN,
+    EYE_NEXT_WIDTH,
 };
 use netherwick_now::Now;
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,22 @@ pub struct EyeNextShadowMetric {
     pub hardcoded: EyeNextOutput,
     pub model: EyeNextOutput,
     pub target: EyeNextTarget,
+    pub loss: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EarNextTrainStats {
+    pub loss: f32,
+    pub samples_seen: u64,
+    pub improved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EarNextShadowMetric {
+    pub observed_at_ms: u64,
+    pub hardcoded: EarNextOutput,
+    pub model: EarNextOutput,
+    pub target: EarNextTarget,
     pub loss: f32,
 }
 
@@ -331,6 +348,36 @@ impl NeuralModel<(EyeNextInput, Now), EyeNextOutput> for CopyCurrentEyePredictor
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CopyCurrentEarPredictor;
+
+impl CopyCurrentEarPredictor {
+    pub fn predict_from_now(&self, now: &Now, _input: &EarNextInput) -> EarNextOutput {
+        let Some(features) = netherwick_experience::ear_frame_features(now) else {
+            return EarNextOutput {
+                sample_rate_hz: 0,
+                channels: 0,
+                pcm: Vec::new(),
+                features: Vec::new(),
+                confidence: 0.0,
+            };
+        };
+        EarNextOutput {
+            sample_rate_hz: 0,
+            channels: 0,
+            pcm: Vec::new(),
+            features,
+            confidence: 0.75,
+        }
+    }
+}
+
+impl NeuralModel<(EarNextInput, Now), EarNextOutput> for CopyCurrentEarPredictor {
+    fn predict(&self, input: (EarNextInput, Now)) -> Result<EarNextOutput> {
+        Ok(self.predict_from_now(&input.1, &input.0))
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct DangerNet<B: Backend> {
     input: Linear<B>,
@@ -354,6 +401,13 @@ pub struct ActionValueNet<B: Backend> {
 
 #[derive(Module, Debug)]
 pub struct EyeNextNet<B: Backend> {
+    input: Linear<B>,
+    hidden: Linear<B>,
+    output: Linear<B>,
+}
+
+#[derive(Module, Debug)]
+pub struct EarNextNet<B: Backend> {
     input: Linear<B>,
     hidden: Linear<B>,
     output: Linear<B>,
@@ -423,6 +477,22 @@ impl<B: Backend> EyeNextNet<B> {
     }
 }
 
+impl<B: Backend> EarNextNet<B> {
+    pub fn init(input_dim: usize, output_dim: usize, device: &B::Device) -> Self {
+        Self {
+            input: LinearConfig::new(input_dim, 64).init(device),
+            hidden: LinearConfig::new(64, 64).init(device),
+            output: LinearConfig::new(64, output_dim).init(device),
+        }
+    }
+
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let x = activation::relu(self.input.forward(input));
+        let x = activation::relu(self.hidden.forward(x));
+        activation::sigmoid(self.output.forward(x))
+    }
+}
+
 pub type DangerBackend = NdArray<f32>;
 pub type DangerAutodiffBackend = Autodiff<DangerBackend>;
 pub type ChargeBackend = NdArray<f32>;
@@ -431,6 +501,8 @@ pub type ActionValueBackend = NdArray<f32>;
 pub type ActionValueAutodiffBackend = Autodiff<ActionValueBackend>;
 pub type EyeNextBackend = NdArray<f32>;
 pub type EyeNextAutodiffBackend = Autodiff<EyeNextBackend>;
+pub type EarNextBackend = NdArray<f32>;
+pub type EarNextAutodiffBackend = Autodiff<EarNextBackend>;
 
 pub struct DangerNetTrainer<B: AutodiffBackend = DangerAutodiffBackend> {
     model: DangerNet<B>,
@@ -475,6 +547,19 @@ pub struct EyeNextNetTrainer<B: AutodiffBackend = EyeNextAutodiffBackend> {
     best_loss: Option<f32>,
 }
 
+pub struct EarNextNetTrainer<B: AutodiffBackend = EarNextAutodiffBackend> {
+    model: EarNextNet<B>,
+    optimizer: OptimizerAdaptor<Sgd<B::InnerBackend>, EarNextNet<B>, B>,
+    device: B::Device,
+    input_dim: usize,
+    output_dim: usize,
+    sample_rate_hz: u32,
+    channels: u16,
+    learning_rate: f64,
+    samples_seen: u64,
+    best_loss: Option<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DangerModelMetadata {
     pub input_dim: usize,
@@ -505,6 +590,17 @@ pub struct EyeNextModelMetadata {
     pub output_dim: usize,
     pub width: u32,
     pub height: u32,
+    pub samples_seen: u64,
+    pub best_loss: Option<f32>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EarNextModelMetadata {
+    pub input_dim: usize,
+    pub output_dim: usize,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
     pub samples_seen: u64,
     pub best_loss: Option<f32>,
     pub created_at_ms: u64,
@@ -1164,6 +1260,200 @@ impl<B: AutodiffBackend> EyeNextNetTrainer<B> {
     }
 }
 
+impl EarNextNetTrainer<EarNextAutodiffBackend> {
+    pub fn new(input_dim: usize, output_dim: usize) -> Self {
+        Self::with_device(input_dim, output_dim, 0, 0, Default::default())
+    }
+
+    pub fn with_audio_shape(
+        input_dim: usize,
+        output_dim: usize,
+        sample_rate_hz: u32,
+        channels: u16,
+    ) -> Self {
+        Self::with_device(
+            input_dim,
+            output_dim,
+            sample_rate_hz,
+            channels,
+            Default::default(),
+        )
+    }
+
+    pub fn load_checkpoint(path: impl AsRef<Path>, input_dim: usize) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_ear_next_metadata(path)?;
+        if metadata.input_dim != input_dim {
+            return Err(anyhow!(
+                "ear-next checkpoint input dimension mismatch at {}: metadata has {}, runtime expected {}",
+                path.display(),
+                metadata.input_dim,
+                input_dim
+            ));
+        }
+
+        let device = Default::default();
+        let model = EarNextNet::init(input_dim, metadata.output_dim, &device).load_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+            &device,
+        )?;
+        Ok(Self {
+            model,
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            output_dim: metadata.output_dim,
+            sample_rate_hz: metadata.sample_rate_hz,
+            channels: metadata.channels,
+            learning_rate: 0.01,
+            samples_seen: metadata.samples_seen,
+            best_loss: metadata.best_loss,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> EarNextNetTrainer<B> {
+    pub fn with_device(
+        input_dim: usize,
+        output_dim: usize,
+        sample_rate_hz: u32,
+        channels: u16,
+        device: B::Device,
+    ) -> Self {
+        Self {
+            model: EarNextNet::init(input_dim, output_dim, &device),
+            optimizer: SgdConfig::new().init(),
+            device,
+            input_dim,
+            output_dim,
+            sample_rate_hz,
+            channels,
+            learning_rate: 0.01,
+            samples_seen: 0,
+            best_loss: None,
+        }
+    }
+
+    pub fn input_dim(&self) -> usize {
+        self.input_dim
+    }
+
+    pub fn output_dim(&self) -> usize {
+        self.output_dim
+    }
+
+    pub fn samples_seen(&self) -> u64 {
+        self.samples_seen
+    }
+
+    pub fn best_loss(&self) -> Option<f32> {
+        self.best_loss
+    }
+
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create ear-next checkpoint dir {}", path.display()))?;
+        self.model.clone().save_file(
+            path.join("model"),
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+        )?;
+        let metadata = EarNextModelMetadata {
+            input_dim: self.input_dim,
+            output_dim: self.output_dim,
+            sample_rate_hz: self.sample_rate_hz,
+            channels: self.channels,
+            samples_seen: self.samples_seen,
+            best_loss: self.best_loss,
+            created_at_ms: now_ms(),
+        };
+        std::fs::write(
+            path.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )
+        .with_context(|| format!("write ear-next checkpoint metadata {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn predict(&self, input: &EarNextInput) -> Result<EarNextOutput> {
+        let features = self.checked_features(input)?;
+        let tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let output = self.model.forward(tensor).inner();
+        tensor_to_ear_next_output(output, self.output_dim, self.sample_rate_hz, self.channels)
+    }
+
+    pub fn train_step(
+        &mut self,
+        input: &EarNextInput,
+        target: &EarNextTarget,
+    ) -> Result<EarNextTrainStats> {
+        let features = self.checked_features(input)?;
+        let target_values = ear_target_train_values(target, self.output_dim);
+        let input_tensor =
+            Tensor::<B, 2>::from_data(TensorData::new(features, [1, self.input_dim]), &self.device);
+        let target_tensor = Tensor::<B, 2>::from_data(
+            TensorData::new(target_values, [1, self.output_dim]),
+            &self.device,
+        );
+        let output = self.model.forward(input_tensor);
+        let loss = MseLoss::new().forward(output, target_tensor, Reduction::Mean);
+        let loss_value = loss.clone().inner().into_data().to_vec::<f32>()?[0];
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &self.model);
+        self.model = self
+            .optimizer
+            .step(self.learning_rate, self.model.clone(), grads);
+        self.samples_seen = self.samples_seen.saturating_add(1);
+        let improved = self.best_loss.map(|best| loss_value < best).unwrap_or(true);
+        if improved {
+            self.best_loss = Some(loss_value);
+        }
+        Ok(EarNextTrainStats {
+            loss: loss_value,
+            samples_seen: self.samples_seen,
+            improved,
+        })
+    }
+
+    pub fn shadow_compare(
+        &mut self,
+        observed_at_ms: u64,
+        now: &Now,
+        input: &EarNextInput,
+        target: &EarNextTarget,
+    ) -> Result<EarNextShadowMetric> {
+        let hardcoded = CopyCurrentEarPredictor.predict_from_now(now, input);
+        let model = self.predict(input)?;
+        let loss = mse_ear_next_output_target(&model, target);
+        Ok(EarNextShadowMetric {
+            observed_at_ms,
+            hardcoded,
+            model,
+            target: target.clone(),
+            loss,
+        })
+    }
+
+    fn checked_features(&self, input: &EarNextInput) -> Result<Vec<f32>> {
+        let mut features = input.flat_features();
+        if features.len() != self.input_dim {
+            return Err(anyhow!(
+                "ear-next input dimension mismatch: got {}, expected {}",
+                features.len(),
+                self.input_dim
+            ));
+        }
+        for value in &mut features {
+            if !value.is_finite() {
+                *value = 0.0;
+            }
+        }
+        Ok(features)
+    }
+}
+
 pub fn read_danger_metadata(path: impl AsRef<Path>) -> Result<DangerModelMetadata> {
     let path = path.as_ref();
     let bytes = std::fs::read(path.join("metadata.json"))
@@ -1194,6 +1484,14 @@ pub fn read_eye_next_metadata(path: impl AsRef<Path>) -> Result<EyeNextModelMeta
         .with_context(|| format!("read eye-next checkpoint metadata {}", path.display()))?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse eye-next checkpoint metadata {}", path.display()))
+}
+
+pub fn read_ear_next_metadata(path: impl AsRef<Path>) -> Result<EarNextModelMetadata> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path.join("metadata.json"))
+        .with_context(|| format!("read ear-next checkpoint metadata {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse ear-next checkpoint metadata {}", path.display()))
 }
 
 fn now_ms() -> u64 {
@@ -1255,6 +1553,20 @@ impl<B: AutodiffBackend> OnlineTrainer<EyeNextInput, EyeNextTarget> for EyeNextN
         sample: TrainingSample<EyeNextInput, EyeNextTarget>,
     ) -> Result<TrainStats> {
         let stats = EyeNextNetTrainer::train_step(self, &sample.input, &sample.expected)?;
+        Ok(TrainStats {
+            loss: stats.loss,
+            samples_seen: stats.samples_seen,
+            improved: stats.improved,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> OnlineTrainer<EarNextInput, EarNextTarget> for EarNextNetTrainer<B> {
+    fn train_step(
+        &mut self,
+        sample: TrainingSample<EarNextInput, EarNextTarget>,
+    ) -> Result<TrainStats> {
+        let stats = EarNextNetTrainer::train_step(self, &sample.input, &sample.expected)?;
         Ok(TrainStats {
             loss: stats.loss,
             samples_seen: stats.samples_seen,
@@ -1335,6 +1647,32 @@ fn tensor_to_eye_next_output<B: Backend>(
     })
 }
 
+fn tensor_to_ear_next_output<B: Backend>(
+    tensor: Tensor<B, 2>,
+    output_dim: usize,
+    sample_rate_hz: u32,
+    channels: u16,
+) -> Result<EarNextOutput> {
+    let values = tensor.into_data().to_vec::<f32>()?;
+    if values.len() != output_dim {
+        return Err(anyhow!(
+            "ear-next net emitted {} outputs, expected {}",
+            values.len(),
+            output_dim
+        ));
+    }
+    Ok(EarNextOutput {
+        sample_rate_hz,
+        channels,
+        pcm: Vec::new(),
+        features: values
+            .into_iter()
+            .map(|value| value.clamp(0.0, 1.0))
+            .collect(),
+        confidence: 0.5,
+    })
+}
+
 fn charge_target_train_values(target: &ChargeTarget) -> [f32; 3] {
     [
         target.charging_started.clamp(0.0, 1.0),
@@ -1356,6 +1694,17 @@ fn eye_target_train_values(target: &EyeNextTarget, output_dim: usize) -> Vec<f32
         .iter()
         .take(output_dim)
         .map(|byte| *byte as f32 / 255.0)
+        .collect::<Vec<_>>();
+    values.resize(output_dim, 0.0);
+    values
+}
+
+fn ear_target_train_values(target: &EarNextTarget, output_dim: usize) -> Vec<f32> {
+    let mut values = target
+        .features
+        .iter()
+        .take(output_dim)
+        .map(|value| value.clamp(0.0, 1.0))
         .collect::<Vec<_>>();
     values.resize(output_dim, 0.0);
     values
@@ -1410,6 +1759,22 @@ fn mse_eye_next_output_target(output: &EyeNextOutput, target: &EyeNextTarget) ->
         / len as f32
 }
 
+fn mse_ear_next_output_target(output: &EarNextOutput, target: &EarNextTarget) -> f32 {
+    let len = output.features.len().max(target.features.len());
+    if len == 0 {
+        return 0.0;
+    }
+    (0..len)
+        .map(|idx| {
+            let actual = output.features.get(idx).copied().unwrap_or_default();
+            let expected = target.features.get(idx).copied().unwrap_or_default();
+            let delta = actual - expected;
+            delta * delta
+        })
+        .sum::<f32>()
+        / len as f32
+}
+
 pub const MODEL_REGISTRY: &[&str] = &[
     "ExperienceEncoder",
     "ExperienceDecoder",
@@ -1433,8 +1798,8 @@ mod tests {
     use netherwick_actions::ActionPrimitive;
     use netherwick_body::BodySense;
     use netherwick_experience::{
-        ActionValueInput, ActionValueTarget, ChargeInput, ChargeTarget, DangerInput, EyeNextInput,
-        EyeNextTarget,
+        ActionValueInput, ActionValueTarget, ChargeInput, ChargeTarget, DangerInput, EarNextInput,
+        EarNextTarget, EyeNextInput, EyeNextTarget,
     };
 
     #[test]
@@ -1661,6 +2026,64 @@ mod tests {
         assert_eq!(output.width, 4);
         assert_eq!(output.height, 4);
         assert_eq!(output.rgb.len(), 4 * 4 * 3);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn copy_current_ear_predictor_returns_current_features() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.ear.features = vec![vec![0.2, 0.4], vec![0.6, 0.8]];
+        let input =
+            EarNextInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Stop), &now, 100);
+
+        let output = CopyCurrentEarPredictor.predict_from_now(&now, &input);
+
+        assert_eq!(output.features, vec![0.2, 0.4, 0.6, 0.8]);
+        assert!(output.pcm.is_empty());
+        assert!(output.confidence > 0.0);
+    }
+
+    #[test]
+    fn ear_next_net_forward_returns_bounded_features() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        let input =
+            EarNextInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Stop), &now, 100);
+        let trainer = EarNextNetTrainer::new(input.flat_features().len(), 4);
+
+        let output = trainer.predict(&input).unwrap();
+
+        assert_eq!(output.features.len(), 4);
+        assert!(output
+            .features
+            .iter()
+            .all(|value| (0.0..=1.0).contains(value)));
+    }
+
+    #[test]
+    fn ear_next_checkpoint_round_trips_prediction_shape() {
+        let dir = std::env::temp_dir().join(format!("netherwick-ear-next-checkpoint-{}", now_ms()));
+        let mut now = Now::blank(1, BodySense::default());
+        now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        let input =
+            EarNextInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Stop), &now, 100);
+        let mut trainer = EarNextNetTrainer::new(input.flat_features().len(), 4);
+        let target = EarNextTarget {
+            features: vec![0.1, 0.3, 0.5, 0.7],
+            ..EarNextTarget::default()
+        };
+        trainer.train_step(&input, &target).unwrap();
+
+        trainer.save_checkpoint(&dir).unwrap();
+        let loaded = EarNextNetTrainer::load_checkpoint(&dir, input.flat_features().len()).unwrap();
+        let output = loaded.predict(&input).unwrap();
+
+        assert!(dir.join("model.bin").exists());
+        assert!(dir.join("metadata.json").exists());
+        assert_eq!(loaded.samples_seen(), 1);
+        assert_eq!(output.features.len(), 4);
+        assert!(output.pcm.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }

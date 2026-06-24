@@ -355,6 +355,65 @@ pub struct EyeNextTarget {
     pub rgb: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EarNextInput {
+    pub z: Vec<f32>,
+    pub action_features: Vec<f32>,
+    pub ear_features: Vec<f32>,
+    pub body_features: Vec<f32>,
+    pub offset_ms: TimeMs,
+}
+
+impl EarNextInput {
+    pub fn from_parts(
+        z: Vec<f32>,
+        action: Option<&ActionPrimitive>,
+        now: &Now,
+        offset_ms: TimeMs,
+    ) -> Self {
+        Self {
+            z,
+            action_features: danger_action_features(action),
+            ear_features: ear_next_features(now),
+            body_features: action_value_body_features(now),
+            offset_ms,
+        }
+    }
+
+    pub fn flat_features(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(
+            self.z.len()
+                + self.action_features.len()
+                + self.ear_features.len()
+                + self.body_features.len()
+                + 1,
+        );
+        out.extend(self.z.iter().copied().map(sanitize_feature));
+        out.extend(self.action_features.iter().copied().map(sanitize_feature));
+        out.extend(self.ear_features.iter().copied().map(sanitize_feature));
+        out.extend(self.body_features.iter().copied().map(sanitize_feature));
+        out.push((self.offset_ms as f32 / 5_000.0).clamp(0.0, 1.0));
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EarNextOutput {
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub pcm: Vec<i16>,
+    pub features: Vec<f32>,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EarNextTarget {
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub pcm: Vec<i16>,
+    pub features: Vec<f32>,
+}
+
 pub fn eye_next_input_from_transition_like(
     before_z: &ExperienceLatent,
     action: Option<&ActionPrimitive>,
@@ -366,6 +425,25 @@ pub fn eye_next_input_from_transition_like(
 
 pub fn eye_next_target_from_now(after: &Now) -> Option<EyeNextTarget> {
     eye_frame_rgb(after).map(|(width, height, rgb)| EyeNextTarget { width, height, rgb })
+}
+
+pub fn ear_next_input_from_transition_like(
+    before_z: &ExperienceLatent,
+    action: Option<&ActionPrimitive>,
+    before: &Now,
+    offset_ms: TimeMs,
+) -> EarNextInput {
+    EarNextInput::from_parts(before_z.z.clone(), action, before, offset_ms)
+}
+
+pub fn ear_next_target_from_now(after: &Now) -> Option<EarNextTarget> {
+    let features = ear_frame_features(after)?;
+    Some(EarNextTarget {
+        sample_rate_hz: 0,
+        channels: 0,
+        pcm: Vec::new(),
+        features,
+    })
 }
 
 pub fn eye_frame_rgb(now: &Now) -> Option<(u32, u32, Vec<u8>)> {
@@ -389,6 +467,21 @@ pub fn eye_frame_rgb(now: &Now) -> Option<(u32, u32, Vec<u8>)> {
         }
     }
     Some((EYE_NEXT_WIDTH, EYE_NEXT_HEIGHT, rgb))
+}
+
+pub fn ear_frame_features(now: &Now) -> Option<Vec<f32>> {
+    if now.ear.features.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for feature in &now.ear.features {
+        out.extend(feature.iter().copied().map(sanitize_feature));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 pub fn action_value_input_from_transition_like(
@@ -1002,6 +1095,23 @@ fn eye_next_features(now: &Now) -> Vec<f32> {
     for part in frame.chunks(chunk).take(16) {
         let avg = part.iter().copied().map(sanitize_feature).sum::<f32>() / part.len() as f32;
         out.push(avg.clamp(0.0, 1.0));
+    }
+    out.resize(16, 0.0);
+    out
+}
+
+fn ear_next_features(now: &Now) -> Vec<f32> {
+    let Some(features) = ear_frame_features(now) else {
+        return vec![0.0; 16];
+    };
+    if features.is_empty() {
+        return vec![0.0; 16];
+    }
+    let mut out = Vec::with_capacity(16);
+    let chunk = (features.len() / 16).max(1);
+    for part in features.chunks(chunk).take(16) {
+        let avg = part.iter().copied().map(sanitize_feature).sum::<f32>() / part.len() as f32;
+        out.push(avg.clamp(-1.0, 1.0));
     }
     out.resize(16, 0.0);
     out

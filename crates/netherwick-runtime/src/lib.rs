@@ -22,9 +22,10 @@ use netherwick_events::{
 use netherwick_experience::{
     action_value_input_from_transition_like, charge_input_from_transition_like,
     charge_target_from_transition_like, danger_input_from_transition_like,
-    danger_target_from_transition_like, eye_next_input_from_transition_like,
-    eye_next_target_from_now, ActionValueInput, ActionValueOutput, BaselineRewardComputer,
-    BaselineSurpriseComputer, ChargeInput, ChargeOutput, DangerInput, DangerOutput, Experience,
+    danger_target_from_transition_like, ear_next_input_from_transition_like,
+    ear_next_target_from_now, eye_next_input_from_transition_like, eye_next_target_from_now,
+    ActionValueInput, ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer,
+    ChargeInput, ChargeOutput, DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience,
     ExperienceEncoder, ExperienceLatent, EyeNextInput, EyeNextOutput, FeatureExperienceEncoder,
     FuturePrediction, FuturePredictor, Impression, RewardComputer, Sensation,
     StasisFuturePredictor, SurpriseComputer,
@@ -35,14 +36,14 @@ use netherwick_ledger::{
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
 use netherwick_models::{
-    read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_eye_next_metadata,
-    ActionValueNetTrainer, ChargeNetTrainer, CopyCurrentEyePredictor, DangerNetTrainer,
-    EyeNextNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
-    HardcodedDangerPredictor,
+    read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
+    read_eye_next_metadata, ActionValueNetTrainer, ChargeNetTrainer, CopyCurrentEarPredictor,
+    CopyCurrentEyePredictor, DangerNetTrainer, EarNextNetTrainer, EyeNextNetTrainer,
+    HardcodedActionValuePredictor, HardcodedChargePredictor, HardcodedDangerPredictor,
 };
 use netherwick_now::{
-    ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EyePrediction, Now,
-    ReignSense, SafetySense,
+    ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
+    EyePrediction, Now, ReignSense, SafetySense,
 };
 use netherwick_sensors::World;
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
@@ -135,11 +136,27 @@ impl RuntimeModelStack {
         Ok(stack)
     }
 
+    pub fn with_ear_next_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = read_ear_next_metadata(path)?;
+        let mut stack = Self::default();
+        stack.behaviors.ear_next = ear_next_behavior(
+            BehaviorRegime::ShadowInfer,
+            Some(EarNextNetTrainer::load_checkpoint(
+                path,
+                metadata.input_dim,
+            )?),
+            FallbackPolicy::UseHardcoded,
+        );
+        Ok(stack)
+    }
+
     pub fn with_shadow_checkpoints(
         danger_path: Option<&Path>,
         charge_path: Option<&Path>,
         action_value_path: Option<&Path>,
         eye_next_path: Option<&Path>,
+        ear_next_path: Option<&Path>,
     ) -> Result<Self> {
         let mut stack = Self::default();
         if let Some(path) = danger_path {
@@ -174,6 +191,17 @@ impl RuntimeModelStack {
             stack.behaviors.eye_next = eye_next_behavior(
                 BehaviorRegime::ShadowInfer,
                 Some(EyeNextNetTrainer::load_checkpoint(
+                    path,
+                    metadata.input_dim,
+                )?),
+                FallbackPolicy::UseHardcoded,
+            );
+        }
+        if let Some(path) = ear_next_path {
+            let metadata = read_ear_next_metadata(path)?;
+            stack.behaviors.ear_next = ear_next_behavior(
+                BehaviorRegime::ShadowInfer,
+                Some(EarNextNetTrainer::load_checkpoint(
                     path,
                     metadata.input_dim,
                 )?),
@@ -221,6 +249,13 @@ impl RuntimeModelStack {
                 behavior.fallback,
             );
         }
+        if let Some(behavior) = config.behavior.get("ear_next") {
+            stack.behaviors.ear_next = ear_next_behavior(
+                behavior.regime,
+                load_ear_next_behavior_trainer(behavior)?,
+                behavior.fallback,
+            );
+        }
         Ok(stack)
     }
 }
@@ -231,6 +266,7 @@ pub struct BehaviorRegistry {
     pub future: ReplaceableBehavior<FutureInput, FuturePrediction>,
     pub action_value: ReplaceableBehavior<SituatedActionValueInput, ActionValueOutput>,
     pub eye_next: ReplaceableBehavior<SituatedEyeNextInput, EyeNextOutput>,
+    pub ear_next: ReplaceableBehavior<SituatedEarNextInput, EarNextOutput>,
 }
 
 impl Default for BehaviorRegistry {
@@ -257,6 +293,11 @@ impl Default for BehaviorRegistry {
                 None,
                 FallbackPolicy::UseHardcoded,
             ),
+            ear_next: ear_next_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
         }
     }
 }
@@ -270,6 +311,8 @@ pub struct BehaviorTrainingHub {
         Box<dyn TargetExtractor<ExperienceTransition, ActionValueInput, ActionValueOutput>>,
     pub eye_next_extractor:
         Box<dyn TargetExtractor<ExperienceTransition, EyeNextInput, EyeNextOutput>>,
+    pub ear_next_extractor:
+        Box<dyn TargetExtractor<ExperienceTransition, EarNextInput, EarNextOutput>>,
 }
 
 impl Default for BehaviorTrainingHub {
@@ -280,6 +323,7 @@ impl Default for BehaviorTrainingHub {
             future_extractor: Box::new(FutureTargetExtractor { offset_ms: 1_000 }),
             action_value_extractor: Box::new(ActionValueTargetExtractor),
             eye_next_extractor: Box::new(EyeNextTargetExtractor { offset_ms: 100 }),
+            ear_next_extractor: Box::new(EarNextTargetExtractor { offset_ms: 100 }),
         }
     }
 }
@@ -451,6 +495,41 @@ impl TargetExtractor<ExperienceTransition, EyeNextInput, EyeNextOutput> for EyeN
     }
 }
 
+pub struct EarNextTargetExtractor {
+    pub offset_ms: TimeMs,
+}
+
+impl TargetExtractor<ExperienceTransition, EarNextInput, EarNextOutput> for EarNextTargetExtractor {
+    fn extract(
+        &self,
+        transition: &ExperienceTransition,
+    ) -> Result<Option<TrainingSample<EarNextInput, EarNextOutput>>> {
+        let Some(target) = ear_next_target_from_now(&transition.after) else {
+            return Ok(None);
+        };
+        Ok(Some(TrainingSample {
+            input: ear_next_input_from_transition_like(
+                &transition.before_z,
+                transition.action.as_ref(),
+                &transition.before,
+                self.offset_ms,
+            ),
+            expected: EarNextOutput {
+                sample_rate_hz: target.sample_rate_hz,
+                channels: target.channels,
+                pcm: target.pcm,
+                features: target.features,
+                confidence: 1.0,
+            },
+            actual: None,
+            reward: Some(transition.reward.value),
+            weight: 1.0,
+            source: TrainingSource::WorldOutcome,
+            t_ms: transition.created_at_ms,
+        }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SituatedDangerInput {
     pub input: DangerInput,
@@ -472,6 +551,12 @@ pub struct SituatedActionValueInput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SituatedEyeNextInput {
     pub input: EyeNextInput,
+    pub now: Now,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SituatedEarNextInput {
+    pub input: EarNextInput,
     pub now: Now,
 }
 
@@ -639,6 +724,46 @@ impl FunctionBehavior<SituatedEyeNextInput, EyeNextOutput> for EyeNextModelBehav
     }
 }
 
+struct HardcodedEarNextBehavior;
+
+impl FunctionBehavior<SituatedEarNextInput, EarNextOutput> for HardcodedEarNextBehavior {
+    fn id(&self) -> &'static str {
+        "ear.copy_current"
+    }
+
+    fn infer(&mut self, input: &SituatedEarNextInput) -> Result<EarNextOutput> {
+        Ok(CopyCurrentEarPredictor.predict_from_now(&input.now, &input.input))
+    }
+}
+
+struct EarNextModelBehavior {
+    trainer: EarNextNetTrainer,
+}
+
+impl FunctionBehavior<SituatedEarNextInput, EarNextOutput> for EarNextModelBehavior {
+    fn id(&self) -> &'static str {
+        "ear.burn.next_v0"
+    }
+
+    fn infer(&mut self, input: &SituatedEarNextInput) -> Result<EarNextOutput> {
+        self.trainer.predict(&input.input)
+    }
+
+    fn observe(
+        &mut self,
+        sample: &TrainingSample<SituatedEarNextInput, EarNextOutput>,
+    ) -> Result<()> {
+        let target = netherwick_experience::EarNextTarget {
+            sample_rate_hz: sample.expected.sample_rate_hz,
+            channels: sample.expected.channels,
+            pcm: sample.expected.pcm.clone(),
+            features: sample.expected.features.clone(),
+        };
+        self.trainer.train_step(&sample.input.input, &target)?;
+        Ok(())
+    }
+}
+
 struct StasisFutureBehavior {
     predictor: StasisFuturePredictor,
 }
@@ -725,6 +850,20 @@ fn eye_next_behavior(
     )
 }
 
+fn ear_next_behavior(
+    regime: BehaviorRegime,
+    trainer: Option<EarNextNetTrainer>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<SituatedEarNextInput, EarNextOutput> {
+    ReplaceableBehavior::new(
+        "ear_next",
+        regime,
+        Box::new(HardcodedEarNextBehavior),
+        trainer.map(|trainer| Box::new(EarNextModelBehavior { trainer }) as Box<_>),
+        fallback,
+    )
+}
+
 fn load_danger_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<DangerNetTrainer>> {
     let Some(checkpoint) = behavior.checkpoint.as_deref() else {
         return Ok(None);
@@ -783,6 +922,20 @@ fn load_eye_next_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<Ey
     )?))
 }
 
+fn load_ear_next_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<EarNextNetTrainer>> {
+    let Some(checkpoint) = behavior.checkpoint.as_deref() else {
+        return Ok(None);
+    };
+    if !Path::new(checkpoint).exists() {
+        return Ok(None);
+    }
+    let metadata = read_ear_next_metadata(checkpoint)?;
+    Ok(Some(EarNextNetTrainer::load_checkpoint(
+        checkpoint,
+        metadata.input_dim,
+    )?))
+}
+
 fn danger_behavior_input(
     now: &Now,
     latent: &ExperienceLatent,
@@ -836,6 +989,18 @@ fn eye_next_behavior_input(
     }
 }
 
+fn ear_next_behavior_input(
+    now: &Now,
+    latent: &ExperienceLatent,
+    action: Option<&ActionPrimitive>,
+    offset_ms: TimeMs,
+) -> SituatedEarNextInput {
+    SituatedEarNextInput {
+        input: EarNextInput::from_parts(latent.z.clone(), action, now, offset_ms),
+        now: now.clone(),
+    }
+}
+
 fn danger_disagreement(left: &DangerOutput, right: &DangerOutput) -> f32 {
     let deltas = [
         (left.bump_risk - right.bump_risk).abs(),
@@ -868,6 +1033,21 @@ fn eye_next_disagreement(left: &EyeNextOutput, right: &EyeNextOutput) -> f32 {
         .map(|idx| {
             let left = left.rgb.get(idx).copied().unwrap_or_default() as f32 / 255.0;
             let right = right.rgb.get(idx).copied().unwrap_or_default() as f32 / 255.0;
+            (left - right).abs()
+        })
+        .sum::<f32>()
+        / len as f32
+}
+
+fn ear_next_disagreement(left: &EarNextOutput, right: &EarNextOutput) -> f32 {
+    let len = left.features.len().max(right.features.len());
+    if len == 0 {
+        return 0.0;
+    }
+    (0..len)
+        .map(|idx| {
+            let left = left.features.get(idx).copied().unwrap_or_default();
+            let right = right.features.get(idx).copied().unwrap_or_default();
             (left - right).abs()
         })
         .sum::<f32>()
@@ -1265,6 +1445,27 @@ where
         }
         behavior_runs.push(eye_next_record.erase());
 
+        let ear_next_input = ear_next_behavior_input(&now, &latent, Some(&chosen_action), 100);
+        let ear_next_run = self
+            .models
+            .behaviors
+            .ear_next
+            .infer(&ear_next_input, now.t_ms)?;
+        let mut ear_next_record = ear_next_run.record;
+        if let (Some(hard), Some(model)) = (
+            ear_next_record.hardcoded_output.as_ref(),
+            ear_next_record.model_output.as_ref(),
+        ) {
+            ear_next_record.disagreement = Some(ear_next_disagreement(hard, model));
+        }
+        if let Some(model) = ear_next_record.model_output.as_ref() {
+            now.predictions.ear_next_model = Some(ear_prediction(model));
+        }
+        if let Some(hardcoded) = ear_next_record.hardcoded_output.as_ref() {
+            now.predictions.ear_next_hardcoded = Some(ear_prediction(hardcoded));
+        }
+        behavior_runs.push(ear_next_record.erase());
+
         let safety = self
             .safety
             .filter(&now, action_to_motor_command(Some(&chosen_action)));
@@ -1458,6 +1659,16 @@ fn eye_prediction(output: &EyeNextOutput) -> EyePrediction {
         width: output.width,
         height: output.height,
         rgb: output.rgb.clone(),
+        confidence: output.confidence,
+    }
+}
+
+fn ear_prediction(output: &EarNextOutput) -> EarPrediction {
+    EarPrediction {
+        sample_rate_hz: output.sample_rate_hz,
+        channels: output.channels,
+        pcm: output.pcm.clone(),
+        features: output.features.clone(),
         confidence: output.confidence,
     }
 }
@@ -1858,7 +2069,9 @@ mod tests {
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_memory::InMemoryExperienceStore;
-    use netherwick_models::{ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer};
+    use netherwick_models::{
+        ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
+    };
     use netherwick_now::{Now, SurpriseSense};
     use netherwick_sensors::World;
     use netherwick_sim::{ArenaConfig, SimObject, VirtualWorld};
@@ -2065,7 +2278,14 @@ mod tests {
             .await
             .unwrap();
 
-        for behavior_id in ["danger", "charge", "future", "action_value", "eye_next"] {
+        for behavior_id in [
+            "danger",
+            "charge",
+            "future",
+            "action_value",
+            "eye_next",
+            "ear_next",
+        ] {
             assert!(
                 tick.frame
                     .behavior_runs
@@ -2093,6 +2313,7 @@ mod tests {
         after.body.battery_level = 0.55;
         after.body.charging = true;
         after.eye.frames = vec![vec![0.25, 0.5, 0.75]];
+        after.ear.features = vec![vec![0.2, 0.4], vec![0.6, 0.8]];
         let transition = ExperienceTransition {
             id: Uuid::new_v4(),
             before_frame_id: Uuid::new_v4(),
@@ -2150,6 +2371,46 @@ mod tests {
         assert_eq!(eye_next.expected.width, 64);
         assert_eq!(eye_next.expected.height, 48);
         assert_eq!(eye_next.expected.rgb.len(), 64 * 48 * 3);
+
+        let ear_next = EarNextTargetExtractor { offset_ms: 100 }
+            .extract(&transition)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ear_next.source, TrainingSource::WorldOutcome);
+        assert_eq!(ear_next.expected.features, vec![0.2, 0.4, 0.6, 0.8]);
+        assert!(ear_next.expected.pcm.is_empty());
+    }
+
+    #[test]
+    fn ear_next_target_extractor_skips_missing_ear_frame() {
+        let before = Now::blank(100, test_body(1.0, 1.0, 0.0, 100));
+        let mut after = before.clone();
+        after.t_ms = 200;
+        let transition = ExperienceTransition {
+            id: Uuid::new_v4(),
+            before_frame_id: Uuid::new_v4(),
+            before,
+            before_z: ExperienceLatent {
+                t_ms: 100,
+                z: vec![0.1, 0.2],
+                reconstruction_error: 0.0,
+                prediction_error: 0.0,
+                confidence: 0.8,
+            },
+            action: Some(ActionPrimitive::Stop),
+            predicted_futures: Vec::new(),
+            after,
+            after_z: ExperienceLatent::default(),
+            reward: Reward { value: 0.0 },
+            surprise: SurpriseSense::default(),
+            created_at_ms: 200,
+        };
+
+        let sample = EarNextTargetExtractor { offset_ms: 100 }
+            .extract(&transition)
+            .unwrap();
+
+        assert!(sample.is_none());
     }
 
     #[test]
@@ -2198,17 +2459,26 @@ mod tests {
                 100,
             )
             .unwrap();
+        let ear_next = registry
+            .ear_next
+            .infer(
+                &ear_next_behavior_input(&now, &latent, Some(&action), 100),
+                100,
+            )
+            .unwrap();
 
         assert_eq!(danger.record.behavior_id, "danger");
         assert_eq!(charge.record.behavior_id, "charge");
         assert_eq!(future.record.behavior_id, "future");
         assert_eq!(action_value.record.behavior_id, "action_value");
         assert_eq!(eye_next.record.behavior_id, "eye_next");
+        assert_eq!(ear_next.record.behavior_id, "ear_next");
         assert!(danger.record.hardcoded_output.is_some());
         assert!(charge.record.hardcoded_output.is_some());
         assert!(future.record.hardcoded_output.is_some());
         assert!(action_value.record.hardcoded_output.is_some());
         assert!(eye_next.record.hardcoded_output.is_some());
+        assert!(ear_next.record.hardcoded_output.is_some());
     }
 
     #[test]
@@ -2514,6 +2784,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sim_with_ear_next_checkpoint_writes_shadow_prediction() {
+        let root = test_ledger_root("sim-runner-ear-next-shadow");
+        let checkpoint = danger_checkpoint_root("sim-runner-ear-next-shadow");
+        let action = ActionPrimitive::Stop;
+        write_test_ear_next_checkpoint(&checkpoint, action.clone());
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(action))
+            .with_models(RuntimeModelStack::with_ear_next_shadow_checkpoint(&checkpoint).unwrap());
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.8, 7));
+        world.add_object(SimObject {
+            id: "speaker".to_string(),
+            label: "speaker".to_string(),
+            kind: netherwick_sim::SimObjectKind::SoundSource {
+                label: "speaker".to_string(),
+            },
+            x_m: 1.5,
+            y_m: 1.2,
+            radius_m: 0.12,
+            color_rgb: [80, 80, 220],
+            emits_sound: true,
+            charge_rate: 0.0,
+        });
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let frames = ledger.recent(5).await.unwrap();
+        let frame = frames.last().unwrap();
+
+        assert!(frame.now.predictions.ear_next_model.is_some());
+        assert!(frame.now.predictions.ear_next_hardcoded.is_some());
+        assert!(frame
+            .behavior_runs
+            .iter()
+            .any(|run| run.behavior_id == "ear_next"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn ear_next_shadow_mode_does_not_override_safety_or_action() {
+        let root = test_ledger_root("sim-runner-ear-next-shadow-safety");
+        let checkpoint = danger_checkpoint_root("sim-runner-ear-next-shadow-safety");
+        let action = ActionPrimitive::Go {
+            intensity: 0.5,
+            duration_ms: 500,
+        };
+        write_test_ear_next_checkpoint(&checkpoint, action.clone());
+        let ledger = JsonlLedger::new(&root);
+        let mut runtime = test_runtime(ledger, FixedConductor::new(action.clone()))
+            .with_models(RuntimeModelStack::with_ear_next_shadow_checkpoint(&checkpoint).unwrap());
+        let mut body = BodySense::default();
+        body.flags.cliff_left = true;
+        body.last_update_ms = 100;
+        let mut now = Now::blank(100, body);
+        now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, Some(action));
+        assert!(tick.frame.now.predictions.ear_next_model.is_some());
+        assert!(tick
+            .frame
+            .notes
+            .iter()
+            .any(|note| note.contains("Safety vetoed")));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
     async fn shared_reign_queue_controls_next_sim_tick() {
         let root = test_ledger_root("sim-runner-shared-reign");
         let ledger = JsonlLedger::new(&root);
@@ -2687,6 +3033,26 @@ mod tests {
             .train_step(
                 &input,
                 &netherwick_experience::ActionValueTarget { value: 0.25 },
+            )
+            .unwrap();
+        trainer.save_checkpoint(root).unwrap();
+    }
+
+    fn write_test_ear_next_checkpoint(root: &Path, action: ActionPrimitive) {
+        let body = test_body(1.0, 1.0, 0.8, 7);
+        let mut now = Now::blank(100, body);
+        now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];
+        let mut encoder = FeatureExperienceEncoder::new();
+        let latent = encoder.encode(&now).unwrap();
+        let input = EarNextInput::from_parts(latent.z, Some(&action), &now, 100);
+        let mut trainer = EarNextNetTrainer::new(input.flat_features().len(), 4);
+        trainer
+            .train_step(
+                &input,
+                &netherwick_experience::EarNextTarget {
+                    features: vec![0.2, 0.4, 0.6, 0.8],
+                    ..netherwick_experience::EarNextTarget::default()
+                },
             )
             .unwrap();
         trainer.save_checkpoint(root).unwrap();

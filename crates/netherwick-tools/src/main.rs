@@ -9,13 +9,15 @@ use netherwick_experience::{
     action_value_input_from_transition_like, action_value_target_from_reward_surprise,
     charge_input_from_transition_like, charge_target_from_transition_like,
     danger_input_from_transition_like, danger_target_from_transition_like,
+    ear_next_input_from_transition_like, ear_next_target_from_now,
     eye_next_input_from_transition_like, eye_next_target_from_now,
 };
 use netherwick_ledger::{ExperienceFrame, JsonlLedger, LedgerReader};
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
 use netherwick_models::{
-    ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EyeNextNetTrainer, MODEL_REGISTRY,
+    ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
+    EyeNextNetTrainer, MODEL_REGISTRY,
 };
 use netherwick_runtime::{MinimalRuntime, RuntimeModelStack, SimRunner};
 use netherwick_sim::{ArenaConfig, SimObject, SimObjectKind, VirtualWorld};
@@ -80,6 +82,10 @@ struct SimArgs {
     eye_next_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     eye_next_mode: EyeNextMode,
+    #[arg(long)]
+    ear_next_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    ear_next_mode: EarNextMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -106,6 +112,12 @@ enum EyeNextMode {
     ShadowInfer,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum EarNextMode {
+    Off,
+    ShadowInfer,
+}
+
 #[derive(Debug, Parser)]
 struct TrainCommand {
     #[command(subcommand)]
@@ -118,6 +130,7 @@ enum TrainModel {
     Charge(TrainChargeArgs),
     ActionValue(TrainActionValueArgs),
     EyeNext(TrainEyeNextArgs),
+    EarNext(TrainEarNextArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -157,6 +170,16 @@ struct TrainEyeNextArgs {
     #[arg(long, default_value_t = 5)]
     epochs: usize,
     #[arg(long, default_value = "data/models/eye_next_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainEarNextArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/ear_next_v0")]
     checkpoint: String,
 }
 
@@ -220,14 +243,15 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let mut runner = SimRunner::new(runtime, world, motors);
     runner.run_steps(args.steps).await?;
     println!(
-        "sim complete: {} ticks, seed {}, ledger {}, danger_mode {:?}, charge_mode {:?}, action_value_mode {:?}, eye_next_mode {:?}",
+        "sim complete: {} ticks, seed {}, ledger {}, danger_mode {:?}, charge_mode {:?}, action_value_mode {:?}, eye_next_mode {:?}, ear_next_mode {:?}",
         runner.tick_count,
         args.seed,
         args.ledger,
         args.danger_mode,
         args.charge_mode,
         args.action_value_mode,
-        args.eye_next_mode
+        args.eye_next_mode,
+        args.ear_next_mode
     );
     Ok(())
 }
@@ -237,6 +261,7 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
         && args.charge_mode != ChargeMode::ShadowInfer
         && args.action_value_mode != ActionValueMode::ShadowInfer
         && args.eye_next_mode != EyeNextMode::ShadowInfer
+        && args.ear_next_mode != EarNextMode::ShadowInfer
     {
         return Ok(None);
     }
@@ -330,10 +355,33 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
     } else {
         None
     };
+    let ear_next_path = if args.ear_next_mode == EarNextMode::ShadowInfer {
+        match &args.ear_next_checkpoint {
+            Some(checkpoint) if Path::new(checkpoint).exists() => {
+                let path = Path::new(checkpoint);
+                println!("loaded ear-next checkpoint: {}", path.display());
+                Some(path)
+            }
+            Some(checkpoint) => {
+                println!(
+                    "ear-next shadow inference disabled: checkpoint not found at {}",
+                    checkpoint
+                );
+                None
+            }
+            None => {
+                println!("ear-next shadow inference disabled: no --ear-next-checkpoint provided");
+                None
+            }
+        }
+    } else {
+        None
+    };
     if danger_path.is_none()
         && charge_path.is_none()
         && action_value_path.is_none()
         && eye_next_path.is_none()
+        && ear_next_path.is_none()
     {
         return Ok(None);
     }
@@ -343,6 +391,7 @@ fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
         charge_path,
         action_value_path,
         eye_next_path,
+        ear_next_path,
     )?;
     Ok(Some(models))
 }
@@ -367,6 +416,7 @@ async fn run_train(command: TrainCommand) -> Result<()> {
         TrainModel::Charge(args) => train_charge(args).await,
         TrainModel::ActionValue(args) => train_action_value(args).await,
         TrainModel::EyeNext(args) => train_eye_next(args).await,
+        TrainModel::EarNext(args) => train_ear_next(args).await,
     }
 }
 
@@ -681,6 +731,99 @@ async fn train_eye_next(args: TrainEyeNextArgs) -> Result<()> {
     Ok(())
 }
 
+async fn train_ear_next(args: TrainEarNextArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let transitions = ledger.transitions().await?;
+    if transitions.is_empty() {
+        println!(
+            "ear-next training skipped: no transitions found in {}",
+            args.ledger
+        );
+        return Ok(());
+    }
+
+    let mut samples = Vec::new();
+    for transition in &transitions {
+        let Some(target) = ear_next_target_from_now(&transition.after) else {
+            continue;
+        };
+        let input = ear_next_input_from_transition_like(
+            &transition.before_z,
+            transition.action.as_ref(),
+            &transition.before,
+            100,
+        );
+        samples.push((
+            transition.created_at_ms,
+            transition.before.clone(),
+            input,
+            target,
+        ));
+    }
+    if samples.is_empty() {
+        println!(
+            "ear-next training skipped: no transitions with ear features found in {}",
+            args.ledger
+        );
+        return Ok(());
+    }
+
+    let (input_dim, output_dim, sample_rate_hz, channels) = samples
+        .first()
+        .map(|(_, _, input, target)| {
+            (
+                input.flat_features().len(),
+                target.features.len(),
+                target.sample_rate_hz,
+                target.channels,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0));
+    let mut trainer =
+        EarNextNetTrainer::with_audio_shape(input_dim, output_dim, sample_rate_hz, channels);
+    let metrics_path = std::path::Path::new(&args.ledger).join("ear-next-shadow-metrics.jsonl");
+    let mut metrics_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&metrics_path)
+        .await?;
+
+    let mut last_loss = 0.0;
+    let mut seen = 0_u64;
+    for _ in 0..args.epochs {
+        for (observed_at_ms, before, input, target) in &samples {
+            if input.flat_features().len() != trainer.input_dim()
+                || target.features.len() != trainer.output_dim()
+            {
+                continue;
+            }
+            let metric = trainer.shadow_compare(*observed_at_ms, before, input, target)?;
+            let line = serde_json::to_string(&metric)?;
+            metrics_file.write_all(line.as_bytes()).await?;
+            metrics_file.write_all(b"\n").await?;
+
+            let stats = trainer.train_step(input, target)?;
+            last_loss = stats.loss;
+            seen = stats.samples_seen;
+        }
+    }
+
+    println!(
+        "ear-next training complete: {} transitions, {} epochs, {} samples, last_loss {:.6}, metrics {}",
+        samples.len(),
+        args.epochs,
+        seen,
+        last_loss,
+        metrics_path.display()
+    );
+    trainer.save_checkpoint(&args.checkpoint)?;
+    println!("saved ear-next checkpoint: {}", args.checkpoint);
+    println!("samples_seen: {}", trainer.samples_seen());
+    println!("last_loss: {:.6}", last_loss);
+    println!("best_loss: {:?}", trainer.best_loss());
+    Ok(())
+}
+
 fn model_status() -> Result<()> {
     println!("registered models:");
     for model in MODEL_REGISTRY {
@@ -697,6 +840,9 @@ fn model_status() -> Result<()> {
     );
     println!(
         "EyeNextPredictor: shadow-train ready; metrics: data/ledger/eye-next-shadow-metrics.jsonl; checkpoint: data/models/eye_next_v0"
+    );
+    println!(
+        "EarNextPredictor: shadow-train ready; metrics: data/ledger/ear-next-shadow-metrics.jsonl; checkpoint: data/models/ear_next_v0"
     );
     Ok(())
 }
