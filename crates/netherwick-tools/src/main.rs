@@ -787,7 +787,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let motors = scenario.motors;
     let mut runner = SimRunner::new(runtime, world, motors);
     if args.live {
-        let live_state = LiveViewState::new();
+        let live_state = LiveViewState::new().with_virtual_retina(true);
         live_state.update_scene_metadata(live_metadata);
         live_state.update_session(SceneSession {
             mode: "virtual-live".to_string(),

@@ -385,6 +385,8 @@ pub struct SceneEye {
 pub struct SceneKinect {
     pub points: Vec<ScenePoint>,
     pub skeletons: Vec<KinectSkeletonSense>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinate_system: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1202,7 +1204,7 @@ async fn get_capture_scene(
                             ) {
                                 points.push(ScenePoint {
                                     x,
-                                    y,
+                                    y: -y,
                                     z,
                                     r: 180,
                                     g: 180,
@@ -1212,6 +1214,7 @@ async fn get_capture_scene(
                         }
                     }
                     scene.kinect.points = points;
+                    scene.kinect.coordinate_system = Some("camera".to_string());
                 }
                 Err(error) => {
                     scene.warnings.push(format!(
@@ -1656,9 +1659,15 @@ fn scene_kinect_from_snapshot(
     if points.is_empty() {
         warnings.push("no point cloud stream".to_string());
     }
+    let coordinate_system = if snapshot.kinect.depth_m.len() == calibration.map_or(32, |c| c.compact_depth_beam_count) {
+        "robot".to_string()
+    } else {
+        "camera".to_string()
+    };
     SceneKinect {
         points,
         skeletons: snapshot.kinect.skeletons.clone(),
+        coordinate_system: Some(coordinate_system),
     }
 }
 
@@ -1692,7 +1701,7 @@ fn depth_points(depth_m: &[f32], calibration: Option<SceneSensorCalibration>) ->
             let shade = ((1.0 - (z / 8.0)).clamp(0.15, 1.0) * 255.0) as u8;
             Some(ScenePoint {
                 x: nx * z,
-                y: -ny * z + 0.25,
+                y: ny * z,
                 z,
                 r: shade,
                 g: shade,
@@ -2427,6 +2436,15 @@ canvas{display:block}
 <div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers, squeeze stops, A/B dock or explore.</div>
 <script src="/static/vendor/babylon/babylon.js"></script>
 <script type="module">
+if (window.trustedTypes && window.trustedTypes.createPolicy) {
+  if (!window.trustedTypes.defaultPolicy) {
+    window.trustedTypes.createPolicy("default", {
+      createHTML: (string) => string,
+      createScript: (string) => string,
+      createScriptURL: (string) => string,
+    });
+  }
+}
 
 const canvas = document.getElementById('scene');
 const statusEl = document.getElementById('status');
@@ -2495,7 +2513,7 @@ function createGrid(size, subdivisions, color1, color2) {
   }
   return BABYLON.MeshBuilder.CreateLineSystem("grid", {lines: points, colors: colors}, scene);
 }
-createGrid(10, 20, new BABYLON.Color3(0.208, 0.255, 0.302), new BABYLON.Color3(0.141, 0.188, 0.227));
+const gridMesh = createGrid(10, 20, new BABYLON.Color3(0.208, 0.255, 0.302), new BABYLON.Color3(0.141, 0.188, 0.227));
 
 // Robot node & components
 const robot = new BABYLON.TransformNode("robot", scene);
@@ -2531,6 +2549,7 @@ eyeCamera.layerMask = 0x0FFFFFFF; // hide eye screen/frustum lines
 // Render Target Texture (RTT) for eyeCamera
 const eyeRTT = new BABYLON.RenderTargetTexture("eyeRTT", 256, scene);
 eyeRTT.activeCamera = eyeCamera;
+eyeRTT.renderList = null;
 
 // Eye Panel
 const eyePanel = BABYLON.MeshBuilder.CreatePlane("eyePanel", {width: 0.96, height: 0.72, sideOrientation: BABYLON.Mesh.DOUBLESIDE}, scene);
@@ -2639,6 +2658,7 @@ function renderObjects(scenePacket){
   if(arena){
     ground.scaling.set(arena.width_m / 10, 1, arena.height_m / 10);
     ground.position.set(arena.width_m / 2, 0, arena.height_m / 2);
+    gridMesh.position.set(arena.width_m / 2, 0, arena.height_m / 2);
     viewerCamera.setTarget(new BABYLON.Vector3(arena.width_m / 2, 0, arena.height_m / 2));
   }
   for(const item of scenePacket.objects || []){
@@ -2701,7 +2721,7 @@ function renderBeams(packet){
   }
 }
 
-function renderPoints(points){
+function renderPoints(points, coordinateSystem){
   if(pointCloud){
     pointCloud.dispose();
     pointCloud = null;
@@ -2712,9 +2732,14 @@ function renderPoints(points){
   const colors = [];
   const indices = [];
   
+  const isRobot = coordinateSystem === 'robot';
+  
   points.forEach((p, i) => {
-    // Project points in local space of eyeCamera
-    positions.push(p.x, p.y, p.z);
+    if (isRobot) {
+      positions.push(p.x, p.y, -p.z);
+    } else {
+      positions.push(p.x, p.y, p.z);
+    }
     colors.push(p.r / 255, p.g / 255, p.b / 255, 1.0);
     indices.push(i);
   });
@@ -2732,7 +2757,11 @@ function renderPoints(points){
   mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
   pointCloud.material = mat;
   
-  pointCloud.parent = eyeCamera;
+  if (isRobot) {
+    pointCloud.parent = robot;
+  } else {
+    pointCloud.parent = eyeCamera;
+  }
 }
 
 function shouldUseGeneratedEye(packet){
@@ -2857,7 +2886,7 @@ function updateScene(packet){
   robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
   renderObjects(packet);
   renderBeams(packet);
-  renderPoints(packet.kinect?.points || []);
+  renderPoints(packet.kinect?.points || [], packet.kinect?.coordinate_system || 'camera');
   renderEye(packet);
   const session = packet.session || {};
   fields.mode.textContent = session.mode || '-';
