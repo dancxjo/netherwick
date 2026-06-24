@@ -224,6 +224,8 @@ impl WorldSnapshot {
         let mut now = Now::blank(t_ms, self.body.clone());
         now.eye = self.eye.clone();
         now.ear = self.ear.clone();
+        now.face = self.face.clone();
+        now.voice = self.voice.clone();
         now.range = self.range.clone();
         now.imu = self.imu.clone();
         now.gps = self.gps.clone();

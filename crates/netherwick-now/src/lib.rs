@@ -163,6 +163,8 @@ pub struct Now {
     pub body: BodySense,
     pub eye: EyeSense,
     pub ear: EarSense,
+    pub face: FaceSense,
+    pub voice: VoiceSense,
     pub range: RangeSense,
     pub imu: ImuSense,
     pub gps: Option<GpsSense>,
@@ -188,6 +190,14 @@ impl Now {
             ear: EarSense {
                 schema_version: 1,
                 ..EarSense::default()
+            },
+            face: FaceSense {
+                schema_version: 1,
+                ..FaceSense::default()
+            },
+            voice: VoiceSense {
+                schema_version: 1,
+                ..VoiceSense::default()
             },
             range: RangeSense {
                 schema_version: 1,

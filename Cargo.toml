@@ -13,6 +13,7 @@ members = [
     "crates/netherwick-models",
     "crates/netherwick-experience",
     "crates/netherwick-memory",
+    "crates/netherwick-events",
     "crates/netherwick-llm",
     "crates/netherwick-conductor",
     "crates/netherwick-runtime",

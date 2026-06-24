@@ -1,5 +1,5 @@
 [package]
-name = "netherwick-llm"
+name = "netherwick-events"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,11 +7,14 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
-reqwest.workspace = true
+uuid.workspace = true
 netherwick-actions = { path = "../netherwick-actions" }
+netherwick-autonomic = { path = "../netherwick-autonomic" }
+netherwick-body = { path = "../netherwick-body" }
+netherwick-core = { path = "../netherwick-core" }
 netherwick-experience = { path = "../netherwick-experience" }
+netherwick-llm = { path = "../netherwick-llm" }
+netherwick-memory = { path = "../netherwick-memory" }
 netherwick-now = { path = "../netherwick-now" }

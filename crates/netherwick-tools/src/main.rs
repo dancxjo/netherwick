@@ -47,14 +47,14 @@ async fn run_sim_tick() -> Result<()> {
     let ledger = JsonlLedger::new("data/ledger");
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
-    let mut runtime = MinimalRuntime {
+    let mut runtime = MinimalRuntime::with_default_events(
         ledger,
-        memory_store: memory,
-        memory_recall: recall,
-        conductor: SimpleConductor::default(),
-        safety: SimpleSafety::default(),
-        llm: NoopLlmAgent,
-    };
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        NoopLlmAgent,
+    );
 
     let (mut world, mut motors) = VirtualWorld::new_with_motor(
         7,

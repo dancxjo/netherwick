@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -17,6 +18,7 @@ netherwick-behaviors = { path = "../netherwick-behaviors" }
 netherwick-body = { path = "../netherwick-body" }
 netherwick-conductor = { path = "../netherwick-conductor" }
 netherwick-core = { path = "../netherwick-core" }
+netherwick-events = { path = "../netherwick-events" }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-ledger = { path = "../netherwick-ledger" }
 netherwick-llm = { path = "../netherwick-llm" }

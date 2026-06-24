@@ -37,8 +37,8 @@ impl RecallQuery {
             now_text: format!("t_ms={} battery={:.2}", now.t_ms, now.body.battery_level),
             pose: Some(now.body.odometry),
             scene_vector: None,
-            face_vectors: Vec::new(),
-            voice_vectors: Vec::new(),
+            face_vectors: now.face.embeddings.clone(),
+            voice_vectors: now.voice.embeddings.clone(),
             battery: now.body.battery_level,
             active_goal: now
                 .self_sense
