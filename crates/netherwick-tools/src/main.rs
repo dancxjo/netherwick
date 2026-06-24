@@ -32,7 +32,9 @@ use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
     MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, WorldSnapshot,
 };
-use netherwick_server::{LiveSceneMetadata, LiveViewState, SceneArena, SceneObject, SceneSession};
+use netherwick_server::{
+    LiveSceneMetadata, LiveViewState, SceneArena, SceneObject, SceneSensorCalibration, SceneSession,
+};
 use netherwick_sim::{build_scenario, ScenarioConfig, ScenarioKind, SimObjectKind};
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
@@ -890,6 +892,10 @@ fn live_scene_metadata_from_scenario(
                 color_rgb: Some(object.color_rgb),
             })
             .collect(),
+        sensor_calibration: Some(SceneSensorCalibration {
+            compact_depth_fov_rad: std::f32::consts::PI * 0.68,
+            ..SceneSensorCalibration::sim_default()
+        }),
     }
 }
 

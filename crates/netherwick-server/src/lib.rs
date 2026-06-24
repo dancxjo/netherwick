@@ -171,6 +171,26 @@ pub struct LiveSceneMetadata {
     pub arena: Option<SceneArena>,
     #[serde(default)]
     pub objects: Vec<SceneObject>,
+    pub sensor_calibration: Option<SceneSensorCalibration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneSensorCalibration {
+    pub compact_depth_beam_count: usize,
+    pub compact_depth_fov_rad: f32,
+    pub depth_scale: f32,
+    pub point_y_m: f32,
+}
+
+impl SceneSensorCalibration {
+    pub fn sim_default() -> Self {
+        Self {
+            compact_depth_beam_count: 32,
+            compact_depth_fov_rad: std::f32::consts::PI * 0.75,
+            depth_scale: 1.0,
+            point_y_m: 0.18,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -211,6 +231,7 @@ pub struct LiveSceneResponse {
     pub audio: Option<SceneAudio>,
     pub objects: Vec<SceneObject>,
     pub arena: Option<SceneArena>,
+    pub sensor_calibration: Option<SceneSensorCalibration>,
     pub action: SceneAction,
     pub stuck: bool,
     pub dead_battery: bool,
@@ -803,6 +824,7 @@ async fn get_capture_scene(
                     color_rgb: Some(object.color_rgb),
                 })
                 .collect(),
+            sensor_calibration: None,
         });
     let mut scene = snapshot_to_scene(
         &record.snapshot,
@@ -876,7 +898,8 @@ pub fn snapshot_to_scene(
             None
         }
     };
-    let kinect = scene_kinect_from_snapshot(snapshot, &mut warnings);
+    let sensor_calibration = metadata.and_then(|metadata| metadata.sensor_calibration);
+    let kinect = scene_kinect_from_snapshot(snapshot, sensor_calibration, &mut warnings);
     let audio = snapshot
         .kinect
         .audio_angle_rad
@@ -925,6 +948,7 @@ pub fn snapshot_to_scene(
             .map(|metadata| metadata.objects.clone())
             .unwrap_or_default(),
         arena: metadata.and_then(|metadata| metadata.arena),
+        sensor_calibration,
         action: SceneAction::default(),
         stuck: stuck.active,
         dead_battery: stuck.dead_battery,
@@ -1212,8 +1236,12 @@ fn push_yuv_rgb(rgb: &mut Vec<u8>, y: u8, u: u8, v: u8) {
     rgb.push(((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8);
 }
 
-fn scene_kinect_from_snapshot(snapshot: &WorldSnapshot, warnings: &mut Vec<String>) -> SceneKinect {
-    let points = depth_points(&snapshot.kinect.depth_m);
+fn scene_kinect_from_snapshot(
+    snapshot: &WorldSnapshot,
+    calibration: Option<SceneSensorCalibration>,
+    warnings: &mut Vec<String>,
+) -> SceneKinect {
+    let points = depth_points(&snapshot.kinect.depth_m, calibration);
     if points.is_empty() {
         warnings.push("no point cloud stream".to_string());
     }
@@ -1223,15 +1251,15 @@ fn scene_kinect_from_snapshot(snapshot: &WorldSnapshot, warnings: &mut Vec<Strin
     }
 }
 
-fn depth_points(depth_m: &[f32]) -> Vec<ScenePoint> {
+fn depth_points(depth_m: &[f32], calibration: Option<SceneSensorCalibration>) -> Vec<ScenePoint> {
     const MAX_POINTS: usize = 2_000;
-    const COMPACT_RANGE_BEAM_COUNT: usize = 32;
-    const COMPACT_RANGE_FOV_RAD: f32 = std::f32::consts::PI * 0.75;
     if depth_m.is_empty() {
         return Vec::new();
     }
-    if depth_m.len() == COMPACT_RANGE_BEAM_COUNT {
-        return range_beam_points(depth_m, COMPACT_RANGE_FOV_RAD);
+    if let Some(calibration) = calibration {
+        if depth_m.len() == calibration.compact_depth_beam_count {
+            return range_beam_points(depth_m, calibration);
+        }
     }
     let width = (depth_m.len() as f32).sqrt().ceil().max(1.0) as usize;
     let height = depth_m.len().div_ceil(width).max(1);
@@ -1248,7 +1276,8 @@ fn depth_points(depth_m: &[f32]) -> Vec<ScenePoint> {
             let y = index / width;
             let nx = (x as f32 / width as f32) - 0.5;
             let ny = (y as f32 / height as f32) - 0.5;
-            let z = depth.clamp(0.0, 8.0);
+            let z = (depth * calibration.map_or(1.0, |calibration| calibration.depth_scale))
+                .clamp(0.0, 8.0);
             let shade = ((1.0 - (z / 8.0)).clamp(0.15, 1.0) * 255.0) as u8;
             Some(ScenePoint {
                 x: nx * z,
@@ -1262,8 +1291,9 @@ fn depth_points(depth_m: &[f32]) -> Vec<ScenePoint> {
         .collect()
 }
 
-fn range_beam_points(depth_m: &[f32], fov_rad: f32) -> Vec<ScenePoint> {
+fn range_beam_points(depth_m: &[f32], calibration: SceneSensorCalibration) -> Vec<ScenePoint> {
     let beam_count = depth_m.len().max(1);
+    let fov_rad = calibration.compact_depth_fov_rad.clamp(0.01, std::f32::consts::TAU);
     let start = if beam_count == 1 { 0.0 } else { -fov_rad * 0.5 };
     let step = if beam_count == 1 {
         0.0
@@ -1277,12 +1307,12 @@ fn range_beam_points(depth_m: &[f32], fov_rad: f32) -> Vec<ScenePoint> {
             if !depth.is_finite() || *depth <= 0.0 {
                 return None;
             }
-            let distance = depth.clamp(0.0, 8.0);
+            let distance = (depth * calibration.depth_scale).clamp(0.0, 8.0);
             let angle = start + step * index as f32;
             let shade = ((1.0 - (distance / 8.0)).clamp(0.15, 1.0) * 255.0) as u8;
             Some(ScenePoint {
                 x: angle.sin() * distance,
-                y: 0.18,
+                y: calibration.point_y_m,
                 z: angle.cos() * distance,
                 r: shade,
                 g: shade,
@@ -1842,7 +1872,7 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 @media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{grid-template-columns:1fr;bottom:98px;max-height:46vh}#model-graph{height:220px}}
 canvas{display:block}
 </style>
-<div id="scene"></div>
+<canvas id="scene"></canvas>
 <aside id="hud">
   <h1>Sensorium 3D</h1>
   <div id="status">connecting...</div>
@@ -1897,11 +1927,10 @@ canvas{display:block}
 </aside>
 <button id="xr" disabled>VR unavailable</button>
 <div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers, squeeze stops, A/B dock or explore.</div>
+<script src="/static/vendor/babylon/babylon.js"></script>
 <script type="module">
-import * as THREE from '/static/vendor/three/three.module.js';
-import { OrbitControls } from '/static/vendor/three/OrbitControls.js';
 
-const root = document.getElementById('scene');
+const canvas = document.getElementById('scene');
 const statusEl = document.getElementById('status');
 const xrButton = document.getElementById('xr');
 const reignState = document.getElementById('reign-state');
@@ -1911,73 +1940,145 @@ const modelStatus = document.getElementById('model-status');
 const modelList = document.getElementById('model-list');
 const modelGraph = document.getElementById('model-graph');
 const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b0d10);
-const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
-camera.position.set(3.8, 4.0, 5.2);
-const renderer = new THREE.WebGLRenderer({antialias:true});
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.setSize(innerWidth, innerHeight);
-renderer.xr.enabled = true;
-root.appendChild(renderer.domElement);
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 0, 0);
-controls.enableDamping = true;
 
-scene.add(new THREE.HemisphereLight(0xeef6ff, 0x253040, 1.8));
-const sun = new THREE.DirectionalLight(0xffffff, 1.8);
-sun.position.set(3, 6, 2);
-scene.add(sun);
+// Initialize Babylon Engine & Scene
+const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+const scene = new BABYLON.Scene(engine);
+scene.clearColor = new BABYLON.Color4(0.043, 0.051, 0.063, 1.0); // 0x0b0d10
 
-// Coordinate convention: Netherwick sim/world x maps to Three.js x, sim/world y maps to Three.js z,
-// and Three.js y is up. heading_rad rotates around the y axis.
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(10, 10, 10, 10),
-  new THREE.MeshStandardMaterial({color:0x171d22, roughness:.8, metalness:0})
-);
-ground.rotation.x = -Math.PI / 2;
-scene.add(ground);
-scene.add(new THREE.GridHelper(10, 20, 0x35414d, 0x24303a));
+// Viewer Camera (OrbitControls)
+const viewerCamera = new BABYLON.ArcRotateCamera("viewerCamera", 0, 0, 10, new BABYLON.Vector3(0, 0, 0), scene);
+viewerCamera.setPosition(new BABYLON.Vector3(3.8, 4.0, 5.2));
+viewerCamera.attachControl(canvas, true);
+viewerCamera.fov = 62 * Math.PI / 180;
+viewerCamera.minZ = 0.05;
+viewerCamera.maxZ = 80;
+viewerCamera.inertia = 0.9;
+viewerCamera.layerMask = 0xFFFFFFFF;
 
-const robot = new THREE.Group();
-const bodyMesh = new THREE.Mesh(
-  new THREE.CylinderGeometry(.18, .18, .18, 32),
-  new THREE.MeshStandardMaterial({color:0x8bd3ff, roughness:.55})
-);
-bodyMesh.position.y = .09;
-robot.add(bodyMesh);
-const heading = new THREE.ArrowHelper(new THREE.Vector3(0,0,-1), new THREE.Vector3(0,.22,0), .55, 0xffcf66, .16, .08);
-robot.add(heading);
-scene.add(robot);
+// Hemispheric Light (ambient)
+const hemiLight = new BABYLON.HemisphereLight("hemiLight", new BABYLON.Vector3(0, 1, 0), scene);
+hemiLight.diffuse = new BABYLON.Color3(0.937, 0.965, 1.0); // 0xeef6ff
+hemiLight.groundColor = new BABYLON.Color3(0.145, 0.188, 0.251); // 0x253040
+hemiLight.intensity = 1.8;
 
-const beams = new THREE.Group();
-scene.add(beams);
-const objects = new THREE.Group();
-scene.add(objects);
-const controller0 = renderer.xr.getController(0);
-const controller1 = renderer.xr.getController(1);
-scene.add(controller0);
-scene.add(controller1);
+// Directional Light (sun)
+const sunLight = new BABYLON.DirectionalLight("sunLight", new BABYLON.Vector3(-3, -6, -2).normalize(), scene);
+sunLight.diffuse = new BABYLON.Color3(1.0, 1.0, 1.0);
+sunLight.intensity = 1.8;
 
+// Ground Plane
+const ground = BABYLON.MeshBuilder.CreateGround("ground", {width: 10, height: 10, subdivisions: 10}, scene);
+const groundMat = new BABYLON.PBRMaterial("groundMat", scene);
+groundMat.albedoColor = new BABYLON.Color3(0.09, 0.114, 0.133); // 0x171d22
+groundMat.roughness = 0.8;
+groundMat.metallic = 0.0;
+ground.material = groundMat;
+
+// Grid line helper
+function createGrid(size, subdivisions, color1, color2) {
+  const points = [];
+  const colors = [];
+  const half = size / 2;
+  const step = size / subdivisions;
+  const c1 = BABYLON.Color4.FromColor3(color1, 1.0);
+  const c2 = BABYLON.Color4.FromColor3(color2, 1.0);
+  for (let i = 0; i <= subdivisions; i++) {
+    const pos = -half + i * step;
+    const isCenter = Math.abs(pos) < 0.001;
+    const col = isCenter ? c1 : c2;
+    points.push([new BABYLON.Vector3(pos, 0.001, -half), new BABYLON.Vector3(pos, 0.001, half)]);
+    colors.push([col, col]);
+    points.push([new BABYLON.Vector3(-half, 0.001, pos), new BABYLON.Vector3(half, 0.001, pos)]);
+    colors.push([col, col]);
+  }
+  return BABYLON.MeshBuilder.CreateLineSystem("grid", {lines: points, colors: colors}, scene);
+}
+createGrid(10, 20, new BABYLON.Color3(0.208, 0.255, 0.302), new BABYLON.Color3(0.141, 0.188, 0.227));
+
+// Robot node & components
+const robot = new BABYLON.TransformNode("robot", scene);
+
+const bodyMesh = BABYLON.MeshBuilder.CreateCylinder("bodyMesh", {height: 0.18, diameter: 0.36, tessellation: 32}, scene);
+const bodyMat = new BABYLON.PBRMaterial("bodyMat", scene);
+bodyMat.albedoColor = new BABYLON.Color3(0.545, 0.827, 1.0); // 0x8bd3ff
+bodyMat.roughness = 0.55;
+bodyMesh.material = bodyMat;
+bodyMesh.position.y = 0.09;
+bodyMesh.parent = robot;
+
+const headingArrow = BABYLON.MeshBuilder.CreateCylinder("headingArrow", {height: 0.16, diameterTop: 0.0, diameterBottom: 0.08, tessellation: 12}, scene);
+const headingLine = BABYLON.MeshBuilder.CreateLines("headingLine", {points: [new BABYLON.Vector3(0, 0.22, 0), new BABYLON.Vector3(0, 0.22, -0.55)]}, scene);
+const headingMat = new BABYLON.StandardMaterial("headingMat", scene);
+headingMat.emissiveColor = new BABYLON.Color3(1.0, 0.812, 0.4); // 0xffcf66
+headingLine.color = new BABYLON.Color3(1.0, 0.812, 0.4);
+headingArrow.material = headingMat;
+headingArrow.position.set(0, 0.22, -0.55);
+headingArrow.rotation.x = -Math.PI / 2;
+headingArrow.parent = robot;
+headingLine.parent = robot;
+
+// Second Camera (Eye Camera)
+const eyeCamera = new BABYLON.TargetCamera("eyeCamera", new BABYLON.Vector3(0, 0.46, -0.18), scene);
+eyeCamera.parent = robot;
+eyeCamera.rotation.set(0, Math.PI, 0); // pointing forward along robot's -Z axis
+eyeCamera.fov = 62 * Math.PI / 180;
+eyeCamera.minZ = 0.05;
+eyeCamera.maxZ = 80;
+eyeCamera.layerMask = 0x0FFFFFFF; // hide eye screen/frustum lines
+
+// Render Target Texture (RTT) for eyeCamera
+const eyeRTT = new BABYLON.RenderTargetTexture("eyeRTT", 256, scene);
+eyeRTT.activeCamera = eyeCamera;
+
+// Eye Panel
+const eyePanel = BABYLON.MeshBuilder.CreatePlane("eyePanel", {width: 0.96, height: 0.72, sideOrientation: BABYLON.Mesh.DOUBLESIDE}, scene);
+eyePanel.position.set(0, 0.65, -0.78);
+eyePanel.parent = robot;
+eyePanel.layerMask = 0x10000000;
+
+const eyePanelMat = new BABYLON.StandardMaterial("eyePanelMat", scene);
+eyePanelMat.disableLighting = true;
+eyePanelMat.backFaceCulling = false;
+eyePanel.material = eyePanelMat;
+
+// Frustum Helper Lines
+const frustumPoints = [
+  [new BABYLON.Vector3(0, 0.46, -0.18), new BABYLON.Vector3(-0.48, 0.28, -0.78)],
+  [new BABYLON.Vector3(0, 0.46, -0.18), new BABYLON.Vector3(0.48, 0.28, -0.78)],
+  [new BABYLON.Vector3(0, 0.46, -0.18), new BABYLON.Vector3(-0.48, 1.02, -0.78)],
+  [new BABYLON.Vector3(0, 0.46, -0.18), new BABYLON.Vector3(0.48, 1.02, -0.78)]
+];
+const frustum = BABYLON.MeshBuilder.CreateLineSystem("frustum", {lines: frustumPoints}, scene);
+frustum.color = new BABYLON.Color3(0.565, 0.643, 0.722); // 0x90a4b8
+frustum.parent = robot;
+frustum.layerMask = 0x10000000;
+
+// Textures
 const eyeCanvas = document.createElement('canvas');
 eyeCanvas.width = 2; eyeCanvas.height = 2;
-const eyeTexture = new THREE.CanvasTexture(eyeCanvas);
-const eyePanel = new THREE.Mesh(
-  new THREE.PlaneGeometry(.96, .72),
-  new THREE.MeshBasicMaterial({map: eyeTexture, side: THREE.DoubleSide})
-);
-eyePanel.position.set(0, .65, -.78);
-robot.add(eyePanel);
-const frustum = new THREE.LineSegments(
-  new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(0,.46,-.18), new THREE.Vector3(-.48,.28,-.78),
-    new THREE.Vector3(0,.46,-.18), new THREE.Vector3(.48,.28,-.78),
-    new THREE.Vector3(0,.46,-.18), new THREE.Vector3(-.48,1.02,-.78),
-    new THREE.Vector3(0,.46,-.18), new THREE.Vector3(.48,1.02,-.78)
-  ]),
-  new THREE.LineBasicMaterial({color:0x90a4b8})
-);
-robot.add(frustum);
+const eyeTexture = new BABYLON.DynamicTexture("eyeTexture", eyeCanvas, scene, true);
+
+function useRTT() {
+  eyePanelMat.emissiveTexture = eyeRTT;
+  eyePanelMat.diffuseTexture = null;
+  if (scene.customRenderTargets.indexOf(eyeRTT) === -1) {
+    scene.customRenderTargets.push(eyeRTT);
+  }
+}
+
+function useDynamicTexture() {
+  eyePanelMat.emissiveTexture = eyeTexture;
+  eyePanelMat.diffuseTexture = eyeTexture;
+  const index = scene.customRenderTargets.indexOf(eyeRTT);
+  if (index !== -1) {
+    scene.customRenderTargets.splice(index, 1);
+  }
+}
+
+// Scene Nodes
+const beams = new BABYLON.TransformNode("beams", scene);
+const objects = new BABYLON.TransformNode("objects", scene);
 
 let pointCloud = null;
 let lastScene = null;
@@ -1986,89 +2087,141 @@ let lastReignKey = '';
 let lastReignSentAt = 0;
 let lastReignText = 'idle';
 const llmCards = new Map();
+
 function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
-function world(x, y, up=0){ return new THREE.Vector3(x, up, y); }
-function clear(group){ while(group.children.length) group.remove(group.children.pop()); }
+function world(x, y, up=0){ return new BABYLON.Vector3(x, up, y); }
+
+function clearChildren(node){
+  const children = node.getChildren();
+  for (const child of children) {
+    child.dispose();
+  }
+}
+
 function xrReason(message){
   xrButton.textContent = 'VR unavailable';
   xrButton.disabled = true;
   fields.webxr.textContent = message;
   return message;
 }
+
 function materialFor(kind, color){
-  const hex = color ? (color[0]<<16) | (color[1]<<8) | color[2] : ({charger:0x45d483, person:0xe8c08c, speaker:0x778cff, obstacle:0xd67666}[kind] || 0xb0b8c0);
-  return new THREE.MeshStandardMaterial({color:hex, roughness:.7});
+  const hex = color ? new BABYLON.Color3(color[0]/255, color[1]/255, color[2]/255) : ({
+    charger: new BABYLON.Color3(0.27, 0.83, 0.51), // 0x45d483
+    person: new BABYLON.Color3(0.91, 0.75, 0.55), // 0xe8c08c
+    speaker: new BABYLON.Color3(0.47, 0.55, 1.0), // 0x778cff
+    obstacle: new BABYLON.Color3(0.84, 0.46, 0.4) // 0xd67666
+  }[kind] || new BABYLON.Color3(0.69, 0.72, 0.75));
+  
+  const mat = new BABYLON.PBRMaterial("mat_" + kind, scene);
+  mat.albedoColor = hex;
+  mat.roughness = 0.7;
+  mat.metallic = 0.0;
+  return mat;
 }
+
 function renderObjects(scenePacket){
-  clear(objects);
+  clearChildren(objects);
   const arena = scenePacket.arena;
   if(arena){
-    ground.scale.set(arena.width_m / 10, arena.height_m / 10, 1);
+    ground.scaling.set(arena.width_m / 10, 1, arena.height_m / 10);
     ground.position.set(arena.width_m / 2, 0, arena.height_m / 2);
-    controls.target.set(arena.width_m / 2, 0, arena.height_m / 2);
+    viewerCamera.setTarget(new BABYLON.Vector3(arena.width_m / 2, 0, arena.height_m / 2));
   }
   for(const item of scenePacket.objects || []){
     let mesh;
+    const mat = materialFor(item.kind, item.color_rgb);
     if(item.kind === 'person'){
-      mesh = new THREE.Mesh(new THREE.CapsuleGeometry(item.radius_m, .8, 8, 16), materialFor(item.kind, item.color_rgb));
-      mesh.position.copy(world(item.x_m, item.y_m, .55));
+      const radius = item.radius_m;
+      const height = 0.8 + 2 * radius;
+      mesh = BABYLON.MeshBuilder.CreateCapsule("person", {radius: radius, height: height, subdivisions: 8}, scene);
+      mesh.material = mat;
+      mesh.position.copyFrom(world(item.x_m, item.y_m, 0.55));
     }else if(item.kind === 'speaker'){
-      mesh = new THREE.Mesh(new THREE.ConeGeometry(item.radius_m * 1.8, .35, 24), materialFor(item.kind, item.color_rgb));
+      mesh = BABYLON.MeshBuilder.CreateCylinder("speaker", {
+        height: 0.35,
+        diameterTop: 0,
+        diameterBottom: item.radius_m * 1.8 * 2,
+        tessellation: 24
+      }, scene);
+      mesh.material = mat;
       mesh.rotation.x = Math.PI / 2;
-      mesh.position.copy(world(item.x_m, item.y_m, .25));
+      mesh.position.copyFrom(world(item.x_m, item.y_m, 0.25));
     }else{
-      mesh = new THREE.Mesh(new THREE.CylinderGeometry(item.radius_m, item.radius_m, item.kind === 'charger' ? .08 : .45, 28), materialFor(item.kind, item.color_rgb));
-      mesh.position.copy(world(item.x_m, item.y_m, item.kind === 'charger' ? .04 : .225));
+      const h = item.kind === 'charger' ? 0.08 : 0.45;
+      mesh = BABYLON.MeshBuilder.CreateCylinder("obj", {
+        height: h,
+        diameterTop: item.radius_m * 2,
+        diameterBottom: item.radius_m * 2,
+        tessellation: 28
+      }, scene);
+      mesh.material = mat;
+      mesh.position.copyFrom(world(item.x_m, item.y_m, item.kind === 'charger' ? 0.04 : 0.225));
     }
-    mesh.userData.id = item.id;
-    objects.add(mesh);
+    mesh.metadata = { id: item.id };
+    mesh.parent = objects;
   }
 }
+
 function renderBeams(packet){
-  clear(beams);
+  clearChildren(beams);
   const b = packet.body;
   for(const beam of packet.range?.beams || []){
     const angle = b.heading_rad + beam.angle_rad;
     const start = world(b.x_m, b.y_m, .12);
     const end = world(b.x_m + Math.cos(angle) * beam.distance_m, b.y_m + Math.sin(angle) * beam.distance_m, .12);
-    const geo = new THREE.BufferGeometry().setFromPoints([start, end]);
-    const mat = new THREE.LineBasicMaterial({color:beam.hit ? 0xff6e5c : 0x62d394, transparent:true, opacity:beam.hit ? .95 : .55});
-    beams.add(new THREE.Line(geo, mat));
+    
+    const beamLine = BABYLON.MeshBuilder.CreateLines("beamLine", {points: [start, end]}, scene);
+    beamLine.color = beam.hit ? new BABYLON.Color3(1.0, 0.43, 0.36) : new BABYLON.Color3(0.38, 0.83, 0.58);
+    beamLine.alpha = beam.hit ? 0.95 : 0.55;
+    beamLine.parent = beams;
+    
     if(beam.hit){
-      const dot = new THREE.Mesh(new THREE.SphereGeometry(.055, 12, 12), new THREE.MeshBasicMaterial({color:0xff6e5c}));
-      dot.position.copy(end);
-      beams.add(dot);
+      const dot = BABYLON.MeshBuilder.CreateSphere("dot", {diameter: 0.11, segments: 12}, scene);
+      const dotMat = new BABYLON.StandardMaterial("dotMat", scene);
+      dotMat.emissiveColor = new BABYLON.Color3(1.0, 0.43, 0.36);
+      dotMat.disableLighting = true;
+      dot.material = dotMat;
+      dot.position.copyFrom(end);
+      dot.parent = beams;
     }
   }
 }
-function pointWorldPosition(p){
-  const local = new THREE.Vector3(p.x, p.y, -p.z);
-  robot.updateMatrixWorld();
-  return robot.localToWorld(local);
-}
+
 function renderPoints(points){
   if(pointCloud){
-    scene.remove(pointCloud);
-    pointCloud.geometry.dispose();
-    pointCloud.material.dispose();
+    pointCloud.dispose();
     pointCloud = null;
   }
   if(!points || !points.length) return;
-  const positions = new Float32Array(points.length * 3);
-  const colors = new Float32Array(points.length * 3);
+  
+  const positions = [];
+  const colors = [];
+  const indices = [];
+  
   points.forEach((p, i) => {
-    const pos = pointWorldPosition(p);
-    positions[i*3] = pos.x;
-    positions[i*3+1] = pos.y;
-    positions[i*3+2] = pos.z;
-    colors[i*3] = p.r / 255; colors[i*3+1] = p.g / 255; colors[i*3+2] = p.b / 255;
+    // Project points in local space of eyeCamera
+    positions.push(p.x, p.y, p.z);
+    colors.push(p.r / 255, p.g / 255, p.b / 255, 1.0);
+    indices.push(i);
   });
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  pointCloud = new THREE.Points(geo, new THREE.PointsMaterial({size:.035, vertexColors:true}));
-  scene.add(pointCloud);
+  
+  pointCloud = new BABYLON.Mesh("pointCloud", scene);
+  const vertexData = new BABYLON.VertexData();
+  vertexData.positions = positions;
+  vertexData.colors = colors;
+  vertexData.indices = indices;
+  vertexData.applyToMesh(pointCloud);
+  
+  const mat = new BABYLON.StandardMaterial("pointCloudMat", scene);
+  mat.pointsCloud = true;
+  mat.pointSize = 3.5;
+  mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
+  pointCloud.material = mat;
+  
+  pointCloud.parent = eyeCamera;
 }
+
 function shouldUseGeneratedEye(packet){
   const session = packet?.session || {};
   const virtualMode = session.source === 'sim' || String(session.mode || '').includes('virtual');
@@ -2076,16 +2229,15 @@ function shouldUseGeneratedEye(packet){
   const eye = packet?.eye;
   return !eye || !eye.data_url || eye.mean_luma < .08 || eye.non_background_ratio < .01;
 }
-function panelColorFor(item){
-  if(item.color_rgb) return `rgb(${item.color_rgb[0]},${item.color_rgb[1]},${item.color_rgb[2]})`;
-  return {charger:'#45d483', person:'#e8c08c', speaker:'#778cff', obstacle:'#d67666', landmark:'#b0b8c0'}[item.kind] || '#b0b8c0';
-}
+
 function frameFormatIs(format, name){
   return format === name || (typeof format === 'object' && format?.[name] !== undefined);
 }
+
 function frameFormatText(format){
   return typeof format === 'string' ? format : JSON.stringify(format || '');
 }
+
 function yuvToRgb(y, u, v){
   const c = y - 16, d = u - 128, e = v - 128;
   return [
@@ -2094,10 +2246,12 @@ function yuvToRgb(y, u, v){
     Math.max(0, Math.min(255, (298 * c + 516 * d + 128) >> 8))
   ];
 }
+
 function writeYuvPixel(data, target, y, u, v){
   const [r, g, b] = yuvToRgb(y, u, v);
   data[target] = r; data[target + 1] = g; data[target + 2] = b; data[target + 3] = 255;
 }
+
 function renderRawEyeFrame(frame){
   if(!frame) return false;
   const fmt = frame.format;
@@ -2129,7 +2283,8 @@ function renderRawEyeFrame(frame){
       }
     }
     eyeCanvas.getContext('2d').putImageData(image, 0, 0);
-    eyeTexture.needsUpdate = true;
+    eyeTexture.update();
+    useDynamicTexture();
     return true;
   }
   if(isMjpg){
@@ -2139,7 +2294,8 @@ function renderRawEyeFrame(frame){
     img.onload = () => {
       eyeCanvas.width = img.width; eyeCanvas.height = img.height;
       eyeCanvas.getContext('2d').drawImage(img, 0, 0);
-      eyeTexture.needsUpdate = true;
+      eyeTexture.update();
+      useDynamicTexture();
       URL.revokeObjectURL(url);
     };
     img.onerror = () => URL.revokeObjectURL(url);
@@ -2148,75 +2304,21 @@ function renderRawEyeFrame(frame){
   }
   return false;
 }
+
 async function renderSnapshotEyeFallback(packet){
   try{
     const res = await fetch('/view/snapshot', {cache:'no-store'});
     if(!res.ok) throw new Error(await res.text());
     const snapshot = await res.json();
-    if(!renderRawEyeFrame(snapshot.eye_frame)) renderGeneratedEye(packet);
+    if(!renderRawEyeFrame(snapshot.eye_frame)) useRTT();
   }catch(_error){
-    renderGeneratedEye(packet);
+    useRTT();
   }
 }
-function renderGeneratedEye(packet){
-  if(!packet?.body) return;
-  const width = 160, height = 120, horizon = 54;
-  eyeCanvas.width = width; eyeCanvas.height = height;
-  const ctx2 = eyeCanvas.getContext('2d');
-  const sky = ctx2.createLinearGradient(0, 0, 0, horizon);
-  sky.addColorStop(0, '#253646');
-  sky.addColorStop(1, '#55636d');
-  ctx2.fillStyle = sky;
-  ctx2.fillRect(0, 0, width, horizon);
-  const floor = ctx2.createLinearGradient(0, horizon, 0, height);
-  floor.addColorStop(0, '#555954');
-  floor.addColorStop(1, '#262b29');
-  ctx2.fillStyle = floor;
-  ctx2.fillRect(0, horizon, width, height - horizon);
-  ctx2.strokeStyle = 'rgba(255,255,255,.16)';
-  for(let y = horizon + 10; y < height; y += Math.max(5, (y - horizon) * .22)){
-    ctx2.beginPath(); ctx2.moveTo(0, y); ctx2.lineTo(width, y); ctx2.stroke();
-  }
-  const body = packet.body;
-  const fov = Math.PI * .62;
-  const visible = (packet.objects || []).map(item => {
-    const dx = item.x_m - body.x_m, dy = item.y_m - body.y_m;
-    const forward = dx * Math.cos(body.heading_rad) + dy * Math.sin(body.heading_rad);
-    const lateral = -dx * Math.sin(body.heading_rad) + dy * Math.cos(body.heading_rad);
-    return {...item, forward, angle: Math.atan2(lateral, forward)};
-  }).filter(item => item.forward > .05 && Math.abs(item.angle) < fov * .55)
-    .sort((a, b) => b.forward - a.forward);
-  for(const item of visible){
-    const cx = width * .5 + (item.angle / (fov * .5)) * width * .5;
-    const near = Math.max(.18, item.forward);
-    const radiusPx = Math.max(5, item.radius_m / near * 58);
-    const h = Math.max(8, radiusPx * ({person:4.2, speaker:2.0, charger:.9, landmark:2.4}[item.kind] || 2.2));
-    const y = horizon + Math.min(45, 28 / near);
-    ctx2.fillStyle = panelColorFor(item);
-    ctx2.strokeStyle = 'rgba(0,0,0,.45)';
-    ctx2.lineWidth = 2;
-    ctx2.beginPath();
-    if(item.kind === 'speaker'){
-      ctx2.moveTo(cx, y - h);
-      ctx2.lineTo(cx + radiusPx * 1.3, y);
-      ctx2.lineTo(cx - radiusPx * 1.3, y);
-      ctx2.closePath();
-    }else{
-      ctx2.ellipse(cx, y - h * .45, radiusPx, h * .5, 0, 0, Math.PI * 2);
-    }
-    ctx2.fill();
-    ctx2.stroke();
-  }
-  ctx2.strokeStyle = 'rgba(255,207,102,.9)';
-  ctx2.beginPath();
-  ctx2.moveTo(width / 2 - 8, height / 2); ctx2.lineTo(width / 2 + 8, height / 2);
-  ctx2.moveTo(width / 2, height / 2 - 8); ctx2.lineTo(width / 2, height / 2 + 8);
-  ctx2.stroke();
-  eyeTexture.needsUpdate = true;
-}
+
 function renderEye(packet){
   if(shouldUseGeneratedEye(packet)){
-    renderGeneratedEye(packet);
+    useRTT();
     return;
   }
   const eye = packet.eye;
@@ -2228,14 +2330,16 @@ function renderEye(packet){
   img.onload = () => {
     eyeCanvas.width = img.width; eyeCanvas.height = img.height;
     eyeCanvas.getContext('2d').drawImage(img, 0, 0);
-    eyeTexture.needsUpdate = true;
+    eyeTexture.update();
+    useDynamicTexture();
   };
   img.onerror = () => renderSnapshotEyeFallback(packet);
   img.src = eye.data_url;
 }
+
 function updateScene(packet){
   lastScene = packet;
-  robot.position.copy(world(packet.body.x_m, packet.body.y_m, 0));
+  robot.position.copyFrom(world(packet.body.x_m, packet.body.y_m, 0));
   robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
   renderObjects(packet);
   renderBeams(packet);
@@ -2263,21 +2367,24 @@ function updateScene(packet){
   fields.nearest.textContent = packet.range?.nearest_m == null ? '-' : `${fmt(packet.range.nearest_m)} m`;
   fields.eye.textContent = packet.eye ? `${packet.eye.width}x${packet.eye.height} luma ${fmt(packet.eye.mean_luma, 2)}` : '-';
   fields.points.textContent = String(packet.kinect?.points?.length || 0);
-  fields.audio.textContent = packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio.bearing_rad)} rad`;
+  fields.audio.textContent = packet.audio?.heading_rad == null && packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio?.bearing_rad ?? packet.audio?.heading_rad)} rad`;
   fields.mind.textContent = packet.mind?.combobulation || packet.warnings?.[0] || '-';
   fields.scheme.textContent = location.protocol.replace(':', '');
   fields.secure.textContent = window.isSecureContext ? 'yes' : 'no';
 }
+
 function buttonPressed(gamepad, index){
   const button = gamepad?.buttons?.[index];
   return !!button && (button.pressed || button.value > .6);
 }
+
 function stickAxes(gamepad){
   const axes = gamepad?.axes || [];
   if(axes.length >= 4) return {x: axes[2], y: axes[3]};
   if(axes.length >= 2) return {x: axes[0], y: axes[1]};
   return {x: 0, y: 0};
 }
+
 async function postReign(command, ttl_ms, label, priority=.95){
   const key = JSON.stringify(command);
   const now = performance.now();
@@ -2305,6 +2412,7 @@ async function postReign(command, ttl_ms, label, priority=.95){
     reignState.textContent = 'reign send failed';
   }
 }
+
 function commandForInputSource(inputSource){
   const gamepad = inputSource.gamepad;
   if(!gamepad) return null;
@@ -2331,6 +2439,7 @@ function commandForInputSource(inputSource){
   }
   return null;
 }
+
 function pollXrReigns(){
   if(!xrSession){
     reignState.textContent = 'enter VR to enable controller reigns';
@@ -2353,6 +2462,7 @@ function pollXrReigns(){
     reignState.textContent = lastReignText === 'idle' ? 'ready' : `ready, last ${lastReignText}`;
   }
 }
+
 async function poll(){
   try{
     const res = await fetch('/view/scene', {cache:'no-store'});
@@ -2365,9 +2475,11 @@ async function poll(){
     setTimeout(poll, 100);
   }
 }
+
 function llmText(value){
   return value && value.trim() ? value : '-';
 }
+
 function phaseLabel(event){
   if(event.phase === 'start') return 'prompt';
   if(event.phase === 'delta') return 'streaming';
@@ -2375,6 +2487,7 @@ function phaseLabel(event){
   if(event.phase === 'error') return 'error';
   return event.phase || '-';
 }
+
 function createLlmCard(event){
   const card = document.createElement('article');
   card.className = 'llm-card live';
@@ -2403,6 +2516,7 @@ function createLlmCard(event){
   card.dataset.id = String(event.id);
   return state;
 }
+
 function renderLlmEvent(event){
   let state = llmCards.get(event.id);
   if(!state) state = createLlmCard(event);
@@ -2423,6 +2537,7 @@ function renderLlmEvent(event){
   outputEl.scrollTop = outputEl.scrollHeight;
   llmStatus.textContent = `${phaseLabel(event)} #${event.id}`;
 }
+
 function connectLlmStream(){
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${protocol}//${location.host}/stream/llm`);
@@ -2437,6 +2552,7 @@ function connectLlmStream(){
   });
   socket.addEventListener('error', () => { llmStatus.textContent = 'socket error'; });
 }
+
 function compactNumber(value, digits=3){
   if(value == null || !Number.isFinite(Number(value))) return '-';
   const n = Number(value);
@@ -2444,9 +2560,11 @@ function compactNumber(value, digits=3){
   if(Math.abs(n) > 0 && Math.abs(n) < .001) return n.toExponential(2);
   return n.toFixed(digits).replace(/\.?0+$/, '');
 }
+
 function modelLabel(model){
   return model.behavior || model.name.replace(/_v\d+$/, '');
 }
+
 function renderModelStats(packet){
   const models = packet.models || [];
   modelStatus.textContent = `${models.length} models`;
@@ -2477,6 +2595,7 @@ function renderModelStats(packet){
     return row;
   }));
 }
+
 function renderModelGraph(packet){
   const nodes = {
     Sensors:[28,18,'core'], Now:[148,18,'core'], Experience:[268,18,'model'], Future:[396,18,'model'],
@@ -2512,6 +2631,7 @@ function renderModelGraph(packet){
     modelGraph.appendChild(group);
   }
 }
+
 async function refreshModels(){
   try{
     const res = await fetch('/models', {cache:'no-store'});
@@ -2525,6 +2645,7 @@ async function refreshModels(){
     setTimeout(refreshModels, 5000);
   }
 }
+
 async function setupXr(){
   fields.scheme.textContent = location.protocol.replace(':', '');
   fields.secure.textContent = window.isSecureContext ? 'yes' : 'no';
@@ -2536,7 +2657,7 @@ async function setupXr(){
     xrReason('navigator.xr missing');
     return;
   }
-  const ok = await navigator.xr.isSessionSupported('immersive-vr').catch(() => false);
+  const ok = await BABYLON.WebXRSessionManager.IsSessionSupportedAsync('immersive-vr');
   if(!ok){
     xrReason('immersive-vr unsupported');
     return;
@@ -2545,28 +2666,33 @@ async function setupXr(){
   xrButton.disabled = false;
   fields.webxr.textContent = 'immersive-vr supported';
   xrButton.onclick = async () => {
-    const session = await navigator.xr.requestSession('immersive-vr', {optionalFeatures:['local-floor','bounded-floor']});
-    xrSession = session;
+    const customXRButton = new BABYLON.WebXREnterExitUIButton(xrButton, "immersive-vr", "local-floor");
+    const xrHelper = await scene.createDefaultXRExperienceAsync({
+      floorMeshes: [ground],
+      uiOptions: {
+        customButtons: [customXRButton]
+      }
+    });
+    xrSession = xrHelper.baseExperience.sessionManager.session;
     reignState.textContent = 'controller reigns ready';
-    session.addEventListener('end', () => {
+    xrHelper.baseExperience.sessionManager.onXRSessionEnded.add(() => {
       xrSession = null;
       lastReignKey = '';
       lastReignText = 'idle';
       reignState.textContent = 'enter VR to enable controller reigns';
     });
-    await renderer.xr.setSession(session);
   };
 }
+
 addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
+  engine.resize();
 });
-renderer.setAnimationLoop(() => {
-  controls.update();
+
+engine.runRenderLoop(() => {
   pollXrReigns();
-  renderer.render(scene, camera);
+  scene.render();
 });
+
 setupXr();
 connectLlmStream();
 refreshModels();
@@ -2740,6 +2866,7 @@ mod tests {
                 label: Some("charger".to_string()),
                 color_rgb: Some([80, 220, 130]),
             }],
+            sensor_calibration: Some(SceneSensorCalibration::sim_default()),
         });
         state.update_session(SceneSession {
             mode: "virtual-live".to_string(),
@@ -2843,7 +2970,7 @@ mod tests {
     #[test]
     fn compact_kinect_depth_projects_as_meter_range_fan() {
         let depths = vec![2.0; 32];
-        let points = depth_points(&depths);
+        let points = depth_points(&depths, Some(SceneSensorCalibration::sim_default()));
 
         assert_eq!(points.len(), 32);
         assert!((points[0].x + 1.847759).abs() < 0.001);
@@ -2904,7 +3031,7 @@ mod tests {
         assert!(page.contains("window.isSecureContext"));
         assert!(page.contains("/reign/command"));
         assert!(page.contains("source:'Gamepad'"));
-        assert!(page.contains("renderer.xr.getController"));
+        assert!(page.contains("createDefaultXRExperienceAsync"));
         assert!(page.contains("if(!eye?.data_url)"));
     }
 
