@@ -4,7 +4,7 @@ use netherwick_actions::{
     ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle, InspectTarget, TurnDir,
 };
 use netherwick_experience::{ExperienceLatent, FuturePrediction};
-use netherwick_now::{LlmSense, Now};
+use netherwick_now::{LlmSense, Now, ReignSense};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +58,13 @@ pub struct LlmTickResult {
     pub sense: LlmSense,
     pub conscious_command: Option<ConsciousCommand>,
     pub teaching: Vec<LlmTeaching>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmBrief {
+    pub now_ms: u64,
+    pub senses: Vec<String>,
+    pub reign: ReignSense,
 }
 
 #[async_trait]
@@ -200,6 +207,16 @@ pub fn summarized_senses(now: &Now) -> Vec<String> {
     }
     if let Some(mode) = &now.self_sense.mode {
         lines.push(format!("My mode is {mode}."));
+    }
+    if let Some(input) = &now.reign.latest {
+        lines.push(format!("Remote control active: {:?}.", input.mode));
+        lines.push(format!(
+            "Latest human reign command: {}.",
+            summarize_reign_command(input)
+        ));
+        if let Some(note) = &input.note {
+            lines.push(format!("Human note: {note}"));
+        }
     }
     if now.memory.similar_situation_count > 0 {
         lines.push(format!(
@@ -538,6 +555,7 @@ fn build_agent_prompt(
         "You are the conscious LLM layer for an embodied robot.\n\
 You may suggest a high-level action primitive, critique the situation, and record memory notes.\n\
 Never output raw motor control.\n\
+A human may be steering you. Treat Reign controls as important present-tense input. Do not override active Direct reign unless there is a safety or coherence reason. You may comment on it, remember it, or learn from it.\n\
 Allowed action kinds: stop, go, turn, inspect, approach, dock, explore, speak, chirp.\n\
 If commands are disabled, leave action null. Commands enabled: {}. Teaching enabled: {}.\n\
 Return JSON only with this schema:\n\
@@ -568,6 +586,40 @@ Summarized senses:\n{}\n",
         futures,
         senses
     )
+}
+
+fn summarize_reign_command(input: &netherwick_actions::ReignInput) -> String {
+    match &input.command {
+        netherwick_actions::ReignCommand::Stop => "Stop".to_string(),
+        netherwick_actions::ReignCommand::Go {
+            intensity,
+            duration_ms,
+        } => format!("Go, intensity {:.2}, {}ms", intensity, duration_ms),
+        netherwick_actions::ReignCommand::Turn {
+            direction,
+            intensity,
+            duration_ms,
+        } => format!(
+            "Turn {:?}, intensity {:.2}, {}ms",
+            direction, intensity, duration_ms
+        ),
+        netherwick_actions::ReignCommand::Inspect { target } => {
+            format!("Inspect {:?}", target)
+        }
+        netherwick_actions::ReignCommand::Approach { target } => {
+            format!("Approach {:?}", target)
+        }
+        netherwick_actions::ReignCommand::Dock => "Dock".to_string(),
+        netherwick_actions::ReignCommand::Explore { duration_ms } => {
+            format!("Explore for {}ms", duration_ms)
+        }
+        netherwick_actions::ReignCommand::Speak { text } => {
+            format!("Speak {text}")
+        }
+        netherwick_actions::ReignCommand::SetMode { mode } => {
+            format!("Set mode {:?}", mode)
+        }
+    }
 }
 
 fn summarize_futures(futures: &[FuturePrediction]) -> String {
@@ -720,6 +772,10 @@ fn extract_json_object(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource};
+    use netherwick_body::BodySense;
+    use netherwick_now::Now;
+    use uuid::Uuid;
 
     #[test]
     fn extracts_json_from_fenced_response() {
@@ -749,5 +805,32 @@ mod tests {
                 duration_ms: 1200,
             }
         );
+    }
+
+    #[test]
+    fn summarized_senses_include_latest_reign_command() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.reign.latest = Some(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: 1_100,
+            source: ReignSource::WebRemote,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.5,
+                duration_ms: 500,
+            },
+            priority: 1.0,
+            note: Some("turn toward charger".to_string()),
+        });
+        now.reign.active = true;
+        now.reign.mode = Some(ReignMode::Direct);
+
+        let senses = summarized_senses(&now).join("\n");
+
+        assert!(senses.contains("Remote control active: Direct"));
+        assert!(senses.contains("Latest human reign command: Turn Left"));
+        assert!(senses.contains("Human note: turn toward charger"));
     }
 }

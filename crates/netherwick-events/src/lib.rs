@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use anyhow::Result;
-use netherwick_actions::{ActionPrimitive, ApproachTarget, InspectTarget, TurnDir};
+use netherwick_actions::{ActionPrimitive, ApproachTarget, InspectTarget, ReignInput, TurnDir};
 use netherwick_autonomic::{SafetyDecision, SafetyReason};
 use netherwick_core::{Provenance, TimeMs};
 use netherwick_experience::{
@@ -48,6 +48,9 @@ pub enum EventKind {
     LlmCommanded,
     LlmCritiqued,
     SafetyVetoed,
+    ReignCommanded,
+    ReignExpired,
+    ReignCleared,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -100,6 +103,13 @@ pub enum EventPayload {
         desired_action: ActionPrimitive,
         reason: String,
     },
+    ReignCommanded {
+        input: ReignInput,
+    },
+    ReignExpired {
+        input: ReignInput,
+    },
+    ReignCleared,
     NearWall {
         distance_norm: f32,
     },
@@ -262,12 +272,37 @@ impl Default for EventExtractorConfig {
 pub struct EventExtractor {
     pub config: EventExtractorConfig,
     last_now: Option<Now>,
+    last_reign_id: Option<Uuid>,
+    last_reign_input: Option<ReignInput>,
 }
 
 impl EventExtractor {
     pub fn events_from_now(&mut self, now: &Now, recall: Option<&RecallBundle>) -> Vec<Event> {
         let mut events = Vec::new();
         let previous = self.last_now.as_ref();
+
+        if let Some(input) = &now.reign.latest {
+            if Some(input.id) != self.last_reign_id {
+                events.push(
+                    Event::new(now.t_ms, EventKind::ReignCommanded)
+                        .with_summary(format!("Human reign command: {:?}.", input.command))
+                        .with_payload(EventPayload::ReignCommanded {
+                            input: input.clone(),
+                        })
+                        .with_provenance(Provenance::direct().with_stage("reign")),
+                );
+                self.last_reign_id = Some(input.id);
+                self.last_reign_input = Some(input.clone());
+            }
+        } else if let Some(input) = self.last_reign_input.take() {
+            events.push(
+                Event::new(now.t_ms, EventKind::ReignExpired)
+                    .with_summary("Human reign command expired.")
+                    .with_payload(EventPayload::ReignExpired { input })
+                    .with_provenance(Provenance::direct().with_stage("reign")),
+            );
+            self.last_reign_id = None;
+        }
 
         if now.body.battery_level <= self.config.low_battery_threshold {
             events.push(
@@ -710,6 +745,45 @@ pub mod responders {
     }
 
     #[derive(Default)]
+    pub struct ReignResponder;
+
+    impl EventResponder for ReignResponder {
+        fn id(&self) -> &'static str {
+            "reign.default_responder"
+        }
+
+        fn matches(&self, event: &Event) -> bool {
+            event.kind == EventKind::ReignCommanded
+        }
+
+        fn respond(&mut self, _ctx: &EventContext, event: &Event) -> Result<Vec<Response>> {
+            let input = match &event.payload {
+                EventPayload::ReignCommanded { input } => input,
+                _ => return Ok(Vec::new()),
+            };
+            let Some(action) = input.command.to_action() else {
+                return Ok(vec![Response::AddSensation(event_sensation(
+                    event,
+                    "reign.mode",
+                    "human",
+                    "I received a remote reign mode command.",
+                    json!({ "input": input }),
+                ))]);
+            };
+            Ok(vec![
+                Response::AddSensation(event_sensation(
+                    event,
+                    "reign.command",
+                    "human",
+                    "I received a remote reign command.",
+                    json!({ "input": input }),
+                )),
+                Response::ProposeAction(action),
+            ])
+        }
+    }
+
+    #[derive(Default)]
     pub struct FaceRecognizedResponder;
 
     impl EventResponder for FaceRecognizedResponder {
@@ -757,6 +831,7 @@ pub mod responders {
 
 pub fn default_event_bus() -> EventBus {
     let mut bus = EventBus::new();
+    bus.on(responders::ReignResponder);
     bus.on(responders::BatteryLowResponder);
     bus.on(responders::ChargingStartedResponder);
     bus.on(responders::BumpResponder);
@@ -992,5 +1067,49 @@ mod tests {
             response,
             Response::AddMemoryNote(note) if note.contains("Cliff")
         )));
+    }
+
+    #[test]
+    fn reign_responder_maps_turn_to_action() {
+        let mut bus = EventBus::new();
+        bus.on(responders::ReignResponder);
+        let now = Now::blank(10, BodySense::default());
+        let ctx = EventContext {
+            now: &now,
+            latent: None,
+            recall: None,
+            predicted_futures: &[],
+            llm: None,
+            safety: None,
+        };
+        let input = ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 10,
+            expires_at_ms: 1_010,
+            source: netherwick_actions::ReignSource::WebRemote,
+            mode: netherwick_actions::ReignMode::Direct,
+            command: netherwick_actions::ReignCommand::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.5,
+                duration_ms: 500,
+            },
+            priority: 1.0,
+            note: None,
+        };
+        let event = Event::new(10, EventKind::ReignCommanded)
+            .with_payload(EventPayload::ReignCommanded { input });
+
+        let output = bus.dispatch(&ctx, &event).unwrap();
+
+        assert!(output.iter().any(|response| {
+            matches!(
+                response,
+                Response::ProposeAction(ActionPrimitive::Turn {
+                    direction: TurnDir::Left,
+                    intensity: 0.5,
+                    duration_ms: 500,
+                })
+            )
+        }));
     }
 }

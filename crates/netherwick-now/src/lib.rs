@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use netherwick_actions::ActionPrimitive;
+use netherwick_actions::{ActionPrimitive, ReignInput, ReignMode};
 use netherwick_body::BodySense;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -103,6 +103,16 @@ pub struct SafetySense {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReignSense {
+    pub active: bool,
+    pub mode: Option<ReignMode>,
+    pub latest: Option<ReignInput>,
+    pub pending_count: usize,
+    pub last_command_age_ms: Option<u64>,
+    pub human_override_pressure: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FaceSense {
     pub schema_version: u32,
     pub embeddings: Vec<Vec<f32>>,
@@ -174,6 +184,7 @@ pub struct Now {
     pub surprise: SurpriseSense,
     pub drives: DriveSense,
     pub llm: LlmSense,
+    pub reign: ReignSense,
     pub self_sense: SelfSense,
     pub extensions: ExtensionMap,
 }
@@ -226,6 +237,7 @@ impl Now {
                 schema_version: 1,
                 ..LlmSense::default()
             },
+            reign: ReignSense::default(),
             self_sense: SelfSense {
                 schema_version: 1,
                 ..SelfSense::default()

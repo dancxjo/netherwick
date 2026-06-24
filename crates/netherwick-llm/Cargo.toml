@@ -15,3 +15,7 @@ reqwest.workspace = true
 netherwick-actions = { path = "../netherwick-actions" }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-now = { path = "../netherwick-now" }
+
+[dev-dependencies]
+netherwick-body = { path = "../netherwick-body" }
+uuid.workspace = true

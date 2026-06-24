@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use netherwick_actions::ActionPrimitive;
+use netherwick_actions::{ActionPrimitive, ReignInput, ReignOutcome};
 use netherwick_core::Reward;
 use netherwick_experience::{
     Experience, ExperienceLatent, FuturePrediction, Impression, RecalledExperience, Sensation,
@@ -27,6 +27,8 @@ pub struct ExperienceFrame {
     pub z: Option<ExperienceLatent>,
     pub chosen_action: Option<ActionPrimitive>,
     pub conscious_command: Option<ConsciousCommand>,
+    pub reign_input: Option<ReignInput>,
+    pub reign_outcome: Option<ReignOutcome>,
     pub predicted_futures: Vec<FuturePrediction>,
     pub actual_next: Option<Box<Now>>,
     pub reward: Reward,

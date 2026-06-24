@@ -1,9 +1,13 @@
+use std::collections::VecDeque;
+
 use anyhow::Result;
-use netherwick_actions::{ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, TurnDir};
+use netherwick_actions::{
+    ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, ReignInput, ReignOutcome, TurnDir,
+};
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_body::MotorCommand;
 use netherwick_conductor::{Conductor, ConductorInput};
-use netherwick_core::{Provenance, Reward};
+use netherwick_core::{Provenance, Reward, TimeMs};
 use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
@@ -13,7 +17,7 @@ use netherwick_experience::{
 use netherwick_ledger::{ExperienceFrame, LedgerWriter};
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
-use netherwick_now::{DriveSense, Now, SafetySense};
+use netherwick_now::{DriveSense, Now, ReignSense, SafetySense};
 use uuid::Uuid;
 
 pub struct MinimalRuntime<L, M, R, C, S, A>
@@ -33,6 +37,67 @@ where
     pub llm: A,
     pub extractor: EventExtractor,
     pub bus: EventBus,
+    pub reign_queue: ReignQueue,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReignQueue {
+    pending: VecDeque<ReignInput>,
+    latest: Option<ReignInput>,
+}
+
+impl ReignQueue {
+    pub fn push(&mut self, input: ReignInput) {
+        self.latest = Some(input.clone());
+        self.pending.push_back(input);
+    }
+
+    pub fn latest_active(&self, now_ms: TimeMs) -> Option<ReignInput> {
+        self.pending
+            .iter()
+            .rev()
+            .find(|input| input.expires_at_ms > now_ms)
+            .cloned()
+    }
+
+    pub fn drain_expired(&mut self, now_ms: TimeMs) {
+        self.pending.retain(|input| input.expires_at_ms > now_ms);
+        if self
+            .latest
+            .as_ref()
+            .map(|input| input.expires_at_ms <= now_ms)
+            .unwrap_or(false)
+        {
+            self.latest = self.latest_active(now_ms);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.latest = None;
+    }
+
+    pub fn sense(&self, now_ms: TimeMs) -> ReignSense {
+        let latest = self.latest_active(now_ms);
+        let active = latest.is_some();
+        ReignSense {
+            active,
+            mode: latest.as_ref().map(|input| input.mode.clone()),
+            last_command_age_ms: latest
+                .as_ref()
+                .map(|input| now_ms.saturating_sub(input.issued_at_ms)),
+            human_override_pressure: latest
+                .as_ref()
+                .map(|input| input.priority.clamp(0.0, 1.0))
+                .unwrap_or(0.0),
+            latest,
+            pending_count: self
+                .pending
+                .iter()
+                .filter(|input| input.expires_at_ms > now_ms)
+                .count(),
+        }
+    }
 }
 
 impl<L, M, R, C, S, A> MinimalRuntime<L, M, R, C, S, A>
@@ -61,6 +126,7 @@ where
             llm,
             extractor: EventExtractor::default(),
             bus: default_event_bus(),
+            reign_queue: ReignQueue::default(),
         }
     }
 
@@ -81,6 +147,13 @@ where
         latent: ExperienceLatent,
         futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick> {
+        self.reign_queue.drain_expired(now.t_ms);
+        now.reign = self.reign_queue.sense(now.t_ms);
+        let reign_input = now.reign.latest.clone();
+        let reign_action = reign_input
+            .as_ref()
+            .and_then(|input| input.command.to_action());
+
         let recall = self
             .memory_recall
             .recall(RecallQuery::from_now(&now))
@@ -156,6 +229,7 @@ where
             surprise: now.surprise.clone(),
             llm: now.llm.clone(),
             safety: SafetySense::default(),
+            reign: now.reign.clone(),
             body: now.body.clone(),
             proposals,
         })?;
@@ -189,7 +263,7 @@ where
             notes.push(format!(
                 "Safety vetoed {:?}: {}",
                 chosen_action,
-                describe_safety_reason(safety.reason)
+                describe_safety_reason(safety.reason.clone())
             ));
         }
 
@@ -202,6 +276,26 @@ where
                 combobulation,
             );
         }
+
+        let reign_outcome = reign_input.as_ref().map(|input| {
+            let accepted_by_conductor = reign_action
+                .as_ref()
+                .map(|action| action == &chosen_action)
+                .unwrap_or(false);
+            ReignOutcome {
+                input_id: input.id,
+                accepted_by_conductor,
+                vetoed_by_safety: safety.vetoed,
+                final_action: Some(chosen_action.clone()),
+                reason: if safety.vetoed {
+                    Some(describe_safety_reason(safety.reason.clone()).to_string())
+                } else if accepted_by_conductor {
+                    None
+                } else {
+                    Some("conductor chose another action".to_string())
+                },
+            }
+        });
 
         if experiences.is_empty() {
             experiences.push(Experience::new(
@@ -227,6 +321,8 @@ where
             z: Some(latent.clone()),
             chosen_action: Some(chosen_action.clone()),
             conscious_command: llm_tick.conscious_command.clone(),
+            reign_input,
+            reign_outcome,
             predicted_futures: futures.clone(),
             actual_next: None,
             reward: Reward::default(),
@@ -562,6 +658,7 @@ fn describe_safety_reason(reason: Option<SafetyReason>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netherwick_actions::{ReignCommand, ReignMode, ReignSource};
     use netherwick_autonomic::SimpleSafety;
     use netherwick_body::BodySense;
     use netherwick_conductor::SimpleConductor;
@@ -595,5 +692,136 @@ mod tests {
             .experiences
             .iter()
             .any(|experience| experience.text.contains("hello world")));
+    }
+
+    #[tokio::test]
+    async fn stop_reign_becomes_now_event_and_chosen_action() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-reign-stop-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+        );
+        runtime.reign_queue.push(test_reign_input(
+            100,
+            ReignMode::Direct,
+            ReignCommand::Stop,
+            2_000,
+        ));
+        let mut body = BodySense::default();
+        body.last_update_ms = 100;
+        let now = Now::blank(100, body);
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert!(tick.frame.now.reign.active);
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert!(tick
+            .frame
+            .sensations
+            .iter()
+            .any(|sensation| sensation.kind == "reign.command"));
+        assert!(tick
+            .frame
+            .reign_outcome
+            .as_ref()
+            .map(|outcome| outcome.accepted_by_conductor)
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn expired_reign_disappears_from_sense() {
+        let mut queue = ReignQueue::default();
+        queue.push(test_reign_input(
+            100,
+            ReignMode::Direct,
+            ReignCommand::Stop,
+            100,
+        ));
+
+        queue.drain_expired(250);
+        let sense = queue.sense(250);
+
+        assert!(!sense.active);
+        assert!(sense.latest.is_none());
+        assert_eq!(sense.pending_count, 0);
+    }
+
+    #[tokio::test]
+    async fn safety_veto_beats_direct_go_reign_at_cliff() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-reign-safety-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+        );
+        runtime.reign_queue.push(test_reign_input(
+            100,
+            ReignMode::Direct,
+            ReignCommand::Go {
+                intensity: 0.5,
+                duration_ms: 500,
+            },
+            2_000,
+        ));
+        let mut body = BodySense::default();
+        body.flags.cliff_left = true;
+        body.last_update_ms = 100;
+        let now = Now::blank(100, body);
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: 0.5,
+                duration_ms: 500,
+            })
+        );
+        assert!(tick
+            .frame
+            .reign_outcome
+            .as_ref()
+            .map(|outcome| outcome.vetoed_by_safety)
+            .unwrap_or(false));
+        assert!(tick
+            .frame
+            .notes
+            .iter()
+            .any(|note| note.contains("Safety vetoed")));
+    }
+
+    fn test_reign_input(
+        issued_at_ms: u64,
+        mode: ReignMode,
+        command: ReignCommand,
+        ttl_ms: u64,
+    ) -> ReignInput {
+        ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms,
+            expires_at_ms: issued_at_ms + ttl_ms,
+            source: ReignSource::WebRemote,
+            mode,
+            command,
+            priority: 1.0,
+            note: None,
+        }
     }
 }

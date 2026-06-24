@@ -1,9 +1,11 @@
 use anyhow::Result;
-use netherwick_actions::{ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, TurnDir};
+use netherwick_actions::{
+    ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, ReignCommand, ReignMode, TurnDir,
+};
 use netherwick_body::BodySense;
 use netherwick_experience::ExperienceLatent;
 use netherwick_now::{
-    DriveSense, LlmSense, MemorySense, PredictionSense, SafetySense, SurpriseSense,
+    DriveSense, LlmSense, MemorySense, PredictionSense, ReignSense, SafetySense, SurpriseSense,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,7 @@ pub struct ConductorInput {
     pub surprise: SurpriseSense,
     pub llm: LlmSense,
     pub safety: SafetySense,
+    pub reign: ReignSense,
     pub body: BodySense,
     pub proposals: Vec<ActionPrimitive>,
 }
@@ -77,6 +80,9 @@ impl Conductor for SimpleConductor {
                 target: InspectTarget::Novelty,
             });
         }
+        if let Some(action) = preferred_reign_action(&input) {
+            return Ok(action);
+        }
         if let Some(action) = input.proposals.last() {
             return Ok(action.clone());
         }
@@ -84,6 +90,21 @@ impl Conductor for SimpleConductor {
             style: ExploreStyle::RandomWalk,
             duration_ms: 1_000,
         })
+    }
+}
+
+fn preferred_reign_action(input: &ConductorInput) -> Option<ActionPrimitive> {
+    let reign_input = input.reign.latest.as_ref()?;
+    let action = reign_input.command.to_action()?;
+    if matches!(reign_input.command, ReignCommand::Stop) {
+        return Some(action);
+    }
+    match reign_input.mode {
+        ReignMode::Direct => Some(action),
+        ReignMode::Assist if input.proposals.iter().any(|proposal| proposal == &action) => {
+            Some(action)
+        }
+        _ => None,
     }
 }
 
@@ -104,6 +125,7 @@ mod tests {
             surprise: SurpriseSense::default(),
             llm: LlmSense::default(),
             safety: SafetySense::default(),
+            reign: ReignSense::default(),
             body,
             proposals: Vec::new(),
         };

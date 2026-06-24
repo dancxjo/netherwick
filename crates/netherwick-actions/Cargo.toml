@@ -7,4 +7,5 @@ publish = false
 
 [dependencies]
 serde.workspace = true
+uuid.workspace = true
 netherwick-core = { path = "../netherwick-core" }
