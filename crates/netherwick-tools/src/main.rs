@@ -17,17 +17,17 @@ use netherwick_create1::{Create1Body, MockCreate1Body};
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
-use netherwick_llm::NoopLlmAgent;
+use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
 use netherwick_memory::InMemoryExperienceStore;
 use netherwick_models::MODEL_REGISTRY;
-use netherwick_now::{EarSense, EyeSense, KinectSense, RangeSense};
+use netherwick_now::{EarSense, KinectSense, RangeSense};
 use netherwick_runtime::{
     MinimalRuntime, RealRobotRunner, RobotMode, RuntimeLoop, RuntimeModelStack, RuntimeTick,
     SimRunner,
 };
 use netherwick_sensors::{
-    CameraSenseProvider, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider,
-    PcmAudioFrame, SensePacket, SenseProducer, WorldSnapshot,
+    CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
+    MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, WorldSnapshot,
 };
 use netherwick_server::LiveViewState;
 use netherwick_sim::{build_scenario, default_sim_world, ScenarioConfig, ScenarioKind};
@@ -36,6 +36,7 @@ use netherwick_training::{
     EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
 };
 use netherwick_worldlab::{
+    export_pointcloud_for_frame, export_snapshot_assets, rewrite_frames, update_manifest,
     CaptureReader, CaptureReplayRunner, CaptureSource, CaptureStreams, CaptureWriter,
 };
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,7 @@ enum Command {
     Replay,
     CaptureSim(CaptureSimArgs),
     CaptureReal(CaptureRealArgs),
+    CaptureAssets(CaptureAssetsArgs),
     InspectCapture(InspectCaptureArgs),
     ReplayCapture(ReplayCaptureArgs),
     Train(TrainCommand),
@@ -83,6 +85,7 @@ async fn main() -> Result<()> {
         Command::HardwareEnv(args) => hardware_env(args).await,
         Command::CaptureSim(args) => capture_sim(args).await,
         Command::CaptureReal(args) => capture_real(args).await,
+        Command::CaptureAssets(args) => capture_assets(args).await,
         Command::InspectCapture(args) => inspect_capture(args).await,
         Command::ReplayCapture(args) => replay_capture(args).await,
         Command::InspectLedger => inspect_ledger().await,
@@ -142,6 +145,8 @@ struct SimArgs {
     live_addr: SocketAddr,
     #[arg(long, default_value_t = 100)]
     tick_delay_ms: u64,
+    #[command(flatten)]
+    llm: LlmArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -164,6 +169,8 @@ struct SimCurriculumArgs {
     validation_ratio: f32,
     #[arg(long, default_value_t = 0.1)]
     test_ratio: f32,
+    #[command(flatten)]
+    llm: LlmArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -212,6 +219,31 @@ struct EvalScenarioArgs {
     experience_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     experience_mode: ExperienceMode,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Clone, Debug, Default, Parser)]
+struct LlmArgs {
+    #[arg(long)]
+    llm_config: Option<String>,
+    #[arg(long, value_enum)]
+    llm_provider: Option<CliLlmProvider>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliLlmProvider {
+    Disabled,
+    Ollama,
+}
+
+impl From<CliLlmProvider> for LlmProvider {
+    fn from(value: CliLlmProvider) -> Self {
+        match value {
+            CliLlmProvider::Disabled => LlmProvider::Disabled,
+            CliLlmProvider::Ollama => LlmProvider::Ollama,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -271,6 +303,8 @@ struct RobotArgs {
     require_imu: bool,
     #[arg(long)]
     require_gps: bool,
+    #[command(flatten)]
+    llm: LlmArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -296,6 +330,8 @@ struct CaptureSimArgs {
     seed: u64,
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
+    #[command(flatten)]
+    llm: LlmArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -322,6 +358,30 @@ struct CaptureRealArgs {
     gps: Option<String>,
     #[arg(long)]
     mock: bool,
+    #[arg(long)]
+    export_rgb: bool,
+    #[arg(long)]
+    export_depth: bool,
+    #[arg(long)]
+    export_audio: bool,
+    #[arg(long)]
+    export_pointcloud: bool,
+    #[arg(long, default_value_t = 4)]
+    pointcloud_stride: usize,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct CaptureAssetsArgs {
+    #[arg(long)]
+    capture: String,
+    #[arg(long)]
+    pointcloud: bool,
+    #[arg(long, default_value_t = 4)]
+    stride: usize,
+    #[arg(long, default_value_t = 8.0)]
+    max_depth_m: f32,
 }
 
 #[derive(Debug, Parser)]
@@ -335,6 +395,8 @@ struct ReplayCaptureArgs {
     capture: String,
     #[arg(long, default_value = "data/ledger/replay-test")]
     ledger: String,
+    #[command(flatten)]
+    llm: LlmArgs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -595,13 +657,14 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let ledger = JsonlLedger::new(&args.ledger);
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
+    let llm = configured_llm_agent(&args.llm)?;
     let mut runtime = MinimalRuntime::with_default_events(
         ledger,
         memory,
         recall,
         SimpleConductor::default(),
         SimpleSafety::default(),
-        NoopLlmAgent,
+        llm,
     );
     if let Some(models) = load_runtime_models(&args)? {
         runtime = runtime.with_models(models);
@@ -662,7 +725,7 @@ async fn run_sim_curriculum(args: SimCurriculumArgs) -> Result<()> {
         let scenario = build_scenario(ScenarioConfig::new(kind, episode_seed));
         let object_count = scenario.metadata.objects.len();
         let object_summary = scenario_object_summary(&scenario.metadata.objects);
-        let runtime = default_runtime(ledger.clone());
+        let runtime = default_runtime(ledger.clone(), &args.llm)?;
         let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
         runner.tick_ms = args.tick_ms;
         let mut capture_path_for_manifest = None;
@@ -1159,13 +1222,13 @@ async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {
             capture.clone(),
         );
         let (episode, warnings) = if let Some(ledger_path) = &args.ledger {
-            let mut runtime = default_runtime(JsonlLedger::new(ledger_path));
+            let mut runtime = default_runtime(JsonlLedger::new(ledger_path), &args.llm)?;
             if let Some(models) = load_runtime_models_from_flags(&flags)?.0 {
                 runtime = runtime.with_models(models);
             }
             run_eval_episode(runtime, scenario.world, scenario.motors, &args, builder).await?
         } else {
-            let mut runtime = default_noop_runtime();
+            let mut runtime = default_noop_runtime(&args.llm)?;
             if let Some(models) = load_runtime_models_from_flags(&flags)?.0 {
                 runtime = runtime.with_models(models);
             }
@@ -1261,24 +1324,39 @@ where
     Ok((metrics.finish(), warnings))
 }
 
-fn default_noop_runtime() -> MinimalRuntime<
-    NoopLedger,
-    InMemoryExperienceStore,
-    InMemoryExperienceStore,
-    SimpleConductor,
-    SimpleSafety,
-    NoopLlmAgent,
+fn configured_llm_agent(args: &LlmArgs) -> Result<ConfiguredLlmAgent> {
+    let mut config = match &args.llm_config {
+        Some(path) => LlmConfig::load(path)?,
+        None => LlmConfig::default(),
+    };
+    if let Some(provider) = args.llm_provider {
+        config.provider = provider.into();
+    }
+    ConfiguredLlmAgent::from_config(config)
+}
+
+fn default_noop_runtime(
+    llm_args: &LlmArgs,
+) -> Result<
+    MinimalRuntime<
+        NoopLedger,
+        InMemoryExperienceStore,
+        InMemoryExperienceStore,
+        SimpleConductor,
+        SimpleSafety,
+        ConfiguredLlmAgent,
+    >,
 > {
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
-    MinimalRuntime::with_default_events(
+    Ok(MinimalRuntime::with_default_events(
         NoopLedger,
         memory,
         recall,
         SimpleConductor::default(),
         SimpleSafety::default(),
-        NoopLlmAgent,
-    )
+        configured_llm_agent(llm_args)?,
+    ))
 }
 
 fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool {
@@ -1419,7 +1497,7 @@ async fn capture_sim(args: CaptureSimArgs) -> Result<()> {
         recall,
         SimpleConductor::default(),
         SimpleSafety::default(),
-        NoopLlmAgent,
+        configured_llm_agent(&args.llm)?,
     );
     let (world, motors) = default_sim_world(args.seed);
     let mut runner = SimRunner::new(runtime, world, motors);
@@ -1454,7 +1532,7 @@ async fn replay_capture(args: ReplayCaptureArgs) -> Result<()> {
         recall,
         SimpleConductor::default(),
         SimpleSafety::default(),
-        NoopLlmAgent,
+        configured_llm_agent(&args.llm)?,
     );
     let mut runner = CaptureReplayRunner::new(runtime, reader);
     let summary = runner.replay().await?;
@@ -1587,7 +1665,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
 
     let requested_frames = duration_to_steps(args.duration_seconds, args.tick_ms);
     if let Some(ledger_path) = &args.ledger {
-        let runtime = default_runtime(JsonlLedger::new(ledger_path));
+        let runtime = default_runtime(JsonlLedger::new(ledger_path), &args.llm)?;
         capture_real_with_runtime(
             args,
             runtime,
@@ -1600,7 +1678,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         )
         .await
     } else {
-        let runtime = default_noop_runtime();
+        let runtime = default_noop_runtime(&args.llm)?;
         capture_real_with_runtime(
             args,
             runtime,
@@ -1641,10 +1719,24 @@ where
         manifest
             .notes
             .push("capture-real is capture-only; motors are not commanded".to_string());
+        if args.export_rgb || args.export_depth || args.export_audio {
+            manifest.notes.push(
+                "asset export enabled; frame asset paths are relative to capture root".to_string(),
+            );
+        }
+    }
+    if args.export_pointcloud
+        && !warnings
+            .iter()
+            .any(|warning| warning.contains("uncalibrated point cloud"))
+    {
+        warnings
+            .push("uncalibrated point cloud: using approximate placeholder intrinsics".to_string());
     }
 
     let mut stream_counts = StreamCounts::default();
     let mut events_written = 0usize;
+    let mut frame_index = 0u64;
     for _ in 0..requested_frames {
         let (snapshot, tick) = runner.tick_read_only().await?;
         stream_counts.observe(&snapshot);
@@ -1656,9 +1748,29 @@ where
         {
             events_written = events_written.saturating_add(1);
         }
+        let export = export_snapshot_assets(
+            writer.root(),
+            frame_index,
+            &snapshot,
+            args.export_rgb,
+            args.export_depth,
+            args.export_audio,
+        )?;
         writer
-            .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+            .append_snapshot_with_assets(
+                snapshot.body.last_update_ms,
+                snapshot,
+                Vec::new(),
+                export.assets,
+                (!export
+                    .metadata
+                    .as_object()
+                    .map(|m| m.is_empty())
+                    .unwrap_or(true))
+                .then_some(export.metadata),
+            )
             .await?;
+        frame_index = frame_index.saturating_add(1);
         tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
     }
 
@@ -1686,6 +1798,48 @@ where
     if events_written > 0 {
         println!("  read-only motor suppressions observed: {events_written}");
     }
+    if args.export_pointcloud {
+        capture_assets(CaptureAssetsArgs {
+            capture: args.out.clone(),
+            pointcloud: true,
+            stride: args.pointcloud_stride,
+            max_depth_m: 8.0,
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+async fn capture_assets(args: CaptureAssetsArgs) -> Result<()> {
+    if !args.pointcloud {
+        anyhow::bail!("no asset conversion requested; pass --pointcloud");
+    }
+    let root = PathBuf::from(&args.capture);
+    let reader = CaptureReader::open(&root).await?;
+    let mut manifest = reader.manifest().clone();
+    let mut frames = reader.read_frames().await?;
+    let mut exported = 0usize;
+    for frame in &mut frames {
+        if export_pointcloud_for_frame(&root, frame, args.max_depth_m, args.stride)?.is_some() {
+            exported = exported.saturating_add(1);
+        }
+    }
+    rewrite_frames(&root, &frames).await?;
+    if exported > 0
+        && !manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("uncalibrated point cloud"))
+    {
+        manifest
+            .warnings
+            .push("uncalibrated point cloud: using approximate placeholder intrinsics".to_string());
+    }
+    update_manifest(&root, &manifest).await?;
+    println!(
+        "capture-assets complete: pointcloud {} frames, capture {}, stride {}",
+        exported, args.capture, args.stride
+    );
     Ok(())
 }
 
@@ -1710,6 +1864,9 @@ async fn inspect_capture(args: InspectCaptureArgs) -> Result<()> {
     println!("  assets:");
     for (kind, count) in &report.asset_counts {
         println!("    {kind}: {count}");
+    }
+    for detail in &report.asset_details {
+        println!("    {detail}");
     }
     println!("  warnings: {}", report.warnings.len());
     for warning in &report.warnings {
@@ -1809,7 +1966,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         recall,
         SimpleConductor::default(),
         SimpleSafety::default(),
-        NoopLlmAgent,
+        configured_llm_agent(&args.llm)?,
     );
     let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, body, sensors, runtime);
     runner.tick_ms = args.tick_ms;
@@ -1880,24 +2037,27 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
 
 fn default_runtime(
     ledger: JsonlLedger,
-) -> MinimalRuntime<
-    JsonlLedger,
-    InMemoryExperienceStore,
-    InMemoryExperienceStore,
-    SimpleConductor,
-    SimpleSafety,
-    NoopLlmAgent,
+    llm_args: &LlmArgs,
+) -> Result<
+    MinimalRuntime<
+        JsonlLedger,
+        InMemoryExperienceStore,
+        InMemoryExperienceStore,
+        SimpleConductor,
+        SimpleSafety,
+        ConfiguredLlmAgent,
+    >,
 > {
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
-    MinimalRuntime::with_default_events(
+    Ok(MinimalRuntime::with_default_events(
         ledger,
         memory,
         recall,
         SimpleConductor::default(),
         SimpleSafety::default(),
-        NoopLlmAgent,
-    )
+        configured_llm_agent(llm_args)?,
+    ))
 }
 
 fn duration_to_steps(duration_seconds: u64, tick_ms: u64) -> usize {
@@ -1991,10 +2151,13 @@ impl SenseProducer for MockEyeProducer {
     async fn poll(&mut self) -> Result<SensePacket> {
         self.tick = self.tick.saturating_add(1);
         let base = (self.tick % 16) as f32 / 16.0;
-        Ok(SensePacket::Eye(EyeSense {
-            schema_version: 1,
-            frames: vec![vec![base, 0.25, 0.5, 0.75]],
-            ..EyeSense::default()
+        let b = (base * 255.0).round() as u8;
+        Ok(SensePacket::EyeFrame(EyeFrame {
+            captured_at_ms: Utc::now().timestamp_millis().max(0) as u64,
+            width: 2,
+            height: 2,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![b, 64, 128, 128, b, 64, 64, 128, b, 255, 255, 255],
         }))
     }
 }
@@ -2402,6 +2565,7 @@ struct CaptureInspectionReport {
     last_timestamp_ms: Option<u64>,
     event_count: usize,
     asset_counts: Vec<(String, usize)>,
+    asset_details: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -2438,8 +2602,66 @@ async fn inspect_capture_report(path: impl AsRef<Path>) -> Result<CaptureInspect
         last_timestamp_ms,
         event_count,
         asset_counts: asset_counts(&path),
+        asset_details: asset_details(&frames),
         warnings: reader.manifest().warnings.clone(),
     })
+}
+
+fn asset_details(frames: &[netherwick_worldlab::CaptureFrameRecord]) -> Vec<String> {
+    let mut details = Vec::new();
+    let mut seen = BTreeSet::new();
+    for frame in frames {
+        let Some(metadata) = frame.stream_metadata.as_ref().and_then(Value::as_object) else {
+            continue;
+        };
+        for kind in ["rgb", "depth", "audio", "pointcloud"] {
+            if seen.contains(kind) {
+                continue;
+            }
+            let Some(value) = metadata.get(kind).and_then(Value::as_object) else {
+                continue;
+            };
+            let detail = match kind {
+                "rgb" | "depth" => format!(
+                    "{kind} metadata: {}x{}, {}",
+                    value.get("width").and_then(Value::as_u64).unwrap_or(0),
+                    value.get("height").and_then(Value::as_u64).unwrap_or(0),
+                    value
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                "audio" => format!(
+                    "audio metadata: {} Hz, {} channel(s), {}",
+                    value
+                        .get("sample_rate_hz")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    value.get("channels").and_then(Value::as_u64).unwrap_or(0),
+                    value
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                "pointcloud" => format!(
+                    "pointcloud metadata: {} vertices, {}, calibration {}",
+                    value.get("vertices").and_then(Value::as_u64).unwrap_or(0),
+                    value
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    value
+                        .get("calibration")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                _ => continue,
+            };
+            seen.insert(kind);
+            details.push(detail);
+        }
+    }
+    details
 }
 
 fn asset_counts(root: &Path) -> Vec<(String, usize)> {
@@ -3841,6 +4063,7 @@ mod tests {
             ear_next_mode: EarNextMode::Off,
             experience_checkpoint: None,
             experience_mode: ExperienceMode::Off,
+            llm: LlmArgs::default(),
         }
     }
 
@@ -4075,6 +4298,12 @@ mod tests {
             imu: None,
             gps: None,
             mock: true,
+            export_rgb: false,
+            export_depth: false,
+            export_audio: false,
+            export_pointcloud: false,
+            pointcloud_stride: 4,
+            llm: LlmArgs::default(),
         };
 
         capture_real(args).await.unwrap();
@@ -4085,6 +4314,67 @@ mod tests {
         assert!(report.streams_present.contains(&"body".to_string()));
         assert!(report.streams_present.contains(&"audio".to_string()));
         assert!(report.streams_present.contains(&"depth".to_string()));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn capture_real_mock_exports_assets_and_pointclouds() {
+        let temp_dir = temp_path("netherwick_capture_real_mock_assets");
+        let args = CaptureRealArgs {
+            duration_seconds: 1,
+            out: temp_dir.to_string_lossy().to_string(),
+            ledger: None,
+            tick_ms: 1000,
+            create_port: "mock".to_string(),
+            create_baud: 57_600,
+            camera: None,
+            mic: None,
+            imu: None,
+            gps: None,
+            mock: true,
+            export_rgb: true,
+            export_depth: true,
+            export_audio: true,
+            export_pointcloud: false,
+            pointcloud_stride: 4,
+            llm: LlmArgs::default(),
+        };
+
+        capture_real(args).await.unwrap();
+        capture_assets(CaptureAssetsArgs {
+            capture: temp_dir.to_string_lossy().to_string(),
+            pointcloud: true,
+            stride: 1,
+            max_depth_m: 8.0,
+        })
+        .await
+        .unwrap();
+
+        let report = inspect_capture_report(&temp_dir).await.unwrap();
+        assert_eq!(
+            report.asset_counts,
+            vec![
+                ("rgb".to_string(), 1),
+                ("depth".to_string(), 1),
+                ("audio".to_string(), 1),
+                ("pointcloud".to_string(), 1)
+            ]
+        );
+        assert!(report
+            .asset_details
+            .iter()
+            .any(|detail| detail.contains("rgb metadata: 2x2")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("uncalibrated point cloud")));
+        let replay = replay_capture(ReplayCaptureArgs {
+            capture: temp_dir.to_string_lossy().to_string(),
+            ledger: temp_dir.join("ledger").to_string_lossy().to_string(),
+            llm: LlmArgs::default(),
+        })
+        .await;
+        assert!(replay.is_ok());
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
@@ -4149,6 +4439,7 @@ mod tests {
             tick_ms: 100,
             validation_ratio: 0.25,
             test_ratio: 0.25,
+            llm: LlmArgs::default(),
         };
 
         run_sim_curriculum(args).await.unwrap();

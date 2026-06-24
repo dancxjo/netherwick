@@ -1,8 +1,8 @@
-provider = "disabled"
-allow_commands = true
-allow_teaching = true
+provider = "ollama"
 endpoint = "http://127.0.0.1:11434"
 agent_model = "qwen2.5:7b-instruct"
 combobulator_model = "qwen2.5:7b-instruct"
+allow_commands = false
+allow_teaching = true
 temperature = 0.2
 timeout_ms = 20000

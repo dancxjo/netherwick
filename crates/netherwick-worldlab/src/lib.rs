@@ -1,10 +1,12 @@
+use std::fs as std_fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use image::{ImageBuffer, Luma, RgbImage};
 use netherwick_experience::{ExperienceLatent, FuturePrediction};
 use netherwick_runtime::{RuntimeLoop, RuntimeTick};
-use netherwick_sensors::WorldSnapshot;
+use netherwick_sensors::{EyeFrameFormat, PcmAudioFrame, WorldSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs::{self, File, OpenOptions};
@@ -60,6 +62,10 @@ pub struct CaptureFrameRecord {
     pub t_ms: u64,
     pub snapshot: SerializableWorldSnapshot,
     pub events: Vec<RecordedEvent>,
+    #[serde(default, skip_serializing_if = "CaptureFrameAssets::is_empty")]
+    pub assets: CaptureFrameAssets,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_metadata: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,6 +79,27 @@ pub struct RecordedEvent {
 pub struct CaptureStreams {
     pub present: Vec<String>,
     pub missing: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureFrameAssets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rgb: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointcloud: Option<String>,
+}
+
+impl CaptureFrameAssets {
+    pub fn is_empty(&self) -> bool {
+        self.rgb.is_none()
+            && self.depth.is_none()
+            && self.audio.is_none()
+            && self.pointcloud.is_none()
+    }
 }
 
 pub struct CaptureWriter {
@@ -136,11 +163,31 @@ impl CaptureWriter {
         snapshot: WorldSnapshot,
         events: Vec<RecordedEvent>,
     ) -> Result<()> {
+        self.append_snapshot_with_assets(
+            t_ms,
+            snapshot,
+            events,
+            CaptureFrameAssets::default(),
+            None,
+        )
+        .await
+    }
+
+    pub async fn append_snapshot_with_assets(
+        &mut self,
+        t_ms: u64,
+        snapshot: WorldSnapshot,
+        events: Vec<RecordedEvent>,
+        assets: CaptureFrameAssets,
+        stream_metadata: Option<Value>,
+    ) -> Result<()> {
         let record = CaptureFrameRecord {
             index: self.frame_count,
             t_ms,
             snapshot,
             events,
+            assets,
+            stream_metadata,
         };
         let line = serde_json::to_string(&record)?;
         self.frames.write_all(line.as_bytes()).await?;
@@ -159,6 +206,10 @@ impl CaptureWriter {
 
     pub fn manifest_mut(&mut self) -> &mut CaptureManifest {
         &mut self.manifest
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 }
 
@@ -278,8 +329,319 @@ fn default_asset_layout() -> Value {
         "depth": "assets/depth/",
         "audio": "assets/audio/",
         "pointcloud": "assets/pointcloud/",
-        "raw_export": "not yet saved by capture-real; compact JSON features are embedded in frames.jsonl"
+        "paths": "frame asset paths are relative to capture root",
+        "rgb_format": "PNG RGB8",
+        "depth_format": "PNG Gray16, millimeters",
+        "audio_format": "WAV PCM16",
+        "pointcloud_format": "PLY ASCII"
     })
+}
+
+pub fn capture_asset_path(kind: &str, index: u64, extension: &str) -> String {
+    format!("assets/{kind}/{index:06}.{extension}")
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CaptureAssetExport {
+    pub assets: CaptureFrameAssets,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DepthImage {
+    pub width: u32,
+    pub height: u32,
+    pub units: DepthUnits,
+    pub values_mm: Vec<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthUnits {
+    Millimeters,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraIntrinsics {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+}
+
+impl CameraIntrinsics {
+    pub fn approximate_for(width: u32, height: u32) -> Self {
+        Self {
+            fx: width.max(1) as f32,
+            fy: width.max(1) as f32,
+            cx: (width.saturating_sub(1)) as f32 * 0.5,
+            cy: (height.saturating_sub(1)) as f32 * 0.5,
+        }
+    }
+}
+
+pub fn export_snapshot_assets(
+    root: &Path,
+    index: u64,
+    snapshot: &WorldSnapshot,
+    export_rgb: bool,
+    export_depth: bool,
+    export_audio: bool,
+) -> Result<CaptureAssetExport> {
+    let mut assets = CaptureFrameAssets::default();
+    let mut metadata = serde_json::Map::new();
+
+    if export_rgb {
+        if let Some((width, height, rgb)) = snapshot_rgb8(snapshot) {
+            let rel = capture_asset_path("rgb", index, "png");
+            write_rgb_png(&root.join(&rel), width, height, &rgb)?;
+            assets.rgb = Some(rel);
+            metadata.insert(
+                "rgb".to_string(),
+                serde_json::json!({"width": width, "height": height, "format": "rgb8_png"}),
+            );
+        }
+    }
+
+    if export_depth {
+        if let Some(depth) = snapshot_depth_image(snapshot) {
+            let rel = capture_asset_path("depth", index, "depth16.png");
+            write_depth_png(&root.join(&rel), &depth)?;
+            assets.depth = Some(rel);
+            metadata.insert(
+                "depth".to_string(),
+                serde_json::json!({
+                    "width": depth.width,
+                    "height": depth.height,
+                    "format": "gray16_png",
+                    "units": "millimeters",
+                    "scale": 0.001
+                }),
+            );
+        }
+    }
+
+    if export_audio {
+        if let Some(audio) = &snapshot.ear_pcm {
+            let rel = capture_asset_path("audio", index, "wav");
+            write_wav(&root.join(&rel), audio)?;
+            assets.audio = Some(rel);
+            metadata.insert(
+                "audio".to_string(),
+                serde_json::json!({
+                    "sample_rate_hz": audio.sample_rate_hz,
+                    "channels": audio.channels,
+                    "format": "pcm16_wav",
+                    "samples": audio.samples.len()
+                }),
+            );
+        }
+    }
+
+    Ok(CaptureAssetExport {
+        assets,
+        metadata: Value::Object(metadata),
+    })
+}
+
+pub fn snapshot_depth_image(snapshot: &WorldSnapshot) -> Option<DepthImage> {
+    if snapshot.kinect.depth_m.is_empty() {
+        return None;
+    }
+    let width = snapshot.kinect.depth_m.len() as u32;
+    let height = 1;
+    let values_mm = snapshot
+        .kinect
+        .depth_m
+        .iter()
+        .map(|meters| {
+            if meters.is_finite() && *meters > 0.0 {
+                (meters * 1000.0).round().clamp(0.0, u16::MAX as f32) as u16
+            } else {
+                0
+            }
+        })
+        .collect();
+    Some(DepthImage {
+        width,
+        height,
+        units: DepthUnits::Millimeters,
+        values_mm,
+    })
+}
+
+pub fn write_pointcloud_ply(
+    path: &Path,
+    depth: &DepthImage,
+    intrinsics: CameraIntrinsics,
+    max_depth_m: f32,
+    stride: usize,
+) -> Result<usize> {
+    let stride = stride.max(1);
+    let mut vertices = Vec::new();
+    for y in (0..depth.height as usize).step_by(stride) {
+        for x in (0..depth.width as usize).step_by(stride) {
+            let index = y * depth.width as usize + x;
+            let z_m = depth.values_mm.get(index).copied().unwrap_or(0) as f32 * 0.001;
+            if z_m <= 0.0 || z_m > max_depth_m {
+                continue;
+            }
+            let x_m = ((x as f32 - intrinsics.cx) * z_m) / intrinsics.fx.max(f32::EPSILON);
+            let y_m = ((y as f32 - intrinsics.cy) * z_m) / intrinsics.fy.max(f32::EPSILON);
+            vertices.push((x_m, y_m, z_m));
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("ply\nformat ascii 1.0\n");
+    out.push_str(&format!("element vertex {}\n", vertices.len()));
+    out.push_str("property float x\nproperty float y\nproperty float z\nend_header\n");
+    for (x, y, z) in &vertices {
+        out.push_str(&format!("{x:.6} {y:.6} {z:.6}\n"));
+    }
+    if let Some(parent) = path.parent() {
+        std_fs::create_dir_all(parent)?;
+    }
+    std_fs::write(path, out)?;
+    Ok(vertices.len())
+}
+
+pub fn export_pointcloud_for_frame(
+    root: &Path,
+    frame: &mut CaptureFrameRecord,
+    max_depth_m: f32,
+    stride: usize,
+) -> Result<Option<Value>> {
+    let Some(depth) = snapshot_depth_image(&frame.snapshot) else {
+        return Ok(None);
+    };
+    let rel = capture_asset_path("pointcloud", frame.index, "ply");
+    let intrinsics = CameraIntrinsics::approximate_for(depth.width, depth.height);
+    let vertices = write_pointcloud_ply(&root.join(&rel), &depth, intrinsics, max_depth_m, stride)?;
+    frame.assets.pointcloud = Some(rel);
+    let mut metadata = frame
+        .stream_metadata
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.insert(
+        "pointcloud".to_string(),
+        serde_json::json!({
+            "format": "ply_ascii",
+            "vertices": vertices,
+            "stride": stride.max(1),
+            "max_depth_m": max_depth_m,
+            "intrinsics": {
+                "fx": intrinsics.fx,
+                "fy": intrinsics.fy,
+                "cx": intrinsics.cx,
+                "cy": intrinsics.cy
+            },
+            "calibration": "uncalibrated"
+        }),
+    );
+    let metadata = Value::Object(metadata);
+    frame.stream_metadata = Some(metadata.clone());
+    Ok(Some(metadata))
+}
+
+pub async fn rewrite_frames(root: &Path, frames: &[CaptureFrameRecord]) -> Result<()> {
+    let path = root.join(FRAMES_FILE);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)
+        .await?;
+    for frame in frames {
+        let line = serde_json::to_string(frame)?;
+        file.write_all(line.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+pub async fn update_manifest(root: &Path, manifest: &CaptureManifest) -> Result<()> {
+    write_manifest_atomic(root, manifest).await
+}
+
+fn snapshot_rgb8(snapshot: &WorldSnapshot) -> Option<(u32, u32, Vec<u8>)> {
+    if let Some(frame) = &snapshot.eye_frame {
+        match frame.format {
+            EyeFrameFormat::Rgb8
+                if frame.bytes.len() == frame.width as usize * frame.height as usize * 3 =>
+            {
+                return Some((frame.width, frame.height, frame.bytes.clone()));
+            }
+            EyeFrameFormat::Bgr8
+                if frame.bytes.len() == frame.width as usize * frame.height as usize * 3 =>
+            {
+                let mut rgb = frame.bytes.clone();
+                for pixel in rgb.chunks_exact_mut(3) {
+                    pixel.swap(0, 2);
+                }
+                return Some((frame.width, frame.height, rgb));
+            }
+            EyeFrameFormat::Gray8
+                if frame.bytes.len() == frame.width as usize * frame.height as usize =>
+            {
+                let mut rgb = Vec::with_capacity(frame.bytes.len() * 3);
+                for value in &frame.bytes {
+                    rgb.extend_from_slice(&[*value, *value, *value]);
+                }
+                return Some((frame.width, frame.height, rgb));
+            }
+            _ => {}
+        }
+    }
+
+    let features = snapshot.eye.frames.first()?;
+    let width = features.len().max(1) as u32;
+    let mut rgb = Vec::with_capacity(width as usize * 3);
+    for value in features {
+        let byte = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        rgb.extend_from_slice(&[byte, byte, byte]);
+    }
+    Some((width, 1, rgb))
+}
+
+fn write_rgb_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std_fs::create_dir_all(parent)?;
+    }
+    let image: RgbImage = ImageBuffer::from_vec(width, height, rgb.to_vec())
+        .context("RGB bytes did not match image dimensions")?;
+    image.save(path)?;
+    Ok(())
+}
+
+fn write_depth_png(path: &Path, depth: &DepthImage) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std_fs::create_dir_all(parent)?;
+    }
+    let image: ImageBuffer<Luma<u16>, Vec<u16>> =
+        ImageBuffer::from_vec(depth.width, depth.height, depth.values_mm.clone())
+            .context("depth values did not match image dimensions")?;
+    image.save(path)?;
+    Ok(())
+}
+
+fn write_wav(path: &Path, audio: &PcmAudioFrame) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std_fs::create_dir_all(parent)?;
+    }
+    let spec = hound::WavSpec {
+        channels: audio.channels,
+        sample_rate: audio.sample_rate_hz,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    for sample in &audio.samples {
+        writer.write_sample(*sample)?;
+    }
+    writer.finalize()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -319,6 +681,92 @@ mod tests {
         let decoded: CaptureManifest = serde_json::from_str(&encoded).unwrap();
 
         assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn capture_asset_paths_are_deterministic() {
+        assert_eq!(capture_asset_path("rgb", 7, "png"), "assets/rgb/000007.png");
+        assert_eq!(
+            capture_asset_path("depth", 42, "depth16.png"),
+            "assets/depth/000042.depth16.png"
+        );
+    }
+
+    #[test]
+    fn old_frame_records_deserialize_without_assets() {
+        let encoded = serde_json::json!({
+            "index": 0,
+            "t_ms": 123,
+            "snapshot": WorldSnapshot::default(),
+            "events": []
+        });
+
+        let decoded: CaptureFrameRecord = serde_json::from_value(encoded).unwrap();
+
+        assert!(decoded.assets.is_empty());
+        assert!(decoded.stream_metadata.is_none());
+    }
+
+    #[test]
+    fn frame_asset_references_serialize() {
+        let record = CaptureFrameRecord {
+            index: 1,
+            t_ms: 1234,
+            snapshot: WorldSnapshot::default(),
+            events: Vec::new(),
+            assets: CaptureFrameAssets {
+                rgb: Some("assets/rgb/000001.png".to_string()),
+                depth: Some("assets/depth/000001.depth16.png".to_string()),
+                audio: None,
+                pointcloud: Some("assets/pointcloud/000001.ply".to_string()),
+            },
+            stream_metadata: Some(serde_json::json!({"rgb": {"width": 2, "height": 2}})),
+        };
+
+        let encoded = serde_json::to_value(&record).unwrap();
+
+        assert_eq!(encoded["assets"]["rgb"], "assets/rgb/000001.png");
+        assert_eq!(
+            encoded["assets"]["pointcloud"],
+            "assets/pointcloud/000001.ply"
+        );
+        assert_eq!(encoded["stream_metadata"]["rgb"]["width"], 2);
+    }
+
+    #[test]
+    fn tiny_depth_map_exports_expected_ply_vertices() {
+        let dir = tempdir().unwrap();
+        let depth = DepthImage {
+            width: 2,
+            height: 2,
+            units: DepthUnits::Millimeters,
+            values_mm: vec![1000, 0, 2000, 9000],
+        };
+        let path = dir.path().join("tiny.ply");
+
+        let vertices = write_pointcloud_ply(
+            &path,
+            &depth,
+            CameraIntrinsics {
+                fx: 2.0,
+                fy: 2.0,
+                cx: 0.5,
+                cy: 0.5,
+            },
+            3.0,
+            1,
+        )
+        .unwrap();
+        let ply = std_fs::read_to_string(path).unwrap();
+
+        assert_eq!(vertices, 2);
+        assert!(ply.contains("element vertex 2"));
+        let vertex_rows = ply
+            .lines()
+            .skip_while(|line| *line != "end_header")
+            .skip(1)
+            .count();
+        assert_eq!(vertex_rows, 2);
     }
 
     #[tokio::test]

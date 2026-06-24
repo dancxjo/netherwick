@@ -12,9 +12,13 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, not the sensor stream. Interpret images, audio, motion, location, body state, and memory-derived entries as the robot's own senses, not as media files or external sensor artifacts. Do not summarize the amount, density, cadence, or mix of input modalities as if that were the situation. Repeated frames, repeated detections, embeddings, and heartbeat-like status records are usually evidence to compress or ignore, not events to report. If the evidence does not reveal what is happening, say that I cannot tell what is happening yet.";
+pub const IMAGE_CAPTION_PROMPT: &str = "The attached visual input is what I am seeing now. Describe only what you see from my viewpoint. Start from the fact that this is my own vision looking out, so first person should mean phrases like \"I see...\" or \"in front of me,\" not that visible people, faces, hands, eyes, or bodies are mine. Prefer concrete scene details over lighting or color summaries. Stay grounded in visible evidence and do not speculate beyond what can be seen. Do not interpret this as an image, screenshot, photo, frame, camera feed, metadata, data URL, or analysis; interpret it as the robot's own live view. When looking out, one does not see oneself: anyone visible is most likely someone I am looking at, not myself, unless I am clearly looking in a mirror or reflection. Describe visible people in third person, as someone in front of me.";
 
-const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation. Sort meaning by time: occurred time first, observed time second. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as sensation; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, or each detection unless they are the point.";
+const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, not the sensor stream. Interpret images, audio, motion, location, body state, memory-derived entries, and other sensor-derived entries as the robot's own vision, hearing, body sense, position sense, and memory sense, not as media files or external sensor artifacts. Do not summarize the amount, density, cadence, or mix of input modalities as if that were the situation. Repeated frames, repeated detections, image embeddings, pending audio clips, and heartbeat-like status records are usually evidence to compress or ignore, not events to report. If people are visible, do not assume any visible person is me unless the vision is clearly a mirror or reflection. If the evidence does not reveal what is happening, say that I cannot tell what is happening yet. Do not infer emotional tone or words like chaotic, intense, overwhelming, anxious, or ominous from sensor volume alone.";
+
+const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation, not as the topic to describe. Try to infer what is going on in the real world from those fragments. Sort meaning by time: occurred time first, observed time second. Consume the timeline in order; do not group by faculty or source. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as sensations; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, recordings, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, edges, or detections unless they are the point.";
+
+const LIVE_EVENT_RULES: &str = "Live events may arrive while generation is happening. Treat them as observations from outside. Do not assume a human is currently present or addressing me; there may be nobody nearby. Clock and status events help track timing, pauses, and elapsed time, but do not narrate every tick, quiet moment, or idle thought.";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConsciousCommand {
@@ -132,6 +136,7 @@ impl Default for LlmProvider {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LlmConfig {
     pub provider: LlmProvider,
     pub allow_commands: bool,
@@ -561,9 +566,12 @@ fn build_combobulator_prompt(
     format!(
         "You are the combobulator for an embodied robot.\n\
 Given recent sensations, impressions, memories, and predicted futures in timeline order, distill what appears to be happening right now.\n\
-Write one short grounded first-person sentence using I/my/me. Use only the evidence below. Prefer concrete body facts, nearby people or speech, memory, safety, and immediate context.\n\
+You run continuously over the recent timeline; each pass tries to understand what is going on right now. Write from first-person lived experience from the robot's point of view, using I/my/me naturally.\n\
+This summary will be used as a basic understanding of the current situation for a system that may need to act immediately. Think of it as telling someone with amnesia as quickly as possible, but as thoroughly as needed for them to act reasonably.\n\
+Use only the evidence below. Prefer concrete body facts, nearby people or speech, visible scene details, memory, safety, and immediate context. Explain what appears to be happening right now, not a redundant list of events.\n\
 {SENSOR_GROUNDING_RULES}\n\
 {COMBOBULATOR_DISTILLATION_RULES}\n\
+{LIVE_EVENT_RULES}\n\
 Return JSON only with this schema:\n\
 {{\"summary\":\"...\",\"confidence\":0.0}}\n\n\
 CONTEXT FRAME\n\
@@ -607,6 +615,7 @@ fn build_agent_prompt(
 You may suggest a high-level action primitive, critique the situation, and record memory notes.\n\
 Never output raw motor control.\n\
 A human may be steering you. Treat Reign controls as important present-tense input. Do not override active Direct reign unless there is a safety or coherence reason. You may comment on it, remember it, or learn from it.\n\
+{LIVE_EVENT_RULES}\n\
 Allowed action kinds: stop, go, turn, inspect, approach, dock, explore, speak, chirp.\n\
 If commands are disabled, leave action null. Commands enabled: {}. Teaching enabled: {}.\n\
 Return JSON only with this schema:\n\
@@ -949,10 +958,32 @@ mod tests {
 
         assert!(prompt.contains("Timeline evidence:"));
         assert!(prompt.contains("[250 ms observed]"));
+        assert!(prompt.contains("what is going on right now"));
+        assert!(prompt.contains("first-person lived experience"));
+        assert!(prompt.contains("telling someone with amnesia"));
         assert!(prompt.contains("Distill what matters, not what the records said."));
-        assert!(prompt.contains("prior combobulation summaries looping back as sensation"));
+        assert!(prompt.contains("Treat the entries as fragmentary, possibly contradictory"));
+        assert!(prompt.contains("not as the topic to describe"));
+        assert!(prompt.contains("prior combobulation summaries looping back as sensations"));
+        assert!(prompt.contains("do not group by faculty or source"));
+        assert!(prompt.contains("Do not infer emotional tone"));
+        assert!(prompt.contains("do not enumerate ids"));
+        assert!(prompt.contains("Do not assume a human is currently present"));
         assert!(prompt.contains("CONTEXT FRAME"));
         assert!(prompt.contains("I hear: hello there"));
+    }
+
+    #[test]
+    fn image_caption_prompt_frames_live_vision_viewpoint() {
+        assert!(IMAGE_CAPTION_PROMPT.contains("what I am seeing now"));
+        assert!(IMAGE_CAPTION_PROMPT.contains("my own vision looking out"));
+        assert!(IMAGE_CAPTION_PROMPT.contains("not that visible people"));
+        assert!(IMAGE_CAPTION_PROMPT.contains("When looking out, one does not see oneself"));
+        assert!(
+            IMAGE_CAPTION_PROMPT.contains("unless I am clearly looking in a mirror or reflection")
+        );
+        assert!(IMAGE_CAPTION_PROMPT.contains("Describe visible people in third person"));
+        assert!(!IMAGE_CAPTION_PROMPT.contains("data:image"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ data/captures/<capture-id>/
     pointcloud/
 ```
 
-`manifest.json` stores the capture id, source, schema version, tick duration, frame count, optional machine info, command args, device availability, streams present/missing, capture start/end times, warnings, and asset layout. `frames.jsonl` contains one JSON record per captured frame with `index`, `t_ms`, the serialized `WorldSnapshot`, and any recorded events. The asset directories are reserved for future RGB, depth, audio, and point-cloud files; v0 embeds compact sense data directly in JSON.
+`manifest.json` stores the capture id, source, schema version, tick duration, frame count, optional machine info, command args, device availability, streams present/missing, capture start/end times, warnings, and asset layout. `frames.jsonl` contains one JSON record per captured frame with `index`, `t_ms`, the serialized `WorldSnapshot`, any recorded events, optional frame asset references, and optional stream metadata. Asset paths are relative to the capture root.
 
 ## Commands
 
@@ -57,6 +57,27 @@ cargo run -p netherwick-tools -- capture-real \
   --out data/captures/real/rpi5-smoke
 ```
 
+Record a mocked session with RGB, depth, and audio assets:
+
+```bash
+cargo run --bin netherwick -- capture-real \
+  --duration-seconds 3 \
+  --mock \
+  --out data/captures/real/mock-assets-smoke \
+  --export-rgb \
+  --export-depth \
+  --export-audio
+```
+
+Export point-cloud v0 assets from captured depth:
+
+```bash
+cargo run --bin netherwick -- capture-assets \
+  --capture data/captures/real/mock-assets-smoke \
+  --pointcloud \
+  --stride 4
+```
+
 Inspect a capture:
 
 ```bash
@@ -64,6 +85,8 @@ cargo run -p netherwick-tools -- inspect-capture \
   data/captures/real/rpi5-smoke
 ```
 
+See [worldlab-assets.md](worldlab-assets.md) for the asset formats and calibration assumptions.
+
 ## Future Path
 
-Planned layers include raw RGB/depth/audio asset export, point-cloud reconstruction, a game-engine renderer, semantic editing, and counterfactual replay.
+Planned layers include real Kinect raw-frame hooks, calibrated camera intrinsics, a game-engine renderer, semantic editing, and counterfactual replay.
