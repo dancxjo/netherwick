@@ -70,8 +70,13 @@ Change scenario:
 NETHERWICK_SCENARIO=charger-seeking just go virtual
 ```
 
+The default is `dream`, a seeded randomized Dream World. Re-run with the same
+`--seed`/environment to get the same arena, object population, labels, colors,
+voices, charger signals, and collision geometry.
+
 Useful scenario slugs:
 
+- `dream`
 - `empty-room`
 - `obstacle-avoidance`
 - `corner-trap`
@@ -79,6 +84,31 @@ Useful scenario slugs:
 - `charger-seeking`
 - `person-speaker-room`
 - `mixed-room`
+
+Dream generation knobs:
+
+```bash
+NETHERWICK_SCENARIO=dream \
+NETHERWICK_DREAM_WEIRDNESS=0.65 \
+NETHERWICK_DREAM_DENSITY=0.7 \
+NETHERWICK_DREAM_SOCIALITY=0.5 \
+NETHERWICK_DREAM_HAZARD_BIAS=0.35 \
+NETHERWICK_DREAM_CHARGER_BIAS=0.4 \
+just go virtual
+```
+
+- `NETHERWICK_DREAM_WEIRDNESS`: increases odd labels, colors, size variance,
+  sound sources, landmarks, and asymmetric placement.
+- `NETHERWICK_DREAM_DENSITY`: increases object population.
+- `NETHERWICK_DREAM_SOCIALITY`: increases people and voices.
+- `NETHERWICK_DREAM_HAZARD_BIAS`: increases blockers and charger-adjacent decoys.
+- `NETHERWICK_DREAM_CHARGER_BIAS`: increases charger likelihood.
+
+Dream objects are not decorative-only. Obstacles and landmarks project into
+range, eye frames, Kinect depth/color, and collision; people project into face,
+voice, ear, Kinect skeleton, depth, and collision; sound sources project into
+voice and ear; chargers project into visible color, proximity, and charging
+signal.
 
 Change the long-running step budget or tick delay:
 

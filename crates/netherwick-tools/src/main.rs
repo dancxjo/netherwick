@@ -344,6 +344,7 @@ enum ScenarioArg {
     ChargerSeeking,
     PersonSpeakerRoom,
     MixedRoom,
+    Dream,
 }
 
 impl From<ScenarioArg> for ScenarioKind {
@@ -356,6 +357,7 @@ impl From<ScenarioArg> for ScenarioKind {
             ScenarioArg::ChargerSeeking => ScenarioKind::ChargerSeeking,
             ScenarioArg::PersonSpeakerRoom => ScenarioKind::PersonAndSpeaker,
             ScenarioArg::MixedRoom => ScenarioKind::MixedRoom,
+            ScenarioArg::Dream => ScenarioKind::Dream,
         }
     }
 }
@@ -2066,6 +2068,14 @@ fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool 
                 && (episode.charging_ticks > 0
                     || episode.ticks_with_face_embeddings > 0
                     || episode.ticks_with_voice_embeddings > 0)
+        }
+        ScenarioKind::Dream => {
+            episode.ticks > 0
+                && episode.collisions <= (episode.ticks / 30).max(1)
+                && (episode.charging_ticks > 0
+                    || episode.ticks_with_face_embeddings > 0
+                    || episode.ticks_with_voice_embeddings > 0
+                    || episode.ticks_with_ear_features > 0)
         }
     }
 }
@@ -6141,6 +6151,7 @@ mod tests {
             ("charger-seeking", ScenarioArg::ChargerSeeking),
             ("person-speaker-room", ScenarioArg::PersonSpeakerRoom),
             ("mixed-room", ScenarioArg::MixedRoom),
+            ("dream", ScenarioArg::Dream),
         ] {
             let cli = Cli::try_parse_from(["netherwick", "sim", "--scenario", slug]).unwrap();
             let Command::Sim(args) = cli.command else {

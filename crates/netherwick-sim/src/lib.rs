@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 
 pub mod scenario;
 pub use scenario::{
-    build_scenario, default_sim_world, ScenarioConfig, ScenarioKind, ScenarioMetadata,
-    ScenarioWorld,
+    build_scenario, default_sim_world, mutate_dream_world, DreamConfig, ScenarioConfig,
+    ScenarioKind, ScenarioMetadata, ScenarioWorld,
 };
 
 const ROBOT_RADIUS_M: f32 = 0.18;

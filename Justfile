@@ -127,7 +127,7 @@ go target="virtual":
         --live-addr "0.0.0.0:$PORT" \
         --live-tls-cert certs/netherwick-dev.crt \
         --live-tls-key certs/netherwick-dev.key \
-        --scenario "${NETHERWICK_SCENARIO:-mixed-room}" \
+        --scenario "${NETHERWICK_SCENARIO:-dream}" \
         --steps "${NETHERWICK_SIM_STEPS:-1000000000}" \
         --tick-delay-ms "${NETHERWICK_TICK_DELAY_MS:-100}" \
         --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}"
