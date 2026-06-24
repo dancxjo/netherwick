@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use netherwick_body::{BodySense, MotionCommand, MotorCommand, MotorComplex, RobotBody};
 #[cfg(feature = "serial")]
 use netherwick_body::CliffSensors;
+use netherwick_body::{BodySense, MotionCommand, MotorCommand, MotorComplex, RobotBody};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serial")]
 use serialport::SerialPort;

@@ -1,4 +1,6 @@
+use std::net::SocketAddr;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -21,6 +23,7 @@ use netherwick_models::{
     ExperienceAutoencoderTrainer, EyeNextNetTrainer, MODEL_REGISTRY,
 };
 use netherwick_runtime::{MinimalRuntime, RuntimeModelStack, SimRunner};
+use netherwick_server::LiveViewState;
 use netherwick_sim::{ArenaConfig, SimObject, SimObjectKind, VirtualWorld};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -91,6 +94,12 @@ struct SimArgs {
     experience_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     experience_mode: ExperienceMode,
+    #[arg(long)]
+    live: bool,
+    #[arg(long, default_value = "127.0.0.1:8787")]
+    live_addr: SocketAddr,
+    #[arg(long, default_value_t = 100)]
+    tick_delay_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -263,7 +272,25 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     });
 
     let mut runner = SimRunner::new(runtime, world, motors);
-    runner.run_steps(args.steps).await?;
+    if args.live {
+        let live_state = LiveViewState::new();
+        let server_state = live_state.clone();
+        let live_addr = args.live_addr;
+        tokio::spawn(async move {
+            if let Err(error) = netherwick_server::serve_live_view(live_addr, server_state).await {
+                eprintln!("live robot view server stopped: {error}");
+            }
+        });
+        println!("live robot view: http://{}/view", args.live_addr);
+        for _ in 0..args.steps {
+            runner
+                .run_steps_observing(1, |snapshot| live_state.update(snapshot.clone()))
+                .await?;
+            tokio::time::sleep(Duration::from_millis(args.tick_delay_ms)).await;
+        }
+    } else {
+        runner.run_steps(args.steps).await?;
+    }
     println!(
         "sim complete: {} ticks, seed {}, ledger {}, danger_mode {:?}, charge_mode {:?}, action_value_mode {:?}, eye_next_mode {:?}, ear_next_mode {:?}, experience_mode {:?}",
         runner.tick_count,

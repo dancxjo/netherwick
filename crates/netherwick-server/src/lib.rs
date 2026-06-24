@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource};
 use netherwick_core::TimeMs;
 use netherwick_now::ReignSense;
 use netherwick_runtime::ReignQueue;
+use netherwick_sensors::WorldSnapshot;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -27,6 +29,8 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/stream/now",
     "/stream/mind",
     "/stream/logs",
+    "/view",
+    "/view/snapshot",
 ];
 
 #[derive(Clone, Debug)]
@@ -66,6 +70,107 @@ pub fn reign_router(state: ReignServerState) -> Router {
         .route("/reign/state", get(get_reign_state))
         .route("/reign/clear", post(post_reign_clear))
         .with_state(state)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LiveViewState {
+    latest: Arc<Mutex<Option<WorldSnapshot>>>,
+}
+
+impl LiveViewState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&self, snapshot: WorldSnapshot) {
+        *self
+            .latest
+            .lock()
+            .expect("live view snapshot mutex poisoned") = Some(snapshot);
+    }
+
+    pub fn latest(&self) -> Option<WorldSnapshot> {
+        self.latest
+            .lock()
+            .expect("live view snapshot mutex poisoned")
+            .clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveSnapshotResponse {
+    pub t_ms: TimeMs,
+    pub body: netherwick_body::BodySense,
+    pub range: netherwick_now::RangeSense,
+    pub eye_frame: Option<netherwick_sensors::EyeFrame>,
+}
+
+pub fn live_view_router(state: LiveViewState) -> Router {
+    Router::new()
+        .route("/", get(live_view_page))
+        .route("/now", get(get_live_now))
+        .route("/view", get(live_view_page))
+        .route("/view/snapshot", get(get_live_snapshot))
+        .with_state(state)
+}
+
+pub async fn serve_live_view(addr: SocketAddr, state: LiveViewState) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, live_view_router(state)).await
+}
+
+async fn get_live_snapshot(
+    State(state): State<LiveViewState>,
+) -> Result<Json<LiveSnapshotResponse>, LiveViewError> {
+    let snapshot = state
+        .latest()
+        .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
+    Ok(Json(LiveSnapshotResponse {
+        t_ms: snapshot.body.last_update_ms,
+        body: snapshot.body,
+        range: snapshot.range,
+        eye_frame: snapshot.eye_frame,
+    }))
+}
+
+async fn get_live_now(
+    State(state): State<LiveViewState>,
+) -> Result<Json<netherwick_now::Now>, LiveViewError> {
+    let snapshot = state
+        .latest()
+        .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
+    Ok(Json(snapshot.to_now(snapshot.body.last_update_ms)))
+}
+
+async fn live_view_page() -> Html<&'static str> {
+    Html(LIVE_VIEW_PAGE)
+}
+
+#[derive(Debug)]
+pub struct LiveViewError {
+    status: StatusCode,
+    message: String,
+}
+
+impl LiveViewError {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for LiveViewError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "error": self.message,
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn post_reign_command(
@@ -246,6 +351,96 @@ addEventListener('keydown', e => {
   if(e.key === 'e') send({type:'Explore',duration_ms:3000},5000);
 });
 refresh(); setInterval(refresh, 1000);
+</script>"#;
+
+const LIVE_VIEW_PAGE: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Netherwick Robot View</title>
+<style>
+:root{color-scheme:dark;background:#101214;color:#eef1f3;font:14px system-ui}
+body{margin:0;min-height:100vh;display:grid;grid-template-columns:minmax(0,1fr) 320px}
+main{display:grid;place-items:center;background:#070809}
+canvas{width:min(100vw,calc((100vh - 28px)*1.333));height:auto;image-rendering:pixelated;background:#111;border:1px solid #34383c}
+aside{border-left:1px solid #2f3337;padding:16px;background:#171a1d}
+h1{font-size:16px;margin:0 0 14px}
+dl{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;margin:0 0 18px}
+dt{color:#9aa4ad}
+dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+#status{color:#ffcf7a;margin-bottom:12px;min-height:20px}
+.beams{display:flex;align-items:end;gap:5px;height:96px;margin-top:8px}
+.beam{flex:1;background:#60d394;min-height:2px}
+@media(max-width:760px){body{display:block}aside{border-left:0;border-top:1px solid #2f3337}canvas{width:100vw}}
+</style>
+<main><canvas id="eye" width="64" height="48"></canvas></main>
+<aside>
+  <h1>Robot View</h1>
+  <div id="status">waiting for frames...</div>
+  <dl>
+    <dt>t</dt><dd id="t">-</dd>
+    <dt>x</dt><dd id="x">-</dd>
+    <dt>y</dt><dd id="y">-</dd>
+    <dt>heading</dt><dd id="heading">-</dd>
+    <dt>battery</dt><dd id="battery">-</dd>
+    <dt>nearest</dt><dd id="nearest">-</dd>
+  </dl>
+  <div>Range</div>
+  <div class="beams" id="beams"></div>
+</aside>
+<script>
+const canvas = document.getElementById('eye');
+const ctx = canvas.getContext('2d');
+const fields = Object.fromEntries(['t','x','y','heading','battery','nearest'].map(id => [id, document.getElementById(id)]));
+const status = document.getElementById('status');
+const beams = document.getElementById('beams');
+function fmt(value, digits = 2){
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '-';
+}
+function drawEye(frame){
+  if(!frame || frame.format !== 'Rgb8') return;
+  if(canvas.width !== frame.width || canvas.height !== frame.height){
+    canvas.width = frame.width; canvas.height = frame.height;
+  }
+  const image = ctx.createImageData(frame.width, frame.height);
+  for(let source = 0, target = 0; source < frame.bytes.length; source += 3, target += 4){
+    image.data[target] = frame.bytes[source];
+    image.data[target + 1] = frame.bytes[source + 1];
+    image.data[target + 2] = frame.bytes[source + 2];
+    image.data[target + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+}
+function drawBeams(values){
+  beams.replaceChildren(...(values || []).map(value => {
+    const bar = document.createElement('div');
+    bar.className = 'beam';
+    bar.style.height = `${Math.max(4, value * 96)}px`;
+    bar.style.opacity = `${0.35 + (1 - value) * 0.65}`;
+    return bar;
+  }));
+}
+async function refresh(){
+  try{
+    const response = await fetch('/view/snapshot', {cache:'no-store'});
+    if(!response.ok) throw new Error(await response.text());
+    const snapshot = await response.json();
+    const body = snapshot.body;
+    fields.t.textContent = `${snapshot.t_ms} ms`;
+    fields.x.textContent = `${fmt(body.odometry.x_m)} m`;
+    fields.y.textContent = `${fmt(body.odometry.y_m)} m`;
+    fields.heading.textContent = `${fmt(body.odometry.heading_rad)} rad`;
+    fields.battery.textContent = `${fmt(body.battery_level * 100, 1)}%`;
+    fields.nearest.textContent = snapshot.range.nearest_m == null ? '-' : `${fmt(snapshot.range.nearest_m)} m`;
+    drawEye(snapshot.eye_frame);
+    drawBeams(snapshot.range.beams);
+    status.textContent = 'live';
+  }catch(error){
+    status.textContent = 'waiting for frames...';
+  }finally{
+    setTimeout(refresh, 100);
+  }
+}
+refresh();
 </script>"#;
 
 #[cfg(test)]

@@ -25,5 +25,6 @@ netherwick-memory = { path = "../netherwick-memory" }
 netherwick-models = { path = "../netherwick-models" }
 netherwick-now = { path = "../netherwick-now" }
 netherwick-runtime = { path = "../netherwick-runtime" }
+netherwick-server = { path = "../netherwick-server" }
 netherwick-sensors = { path = "../netherwick-sensors" }
 netherwick-sim = { path = "../netherwick-sim" }

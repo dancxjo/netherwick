@@ -48,7 +48,7 @@ use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
     EyePrediction, Now, ReignSense, SafetySense,
 };
-use netherwick_sensors::World;
+use netherwick_sensors::{World, WorldSnapshot};
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -1923,8 +1923,16 @@ where
     }
 
     pub async fn run_steps(&mut self, steps: usize) -> Result<()> {
+        self.run_steps_observing(steps, |_| {}).await
+    }
+
+    pub async fn run_steps_observing<F>(&mut self, steps: usize, mut observe: F) -> Result<()>
+    where
+        F: FnMut(&WorldSnapshot),
+    {
         for _ in 0..steps {
             let snapshot = self.world.snapshot().await?;
+            observe(&snapshot);
             let now = snapshot.to_now(snapshot.body.last_update_ms);
             let tick = self
                 .runtime
