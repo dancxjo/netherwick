@@ -1748,7 +1748,7 @@ function drawGeneratedEye(scenePacket){
       ctx.lineTo(cx - radiusPx * 1.3, y);
       ctx.closePath();
     }else{
-      ctx.ellipse(cx, y - h * .45, radiusPx, h * .5, 0, 0, Math.PI * 2);
+      ctx.rect(cx - radiusPx, y - h, radiusPx * 2, h);
     }
     ctx.fill();
     ctx.stroke();

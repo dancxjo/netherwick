@@ -608,17 +608,8 @@ fn draw_projected_object(
         SimObjectKind::SoundSource { .. } => draw_depth_triangle(
             bytes, depth, width, height, center_x, min_y, max_y, half_width, forward, color,
         ),
-        SimObjectKind::Obstacle | SimObjectKind::Landmark { .. } => draw_depth_ellipse(
-            bytes,
-            depth,
-            width,
-            height,
-            center_x,
-            (top_y + bottom_y) * 0.5,
-            half_width,
-            ((bottom_y - top_y) * 0.5).max(2.0),
-            forward,
-            color,
+        SimObjectKind::Obstacle | SimObjectKind::Landmark { .. } => draw_depth_rectangle(
+            bytes, depth, width, height, min_x, max_x, min_y, max_y, forward, color,
         ),
     }
 }
@@ -666,6 +657,26 @@ fn shade_object_color(color: [u8; 3], forward: f32) -> [u8; 3] {
         (color[1] as f32 * light) as u8,
         (color[2] as f32 * light) as u8,
     ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_depth_rectangle(
+    bytes: &mut [u8],
+    depth: &mut [f32],
+    width: usize,
+    height: usize,
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+    z: f32,
+    color: [u8; 3],
+) {
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            put_depth_pixel(bytes, depth, width, height, x, y, z, color);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
