@@ -51,6 +51,7 @@ where
 pub struct ReignQueue {
     pending: VecDeque<ReignInput>,
     latest: Option<ReignInput>,
+    clear_sequence: u64,
 }
 
 impl ReignQueue {
@@ -82,6 +83,7 @@ impl ReignQueue {
     pub fn clear(&mut self) {
         self.pending.clear();
         self.latest = None;
+        self.clear_sequence = self.clear_sequence.saturating_add(1);
     }
 
     pub fn sense(&self, now_ms: TimeMs) -> ReignSense {
@@ -103,6 +105,7 @@ impl ReignQueue {
                 .iter()
                 .filter(|input| input.expires_at_ms > now_ms)
                 .count(),
+            clear_sequence: self.clear_sequence,
         }
     }
 }
@@ -809,6 +812,12 @@ mod tests {
             .any(|sensation| sensation.kind == "reign.command"));
         assert!(tick
             .frame
+            .reign_input
+            .as_ref()
+            .map(|input| matches!(input.command, ReignCommand::Stop))
+            .unwrap_or(false));
+        assert!(tick
+            .frame
             .reign_outcome
             .as_ref()
             .map(|outcome| outcome.accepted_by_conductor)
@@ -831,6 +840,24 @@ mod tests {
         assert!(!sense.active);
         assert!(sense.latest.is_none());
         assert_eq!(sense.pending_count, 0);
+    }
+
+    #[test]
+    fn clear_marks_reign_sense_for_event_extraction() {
+        let mut queue = ReignQueue::default();
+        queue.push(test_reign_input(
+            100,
+            ReignMode::Direct,
+            ReignCommand::Stop,
+            1_000,
+        ));
+
+        queue.clear();
+        let sense = queue.sense(150);
+
+        assert!(!sense.active);
+        assert!(sense.latest.is_none());
+        assert_eq!(sense.clear_sequence, 1);
     }
 
     #[tokio::test]

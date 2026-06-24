@@ -110,6 +110,7 @@ pub struct ReignSense {
     pub pending_count: usize,
     pub last_command_age_ms: Option<u64>,
     pub human_override_pressure: f32,
+    pub clear_sequence: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

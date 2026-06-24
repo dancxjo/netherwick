@@ -274,6 +274,7 @@ pub struct EventExtractor {
     last_now: Option<Now>,
     last_reign_id: Option<Uuid>,
     last_reign_input: Option<ReignInput>,
+    last_reign_clear_sequence: u64,
 }
 
 impl EventExtractor {
@@ -281,26 +282,42 @@ impl EventExtractor {
         let mut events = Vec::new();
         let previous = self.last_now.as_ref();
 
-        if let Some(input) = &now.reign.latest {
-            if Some(input.id) != self.last_reign_id {
-                events.push(
-                    Event::new(now.t_ms, EventKind::ReignCommanded)
-                        .with_summary(format!("Human reign command: {:?}.", input.command))
-                        .with_payload(EventPayload::ReignCommanded {
-                            input: input.clone(),
-                        })
-                        .with_provenance(Provenance::direct().with_stage("reign")),
-                );
-                self.last_reign_id = Some(input.id);
-                self.last_reign_input = Some(input.clone());
-            }
-        } else if let Some(input) = self.last_reign_input.take() {
+        if now.reign.clear_sequence > self.last_reign_clear_sequence {
             events.push(
-                Event::new(now.t_ms, EventKind::ReignExpired)
-                    .with_summary("Human reign command expired.")
-                    .with_payload(EventPayload::ReignExpired { input })
+                Event::new(now.t_ms, EventKind::ReignCleared)
+                    .with_summary("Human reign commands cleared.")
+                    .with_payload(EventPayload::ReignCleared)
                     .with_provenance(Provenance::direct().with_stage("reign")),
             );
+            self.last_reign_clear_sequence = now.reign.clear_sequence;
+            self.last_reign_id = None;
+            self.last_reign_input = None;
+        }
+
+        if now.reign.active {
+            if let Some(input) = &now.reign.latest {
+                if Some(input.id) != self.last_reign_id {
+                    events.push(
+                        Event::new(now.t_ms, EventKind::ReignCommanded)
+                            .with_summary(format!("Human reign command: {:?}.", input.command))
+                            .with_payload(EventPayload::ReignCommanded {
+                                input: input.clone(),
+                            })
+                            .with_provenance(Provenance::direct().with_stage("reign")),
+                    );
+                    self.last_reign_id = Some(input.id);
+                    self.last_reign_input = Some(input.clone());
+                }
+            }
+        } else if let Some(input) = self.last_reign_input.take() {
+            if now.reign.clear_sequence <= self.last_reign_clear_sequence {
+                events.push(
+                    Event::new(now.t_ms, EventKind::ReignExpired)
+                        .with_summary("Human reign command expired.")
+                        .with_payload(EventPayload::ReignExpired { input })
+                        .with_provenance(Provenance::direct().with_stage("reign")),
+                );
+            }
             self.last_reign_id = None;
         }
 
