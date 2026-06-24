@@ -5,13 +5,13 @@ use netherwick_body::MotorCommand;
 use netherwick_conductor::{Conductor, ConductorInput};
 use netherwick_core::{Provenance, Reward};
 use netherwick_events::{
-    default_event_bus, safety_veto_event, EventBus, EventContext, EventExtractor, Response,
+    default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
 use netherwick_experience::{Experience, ExperienceLatent, FuturePrediction, Impression, Sensation};
 use netherwick_ledger::{ExperienceFrame, LedgerWriter};
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
-use netherwick_now::{DriveSense, LlmSense, MemorySense, Now, SafetySense, SurpriseSense};
+use netherwick_now::{DriveSense, Now, SafetySense};
 use uuid::Uuid;
 
 pub struct MinimalRuntime<L, M, R, C, S, A>
@@ -55,6 +55,17 @@ where
         }
     }
 
+    pub fn with_default_events(
+        ledger: L,
+        memory_store: M,
+        memory_recall: R,
+        conductor: C,
+        safety: S,
+        llm: A,
+    ) -> Self {
+        Self::new(ledger, memory_store, memory_recall, conductor, safety, llm)
+    }
+
     pub async fn tick(
         &mut self,
         mut now: Now,
@@ -79,6 +90,8 @@ where
             latent: Some(&latent),
             recall: Some(&recall),
             predicted_futures: &futures,
+            llm: Some(&now.llm),
+            safety: None,
         };
         let event_output = self.bus.dispatch_all(&ctx, events)?;
         apply_responses(
@@ -111,7 +124,12 @@ where
         now.llm = llm_tick.sense.clone();
         apply_llm_tick(&llm_tick, &mut sensations, &mut impressions, &mut experiences, &mut teachings);
 
-        let fallback_action = self.conductor.choose(ConductorInput {
+        let mut proposals = proposed_actions.clone();
+        if let Some(action) = llm_tick.conscious_command.as_ref().and_then(|cmd| cmd.action.clone()) {
+            proposals.push(action);
+        }
+
+        let chosen_action = self.conductor.choose(ConductorInput {
             latent: latent.clone(),
             drives: now.drives.clone(),
             memory: now.memory.clone(),
@@ -120,13 +138,8 @@ where
             llm: now.llm.clone(),
             safety: SafetySense::default(),
             body: now.body.clone(),
+            proposals,
         })?;
-
-        let chosen_action = proposed_actions
-            .last()
-            .cloned()
-            .or_else(|| llm_tick.conscious_command.as_ref().and_then(|cmd| cmd.action.clone()))
-            .unwrap_or(fallback_action);
 
         let safety = self
             .safety
@@ -137,11 +150,11 @@ where
                 latent: Some(&latent),
                 recall: Some(&recall),
                 predicted_futures: &futures,
+                llm: Some(&now.llm),
+                safety: Some(&safety),
             };
-            let veto_output = self.bus.dispatch_all(
-                &veto_ctx,
-                vec![safety_veto_event(&now, &chosen_action, safety.reason.clone())],
-            )?;
+            let veto_events = self.extractor.events_from_safety(&now, &chosen_action, &safety);
+            let veto_output = self.bus.dispatch_all(&veto_ctx, veto_events)?;
             apply_responses(
                 &mut now,
                 veto_output.responses,
@@ -242,7 +255,7 @@ fn apply_responses(
 ) {
     for response in responses {
         match response {
-            Response::None | Response::Emit(_) => {}
+            Response::Emit(_) => {}
             Response::AddSensation(sensation) => sensations.push(sensation),
             Response::AddImpression(impression) => impressions.push(impression),
             Response::AddExperience(experience) => experiences.push(experience),
@@ -250,7 +263,7 @@ fn apply_responses(
             Response::SetDrive { name, value } => set_drive(&mut now.drives, &name, value),
             Response::SetMemorySense(memory) => now.memory = memory,
             Response::Teach(teaching) => teachings.push(teaching),
-            Response::RememberNote(note) => notes.push(note),
+            Response::AddMemoryNote(note) => notes.push(note),
         }
     }
 }
@@ -440,15 +453,14 @@ fn derive_direct_experiences(
     )]
 }
 
-fn set_drive(drives: &mut DriveSense, name: &str, value: f32) {
+fn set_drive(drives: &mut DriveSense, name: &DriveName, value: f32) {
     match name {
-        "battery_hunger" => drives.battery_hunger = value,
-        "danger_avoidance" => drives.danger_avoidance = value,
-        "curiosity" => drives.curiosity = value,
-        "social_interest" => drives.social_interest = value,
-        "fatigue" => drives.fatigue = value,
-        "uncertainty_pressure" => drives.uncertainty_pressure = value,
-        _ => {}
+        DriveName::BatteryHunger => drives.battery_hunger = value,
+        DriveName::DangerAvoidance => drives.danger_avoidance = value,
+        DriveName::Curiosity => drives.curiosity = value,
+        DriveName::SocialInterest => drives.social_interest = value,
+        DriveName::Fatigue => drives.fatigue = value,
+        DriveName::UncertaintyPressure => drives.uncertainty_pressure = value,
     }
 }
 

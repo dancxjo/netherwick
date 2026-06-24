@@ -21,6 +21,7 @@ pub struct ConductorInput {
     pub llm: LlmSense,
     pub safety: SafetySense,
     pub body: BodySense,
+    pub proposals: Vec<ActionPrimitive>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,6 +77,9 @@ impl Conductor for SimpleConductor {
                 target: InspectTarget::Novelty,
             });
         }
+        if let Some(action) = input.proposals.last() {
+            return Ok(action.clone());
+        }
         Ok(ActionPrimitive::Explore {
             style: ExploreStyle::RandomWalk,
             duration_ms: 1_000,
@@ -101,6 +105,7 @@ mod tests {
             llm: LlmSense::default(),
             safety: SafetySense::default(),
             body,
+            proposals: Vec::new(),
         };
 
         assert_eq!(conductor.choose(input).unwrap(), ActionPrimitive::Dock);
