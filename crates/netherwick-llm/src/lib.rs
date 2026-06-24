@@ -213,7 +213,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            provider: LlmProvider::Disabled,
+            provider: LlmProvider::Ollama,
             allow_commands: true,
             allow_teaching: true,
             endpoint: "http://127.0.0.1:11434".to_string(),
@@ -1156,6 +1156,14 @@ mod tests {
     use netherwick_body::{BodySense, CliffSensors};
     use netherwick_now::Now;
     use uuid::Uuid;
+
+    #[test]
+    fn default_llm_config_uses_local_ollama() {
+        let config = LlmConfig::default();
+
+        assert_eq!(config.provider, LlmProvider::Ollama);
+        assert_eq!(config.endpoint, "http://127.0.0.1:11434");
+    }
 
     #[test]
     fn extracts_json_from_fenced_response() {

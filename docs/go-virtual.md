@@ -2,7 +2,7 @@
 
 `just go virtual` starts Netherwick as a virtual live training theater: a simulated scenario updates the live view state, the server binds to `0.0.0.0`, and HTTPS pages are served for desktop browsers and LAN headset browsers.
 
-This mode collects experience into the ledger. It does not update model weights online. Startup prints:
+By default this mode collects experience into the ledger without updating model weights online. Startup prints:
 
 ```text
 Virtual training theater is collecting experience.
@@ -11,6 +11,34 @@ Train later with `cargo run --bin netherwick -- train behavior ...`
 ```
 
 The `/view/scene` packet and `/view/3d` HUD expose `training_mode`, `ledger_path`, written frame/transition counts, loaded models, model modes, action selector mode, and `weights_updating`. For the default virtual run, expect `training_mode: "collecting"` and `weights_updating: false`.
+
+Inline learning can be enabled for virtual live runs. Ledger writing remains on; Pete still writes memory while learning from the stream.
+
+Collect-only:
+
+```bash
+just go virtual
+```
+
+Inline world-outcome learning:
+
+```bash
+NETHERWICK_INLINE_LEARNING=1 \
+NETHERWICK_INLINE_LEARNING_MODE=world-outcome \
+NETHERWICK_INLINE_TRAIN_STEPS_PER_TICK=1 \
+NETHERWICK_INLINE_BEHAVIORS=future,action_value \
+just go virtual
+```
+
+Shadow-only learning/status:
+
+```bash
+NETHERWICK_INLINE_LEARNING_MODE=shadow-only \
+NETHERWICK_INLINE_BEHAVIORS=danger,charge,future \
+just go virtual
+```
+
+Offline training still exists and is still useful. Use `train virtual` or behavior training commands when you want repeatable batches, more epochs, promotion checks, and registry updates from a collected ledger.
 
 Open:
 

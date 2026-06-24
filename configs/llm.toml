@@ -1,4 +1,4 @@
-provider = "disabled"
+provider = "ollama"
 allow_commands = true
 allow_teaching = true
 endpoint = "http://127.0.0.1:11434"

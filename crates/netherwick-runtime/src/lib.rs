@@ -79,6 +79,8 @@ where
     pub surprise_computer: BaselineSurpriseComputer,
     pub reward_computer: BaselineRewardComputer,
     pub transition_builder: TransitionBuilder,
+    pub behavior_training_hub: BehaviorTrainingHub,
+    pub inline_learning: InlineLearningConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +102,93 @@ impl ActionSelectorMode {
             Self::Scripted => "scripted",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InlineLearningMode {
+    #[default]
+    Off,
+    ShadowOnly,
+    WorldOutcome,
+}
+
+impl InlineLearningMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ShadowOnly => "shadow-only",
+            Self::WorldOutcome => "world-outcome",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineLearningBehaviors {
+    pub danger: bool,
+    pub charge: bool,
+    pub future: bool,
+    pub action_value: bool,
+    pub eye_next: bool,
+    pub ear_next: bool,
+    pub experience: bool,
+}
+
+impl Default for InlineLearningBehaviors {
+    fn default() -> Self {
+        Self {
+            danger: true,
+            charge: true,
+            future: true,
+            action_value: true,
+            eye_next: true,
+            ear_next: true,
+            experience: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineLearningConfig {
+    pub mode: InlineLearningMode,
+    pub behaviors: InlineLearningBehaviors,
+    pub max_train_steps_per_tick: usize,
+}
+
+impl Default for InlineLearningConfig {
+    fn default() -> Self {
+        Self {
+            mode: InlineLearningMode::Off,
+            behaviors: InlineLearningBehaviors::default(),
+            max_train_steps_per_tick: 1,
+        }
+    }
+}
+
+impl InlineLearningConfig {
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.mode != InlineLearningMode::Off && self.max_train_steps_per_tick > 0
+    }
+
+    pub fn training_mode_label(&self) -> &'static str {
+        match self.mode {
+            InlineLearningMode::Off => "collecting",
+            InlineLearningMode::ShadowOnly => "inline-shadow",
+            InlineLearningMode::WorldOutcome => "inline-world-outcome",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineLearningTickStatus {
+    pub enabled: bool,
+    pub mode: InlineLearningMode,
+    pub samples_observed: usize,
+    pub train_steps_used: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1483,6 +1572,8 @@ where
             surprise_computer: BaselineSurpriseComputer,
             reward_computer: BaselineRewardComputer,
             transition_builder: TransitionBuilder::new(),
+            behavior_training_hub: BehaviorTrainingHub::default(),
+            inline_learning: InlineLearningConfig::default(),
         }
     }
 
@@ -1512,6 +1603,8 @@ where
             surprise_computer: BaselineSurpriseComputer,
             reward_computer: BaselineRewardComputer,
             transition_builder: TransitionBuilder::new(),
+            behavior_training_hub: BehaviorTrainingHub::default(),
+            inline_learning: InlineLearningConfig::default(),
         }
     }
 
@@ -1533,6 +1626,11 @@ where
 
     pub fn with_action_selector_mode(mut self, mode: ActionSelectorMode) -> Self {
         self.action_selector_mode = mode;
+        self
+    }
+
+    pub fn with_inline_learning(mut self, config: InlineLearningConfig) -> Self {
+        self.inline_learning = config;
         self
     }
 
@@ -2079,6 +2177,12 @@ where
         self.memory_recall.observe_now(&frame.now).await?;
         let surprise_computer = self.surprise_computer.clone();
         let reward_computer = self.reward_computer.clone();
+        let mut inline_learning = InlineLearningTickStatus {
+            enabled: self.inline_learning.is_enabled(),
+            mode: self.inline_learning.mode,
+            samples_observed: 0,
+            train_steps_used: 0,
+        };
         if let Some(transition) = self.transition_builder.observe(
             PendingFrame {
                 frame_id: frame.id,
@@ -2105,6 +2209,7 @@ where
             },
         ) {
             self.ledger.append_transition(&transition).await?;
+            inline_learning = self.observe_inline_learning(&transition)?;
         }
         self.memory_store.store(&frame).await?;
 
@@ -2124,7 +2229,182 @@ where
             recall,
             llm: llm_tick,
             combobulation,
+            inline_learning,
         })
+    }
+
+    fn observe_inline_learning(
+        &mut self,
+        transition: &ExperienceTransition,
+    ) -> Result<InlineLearningTickStatus> {
+        let mut status = InlineLearningTickStatus {
+            enabled: self.inline_learning.is_enabled(),
+            mode: self.inline_learning.mode,
+            samples_observed: 0,
+            train_steps_used: 0,
+        };
+        if !self.inline_learning.is_enabled() {
+            return Ok(status);
+        }
+        if self.inline_learning.mode != InlineLearningMode::WorldOutcome {
+            return Ok(status);
+        }
+
+        let mut remaining = self.inline_learning.max_train_steps_per_tick;
+        if self.inline_learning.behaviors.danger && remaining > 0 {
+            if let Some(sample) = self
+                .behavior_training_hub
+                .danger_extractor
+                .extract(transition)?
+            {
+                let sample = TrainingSample {
+                    input: SituatedDangerInput {
+                        input: sample.input,
+                        now: transition.before.clone(),
+                    },
+                    expected: sample.expected,
+                    actual: sample.actual,
+                    reward: sample.reward,
+                    weight: sample.weight,
+                    source: sample.source,
+                    t_ms: sample.t_ms,
+                };
+                self.models.behaviors.danger.observe(&sample)?;
+                remaining = remaining.saturating_sub(1);
+                status.samples_observed = status.samples_observed.saturating_add(1);
+                status.train_steps_used = status.train_steps_used.saturating_add(1);
+            }
+        }
+        if self.inline_learning.behaviors.charge && remaining > 0 {
+            if let Some(sample) = self
+                .behavior_training_hub
+                .charge_extractor
+                .extract(transition)?
+            {
+                let sample = TrainingSample {
+                    input: SituatedChargeInput {
+                        input: sample.input,
+                        now: transition.before.clone(),
+                    },
+                    expected: sample.expected,
+                    actual: sample.actual,
+                    reward: sample.reward,
+                    weight: sample.weight,
+                    source: sample.source,
+                    t_ms: sample.t_ms,
+                };
+                self.models.behaviors.charge.observe(&sample)?;
+                remaining = remaining.saturating_sub(1);
+                status.samples_observed = status.samples_observed.saturating_add(1);
+                status.train_steps_used = status.train_steps_used.saturating_add(1);
+            }
+        }
+        if self.inline_learning.behaviors.future && remaining > 0 {
+            if let Some(sample) = self
+                .behavior_training_hub
+                .future_extractor
+                .extract(transition)?
+            {
+                self.models.behaviors.future.observe(&sample)?;
+                remaining = remaining.saturating_sub(1);
+                status.samples_observed = status.samples_observed.saturating_add(1);
+                status.train_steps_used = status.train_steps_used.saturating_add(1);
+            }
+        }
+        if self.inline_learning.behaviors.action_value && remaining > 0 {
+            if let Some(sample) = self
+                .behavior_training_hub
+                .action_value_extractor
+                .extract(transition)?
+            {
+                let sample = TrainingSample {
+                    input: SituatedActionValueInput {
+                        input: sample.input,
+                        now: transition.before.clone(),
+                    },
+                    expected: sample.expected,
+                    actual: sample.actual,
+                    reward: sample.reward,
+                    weight: sample.weight,
+                    source: sample.source,
+                    t_ms: sample.t_ms,
+                };
+                self.models.behaviors.action_value.observe(&sample)?;
+                remaining = remaining.saturating_sub(1);
+                status.samples_observed = status.samples_observed.saturating_add(1);
+                status.train_steps_used = status.train_steps_used.saturating_add(1);
+            }
+        }
+        if self.inline_learning.behaviors.eye_next && remaining > 0 {
+            if let Some(sample) = self
+                .behavior_training_hub
+                .eye_next_extractor
+                .extract(transition)?
+            {
+                let sample = TrainingSample {
+                    input: SituatedEyeNextInput {
+                        input: sample.input,
+                        now: transition.before.clone(),
+                    },
+                    expected: sample.expected,
+                    actual: sample.actual,
+                    reward: sample.reward,
+                    weight: sample.weight,
+                    source: sample.source,
+                    t_ms: sample.t_ms,
+                };
+                self.models.behaviors.eye_next.observe(&sample)?;
+                remaining = remaining.saturating_sub(1);
+                status.samples_observed = status.samples_observed.saturating_add(1);
+                status.train_steps_used = status.train_steps_used.saturating_add(1);
+            }
+        }
+        if self.inline_learning.behaviors.ear_next && remaining > 0 {
+            if let Some(sample) = self
+                .behavior_training_hub
+                .ear_next_extractor
+                .extract(transition)?
+            {
+                let sample = TrainingSample {
+                    input: SituatedEarNextInput {
+                        input: sample.input,
+                        now: transition.before.clone(),
+                    },
+                    expected: sample.expected,
+                    actual: sample.actual,
+                    reward: sample.reward,
+                    weight: sample.weight,
+                    source: sample.source,
+                    t_ms: sample.t_ms,
+                };
+                self.models.behaviors.ear_next.observe(&sample)?;
+                remaining = remaining.saturating_sub(1);
+                status.samples_observed = status.samples_observed.saturating_add(1);
+                status.train_steps_used = status.train_steps_used.saturating_add(1);
+            }
+        }
+        if self.inline_learning.behaviors.experience && remaining > 0 {
+            let input = ExperienceBehaviorInput::from_now(&transition.before);
+            let sample = TrainingSample {
+                input,
+                expected: ExperienceBehaviorOutput {
+                    latent: transition.before_z.clone(),
+                    reconstruction: None,
+                    reconstruction_loss: None,
+                    confidence: transition.before_z.confidence,
+                },
+                actual: None,
+                reward: Some(transition.reward.value),
+                weight: 1.0,
+                source: TrainingSource::WorldOutcome,
+                t_ms: transition.created_at_ms,
+            };
+            self.models.behaviors.experience.observe(&sample)?;
+            status.samples_observed = status.samples_observed.saturating_add(1);
+            status.train_steps_used = status.train_steps_used.saturating_add(1);
+        }
+
+        Ok(status)
     }
 }
 
@@ -2193,6 +2473,7 @@ pub struct RuntimeTick {
     pub recall: RecallBundle,
     pub llm: LlmTickResult,
     pub combobulation: Option<Combobulation>,
+    pub inline_learning: InlineLearningTickStatus,
 }
 
 #[async_trait::async_trait]
@@ -3836,6 +4117,7 @@ mod tests {
                 recall: RecallBundle::default(),
                 llm: LlmTickResult::default(),
                 combobulation: None,
+                inline_learning: InlineLearningTickStatus::default(),
             })
         }
     }
@@ -4910,6 +5192,72 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn inline_world_outcome_learning_observes_transition_sample() {
+        let root = test_ledger_root("inline-world-outcome");
+        let checkpoint = danger_checkpoint_root("inline-world-outcome");
+        write_test_future_checkpoint(&checkpoint, ActionPrimitive::Stop);
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(ActionPrimitive::Stop))
+            .with_models(RuntimeModelStack::with_future_shadow_checkpoint(&checkpoint).unwrap())
+            .with_inline_learning(InlineLearningConfig {
+                mode: InlineLearningMode::WorldOutcome,
+                behaviors: InlineLearningBehaviors {
+                    danger: false,
+                    charge: false,
+                    future: true,
+                    action_value: false,
+                    eye_next: false,
+                    ear_next: false,
+                    experience: false,
+                },
+                max_train_steps_per_tick: 1,
+            });
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.8, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+        let mut observed_samples = 0usize;
+
+        runner
+            .run_steps_observing_ticks(3, |_snapshot, tick| {
+                observed_samples =
+                    observed_samples.saturating_add(tick.inline_learning.samples_observed);
+            })
+            .await
+            .unwrap();
+
+        assert!(observed_samples > 0);
+        assert!(!read_transitions(&root).is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn disabled_inline_learning_reports_no_weight_updates() {
+        let root = test_ledger_root("inline-disabled");
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(ActionPrimitive::Stop));
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.8, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+        let mut statuses = Vec::new();
+
+        runner
+            .run_steps_observing_ticks(3, |_snapshot, tick| {
+                statuses.push(tick.inline_learning.clone());
+            })
+            .await
+            .unwrap();
+
+        assert!(statuses.iter().all(|status| !status.enabled));
+        assert!(statuses
+            .iter()
+            .all(|status| status.samples_observed == 0 && status.train_steps_used == 0));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

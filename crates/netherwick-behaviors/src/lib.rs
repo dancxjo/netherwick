@@ -395,7 +395,7 @@ impl OutputDistance for bool {
     }
 }
 
-pub trait TargetExtractor<T, I, O> {
+pub trait TargetExtractor<T, I, O>: Send + Sync {
     fn extract(&self, transition: &T) -> Result<Option<TrainingSample<I, O>>>;
 }
 

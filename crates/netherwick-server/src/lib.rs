@@ -18,7 +18,7 @@ use image::{ColorType, ImageEncoder};
 use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource};
 use netherwick_core::TimeMs;
 use netherwick_now::{KinectSkeletonSense, ReignSense};
-use netherwick_runtime::ReignQueue;
+use netherwick_runtime::{InlineLearningConfig, InlineLearningMode, ReignQueue};
 use netherwick_sensors::{EyeFrameFormat, WorldSnapshot};
 use netherwick_worldlab::CaptureReader;
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,7 @@ pub struct LiveViewState {
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
     session: Arc<Mutex<Option<SceneSession>>>,
     training_status: Arc<Mutex<LiveTrainingStatus>>,
+    inline_learning: Arc<Mutex<InlineLearningConfig>>,
     pub virtual_retina: bool,
     pub retina_width: u32,
     pub retina_height: u32,
@@ -118,6 +119,7 @@ impl Default for LiveViewState {
             scene_metadata: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
             training_status: Arc::new(Mutex::new(LiveTrainingStatus::default())),
+            inline_learning: Arc::new(Mutex::new(InlineLearningConfig::default())),
             virtual_retina: false,
             retina_width: 160,
             retina_height: 90,
@@ -149,7 +151,10 @@ impl LiveViewState {
     }
 
     pub fn take_pending_retina_frame(&self) -> Option<netherwick_sensors::EyeFrame> {
-        let mut state = self.retina_state.lock().expect("retina state mutex poisoned");
+        let mut state = self
+            .retina_state
+            .lock()
+            .expect("retina state mutex poisoned");
         if state.has_new_frame {
             state.has_new_frame = false;
             state.frames_attached_to_snapshots += 1;
@@ -160,7 +165,10 @@ impl LiveViewState {
     }
 
     pub fn record_ledger_write(&self) {
-        let mut state = self.retina_state.lock().expect("retina state mutex poisoned");
+        let mut state = self
+            .retina_state
+            .lock()
+            .expect("retina state mutex poisoned");
         state.frames_written_to_ledger += 1;
     }
 
@@ -217,6 +225,20 @@ impl LiveViewState {
         self.training_status
             .lock()
             .expect("live view training status mutex poisoned")
+            .clone()
+    }
+
+    pub fn update_inline_learning(&self, config: InlineLearningConfig) {
+        *self
+            .inline_learning
+            .lock()
+            .expect("inline learning mutex poisoned") = config;
+    }
+
+    pub fn inline_learning(&self) -> InlineLearningConfig {
+        self.inline_learning
+            .lock()
+            .expect("inline learning mutex poisoned")
             .clone()
     }
 }
@@ -526,6 +548,8 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view/retina/status", get(get_retina_status))
         .route("/view/retina/latest.png", get(get_retina_latest))
         .route("/view/training/latest", get(get_latest_training))
+        .route("/view/inline-learning", get(get_inline_learning))
+        .route("/view/inline-learning", post(post_inline_learning))
         .route("/view/calibration", post(post_calibration))
         .nest_service(
             "/static",
@@ -574,16 +598,23 @@ async fn get_live_scene(
     let snapshot = state
         .latest()
         .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
-    
-    let rstate = state.retina_state.lock().expect("retina state mutex poisoned");
-    let connected = state.virtual_retina && rstate.last_received_at.map(|t| t.elapsed() < std::time::Duration::from_millis(1500)).unwrap_or(false);
+
+    let rstate = state
+        .retina_state
+        .lock()
+        .expect("retina state mutex poisoned");
+    let connected = state.virtual_retina
+        && rstate
+            .last_received_at
+            .map(|t| t.elapsed() < std::time::Duration::from_millis(1500))
+            .unwrap_or(false);
     let retina_status = Some(RetinaStatusInfo {
         enabled: state.virtual_retina,
         connected,
         frames_received: rstate.frames_received,
         frames_written_to_ledger: rstate.frames_written_to_ledger,
     });
-    
+
     Ok(Json(snapshot_to_scene(
         &snapshot,
         state.scene_metadata().as_ref(),
@@ -619,9 +650,14 @@ async fn post_retina_frame(
     Json(payload): Json<RetinaFramePayload>,
 ) -> Result<StatusCode, LiveViewError> {
     let session = state.session();
-    let is_virtual_live = session.as_ref().map(|s| s.mode == "virtual-live").unwrap_or(false);
+    let is_virtual_live = session
+        .as_ref()
+        .map(|s| s.mode == "virtual-live")
+        .unwrap_or(false);
     if !is_virtual_live {
-        return Err(LiveViewError::forbidden("retina frames are only accepted in virtual-live mode"));
+        return Err(LiveViewError::forbidden(
+            "retina frames are only accepted in virtual-live mode",
+        ));
     }
 
     let mut base64_str = payload.data.as_str();
@@ -645,7 +681,10 @@ async fn post_retina_frame(
         )));
     }
 
-    let sim_t_ms = state.latest().map(|snap| snap.body.last_update_ms).unwrap_or(0);
+    let sim_t_ms = state
+        .latest()
+        .map(|snap| snap.body.last_update_ms)
+        .unwrap_or(0);
     if sim_t_ms > 0 && payload.t_ms + 1500 < sim_t_ms {
         return Err(LiveViewError::bad_request("retina frame is too stale"));
     }
@@ -670,7 +709,10 @@ async fn post_retina_frame(
     };
 
     {
-        let mut rstate = state.retina_state.lock().expect("retina state mutex poisoned");
+        let mut rstate = state
+            .retina_state
+            .lock()
+            .expect("retina state mutex poisoned");
         rstate.latest_frame = Some(eye_frame);
         rstate.has_new_frame = true;
         rstate.last_received_at = Some(std::time::Instant::now());
@@ -690,6 +732,45 @@ async fn post_calibration(
     Ok(StatusCode::OK)
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct InlineLearningControlResponse {
+    pub config: InlineLearningConfig,
+    pub enabled: bool,
+    pub training_mode: String,
+    pub weights_updating: bool,
+}
+
+fn inline_learning_response(config: InlineLearningConfig) -> InlineLearningControlResponse {
+    InlineLearningControlResponse {
+        enabled: config.is_enabled(),
+        training_mode: config.training_mode_label().to_string(),
+        weights_updating: config.is_enabled(),
+        config,
+    }
+}
+
+async fn get_inline_learning(
+    State(state): State<LiveViewState>,
+) -> Json<InlineLearningControlResponse> {
+    Json(inline_learning_response(state.inline_learning()))
+}
+
+async fn post_inline_learning(
+    State(state): State<LiveViewState>,
+    Json(mut config): Json<InlineLearningConfig>,
+) -> Result<Json<InlineLearningControlResponse>, LiveViewError> {
+    if config.max_train_steps_per_tick > 64 {
+        return Err(LiveViewError::bad_request(
+            "max_train_steps_per_tick must be 64 or less",
+        ));
+    }
+    if config.mode == InlineLearningMode::Off {
+        config.max_train_steps_per_tick = config.max_train_steps_per_tick.max(1);
+    }
+    state.update_inline_learning(config.clone());
+    Ok(Json(inline_learning_response(config)))
+}
+
 #[derive(Serialize)]
 pub struct RetinaStatusResponse {
     pub enabled: bool,
@@ -706,17 +787,26 @@ pub struct RetinaStatusResponse {
     pub warnings: Vec<String>,
 }
 
-async fn get_retina_status(
-    State(state): State<LiveViewState>,
-) -> Json<RetinaStatusResponse> {
-    let rstate = state.retina_state.lock().expect("retina state mutex poisoned");
-    let connected = state.virtual_retina && rstate.last_received_at.map(|t| t.elapsed() < std::time::Duration::from_millis(1500)).unwrap_or(false);
-    let latest_age_ms = rstate.last_received_at.map(|t| t.elapsed().as_millis() as u64);
+async fn get_retina_status(State(state): State<LiveViewState>) -> Json<RetinaStatusResponse> {
+    let rstate = state
+        .retina_state
+        .lock()
+        .expect("retina state mutex poisoned");
+    let connected = state.virtual_retina
+        && rstate
+            .last_received_at
+            .map(|t| t.elapsed() < std::time::Duration::from_millis(1500))
+            .unwrap_or(false);
+    let latest_age_ms = rstate
+        .last_received_at
+        .map(|t| t.elapsed().as_millis() as u64);
     let latest_luma = rstate.latest_frame.as_ref().map(|frame| {
         let stats = eye_frame_stats(frame);
         stats.mean_luma
     });
-    let source = rstate.latest_frame.as_ref()
+    let source = rstate
+        .latest_frame
+        .as_ref()
         .and_then(|f| f.source.clone())
         .unwrap_or_else(|| "none".to_string());
 
@@ -800,10 +890,11 @@ fn encode_eye_png_bytes(frame: &netherwick_sensors::EyeFrame) -> Result<Vec<u8>,
     }
 }
 
-async fn get_retina_latest(
-    State(state): State<LiveViewState>,
-) -> impl IntoResponse {
-    let rstate = state.retina_state.lock().expect("retina state mutex poisoned");
+async fn get_retina_latest(State(state): State<LiveViewState>) -> impl IntoResponse {
+    let rstate = state
+        .retina_state
+        .lock()
+        .expect("retina state mutex poisoned");
     if let Some(ref frame) = rstate.latest_frame {
         match encode_eye_png_bytes(frame) {
             Ok(bytes) => {
@@ -815,12 +906,14 @@ async fn get_retina_latest(
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, content_type)],
                     bytes,
-                ).into_response()
+                )
+                    .into_response()
             }
             Err(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to encode frame: {err}"),
-            ).into_response(),
+            )
+                .into_response(),
         }
     } else {
         (StatusCode::NOT_FOUND, "no retina frame received yet").into_response()
@@ -840,7 +933,8 @@ async fn get_latest_training() -> impl IntoResponse {
             }
         }
     }
-    let alt_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/reports/virtual/latest.json");
+    let alt_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/reports/virtual/latest.json");
     if alt_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&alt_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -848,7 +942,11 @@ async fn get_latest_training() -> impl IntoResponse {
             }
         }
     }
-    (StatusCode::OK, Json(serde_json::json!({ "status": "none" }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "none" })),
+    )
+        .into_response()
 }
 
 fn default_model_root() -> PathBuf {
@@ -1224,7 +1322,9 @@ async fn get_capture_scene(
                 }
             }
         } else {
-            scene.warnings.push(format!("PLY file not found: {}", ply_path.display()));
+            scene
+                .warnings
+                .push(format!("PLY file not found: {}", ply_path.display()));
         }
     }
     Ok(Json(scene))
@@ -1280,7 +1380,8 @@ pub fn snapshot_to_scene(
     let body = &snapshot.body;
     let eye = match snapshot.eye_frame.as_ref() {
         Some(f) => {
-            let (eye, frame_warnings) = scene_eye_from_frame(f, retina_status.as_ref(), snapshot.body.last_update_ms);
+            let (eye, frame_warnings) =
+                scene_eye_from_frame(f, retina_status.as_ref(), snapshot.body.last_update_ms);
             warnings.extend(frame_warnings);
             Some(eye)
         }
@@ -1503,7 +1604,7 @@ fn scene_eye_from_frame(
     let source = frame.source.clone().unwrap_or_else(|| "none".to_string());
     let authoritative = source == "babylon-robot-eye" || source == "real-camera";
     let retina_connected = retina_status.map(|s| s.connected).unwrap_or(false);
-    
+
     let retina_last_frame_age_ms = if source == "babylon-robot-eye" {
         Some(current_t_ms.saturating_sub(frame.captured_at_ms))
     } else {
@@ -1511,7 +1612,9 @@ fn scene_eye_from_frame(
     };
 
     let frames_received = retina_status.map(|s| s.frames_received).unwrap_or(0);
-    let frames_written_to_ledger = retina_status.map(|s| s.frames_written_to_ledger).unwrap_or(0);
+    let frames_written_to_ledger = retina_status
+        .map(|s| s.frames_written_to_ledger)
+        .unwrap_or(0);
 
     (
         SceneEye {
@@ -1682,7 +1785,9 @@ fn scene_kinect_from_snapshot(
     if points.is_empty() {
         warnings.push("no point cloud stream".to_string());
     }
-    let coordinate_system = if snapshot.kinect.depth_m.len() == calibration.map_or(32, |c| c.compact_depth_beam_count) {
+    let coordinate_system = if snapshot.kinect.depth_m.len()
+        == calibration.map_or(32, |c| c.compact_depth_beam_count)
+    {
         "robot".to_string()
     } else {
         "camera".to_string()
@@ -1736,7 +1841,9 @@ fn depth_points(depth_m: &[f32], calibration: Option<SceneSensorCalibration>) ->
 
 fn range_beam_points(depth_m: &[f32], calibration: SceneSensorCalibration) -> Vec<ScenePoint> {
     let beam_count = depth_m.len().max(1);
-    let fov_rad = calibration.compact_depth_fov_rad.clamp(0.01, std::f32::consts::TAU);
+    let fov_rad = calibration
+        .compact_depth_fov_rad
+        .clamp(0.01, std::f32::consts::TAU);
     let start = if beam_count == 1 { 0.0 } else { -fov_rad * 0.5 };
     let step = if beam_count == 1 {
         0.0
@@ -2304,6 +2411,7 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #hud dl{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;margin:0}
 #hud dt{color:#aab4bd}
 #hud dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+#hud dd.active-learning{color:#8df0b2;font-weight:700}
 #status{color:#ffd083}
 #reign{position:fixed;right:12px;top:12px;min-width:220px;padding:10px;border:1px solid #36424d;background:rgba(11,16,22,.84);backdrop-filter:blur(8px);border-radius:6px;color:#dce8f2;resize:both;overflow:auto}
 #reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
@@ -2338,16 +2446,26 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #model-graph .node rect{fill:#17222b;stroke:#52687b;stroke-width:1.2;rx:5}
 #model-graph .node.model rect{stroke:#81c995}
 #model-graph .node.core rect{stroke:#8bd3ff}
-#calibration{position:fixed;left:12px;top:400px;width:340px;padding:10px;border:1px solid #3c4854;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px;color:#e7eef5;resize:both;overflow:auto;display:grid;gap:6px}
+#calibration{position:fixed;left:12px;top:540px;width:340px;padding:10px;border:1px solid #3c4854;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px;color:#e7eef5;resize:both;overflow:auto;display:grid;gap:6px}
 #calibration header{display:flex;align-items:center;justify-content:space-between;gap:12px}
 #calibration h2{font-size:12px;margin:0;color:#c6e6ff}
 #calibration label{color:#8fa1b2;font-size:11px}
 #calibration span{color:#ffd083;font-size:11px;font-variant-numeric:tabular-nums}
 #calibration input[type="range"]{width:100%;accent-color:#52a9ff;background:#242a32;height:4px;border-radius:2px;outline:none}
+#learning{position:fixed;left:12px;top:318px;width:340px;padding:10px;border:1px solid #3c4854;background:rgba(10,13,17,.86);backdrop-filter:blur(8px);border-radius:6px;color:#e7eef5;resize:both;overflow:auto;display:grid;gap:8px}
+#learning header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+#learning h2{font-size:12px;margin:0;color:#c6e6ff}
+#learning-status{color:#ffcf7a;font-size:11px;font-variant-numeric:tabular-nums}
+#learning .row{display:grid;grid-template-columns:86px 1fr;gap:8px;align-items:center}
+#learning label{color:#8fa1b2;font-size:11px}
+#learning select,#learning input[type="number"]{width:100%;box-sizing:border-box;background:#111820;border:1px solid #33414d;color:#e7eef5;border-radius:4px;padding:4px 6px}
+#learning .checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 8px}
+#learning .checks label{display:flex;align-items:center;gap:5px;color:#d7e3ee}
+#learning button{justify-self:end;font-size:11px;padding:4px 8px;background:#243646;border:1px solid #3f607b;color:#b8e1ff;border-radius:4px;cursor:pointer}
 #xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
 #xr[disabled]{opacity:.55}
 #fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
-@media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{grid-template-columns:1fr;bottom:98px;max-height:46vh}#model-graph{height:220px}#calibration{display:none}}
+@media(max-width:820px){#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{grid-template-columns:1fr;bottom:98px;max-height:46vh}#model-graph{height:220px}#learning{left:12px;right:12px;top:220px;width:auto;max-height:34vh}#calibration{display:none}}
 canvas{display:block}
 </style>
 <canvas id="scene"></canvas>
@@ -2381,6 +2499,34 @@ canvas{display:block}
     <dt>secure</dt><dd id="secure">-</dd>
     <dt>WebXR</dt><dd id="webxr">checking...</dd>
   </dl>
+</aside>
+<aside id="learning">
+  <header>
+    <h2>Live learning</h2>
+    <div id="learning-status">loading...</div>
+  </header>
+  <div class="row">
+    <label for="learning-mode">mode</label>
+    <select id="learning-mode">
+      <option value="off">off</option>
+      <option value="shadow-only">shadow-only</option>
+      <option value="world-outcome">world-outcome</option>
+    </select>
+  </div>
+  <div class="row">
+    <label for="learning-steps">steps/tick</label>
+    <input id="learning-steps" type="number" min="1" max="64" step="1" value="1">
+  </div>
+  <div class="checks" id="learning-behaviors">
+    <label><input type="checkbox" data-behavior="danger">danger</label>
+    <label><input type="checkbox" data-behavior="charge">charge</label>
+    <label><input type="checkbox" data-behavior="future">future</label>
+    <label><input type="checkbox" data-behavior="action_value">action value</label>
+    <label><input type="checkbox" data-behavior="eye_next">eye next</label>
+    <label><input type="checkbox" data-behavior="ear_next">ear next</label>
+    <label><input type="checkbox" data-behavior="experience">experience</label>
+  </div>
+  <button id="learning-apply">Apply</button>
 </aside>
 <aside id="reign">
   <strong>XR reigns</strong>
@@ -2482,6 +2628,11 @@ const virtualPipelineSection = document.getElementById('virtual-pipeline-section
 const virtualReportSummary = document.getElementById('virtual-report-summary');
 const virtualModelRecommendations = document.getElementById('virtual-model-recommendations');
 const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
+const learningMode = document.getElementById('learning-mode');
+const learningSteps = document.getElementById('learning-steps');
+const learningStatus = document.getElementById('learning-status');
+const learningApply = document.getElementById('learning-apply');
+const learningChecks = Array.from(document.querySelectorAll('#learning-behaviors input[type="checkbox"]'));
 
 // Initialize Babylon Engine & Scene
 const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
@@ -2903,6 +3054,62 @@ function renderEye(packet){
   img.src = eye.data_url;
 }
 
+function learningConfigFromControls(){
+  const behaviors = {};
+  for(const checkbox of learningChecks){
+    behaviors[checkbox.dataset.behavior] = checkbox.checked;
+  }
+  return {
+    mode: learningMode.value,
+    behaviors,
+    max_train_steps_per_tick: Math.max(1, Math.min(64, Number.parseInt(learningSteps.value || '1', 10)))
+  };
+}
+
+function applyLearningConfigToControls(config){
+  learningMode.value = config.mode || 'off';
+  learningSteps.value = String(config.max_train_steps_per_tick || 1);
+  const behaviors = config.behaviors || {};
+  for(const checkbox of learningChecks){
+    checkbox.checked = behaviors[checkbox.dataset.behavior] !== false;
+  }
+}
+
+function renderLearningStatus(packet){
+  if(!packet) return;
+  const config = packet.config || packet;
+  if(config.mode) applyLearningConfigToControls(config);
+  const active = !!(packet.enabled || packet.weights_updating || (config.mode && config.mode !== 'off'));
+  learningStatus.textContent = active ? (packet.training_mode || config.mode || 'active') : 'off';
+  learningStatus.style.color = active ? '#8df0b2' : '#ffcf7a';
+}
+
+async function loadLearningConfig(){
+  try{
+    const res = await fetch('/view/inline-learning', {cache:'no-store'});
+    if(!res.ok) throw new Error(await res.text());
+    renderLearningStatus(await res.json());
+  }catch(error){
+    learningStatus.textContent = 'unavailable';
+  }
+}
+
+async function saveLearningConfig(){
+  learningStatus.textContent = 'saving...';
+  try{
+    const res = await fetch('/view/inline-learning', {
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify(learningConfigFromControls())
+    });
+    if(!res.ok) throw new Error(await res.text());
+    renderLearningStatus(await res.json());
+  }catch(error){
+    learningStatus.textContent = 'save failed';
+    learningStatus.style.color = '#ff8f8f';
+  }
+}
+
 function updateScene(packet){
   lastScene = packet;
   robot.position.copyFrom(world(packet.body.x_m, packet.body.y_m, 0));
@@ -2915,7 +3122,12 @@ function updateScene(packet){
   fields.mode.textContent = session.mode || '-';
   fields.scenario.textContent = session.scenario || '-';
   fields.training_mode.textContent = packet.training_mode || packet.training?.training_mode || '-';
-  fields.weights_updating.textContent = packet.weights_updating ? 'updating' : 'not updating';
+  fields.weights_updating.textContent = packet.weights_updating ? 'live learning active' : 'not updating';
+  fields.weights_updating.classList.toggle('active-learning', !!packet.weights_updating);
+  if(packet.weights_updating){
+    learningStatus.textContent = packet.training_mode || 'active';
+    learningStatus.style.color = '#8df0b2';
+  }
   fields.ledger_counts.textContent = `${packet.frames_written || 0}f / ${packet.transitions_written || 0}t`;
   fields.action_selector_mode.textContent = packet.action_selector_mode || '-';
   fields.seed.textContent = session.seed == null ? '-' : String(session.seed);
@@ -3535,6 +3747,8 @@ engine.runRenderLoop(() => {
 setupXr();
 connectLlmStream();
 refreshModels();
+learningApply.addEventListener('click', saveLearningConfig);
+loadLearningConfig();
 poll();
 async function pollVirtualTraining() {
   try {
@@ -3863,6 +4077,34 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn inline_learning_control_updates_live_state() {
+        let state = LiveViewState::new();
+        let config = InlineLearningConfig {
+            mode: InlineLearningMode::WorldOutcome,
+            behaviors: netherwick_runtime::InlineLearningBehaviors {
+                danger: false,
+                charge: false,
+                future: true,
+                action_value: true,
+                eye_next: false,
+                ear_next: false,
+                experience: false,
+            },
+            max_train_steps_per_tick: 2,
+        };
+
+        let Json(response) = post_inline_learning(State(state.clone()), Json(config.clone()))
+            .await
+            .unwrap();
+        let Json(readback) = get_inline_learning(State(state)).await;
+
+        assert!(response.enabled);
+        assert_eq!(response.training_mode, "inline-world-outcome");
+        assert_eq!(readback.config, config);
+        assert!(readback.weights_updating);
     }
 
     #[tokio::test]

@@ -25,8 +25,9 @@ use netherwick_memory::{
 use netherwick_models::MODEL_REGISTRY;
 use netherwick_now::{EarSense, KinectSense, RangeSense};
 use netherwick_runtime::{
-    ActionSelectionDecision, ActionSelectorMode, MinimalRuntime, RealRobotRunner, RobotMode,
-    RuntimeLoop, RuntimeModelStack, RuntimeTick, SimRunner,
+    ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
+    InlineLearningMode, MinimalRuntime, RealRobotRunner, RobotMode, RuntimeLoop, RuntimeModelStack,
+    RuntimeTick, SimRunner,
 };
 use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
@@ -157,6 +158,23 @@ struct SimArgs {
     experience_mode: ExperienceMode,
     #[arg(long, value_enum, default_value = "baseline")]
     action_selector: CliActionSelectorMode,
+    #[arg(long, env = "NETHERWICK_INLINE_LEARNING")]
+    inline_learning: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "off",
+        env = "NETHERWICK_INLINE_LEARNING_MODE"
+    )]
+    inline_learning_mode: InlineLearningModeArg,
+    #[arg(
+        long,
+        default_value_t = 1,
+        env = "NETHERWICK_INLINE_TRAIN_STEPS_PER_TICK"
+    )]
+    inline_train_steps_per_tick: usize,
+    #[arg(long, env = "NETHERWICK_INLINE_BEHAVIORS")]
+    inline_behaviors: Option<String>,
     #[arg(long)]
     live: bool,
     #[arg(long, default_value = "127.0.0.1:8787")]
@@ -272,6 +290,23 @@ impl From<CliActionSelectorMode> for ActionSelectorMode {
             CliActionSelectorMode::Random => ActionSelectorMode::Random,
             CliActionSelectorMode::ModelAssisted => ActionSelectorMode::ModelAssisted,
             CliActionSelectorMode::Scripted => ActionSelectorMode::Scripted,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum InlineLearningModeArg {
+    Off,
+    ShadowOnly,
+    WorldOutcome,
+}
+
+impl From<InlineLearningModeArg> for InlineLearningMode {
+    fn from(value: InlineLearningModeArg) -> Self {
+        match value {
+            InlineLearningModeArg::Off => InlineLearningMode::Off,
+            InlineLearningModeArg::ShadowOnly => InlineLearningMode::ShadowOnly,
+            InlineLearningModeArg::WorldOutcome => InlineLearningMode::WorldOutcome,
         }
     }
 }
@@ -626,13 +661,21 @@ struct TrainExperienceArgs {
 
 #[derive(Debug, Parser)]
 struct InspectLedgerArgs {
-    #[arg(long, default_value = "data/ledger/virtual-live", env = "NETHERWICK_LEDGER")]
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "NETHERWICK_LEDGER"
+    )]
     ledger: String,
 }
 
 #[derive(Debug, Parser)]
 struct VirtualReportArgs {
-    #[arg(long, default_value = "data/ledger/virtual-live", env = "NETHERWICK_LEDGER")]
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "NETHERWICK_LEDGER"
+    )]
     ledger: String,
     #[arg(long, default_value = "data/reports/virtual/latest.json")]
     out: String,
@@ -640,9 +683,17 @@ struct VirtualReportArgs {
 
 #[derive(Debug, Parser)]
 struct TrainVirtualArgs {
-    #[arg(long, default_value = "data/ledger/virtual-live", env = "NETHERWICK_LEDGER")]
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "NETHERWICK_LEDGER"
+    )]
     ledger: String,
-    #[arg(long, default_value = "data/models/virtual/latest", env = "NETHERWICK_MODEL_OUT")]
+    #[arg(
+        long,
+        default_value = "data/models/virtual/latest",
+        env = "NETHERWICK_MODEL_OUT"
+    )]
     out_dir: String,
     #[arg(long, default_value = "data/reports/virtual/latest.json")]
     report_out: String,
@@ -764,6 +815,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let flags = RuntimeModelFlags::from(&args);
     let (models, model_loading) = load_runtime_models_from_flags(&flags)?;
     let action_selector_mode = ActionSelectorMode::from(args.action_selector);
+    let inline_learning = inline_learning_config_from_sim_args(&args)?;
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
     let llm = configured_llm_agent(&args.llm)?;
@@ -775,7 +827,8 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         SimpleSafety::default(),
         llm,
     )
-    .with_action_selector_mode(action_selector_mode);
+    .with_action_selector_mode(action_selector_mode)
+    .with_inline_learning(inline_learning.clone());
     if let Some(models) = models {
         runtime = runtime.with_models(models);
     }
@@ -788,6 +841,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let mut runner = SimRunner::new(runtime, world, motors);
     if args.live {
         let live_state = LiveViewState::new().with_virtual_retina(true);
+        live_state.update_inline_learning(inline_learning.clone());
         live_state.update_scene_metadata(live_metadata);
         live_state.update_session(SceneSession {
             mode: "virtual-live".to_string(),
@@ -797,14 +851,14 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             tick_ms: Some(args.tick_delay_ms),
         });
         live_state.update_training_status(netherwick_server::LiveTrainingStatus {
-            training_mode: "collecting".to_string(),
+            training_mode: inline_learning.training_mode_label().to_string(),
             ledger_path: Some(args.ledger.clone()),
             frames_written: 0,
             transitions_written: 0,
             models_loaded: loaded_model_names(&model_loading),
             model_modes: model_modes_from_flags(&flags),
             action_selector_mode: action_selector_mode.as_str().to_string(),
-            weights_updating: false,
+            weights_updating: inline_learning.is_enabled(),
         });
         let server_state = live_state.clone();
         let live_addr = args.live_addr;
@@ -835,9 +889,16 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         let scheme = if args.live_tls { "https" } else { "http" };
         println!();
         println!("Netherwick virtual theater is running.");
-        println!("Virtual training theater is collecting experience.");
-        println!("Models are not updated online in this run.");
-        println!("Train later with `cargo run --bin netherwick -- train behavior ...`");
+        if inline_learning.is_enabled() {
+            println!(
+                "Virtual training theater is collecting experience and running {} inline learning.",
+                inline_learning.mode.as_str()
+            );
+        } else {
+            println!("Virtual training theater is collecting experience.");
+            println!("Models are not updated online in this run.");
+            println!("Train later with `cargo run --bin netherwick -- train behavior ...`");
+        }
         println!();
         println!("Desktop:");
         println!("  {scheme}://127.0.0.1:{}/view/3d", args.live_addr.port());
@@ -853,6 +914,8 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             println!("This serves robot/sim sensor data on the LAN. Use only on trusted networks.");
         }
         for _ in 0..args.steps {
+            let current_inline_learning = live_state.inline_learning();
+            runner.runtime.inline_learning = current_inline_learning.clone();
             let eye_frame = live_state.take_pending_retina_frame();
             if let Some(mut frame) = eye_frame {
                 frame.source = Some("babylon-robot-eye".to_string());
@@ -865,14 +928,14 @@ async fn run_sim(args: SimArgs) -> Result<()> {
                 .run_steps_observing(1, |snapshot| live_state.update(snapshot.clone()))
                 .await?;
             live_state.update_training_status(netherwick_server::LiveTrainingStatus {
-                training_mode: "collecting".to_string(),
+                training_mode: current_inline_learning.training_mode_label().to_string(),
                 ledger_path: Some(args.ledger.clone()),
                 frames_written: runner.tick_count,
                 transitions_written: runner.tick_count.saturating_sub(1),
                 models_loaded: loaded_model_names(&model_loading),
                 model_modes: model_modes_from_flags(&flags),
                 action_selector_mode: action_selector_mode.as_str().to_string(),
-                weights_updating: false,
+                weights_updating: current_inline_learning.is_enabled(),
             });
             tokio::time::sleep(Duration::from_millis(args.tick_delay_ms)).await;
         }
@@ -903,6 +966,52 @@ fn loaded_model_names(report: &RuntimeModelLoadReport) -> Vec<String> {
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+fn inline_learning_config_from_sim_args(args: &SimArgs) -> Result<InlineLearningConfig> {
+    let mut mode = InlineLearningMode::from(args.inline_learning_mode);
+    if args.inline_learning && mode == InlineLearningMode::Off {
+        mode = InlineLearningMode::WorldOutcome;
+    }
+    Ok(InlineLearningConfig {
+        mode,
+        behaviors: inline_learning_behaviors(args.inline_behaviors.as_deref())?,
+        max_train_steps_per_tick: args.inline_train_steps_per_tick,
+    })
+}
+
+fn inline_learning_behaviors(list: Option<&str>) -> Result<InlineLearningBehaviors> {
+    let Some(list) = list else {
+        return Ok(InlineLearningBehaviors::default());
+    };
+    if list.trim().is_empty() || list.trim().eq_ignore_ascii_case("all") {
+        return Ok(InlineLearningBehaviors::default());
+    }
+    let mut behaviors = InlineLearningBehaviors {
+        danger: false,
+        charge: false,
+        future: false,
+        action_value: false,
+        eye_next: false,
+        ear_next: false,
+        experience: false,
+    };
+    for raw in list.split(',') {
+        match raw.trim().replace('-', "_").as_str() {
+            "" => {}
+            "danger" => behaviors.danger = true,
+            "charge" => behaviors.charge = true,
+            "future" => behaviors.future = true,
+            "action_value" => behaviors.action_value = true,
+            "eye_next" => behaviors.eye_next = true,
+            "ear_next" => behaviors.ear_next = true,
+            "experience" => behaviors.experience = true,
+            other => anyhow::bail!(
+                "unknown inline behavior '{other}', expected one of danger,charge,future,action_value,eye_next,ear_next,experience"
+            ),
+        }
+    }
+    Ok(behaviors)
 }
 
 fn live_scene_metadata_from_scenario(
@@ -5412,7 +5521,10 @@ async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> 
 
         // 1. Eye source tracking
         if let Some(eye_frame) = &frame.now.eye_frame {
-            let src = eye_frame.source.clone().unwrap_or_else(|| "none".to_string());
+            let src = eye_frame
+                .source
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
             *eye_sources.entry(src.clone()).or_insert(0) += 1;
             if src == "babylon-robot-eye" {
                 babylon_eye_frames += 1;
@@ -5458,7 +5570,8 @@ async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> 
                         2.0 => "Corner",
                         3.0 => "Column",
                         _ => "Unknown",
-                    }.to_string();
+                    }
+                    .to_string();
                     *trap_kinds.entry(trap_name).or_insert(0) += 1;
                 }
                 if recovered {
@@ -5471,7 +5584,10 @@ async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> 
         if let Some(prev) = prev_t_ms {
             let diff = frame.t_ms.saturating_sub(prev);
             if diff > 500 {
-                ledger_gaps.push(format!("gap of {}ms between {}ms and {}ms", diff, prev, frame.t_ms));
+                ledger_gaps.push(format!(
+                    "gap of {}ms between {}ms and {}ms",
+                    diff, prev, frame.t_ms
+                ));
             }
         }
         prev_t_ms = Some(frame.t_ms);
@@ -5564,7 +5680,8 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
             epochs: args.epochs,
             validation_split: 0.2,
             seed: 7,
-        }).await?;
+        })
+        .await?;
         trained_summaries.insert(behavior.clone(), summary);
     }
 
@@ -5613,17 +5730,42 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
         ledger: None,
         capture_root: None,
         memory_report: false,
-        danger_checkpoint: Some(Path::new(&args.out_dir).join("danger").to_string_lossy().to_string()),
+        danger_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("danger")
+                .to_string_lossy()
+                .to_string(),
+        ),
         danger_mode: DangerMode::ShadowInfer,
-        charge_checkpoint: Some(Path::new(&args.out_dir).join("charge").to_string_lossy().to_string()),
+        charge_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("charge")
+                .to_string_lossy()
+                .to_string(),
+        ),
         charge_mode: ChargeMode::ShadowInfer,
         action_value_checkpoint: None,
         action_value_mode: ActionValueMode::Off,
-        future_checkpoint: Some(Path::new(&args.out_dir).join("future").to_string_lossy().to_string()),
+        future_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("future")
+                .to_string_lossy()
+                .to_string(),
+        ),
         future_mode: FutureMode::ShadowInfer,
-        eye_next_checkpoint: Some(Path::new(&args.out_dir).join("eye_next").to_string_lossy().to_string()),
+        eye_next_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("eye_next")
+                .to_string_lossy()
+                .to_string(),
+        ),
         eye_next_mode: EyeNextMode::ShadowInfer,
-        ear_next_checkpoint: Some(Path::new(&args.out_dir).join("ear_next").to_string_lossy().to_string()),
+        ear_next_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("ear_next")
+                .to_string_lossy()
+                .to_string(),
+        ),
         ear_next_mode: EarNextMode::ShadowInfer,
         experience_checkpoint: None,
         experience_mode: ExperienceMode::Off,
@@ -5644,7 +5786,10 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
 
     for behavior in &behaviors {
         let name = format!("{}_virtual_{}", behavior.config_key(), timestamp);
-        let checkpoint = Path::new(&args.out_dir).join(behavior.config_key()).to_string_lossy().to_string();
+        let checkpoint = Path::new(&args.out_dir)
+            .join(behavior.config_key())
+            .to_string_lossy()
+            .to_string();
         let behavior_report = Path::new(&checkpoint).join("evaluation.json");
 
         println!("Registering candidate model {}...", name);
@@ -5664,7 +5809,12 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
 
         // Load the registry to get the entry we just registered
         let registry = load_model_registry(registry_path)?;
-        let entry = registry.entries.iter().find(|e| e.name == name && e.behavior == *behavior).unwrap().clone();
+        let entry = registry
+            .entries
+            .iter()
+            .find(|e| e.name == name && e.behavior == *behavior)
+            .unwrap()
+            .clone();
 
         // Determine recommended promotion status
         // First test Inference promotion
@@ -5721,19 +5871,22 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
 
         let loss = trained_summaries.get(behavior).and_then(|s| s.last_loss);
 
-        model_statuses.insert(behavior.config_key().to_string(), ModelTrainingStatus {
-            name,
-            trained: true,
-            previous_status: "registered".to_string(),
-            new_status: new_status.as_str().to_string(),
-            recommended_action,
-            warnings,
-            loss,
-            baseline_collision_rate: Some(baseline_report.summary.collision_rate),
-            candidate_collision_rate: Some(candidate_report.summary.collision_rate),
-            baseline_success_rate: Some(baseline_report.summary.success_rate),
-            candidate_success_rate: Some(candidate_report.summary.success_rate),
-        });
+        model_statuses.insert(
+            behavior.config_key().to_string(),
+            ModelTrainingStatus {
+                name,
+                trained: true,
+                previous_status: "registered".to_string(),
+                new_status: new_status.as_str().to_string(),
+                recommended_action,
+                warnings,
+                loss,
+                baseline_collision_rate: Some(baseline_report.summary.collision_rate),
+                candidate_collision_rate: Some(candidate_report.summary.collision_rate),
+                baseline_success_rate: Some(baseline_report.summary.success_rate),
+                candidate_success_rate: Some(candidate_report.summary.success_rate),
+            },
+        );
     }
 
     // 5. Write final consolidated training report
@@ -5742,7 +5895,10 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
         run_report,
         models: model_statuses,
         warnings: if comparison.outcome == ComparisonOutcome::Regressed {
-            vec!["Candidate models overall regressed on MixedRoom scenario against baseline".to_string()]
+            vec![
+                "Candidate models overall regressed on MixedRoom scenario against baseline"
+                    .to_string(),
+            ]
         } else {
             Vec::new()
         },
@@ -5752,8 +5908,14 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
     if let Some(p) = parent {
         fs::create_dir_all(p)?;
     }
-    fs::write(&args.report_out, serde_json::to_string_pretty(&final_report)?)?;
-    println!("Consolidated training report written to {}", args.report_out);
+    fs::write(
+        &args.report_out,
+        serde_json::to_string_pretty(&final_report)?,
+    )?;
+    println!(
+        "Consolidated training report written to {}",
+        args.report_out
+    );
 
     Ok(())
 }
@@ -5781,11 +5943,16 @@ struct RetinaMockSendArgs {
     pattern: String,
 }
 
-fn generate_mock_image_base64(width: u32, height: u32, pattern: &str, frame_index: usize) -> Result<String> {
-    use image::{Rgb, RgbImage};
+fn generate_mock_image_base64(
+    width: u32,
+    height: u32,
+    pattern: &str,
+    frame_index: usize,
+) -> Result<String> {
+    use base64::Engine;
     use image::codecs::png::PngEncoder;
     use image::ImageEncoder;
-    use base64::Engine;
+    use image::{Rgb, RgbImage};
 
     let mut img = RgbImage::new(width, height);
 
@@ -5830,12 +5997,9 @@ fn generate_mock_image_base64(width: u32, height: u32, pattern: &str, frame_inde
     }
 
     let mut png_bytes = Vec::new();
-    PngEncoder::new(&mut png_bytes).write_image(
-        &img,
-        width,
-        height,
-        image::ColorType::Rgb8.into(),
-    ).context("failed to encode mock image as PNG")?;
+    PngEncoder::new(&mut png_bytes)
+        .write_image(&img, width, height, image::ColorType::Rgb8.into())
+        .context("failed to encode mock image as PNG")?;
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
     Ok(encoded)
@@ -5848,25 +6012,29 @@ async fn run_retina_mock_send(args: RetinaMockSendArgs) -> Result<()> {
         .context("failed to build reqwest client")?;
 
     let url = format!("{}/view/retina-frame", args.url.trim_end_matches('/'));
-    println!("Starting mock retina stream to {url} at {} FPS ({}x{})...", args.fps, args.width, args.height);
+    println!(
+        "Starting mock retina stream to {url} at {} FPS ({}x{})...",
+        args.fps, args.width, args.height
+    );
 
     let interval = Duration::from_millis(1000 / args.fps.max(1));
     let mut interval_timer = tokio::time::interval(interval);
     let mut frame_index = 0;
-    
+
     let start_time = std::time::Instant::now();
 
     loop {
         interval_timer.tick().await;
-        
+
         let t_ms = start_time.elapsed().as_millis() as u64;
-        let base64_str = match generate_mock_image_base64(args.width, args.height, &args.pattern, frame_index) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Error generating mock image: {e}");
-                continue;
-            }
-        };
+        let base64_str =
+            match generate_mock_image_base64(args.width, args.height, &args.pattern, frame_index) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error generating mock image: {e}");
+                    continue;
+                }
+            };
 
         let payload = serde_json::json!({
             "schema_version": 1,
@@ -5880,19 +6048,25 @@ async fn run_retina_mock_send(args: RetinaMockSendArgs) -> Result<()> {
             "data": format!("data:image/png;base64,{base64_str}")
         });
 
-        let res = client.post(&url)
-            .json(&payload)
-            .send()
-            .await;
+        let res = client.post(&url).json(&payload).send().await;
 
         match res {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
-                    println!("[frame {}] Sent successfully (t_ms = {})", frame_index, t_ms);
+                    println!(
+                        "[frame {}] Sent successfully (t_ms = {})",
+                        frame_index, t_ms
+                    );
                 } else {
-                    let err_text = response.text().await.unwrap_or_else(|_| "unknown error".to_string());
-                    eprintln!("[frame {}] FAILED with status {}: {}", frame_index, status, err_text);
+                    let err_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "unknown error".to_string());
+                    eprintln!(
+                        "[frame {}] FAILED with status {}: {}",
+                        frame_index, status, err_text
+                    );
                 }
             }
             Err(e) => {
@@ -6233,6 +6407,7 @@ mod tests {
             recall: Default::default(),
             llm: Default::default(),
             combobulation: None,
+            inline_learning: Default::default(),
         }
     }
 
