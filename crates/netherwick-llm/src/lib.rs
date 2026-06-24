@@ -27,6 +27,7 @@ const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what th
 const LIVE_EVENT_RULES: &str = "Live events may arrive while generation is happening. Treat them as observations from outside. Do not assume a human is currently present or addressing me; there may be nobody nearby. Clock and status events help track timing, pauses, and elapsed time, but do not narrate every tick, quiet moment, or idle thought.";
 const COMBOBULATOR_CLUSTER_GAP_MS: u64 = 1_000;
 const MILLIS_PER_SECOND: f64 = 1_000.0;
+const DEFAULT_OLLAMA_TIMEOUT_MS: u64 = 120_000;
 
 static LLM_STREAM_BUS: OnceLock<broadcast::Sender<LlmStreamEvent>> = OnceLock::new();
 static LLM_STREAM_ID: AtomicU64 = AtomicU64::new(1);
@@ -226,7 +227,7 @@ impl Default for LlmConfig {
             agent_model,
             combobulator_model: None,
             temperature: 0.2,
-            timeout_ms: 20_000,
+            timeout_ms: DEFAULT_OLLAMA_TIMEOUT_MS,
         }
     }
 }
