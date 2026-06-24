@@ -103,6 +103,8 @@ pub struct LiveSnapshotResponse {
     pub body: netherwick_body::BodySense,
     pub range: netherwick_now::RangeSense,
     pub eye_frame: Option<netherwick_sensors::EyeFrame>,
+    pub gps: Option<netherwick_now::GpsSense>,
+    pub ear_pcm: Option<netherwick_sensors::PcmAudioFrame>,
 }
 
 pub fn live_view_router(state: LiveViewState) -> Router {
@@ -130,6 +132,8 @@ async fn get_live_snapshot(
         body: snapshot.body,
         range: snapshot.range,
         eye_frame: snapshot.eye_frame,
+        gps: snapshot.gps,
+        ear_pcm: snapshot.ear_pcm,
     }))
 }
 
@@ -383,6 +387,12 @@ dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
     <dt>heading</dt><dd id="heading">-</dd>
     <dt>battery</dt><dd id="battery">-</dd>
     <dt>nearest</dt><dd id="nearest">-</dd>
+    <dt>gps lat</dt><dd id="gps_lat">-</dd>
+    <dt>gps lon</dt><dd id="gps_lon">-</dd>
+    <dt>gps alt</dt><dd id="gps_alt">-</dd>
+    <dt>eye format</dt><dd id="eye_format">-</dd>
+    <dt>eye age</dt><dd id="eye_age">-</dd>
+    <dt>ear age</dt><dd id="ear_age">-</dd>
   </dl>
   <div>Range</div>
   <div class="beams" id="beams"></div>
@@ -390,25 +400,42 @@ dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
 <script>
 const canvas = document.getElementById('eye');
 const ctx = canvas.getContext('2d');
-const fields = Object.fromEntries(['t','x','y','heading','battery','nearest'].map(id => [id, document.getElementById(id)]));
+const fields = Object.fromEntries(['t','x','y','heading','battery','nearest','gps_lat','gps_lon','gps_alt','eye_format','eye_age','ear_age'].map(id => [id, document.getElementById(id)]));
 const status = document.getElementById('status');
 const beams = document.getElementById('beams');
 function fmt(value, digits = 2){
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '-';
 }
 function drawEye(frame){
-  if(!frame || frame.format !== 'Rgb8') return;
-  if(canvas.width !== frame.width || canvas.height !== frame.height){
-    canvas.width = frame.width; canvas.height = frame.height;
+  if(!frame) return;
+  const fmt = frame.format;
+  const isRgb = fmt === 'Rgb8' || (typeof fmt === 'object' && fmt.Rgb8 !== undefined);
+  const isMjpg = fmt === 'Mjpeg' || (typeof fmt === 'object' && fmt.Mjpeg !== undefined) || (typeof fmt === 'object' && JSON.stringify(fmt).includes('MJPG'));
+  if(isRgb){
+    if(canvas.width !== frame.width || canvas.height !== frame.height){
+      canvas.width = frame.width; canvas.height = frame.height;
+    }
+    const image = ctx.createImageData(frame.width, frame.height);
+    for(let source = 0, target = 0; source < frame.bytes.length; source += 3, target += 4){
+      image.data[target] = frame.bytes[source];
+      image.data[target + 1] = frame.bytes[source + 1];
+      image.data[target + 2] = frame.bytes[source + 2];
+      image.data[target + 3] = 255;
+    }
+    ctx.putImageData(image, 0, 0);
+  } else if(isMjpg){
+    const blob = new Blob([new Uint8Array(frame.bytes)], {type: 'image/jpeg'});
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      if(canvas.width !== img.width || canvas.height !== img.height){
+        canvas.width = img.width; canvas.height = img.height;
+      }
+      ctx.drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
   }
-  const image = ctx.createImageData(frame.width, frame.height);
-  for(let source = 0, target = 0; source < frame.bytes.length; source += 3, target += 4){
-    image.data[target] = frame.bytes[source];
-    image.data[target + 1] = frame.bytes[source + 1];
-    image.data[target + 2] = frame.bytes[source + 2];
-    image.data[target + 3] = 255;
-  }
-  ctx.putImageData(image, 0, 0);
 }
 function drawBeams(values){
   beams.replaceChildren(...(values || []).map(value => {
@@ -431,6 +458,29 @@ async function refresh(){
     fields.heading.textContent = `${fmt(body.odometry.heading_rad)} rad`;
     fields.battery.textContent = `${fmt(body.battery_level * 100, 1)}%`;
     fields.nearest.textContent = snapshot.range.nearest_m == null ? '-' : `${fmt(snapshot.range.nearest_m)} m`;
+    const gps = snapshot.gps;
+    if(gps){
+      fields.gps_lat.textContent = fmt(gps.lat, 6);
+      fields.gps_lon.textContent = fmt(gps.lon, 6);
+      fields.gps_alt.textContent = gps.altitude_m != null ? `${fmt(gps.altitude_m, 1)} m` : '-';
+    }else{
+      fields.gps_lat.textContent = '-';
+      fields.gps_lon.textContent = '-';
+      fields.gps_alt.textContent = '-';
+    }
+    if(snapshot.eye_frame){
+      let fmt_str = typeof snapshot.eye_frame.format === 'string' ? snapshot.eye_frame.format : JSON.stringify(snapshot.eye_frame.format);
+      fields.eye_format.textContent = fmt_str;
+      fields.eye_age.textContent = `${snapshot.t_ms - snapshot.eye_frame.captured_at_ms} ms`;
+    }else{
+      fields.eye_format.textContent = '-';
+      fields.eye_age.textContent = '-';
+    }
+    if(snapshot.ear_pcm){
+      fields.ear_age.textContent = `${snapshot.t_ms - snapshot.ear_pcm.captured_at_ms} ms`;
+    }else{
+      fields.ear_age.textContent = '-';
+    }
     drawEye(snapshot.eye_frame);
     drawBeams(snapshot.range.beams);
     status.textContent = 'live';

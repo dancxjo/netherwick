@@ -143,7 +143,9 @@ pub trait World: Send {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SensePacket {
     Eye(EyeSense),
+    EyeFrame(EyeFrame),
     Ear(EarSense),
+    EarPcm(PcmAudioFrame),
     Range(RangeSense),
     Imu(ImuSense),
     Gps(GpsSense),
@@ -194,8 +196,18 @@ impl NowBuilder {
                     self.last_snapshot.eye = eye;
                     self.last_updates.eye = Some(t_ms);
                 }
+                SensePacket::EyeFrame(frame) => {
+                    self.last_snapshot.eye.frames = vec![bytes_to_unit_signal(&frame.bytes)];
+                    self.last_snapshot.eye_frame = Some(frame);
+                    self.last_updates.eye = Some(t_ms);
+                }
                 SensePacket::Ear(ear) => {
                     self.last_snapshot.ear = ear;
+                    self.last_updates.ear = Some(t_ms);
+                }
+                SensePacket::EarPcm(frame) => {
+                    self.last_snapshot.ear.features = vec![pcm_to_unit_signal(&frame.samples)];
+                    self.last_snapshot.ear_pcm = Some(frame);
                     self.last_updates.ear = Some(t_ms);
                 }
                 SensePacket::Range(range) => {
@@ -526,6 +538,11 @@ pub struct CpalMicrophone {
 }
 
 #[cfg(feature = "linux-hardware")]
+unsafe impl Send for CpalMicrophone {}
+#[cfg(feature = "linux-hardware")]
+unsafe impl Sync for CpalMicrophone {}
+
+#[cfg(feature = "linux-hardware")]
 impl CpalMicrophone {
     pub fn new(preferred_name: Option<&str>, sample_rate_hz: u32, channels: u16) -> Result<Self> {
         let host = cpal::default_host();
@@ -690,7 +707,6 @@ fn bytes_to_unit_signal(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-#[cfg(feature = "linux-hardware")]
 fn pcm_to_unit_signal(samples: &[i16]) -> Vec<f32> {
     samples
         .iter()
@@ -894,6 +910,140 @@ fn read_depth_values(path: &Path) -> Result<Vec<f32>> {
     text.split_whitespace()
         .map(|value| value.parse::<f32>().map_err(anyhow::Error::from))
         .collect()
+}
+
+pub struct CameraSenseProvider {
+    #[cfg(feature = "linux-hardware")]
+    camera: V4lCamera,
+}
+
+impl CameraSenseProvider {
+    pub fn new(device: &str) -> Result<Self> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            Ok(Self {
+                camera: V4lCamera::new(device)?,
+            })
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            let _ = device;
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
+    }
+}
+
+#[async_trait]
+impl SenseProducer for CameraSenseProvider {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            let frame = self.camera.capture_frame()?;
+            Ok(SensePacket::EyeFrame(frame))
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
+    }
+}
+
+pub struct MicrophoneSenseProvider {
+    #[cfg(feature = "linux-hardware")]
+    microphone: CpalMicrophone,
+}
+
+impl MicrophoneSenseProvider {
+    pub fn new(preferred_name: Option<&str>) -> Result<Self> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            Ok(Self {
+                microphone: CpalMicrophone::new(preferred_name, 16000, 1)?,
+            })
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            let _ = preferred_name;
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
+    }
+}
+
+#[async_trait]
+impl SenseProducer for MicrophoneSenseProvider {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            let frame = self.microphone.latest_frame().unwrap_or_else(|| PcmAudioFrame {
+                captured_at_ms: unix_time_ms(),
+                sample_rate_hz: 16000,
+                channels: 1,
+                samples: Vec::new(),
+            });
+            Ok(SensePacket::EarPcm(frame))
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
+    }
+}
+
+pub struct GpsSenseProvider {
+    #[cfg(feature = "linux-hardware")]
+    gps: Ublox7Gps,
+    #[cfg(feature = "linux-hardware")]
+    last_fix: GpsSense,
+}
+
+impl GpsSenseProvider {
+    pub fn new(port: &str, baud_rate: u32) -> Result<Self> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            Ok(Self {
+                gps: Ublox7Gps::new(port, baud_rate)?,
+                last_fix: GpsSense::default(),
+            })
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            let _ = port;
+            let _ = baud_rate;
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
+    }
+}
+
+#[async_trait]
+impl SenseProducer for GpsSenseProvider {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            if let Some(fix) = self.gps.try_read_fix()? {
+                self.last_fix = fix;
+            }
+            Ok(SensePacket::Gps(self.last_fix.clone()))
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
+    }
+}
+
+pub struct ImuSenseProvider;
+
+impl ImuSenseProvider {
+    pub fn new(_device: &str) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[async_trait]
+impl SenseProducer for ImuSenseProvider {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        Ok(SensePacket::Imu(ImuSense::default()))
+    }
 }
 
 #[cfg(test)]

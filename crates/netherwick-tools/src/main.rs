@@ -18,7 +18,9 @@ use netherwick_models::MODEL_REGISTRY;
 use netherwick_runtime::{
     MinimalRuntime, RealRobotRunner, RobotMode, RuntimeModelStack, SimRunner,
 };
-use netherwick_sensors::SenseProducer;
+use netherwick_sensors::{
+    CameraSenseProvider, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider, SenseProducer,
+};
 use netherwick_server::LiveViewState;
 use netherwick_sim::{ArenaConfig, SimMotorComplex, SimObject, SimObjectKind, VirtualWorld};
 use netherwick_training::{
@@ -537,17 +539,66 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     if args.mode != RobotModeArg::ReadOnly {
         anyhow::bail!("only --mode read-only is implemented for real robot bring-up");
     }
-    validate_optional_sensor("camera", args.camera.as_deref(), args.require_camera)?;
-    validate_optional_sensor("mic", args.mic.as_deref(), args.require_mic)?;
-    validate_optional_sensor("imu", args.imu.as_deref(), args.require_imu)?;
-    validate_optional_sensor("gps", args.gps.as_deref(), args.require_gps)?;
+    let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
+
+    if let Some(device) = &args.camera {
+        match CameraSenseProvider::new(device) {
+            Ok(provider) => sensors.push(Box::new(provider)),
+            Err(err) => {
+                if args.require_camera {
+                    anyhow::bail!("failed to initialize camera: {err}");
+                } else {
+                    println!("failed to initialize camera: {err}; continuing without it");
+                }
+            }
+        }
+    }
+
+    if let Some(device) = &args.mic {
+        let pref_name = if device == "default" { None } else { Some(device.as_str()) };
+        match MicrophoneSenseProvider::new(pref_name) {
+            Ok(provider) => sensors.push(Box::new(provider)),
+            Err(err) => {
+                if args.require_mic {
+                    anyhow::bail!("failed to initialize mic: {err}");
+                } else {
+                    println!("failed to initialize mic: {err}; continuing without it");
+                }
+            }
+        }
+    }
+
+    if let Some(device) = &args.gps {
+        match GpsSenseProvider::new(device, 9600) {
+            Ok(provider) => sensors.push(Box::new(provider)),
+            Err(err) => {
+                if args.require_gps {
+                    anyhow::bail!("failed to initialize gps: {err}");
+                } else {
+                    println!("failed to initialize gps: {err}; continuing without it");
+                }
+            }
+        }
+    }
+
+    if let Some(device) = &args.imu {
+        match ImuSenseProvider::new(device) {
+            Ok(provider) => sensors.push(Box::new(provider)),
+            Err(err) => {
+                if args.require_imu {
+                    anyhow::bail!("failed to initialize imu: {err}");
+                } else {
+                    println!("failed to initialize imu: {err}; continuing without it");
+                }
+            }
+        }
+    }
 
     let body: Box<dyn RobotBody + Send> = if args.create_port == "mock" {
         Box::new(MockCreate1Body::new())
     } else {
         Box::new(Create1Body::connect(&args.create_port, args.create_baud).await?)
     };
-    let sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
     let ledger = JsonlLedger::new(&args.ledger);
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
@@ -623,17 +674,6 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     Ok(())
 }
 
-fn validate_optional_sensor(kind: &str, device: Option<&str>, required: bool) -> Result<()> {
-    if device.is_none() {
-        return Ok(());
-    }
-    let message = format!("{kind} provider is not wired into this build yet");
-    if required {
-        anyhow::bail!(message);
-    }
-    println!("{message}; continuing without it");
-    Ok(())
-}
 
 #[derive(Clone, Debug, Default)]
 struct NoopLedger;
