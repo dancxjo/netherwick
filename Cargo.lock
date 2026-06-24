@@ -4813,6 +4813,7 @@ dependencies = [
  "netherwick-sensors",
  "netherwick-server",
  "netherwick-sim",
+ "netherwick-worldlab",
  "serde_json",
  "tokio",
  "uuid",
@@ -4823,6 +4824,30 @@ name = "netherwick-ui"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "netherwick-worldlab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "netherwick-body",
+ "netherwick-core",
+ "netherwick-experience",
+ "netherwick-ledger",
+ "netherwick-now",
+ "netherwick-runtime",
+ "netherwick-sensors",
+ "netherwick-sim",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
