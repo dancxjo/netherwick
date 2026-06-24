@@ -17,3 +17,6 @@ netherwick-core = { path = "../netherwick-core" }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-ledger = { path = "../netherwick-ledger" }
 netherwick-now = { path = "../netherwick-now" }
+
+[dev-dependencies]
+netherwick-body = { path = "../netherwick-body" }

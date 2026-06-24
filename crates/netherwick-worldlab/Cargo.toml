@@ -26,3 +26,7 @@ netherwick-sim = { path = "../netherwick-sim" }
 
 [dev-dependencies]
 tempfile = "3"
+netherwick-autonomic = { path = "../netherwick-autonomic" }
+netherwick-conductor = { path = "../netherwick-conductor" }
+netherwick-llm = { path = "../netherwick-llm" }
+netherwick-memory = { path = "../netherwick-memory" }

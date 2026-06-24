@@ -163,9 +163,7 @@ impl CaptureReader {
         Ok(frames)
     }
 
-    pub async fn stream_frames(
-        &self,
-    ) -> Result<impl Stream<Item = Result<CaptureFrameRecord>>> {
+    pub async fn stream_frames(&self) -> Result<impl Stream<Item = Result<CaptureFrameRecord>>> {
         let frames = self.read_frames().await?;
         Ok(stream::iter(frames.into_iter().map(Ok)))
     }
@@ -194,7 +192,10 @@ where
         self.replay_with_ticks(|_| {}).await
     }
 
-    pub async fn replay_with_ticks<F>(&mut self, mut observe_tick: F) -> Result<CaptureReplaySummary>
+    pub async fn replay_with_ticks<F>(
+        &mut self,
+        mut observe_tick: F,
+    ) -> Result<CaptureReplaySummary>
     where
         F: FnMut(&RuntimeTick),
     {
@@ -203,7 +204,11 @@ where
             let now = record.snapshot.to_now(record.t_ms);
             let tick = self
                 .runtime
-                .tick(now, ExperienceLatent::default(), Vec::<FuturePrediction>::new())
+                .tick(
+                    now,
+                    ExperienceLatent::default(),
+                    Vec::<FuturePrediction>::new(),
+                )
                 .await?;
             observe_tick(&tick);
             summary.frames_replayed = summary.frames_replayed.saturating_add(1);
@@ -233,7 +238,14 @@ async fn write_manifest_atomic(root: &Path, manifest: &CaptureManifest) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netherwick_autonomic::SimpleSafety;
     use netherwick_body::BodySense;
+    use netherwick_conductor::SimpleConductor;
+    use netherwick_ledger::JsonlLedger;
+    use netherwick_llm::NoopLlmAgent;
+    use netherwick_memory::InMemoryExperienceStore;
+    use netherwick_runtime::{MinimalRuntime, SimRunner};
+    use netherwick_sim::{ArenaConfig, VirtualWorld};
     use tempfile::tempdir;
 
     #[test]
@@ -291,7 +303,10 @@ mod tests {
         let reader = CaptureReader::open(dir.path()).await.unwrap();
         let frames = reader.read_frames().await.unwrap();
 
-        assert_eq!(frames.iter().map(|frame| frame.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            frames.iter().map(|frame| frame.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         assert_eq!(
             frames.iter().map(|frame| frame.t_ms).collect::<Vec<_>>(),
             vec![100, 200, 300]
@@ -311,5 +326,91 @@ mod tests {
 
         assert_eq!(now.t_ms, 600);
         assert_eq!(now.body.battery_level, 0.42);
+    }
+
+    #[tokio::test]
+    async fn capture_sim_creates_nonempty_session() {
+        let capture_dir = tempdir().unwrap();
+        let ledger_dir = tempdir().unwrap();
+        let runtime = test_runtime(ledger_dir.path());
+        let (world, motors) = VirtualWorld::new_with_motor(
+            7,
+            ArenaConfig {
+                width_m: 4.0,
+                height_m: 4.0,
+            },
+        );
+        let mut runner = SimRunner::new(runtime, world, motors);
+        let mut snapshots = Vec::new();
+        runner
+            .run_steps_observing(3, |snapshot| snapshots.push(snapshot.clone()))
+            .await
+            .unwrap();
+
+        let mut writer = CaptureWriter::create(capture_dir.path(), CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        for snapshot in snapshots {
+            writer
+                .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+                .await
+                .unwrap();
+        }
+        let manifest = writer.finish().await.unwrap();
+        let reader = CaptureReader::open(capture_dir.path()).await.unwrap();
+
+        assert_eq!(manifest.frame_count, 3);
+        assert_eq!(reader.read_frames().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn replay_capture_produces_runtime_ticks() {
+        let capture_dir = tempdir().unwrap();
+        let ledger_dir = tempdir().unwrap();
+        let mut writer = CaptureWriter::create(capture_dir.path(), CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        for t_ms in [100, 200, 300] {
+            let mut snapshot = WorldSnapshot::default();
+            snapshot.body.last_update_ms = t_ms;
+            snapshot.body.battery_level = 1.0 - (t_ms as f32 / 1_000.0);
+            writer
+                .append_snapshot(t_ms, snapshot, Vec::new())
+                .await
+                .unwrap();
+        }
+        writer.finish().await.unwrap();
+
+        let reader = CaptureReader::open(capture_dir.path()).await.unwrap();
+        let ledger = JsonlLedger::new(ledger_dir.path());
+        let runtime = test_runtime(ledger_dir.path());
+        let mut runner = CaptureReplayRunner::new(runtime, reader);
+        let summary = runner.replay().await.unwrap();
+        let transitions = ledger.transitions().await.unwrap();
+
+        assert_eq!(summary.frames_replayed, 3);
+        assert_eq!(summary.runtime_ticks, 3);
+        assert_eq!(transitions.len(), 2);
+    }
+
+    fn test_runtime(
+        ledger_path: impl Into<std::path::PathBuf>,
+    ) -> MinimalRuntime<
+        JsonlLedger,
+        InMemoryExperienceStore,
+        InMemoryExperienceStore,
+        SimpleConductor,
+        SimpleSafety,
+        NoopLlmAgent,
+    > {
+        let memory = InMemoryExperienceStore::new();
+        MinimalRuntime::with_default_events(
+            JsonlLedger::new(ledger_path),
+            memory.clone(),
+            memory,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            NoopLlmAgent,
+        )
     }
 }

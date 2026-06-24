@@ -8,10 +8,73 @@ use uuid::Uuid;
 
 pub type ExtensionMap = BTreeMap<String, Value>;
 
+pub const MEMORY_VECTOR_COLLECTION: &str = "memories";
+pub const IMAGE_VECTOR_COLLECTION: &str = "images";
+pub const IMAGE_DESCRIPTION_VECTOR_COLLECTION: &str = "image_descriptions";
+pub const SCENE_VECTOR_COLLECTION: &str = "scene_vectors";
+pub const FACE_VECTOR_COLLECTION: &str = "faces";
+pub const VOICE_VECTOR_COLLECTION: &str = "voices";
+pub const GEOLOCATION_VECTOR_COLLECTION: &str = "geolocations";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorArtifact {
+    pub collection: String,
+    pub point_id: String,
+    pub vector: Vec<f32>,
+    pub model: Option<String>,
+    pub source_id: Option<String>,
+    pub source_frame_id: Option<String>,
+    pub occurred_at_ms: Option<u64>,
+}
+
+impl VectorArtifact {
+    pub fn new(
+        collection: impl Into<String>,
+        point_id: impl Into<String>,
+        vector: Vec<f32>,
+    ) -> Self {
+        Self {
+            collection: collection.into(),
+            point_id: point_id.into(),
+            vector,
+            model: None,
+            source_id: None,
+            source_frame_id: None,
+            occurred_at_ms: None,
+        }
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_source_id(mut self, source_id: impl Into<String>) -> Self {
+        self.source_id = Some(source_id.into());
+        self
+    }
+
+    pub fn with_source_frame_id(mut self, source_frame_id: impl Into<String>) -> Self {
+        self.source_frame_id = Some(source_frame_id.into());
+        self
+    }
+
+    pub fn with_occurred_at_ms(mut self, occurred_at_ms: u64) -> Self {
+        self.occurred_at_ms = Some(occurred_at_ms);
+        self
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EyeSense {
     pub schema_version: u32,
     pub frames: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub image_vectors: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub image_description_vectors: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub scene_vectors: Vec<VectorArtifact>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -168,12 +231,16 @@ pub struct ReignSense {
 pub struct FaceSense {
     pub schema_version: u32,
     pub embeddings: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub vectors: Vec<VectorArtifact>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VoiceSense {
     pub schema_version: u32,
     pub embeddings: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub vectors: Vec<VectorArtifact>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

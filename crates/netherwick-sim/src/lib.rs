@@ -723,6 +723,7 @@ fn project_face_sense(body: &BodySense, objects: &[SimObject]) -> FaceSense {
     FaceSense {
         schema_version: 1,
         embeddings,
+        vectors: Vec::new(),
     }
 }
 
@@ -734,6 +735,7 @@ fn project_voice_sense(body: &BodySense, objects: &[SimObject]) -> VoiceSense {
     VoiceSense {
         schema_version: 1,
         embeddings,
+        vectors: Vec::new(),
     }
 }
 

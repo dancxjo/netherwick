@@ -720,6 +720,9 @@ impl KinectReplayProvider {
             SensePacket::Eye(EyeSense {
                 schema_version: 1,
                 frames: vec![bytes_to_unit_signal(&bytes)],
+                image_vectors: Vec::new(),
+                image_description_vectors: Vec::new(),
+                scene_vectors: Vec::new(),
             })
         });
         let kinect = KinectSense {

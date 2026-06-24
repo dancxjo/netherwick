@@ -15,7 +15,9 @@ use netherwick_experience::{
     experience_decode_target_from_now, experience_encode_input_from_now,
     eye_next_input_from_transition_like, eye_next_target_from_now,
 };
-use netherwick_ledger::{ExperienceFrame, JsonlLedger, LedgerReader};
+use netherwick_ledger::{
+    ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
+};
 use netherwick_llm::NoopLlmAgent;
 use netherwick_memory::InMemoryExperienceStore;
 use netherwick_models::{
@@ -24,7 +26,8 @@ use netherwick_models::{
 };
 use netherwick_runtime::{MinimalRuntime, RuntimeModelStack, SimRunner};
 use netherwick_server::LiveViewState;
-use netherwick_sim::{ArenaConfig, SimObject, SimObjectKind, VirtualWorld};
+use netherwick_sim::{ArenaConfig, SimMotorComplex, SimObject, SimObjectKind, VirtualWorld};
+use netherwick_worldlab::{CaptureReader, CaptureReplayRunner, CaptureSource, CaptureWriter};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
@@ -41,6 +44,8 @@ enum Command {
     Sim(SimArgs),
     Robot,
     Replay,
+    CaptureSim(CaptureSimArgs),
+    ReplayCapture(ReplayCaptureArgs),
     Train(TrainCommand),
     InspectLedger,
     ModelStatus,
@@ -52,6 +57,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Sim(args) => run_sim(args).await,
+        Command::CaptureSim(args) => capture_sim(args).await,
+        Command::ReplayCapture(args) => replay_capture(args).await,
         Command::InspectLedger => inspect_ledger().await,
         Command::Train(command) => run_train(command).await,
         Command::ModelStatus => model_status(),
@@ -100,6 +107,26 @@ struct SimArgs {
     live_addr: SocketAddr,
     #[arg(long, default_value_t = 100)]
     tick_delay_ms: u64,
+}
+
+#[derive(Debug, Parser)]
+struct CaptureSimArgs {
+    #[arg(long, default_value = "data/captures/sim-test")]
+    out: String,
+    #[arg(long, default_value_t = 100)]
+    steps: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+}
+
+#[derive(Debug, Parser)]
+struct ReplayCaptureArgs {
+    #[arg(long)]
+    capture: String,
+    #[arg(long, default_value = "data/ledger/replay-test")]
+    ledger: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -230,47 +257,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         runtime = runtime.with_models(models);
     }
 
-    let (mut world, motors) = VirtualWorld::new_with_motor(
-        args.seed,
-        ArenaConfig {
-            width_m: 8.0,
-            height_m: 8.0,
-        },
-    );
-    let mut body = BodySense::default();
-    body.last_update_ms = args.seed;
-    body.odometry.x_m = 1.0;
-    body.odometry.y_m = 1.0;
-    world.set_body(body);
-    world.add_object(SimObject::charger("charger", "charger", 1.9, 1.0, 0.25));
-    world.add_object(SimObject::obstacle("crate", "crate", 3.2, 2.3, 0.35));
-    world.add_object(SimObject {
-        id: "person".to_string(),
-        label: "person".to_string(),
-        kind: SimObjectKind::Person {
-            identity: Some("sim-person".to_string()),
-        },
-        x_m: 2.4,
-        y_m: 1.6,
-        radius_m: 0.22,
-        color_rgb: [220, 180, 140],
-        emits_sound: false,
-        charge_rate: 0.0,
-    });
-    world.add_object(SimObject {
-        id: "speaker".to_string(),
-        label: "speaker".to_string(),
-        kind: SimObjectKind::SoundSource {
-            label: "speaker".to_string(),
-        },
-        x_m: 1.5,
-        y_m: 2.2,
-        radius_m: 0.12,
-        color_rgb: [80, 80, 220],
-        emits_sound: true,
-        charge_rate: 0.0,
-    });
-
+    let (world, motors) = default_sim_world(args.seed);
     let mut runner = SimRunner::new(runtime, world, motors);
     if args.live {
         let live_state = LiveViewState::new();
@@ -304,6 +291,124 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         args.experience_mode
     );
     Ok(())
+}
+
+async fn capture_sim(args: CaptureSimArgs) -> Result<()> {
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    let runtime = MinimalRuntime::with_default_events(
+        NoopLedger,
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        NoopLlmAgent,
+    );
+    let (world, motors) = default_sim_world(args.seed);
+    let mut runner = SimRunner::new(runtime, world, motors);
+    let mut snapshots = Vec::new();
+    runner
+        .run_steps_observing(args.steps, |snapshot| snapshots.push(snapshot.clone()))
+        .await?;
+
+    let mut writer =
+        CaptureWriter::create(&args.out, CaptureSource::Sim, Some(args.tick_ms)).await?;
+    for snapshot in snapshots {
+        let t_ms = snapshot.body.last_update_ms;
+        writer.append_snapshot(t_ms, snapshot, Vec::new()).await?;
+    }
+    let manifest = writer.finish().await?;
+
+    println!(
+        "capture complete: {} frames, seed {}, out {}, tick_ms {:?}",
+        manifest.frame_count, args.seed, args.out, manifest.tick_ms
+    );
+    Ok(())
+}
+
+async fn replay_capture(args: ReplayCaptureArgs) -> Result<()> {
+    let reader = CaptureReader::open(&args.capture).await?;
+    let ledger = JsonlLedger::new(&args.ledger);
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    let runtime = MinimalRuntime::with_default_events(
+        ledger.clone(),
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        NoopLlmAgent,
+    );
+    let mut runner = CaptureReplayRunner::new(runtime, reader);
+    let summary = runner.replay().await?;
+    let transitions = ledger.transitions().await?;
+
+    println!(
+        "replay complete: {} frames replayed, {} runtime ticks, ledger {}, {} transitions written",
+        summary.frames_replayed,
+        summary.runtime_ticks,
+        args.ledger,
+        transitions.len()
+    );
+    Ok(())
+}
+
+fn default_sim_world(seed: u64) -> (VirtualWorld, SimMotorComplex) {
+    let (mut world, motors) = VirtualWorld::new_with_motor(
+        seed,
+        ArenaConfig {
+            width_m: 8.0,
+            height_m: 8.0,
+        },
+    );
+    let mut body = BodySense::default();
+    body.last_update_ms = seed;
+    body.odometry.x_m = 1.0;
+    body.odometry.y_m = 1.0;
+    world.set_body(body);
+    world.add_object(SimObject::charger("charger", "charger", 1.9, 1.0, 0.25));
+    world.add_object(SimObject::obstacle("crate", "crate", 3.2, 2.3, 0.35));
+    world.add_object(SimObject {
+        id: "person".to_string(),
+        label: "person".to_string(),
+        kind: SimObjectKind::Person {
+            identity: Some("sim-person".to_string()),
+        },
+        x_m: 2.4,
+        y_m: 1.6,
+        radius_m: 0.22,
+        color_rgb: [220, 180, 140],
+        emits_sound: false,
+        charge_rate: 0.0,
+    });
+    world.add_object(SimObject {
+        id: "speaker".to_string(),
+        label: "speaker".to_string(),
+        kind: SimObjectKind::SoundSource {
+            label: "speaker".to_string(),
+        },
+        x_m: 1.5,
+        y_m: 2.2,
+        radius_m: 0.12,
+        color_rgb: [80, 80, 220],
+        emits_sound: true,
+        charge_rate: 0.0,
+    });
+    (world, motors)
+}
+
+#[derive(Clone, Debug, Default)]
+struct NoopLedger;
+
+#[async_trait::async_trait]
+impl LedgerWriter for NoopLedger {
+    async fn append(&self, _frame: &ExperienceFrame) -> Result<()> {
+        Ok(())
+    }
+
+    async fn append_transition(&self, _transition: &ExperienceTransition) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn load_runtime_models(args: &SimArgs) -> Result<Option<RuntimeModelStack>> {
