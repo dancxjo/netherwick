@@ -25,6 +25,7 @@ const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, no
 const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation, not as the topic to describe. Try to infer what is going on in the real world from those fragments. Sort meaning by time: occurred time first, observed time second. Consume the timeline in order; do not group by faculty or source. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as impressions; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, recordings, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, edges, or detections unless they are the point.";
 
 const LIVE_EVENT_RULES: &str = "Live events may arrive while generation is happening. Treat them as observations from outside. Do not assume a human is currently present or addressing me; there may be nobody nearby. Clock and status events help track timing, pauses, and elapsed time, but do not narrate every tick, quiet moment, or idle thought.";
+const STRICT_JSON_RESPONSE_RULES: &str = "\n\nFINAL OUTPUT REQUIREMENT (MANDATORY):\nReturn exactly one JSON object and nothing else.\nDo not include markdown fences, prose, explanations, preambles, or trailing text.\nOutput must start with '{' and end with '}'.\nIf unsure, still emit the best-effort valid JSON object matching the schema.";
 const COMBOBULATOR_CLUSTER_GAP_MS: u64 = 1_000;
 const MILLIS_PER_SECOND: f64 = 1_000.0;
 const DEFAULT_OLLAMA_TIMEOUT_MS: u64 = 300_000;
@@ -414,6 +415,7 @@ impl OllamaLlmAgent {
     where
         T: for<'de> Deserialize<'de>,
     {
+        let prompt = append_strict_json_suffix(prompt);
         let stream_id = next_stream_id();
         emit_llm_stream(LlmStreamEvent {
             id: stream_id,
@@ -510,6 +512,11 @@ impl OllamaLlmAgent {
             .with_context(|| format!("ollama returned non-json content: {}", body))?;
         serde_json::from_str(&json).context("failed to parse llm json payload")
     }
+}
+
+fn append_strict_json_suffix(mut prompt: String) -> String {
+    prompt.push_str(STRICT_JSON_RESPONSE_RULES);
+    prompt
 }
 
 fn handle_ollama_stream_line(
@@ -1123,13 +1130,42 @@ fn parse_action_spec(spec: ActionSpec) -> Option<ActionPrimitive> {
 }
 
 fn extract_json_object(text: &str) -> Option<String> {
-    if serde_json::from_str::<Value>(text).is_ok() {
-        return Some(text.to_string());
+    let trimmed = text.trim();
+    if let Some(json) = normalize_json_candidate(trimmed) {
+        return Some(json);
+    }
+
+    if let Some(unfenced) = strip_markdown_fence(trimmed) {
+        if let Some(json) = normalize_json_candidate(&unfenced) {
+            return Some(json);
+        }
     }
 
     let mut start = None;
     let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
     for (index, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            continue;
+        }
+
         if ch == '{' {
             if start.is_none() {
                 start = Some(index);
@@ -1142,13 +1178,49 @@ fn extract_json_object(text: &str) -> Option<String> {
             depth -= 1;
             if depth == 0 {
                 let candidate = &text[start?..=index];
-                if serde_json::from_str::<Value>(candidate).is_ok() {
-                    return Some(candidate.to_string());
+                if let Some(json) = normalize_json_candidate(candidate) {
+                    return Some(json);
                 }
             }
         }
     }
     None
+}
+
+fn normalize_json_candidate(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
+
+    if let Ok(json_text) = serde_json::from_str::<String>(trimmed) {
+        let inner = json_text.trim();
+        if serde_json::from_str::<Value>(inner).is_ok() {
+            return Some(inner.to_string());
+        }
+    }
+
+    None
+}
+
+fn strip_markdown_fence(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with("```") && trimmed.ends_with("```")) {
+        return None;
+    }
+
+    let mut lines = trimmed.lines();
+    let first = lines.next()?;
+    if !first.starts_with("```") {
+        return None;
+    }
+
+    let mut content = lines.collect::<Vec<_>>();
+    if content.last().copied() != Some("```") {
+        return None;
+    }
+    content.pop();
+    Some(content.join("\n").trim().to_string())
 }
 
 #[cfg(test)]
@@ -1170,6 +1242,13 @@ mod tests {
     #[test]
     fn extracts_json_from_fenced_response() {
         let text = "```json\n{\"summary\":\"hi\",\"confidence\":0.9}\n```";
+        let json = extract_json_object(text).unwrap();
+        assert_eq!(json, "{\"summary\":\"hi\",\"confidence\":0.9}");
+    }
+
+    #[test]
+    fn extracts_json_from_wrapped_response_text() {
+        let text = "Sure, here you go:\n{\"summary\":\"hi\",\"confidence\":0.9}\nThanks";
         let json = extract_json_object(text).unwrap();
         assert_eq!(json, "{\"summary\":\"hi\",\"confidence\":0.9}");
     }
