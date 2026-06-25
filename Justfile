@@ -4,13 +4,16 @@ create1_port := env_var_or_default("CREATE1_PORT", "/dev/ttyUSB0")
 gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "/dev/ttyACM0")
 camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 
+# Show the recipe catalog.
 default:
     @just --list
 
+# Install Linux dependencies, Rust toolchain, and Kinect prerequisites.
 setup: setup-system setup-rust setup-kinect
     @echo "netherwick Linux setup complete"
     @echo "next: cargo check && just sim"
 
+# Install required system packages via apt.
 setup-system:
     sudo apt-get update
     sudo apt-get install -y \
@@ -28,11 +31,13 @@ setup-system:
         libusb-1.0-0-dev \
         libv4l-dev
 
+# Install Rust with rustup if cargo is missing.
 setup-rust:
     if ! command -v cargo >/dev/null 2>&1; then \
         curl https://sh.rustup.rs -sSf | sh -s -- -y; \
     fi
 
+# Install Kinect packages from apt when available.
 setup-kinect:
     if apt-cache show libfreenect-dev >/dev/null 2>&1; then \
         sudo apt-get install -y libfreenect-dev freenect; \
@@ -41,6 +46,7 @@ setup-kinect:
         exit 1; \
     fi
 
+# Build and install libfreenect from source.
 setup-kinect-from-source:
     mkdir -p .vendor
     if [ ! -d .vendor/libfreenect/.git ]; then \
@@ -55,39 +61,51 @@ setup-kinect-from-source:
     cmake --build .vendor/libfreenect/build -j
     sudo cmake --install .vendor/libfreenect/build
 
+# Format all Rust code in the workspace.
 fmt:
     cargo fmt --all
 
+# Run cargo check across the whole workspace.
 check:
     cargo check --workspace
 
+# Render merged docker-compose configuration.
 compose-config:
     docker compose config
 
+# Build the netherwick-live compose image.
 compose-build:
     docker compose build netherwick-live
 
+# Start shared backing services (neo4j and qdrant).
 servers:
     docker compose up -d neo4j qdrant
 
+# Start backing services plus the netherwick-live container.
 live-server:
     docker compose --profile netherwick up -d neo4j qdrant netherwick-live
 
+# Follow docker compose logs for a selected service.
 server-logs service="netherwick-live":
     docker compose logs -f {{service}}
 
+# Stop and remove compose services.
 stop-servers:
     docker compose down
 
+# Run workspace tests.
 test:
     cargo test --workspace
 
+# Lint with clippy and fail on warnings.
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Run simulator mode through netherwick-tools.
 sim:
     cargo run -p netherwick-tools -- sim
 
+# Launch the virtual dream world with HTTPS live view.
 go target="virtual":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -169,15 +187,19 @@ go target="virtual":
     trap - INT TERM EXIT
     exit "$STATUS"
 
+# Alias for `just go virtual`.
 go-virtual:
     just go virtual
 
+# Alias for `just go virtual`.
 virtual:
     just go virtual
 
+# Alias for `just go virtual` (legacy naming).
 virtual-https:
     just go virtual
 
+# Train models from virtual ledger data.
 train target="virtual":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -191,9 +213,11 @@ train target="virtual":
         --report-out "${NETHERWICK_REPORT_OUT:-data/reports/virtual/latest.json}" \
         --epochs "${NETHERWICK_EPOCHS:-5}"
 
+# Alias for `just train virtual`.
 train-virtual:
     just train virtual
 
+# Run Dream NEAT evolution in fast detailed mode.
 evolve clear="false":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -237,9 +261,11 @@ evolve clear="false":
         --detailed-logs \
         "${CLEAR_FLAG[@]}"
 
+# Alias for `just evolve`.
 evolve-fast clear="false":
     just evolve clear={{clear}}
 
+# Run a higher-quality Dream NEAT evolution profile.
 evolve-quality clear="false":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -283,6 +309,7 @@ evolve-quality clear="false":
         --detailed-logs \
         "${CLEAR_FLAG[@]}"
 
+# Continuously run evolve-quality with retention and periodic benchmarks.
 evolve-infinite clear="false":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -446,6 +473,7 @@ evolve-infinite clear="false":
         prune_benchmark_artifacts
     done
 
+# Create or reuse local development TLS certificates.
 dev-cert:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -469,6 +497,7 @@ dev-cert:
         echo "using existing certs/netherwick-dev.crt and certs/netherwick-dev.key"
     fi
 
+# Print the LAN URL for the virtual 3D HTTPS view.
 virtual-url:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -477,9 +506,11 @@ virtual-url:
     if [ -z "$LAN_IP" ]; then LAN_IP="127.0.0.1"; fi
     echo "https://$LAN_IP:$PORT/view/3d"
 
+# Pass arbitrary arguments through to netherwick-tools.
 run *args:
     cargo run -p netherwick-tools -- {{args}}
 
+# Run an end-to-end model rehearsal sequence.
 rehearse-models:
     just run sim --steps 200 --ledger data/ledger/sim1
     just run train behavior danger --ledger data/ledger/sim1
@@ -491,24 +522,30 @@ rehearse-models:
     just run robot --mode read-only --create-port mock --steps 20 --capture data/captures/mock-readonly
     just run replay-capture --capture data/captures/mock-readonly
 
+# Run lightweight scenario evaluations for quick validation.
 eval-scenario-smoke:
     just run eval-scenario --scenario empty-room --episodes 2 --steps 10 --out data/reports/scenario/empty-smoke.json
     just run eval-scenario --scenario obstacle-avoidance --episodes 2 --steps 10 --out data/reports/scenario/obstacle-smoke.json
     just run eval-scenario --scenario corner-trap --episodes 1 --steps 40 --out data/reports/scenario/corner-trap-smoke.json
     just run eval-scenario --scenario charger-seeking --episodes 2 --steps 10 --out data/reports/scenario/charge-smoke.json
 
+# Inspect ledger contents with the tools CLI.
 inspect-ledger:
     cargo run -p netherwick-tools -- inspect-ledger
 
+# Run workspace automation commands from xtask.
 xtask command="check":
     cargo run -p xtask -- {{command}}
 
+# Show Create 1 wiring status and selected serial port.
 real-create1:
     @echo "Create 1 port: {{create1_port}}"
     @echo "The Create 1 control path is scaffolded at the crate level but the CLI robot mode is not wired yet."
 
+# Print detected hardware-related environment status.
 hardware-env:
     cargo run -p netherwick-tools -- hardware-env
 
+# Remove build artifacts.
 clean:
     cargo clean

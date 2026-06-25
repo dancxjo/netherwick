@@ -2504,7 +2504,10 @@ async fn run_dream_train(args: DreamTrainArgs) -> Result<()> {
                 evolve_best.display()
             )
         })?;
-        println!("published evolve checkpoint alias: {}", evolve_best.display());
+        println!(
+            "published evolve checkpoint alias: {}",
+            evolve_best.display()
+        );
     } else if let Some(current) = &incumbent {
         println!(
             "kept incumbent evolve checkpoint: {} (incumbent level={} score={:.3}, candidate level={} score={:.3})",

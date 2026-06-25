@@ -676,7 +676,10 @@ pub mod dream_policy {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             let best = scored[0].clone();
-            let worst_fitness = scored.last().map(|genome| genome.fitness).unwrap_or(best.fitness);
+            let worst_fitness = scored
+                .last()
+                .map(|genome| genome.fitness)
+                .unwrap_or(best.fitness);
             let mean_fitness =
                 scored.iter().map(|genome| genome.fitness).sum::<f32>() / scored.len() as f32;
             let probe =
