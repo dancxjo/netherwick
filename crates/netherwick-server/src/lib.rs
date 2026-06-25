@@ -2976,6 +2976,7 @@ eyeCamera.layerMask = 0x0FFFFFFF; // hide eye screen/frustum lines
 const eyeRTT = new BABYLON.RenderTargetTexture("eyeRTT", 256, scene);
 eyeRTT.activeCamera = eyeCamera;
 eyeRTT.renderList = null;
+eyeRTT.uScale = -1;
 
 // Eye Panel
 const eyePanel = BABYLON.MeshBuilder.CreatePlane("eyePanel", {width: 0.96, height: 0.72, sideOrientation: BABYLON.Mesh.DOUBLESIDE}, scene);
@@ -4057,8 +4058,12 @@ async function sendRetinaFrame() {
     retinaCanvas.width = retinaWidth;
     retinaCanvas.height = retinaHeight;
     const retinaCtx = retinaCanvas.getContext('2d');
-    
+
+    // Correct left-right mirror so uploaded robot-eye frames match world orientation.
+    retinaCtx.translate(retinaWidth, 0);
+    retinaCtx.scale(-1, 1);
     retinaCtx.drawImage(tempCanvas, 0, 0, 256, 256, 0, 0, retinaWidth, retinaHeight);
+    retinaCtx.setTransform(1, 0, 0, 1, 0, 0);
 
     const dataUrl = retinaCanvas.toDataURL('image/png');
 
