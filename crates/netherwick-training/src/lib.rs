@@ -638,6 +638,13 @@ pub mod dream_policy {
                     reports.push(report);
                 }
                 genome.fitness = score / level_config.seeds_per_genome as f32;
+                if config.export_dataset {
+                    for report in &reports {
+                        export_episode_records(report, &config.dataset_dir).await?;
+                        total_records_exported =
+                            total_records_exported.saturating_add(report.records.len() as u64);
+                    }
+                }
                 let fitness_ratio = genome.fitness / level_config.unlock_threshold.max(0.001);
                 if fitness_ratio > best_draft_ratio {
                     best_draft_ratio = fitness_ratio;
@@ -658,13 +665,6 @@ pub mod dream_policy {
                         .checkpoint_dir
                         .join(format!("level-{}-best.json", level.id()));
                     save_best_genome(&checkpoint, &level_best_checkpoint)?;
-                    if config.export_dataset {
-                        for report in &reports {
-                            export_episode_records(report, &config.dataset_dir).await?;
-                            total_records_exported = total_records_exported
-                                .saturating_add(report.records.len() as u64);
-                        }
-                    }
                 }
                 scored.push(genome);
             }

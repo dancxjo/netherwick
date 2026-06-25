@@ -120,8 +120,9 @@ go target="virtual":
         qrencode -t ANSIUTF8 "https://$LAN_IP:$PORT/view/3d" || true
     fi
     cargo build -p netherwick-tools
+    AUTO_DREAM_POLICY="${NETHERWICK_AUTO_DREAM_POLICY:-0}"
     DREAM_POLICY_CHECKPOINT="${NETHERWICK_DREAM_POLICY_CHECKPOINT:-}"
-    if [ -z "$DREAM_POLICY_CHECKPOINT" ] && [ -f "${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}/evolve-best.json" ]; then
+    if [ -z "$DREAM_POLICY_CHECKPOINT" ] && [ "$AUTO_DREAM_POLICY" = "1" ] && [ -f "${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}/evolve-best.json" ]; then
         DREAM_POLICY_CHECKPOINT="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}/evolve-best.json"
     fi
     SIM_DREAM_POLICY_ARGS=()
@@ -193,17 +194,25 @@ train target="virtual":
 train-virtual:
     just train virtual
 
-evolve *args:
+evolve clear="false":
     #!/usr/bin/env bash
     set -euo pipefail
     START_LEVEL="${NETHERWICK_NEAT_START_LEVEL:-motion}"
     GENERATIONS="${NETHERWICK_NEAT_GENERATIONS:-12}"
     POPULATION="${NETHERWICK_NEAT_POPULATION:-24}"
-    SEED="${NETHERWICK_NEAT_SEED:-7}"
+    if [ -n "${NETHERWICK_NEAT_SEED:-}" ]; then
+        SEED="${NETHERWICK_NEAT_SEED}"
+    else
+        SEED="$(date +%s)"
+    fi
     HIDDEN_DIM="${NETHERWICK_NEAT_HIDDEN_DIM:-10}"
     CHECKPOINT_DIR="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
     DATASET_DIR="${NETHERWICK_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
     EXPORT_DATASET="${NETHERWICK_NEAT_EXPORT_DATASET:-false}"
+    CLEAR_FLAG=()
+    if [ "{{clear}}" = "true" ] || [ "{{clear}}" = "--clear" ]; then
+        CLEAR_FLAG=(--clear)
+    fi
 
     echo "Dream NEAT evolve: fast mode + detailed CLI progress"
     echo "  start-level:   $START_LEVEL"
@@ -226,22 +235,30 @@ evolve *args:
         --dataset-dir "$DATASET_DIR" \
         --export-dataset "$EXPORT_DATASET" \
         --detailed-logs \
-        {{args}}
+        "${CLEAR_FLAG[@]}"
 
-evolve-fast *args:
-    just evolve {{args}}
+evolve-fast clear="false":
+    just evolve clear={{clear}}
 
-evolve-quality *args:
+evolve-quality clear="false":
     #!/usr/bin/env bash
     set -euo pipefail
     START_LEVEL="${NETHERWICK_NEAT_START_LEVEL:-motion}"
     GENERATIONS="${NETHERWICK_NEAT_QUALITY_GENERATIONS:-36}"
     POPULATION="${NETHERWICK_NEAT_QUALITY_POPULATION:-64}"
-    SEED="${NETHERWICK_NEAT_SEED:-7}"
+    if [ -n "${NETHERWICK_NEAT_SEED:-}" ]; then
+        SEED="${NETHERWICK_NEAT_SEED}"
+    else
+        SEED="$(date +%s)"
+    fi
     HIDDEN_DIM="${NETHERWICK_NEAT_QUALITY_HIDDEN_DIM:-14}"
     CHECKPOINT_DIR="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
     DATASET_DIR="${NETHERWICK_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
-    EXPORT_DATASET="${NETHERWICK_NEAT_EXPORT_DATASET:-true}"
+    EXPORT_DATASET="${NETHERWICK_NEAT_EXPORT_DATASET:-false}"
+    CLEAR_FLAG=()
+    if [ "{{clear}}" = "true" ] || [ "{{clear}}" = "--clear" ]; then
+        CLEAR_FLAG=(--clear)
+    fi
 
     echo "Dream NEAT evolve-quality: stronger first-draft profile + detailed CLI progress"
     echo "  start-level:   $START_LEVEL"
@@ -264,7 +281,170 @@ evolve-quality *args:
         --dataset-dir "$DATASET_DIR" \
         --export-dataset "$EXPORT_DATASET" \
         --detailed-logs \
-        {{args}}
+        "${CLEAR_FLAG[@]}"
+
+evolve-infinite clear="false":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cyan() { printf '\033[36m%s\033[0m' "$1"; }
+    green() { printf '\033[32m%s\033[0m' "$1"; }
+    yellow() { printf '\033[33m%s\033[0m' "$1"; }
+    print_progress() {
+        local current="$1"
+        local total="$2"
+        local label="$3"
+        if [ "$total" -gt 0 ]; then
+            local pct
+            pct="$(awk -v c="$current" -v t="$total" 'BEGIN { printf "%.1f", (100*c)/t }')"
+            printf "\r%s %5s%% (%s/%s)" "$(cyan "$label")" "$pct" "$current" "$total"
+        else
+            printf "\r%s %s" "$(cyan "$label")" "$current"
+        fi
+        if [ "$current" -ge "$total" ] && [ "$total" -gt 0 ]; then
+            printf "\n"
+        fi
+    }
+
+    CLEAR_VALUE="{{clear}}"
+    CLEAR_VALUE="${CLEAR_VALUE#clear=}"
+
+    DATASET_DIR="${NETHERWICK_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
+    EXPORT_DATASET="${NETHERWICK_NEAT_EXPORT_DATASET:-false}"
+    CHECKPOINT_DIR="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
+    BENCHMARK_EVERY="${NETHERWICK_EVOLVE_BENCHMARK_EVERY:-10}"
+    BENCHMARK_STEPS="${NETHERWICK_EVOLVE_BENCHMARK_STEPS:-160}"
+    BENCHMARK_ROOT="${NETHERWICK_EVOLVE_BENCHMARK_ROOT:-data/reports/scenario/evolve}"
+    BENCHMARK_LEDGER_ROOT="${NETHERWICK_EVOLVE_BENCHMARK_LEDGER_ROOT:-data/ledger/evolve-benchmark}"
+
+    BENCHMARK_MAX_RUNS="${NETHERWICK_EVOLVE_BENCHMARK_MAX_RUNS:-64}"
+    BENCHMARK_MAX_AGE_DAYS="${NETHERWICK_EVOLVE_BENCHMARK_MAX_AGE_DAYS:-21}"
+
+    DATASET_MAX_FILES="${NETHERWICK_DATASET_MAX_FILES:-8000}"
+    DATASET_MAX_BYTES="${NETHERWICK_DATASET_MAX_BYTES:-536870912}"
+    DATASET_MAX_AGE_DAYS="${NETHERWICK_DATASET_MAX_AGE_DAYS:-10}"
+
+    prune_dataset() {
+        mkdir -p "$DATASET_DIR"
+        local files_before
+        files_before="$(find "$DATASET_DIR" -type f -name 'level-*-seed-*-genome-*.jsonl' | wc -l || true)"
+        if [ "$DATASET_MAX_AGE_DAYS" -gt 0 ]; then
+            find "$DATASET_DIR" -type f -name 'level-*-seed-*-genome-*.jsonl' -mtime "+$DATASET_MAX_AGE_DAYS" -delete || true
+        fi
+
+        local files_now
+        files_now="$(find "$DATASET_DIR" -type f -name 'level-*-seed-*-genome-*.jsonl' | wc -l || true)"
+        if [ "$DATASET_MAX_FILES" -gt 0 ] && [ "$files_now" -gt "$DATASET_MAX_FILES" ]; then
+            local drop
+            drop="$((files_now - DATASET_MAX_FILES))"
+            find "$DATASET_DIR" -type f -name 'level-*-seed-*-genome-*.jsonl' -printf '%T@ %p\n' \
+                | sort -n \
+                | head -n "$drop" \
+                | cut -d' ' -f2- \
+                | xargs -r rm -f
+        fi
+
+        local size_now
+        size_now="$(du -sb "$DATASET_DIR" | awk '{print $1}')"
+        while [ "$DATASET_MAX_BYTES" -gt 0 ] && [ "$size_now" -gt "$DATASET_MAX_BYTES" ]; do
+            local oldest
+            oldest="$(find "$DATASET_DIR" -type f -name 'level-*-seed-*-genome-*.jsonl' -printf '%T@ %p\n' | sort -n | head -n 1 | cut -d' ' -f2-)"
+            if [ -z "$oldest" ]; then
+                break
+            fi
+            rm -f "$oldest"
+            size_now="$(du -sb "$DATASET_DIR" | awk '{print $1}')"
+        done
+
+        local files_after
+        files_after="$(find "$DATASET_DIR" -type f -name 'level-*-seed-*-genome-*.jsonl' | wc -l || true)"
+        echo "$(green "dataset") files: $files_before -> $files_after, size: $(du -sh "$DATASET_DIR" | awk '{print $1}')"
+    }
+
+    prune_benchmark_artifacts() {
+        mkdir -p "$BENCHMARK_ROOT" "$BENCHMARK_LEDGER_ROOT"
+        if [ "$BENCHMARK_MAX_AGE_DAYS" -gt 0 ]; then
+            find "$BENCHMARK_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime "+$BENCHMARK_MAX_AGE_DAYS" -exec rm -rf {} + || true
+            find "$BENCHMARK_LEDGER_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime "+$BENCHMARK_MAX_AGE_DAYS" -exec rm -rf {} + || true
+        fi
+
+        local reports_count
+        reports_count="$(find "$BENCHMARK_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l || true)"
+        if [ "$BENCHMARK_MAX_RUNS" -gt 0 ] && [ "$reports_count" -gt "$BENCHMARK_MAX_RUNS" ]; then
+            local drop
+            drop="$((reports_count - BENCHMARK_MAX_RUNS))"
+            find "$BENCHMARK_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+                | sort -n \
+                | head -n "$drop" \
+                | cut -d' ' -f2- \
+                | xargs -r rm -rf
+            find "$BENCHMARK_LEDGER_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+                | sort -n \
+                | head -n "$drop" \
+                | cut -d' ' -f2- \
+                | xargs -r rm -rf
+        fi
+        echo "$(green "bench-retain") reports: $(find "$BENCHMARK_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l), ledgers: $(find "$BENCHMARK_LEDGER_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+    }
+
+    run_benchmarks() {
+        local iteration="$1"
+        local checkpoint="$CHECKPOINT_DIR/evolve-best.json"
+        if [ ! -f "$checkpoint" ]; then
+            echo "$(yellow "benchmark") skipped (missing checkpoint: $checkpoint)"
+            return 0
+        fi
+
+        local stamp
+        stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+        local out_dir="$BENCHMARK_ROOT/$stamp-iter-$iteration"
+        local ledger_dir="$BENCHMARK_LEDGER_ROOT/$stamp-iter-$iteration"
+        mkdir -p "$out_dir" "$ledger_dir"
+
+        local names=(obstacle-avoidance corner-trap column-trap)
+        local seeds=(701 1701 2701)
+        local total="${#names[@]}"
+        local idx=0
+        while [ "$idx" -lt "$total" ]; do
+            local scenario="${names[$idx]}"
+            local seed="${seeds[$idx]}"
+            local scenario_ledger="$ledger_dir/$scenario"
+            local scenario_out="$out_dir/$scenario.json"
+            rm -rf "$scenario_ledger"
+
+            target/release/netherwick sim \
+                --scenario "$scenario" \
+                --steps "$BENCHMARK_STEPS" \
+                --tick-delay-ms 0 \
+                --seed "$seed" \
+                --ledger "$scenario_ledger" \
+                --dream-policy-checkpoint "$checkpoint" >/dev/null
+
+            target/release/netherwick virtual-report \
+                --ledger "$scenario_ledger" \
+                --out "$scenario_out" >/dev/null
+
+            idx="$((idx + 1))"
+            print_progress "$idx" "$total" "benchmark"
+        done
+        echo "$(green "benchmark") reports: $out_dir"
+    }
+
+    ITERATION=0
+    echo "$(cyan "evolve-infinite") clear=$CLEAR_VALUE benchmark_every=$BENCHMARK_EVERY export_dataset=$EXPORT_DATASET"
+    while true; do
+        ITERATION="$((ITERATION + 1))"
+        echo "$(cyan "iteration") #$ITERATION"
+        NETHERWICK_NEAT_EXPORT_DATASET="$EXPORT_DATASET" just evolve-quality clear="$CLEAR_VALUE"
+        if [ "$EXPORT_DATASET" = "true" ]; then
+            prune_dataset
+        else
+            echo "$(yellow "dataset") export disabled; skipping dataset retention"
+        fi
+        if [ "$BENCHMARK_EVERY" -gt 0 ] && [ $((ITERATION % BENCHMARK_EVERY)) -eq 0 ]; then
+            run_benchmarks "$ITERATION"
+        fi
+        prune_benchmark_artifacts
+    done
 
 dev-cert:
     #!/usr/bin/env bash
