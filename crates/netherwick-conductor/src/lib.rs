@@ -78,13 +78,13 @@ impl Conductor for SimpleConductor {
                 target: ApproachTarget::Charger,
             });
         }
+        if let Some(action) = input.proposals.last() {
+            return Ok(action.clone());
+        }
         if input.drives.curiosity >= self.config.novelty_threshold {
             return Ok(ActionPrimitive::Inspect {
                 target: InspectTarget::Novelty,
             });
-        }
-        if let Some(action) = input.proposals.last() {
-            return Ok(action.clone());
         }
         Ok(ActionPrimitive::Explore {
             style: ExploreStyle::RandomWalk,

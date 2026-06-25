@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use netherwick_actions::{
     action_to_motor_command, ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget,
-    ReignInput, ReignOutcome, TurnDir,
+    LlmActionProposal, ReignInput, ReignOutcome, TurnDir,
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_behaviors::{
@@ -517,6 +517,55 @@ pub struct RuntimeModelStack {
     pub behaviors: BehaviorRegistry,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BumpEventInput {
+    pub t_ms: TimeMs,
+    pub bump_left: bool,
+    pub bump_right: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceDetectedEventInput {
+    pub t_ms: TimeMs,
+    pub recognized: bool,
+    pub person: FacePerson,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FacePerson {
+    pub id: String,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventScriptAction {
+    Say { text: String },
+    Stop,
+    Rotate { deg: i16 },
+    Go,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventScriptOutput {
+    pub actions: Vec<EventScriptAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SafeScriptAction {
+    pub requested: EventScriptAction,
+    pub action: Option<ActionPrimitive>,
+    pub desired_motor: MotorCommand,
+    pub final_motor: MotorCommand,
+    pub vetoed: bool,
+    pub safety_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SafeScriptSequence {
+    pub actions: Vec<SafeScriptAction>,
+}
+
 impl RuntimeModelStack {
     pub fn with_danger_shadow_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -771,6 +820,17 @@ impl RuntimeModelStack {
                 behavior.fallback,
             );
         }
+        if let Some(behavior) = config.behavior.get("event_bump") {
+            stack.behaviors.event_bump =
+                bump_event_behavior(behavior.regime, behavior.model.clone(), behavior.fallback);
+        }
+        if let Some(behavior) = config.behavior.get("event_face_detected") {
+            stack.behaviors.event_face_detected = face_detected_event_behavior(
+                behavior.regime,
+                behavior.model.clone(),
+                behavior.fallback,
+            );
+        }
         Ok(stack)
     }
 
@@ -892,6 +952,33 @@ impl RuntimeModelStack {
                 vec![impl_id("ear.burn.next_v0", "Burn next v0")],
                 last("ear_next"),
             ),
+            behavior_node_state(
+                "EventBump",
+                "event_bump",
+                "on(bump)",
+                self.behaviors.event_bump.regime,
+                self.behaviors.event_bump.hardcoded_id(),
+                self.behaviors.event_bump.model_id(),
+                self.behaviors.event_bump.fallback,
+                vec![impl_id("script.on_bump.v0", "Script hardcoded teacher")],
+                vec![impl_id("event.bump.shadow.v0", "Shadow model")],
+                last("event_bump"),
+            ),
+            behavior_node_state(
+                "EventFaceDetected",
+                "event_face_detected",
+                "on(face-detected)",
+                self.behaviors.event_face_detected.regime,
+                self.behaviors.event_face_detected.hardcoded_id(),
+                self.behaviors.event_face_detected.model_id(),
+                self.behaviors.event_face_detected.fallback,
+                vec![impl_id(
+                    "script.on_face_detected.v0",
+                    "Script hardcoded teacher",
+                )],
+                vec![impl_id("event.face_detected.shadow.v0", "Shadow model")],
+                last("event_face_detected"),
+            ),
         ]
     }
 
@@ -937,6 +1024,8 @@ impl RuntimeModelStack {
             "action_value" => update_behavior!(action_value),
             "eye_next" => update_behavior!(eye_next),
             "ear_next" => update_behavior!(ear_next),
+            "event_bump" => update_behavior!(event_bump),
+            "event_face_detected" => update_behavior!(event_face_detected),
             _ => {}
         }
     }
@@ -998,6 +1087,8 @@ fn normalize_behavior_node_id(node_id: &str) -> String {
         "ActionValue" => "action_value".to_string(),
         "EyeNext" => "eye_next".to_string(),
         "EarNext" => "ear_next".to_string(),
+        "EventBump" => "event_bump".to_string(),
+        "EventFaceDetected" => "event_face_detected".to_string(),
         other => other.to_ascii_lowercase().replace('-', "_"),
     }
 }
@@ -1025,6 +1116,8 @@ pub struct BehaviorRegistry {
     pub conductor: ReplaceableBehavior<ConductorInput, ActionPrimitive>,
     pub eye_next: ReplaceableBehavior<SituatedEyeNextInput, EyeNextOutput>,
     pub ear_next: ReplaceableBehavior<SituatedEarNextInput, EarNextOutput>,
+    pub event_bump: ReplaceableBehavior<BumpEventInput, EventScriptOutput>,
+    pub event_face_detected: ReplaceableBehavior<FaceDetectedEventInput, EventScriptOutput>,
 }
 
 impl Default for BehaviorRegistry {
@@ -1069,6 +1162,16 @@ impl Default for BehaviorRegistry {
             ear_next: ear_next_behavior(
                 BehaviorRegime::Hardcoded,
                 None,
+                FallbackPolicy::UseHardcoded,
+            ),
+            event_bump: bump_event_behavior(
+                BehaviorRegime::ShadowTrain,
+                Some("event.bump.shadow.v0".to_string()),
+                FallbackPolicy::UseHardcoded,
+            ),
+            event_face_detected: face_detected_event_behavior(
+                BehaviorRegime::ShadowTrain,
+                Some("event.face_detected.shadow.v0".to_string()),
                 FallbackPolicy::UseHardcoded,
             ),
         }
@@ -1811,6 +1914,118 @@ impl FunctionBehavior<ConductorInput, ActionPrimitive> for ShadowActionSelectorM
     }
 }
 
+struct BumpScriptBehavior;
+
+impl FunctionBehavior<BumpEventInput, EventScriptOutput> for BumpScriptBehavior {
+    fn id(&self) -> &'static str {
+        "script.on_bump.v0"
+    }
+
+    fn infer(&mut self, _input: &BumpEventInput) -> Result<EventScriptOutput> {
+        Ok(EventScriptOutput {
+            actions: vec![
+                EventScriptAction::Stop,
+                EventScriptAction::Rotate { deg: 180 },
+                EventScriptAction::Go,
+            ],
+        })
+    }
+}
+
+struct FaceDetectedScriptBehavior;
+
+impl FunctionBehavior<FaceDetectedEventInput, EventScriptOutput> for FaceDetectedScriptBehavior {
+    fn id(&self) -> &'static str {
+        "script.on_face_detected.v0"
+    }
+
+    fn infer(&mut self, input: &FaceDetectedEventInput) -> Result<EventScriptOutput> {
+        let label = if input.recognized {
+            input
+                .person
+                .name
+                .as_ref()
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("Acquaintance {}", input.person.id))
+        } else {
+            format!("Stranger {}", input.person.id)
+        };
+        Ok(EventScriptOutput {
+            actions: vec![EventScriptAction::Say {
+                text: format!("Hello {label}"),
+            }],
+        })
+    }
+}
+
+struct EventScriptShadowModel {
+    id: &'static str,
+    last_observed: Option<EventScriptOutput>,
+    samples_seen: usize,
+}
+
+impl<I> FunctionBehavior<I, EventScriptOutput> for EventScriptShadowModel
+where
+    I: Send,
+{
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn infer(&mut self, _input: &I) -> Result<EventScriptOutput> {
+        self.last_observed
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{} has no observed script samples", self.id))
+    }
+
+    fn observe(&mut self, sample: &TrainingSample<I, EventScriptOutput>) -> Result<()> {
+        self.last_observed = Some(sample.expected.clone());
+        self.samples_seen = self.samples_seen.saturating_add(1);
+        Ok(())
+    }
+}
+
+fn bump_event_behavior(
+    regime: BehaviorRegime,
+    model_id: Option<String>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<BumpEventInput, EventScriptOutput> {
+    ReplaceableBehavior::new(
+        "event_bump",
+        regime,
+        Box::new(BumpScriptBehavior),
+        model_id.map(|_| {
+            Box::new(EventScriptShadowModel {
+                id: "event.bump.shadow.v0",
+                last_observed: None,
+                samples_seen: 0,
+            }) as Box<_>
+        }),
+        fallback,
+    )
+}
+
+fn face_detected_event_behavior(
+    regime: BehaviorRegime,
+    model_id: Option<String>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<FaceDetectedEventInput, EventScriptOutput> {
+    ReplaceableBehavior::new(
+        "event_face_detected",
+        regime,
+        Box::new(FaceDetectedScriptBehavior),
+        model_id.map(|_| {
+            Box::new(EventScriptShadowModel {
+                id: "event.face_detected.shadow.v0",
+                last_observed: None,
+                samples_seen: 0,
+            }) as Box<_>
+        }),
+        fallback,
+    )
+}
+
 fn eye_next_behavior(
     regime: BehaviorRegime,
     trainer: Option<EyeNextNetTrainer>,
@@ -2461,6 +2676,9 @@ where
             &mut notes,
             &mut proposed_actions,
         );
+        let (event_script_forced_action, event_script_records) =
+            self.run_event_scripts(&mut now, &recall, &mut notes, &mut proposed_actions)?;
+        behavior_runs.extend(event_script_records);
 
         let combobulation = self
             .llm
@@ -2493,9 +2711,32 @@ where
             &mut teachings,
         );
         let llm_command_action = llm_tick
-            .conscious_command
+            .decision
             .as_ref()
-            .and_then(|cmd| cmd.action.clone());
+            .and_then(|decision| decision.action.clone());
+        let mut llm_action_proposal = LlmActionProposal {
+            proposed_action: llm_command_action.clone(),
+            ignored_reason: if llm_command_action.is_none() {
+                llm_tick
+                    .decision
+                    .as_ref()
+                    .map(|_| "no executable action proposed".to_string())
+            } else {
+                None
+            },
+            ..LlmActionProposal::default()
+        };
+        let llm_has_safety_reason = crate::llm_explicit_safety_reason(&llm_tick);
+        let mechanical_reign_action_for_selection =
+            if mechanical_reign_action.is_some() && llm_has_safety_reason {
+                notes.push(
+                    "LlmActionProposal: explicit safety reason allowed competition with Reign"
+                        .to_string(),
+                );
+                None
+            } else {
+                mechanical_reign_action.clone()
+            };
 
         let nudge_proposal = self.nudge.propose(&now, self.nudge_policy);
         if let Some(action) = nudge_proposal.clone() {
@@ -2507,6 +2748,7 @@ where
 
         let mut proposals = proposed_actions.clone();
         if let Some(action) = llm_command_action.clone() {
+            notes.push(format!("LlmActionProposal: proposed {:?}", action));
             proposals.push(action);
         }
         let action_value_candidates =
@@ -2525,7 +2767,7 @@ where
             body: now.body.clone(),
             proposals,
         })?;
-        if let Some(action) = mechanical_reign_action.as_ref() {
+        if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
             baseline_action = action.clone();
         }
 
@@ -2633,15 +2875,14 @@ where
             baseline_action.clone(),
             candidate_scores,
         );
-        if let Some(action) = mechanical_reign_action.as_ref() {
+        if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
             action_selection.selected_action = Some(action.clone());
             action_selection.selected_score = None;
             action_selection.safety_overrode = false;
-        } else if let Some(action) = llm_command_action.as_ref() {
-            if !action_selection.safety_overrode {
-                action_selection.selected_action = Some(action.clone());
-                action_selection.selected_score = None;
-            }
+        } else if let Some(action) = event_script_forced_action.as_ref() {
+            action_selection.selected_action = Some(action.clone());
+            action_selection.selected_score = None;
+            action_selection.safety_overrode = false;
         }
         for warning in &action_selection.fallback_warnings {
             notes.push(warning.clone());
@@ -2690,15 +2931,34 @@ where
             teacher_action.clone()
         };
         conductor_record.selected_output = Some(conductor_selected_action.clone());
-        if mechanical_reign_action.is_some()
-            && !matches!(conductor_record.selected_output, Some(ref action) if Some(action) == mechanical_reign_action.as_ref())
+        if mechanical_reign_action_for_selection.is_some()
+            && !matches!(conductor_record.selected_output, Some(ref action) if Some(action) == mechanical_reign_action_for_selection.as_ref())
         {
-            conductor_record.selected_output = mechanical_reign_action.clone();
+            conductor_record.selected_output = mechanical_reign_action_for_selection.clone();
         }
-        let chosen_action = mechanical_reign_action
+        let chosen_action = mechanical_reign_action_for_selection
             .clone()
+            .or_else(|| event_script_forced_action.clone())
             .unwrap_or(conductor_selected_action);
         behavior_runs.push(conductor_record.erase());
+
+        if let Some(proposed) = llm_action_proposal.proposed_action.as_ref() {
+            llm_action_proposal.accepted = proposed == &chosen_action;
+            llm_action_proposal.final_action = Some(chosen_action.clone());
+            if !llm_action_proposal.accepted && llm_action_proposal.ignored_reason.is_none() {
+                llm_action_proposal.ignored_reason = if mechanical_reign_action_for_selection
+                    .is_some()
+                {
+                    Some("safe active Reign command outranked LLM action".to_string())
+                } else if mechanical_reign_action.is_some() && llm_has_safety_reason {
+                    Some("LLM safety rationale competed with Reign but conductor selected another action".to_string())
+                } else if event_script_forced_action.is_some() {
+                    Some("event script action outranked LLM action".to_string())
+                } else {
+                    Some("conductor selected a different action".to_string())
+                };
+            }
+        }
 
         let danger_input = danger_behavior_input(&now, &latent, Some(&chosen_action));
         let danger_run = self
@@ -2803,6 +3063,23 @@ where
             serde_json::to_value(&self.nudge.status)?,
         );
         if safety.vetoed {
+            if llm_action_proposal.accepted {
+                let reason = describe_safety_reason(safety.reason.clone()).to_string();
+                llm_action_proposal.safety_vetoed = true;
+                llm_action_proposal.safety_reason = Some(reason.clone());
+                notes.push(format!("LlmActionProposalSafetyVeto: {reason}"));
+                teachings.push(netherwick_llm::LlmTeaching {
+                    t_ms: now.t_ms,
+                    summary: format!("Safety vetoed LLM action {:?}", chosen_action),
+                    critique: Some(format!("LLM proposed an unsafe action: {reason}")),
+                    counterfactuals: Vec::new(),
+                    memory_notes: vec![format!(
+                        "Avoid repeating LLM action {:?} when safety reports {reason}",
+                        chosen_action
+                    )],
+                    confidence: now.llm.confidence,
+                });
+            }
             now.extensions
                 .insert("safety.vetoed".to_string(), serde_json::Value::Bool(true));
             let veto_ctx = EventContext {
@@ -2833,6 +3110,10 @@ where
                 describe_safety_reason(safety.reason.clone())
             ));
         }
+        now.extensions.insert(
+            "llm.action_proposal".to_string(),
+            serde_json::to_value(&llm_action_proposal)?,
+        );
 
         if let Some(combobulation) = &combobulation {
             append_combobulation(
@@ -2964,6 +3245,89 @@ where
             combobulation,
             inline_learning,
         })
+    }
+
+    fn run_event_scripts(
+        &mut self,
+        now: &mut Now,
+        recall: &RecallBundle,
+        notes: &mut Vec<String>,
+        proposed_actions: &mut Vec<ActionPrimitive>,
+    ) -> Result<(Option<ActionPrimitive>, Vec<ErasedBehaviorRunRecord>)> {
+        let mut behavior_runs = Vec::new();
+        let mut forced_action = None;
+        let mut safe_sequences = serde_json::Map::new();
+
+        if now.body.flags.bump_left || now.body.flags.bump_right {
+            let input = BumpEventInput {
+                t_ms: now.t_ms,
+                bump_left: now.body.flags.bump_left,
+                bump_right: now.body.flags.bump_right,
+            };
+            let run = self.models.behaviors.event_bump.infer_with_teacher_source(
+                &input,
+                now.t_ms,
+                TrainingSource::HardcodedTeacher,
+            )?;
+            let sequence = safety_trace_script_actions(&mut self.safety, now, &run.chosen);
+            if let Some(first) = first_motor_script_action(&run.chosen) {
+                forced_action = Some(first.clone());
+                proposed_actions.push(first);
+            }
+            safe_sequences.insert("bump".to_string(), serde_json::to_value(&sequence)?);
+            notes.push("EventScript:on(bump) emitted Stop -> Rotate(180) -> Go".to_string());
+            let mut record = run.record;
+            record.selected_output = Some(EventScriptOutput {
+                actions: sequence
+                    .actions
+                    .iter()
+                    .map(|action| action.requested.clone())
+                    .collect(),
+            });
+            record.confidence = Some(if sequence.actions.iter().any(|action| action.vetoed) {
+                0.5
+            } else {
+                1.0
+            });
+            behavior_runs.push(record.erase());
+        }
+
+        if let Some(input) = face_detected_event_input(now, recall) {
+            let run = self
+                .models
+                .behaviors
+                .event_face_detected
+                .infer_with_teacher_source(&input, now.t_ms, TrainingSource::HardcodedTeacher)?;
+            let sequence = safety_trace_script_actions(&mut self.safety, now, &run.chosen);
+            for action in run
+                .chosen
+                .actions
+                .iter()
+                .filter_map(script_action_to_primitive)
+            {
+                proposed_actions.push(action);
+            }
+            safe_sequences.insert(
+                "face-detected".to_string(),
+                serde_json::to_value(&sequence)?,
+            );
+            if let Some(EventScriptAction::Say { text }) = run.chosen.actions.first() {
+                notes.push(format!(
+                    "EventScript:on(face-detected) emitted say({text:?})"
+                ));
+            }
+            behavior_runs.push(run.record.erase());
+        }
+
+        if !safe_sequences.is_empty() {
+            now.extensions.insert(
+                "event_scripts".to_string(),
+                serde_json::Value::Object(safe_sequences),
+            );
+            notes.push("EventScript: safety filtered every emitted action".to_string());
+        }
+
+        Ok((forced_action, behavior_runs))
     }
 
     fn observe_inline_learning(
@@ -3199,6 +3563,100 @@ fn ear_prediction(output: &EarNextOutput) -> EarPrediction {
     }
 }
 
+fn face_detected_event_input(now: &Now, recall: &RecallBundle) -> Option<FaceDetectedEventInput> {
+    if now.face.embeddings.is_empty() && now.face.vectors.is_empty() {
+        return None;
+    }
+    let recognized = now.memory.face_familiarity >= 0.70 || !recall.hits.is_empty();
+    let recalled_name = recall
+        .hits
+        .first()
+        .map(|hit| hit.summary.trim().to_string())
+        .filter(|summary| !summary.is_empty());
+    let id = now
+        .face
+        .vectors
+        .first()
+        .map(|artifact| artifact.point_id.clone())
+        .or_else(|| recalled_name.as_ref().map(|name| stable_person_id(name)))
+        .unwrap_or_else(|| format!("face-{}", now.t_ms));
+    Some(FaceDetectedEventInput {
+        t_ms: now.t_ms,
+        recognized,
+        person: FacePerson {
+            id,
+            name: recognized.then_some(recalled_name).flatten(),
+        },
+    })
+}
+
+fn stable_person_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn safety_trace_script_actions<S>(
+    safety: &mut S,
+    now: &Now,
+    output: &EventScriptOutput,
+) -> SafeScriptSequence
+where
+    S: SafetyLayer,
+{
+    SafeScriptSequence {
+        actions: output
+            .actions
+            .iter()
+            .map(|requested| {
+                let action = script_action_to_primitive(requested);
+                let desired_motor = action_to_motor_command(action.as_ref());
+                let decision = safety.filter(now, desired_motor);
+                SafeScriptAction {
+                    requested: requested.clone(),
+                    action,
+                    desired_motor,
+                    final_motor: decision.command,
+                    vetoed: decision.vetoed,
+                    safety_reason: decision
+                        .reason
+                        .map(|reason| describe_safety_reason(Some(reason)).to_string()),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn first_motor_script_action(output: &EventScriptOutput) -> Option<ActionPrimitive> {
+    output
+        .actions
+        .iter()
+        .filter_map(script_action_to_primitive)
+        .find(|action| !matches!(action, ActionPrimitive::Speak { .. }))
+}
+
+fn script_action_to_primitive(action: &EventScriptAction) -> Option<ActionPrimitive> {
+    match action {
+        EventScriptAction::Say { text } => Some(ActionPrimitive::Speak { text: text.clone() }),
+        EventScriptAction::Stop => Some(ActionPrimitive::Stop),
+        EventScriptAction::Rotate { deg } => Some(ActionPrimitive::Turn {
+            direction: if *deg >= 0 {
+                TurnDir::Left
+            } else {
+                TurnDir::Right
+            },
+            intensity: 0.5,
+            duration_ms: ((*deg as i32).unsigned_abs() as u64 * 10).max(500),
+        }),
+        EventScriptAction::Go => Some(ActionPrimitive::Go {
+            intensity: 0.15,
+            duration_ms: 500,
+        }),
+    }
+}
+
 pub struct RuntimeTick {
     pub frame: ExperienceFrame,
     pub experience: Experience,
@@ -3339,7 +3797,8 @@ where
             .runtime
             .tick(now, ExperienceLatent::default(), Vec::new())
             .await?;
-        let snapshot = self.now_builder.snapshot();
+        let mut snapshot = self.now_builder.snapshot();
+        annotate_snapshot_from_tick(&mut snapshot, &tick);
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
     }
@@ -3362,6 +3821,17 @@ fn final_motor_from_tick(tick: &RuntimeTick) -> MotorCommand {
         .and_then(|value| value.get("final_motor"))
         .and_then(|value| serde_json::from_value::<MotorCommand>(value.clone()).ok())
         .unwrap_or_else(|| action_to_motor_command(tick.chosen_action.as_ref()))
+}
+
+fn annotate_snapshot_from_tick(snapshot: &mut WorldSnapshot, tick: &RuntimeTick) {
+    snapshot.final_selected_action = tick.chosen_action.clone();
+    snapshot.llm_action_proposal = tick
+        .frame
+        .now
+        .extensions
+        .get("llm.action_proposal")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
 }
 
 fn motor_command_to_motion(motor: MotorCommand) -> MotionCommand {
@@ -3868,6 +4338,7 @@ where
                 .runtime
                 .tick(now, ExperienceLatent::default(), Vec::new())
                 .await?;
+            annotate_snapshot_from_tick(&mut snapshot, &tick);
             observe(&snapshot, &tick);
             self.stuck.observe(&snapshot, tick.chosen_action.as_ref());
             if is_dead_battery(&snapshot) || reset_after_tick {
@@ -4222,6 +4693,34 @@ fn action_value_candidate_actions(
         push_unique_action(&mut candidates, action.clone());
     }
     candidates
+}
+
+fn llm_explicit_safety_reason(llm_tick: &LlmTickResult) -> bool {
+    let Some(decision) = llm_tick.decision.as_ref() else {
+        return false;
+    };
+    [
+        Some(decision.summary.as_str()),
+        decision.critique.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|text| {
+        let text = text.to_ascii_lowercase();
+        [
+            "safety",
+            "unsafe",
+            "danger",
+            "hazard",
+            "collision",
+            "cliff",
+            "wheel drop",
+            "blocked",
+            "veto",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+    })
 }
 
 fn push_unique_action(actions: &mut Vec<ActionPrimitive>, action: ActionPrimitive) {
@@ -4847,7 +5346,7 @@ mod tests {
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_experience::experience_encode_input_from_now;
     use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
-    use netherwick_llm::{ConsciousCommand, LlmTickResult};
+    use netherwick_llm::{ConsciousCommand, LlmDecision, LlmTickResult};
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_models::{
         ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
@@ -4943,6 +5442,122 @@ mod tests {
         assert_eq!(run.chosen, teacher_action);
         assert!(run.fallback_used);
         assert!(run.record.error.is_some());
+    }
+
+    #[test]
+    fn bump_script_hardcoded_returns_escape_sequence() {
+        let mut behavior = bump_event_behavior(
+            BehaviorRegime::Hardcoded,
+            Some("event.bump.shadow.v0".to_string()),
+            FallbackPolicy::UseHardcoded,
+        );
+
+        let run = behavior.infer(&BumpEventInput::default(), 10).unwrap();
+
+        assert_eq!(
+            run.chosen.actions,
+            vec![
+                EventScriptAction::Stop,
+                EventScriptAction::Rotate { deg: 180 },
+                EventScriptAction::Go,
+            ]
+        );
+    }
+
+    #[test]
+    fn bump_script_shadow_train_returns_teacher_and_observes_model() {
+        let mut behavior = bump_event_behavior(
+            BehaviorRegime::ShadowTrain,
+            Some("event.bump.shadow.v0".to_string()),
+            FallbackPolicy::UseHardcoded,
+        );
+
+        let run = behavior.infer(&BumpEventInput::default(), 10).unwrap();
+
+        assert_eq!(
+            run.chosen.actions,
+            vec![
+                EventScriptAction::Stop,
+                EventScriptAction::Rotate { deg: 180 },
+                EventScriptAction::Go,
+            ]
+        );
+        assert!(run.training_sample_emitted);
+        assert_eq!(run.record.hardcoded_output, Some(run.chosen));
+    }
+
+    #[test]
+    fn face_detected_script_greets_named_unnamed_and_stranger_faces() {
+        let mut behavior = face_detected_event_behavior(
+            BehaviorRegime::Hardcoded,
+            Some("event.face_detected.shadow.v0".to_string()),
+            FallbackPolicy::UseHardcoded,
+        );
+        let named = FaceDetectedEventInput {
+            t_ms: 10,
+            recognized: true,
+            person: FacePerson {
+                id: "p1".to_string(),
+                name: Some("Ada".to_string()),
+            },
+        };
+        let unnamed = FaceDetectedEventInput {
+            t_ms: 10,
+            recognized: true,
+            person: FacePerson {
+                id: "p2".to_string(),
+                name: None,
+            },
+        };
+        let stranger = FaceDetectedEventInput {
+            t_ms: 10,
+            recognized: false,
+            person: FacePerson {
+                id: "p3".to_string(),
+                name: None,
+            },
+        };
+
+        assert_eq!(
+            behavior.infer(&named, 10).unwrap().chosen.actions,
+            vec![EventScriptAction::Say {
+                text: "Hello Ada".to_string()
+            }]
+        );
+        assert_eq!(
+            behavior.infer(&unnamed, 10).unwrap().chosen.actions,
+            vec![EventScriptAction::Say {
+                text: "Hello Acquaintance p2".to_string()
+            }]
+        );
+        assert_eq!(
+            behavior.infer(&stranger, 10).unwrap().chosen.actions,
+            vec![EventScriptAction::Say {
+                text: "Hello Stranger p3".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn safety_veto_prevents_unsafe_script_movement_and_records_context() {
+        let mut now = idle_now(10);
+        now.body.battery_level = 0.05;
+        let mut safety = SimpleSafety::default();
+        let output = EventScriptOutput {
+            actions: vec![
+                EventScriptAction::Stop,
+                EventScriptAction::Rotate { deg: 180 },
+                EventScriptAction::Go,
+            ],
+        };
+
+        let sequence = safety_trace_script_actions(&mut safety, &now, &output);
+
+        let go = sequence.actions.last().unwrap();
+        assert_eq!(go.requested, EventScriptAction::Go);
+        assert!(go.vetoed);
+        assert_eq!(go.final_motor, MotorCommand::stop());
+        assert_eq!(go.safety_reason.as_deref(), Some("critical battery"));
     }
 
     fn prime_idle(controller: &mut NudgeController, now: &Now, policy: NudgePolicy) {
@@ -5752,6 +6367,45 @@ mod tests {
                 "missing behavior run for {behavior_id}"
             );
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tick_runs_bump_event_script_and_records_safety_trace() {
+        let root = test_ledger_root("runtime-bump-event-script");
+        let ledger = JsonlLedger::new(&root);
+        let mut runtime = test_runtime(
+            ledger,
+            FixedConductor::new(ActionPrimitive::Go {
+                intensity: 0.3,
+                duration_ms: 500,
+            }),
+        );
+        let mut body = test_body(1.0, 1.0, 0.05, 100);
+        body.flags.bump_left = true;
+        let now = Now::blank(100, body);
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert!(tick.frame.behavior_runs.iter().any(
+            |run| run.behavior_id == "event_bump" && run.regime == BehaviorRegime::ShadowTrain
+        ));
+        let sequence = tick
+            .frame
+            .now
+            .extensions
+            .get("event_scripts")
+            .and_then(|value| value.get("bump"))
+            .cloned()
+            .and_then(|value| serde_json::from_value::<SafeScriptSequence>(value).ok())
+            .unwrap();
+        assert_eq!(sequence.actions.len(), 3);
+        assert!(sequence.actions.last().unwrap().vetoed);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -6709,6 +7363,12 @@ mod tests {
                     summary: "test command".to_string(),
                     action: Some(self.action.clone()),
                 }),
+                decision: Some(LlmDecision {
+                    summary: "test command".to_string(),
+                    action: Some(self.action.clone()),
+                    confidence: 1.0,
+                    ..LlmDecision::default()
+                }),
                 teaching: Vec::new(),
             })
         }
@@ -6784,6 +7444,111 @@ mod tests {
             .and_then(|value| serde_json::from_value::<ActionSelectionDecision>(value).ok())
             .unwrap();
         assert_eq!(decision.selected_action, Some(llm_action));
+    }
+
+    #[tokio::test]
+    async fn active_safe_reign_wins_over_llm_action() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-llm-reign-wins-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        let reign_command = ReignCommand::Turn {
+            direction: TurnDir::Left,
+            intensity: 0.4,
+            duration_ms: 500,
+        };
+        queue.lock().unwrap().push(test_reign_input(
+            100,
+            ReignMode::Direct,
+            reign_command.clone(),
+            1_000,
+        ));
+        let mut runtime = MinimalRuntime::with_reign_queue(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            FixedLlmAgent {
+                action: ActionPrimitive::Explore {
+                    style: ExploreStyle::RandomWalk,
+                    duration_ms: 1_000,
+                },
+            },
+            queue,
+        );
+        let now = idle_now(100);
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        let proposal = tick
+            .frame
+            .now
+            .extensions
+            .get("llm.action_proposal")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<LlmActionProposal>(value).ok())
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, reign_command.to_action());
+        assert!(!proposal.accepted);
+        assert_eq!(
+            proposal.ignored_reason.as_deref(),
+            Some("safe active Reign command outranked LLM action")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_llm_action_is_safety_vetoed_and_recorded() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-llm-safety-veto-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            FixedLlmAgent {
+                action: ActionPrimitive::Go {
+                    intensity: 0.3,
+                    duration_ms: 700,
+                },
+            },
+        );
+        let mut now = idle_now(100);
+        now.body.flags.cliff_left = true;
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        let proposal = tick
+            .frame
+            .now
+            .extensions
+            .get("llm.action_proposal")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<LlmActionProposal>(value).ok())
+            .unwrap();
+
+        assert_eq!(
+            proposal.proposed_action,
+            Some(ActionPrimitive::Go {
+                intensity: 0.3,
+                duration_ms: 700,
+            })
+        );
+        assert!(proposal.accepted);
+        assert!(proposal.safety_vetoed);
+        assert_eq!(proposal.safety_reason.as_deref(), Some("cliff"));
+        assert!(tick.frame.llm_teaching.iter().any(|teaching| teaching
+            .critique
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unsafe action")));
     }
 
     fn arena() -> ArenaConfig {

@@ -15,7 +15,9 @@ use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
-use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir};
+use netherwick_actions::{
+    ActionPrimitive, ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir,
+};
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use netherwick_core::TimeMs;
 use netherwick_now::{KinectSkeletonSense, ReignSense};
@@ -406,6 +408,8 @@ fn normalize_behavior_node_id(id: &str) -> String {
         "ActionValue" => "action_value".to_string(),
         "EyeNext" => "eye_next".to_string(),
         "EarNext" => "ear_next".to_string(),
+        "EventBump" => "event_bump".to_string(),
+        "EventFaceDetected" => "event_face_detected".to_string(),
         other => other.to_ascii_lowercase().replace('-', "_"),
     }
 }
@@ -605,6 +609,12 @@ pub struct SceneAudio {
 pub struct SceneAction {
     pub latest: Option<String>,
     pub safety_override: bool,
+    pub latest_llm_proposed_action: Option<ActionPrimitive>,
+    pub llm_action_accepted: Option<bool>,
+    pub llm_action_safety_vetoed: Option<bool>,
+    pub final_selected_action: Option<ActionPrimitive>,
+    pub llm_action_ignored_reason: Option<String>,
+    pub llm_action_safety_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -1452,7 +1462,11 @@ fn model_connections() -> Vec<ModelConnection> {
         ("Now", "Charge", "battery/dock cues"),
         ("Now", "EyeNext", "vision context"),
         ("Now", "EarNext", "audio context"),
+        ("Now", "EventBump", "body bump event"),
+        ("Now", "EventFaceDetected", "face event"),
         ("Experience", "Future", "latent z"),
+        ("EventBump", "Autonomic", "scripted escape"),
+        ("EventFaceDetected", "Conductor", "scripted greeting"),
         ("Danger", "Conductor", "risk"),
         ("Charge", "Conductor", "dock value"),
         ("Future", "Conductor", "imagined state"),
@@ -1802,6 +1816,32 @@ fn scene_action_from_snapshot(snapshot: &WorldSnapshot) -> SceneAction {
         safety_override: snapshot.body.flags.wheel_drop
             || snapshot.body.flags.cliff_left
             || snapshot.body.flags.cliff_right,
+        latest_llm_proposed_action: snapshot
+            .llm_action_proposal
+            .as_ref()
+            .and_then(|proposal| proposal.proposed_action.clone()),
+        llm_action_accepted: snapshot
+            .llm_action_proposal
+            .as_ref()
+            .map(|proposal| proposal.accepted),
+        llm_action_safety_vetoed: snapshot
+            .llm_action_proposal
+            .as_ref()
+            .map(|proposal| proposal.safety_vetoed),
+        final_selected_action: snapshot.final_selected_action.clone().or_else(|| {
+            snapshot
+                .llm_action_proposal
+                .as_ref()
+                .and_then(|proposal| proposal.final_action.clone())
+        }),
+        llm_action_ignored_reason: snapshot
+            .llm_action_proposal
+            .as_ref()
+            .and_then(|proposal| proposal.ignored_reason.clone()),
+        llm_action_safety_reason: snapshot
+            .llm_action_proposal
+            .as_ref()
+            .and_then(|proposal| proposal.safety_reason.clone()),
     }
 }
 
@@ -3959,8 +3999,8 @@ let selectedBehaviorNodeId = 'Conductor';
 const graphLayout = {
   Sensors:[28,18,'core'], Now:[148,18,'core'], Experience:[268,18,'model'], Future:[396,18,'model'],
   Danger:[28,92,'model'], Charge:[148,92,'model'], EyeNext:[268,92,'model'], EarNext:[396,92,'model'],
-  Conductor:[148,166,'core'], ActionValue:[282,166,'model'], Autonomic:[416,166,'core'],
-  Body:[28,226,'core'], Ledger:[148,226,'core'], Training:[282,226,'core'], Models:[416,226,'model']
+  EventBump:[28,166,'model'], EventFaceDetected:[148,166,'model'], Conductor:[268,166,'core'], ActionValue:[416,166,'model'],
+  Autonomic:[416,226,'core'], Body:[28,226,'core'], Ledger:[148,226,'core'], Training:[268,226,'core'], Models:[416,286,'model']
 };
 const staticGraphNodes = ['Sensors','Now','Autonomic','Body','Ledger','Training','Models'];
 
@@ -4850,7 +4890,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let Json(readback) = get_behavior_nodes(State(state)).await;
+        let Json(readback) = get_behavior_nodes(State(state.clone())).await;
         let conductor = readback
             .nodes
             .iter()
@@ -4864,6 +4904,28 @@ mod tests {
             Some("data/models/conductor_v0")
         );
         assert!(conductor.training_enabled);
+
+        let Json(updated_event) = post_behavior_node(
+            State(state.clone()),
+            AxumPath("EventBump".to_string()),
+            Json(BehaviorNodeUpdate {
+                selected_regime: Some(BehaviorRegime::ShadowTrain),
+                selected_hardcoded: Some("script.on_bump.v0".to_string()),
+                selected_model: Some("event.bump.shadow.v0".to_string()),
+                checkpoint_path: Some("data/models/event_bump_v0".to_string()),
+                fallback_policy: Some(netherwick_behaviors::FallbackPolicy::UseHardcoded),
+                training_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated_event.selected_regime, BehaviorRegime::ShadowTrain);
+        assert_eq!(updated_event.selected_hardcoded, "script.on_bump.v0");
+        assert_eq!(
+            updated_event.selected_model.as_deref(),
+            Some("event.bump.shadow.v0")
+        );
     }
 
     #[tokio::test]
@@ -4915,6 +4977,21 @@ mod tests {
         snapshot.body.odometry.heading_rad = 1.25;
         snapshot.body.battery_level = 0.82;
         snapshot.body.last_update_ms = 1234;
+        snapshot.final_selected_action = Some(ActionPrimitive::Explore {
+            style: netherwick_actions::ExploreStyle::RandomWalk,
+            duration_ms: 1_000,
+        });
+        snapshot.llm_action_proposal = Some(netherwick_actions::LlmActionProposal {
+            proposed_action: Some(ActionPrimitive::Explore {
+                style: netherwick_actions::ExploreStyle::RandomWalk,
+                duration_ms: 1_000,
+            }),
+            accepted: true,
+            safety_vetoed: false,
+            final_action: snapshot.final_selected_action.clone(),
+            ignored_reason: None,
+            safety_reason: None,
+        });
         snapshot.range.beams = vec![1.0, 2.0, 3.0];
         snapshot.range.nearest_m = Some(1.0);
         snapshot.extensions.push(netherwick_now::ExtensionSense {
@@ -4932,6 +5009,11 @@ mod tests {
             bytes: vec![255, 0, 0],
             source: None,
         });
+        let expected_llm_action = snapshot
+            .llm_action_proposal
+            .as_ref()
+            .and_then(|proposal| proposal.proposed_action.clone());
+        let expected_final_action = snapshot.final_selected_action.clone();
         state.update(snapshot);
 
         let Json(scene) = get_live_scene(State(state)).await.unwrap();
@@ -4946,6 +5028,10 @@ mod tests {
         assert_eq!(scene.body.x_m, 0.5);
         assert_eq!(scene.body.y_m, 0.75);
         assert_eq!(scene.body.heading_rad, 1.25);
+        assert_eq!(scene.action.latest_llm_proposed_action, expected_llm_action);
+        assert_eq!(scene.action.llm_action_accepted, Some(true));
+        assert_eq!(scene.action.llm_action_safety_vetoed, Some(false));
+        assert_eq!(scene.action.final_selected_action, expected_final_action);
         assert_eq!(scene.range.nearest_m, Some(1.0));
         assert_eq!(scene.range.beams.len(), 3);
         assert_eq!(scene.training_mode, "collecting");

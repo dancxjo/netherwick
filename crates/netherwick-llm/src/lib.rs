@@ -89,6 +89,16 @@ pub struct ConsciousCommand {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmDecision {
+    pub summary: String,
+    pub critique: Option<String>,
+    pub confidence: f32,
+    pub action: Option<ActionPrimitive>,
+    pub counterfactuals: Vec<CounterfactualAction>,
+    pub memory_notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmTeaching {
     pub t_ms: u64,
     pub summary: String,
@@ -127,6 +137,7 @@ pub struct Combobulation {
 pub struct LlmTickResult {
     pub sense: LlmSense,
     pub conscious_command: Option<ConsciousCommand>,
+    pub decision: Option<LlmDecision>,
     pub teaching: Vec<LlmTeaching>,
 }
 
@@ -639,7 +650,7 @@ impl LlmAgent for OllamaLlmAgent {
         } else {
             None
         };
-        let action = reign_action.clone().or(model_action);
+        let command_action = reign_action.clone().or_else(|| model_action.clone());
         let critique = reply
             .critique
             .map(|value| value.trim().to_string())
@@ -650,12 +661,25 @@ impl LlmAgent for OllamaLlmAgent {
             reply.summary.trim().to_string()
         };
         let confidence = reply.confidence.clamp(0.0, 1.0);
+        let counterfactuals = reply
+            .counterfactuals
+            .into_iter()
+            .filter_map(parse_counterfactual_spec)
+            .collect::<Vec<_>>();
+        let decision = LlmDecision {
+            summary: summary.clone(),
+            critique: critique.clone(),
+            confidence,
+            action: model_action.clone(),
+            counterfactuals,
+            memory_notes: reply.memory_notes,
+        };
 
         let conscious_command =
-            if self.config.allow_commands && (action.is_some() || !summary.is_empty()) {
+            if self.config.allow_commands && (command_action.is_some() || !summary.is_empty()) {
                 Some(ConsciousCommand {
                     summary: summary.clone(),
-                    action: action.clone(),
+                    action: command_action.clone(),
                 })
             } else {
                 None
@@ -663,8 +687,8 @@ impl LlmAgent for OllamaLlmAgent {
 
         let teaching = if self.config.allow_teaching
             && (critique.is_some()
-                || !reply.memory_notes.is_empty()
-                || !reply.counterfactuals.is_empty())
+                || !decision.memory_notes.is_empty()
+                || !decision.counterfactuals.is_empty())
         {
             vec![LlmTeaching {
                 t_ms: now.t_ms,
@@ -674,12 +698,8 @@ impl LlmAgent for OllamaLlmAgent {
                     summary.clone()
                 },
                 critique: critique.clone(),
-                counterfactuals: reply
-                    .counterfactuals
-                    .into_iter()
-                    .filter_map(parse_counterfactual_spec)
-                    .collect(),
-                memory_notes: reply.memory_notes,
+                counterfactuals: decision.counterfactuals.clone(),
+                memory_notes: decision.memory_notes.clone(),
                 confidence,
             }]
         } else {
@@ -694,6 +714,7 @@ impl LlmAgent for OllamaLlmAgent {
                 confidence,
             },
             conscious_command,
+            decision: Some(decision),
             teaching,
         })
     }
@@ -1165,6 +1186,31 @@ fn parse_counterfactual_spec(spec: CounterfactualSpec) -> Option<CounterfactualA
     })
 }
 
+pub fn parse_llm_decision_json(text: &str, commands_enabled: bool) -> Result<LlmDecision> {
+    let json = extract_json_object(text).unwrap_or_else(|| text.trim().to_string());
+    let reply: AgentReply = serde_json::from_str(&json).context("failed to parse llm decision")?;
+    let summary = reply.summary.trim().to_string();
+    Ok(LlmDecision {
+        summary,
+        critique: reply
+            .critique
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        confidence: reply.confidence.clamp(0.0, 1.0),
+        action: if commands_enabled {
+            reply.action.and_then(parse_action_spec)
+        } else {
+            None
+        },
+        counterfactuals: reply
+            .counterfactuals
+            .into_iter()
+            .filter_map(parse_counterfactual_spec)
+            .collect(),
+        memory_notes: reply.memory_notes,
+    })
+}
+
 fn parse_action_spec(spec: ActionSpec) -> Option<ActionPrimitive> {
     let kind = spec.kind.to_ascii_lowercase();
     match kind.as_str() {
@@ -1381,6 +1427,24 @@ mod tests {
                 duration_ms: 1200,
             }
         );
+    }
+
+    #[test]
+    fn parses_llm_json_explore_action_into_decision() {
+        let decision = parse_llm_decision_json(r#"{"action":{"kind":"explore"}}"#, true).unwrap();
+        assert_eq!(
+            decision.action,
+            Some(ActionPrimitive::Explore {
+                style: ExploreStyle::RandomWalk,
+                duration_ms: 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn commands_disabled_ignores_llm_json_action() {
+        let decision = parse_llm_decision_json(r#"{"action":{"kind":"explore"}}"#, false).unwrap();
+        assert_eq!(decision.action, None);
     }
 
     #[test]

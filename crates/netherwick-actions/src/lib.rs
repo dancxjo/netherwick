@@ -195,6 +195,16 @@ pub struct ReignOutcome {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmActionProposal {
+    pub proposed_action: Option<ActionPrimitive>,
+    pub accepted: bool,
+    pub safety_vetoed: bool,
+    pub final_action: Option<ActionPrimitive>,
+    pub ignored_reason: Option<String>,
+    pub safety_reason: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CommandLease {
     pub command: ActionPrimitive,

@@ -2,6 +2,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+use netherwick_actions::{ActionPrimitive, LlmActionProposal};
 use netherwick_body::BodySense;
 use netherwick_now::{
     EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense, RangeSense,
@@ -474,6 +475,8 @@ pub struct PcmAudioFrame {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorldSnapshot {
     pub body: BodySense,
+    pub final_selected_action: Option<ActionPrimitive>,
+    pub llm_action_proposal: Option<LlmActionProposal>,
     pub eye_frame: Option<EyeFrame>,
     pub ear_pcm: Option<PcmAudioFrame>,
     pub eye: EyeSense,
@@ -491,6 +494,8 @@ impl Default for WorldSnapshot {
     fn default() -> Self {
         Self {
             body: BodySense::default(),
+            final_selected_action: None,
+            llm_action_proposal: None,
             eye_frame: None,
             ear_pcm: None,
             eye: EyeSense {

@@ -22,6 +22,7 @@ v4l = { version = "0.14", optional = true }
 netherwick-now = { path = "../netherwick-now" }
 netherwick-body = { path = "../netherwick-body" }
 netherwick-core = { path = "../netherwick-core" }
+netherwick-actions = { path = "../netherwick-actions" }
 
 [dev-dependencies]
 tokio.workspace = true
