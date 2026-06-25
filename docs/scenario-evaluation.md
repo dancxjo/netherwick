@@ -57,9 +57,9 @@ just run eval-scenario \
 
 Use `--ledger data/ledger/eval/foo` when you also want normal `ExperienceFrame` and `ExperienceTransition` output. Use `--capture-root data/captures/eval/foo` to write one Worldlab capture per episode.
 
-## Golden Danger Training
+## Golden Behavior Training
 
-Train `danger` only after the golden locomotion baseline is passing. Keep the checkpoint in shadow/off modes for scenario control; this step proves prediction quality, not motor authority.
+Train `danger` and `action-value` only after the golden locomotion baseline is passing. Keep checkpoints in shadow/off modes for scenario control; this step proves prediction quality, not motor authority.
 
 ```bash
 just run sim \
@@ -86,9 +86,44 @@ just run evaluate behavior danger \
   --ledger data/ledger/golden-column-trap-heldout \
   --checkpoint data/models/danger_golden_column_v0 \
   --out data/reports/danger-golden-column-heldout-eval.json
+
+just run train action-value \
+  --ledger data/ledger/golden-column-trap \
+  --epochs 5 \
+  --checkpoint data/models/action_value_golden_column_v0
+
+just run evaluate behavior action-value \
+  --ledger data/ledger/golden-column-trap-heldout \
+  --checkpoint data/models/action_value_golden_column_v0 \
+  --out data/reports/action-value-golden-column-heldout-eval.json
+
+just run eval-scenario \
+  --scenario column-trap \
+  --episodes 5 \
+  --steps 300 \
+  --seed 2007 \
+  --danger-checkpoint data/models/danger_golden_column_v0 \
+  --danger-mode shadow-infer \
+  --action-value-checkpoint data/models/action_value_golden_column_v0 \
+  --action-value-mode shadow-infer \
+  --out data/reports/golden-column-trap-shadow-models.json \
+  --memory-report
+
+just run eval-scenario \
+  --scenario column-trap \
+  --episodes 5 \
+  --steps 300 \
+  --seed 3007 \
+  --action-selector model-assisted \
+  --danger-checkpoint data/models/danger_golden_column_v0 \
+  --danger-mode shadow-infer \
+  --action-value-checkpoint data/models/action_value_golden_column_v0 \
+  --action-value-mode shadow-infer \
+  --out data/reports/golden-column-trap-model-assisted.json \
+  --memory-report
 ```
 
-The held-out behavior report must show `model_better_than_hardcoded: true` before the checkpoint is registered as a shadow candidate. Do not use `danger-mode model-infer` for the golden loop.
+The held-out behavior reports must show `model_better_than_hardcoded: true` before checkpoints are registered as shadow candidates. The combined shadow scenario report should preserve baseline success, collision, and veto metrics. The model-assisted scenario report is only a candidate-scoring gate: it may choose among typed actions, but close-range trap recovery must still yield to the baseline conductor. Do not use `danger-mode model-infer` or `action-value-mode model-infer` for the golden loop.
 
 ## Comparing Runs
 

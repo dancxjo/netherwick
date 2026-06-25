@@ -4608,6 +4608,21 @@ fn select_action_from_scores(
                 fallback_warnings: fallback_warnings_for_mode(mode),
             };
         }
+        if mode == ActionSelectorMode::ModelAssisted
+            && baseline_recovery_guard_active(now, &baseline_action)
+        {
+            return ActionSelectionDecision {
+                mode,
+                candidates,
+                selected_action: Some(baseline_action.clone()),
+                baseline_action: Some(baseline_action),
+                selected_score: None,
+                safety_overrode: false,
+                fallback_warnings: vec![
+                    "model-assisted selector yielded to baseline trap recovery".to_string(),
+                ],
+            };
+        }
     }
 
     let selected = match mode {
@@ -4670,6 +4685,24 @@ fn fallback_warnings_for_mode(mode: ActionSelectorMode) -> Vec<String> {
         vec!["model-assisted selector used hardcoded fallback estimates".to_string()]
     } else {
         Vec::new()
+    }
+}
+
+fn baseline_recovery_guard_active(now: &Now, baseline_action: &ActionPrimitive) -> bool {
+    let contact = now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall;
+    let close_range = now
+        .range
+        .nearest_m
+        .map(|nearest| nearest < 0.35)
+        .unwrap_or(false);
+    (contact || close_range) && is_recovery_locomotion_action(baseline_action)
+}
+
+fn is_recovery_locomotion_action(action: &ActionPrimitive) -> bool {
+    match action {
+        ActionPrimitive::Go { intensity, .. } => intensity.abs() <= 0.25,
+        ActionPrimitive::Turn { intensity, .. } => *intensity >= 0.5,
+        _ => false,
     }
 }
 
@@ -6017,6 +6050,38 @@ mod tests {
 
         assert_eq!(decision.selected_action, Some(ActionPrimitive::Stop));
         assert!(decision.safety_overrode);
+    }
+
+    #[test]
+    fn model_assisted_yields_to_baseline_close_range_recovery() {
+        let body = BodySense::default();
+        let mut now = Now::blank(100, body);
+        now.range.nearest_m = Some(0.12);
+        let baseline = ActionPrimitive::Go {
+            intensity: -0.18,
+            duration_ms: 300,
+        };
+        let decision = select_action_from_scores(
+            ActionSelectorMode::ModelAssisted,
+            &now,
+            baseline.clone(),
+            vec![ActionSelectionCandidateScore {
+                action: ActionPrimitive::Turn {
+                    direction: TurnDir::Right,
+                    intensity: 0.25,
+                    duration_ms: 750,
+                },
+                score: 10.0,
+                ..ActionSelectionCandidateScore::default()
+            }],
+        );
+
+        assert_eq!(decision.selected_action, Some(baseline));
+        assert!(!decision.safety_overrode);
+        assert!(decision
+            .fallback_warnings
+            .iter()
+            .any(|warning| warning.contains("baseline trap recovery")));
     }
 
     #[test]

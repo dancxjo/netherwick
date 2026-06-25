@@ -1,0 +1,12 @@
+{
+  "behavior": "action_value",
+  "checkpoint_path": "data/models/action_value_golden_column_v0",
+  "sample_count": 1495,
+  "model_loss_mean": 0.0023444477,
+  "hardcoded_loss_mean": 0.026986253,
+  "selected_loss_mean": 0.026986253,
+  "model_better_than_hardcoded": true,
+  "improvement_ratio": 0.9131244,
+  "warnings": [],
+  "recommendation": "shadow_infer"
+}
