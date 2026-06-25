@@ -805,9 +805,10 @@ fn build_agent_prompt(
     let futures = summarize_futures(futures);
     format!(
         "You are the conscious LLM layer for an embodied robot.\n\
-You may suggest a high-level action primitive, critique the situation, and record memory notes.\n\
-Never output raw motor control.\n\
-Treat Reign controls as present-tense input. You may comment on them, remember them, or learn from them.\n\
+When commands are enabled, choose a high-level action primitive whenever movement, speech, inspection, docking, or stopping is appropriate.\n\
+The action field is an executable command candidate for the robot body, not only a suggestion or note.\n\
+Never output raw motor control such as wheel speeds, PWM values, serial bytes, or velocity arrays.\n\
+Treat Reign controls as present-tense command input. If a Reign command is active and safe, set action to the matching allowed action; if you choose something else, explain why in critique.\n\
 {LIVE_EVENT_RULES}\n\
 Allowed action kinds: stop, go, turn, inspect, approach, dock, explore, speak, chirp.\n\
 If commands are disabled, leave action null. Commands enabled: {}. Teaching enabled: {}.\n\
@@ -1220,6 +1221,27 @@ mod tests {
         assert!(senses.contains("Remote control active: Direct"));
         assert!(senses.contains("Latest remote command: Turn Left"));
         assert!(senses.contains("Remote note: turn toward charger"));
+    }
+
+    #[test]
+    fn agent_prompt_frames_actions_as_executable_and_reign_as_command_input() {
+        let now = Now::blank(100, BodySense::default());
+        let prompt = build_agent_prompt(
+            &now,
+            &ExperienceLatent::default(),
+            &[],
+            "none",
+            Some("I am awake."),
+            &LlmConfig::default(),
+        );
+
+        assert!(prompt.contains("choose a high-level action primitive"));
+        assert!(prompt.contains("executable command candidate"));
+        assert!(prompt.contains("not only a suggestion or note"));
+        assert!(prompt.contains("Never output raw motor control such as wheel speeds"));
+        assert!(prompt.contains("Treat Reign controls as present-tense command input"));
+        assert!(prompt.contains("set action to the matching allowed action"));
+        assert!(!prompt.contains("Do not override active Direct reign"));
     }
 
     #[test]
