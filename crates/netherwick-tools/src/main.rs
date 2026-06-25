@@ -886,7 +886,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     }
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
-    let llm = configured_llm_agent(&args.llm)?;
+    let llm = configured_llm_agent_for_sim(&args.llm, args.live)?;
     let mut runtime = MinimalRuntime::with_default_events(
         ledger,
         memory,
@@ -1018,9 +1018,14 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             } else {
                 runner.world.set_retina_frame(None);
             }
-            runner.run_steps(1).await?;
+            let mut live_snapshot = None;
+            runner
+                .run_steps_observing(1, |snapshot| {
+                    live_snapshot = Some(snapshot.clone());
+                })
+                .await?;
             live_state.update_behavior_nodes(runner.runtime.behavior_node_states());
-            live_state.update(runner.world.snapshot().await?);
+            live_state.update(live_snapshot.unwrap_or(runner.world.snapshot().await?));
             live_state.update_prod_state(runner.runtime.nudge_status());
             live_state.update_training_status(netherwick_server::LiveTrainingStatus {
                 training_mode: current_inline_learning.training_mode_label().to_string(),
@@ -2098,6 +2103,24 @@ fn configured_llm_agent(args: &LlmArgs) -> Result<ConfiguredLlmAgent> {
     };
     if let Some(provider) = args.llm_provider {
         config.provider = provider.into();
+    }
+    ConfiguredLlmAgent::from_config(config)
+}
+
+fn configured_llm_agent_for_sim(args: &LlmArgs, live: bool) -> Result<ConfiguredLlmAgent> {
+    let mut config = match &args.llm_config {
+        Some(path) => LlmConfig::load(path)?,
+        None => LlmConfig::default(),
+    };
+    if let Some(provider) = args.llm_provider {
+        config.provider = provider.into();
+    }
+    if live && args.llm_config.is_none() {
+        let live_timeout_ms = std::env::var("NETHERWICK_LIVE_LLM_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(750);
+        config.timeout_ms = config.timeout_ms.min(live_timeout_ms.max(1));
     }
     ConfiguredLlmAgent::from_config(config)
 }

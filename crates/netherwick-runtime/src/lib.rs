@@ -2680,7 +2680,7 @@ where
             self.run_event_scripts(&mut now, &recall, &mut notes, &mut proposed_actions)?;
         behavior_runs.extend(event_script_records);
 
-        let combobulation = self
+        let combobulation = match self
             .llm
             .combobulate(
                 &now,
@@ -2689,10 +2689,17 @@ where
                 &futures,
                 &recall.first_person_summary,
             )
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                notes.push(format!("LlmCombobulationSkipped: {error}"));
+                None
+            }
+        };
 
         let awareness_summary = combobulation.as_ref().map(|value| value.summary.as_str());
-        let llm_tick = self
+        let llm_tick = match self
             .llm
             .maybe_tick(
                 &now,
@@ -2701,7 +2708,14 @@ where
                 &recall.first_person_summary,
                 awareness_summary,
             )
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                notes.push(format!("LlmTickSkipped: {error}"));
+                LlmTickResult::default()
+            }
+        };
         now.llm = llm_tick.sense.clone();
         apply_llm_tick(
             &llm_tick,
