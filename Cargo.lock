@@ -4945,6 +4945,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "netherwick-actions",
+ "netherwick-autonomic",
  "netherwick-behaviors",
  "netherwick-body",
  "netherwick-core",
@@ -4952,6 +4953,8 @@ dependencies = [
  "netherwick-ledger",
  "netherwick-models",
  "netherwick-now",
+ "netherwick-sensors",
+ "netherwick-sim",
  "rand 0.8.6",
  "serde",
  "serde_json",

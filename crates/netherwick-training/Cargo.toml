@@ -13,13 +13,16 @@ serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 netherwick-behaviors = { path = "../netherwick-behaviors" }
+netherwick-actions = { path = "../netherwick-actions" }
+netherwick-autonomic = { path = "../netherwick-autonomic" }
+netherwick-body = { path = "../netherwick-body" }
 netherwick-core = { path = "../netherwick-core" }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-ledger = { path = "../netherwick-ledger" }
 netherwick-models = { path = "../netherwick-models" }
 netherwick-now = { path = "../netherwick-now" }
+netherwick-sensors = { path = "../netherwick-sensors" }
+netherwick-sim = { path = "../netherwick-sim" }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
-netherwick-actions = { path = "../netherwick-actions" }
-netherwick-body = { path = "../netherwick-body" }

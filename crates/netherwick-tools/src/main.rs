@@ -37,6 +37,7 @@ use netherwick_server::{
     LiveSceneMetadata, LiveViewState, SceneArena, SceneObject, SceneSensorCalibration, SceneSession,
 };
 use netherwick_sim::{build_scenario, ScenarioConfig, ScenarioKind, SimObjectKind};
+use netherwick_training::dream_policy::{train_dream_policy, DreamLevel, DreamTrainingConfig};
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
     EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
@@ -61,6 +62,7 @@ struct Cli {
 enum Command {
     Sim(SimArgs),
     SimCurriculum(SimCurriculumArgs),
+    DreamTrain(DreamTrainArgs),
     EvalScenario(EvalScenarioArgs),
     MemoryInspect(MemoryInspectArgs),
     Robot(RobotArgs),
@@ -92,6 +94,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Sim(args) => run_sim(args).await,
         Command::SimCurriculum(args) => run_sim_curriculum(args).await,
+        Command::DreamTrain(args) => run_dream_train(args).await,
         Command::EvalScenario(args) => run_eval_scenario(args).await,
         Command::MemoryInspect(args) => memory_inspect(args).await,
         Command::Robot(args) => run_robot(args).await,
@@ -214,6 +217,26 @@ struct SimCurriculumArgs {
     test_ratio: f32,
     #[command(flatten)]
     llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct DreamTrainArgs {
+    #[arg(long, value_enum, default_value = "motion")]
+    start_level: DreamLevelArg,
+    #[arg(long, default_value_t = 30)]
+    generations: usize,
+    #[arg(long, default_value_t = 32)]
+    population: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value_t = 12)]
+    hidden_dim: usize,
+    #[arg(long, default_value = "data/models/dream-policy/neat")]
+    checkpoint_dir: String,
+    #[arg(long, default_value = "datasets/dream-policy/v0/episodes")]
+    dataset_dir: String,
+    #[arg(long, default_value_t = true)]
+    export_dataset: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -358,6 +381,31 @@ impl From<ScenarioArg> for ScenarioKind {
             ScenarioArg::PersonSpeakerRoom => ScenarioKind::PersonAndSpeaker,
             ScenarioArg::MixedRoom => ScenarioKind::MixedRoom,
             ScenarioArg::Dream => ScenarioKind::Dream,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DreamLevelArg {
+    Motion,
+    ObstacleAvoidance,
+    EscapeTrap,
+    ChargerSeeking,
+    SocialInspection,
+    PlaceMemory,
+    WeirdDream,
+}
+
+impl From<DreamLevelArg> for DreamLevel {
+    fn from(value: DreamLevelArg) -> Self {
+        match value {
+            DreamLevelArg::Motion => DreamLevel::Motion,
+            DreamLevelArg::ObstacleAvoidance => DreamLevel::ObstacleAvoidance,
+            DreamLevelArg::EscapeTrap => DreamLevel::EscapeTrap,
+            DreamLevelArg::ChargerSeeking => DreamLevel::ChargerSeeking,
+            DreamLevelArg::SocialInspection => DreamLevel::SocialInspection,
+            DreamLevelArg::PlaceMemory => DreamLevel::PlaceMemory,
+            DreamLevelArg::WeirdDream => DreamLevel::WeirdDream,
         }
     }
 }
@@ -2253,6 +2301,33 @@ fn summarize_episode_memory(episodes: &[ScenarioEpisodeReport]) -> ScenarioMemor
         novelty_decay_sane,
         warnings,
     }
+}
+
+async fn run_dream_train(args: DreamTrainArgs) -> Result<()> {
+    let config = DreamTrainingConfig {
+        population_size: args.population,
+        generations: args.generations,
+        base_seed: args.seed,
+        start_level: args.start_level.into(),
+        hidden_dim: args.hidden_dim,
+        checkpoint_dir: PathBuf::from(args.checkpoint_dir),
+        dataset_dir: PathBuf::from(args.dataset_dir),
+        export_dataset: args.export_dataset,
+    };
+    let report = train_dream_policy(config).await?;
+    println!(
+        "dream policy training complete: level {}, generation {}, best score {:.3}, genome {}, checkpoint {}, dataset {}",
+        report.status.current_level.name(),
+        report.status.generation,
+        report.status.best_score,
+        report.status.selected_genome_id,
+        report.best_checkpoint.display(),
+        report.dataset_dir.display()
+    );
+    if let Some(reason) = report.status.blocked_reason {
+        println!("last safety block: {reason}");
+    }
+    Ok(())
 }
 
 fn scenario_recommendation(episodes: usize, summary: &ScenarioEvaluationSummary) -> String {
