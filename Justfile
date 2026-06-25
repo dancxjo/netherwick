@@ -102,6 +102,7 @@ go target="virtual":
     echo
     echo "Netherwick Dream World is starting."
     echo "Virtual training theater is collecting experience."
+    echo "Dream NEAT policy training starts automatically. Set NETHERWICK_NEAT_TRAINING=0 to disable."
     echo "Inline learning defaults to world-outcome. Set NETHERWICK_INLINE_LEARNING_MODE=off for collect-only."
     echo 'Offline training still exists: `cargo run --bin netherwick -- train behavior ...`'
     echo
@@ -118,7 +119,21 @@ go target="virtual":
     if command -v qrencode >/dev/null 2>&1; then
         qrencode -t ANSIUTF8 "https://$LAN_IP:$PORT/view/3d" || true
     fi
-    cargo run -p netherwick-tools -- sim \
+    cargo build -p netherwick-tools
+    TRAIN_PID=""
+    if [ "${NETHERWICK_NEAT_TRAINING:-1}" = "1" ]; then
+        target/debug/netherwick dream-train \
+            --start-level "${NETHERWICK_NEAT_START_LEVEL:-motion}" \
+            --generations "${NETHERWICK_NEAT_GENERATIONS:-30}" \
+            --population "${NETHERWICK_NEAT_POPULATION:-32}" \
+            --seed "${NETHERWICK_NEAT_SEED:-7}" \
+            --hidden-dim "${NETHERWICK_NEAT_HIDDEN_DIM:-12}" \
+            --checkpoint-dir "${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}" \
+            --dataset-dir "${NETHERWICK_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}" \
+            --export-dataset "${NETHERWICK_NEAT_EXPORT_DATASET:-true}" &
+        TRAIN_PID="$!"
+    fi
+    target/debug/netherwick sim \
         --live \
         --live-tls \
         --live-addr "0.0.0.0:$PORT" \
@@ -129,7 +144,7 @@ go target="virtual":
         --tick-delay-ms "${NETHERWICK_TICK_DELAY_MS:-100}" \
         --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" &
     PID="$!"
-    trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' INT TERM EXIT
+    trap 'kill "$PID" 2>/dev/null || true; if [ -n "${TRAIN_PID:-}" ]; then kill "$TRAIN_PID" 2>/dev/null || true; wait "$TRAIN_PID" 2>/dev/null || true; fi; wait "$PID" 2>/dev/null || true' INT TERM EXIT
     if [ "${NETHERWICK_OPEN_BROWSER:-0}" = "1" ] && command -v xdg-open >/dev/null 2>&1; then
         if command -v curl >/dev/null 2>&1; then
             for _ in $(seq 1 80); do

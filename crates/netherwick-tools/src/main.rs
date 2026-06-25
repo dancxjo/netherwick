@@ -235,7 +235,7 @@ struct DreamTrainArgs {
     checkpoint_dir: String,
     #[arg(long, default_value = "datasets/dream-policy/v0/episodes")]
     dataset_dir: String,
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true")]
     export_dataset: bool,
 }
 

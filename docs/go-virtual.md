@@ -2,10 +2,13 @@
 
 `just go virtual` starts Netherwick's Dream World: a simulated dream scenario updates the live view state, the server binds to `0.0.0.0`, and HTTPS pages are served for desktop browsers and LAN headset browsers.
 
-By default this mode collects experience into the ledger and runs inline world-outcome learning. Startup prints:
+By default this mode collects experience into the ledger, starts Dream NEAT policy
+training in the background, and runs inline world-outcome learning. Startup
+prints:
 
 ```text
 Virtual training theater is collecting experience.
+Dream NEAT policy training starts automatically. Set NETHERWICK_NEAT_TRAINING=0 to disable.
 Inline learning defaults to world-outcome. Set NETHERWICK_INLINE_LEARNING_MODE=off for collect-only.
 Offline training still exists: `cargo run --bin netherwick -- train behavior ...`
 ```
@@ -39,6 +42,22 @@ just go virtual
 ```
 
 Offline training still exists and is still useful. Use `train virtual` or behavior training commands when you want repeatable batches, more epochs, promotion checks, and registry updates from a collected Dream World ledger.
+
+Dream NEAT training writes checkpoints to `data/models/dream-policy/neat` and
+distillation rollouts to `datasets/dream-policy/v0/episodes`.
+
+Tune or disable the automatic Dream NEAT run:
+
+```bash
+NETHERWICK_NEAT_GENERATIONS=60 \
+NETHERWICK_NEAT_POPULATION=48 \
+NETHERWICK_NEAT_START_LEVEL=motion \
+just go virtual
+```
+
+```bash
+NETHERWICK_NEAT_TRAINING=0 just go virtual
+```
 
 Open:
 
