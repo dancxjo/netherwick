@@ -1,0 +1,12 @@
+{
+  "behavior": "danger",
+  "checkpoint_path": "data/models/danger_golden_column_v0",
+  "sample_count": 1495,
+  "model_loss_mean": 0.0087624965,
+  "hardcoded_loss_mean": 0.1579437,
+  "selected_loss_mean": 0.1579437,
+  "model_better_than_hardcoded": true,
+  "improvement_ratio": 0.9445214,
+  "warnings": [],
+  "recommendation": "shadow_infer"
+}

@@ -3972,7 +3972,6 @@ pub struct SimRunner<R> {
 const STUCK_LOW_DISPLACEMENT_TICKS: usize = 6;
 const STUCK_WINDOW_DISPLACEMENT_EPSILON_M: f32 = 0.015;
 const NEAR_ARENA_WALL_M: f32 = 0.32;
-const RECOVERY_CLEARANCE_M: f32 = 0.18;
 const SAME_TRAP_RADIUS_M: f32 = 0.18;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3980,9 +3979,6 @@ enum RecoveryPhase {
     #[default]
     None,
     Stop,
-    Reverse,
-    Turn,
-    Probe,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4110,69 +4106,6 @@ impl StuckRecoveryController {
         self.last_position = Some(position);
     }
 
-    fn recovery_motion(&mut self) -> Option<MotionCommand> {
-        if !self.active {
-            return None;
-        }
-        self.duration_ticks = self.duration_ticks.saturating_add(1);
-        let motion = match self.phase {
-            RecoveryPhase::Stop => MotionCommand::Stop,
-            RecoveryPhase::Reverse => MotionCommand::Forward {
-                speed_m_s: -reverse_speed(self.recovery_attempts),
-            },
-            RecoveryPhase::Turn => MotionCommand::Turn {
-                turn_rad_s: self.turn_sign * turn_speed(self.recovery_attempts),
-            },
-            RecoveryPhase::Probe => MotionCommand::Drive {
-                forward_m_s: 0.04,
-                turn_rad_s: self.turn_sign * 0.25,
-            },
-            RecoveryPhase::None => return None,
-        };
-        self.advance_phase();
-        Some(motion)
-    }
-
-    fn advance_phase(&mut self) {
-        self.phase_ticks_remaining = self.phase_ticks_remaining.saturating_sub(1);
-        if self.phase_ticks_remaining > 0 {
-            return;
-        }
-        match self.phase {
-            RecoveryPhase::Stop => {
-                self.phase = RecoveryPhase::Reverse;
-                self.phase_ticks_remaining = reverse_ticks(self.recovery_attempts);
-            }
-            RecoveryPhase::Reverse => {
-                self.phase = RecoveryPhase::Turn;
-                self.phase_ticks_remaining = turn_ticks(self.recovery_attempts);
-            }
-            RecoveryPhase::Turn => {
-                self.phase = RecoveryPhase::Probe;
-                self.phase_ticks_remaining = 1;
-            }
-            RecoveryPhase::Probe => {
-                if self.clearance_achieved() {
-                    self.finish_recovery_success();
-                } else {
-                    self.last_failed_turn_sign = Some(self.turn_sign);
-                    self.recovery_attempts = self.recovery_attempts.saturating_add(1);
-                    self.repeated_trap_count = self.repeated_trap_count.saturating_add(1);
-                    self.turn_sign = -self.turn_sign;
-                    self.phase = RecoveryPhase::Stop;
-                    self.phase_ticks_remaining = 1;
-                }
-            }
-            RecoveryPhase::None => {}
-        }
-    }
-
-    fn clearance_achieved(&self) -> bool {
-        self.clearance_m
-            .map(|nearest| nearest > RECOVERY_CLEARANCE_M)
-            .unwrap_or(true)
-    }
-
     fn finish_recovery_success(&mut self) {
         self.active = false;
         self.corner_trap = false;
@@ -4267,9 +4200,6 @@ fn recovery_phase_code(phase: RecoveryPhase) -> f32 {
     match phase {
         RecoveryPhase::None => 0.0,
         RecoveryPhase::Stop => 1.0,
-        RecoveryPhase::Reverse => 2.0,
-        RecoveryPhase::Turn => 3.0,
-        RecoveryPhase::Probe => 4.0,
     }
 }
 
@@ -4369,22 +4299,6 @@ fn beam_clearance_buckets(beams: &[f32]) -> (f32, f32, f32) {
         .fold(1.0, f32::min);
     let right = beams[right_start..].iter().copied().fold(1.0, f32::min);
     (left, center, right)
-}
-
-fn reverse_ticks(attempt: usize) -> usize {
-    (6 + attempt.saturating_mul(2)).min(12)
-}
-
-fn turn_ticks(attempt: usize) -> usize {
-    (12 + attempt.saturating_mul(4)).min(24)
-}
-
-fn reverse_speed(attempt: usize) -> f32 {
-    (0.18 + attempt as f32 * 0.03).min(0.28)
-}
-
-fn turn_speed(attempt: usize) -> f32 {
-    (0.8 + attempt as f32 * 0.1).min(1.0)
 }
 
 fn arena_bounds(snapshot: &WorldSnapshot) -> Option<(f32, f32)> {
@@ -7523,7 +7437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_reign_reverse_interrupts_sim_stuck_recovery_motion() {
+    async fn direct_reign_reverse_drives_sim_while_stuck_active() {
         let root = test_ledger_root("sim-runner-reign-reverse-interrupts-stuck");
         let ledger = JsonlLedger::new(&root);
         let queue = Arc::new(Mutex::new(ReignQueue::default()));
@@ -7551,8 +7465,8 @@ mod tests {
         world.set_body(test_body(1.0, 1.0, 1.0, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
         runner.stuck.active = true;
-        runner.stuck.phase = RecoveryPhase::Turn;
-        runner.stuck.phase_ticks_remaining = 12;
+        runner.stuck.phase = RecoveryPhase::Stop;
+        runner.stuck.phase_ticks_remaining = 1;
         runner.stuck.turn_sign = 1.0;
 
         let mut observed_debug = None;
@@ -7603,6 +7517,98 @@ mod tests {
         assert!(saw_column);
         assert!(recovered);
         assert!(distance > 0.10, "distance after recovery was {distance}");
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct TrapRunMetrics {
+        collision_frames: usize,
+        stuck_frames: usize,
+        recovered: bool,
+        distance_m: f32,
+    }
+
+    async fn run_column_trap_metrics<C>(
+        ledger_name: &str,
+        conductor: C,
+        steps: usize,
+    ) -> TrapRunMetrics
+    where
+        C: Conductor + Send + 'static,
+    {
+        let root = test_ledger_root(ledger_name);
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger, conductor);
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ColumnTrap, 7));
+        let start = (
+            scenario.metadata.body.odometry.x_m,
+            scenario.metadata.body.odometry.y_m,
+        );
+        let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
+        let mut metrics = TrapRunMetrics::default();
+
+        runner
+            .run_steps_observing(steps, |snapshot| {
+                let flags = &snapshot.body.flags;
+                if flags.wall
+                    || flags.bump_left
+                    || flags.bump_right
+                    || flags.cliff_front_left
+                    || flags.cliff_front_right
+                {
+                    metrics.collision_frames += 1;
+                }
+                if let Some(stuck) = snapshot
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.name == "sim.stuck")
+                {
+                    metrics.stuck_frames +=
+                        (stuck.values.first().copied().unwrap_or_default() > 0.0) as usize;
+                    metrics.recovered |= stuck.values.get(7).copied() == Some(1.0);
+                }
+            })
+            .await
+            .unwrap();
+        let end = runner.world.body();
+        metrics.distance_m =
+            distance_between_points(start, (end.odometry.x_m, end.odometry.y_m));
+        metrics
+    }
+
+    #[tokio::test]
+    async fn column_trap_recovery_beats_plain_explore_baseline() {
+        let plain = run_column_trap_metrics(
+            "sim-runner-column-trap-plain-explore",
+            FixedConductor::new(ActionPrimitive::Explore {
+                style: ExploreStyle::RandomWalk,
+                duration_ms: 1_000,
+            }),
+            120,
+        )
+        .await;
+        let recovered = run_column_trap_metrics(
+            "sim-runner-column-trap-simple-recovery-comparison",
+            SimpleConductor::default(),
+            120,
+        )
+        .await;
+
+        assert!(
+            recovered.recovered,
+            "expected recovery event, got {recovered:?}"
+        );
+        assert!(
+            recovered.collision_frames < plain.collision_frames / 2,
+            "recovery should reduce repeated collision frames; plain={plain:?} recovered={recovered:?}"
+        );
+        assert!(
+            recovered.distance_m > plain.distance_m,
+            "recovery should make more progress than plain explore; plain={plain:?} recovered={recovered:?}"
+        );
+        assert!(
+            recovered.stuck_frames < plain.stuck_frames,
+            "recovery should reduce repeated stuck frames; plain={plain:?} recovered={recovered:?}"
+        );
     }
 
     #[derive(Clone, Debug)]
@@ -7907,8 +7913,7 @@ mod tests {
         for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
             detector.observe(&stuck_test_snapshot(0.2, 0.2, 1.0), Some(&action));
         }
-        detector.clearance_m = Some(0.8);
-        while detector.recovery_motion().is_some() {}
+        detector.finish_recovery_success();
         detector.clearance_m = Some(0.10);
         detector.recovery_attempts = 1;
         detector.trap_anchor = Some((0.2, 0.2));
@@ -7972,84 +7977,6 @@ mod tests {
         assert!(status.active);
         assert_eq!(status.trap_kind, TrapKind::Column);
         assert_eq!(status.stuck_ticks, STUCK_LOW_DISPLACEMENT_TICKS);
-    }
-
-    #[test]
-    fn recovery_transition_runs_stop_reverse_turn_probe_then_releases() {
-        let mut detector = StuckRecoveryController::default();
-        detector.active = true;
-        detector.corner_trap = true;
-        detector.phase = RecoveryPhase::Stop;
-        detector.phase_ticks_remaining = 1;
-        detector.turn_sign = -1.0;
-        detector.clearance_m = Some(0.8);
-
-        assert_eq!(detector.recovery_motion(), Some(MotionCommand::Stop));
-        assert_eq!(detector.phase, RecoveryPhase::Reverse);
-        for _ in 0..6 {
-            assert_eq!(
-                detector.recovery_motion(),
-                Some(MotionCommand::Forward { speed_m_s: -0.18 })
-            );
-        }
-        assert_eq!(detector.phase, RecoveryPhase::Turn);
-        for _ in 0..12 {
-            assert_eq!(
-                detector.recovery_motion(),
-                Some(MotionCommand::Turn { turn_rad_s: -0.8 })
-            );
-        }
-        assert_eq!(
-            detector.recovery_motion(),
-            Some(MotionCommand::Drive {
-                forward_m_s: 0.04,
-                turn_rad_s: -0.25
-            })
-        );
-
-        assert!(!detector.status().active);
-        assert!(detector.status().recovered);
-        assert_eq!(detector.recovery_motion(), None);
-    }
-
-    #[test]
-    fn failed_left_recovery_tries_right_next() {
-        let mut detector = StuckRecoveryController {
-            active: true,
-            phase: RecoveryPhase::Stop,
-            phase_ticks_remaining: 1,
-            turn_sign: 1.0,
-            clearance_m: Some(0.10),
-            ..StuckRecoveryController::default()
-        };
-
-        while detector.phase != RecoveryPhase::Probe {
-            assert!(detector.recovery_motion().is_some());
-        }
-        assert!(detector.recovery_motion().is_some());
-
-        let status = detector.status();
-        assert!(status.active);
-        assert_eq!(status.turn_sign, -1.0);
-        assert_eq!(status.recovery_attempts, 1);
-    }
-
-    #[test]
-    fn recovery_does_not_resume_while_clearance_is_too_low() {
-        let mut detector = StuckRecoveryController {
-            active: true,
-            phase: RecoveryPhase::Probe,
-            phase_ticks_remaining: 1,
-            turn_sign: -1.0,
-            clearance_m: Some(0.12),
-            ..StuckRecoveryController::default()
-        };
-
-        assert!(detector.recovery_motion().is_some());
-
-        assert!(detector.status().active);
-        assert_eq!(detector.status().phase, RecoveryPhase::Stop);
-        assert!(!detector.status().recovered);
     }
 
     #[test]

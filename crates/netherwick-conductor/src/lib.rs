@@ -85,7 +85,7 @@ impl Conductor for SimpleConductor {
         }
         if self.recovery.step == RecoveryStep::Idle {
             if contact_recovery_triggered(&input) {
-                self.start_contact_recovery(clearer_turn_direction(&input.range));
+                self.start_contact_recovery(contact_turn_direction(&input));
             } else if cramped_and_not_advancing(&input) {
                 if side_escape_gap(&input.range.beams) {
                     self.start_contact_recovery(clearer_turn_direction(&input.range));
@@ -210,6 +210,16 @@ fn contact_recovery_triggered(input: &ConductorInput) -> bool {
     input.body.flags.bump_left
         || input.body.flags.bump_right
         || input.body.flags.wall
+}
+
+fn contact_turn_direction(input: &ConductorInput) -> TurnDir {
+    if input.body.flags.bump_left && !input.body.flags.bump_right {
+        TurnDir::Right
+    } else if input.body.flags.bump_right && !input.body.flags.bump_left {
+        TurnDir::Left
+    } else {
+        clearer_turn_direction(&input.range)
+    }
 }
 
 fn cramped_and_not_advancing(input: &ConductorInput) -> bool {
