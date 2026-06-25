@@ -641,17 +641,29 @@ fn social_signal(now: &Now) -> f32 {
 }
 
 fn observed_object_summary(now: &Now) -> Vec<String> {
-    let mut objects = Vec::new();
+    let mut objects = now
+        .objects
+        .observations
+        .iter()
+        .filter(|observation| observation.confidence >= 0.3)
+        .map(|observation| observation.label.clone())
+        .collect::<Vec<_>>();
     if danger_signal(now) >= 0.5 {
-        objects.push("danger".to_string());
+        push_unique_object(&mut objects, "danger");
     }
     if charge_signal(now) >= 0.5 {
-        objects.push("charger".to_string());
+        push_unique_object(&mut objects, "charger");
     }
     if social_signal(now) >= 0.5 {
-        objects.push("person_or_speaker".to_string());
+        push_unique_object(&mut objects, "person_or_speaker");
     }
     objects
+}
+
+fn push_unique_object(objects: &mut Vec<String>, value: &str) {
+    if !objects.iter().any(|object| object == value) {
+        objects.push(value.to_string());
+    }
 }
 
 fn top_cells(

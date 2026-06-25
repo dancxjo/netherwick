@@ -98,6 +98,56 @@ pub struct EyeSense {
     pub scene_vectors: Vec<VectorArtifact>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectClass {
+    Obstacle,
+    Charger,
+    Person,
+    SoundSource,
+    Landmark,
+    Unknown,
+}
+
+impl Default for ObjectClass {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectObservationSource {
+    Sim,
+    Kinect,
+    Captioner,
+    HumanLabel,
+    Unknown,
+}
+
+impl Default for ObjectObservationSource {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ObjectObservation {
+    pub label: String,
+    pub class: ObjectClass,
+    pub bearing_rad: f32,
+    pub distance_m: Option<f32>,
+    pub confidence: f32,
+    pub source: ObjectObservationSource,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ObjectSense {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub observations: Vec<ObjectObservation>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EarSense {
     pub schema_version: u32,
@@ -704,6 +754,8 @@ pub struct Now {
     #[serde(default)]
     pub kinect: KinectSense,
     #[serde(default)]
+    pub objects: ObjectSense,
+    #[serde(default)]
     pub memory: MemorySense,
     #[serde(default)]
     pub predictions: PredictionSense,
@@ -755,6 +807,10 @@ impl Now {
             kinect: KinectSense {
                 schema_version: 1,
                 ..KinectSense::default()
+            },
+            objects: ObjectSense {
+                schema_version: 1,
+                ..ObjectSense::default()
             },
             memory: MemorySense::default(),
             predictions: PredictionSense {

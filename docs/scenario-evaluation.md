@@ -125,6 +125,8 @@ just run eval-scenario \
 
 The held-out behavior reports must show `model_better_than_hardcoded: true` before checkpoints are registered as shadow candidates. The combined shadow scenario report should preserve baseline success, collision, and veto metrics. The model-assisted scenario report is only a candidate-scoring gate: it may choose among typed actions, but close-range trap recovery must still yield to the baseline conductor. Do not use `danger-mode model-infer` or `action-value-mode model-infer` for the golden loop.
 
+Place-memory steering is part of the baseline conductor, not a learned-model privilege. A dangerous current place should turn toward `nearby_best_safe_direction_rad` when available. Low battery with known charger memory should first turn toward `nearby_best_charge_direction_rad`, then approach the charger once roughly aligned. Novel, low-danger places may inspect before default exploration.
+
 ## Comparing Runs
 
 Run a baseline first with no model checkpoints, then run the same scenario and episode count with shadow checkpoints. Compare:

@@ -113,6 +113,17 @@ impl Conductor for SimpleConductor {
         if input.body.battery_level <= self.config.low_battery
             && input.memory.place_charge_value > 0.5
         {
+            if let Some(direction) = input
+                .memory
+                .nearby_best_charge_direction_rad
+                .and_then(charge_alignment_turn)
+            {
+                return Ok(ActionPrimitive::Turn {
+                    direction,
+                    intensity: 0.4,
+                    duration_ms: 700,
+                });
+            }
             return Ok(ActionPrimitive::Approach {
                 target: ApproachTarget::Charger,
             });
@@ -120,7 +131,10 @@ impl Conductor for SimpleConductor {
         if let Some(action) = input.proposals.last() {
             return Ok(action.clone());
         }
-        if input.drives.curiosity >= self.config.novelty_threshold {
+        if input.drives.curiosity >= self.config.novelty_threshold
+            || (input.memory.place_novelty >= self.config.novelty_threshold
+                && input.memory.place_danger < self.config.danger_threshold)
+        {
             return Ok(ActionPrimitive::Inspect {
                 target: InspectTarget::Novelty,
             });
@@ -160,7 +174,11 @@ impl SimpleConductor {
                 })
             }
             RecoveryStep::Turn => {
-                let direction = self.recovery.turn_direction.clone().unwrap_or(TurnDir::Left);
+                let direction = self
+                    .recovery
+                    .turn_direction
+                    .clone()
+                    .unwrap_or(TurnDir::Left);
                 self.advance_recovery(RecoveryStep::Probe, 3);
                 Some(ActionPrimitive::Turn {
                     direction,
@@ -207,9 +225,7 @@ fn reign_action(input: &ConductorInput) -> Option<ActionPrimitive> {
 }
 
 fn contact_recovery_triggered(input: &ConductorInput) -> bool {
-    input.body.flags.bump_left
-        || input.body.flags.bump_right
-        || input.body.flags.wall
+    input.body.flags.bump_left || input.body.flags.bump_right || input.body.flags.wall
 }
 
 fn contact_turn_direction(input: &ConductorInput) -> TurnDir {
@@ -246,6 +262,10 @@ fn direction_from_bearing(bearing_rad: f32) -> TurnDir {
     } else {
         TurnDir::Left
     }
+}
+
+fn charge_alignment_turn(bearing_rad: f32) -> Option<TurnDir> {
+    (bearing_rad.abs() > 0.20).then(|| direction_from_bearing(bearing_rad))
 }
 
 fn range_clearance_sides(beams: &[f32]) -> (f32, f32) {
@@ -402,6 +422,74 @@ mod tests {
                 direction: TurnDir::Left,
                 intensity: 0.75,
                 duration_ms: 500
+            }
+        );
+    }
+
+    #[test]
+    fn dangerous_place_turns_toward_remembered_safe_direction() {
+        let mut conductor = SimpleConductor::default();
+        let mut input = input_with_body(BodySense::default());
+        input.memory.place_danger = 0.9;
+        input.memory.nearby_best_safe_direction_rad = Some(-0.8);
+        input.range.beams = vec![0.9, 0.9, 0.9, 0.1, 0.1, 0.1];
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.5,
+                duration_ms: 1_000
+            }
+        );
+    }
+
+    #[test]
+    fn low_battery_turns_toward_remembered_charger_before_approach() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.15;
+        let mut input = input_with_body(body);
+        input.memory.place_charge_value = 0.8;
+        input.memory.nearby_best_charge_direction_rad = Some(0.7);
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.4,
+                duration_ms: 700
+            }
+        );
+    }
+
+    #[test]
+    fn low_battery_approaches_charger_when_memory_bearing_is_aligned() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.15;
+        let mut input = input_with_body(body);
+        input.memory.place_charge_value = 0.8;
+        input.memory.nearby_best_charge_direction_rad = Some(0.05);
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Approach {
+                target: ApproachTarget::Charger
+            }
+        );
+    }
+
+    #[test]
+    fn safe_novel_place_inspects_before_default_explore() {
+        let mut conductor = SimpleConductor::default();
+        let mut input = input_with_body(BodySense::default());
+        input.memory.place_novelty = 0.9;
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Inspect {
+                target: InspectTarget::Novelty
             }
         );
     }

@@ -5,7 +5,8 @@ use netherwick_body::{
 };
 use netherwick_now::{
     EarSense, ExtensionSense, FaceSense, GpsSense, ImuSense, KinectJointSense, KinectSense,
-    KinectSkeletonSense, RangeSense, VoiceSense,
+    KinectSkeletonSense, ObjectClass, ObjectObservation, ObjectObservationSource, ObjectSense,
+    RangeSense, VoiceSense,
 };
 use netherwick_sensors::{
     EyeFrame, EyeFrameFormat, PcmAudioFrame, World, WorldSnapshot, WorldUpdate,
@@ -330,6 +331,7 @@ impl VirtualWorld {
         state.snapshot.ear = ear;
         state.snapshot.ear_pcm = ear_pcm;
         state.snapshot.kinect = project_kinect_sense(body, &state.objects, state.arena);
+        state.snapshot.objects = project_object_sense(body, &state.objects);
         state.snapshot.extensions = vec![ExtensionSense {
             schema_version: 1,
             name: "sim.world".to_string(),
@@ -767,6 +769,40 @@ fn project_voice_sense(body: &BodySense, objects: &[SimObject]) -> VoiceSense {
     }
 }
 
+fn project_object_sense(body: &BodySense, objects: &[SimObject]) -> ObjectSense {
+    let observations = visible_objects(body, objects)
+        .into_iter()
+        .map(|(object, distance, bearing)| ObjectObservation {
+            label: object.label.clone(),
+            class: sim_object_class(&object.kind),
+            bearing_rad: bearing,
+            distance_m: Some((distance - object.radius_m - ROBOT_RADIUS_M).max(0.0)),
+            confidence: visible_object_confidence(distance, bearing),
+            source: ObjectObservationSource::Sim,
+        })
+        .collect();
+    ObjectSense {
+        schema_version: 1,
+        observations,
+    }
+}
+
+fn sim_object_class(kind: &SimObjectKind) -> ObjectClass {
+    match kind {
+        SimObjectKind::Obstacle => ObjectClass::Obstacle,
+        SimObjectKind::Charger => ObjectClass::Charger,
+        SimObjectKind::Person { .. } => ObjectClass::Person,
+        SimObjectKind::SoundSource { .. } => ObjectClass::SoundSource,
+        SimObjectKind::Landmark { .. } => ObjectClass::Landmark,
+    }
+}
+
+fn visible_object_confidence(distance_m: f32, bearing_rad: f32) -> f32 {
+    let distance_score = (1.0 - distance_m / VISIBLE_MAX_M).clamp(0.0, 1.0);
+    let bearing_score = (1.0 - bearing_rad.abs() / (VISIBLE_FOV_RAD * 0.5)).clamp(0.0, 1.0);
+    (0.4 + 0.4 * distance_score + 0.2 * bearing_score).clamp(0.0, 1.0)
+}
+
 fn project_ear_sense(body: &BodySense, objects: &[SimObject]) -> (EarSense, Option<PcmAudioFrame>) {
     let audible = audible_objects(body, objects);
     let transcript = audible
@@ -1078,6 +1114,29 @@ mod tests {
 
         assert_eq!(snapshot.face.embeddings.len(), 1);
         assert_eq!(snapshot.kinect.skeletons.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn visible_object_projects_typed_observation_into_now() {
+        let (mut world, _motor) = VirtualWorld::new_with_motor(0, arena());
+        world.add_object(SimObject::charger("dock", "charger dock", 3.0, 2.0, 0.2));
+
+        let snapshot = world.snapshot().await.unwrap();
+        let observation = snapshot
+            .objects
+            .observations
+            .iter()
+            .find(|observation| observation.label == "charger dock")
+            .unwrap();
+
+        assert_eq!(observation.class, ObjectClass::Charger);
+        assert_eq!(observation.source, ObjectObservationSource::Sim);
+        assert!(observation.bearing_rad.abs() < 0.01);
+        assert!(observation.distance_m.unwrap() > 0.5);
+        assert!(observation.confidence > 0.5);
+
+        let now = snapshot.to_now(snapshot.body.last_update_ms);
+        assert_eq!(now.objects.observations, snapshot.objects.observations);
     }
 
     #[tokio::test]

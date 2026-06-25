@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use netherwick_actions::{ActionPrimitive, LlmActionProposal};
 use netherwick_body::BodySense;
 use netherwick_now::{
-    EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense, RangeSense,
-    VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION,
-    IMAGE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
+    EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense, ObjectSense,
+    RangeSense, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
+    IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
 };
 use netherwick_now::{Now, PredictionSense, SurpriseSense};
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,14 @@ pub trait World: Send {
         .await
     }
 
+    async fn set_object_sense(&mut self, objects: ObjectSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            objects: Some(objects),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
     async fn set_face_sense(&mut self, face: FaceSense) -> Result<()> {
         self.apply_update(WorldUpdate {
             face: Some(face),
@@ -160,6 +168,7 @@ pub enum SensePacket {
     Kinect(KinectSense),
     Face(FaceSense),
     Voice(VoiceSense),
+    Objects(ObjectSense),
     Extension(ExtensionSense),
 }
 
@@ -263,6 +272,9 @@ impl NowBuilder {
                 SensePacket::Voice(voice) => {
                     self.last_snapshot.voice = voice;
                     self.last_updates.voice = Some(t_ms);
+                }
+                SensePacket::Objects(objects) => {
+                    self.last_snapshot.objects = objects;
                 }
                 SensePacket::Extension(extension) => {
                     self.last_snapshot.extensions.push(extension);
@@ -487,6 +499,7 @@ pub struct WorldSnapshot {
     pub imu: ImuSense,
     pub gps: Option<GpsSense>,
     pub kinect: KinectSense,
+    pub objects: ObjectSense,
     pub face: FaceSense,
     pub voice: VoiceSense,
     pub extensions: Vec<ExtensionSense>,
@@ -522,6 +535,10 @@ impl Default for WorldSnapshot {
                 schema_version: 1,
                 ..KinectSense::default()
             },
+            objects: ObjectSense {
+                schema_version: 1,
+                ..ObjectSense::default()
+            },
             face: FaceSense {
                 schema_version: 1,
                 ..FaceSense::default()
@@ -547,6 +564,7 @@ impl WorldSnapshot {
         now.imu = self.imu.clone();
         now.gps = self.gps.clone();
         now.kinect = self.kinect.clone();
+        now.objects = self.objects.clone();
         now.predictions = PredictionSense {
             schema_version: 1,
             ..PredictionSense::default()
@@ -591,6 +609,7 @@ pub struct WorldUpdate {
     pub imu: Option<ImuSense>,
     pub gps: Option<GpsSense>,
     pub kinect: Option<KinectSense>,
+    pub objects: Option<ObjectSense>,
     pub face: Option<FaceSense>,
     pub voice: Option<VoiceSense>,
     pub extensions: Option<Vec<ExtensionSense>>,
@@ -624,6 +643,9 @@ impl WorldUpdate {
         }
         if let Some(kinect) = self.kinect {
             snapshot.kinect = kinect;
+        }
+        if let Some(objects) = self.objects {
+            snapshot.objects = objects;
         }
         if let Some(face) = self.face {
             snapshot.face = face;

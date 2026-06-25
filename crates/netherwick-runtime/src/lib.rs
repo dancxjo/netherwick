@@ -7635,8 +7635,7 @@ mod tests {
             .await
             .unwrap();
         let end = runner.world.body();
-        metrics.distance_m =
-            distance_between_points(start, (end.odometry.x_m, end.odometry.y_m));
+        metrics.distance_m = distance_between_points(start, (end.odometry.x_m, end.odometry.y_m));
         metrics
     }
 
