@@ -222,10 +222,11 @@ impl Default for NudgePolicy {
 
 impl NudgePolicy {
     pub fn virtual_default() -> Self {
-        Self {
-            enabled: true,
-            ..Self::default()
-        }
+        let mut policy = Self::default();
+        policy.enabled = true;
+        policy.idle_after_ms = 1_200;
+        policy.cooldown_ms = 2_500;
+        policy
     }
 }
 
@@ -269,9 +270,8 @@ impl NudgeController {
             .map(|last| now.t_ms.saturating_sub(last) < 1_500)
             .unwrap_or(false);
 
-        let low_motion = is_near_zero_motor(self.last_motor)
-            && now.body.velocity.forward_m_s.abs() < 0.02
-            && now.body.velocity.turn_rad_s.abs() < 0.04;
+        let low_motion =
+            self.last_motor.forward.abs() < 0.02 && now.body.velocity.forward_m_s.abs() < 0.02;
         let low_pose_delta = self
             .last_pose
             .map(|pose| pose_delta_small(pose, now.body.odometry))
@@ -439,8 +439,7 @@ fn pose_delta_small(left: netherwick_core::Pose2, right: netherwick_core::Pose2)
     let dx = left.x_m - right.x_m;
     let dy = left.y_m - right.y_m;
     let distance = (dx * dx + dy * dy).sqrt();
-    let heading = (left.heading_rad - right.heading_rad).abs();
-    distance < 0.025 && heading < 0.05
+    distance < 0.025
 }
 
 fn forward_clear(now: &Now, clearance_m: f32) -> bool {
@@ -1817,8 +1816,14 @@ impl ReignQueue {
     }
 }
 
-fn immediate_reign_action(input: &Option<ReignInput>) -> Option<ActionPrimitive> {
+fn mechanical_reign_action(input: &Option<ReignInput>) -> Option<ActionPrimitive> {
     let input = input.as_ref()?;
+    if !matches!(
+        input.mode,
+        netherwick_actions::ReignMode::Direct | netherwick_actions::ReignMode::Assist
+    ) {
+        return None;
+    }
     input.command.to_action()
 }
 
@@ -1949,7 +1954,7 @@ where
         let reign_action = reign_input
             .as_ref()
             .and_then(|input| input.command.to_action());
-        let immediate_reign_action = immediate_reign_action(&reign_input);
+        let mechanical_reign_action = mechanical_reign_action(&reign_input);
 
         let mut behavior_runs: Vec<ErasedBehaviorRunRecord> = Vec::new();
         let experience_input = ExperienceBehaviorInput::from_now(&now);
@@ -2162,7 +2167,7 @@ where
             body: now.body.clone(),
             proposals,
         })?;
-        if let Some(action) = immediate_reign_action.as_ref() {
+        if let Some(action) = mechanical_reign_action.as_ref() {
             baseline_action = action.clone();
         }
 
@@ -2270,7 +2275,7 @@ where
             baseline_action.clone(),
             candidate_scores,
         );
-        if let Some(action) = immediate_reign_action.as_ref() {
+        if let Some(action) = mechanical_reign_action.as_ref() {
             action_selection.selected_action = Some(action.clone());
             action_selection.selected_score = None;
             action_selection.safety_overrode = false;
@@ -5037,6 +5042,49 @@ mod tests {
             .as_ref()
             .map(|outcome| outcome.accepted_by_conductor)
             .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn observe_or_suggest_reign_does_not_mechanically_override_selector() {
+        for mode in [ReignMode::ObserveOnly, ReignMode::Suggest] {
+            let ledger = JsonlLedger::new(format!(
+                "/tmp/netherwick-runtime-non-driving-reign-{mode:?}"
+            ));
+            let memory = InMemoryExperienceStore::new();
+            let recall = memory.clone();
+            let mut runtime = MinimalRuntime::new(
+                ledger,
+                memory,
+                recall,
+                FixedConductor::new(ActionPrimitive::Stop),
+                SimpleSafety::default(),
+                netherwick_llm::NoopLlmAgent,
+            );
+            let command = ReignCommand::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.5,
+                duration_ms: 500,
+            };
+            runtime
+                .reign_queue
+                .lock()
+                .unwrap()
+                .push(test_reign_input(100, mode, command, 2_000));
+
+            let tick = runtime
+                .tick(idle_now(100), ExperienceLatent::default(), Vec::new())
+                .await
+                .unwrap();
+
+            assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+            assert!(tick.frame.reign_input.is_some());
+            assert!(!tick
+                .frame
+                .reign_outcome
+                .as_ref()
+                .map(|outcome| outcome.accepted_by_conductor)
+                .unwrap_or(true));
+        }
     }
 
     #[tokio::test]

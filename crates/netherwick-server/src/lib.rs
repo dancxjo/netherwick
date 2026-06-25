@@ -100,6 +100,7 @@ impl ReignServerState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReignCommandRequest {
+    #[serde(default = "default_reign_mode")]
     pub mode: ReignMode,
     pub command: ReignCommand,
     #[serde(default = "default_priority")]
@@ -1564,7 +1565,7 @@ pub fn snapshot_to_scene(
             .unwrap_or_default(),
         arena: metadata.and_then(|metadata| metadata.arena),
         sensor_calibration,
-        action: SceneAction::default(),
+        action: scene_action_from_snapshot(snapshot),
         prod: SceneProd {
             idle_ms: prod_state.idle_ms,
             last_nudge_ms: prod_state.last_nudge_ms,
@@ -1596,6 +1597,26 @@ pub fn snapshot_to_scene(
             surprise: None,
         },
         warnings,
+    }
+}
+
+fn scene_action_from_snapshot(snapshot: &WorldSnapshot) -> SceneAction {
+    let forward = snapshot.body.velocity.forward_m_s;
+    let turn = snapshot.body.velocity.turn_rad_s;
+    let latest = if forward.abs() < 0.01 && turn.abs() < 0.01 {
+        Some("stop".to_string())
+    } else if turn.abs() < 0.01 {
+        Some(format!("forward {:.2} m/s", forward))
+    } else if forward.abs() < 0.01 {
+        Some(format!("turn {:.2} rad/s", turn))
+    } else {
+        Some(format!("drive {:.2} m/s, turn {:.2} rad/s", forward, turn))
+    };
+    SceneAction {
+        latest,
+        safety_override: snapshot.body.flags.wheel_drop
+            || snapshot.body.flags.cliff_left
+            || snapshot.body.flags.cliff_right,
     }
 }
 
@@ -2287,6 +2308,10 @@ fn finite_intensity(value: f32) -> Result<f32, ReignApiError> {
 
 fn default_priority() -> f32 {
     0.8
+}
+
+fn default_reign_mode() -> ReignMode {
+    ReignMode::Direct
 }
 
 fn wall_now_ms() -> TimeMs {
@@ -4349,6 +4374,33 @@ mod tests {
             sense.latest.as_ref().map(|value| &value.command),
             Some(ReignCommand::Stop)
         ));
+    }
+
+    #[tokio::test]
+    async fn posted_reign_command_defaults_to_direct_mode() {
+        let state = ReignServerState::standalone();
+        let request: ReignCommandRequest = serde_json::from_value(serde_json::json!({
+            "command": {
+                "type": "Turn",
+                "direction": "Left",
+                "intensity": 0.5,
+                "duration_ms": 500
+            },
+            "ttl_ms": 2_000
+        }))
+        .unwrap();
+
+        let Json(input) = post_reign_command(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        let sense = state.queue().lock().unwrap().sense(input.issued_at_ms);
+
+        assert_eq!(input.mode, ReignMode::Direct);
+        assert!(sense.active);
+        assert_eq!(
+            sense.latest.as_ref().map(|input| &input.mode),
+            Some(&ReignMode::Direct)
+        );
     }
 
     #[tokio::test]

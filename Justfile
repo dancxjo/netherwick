@@ -121,8 +121,8 @@ go target="virtual":
     echo "Netherwick Dream World is starting."
     echo "Virtual training theater is collecting experience."
     echo "Inline learning defaults to world-outcome. Set NETHERWICK_INLINE_LEARNING_MODE=off for collect-only."
-    echo "Dream controller mode: baseline (no automatic NEAT training in go virtual)."
-    echo "Use just evolve for Dream NEAT policy training."
+    echo "Dream controller mode: mechanical Reign passthrough."
+    echo "Models shadow the mechanics; no NEAT/evolution controller is used for live control."
     echo
     echo "Desktop:"
     echo "  https://127.0.0.1:$PORT/view/3d"
@@ -138,24 +138,19 @@ go target="virtual":
         qrencode -t ANSIUTF8 "https://$LAN_IP:$PORT/view/3d" || true
     fi
     cargo build -p netherwick-tools
-    AUTO_DREAM_POLICY="${NETHERWICK_AUTO_DREAM_POLICY:-0}"
-    DREAM_POLICY_CHECKPOINT="${NETHERWICK_DREAM_POLICY_CHECKPOINT:-}"
-    if [ -z "$DREAM_POLICY_CHECKPOINT" ] && [ "$AUTO_DREAM_POLICY" = "1" ] && [ -f "${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}/evolve-best.json" ]; then
-        DREAM_POLICY_CHECKPOINT="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}/evolve-best.json"
-    fi
     SIM_DREAM_POLICY_ARGS=()
-    if [ -n "$DREAM_POLICY_CHECKPOINT" ]; then
-        echo "Visible Dream World controller: $DREAM_POLICY_CHECKPOINT"
-        SIM_DREAM_POLICY_ARGS=(--dream-policy-checkpoint "$DREAM_POLICY_CHECKPOINT")
-    else
-        echo "Visible Dream World controller: baseline"
+    ACTION_SELECTOR="${NETHERWICK_ACTION_SELECTOR:-baseline}"
+    if [ -n "${NETHERWICK_DREAM_POLICY_CHECKPOINT:-}" ] || [ "${NETHERWICK_AUTO_DREAM_POLICY:-0}" = "1" ]; then
+        echo "Visible Dream World controller: mechanical Reign passthrough (Dream NEAT ignored)"
     fi
+    echo "Visible Dream World action selector: $ACTION_SELECTOR"
     target/debug/netherwick sim \
         --live \
         --live-tls \
         --live-addr "0.0.0.0:$PORT" \
         --live-tls-cert certs/netherwick-dev.crt \
         --live-tls-key certs/netherwick-dev.key \
+        --action-selector "$ACTION_SELECTOR" \
         --scenario "${NETHERWICK_SCENARIO:-dream}" \
         --steps "${NETHERWICK_SIM_STEPS:-1000000000}" \
         --tick-delay-ms "${NETHERWICK_TICK_DELAY_MS:-100}" \

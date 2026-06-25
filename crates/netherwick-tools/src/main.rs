@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
-use netherwick_actions::{action_to_motor_command, ActionPrimitive};
+use netherwick_actions::ActionPrimitive;
 use netherwick_actions::{ApproachTarget, ExploreStyle, TurnDir};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
@@ -38,8 +38,7 @@ use netherwick_server::{
 };
 use netherwick_sim::{build_scenario, ScenarioConfig, ScenarioKind, SimObjectKind};
 use netherwick_training::dream_policy::{
-    load_best_genome, train_dream_policy, DreamGenome, DreamLevel, DreamObservation,
-    DreamPolicyCheckpoint, DreamTrainingConfig, OBSERVATION_DIM,
+    load_best_genome, train_dream_policy, DreamLevel, DreamTrainingConfig,
 };
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
@@ -341,117 +340,6 @@ impl From<InlineLearningModeArg> for InlineLearningMode {
             InlineLearningModeArg::ShadowOnly => InlineLearningMode::ShadowOnly,
             InlineLearningModeArg::WorldOutcome => InlineLearningMode::WorldOutcome,
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-enum LiveSimConductor {
-    Baseline(SimpleConductor),
-    DreamNeat(DreamNeatConductor),
-}
-
-impl Conductor for LiveSimConductor {
-    fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
-        if let Some(action) = input
-            .reign
-            .latest
-            .as_ref()
-            .and_then(|input| input.command.to_action())
-        {
-            return Ok(action);
-        }
-        match self {
-            Self::Baseline(conductor) => conductor.choose(input),
-            Self::DreamNeat(conductor) => conductor.choose(input),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct DreamNeatConductor {
-    genome: DreamGenome,
-    level: DreamLevel,
-    checkpoint_path: PathBuf,
-    previous_action: Option<ActionPrimitive>,
-}
-
-impl DreamNeatConductor {
-    fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let checkpoint = load_best_genome(path)?;
-        Ok(Self::from_checkpoint(path.to_path_buf(), checkpoint))
-    }
-
-    fn from_checkpoint(path: PathBuf, checkpoint: DreamPolicyCheckpoint) -> Self {
-        Self {
-            genome: checkpoint.genome,
-            level: checkpoint.level,
-            checkpoint_path: path,
-            previous_action: None,
-        }
-    }
-
-    fn observation_from_input(&self, input: &ConductorInput) -> DreamObservation {
-        let mut values = Vec::with_capacity(OBSERVATION_DIM);
-        for beam in input.range.beams.iter().take(16) {
-            values.push(beam.clamp(0.0, 1.0));
-        }
-        while values.len() < 16 {
-            values.push(1.0);
-        }
-
-        let previous_motor = action_to_motor_command(self.previous_action.as_ref());
-        values.extend([
-            bool01(input.body.flags.bump_left),
-            bool01(input.body.flags.bump_right),
-            bool01(input.body.flags.cliff_left || input.body.flags.cliff_front_left),
-            bool01(input.body.flags.cliff_right || input.body.flags.cliff_front_right),
-            bool01(input.body.flags.wheel_drop),
-            input.body.battery_level.clamp(0.0, 1.0),
-            bool01(input.body.charging),
-            input.body.velocity.forward_m_s.clamp(-0.5, 0.5) / 0.5,
-            input.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
-            0.0,
-            1.0,
-            input.memory.place_charge_value.clamp(0.0, 1.0),
-            0.0,
-            1.0,
-            input.memory.place_social_value.clamp(0.0, 1.0),
-            input
-                .memory
-                .place_novelty
-                .max(input.drives.curiosity)
-                .clamp(0.0, 1.0),
-            input.memory.place_familiarity.clamp(0.0, 1.0),
-            previous_motor.forward.clamp(-0.5, 0.5) / 0.5,
-            previous_motor.turn.clamp(-1.0, 1.0),
-            input.drives.danger_avoidance.clamp(0.0, 1.0),
-            self.level.id() as f32 / 6.0,
-        ]);
-
-        values.extend(input.latent.z.iter().copied().take(24));
-        values.push(input.latent.confidence.clamp(0.0, 1.0));
-        values.push(input.latent.reconstruction_error.clamp(0.0, 1.0));
-        values.push(input.latent.prediction_error.clamp(0.0, 1.0));
-        values.resize(OBSERVATION_DIM, 0.0);
-        DreamObservation { values }
-    }
-}
-
-impl Conductor for DreamNeatConductor {
-    fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
-        let observation = self.observation_from_input(&input);
-        let action = self.genome.infer(&observation).to_action(self.level);
-        self.previous_action = Some(action.clone());
-        Ok(action)
-    }
-}
-
-fn bool01(value: bool) -> f32 {
-    if value {
-        1.0
-    } else {
-        0.0
     }
 }
 
@@ -987,25 +875,14 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let (models, model_loading) = load_runtime_models_from_flags(&flags)?;
     let action_selector_mode = ActionSelectorMode::from(args.action_selector);
     let inline_learning = inline_learning_config_from_sim_args(&args)?;
-    let mut models_loaded = loaded_model_names(&model_loading);
-    let mut conductor = LiveSimConductor::Baseline(SimpleConductor::default());
+    let models_loaded = loaded_model_names(&model_loading);
+    let conductor = SimpleConductor::default();
     let mut live_action_selector_label = action_selector_mode.as_str().to_string();
     if let Some(checkpoint) = args.dream_policy_checkpoint.as_deref() {
-        let dream_conductor = DreamNeatConductor::load(checkpoint)
-            .with_context(|| format!("failed to load dream policy checkpoint {checkpoint}"))?;
         println!(
-            "Dream NEAT controller loaded: level {}, genome {}, checkpoint {}",
-            dream_conductor.level.name(),
-            dream_conductor.genome.id,
-            dream_conductor.checkpoint_path.display()
+            "Dream NEAT controller ignored for live control: {checkpoint}. Reign mechanics drive directly; models remain shadow observers."
         );
-        models_loaded.push(format!(
-            "dream-neat:{}:genome-{}",
-            dream_conductor.level.name(),
-            dream_conductor.genome.id
-        ));
-        live_action_selector_label = format!("dream-neat+{}", action_selector_mode.as_str());
-        conductor = LiveSimConductor::DreamNeat(dream_conductor);
+        live_action_selector_label = format!("reign-passthrough+{}", action_selector_mode.as_str());
     }
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();

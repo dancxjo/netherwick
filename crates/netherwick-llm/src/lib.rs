@@ -323,6 +323,11 @@ pub fn summarized_senses(now: &Now) -> Vec<String> {
             "Latest remote command: {}.",
             summarize_reign_command(input)
         ));
+        if let Some(action) = input.command.to_action() {
+            if let Ok(json) = serde_json::to_string(&action_spec_json(&action)) {
+                lines.push(format!("Matching executable remote action JSON: {json}."));
+            }
+        }
         if let Some(note) = &input.note {
             lines.push(format!("Remote note: {note}"));
         }
@@ -624,16 +629,26 @@ impl LlmAgent for OllamaLlmAgent {
             Err(_) => return Ok(LlmTickResult::default()),
         };
 
-        let action = if self.config.allow_commands {
+        let model_action = if self.config.allow_commands {
             reply.action.and_then(parse_action_spec)
         } else {
             None
         };
+        let reign_action = if self.config.allow_commands {
+            active_reign_action(now)
+        } else {
+            None
+        };
+        let action = reign_action.clone().or(model_action);
         let critique = reply
             .critique
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let summary = reply.summary.trim().to_string();
+        let summary = if reply.summary.trim().is_empty() {
+            reign_command_summary(now).unwrap_or_default()
+        } else {
+            reply.summary.trim().to_string()
+        };
         let confidence = reply.confidence.clamp(0.0, 1.0);
 
         let conscious_command =
@@ -882,6 +897,98 @@ fn summarize_reign_command(input: &netherwick_actions::ReignInput) -> String {
             format!("Set mode {:?}", mode)
         }
     }
+}
+
+fn reign_command_summary(now: &Now) -> Option<String> {
+    let input = now.reign.latest.as_ref()?;
+    if !reign_command_can_drive_agent(now, input) {
+        return None;
+    }
+    Some(format!(
+        "Following Reign command: {}",
+        summarize_reign_command(input)
+    ))
+}
+
+fn active_reign_action(now: &Now) -> Option<ActionPrimitive> {
+    let input = now.reign.latest.as_ref()?;
+    if !reign_command_can_drive_agent(now, input) {
+        return None;
+    }
+    input.command.to_action()
+}
+
+fn action_spec_json(action: &ActionPrimitive) -> serde_json::Value {
+    match action {
+        ActionPrimitive::Stop => serde_json::json!({ "kind": "stop" }),
+        ActionPrimitive::Go {
+            intensity,
+            duration_ms,
+        } => serde_json::json!({
+            "kind": "go",
+            "intensity": intensity,
+            "duration_ms": duration_ms,
+        }),
+        ActionPrimitive::Turn {
+            direction,
+            intensity,
+            duration_ms,
+        } => serde_json::json!({
+            "kind": "turn",
+            "direction": match direction {
+                TurnDir::Left => "left",
+                TurnDir::Right => "right",
+            },
+            "intensity": intensity,
+            "duration_ms": duration_ms,
+        }),
+        ActionPrimitive::Inspect { target } => serde_json::json!({
+            "kind": "inspect",
+            "target": match target {
+                InspectTarget::Novelty => "novelty",
+                InspectTarget::Charger => "charger",
+                InspectTarget::Person => "person",
+                InspectTarget::Sound => "sound",
+            },
+        }),
+        ActionPrimitive::Approach { target } => serde_json::json!({
+            "kind": "approach",
+            "target": match target {
+                ApproachTarget::Charger => "charger",
+                ApproachTarget::Person => "person",
+                ApproachTarget::Sound => "sound",
+            },
+        }),
+        ActionPrimitive::Dock => serde_json::json!({ "kind": "dock" }),
+        ActionPrimitive::Explore { style, duration_ms } => serde_json::json!({
+            "kind": "explore",
+            "style": match style {
+                ExploreStyle::Wander => "wander",
+                ExploreStyle::RandomWalk => "random_walk",
+                ExploreStyle::WallFollow => "wall_follow",
+            },
+            "duration_ms": duration_ms,
+        }),
+        ActionPrimitive::Speak { text } => serde_json::json!({
+            "kind": "speak",
+            "text": text,
+        }),
+        ActionPrimitive::Chirp { pattern } => serde_json::json!({
+            "kind": "chirp",
+            "pattern": match pattern {
+                ChirpPattern::Confirm => "confirm",
+                ChirpPattern::Warning => "warning",
+                ChirpPattern::Curious => "curious",
+            },
+        }),
+    }
+}
+
+fn reign_command_can_drive_agent(now: &Now, input: &netherwick_actions::ReignInput) -> bool {
+    if !now.reign.active {
+        return false;
+    }
+    !matches!(input.mode, netherwick_actions::ReignMode::ObserveOnly)
 }
 
 fn summarize_futures(futures: &[FuturePrediction]) -> String {
@@ -1300,7 +1407,55 @@ mod tests {
 
         assert!(senses.contains("Remote control active: Direct"));
         assert!(senses.contains("Latest remote command: Turn Left"));
+        assert!(senses.contains(
+            "Matching executable remote action JSON: {\"direction\":\"left\",\"duration_ms\":500,\"intensity\":0.5,\"kind\":\"turn\"}."
+        ));
         assert!(senses.contains("Remote note: turn toward charger"));
+    }
+
+    #[test]
+    fn active_reign_action_becomes_llm_command_action() {
+        let command = ReignCommand::Go {
+            intensity: 0.4,
+            duration_ms: 700,
+        };
+        let mut now = Now::blank(100, BodySense::default());
+        now.reign.active = true;
+        now.reign.mode = Some(ReignMode::Assist);
+        now.reign.latest = Some(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: 1_100,
+            source: ReignSource::WebRemote,
+            mode: ReignMode::Assist,
+            command: command.clone(),
+            priority: 1.0,
+            note: None,
+        });
+
+        assert_eq!(active_reign_action(&now), command.to_action());
+        assert_eq!(
+            reign_command_summary(&now),
+            Some("Following Reign command: Go, intensity 0.40, 700ms".to_string())
+        );
+    }
+
+    #[test]
+    fn observe_only_reign_does_not_become_llm_command_action() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.reign.active = true;
+        now.reign.mode = Some(ReignMode::ObserveOnly);
+        now.reign.latest = Some(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: 1_100,
+            source: ReignSource::WebRemote,
+            mode: ReignMode::ObserveOnly,
+            command: ReignCommand::Stop,
+            priority: 1.0,
+            note: None,
+        });
+        assert_eq!(active_reign_action(&now), None);
     }
 
     #[test]
