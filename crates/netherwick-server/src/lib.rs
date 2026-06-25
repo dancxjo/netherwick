@@ -19,6 +19,7 @@ use netherwick_actions::{
     ActionPrimitive, ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir,
 };
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
+use netherwick_body::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
 use netherwick_now::{KinectSkeletonSense, ReignSense};
 use netherwick_runtime::{
@@ -608,7 +609,13 @@ pub struct SceneAudio {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SceneAction {
     pub latest: Option<String>,
+    pub desired_motor: Option<MotorCommand>,
+    pub final_motor: Option<MotorCommand>,
+    pub motion_sent: Option<MotionCommand>,
+    pub motor_applied: Option<bool>,
+    pub movement_delta: Option<f32>,
     pub safety_override: bool,
+    pub not_moving_reason: Option<String>,
     pub latest_llm_proposed_action: Option<ActionPrimitive>,
     pub llm_action_accepted: Option<bool>,
     pub llm_action_safety_vetoed: Option<bool>,
@@ -1802,6 +1809,7 @@ pub fn snapshot_to_scene(
 fn scene_action_from_snapshot(snapshot: &WorldSnapshot) -> SceneAction {
     let forward = snapshot.body.velocity.forward_m_s;
     let turn = snapshot.body.velocity.turn_rad_s;
+    let action_debug = snapshot.action_debug.as_ref();
     let latest = if forward.abs() < 0.01 && turn.abs() < 0.01 {
         Some("stop".to_string())
     } else if turn.abs() < 0.01 {
@@ -1813,9 +1821,31 @@ fn scene_action_from_snapshot(snapshot: &WorldSnapshot) -> SceneAction {
     };
     SceneAction {
         latest,
-        safety_override: snapshot.body.flags.wheel_drop
-            || snapshot.body.flags.cliff_left
-            || snapshot.body.flags.cliff_right,
+        desired_motor: action_debug_value(action_debug, "desired_motor"),
+        final_motor: action_debug_value(action_debug, "final_motor"),
+        motion_sent: action_debug_value(action_debug, "motion_sent_to_sim"),
+        motor_applied: action_debug
+            .and_then(|debug| debug.get("motor_applied"))
+            .and_then(|value| value.as_bool()),
+        movement_delta: action_debug
+            .and_then(|debug| debug.get("movement_delta"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        safety_override: action_debug
+            .and_then(|debug| debug.get("safety_override"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or_else(|| {
+                snapshot.body.flags.wheel_drop
+                    || snapshot.body.flags.cliff_left
+                    || snapshot.body.flags.cliff_right
+            }),
+        not_moving_reason: action_debug
+            .and_then(|debug| {
+                debug
+                    .get("why_not_moving")
+                    .or_else(|| debug.get("not_moving_reason"))
+            })
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         latest_llm_proposed_action: snapshot
             .llm_action_proposal
             .as_ref()
@@ -1843,6 +1873,16 @@ fn scene_action_from_snapshot(snapshot: &WorldSnapshot) -> SceneAction {
             .as_ref()
             .and_then(|proposal| proposal.safety_reason.clone()),
     }
+}
+
+fn action_debug_value<T>(debug: Option<&serde_json::Value>, key: &str) -> Option<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    debug
+        .and_then(|debug| debug.get(key))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 fn scene_stuck_from_snapshot(snapshot: &WorldSnapshot) -> SceneStuck {
@@ -2978,6 +3018,11 @@ canvas{display:block}
     <dt>weights</dt><dd id="weights_updating">-</dd>
     <dt>ledger</dt><dd id="ledger_counts">-</dd>
     <dt>selector</dt><dd id="action_selector_mode">-</dd>
+    <dt>chosen</dt><dd id="chosen_action">-</dd>
+    <dt>motor</dt><dd id="motor_line">-</dd>
+    <dt>motion sent</dt><dd id="motion_sent">-</dd>
+    <dt>delta</dt><dd id="movement_delta">-</dd>
+    <dt>blocked</dt><dd id="blocked_reason">-</dd>
     <dt>seed</dt><dd id="seed">-</dd>
     <dt>tick</dt><dd id="tick">-</dd>
     <dt>t</dt><dd id="t">-</dd>
@@ -3146,7 +3191,7 @@ const behaviorInspector = document.getElementById('behavior-inspector');
 const virtualPipelineSection = document.getElementById('virtual-pipeline-section');
 const virtualReportSummary = document.getElementById('virtual-report-summary');
 const virtualModelRecommendations = document.getElementById('virtual-model-recommendations');
-const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
+const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const learningMode = document.getElementById('learning-mode');
 const learningSteps = document.getElementById('learning-steps');
 const learningStatus = document.getElementById('learning-status');
@@ -3318,6 +3363,29 @@ const llmCards = new Map();
 
 function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
 function world(x, y, up=0){ return new BABYLON.Vector3(x, up, y); }
+function titleCase(value){
+  return String(value || '-').replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
+}
+function actionLabel(action){
+  if(!action) return '-';
+  if(typeof action === 'string') return titleCase(action);
+  const kind = action.kind || Object.keys(action)[0];
+  return titleCase(kind);
+}
+function motorLabel(motor){
+  if(!motor) return '-';
+  return `forward=${fmt(motor.forward)}, turn=${fmt(motor.turn)}`;
+}
+function motionLabel(motion){
+  if(!motion) return '-';
+  if(typeof motion === 'string') return motion;
+  if(motion.Stop != null) return 'Stop';
+  if(motion.Forward) return `Forward ${fmt(motion.Forward.speed_m_s)} m/s`;
+  if(motion.Turn) return `Turn ${fmt(motion.Turn.turn_rad_s)} rad/s`;
+  if(motion.Drive) return `Drive ${fmt(motion.Drive.forward_m_s)} m/s, turn ${fmt(motion.Drive.turn_rad_s)}`;
+  const kind = Object.keys(motion)[0];
+  return kind ? titleCase(kind) : '-';
+}
 
 function clearChildren(node){
   const children = node.getChildren();
@@ -3652,6 +3720,12 @@ function updateScene(packet){
   }
   fields.ledger_counts.textContent = `${packet.frames_written || 0}f / ${packet.transitions_written || 0}t`;
   fields.action_selector_mode.textContent = packet.action_selector_mode || '-';
+  const action = packet.action || {};
+  fields.chosen_action.textContent = actionLabel(action.final_selected_action);
+  fields.motor_line.textContent = motorLabel(action.final_motor || action.desired_motor);
+  fields.motion_sent.textContent = motionLabel(action.motion_sent);
+  fields.movement_delta.textContent = action.movement_delta == null ? '-' : `${fmt(action.movement_delta, 3)} m`;
+  fields.blocked_reason.textContent = action.not_moving_reason || (action.safety_override ? 'safety override active' : '-');
   fields.seed.textContent = session.seed == null ? '-' : String(session.seed);
   fields.tick.textContent = session.tick_ms == null ? '-' : `${session.tick_ms} ms`;
   fields.t.textContent = `${packet.t_ms} ms`;

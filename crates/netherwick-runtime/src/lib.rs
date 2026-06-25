@@ -2940,6 +2940,7 @@ where
             .clone()
             .or_else(|| event_script_forced_action.clone())
             .unwrap_or(conductor_selected_action);
+        let conductor_selected_output = conductor_record.selected_output.clone();
         behavior_runs.push(conductor_record.erase());
 
         if let Some(proposed) = llm_action_proposal.proposed_action.as_ref() {
@@ -3058,6 +3059,29 @@ where
                 "safety_reason": safety.reason.clone().map(Some).map(describe_safety_reason),
             }),
         );
+        now.extensions.insert(
+            "action.motion_bridge".to_string(),
+            serde_json::json!({
+                "llm_action": llm_action_proposal.proposed_action.clone(),
+                "selected_action": action_selection.selected_action.clone(),
+                "conductor_selected_action": conductor_selected_output.clone(),
+                "chosen_action": chosen_action.clone(),
+                "desired_motor": action_to_motor_command(Some(&chosen_action)),
+                "final_motor": safety.command,
+                "safety_override": safety.vetoed,
+                "safety_reason": safety.reason.clone().map(Some).map(describe_safety_reason),
+            }),
+        );
+        notes.push(format!(
+            "ActionMotorBridge llm_action={:?} selected_action={:?} conductor_selected_action={:?} chosen_action={:?} desired_motor={:?} final_motor={:?} safety_override={}",
+            llm_action_proposal.proposed_action,
+            action_selection.selected_action,
+            conductor_selected_output,
+            chosen_action,
+            action_to_motor_command(Some(&chosen_action)),
+            safety.command,
+            safety.vetoed
+        ));
         now.extensions.insert(
             "prod.nudge".to_string(),
             serde_json::to_value(&self.nudge.status)?,
@@ -3832,6 +3856,12 @@ fn annotate_snapshot_from_tick(snapshot: &mut WorldSnapshot, tick: &RuntimeTick)
         .get("llm.action_proposal")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok());
+    snapshot.action_debug = tick
+        .frame
+        .now
+        .extensions
+        .get("action.motion_bridge")
+        .cloned();
 }
 
 fn motor_command_to_motion(motor: MotorCommand) -> MotionCommand {
@@ -3851,6 +3881,63 @@ fn motor_command_to_motion(motor: MotorCommand) -> MotionCommand {
             turn_rad_s: motor.turn,
         }
     }
+}
+
+fn pose_json(body: &netherwick_body::BodySense) -> serde_json::Value {
+    serde_json::json!({
+        "x_m": body.odometry.x_m,
+        "y_m": body.odometry.y_m,
+        "heading_rad": body.odometry.heading_rad,
+    })
+}
+
+fn movement_delta_m(
+    before: &netherwick_body::BodySense,
+    after: &netherwick_body::BodySense,
+) -> f32 {
+    distance_between_points(
+        (before.odometry.x_m, before.odometry.y_m),
+        (after.odometry.x_m, after.odometry.y_m),
+    )
+}
+
+fn not_moving_reason(
+    final_motor: MotorCommand,
+    motion: &MotionCommand,
+    before: &netherwick_body::BodySense,
+    after: &netherwick_body::BodySense,
+    movement_delta: f32,
+    reset_or_dead: bool,
+    tick: &RuntimeTick,
+) -> Option<String> {
+    if movement_delta >= 0.005 {
+        return None;
+    }
+    if reset_or_dead {
+        return Some("dead battery or stuck reset prevented motor application".to_string());
+    }
+    if is_near_zero_motor(final_motor) || matches!(motion, MotionCommand::Stop) {
+        return Some(
+            tick.frame
+                .now
+                .extensions
+                .get("motor_gate")
+                .and_then(|value| value.get("safety_reason"))
+                .and_then(|value| value.as_str())
+                .map(|reason| format!("final motor was stop: {reason}"))
+                .unwrap_or_else(|| "final motor was stop or near zero".to_string()),
+        );
+    }
+    if after.flags.wall || after.flags.bump_left || after.flags.bump_right {
+        return Some("sim collision blocked commanded motion".to_string());
+    }
+    if before.odometry.x_m == after.odometry.x_m
+        && before.odometry.y_m == after.odometry.y_m
+        && before.odometry.heading_rad != after.odometry.heading_rad
+    {
+        return Some("turn-only motion changed heading without translation".to_string());
+    }
+    Some("non-stop motion was sent but pose delta was near zero".to_string())
 }
 
 pub struct SimRunner<R> {
@@ -4333,24 +4420,83 @@ where
             let mut snapshot = self.world.snapshot().await?;
             self.stuck.annotate_snapshot(&mut snapshot, self.tick_ms);
             let reset_after_tick = sim_stuck_reset_due(&snapshot);
+            let body_pose_before = snapshot.body.clone();
             let now = snapshot.to_now(snapshot.body.last_update_ms);
             let tick = self
                 .runtime
                 .tick(now, ExperienceLatent::default(), Vec::new())
                 .await?;
-            annotate_snapshot_from_tick(&mut snapshot, &tick);
-            observe(&snapshot, &tick);
+            let final_motor = final_motor_from_tick(&tick);
+            let mut motion = motor_command_to_motion(final_motor);
+            let mut motion_sent_to_sim = Some(serde_json::to_value(&motion)?);
+            let reset_or_dead = is_dead_battery(&snapshot) || reset_after_tick;
             self.stuck.observe(&snapshot, tick.chosen_action.as_ref());
+            let observed_stuck_extension = self.stuck.extension(self.tick_ms);
             if is_dead_battery(&snapshot) || reset_after_tick {
                 self.world.reset_body_to_spawn();
                 self.stuck.reset();
+                motion = MotionCommand::Stop;
+                motion_sent_to_sim = None;
             } else {
-                let motion = self
-                    .stuck
-                    .recovery_motion()
-                    .unwrap_or_else(|| motor_command_to_motion(final_motor_from_tick(&tick)));
-                self.motors.send(motion).await?;
+                if let Some(recovery_motion) = self.stuck.recovery_motion() {
+                    motion = recovery_motion;
+                    motion_sent_to_sim = Some(serde_json::to_value(&motion)?);
+                }
+                self.motors.send(motion.clone()).await?;
             };
+            let mut after_snapshot = self.world.snapshot().await?;
+            annotate_snapshot_from_tick(&mut after_snapshot, &tick);
+            let movement_delta = movement_delta_m(&body_pose_before, &after_snapshot.body);
+            let why_not_moving = not_moving_reason(
+                final_motor,
+                &motion,
+                &body_pose_before,
+                &after_snapshot.body,
+                movement_delta,
+                reset_or_dead,
+                &tick,
+            );
+            let mut action_debug = after_snapshot
+                .action_debug
+                .take()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !action_debug.is_object() {
+                action_debug = serde_json::json!({});
+            }
+            if let Some(object) = action_debug.as_object_mut() {
+                object.insert("body_pose_before".to_string(), pose_json(&body_pose_before));
+                object.insert(
+                    "body_pose_after".to_string(),
+                    pose_json(&after_snapshot.body),
+                );
+                object.insert(
+                    "movement_delta".to_string(),
+                    serde_json::json!(movement_delta),
+                );
+                object.insert(
+                    "motion_sent_to_sim".to_string(),
+                    motion_sent_to_sim.unwrap_or(serde_json::Value::Null),
+                );
+                object.insert(
+                    "motor_applied".to_string(),
+                    serde_json::json!(movement_delta >= 0.005),
+                );
+                object.insert(
+                    "why_not_moving".to_string(),
+                    why_not_moving
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            after_snapshot.action_debug = Some(action_debug);
+            after_snapshot
+                .extensions
+                .retain(|extension| extension.name != "sim.stuck");
+            after_snapshot.extensions.push(observed_stuck_extension);
+            self.stuck.event_started = false;
+            self.stuck.recovered = false;
+            observe(&after_snapshot, &tick);
             self.tick_count = self.tick_count.saturating_add(1);
         }
         Ok(())
@@ -6705,6 +6851,61 @@ mod tests {
 
         assert!(snapshot.body.odometry.x_m > 1.0);
         assert_eq!(runner.tick_count, 1);
+    }
+
+    #[tokio::test]
+    async fn sim_runner_go_and_explore_send_non_stop_motion_and_change_pose() {
+        for (name, action) in [
+            (
+                "go",
+                ActionPrimitive::Go {
+                    intensity: 0.4,
+                    duration_ms: 1_000,
+                },
+            ),
+            (
+                "explore",
+                ActionPrimitive::Explore {
+                    style: ExploreStyle::RandomWalk,
+                    duration_ms: 1_000,
+                },
+            ),
+        ] {
+            let ledger =
+                JsonlLedger::new(test_ledger_root(&format!("sim-runner-{name}-motor-bridge")));
+            let runtime = test_runtime(ledger, FixedConductor::new(action.clone()));
+            let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+            world.set_body(test_body(1.0, 1.0, 0.5, 7));
+            let mut runner = SimRunner::new(runtime, world, motors);
+            let start = runner.world.body();
+            let mut saw_non_zero_final_motor = false;
+
+            runner
+                .run_steps_observing_ticks(5, |snapshot, tick| {
+                    let final_motor = final_motor_from_tick(tick);
+                    if !is_near_zero_motor(final_motor) {
+                        saw_non_zero_final_motor = true;
+                    }
+                    assert_eq!(snapshot.final_selected_action, Some(action.clone()));
+                })
+                .await
+                .unwrap();
+
+            let end = runner.world.body();
+            let delta = movement_delta_m(&start, &end);
+            assert!(
+                delta > 0.005,
+                "{name} should move the simulated body, delta was {delta}"
+            );
+            assert!(saw_non_zero_final_motor, "{name} final motor was zero");
+            assert!(
+                !matches!(
+                    runner.world.last_motion_sent(),
+                    Some(MotionCommand::Stop) | None
+                ),
+                "{name} did not send non-stop motion to sim"
+            );
+        }
     }
 
     #[tokio::test]

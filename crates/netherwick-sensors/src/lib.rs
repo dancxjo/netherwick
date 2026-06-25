@@ -477,6 +477,8 @@ pub struct WorldSnapshot {
     pub body: BodySense,
     pub final_selected_action: Option<ActionPrimitive>,
     pub llm_action_proposal: Option<LlmActionProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_debug: Option<serde_json::Value>,
     pub eye_frame: Option<EyeFrame>,
     pub ear_pcm: Option<PcmAudioFrame>,
     pub eye: EyeSense,
@@ -496,6 +498,7 @@ impl Default for WorldSnapshot {
             body: BodySense::default(),
             final_selected_action: None,
             llm_action_proposal: None,
+            action_debug: None,
             eye_frame: None,
             ear_pcm: None,
             eye: EyeSense {

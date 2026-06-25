@@ -160,6 +160,7 @@ struct VirtualWorldState {
     arena: ArenaConfig,
     objects: Vec<SimObject>,
     retina_frame: Option<EyeFrame>,
+    last_motion_sent: Option<MotionCommand>,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +189,7 @@ impl VirtualWorld {
             arena,
             objects: Vec::new(),
             retina_frame: None,
+            last_motion_sent: None,
         }));
         (
             Self {
@@ -238,6 +240,14 @@ impl VirtualWorld {
             .expect("virtual world mutex poisoned")
             .snapshot
             .body
+            .clone()
+    }
+
+    pub fn last_motion_sent(&self) -> Option<MotionCommand> {
+        self.state
+            .lock()
+            .expect("virtual world mutex poisoned")
+            .last_motion_sent
             .clone()
     }
 
@@ -354,6 +364,7 @@ impl MotorComplex for SimMotorComplex {
     async fn send(&mut self, command: MotionCommand) -> Result<BodySense> {
         let motor = command.to_motor_command();
         let mut guard = self.state.lock().expect("virtual world mutex poisoned");
+        guard.last_motion_sent = Some(command.clone());
         let objects = guard.objects.clone();
         let arena = guard.arena;
         let body = &mut guard.snapshot.body;
