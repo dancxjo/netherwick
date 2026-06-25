@@ -84,6 +84,10 @@ pub enum ReignCommand {
         intensity: f32,
         duration_ms: TimeMs,
     },
+    Reverse {
+        intensity: f32,
+        duration_ms: TimeMs,
+    },
     Turn {
         direction: TurnDir,
         intensity: f32,
@@ -111,9 +115,9 @@ impl ReignCommand {
     pub fn default_ttl_ms(&self) -> TimeMs {
         match self {
             Self::Stop => 2_000,
-            Self::Go { duration_ms, .. } | Self::Turn { duration_ms, .. } => {
-                duration_ms.saturating_add(500)
-            }
+            Self::Go { duration_ms, .. }
+            | Self::Reverse { duration_ms, .. }
+            | Self::Turn { duration_ms, .. } => duration_ms.saturating_add(500),
             Self::Dock | Self::Explore { .. } | Self::Approach { .. } => 5_000,
             Self::Inspect { .. } => 5_000,
             Self::Speak { .. } => 10_000,
@@ -129,6 +133,13 @@ impl ReignCommand {
                 duration_ms,
             } => Some(ActionPrimitive::Go {
                 intensity: *intensity,
+                duration_ms: *duration_ms,
+            }),
+            Self::Reverse {
+                intensity,
+                duration_ms,
+            } => Some(ActionPrimitive::Go {
+                intensity: -*intensity,
                 duration_ms: *duration_ms,
             }),
             Self::Turn {
@@ -296,5 +307,25 @@ mod tests {
 
         assert_eq!(motor.forward, 0.0);
         assert!(motor.turn.abs() > 0.0);
+    }
+
+    #[test]
+    fn reign_reverse_maps_to_negative_go_action() {
+        let action = ReignCommand::Reverse {
+            intensity: 0.4,
+            duration_ms: 350,
+        }
+        .to_action();
+
+        assert_eq!(
+            action,
+            Some(ActionPrimitive::Go {
+                intensity: -0.4,
+                duration_ms: 350
+            })
+        );
+        let motor = action_to_motor_command(action.as_ref());
+        assert_eq!(motor.forward, -0.4);
+        assert_eq!(motor.turn, 0.0);
     }
 }

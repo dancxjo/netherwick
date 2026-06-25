@@ -52,6 +52,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const DEFAULT_LIVE_LLM_TIMEOUT_MS: u64 = 300_000;
+
 #[derive(Parser)]
 #[command(name = "netherwick")]
 #[command(about = "Netherwick CLI entrypoint")]
@@ -2096,7 +2098,7 @@ where
     Ok((metrics.finish(), warnings))
 }
 
-fn configured_llm_agent(args: &LlmArgs) -> Result<ConfiguredLlmAgent> {
+fn configured_llm_config(args: &LlmArgs) -> Result<LlmConfig> {
     let mut config = match &args.llm_config {
         Some(path) => LlmConfig::load(path)?,
         None => LlmConfig::default(),
@@ -2104,24 +2106,28 @@ fn configured_llm_agent(args: &LlmArgs) -> Result<ConfiguredLlmAgent> {
     if let Some(provider) = args.llm_provider {
         config.provider = provider.into();
     }
+    Ok(config)
+}
+
+fn configured_llm_agent(args: &LlmArgs) -> Result<ConfiguredLlmAgent> {
+    let config = configured_llm_config(args)?;
     ConfiguredLlmAgent::from_config(config)
 }
 
-fn configured_llm_agent_for_sim(args: &LlmArgs, live: bool) -> Result<ConfiguredLlmAgent> {
-    let mut config = match &args.llm_config {
-        Some(path) => LlmConfig::load(path)?,
-        None => LlmConfig::default(),
-    };
-    if let Some(provider) = args.llm_provider {
-        config.provider = provider.into();
-    }
+fn configured_llm_config_for_sim(args: &LlmArgs, live: bool) -> Result<LlmConfig> {
+    let mut config = configured_llm_config(args)?;
     if live && args.llm_config.is_none() {
         let live_timeout_ms = std::env::var("NETHERWICK_LIVE_LLM_TIMEOUT_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(750);
+            .unwrap_or(DEFAULT_LIVE_LLM_TIMEOUT_MS);
         config.timeout_ms = config.timeout_ms.min(live_timeout_ms.max(1));
     }
+    Ok(config)
+}
+
+fn configured_llm_agent_for_sim(args: &LlmArgs, live: bool) -> Result<ConfiguredLlmAgent> {
+    let config = configured_llm_config_for_sim(args, live)?;
     ConfiguredLlmAgent::from_config(config)
 }
 
@@ -6336,6 +6342,21 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn live_sim_default_llm_timeout_allows_slow_ollama_responses() {
+        let previous = std::env::var("NETHERWICK_LIVE_LLM_TIMEOUT_MS").ok();
+        std::env::remove_var("NETHERWICK_LIVE_LLM_TIMEOUT_MS");
+
+        let config = configured_llm_config_for_sim(&LlmArgs::default(), true).unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("NETHERWICK_LIVE_LLM_TIMEOUT_MS", value),
+            None => std::env::remove_var("NETHERWICK_LIVE_LLM_TIMEOUT_MS"),
+        }
+
+        assert_eq!(config.timeout_ms, DEFAULT_LIVE_LLM_TIMEOUT_MS);
     }
 
     #[test]

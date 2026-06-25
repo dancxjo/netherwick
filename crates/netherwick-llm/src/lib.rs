@@ -893,6 +893,10 @@ fn summarize_reign_command(input: &netherwick_actions::ReignInput) -> String {
             intensity,
             duration_ms,
         } => format!("Go, intensity {:.2}, {}ms", intensity, duration_ms),
+        netherwick_actions::ReignCommand::Reverse {
+            intensity,
+            duration_ms,
+        } => format!("Reverse, intensity {:.2}, {}ms", intensity, duration_ms),
         netherwick_actions::ReignCommand::Turn {
             direction,
             intensity,

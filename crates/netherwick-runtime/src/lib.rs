@@ -2390,6 +2390,13 @@ fn mechanical_reign_action(input: &Option<ReignInput>) -> Option<ActionPrimitive
     input.command.to_action()
 }
 
+fn reign_input_drives_sim_directly(input: &ReignInput) -> bool {
+    matches!(
+        input.mode,
+        netherwick_actions::ReignMode::Direct | netherwick_actions::ReignMode::Assist
+    ) && input.command.to_action().is_some()
+}
+
 impl<L, M, R, C, S, A> MinimalRuntime<L, M, R, C, S, A>
 where
     L: LedgerWriter + Sync,
@@ -4050,7 +4057,14 @@ impl StuckRecoveryController {
         let commanded_motion = action_is_commanded_motion(action);
         self.dead_battery = is_dead_battery(snapshot);
         self.push_motion_sample(step_distance, commanded_motion);
-        let low_displacement = self.rolling_low_displacement() && !snapshot.body.charging;
+        self.clearance_m = snapshot.range.nearest_m;
+        let trap_kind = classify_trap_kind(snapshot);
+        let trapped = trap_kind != TrapKind::Unknown;
+        let stationary_column_or_corner = matches!(trap_kind, TrapKind::Column | TrapKind::Corner)
+            && self.rolling_stationary()
+            && matches!(action, Some(ActionPrimitive::Stop) | None);
+        let low_displacement = (self.rolling_low_displacement() || stationary_column_or_corner)
+            && !snapshot.body.charging;
         self.stuck_ticks = if low_displacement {
             self.stuck_ticks
                 .saturating_add(1)
@@ -4062,11 +4076,8 @@ impl StuckRecoveryController {
             0
         };
 
-        self.clearance_m = snapshot.range.nearest_m;
-        let trap_kind = classify_trap_kind(snapshot);
-        let trapped = trap_kind != TrapKind::Unknown;
         if !self.active
-            && commanded_motion
+            && (commanded_motion || stationary_column_or_corner)
             && self.stuck_ticks >= STUCK_LOW_DISPLACEMENT_TICKS
             && trapped
             && !self.dead_battery
@@ -4193,6 +4204,11 @@ impl StuckRecoveryController {
         self.displacement_window.len() >= STUCK_LOW_DISPLACEMENT_TICKS
             && self.commanded_window.len() >= STUCK_LOW_DISPLACEMENT_TICKS
             && self.commanded_window.iter().all(|commanded| *commanded)
+            && self.displacement_window.iter().sum::<f32>() < STUCK_WINDOW_DISPLACEMENT_EPSILON_M
+    }
+
+    fn rolling_stationary(&self) -> bool {
+        self.displacement_window.len() >= STUCK_LOW_DISPLACEMENT_TICKS
             && self.displacement_window.iter().sum::<f32>() < STUCK_WINDOW_DISPLACEMENT_EPSILON_M
     }
 
@@ -4445,6 +4461,12 @@ where
             let mut motion_sent_to_sim = Some(serde_json::to_value(&motion)?);
             let reset_or_dead = is_dead_battery(&snapshot) || reset_after_tick;
             self.stuck.observe(&snapshot, tick.chosen_action.as_ref());
+            let manual_reign_driving = tick
+                .frame
+                .reign_input
+                .as_ref()
+                .map(reign_input_drives_sim_directly)
+                .unwrap_or(false);
             let observed_stuck_extension = self.stuck.extension(self.tick_ms);
             if is_dead_battery(&snapshot) || reset_after_tick {
                 self.world.reset_body_to_spawn();
@@ -4452,8 +4474,12 @@ where
                 motion = MotionCommand::Stop;
                 motion_sent_to_sim = None;
             } else {
-                if let Some(recovery_motion) = self.stuck.recovery_motion() {
-                    motion = recovery_motion;
+                if !manual_reign_driving {
+                    if let Some(recovery_motion) = self.stuck.recovery_motion() {
+                        motion = recovery_motion;
+                        motion_sent_to_sim = Some(serde_json::to_value(&motion)?);
+                    }
+                } else if self.stuck.active {
                     motion_sent_to_sim = Some(serde_json::to_value(&motion)?);
                 }
                 self.motors.send(motion.clone()).await?;
@@ -5430,6 +5456,10 @@ fn summarize_reign_command_for_runtime(input: &netherwick_actions::ReignInput) -
             intensity,
             duration_ms,
         } => format!("Go intensity {:.2} for {}ms", intensity, duration_ms),
+        netherwick_actions::ReignCommand::Reverse {
+            intensity,
+            duration_ms,
+        } => format!("Reverse intensity {:.2} for {}ms", intensity, duration_ms),
         netherwick_actions::ReignCommand::Turn {
             direction,
             intensity,
@@ -7484,6 +7514,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_reign_reverse_interrupts_sim_stuck_recovery_motion() {
+        let root = test_ledger_root("sim-runner-reign-reverse-interrupts-stuck");
+        let ledger = JsonlLedger::new(&root);
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        queue.lock().unwrap().push(test_reign_input(
+            7,
+            ReignMode::Direct,
+            ReignCommand::Reverse {
+                intensity: 0.5,
+                duration_ms: 500,
+            },
+            2_000,
+        ));
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let runtime = MinimalRuntime::with_reign_queue(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+            queue,
+        );
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 1.0, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+        runner.stuck.active = true;
+        runner.stuck.phase = RecoveryPhase::Turn;
+        runner.stuck.phase_ticks_remaining = 12;
+        runner.stuck.turn_sign = 1.0;
+
+        let mut observed_debug = None;
+        runner
+            .run_steps_observing(1, |snapshot| {
+                observed_debug = snapshot.action_debug.clone();
+            })
+            .await
+            .unwrap();
+        let debug = observed_debug.unwrap();
+        let motion = debug.get("motion_sent_to_sim").cloned().unwrap();
+
+        let motion = serde_json::from_value::<MotionCommand>(motion.clone())
+            .unwrap_or_else(|error| panic!("motion decode failed: {error}; debug={debug}"));
+        assert_eq!(motion, MotionCommand::Forward { speed_m_s: -0.5 });
+    }
+
+    #[tokio::test]
     async fn column_trap_scenario_recovers_within_budget() {
         let root = test_ledger_root("sim-runner-column-trap-recovery");
         let ledger = JsonlLedger::new(&root);
@@ -7876,6 +7954,21 @@ mod tests {
             .unwrap()
             .values;
         assert_eq!(values.get(8).copied(), Some(1.0));
+    }
+
+    #[test]
+    fn stopped_column_trap_still_triggers_stuck_recovery() {
+        let mut detector = StuckRecoveryController::default();
+        let action = ActionPrimitive::Stop;
+
+        for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
+            detector.observe(&stuck_test_snapshot(2.0, 2.0, 1.0), Some(&action));
+        }
+
+        let status = detector.status();
+        assert!(status.active);
+        assert_eq!(status.trap_kind, TrapKind::Column);
+        assert_eq!(status.stuck_ticks, STUCK_LOW_DISPLACEMENT_TICKS);
     }
 
     #[test]

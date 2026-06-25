@@ -2454,6 +2454,10 @@ fn prod_command_from_request(request: ProdRequest) -> Result<ReignCommand, Reign
             intensity: intensity.min(0.15),
             duration_ms: duration_ms.min(1_000),
         },
+        "reverse" | "back" | "backward" => ReignCommand::Reverse {
+            intensity: intensity.min(0.15),
+            duration_ms: duration_ms.min(1_000),
+        },
         "turn" | "left" => ReignCommand::Turn {
             direction: TurnDir::Left,
             intensity: intensity.min(0.25),
@@ -2539,6 +2543,13 @@ fn sanitize_command(command: ReignCommand) -> Result<ReignCommand, ReignApiError
             intensity: finite_intensity(intensity)?,
             duration_ms: duration_ms.clamp(50, 10_000),
         },
+        ReignCommand::Reverse {
+            intensity,
+            duration_ms,
+        } => ReignCommand::Reverse {
+            intensity: finite_intensity(intensity)?,
+            duration_ms: duration_ms.clamp(50, 10_000),
+        },
         ReignCommand::Turn {
             direction,
             intensity,
@@ -2601,6 +2612,7 @@ button.stop{background:#b00020;color:white}
 </select>
 <button class="stop" onclick="send({type:'Stop'},2000)">STOP</button>
 <button onclick="send({type:'Go',intensity:.4,duration_ms:700},1200)">Forward</button>
+<button onclick="send({type:'Reverse',intensity:.4,duration_ms:700},1200)">Reverse</button>
 <button onclick="send({type:'Turn',direction:'Left',intensity:.5,duration_ms:500},1000)">Turn Left</button>
 <button onclick="send({type:'Turn',direction:'Right',intensity:.5,duration_ms:500},1000)">Turn Right</button>
 <button onclick="send({type:'Dock'},5000)">Dock</button>
@@ -3161,7 +3173,7 @@ canvas{display:block}
 </aside>
 <button id="xr" disabled>VR unavailable</button>
 <div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers, squeeze stops, A/B dock or explore.</div>
-<script src="/static/vendor/babylon/babylon.js"></script>
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
 <script type="module">
 if (window.trustedTypes && window.trustedTypes.createPolicy) {
   if (!window.trustedTypes.defaultPolicy) {
@@ -3836,11 +3848,14 @@ function commandForWebJoystick(){
     const intensity = Math.min(1, Math.max(.25, -y));
     return {command:{type:'Go', intensity, duration_ms:350}, ttl:700, label:`forward ${fmt(intensity, 2)}`, priority:.95};
   }
+  if(y > .32 && Math.abs(y) >= Math.abs(x) * .85){
+    const intensity = Math.min(1, Math.max(.25, y));
+    return {command:{type:'Reverse', intensity, duration_ms:350}, ttl:700, label:`reverse ${fmt(intensity, 2)}`, priority:.98};
+  }
   if(Math.abs(x) > .32){
     const intensity = Math.min(1, Math.max(.25, Math.abs(x)));
     return {command:{type:'Turn', direction:x < 0 ? 'Left' : 'Right', intensity, duration_ms:300}, ttl:650, label:`turn ${x < 0 ? 'left' : 'right'} ${fmt(intensity, 2)}`, priority:.95};
   }
-  if(y > .52) return {command:{type:'Stop'}, ttl:900, label:'stop', priority:1};
   return null;
 }
 
@@ -3897,6 +3912,10 @@ function commandForInputSource(inputSource){
   if(y < -.35) {
     const intensity = Math.min(1, Math.max(.25, -y));
     return {command:{type:'Go', intensity, duration_ms:350}, ttl:700, label:`forward ${fmt(intensity, 2)}`, priority:.95};
+  }
+  if(y > .35) {
+    const intensity = Math.min(1, Math.max(.25, y));
+    return {command:{type:'Reverse', intensity, duration_ms:350}, ttl:700, label:`reverse ${fmt(intensity, 2)}`, priority:.98};
   }
   if(Math.abs(x) > .35) {
     const intensity = Math.min(1, Math.max(.25, Math.abs(x)));
@@ -5236,6 +5255,7 @@ mod tests {
         assert!(page.contains("packet.behavior_nodes"));
         assert!(page.contains("const nodes = {...graphLayout}"));
         assert!(page.contains("source='Gamepad'"));
+        assert!(page.contains("type:'Reverse'"));
         assert!(page.contains("createDefaultXRExperienceAsync"));
         assert!(page.contains("if(!eye?.data_url)"));
         assert!(page.contains(
