@@ -151,6 +151,42 @@ pub struct ErasedBehaviorRunRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BehaviorImplementation {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BehaviorNodeState {
+    pub node_id: String,
+    pub behavior_id: String,
+    pub label: String,
+    pub allowed_regimes: Vec<BehaviorRegime>,
+    pub hardcoded_implementations: Vec<BehaviorImplementation>,
+    pub model_implementations: Vec<BehaviorImplementation>,
+    pub selected_regime: BehaviorRegime,
+    pub selected_hardcoded: String,
+    pub selected_model: Option<String>,
+    pub checkpoint_path: Option<String>,
+    pub fallback_policy: FallbackPolicy,
+    pub training_enabled: bool,
+    pub last_run: Option<ErasedBehaviorRunRecord>,
+    pub samples_observed: usize,
+    pub train_steps_used: usize,
+    pub missing_model_or_checkpoint: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BehaviorNodeUpdate {
+    pub selected_regime: Option<BehaviorRegime>,
+    pub selected_hardcoded: Option<String>,
+    pub selected_model: Option<String>,
+    pub checkpoint_path: Option<String>,
+    pub fallback_policy: Option<FallbackPolicy>,
+    pub training_enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BehaviorRun<I, O> {
     pub chosen: O,
     pub record: BehaviorRunRecord<I, O>,
@@ -192,6 +228,15 @@ where
     }
 
     pub fn infer(&mut self, input: &I, t_ms: TimeMs) -> Result<BehaviorRun<I, O>> {
+        self.infer_with_teacher_source(input, t_ms, TrainingSource::HardcodedTeacher)
+    }
+
+    pub fn infer_with_teacher_source(
+        &mut self,
+        input: &I,
+        t_ms: TimeMs,
+        teacher_source: TrainingSource,
+    ) -> Result<BehaviorRun<I, O>> {
         let mut record = BehaviorRunRecord {
             behavior_id: self.id.clone(),
             regime: self.regime,
@@ -216,20 +261,21 @@ where
                 record.hardcoded_output = Some(hard.clone());
                 let mut trained = false;
                 if let Some(model) = self.model.as_mut() {
-                    match model.infer(input) {
+                    let actual = match model.infer(input) {
                         Ok(model_output) => {
                             record.model_output = Some(model_output.clone());
-                            let sample = TrainingSample::teacher(
-                                input.clone(),
-                                hard.clone(),
-                                Some(model_output),
-                                t_ms,
-                            );
-                            model.observe(&sample)?;
-                            trained = true;
+                            Some(model_output)
                         }
-                        Err(error) => record.error = Some(error.to_string()),
-                    }
+                        Err(error) => {
+                            record.error = Some(error.to_string());
+                            None
+                        }
+                    };
+                    let mut sample =
+                        TrainingSample::teacher(input.clone(), hard.clone(), actual, t_ms);
+                    sample.source = teacher_source;
+                    model.observe(&sample)?;
+                    trained = true;
                 }
                 (hard, false, trained)
             }
@@ -244,11 +290,15 @@ where
                 }
                 (hard, false, false)
             }
-            BehaviorRegime::ModelInfer => {
-                self.run_model_controlled(input, t_ms, false, &mut record)?
-            }
+            BehaviorRegime::ModelInfer => self.run_model_controlled(
+                input,
+                t_ms,
+                false,
+                TrainingSource::HardcodedTeacher,
+                &mut record,
+            )?,
             BehaviorRegime::ModelTrainAndInfer => {
-                self.run_model_controlled(input, t_ms, true, &mut record)?
+                self.run_model_controlled(input, t_ms, true, teacher_source, &mut record)?
             }
             BehaviorRegime::Compare => {
                 let hard = self.hardcoded.infer(input)?;
@@ -278,6 +328,14 @@ where
         self.infer(input, t_ms)
     }
 
+    pub fn hardcoded_id(&self) -> &'static str {
+        self.hardcoded.id()
+    }
+
+    pub fn model_id(&self) -> Option<&'static str> {
+        self.model.as_ref().map(|model| model.id())
+    }
+
     pub fn observe(&mut self, sample: &TrainingSample<I, O>) -> Result<()> {
         if let Some(model) = self.model.as_mut() {
             model.observe(sample)?;
@@ -290,6 +348,7 @@ where
         input: &I,
         t_ms: TimeMs,
         train: bool,
+        teacher_source: TrainingSource,
         record: &mut BehaviorRunRecord<I, O>,
     ) -> Result<(O, bool, bool)> {
         if let Some(model) = self.model.as_mut() {
@@ -300,12 +359,13 @@ where
                     if train {
                         let hard = self.hardcoded.infer(input)?;
                         record.hardcoded_output = Some(hard.clone());
-                        let sample = TrainingSample::teacher(
+                        let mut sample = TrainingSample::teacher(
                             input.clone(),
                             hard,
                             Some(model_output.clone()),
                             t_ms,
                         );
+                        sample.source = teacher_source;
                         model.observe(&sample)?;
                         trained = true;
                     }

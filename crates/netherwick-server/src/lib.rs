@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
@@ -16,11 +16,12 @@ use base64::Engine;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
 use netherwick_actions::{ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir};
+use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use netherwick_core::TimeMs;
 use netherwick_now::{KinectSkeletonSense, ReignSense};
 use netherwick_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
-    NudgeStatus, ReignQueue,
+    NudgeStatus, ReignQueue, RuntimeModelStack,
 };
 use netherwick_sensors::{EyeFrameFormat, WorldSnapshot};
 use netherwick_worldlab::CaptureReader;
@@ -47,6 +48,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/view",
     "/view/snapshot",
     "/view/scene",
+    "/view/behavior-nodes",
     "/view/3d",
     "/view/capture-scene",
     "/view/training/latest",
@@ -141,6 +143,7 @@ pub struct LiveViewState {
     training_status: Arc<Mutex<LiveTrainingStatus>>,
     inline_learning: Arc<Mutex<InlineLearningConfig>>,
     prod_state: Arc<Mutex<NudgeStatus>>,
+    behavior_nodes: Arc<Mutex<Vec<BehaviorNodeState>>>,
     pub virtual_retina: bool,
     pub retina_width: u32,
     pub retina_height: u32,
@@ -168,6 +171,7 @@ impl Default for LiveViewState {
             training_status: Arc::new(Mutex::new(LiveTrainingStatus::default())),
             inline_learning: Arc::new(Mutex::new(InlineLearningConfig::default())),
             prod_state: Arc::new(Mutex::new(NudgeStatus::default())),
+            behavior_nodes: Arc::new(Mutex::new(default_behavior_nodes())),
             virtual_retina: false,
             retina_width: 160,
             retina_height: 90,
@@ -300,6 +304,110 @@ impl LiveViewState {
             .expect("prod state mutex poisoned")
             .clone()
     }
+
+    pub fn behavior_nodes(&self) -> Vec<BehaviorNodeState> {
+        self.behavior_nodes
+            .lock()
+            .expect("behavior nodes mutex poisoned")
+            .clone()
+    }
+
+    pub fn update_behavior_nodes(&self, nodes: Vec<BehaviorNodeState>) {
+        let mut current = self
+            .behavior_nodes
+            .lock()
+            .expect("behavior nodes mutex poisoned");
+        let merged = nodes
+            .into_iter()
+            .map(|mut node| {
+                if let Some(previous) = current
+                    .iter()
+                    .find(|old| same_behavior_node(&old.node_id, &node.node_id))
+                {
+                    if node.checkpoint_path.is_none() {
+                        node.checkpoint_path = previous.checkpoint_path.clone();
+                    }
+                    node.training_enabled = previous.training_enabled
+                        || matches!(
+                            node.selected_regime,
+                            BehaviorRegime::ShadowTrain | BehaviorRegime::ModelTrainAndInfer
+                        );
+                }
+                node.missing_model_or_checkpoint =
+                    !matches!(node.selected_regime, BehaviorRegime::Hardcoded)
+                        && (node.selected_model.is_none()
+                            || node
+                                .checkpoint_path
+                                .as_ref()
+                                .map(|path| path.trim().is_empty())
+                                .unwrap_or(true));
+                node
+            })
+            .collect();
+        *current = merged;
+    }
+
+    pub fn update_behavior_node(
+        &self,
+        id: &str,
+        update: BehaviorNodeUpdate,
+    ) -> Option<BehaviorNodeState> {
+        let mut nodes = self
+            .behavior_nodes
+            .lock()
+            .expect("behavior nodes mutex poisoned");
+        let node = nodes.iter_mut().find(|node| {
+            same_behavior_node(&node.node_id, id) || same_behavior_node(&node.behavior_id, id)
+        })?;
+        if let Some(regime) = update.selected_regime {
+            node.selected_regime = regime;
+            node.training_enabled = update.training_enabled.unwrap_or(matches!(
+                regime,
+                BehaviorRegime::ShadowTrain | BehaviorRegime::ModelTrainAndInfer
+            ));
+        }
+        if let Some(hardcoded) = update.selected_hardcoded {
+            node.selected_hardcoded = hardcoded;
+        }
+        if let Some(model) = update.selected_model {
+            node.selected_model = Some(model);
+        }
+        if let Some(checkpoint) = update.checkpoint_path {
+            node.checkpoint_path = (!checkpoint.trim().is_empty()).then_some(checkpoint);
+        }
+        if let Some(fallback) = update.fallback_policy {
+            node.fallback_policy = fallback;
+        }
+        if let Some(training_enabled) = update.training_enabled {
+            node.training_enabled = training_enabled;
+        }
+        node.missing_model_or_checkpoint =
+            !matches!(node.selected_regime, BehaviorRegime::Hardcoded)
+                && (node.selected_model.is_none()
+                    || node
+                        .checkpoint_path
+                        .as_ref()
+                        .map(|path| path.trim().is_empty())
+                        .unwrap_or(true));
+        Some(node.clone())
+    }
+}
+
+fn default_behavior_nodes() -> Vec<BehaviorNodeState> {
+    RuntimeModelStack::default().behavior_node_states(&[])
+}
+
+fn same_behavior_node(left: &str, right: &str) -> bool {
+    normalize_behavior_node_id(left) == normalize_behavior_node_id(right)
+}
+
+fn normalize_behavior_node_id(id: &str) -> String {
+    match id {
+        "ActionValue" => "action_value".to_string(),
+        "EyeNext" => "eye_next".to_string(),
+        "EarNext" => "ear_next".to_string(),
+        other => other.to_ascii_lowercase().replace('-', "_"),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -367,6 +475,7 @@ pub struct LiveSceneResponse {
     pub transitions_written: usize,
     pub models_loaded: Vec<String>,
     pub model_modes: HashMap<String, String>,
+    pub behavior_nodes: Vec<BehaviorNodeState>,
     pub action_selector_mode: String,
     pub weights_updating: bool,
     pub t_ms: TimeMs,
@@ -536,6 +645,7 @@ pub struct ModelsResponse {
     pub root: String,
     pub models: Vec<ModelSummary>,
     pub registry: Vec<ModelRegistrySummary>,
+    pub behavior_nodes: Vec<BehaviorNodeState>,
     pub connections: Vec<ModelConnection>,
     pub warnings: Vec<String>,
 }
@@ -615,6 +725,12 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view", get(live_view_page))
         .route("/view/snapshot", get(get_live_snapshot))
         .route("/view/scene", get(get_live_scene))
+        .route("/view/behavior-nodes", get(get_behavior_nodes))
+        .route("/view/behavior-nodes/{id}", post(post_behavior_node))
+        .route(
+            "/view/behavior-nodes/{id}/promote",
+            post(post_promote_behavior_node),
+        )
         .route("/view/3d", get(live_view_3d_page))
         .route("/view/capture-scene", get(get_capture_scene))
         .route("/stream/llm", get(get_llm_stream))
@@ -720,8 +836,73 @@ async fn get_live_scene(
         state.session(),
         state.training_status(),
         state.prod_state(),
+        state.behavior_nodes(),
         retina_status,
     )))
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BehaviorNodesResponse {
+    pub schema_version: u32,
+    pub nodes: Vec<BehaviorNodeState>,
+    pub connections: Vec<ModelConnection>,
+}
+
+async fn get_behavior_nodes(State(state): State<LiveViewState>) -> Json<BehaviorNodesResponse> {
+    Json(BehaviorNodesResponse {
+        schema_version: 1,
+        nodes: state.behavior_nodes(),
+        connections: model_connections(),
+    })
+}
+
+async fn post_behavior_node(
+    State(state): State<LiveViewState>,
+    AxumPath(id): AxumPath<String>,
+    Json(update): Json<BehaviorNodeUpdate>,
+) -> Result<Json<BehaviorNodeState>, LiveViewError> {
+    state
+        .update_behavior_node(&id, update)
+        .map(Json)
+        .ok_or_else(|| LiveViewError::not_found(format!("behavior node {id} was not found")))
+}
+
+async fn post_promote_behavior_node(
+    State(state): State<LiveViewState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<BehaviorNodeState>, LiveViewError> {
+    let current = state
+        .behavior_nodes()
+        .into_iter()
+        .find(|node| {
+            same_behavior_node(&node.node_id, &id) || same_behavior_node(&node.behavior_id, &id)
+        })
+        .ok_or_else(|| LiveViewError::not_found(format!("behavior node {id} was not found")))?;
+    let gates_pass = current
+        .last_run
+        .as_ref()
+        .and_then(|run| run.error.as_ref())
+        .is_none()
+        && current
+            .last_run
+            .as_ref()
+            .and_then(|run| run.disagreement)
+            .map(|value| value <= 0.25)
+            .unwrap_or(true)
+        && !current.missing_model_or_checkpoint;
+    if !gates_pass {
+        return Err(LiveViewError::bad_request(
+            "promotion safety gates failed: resolve errors, disagreement, or missing model/checkpoint",
+        ));
+    }
+    let update = BehaviorNodeUpdate {
+        selected_regime: Some(BehaviorRegime::ModelInfer),
+        ..BehaviorNodeUpdate::default()
+    };
+    state
+        .update_behavior_node(&id, update)
+        .map(Json)
+        .ok_or_else(|| LiveViewError::not_found(format!("behavior node {id} was not found")))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1063,6 +1244,7 @@ fn read_models_response(root: &Path) -> ModelsResponse {
         schema_version: 1,
         root: root.display().to_string(),
         connections: model_connections(),
+        behavior_nodes: default_behavior_nodes(),
         ..ModelsResponse::default()
     };
     let registry = read_model_registry_summary(&root.join("registry.json"), &mut response.warnings);
@@ -1373,6 +1555,7 @@ async fn get_capture_scene(
         None,
         LiveTrainingStatus::default(),
         NudgeStatus::default(),
+        default_behavior_nodes(),
         None,
     );
     scene.t_ms = record.t_ms;
@@ -1476,6 +1659,7 @@ pub fn snapshot_to_scene(
     session: Option<SceneSession>,
     training: LiveTrainingStatus,
     prod_state: NudgeStatus,
+    behavior_nodes: Vec<BehaviorNodeState>,
     retina_status: Option<RetinaStatusInfo>,
 ) -> LiveSceneResponse {
     let mut warnings = Vec::new();
@@ -1546,6 +1730,7 @@ pub fn snapshot_to_scene(
         transitions_written,
         models_loaded,
         model_modes,
+        behavior_nodes,
         action_selector_mode,
         weights_updating,
         t_ms: body.last_update_ms,
@@ -2686,7 +2871,7 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #virtual-pipeline-section .panel-content{display:grid;gap:8px}
 #models{left:12px;bottom:40px;width:310px;height:320px;min-width:260px;min-height:180px;border-color:#37424c;background:rgba(8,11,15,.88)}
 #models .panel-content{display:flex;flex-direction:column;gap:8px;overflow:hidden}
-#model-graph-window{left:336px;bottom:40px;width:360px;height:320px;min-width:280px;min-height:220px;border-color:#37424c;background:rgba(8,11,15,.88)}
+#model-graph-window{left:336px;bottom:40px;width:430px;height:420px;min-width:320px;min-height:260px;border-color:#37424c;background:rgba(8,11,15,.88)}
 #model-graph-window .panel-content{display:flex;flex-direction:column;gap:8px;overflow:hidden}
 #models section,#model-graph-window section{display:flex;flex-direction:column;min-height:0;flex:1}
 #models h2,#model-graph-window h2,#virtual-pipeline-section h2{font-size:12px;margin:0 0 8px;color:#c6e6ff}
@@ -2703,6 +2888,21 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #model-graph .node rect{fill:#17222b;stroke:#52687b;stroke-width:1.2;rx:5}
 #model-graph .node.model rect{stroke:#81c995}
 #model-graph .node.core rect{stroke:#8bd3ff}
+#model-graph .node{cursor:pointer}
+#model-graph .node.hardcoded rect{stroke:#8bd3ff}
+#model-graph .node.shadow_train rect{stroke:#ffcf66}
+#model-graph .node.shadow_infer rect{stroke:#d6b5ff}
+#model-graph .node.model_infer rect,#model-graph .node.model_train_and_infer rect{stroke:#81c995}
+#model-graph .node.compare rect{stroke:#ff9f6e}
+#model-graph .node.missing rect{stroke:#f06d6d;stroke-dasharray:4 3}
+#model-graph .node.selected rect{stroke-width:2.4}
+#behavior-inspector{display:grid;grid-template-columns:1fr 1fr;gap:6px;border:1px solid #27313b;border-radius:5px;background:rgba(4,7,10,.28);padding:8px;min-height:112px}
+#behavior-inspector .wide{grid-column:1/-1}
+#behavior-inspector label{display:grid;gap:3px;color:#8fa1b2;font-size:10px;text-transform:uppercase}
+#behavior-inspector select,#behavior-inspector input{width:100%;min-width:0;background:#111820;border:1px solid #2d3944;color:#e7eef5;border-radius:4px;padding:4px;font-size:11px}
+#behavior-inspector input[type="checkbox"]{width:auto;justify-self:start;accent-color:#52a9ff}
+#behavior-inspector .title{grid-column:1/-1;color:#fff;font-weight:700;font-size:12px;display:flex;justify-content:space-between;gap:8px}
+#behavior-inspector .run{grid-column:1/-1;color:#9fb0bf;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #calibration{left:12px;top:540px;width:340px;border-color:#3c4854}
 #calibration .panel-content{display:grid;gap:6px}
 #calibration header{display:flex;align-items:center;justify-content:space-between;gap:12px}
@@ -2824,6 +3024,7 @@ canvas{display:block}
   <section>
     <h2>Connections</h2>
     <svg id="model-graph" viewBox="0 0 560 260" role="img" aria-label="Model connection diagram"></svg>
+    <div id="behavior-inspector" aria-live="polite"></div>
   </section>
 </aside>
 <aside id="calibration" data-window-title="Sensor Calibration">
@@ -2901,6 +3102,7 @@ const llmStreams = document.getElementById('llm-streams');
 const modelStatus = document.getElementById('model-status');
 const modelList = document.getElementById('model-list');
 const modelGraph = document.getElementById('model-graph');
+const behaviorInspector = document.getElementById('behavior-inspector');
 const virtualPipelineSection = document.getElementById('virtual-pipeline-section');
 const virtualReportSummary = document.getElementById('virtual-report-summary');
 const virtualModelRecommendations = document.getElementById('virtual-model-recommendations');
@@ -3752,13 +3954,83 @@ function renderModelStats(packet){
   }));
 }
 
+let behaviorNodes = [];
+let selectedBehaviorNodeId = 'Conductor';
+const graphLayout = {
+  Sensors:[28,18,'core'], Now:[148,18,'core'], Experience:[268,18,'model'], Future:[396,18,'model'],
+  Danger:[28,92,'model'], Charge:[148,92,'model'], EyeNext:[268,92,'model'], EarNext:[396,92,'model'],
+  Conductor:[148,166,'core'], ActionValue:[282,166,'model'], Autonomic:[416,166,'core'],
+  Body:[28,226,'core'], Ledger:[148,226,'core'], Training:[282,226,'core'], Models:[416,226,'model']
+};
+const staticGraphNodes = ['Sensors','Now','Autonomic','Body','Ledger','Training','Models'];
+
+function nodeStateClass(node){
+  if(!node) return 'core';
+  const classes = [node.selected_regime || 'hardcoded'];
+  if(node.missing_model_or_checkpoint) classes.push('missing');
+  if(node.node_id === selectedBehaviorNodeId) classes.push('selected');
+  return classes.join(' ');
+}
+
+function renderBehaviorInspector(){
+  const node = behaviorNodes.find(item => item.node_id === selectedBehaviorNodeId) || behaviorNodes[0];
+  if(!node){
+    behaviorInspector.innerHTML = '<div class="title">No behavior nodes</div>';
+    return;
+  }
+  selectedBehaviorNodeId = node.node_id;
+  const hardcodedOptions = (node.hardcoded_implementations || []).map(item => `<option value="${item.id}" ${item.id === node.selected_hardcoded ? 'selected' : ''}>${item.id}</option>`).join('');
+  const modelOptions = (node.model_implementations || []).map(item => `<option value="${item.id}" ${item.id === node.selected_model ? 'selected' : ''}>${item.id}</option>`).join('');
+  const regimeOptions = (node.allowed_regimes || []).map(item => `<option value="${item}" ${item === node.selected_regime ? 'selected' : ''}>${item}</option>`).join('');
+  const fallbacks = ['use_hardcoded','use_last_good_output','return_error','stop_safely','hardcoded_on_error','stop_on_error'];
+  const fallbackOptions = fallbacks.map(item => `<option value="${item}" ${item === node.fallback_policy ? 'selected' : ''}>${item}</option>`).join('');
+  const run = node.last_run ? `${node.last_run.regime} · ${node.last_run.error || 'ok'}${node.last_run.disagreement != null ? ` · disagreement ${compactNumber(node.last_run.disagreement)}` : ''}` : 'no run yet';
+  behaviorInspector.innerHTML = `
+    <div class="title"><span>${node.label || node.node_id}</span><span>${node.behavior_id}</span></div>
+    <label>Regime<select data-field="selected_regime">${regimeOptions}</select></label>
+    <label>Fallback<select data-field="fallback_policy">${fallbackOptions}</select></label>
+    <label class="wide">Hardcoded teacher<select data-field="selected_hardcoded">${hardcodedOptions}</select></label>
+    <label class="wide">Model<select data-field="selected_model"><option value="">none</option>${modelOptions}</select></label>
+    <label class="wide">Checkpoint<input data-field="checkpoint_path" value="${node.checkpoint_path || ''}" placeholder="data/models/..."></label>
+    <label>Training<input type="checkbox" data-field="training_enabled" ${node.training_enabled ? 'checked' : ''}></label>
+    <div class="run">${run}</div>`;
+  behaviorInspector.querySelectorAll('[data-field]').forEach(control => {
+    control.addEventListener('change', () => updateBehaviorNode(node.node_id));
+  });
+}
+
+async function updateBehaviorNode(nodeId){
+  const payload = {};
+  behaviorInspector.querySelectorAll('[data-field]').forEach(control => {
+    const field = control.dataset.field;
+    payload[field] = control.type === 'checkbox' ? control.checked : control.value;
+  });
+  if(payload.selected_model === '') payload.selected_model = null;
+  try{
+    const res = await fetch(`/view/behavior-nodes/${encodeURIComponent(nodeId)}`, {
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if(!res.ok) throw new Error(await res.text());
+    const updated = await res.json();
+    behaviorNodes = behaviorNodes.map(node => node.node_id === updated.node_id ? updated : node);
+    renderBehaviorInspector();
+    renderModelGraph({connections: currentModelConnections, behavior_nodes: behaviorNodes});
+  }catch(error){
+    behaviorInspector.querySelector('.run').textContent = error.message || 'update failed';
+  }
+}
+
+let currentModelConnections = [];
+
 function renderModelGraph(packet){
-  const nodes = {
-    Sensors:[28,18,'core'], Now:[148,18,'core'], Experience:[268,18,'model'], Future:[396,18,'model'],
-    Danger:[28,92,'model'], Charge:[148,92,'model'], EyeNext:[268,92,'model'], EarNext:[396,92,'model'],
-    Conductor:[148,166,'core'], ActionValue:[282,166,'model'], Autonomic:[416,166,'core'],
-    Body:[28,226,'core'], Ledger:[148,226,'core'], Training:[282,226,'core'], Models:[416,226,'model']
-  };
+  currentModelConnections = packet.connections || currentModelConnections;
+  behaviorNodes = packet.behavior_nodes || packet.nodes || behaviorNodes;
+  const nodes = {...graphLayout};
+  for(const node of behaviorNodes){
+    if(!nodes[node.node_id]) nodes[node.node_id] = [282,166,'model'];
+  }
   const w = 94, h = 26;
   const cx = name => nodes[name] ? nodes[name][0] + w / 2 : 0;
   const cy = name => nodes[name] ? nodes[name][1] + h / 2 : 0;
@@ -3781,11 +4053,20 @@ function renderModelGraph(packet){
     }
   }
   for(const [name, [x, y, kind]] of Object.entries(nodes)){
+    const behaviorNode = behaviorNodes.find(item => item.node_id === name);
     const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    group.setAttribute('class', `node ${kind}`);
+    group.setAttribute('class', `node ${kind} ${nodeStateClass(behaviorNode)}`);
+    if(behaviorNode){
+      group.addEventListener('click', () => {
+        selectedBehaviorNodeId = behaviorNode.node_id;
+        renderBehaviorInspector();
+        renderModelGraph({connections: currentModelConnections, behavior_nodes: behaviorNodes});
+      });
+    }
     group.innerHTML = `<rect x="${x}" y="${y}" width="${w}" height="${h}"></rect><text x="${x + w / 2}" y="${y + 17}" text-anchor="middle">${name}</text>`;
     modelGraph.appendChild(group);
   }
+  renderBehaviorInspector();
 }
 
 async function refreshModels(){
@@ -4549,6 +4830,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn behavior_node_endpoints_round_trip_config() {
+        let state = LiveViewState::new();
+
+        let Json(initial) = get_behavior_nodes(State(state.clone())).await;
+        assert!(initial.nodes.iter().any(|node| node.node_id == "Conductor"));
+
+        let Json(updated) = post_behavior_node(
+            State(state.clone()),
+            AxumPath("Conductor".to_string()),
+            Json(BehaviorNodeUpdate {
+                selected_regime: Some(BehaviorRegime::ShadowTrain),
+                selected_hardcoded: Some("reign.teacher".to_string()),
+                selected_model: Some("conductor.burn.v0".to_string()),
+                checkpoint_path: Some("data/models/conductor_v0".to_string()),
+                fallback_policy: Some(netherwick_behaviors::FallbackPolicy::UseHardcoded),
+                training_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(readback) = get_behavior_nodes(State(state)).await;
+        let conductor = readback
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "Conductor")
+            .unwrap();
+
+        assert_eq!(updated.selected_regime, BehaviorRegime::ShadowTrain);
+        assert_eq!(conductor.selected_hardcoded, "reign.teacher");
+        assert_eq!(
+            conductor.checkpoint_path.as_deref(),
+            Some("data/models/conductor_v0")
+        );
+        assert!(conductor.training_enabled);
+    }
+
+    #[tokio::test]
     async fn live_scene_returns_body_pose_and_range_beams() {
         let state = LiveViewState::new();
         state.update_scene_metadata(LiveSceneMetadata {
@@ -4678,6 +4996,7 @@ mod tests {
             None,
             LiveTrainingStatus::default(),
             NudgeStatus::default(),
+            default_behavior_nodes(),
             None,
         );
         let value = serde_json::to_value(scene).unwrap();
@@ -4752,6 +5071,10 @@ mod tests {
         assert!(page.contains("navigator.xr"));
         assert!(page.contains("window.isSecureContext"));
         assert!(page.contains("/reign/command"));
+        assert!(page.contains("/view/behavior-nodes"));
+        assert!(page.contains("behaviorInspector"));
+        assert!(page.contains("packet.behavior_nodes"));
+        assert!(page.contains("const nodes = {...graphLayout}"));
         assert!(page.contains("source='Gamepad'"));
         assert!(page.contains("createDefaultXRExperienceAsync"));
         assert!(page.contains("if(!eye?.data_url)"));
@@ -4770,12 +5093,14 @@ mod tests {
             .connections
             .iter()
             .any(|edge| edge.from == "Ledger" && edge.to == "Training"));
-        assert!(packet.models.iter().any(|model| {
-            model.name == "danger_v0"
-                && model.samples_seen.is_some()
-                && model.evaluation.is_some()
-                && model.metrics.is_some()
-        }));
+        assert!(packet
+            .behavior_nodes
+            .iter()
+            .any(|node| node.node_id == "ActionValue"));
+        assert!(packet
+            .registry
+            .iter()
+            .any(|entry| entry.behavior == "danger"));
     }
 
     #[tokio::test]

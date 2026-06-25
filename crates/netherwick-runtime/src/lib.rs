@@ -9,12 +9,12 @@ use netherwick_actions::{
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_behaviors::{
-    BehaviorConfig, BehaviorRegime, BehaviorRegistryConfig, ErasedBehaviorRunRecord,
-    FallbackPolicy, FunctionBehavior, ReplaceableBehavior, TargetExtractor, TrainingSample,
-    TrainingSource,
+    BehaviorConfig, BehaviorImplementation, BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime,
+    BehaviorRegistryConfig, ErasedBehaviorRunRecord, FallbackPolicy, FunctionBehavior,
+    ReplaceableBehavior, TargetExtractor, TrainingSample, TrainingSource,
 };
 use netherwick_body::{MotionCommand, MotorCommand, MotorComplex, RobotBody};
-use netherwick_conductor::{Conductor, ConductorInput};
+use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
 use netherwick_core::{Provenance, Reward, TimeMs};
 use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
@@ -82,6 +82,7 @@ where
     pub behavior_training_hub: BehaviorTrainingHub,
     pub inline_learning: InlineLearningConfig,
     pub nudge_policy: NudgePolicy,
+    pub last_behavior_runs: Vec<ErasedBehaviorRunRecord>,
     nudge: NudgeController,
 }
 
@@ -741,6 +742,14 @@ impl RuntimeModelStack {
                 behavior.fallback,
             );
         }
+        if let Some(behavior) = config.behavior.get("conductor") {
+            stack.behaviors.conductor = conductor_behavior(
+                behavior.regime,
+                &behavior.hardcoded,
+                behavior.model.clone(),
+                behavior.fallback,
+            );
+        }
         if let Some(behavior) = config.behavior.get("eye_next") {
             stack.behaviors.eye_next = eye_next_behavior(
                 behavior.regime,
@@ -764,6 +773,247 @@ impl RuntimeModelStack {
         }
         Ok(stack)
     }
+
+    pub fn behavior_node_states(
+        &self,
+        last_runs: &[ErasedBehaviorRunRecord],
+    ) -> Vec<BehaviorNodeState> {
+        let last = |id: &str| {
+            last_runs
+                .iter()
+                .rev()
+                .find(|run| run.behavior_id == id)
+                .cloned()
+        };
+        vec![
+            behavior_node_state(
+                "Experience",
+                "experience",
+                "Experience",
+                self.behaviors.experience.regime,
+                self.behaviors.experience.hardcoded_id(),
+                self.behaviors.experience.model_id(),
+                self.behaviors.experience.fallback,
+                vec![impl_id("experience.feature_encoder", "Feature encoder")],
+                vec![impl_id("experience.autoencoder.v0", "Autoencoder v0")],
+                last("experience"),
+            ),
+            behavior_node_state(
+                "Danger",
+                "danger",
+                "Danger",
+                self.behaviors.danger.regime,
+                self.behaviors.danger.hardcoded_id(),
+                self.behaviors.danger.model_id(),
+                self.behaviors.danger.fallback,
+                vec![impl_id("danger.range_bumper", "Range/bumper")],
+                vec![impl_id("danger.burn.v0", "Burn v0")],
+                last("danger"),
+            ),
+            behavior_node_state(
+                "Charge",
+                "charge",
+                "Charge",
+                self.behaviors.charge.regime,
+                self.behaviors.charge.hardcoded_id(),
+                self.behaviors.charge.model_id(),
+                self.behaviors.charge.fallback,
+                vec![impl_id(
+                    "charge.sensor_battery_delta",
+                    "Sensor/battery delta",
+                )],
+                vec![impl_id("charge.burn.v0", "Burn v0")],
+                last("charge"),
+            ),
+            behavior_node_state(
+                "Future",
+                "future",
+                "Future",
+                self.behaviors.future.regime,
+                self.behaviors.future.hardcoded_id(),
+                self.behaviors.future.model_id(),
+                self.behaviors.future.fallback,
+                vec![impl_id("future.stasis", "Stasis")],
+                vec![impl_id("future.burn.v0", "Burn v0")],
+                last("future"),
+            ),
+            behavior_node_state(
+                "Conductor",
+                "conductor",
+                "Conductor",
+                self.behaviors.conductor.regime,
+                self.behaviors.conductor.hardcoded_id(),
+                self.behaviors.conductor.model_id(),
+                self.behaviors.conductor.fallback,
+                vec![
+                    impl_id("conductor.simple_v0", "Simple conductor"),
+                    impl_id("action_selector.baseline", "Baseline selector"),
+                    impl_id("reign.teacher", "Reign teacher"),
+                ],
+                vec![
+                    impl_id("conductor.burn.v0", "Conductor Burn v0"),
+                    impl_id("action_selector.burn.v0", "Action selector Burn v0"),
+                ],
+                last("conductor"),
+            ),
+            behavior_node_state(
+                "ActionValue",
+                "action_value",
+                "ActionValue",
+                self.behaviors.action_value.regime,
+                self.behaviors.action_value.hardcoded_id(),
+                self.behaviors.action_value.model_id(),
+                self.behaviors.action_value.fallback,
+                vec![impl_id("action_value.handcoded", "Handcoded value")],
+                vec![impl_id("action_value.burn.v0", "Burn v0")],
+                last("action_value"),
+            ),
+            behavior_node_state(
+                "EyeNext",
+                "eye_next",
+                "EyeNext",
+                self.behaviors.eye_next.regime,
+                self.behaviors.eye_next.hardcoded_id(),
+                self.behaviors.eye_next.model_id(),
+                self.behaviors.eye_next.fallback,
+                vec![impl_id("eye.copy_current", "Copy current")],
+                vec![impl_id("eye.burn.next_v0", "Burn next v0")],
+                last("eye_next"),
+            ),
+            behavior_node_state(
+                "EarNext",
+                "ear_next",
+                "EarNext",
+                self.behaviors.ear_next.regime,
+                self.behaviors.ear_next.hardcoded_id(),
+                self.behaviors.ear_next.model_id(),
+                self.behaviors.ear_next.fallback,
+                vec![impl_id("ear.copy_current", "Copy current")],
+                vec![impl_id("ear.burn.next_v0", "Burn next v0")],
+                last("ear_next"),
+            ),
+        ]
+    }
+
+    pub fn apply_behavior_node_update(&mut self, node_id: &str, update: &BehaviorNodeUpdate) {
+        let id = normalize_behavior_node_id(node_id);
+        if id == "conductor" {
+            let regime = effective_training_regime(
+                update
+                    .selected_regime
+                    .unwrap_or(self.behaviors.conductor.regime),
+                update.training_enabled,
+            );
+            let hardcoded = update
+                .selected_hardcoded
+                .as_deref()
+                .unwrap_or_else(|| self.behaviors.conductor.hardcoded_id());
+            let model = update
+                .selected_model
+                .clone()
+                .or_else(|| self.behaviors.conductor.model_id().map(str::to_string));
+            let fallback = update
+                .fallback_policy
+                .unwrap_or(self.behaviors.conductor.fallback);
+            self.behaviors.conductor = conductor_behavior(regime, hardcoded, model, fallback);
+            return;
+        }
+        macro_rules! update_behavior {
+            ($field:ident) => {{
+                if let Some(regime) = update.selected_regime {
+                    self.behaviors.$field.regime =
+                        effective_training_regime(regime, update.training_enabled);
+                }
+                if let Some(fallback) = update.fallback_policy {
+                    self.behaviors.$field.fallback = fallback;
+                }
+            }};
+        }
+        match id.as_str() {
+            "experience" => update_behavior!(experience),
+            "danger" => update_behavior!(danger),
+            "charge" => update_behavior!(charge),
+            "future" => update_behavior!(future),
+            "action_value" => update_behavior!(action_value),
+            "eye_next" => update_behavior!(eye_next),
+            "ear_next" => update_behavior!(ear_next),
+            _ => {}
+        }
+    }
+}
+
+fn impl_id(id: &str, label: &str) -> BehaviorImplementation {
+    BehaviorImplementation {
+        id: id.to_string(),
+        label: label.to_string(),
+    }
+}
+
+fn behavior_node_state(
+    node_id: &str,
+    behavior_id: &str,
+    label: &str,
+    regime: BehaviorRegime,
+    hardcoded_id: &str,
+    model_id: Option<&str>,
+    fallback: FallbackPolicy,
+    hardcoded_implementations: Vec<BehaviorImplementation>,
+    model_implementations: Vec<BehaviorImplementation>,
+    last_run: Option<ErasedBehaviorRunRecord>,
+) -> BehaviorNodeState {
+    let training_enabled = matches!(
+        regime,
+        BehaviorRegime::ShadowTrain | BehaviorRegime::ModelTrainAndInfer
+    );
+    BehaviorNodeState {
+        node_id: node_id.to_string(),
+        behavior_id: behavior_id.to_string(),
+        label: label.to_string(),
+        allowed_regimes: vec![
+            BehaviorRegime::Hardcoded,
+            BehaviorRegime::ShadowTrain,
+            BehaviorRegime::ShadowInfer,
+            BehaviorRegime::ModelInfer,
+            BehaviorRegime::ModelTrainAndInfer,
+            BehaviorRegime::Compare,
+        ],
+        hardcoded_implementations,
+        model_implementations,
+        selected_regime: regime,
+        selected_hardcoded: hardcoded_id.to_string(),
+        selected_model: model_id.map(str::to_string),
+        checkpoint_path: None,
+        fallback_policy: fallback,
+        training_enabled,
+        last_run,
+        samples_observed: 0,
+        train_steps_used: 0,
+        missing_model_or_checkpoint: model_id.is_none()
+            && !matches!(regime, BehaviorRegime::Hardcoded),
+    }
+}
+
+fn normalize_behavior_node_id(node_id: &str) -> String {
+    match node_id {
+        "ActionValue" => "action_value".to_string(),
+        "EyeNext" => "eye_next".to_string(),
+        "EarNext" => "ear_next".to_string(),
+        other => other.to_ascii_lowercase().replace('-', "_"),
+    }
+}
+
+fn effective_training_regime(
+    regime: BehaviorRegime,
+    training_enabled: Option<bool>,
+) -> BehaviorRegime {
+    if training_enabled.unwrap_or(true) {
+        return regime;
+    }
+    match regime {
+        BehaviorRegime::ShadowTrain => BehaviorRegime::ShadowInfer,
+        BehaviorRegime::ModelTrainAndInfer => BehaviorRegime::ModelInfer,
+        other => other,
+    }
 }
 
 pub struct BehaviorRegistry {
@@ -772,6 +1022,7 @@ pub struct BehaviorRegistry {
     pub charge: ReplaceableBehavior<SituatedChargeInput, ChargeOutput>,
     pub future: ReplaceableBehavior<FutureInput, FuturePrediction>,
     pub action_value: ReplaceableBehavior<SituatedActionValueInput, ActionValueOutput>,
+    pub conductor: ReplaceableBehavior<ConductorInput, ActionPrimitive>,
     pub eye_next: ReplaceableBehavior<SituatedEyeNextInput, EyeNextOutput>,
     pub ear_next: ReplaceableBehavior<SituatedEarNextInput, EarNextOutput>,
 }
@@ -803,6 +1054,12 @@ impl Default for BehaviorRegistry {
                 BehaviorRegime::Hardcoded,
                 None,
                 FallbackPolicy::UseHardcoded,
+            ),
+            conductor: conductor_behavior(
+                BehaviorRegime::Hardcoded,
+                "conductor.simple_v0",
+                Some("conductor.burn.v0".to_string()),
+                FallbackPolicy::StopSafely,
             ),
             eye_next: eye_next_behavior(
                 BehaviorRegime::Hardcoded,
@@ -1463,6 +1720,97 @@ fn action_value_behavior(
     )
 }
 
+fn conductor_behavior(
+    regime: BehaviorRegime,
+    hardcoded_id: &str,
+    model_id: Option<String>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<ConductorInput, ActionPrimitive> {
+    ReplaceableBehavior::new(
+        "conductor",
+        regime,
+        Box::new(HardcodedConductorBehavior {
+            id: known_conductor_hardcoded_id(hardcoded_id),
+        }),
+        model_id.map(|id| {
+            Box::new(ShadowActionSelectorModel {
+                id,
+                last_observed: None,
+                samples_seen: 0,
+            }) as Box<_>
+        }),
+        fallback,
+    )
+}
+
+fn known_conductor_hardcoded_id(id: &str) -> &'static str {
+    match id {
+        "action_selector.baseline" => "action_selector.baseline",
+        "reign.teacher" => "reign.teacher",
+        _ => "conductor.simple_v0",
+    }
+}
+
+struct HardcodedConductorBehavior {
+    id: &'static str,
+}
+
+impl FunctionBehavior<ConductorInput, ActionPrimitive> for HardcodedConductorBehavior {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn infer(&mut self, input: &ConductorInput) -> Result<ActionPrimitive> {
+        match self.id {
+            "reign.teacher" => input
+                .reign
+                .latest
+                .as_ref()
+                .and_then(|input| input.command.to_action())
+                .or_else(|| input.proposals.last().cloned())
+                .map(Ok)
+                .unwrap_or_else(|| Ok(ActionPrimitive::Stop)),
+            "action_selector.baseline" => {
+                Ok(input
+                    .proposals
+                    .last()
+                    .cloned()
+                    .unwrap_or(ActionPrimitive::Explore {
+                        style: ExploreStyle::RandomWalk,
+                        duration_ms: 1_000,
+                    }))
+            }
+            _ => SimpleConductor::default().choose(input.clone()),
+        }
+    }
+}
+
+struct ShadowActionSelectorModel {
+    id: String,
+    last_observed: Option<ActionPrimitive>,
+    samples_seen: usize,
+}
+
+impl FunctionBehavior<ConductorInput, ActionPrimitive> for ShadowActionSelectorModel {
+    fn id(&self) -> &'static str {
+        "conductor.burn.v0"
+    }
+
+    fn infer(&mut self, _input: &ConductorInput) -> Result<ActionPrimitive> {
+        self.last_observed
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{} has no observed teacher samples", self.id))
+    }
+
+    fn observe(&mut self, sample: &TrainingSample<ConductorInput, ActionPrimitive>) -> Result<()> {
+        if sample.source != TrainingSource::SafetyVeto {
+            self.last_observed = Some(sample.expected.clone());
+            self.samples_seen = self.samples_seen.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
 fn eye_next_behavior(
     regime: BehaviorRegime,
     trainer: Option<EyeNextNetTrainer>,
@@ -1864,6 +2212,7 @@ where
             behavior_training_hub: BehaviorTrainingHub::default(),
             inline_learning: InlineLearningConfig::default(),
             nudge_policy: NudgePolicy::default(),
+            last_behavior_runs: Vec::new(),
             nudge: NudgeController::default(),
         }
     }
@@ -1897,6 +2246,7 @@ where
             behavior_training_hub: BehaviorTrainingHub::default(),
             inline_learning: InlineLearningConfig::default(),
             nudge_policy: NudgePolicy::default(),
+            last_behavior_runs: Vec::new(),
             nudge: NudgeController::default(),
         }
     }
@@ -1934,6 +2284,14 @@ where
 
     pub fn nudge_status(&self) -> NudgeStatus {
         self.nudge.status.clone()
+    }
+
+    pub fn behavior_node_states(&self) -> Vec<BehaviorNodeState> {
+        self.models.behavior_node_states(&self.last_behavior_runs)
+    }
+
+    pub fn apply_behavior_node_update(&mut self, node_id: &str, update: &BehaviorNodeUpdate) {
+        self.models.apply_behavior_node_update(node_id, update);
     }
 
     pub async fn tick(
@@ -2292,10 +2650,55 @@ where
             "action_selector".to_string(),
             serde_json::to_value(&action_selection)?,
         );
-        let chosen_action = action_selection
+        let teacher_action = action_selection
             .selected_action
             .clone()
             .unwrap_or(baseline_action);
+        let mut conductor_proposals = action_value_candidates.clone();
+        conductor_proposals.push(teacher_action.clone());
+        let conductor_behavior_input = ConductorInput {
+            latent: latent.clone(),
+            drives: now.drives.clone(),
+            memory: now.memory.clone(),
+            predictions: now.predictions.clone(),
+            surprise: now.surprise.clone(),
+            llm: now.llm.clone(),
+            safety: SafetySense::default(),
+            reign: now.reign.clone(),
+            range: now.range.clone(),
+            body: now.body.clone(),
+            proposals: conductor_proposals,
+        };
+        let teacher_source = if now.reign.active {
+            TrainingSource::HumanReign
+        } else {
+            TrainingSource::HardcodedTeacher
+        };
+        let conductor_run = self.models.behaviors.conductor.infer_with_teacher_source(
+            &conductor_behavior_input,
+            now.t_ms,
+            teacher_source,
+        )?;
+        let mut conductor_record = conductor_run.record;
+        let conductor_controls = matches!(
+            self.models.behaviors.conductor.regime,
+            BehaviorRegime::ModelInfer | BehaviorRegime::ModelTrainAndInfer
+        );
+        let conductor_selected_action = if conductor_controls {
+            conductor_run.chosen
+        } else {
+            teacher_action.clone()
+        };
+        conductor_record.selected_output = Some(conductor_selected_action.clone());
+        if mechanical_reign_action.is_some()
+            && !matches!(conductor_record.selected_output, Some(ref action) if Some(action) == mechanical_reign_action.as_ref())
+        {
+            conductor_record.selected_output = mechanical_reign_action.clone();
+        }
+        let chosen_action = mechanical_reign_action
+            .clone()
+            .unwrap_or(conductor_selected_action);
+        behavior_runs.push(conductor_record.erase());
 
         let danger_input = danger_behavior_input(&now, &latent, Some(&chosen_action));
         let danger_run = self
@@ -2475,6 +2878,7 @@ where
             ));
         }
 
+        self.last_behavior_runs = behavior_runs.clone();
         let frame = ExperienceFrame {
             id: Uuid::new_v4(),
             t_ms: now.t_ms,
@@ -4466,6 +4870,79 @@ mod tests {
         now.range.nearest_m = Some(1.0);
         now.range.beams = vec![1.0, 1.0, 1.0];
         now
+    }
+
+    fn test_conductor_input(action: ActionPrimitive) -> ConductorInput {
+        ConductorInput {
+            latent: ExperienceLatent::default(),
+            drives: DriveSense::default(),
+            memory: netherwick_now::MemorySense::default(),
+            predictions: netherwick_now::PredictionSense::default(),
+            surprise: SurpriseSense::default(),
+            llm: netherwick_now::LlmSense::default(),
+            safety: SafetySense::default(),
+            reign: ReignSense::default(),
+            range: netherwick_now::RangeSense::default(),
+            body: BodySense::default(),
+            proposals: vec![action],
+        }
+    }
+
+    #[test]
+    fn conductor_shadow_train_returns_reign_teacher_action_and_observes_model() {
+        let teacher_action = ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.4,
+            duration_ms: 500,
+        };
+        let mut input = test_conductor_input(ActionPrimitive::Stop);
+        input.reign.active = true;
+        input.reign.latest = Some(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 10,
+            expires_at_ms: 500,
+            source: ReignSource::WebRemote,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.4,
+                duration_ms: 500,
+            },
+            priority: 1.0,
+            note: None,
+        });
+        let mut behavior = conductor_behavior(
+            BehaviorRegime::ShadowTrain,
+            "reign.teacher",
+            Some("conductor.burn.v0".to_string()),
+            FallbackPolicy::UseHardcoded,
+        );
+
+        let run = behavior
+            .infer_with_teacher_source(&input, 10, TrainingSource::HumanReign)
+            .unwrap();
+
+        assert_eq!(run.chosen, teacher_action);
+        assert!(run.training_sample_emitted);
+        assert_eq!(run.record.model_output, None);
+    }
+
+    #[test]
+    fn conductor_model_infer_falls_back_to_hardcoded_when_model_has_no_sample() {
+        let teacher_action = ActionPrimitive::Dock;
+        let input = test_conductor_input(teacher_action.clone());
+        let mut behavior = conductor_behavior(
+            BehaviorRegime::ModelInfer,
+            "action_selector.baseline",
+            Some("conductor.burn.v0".to_string()),
+            FallbackPolicy::UseHardcoded,
+        );
+
+        let run = behavior.infer(&input, 10).unwrap();
+
+        assert_eq!(run.chosen, teacher_action);
+        assert!(run.fallback_used);
+        assert!(run.record.error.is_some());
     }
 
     fn prime_idle(controller: &mut NudgeController, now: &Now, policy: NudgePolicy) {

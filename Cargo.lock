@@ -4868,6 +4868,7 @@ dependencies = [
  "image",
  "netherwick-actions",
  "netherwick-autonomic",
+ "netherwick-behaviors",
  "netherwick-body",
  "netherwick-conductor",
  "netherwick-core",

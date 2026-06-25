@@ -931,6 +931,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             action_selector_mode: live_action_selector_label.clone(),
             weights_updating: inline_learning.is_enabled(),
         });
+        live_state.update_behavior_nodes(runner.runtime.behavior_node_states());
         let server_state = live_state.clone();
         let reign_state = netherwick_server::ReignServerState::with_live_view(
             runner.runtime.reign_queue.clone(),
@@ -996,6 +997,19 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         for _ in 0..args.steps {
             let current_inline_learning = live_state.inline_learning();
             runner.runtime.inline_learning = current_inline_learning.clone();
+            for node in live_state.behavior_nodes() {
+                runner.runtime.apply_behavior_node_update(
+                    &node.behavior_id,
+                    &netherwick_behaviors::BehaviorNodeUpdate {
+                        selected_regime: Some(node.selected_regime),
+                        selected_hardcoded: Some(node.selected_hardcoded.clone()),
+                        selected_model: node.selected_model.clone(),
+                        checkpoint_path: node.checkpoint_path.clone(),
+                        fallback_policy: Some(node.fallback_policy),
+                        training_enabled: Some(node.training_enabled),
+                    },
+                );
+            }
             let eye_frame = live_state.take_pending_retina_frame();
             if let Some(mut frame) = eye_frame {
                 frame.source = Some("babylon-robot-eye".to_string());
@@ -1005,6 +1019,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
                 runner.world.set_retina_frame(None);
             }
             runner.run_steps(1).await?;
+            live_state.update_behavior_nodes(runner.runtime.behavior_node_states());
             live_state.update(runner.world.snapshot().await?);
             live_state.update_prod_state(runner.runtime.nudge_status());
             live_state.update_training_status(netherwick_server::LiveTrainingStatus {
