@@ -120,7 +120,17 @@ go target="virtual":
         qrencode -t ANSIUTF8 "https://$LAN_IP:$PORT/view/3d" || true
     fi
     cargo build -p netherwick-tools
-    echo "Visible Dream World controller: baseline"
+    DREAM_POLICY_CHECKPOINT="${NETHERWICK_DREAM_POLICY_CHECKPOINT:-}"
+    if [ -z "$DREAM_POLICY_CHECKPOINT" ] && [ -f "${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}/evolve-best.json" ]; then
+        DREAM_POLICY_CHECKPOINT="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}/evolve-best.json"
+    fi
+    SIM_DREAM_POLICY_ARGS=()
+    if [ -n "$DREAM_POLICY_CHECKPOINT" ]; then
+        echo "Visible Dream World controller: $DREAM_POLICY_CHECKPOINT"
+        SIM_DREAM_POLICY_ARGS=(--dream-policy-checkpoint "$DREAM_POLICY_CHECKPOINT")
+    else
+        echo "Visible Dream World controller: baseline"
+    fi
     target/debug/netherwick sim \
         --live \
         --live-tls \
@@ -130,7 +140,8 @@ go target="virtual":
         --scenario "${NETHERWICK_SCENARIO:-dream}" \
         --steps "${NETHERWICK_SIM_STEPS:-1000000000}" \
         --tick-delay-ms "${NETHERWICK_TICK_DELAY_MS:-100}" \
-        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" &
+        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" \
+        "${SIM_DREAM_POLICY_ARGS[@]}" &
     PID="$!"
     trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' INT TERM EXIT
     if [ "${NETHERWICK_OPEN_BROWSER:-0}" = "1" ] && command -v xdg-open >/dev/null 2>&1; then
@@ -182,7 +193,7 @@ train target="virtual":
 train-virtual:
     just train virtual
 
-evolve:
+evolve *args:
     #!/usr/bin/env bash
     set -euo pipefail
     START_LEVEL="${NETHERWICK_NEAT_START_LEVEL:-motion}"
@@ -214,7 +225,46 @@ evolve:
         --checkpoint-dir "$CHECKPOINT_DIR" \
         --dataset-dir "$DATASET_DIR" \
         --export-dataset "$EXPORT_DATASET" \
-        --detailed-logs
+        --detailed-logs \
+        {{args}}
+
+evolve-fast *args:
+    just evolve {{args}}
+
+evolve-quality *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    START_LEVEL="${NETHERWICK_NEAT_START_LEVEL:-motion}"
+    GENERATIONS="${NETHERWICK_NEAT_QUALITY_GENERATIONS:-36}"
+    POPULATION="${NETHERWICK_NEAT_QUALITY_POPULATION:-64}"
+    SEED="${NETHERWICK_NEAT_SEED:-7}"
+    HIDDEN_DIM="${NETHERWICK_NEAT_QUALITY_HIDDEN_DIM:-14}"
+    CHECKPOINT_DIR="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
+    DATASET_DIR="${NETHERWICK_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
+    EXPORT_DATASET="${NETHERWICK_NEAT_EXPORT_DATASET:-true}"
+
+    echo "Dream NEAT evolve-quality: stronger first-draft profile + detailed CLI progress"
+    echo "  start-level:   $START_LEVEL"
+    echo "  generations:   $GENERATIONS"
+    echo "  population:    $POPULATION"
+    echo "  seed:          $SEED"
+    echo "  hidden-dim:    $HIDDEN_DIM"
+    echo "  checkpoint:    $CHECKPOINT_DIR"
+    echo "  dataset-dir:   $DATASET_DIR"
+    echo "  export-dataset:$EXPORT_DATASET"
+
+    cargo build --release -p netherwick-tools
+    target/release/netherwick dream-train \
+        --start-level "$START_LEVEL" \
+        --generations "$GENERATIONS" \
+        --population "$POPULATION" \
+        --seed "$SEED" \
+        --hidden-dim "$HIDDEN_DIM" \
+        --checkpoint-dir "$CHECKPOINT_DIR" \
+        --dataset-dir "$DATASET_DIR" \
+        --export-dataset "$EXPORT_DATASET" \
+        --detailed-logs \
+        {{args}}
 
 dev-cert:
     #!/usr/bin/env bash

@@ -582,6 +582,7 @@ pub mod dream_policy {
         let mut unlocked = vec![level];
         let mut best_checkpoint = config.checkpoint_dir.join("best.json");
         let mut best_score = f32::NEG_INFINITY;
+        let mut best_draft_ratio = f32::NEG_INFINITY;
         let mut total_episodes_run = 0u64;
         let mut total_records_exported = 0u64;
         let started_at = std::time::Instant::now();
@@ -637,6 +638,13 @@ pub mod dream_policy {
                     reports.push(report);
                 }
                 genome.fitness = score / level_config.seeds_per_genome as f32;
+                let fitness_ratio = genome.fitness / level_config.unlock_threshold.max(0.001);
+                if fitness_ratio > best_draft_ratio {
+                    best_draft_ratio = fitness_ratio;
+                    best_checkpoint = config
+                        .checkpoint_dir
+                        .join(format!("level-{}-best.json", level.id()));
+                }
                 if genome.fitness > best_score {
                     best_score = genome.fitness;
                     let checkpoint = DreamPolicyCheckpoint {
@@ -646,10 +654,10 @@ pub mod dream_policy {
                         best_score,
                         genome: genome.clone(),
                     };
-                    best_checkpoint = config
+                    let level_best_checkpoint = config
                         .checkpoint_dir
                         .join(format!("level-{}-best.json", level.id()));
-                    save_best_genome(&checkpoint, &best_checkpoint)?;
+                    save_best_genome(&checkpoint, &level_best_checkpoint)?;
                     if config.export_dataset {
                         for report in &reports {
                             export_episode_records(report, &config.dataset_dir).await?;

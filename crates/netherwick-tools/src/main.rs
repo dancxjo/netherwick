@@ -244,6 +244,8 @@ struct DreamTrainArgs {
     export_dataset: bool,
     #[arg(long, default_value_t = false)]
     detailed_logs: bool,
+    #[arg(long, default_value_t = false)]
+    clear: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -2441,18 +2443,78 @@ fn summarize_episode_memory(episodes: &[ScenarioEpisodeReport]) -> ScenarioMemor
 }
 
 async fn run_dream_train(args: DreamTrainArgs) -> Result<()> {
+    let checkpoint_dir = PathBuf::from(&args.checkpoint_dir);
+    if args.clear && checkpoint_dir.exists() {
+        fs::remove_dir_all(&checkpoint_dir).with_context(|| {
+            format!(
+                "failed to clear checkpoint dir {}",
+                checkpoint_dir.display()
+            )
+        })?;
+        println!(
+            "cleared dream checkpoint dir for fresh evolve run: {}",
+            checkpoint_dir.display()
+        );
+    }
+
+    let evolve_best = checkpoint_dir.join("evolve-best.json");
+    let incumbent = if !args.clear && evolve_best.exists() {
+        Some(load_best_genome(&evolve_best).with_context(|| {
+            format!(
+                "failed to load incumbent evolve checkpoint {}",
+                evolve_best.display()
+            )
+        })?)
+    } else {
+        None
+    };
+
     let config = DreamTrainingConfig {
         population_size: args.population,
         generations: args.generations,
         base_seed: args.seed,
         start_level: args.start_level.into(),
         hidden_dim: args.hidden_dim,
-        checkpoint_dir: PathBuf::from(args.checkpoint_dir),
+        checkpoint_dir: checkpoint_dir.clone(),
         dataset_dir: PathBuf::from(args.dataset_dir),
         export_dataset: args.export_dataset,
         detailed_logs: args.detailed_logs,
     };
     let report = train_dream_policy(config).await?;
+
+    let candidate = load_best_genome(&report.best_checkpoint).with_context(|| {
+        format!(
+            "failed to load candidate checkpoint {}",
+            report.best_checkpoint.display()
+        )
+    })?;
+    let promote = incumbent.as_ref().map_or(true, |current| {
+        if candidate.level.id() != current.level.id() {
+            candidate.level.id() > current.level.id()
+        } else {
+            candidate.best_score > current.best_score
+        }
+    });
+
+    if promote {
+        fs::copy(&report.best_checkpoint, &evolve_best).with_context(|| {
+            format!(
+                "failed to publish evolve checkpoint alias from {} to {}",
+                report.best_checkpoint.display(),
+                evolve_best.display()
+            )
+        })?;
+        println!("published evolve checkpoint alias: {}", evolve_best.display());
+    } else if let Some(current) = &incumbent {
+        println!(
+            "kept incumbent evolve checkpoint: {} (incumbent level={} score={:.3}, candidate level={} score={:.3})",
+            evolve_best.display(),
+            current.level.name(),
+            current.best_score,
+            candidate.level.name(),
+            candidate.best_score,
+        );
+    }
 
     fn comma_count(value: u64) -> String {
         let digits = value.to_string();
