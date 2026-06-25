@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
-use netherwick_actions::ActionPrimitive;
+use netherwick_actions::{action_to_motor_command, ActionPrimitive};
 use netherwick_actions::{ApproachTarget, ExploreStyle, TurnDir};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
@@ -37,7 +37,10 @@ use netherwick_server::{
     LiveSceneMetadata, LiveViewState, SceneArena, SceneObject, SceneSensorCalibration, SceneSession,
 };
 use netherwick_sim::{build_scenario, ScenarioConfig, ScenarioKind, SimObjectKind};
-use netherwick_training::dream_policy::{train_dream_policy, DreamLevel, DreamTrainingConfig};
+use netherwick_training::dream_policy::{
+    load_best_genome, train_dream_policy, DreamGenome, DreamLevel, DreamObservation,
+    DreamPolicyCheckpoint, DreamTrainingConfig, OBSERVATION_DIM,
+};
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
     EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
@@ -162,6 +165,8 @@ struct SimArgs {
     experience_mode: ExperienceMode,
     #[arg(long, value_enum, default_value = "baseline")]
     action_selector: CliActionSelectorMode,
+    #[arg(long, env = "NETHERWICK_DREAM_POLICY_CHECKPOINT")]
+    dream_policy_checkpoint: Option<String>,
     #[arg(long, env = "NETHERWICK_INLINE_LEARNING")]
     inline_learning: bool,
     #[arg(
@@ -332,6 +337,117 @@ impl From<InlineLearningModeArg> for InlineLearningMode {
             InlineLearningModeArg::ShadowOnly => InlineLearningMode::ShadowOnly,
             InlineLearningModeArg::WorldOutcome => InlineLearningMode::WorldOutcome,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum LiveSimConductor {
+    Baseline(SimpleConductor),
+    DreamNeat(DreamNeatConductor),
+}
+
+impl Conductor for LiveSimConductor {
+    fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
+        if let Some(action) = input
+            .reign
+            .latest
+            .as_ref()
+            .and_then(|input| input.command.to_action())
+        {
+            return Ok(action);
+        }
+        match self {
+            Self::Baseline(conductor) => conductor.choose(input),
+            Self::DreamNeat(conductor) => conductor.choose(input),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DreamNeatConductor {
+    genome: DreamGenome,
+    level: DreamLevel,
+    checkpoint_path: PathBuf,
+    previous_action: Option<ActionPrimitive>,
+}
+
+impl DreamNeatConductor {
+    fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let checkpoint = load_best_genome(path)?;
+        Ok(Self::from_checkpoint(path.to_path_buf(), checkpoint))
+    }
+
+    fn from_checkpoint(path: PathBuf, checkpoint: DreamPolicyCheckpoint) -> Self {
+        Self {
+            genome: checkpoint.genome,
+            level: checkpoint.level,
+            checkpoint_path: path,
+            previous_action: None,
+        }
+    }
+
+    fn observation_from_input(&self, input: &ConductorInput) -> DreamObservation {
+        let mut values = Vec::with_capacity(OBSERVATION_DIM);
+        for beam in input.range.beams.iter().take(16) {
+            values.push(beam.clamp(0.0, 1.0));
+        }
+        while values.len() < 16 {
+            values.push(1.0);
+        }
+
+        let previous_motor = action_to_motor_command(self.previous_action.as_ref());
+        values.extend([
+            bool01(input.body.flags.bump_left),
+            bool01(input.body.flags.bump_right),
+            bool01(input.body.flags.cliff_left || input.body.flags.cliff_front_left),
+            bool01(input.body.flags.cliff_right || input.body.flags.cliff_front_right),
+            bool01(input.body.flags.wheel_drop),
+            input.body.battery_level.clamp(0.0, 1.0),
+            bool01(input.body.charging),
+            input.body.velocity.forward_m_s.clamp(-0.5, 0.5) / 0.5,
+            input.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
+            0.0,
+            1.0,
+            input.memory.place_charge_value.clamp(0.0, 1.0),
+            0.0,
+            1.0,
+            input.memory.place_social_value.clamp(0.0, 1.0),
+            input
+                .memory
+                .place_novelty
+                .max(input.drives.curiosity)
+                .clamp(0.0, 1.0),
+            input.memory.place_familiarity.clamp(0.0, 1.0),
+            previous_motor.forward.clamp(-0.5, 0.5) / 0.5,
+            previous_motor.turn.clamp(-1.0, 1.0),
+            input.drives.danger_avoidance.clamp(0.0, 1.0),
+            self.level.id() as f32 / 6.0,
+        ]);
+
+        values.extend(input.latent.z.iter().copied().take(24));
+        values.push(input.latent.confidence.clamp(0.0, 1.0));
+        values.push(input.latent.reconstruction_error.clamp(0.0, 1.0));
+        values.push(input.latent.prediction_error.clamp(0.0, 1.0));
+        values.resize(OBSERVATION_DIM, 0.0);
+        DreamObservation { values }
+    }
+}
+
+impl Conductor for DreamNeatConductor {
+    fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
+        let observation = self.observation_from_input(&input);
+        let action = self.genome.infer(&observation).to_action(self.level);
+        self.previous_action = Some(action.clone());
+        Ok(action)
+    }
+}
+
+fn bool01(value: bool) -> f32 {
+    if value {
+        1.0
+    } else {
+        0.0
     }
 }
 
@@ -867,6 +983,26 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let (models, model_loading) = load_runtime_models_from_flags(&flags)?;
     let action_selector_mode = ActionSelectorMode::from(args.action_selector);
     let inline_learning = inline_learning_config_from_sim_args(&args)?;
+    let mut models_loaded = loaded_model_names(&model_loading);
+    let mut conductor = LiveSimConductor::Baseline(SimpleConductor::default());
+    let mut live_action_selector_label = action_selector_mode.as_str().to_string();
+    if let Some(checkpoint) = args.dream_policy_checkpoint.as_deref() {
+        let dream_conductor = DreamNeatConductor::load(checkpoint)
+            .with_context(|| format!("failed to load dream policy checkpoint {checkpoint}"))?;
+        println!(
+            "Dream NEAT controller loaded: level {}, genome {}, checkpoint {}",
+            dream_conductor.level.name(),
+            dream_conductor.genome.id,
+            dream_conductor.checkpoint_path.display()
+        );
+        models_loaded.push(format!(
+            "dream-neat:{}:genome-{}",
+            dream_conductor.level.name(),
+            dream_conductor.genome.id
+        ));
+        live_action_selector_label = format!("dream-neat+{}", action_selector_mode.as_str());
+        conductor = LiveSimConductor::DreamNeat(dream_conductor);
+    }
     let memory = InMemoryExperienceStore::new();
     let recall = memory.clone();
     let llm = configured_llm_agent(&args.llm)?;
@@ -874,7 +1010,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         ledger,
         memory,
         recall,
-        SimpleConductor::default(),
+        conductor,
         SimpleSafety::default(),
         llm,
     )
@@ -909,9 +1045,9 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             ledger_path: Some(args.ledger.clone()),
             frames_written: 0,
             transitions_written: 0,
-            models_loaded: loaded_model_names(&model_loading),
+            models_loaded: models_loaded.clone(),
             model_modes: model_modes_from_flags(&flags),
-            action_selector_mode: action_selector_mode.as_str().to_string(),
+            action_selector_mode: live_action_selector_label.clone(),
             weights_updating: inline_learning.is_enabled(),
         });
         let server_state = live_state.clone();
@@ -987,18 +1123,17 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             } else {
                 runner.world.set_retina_frame(None);
             }
-            runner
-                .run_steps_observing(1, |snapshot| live_state.update(snapshot.clone()))
-                .await?;
+            runner.run_steps(1).await?;
+            live_state.update(runner.world.snapshot().await?);
             live_state.update_prod_state(runner.runtime.nudge_status());
             live_state.update_training_status(netherwick_server::LiveTrainingStatus {
                 training_mode: current_inline_learning.training_mode_label().to_string(),
                 ledger_path: Some(args.ledger.clone()),
                 frames_written: runner.tick_count,
                 transitions_written: runner.tick_count.saturating_sub(1),
-                models_loaded: loaded_model_names(&model_loading),
+                models_loaded: models_loaded.clone(),
                 model_modes: model_modes_from_flags(&flags),
-                action_selector_mode: action_selector_mode.as_str().to_string(),
+                action_selector_mode: live_action_selector_label.clone(),
                 weights_updating: current_inline_learning.is_enabled(),
             });
             tokio::time::sleep(Duration::from_millis(args.tick_delay_ms)).await;

@@ -4058,10 +4058,7 @@ async function sendRetinaFrame() {
     retinaCanvas.height = retinaHeight;
     const retinaCtx = retinaCanvas.getContext('2d');
     
-    retinaCtx.translate(0, retinaHeight);
-    retinaCtx.scale(1, -1);
     retinaCtx.drawImage(tempCanvas, 0, 0, 256, 256, 0, 0, retinaWidth, retinaHeight);
-    retinaCtx.setTransform(1, 0, 0, 1, 0, 0);
 
     const dataUrl = retinaCanvas.toDataURL('image/png');
 

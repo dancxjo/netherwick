@@ -44,7 +44,11 @@ just go virtual
 Offline training still exists and is still useful. Use `train virtual` or behavior training commands when you want repeatable batches, more epochs, promotion checks, and registry updates from a collected Dream World ledger.
 
 Dream NEAT training writes checkpoints to `data/models/dream-policy/neat` and
-distillation rollouts to `datasets/dream-policy/v0/episodes`.
+distillation rollouts to `datasets/dream-policy/v0/episodes`. When a
+`level-*-best.json` checkpoint exists, the visible Dream World robot is started
+with the newest checkpoint as its controller. The browser HUD/scene JSON reports
+this as an action selector mode like `dream-neat+baseline` and includes the
+loaded `dream-neat:<level>:genome-<id>` model entry.
 
 Tune or disable the automatic Dream NEAT run:
 
@@ -57,6 +61,13 @@ just go virtual
 
 ```bash
 NETHERWICK_NEAT_TRAINING=0 just go virtual
+```
+
+Use a specific visible-controller checkpoint:
+
+```bash
+NETHERWICK_DREAM_POLICY_CHECKPOINT=data/models/dream-policy/neat/level-1-best.json \
+just go virtual
 ```
 
 Open:

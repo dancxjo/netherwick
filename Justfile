@@ -133,6 +133,22 @@ go target="virtual":
             --export-dataset "${NETHERWICK_NEAT_EXPORT_DATASET:-true}" &
         TRAIN_PID="$!"
     fi
+    DREAM_POLICY_CHECKPOINT="${NETHERWICK_DREAM_POLICY_CHECKPOINT:-}"
+    if [ -z "$DREAM_POLICY_CHECKPOINT" ]; then
+        DREAM_POLICY_CHECKPOINT="$(
+            find "${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}" -maxdepth 1 -type f -name 'level-*-best.json' -printf '%f\t%T@\t%p\n' 2>/dev/null \
+                | awk -F '\t' '{ level=$1; sub(/^level-/, "", level); sub(/-best[.]json$/, "", level); if (level ~ /^[0-9]+$/) print level "\t" $2 "\t" $3 }' \
+                | sort -t '	' -k1,1nr -k2,2nr \
+                | awk -F '\t' 'NR==1 {print $3}'
+        )"
+    fi
+    SIM_DREAM_POLICY_ARGS=()
+    if [ -n "$DREAM_POLICY_CHECKPOINT" ]; then
+        echo "Visible Dream World controller: $DREAM_POLICY_CHECKPOINT"
+        SIM_DREAM_POLICY_ARGS=(--dream-policy-checkpoint "$DREAM_POLICY_CHECKPOINT")
+    else
+        echo "Visible Dream World controller: baseline (no Dream NEAT checkpoint found)"
+    fi
     target/debug/netherwick sim \
         --live \
         --live-tls \
@@ -142,7 +158,8 @@ go target="virtual":
         --scenario "${NETHERWICK_SCENARIO:-dream}" \
         --steps "${NETHERWICK_SIM_STEPS:-1000000000}" \
         --tick-delay-ms "${NETHERWICK_TICK_DELAY_MS:-100}" \
-        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" &
+        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" \
+        "${SIM_DREAM_POLICY_ARGS[@]}" &
     PID="$!"
     trap 'kill "$PID" 2>/dev/null || true; if [ -n "${TRAIN_PID:-}" ]; then kill "$TRAIN_PID" 2>/dev/null || true; wait "$TRAIN_PID" 2>/dev/null || true; fi; wait "$PID" 2>/dev/null || true' INT TERM EXIT
     if [ "${NETHERWICK_OPEN_BROWSER:-0}" = "1" ] && command -v xdg-open >/dev/null 2>&1; then

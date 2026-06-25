@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use netherwick_actions::{
-    action_to_motion, action_to_motor_command, ActionPrimitive, ApproachTarget, ExploreStyle,
-    InspectTarget, ReignCommand, ReignInput, ReignMode, ReignOutcome, TurnDir,
+    action_to_motor_command, ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget,
+    ReignInput, ReignOutcome, TurnDir,
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_behaviors::{
@@ -1817,13 +1817,9 @@ impl ReignQueue {
     }
 }
 
-fn direct_reign_action(input: &Option<ReignInput>) -> Option<ActionPrimitive> {
+fn immediate_reign_action(input: &Option<ReignInput>) -> Option<ActionPrimitive> {
     let input = input.as_ref()?;
-    if matches!(input.command, ReignCommand::Stop) || input.mode == ReignMode::Direct {
-        input.command.to_action()
-    } else {
-        None
-    }
+    input.command.to_action()
 }
 
 impl<L, M, R, C, S, A> MinimalRuntime<L, M, R, C, S, A>
@@ -1953,7 +1949,7 @@ where
         let reign_action = reign_input
             .as_ref()
             .and_then(|input| input.command.to_action());
-        let direct_reign_action = direct_reign_action(&reign_input);
+        let immediate_reign_action = immediate_reign_action(&reign_input);
 
         let mut behavior_runs: Vec<ErasedBehaviorRunRecord> = Vec::new();
         let experience_input = ExperienceBehaviorInput::from_now(&now);
@@ -2133,6 +2129,10 @@ where
             &mut experiences,
             &mut teachings,
         );
+        let llm_command_action = llm_tick
+            .conscious_command
+            .as_ref()
+            .and_then(|cmd| cmd.action.clone());
 
         let nudge_proposal = self.nudge.propose(&now, self.nudge_policy);
         if let Some(action) = nudge_proposal.clone() {
@@ -2143,11 +2143,7 @@ where
         }
 
         let mut proposals = proposed_actions.clone();
-        if let Some(action) = llm_tick
-            .conscious_command
-            .as_ref()
-            .and_then(|cmd| cmd.action.clone())
-        {
+        if let Some(action) = llm_command_action.clone() {
             proposals.push(action);
         }
         let action_value_candidates =
@@ -2162,10 +2158,11 @@ where
             llm: now.llm.clone(),
             safety: SafetySense::default(),
             reign: now.reign.clone(),
+            range: now.range.clone(),
             body: now.body.clone(),
             proposals,
         })?;
-        if let Some(action) = direct_reign_action.as_ref() {
+        if let Some(action) = immediate_reign_action.as_ref() {
             baseline_action = action.clone();
         }
 
@@ -2273,10 +2270,15 @@ where
             baseline_action.clone(),
             candidate_scores,
         );
-        if let Some(action) = direct_reign_action.as_ref() {
+        if let Some(action) = immediate_reign_action.as_ref() {
             action_selection.selected_action = Some(action.clone());
             action_selection.selected_score = None;
             action_selection.safety_overrode = false;
+        } else if let Some(action) = llm_command_action.as_ref() {
+            if !action_selection.safety_overrode {
+                action_selection.selected_action = Some(action.clone());
+                action_selection.selected_score = None;
+            }
         }
         for warning in &action_selection.fallback_warnings {
             notes.push(warning.clone());
@@ -2378,6 +2380,16 @@ where
             .safety
             .filter(&now, action_to_motor_command(Some(&chosen_action)));
         self.nudge.observe_motor(safety.command);
+        now.extensions.insert(
+            "motor_gate".to_string(),
+            serde_json::json!({
+                "desired_motor": action_to_motor_command(Some(&chosen_action)),
+                "final_motor": safety.command,
+                "motor_applied": !is_near_zero_motor(safety.command),
+                "vetoed": safety.vetoed,
+                "safety_reason": safety.reason.clone().map(Some).map(describe_safety_reason),
+            }),
+        );
         now.extensions.insert(
             "prod.nudge".to_string(),
             serde_json::to_value(&self.nudge.status)?,
@@ -2933,6 +2945,35 @@ fn wall_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn final_motor_from_tick(tick: &RuntimeTick) -> MotorCommand {
+    tick.frame
+        .now
+        .extensions
+        .get("motor_gate")
+        .and_then(|value| value.get("final_motor"))
+        .and_then(|value| serde_json::from_value::<MotorCommand>(value.clone()).ok())
+        .unwrap_or_else(|| action_to_motor_command(tick.chosen_action.as_ref()))
+}
+
+fn motor_command_to_motion(motor: MotorCommand) -> MotionCommand {
+    if is_near_zero_motor(motor) {
+        MotionCommand::Stop
+    } else if motor.turn == 0.0 {
+        MotionCommand::Forward {
+            speed_m_s: motor.forward,
+        }
+    } else if motor.forward == 0.0 {
+        MotionCommand::Turn {
+            turn_rad_s: motor.turn,
+        }
+    } else {
+        MotionCommand::Drive {
+            forward_m_s: motor.forward,
+            turn_rad_s: motor.turn,
+        }
+    }
+}
+
 pub struct SimRunner<R> {
     pub runtime: R,
     pub world: VirtualWorld,
@@ -3427,7 +3468,7 @@ where
                 let motion = self
                     .stuck
                     .recovery_motion()
-                    .unwrap_or_else(|| action_to_motion(tick.chosen_action.as_ref()));
+                    .unwrap_or_else(|| motor_command_to_motion(final_motor_from_tick(&tick)));
                 self.motors.send(motion).await?;
             };
             self.tick_count = self.tick_count.saturating_add(1);
@@ -4397,7 +4438,7 @@ mod tests {
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_experience::experience_encode_input_from_now;
     use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
-    use netherwick_llm::LlmTickResult;
+    use netherwick_llm::{ConsciousCommand, LlmTickResult};
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_models::{
         ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
@@ -4918,6 +4959,57 @@ mod tests {
         runtime.reign_queue.lock().unwrap().push(test_reign_input(
             100,
             ReignMode::Direct,
+            command.clone(),
+            2_000,
+        ));
+        let mut now = idle_now(100);
+        now.drives.curiosity = 1.0;
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, command.to_action());
+        let decision = tick
+            .frame
+            .now
+            .extensions
+            .get("action_selector")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ActionSelectionDecision>(value).ok())
+            .unwrap();
+        assert_eq!(decision.selected_action, command.to_action());
+        assert!(tick
+            .frame
+            .reign_outcome
+            .as_ref()
+            .map(|outcome| outcome.accepted_by_conductor)
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn assist_reign_overrides_model_assisted_selector_immediately() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-assist-reign-model-assisted-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+        )
+        .with_action_selector_mode(ActionSelectorMode::ModelAssisted);
+        let command = ReignCommand::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.5,
+            duration_ms: 500,
+        };
+        runtime.reign_queue.lock().unwrap().push(test_reign_input(
+            100,
+            ReignMode::Assist,
             command.clone(),
             2_000,
         ));
@@ -6055,6 +6147,48 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct FixedLlmAgent {
+        action: ActionPrimitive,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmAgent for FixedLlmAgent {
+        async fn combobulate(
+            &mut self,
+            _now: &Now,
+            _impressions: &[Impression],
+            _z: &ExperienceLatent,
+            _futures: &[FuturePrediction],
+            _recall_summary: &str,
+        ) -> Result<Option<Combobulation>> {
+            Ok(None)
+        }
+
+        async fn maybe_tick(
+            &mut self,
+            _now: &Now,
+            _z: &ExperienceLatent,
+            _futures: &[FuturePrediction],
+            _recall_summary: &str,
+            _awareness_summary: Option<&str>,
+        ) -> Result<LlmTickResult> {
+            Ok(LlmTickResult {
+                sense: netherwick_now::LlmSense {
+                    schema_version: 1,
+                    command_summary: Some("test command".to_string()),
+                    critique: None,
+                    confidence: 1.0,
+                },
+                conscious_command: Some(ConsciousCommand {
+                    summary: "test command".to_string(),
+                    action: Some(self.action.clone()),
+                }),
+                teaching: Vec::new(),
+            })
+        }
+    }
+
     fn test_runtime<C>(
         ledger: JsonlLedger,
         conductor: C,
@@ -6079,6 +6213,52 @@ mod tests {
             SimpleSafety::default(),
             netherwick_llm::NoopLlmAgent,
         )
+    }
+
+    #[tokio::test]
+    async fn llm_command_action_overrides_default_curiosity_drive() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-llm-command-action-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let llm_action = ActionPrimitive::Go {
+            intensity: 0.3,
+            duration_ms: 700,
+        };
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            FixedLlmAgent {
+                action: llm_action.clone(),
+            },
+        );
+        let mut now = idle_now(100);
+        now.drives.curiosity = 1.0;
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, Some(llm_action.clone()));
+        assert_eq!(
+            tick.frame
+                .conscious_command
+                .as_ref()
+                .and_then(|cmd| cmd.action.clone()),
+            Some(llm_action.clone())
+        );
+        let decision = tick
+            .frame
+            .now
+            .extensions
+            .get("action_selector")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ActionSelectionDecision>(value).ok())
+            .unwrap();
+        assert_eq!(decision.selected_action, Some(llm_action));
     }
 
     fn arena() -> ArenaConfig {
