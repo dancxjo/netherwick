@@ -1370,7 +1370,12 @@ struct ScenarioEvaluationSummary {
     distance_after_recovery_m: Option<f32>,
     mean_safety_interventions: f32,
     behavior_run_records: usize,
+    #[serde(default)]
     model_fallbacks: usize,
+    #[serde(default)]
+    action_selector_fallbacks: usize,
+    #[serde(default)]
+    action_selector_guard_yields: usize,
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
     mean_chosen_score: Option<f32>,
@@ -1433,6 +1438,8 @@ struct ScenarioEpisodeReport {
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
     action_selector_fallbacks: usize,
+    #[serde(default)]
+    action_selector_guard_yields: usize,
     mean_chosen_score: Option<f32>,
     mean_candidate_score: Option<f32>,
     ticks_with_eye_frames: usize,
@@ -1520,6 +1527,7 @@ struct EpisodeMetricBuilder {
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
     action_selector_fallbacks: usize,
+    action_selector_guard_yields: usize,
     chosen_score_sum: f32,
     chosen_score_count: usize,
     candidate_score_sum: f32,
@@ -1586,6 +1594,7 @@ impl EpisodeMetricBuilder {
             model_assisted_decisions: 0,
             action_selector_safety_overrides: 0,
             action_selector_fallbacks: 0,
+            action_selector_guard_yields: 0,
             chosen_score_sum: 0.0,
             chosen_score_count: 0,
             candidate_score_sum: 0.0,
@@ -1745,10 +1754,11 @@ impl EpisodeMetricBuilder {
             records
                 .iter()
                 .filter(|record| {
-                    record.error.is_some()
-                        || (record.regime == BehaviorRegime::ModelInfer
-                            && record.model_json.is_none()
-                            && record.hardcoded_json.is_some())
+                    matches!(
+                        record.regime,
+                        BehaviorRegime::ModelInfer | BehaviorRegime::ModelTrainAndInfer
+                    ) && (record.error.is_some()
+                        || (record.model_json.is_none() && record.hardcoded_json.is_some()))
                 })
                 .count(),
         );
@@ -1768,13 +1778,19 @@ impl EpisodeMetricBuilder {
             self.action_selector_safety_overrides =
                 self.action_selector_safety_overrides.saturating_add(1);
         }
-        if !decision.fallback_warnings.is_empty()
-            || decision
-                .candidates
-                .iter()
-                .any(|candidate| candidate.fallback_used)
+        if decision
+            .candidates
+            .iter()
+            .any(|candidate| candidate.fallback_used)
         {
             self.action_selector_fallbacks = self.action_selector_fallbacks.saturating_add(1);
+        }
+        if decision
+            .fallback_warnings
+            .iter()
+            .any(|warning| warning.contains("baseline trap recovery"))
+        {
+            self.action_selector_guard_yields = self.action_selector_guard_yields.saturating_add(1);
         }
         if let Some(score) = decision.selected_score {
             self.chosen_score_sum += score;
@@ -1873,6 +1889,7 @@ impl EpisodeMetricBuilder {
             model_assisted_decisions: self.model_assisted_decisions,
             action_selector_safety_overrides: self.action_selector_safety_overrides,
             action_selector_fallbacks: self.action_selector_fallbacks,
+            action_selector_guard_yields: self.action_selector_guard_yields,
             mean_chosen_score: (self.chosen_score_count > 0)
                 .then_some(self.chosen_score_sum / self.chosen_score_count as f32),
             mean_candidate_score: (self.candidate_score_count > 0)
@@ -2322,6 +2339,14 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
             .map(|episode| episode.behavior_run_records)
             .sum(),
         model_fallbacks: episodes.iter().map(|episode| episode.model_fallbacks).sum(),
+        action_selector_fallbacks: episodes
+            .iter()
+            .map(|episode| episode.action_selector_fallbacks)
+            .sum(),
+        action_selector_guard_yields: episodes
+            .iter()
+            .map(|episode| episode.action_selector_guard_yields)
+            .sum(),
         model_assisted_decisions: episodes
             .iter()
             .map(|episode| episode.model_assisted_decisions)
@@ -6841,6 +6866,125 @@ mod tests {
         assert_eq!(report.bumper_hits, 1);
         assert_eq!(report.cliff_hits, 1);
         assert_eq!(report.min_nearest_obstacle_m, Some(0.2));
+    }
+
+    #[test]
+    fn action_selector_fallbacks_do_not_count_as_model_fallbacks() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 14));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            14,
+            None,
+            None,
+        );
+        let mut tick = tick_with_action(ActionPrimitive::Stop);
+        tick.frame.now.extensions.insert(
+            "action_selector".to_string(),
+            serde_json::to_value(ActionSelectionDecision {
+                mode: ActionSelectorMode::ModelAssisted,
+                candidates: vec![netherwick_runtime::ActionSelectionCandidateScore {
+                    action: ActionPrimitive::Stop,
+                    score: -0.5,
+                    fallback_used: true,
+                    ..Default::default()
+                }],
+                selected_action: Some(ActionPrimitive::Stop),
+                baseline_action: Some(ActionPrimitive::Stop),
+                selected_score: Some(-0.5),
+                safety_overrode: true,
+                fallback_warnings: vec!["action selector used hardcoded score".to_string()],
+            })
+            .unwrap(),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.model_fallbacks, 0);
+        assert_eq!(episode.action_selector_fallbacks, 1);
+        assert_eq!(episode.action_selector_safety_overrides, 1);
+        assert_eq!(episode.model_assisted_decisions, 1);
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.model_fallbacks, 0);
+        assert_eq!(summary.action_selector_fallbacks, 1);
+    }
+
+    #[test]
+    fn baseline_recovery_yields_are_reported_separately_from_selector_fallbacks() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 16));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            16,
+            None,
+            None,
+        );
+        let turn_right = ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.75,
+            duration_ms: 500,
+        };
+        let mut tick = tick_with_action(turn_right.clone());
+        tick.frame.now.extensions.insert(
+            "action_selector".to_string(),
+            serde_json::to_value(ActionSelectionDecision {
+                mode: ActionSelectorMode::ModelAssisted,
+                candidates: vec![netherwick_runtime::ActionSelectionCandidateScore {
+                    action: turn_right.clone(),
+                    score: 1.0,
+                    fallback_used: false,
+                    ..Default::default()
+                }],
+                selected_action: Some(turn_right.clone()),
+                baseline_action: Some(turn_right.clone()),
+                selected_score: None,
+                safety_overrode: false,
+                fallback_warnings: vec![
+                    "model-assisted selector yielded to baseline trap recovery".to_string(),
+                ],
+            })
+            .unwrap(),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.action_selector_fallbacks, 0);
+        assert_eq!(episode.action_selector_guard_yields, 1);
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.action_selector_fallbacks, 0);
+        assert_eq!(summary.action_selector_guard_yields, 1);
+    }
+
+    #[test]
+    fn shadow_train_script_errors_do_not_count_as_model_fallbacks() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 15));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            15,
+            None,
+            None,
+        );
+        metrics.observe_behavior_runs(&[ErasedBehaviorRunRecord {
+            behavior_id: "event_bump".to_string(),
+            regime: BehaviorRegime::ShadowTrain,
+            t_ms: 100,
+            input_json: Value::Null,
+            hardcoded_json: Some(Value::Null),
+            model_json: None,
+            selected_json: Some(Value::Null),
+            error: Some("event.bump.shadow.v0 has no observed script samples".to_string()),
+            disagreement: None,
+        }]);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.behavior_run_records, 1);
+        assert_eq!(episode.model_fallbacks, 0);
     }
 
     #[test]

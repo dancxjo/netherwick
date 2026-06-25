@@ -1,0 +1,12 @@
+{
+  "behavior": "charge",
+  "checkpoint_path": "data/models/charge_golden_charger_v0",
+  "sample_count": 1495,
+  "model_loss_mean": 0.000088089975,
+  "hardcoded_loss_mean": 0.2646477,
+  "selected_loss_mean": 0.2646477,
+  "model_better_than_hardcoded": true,
+  "improvement_ratio": 0.9996671,
+  "warnings": [],
+  "recommendation": "promote_to_model_infer"
+}

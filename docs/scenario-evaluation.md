@@ -140,7 +140,9 @@ Run a baseline first with no model checkpoints, then run the same scenario and e
 - `summary.escape_progress_score`: progress after trap recovery minus collision/stuck penalties.
 - `summary.mean_battery_delta`: useful for charger-seeking.
 - `summary.mean_distance_to_charger_final_m`: whether the policy ends closer to dock.
-- `summary.model_fallbacks` and `warnings`: whether requested checkpoints actually ran.
+- `summary.model_fallbacks` and `warnings`: whether requested behavior checkpoints actually ran.
+- `summary.action_selector_fallbacks`: model-assisted selector ticks where at least one candidate score used fallback estimates because a model signal was missing.
+- `summary.action_selector_guard_yields`: model-assisted selector ticks that deliberately yielded to a hardcoded guard such as trap recovery.
 
 Shadow inference never grants a model direct motor authority for safety-critical behavior. Model-controlled modes are limited to the replaceable behavior they configure, and the hardcoded safety layer still filters actions.
 
