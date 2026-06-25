@@ -242,6 +242,8 @@ struct DreamTrainArgs {
     dataset_dir: String,
     #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true")]
     export_dataset: bool,
+    #[arg(long, default_value_t = false)]
+    detailed_logs: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -2448,16 +2450,40 @@ async fn run_dream_train(args: DreamTrainArgs) -> Result<()> {
         checkpoint_dir: PathBuf::from(args.checkpoint_dir),
         dataset_dir: PathBuf::from(args.dataset_dir),
         export_dataset: args.export_dataset,
+        detailed_logs: args.detailed_logs,
     };
     let report = train_dream_policy(config).await?;
+
+    fn comma_count(value: u64) -> String {
+        let digits = value.to_string();
+        let mut out = String::with_capacity(digits.len() + (digits.len().saturating_sub(1) / 3));
+        let mut since_comma = 0usize;
+        for ch in digits.chars().rev() {
+            if since_comma == 3 {
+                out.push(',');
+                since_comma = 0;
+            }
+            out.push(ch);
+            since_comma += 1;
+        }
+        out.chars().rev().collect()
+    }
+
+    let unlocked = report
+        .unlocked_levels
+        .iter()
+        .map(|level| level.name())
+        .collect::<Vec<_>>()
+        .join(" -> ");
     println!(
-        "dream policy training complete: level {}, generation {}, best score {:.3}, genome {}, checkpoint {}, dataset {}",
+        "dream policy training complete: level {}, generation {}, best score {:.3}, genome {}, checkpoint {}, dataset {}, unlocked {}",
         report.status.current_level.name(),
-        report.status.generation,
+        comma_count(report.status.generation as u64),
         report.status.best_score,
-        report.status.selected_genome_id,
+        comma_count(report.status.selected_genome_id),
         report.best_checkpoint.display(),
-        report.dataset_dir.display()
+        report.dataset_dir.display(),
+        unlocked,
     );
     if let Some(reason) = report.status.blocked_reason {
         println!("last safety block: {reason}");

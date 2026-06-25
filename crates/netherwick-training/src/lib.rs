@@ -478,6 +478,7 @@ pub mod dream_policy {
         pub checkpoint_dir: PathBuf,
         pub dataset_dir: PathBuf,
         pub export_dataset: bool,
+        pub detailed_logs: bool,
     }
 
     impl Default for DreamTrainingConfig {
@@ -491,6 +492,7 @@ pub mod dream_policy {
                 checkpoint_dir: PathBuf::from("data/models/dream-policy/neat"),
                 dataset_dir: PathBuf::from("datasets/dream-policy/v0/episodes"),
                 export_dataset: true,
+                detailed_logs: false,
             }
         }
     }
@@ -524,6 +526,35 @@ pub mod dream_policy {
         pub genome: DreamGenome,
     }
 
+    fn format_count(value: u64) -> String {
+        let digits = value.to_string();
+        let mut out = String::with_capacity(digits.len() + (digits.len().saturating_sub(1) / 3));
+        let mut since_comma = 0usize;
+        for ch in digits.chars().rev() {
+            if since_comma == 3 {
+                out.push(',');
+                since_comma = 0;
+            }
+            out.push(ch);
+            since_comma += 1;
+        }
+        out.chars().rev().collect()
+    }
+
+    fn render_status_bar(current: usize, total: usize, width: usize) -> String {
+        let total = total.max(1);
+        let current = current.min(total);
+        let filled = current.saturating_mul(width) / total;
+        let mut bar = String::with_capacity(width);
+        for _ in 0..filled {
+            bar.push('#');
+        }
+        for _ in filled..width {
+            bar.push('-');
+        }
+        bar
+    }
+
     pub async fn train_dream_policy(config: DreamTrainingConfig) -> Result<DreamTrainingReport> {
         fs::create_dir_all(&config.checkpoint_dir).with_context(|| {
             format!(
@@ -551,6 +582,9 @@ pub mod dream_policy {
         let mut unlocked = vec![level];
         let mut best_checkpoint = config.checkpoint_dir.join("best.json");
         let mut best_score = f32::NEG_INFINITY;
+        let mut total_episodes_run = 0u64;
+        let mut total_records_exported = 0u64;
+        let started_at = std::time::Instant::now();
         let mut last_status = DreamTrainingStatus {
             current_level: level,
             generation: 0,
@@ -568,7 +602,22 @@ pub mod dream_policy {
             blocked_reason: None,
         };
 
+        if config.detailed_logs {
+            println!(
+                "dream-train start: level={} generations={} population={} hidden_dim={} seed={} checkpoint_dir={} dataset_dir={} export_dataset={}",
+                level.name(),
+                format_count(config.generations as u64),
+                format_count(population_size as u64),
+                hidden_dim,
+                config.base_seed,
+                config.checkpoint_dir.display(),
+                config.dataset_dir.display(),
+                config.export_dataset,
+            );
+        }
+
         for generation in 0..config.generations {
+            let generation_started_at = std::time::Instant::now();
             let level_config = level.config();
             let mut scored = Vec::with_capacity(population.len());
             for mut genome in population {
@@ -580,6 +629,7 @@ pub mod dream_policy {
                         .wrapping_add((generation as u64) * 10_000)
                         .wrapping_add((seed_index as u64) * 37)
                         .wrapping_add(genome.id);
+                    total_episodes_run = total_episodes_run.saturating_add(1);
                     let report =
                         evaluate_genome_episode(&genome, level, seed, level_config.episode_steps)
                             .await?;
@@ -603,6 +653,8 @@ pub mod dream_policy {
                     if config.export_dataset {
                         for report in &reports {
                             export_episode_records(report, &config.dataset_dir).await?;
+                            total_records_exported = total_records_exported
+                                .saturating_add(report.records.len() as u64);
                         }
                     }
                 }
@@ -616,6 +668,9 @@ pub mod dream_policy {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             let best = scored[0].clone();
+            let worst_fitness = scored.last().map(|genome| genome.fitness).unwrap_or(best.fitness);
+            let mean_fitness =
+                scored.iter().map(|genome| genome.fitness).sum::<f32>() / scored.len() as f32;
             let probe =
                 evaluate_genome_episode(&best, level, config.base_seed ^ generation as u64, 24)
                     .await?;
@@ -633,8 +688,38 @@ pub mod dream_policy {
                     .and_then(|r| r.safety_blocked_reason.clone()),
             };
 
+            if config.detailed_logs {
+                let generation_number = generation.saturating_add(1);
+                let bar = render_status_bar(generation_number, config.generations, 28);
+                println!(
+                    "[{bar}] gen {}/{} level={} best_id={} best={:.3} avg={:.3} min={:.3} unlock={:.3} probe={:.3} episodes={} exported_records={} gen_s={:.2} total_s={:.2}",
+                    format_count(generation_number as u64),
+                    format_count(config.generations as u64),
+                    level.name(),
+                    best.id,
+                    best.fitness,
+                    mean_fitness,
+                    worst_fitness,
+                    level_config.unlock_threshold,
+                    probe.score,
+                    format_count(total_episodes_run),
+                    format_count(total_records_exported),
+                    generation_started_at.elapsed().as_secs_f32(),
+                    started_at.elapsed().as_secs_f32(),
+                );
+            }
+
             if best.fitness >= level_config.unlock_threshold {
                 if let Some(next) = level.next() {
+                    if config.detailed_logs {
+                        println!(
+                            "level unlocked: {} -> {} (fitness {:.3} >= {:.3})",
+                            level.name(),
+                            next.name(),
+                            best.fitness,
+                            level_config.unlock_threshold,
+                        );
+                    }
                     level = next;
                     best_score = f32::NEG_INFINITY;
                     unlocked.push(level);
@@ -647,6 +732,16 @@ pub mod dream_policy {
                 &mut next_genome_id,
                 &mut rng,
                 generation,
+            );
+        }
+
+        if config.detailed_logs {
+            println!(
+                "dream-train done: generations={} episodes={} exported_records={} elapsed_s={:.2}",
+                format_count(config.generations as u64),
+                format_count(total_episodes_run),
+                format_count(total_records_exported),
+                started_at.elapsed().as_secs_f32(),
             );
         }
 
