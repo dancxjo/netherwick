@@ -1341,6 +1341,12 @@ struct ScenarioEvaluationSummary {
     mean_distance_to_charger_final_m: Option<f32>,
     mean_nearest_obstacle_m: Option<f32>,
     mean_distance_traveled_m: f32,
+    #[serde(default)]
+    action_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    wall_cliff_veto_count: usize,
+    #[serde(default)]
+    escape_progress_score: f32,
     mean_ticks_survived: f32,
     #[serde(default)]
     stuck_count: usize,
@@ -1392,6 +1398,12 @@ struct ScenarioEpisodeReport {
     final_distance_to_person_m: Option<f32>,
     final_distance_to_speaker_m: Option<f32>,
     distance_traveled_m: f32,
+    #[serde(default)]
+    action_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    wall_cliff_veto_count: usize,
+    #[serde(default)]
+    escape_progress_score: f32,
     #[serde(default)]
     stuck_ticks: usize,
     #[serde(default)]
@@ -1500,6 +1512,8 @@ struct EpisodeMetricBuilder {
     distance_at_last_recovery_m: Option<f32>,
     dead_battery_tick: Option<usize>,
     unique_actions: BTreeSet<String>,
+    action_histogram: HashMap<String, usize>,
+    wall_cliff_veto_count: usize,
     safety_interventions: usize,
     behavior_run_records: usize,
     model_fallbacks: usize,
@@ -1564,6 +1578,8 @@ impl EpisodeMetricBuilder {
             distance_at_last_recovery_m: None,
             dead_battery_tick: None,
             unique_actions: BTreeSet::new(),
+            action_histogram: HashMap::new(),
+            wall_cliff_veto_count: 0,
             safety_interventions: 0,
             behavior_run_records: 0,
             model_fallbacks: 0,
@@ -1637,6 +1653,10 @@ impl EpisodeMetricBuilder {
         }
         if let Some(action) = &tick.chosen_action {
             self.unique_actions.insert(format!("{action:?}"));
+            *self
+                .action_histogram
+                .entry(action_histogram_label(action).to_string())
+                .or_default() += 1;
         }
         self.observe_stuck(snapshot);
         if tick
@@ -1648,6 +1668,9 @@ impl EpisodeMetricBuilder {
             .unwrap_or(false)
         {
             self.safety_interventions = self.safety_interventions.saturating_add(1);
+            if wall_or_cliff_veto(tick) {
+                self.wall_cliff_veto_count = self.wall_cliff_veto_count.saturating_add(1);
+            }
         }
         self.observe_behavior_runs(&tick.frame.behavior_runs);
         self.observe_action_selector(tick);
@@ -1818,6 +1841,16 @@ impl EpisodeMetricBuilder {
             final_distance_to_person_m,
             final_distance_to_speaker_m,
             distance_traveled_m: self.distance_traveled_m,
+            action_histogram: self.action_histogram,
+            wall_cliff_veto_count: self.wall_cliff_veto_count,
+            escape_progress_score: escape_progress_score(
+                self.kind,
+                self.distance_traveled_m,
+                self.distance_at_last_recovery_m,
+                self.collisions,
+                self.stuck_ticks,
+                self.ticks,
+            ),
             stuck_ticks: self.stuck_ticks,
             stuck_count: self.stuck_count,
             trap_kind_counts: self.trap_kind_counts,
@@ -2167,12 +2200,14 @@ fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool 
         ScenarioKind::CornerTrap => {
             episode.stuck_count > 0
                 && episode.recovery_success_rate.unwrap_or(0.0) > 0.0
-                && episode.distance_traveled_m > 0.02
+                && episode.distance_traveled_m > 0.10
+                && episode.collisions <= (episode.ticks / 20).max(1)
         }
         ScenarioKind::ColumnTrap => {
             episode.stuck_count > 0
                 && episode.recovery_success_rate.unwrap_or(0.0) > 0.0
-                && episode.distance_after_recovery_m.unwrap_or(0.0) > 0.08
+                && episode.distance_traveled_m > 0.25
+                && episode.collisions <= (episode.ticks / 20).max(1)
         }
         ScenarioKind::ChargerSeeking => episode.charging_ticks > 0 || episode.battery_delta > 0.03,
         ScenarioKind::PersonAndSpeaker => {
@@ -2235,6 +2270,12 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
                 .filter_map(|episode| episode.mean_nearest_obstacle_m),
         ),
         mean_distance_traveled_m: mean(episodes.iter().map(|episode| episode.distance_traveled_m)),
+        action_histogram: summarize_action_histogram(episodes),
+        wall_cliff_veto_count: episodes
+            .iter()
+            .map(|episode| episode.wall_cliff_veto_count)
+            .sum(),
+        escape_progress_score: mean(episodes.iter().map(|episode| episode.escape_progress_score)),
         mean_ticks_survived: mean(episodes.iter().map(|episode| episode.ticks as f32)),
         stuck_count: episodes.iter().map(|episode| episode.stuck_count).sum(),
         trap_kind_counts,
@@ -2300,6 +2341,78 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
                 .filter_map(|episode| episode.mean_candidate_score),
         ),
     }
+}
+
+fn summarize_action_histogram(episodes: &[ScenarioEpisodeReport]) -> HashMap<String, usize> {
+    let mut histogram = HashMap::new();
+    for episode in episodes {
+        for (action, count) in &episode.action_histogram {
+            *histogram.entry(action.clone()).or_default() += count;
+        }
+    }
+    histogram
+}
+
+fn action_histogram_label(action: &ActionPrimitive) -> &'static str {
+    match action {
+        ActionPrimitive::Stop => "Stop",
+        ActionPrimitive::Go { intensity, .. } if *intensity < 0.0 => "Reverse",
+        ActionPrimitive::Go { .. } => "Go",
+        ActionPrimitive::Turn {
+            direction: TurnDir::Left,
+            ..
+        } => "TurnLeft",
+        ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            ..
+        } => "TurnRight",
+        ActionPrimitive::Inspect { .. } => "Inspect",
+        ActionPrimitive::Approach { .. } => "Approach",
+        ActionPrimitive::Dock => "Dock",
+        ActionPrimitive::Explore { .. } => "Explore",
+        ActionPrimitive::Speak { .. } => "Speak",
+        ActionPrimitive::Chirp { .. } => "Chirp",
+    }
+}
+
+fn wall_or_cliff_veto(tick: &RuntimeTick) -> bool {
+    tick.frame
+        .now
+        .extensions
+        .get("motor_gate")
+        .and_then(|value| value.get("safety_reason"))
+        .and_then(|value| value.as_str())
+        .map(|reason| reason == "cliff")
+        .unwrap_or(false)
+        || tick.frame.now.body.flags.wall
+        || tick.frame.now.body.flags.cliff_left
+        || tick.frame.now.body.flags.cliff_front_left
+        || tick.frame.now.body.flags.cliff_front_right
+        || tick.frame.now.body.flags.cliff_right
+}
+
+fn escape_progress_score(
+    kind: ScenarioKind,
+    distance_traveled_m: f32,
+    distance_at_last_recovery_m: Option<f32>,
+    collisions: usize,
+    stuck_ticks: usize,
+    ticks: usize,
+) -> f32 {
+    let progress = match kind {
+        ScenarioKind::ColumnTrap | ScenarioKind::CornerTrap => distance_at_last_recovery_m
+            .map(|distance| (distance_traveled_m - distance).max(0.0))
+            .filter(|distance| *distance >= 0.08)
+            .unwrap_or(distance_traveled_m),
+        _ => distance_traveled_m,
+    };
+    let collision_penalty = collisions as f32 * 0.05;
+    let stuck_penalty = if ticks == 0 {
+        0.0
+    } else {
+        stuck_ticks as f32 / ticks as f32 * 0.25
+    };
+    (progress - collision_penalty - stuck_penalty).max(0.0)
 }
 
 fn trap_kind_label(code: f32) -> Option<&'static str> {

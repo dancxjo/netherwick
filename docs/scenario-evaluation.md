@@ -7,6 +7,27 @@ This is different from `sim-curriculum`: curriculum runs generate training ledge
 ## Examples
 
 ```bash
+just run sim \
+  --scenario column-trap \
+  --steps 300 \
+  --ledger data/ledger/golden-column-trap \
+  --action-selector baseline \
+  --inline-learning false
+
+just run eval-scenario \
+  --scenario column-trap \
+  --episodes 20 \
+  --steps 300 \
+  --out data/reports/golden-column-trap.json \
+  --memory-report
+
+just run eval-scenario \
+  --scenario corner-trap \
+  --episodes 20 \
+  --steps 300 \
+  --out data/reports/golden-corner-trap.json \
+  --memory-report
+
 just run eval-scenario \
   --scenario obstacle-avoidance \
   --episodes 20 \
@@ -43,6 +64,11 @@ Run a baseline first with no model checkpoints, then run the same scenario and e
 
 - `summary.success_rate`: task-level pass rate.
 - `summary.collision_rate`: collision frames divided by total frames.
+- `summary.mean_distance_traveled_m`: total locomotion during the episode.
+- `summary.action_histogram`: counts of Stop, Go, Reverse, TurnLeft, TurnRight, Inspect, and other action classes.
+- `summary.wall_cliff_veto_count`: safety vetoes tied to cliff or wall contact conditions.
+- `summary.mean_nearest_obstacle_m`: average nearest range reading.
+- `summary.escape_progress_score`: progress after trap recovery minus collision/stuck penalties.
 - `summary.mean_battery_delta`: useful for charger-seeking.
 - `summary.mean_distance_to_charger_final_m`: whether the policy ends closer to dock.
 - `summary.model_fallbacks` and `warnings`: whether requested checkpoints actually ran.

@@ -46,27 +46,66 @@ impl Default for ConductorConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RecoveryStep {
+    #[default]
+    Idle,
+    Reverse,
+    Turn,
+    Probe,
+    Inspect,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RecoveryState {
+    step: RecoveryStep,
+    remaining_ticks: usize,
+    turn_direction: Option<TurnDir>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SimpleConductor {
     pub config: ConductorConfig,
+    recovery: RecoveryState,
 }
 
 impl Conductor for SimpleConductor {
     fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
         if let Some(action) = reign_action(&input) {
+            self.recovery = RecoveryState::default();
             return Ok(action);
         }
         if input.body.flags.wheel_drop {
+            self.recovery = RecoveryState::default();
             return Ok(ActionPrimitive::Stop);
         }
         if input.body.battery_level <= self.config.critical_battery {
+            self.recovery = RecoveryState::default();
             return Ok(ActionPrimitive::Dock);
+        }
+        if self.recovery.step == RecoveryStep::Idle {
+            if contact_recovery_triggered(&input) {
+                self.start_contact_recovery(clearer_turn_direction(&input.range));
+            } else if cramped_and_not_advancing(&input) {
+                if side_escape_gap(&input.range.beams) {
+                    self.start_contact_recovery(clearer_turn_direction(&input.range));
+                } else {
+                    self.start_range_recovery(clearer_turn_direction(&input.range));
+                }
+            }
+        }
+        if let Some(action) = self.next_recovery_action(&input) {
+            return Ok(action);
         }
         if input.memory.place_danger >= self.config.danger_threshold
             || input.drives.danger_avoidance >= self.config.danger_threshold
         {
             return Ok(ActionPrimitive::Turn {
-                direction: TurnDir::Left,
+                direction: input
+                    .memory
+                    .nearby_best_safe_direction_rad
+                    .map(direction_from_bearing)
+                    .unwrap_or_else(|| clearer_turn_direction(&input.range)),
                 intensity: 0.5,
                 duration_ms: 1_000,
             });
@@ -93,9 +132,149 @@ impl Conductor for SimpleConductor {
     }
 }
 
+impl SimpleConductor {
+    fn start_contact_recovery(&mut self, turn_direction: TurnDir) {
+        self.recovery = RecoveryState {
+            step: RecoveryStep::Reverse,
+            remaining_ticks: 2,
+            turn_direction: Some(turn_direction),
+        };
+    }
+
+    fn start_range_recovery(&mut self, turn_direction: TurnDir) {
+        self.recovery = RecoveryState {
+            step: RecoveryStep::Turn,
+            remaining_ticks: 9,
+            turn_direction: Some(turn_direction),
+        };
+    }
+
+    fn next_recovery_action(&mut self, input: &ConductorInput) -> Option<ActionPrimitive> {
+        match self.recovery.step {
+            RecoveryStep::Idle => None,
+            RecoveryStep::Reverse => {
+                self.advance_recovery(RecoveryStep::Turn, 7);
+                Some(ActionPrimitive::Go {
+                    intensity: -0.18,
+                    duration_ms: 300,
+                })
+            }
+            RecoveryStep::Turn => {
+                let direction = self.recovery.turn_direction.clone().unwrap_or(TurnDir::Left);
+                self.advance_recovery(RecoveryStep::Probe, 3);
+                Some(ActionPrimitive::Turn {
+                    direction,
+                    intensity: 0.75,
+                    duration_ms: 500,
+                })
+            }
+            RecoveryStep::Probe => {
+                if center_clearance(&input.range.beams) < 0.30 {
+                    self.recovery.step = RecoveryStep::Reverse;
+                    self.recovery.remaining_ticks = 2;
+                    return Some(ActionPrimitive::Go {
+                        intensity: -0.16,
+                        duration_ms: 300,
+                    });
+                }
+                self.advance_recovery(RecoveryStep::Inspect, 1);
+                Some(ActionPrimitive::Go {
+                    intensity: 0.14,
+                    duration_ms: 300,
+                })
+            }
+            RecoveryStep::Inspect => {
+                self.advance_recovery(RecoveryStep::Idle, 0);
+                Some(ActionPrimitive::Inspect {
+                    target: InspectTarget::Novelty,
+                })
+            }
+        }
+    }
+
+    fn advance_recovery(&mut self, next_step: RecoveryStep, next_ticks: usize) {
+        self.recovery.remaining_ticks = self.recovery.remaining_ticks.saturating_sub(1);
+        if self.recovery.remaining_ticks == 0 {
+            self.recovery.step = next_step;
+            self.recovery.remaining_ticks = next_ticks;
+        }
+    }
+}
+
 fn reign_action(input: &ConductorInput) -> Option<ActionPrimitive> {
     let reign_input = input.reign.latest.as_ref()?;
     reign_input.command.to_action()
+}
+
+fn contact_recovery_triggered(input: &ConductorInput) -> bool {
+    input.body.flags.bump_left
+        || input.body.flags.bump_right
+        || input.body.flags.wall
+}
+
+fn cramped_and_not_advancing(input: &ConductorInput) -> bool {
+    input
+        .range
+        .nearest_m
+        .map(|nearest| nearest < 0.35)
+        .unwrap_or(false)
+        && input.body.velocity.forward_m_s.abs() < 0.02
+}
+
+fn clearer_turn_direction(range: &RangeSense) -> TurnDir {
+    let (left, right) = range_clearance_sides(&range.beams);
+    if right > left {
+        TurnDir::Right
+    } else {
+        TurnDir::Left
+    }
+}
+
+fn direction_from_bearing(bearing_rad: f32) -> TurnDir {
+    if bearing_rad < 0.0 {
+        TurnDir::Right
+    } else {
+        TurnDir::Left
+    }
+}
+
+fn range_clearance_sides(beams: &[f32]) -> (f32, f32) {
+    if beams.is_empty() {
+        return (1.0, 1.0);
+    }
+    let third = (beams.len() / 3).max(1);
+    let left_end = third.min(beams.len());
+    let right_start = beams.len().saturating_sub(third);
+    let left = beams[..left_end].iter().copied().fold(1.0, f32::min);
+    let right = beams[right_start..].iter().copied().fold(1.0, f32::min);
+    (left, right)
+}
+
+fn center_clearance(beams: &[f32]) -> f32 {
+    if beams.is_empty() {
+        return 1.0;
+    }
+    let third = (beams.len() / 3).max(1);
+    let left_end = third.min(beams.len());
+    let right_start = beams.len().saturating_sub(third);
+    let center_start = left_end.saturating_sub(1).min(beams.len());
+    let center_end = (right_start + 1).min(beams.len()).max(center_start + 1);
+    beams[center_start..center_end]
+        .iter()
+        .copied()
+        .fold(1.0, f32::min)
+}
+
+fn side_escape_gap(beams: &[f32]) -> bool {
+    if beams.is_empty() {
+        return false;
+    }
+    let third = (beams.len() / 3).max(1);
+    let left_end = third.min(beams.len());
+    let right_start = beams.len().saturating_sub(third);
+    let left = beams[..left_end].iter().copied().fold(0.0, f32::max);
+    let right = beams[right_start..].iter().copied().fold(0.0, f32::max);
+    left.max(right) >= 0.75
 }
 
 #[cfg(test)]
@@ -103,12 +282,8 @@ mod tests {
     use super::*;
     use netherwick_actions::{ReignCommand, ReignMode};
 
-    #[test]
-    fn docks_on_critical_battery() {
-        let mut conductor = SimpleConductor::default();
-        let mut body = BodySense::default();
-        body.battery_level = 0.05;
-        let input = ConductorInput {
+    fn input_with_body(body: BodySense) -> ConductorInput {
+        ConductorInput {
             latent: ExperienceLatent::default(),
             drives: DriveSense::default(),
             memory: MemorySense::default(),
@@ -120,9 +295,105 @@ mod tests {
             range: RangeSense::default(),
             body,
             proposals: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn docks_on_critical_battery() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        let input = input_with_body(body);
 
         assert_eq!(conductor.choose(input).unwrap(), ActionPrimitive::Dock);
+    }
+
+    #[test]
+    fn bump_triggers_bounded_recovery_sequence() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.flags.bump_left = true;
+        let mut input = input_with_body(body);
+        input.range.beams = vec![0.2, 0.2, 0.8, 0.9, 0.9, 0.9];
+
+        assert_eq!(
+            conductor.choose(input.clone()).unwrap(),
+            ActionPrimitive::Go {
+                intensity: -0.18,
+                duration_ms: 300
+            }
+        );
+        input.body.flags.bump_left = false;
+        for _ in 0..2 {
+            let _ = conductor.choose(input.clone()).unwrap();
+        }
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.75,
+                duration_ms: 500
+            }
+        );
+    }
+
+    #[test]
+    fn wheel_drop_vetoes_recovery() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.flags.bump_left = true;
+        body.flags.wheel_drop = true;
+
+        assert_eq!(
+            conductor.choose(input_with_body(body)).unwrap(),
+            ActionPrimitive::Stop
+        );
+    }
+
+    #[test]
+    fn cramped_stationary_range_triggers_recovery() {
+        let mut conductor = SimpleConductor::default();
+        let body = BodySense::default();
+        let mut input = input_with_body(body);
+        input.range.nearest_m = Some(0.12);
+        input.range.beams = vec![0.2, 0.2, 0.8, 0.8, 0.2, 0.2];
+
+        assert_eq!(
+            conductor.choose(input.clone()).unwrap(),
+            ActionPrimitive::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.75,
+                duration_ms: 500
+            }
+        );
+    }
+
+    #[test]
+    fn contact_recovery_reverses_before_turning() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.flags.bump_right = true;
+        let mut input = input_with_body(body);
+        input.range.beams = vec![0.9, 0.9, 0.8, 0.2, 0.2, 0.2];
+
+        assert_eq!(
+            conductor.choose(input.clone()).unwrap(),
+            ActionPrimitive::Go {
+                intensity: -0.18,
+                duration_ms: 300
+            }
+        );
+        for _ in 0..2 {
+            let _ = conductor.choose(input.clone()).unwrap();
+        }
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.75,
+                duration_ms: 500
+            }
+        );
     }
 
     #[test]

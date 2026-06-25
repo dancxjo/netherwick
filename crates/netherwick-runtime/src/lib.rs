@@ -3300,7 +3300,7 @@ where
         proposed_actions: &mut Vec<ActionPrimitive>,
     ) -> Result<(Option<ActionPrimitive>, Vec<ErasedBehaviorRunRecord>)> {
         let mut behavior_runs = Vec::new();
-        let mut forced_action = None;
+        let forced_action = None;
         let mut safe_sequences = serde_json::Map::new();
 
         if now.body.flags.bump_left || now.body.flags.bump_right {
@@ -3316,7 +3316,6 @@ where
             )?;
             let sequence = safety_trace_script_actions(&mut self.safety, now, &run.chosen);
             if let Some(first) = first_motor_script_action(&run.chosen) {
-                forced_action = Some(first.clone());
                 proposed_actions.push(first);
             }
             safe_sequences.insert("bump".to_string(), serde_json::to_value(&sequence)?);
@@ -4104,6 +4103,10 @@ impl StuckRecoveryController {
             self.event_started = true;
         }
 
+        if self.active && step_distance > STUCK_WINDOW_DISPLACEMENT_EPSILON_M {
+            self.finish_recovery_success();
+        }
+
         self.last_position = Some(position);
     }
 
@@ -4474,14 +4477,7 @@ where
                 motion = MotionCommand::Stop;
                 motion_sent_to_sim = None;
             } else {
-                if !manual_reign_driving {
-                    if let Some(recovery_motion) = self.stuck.recovery_motion() {
-                        motion = recovery_motion;
-                        motion_sent_to_sim = Some(serde_json::to_value(&motion)?);
-                    }
-                } else if self.stuck.active {
-                    motion_sent_to_sim = Some(serde_json::to_value(&motion)?);
-                }
+                let _ = manual_reign_driving;
                 self.motors.send(motion.clone()).await?;
             };
             let mut after_snapshot = self.world.snapshot().await?;
@@ -6581,7 +6577,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert_eq!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: 0.3,
+                duration_ms: 500
+            })
+        );
+        assert!(tick
+            .frame
+            .now
+            .extensions
+            .get("safety.vetoed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false));
         assert!(tick.frame.behavior_runs.iter().any(
             |run| run.behavior_id == "event_bump" && run.regime == BehaviorRegime::ShadowTrain
         ));
@@ -7565,13 +7574,7 @@ mod tests {
     async fn column_trap_scenario_recovers_within_budget() {
         let root = test_ledger_root("sim-runner-column-trap-recovery");
         let ledger = JsonlLedger::new(&root);
-        let runtime = test_runtime(
-            ledger,
-            FixedConductor::new(ActionPrimitive::Go {
-                intensity: 0.2,
-                duration_ms: 1_000,
-            }),
-        );
+        let runtime = test_runtime(ledger, SimpleConductor::default());
         let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ColumnTrap, 7));
         let start = (
             scenario.metadata.body.odometry.x_m,
