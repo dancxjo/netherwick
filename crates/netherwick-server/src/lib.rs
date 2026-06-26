@@ -135,6 +135,21 @@ impl ReignServerState {
             state.armed = armed;
             state.last_changed_ms = Some(now_ms);
         }
+        if !armed {
+            self.queue
+                .lock()
+                .map_err(|_| ReignApiError::internal("reign queue lock poisoned"))?
+                .push(ReignInput {
+                    id: Uuid::new_v4(),
+                    issued_at_ms: now_ms,
+                    expires_at_ms: now_ms.saturating_add(HARDWARE_TTL_MAX_MS),
+                    source: ReignSource::WebRemote,
+                    mode: ReignMode::Direct,
+                    command: ReignCommand::Stop,
+                    priority: 1.0,
+                    note: Some("hardware cockpit disarmed".to_string()),
+                });
+        }
         Ok(self.hardware_control_status(now_ms))
     }
 }
@@ -4181,9 +4196,10 @@ function updateHardwareControl(hw){
   const stateText = !cockpitAvailable ? 'unavailable'
     : cockpitArmed ? 'ARMED'
     : 'disarmed';
+  const sessionText = hw?.source && hw?.mode ? ` ${hw.source}/${hw.mode}` : '';
   const detail = hw?.reason ? `: ${hw.reason}` : '';
   const age = hw?.body_age_ms == null ? '' : ` body ${hw.body_age_ms}ms`;
-  hardwareState.textContent = `${stateText}${detail}${age}`;
+  hardwareState.textContent = `${stateText}${sessionText}${detail}${age}`;
   hardwareState.style.color = cockpitArmed ? '#8df0b2' : '#ffbf7a';
 }
 
@@ -4201,6 +4217,16 @@ async function setHardwareArmed(armed){
     hardwareState.textContent = 'arm request rejected';
     hardwareArm.checked = false;
     cockpitArmed = false;
+  }
+}
+
+function disarmHardwareOnExit(){
+  cockpitHeldKeys.clear();
+  if(navigator.sendBeacon){
+    const body = new Blob([JSON.stringify({armed:false})], {type:'application/json'});
+    navigator.sendBeacon('/reign/hardware-arm', body);
+  } else {
+    sendCockpitStop();
   }
 }
 
@@ -4398,6 +4424,8 @@ window.addEventListener('blur', () => {
   cockpitHeldKeys.clear();
   sendCockpitStop();
 });
+window.addEventListener('pagehide', disarmHardwareOnExit);
+window.addEventListener('beforeunload', disarmHardwareOnExit);
 
 function commandForInputSource(inputSource){
   const gamepad = inputSource.gamepad;
@@ -5417,6 +5445,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hardware_arm_rejected_in_non_hardware_session() {
+        let state = ReignServerState::standalone();
+
+        let error = post_hardware_arm(State(state), Json(HardwareArmRequest { armed: true }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(error.message.contains("not available"));
+    }
+
+    #[tokio::test]
+    async fn hardware_disarm_enqueues_stop() {
+        let state = hardware_reign_state_with_snapshot(recent_snapshot());
+        let Json(armed) = post_hardware_arm(
+            State(state.clone()),
+            Json(HardwareArmRequest { armed: true }),
+        )
+        .await
+        .unwrap();
+        assert!(armed.armed);
+
+        let Json(disarmed) = post_hardware_arm(
+            State(state.clone()),
+            Json(HardwareArmRequest { armed: false }),
+        )
+        .await
+        .unwrap();
+        let sense = state.queue().lock().unwrap().sense(wall_now_ms());
+
+        assert!(!disarmed.armed);
+        assert!(matches!(
+            sense.latest.as_ref().map(|input| &input.command),
+            Some(ReignCommand::Stop)
+        ));
+    }
+
+    #[tokio::test]
     async fn hardware_drive_rejected_on_cliff_even_when_armed() {
         let mut snapshot = recent_snapshot();
         snapshot.body.flags.cliff_front_left = true;
@@ -5858,6 +5924,8 @@ mod tests {
         assert!(page.contains("Real hardware armed"));
         assert!(page.contains("/reign/hardware-arm"));
         assert!(page.contains("window.addEventListener('keyup'"));
+        assert!(page.contains("window.addEventListener('pagehide'"));
+        assert!(page.contains("navigator.sendBeacon"));
         assert!(page.contains("function projectRangeBeam"));
         assert!(page.contains("Odometry/range trace, not SLAM."));
         assert!(page.contains("createDefaultXRExperienceAsync"));
