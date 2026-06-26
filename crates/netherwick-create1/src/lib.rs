@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 #[cfg(feature = "serial")]
 use netherwick_body::CliffSensors;
@@ -81,9 +81,10 @@ impl Create1Body {
         let mut body = body;
         #[cfg(feature = "serial")]
         if let Some(path) = body.config.port.clone() {
-            let port = serialport::new(path, body.config.baud_rate)
+            let port = serialport::new(&path, body.config.baud_rate)
                 .timeout(Duration::from_millis(500))
-                .open()?;
+                .open()
+                .with_context(|| format!("failed to open Create serial port {path}"))?;
             body.port = Some(port);
             body.initialize()?;
         }

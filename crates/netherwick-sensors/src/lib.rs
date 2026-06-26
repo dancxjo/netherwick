@@ -43,6 +43,41 @@ use v4l::video::Capture;
 #[cfg(feature = "linux-hardware")]
 use v4l::{Format, FourCC};
 
+#[cfg(feature = "kinect-freenect")]
+#[link(name = "freenect_sync")]
+unsafe extern "C" {
+    fn freenect_sync_get_depth_with_res(
+        depth: *mut *mut std::ffi::c_void,
+        timestamp: *mut u32,
+        index: i32,
+        resolution: i32,
+        format: i32,
+    ) -> i32;
+    fn freenect_sync_get_video_with_res(
+        video: *mut *mut std::ffi::c_void,
+        timestamp: *mut u32,
+        index: i32,
+        resolution: i32,
+        format: i32,
+    ) -> i32;
+    fn freenect_sync_stop();
+}
+
+#[cfg(feature = "kinect-freenect")]
+const FREENECT_RESOLUTION_MEDIUM: i32 = 1;
+#[cfg(feature = "kinect-freenect")]
+const FREENECT_DEPTH_MM: i32 = 5;
+#[cfg(feature = "kinect-freenect")]
+const FREENECT_VIDEO_RGB: i32 = 0;
+#[cfg(feature = "kinect-freenect")]
+const FREENECT_DEPTH_WIDTH: usize = 640;
+#[cfg(feature = "kinect-freenect")]
+const FREENECT_DEPTH_HEIGHT: usize = 480;
+#[cfg(feature = "kinect-freenect")]
+const FREENECT_DEPTH_PIXELS: usize = FREENECT_DEPTH_WIDTH * FREENECT_DEPTH_HEIGHT;
+#[cfg(feature = "kinect-freenect")]
+const FREENECT_RGB_BYTES: usize = FREENECT_DEPTH_PIXELS * 3;
+
 #[async_trait]
 pub trait SenseProducer {
     async fn poll(&mut self) -> Result<SensePacket>;
@@ -832,9 +867,12 @@ impl V4lCamera {
     pub fn new(path: &str) -> Result<Self> {
         let mut device = Device::with_path(path)?;
         configure_camera_format(&mut device);
-        let format = device.format()?;
+        let format = device
+            .format()
+            .with_context(|| format!("failed to read V4L camera format for {path}"))?;
         let device = Box::leak(Box::new(device));
-        let stream = MmapStream::with_buffers(device, Type::VideoCapture, 4)?;
+        let stream = MmapStream::with_buffers(device, Type::VideoCapture, 4)
+            .with_context(|| format!("failed to create V4L mmap stream for {path}"))?;
         Ok(Self { stream, format })
     }
 
@@ -871,12 +909,16 @@ fn eye_frame_format_from_fourcc(fourcc: &str) -> EyeFrameFormat {
 #[cfg(feature = "linux-hardware")]
 fn configure_camera_format(device: &mut Device) {
     let candidates = [
+        (640, 480, *b"UYVY"),
+        (640, 480, *b"GRBG"),
         (320, 240, *b"MJPG"),
         (320, 240, *b"YUYV"),
         (640, 480, *b"MJPG"),
+        (640, 480, *b"YUYV"),
         (640, 480, *b"RGB3"),
         (640, 480, *b"BGR3"),
         (640, 480, *b"GREY"),
+        (1280, 1024, *b"GRBG"),
     ];
     for (width, height, fourcc) in candidates {
         let format = Format::new(width, height, FourCC::new(&fourcc));
@@ -1267,12 +1309,24 @@ impl SenseProducer for KinectReplayProvider {
 }
 
 #[cfg(feature = "kinect-freenect")]
-pub struct FreenectKinectProvider;
+pub struct FreenectKinectProvider {
+    index: i32,
+    pending: VecDeque<SensePacket>,
+    failed_error: Option<String>,
+}
 
 #[cfg(feature = "kinect-freenect")]
 impl FreenectKinectProvider {
     pub fn new() -> Result<Self> {
-        Ok(Self)
+        Self::with_index(0)
+    }
+
+    pub fn with_index(index: i32) -> Result<Self> {
+        Ok(Self {
+            index,
+            pending: VecDeque::new(),
+            failed_error: None,
+        })
     }
 }
 
@@ -1280,9 +1334,109 @@ impl FreenectKinectProvider {
 #[async_trait]
 impl SenseProducer for FreenectKinectProvider {
     async fn poll(&mut self) -> Result<SensePacket> {
-        anyhow::bail!(
-            "FreenectKinectProvider is a feature-gated skeleton; wire libfreenect FFI or a freenect subprocess here"
+        if let Some(packet) = self.pending.pop_front() {
+            return Ok(packet);
+        }
+        if let Some(error) = &self.failed_error {
+            anyhow::bail!("{error}");
+        }
+        let (depth_m, rgb_frame) = match read_freenect_rgbd(self.index) {
+            Ok(rgbd) => rgbd,
+            Err(error) => {
+                let error = error.to_string();
+                self.failed_error = Some(error.clone());
+                anyhow::bail!("{error}");
+            }
+        };
+        self.pending.push_back(SensePacket::EyeFrame(rgb_frame));
+        Ok(SensePacket::Kinect(KinectSense {
+            schema_version: 1,
+            depth_m,
+            ..KinectSense::default()
+        }))
+    }
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn read_freenect_rgbd(index: i32) -> Result<(Vec<f32>, EyeFrame)> {
+    let depth_m = read_freenect_depth_m(index)?;
+    let rgb_frame = read_freenect_rgb_frame(index)?;
+    Ok((depth_m, rgb_frame))
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn read_freenect_depth_m(index: i32) -> Result<Vec<f32>> {
+    let mut depth_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut timestamp = 0u32;
+    let result = unsafe {
+        freenect_sync_get_depth_with_res(
+            &mut depth_ptr,
+            &mut timestamp,
+            index,
+            FREENECT_RESOLUTION_MEDIUM,
+            FREENECT_DEPTH_MM,
         )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "libfreenect failed to read Kinect depth frame from device index {index}: {result}"
+        );
+    }
+    if depth_ptr.is_null() {
+        anyhow::bail!("libfreenect returned a null Kinect depth frame for device index {index}");
+    }
+    let depth_mm =
+        unsafe { std::slice::from_raw_parts(depth_ptr as *const u16, FREENECT_DEPTH_PIXELS) };
+    Ok(depth_mm
+        .iter()
+        .map(|value| {
+            if *value == 0 {
+                0.0
+            } else {
+                (*value as f32 * 0.001).clamp(0.0, 8.0)
+            }
+        })
+        .collect())
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn read_freenect_rgb_frame(index: i32) -> Result<EyeFrame> {
+    let mut video_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut timestamp = 0u32;
+    let result = unsafe {
+        freenect_sync_get_video_with_res(
+            &mut video_ptr,
+            &mut timestamp,
+            index,
+            FREENECT_RESOLUTION_MEDIUM,
+            FREENECT_VIDEO_RGB,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "libfreenect failed to read Kinect RGB frame from device index {index}: {result}"
+        );
+    }
+    if video_ptr.is_null() {
+        anyhow::bail!("libfreenect returned a null Kinect RGB frame for device index {index}");
+    }
+    let rgb = unsafe { std::slice::from_raw_parts(video_ptr as *const u8, FREENECT_RGB_BYTES) };
+    Ok(EyeFrame {
+        captured_at_ms: unix_time_ms(),
+        width: FREENECT_DEPTH_WIDTH as u32,
+        height: FREENECT_DEPTH_HEIGHT as u32,
+        format: EyeFrameFormat::Rgb8,
+        bytes: rgb.to_vec(),
+        source: Some("kinect-freenect-rgb".to_string()),
+    })
+}
+
+#[cfg(feature = "kinect-freenect")]
+impl Drop for FreenectKinectProvider {
+    fn drop(&mut self) {
+        unsafe {
+            freenect_sync_stop();
+        }
     }
 }
 

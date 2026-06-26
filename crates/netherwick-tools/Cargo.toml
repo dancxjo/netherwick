@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["kinect-freenect"]
+kinect-freenect = ["netherwick-sensors/kinect-freenect"]
+
 [[bin]]
 name = "netherwick"
 path = "src/main.rs"

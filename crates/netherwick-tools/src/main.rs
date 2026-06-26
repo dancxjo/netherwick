@@ -29,6 +29,8 @@ use netherwick_runtime::{
     InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, RobotMode, RuntimeLoop,
     RuntimeModelStack, RuntimeTick, SimRunner,
 };
+#[cfg(feature = "kinect-freenect")]
+use netherwick_sensors::FreenectKinectProvider;
 use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
     MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World, WorldSnapshot,
@@ -433,6 +435,10 @@ struct RobotArgs {
     #[arg(long)]
     camera: Option<String>,
     #[arg(long)]
+    kinect_depth: bool,
+    #[arg(long, default_value_t = 0)]
+    kinect_index: i32,
+    #[arg(long)]
     mic: Option<String>,
     #[arg(long)]
     imu: Option<String>,
@@ -503,6 +509,10 @@ struct CaptureRealArgs {
     create_baud: u32,
     #[arg(long)]
     camera: Option<String>,
+    #[arg(long)]
+    kinect_depth: bool,
+    #[arg(long, default_value_t = 0)]
+    kinect_index: i32,
     #[arg(long)]
     mic: Option<String>,
     #[arg(long)]
@@ -3750,7 +3760,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
 
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
 
-    if let Some(device) = &args.camera {
+    if args.kinect_depth {
+        if let Some(device) = &args.camera {
+            println!(
+                "Kinect depth enabled; using libfreenect for Kinect RGB/depth and not opening {device} through V4L"
+            );
+        }
+    } else if let Some(device) = &args.camera {
         match CameraSenseProvider::new(device) {
             Ok(provider) => {
                 let live_state_for_camera = live_state.clone();
@@ -3775,6 +3791,34 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 }
             }
         }
+    }
+
+    if args.kinect_depth {
+        #[cfg(feature = "kinect-freenect")]
+        match FreenectKinectProvider::with_index(args.kinect_index) {
+            Ok(provider) => {
+                let live_state_for_kinect = live_state.clone();
+                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                    "kinect-depth",
+                    provider,
+                    Duration::from_millis(33),
+                    move |packet| {
+                        if let (Some(live_state), SensePacket::EyeFrame(frame)) =
+                            (&live_state_for_kinect, packet)
+                        {
+                            live_state.record_live_eye_frame(frame.clone());
+                        }
+                    },
+                )));
+            }
+            Err(err) => {
+                println!("failed to initialize Kinect depth: {err}; continuing without it");
+            }
+        }
+        #[cfg(not(feature = "kinect-freenect"))]
+        println!(
+            "failed to initialize Kinect depth: rebuild with --features kinect-freenect; continuing without it"
+        );
     }
 
     if let Some(device) = &args.mic {
@@ -3971,7 +4015,13 @@ fn add_optional_real_sensors(
     availability: &mut Value,
     warnings: &mut Vec<String>,
 ) {
-    if let Some(device) = &args.camera {
+    if args.kinect_depth {
+        if let Some(device) = &args.camera {
+            warnings.push(format!(
+                "Kinect depth requested; using libfreenect for Kinect RGB/depth instead of opening {device} through V4L"
+            ));
+        }
+    } else if let Some(device) = &args.camera {
         match CameraSenseProvider::new(device) {
             Ok(provider) => {
                 sensors.push(Box::new(provider));
@@ -3985,6 +4035,44 @@ fn add_optional_real_sensors(
     } else {
         availability["camera"] = serde_json::json!({"present": false, "reason": "not requested"});
         warnings.push("camera not requested; RGB stream missing".to_string());
+    }
+
+    if args.kinect_depth {
+        #[cfg(feature = "kinect-freenect")]
+        match FreenectKinectProvider::with_index(args.kinect_index) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["kinect"] = serde_json::json!({
+                    "present": true,
+                    "source": "libfreenect",
+                    "index": args.kinect_index
+                });
+                availability["camera"] = serde_json::json!({
+                    "present": true,
+                    "source": "libfreenect",
+                    "index": args.kinect_index
+                });
+            }
+            Err(error) => {
+                availability["kinect"] = serde_json::json!({
+                    "present": false,
+                    "source": "libfreenect",
+                    "index": args.kinect_index,
+                    "error": error.to_string()
+                });
+                warnings.push(format!("Kinect depth unavailable: {error}"));
+            }
+        }
+        #[cfg(not(feature = "kinect-freenect"))]
+        {
+            availability["kinect"] = serde_json::json!({
+                "present": false,
+                "reason": "netherwick-tools was built without kinect-freenect"
+            });
+            warnings.push(
+                "Kinect depth requested but binary was built without kinect-freenect".to_string(),
+            );
+        }
     }
 
     if let Some(device) = &args.mic {
@@ -4035,7 +4123,9 @@ fn add_optional_real_sensors(
         availability["imu"] = serde_json::json!({"present": false, "reason": "not requested"});
     }
 
-    if availability["kinect"]["freenect_available"].as_bool() != Some(true) {
+    if availability["kinect"]["present"].as_bool() != Some(true)
+        && availability["kinect"]["freenect_available"].as_bool() != Some(true)
+    {
         warnings.push("Kinect/libfreenect not detected; depth stream missing".to_string());
     }
 }
@@ -7384,6 +7474,8 @@ mod tests {
             create_port: "mock".to_string(),
             create_baud: 57_600,
             camera: None,
+            kinect_depth: false,
+            kinect_index: 0,
             mic: None,
             imu: None,
             gps: None,
@@ -7418,6 +7510,8 @@ mod tests {
             create_port: "mock".to_string(),
             create_baud: 57_600,
             camera: None,
+            kinect_depth: false,
+            kinect_index: 0,
             mic: None,
             imu: None,
             gps: None,

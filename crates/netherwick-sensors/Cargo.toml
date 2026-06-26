@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [features]
-default = []
+default = ["kinect-freenect"]
 linux-hardware = ["dep:cpal", "dep:libc", "dep:serialport", "dep:v4l"]
 kinect-freenect = []
 
