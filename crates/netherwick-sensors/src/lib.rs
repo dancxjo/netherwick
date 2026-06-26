@@ -40,6 +40,8 @@ use v4l::io::traits::CaptureStream;
 use v4l::prelude::{MmapStream, *};
 #[cfg(feature = "linux-hardware")]
 use v4l::video::Capture;
+#[cfg(feature = "linux-hardware")]
+use v4l::{Format, FourCC};
 
 #[async_trait]
 pub trait SenseProducer {
@@ -821,28 +823,30 @@ impl CpalMicrophone {
 
 #[cfg(feature = "linux-hardware")]
 pub struct V4lCamera {
-    device: Device,
+    stream: MmapStream<'static>,
+    format: Format,
 }
 
 #[cfg(feature = "linux-hardware")]
 impl V4lCamera {
     pub fn new(path: &str) -> Result<Self> {
-        Ok(Self {
-            device: Device::with_path(path)?,
-        })
+        let mut device = Device::with_path(path)?;
+        configure_camera_format(&mut device);
+        let format = device.format()?;
+        let device = Box::leak(Box::new(device));
+        let stream = MmapStream::with_buffers(device, Type::VideoCapture, 4)?;
+        Ok(Self { stream, format })
     }
 
     pub fn capture_frame(&mut self) -> Result<EyeFrame> {
-        let format = self.device.format()?;
-        let mut stream = MmapStream::with_buffers(&self.device, Type::VideoCapture, 2)?;
-        let (bytes, _) = stream.next()?;
+        let (bytes, _) = self.stream.next()?;
         Ok(EyeFrame {
             captured_at_ms: unix_time_ms(),
-            width: format.width,
-            height: format.height,
-            format: eye_frame_format_from_fourcc(format.fourcc.str().unwrap_or_default()),
+            width: self.format.width,
+            height: self.format.height,
+            format: eye_frame_format_from_fourcc(self.format.fourcc.str().unwrap_or_default()),
             bytes: bytes.to_vec(),
-            source: None,
+            source: Some("real-camera".to_string()),
         })
     }
 }
@@ -854,8 +858,27 @@ fn eye_frame_format_from_fourcc(fourcc: &str) -> EyeFrameFormat {
         "RGB3" => EyeFrameFormat::Rgb8,
         "BGR3" => EyeFrameFormat::Bgr8,
         "YUYV" | "YUY2" => EyeFrameFormat::Yuyv422,
+        "UYVY" => EyeFrameFormat::Uyvy422,
         "MJPG" | "JPEG" => EyeFrameFormat::Mjpeg,
         other => EyeFrameFormat::Unknown(other.to_string()),
+    }
+}
+
+#[cfg(feature = "linux-hardware")]
+fn configure_camera_format(device: &mut Device) {
+    let candidates = [
+        (320, 240, *b"MJPG"),
+        (320, 240, *b"YUYV"),
+        (640, 480, *b"MJPG"),
+        (640, 480, *b"RGB3"),
+        (640, 480, *b"BGR3"),
+        (640, 480, *b"GREY"),
+    ];
+    for (width, height, fourcc) in candidates {
+        let format = Format::new(width, height, FourCC::new(&fourcc));
+        if device.set_format(&format).is_ok() {
+            return;
+        }
     }
 }
 

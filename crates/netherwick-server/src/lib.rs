@@ -1343,10 +1343,13 @@ fn encode_eye_png_bytes(frame: &netherwick_sensors::EyeFrame) -> Result<Vec<u8>,
         EyeFrameFormat::Rgb8
         | EyeFrameFormat::Bgr8
         | EyeFrameFormat::Gray8
-        | EyeFrameFormat::Yuyv422 => {
+        | EyeFrameFormat::Yuyv422
+        | EyeFrameFormat::Uyvy422 => {
             let expected_len = match frame.format {
                 EyeFrameFormat::Gray8 => frame.width as usize * frame.height as usize,
-                EyeFrameFormat::Yuyv422 => frame.width as usize * frame.height as usize * 2,
+                EyeFrameFormat::Yuyv422 | EyeFrameFormat::Uyvy422 => {
+                    frame.width as usize * frame.height as usize * 2
+                }
                 _ => frame.width as usize * frame.height as usize * 3,
             };
             if frame.bytes.len() < expected_len {
@@ -1371,6 +1374,9 @@ fn encode_eye_png_bytes(frame: &netherwick_sensors::EyeFrame) -> Result<Vec<u8>,
                 }
                 EyeFrameFormat::Yuyv422 => {
                     rgb.extend(yuyv422_to_rgb(&frame.bytes[..expected_len]));
+                }
+                EyeFrameFormat::Uyvy422 => {
+                    rgb.extend(uyvy422_to_rgb(&frame.bytes[..expected_len]));
                 }
                 _ => {}
             }
@@ -2285,9 +2291,13 @@ fn eye_frame_stats(frame: &netherwick_sensors::EyeFrame) -> EyeFrameStats {
                 }
             }
         }
-        EyeFrameFormat::Yuyv422 => {
+        EyeFrameFormat::Yuyv422 | EyeFrameFormat::Uyvy422 => {
             for pair in frame.bytes.chunks_exact(4).take(pixels.div_ceil(2)) {
-                for value in [pair[0], pair[2]] {
+                let values = match frame.format {
+                    EyeFrameFormat::Uyvy422 => [pair[1], pair[3]],
+                    _ => [pair[0], pair[2]],
+                };
+                for value in values {
                     let luma = value as f32 / 255.0;
                     luma_sum += luma;
                     if luma > 0.08 {
@@ -2313,10 +2323,13 @@ fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>,
         EyeFrameFormat::Rgb8
         | EyeFrameFormat::Bgr8
         | EyeFrameFormat::Gray8
-        | EyeFrameFormat::Yuyv422 => {
+        | EyeFrameFormat::Yuyv422
+        | EyeFrameFormat::Uyvy422 => {
             let expected_len = match frame.format {
                 EyeFrameFormat::Gray8 => frame.width as usize * frame.height as usize,
-                EyeFrameFormat::Yuyv422 => frame.width as usize * frame.height as usize * 2,
+                EyeFrameFormat::Yuyv422 | EyeFrameFormat::Uyvy422 => {
+                    frame.width as usize * frame.height as usize * 2
+                }
                 _ => frame.width as usize * frame.height as usize * 3,
             };
             if frame.bytes.len() < expected_len {
@@ -2344,6 +2357,9 @@ fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>,
                 }
                 EyeFrameFormat::Yuyv422 => {
                     rgb.extend(yuyv422_to_rgb(&frame.bytes[..expected_len]));
+                }
+                EyeFrameFormat::Uyvy422 => {
+                    rgb.extend(uyvy422_to_rgb(&frame.bytes[..expected_len]));
                 }
                 _ => {}
             }
@@ -2375,6 +2391,19 @@ fn yuyv422_to_rgb(bytes: &[u8]) -> Vec<u8> {
         let u = pair[1];
         let y1 = pair[2];
         let v = pair[3];
+        push_yuv_rgb(&mut rgb, y0, u, v);
+        push_yuv_rgb(&mut rgb, y1, u, v);
+    }
+    rgb
+}
+
+fn uyvy422_to_rgb(bytes: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(bytes.len() / 2 * 3);
+    for pair in bytes.chunks_exact(4) {
+        let u = pair[0];
+        let y0 = pair[1];
+        let v = pair[2];
+        let y1 = pair[3];
         push_yuv_rgb(&mut rgb, y0, u, v);
         push_yuv_rgb(&mut rgb, y1, u, v);
     }
@@ -2994,8 +3023,9 @@ function drawEye(frame){
   const isBgr = fmt === 'Bgr8' || (typeof fmt === 'object' && fmt.Bgr8 !== undefined);
   const isGray = fmt === 'Gray8' || (typeof fmt === 'object' && fmt.Gray8 !== undefined);
   const isYuyv = fmt === 'Yuyv422' || (typeof fmt === 'object' && fmt.Yuyv422 !== undefined);
+  const isUyvy = fmt === 'Uyvy422' || (typeof fmt === 'object' && fmt.Uyvy422 !== undefined);
   const isMjpg = fmt === 'Mjpeg' || (typeof fmt === 'object' && fmt.Mjpeg !== undefined) || (typeof fmt === 'object' && JSON.stringify(fmt).includes('MJPG'));
-  if(isRgb || isBgr || isGray || isYuyv){
+  if(isRgb || isBgr || isGray || isYuyv || isUyvy){
     if(canvas.width !== frame.width || canvas.height !== frame.height){
       canvas.width = frame.width; canvas.height = frame.height;
     }
@@ -3008,9 +3038,12 @@ function drawEye(frame){
         image.data[target + 2] = value;
         image.data[target + 3] = 255;
       }
-    }else if(isYuyv){
+    }else if(isYuyv || isUyvy){
       for(let source = 0, target = 0; target + 7 < image.data.length && source + 3 < frame.bytes.length; source += 4, target += 8){
-        const y0 = frame.bytes[source], u = frame.bytes[source + 1], y1 = frame.bytes[source + 2], v = frame.bytes[source + 3];
+        const y0 = isUyvy ? frame.bytes[source + 1] : frame.bytes[source];
+        const u = isUyvy ? frame.bytes[source] : frame.bytes[source + 1];
+        const y1 = isUyvy ? frame.bytes[source + 3] : frame.bytes[source + 2];
+        const v = isUyvy ? frame.bytes[source + 2] : frame.bytes[source + 3];
         writeYuvPixel(image.data, target, y0, u, v);
         writeYuvPixel(image.data, target + 4, y1, u, v);
       }
@@ -3037,6 +3070,18 @@ function drawEye(frame){
     img.src = url;
   }
 }
+function drawEyeDataUrl(dataUrl){
+  if(!dataUrl) return false;
+  const img = new Image();
+  img.onload = () => {
+    if(canvas.width !== img.width || canvas.height !== img.height){
+      canvas.width = img.width; canvas.height = img.height;
+    }
+    ctx.drawImage(img, 0, 0);
+  };
+  img.src = dataUrl;
+  return true;
+}
 function writeYuvPixel(data, target, y, u, v){
   const c = y - 16, d = u - 128, e = v - 128;
   data[target] = Math.max(0, Math.min(255, (298 * c + 409 * e + 128) >> 8));
@@ -3046,7 +3091,12 @@ function writeYuvPixel(data, target, y, u, v){
 }
 function shouldGenerateEye(scenePacket){
   const session = scenePacket?.session || {};
-  const virtualMode = session.source === 'sim' || String(session.mode || '').includes('virtual');
+  const mode = String(session.mode || '').toLowerCase();
+  const virtualMode =
+    session.source === 'sim' ||
+    mode.includes('virtual') ||
+    mode.includes('read-only') ||
+    mode.includes('readonly');
   if(!virtualMode) return false;
   if(scenePacket?.eye?.source === 'babylon-robot-eye') return false;
   const eye = scenePacket?.eye;
@@ -3128,13 +3178,41 @@ function drawBeams(values){
 }
 async function refresh(){
   try{
-    const [response, sceneResponse] = await Promise.all([
-      fetch('/view/snapshot', {cache:'no-store'}),
-      fetch('/view/scene', {cache:'no-store'})
-    ]);
+    const sceneResponse = await fetch('/view/scene', {cache:'no-store'});
+    if(sceneResponse.ok){
+      const scenePacket = await sceneResponse.json();
+      const body = scenePacket.body;
+      fields.t.textContent = `${scenePacket.t_ms} ms`;
+      fields.x.textContent = `${fmt(body.x_m)} m`;
+      fields.y.textContent = `${fmt(body.y_m)} m`;
+      fields.heading.textContent = `${fmt(body.heading_rad)} rad`;
+      fields.battery.textContent = `${fmt(body.battery_level * 100, 1)}%`;
+      fields.nearest.textContent = scenePacket.range?.nearest_m == null ? '-' : `${fmt(scenePacket.range.nearest_m)} m`;
+      fields.gps_lat.textContent = '-';
+      fields.gps_lon.textContent = '-';
+      fields.gps_alt.textContent = '-';
+      if(scenePacket.eye){
+        const eye = scenePacket.eye;
+        const isAuth = eye.authoritative ? " (auth)" : " (symbolic)";
+        const statusText = eye.retina_connected ? `connected, age ${eye.retina_last_frame_age_ms}ms` : "disconnected";
+        fields.eye_format.textContent = `${eye.width}x${eye.height} luma ${fmt(eye.mean_luma, 2)} | source: ${eye.source}${isAuth} | retina: ${statusText} | rx: ${eye.frames_received} tx: ${eye.frames_written_to_ledger}`;
+        fields.eye_format.style.color = '';
+        fields.eye_format.style.fontWeight = '';
+        fields.eye_age.textContent = '-';
+        drawEyeDataUrl(eye.data_url);
+      }else{
+        fields.eye_format.textContent = '-';
+        fields.eye_age.textContent = '-';
+      }
+      fields.ear_age.textContent = '-';
+      drawBeams((scenePacket.range?.beams || []).map(beam => beam.distance_m));
+      status.textContent = 'live';
+      return;
+    }
+    const response = await fetch('/view/snapshot', {cache:'no-store'});
     if(!response.ok) throw new Error(await response.text());
     const snapshot = await response.json();
-    const scenePacket = sceneResponse.ok ? await sceneResponse.json() : null;
+    const scenePacket = null;
     const body = snapshot.body;
     fields.t.textContent = `${snapshot.t_ms} ms`;
     fields.x.textContent = `${fmt(body.odometry.x_m)} m`;
@@ -3191,7 +3269,7 @@ async function refresh(){
   }catch(error){
     status.textContent = 'waiting for frames...';
   }finally{
-    setTimeout(refresh, 100);
+    setTimeout(refresh, 250);
   }
 }
 refresh();
@@ -3879,7 +3957,12 @@ function renderPoints(points, coordinateSystem){
 
 function shouldUseGeneratedEye(packet){
   const session = packet?.session || {};
-  const virtualMode = session.source === 'sim' || String(session.mode || '').includes('virtual');
+  const mode = String(session.mode || '').toLowerCase();
+  const virtualMode =
+    session.source === 'sim' ||
+    mode.includes('virtual') ||
+    mode.includes('read-only') ||
+    mode.includes('readonly');
   if(!virtualMode) return false;
   if(session.mode === 'virtual-live') return true;
   const eye = packet?.eye;
@@ -3915,8 +3998,9 @@ function renderRawEyeFrame(frame){
   const isBgr = frameFormatIs(fmt, 'Bgr8');
   const isGray = frameFormatIs(fmt, 'Gray8');
   const isYuyv = frameFormatIs(fmt, 'Yuyv422');
+  const isUyvy = frameFormatIs(fmt, 'Uyvy422');
   const isMjpg = frameFormatIs(fmt, 'Mjpeg') || frameFormatText(fmt).includes('MJPG');
-  if(isRgb || isBgr || isGray || isYuyv){
+  if(isRgb || isBgr || isGray || isYuyv || isUyvy){
     eyeCanvas.width = frame.width; eyeCanvas.height = frame.height;
     const image = eyeCanvas.getContext('2d').createImageData(frame.width, frame.height);
     if(isGray){
@@ -3924,9 +4008,12 @@ function renderRawEyeFrame(frame){
         const value = frame.bytes[source];
         image.data[target] = value; image.data[target + 1] = value; image.data[target + 2] = value; image.data[target + 3] = 255;
       }
-    }else if(isYuyv){
+    }else if(isYuyv || isUyvy){
       for(let source = 0, target = 0; target + 7 < image.data.length && source + 3 < frame.bytes.length; source += 4, target += 8){
-        const y0 = frame.bytes[source], u = frame.bytes[source + 1], y1 = frame.bytes[source + 2], v = frame.bytes[source + 3];
+        const y0 = isUyvy ? frame.bytes[source + 1] : frame.bytes[source];
+        const u = isUyvy ? frame.bytes[source] : frame.bytes[source + 1];
+        const y1 = isUyvy ? frame.bytes[source + 3] : frame.bytes[source + 2];
+        const v = isUyvy ? frame.bytes[source + 2] : frame.bytes[source + 3];
         writeYuvPixel(image.data, target, y0, u, v);
         writeYuvPixel(image.data, target + 4, y1, u, v);
       }
@@ -4528,15 +4615,91 @@ function pollXrReigns(){
 
 async function poll(){
   try{
-    const res = await fetch('/view/scene', {cache:'no-store'});
-    if(!res.ok) throw new Error(await res.text());
-    updateScene(await res.json());
+    const sceneResponse = await fetch('/view/scene', {cache:'no-store'});
+    if(!sceneResponse.ok){
+      const statusText = await sceneResponse.text();
+      throw new Error(statusText || 'scene unavailable');
+    }
+    const scene = await sceneResponse.json();
+    if(!scene) throw new Error('invalid snapshot payload');
+    updateScene(scene);
     statusEl.textContent = 'live';
   }catch(error){
     statusEl.textContent = 'waiting for scene packets...';
   }finally{
-    setTimeout(poll, 100);
+    setTimeout(poll, 250);
   }
+}
+
+function sceneFromSnapshot(snapshot){
+  if(!snapshot?.body) return null;
+  const body = snapshot.body;
+  const pose = body.odometry || {};
+  const range = snapshot.range || {};
+  const cliffSensors = body.cliff_sensors || {};
+  const cliffSignal = Math.max(
+    cliffSensors.left || 0,
+    cliffSensors.front_left || 0,
+    cliffSensors.front_right || 0,
+    cliffSensors.right || 0
+  );
+  const beams = (range.beams || []).map((distance, index, allBeams) => {
+    const finite = Number(distance);
+    const beamCount = allBeams.length || 1;
+    const ratio = beamCount <= 1 ? 0.5 : index / (beamCount - 1);
+    return {
+      angle_rad: -Math.PI * .5 + ratio * Math.PI,
+      distance_m: Number.isFinite(finite) ? finite : 0,
+      hit: Number.isFinite(range.nearest_m) ? Math.abs(finite - range.nearest_m) < 0.05 : false
+    };
+  });
+  return {
+    schema_version: 1,
+    t_ms: body.last_update_ms || 0,
+    body: {
+      x_m: pose.x_m || 0,
+      y_m: pose.y_m || 0,
+      heading_rad: pose.heading_rad || 0,
+      battery_level: body.battery_level == null ? 1 : body.battery_level,
+      charging: !!body.charging,
+      bump_left: !!body.flags?.bump_left,
+      bump_right: !!body.flags?.bump_right,
+      cliff: !!(
+        body.flags?.cliff_left ||
+        body.flags?.cliff_front_left ||
+        body.flags?.cliff_front_right ||
+        body.flags?.cliff_right ||
+        cliffSignal >= 0.5
+      ),
+      wheel_drop: !!body.flags?.wheel_drop
+    },
+    range: {
+      nearest_m: range.nearest_m == null ? null : range.nearest_m,
+      beams,
+    },
+    eye: null,
+    kinect: {points: [], coordinate_system: 'camera', skeletons: []},
+    objects: [],
+    session: snapshot.session || null,
+    hardware_control: snapshot.hardware_control || null,
+    arena: null,
+    action: {},
+    prod: {},
+    stuck: false,
+    dead_battery: false,
+    recovery_mode: null,
+    stuck_ticks: 0,
+    stuck_detail: {},
+    training_mode: 'standalone',
+    frames_written: 0,
+    transitions_written: 0,
+    models_loaded: [],
+    model_modes: {},
+    behavior_nodes: [],
+    action_selector_mode: '-',
+    weights_updating: false,
+    training: {training_mode: 'standalone'}
+  };
 }
 
 function llmText(value){
@@ -5987,7 +6150,7 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/stream/llm"));
         let Html(page) = live_view_3d_page().await;
         assert!(page.contains("Sensorium 3D"));
-        assert!(page.contains("/view/scene"));
+        assert!(page.contains("/view/snapshot"));
         assert!(page.contains("/models"));
         assert!(page.contains("Training stats"));
         assert!(page.contains("Connections"));

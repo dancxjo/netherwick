@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error as AnyhowError, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use netherwick_actions::ActionPrimitive;
@@ -3483,7 +3483,16 @@ where
     let mut events_written = 0usize;
     let mut frame_index = 0u64;
     for _ in 0..requested_frames {
-        let (snapshot, tick) = runner.tick_read_only().await?;
+        let tick_result = runner.tick_read_only().await;
+        let (snapshot, tick) = match tick_result {
+            Ok(values) => values,
+            Err(error) if is_transient_readonly_timeout(&error) => {
+                eprintln!("read-only capture tick timed out; continuing");
+                tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         stream_counts.observe(&snapshot);
         if tick
             .frame
@@ -3620,12 +3629,73 @@ async fn inspect_capture(args: InspectCaptureArgs) -> Result<()> {
     Ok(())
 }
 
+struct BackgroundSenseProducer {
+    name: &'static str,
+    latest: std::sync::Arc<std::sync::Mutex<Option<Result<SensePacket, String>>>>,
+}
+
+impl BackgroundSenseProducer {
+    fn spawn<T>(name: &'static str, mut producer: T, poll_interval: Duration) -> Self
+    where
+        T: SenseProducer + Send + 'static,
+    {
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let worker_latest = std::sync::Arc::clone(&latest);
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    *worker_latest
+                        .lock()
+                        .expect("background sensor mutex poisoned") = Some(Err(format!(
+                        "failed to start background sensor runtime: {error}"
+                    )));
+                    return;
+                }
+            };
+            loop {
+                let result = runtime
+                    .block_on(producer.poll())
+                    .map_err(|error| error.to_string());
+                *worker_latest
+                    .lock()
+                    .expect("background sensor mutex poisoned") = Some(result);
+                std::thread::sleep(poll_interval);
+            }
+        });
+        Self { name, latest }
+    }
+}
+
+#[async_trait::async_trait]
+impl SenseProducer for BackgroundSenseProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        match self
+            .latest
+            .lock()
+            .expect("background sensor mutex poisoned")
+            .clone()
+        {
+            Some(Ok(packet)) => Ok(packet),
+            Some(Err(error)) => anyhow::bail!("{} sensor unavailable: {error}", self.name),
+            None => anyhow::bail!("{} sensor has no frame yet", self.name),
+        }
+    }
+}
+
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
 
     if let Some(device) = &args.camera {
         match CameraSenseProvider::new(device) {
-            Ok(provider) => sensors.push(Box::new(provider)),
+            Ok(provider) => sensors.push(Box::new(BackgroundSenseProducer::spawn(
+                "camera",
+                provider,
+                Duration::from_millis(args.tick_ms.max(1)),
+            ))),
             Err(err) => {
                 if args.require_camera {
                     anyhow::bail!("failed to initialize camera: {err}");
@@ -3690,6 +3760,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     } else {
         Some(args.create_port.clone())
     };
+    let is_mock_body = create_port.as_deref() == Some("mock");
     let body: Box<dyn RobotBody + Send> = if create_port.as_deref() == Some("mock") {
         Box::new(MockCreate1Body::new())
     } else if let Some(create_port) = create_port {
@@ -3710,11 +3781,17 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         SimpleSafety::default(),
         configured_llm_agent(&args.llm)?,
     );
-    let robot_mode = match args.mode {
+    let mut robot_mode = match args.mode {
         RobotModeArg::ReadOnly => RobotMode::ReadOnly,
         RobotModeArg::Slow => RobotMode::Slow,
         RobotModeArg::Disabled => RobotMode::Disabled,
     };
+    if is_mock_body && robot_mode == RobotMode::Slow {
+        println!(
+            "warning: create-port mock does not support motorized slow mode; running in read-only mode instead"
+        );
+        robot_mode = RobotMode::ReadOnly;
+    }
     if robot_mode == RobotMode::Disabled {
         anyhow::bail!("--mode disabled does not start the real robot runner");
     }
@@ -3769,10 +3846,22 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         .map(|limit| runner.tick_count < limit)
         .unwrap_or(true)
     {
-        let (snapshot, tick) = match robot_mode {
-            RobotMode::ReadOnly => runner.tick_read_only().await?,
-            RobotMode::Slow => runner.tick_slow_manual().await?,
+        let tick_result = match robot_mode {
+            RobotMode::ReadOnly => runner.tick_read_only().await,
+            RobotMode::Slow => runner.tick_slow_manual().await,
             RobotMode::Disabled => unreachable!("disabled mode bailed before runner start"),
+        };
+        let (snapshot, tick) = match tick_result {
+            Ok(values) => values,
+            Err(error) if robot_mode == RobotMode::ReadOnly => {
+                if is_transient_readonly_timeout(&error) {
+                    eprintln!("read-only tick timed out; continuing");
+                    tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
         };
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
@@ -4744,6 +4833,36 @@ async fn inspect_ledger(args: InspectLedgerArgs) -> Result<()> {
         print_frame(&frame);
     }
     Ok(())
+}
+
+fn is_transient_readonly_timeout(error: &AnyhowError) -> bool {
+    let message = error.to_string().to_lowercase();
+    if message.contains("timed out") || message.contains("operation timed out") {
+        return true;
+    }
+
+    if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+        return io_error.kind() == std::io::ErrorKind::TimedOut;
+    }
+
+    let mut current = error.source();
+    while let Some(err) = current {
+        if err.to_string().to_lowercase().contains("timed out")
+            || err
+                .to_string()
+                .to_lowercase()
+                .contains("operation timed out")
+        {
+            return true;
+        }
+        if let Some(io_error) = err.downcast_ref::<std::io::Error>() {
+            if io_error.kind() == std::io::ErrorKind::TimedOut {
+                return true;
+            }
+        }
+        current = err.source();
+    }
+    false
 }
 
 async fn memory_inspect(args: MemoryInspectArgs) -> Result<()> {

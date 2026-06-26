@@ -3812,10 +3812,7 @@ where
         }
 
         let body = self.body.read_body().await?;
-        let mut packets = Vec::new();
-        for sensor in &mut self.sensors {
-            packets.push(sensor.poll().await?);
-        }
+        let packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body.last_update_ms.max(wall_time_ms());
         let mut now = self.now_builder.build(t_ms, body, packets)?;
         now.self_sense.mode = Some("read-only".to_string());
@@ -3856,10 +3853,7 @@ where
         }
 
         let body_before = self.body.read_body().await?;
-        let mut packets = Vec::new();
-        for sensor in &mut self.sensors {
-            packets.push(sensor.poll().await?);
-        }
+        let packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
         let mut now = self.now_builder.build(t_ms, body_before.clone(), packets)?;
         now.self_sense.mode = Some("slow".to_string());
@@ -3939,6 +3933,20 @@ where
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
     }
+}
+
+async fn poll_sensors_lossy(
+    sensors: &mut [Box<dyn SenseProducer + Send>],
+) -> Vec<netherwick_sensors::SensePacket> {
+    let mut packets = Vec::new();
+    for sensor in sensors {
+        match tokio::time::timeout(std::time::Duration::from_millis(25), sensor.poll()).await {
+            Ok(Ok(packet)) => packets.push(packet),
+            Ok(Err(error)) => eprintln!("sensor poll failed; continuing without packet: {error}"),
+            Err(_) => eprintln!("sensor poll timed out; continuing without packet"),
+        }
+    }
+    packets
 }
 
 fn wall_time_ms() -> u64 {
@@ -6026,6 +6034,15 @@ mod tests {
         }
     }
 
+    struct FailingSensor;
+
+    #[async_trait::async_trait]
+    impl SenseProducer for FailingSensor {
+        async fn poll(&mut self) -> Result<netherwick_sensors::SensePacket> {
+            anyhow::bail!("simulated sensor timeout")
+        }
+    }
+
     #[tokio::test]
     async fn real_robot_read_only_runner_never_applies_motor() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
@@ -6057,6 +6074,26 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn real_robot_read_only_runner_publishes_snapshot_when_optional_sensor_fails() {
+        let body = CountingBody {
+            motor_attempts: Arc::new(AtomicUsize::new(0)),
+            motors: Arc::new(Mutex::new(Vec::new())),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let sensors: Vec<Box<dyn SenseProducer + Send>> = vec![Box::new(FailingSensor)];
+        let mut runner =
+            RealRobotRunner::new(RobotMode::ReadOnly, Box::new(body), sensors, StubRuntime);
+
+        let (snapshot, _tick) = runner.tick_read_only().await.unwrap();
+
+        assert!(snapshot.body.last_update_ms >= 100);
+        assert_eq!(runner.tick_count, 1);
     }
 
     #[tokio::test]
