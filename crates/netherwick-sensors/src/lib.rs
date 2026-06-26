@@ -859,6 +859,10 @@ fn eye_frame_format_from_fourcc(fourcc: &str) -> EyeFrameFormat {
         "BGR3" => EyeFrameFormat::Bgr8,
         "YUYV" | "YUY2" => EyeFrameFormat::Yuyv422,
         "UYVY" => EyeFrameFormat::Uyvy422,
+        "GRBG" => EyeFrameFormat::BayerGrbg8,
+        "RGGB" => EyeFrameFormat::BayerRggb8,
+        "BGGR" => EyeFrameFormat::BayerBggr8,
+        "GBRG" => EyeFrameFormat::BayerGbrg8,
         "MJPG" | "JPEG" => EyeFrameFormat::Mjpeg,
         other => EyeFrameFormat::Unknown(other.to_string()),
     }

@@ -283,7 +283,6 @@ fn hardware_snapshot_block_reason(snapshot: &WorldSnapshot, now_ms: TimeMs) -> O
         || snapshot.body.flags.cliff_front_left
         || snapshot.body.flags.cliff_front_right
         || snapshot.body.flags.cliff_right
-        || snapshot.body.cliff_sensors.max() >= 0.5
     {
         return Some("cliff sensor active".to_string());
     }
@@ -1366,42 +1365,12 @@ fn encode_eye_png_bytes(frame: &netherwick_sensors::EyeFrame) -> Result<Vec<u8>,
         | EyeFrameFormat::Bgr8
         | EyeFrameFormat::Gray8
         | EyeFrameFormat::Yuyv422
-        | EyeFrameFormat::Uyvy422 => {
-            let expected_len = match frame.format {
-                EyeFrameFormat::Gray8 => frame.width as usize * frame.height as usize,
-                EyeFrameFormat::Yuyv422 | EyeFrameFormat::Uyvy422 => {
-                    frame.width as usize * frame.height as usize * 2
-                }
-                _ => frame.width as usize * frame.height as usize * 3,
-            };
-            if frame.bytes.len() < expected_len {
-                return Err(format!(
-                    "eye frame has {} bytes, expected at least {}",
-                    frame.bytes.len(),
-                    expected_len
-                ));
-            }
-            let mut rgb = Vec::with_capacity(frame.width as usize * frame.height as usize * 3);
-            match frame.format {
-                EyeFrameFormat::Rgb8 => rgb.extend_from_slice(&frame.bytes[..expected_len]),
-                EyeFrameFormat::Bgr8 => {
-                    for pixel in frame.bytes[..expected_len].chunks_exact(3) {
-                        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-                    }
-                }
-                EyeFrameFormat::Gray8 => {
-                    for value in &frame.bytes[..expected_len] {
-                        rgb.extend_from_slice(&[*value, *value, *value]);
-                    }
-                }
-                EyeFrameFormat::Yuyv422 => {
-                    rgb.extend(yuyv422_to_rgb(&frame.bytes[..expected_len]));
-                }
-                EyeFrameFormat::Uyvy422 => {
-                    rgb.extend(uyvy422_to_rgb(&frame.bytes[..expected_len]));
-                }
-                _ => {}
-            }
+        | EyeFrameFormat::Uyvy422
+        | EyeFrameFormat::BayerGrbg8
+        | EyeFrameFormat::BayerRggb8
+        | EyeFrameFormat::BayerBggr8
+        | EyeFrameFormat::BayerGbrg8 => {
+            let rgb = eye_frame_to_rgb(frame)?;
             let mut png = Vec::new();
             let result = PngEncoder::new(&mut png).write_image(
                 &rgb,
@@ -1418,6 +1387,66 @@ fn encode_eye_png_bytes(frame: &netherwick_sensors::EyeFrame) -> Result<Vec<u8>,
             Err(format!("unsupported eye frame format {format}"))
         }
     }
+}
+
+fn eye_frame_to_rgb(frame: &netherwick_sensors::EyeFrame) -> Result<Vec<u8>, String> {
+    let expected_len = match frame.format {
+        EyeFrameFormat::Gray8
+        | EyeFrameFormat::BayerGrbg8
+        | EyeFrameFormat::BayerRggb8
+        | EyeFrameFormat::BayerBggr8
+        | EyeFrameFormat::BayerGbrg8 => frame.width as usize * frame.height as usize,
+        EyeFrameFormat::Yuyv422 | EyeFrameFormat::Uyvy422 => {
+            frame.width as usize * frame.height as usize * 2
+        }
+        EyeFrameFormat::Rgb8 | EyeFrameFormat::Bgr8 => {
+            frame.width as usize * frame.height as usize * 3
+        }
+        EyeFrameFormat::Mjpeg | EyeFrameFormat::Unknown(_) => {
+            return Err(format!("unsupported eye frame format {:?}", frame.format));
+        }
+    };
+    if frame.bytes.len() < expected_len {
+        return Err(format!(
+            "eye frame has {} bytes, expected at least {}",
+            frame.bytes.len(),
+            expected_len
+        ));
+    }
+    let bytes = &frame.bytes[..expected_len];
+    let mut rgb = Vec::with_capacity(frame.width as usize * frame.height as usize * 3);
+    match frame.format {
+        EyeFrameFormat::Rgb8 => rgb.extend_from_slice(bytes),
+        EyeFrameFormat::Bgr8 => {
+            for pixel in bytes.chunks_exact(3) {
+                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+        }
+        EyeFrameFormat::Gray8 => {
+            for value in bytes {
+                rgb.extend_from_slice(&[*value, *value, *value]);
+            }
+        }
+        EyeFrameFormat::Yuyv422 => {
+            rgb.extend(yuyv422_to_rgb(bytes));
+        }
+        EyeFrameFormat::Uyvy422 => {
+            rgb.extend(uyvy422_to_rgb(bytes));
+        }
+        EyeFrameFormat::BayerGrbg8
+        | EyeFrameFormat::BayerRggb8
+        | EyeFrameFormat::BayerBggr8
+        | EyeFrameFormat::BayerGbrg8 => {
+            rgb.extend(bayer8_to_rgb(
+                bytes,
+                frame.width as usize,
+                frame.height as usize,
+                &frame.format,
+            ));
+        }
+        EyeFrameFormat::Mjpeg | EyeFrameFormat::Unknown(_) => {}
+    }
+    Ok(rgb)
 }
 
 async fn get_retina_latest(State(state): State<LiveViewState>) -> impl IntoResponse {
@@ -2001,8 +2030,7 @@ pub fn snapshot_to_scene(
             cliff: body.flags.cliff_left
                 || body.flags.cliff_front_left
                 || body.flags.cliff_front_right
-                || body.flags.cliff_right
-                || body.cliff_sensors.max() >= 0.5,
+                || body.flags.cliff_right,
             wheel_drop: body.flags.wheel_drop,
         },
         range: scene_range_from_snapshot(snapshot),
@@ -2328,6 +2356,18 @@ fn eye_frame_stats(frame: &netherwick_sensors::EyeFrame) -> EyeFrameStats {
                 }
             }
         }
+        EyeFrameFormat::BayerGrbg8
+        | EyeFrameFormat::BayerRggb8
+        | EyeFrameFormat::BayerBggr8
+        | EyeFrameFormat::BayerGbrg8 => {
+            for value in frame.bytes.iter().take(pixels) {
+                let luma = *value as f32 / 255.0;
+                luma_sum += luma;
+                if luma > 0.08 {
+                    non_background += 1;
+                }
+            }
+        }
         EyeFrameFormat::Mjpeg | EyeFrameFormat::Unknown(_) => {}
     }
     EyeFrameStats {
@@ -2346,45 +2386,15 @@ fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>,
         | EyeFrameFormat::Bgr8
         | EyeFrameFormat::Gray8
         | EyeFrameFormat::Yuyv422
-        | EyeFrameFormat::Uyvy422 => {
-            let expected_len = match frame.format {
-                EyeFrameFormat::Gray8 => frame.width as usize * frame.height as usize,
-                EyeFrameFormat::Yuyv422 | EyeFrameFormat::Uyvy422 => {
-                    frame.width as usize * frame.height as usize * 2
-                }
-                _ => frame.width as usize * frame.height as usize * 3,
+        | EyeFrameFormat::Uyvy422
+        | EyeFrameFormat::BayerGrbg8
+        | EyeFrameFormat::BayerRggb8
+        | EyeFrameFormat::BayerBggr8
+        | EyeFrameFormat::BayerGbrg8 => {
+            let rgb = match eye_frame_to_rgb(frame) {
+                Ok(rgb) => rgb,
+                Err(error) => return (None, Some(error)),
             };
-            if frame.bytes.len() < expected_len {
-                return (
-                    None,
-                    Some(format!(
-                        "eye frame has {} bytes, expected at least {}",
-                        frame.bytes.len(),
-                        expected_len
-                    )),
-                );
-            }
-            let mut rgb = Vec::with_capacity(frame.width as usize * frame.height as usize * 3);
-            match frame.format {
-                EyeFrameFormat::Rgb8 => rgb.extend_from_slice(&frame.bytes[..expected_len]),
-                EyeFrameFormat::Bgr8 => {
-                    for pixel in frame.bytes[..expected_len].chunks_exact(3) {
-                        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-                    }
-                }
-                EyeFrameFormat::Gray8 => {
-                    for value in &frame.bytes[..expected_len] {
-                        rgb.extend_from_slice(&[*value, *value, *value]);
-                    }
-                }
-                EyeFrameFormat::Yuyv422 => {
-                    rgb.extend(yuyv422_to_rgb(&frame.bytes[..expected_len]));
-                }
-                EyeFrameFormat::Uyvy422 => {
-                    rgb.extend(uyvy422_to_rgb(&frame.bytes[..expected_len]));
-                }
-                _ => {}
-            }
             let mut png = Vec::new();
             let result = PngEncoder::new(&mut png).write_image(
                 &rgb,
@@ -2404,6 +2414,117 @@ fn encode_eye_data_url(frame: &netherwick_sensors::EyeFrame) -> (Option<String>,
             (None, Some(format!("unsupported eye frame format {format}")))
         }
     }
+}
+
+fn bayer8_to_rgb(bytes: &[u8], width: usize, height: usize, format: &EyeFrameFormat) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let (r, g, b) = bayer_pixel_to_rgb(bytes, width, height, x, y, format);
+            rgb.extend_from_slice(&[r, g, b]);
+        }
+    }
+    rgb
+}
+
+fn bayer_pixel_to_rgb(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    format: &EyeFrameFormat,
+) -> (u8, u8, u8) {
+    let value = bayer_sample(bytes, width, x, y);
+    match bayer_color_at(x, y, format) {
+        BayerColor::Red => (
+            value,
+            average_bayer_neighbors(bytes, width, height, x, y, format, &[BayerColor::Green]),
+            average_bayer_neighbors(bytes, width, height, x, y, format, &[BayerColor::Blue]),
+        ),
+        BayerColor::Green => (
+            average_bayer_neighbors(bytes, width, height, x, y, format, &[BayerColor::Red]),
+            value,
+            average_bayer_neighbors(bytes, width, height, x, y, format, &[BayerColor::Blue]),
+        ),
+        BayerColor::Blue => (
+            average_bayer_neighbors(bytes, width, height, x, y, format, &[BayerColor::Red]),
+            average_bayer_neighbors(bytes, width, height, x, y, format, &[BayerColor::Green]),
+            value,
+        ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BayerColor {
+    Red,
+    Green,
+    Blue,
+}
+
+fn bayer_color_at(x: usize, y: usize, format: &EyeFrameFormat) -> BayerColor {
+    let even_x = x % 2 == 0;
+    let even_y = y % 2 == 0;
+    match format {
+        EyeFrameFormat::BayerGrbg8 => match (even_y, even_x) {
+            (true, true) | (false, false) => BayerColor::Green,
+            (true, false) => BayerColor::Red,
+            (false, true) => BayerColor::Blue,
+        },
+        EyeFrameFormat::BayerRggb8 => match (even_y, even_x) {
+            (true, true) => BayerColor::Red,
+            (true, false) | (false, true) => BayerColor::Green,
+            (false, false) => BayerColor::Blue,
+        },
+        EyeFrameFormat::BayerBggr8 => match (even_y, even_x) {
+            (true, true) => BayerColor::Blue,
+            (true, false) | (false, true) => BayerColor::Green,
+            (false, false) => BayerColor::Red,
+        },
+        EyeFrameFormat::BayerGbrg8 => match (even_y, even_x) {
+            (true, true) | (false, false) => BayerColor::Green,
+            (true, false) => BayerColor::Blue,
+            (false, true) => BayerColor::Red,
+        },
+        _ => BayerColor::Green,
+    }
+}
+
+fn average_bayer_neighbors(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    format: &EyeFrameFormat,
+    colors: &[BayerColor],
+) -> u8 {
+    let mut sum = 0usize;
+    let mut count = 0usize;
+    let min_y = y.saturating_sub(1);
+    let max_y = (y + 1).min(height.saturating_sub(1));
+    let min_x = x.saturating_sub(1);
+    let max_x = (x + 1).min(width.saturating_sub(1));
+    for ny in min_y..=max_y {
+        for nx in min_x..=max_x {
+            if nx == x && ny == y {
+                continue;
+            }
+            if colors.contains(&bayer_color_at(nx, ny, format)) {
+                sum += bayer_sample(bytes, width, nx, ny) as usize;
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        bayer_sample(bytes, width, x, y)
+    } else {
+        (sum / count) as u8
+    }
+}
+
+fn bayer_sample(bytes: &[u8], width: usize, x: usize, y: usize) -> u8 {
+    bytes[y * width + x]
 }
 
 fn yuyv422_to_rgb(bytes: &[u8]) -> Vec<u8> {
@@ -4658,13 +4779,6 @@ function sceneFromSnapshot(snapshot){
   const body = snapshot.body;
   const pose = body.odometry || {};
   const range = snapshot.range || {};
-  const cliffSensors = body.cliff_sensors || {};
-  const cliffSignal = Math.max(
-    cliffSensors.left || 0,
-    cliffSensors.front_left || 0,
-    cliffSensors.front_right || 0,
-    cliffSensors.right || 0
-  );
   const beams = (range.beams || []).map((distance, index, allBeams) => {
     const finite = Number(distance);
     const beamCount = allBeams.length || 1;
@@ -4690,8 +4804,7 @@ function sceneFromSnapshot(snapshot){
         body.flags?.cliff_left ||
         body.flags?.cliff_front_left ||
         body.flags?.cliff_front_right ||
-        body.flags?.cliff_right ||
-        cliffSignal >= 0.5
+        body.flags?.cliff_right
       ),
       wheel_drop: !!body.flags?.wheel_drop
     },
@@ -5781,6 +5894,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hardware_drive_allows_analog_cliff_risk_without_create_cliff_flag() {
+        let mut snapshot = recent_snapshot();
+        snapshot.body.cliff_sensors.front_left = 0.96;
+        snapshot.body.cliff_sensors.front_right = 0.82;
+        let state = hardware_reign_state_with_snapshot(snapshot);
+        let _ = post_hardware_arm(
+            State(state.clone()),
+            Json(HardwareArmRequest { armed: true }),
+        )
+        .await
+        .unwrap();
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.20,
+                duration_ms: 300,
+            },
+            priority: 1.0,
+            ttl_ms: Some(300),
+            note: None,
+            source: Some(ReignSource::WebRemote),
+        };
+
+        let Json(input) = post_reign_command(State(state), Json(request))
+            .await
+            .unwrap();
+
+        assert!(matches!(input.command, ReignCommand::Turn { .. }));
+    }
+
+    #[tokio::test]
     async fn posted_reign_command_is_seen_by_runtime_tick() {
         let queue = Arc::new(Mutex::new(ReignQueue::default()));
         let state = ReignServerState::new(Arc::clone(&queue));
@@ -6119,6 +6264,39 @@ mod tests {
     }
 
     #[test]
+    fn scene_body_cliff_uses_create_flags_not_analog_risk() {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.cliff_sensors.front_left = 0.96;
+        snapshot.body.cliff_sensors.front_right = 0.82;
+        let scene = snapshot_to_scene(
+            &snapshot,
+            None,
+            None,
+            LiveTrainingStatus::default(),
+            NudgeStatus::default(),
+            default_behavior_nodes(),
+            None,
+            HardwareControlStatus::unavailable("unit test"),
+        );
+
+        assert!(!scene.body.cliff);
+
+        snapshot.body.flags.cliff_front_left = true;
+        let scene = snapshot_to_scene(
+            &snapshot,
+            None,
+            None,
+            LiveTrainingStatus::default(),
+            NudgeStatus::default(),
+            default_behavior_nodes(),
+            None,
+            HardwareControlStatus::unavailable("unit test"),
+        );
+
+        assert!(scene.body.cliff);
+    }
+
+    #[test]
     fn compact_kinect_depth_projects_as_meter_range_fan() {
         let depths = vec![2.0; 32];
         let points = depth_points(&depths, Some(SceneSensorCalibration::sim_default()));
@@ -6262,6 +6440,45 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn grbg_bayer_eye_frame_encodes_to_png_data_url() {
+        let frame = EyeFrame {
+            captured_at_ms: 1,
+            width: 2,
+            height: 2,
+            format: EyeFrameFormat::BayerGrbg8,
+            bytes: vec![90, 220, 40, 110],
+            source: None,
+        };
+
+        let (eye, warnings) = scene_eye_from_frame(&frame, None, 1);
+
+        assert!(warnings.is_empty());
+        assert_eq!(eye.width, 2);
+        assert_eq!(eye.height, 2);
+        assert!(eye
+            .data_url
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn grbg_bayer_eye_frame_encodes_latest_png_bytes() {
+        let frame = EyeFrame {
+            captured_at_ms: 1,
+            width: 2,
+            height: 2,
+            format: EyeFrameFormat::BayerGrbg8,
+            bytes: vec![90, 220, 40, 110],
+            source: None,
+        };
+
+        let bytes = encode_eye_png_bytes(&frame).unwrap();
+
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {

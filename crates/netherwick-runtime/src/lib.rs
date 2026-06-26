@@ -47,7 +47,7 @@ use netherwick_models::{
 };
 use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
-    ExtensionSense, EyePrediction, Now, ReignSense, SafetySense,
+    ExtensionSense, EyePrediction, Now, ReignSense, SafetySense, SurpriseSense,
 };
 use netherwick_sensors::{NowBuilder, SenseProducer, World, WorldSnapshot};
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
@@ -3722,6 +3722,10 @@ pub trait RuntimeLoop {
         latent: ExperienceLatent,
         futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick>;
+
+    fn reign_sense(&self, _now_ms: TimeMs) -> Result<ReignSense> {
+        Ok(ReignSense::default())
+    }
 }
 
 #[async_trait::async_trait]
@@ -3734,6 +3738,14 @@ where
     S: SafetyLayer + Send,
     A: LlmAgent + Send,
 {
+    fn reign_sense(&self, now_ms: TimeMs) -> Result<ReignSense> {
+        let reign_queue = self
+            .reign_queue
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reign queue lock poisoned"))?;
+        Ok(reign_queue.sense(now_ms))
+    }
+
     async fn tick(
         &mut self,
         now: Now,
@@ -3866,10 +3878,47 @@ where
             serde_json::Value::String("slow".to_string()),
         );
 
-        let tick = self
-            .runtime
-            .tick(now, ExperienceLatent::default(), Vec::new())
-            .await?;
+        now.reign = self.runtime.reign_sense(t_ms)?;
+        if let Some(input) = now.reign.latest.clone() {
+            if reign_input_drives_real_slow(&input) {
+                let desired_motor =
+                    action_to_motor_command(input.command.to_action().as_ref()).clamped(0.15, 0.25);
+                let block_reason = real_slow_body_block_reason(&body_before);
+                let final_motor = if block_reason.is_none() {
+                    desired_motor
+                } else {
+                    MotorCommand::stop()
+                };
+                self.body.apply_motor(final_motor).await?;
+                let tick = synthetic_slow_manual_tick(
+                    now,
+                    input,
+                    desired_motor,
+                    final_motor,
+                    block_reason,
+                    &body_before,
+                )?;
+                let mut snapshot = self.now_builder.snapshot();
+                annotate_snapshot_from_tick(&mut snapshot, &tick);
+                self.tick_count = self.tick_count.saturating_add(1);
+                return Ok((snapshot, tick));
+            }
+        }
+
+        let runtime_timeout = std::time::Duration::from_millis(self.tick_ms.clamp(25, 100));
+        let tick = match tokio::time::timeout(
+            runtime_timeout,
+            self.runtime
+                .tick(now.clone(), ExperienceLatent::default(), Vec::new()),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => synthetic_slow_idle_tick(
+                now,
+                format!("runtime tick exceeded {} ms", runtime_timeout.as_millis()),
+            ),
+        };
         let chosen_motor = final_motor_from_tick(&tick).clamped(0.15, 0.25);
         let manual_drive = tick
             .frame
@@ -4004,6 +4053,116 @@ fn motor_command_to_motion(motor: MotorCommand) -> MotionCommand {
     }
 }
 
+fn synthetic_slow_manual_tick(
+    mut now: Now,
+    input: ReignInput,
+    desired_motor: MotorCommand,
+    final_motor: MotorCommand,
+    block_reason: Option<String>,
+    body_before: &netherwick_body::BodySense,
+) -> Result<RuntimeTick> {
+    let action = input.command.to_action();
+    let motor_applied = !is_near_zero_motor(final_motor);
+    now.extensions.insert(
+        "action.motion_bridge".to_string(),
+        serde_json::json!({
+            "selected_action": action,
+            "chosen_action": action,
+            "desired_motor": desired_motor,
+            "final_motor": final_motor,
+            "motor_applied": motor_applied,
+            "manual_hardware_gate": true,
+            "body_pose_before": pose_json(body_before),
+            "body_pose_after": pose_json(&now.body),
+            "motion_sent_to_robot": motor_command_to_motion(final_motor),
+            "motion_sent_to_sim": motor_command_to_motion(final_motor),
+            "why_not_moving": block_reason,
+            "runtime_bypassed": true,
+        }),
+    );
+    let experience = Experience::new(
+        "real_robot_slow_manual",
+        "Direct WebRemote slow hardware command.",
+        Vec::new(),
+        Vec::new(),
+        now.t_ms,
+        now.t_ms,
+    );
+    Ok(RuntimeTick {
+        frame: ExperienceFrame {
+            id: Uuid::new_v4(),
+            t_ms: now.t_ms,
+            now,
+            sensations: Vec::new(),
+            impressions: Vec::new(),
+            experiences: vec![experience.clone()],
+            z: Some(ExperienceLatent::default()),
+            chosen_action: action.clone(),
+            conscious_command: None,
+            reign_input: Some(input),
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Reward::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: vec!["RealSlowManualRuntimeBypass: direct hardware command".to_string()],
+        },
+        experience,
+        chosen_action: action,
+        recall: RecallBundle::default(),
+        llm: LlmTickResult::default(),
+        combobulation: None,
+        inline_learning: InlineLearningTickStatus::default(),
+    })
+}
+
+fn synthetic_slow_idle_tick(now: Now, reason: String) -> RuntimeTick {
+    let experience = Experience::new(
+        "real_robot_slow_idle",
+        "Slow hardware runtime tick did not finish before the control deadline.",
+        Vec::new(),
+        Vec::new(),
+        now.t_ms,
+        now.t_ms,
+    );
+    RuntimeTick {
+        frame: ExperienceFrame {
+            id: Uuid::new_v4(),
+            t_ms: now.t_ms,
+            now,
+            sensations: Vec::new(),
+            impressions: Vec::new(),
+            experiences: vec![experience.clone()],
+            z: Some(ExperienceLatent::default()),
+            chosen_action: Some(ActionPrimitive::Stop),
+            conscious_command: None,
+            reign_input: None,
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Reward::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: vec![format!("RealSlowRuntimeSkipped: {reason}")],
+        },
+        experience,
+        chosen_action: Some(ActionPrimitive::Stop),
+        recall: RecallBundle::default(),
+        llm: LlmTickResult::default(),
+        combobulation: None,
+        inline_learning: InlineLearningTickStatus::default(),
+    }
+}
+
 fn reign_input_drives_real_slow(input: &ReignInput) -> bool {
     if input.source != ReignSource::WebRemote || input.mode != ReignMode::Direct {
         return false;
@@ -4017,6 +4176,23 @@ fn reign_input_drives_real_slow(input: &ReignInput) -> bool {
     )
 }
 
+fn real_slow_body_block_reason(body: &netherwick_body::BodySense) -> Option<String> {
+    if body.flags.wheel_drop {
+        return Some("wheel drop active".to_string());
+    }
+    if body.flags.cliff_left
+        || body.flags.cliff_front_left
+        || body.flags.cliff_front_right
+        || body.flags.cliff_right
+    {
+        return Some("cliff sensor active".to_string());
+    }
+    if body.battery_level <= 0.10 && !body.charging {
+        return Some("battery is critical".to_string());
+    }
+    None
+}
+
 fn real_slow_motor_block_reason(
     body: &netherwick_body::BodySense,
     tick: &RuntimeTick,
@@ -4025,19 +4201,8 @@ fn real_slow_motor_block_reason(
     if !manual_drive {
         return Some("real slow mode requires active WebRemote Direct command".to_string());
     }
-    if body.flags.wheel_drop {
-        return Some("wheel drop active".to_string());
-    }
-    if body.flags.cliff_left
-        || body.flags.cliff_front_left
-        || body.flags.cliff_front_right
-        || body.flags.cliff_right
-        || body.cliff_sensors.max() >= 0.5
-    {
-        return Some("cliff sensor active".to_string());
-    }
-    if body.battery_level <= 0.10 && !body.charging {
-        return Some("battery is critical".to_string());
+    if let Some(reason) = real_slow_body_block_reason(body) {
+        return Some(reason);
     }
     tick.frame
         .now
@@ -5159,11 +5324,10 @@ fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impress
         || now.body.flags.cliff_front_left
         || now.body.flags.cliff_front_right
         || now.body.flags.cliff_right
-        || now.body.cliff_sensors.max() >= 0.5
     {
         "the floor feels like it falls away near me"
     } else if now.body.cliff_sensors.max() > 0.0 {
-        "the floor feels mostly steady with a faint edge-sense"
+        "the floor feels steady, though my cliff IR signal is uncertain"
     } else {
         "the floor feels steady under me"
     };
@@ -6178,6 +6342,28 @@ mod tests {
         }
     }
 
+    struct QueueOnlyRuntime {
+        queue: Arc<Mutex<ReignQueue>>,
+        tick_attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeLoop for QueueOnlyRuntime {
+        async fn tick(
+            &mut self,
+            _now: Now,
+            _latent: ExperienceLatent,
+            _futures: Vec<FuturePrediction>,
+        ) -> Result<RuntimeTick> {
+            self.tick_attempts.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("slow direct hardware should bypass runtime tick")
+        }
+
+        fn reign_sense(&self, now_ms: TimeMs) -> Result<ReignSense> {
+            Ok(self.queue.lock().unwrap().sense(now_ms))
+        }
+    }
+
     #[tokio::test]
     async fn real_robot_slow_runner_applies_only_clamped_webremote_direct_motor() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
@@ -6202,6 +6388,64 @@ mod tests {
                 forward: 0.15,
                 turn: 0.0
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_direct_webremote_bypasses_slow_runtime_tick() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let mut body_sense = BodySense {
+            last_update_ms: 100,
+            ..BodySense::default()
+        };
+        body_sense.cliff_sensors.front_left = 0.96;
+        body_sense.cliff_sensors.front_right = 0.82;
+        let body = CountingBody {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: body_sense,
+        };
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        queue.lock().unwrap().push(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: wall_time_ms().saturating_add(500),
+            source: ReignSource::WebRemote,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Go {
+                intensity: 0.50,
+                duration_ms: 300,
+            },
+            priority: 1.0,
+            note: None,
+        });
+        let tick_attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = QueueOnlyRuntime {
+            queue,
+            tick_attempts: Arc::clone(&tick_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), runtime);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            motors.lock().unwrap().as_slice(),
+            &[MotorCommand {
+                forward: 0.15,
+                turn: 0.0
+            }]
+        );
+        assert_eq!(
+            tick.frame
+                .now
+                .extensions
+                .get("action.motion_bridge")
+                .and_then(|value| value.get("runtime_bypassed"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
         );
     }
 
@@ -6231,6 +6475,23 @@ mod tests {
             .experiences
             .iter()
             .any(|experience| experience.text.contains("hello world")));
+    }
+
+    #[test]
+    fn analog_cliff_risk_alone_does_not_say_floor_falls_away() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.body.cliff_sensors.front_left = 0.96;
+        now.body.cliff_sensors.front_right = 0.82;
+
+        let (_sensations, impressions) = derive_direct_impressions_from_now(&now);
+        let body_text = impressions
+            .iter()
+            .find(|impression| impression.kind == "body.state.impression")
+            .map(|impression| impression.text.as_str())
+            .unwrap();
+
+        assert!(!body_text.contains("floor feels like it falls away near me"));
+        assert!(body_text.contains("cliff IR signal is uncertain"));
     }
 
     #[test]

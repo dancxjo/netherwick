@@ -72,6 +72,10 @@ pub enum EyeFrameFormat {
     Bgr8,
     Yuyv422,
     Uyvy422,
+    BayerGrbg8,
+    BayerRggb8,
+    BayerBggr8,
+    BayerGbrg8,
     Mjpeg,
     Unknown(String),
 }
