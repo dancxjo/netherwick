@@ -144,6 +144,8 @@ The latest 5-episode full-shadow column-trap report has:
 {
   "success_rate": 1.0,
   "mean_collisions_per_episode": 5.0,
+  "recovery_attempts": 140,
+  "mean_recovery_ticks": 3.8148148,
   "model_fallbacks": 0,
   "action_selector_fallbacks": 0,
   "action_selector_guard_yields": 0,
@@ -157,6 +159,8 @@ The latest 5-episode full-shadow corner-trap report has:
 {
   "success_rate": 1.0,
   "mean_collisions_per_episode": 0.4,
+  "recovery_attempts": 150,
+  "mean_recovery_ticks": 3.0896554,
   "model_fallbacks": 0,
   "action_selector_fallbacks": 0,
   "action_selector_guard_yields": 0,

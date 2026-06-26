@@ -7,37 +7,37 @@
   "tick_ms": 100,
   "action_selector_mode": "model-assisted",
   "model_modes": {
-    "experience": "off",
     "action_value": "shadow-infer",
-    "danger": "shadow-infer",
+    "experience": "off",
     "eye_next": "off",
+    "charge": "shadow-infer",
     "future": "hardcoded",
     "ear_next": "off",
-    "charge": "shadow-infer"
+    "danger": "shadow-infer"
   },
   "model_loading": {
     "requested_checkpoints": {
+      "danger": "data/models/danger_golden_column_v0",
+      "charge": "data/models/charge_golden_charger_v0",
+      "action_value": "data/models/action_value_golden_column_v0",
+      "ear_next": null,
       "eye_next": null,
       "experience": null,
-      "future": null,
-      "action_value": "data/models/action_value_golden_column_v0",
-      "danger": "data/models/danger_golden_column_v0",
-      "ear_next": null,
-      "charge": "data/models/charge_golden_charger_v0"
+      "future": null
     },
     "loaded_checkpoints": {
+      "action_value": "data/models/action_value_golden_column_v0",
       "charge": "data/models/charge_golden_charger_v0",
-      "danger": "data/models/danger_golden_column_v0",
-      "action_value": "data/models/action_value_golden_column_v0"
+      "danger": "data/models/danger_golden_column_v0"
     },
     "active_modes": {
-      "eye_next": "off",
-      "danger": "shadow-infer",
-      "future": "hardcoded",
       "experience": "off",
+      "eye_next": "off",
       "charge": "shadow-infer",
-      "action_value": "shadow-infer",
-      "ear_next": "off"
+      "ear_next": "off",
+      "future": "hardcoded",
+      "danger": "shadow-infer",
+      "action_value": "shadow-infer"
     },
     "blocked_model_infer": [],
     "warnings": []
@@ -54,9 +54,9 @@
     "mean_nearest_obstacle_m": 0.10051539,
     "mean_distance_traveled_m": 1.4019994,
     "action_histogram": {
-      "Reverse": 435,
       "TurnRight": 1040,
-      "TurnLeft": 25
+      "TurnLeft": 25,
+      "Reverse": 435
     },
     "wall_cliff_veto_count": 0,
     "escape_progress_score": 1.0869994,
@@ -65,11 +65,11 @@
     "trap_kind_counts": {
       "column": 140
     },
-    "recovery_attempts": 0,
-    "stuck_duration": 0.0,
-    "mean_stuck_duration": 0.0,
+    "recovery_attempts": 140,
+    "stuck_duration": 375.0,
+    "mean_stuck_duration": 375.0,
     "recovery_success_rate": 0.96428573,
-    "mean_recovery_ticks": 0.0,
+    "mean_recovery_ticks": 3.8148148,
     "repeated_trap_count": 0,
     "dead_battery_tick": null,
     "distance_after_recovery_m": 0.03400004,
@@ -114,9 +114,9 @@
       "final_distance_to_speaker_m": null,
       "distance_traveled_m": 1.4019994,
       "action_histogram": {
+        "TurnLeft": 5,
         "Reverse": 87,
-        "TurnRight": 208,
-        "TurnLeft": 5
+        "TurnRight": 208
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 1.0869994,
@@ -125,11 +125,11 @@
       "trap_kind_counts": {
         "column": 28
       },
-      "recovery_attempts": 0,
-      "stuck_duration": 0.0,
-      "mean_stuck_duration": 0.0,
+      "recovery_attempts": 28,
+      "stuck_duration": 375.0,
+      "mean_stuck_duration": 375.0,
       "recovery_success_rate": 0.96428573,
-      "mean_recovery_ticks": 0.0,
+      "mean_recovery_ticks": 3.8148148,
       "repeated_trap_count": 0,
       "dead_battery_tick": null,
       "distance_after_recovery_m": 0.03400004,
@@ -193,9 +193,9 @@
       "final_distance_to_speaker_m": null,
       "distance_traveled_m": 1.4019994,
       "action_histogram": {
-        "TurnLeft": 5,
+        "Reverse": 87,
         "TurnRight": 208,
-        "Reverse": 87
+        "TurnLeft": 5
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 1.0869994,
@@ -204,11 +204,11 @@
       "trap_kind_counts": {
         "column": 28
       },
-      "recovery_attempts": 0,
-      "stuck_duration": 0.0,
-      "mean_stuck_duration": 0.0,
+      "recovery_attempts": 28,
+      "stuck_duration": 375.0,
+      "mean_stuck_duration": 375.0,
       "recovery_success_rate": 0.96428573,
-      "mean_recovery_ticks": 0.0,
+      "mean_recovery_ticks": 3.8148148,
       "repeated_trap_count": 0,
       "dead_battery_tick": null,
       "distance_after_recovery_m": 0.03400004,
@@ -273,8 +273,8 @@
       "distance_traveled_m": 1.4019994,
       "action_histogram": {
         "TurnLeft": 5,
-        "TurnRight": 208,
-        "Reverse": 87
+        "Reverse": 87,
+        "TurnRight": 208
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 1.0869994,
@@ -283,11 +283,11 @@
       "trap_kind_counts": {
         "column": 28
       },
-      "recovery_attempts": 0,
-      "stuck_duration": 0.0,
-      "mean_stuck_duration": 0.0,
+      "recovery_attempts": 28,
+      "stuck_duration": 375.0,
+      "mean_stuck_duration": 375.0,
       "recovery_success_rate": 0.96428573,
-      "mean_recovery_ticks": 0.0,
+      "mean_recovery_ticks": 3.8148148,
       "repeated_trap_count": 0,
       "dead_battery_tick": null,
       "distance_after_recovery_m": 0.03400004,
@@ -362,11 +362,11 @@
       "trap_kind_counts": {
         "column": 28
       },
-      "recovery_attempts": 0,
-      "stuck_duration": 0.0,
-      "mean_stuck_duration": 0.0,
+      "recovery_attempts": 28,
+      "stuck_duration": 375.0,
+      "mean_stuck_duration": 375.0,
       "recovery_success_rate": 0.96428573,
-      "mean_recovery_ticks": 0.0,
+      "mean_recovery_ticks": 3.8148148,
       "repeated_trap_count": 0,
       "dead_battery_tick": null,
       "distance_after_recovery_m": 0.03400004,
@@ -431,8 +431,8 @@
       "distance_traveled_m": 1.4019994,
       "action_histogram": {
         "TurnRight": 208,
-        "Reverse": 87,
-        "TurnLeft": 5
+        "TurnLeft": 5,
+        "Reverse": 87
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 1.0869994,
@@ -441,11 +441,11 @@
       "trap_kind_counts": {
         "column": 28
       },
-      "recovery_attempts": 0,
-      "stuck_duration": 0.0,
-      "mean_stuck_duration": 0.0,
+      "recovery_attempts": 28,
+      "stuck_duration": 375.0,
+      "mean_stuck_duration": 375.0,
       "recovery_success_rate": 0.96428573,
-      "mean_recovery_ticks": 0.0,
+      "mean_recovery_ticks": 3.8148148,
       "repeated_trap_count": 0,
       "dead_battery_tick": null,
       "distance_after_recovery_m": 0.03400004,

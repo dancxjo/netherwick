@@ -1723,6 +1723,7 @@ impl EpisodeMetricBuilder {
         let repeated = values.get(12).copied().unwrap_or(0.0).max(0.0) as usize;
         if event_started {
             self.stuck_count = self.stuck_count.saturating_add(1);
+            self.recovery_attempts = self.recovery_attempts.saturating_add(1);
             self.active_stuck_duration_ms = Some(duration_ms);
             if let Some(kind) = trap_kind {
                 *self.trap_kind_counts.entry(kind.to_string()).or_default() += 1;
@@ -1736,7 +1737,13 @@ impl EpisodeMetricBuilder {
         self.repeated_trap_count = self.repeated_trap_count.max(repeated);
         if recovered {
             self.recovery_successes = self.recovery_successes.saturating_add(1);
-            if let Some(duration) = self.active_stuck_duration_ms.take() {
+            let duration = if duration_ms > 0.0 {
+                Some(duration_ms)
+            } else {
+                self.active_stuck_duration_ms
+            };
+            self.active_stuck_duration_ms = None;
+            if let Some(duration) = duration {
                 self.stuck_duration_sum_ms += duration;
                 self.stuck_duration_count = self.stuck_duration_count.saturating_add(1);
                 self.recovery_ticks_sum = self
@@ -7025,9 +7032,11 @@ mod tests {
         let report = metrics.finish();
         assert_eq!(report.stuck_count, 1);
         assert_eq!(report.stuck_ticks, 1);
-        assert_eq!(report.stuck_duration, Some(100.0));
-        assert_eq!(report.mean_stuck_duration, Some(100.0));
+        assert_eq!(report.recovery_attempts, 1);
+        assert_eq!(report.stuck_duration, Some(900.0));
+        assert_eq!(report.mean_stuck_duration, Some(900.0));
         assert_eq!(report.recovery_success_rate, Some(1.0));
+        assert_eq!(report.mean_recovery_ticks, Some(9.0));
     }
 
     #[test]

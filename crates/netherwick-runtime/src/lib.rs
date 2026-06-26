@@ -4047,6 +4047,7 @@ impl StuckRecoveryController {
     }
 
     fn observe(&mut self, snapshot: &WorldSnapshot, action: Option<&ActionPrimitive>) {
+        let was_active = self.active;
         let position = (snapshot.body.odometry.x_m, snapshot.body.odometry.y_m);
         let step_distance = self
             .last_position
@@ -4083,7 +4084,7 @@ impl StuckRecoveryController {
             self.active = true;
             self.corner_trap = trap_kind == TrapKind::Corner;
             self.trap_kind = trap_kind;
-            self.duration_ticks = 0;
+            self.duration_ticks = 1;
             self.phase = RecoveryPhase::Stop;
             self.phase_ticks_remaining = 1;
             if self
@@ -4098,8 +4099,11 @@ impl StuckRecoveryController {
                 self.recovery_attempts = 0;
                 self.last_failed_turn_sign = None;
             }
+            self.recovery_attempts = self.recovery_attempts.saturating_add(1);
             self.turn_sign = recovery_turn_sign(snapshot, self.last_failed_turn_sign);
             self.event_started = true;
+        } else if was_active {
+            self.duration_ticks = self.duration_ticks.saturating_add(1);
         }
 
         if self.active && step_distance > STUCK_WINDOW_DISPLACEMENT_EPSILON_M {
@@ -4114,11 +4118,8 @@ impl StuckRecoveryController {
         self.corner_trap = false;
         self.trap_kind = TrapKind::Unknown;
         self.stuck_ticks = 0;
-        self.duration_ticks = 0;
         self.phase = RecoveryPhase::None;
         self.phase_ticks_remaining = 0;
-        self.recovery_attempts = 0;
-        self.repeated_trap_count = 0;
         self.trap_anchor = None;
         self.last_failed_turn_sign = None;
         self.recovered = true;
@@ -8058,7 +8059,34 @@ mod tests {
         assert!(status.corner_trap);
         assert_eq!(status.stuck_ticks, STUCK_LOW_DISPLACEMENT_TICKS);
         assert!(status.event_started);
+        assert_eq!(status.recovery_attempts, 1);
+        assert_eq!(status.duration_ticks, 1);
         assert!(!status.reset_due);
+    }
+
+    #[test]
+    fn recovered_stuck_event_reports_attempt_and_duration() {
+        let mut detector = StuckRecoveryController::default();
+        let action = ActionPrimitive::Explore {
+            style: ExploreStyle::RandomWalk,
+            duration_ms: 1_000,
+        };
+
+        for _ in 0..=STUCK_LOW_DISPLACEMENT_TICKS {
+            detector.observe(&stuck_test_snapshot(0.2, 0.2, 1.0), Some(&action));
+        }
+        detector.observe(&stuck_test_snapshot(0.2, 0.2, 1.0), Some(&action));
+        detector.observe(&stuck_test_snapshot(0.3, 0.2, 1.0), Some(&action));
+        let status = detector.status();
+        assert!(!status.active);
+        assert!(status.recovered);
+        assert_eq!(status.recovery_attempts, 1);
+        assert!(status.duration_ticks >= 2);
+
+        let extension = detector.extension(100);
+        assert_eq!(extension.values.get(7).copied(), Some(1.0));
+        assert_eq!(extension.values.get(11).copied(), Some(1.0));
+        assert!(extension.values.get(3).copied().unwrap_or_default() >= 200.0);
     }
 
     #[test]
