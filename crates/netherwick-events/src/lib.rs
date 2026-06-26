@@ -9,7 +9,7 @@ use netherwick_experience::{
 };
 use netherwick_llm::LlmTeaching;
 use netherwick_memory::RecallBundle;
-use netherwick_now::{LlmSense, MemorySense, Now};
+use netherwick_now::{LlmSense, MemorySense, Now, ObjectClass};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -38,10 +38,13 @@ pub enum EventKind {
     EarFrame,
     SoundHeard,
     SpeechHeard,
+    ObjectSeen,
     FaceDetected,
     FaceRecognized,
     VoiceRecognized,
     NearWall,
+    EnteredRegion,
+    ExitedRegion,
     MemoryRecalled,
     PredictionMade,
     SurpriseHigh,
@@ -72,8 +75,18 @@ pub enum EventPayload {
     SoundHeard {
         sources: usize,
     },
+    ObjectSeen {
+        labels: Vec<String>,
+        classes: Vec<ObjectClass>,
+    },
     FaceDetected {
         face_embeddings: usize,
+    },
+    EnteredRegion {
+        region_id: String,
+    },
+    ExitedRegion {
+        region_id: String,
     },
     Cliff,
     WheelDrop,
@@ -264,6 +277,7 @@ pub struct EventExtractorConfig {
     pub face_familiarity_threshold: f32,
     pub surprise_threshold: f32,
     pub near_wall_threshold: f32,
+    pub region_size_m: f32,
 }
 
 impl Default for EventExtractorConfig {
@@ -273,6 +287,7 @@ impl Default for EventExtractorConfig {
             face_familiarity_threshold: 0.70,
             surprise_threshold: 0.75,
             near_wall_threshold: 0.18,
+            region_size_m: 1.0,
         }
     }
 }
@@ -471,6 +486,47 @@ impl EventExtractor {
                         sources: now.ear.features.len(),
                     }),
             );
+        }
+
+        if !now.objects.observations.is_empty() {
+            let labels = now
+                .objects
+                .observations
+                .iter()
+                .map(|object| object.label.clone())
+                .collect::<Vec<_>>();
+            let classes = now
+                .objects
+                .observations
+                .iter()
+                .map(|object| object.class.clone())
+                .collect::<Vec<_>>();
+            events.push(
+                Event::new(now.t_ms, EventKind::ObjectSeen)
+                    .with_summary(format!("Saw {} object(s).", labels.len()))
+                    .with_payload(EventPayload::ObjectSeen { labels, classes }),
+            );
+        }
+
+        if let Some(prior) = previous {
+            let previous_region = region_id(prior, self.config.region_size_m);
+            let current_region = region_id(now, self.config.region_size_m);
+            if previous_region != current_region {
+                events.push(
+                    Event::new(now.t_ms, EventKind::ExitedRegion)
+                        .with_summary(format!("Exited region {previous_region}."))
+                        .with_payload(EventPayload::ExitedRegion {
+                            region_id: previous_region,
+                        }),
+                );
+                events.push(
+                    Event::new(now.t_ms, EventKind::EnteredRegion)
+                        .with_summary(format!("Entered region {current_region}."))
+                        .with_payload(EventPayload::EnteredRegion {
+                            region_id: current_region,
+                        }),
+                );
+            }
         }
 
         let face_familiarity = recall
@@ -1018,11 +1074,19 @@ pub fn safety_veto_event(
         .with_provenance(Provenance::direct().with_stage("safety"))
 }
 
+fn region_id(now: &Now, region_size_m: f32) -> String {
+    let size = region_size_m.max(0.1);
+    let x = (now.body.odometry.x_m / size).floor() as i32;
+    let y = (now.body.odometry.y_m / size).floor() as i32;
+    format!("cell:{x}:{y}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use netherwick_body::BodySense;
     use netherwick_memory::RecallBundle;
+    use netherwick_now::{ObjectObservation, ObjectObservationSource, ObjectSense};
 
     #[test]
     fn extractor_emits_memory_recalled_when_hits_exist() {
@@ -1129,6 +1193,17 @@ mod tests {
         let mut now = Now::blank(12, BodySense::default());
         now.range.beams = vec![0.12, 0.8];
         now.ear.features = vec![vec![0.7]];
+        now.objects = ObjectSense {
+            schema_version: 1,
+            observations: vec![ObjectObservation {
+                label: "charger dock".to_string(),
+                class: ObjectClass::Charger,
+                bearing_rad: 0.0,
+                distance_m: Some(0.8),
+                confidence: 0.9,
+                source: ObjectObservationSource::Sim,
+            }],
+        };
         now.face.embeddings = vec![vec![0.1, 0.2, 0.3]];
         now.memory.face_familiarity = 0.9;
 
@@ -1138,12 +1213,70 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.kind == EventKind::SoundHeard));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ObjectSeen { labels, classes }
+                    if labels == &vec!["charger dock".to_string()]
+                        && classes == &vec![ObjectClass::Charger]
+            )
+        }));
         assert!(events
             .iter()
             .any(|event| event.kind == EventKind::FaceDetected));
         assert!(events
             .iter()
             .any(|event| event.kind == EventKind::FaceRecognized));
+    }
+
+    #[test]
+    fn extractor_emits_region_transitions_from_odometry_cells() {
+        let mut extractor = EventExtractor::default();
+        let mut body = BodySense::default();
+        body.odometry.x_m = 0.2;
+        body.odometry.y_m = 0.2;
+        let first = Now::blank(1, body.clone());
+        let _ = extractor.events_from_now(&first, None);
+        body.odometry.x_m = 1.2;
+        body.odometry.y_m = 0.2;
+        let second = Now::blank(2, body);
+
+        let events = extractor.events_from_now(&second, None);
+
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::ExitedRegion { region_id } if region_id == "cell:0:0"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::EnteredRegion { region_id } if region_id == "cell:1:0"
+        )));
+    }
+
+    #[test]
+    fn extractor_emits_bump_and_charging_transition_events() {
+        let mut extractor = EventExtractor::default();
+        let mut body = BodySense::default();
+        let first = Now::blank(1, body.clone());
+        let _ = extractor.events_from_now(&first, None);
+        body.charging = true;
+        body.flags.bump_left = true;
+        let charging = Now::blank(2, body.clone());
+        let charging_events = extractor.events_from_now(&charging, None);
+        body.charging = false;
+        body.flags.bump_left = false;
+        let stopped = Now::blank(3, body);
+        let stopped_events = extractor.events_from_now(&stopped, None);
+
+        assert!(charging_events
+            .iter()
+            .any(|event| event.kind == EventKind::ChargingStarted));
+        assert!(charging_events
+            .iter()
+            .any(|event| matches!(&event.payload, EventPayload::Bump { side } if side == "left")));
+        assert!(stopped_events
+            .iter()
+            .any(|event| event.kind == EventKind::ChargingStopped));
     }
 
     #[test]
