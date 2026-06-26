@@ -49,7 +49,7 @@ use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
     ExtensionSense, EyePrediction, Now, ReignSense, SafetySense, SurpriseSense,
 };
-use netherwick_sensors::{NowBuilder, SenseProducer, World, WorldSnapshot};
+use netherwick_sensors::{NowBuilder, SenseProducer, SurfaceExtractor, World, WorldSnapshot};
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -80,6 +80,7 @@ where
     pub reward_computer: BaselineRewardComputer,
     pub transition_builder: TransitionBuilder,
     pub behavior_training_hub: BehaviorTrainingHub,
+    pub surface_extractor: SurfaceExtractor,
     pub inline_learning: InlineLearningConfig,
     pub nudge_policy: NudgePolicy,
     pub last_behavior_runs: Vec<ErasedBehaviorRunRecord>,
@@ -2432,6 +2433,7 @@ where
             reward_computer: BaselineRewardComputer,
             transition_builder: TransitionBuilder::new(),
             behavior_training_hub: BehaviorTrainingHub::default(),
+            surface_extractor: SurfaceExtractor::default(),
             inline_learning: InlineLearningConfig::default(),
             nudge_policy: NudgePolicy::default(),
             last_behavior_runs: Vec::new(),
@@ -2466,6 +2468,7 @@ where
             reward_computer: BaselineRewardComputer,
             transition_builder: TransitionBuilder::new(),
             behavior_training_hub: BehaviorTrainingHub::default(),
+            surface_extractor: SurfaceExtractor::default(),
             inline_learning: InlineLearningConfig::default(),
             nudge_policy: NudgePolicy::default(),
             last_behavior_runs: Vec::new(),
@@ -2587,6 +2590,30 @@ where
                 "nearby_best_safe_direction_rad": now.memory.nearby_best_safe_direction_rad,
             }),
         );
+
+        if !now.kinect.depth_m.is_empty()
+            && now.kinect.depth_width > 0
+            && now.kinect.depth_height > 0
+        {
+            let surface_output =
+                self.surface_extractor
+                    .process(&now.kinect, now.body.odometry, now.t_ms);
+            now.extensions.insert(
+                "surface.scene_graph".to_string(),
+                serde_json::json!({
+                    "diagnostics": surface_output.diagnostics,
+                    "floor": surface_output.floor,
+                    "surfaces": surface_output.stable_surfaces,
+                    "clusters": surface_output.clusters,
+                    "navigation": surface_output.scene_graph.navigation,
+                    "obstacle_grid": {
+                        "resolution_m": surface_output.obstacle_grid.resolution_m,
+                        "half_extent_m": surface_output.obstacle_grid.half_extent_m,
+                        "cells": surface_output.obstacle_grid.cells,
+                    },
+                }),
+            );
+        }
 
         let (mut sensations, mut impressions) = derive_direct_impressions_from_now(&now);
         let mut experiences = derive_direct_experiences(&impressions, &sensations, now.t_ms);
@@ -5494,6 +5521,17 @@ fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impress
         ),
         0.5,
     );
+    if let Some(surface_graph) = now.extensions.get("surface.scene_graph") {
+        push_now_input_impression(
+            &mut sensations,
+            &mut impressions,
+            now.t_ms,
+            "surface.scene_graph",
+            "surface",
+            summarize_surface_scene_graph(surface_graph),
+            0.75,
+        );
+    }
     push_now_input_impression(
         &mut sensations,
         &mut impressions,
@@ -5613,6 +5651,80 @@ fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impress
         );
     }
     (sensations, impressions)
+}
+
+fn summarize_surface_scene_graph(value: &serde_json::Value) -> String {
+    let floor_confidence = value
+        .get("floor")
+        .and_then(|floor| floor.get("confidence"))
+        .and_then(|confidence| confidence.as_f64());
+    let surfaces = value
+        .get("surfaces")
+        .and_then(|surfaces| surfaces.as_array())
+        .map_or(0, Vec::len);
+    let clusters = value
+        .get("clusters")
+        .and_then(|clusters| clusters.as_array())
+        .map_or(0, Vec::len);
+    let moving_clusters = value
+        .get("clusters")
+        .and_then(|clusters| clusters.as_array())
+        .map(|clusters| {
+            clusters
+                .iter()
+                .filter(|cluster| {
+                    cluster
+                        .get("moving")
+                        .and_then(|moving| moving.as_bool())
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let hints = value
+        .get("clusters")
+        .and_then(|clusters| clusters.as_array())
+        .map(|clusters| {
+            clusters
+                .iter()
+                .filter_map(|cluster| cluster.get("semantic_hint").and_then(|hint| hint.as_str()))
+                .take(4)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let front_clear_m = value
+        .get("navigation")
+        .and_then(|navigation| navigation.get("front_clear_m"))
+        .and_then(|clearance| clearance.as_f64());
+    let left_clear_m = value
+        .get("navigation")
+        .and_then(|navigation| navigation.get("left_clear_m"))
+        .and_then(|clearance| clearance.as_f64());
+    let right_clear_m = value
+        .get("navigation")
+        .and_then(|navigation| navigation.get("right_clear_m"))
+        .and_then(|clearance| clearance.as_f64());
+    format!(
+        "I perceive persistent geometry: floor confidence {}, {} stable surfaces, {} leftover clusters ({} moving; hints: {}), and navigation clearance front {}, left {}, right {}.",
+        format_optional_magnitude(floor_confidence, ""),
+        surfaces,
+        clusters,
+        moving_clusters,
+        if hints.is_empty() {
+            "none".to_string()
+        } else {
+            hints.join(", ")
+        },
+        format_optional_magnitude(front_clear_m, "m"),
+        format_optional_magnitude(left_clear_m, "m"),
+        format_optional_magnitude(right_clear_m, "m")
+    )
+}
+
+fn format_optional_magnitude(value: Option<f64>, unit: &str) -> String {
+    value
+        .map(|value| format!("{value:.2}{unit}"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn push_now_input_impression(
@@ -6541,6 +6653,36 @@ mod tests {
                 Some("mechanical")
             );
         }
+    }
+
+    #[test]
+    fn surface_scene_graph_becomes_spatial_impression() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.extensions.insert(
+            "surface.scene_graph".to_string(),
+            serde_json::json!({
+                "floor": {"confidence": 0.82},
+                "surfaces": [{"id": "floor"}, {"id": "wall_1"}],
+                "clusters": [{"id": "cluster_1"}],
+                "navigation": {
+                    "front_clear_m": 0.6,
+                    "left_clear_m": 1.4,
+                    "right_clear_m": 0.3
+                }
+            }),
+        );
+
+        let (_sensations, impressions) = derive_direct_impressions_from_now(&now);
+        let surface_text = impressions
+            .iter()
+            .find(|impression| impression.kind == "surface.scene_graph.impression")
+            .map(|impression| impression.text.as_str())
+            .unwrap();
+
+        assert!(surface_text.contains("persistent geometry"));
+        assert!(surface_text.contains("2 stable surfaces"));
+        assert!(surface_text.contains("1 leftover clusters"));
+        assert!(surface_text.contains("front 0.60m"));
     }
 
     #[test]

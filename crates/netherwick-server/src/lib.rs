@@ -26,7 +26,10 @@ use netherwick_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
     NudgeStatus, ReignQueue, RuntimeModelStack,
 };
-use netherwick_sensors::{EyeFrameFormat, WorldSnapshot};
+use netherwick_sensors::{
+    ClusterObservation, EyeFrameFormat, OccupancyGrid, PlaneObservation, SceneGraphSummary,
+    SurfaceExtractor, SurfaceExtractorDiagnostics, SurfaceTrack, WorldSnapshot,
+};
 use netherwick_worldlab::CaptureReader;
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
@@ -326,6 +329,7 @@ pub struct LiveViewState {
     inline_learning: Arc<Mutex<InlineLearningConfig>>,
     prod_state: Arc<Mutex<NudgeStatus>>,
     behavior_nodes: Arc<Mutex<Vec<BehaviorNodeState>>>,
+    surface_extractor: Arc<Mutex<SurfaceExtractor>>,
     pub virtual_retina: bool,
     pub retina_width: u32,
     pub retina_height: u32,
@@ -355,6 +359,7 @@ impl Default for LiveViewState {
             inline_learning: Arc::new(Mutex::new(InlineLearningConfig::default())),
             prod_state: Arc::new(Mutex::new(NudgeStatus::default())),
             behavior_nodes: Arc::new(Mutex::new(default_behavior_nodes())),
+            surface_extractor: Arc::new(Mutex::new(SurfaceExtractor::default())),
             virtual_retina: false,
             retina_width: 160,
             retina_height: 90,
@@ -534,6 +539,34 @@ impl LiveViewState {
             .clone()
     }
 
+    pub fn surface_perception(
+        &self,
+        snapshot: &WorldSnapshot,
+        calibration: Option<SceneSensorCalibration>,
+    ) -> Option<SceneSurfacePerception> {
+        if snapshot.kinect.depth_m.is_empty()
+            || snapshot.kinect.depth_width == 0
+            || snapshot.kinect.depth_height == 0
+        {
+            return None;
+        }
+        let mut extractor = self
+            .surface_extractor
+            .lock()
+            .expect("surface extractor mutex poisoned");
+        let calibration = calibration.unwrap_or_else(SceneSensorCalibration::sim_default);
+        extractor.set_depth_camera_extrinsics(
+            calibration.point_y_m,
+            calibration.depth_forward_offset_m,
+            calibration.depth_pitch_down_rad,
+        );
+        Some(SceneSurfacePerception::from(extractor.process(
+            &snapshot.kinect,
+            snapshot.body.odometry,
+            snapshot.body.last_update_ms,
+        )))
+    }
+
     pub fn update_behavior_nodes(&self, nodes: Vec<BehaviorNodeState>) {
         let mut current = self
             .behavior_nodes
@@ -658,6 +691,10 @@ pub struct SceneSensorCalibration {
     pub compact_depth_fov_rad: f32,
     pub depth_scale: f32,
     pub point_y_m: f32,
+    #[serde(default)]
+    pub depth_forward_offset_m: f32,
+    #[serde(default)]
+    pub depth_pitch_down_rad: f32,
 }
 
 impl SceneSensorCalibration {
@@ -667,6 +704,8 @@ impl SceneSensorCalibration {
             compact_depth_fov_rad: std::f32::consts::PI * 0.75,
             depth_scale: 1.0,
             point_y_m: 0.18,
+            depth_forward_offset_m: 0.0,
+            depth_pitch_down_rad: 0.0,
         }
     }
 }
@@ -708,6 +747,8 @@ pub struct LiveSceneResponse {
     pub range: SceneRange,
     pub eye: Option<SceneEye>,
     pub kinect: SceneKinect,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface_perception: Option<SceneSurfacePerception>,
     pub audio: Option<SceneAudio>,
     pub objects: Vec<SceneObject>,
     pub arena: Option<SceneArena>,
@@ -827,6 +868,31 @@ pub struct SceneKinectDiagnostics {
     pub max_depth_m: Option<f32>,
     pub sample_stride: usize,
     pub coordinate_system: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SceneSurfacePerception {
+    pub diagnostics: SurfaceExtractorDiagnostics,
+    pub plane_observations: Vec<PlaneObservation>,
+    pub stable_surfaces: Vec<SurfaceTrack>,
+    pub floor: Option<SurfaceTrack>,
+    pub obstacle_grid: OccupancyGrid,
+    pub clusters: Vec<ClusterObservation>,
+    pub scene_graph: SceneGraphSummary,
+}
+
+impl From<netherwick_sensors::SurfaceExtractorOutput> for SceneSurfacePerception {
+    fn from(output: netherwick_sensors::SurfaceExtractorOutput) -> Self {
+        Self {
+            diagnostics: output.diagnostics,
+            plane_observations: output.plane_observations,
+            stable_surfaces: output.stable_surfaces,
+            floor: output.floor,
+            obstacle_grid: output.obstacle_grid,
+            clusters: output.clusters,
+            scene_graph: output.scene_graph,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1086,16 +1152,22 @@ async fn get_live_scene(
         frames_written_to_ledger: rstate.frames_written_to_ledger,
     });
 
-    Ok(Json(snapshot_to_scene(
+    let metadata = state.scene_metadata();
+    let calibration = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.sensor_calibration);
+    let mut scene = snapshot_to_scene(
         &snapshot,
-        state.scene_metadata().as_ref(),
+        metadata.as_ref(),
         state.session(),
         state.training_status(),
         state.prod_state(),
         state.behavior_nodes(),
         retina_status,
         state.hardware_control_status(),
-    )))
+    );
+    scene.surface_perception = state.surface_perception(&snapshot, calibration);
+    Ok(Json(scene))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2051,6 +2123,7 @@ pub fn snapshot_to_scene(
         range: scene_range_from_snapshot(snapshot),
         eye,
         kinect,
+        surface_perception: None,
         audio,
         objects: metadata
             .map(|metadata| metadata.objects.clone())
@@ -3786,6 +3859,7 @@ canvas{display:block}
     <dt>eye</dt><dd id="eye">-</dd>
     <dt>points</dt><dd id="points">-</dd>
     <dt>depth</dt><dd id="depth_stats">-</dd>
+    <dt>surfaces</dt><dd id="surfaces">-</dd>
     <dt>audio</dt><dd id="audio">-</dd>
     <dt>mind</dt><dd id="mind">-</dd>
     <dt>scheme</dt><dd id="scheme">-</dd>
@@ -3893,6 +3967,16 @@ canvas{display:block}
       <span id="val-point-y" style="width:40px;text-align:right;font-family:monospace">0.18m</span>
     </div>
     <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-depth-z" style="width:90px">Depth Offset</label>
+      <input type="range" id="cal-depth-z" min="-0.50" max="0.50" step="0.01" value="0.00">
+      <span id="val-depth-z" style="width:40px;text-align:right;font-family:monospace">0.00m</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-depth-pitch" style="width:90px">Depth Tilt</label>
+      <input type="range" id="cal-depth-pitch" min="-30" max="30" step="1" value="0">
+      <span id="val-depth-pitch" style="width:40px;text-align:right;font-family:monospace">0°</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
       <label for="cal-depth-fov" style="width:90px">Depth FOV</label>
       <input type="range" id="cal-depth-fov" min="30" max="180" step="1" value="122">
       <span id="val-depth-fov" style="width:40px;text-align:right;font-family:monospace">122°</span>
@@ -3959,7 +4043,7 @@ const behaviorInspector = document.getElementById('behavior-inspector');
 const virtualPipelineSection = document.getElementById('virtual-pipeline-section');
 const virtualReportSummary = document.getElementById('virtual-report-summary');
 const virtualModelRecommendations = document.getElementById('virtual-model-recommendations');
-const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','depth_stats','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
+const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','depth_stats','surfaces','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const learningMode = document.getElementById('learning-mode');
 const learningSteps = document.getElementById('learning-steps');
 const learningStatus = document.getElementById('learning-status');
@@ -4127,6 +4211,7 @@ function useDynamicTexture() {
 // Scene Nodes
 const beams = new BABYLON.TransformNode("beams", scene);
 const objects = new BABYLON.TransformNode("objects", scene);
+const surfaceOverlays = new BABYLON.TransformNode("surfaceOverlays", scene);
 
 let pointCloud = null;
 let lastScene = null;
@@ -4167,6 +4252,13 @@ function motionLabel(motion){
 function clearChildren(node){
   const children = node.getChildren();
   for (const child of children) {
+    if(child.material){
+      const diffuseTexture = child.material.diffuseTexture;
+      const emissiveTexture = child.material.emissiveTexture;
+      if(diffuseTexture) diffuseTexture.dispose();
+      if(emissiveTexture && emissiveTexture !== diffuseTexture) emissiveTexture.dispose();
+      child.material.dispose();
+    }
     child.dispose();
   }
 }
@@ -4312,6 +4404,146 @@ function renderPoints(points, coordinateSystem){
   pointCloud.material = mat;
   
   pointCloud.parent = null;
+}
+
+function v3(value){
+  return {
+    x: Number(value?.x) || 0,
+    y: Number(value?.y) || 0,
+    z: Number(value?.z) || 0
+  };
+}
+
+function add3(a, b){ return {x:a.x + b.x, y:a.y + b.y, z:a.z + b.z}; }
+function sub3(a, b){ return {x:a.x - b.x, y:a.y - b.y, z:a.z - b.z}; }
+function mul3(a, s){ return {x:a.x * s, y:a.y * s, z:a.z * s}; }
+function dot3(a, b){ return a.x * b.x + a.y * b.y + a.z * b.z; }
+function cross3(a, b){
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x
+  };
+}
+function norm3(a){
+  const len = Math.sqrt(dot3(a, a));
+  return len > 1e-6 ? mul3(a, 1 / len) : {x:1, y:0, z:0};
+}
+function surfacePoint(value){
+  const p = v3(value);
+  return world(p.x, p.y, p.z);
+}
+function surfaceColor(kind, confidence=1){
+  const alpha = Math.max(.18, Math.min(.56, .16 + confidence * .34));
+  if(kind === 'floor') return {color:new BABYLON.Color3(0.32, 0.82, 0.58), alpha};
+  if(kind === 'horizontal_plane') return {color:new BABYLON.Color3(0.36, 0.66, 1.0), alpha};
+  if(kind === 'vertical_plane') return {color:new BABYLON.Color3(1.0, 0.72, 0.36), alpha};
+  return {color:new BABYLON.Color3(0.84, 0.68, 1.0), alpha};
+}
+function planeBasis(normal){
+  const n = norm3(normal);
+  const anchor = Math.abs(n.z) < .9 ? {x:0, y:0, z:1} : {x:1, y:0, z:0};
+  const basisA = norm3(cross3(n, anchor));
+  const basisB = norm3(cross3(n, basisA));
+  return {basisA, basisB};
+}
+function planeCorners(surface){
+  const bounds = surface.bounds_2d || {};
+  const minU = Number.isFinite(bounds.min_u) ? bounds.min_u : -.25;
+  const maxU = Number.isFinite(bounds.max_u) ? bounds.max_u : .25;
+  const minV = Number.isFinite(bounds.min_v) ? bounds.min_v : -.25;
+  const maxV = Number.isFinite(bounds.max_v) ? bounds.max_v : .25;
+  const centroid = v3(surface.centroid);
+  const {basisA, basisB} = planeBasis(v3(surface.normal));
+  return [
+    add3(add3(centroid, mul3(basisA, minU)), mul3(basisB, minV)),
+    add3(add3(centroid, mul3(basisA, maxU)), mul3(basisB, minV)),
+    add3(add3(centroid, mul3(basisA, maxU)), mul3(basisB, maxV)),
+    add3(add3(centroid, mul3(basisA, minU)), mul3(basisB, maxV))
+  ];
+}
+function createPlanePatch(surface){
+  const corners = planeCorners(surface).map(surfacePoint);
+  const mesh = new BABYLON.Mesh(`surface_${surface.id || 'plane'}`, scene);
+  const vertexData = new BABYLON.VertexData();
+  vertexData.positions = corners.flatMap(p => [p.x, p.y, p.z]);
+  vertexData.indices = [0, 1, 2, 0, 2, 3];
+  vertexData.applyToMesh(mesh);
+  const style = surfaceColor(surface.kind, surface.confidence);
+  const mat = new BABYLON.StandardMaterial(`surfaceMat_${surface.id || 'plane'}`, scene);
+  mat.diffuseColor = style.color;
+  mat.emissiveColor = style.color.scale(.45);
+  mat.alpha = style.alpha;
+  mat.backFaceCulling = false;
+  mesh.material = mat;
+  mesh.parent = surfaceOverlays;
+  const outline = BABYLON.MeshBuilder.CreateLines(`surfaceOutline_${surface.id || 'plane'}`, {
+    points: [corners[0], corners[1], corners[2], corners[3], corners[0]]
+  }, scene);
+  outline.color = style.color;
+  outline.parent = surfaceOverlays;
+  return mesh;
+}
+function createLabel(text, position, color){
+  const width = 256, height = 64;
+  const texture = new BABYLON.DynamicTexture(`label_${text}`, {width, height}, scene, true);
+  const ctx = texture.getContext();
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = 'rgba(5, 8, 11, .72)';
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = `rgb(${Math.round(color.r * 255)},${Math.round(color.g * 255)},${Math.round(color.b * 255)})`;
+  ctx.lineWidth = 4;
+  ctx.strokeRect(2, 2, width - 4, height - 4);
+  ctx.fillStyle = '#eef6ff';
+  ctx.font = 'bold 26px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text.slice(0, 18), 14, height / 2);
+  texture.update();
+  const plane = BABYLON.MeshBuilder.CreatePlane(`label_${text}`, {width:.72, height:.18}, scene);
+  const mat = new BABYLON.StandardMaterial(`labelMat_${text}`, scene);
+  mat.diffuseTexture = texture;
+  mat.emissiveTexture = texture;
+  mat.disableLighting = true;
+  mat.backFaceCulling = false;
+  plane.material = mat;
+  plane.position.copyFrom(position);
+  plane.billboardMode = BABYLON.Mesh.BILLBOARDMODE_ALL;
+  plane.parent = surfaceOverlays;
+}
+function createClusterBox(cluster){
+  const size = v3(cluster.size_m);
+  const centroid = surfacePoint(cluster.centroid);
+  const mesh = BABYLON.MeshBuilder.CreateBox(`cluster_${cluster.id || 'cluster'}`, {
+    width: Math.max(size.x, .04),
+    height: Math.max(size.z, .04),
+    depth: Math.max(size.y, .04)
+  }, scene);
+  const mat = new BABYLON.StandardMaterial(`clusterMat_${cluster.id || 'cluster'}`, scene);
+  const color = cluster.moving ? new BABYLON.Color3(1.0, 0.92, 0.32) : new BABYLON.Color3(1.0, 0.35, 0.48);
+  mat.diffuseColor = color;
+  mat.emissiveColor = color.scale(.55);
+  mat.alpha = cluster.moving ? .48 : .32;
+  mat.wireframe = true;
+  mesh.material = mat;
+  mesh.position.copyFrom(centroid);
+  mesh.parent = surfaceOverlays;
+  const hint = cluster.semantic_hint ? ` ${cluster.semantic_hint}` : '';
+  const motion = cluster.moving ? ' moving' : '';
+  createLabel(`${cluster.id || 'cluster'}${motion}${hint}`, centroid.add(new BABYLON.Vector3(0, Math.max(size.z, .18) + .14, 0)), mat.diffuseColor);
+}
+function renderSurfacePerception(packet){
+  clearChildren(surfaceOverlays);
+  const perception = packet.surface_perception;
+  if(!perception) return;
+  for(const surface of perception.stable_surfaces || []){
+    createPlanePatch(surface);
+    const style = surfaceColor(surface.kind, surface.confidence);
+    const labelPosition = surfacePoint(surface.centroid).add(new BABYLON.Vector3(0, .12, 0));
+    createLabel(`${surface.id || 'surface'} ${fmt(surface.confidence, 2)}`, labelPosition, style.color);
+  }
+  for(const cluster of perception.clusters || []){
+    createClusterBox(cluster);
+  }
 }
 
 function shouldUseGeneratedEye(packet){
@@ -4502,6 +4734,7 @@ function updateScene(packet){
   renderObjects(packet);
   renderBeams(packet);
   renderPoints(packet.kinect?.points || [], packet.kinect?.coordinate_system || 'camera');
+  renderSurfacePerception(packet);
   renderEye(packet);
   updateHardwareControl(packet.hardware_control);
   drawTraceMap(packet);
@@ -4557,6 +4790,14 @@ function updateScene(packet){
   fields.depth_stats.textContent = depth.depth_width
     ? `${depth.depth_width}x${depth.depth_height} ${depth.coordinate_system || '-'} med ${depth.median_depth_m == null ? '-' : fmt(depth.median_depth_m)}m skip ${depth.skipped_depth_count || 0} clip ${depth.clipped_depth_count || 0} stride ${depth.sample_stride || '-'}`
     : '-';
+  const surface = packet.surface_perception;
+  if(surface){
+    const nav = surface.scene_graph?.navigation || {};
+    const movingClusters = (surface.clusters || []).filter(cluster => cluster.moving).length;
+    fields.surfaces.textContent = `${surface.stable_surfaces?.length || 0} stable / ${surface.plane_observations?.length || 0} planes / ${surface.clusters?.length || 0} clusters (${movingClusters} moving) | front ${nav.front_clear_m == null ? '-' : fmt(nav.front_clear_m)}m`;
+  }else{
+    fields.surfaces.textContent = '-';
+  }
   fields.audio.textContent = packet.audio?.heading_rad == null && packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio?.bearing_rad ?? packet.audio?.heading_rad)} rad`;
   fields.mind.textContent = packet.mind?.combobulation || packet.warnings?.[0] || '-';
   fields.scheme.textContent = location.protocol.replace(':', '');
@@ -4737,6 +4978,16 @@ function rememberCell(map, point, value){
   if(map.size > 520) map.delete(map.keys().next().value);
 }
 
+function robotLocalToWorld(pose, localX, localY){
+  const heading = Number(pose.heading_rad) || 0;
+  const cos = Math.cos(heading);
+  const sin = Math.sin(heading);
+  return {
+    x: pose.x_m + localX * cos - localY * sin,
+    y: pose.y_m + localX * sin + localY * cos
+  };
+}
+
 function updateTraceState(packet){
   const pose = packet.body;
   traceState.poses.push({x_m: pose.x_m, y_m: pose.y_m, heading_rad: pose.heading_rad});
@@ -4771,6 +5022,19 @@ function drawTraceMap(packet){
   for(const cell of traceState.free.values()) traceCtx.fillRect(sx(cell.x)-1, sy(cell.y)-1, 2, 2);
   traceCtx.fillStyle = 'rgba(255,182,86,.62)';
   for(const cell of traceState.occupied.values()) traceCtx.fillRect(sx(cell.x)-2, sy(cell.y)-2, 4, 4);
+  const grid = packet.surface_perception?.obstacle_grid;
+  if(grid?.cells?.length){
+    const res = Number(grid.resolution_m) || .1;
+    for(const cell of grid.cells){
+      const localX = (Number(cell.x) + .5) * res;
+      const localY = (Number(cell.y) + .5) * res;
+      const p = robotLocalToWorld(latest, localX, localY);
+      const occupied = cell.state === 'occupied' || cell.state?.Occupied != null;
+      traceCtx.fillStyle = occupied ? 'rgba(255,102,126,.72)' : 'rgba(91,220,159,.26)';
+      const size = occupied ? 4 : 2;
+      traceCtx.fillRect(sx(p.x)-size/2, sy(p.y)-size/2, size, size);
+    }
+  }
   traceCtx.strokeStyle = '#8df0b2';
   traceCtx.lineWidth = 1.5;
   traceCtx.beginPath();
@@ -5683,6 +5947,8 @@ pollVirtualTraining();
 const defaults = {
   depthScale: 1.0,
   pointY: 0.18,
+  depthZ: 0.0,
+  depthPitch: 0,
   depthFov: 122,
   cameraFov: 62,
   cameraY: 0.46,
@@ -5694,6 +5960,8 @@ let cal = { ...defaults };
 
 const depthScaleEl = document.getElementById('cal-depth-scale');
 const pointYEl = document.getElementById('cal-point-y');
+const depthZEl = document.getElementById('cal-depth-z');
+const depthPitchEl = document.getElementById('cal-depth-pitch');
 const depthFovEl = document.getElementById('cal-depth-fov');
 const cameraFovEl = document.getElementById('cal-camera-fov');
 const cameraYEl = document.getElementById('cal-camera-y');
@@ -5704,6 +5972,8 @@ const statusEl2 = document.getElementById('calibration-status');
 
 const valDepthScale = document.getElementById('val-depth-scale');
 const valPointY = document.getElementById('val-point-y');
+const valDepthZ = document.getElementById('val-depth-z');
+const valDepthPitch = document.getElementById('val-depth-pitch');
 const valDepthFov = document.getElementById('val-depth-fov');
 const valCameraFov = document.getElementById('val-camera-fov');
 const valCameraY = document.getElementById('val-camera-y');
@@ -5728,6 +5998,8 @@ function saveCalibration() {
 function applyCalibrationToUI() {
   depthScaleEl.value = cal.depthScale;
   pointYEl.value = cal.pointY;
+  depthZEl.value = cal.depthZ;
+  depthPitchEl.value = cal.depthPitch;
   depthFovEl.value = cal.depthFov;
   cameraFovEl.value = cal.cameraFov;
   cameraYEl.value = cal.cameraY;
@@ -5736,6 +6008,8 @@ function applyCalibrationToUI() {
 
   valDepthScale.textContent = cal.depthScale.toFixed(2);
   valPointY.textContent = cal.pointY.toFixed(2) + 'm';
+  valDepthZ.textContent = cal.depthZ.toFixed(2) + 'm';
+  valDepthPitch.textContent = cal.depthPitch + '°';
   valDepthFov.textContent = cal.depthFov + '°';
   valCameraFov.textContent = cal.cameraFov + '°';
   valCameraY.textContent = cal.cameraY.toFixed(2) + 'm';
@@ -5765,7 +6039,9 @@ function sendCalibrationToServer() {
           compact_depth_beam_count: (lastScene && lastScene.sensor_calibration) ? lastScene.sensor_calibration.compact_depth_beam_count : 32,
           compact_depth_fov_rad: cal.depthFov * Math.PI / 180,
           depth_scale: cal.depthScale,
-          point_y_m: cal.pointY
+          point_y_m: cal.pointY,
+          depth_forward_offset_m: cal.depthZ,
+          depth_pitch_down_rad: cal.depthPitch * Math.PI / 180
         })
       });
       if (res.ok) {
@@ -5782,6 +6058,8 @@ function sendCalibrationToServer() {
 function onCalChange() {
   cal.depthScale = parseFloat(depthScaleEl.value);
   cal.pointY = parseFloat(pointYEl.value);
+  cal.depthZ = parseFloat(depthZEl.value);
+  cal.depthPitch = parseInt(depthPitchEl.value, 10);
   cal.depthFov = parseInt(depthFovEl.value, 10);
   cal.cameraFov = parseInt(cameraFovEl.value, 10);
   cal.cameraY = parseFloat(cameraYEl.value);
@@ -5794,7 +6072,7 @@ function onCalChange() {
   sendCalibrationToServer();
 }
 
-[depthScaleEl, pointYEl, depthFovEl, cameraFovEl, cameraYEl, cameraZEl, cameraPitchEl].forEach(el => {
+[depthScaleEl, pointYEl, depthZEl, depthPitchEl, depthFovEl, cameraFovEl, cameraYEl, cameraZEl, cameraPitchEl].forEach(el => {
   el.addEventListener('input', onCalChange);
 });
 

@@ -91,9 +91,13 @@ pub struct Point3 {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SurfaceExtractorConfig {
     pub min_depth_m: f32,
     pub max_depth_m: f32,
+    pub depth_camera_height_m: f32,
+    pub depth_camera_forward_offset_m: f32,
+    pub depth_camera_pitch_down_rad: f32,
     pub voxel_size_m: f32,
     pub temporal_frames: usize,
     pub outlier_radius_m: f32,
@@ -109,6 +113,10 @@ pub struct SurfaceExtractorConfig {
     pub track_smoothing_alpha: f32,
     pub cluster_distance_m: f32,
     pub min_cluster_points: usize,
+    pub cluster_track_match_threshold_m: f32,
+    pub cluster_moving_speed_m_s: f32,
+    pub cluster_seen_gain: f32,
+    pub cluster_missing_decay: f32,
     pub occupancy_resolution_m: f32,
     pub occupancy_half_extent_m: f32,
     pub obstacle_min_height_m: f32,
@@ -120,6 +128,9 @@ impl Default for SurfaceExtractorConfig {
         Self {
             min_depth_m: 0.35,
             max_depth_m: 8.0,
+            depth_camera_height_m: 0.18,
+            depth_camera_forward_offset_m: 0.0,
+            depth_camera_pitch_down_rad: 0.0,
             voxel_size_m: 0.075,
             temporal_frames: 4,
             outlier_radius_m: 0.18,
@@ -135,6 +146,10 @@ impl Default for SurfaceExtractorConfig {
             track_smoothing_alpha: 0.2,
             cluster_distance_m: 0.22,
             min_cluster_points: 4,
+            cluster_track_match_threshold_m: 0.4,
+            cluster_moving_speed_m_s: 0.08,
+            cluster_seen_gain: 0.18,
+            cluster_missing_decay: 0.12,
             occupancy_resolution_m: 0.1,
             occupancy_half_extent_m: 3.0,
             obstacle_min_height_m: 0.08,
@@ -213,8 +228,19 @@ pub struct ClusterObservation {
     pub centroid: Vec3,
     pub size_m: Vec3,
     pub point_count: usize,
+    #[serde(default)]
+    pub confidence: f32,
+    #[serde(default)]
     pub moving: bool,
+    #[serde(default)]
+    pub velocity_m_s: Vec3,
+    #[serde(default)]
+    pub last_seen_ms: u64,
+    #[serde(default)]
+    pub seen_count: u32,
     pub above_surface_id: Option<String>,
+    #[serde(default)]
+    pub semantic_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -253,8 +279,22 @@ pub struct SurfaceExtractor {
     config: SurfaceExtractorConfig,
     temporal_clouds: VecDeque<Vec<Point3>>,
     tracks: Vec<SurfaceTrack>,
+    cluster_tracks: Vec<ClusterTrack>,
     next_surface_id: u64,
     next_cluster_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ClusterTrack {
+    id: String,
+    centroid: Vec3,
+    size_m: Vec3,
+    confidence: f32,
+    velocity_m_s: Vec3,
+    last_seen_ms: u64,
+    seen_count: u32,
+    missing_count: u32,
+    point_count: usize,
 }
 
 impl Default for SurfaceExtractor {
@@ -269,9 +309,21 @@ impl SurfaceExtractor {
             config,
             temporal_clouds: VecDeque::new(),
             tracks: Vec::new(),
+            cluster_tracks: Vec::new(),
             next_surface_id: 1,
             next_cluster_id: 1,
         }
+    }
+
+    pub fn set_depth_camera_extrinsics(
+        &mut self,
+        height_m: f32,
+        forward_offset_m: f32,
+        pitch_down_rad: f32,
+    ) {
+        self.config.depth_camera_height_m = height_m;
+        self.config.depth_camera_forward_offset_m = forward_offset_m;
+        self.config.depth_camera_pitch_down_rad = pitch_down_rad;
     }
 
     pub fn process(
@@ -299,7 +351,7 @@ impl SurfaceExtractor {
             .find(|surface| surface.kind == SurfaceKind::Floor)
             .cloned();
         let obstacle_grid = project_obstacles(&filtered, floor.as_ref(), robot_pose, &self.config);
-        let clusters = self.cluster_leftovers(&leftover_points, floor.as_ref());
+        let clusters = self.cluster_leftovers(&leftover_points, &stable_surfaces, t_ms);
         let scene_graph = scene_graph(&stable_surfaces, floor.clone(), &clusters, &obstacle_grid);
         let diagnostics = SurfaceExtractorDiagnostics {
             raw_points: raw_cloud.len(),
@@ -390,19 +442,98 @@ impl SurfaceExtractor {
     fn cluster_leftovers(
         &mut self,
         points: &[Point3],
-        floor: Option<&SurfaceTrack>,
+        surfaces: &[SurfaceTrack],
+        t_ms: u64,
     ) -> Vec<ClusterObservation> {
-        let mut clusters = euclidean_clusters(
+        let clusters = euclidean_clusters(
             points,
             self.config.cluster_distance_m,
             self.config.min_cluster_points,
         );
-        for cluster in &mut clusters {
-            cluster.id = format!("cluster_{}", self.next_cluster_id);
-            self.next_cluster_id += 1;
-            cluster.above_surface_id = floor.map(|floor| floor.id.clone());
+        self.update_cluster_tracks(clusters, surfaces, t_ms)
+    }
+
+    fn update_cluster_tracks(
+        &mut self,
+        observations: Vec<ClusterObservation>,
+        surfaces: &[SurfaceTrack],
+        t_ms: u64,
+    ) -> Vec<ClusterObservation> {
+        let mut matched_tracks = vec![false; self.cluster_tracks.len()];
+        let mut output = Vec::new();
+
+        for mut observation in observations {
+            let match_index = self
+                .cluster_tracks
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !matched_tracks[*index])
+                .filter_map(|(index, track)| {
+                    let distance = track.centroid.distance(observation.centroid);
+                    if distance <= self.config.cluster_track_match_threshold_m {
+                        Some((index, distance))
+                    } else {
+                        None
+                    }
+                })
+                .min_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index);
+
+            if let Some(index) = match_index {
+                matched_tracks[index] = true;
+                let track = &mut self.cluster_tracks[index];
+                let dt_s = t_ms.saturating_sub(track.last_seen_ms).max(1) as f32 / 1000.0;
+                let velocity = (observation.centroid - track.centroid) / dt_s;
+                track.velocity_m_s = track.velocity_m_s * 0.6 + velocity * 0.4;
+                track.centroid = track.centroid * 0.75 + observation.centroid * 0.25;
+                track.size_m = track.size_m * 0.75 + observation.size_m * 0.25;
+                track.confidence = (track.confidence + self.config.cluster_seen_gain).min(1.0);
+                track.last_seen_ms = t_ms;
+                track.seen_count += 1;
+                track.missing_count = 0;
+                track.point_count = observation.point_count;
+                observation.id = track.id.clone();
+                observation.centroid = track.centroid;
+                observation.size_m = track.size_m;
+                observation.confidence = track.confidence;
+                observation.velocity_m_s = track.velocity_m_s;
+                observation.last_seen_ms = track.last_seen_ms;
+                observation.seen_count = track.seen_count;
+            } else {
+                observation.id = format!("cluster_{}", self.next_cluster_id);
+                self.next_cluster_id += 1;
+                observation.confidence = observation.confidence.max(0.35);
+                observation.last_seen_ms = t_ms;
+                observation.seen_count = 1;
+                self.cluster_tracks.push(ClusterTrack {
+                    id: observation.id.clone(),
+                    centroid: observation.centroid,
+                    size_m: observation.size_m,
+                    confidence: observation.confidence,
+                    velocity_m_s: Vec3::default(),
+                    last_seen_ms: t_ms,
+                    seen_count: 1,
+                    missing_count: 0,
+                    point_count: observation.point_count,
+                });
+                matched_tracks.push(true);
+            }
+
+            observation.moving =
+                observation.velocity_m_s.length() >= self.config.cluster_moving_speed_m_s;
+            observation.above_surface_id = surface_below_cluster(&observation, surfaces);
+            observation.semantic_hint = semantic_hint_for_cluster(&observation);
+            output.push(observation);
         }
-        clusters
+
+        for (index, track) in self.cluster_tracks.iter_mut().enumerate() {
+            if !matched_tracks.get(index).copied().unwrap_or(false) {
+                track.confidence = (track.confidence - self.config.cluster_missing_decay).max(0.0);
+                track.missing_count += 1;
+            }
+        }
+        self.cluster_tracks.retain(|track| track.confidence > 0.04);
+        output
     }
 }
 
@@ -430,7 +561,7 @@ fn depth_to_world_points(
             (v - frame.cy) * z / frame.fy,
             z,
         );
-        let robot = Vec3::new(camera.z, -camera.x, -camera.y);
+        let robot = camera_to_robot(camera, config);
         points.push(Point3 {
             position: robot_to_world(robot, robot_pose),
         });
@@ -482,6 +613,18 @@ fn robot_to_world(point: Vec3, pose: Pose2) -> Vec3 {
         pose.x_m + point.x * cos - point.y * sin,
         pose.y_m + point.x * sin + point.y * cos,
         point.z,
+    )
+}
+
+fn camera_to_robot(camera: Vec3, config: &SurfaceExtractorConfig) -> Vec3 {
+    let base_x = camera.z;
+    let base_y = -camera.x;
+    let base_z = -camera.y;
+    let (sin, cos) = config.depth_camera_pitch_down_rad.sin_cos();
+    Vec3::new(
+        base_x * cos - base_z * sin + config.depth_camera_forward_offset_m,
+        base_y,
+        -base_x * sin + base_z * cos + config.depth_camera_height_m,
     )
 }
 
@@ -873,8 +1016,76 @@ fn cluster_from_members(points: &[Point3], members: &[usize]) -> ClusterObservat
         centroid: centroid / members.len() as f32,
         size_m: max - min,
         point_count: members.len(),
+        confidence: (members.len() as f32 / 24.0).clamp(0.2, 0.8),
         moving: false,
+        velocity_m_s: Vec3::default(),
+        last_seen_ms: 0,
+        seen_count: 0,
         above_surface_id: None,
+        semantic_hint: None,
+    }
+}
+
+fn surface_below_cluster(
+    cluster: &ClusterObservation,
+    surfaces: &[SurfaceTrack],
+) -> Option<String> {
+    surfaces
+        .iter()
+        .filter(|surface| surface.normal.z.abs() > 0.75)
+        .filter(|surface| surface.centroid.z <= cluster.centroid.z + 0.05)
+        .filter(|surface| point_inside_surface_bounds(cluster.centroid, surface, 0.25))
+        .min_by(|left, right| {
+            let left_height = (cluster.centroid.z - left.centroid.z).abs();
+            let right_height = (cluster.centroid.z - right.centroid.z).abs();
+            left_height.total_cmp(&right_height)
+        })
+        .map(|surface| surface.id.clone())
+        .or_else(|| {
+            surfaces
+                .iter()
+                .find(|surface| surface.kind == SurfaceKind::Floor)
+                .map(|surface| surface.id.clone())
+        })
+}
+
+fn point_inside_surface_bounds(point: Vec3, surface: &SurfaceTrack, margin_m: f32) -> bool {
+    let normal = surface.normal;
+    let basis_a = if normal.z.abs() < 0.9 {
+        normal.cross(Vec3::new(0.0, 0.0, 1.0))
+    } else {
+        normal.cross(Vec3::new(1.0, 0.0, 0.0))
+    }
+    .normalized()
+    .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+    let basis_b = normal
+        .cross(basis_a)
+        .normalized()
+        .unwrap_or(Vec3::new(0.0, 1.0, 0.0));
+    let relative = point - surface.centroid;
+    let u = relative.dot(basis_a);
+    let v = relative.dot(basis_b);
+    u >= surface.bounds_2d.min_u - margin_m
+        && u <= surface.bounds_2d.max_u + margin_m
+        && v >= surface.bounds_2d.min_v - margin_m
+        && v <= surface.bounds_2d.max_v + margin_m
+}
+
+fn semantic_hint_for_cluster(cluster: &ClusterObservation) -> Option<String> {
+    let height = cluster.size_m.z.max(0.0);
+    let width = cluster.size_m.x.abs().max(cluster.size_m.y.abs());
+    if cluster.moving && height > 0.8 && width > 0.25 {
+        Some("moving_human_sized".to_string())
+    } else if cluster.moving {
+        Some("moving_obstacle".to_string())
+    } else if height < 0.18 && width < 0.35 {
+        Some("small_clutter".to_string())
+    } else if height > 0.5 && width < 0.35 {
+        Some("thin_vertical_obstacle".to_string())
+    } else if cluster.above_surface_id.is_some() {
+        Some("object_on_surface".to_string())
+    } else {
+        None
     }
 }
 
@@ -961,6 +1172,88 @@ mod tests {
         let clusters = euclidean_clusters(&leftovers, config.cluster_distance_m, 3);
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].point_count, 4);
+    }
+
+    #[test]
+    fn camera_extrinsics_apply_height_and_downward_pitch() {
+        let config = SurfaceExtractorConfig {
+            depth_camera_height_m: 0.25,
+            depth_camera_forward_offset_m: 0.1,
+            depth_camera_pitch_down_rad: 10.0_f32.to_radians(),
+            ..SurfaceExtractorConfig::default()
+        };
+
+        let center_ray = camera_to_robot(Vec3::new(0.0, 0.0, 1.0), &config);
+
+        assert!(center_ray.x > 1.0);
+        assert!(center_ray.z < config.depth_camera_height_m);
+    }
+
+    #[test]
+    fn cluster_tracks_keep_ids_and_detect_motion() {
+        let mut extractor = SurfaceExtractor::new(SurfaceExtractorConfig {
+            min_cluster_points: 3,
+            cluster_track_match_threshold_m: 1.0,
+            cluster_moving_speed_m_s: 0.05,
+            ..SurfaceExtractorConfig::default()
+        });
+        let surfaces = vec![SurfaceTrack {
+            id: "floor".to_string(),
+            kind: SurfaceKind::Floor,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            centroid: Vec3::default(),
+            distance_from_origin_m: 0.0,
+            bounds_2d: Bounds2 {
+                min_u: -2.0,
+                max_u: 2.0,
+                min_v: -2.0,
+                max_v: 2.0,
+            },
+            confidence: 1.0,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            seen_count: 1,
+            missing_count: 0,
+        }];
+
+        let first = extractor.update_cluster_tracks(
+            vec![ClusterObservation {
+                id: String::new(),
+                centroid: Vec3::new(0.0, 0.0, 0.6),
+                size_m: Vec3::new(0.3, 0.3, 0.7),
+                point_count: 8,
+                confidence: 0.4,
+                moving: false,
+                velocity_m_s: Vec3::default(),
+                last_seen_ms: 0,
+                seen_count: 0,
+                above_surface_id: None,
+                semantic_hint: None,
+            }],
+            &surfaces,
+            1_000,
+        );
+        let second = extractor.update_cluster_tracks(
+            vec![ClusterObservation {
+                id: String::new(),
+                centroid: Vec3::new(0.2, 0.0, 0.6),
+                size_m: Vec3::new(0.3, 0.3, 0.7),
+                point_count: 8,
+                confidence: 0.4,
+                moving: false,
+                velocity_m_s: Vec3::default(),
+                last_seen_ms: 0,
+                seen_count: 0,
+                above_surface_id: None,
+                semantic_hint: None,
+            }],
+            &surfaces,
+            2_000,
+        );
+
+        assert_eq!(first[0].id, second[0].id);
+        assert!(second[0].moving);
+        assert_eq!(second[0].above_surface_id.as_deref(), Some("floor"));
     }
 
     fn synthetic_floor_depth(width: u32, height: u32, camera_height_m: f32) -> KinectSense {
