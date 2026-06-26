@@ -4069,6 +4069,7 @@ eyeRTT.uScale = -1;
 // Eye Panel
 const eyePanel = BABYLON.MeshBuilder.CreatePlane("eyePanel", {width: 0.96, height: 0.72, sideOrientation: BABYLON.Mesh.DOUBLESIDE}, scene);
 eyePanel.position.set(0, 0.65, -0.78);
+eyePanel.scaling.x = -1;
 eyePanel.parent = robot;
 eyePanel.layerMask = 0x10000000;
 
@@ -4286,7 +4287,7 @@ function renderPoints(points, coordinateSystem){
       );
     } else if (isKinectCamera) {
       worldPoint = BABYLON.Vector3.TransformCoordinates(
-        new BABYLON.Vector3(-p.x, -p.y, p.z),
+        new BABYLON.Vector3(p.x, -p.y, p.z),
         kinectMatrix
       );
     } else {
