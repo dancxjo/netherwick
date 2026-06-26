@@ -7,33 +7,33 @@
   "tick_ms": 100,
   "action_selector_mode": "baseline",
   "model_modes": {
-    "eye_next": "off",
-    "ear_next": "off",
-    "experience": "off",
-    "future": "hardcoded",
-    "charge": "off",
     "danger": "off",
-    "action_value": "off"
+    "action_value": "off",
+    "eye_next": "off",
+    "future": "hardcoded",
+    "experience": "off",
+    "ear_next": "off",
+    "charge": "off"
   },
   "model_loading": {
     "requested_checkpoints": {
+      "experience": null,
+      "danger": null,
+      "ear_next": null,
       "future": null,
       "charge": null,
-      "ear_next": null,
-      "danger": null,
       "action_value": null,
-      "eye_next": null,
-      "experience": null
+      "eye_next": null
     },
     "loaded_checkpoints": {},
     "active_modes": {
-      "danger": "off",
-      "action_value": "off",
       "future": "hardcoded",
       "ear_next": "off",
-      "eye_next": "off",
       "charge": "off",
-      "experience": "off"
+      "experience": "off",
+      "eye_next": "off",
+      "action_value": "off",
+      "danger": "off"
     },
     "blocked_model_infer": [],
     "warnings": []
@@ -50,8 +50,8 @@
     "mean_nearest_obstacle_m": 1.4133327,
     "mean_distance_traveled_m": 1.5899975,
     "action_histogram": {
-      "Dock": 1494,
-      "Approach": 6
+      "Approach": 6,
+      "Dock": 1494
     },
     "wall_cliff_veto_count": 0,
     "escape_progress_score": 1.5584977,
@@ -60,9 +60,9 @@
     "trap_kind_counts": {
       "column": 1
     },
-    "recovery_attempts": 0,
-    "stuck_duration": 0.0,
-    "mean_stuck_duration": 0.0,
+    "recovery_attempts": 1,
+    "stuck_duration": 18900.0,
+    "mean_stuck_duration": 18900.0,
     "recovery_success_rate": 0.0,
     "mean_recovery_ticks": null,
     "repeated_trap_count": 0,
@@ -71,16 +71,18 @@
     "mean_safety_interventions": 193.4,
     "behavior_run_records": 93000,
     "model_fallbacks": 0,
+    "action_selector_fallbacks": 1500,
+    "action_selector_guard_yields": 0,
     "model_assisted_decisions": 0,
     "action_selector_safety_overrides": 0,
     "mean_chosen_score": 0.0,
-    "mean_candidate_score": -0.6088013
+    "mean_candidate_score": -0.58305085
   },
   "memory": {
     "places_visited": 6,
     "mean_places_visited_per_episode": 4.6,
-    "charge_memory_hit_rate": 0.9895178,
-    "danger_memory_hit_rate": 1.995169,
+    "charge_memory_hit_rate": 0.9811321,
+    "danger_memory_hit_rate": 1.0,
     "social_memory_hit_rate": null,
     "novelty_decay_sane": true,
     "warnings": []
@@ -131,6 +133,7 @@
       "model_assisted_decisions": 0,
       "action_selector_safety_overrides": 0,
       "action_selector_fallbacks": 300,
+      "action_selector_guard_yields": 0,
       "mean_chosen_score": 0.0,
       "mean_candidate_score": -0.3479012,
       "ticks_with_eye_frames": 300,
@@ -202,6 +205,7 @@
       "model_assisted_decisions": 0,
       "action_selector_safety_overrides": 0,
       "action_selector_fallbacks": 300,
+      "action_selector_guard_yields": 0,
       "mean_chosen_score": 0.0,
       "mean_candidate_score": -0.34791285,
       "ticks_with_eye_frames": 300,
@@ -273,6 +277,7 @@
       "model_assisted_decisions": 0,
       "action_selector_safety_overrides": 0,
       "action_selector_fallbacks": 300,
+      "action_selector_guard_yields": 0,
       "mean_chosen_score": 0.0,
       "mean_candidate_score": -0.8509908,
       "ticks_with_eye_frames": 300,
@@ -286,7 +291,7 @@
         "charge_memory_ticks": 0,
         "charge_opportunity_ticks": 0,
         "charge_memory_hit_rate": null,
-        "danger_memory_ticks": 198,
+        "danger_memory_ticks": 0,
         "danger_opportunity_ticks": 0,
         "danger_memory_hit_rate": null,
         "social_memory_ticks": 0,
@@ -320,8 +325,8 @@
       "final_distance_to_speaker_m": null,
       "distance_traveled_m": 1.5900052,
       "action_histogram": {
-        "Approach": 6,
-        "Dock": 294
+        "Dock": 294,
+        "Approach": 6
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 1.4325051,
@@ -330,9 +335,9 @@
       "trap_kind_counts": {
         "column": 1
       },
-      "recovery_attempts": 0,
-      "stuck_duration": 0.0,
-      "mean_stuck_duration": 0.0,
+      "recovery_attempts": 1,
+      "stuck_duration": 18900.0,
+      "mean_stuck_duration": 18900.0,
       "recovery_success_rate": 0.0,
       "mean_recovery_ticks": null,
       "repeated_trap_count": 0,
@@ -348,8 +353,9 @@
       "model_assisted_decisions": 0,
       "action_selector_safety_overrides": 0,
       "action_selector_fallbacks": 300,
+      "action_selector_guard_yields": 0,
       "mean_chosen_score": 0.0,
-      "mean_candidate_score": -1.1495254,
+      "mean_candidate_score": -1.020773,
       "ticks_with_eye_frames": 300,
       "ticks_with_ear_features": 0,
       "ticks_with_voice_embeddings": 0,
@@ -358,12 +364,12 @@
       "ticks_with_future_predictions": 300,
       "memory": {
         "places_visited": 6,
-        "charge_memory_ticks": 271,
+        "charge_memory_ticks": 267,
         "charge_opportunity_ticks": 273,
-        "charge_memory_hit_rate": 0.992674,
-        "danger_memory_ticks": 215,
+        "charge_memory_hit_rate": 0.978022,
+        "danger_memory_ticks": 207,
         "danger_opportunity_ticks": 207,
-        "danger_memory_hit_rate": 1.0386473,
+        "danger_memory_hit_rate": 1.0,
         "social_memory_ticks": 0,
         "social_opportunity_ticks": 0,
         "social_memory_hit_rate": null,
@@ -419,6 +425,7 @@
       "model_assisted_decisions": 0,
       "action_selector_safety_overrides": 0,
       "action_selector_fallbacks": 300,
+      "action_selector_guard_yields": 0,
       "mean_chosen_score": 0.0,
       "mean_candidate_score": -0.34767646,
       "ticks_with_eye_frames": 300,

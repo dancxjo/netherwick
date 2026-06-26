@@ -1940,9 +1940,9 @@ impl ScenarioEpisodeMemoryBuilder {
             || sim_world_score(snapshot, 3).max(sim_world_score(snapshot, 4)) >= 0.3;
         if charger_near {
             self.charge_opportunity_ticks = self.charge_opportunity_ticks.saturating_add(1);
-        }
-        if memory.place_charge_value >= 0.3 {
-            self.charge_memory_ticks = self.charge_memory_ticks.saturating_add(1);
+            if memory.place_charge_value >= 0.3 {
+                self.charge_memory_ticks = self.charge_memory_ticks.saturating_add(1);
+            }
         }
 
         let danger_near = snapshot.body.flags.bump_left
@@ -1959,9 +1959,9 @@ impl ScenarioEpisodeMemoryBuilder {
                 .unwrap_or(false);
         if danger_near {
             self.danger_opportunity_ticks = self.danger_opportunity_ticks.saturating_add(1);
-        }
-        if memory.place_danger >= 0.3 {
-            self.danger_memory_ticks = self.danger_memory_ticks.saturating_add(1);
+            if memory.place_danger >= 0.3 {
+                self.danger_memory_ticks = self.danger_memory_ticks.saturating_add(1);
+            }
         }
 
         let social_seen = !snapshot.face.embeddings.is_empty()
@@ -1969,9 +1969,9 @@ impl ScenarioEpisodeMemoryBuilder {
             || !snapshot.kinect.skeletons.is_empty();
         if social_seen {
             self.social_opportunity_ticks = self.social_opportunity_ticks.saturating_add(1);
-        }
-        if memory.place_social_value >= 0.3 {
-            self.social_memory_ticks = self.social_memory_ticks.saturating_add(1);
+            if memory.place_social_value >= 0.3 {
+                self.social_memory_ticks = self.social_memory_ticks.saturating_add(1);
+            }
         }
     }
 
@@ -2658,7 +2658,7 @@ fn distance_between(left: (f32, f32), right: (f32, f32)) -> f32 {
 }
 
 fn hit_rate(hits: usize, opportunities: usize) -> Option<f32> {
-    (opportunities > 0).then_some(hits as f32 / opportunities as f32)
+    (opportunities > 0).then_some(hits.min(opportunities) as f32 / opportunities as f32)
 }
 
 fn aggregate_hit_rate(pairs: impl Iterator<Item = (usize, usize)>) -> Option<f32> {
@@ -7133,6 +7133,14 @@ mod tests {
             scenario_recommendation(10, &risky),
             "reject_or_continue_training"
         );
+    }
+
+    #[test]
+    fn memory_hit_rates_are_bounded() {
+        assert_eq!(hit_rate(3, 2), Some(1.0));
+        assert_eq!(hit_rate(1, 4), Some(0.25));
+        assert_eq!(hit_rate(1, 0), None);
+        assert_eq!(aggregate_hit_rate([(4, 2), (3, 1)].into_iter()), Some(1.0));
     }
 
     #[tokio::test]

@@ -7,37 +7,37 @@
   "tick_ms": 100,
   "action_selector_mode": "model-assisted",
   "model_modes": {
-    "action_value": "shadow-infer",
-    "experience": "off",
-    "eye_next": "off",
-    "charge": "shadow-infer",
-    "future": "hardcoded",
     "ear_next": "off",
-    "danger": "shadow-infer"
+    "charge": "shadow-infer",
+    "action_value": "shadow-infer",
+    "future": "hardcoded",
+    "experience": "off",
+    "danger": "shadow-infer",
+    "eye_next": "off"
   },
   "model_loading": {
     "requested_checkpoints": {
-      "danger": "data/models/danger_golden_column_v0",
-      "charge": "data/models/charge_golden_charger_v0",
-      "action_value": "data/models/action_value_golden_column_v0",
       "ear_next": null,
       "eye_next": null,
+      "charge": "data/models/charge_golden_charger_v0",
+      "danger": "data/models/danger_golden_column_v0",
+      "future": null,
       "experience": null,
-      "future": null
+      "action_value": "data/models/action_value_golden_column_v0"
     },
     "loaded_checkpoints": {
+      "danger": "data/models/danger_golden_column_v0",
       "action_value": "data/models/action_value_golden_column_v0",
-      "charge": "data/models/charge_golden_charger_v0",
-      "danger": "data/models/danger_golden_column_v0"
+      "charge": "data/models/charge_golden_charger_v0"
     },
     "active_modes": {
-      "experience": "off",
-      "eye_next": "off",
       "charge": "shadow-infer",
-      "ear_next": "off",
+      "eye_next": "off",
+      "experience": "off",
+      "action_value": "shadow-infer",
       "future": "hardcoded",
       "danger": "shadow-infer",
-      "action_value": "shadow-infer"
+      "ear_next": "off"
     },
     "blocked_model_infer": [],
     "warnings": []
@@ -54,9 +54,9 @@
     "mean_nearest_obstacle_m": 0.10051539,
     "mean_distance_traveled_m": 1.4019994,
     "action_histogram": {
+      "Reverse": 435,
       "TurnRight": 1040,
-      "TurnLeft": 25,
-      "Reverse": 435
+      "TurnLeft": 25
     },
     "wall_cliff_veto_count": 0,
     "escape_progress_score": 1.0869994,
@@ -86,7 +86,7 @@
   "memory": {
     "places_visited": 2,
     "mean_places_visited_per_episode": 2.0,
-    "charge_memory_hit_rate": 3.047619,
+    "charge_memory_hit_rate": 0.97619045,
     "danger_memory_hit_rate": 0.99333334,
     "social_memory_hit_rate": null,
     "novelty_decay_sane": true,
@@ -114,9 +114,9 @@
       "final_distance_to_speaker_m": null,
       "distance_traveled_m": 1.4019994,
       "action_histogram": {
-        "TurnLeft": 5,
         "Reverse": 87,
-        "TurnRight": 208
+        "TurnRight": 208,
+        "TurnLeft": 5
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 1.0869994,
@@ -194,8 +194,8 @@
       "distance_traveled_m": 1.4019994,
       "action_histogram": {
         "Reverse": 87,
-        "TurnRight": 208,
-        "TurnLeft": 5
+        "TurnLeft": 5,
+        "TurnRight": 208
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 1.0869994,
@@ -273,8 +273,8 @@
       "distance_traveled_m": 1.4019994,
       "action_histogram": {
         "TurnLeft": 5,
-        "Reverse": 87,
-        "TurnRight": 208
+        "TurnRight": 208,
+        "Reverse": 87
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 1.0869994,
@@ -472,9 +472,9 @@
       "ticks_with_future_predictions": 300,
       "memory": {
         "places_visited": 2,
-        "charge_memory_ticks": 256,
+        "charge_memory_ticks": 82,
         "charge_opportunity_ticks": 84,
-        "charge_memory_hit_rate": 3.047619,
+        "charge_memory_hit_rate": 0.97619045,
         "danger_memory_ticks": 298,
         "danger_opportunity_ticks": 300,
         "danger_memory_hit_rate": 0.99333334,
