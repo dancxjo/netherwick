@@ -3621,9 +3621,6 @@ async fn inspect_capture(args: InspectCaptureArgs) -> Result<()> {
 }
 
 async fn run_robot(args: RobotArgs) -> Result<()> {
-    if args.mode != RobotModeArg::ReadOnly {
-        anyhow::bail!("only --mode read-only is implemented for real robot bring-up");
-    }
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
 
     if let Some(device) = &args.camera {
@@ -3713,18 +3710,47 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         SimpleSafety::default(),
         configured_llm_agent(&args.llm)?,
     );
-    let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, body, sensors, runtime);
+    let robot_mode = match args.mode {
+        RobotModeArg::ReadOnly => RobotMode::ReadOnly,
+        RobotModeArg::Slow => RobotMode::Slow,
+        RobotModeArg::Disabled => RobotMode::Disabled,
+    };
+    if robot_mode == RobotMode::Disabled {
+        anyhow::bail!("--mode disabled does not start the real robot runner");
+    }
+    let mut runner = RealRobotRunner::new(robot_mode, body, sensors, runtime);
     runner.tick_ms = args.tick_ms;
 
     let live_state = args.dashboard.map(|addr| {
-        let live_state = LiveViewState::new();
+        let live_state = if robot_mode == RobotMode::Slow {
+            LiveViewState::new().with_real_slow_hardware_control()
+        } else {
+            LiveViewState::new()
+        };
+        live_state.update_session(SceneSession {
+            mode: match robot_mode {
+                RobotMode::ReadOnly => "read-only".to_string(),
+                RobotMode::Slow => "slow".to_string(),
+                RobotMode::Disabled => "disabled".to_string(),
+            },
+            scenario: None,
+            seed: None,
+            source: "real_robot".to_string(),
+            tick_ms: Some(args.tick_ms),
+        });
         let server_state = live_state.clone();
+        let reign_state = netherwick_server::ReignServerState::with_live_view(
+            runner.runtime.reign_queue.clone(),
+            &live_state,
+        );
         tokio::spawn(async move {
-            if let Err(error) = netherwick_server::serve_live_view(addr, server_state).await {
+            if let Err(error) =
+                netherwick_server::serve_live_view_with_reign(addr, server_state, reign_state).await
+            {
                 eprintln!("live robot view server stopped: {error}");
             }
         });
-        println!("read-only robot dashboard: http://{addr}/view");
+        println!("robot {:?} dashboard: http://{addr}/view", robot_mode);
         live_state
     });
 
@@ -3743,7 +3769,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         .map(|limit| runner.tick_count < limit)
         .unwrap_or(true)
     {
-        let (snapshot, tick) = runner.tick_read_only().await?;
+        let (snapshot, tick) = match robot_mode {
+            RobotMode::ReadOnly => runner.tick_read_only().await?,
+            RobotMode::Slow => runner.tick_slow_manual().await?,
+            RobotMode::Disabled => unreachable!("disabled mode bailed before runner start"),
+        };
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
         }
@@ -3753,8 +3783,8 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 .await?;
         }
         println!(
-            "robot read-only tick {}: battery {:.2}, chosen {:?}, motor_applied false",
-            runner.tick_count, tick.frame.now.body.battery_level, tick.chosen_action
+            "robot {:?} tick {}: battery {:.2}, chosen {:?}",
+            robot_mode, runner.tick_count, tick.frame.now.body.battery_level, tick.chosen_action
         );
         tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
     }
@@ -3771,7 +3801,8 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     };
     let transitions = ledger.transitions().await?;
     println!(
-        "robot read-only complete: {} ticks, ledger {}, {} transitions{}, motor_applied false",
+        "robot {:?} complete: {} ticks, ledger {}, {} transitions{}",
+        robot_mode,
         runner.tick_count,
         args.ledger,
         transitions.len(),

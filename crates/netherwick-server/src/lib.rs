@@ -44,6 +44,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/reign/prod",
     "/reign/state",
     "/reign/clear",
+    "/reign/hardware-arm",
     "/stream/now",
     "/stream/mind",
     "/stream/logs",
@@ -61,6 +62,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
 pub struct ReignServerState {
     queue: Arc<Mutex<ReignQueue>>,
     latest_snapshot: Option<Arc<Mutex<Option<WorldSnapshot>>>>,
+    hardware_control: Option<Arc<Mutex<HardwareControlState>>>,
 }
 
 impl ReignServerState {
@@ -68,6 +70,7 @@ impl ReignServerState {
         Self {
             queue,
             latest_snapshot: None,
+            hardware_control: None,
         }
     }
 
@@ -75,6 +78,7 @@ impl ReignServerState {
         Self {
             queue,
             latest_snapshot: Some(Arc::clone(&live_view.latest)),
+            hardware_control: Some(Arc::clone(&live_view.hardware_control)),
         }
     }
 
@@ -85,6 +89,7 @@ impl ReignServerState {
         Self {
             queue,
             latest_snapshot: Some(latest_snapshot),
+            hardware_control: None,
         }
     }
 
@@ -101,6 +106,37 @@ impl ReignServerState {
             .as_ref()
             .and_then(|latest| latest.lock().expect("live snapshot mutex poisoned").clone())
     }
+
+    fn hardware_control_status(&self, now_ms: TimeMs) -> HardwareControlStatus {
+        self.hardware_control
+            .as_ref()
+            .map(|state| {
+                let state = state.lock().expect("hardware control mutex poisoned");
+                state.status(self.latest_snapshot().as_ref(), now_ms)
+            })
+            .unwrap_or_else(|| HardwareControlStatus::unavailable("not a hardware cockpit session"))
+    }
+
+    fn set_hardware_armed(&self, armed: bool) -> Result<HardwareControlStatus, ReignApiError> {
+        let hardware = self
+            .hardware_control
+            .as_ref()
+            .ok_or_else(|| ReignApiError::forbidden("hardware cockpit is not available"))?;
+        let now_ms = wall_now_ms();
+        {
+            let mut state = hardware
+                .lock()
+                .map_err(|_| ReignApiError::internal("hardware control lock poisoned"))?;
+            if armed && !state.available {
+                return Err(ReignApiError::forbidden(
+                    "hardware cockpit is not available in this session",
+                ));
+            }
+            state.armed = armed;
+            state.last_changed_ms = Some(now_ms);
+        }
+        Ok(self.hardware_control_status(now_ms))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,6 +149,133 @@ pub struct ReignCommandRequest {
     pub ttl_ms: Option<TimeMs>,
     pub note: Option<String>,
     pub source: Option<ReignSource>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct HardwareArmRequest {
+    pub armed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HardwareControlStatus {
+    pub available: bool,
+    pub armed: bool,
+    pub mode: Option<String>,
+    pub source: Option<String>,
+    pub reason: Option<String>,
+    pub ttl_min_ms: TimeMs,
+    pub ttl_max_ms: TimeMs,
+    pub max_forward_intensity: f32,
+    pub max_turn_intensity: f32,
+    pub body_age_ms: Option<TimeMs>,
+}
+
+impl HardwareControlStatus {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            armed: false,
+            mode: None,
+            source: None,
+            reason: Some(reason.into()),
+            ttl_min_ms: HARDWARE_TTL_MIN_MS,
+            ttl_max_ms: HARDWARE_TTL_MAX_MS,
+            max_forward_intensity: HARDWARE_MAX_FORWARD_INTENSITY,
+            max_turn_intensity: HARDWARE_MAX_TURN_INTENSITY,
+            body_age_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HardwareControlState {
+    available: bool,
+    armed: bool,
+    mode: Option<String>,
+    source: Option<String>,
+    last_changed_ms: Option<TimeMs>,
+}
+
+impl Default for HardwareControlState {
+    fn default() -> Self {
+        Self {
+            available: false,
+            armed: false,
+            mode: None,
+            source: None,
+            last_changed_ms: None,
+        }
+    }
+}
+
+impl HardwareControlState {
+    fn real_slow() -> Self {
+        Self {
+            available: true,
+            armed: false,
+            mode: Some("slow".to_string()),
+            source: Some("real_robot".to_string()),
+            last_changed_ms: None,
+        }
+    }
+
+    fn status(&self, snapshot: Option<&WorldSnapshot>, now_ms: TimeMs) -> HardwareControlStatus {
+        let reason = if !self.available {
+            Some("not a real slow robot session".to_string())
+        } else if self.mode.as_deref() != Some("slow")
+            || self.source.as_deref() != Some("real_robot")
+        {
+            Some("robot runner is not in real slow mode".to_string())
+        } else if snapshot.is_none() {
+            Some("no body snapshot yet".to_string())
+        } else if let Some(snapshot) = snapshot {
+            hardware_snapshot_block_reason(snapshot, now_ms)
+        } else {
+            None
+        };
+        HardwareControlStatus {
+            available: self.available,
+            armed: self.armed,
+            mode: self.mode.clone(),
+            source: self.source.clone(),
+            reason,
+            ttl_min_ms: HARDWARE_TTL_MIN_MS,
+            ttl_max_ms: HARDWARE_TTL_MAX_MS,
+            max_forward_intensity: HARDWARE_MAX_FORWARD_INTENSITY,
+            max_turn_intensity: HARDWARE_MAX_TURN_INTENSITY,
+            body_age_ms: snapshot
+                .map(|snapshot| now_ms.saturating_sub(snapshot.body.last_update_ms)),
+        }
+    }
+}
+
+const HARDWARE_TTL_MIN_MS: TimeMs = 250;
+const HARDWARE_TTL_MAX_MS: TimeMs = 500;
+const HARDWARE_MAX_FORWARD_INTENSITY: f32 = 0.15;
+const HARDWARE_MAX_TURN_INTENSITY: f32 = 0.25;
+const HARDWARE_BODY_STALE_MS: TimeMs = 1_000;
+const HARDWARE_CRITICAL_BATTERY: f32 = 0.10;
+
+fn hardware_snapshot_block_reason(snapshot: &WorldSnapshot, now_ms: TimeMs) -> Option<String> {
+    let age_ms = now_ms.saturating_sub(snapshot.body.last_update_ms);
+    if age_ms > HARDWARE_BODY_STALE_MS {
+        return Some(format!("body snapshot stale: {age_ms} ms old"));
+    }
+    if snapshot.body.flags.wheel_drop {
+        return Some("wheel drop active".to_string());
+    }
+    if snapshot.body.flags.cliff_left
+        || snapshot.body.flags.cliff_front_left
+        || snapshot.body.flags.cliff_front_right
+        || snapshot.body.flags.cliff_right
+        || snapshot.body.cliff_sensors.max() >= 0.5
+    {
+        return Some("cliff sensor active".to_string());
+    }
+    if snapshot.body.battery_level <= HARDWARE_CRITICAL_BATTERY && !snapshot.body.charging {
+        return Some("battery is critical".to_string());
+    }
+    None
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -135,6 +298,7 @@ pub fn reign_router(state: ReignServerState) -> Router {
         .route("/reign/prod", post(post_reign_prod))
         .route("/reign/state", get(get_reign_state))
         .route("/reign/clear", post(post_reign_clear))
+        .route("/reign/hardware-arm", post(post_hardware_arm))
         .with_state(state)
 }
 
@@ -143,6 +307,7 @@ pub struct LiveViewState {
     latest: Arc<Mutex<Option<WorldSnapshot>>>,
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
     session: Arc<Mutex<Option<SceneSession>>>,
+    hardware_control: Arc<Mutex<HardwareControlState>>,
     training_status: Arc<Mutex<LiveTrainingStatus>>,
     inline_learning: Arc<Mutex<InlineLearningConfig>>,
     prod_state: Arc<Mutex<NudgeStatus>>,
@@ -171,6 +336,7 @@ impl Default for LiveViewState {
             latest: Arc::new(Mutex::new(None)),
             scene_metadata: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
+            hardware_control: Arc::new(Mutex::new(HardwareControlState::default())),
             training_status: Arc::new(Mutex::new(LiveTrainingStatus::default())),
             inline_learning: Arc::new(Mutex::new(InlineLearningConfig::default())),
             prod_state: Arc::new(Mutex::new(NudgeStatus::default())),
@@ -187,6 +353,23 @@ impl Default for LiveViewState {
 impl LiveViewState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_real_slow_hardware_control(self) -> Self {
+        *self
+            .hardware_control
+            .lock()
+            .expect("hardware control mutex poisoned") = HardwareControlState::real_slow();
+        self
+    }
+
+    pub fn hardware_control_status(&self) -> HardwareControlStatus {
+        let now_ms = wall_now_ms();
+        let latest = self.latest();
+        self.hardware_control
+            .lock()
+            .expect("hardware control mutex poisoned")
+            .status(latest.as_ref(), now_ms)
     }
 
     pub fn with_virtual_retina(mut self, enabled: bool) -> Self {
@@ -474,6 +657,7 @@ pub struct LiveSceneResponse {
     pub schema_version: u32,
     pub session: Option<SceneSession>,
     pub training: LiveTrainingStatus,
+    pub hardware_control: HardwareControlStatus,
     pub training_mode: String,
     pub ledger_path: Option<String>,
     pub frames_written: usize,
@@ -551,6 +735,10 @@ pub struct SceneBody {
     pub heading_rad: f32,
     pub battery_level: f32,
     pub charging: bool,
+    pub bump_left: bool,
+    pub bump_right: bool,
+    pub cliff: bool,
+    pub wheel_drop: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -855,6 +1043,7 @@ async fn get_live_scene(
         state.prod_state(),
         state.behavior_nodes(),
         retina_status,
+        state.hardware_control_status(),
     )))
 }
 
@@ -1578,6 +1767,7 @@ async fn get_capture_scene(
         NudgeStatus::default(),
         default_behavior_nodes(),
         None,
+        HardwareControlStatus::unavailable("capture replay is not a hardware cockpit session"),
     );
     scene.t_ms = record.t_ms;
     if let Some(pointcloud) = &record.assets.pointcloud {
@@ -1682,6 +1872,7 @@ pub fn snapshot_to_scene(
     prod_state: NudgeStatus,
     behavior_nodes: Vec<BehaviorNodeState>,
     retina_status: Option<RetinaStatusInfo>,
+    hardware_control: HardwareControlStatus,
 ) -> LiveSceneResponse {
     let mut warnings = Vec::new();
     let body = &snapshot.body;
@@ -1745,6 +1936,7 @@ pub fn snapshot_to_scene(
         schema_version: 1,
         session,
         training,
+        hardware_control,
         training_mode,
         ledger_path,
         frames_written,
@@ -1761,6 +1953,14 @@ pub fn snapshot_to_scene(
             heading_rad: body.odometry.heading_rad,
             battery_level: body.battery_level,
             charging: body.charging,
+            bump_left: body.flags.bump_left,
+            bump_right: body.flags.bump_right,
+            cliff: body.flags.cliff_left
+                || body.flags.cliff_front_left
+                || body.flags.cliff_front_right
+                || body.flags.cliff_right
+                || body.cliff_sensors.max() >= 0.5,
+            wheel_drop: body.flags.wheel_drop,
         },
         range: scene_range_from_snapshot(snapshot),
         eye,
@@ -2362,13 +2562,19 @@ async fn post_reign_command(
     Json(request): Json<ReignCommandRequest>,
 ) -> Result<Json<ReignInput>, ReignApiError> {
     let now_ms = wall_now_ms();
-    let command = sanitize_command(request.command)?;
-    let ttl_ms = request.ttl_ms.unwrap_or_else(|| command.default_ttl_ms());
+    let source = request.source.unwrap_or(ReignSource::WebRemote);
+    let mut command = sanitize_command(request.command)?;
+    let mut ttl_ms = request.ttl_ms.unwrap_or_else(|| command.default_ttl_ms());
+    if state.hardware_control_status(now_ms).available {
+        command = sanitize_hardware_command(command)?;
+        ttl_ms = ttl_ms.clamp(HARDWARE_TTL_MIN_MS, HARDWARE_TTL_MAX_MS);
+        enforce_hardware_command_gate(&state, &source, &request.mode, &command, now_ms)?;
+    }
     let input = ReignInput {
         id: Uuid::new_v4(),
         issued_at_ms: now_ms,
         expires_at_ms: now_ms.saturating_add(ttl_ms.clamp(100, 30_000)),
-        source: request.source.unwrap_or(ReignSource::WebRemote),
+        source,
         mode: request.mode,
         command,
         priority: request.priority.clamp(0.0, 1.0),
@@ -2380,6 +2586,13 @@ async fn post_reign_command(
         .map_err(|_| ReignApiError::internal("reign queue lock poisoned"))?
         .push(input.clone());
     Ok(Json(input))
+}
+
+async fn post_hardware_arm(
+    State(state): State<ReignServerState>,
+    Json(request): Json<HardwareArmRequest>,
+) -> Result<Json<HardwareControlStatus>, ReignApiError> {
+    Ok(Json(state.set_hardware_armed(request.armed)?))
 }
 
 async fn post_reign_prod(
@@ -2573,6 +2786,74 @@ fn sanitize_command(command: ReignCommand) -> Result<ReignCommand, ReignApiError
         }
         other => other,
     })
+}
+
+fn sanitize_hardware_command(command: ReignCommand) -> Result<ReignCommand, ReignApiError> {
+    Ok(match command {
+        ReignCommand::Go {
+            intensity,
+            duration_ms,
+        } => ReignCommand::Go {
+            intensity: finite_intensity(intensity)?.min(HARDWARE_MAX_FORWARD_INTENSITY),
+            duration_ms: duration_ms.clamp(HARDWARE_TTL_MIN_MS, HARDWARE_TTL_MAX_MS),
+        },
+        ReignCommand::Reverse {
+            intensity,
+            duration_ms,
+        } => ReignCommand::Reverse {
+            intensity: finite_intensity(intensity)?.min(HARDWARE_MAX_FORWARD_INTENSITY),
+            duration_ms: duration_ms.clamp(HARDWARE_TTL_MIN_MS, HARDWARE_TTL_MAX_MS),
+        },
+        ReignCommand::Turn {
+            direction,
+            intensity,
+            duration_ms,
+        } => ReignCommand::Turn {
+            direction,
+            intensity: finite_intensity(intensity)?.min(HARDWARE_MAX_TURN_INTENSITY),
+            duration_ms: duration_ms.clamp(HARDWARE_TTL_MIN_MS, HARDWARE_TTL_MAX_MS),
+        },
+        ReignCommand::Stop => ReignCommand::Stop,
+        _ => {
+            return Err(ReignApiError::forbidden(
+                "hardware cockpit only accepts Stop, Go, Reverse, and Turn",
+            ))
+        }
+    })
+}
+
+fn enforce_hardware_command_gate(
+    state: &ReignServerState,
+    source: &ReignSource,
+    mode: &ReignMode,
+    command: &ReignCommand,
+    now_ms: TimeMs,
+) -> Result<(), ReignApiError> {
+    if matches!(command, ReignCommand::Stop) {
+        return Ok(());
+    }
+    if source != &ReignSource::WebRemote {
+        return Err(ReignApiError::forbidden(
+            "hardware cockpit only accepts WebRemote drive commands",
+        ));
+    }
+    if mode != &ReignMode::Direct {
+        return Err(ReignApiError::forbidden(
+            "hardware cockpit drive commands must use Direct mode",
+        ));
+    }
+    let status = state.hardware_control_status(now_ms);
+    if !status.armed {
+        return Err(ReignApiError::forbidden(
+            "hardware cockpit is disarmed; movement rejected",
+        ));
+    }
+    if let Some(reason) = status.reason {
+        return Err(ReignApiError::forbidden(format!(
+            "hardware cockpit movement rejected: {reason}"
+        )));
+    }
+    Ok(())
 }
 
 fn finite_intensity(value: f32) -> Result<f32, ReignApiError> {
@@ -2933,6 +3214,20 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
 #reign div{font-variant-numeric:tabular-nums}
 #reign-state{min-height:17px;color:#ffd083}
+.cockpit{border-top:1px solid #344350;padding-top:8px;display:grid;gap:7px}
+.cockpit-arm{display:flex;align-items:center;gap:7px;font-size:12px;color:#dce8f2}
+.cockpit-arm input{width:16px;height:16px}
+#hardware-state{font-size:11px;color:#ffbf7a;min-height:15px}
+.cockpit-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
+.cockpit-grid button{min-height:32px;border:1px solid #3f607b;background:#15242e;color:#dce8f2;border-radius:5px;cursor:pointer}
+.cockpit-grid button:disabled{opacity:.45;cursor:not-allowed}
+.cockpit-grid .forward{grid-column:2}
+.cockpit-grid .left{grid-column:1}
+.cockpit-grid .back{grid-column:2}
+.cockpit-grid .right{grid-column:3}
+.cockpit-grid .stop{grid-column:1/-1;background:#681923;border-color:#b13a4a;color:#fff}
+.trace-label{font-size:11px;color:#9fb0bf}
+#trace-map{width:100%;height:auto;display:block;background:#081015;border:1px solid #2d3d4a;border-radius:4px}
 .reign-pad{display:grid;grid-template-columns:92px 1fr;gap:10px;align-items:center}
 #reign-joystick{position:relative;width:92px;aspect-ratio:1;border:1px solid #455565;border-radius:50%;background:radial-gradient(circle at 50% 50%,rgba(79,149,188,.24),rgba(15,23,31,.72) 64%);touch-action:none;cursor:pointer}
 #reign-joystick::before,#reign-joystick::after{content:"";position:absolute;background:rgba(170,196,216,.22)}
@@ -3098,6 +3393,20 @@ canvas{display:block}
   </div>
   <div id="reign-state">web reign ready</div>
   <div class="reign-hint">Drag up to go, left or right to turn. Release to stop.</div>
+  <div class="cockpit">
+    <label class="cockpit-arm"><input id="hardware-arm" type="checkbox"> Real hardware armed</label>
+    <div id="hardware-state">hardware cockpit unavailable</div>
+    <div class="cockpit-grid">
+      <button class="forward" data-cockpit="forward" type="button">Forward</button>
+      <button class="left" data-cockpit="left" type="button">Left</button>
+      <button class="stop" data-cockpit="stop" type="button">STOP</button>
+      <button class="back" data-cockpit="back" type="button">Back</button>
+      <button class="right" data-cockpit="right" type="button">Right</button>
+    </div>
+    <div class="trace-label">Speed cautious only. TTL 300 ms.</div>
+    <canvas id="trace-map" width="220" height="180" aria-label="odometry/range trace map"></canvas>
+    <div class="trace-label">Odometry/range trace, not SLAM.</div>
+  </div>
 </aside>
 <aside id="llm" data-window-title="LLM streams">
   <header>
@@ -3194,6 +3503,11 @@ const reignStick = document.getElementById('reign-stick');
 const reignStop = document.getElementById('reign-stop');
 const reignDock = document.getElementById('reign-dock');
 const reignExplore = document.getElementById('reign-explore');
+const hardwareArm = document.getElementById('hardware-arm');
+const hardwareState = document.getElementById('hardware-state');
+const cockpitButtons = Array.from(document.querySelectorAll('[data-cockpit]'));
+const traceCanvas = document.getElementById('trace-map');
+const traceCtx = traceCanvas.getContext('2d');
 const llmStatus = document.getElementById('llm-status');
 const llmStreams = document.getElementById('llm-streams');
 const modelStatus = document.getElementById('model-status');
@@ -3209,6 +3523,10 @@ const learningSteps = document.getElementById('learning-steps');
 const learningStatus = document.getElementById('learning-status');
 const learningApply = document.getElementById('learning-apply');
 const learningChecks = Array.from(document.querySelectorAll('#learning-behaviors input[type="checkbox"]'));
+const cockpitHeldKeys = new Set();
+const traceState = {poses: [], events: [], occupied: new Map(), free: new Map()};
+let cockpitAvailable = false;
+let cockpitArmed = false;
 
 // Initialize Babylon Engine & Scene
 const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
@@ -3720,6 +4038,8 @@ function updateScene(packet){
   renderBeams(packet);
   renderPoints(packet.kinect?.points || [], packet.kinect?.coordinate_system || 'camera');
   renderEye(packet);
+  updateHardwareControl(packet.hardware_control);
+  drawTraceMap(packet);
   const session = packet.session || {};
   fields.mode.textContent = session.mode || '-';
   fields.scenario.textContent = session.scenario || '-';
@@ -3818,6 +4138,153 @@ function postWebReign(command, ttl_ms, label, priority=.95){
   return postReign(command, ttl_ms, label, priority, 'WebRemote', 'Web panel reign');
 }
 
+function cockpitCommand(kind){
+  const duration_ms = 300;
+  if(kind === 'forward') return {type:'Go', intensity:.12, duration_ms};
+  if(kind === 'back') return {type:'Reverse', intensity:.10, duration_ms};
+  if(kind === 'left') return {type:'Turn', direction:'Left', intensity:.20, duration_ms};
+  if(kind === 'right') return {type:'Turn', direction:'Right', intensity:.20, duration_ms};
+  return {type:'Stop'};
+}
+
+function sendCockpitStop(){
+  return postWebReign({type:'Stop'}, 300, 'hardware stop', 1);
+}
+
+function sendCockpit(kind){
+  if(kind === 'stop') return sendCockpitStop();
+  if(!cockpitAvailable || !cockpitArmed){
+    hardwareState.textContent = cockpitAvailable ? 'disarmed' : 'hardware cockpit unavailable';
+    return Promise.resolve();
+  }
+  return postWebReign(cockpitCommand(kind), 300, `hardware ${kind}`, 1);
+}
+
+function keyCockpitKind(key){
+  if(key === 'w' || key === 'ArrowUp') return 'forward';
+  if(key === 's' || key === 'ArrowDown') return 'back';
+  if(key === 'a' || key === 'ArrowLeft') return 'left';
+  if(key === 'd' || key === 'ArrowRight') return 'right';
+  if(key === ' ') return 'stop';
+  return null;
+}
+
+function updateHardwareControl(hw){
+  cockpitAvailable = !!hw?.available;
+  cockpitArmed = !!hw?.armed;
+  hardwareArm.disabled = !cockpitAvailable;
+  hardwareArm.checked = cockpitArmed;
+  cockpitButtons.forEach(button => {
+    const isStop = button.dataset.cockpit === 'stop';
+    button.disabled = !cockpitAvailable || (!cockpitArmed && !isStop);
+  });
+  const stateText = !cockpitAvailable ? 'unavailable'
+    : cockpitArmed ? 'ARMED'
+    : 'disarmed';
+  const detail = hw?.reason ? `: ${hw.reason}` : '';
+  const age = hw?.body_age_ms == null ? '' : ` body ${hw.body_age_ms}ms`;
+  hardwareState.textContent = `${stateText}${detail}${age}`;
+  hardwareState.style.color = cockpitArmed ? '#8df0b2' : '#ffbf7a';
+}
+
+async function setHardwareArmed(armed){
+  try{
+    const res = await fetch('/reign/hardware-arm', {
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({armed})
+    });
+    if(!res.ok) throw new Error(await res.text());
+    updateHardwareControl(await res.json());
+    if(!armed) sendCockpitStop();
+  }catch(error){
+    hardwareState.textContent = 'arm request rejected';
+    hardwareArm.checked = false;
+    cockpitArmed = false;
+  }
+}
+
+function projectRangeBeam(pose, beam){
+  const angle = pose.heading_rad + beam.angle_rad;
+  return {
+    x: pose.x_m + Math.cos(angle) * beam.distance_m,
+    y: pose.y_m + Math.sin(angle) * beam.distance_m,
+    hit: !!beam.hit
+  };
+}
+
+function cellKey(point, size=.12){
+  return `${Math.round(point.x / size)},${Math.round(point.y / size)}`;
+}
+
+function rememberCell(map, point, value){
+  const key = cellKey(point);
+  map.set(key, {x: point.x, y: point.y, value});
+  if(map.size > 520) map.delete(map.keys().next().value);
+}
+
+function updateTraceState(packet){
+  const pose = packet.body;
+  traceState.poses.push({x_m: pose.x_m, y_m: pose.y_m, heading_rad: pose.heading_rad});
+  if(traceState.poses.length > 900) traceState.poses.shift();
+  for(const beam of packet.range?.beams || []){
+    const point = projectRangeBeam(pose, beam);
+    if(beam.hit) rememberCell(traceState.occupied, point, 1);
+    else rememberCell(traceState.free, point, .35);
+  }
+  if(pose.bump_left || pose.bump_right || pose.cliff || pose.wheel_drop || packet.stuck || packet.action?.safety_override){
+    traceState.events.push({
+      x: pose.x_m,
+      y: pose.y_m,
+      kind: pose.cliff || pose.wheel_drop ? 'safety' : packet.stuck ? 'stuck' : 'bump'
+    });
+    if(traceState.events.length > 160) traceState.events.shift();
+  }
+}
+
+function drawTraceMap(packet){
+  updateTraceState(packet);
+  const w = traceCanvas.width, h = traceCanvas.height;
+  traceCtx.clearRect(0, 0, w, h);
+  traceCtx.fillStyle = '#081015';
+  traceCtx.fillRect(0, 0, w, h);
+  const poses = traceState.poses;
+  const latest = poses[poses.length - 1] || {x_m:0, y_m:0, heading_rad:0};
+  const scale = 42;
+  const sx = x => w / 2 + (x - latest.x_m) * scale;
+  const sy = y => h / 2 - (y - latest.y_m) * scale;
+  traceCtx.fillStyle = 'rgba(77,144,185,.22)';
+  for(const cell of traceState.free.values()) traceCtx.fillRect(sx(cell.x)-1, sy(cell.y)-1, 2, 2);
+  traceCtx.fillStyle = 'rgba(255,182,86,.62)';
+  for(const cell of traceState.occupied.values()) traceCtx.fillRect(sx(cell.x)-2, sy(cell.y)-2, 4, 4);
+  traceCtx.strokeStyle = '#8df0b2';
+  traceCtx.lineWidth = 1.5;
+  traceCtx.beginPath();
+  poses.forEach((pose, index) => {
+    if(index === 0) traceCtx.moveTo(sx(pose.x_m), sy(pose.y_m));
+    else traceCtx.lineTo(sx(pose.x_m), sy(pose.y_m));
+  });
+  traceCtx.stroke();
+  for(const event of traceState.events){
+    traceCtx.fillStyle = event.kind === 'safety' ? '#ff4d5f' : event.kind === 'stuck' ? '#ffd166' : '#ff8b4a';
+    traceCtx.beginPath();
+    traceCtx.arc(sx(event.x), sy(event.y), 3, 0, Math.PI * 2);
+    traceCtx.fill();
+  }
+  traceCtx.save();
+  traceCtx.translate(sx(latest.x_m), sy(latest.y_m));
+  traceCtx.rotate(-latest.heading_rad);
+  traceCtx.fillStyle = '#dce8f2';
+  traceCtx.beginPath();
+  traceCtx.moveTo(9, 0);
+  traceCtx.lineTo(-6, -5);
+  traceCtx.lineTo(-4, 0);
+  traceCtx.lineTo(-6, 5);
+  traceCtx.closePath();
+  traceCtx.fill();
+  traceCtx.restore();
+}
+
 function resetWebJoystick(){
   webReignVector = {x: 0, y: 0};
   reignStick.style.transform = 'translate(-50%,-50%)';
@@ -3895,6 +4362,42 @@ reignJoystick.addEventListener('pointercancel', endWebJoystick);
 reignStop.addEventListener('click', () => postWebReign({type:'Stop'}, 2000, 'stop', 1));
 reignDock.addEventListener('click', () => postWebReign({type:'Dock'}, 5000, 'dock', .9));
 reignExplore.addEventListener('click', () => postWebReign({type:'Explore', duration_ms:3000}, 5000, 'explore', .85));
+hardwareArm.addEventListener('change', () => setHardwareArmed(hardwareArm.checked));
+cockpitButtons.forEach(button => {
+  const kind = button.dataset.cockpit;
+  button.addEventListener('pointerdown', event => {
+    sendCockpit(kind);
+    event.preventDefault();
+  });
+  button.addEventListener('pointerup', () => sendCockpitStop());
+  button.addEventListener('pointercancel', () => sendCockpitStop());
+  button.addEventListener('mouseleave', event => {
+    if(event.buttons) sendCockpitStop();
+  });
+});
+window.addEventListener('keydown', event => {
+  if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName)) return;
+  const kind = keyCockpitKind(event.key);
+  if(!kind) return;
+  event.preventDefault();
+  if(kind === 'stop'){
+    cockpitHeldKeys.clear();
+    sendCockpitStop();
+    return;
+  }
+  cockpitHeldKeys.add(event.key);
+  sendCockpit(kind);
+});
+window.addEventListener('keyup', event => {
+  const kind = keyCockpitKind(event.key);
+  if(!kind) return;
+  cockpitHeldKeys.delete(event.key);
+  sendCockpitStop();
+});
+window.addEventListener('blur', () => {
+  cockpitHeldKeys.clear();
+  sendCockpitStop();
+});
 
 function commandForInputSource(inputSource){
   const gamepad = inputSource.gamepad;
@@ -4850,6 +5353,101 @@ mod tests {
         );
     }
 
+    fn hardware_reign_state_with_snapshot(snapshot: WorldSnapshot) -> ReignServerState {
+        let live = LiveViewState::new().with_real_slow_hardware_control();
+        live.update(snapshot);
+        ReignServerState::with_live_view(Arc::new(Mutex::new(ReignQueue::default())), &live)
+    }
+
+    fn recent_snapshot() -> WorldSnapshot {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.last_update_ms = wall_now_ms();
+        snapshot.body.battery_level = 1.0;
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn hardware_drive_command_rejected_when_disarmed() {
+        let state = hardware_reign_state_with_snapshot(recent_snapshot());
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Go {
+                intensity: 0.12,
+                duration_ms: 300,
+            },
+            priority: 1.0,
+            ttl_ms: Some(300),
+            note: None,
+            source: Some(ReignSource::WebRemote),
+        };
+
+        let error = post_reign_command(State(state), Json(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(error.message.contains("disarmed"));
+    }
+
+    #[tokio::test]
+    async fn hardware_stop_accepted_when_disarmed() {
+        let state = hardware_reign_state_with_snapshot(recent_snapshot());
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Stop,
+            priority: 1.0,
+            ttl_ms: Some(300),
+            note: None,
+            source: Some(ReignSource::WebRemote),
+        };
+
+        let Json(input) = post_reign_command(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+
+        assert!(matches!(input.command, ReignCommand::Stop));
+        assert!(
+            state
+                .queue()
+                .lock()
+                .unwrap()
+                .sense(input.issued_at_ms)
+                .active
+        );
+    }
+
+    #[tokio::test]
+    async fn hardware_drive_rejected_on_cliff_even_when_armed() {
+        let mut snapshot = recent_snapshot();
+        snapshot.body.flags.cliff_front_left = true;
+        let state = hardware_reign_state_with_snapshot(snapshot);
+        let _ = post_hardware_arm(
+            State(state.clone()),
+            Json(HardwareArmRequest { armed: true }),
+        )
+        .await
+        .unwrap();
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.20,
+                duration_ms: 300,
+            },
+            priority: 1.0,
+            ttl_ms: Some(300),
+            note: None,
+            source: Some(ReignSource::WebRemote),
+        };
+
+        let error = post_reign_command(State(state), Json(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(error.message.contains("cliff"));
+    }
+
     #[tokio::test]
     async fn posted_reign_command_is_seen_by_runtime_tick() {
         let queue = Arc::new(Mutex::new(ReignQueue::default()));
@@ -5177,6 +5775,7 @@ mod tests {
             NudgeStatus::default(),
             default_behavior_nodes(),
             None,
+            HardwareControlStatus::unavailable("unit test"),
         );
         let value = serde_json::to_value(scene).unwrap();
 
@@ -5256,6 +5855,11 @@ mod tests {
         assert!(page.contains("const nodes = {...graphLayout}"));
         assert!(page.contains("source='Gamepad'"));
         assert!(page.contains("type:'Reverse'"));
+        assert!(page.contains("Real hardware armed"));
+        assert!(page.contains("/reign/hardware-arm"));
+        assert!(page.contains("window.addEventListener('keyup'"));
+        assert!(page.contains("function projectRangeBeam"));
+        assert!(page.contains("Odometry/range trace, not SLAM."));
         assert!(page.contains("createDefaultXRExperienceAsync"));
         assert!(page.contains("if(!eye?.data_url)"));
         assert!(page.contains(

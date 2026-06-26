@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use netherwick_actions::{
     action_to_motor_command, ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget,
-    LlmActionProposal, ReignInput, ReignOutcome, TurnDir,
+    LlmActionProposal, ReignInput, ReignMode, ReignOutcome, ReignSource, TurnDir,
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_behaviors::{
@@ -3849,6 +3849,96 @@ where
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
     }
+
+    pub async fn tick_slow_manual(&mut self) -> Result<(WorldSnapshot, RuntimeTick)> {
+        if self.mode != RobotMode::Slow {
+            anyhow::bail!("slow manual tick requires RobotMode::Slow");
+        }
+
+        let body_before = self.body.read_body().await?;
+        let mut packets = Vec::new();
+        for sensor in &mut self.sensors {
+            packets.push(sensor.poll().await?);
+        }
+        let t_ms = body_before.last_update_ms.max(wall_time_ms());
+        let mut now = self.now_builder.build(t_ms, body_before.clone(), packets)?;
+        now.self_sense.mode = Some("slow".to_string());
+        now.extensions.insert(
+            "source".to_string(),
+            serde_json::Value::String("real_robot".to_string()),
+        );
+        now.extensions.insert(
+            "mode".to_string(),
+            serde_json::Value::String("slow".to_string()),
+        );
+
+        let tick = self
+            .runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await?;
+        let chosen_motor = final_motor_from_tick(&tick).clamped(0.15, 0.25);
+        let manual_drive = tick
+            .frame
+            .reign_input
+            .as_ref()
+            .map(reign_input_drives_real_slow)
+            .unwrap_or(false);
+        let block_reason = real_slow_motor_block_reason(&body_before, &tick, manual_drive);
+        let final_motor = if block_reason.is_none() {
+            chosen_motor
+        } else {
+            MotorCommand::stop()
+        };
+        self.body.apply_motor(final_motor).await?;
+
+        let mut snapshot = self.now_builder.snapshot();
+        annotate_snapshot_from_tick(&mut snapshot, &tick);
+        let mut action_debug = snapshot
+            .action_debug
+            .take()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !action_debug.is_object() {
+            action_debug = serde_json::json!({});
+        }
+        if let Some(object) = action_debug.as_object_mut() {
+            object.insert("body_pose_before".to_string(), pose_json(&body_before));
+            object.insert("body_pose_after".to_string(), pose_json(&snapshot.body));
+            object.insert(
+                "desired_motor".to_string(),
+                serde_json::to_value(chosen_motor)?,
+            );
+            object.insert(
+                "final_motor".to_string(),
+                serde_json::to_value(final_motor)?,
+            );
+            object.insert(
+                "motion_sent_to_robot".to_string(),
+                serde_json::to_value(motor_command_to_motion(final_motor))?,
+            );
+            object.insert(
+                "motion_sent_to_sim".to_string(),
+                serde_json::to_value(motor_command_to_motion(final_motor))?,
+            );
+            object.insert(
+                "motor_applied".to_string(),
+                serde_json::json!(!is_near_zero_motor(final_motor)),
+            );
+            object.insert(
+                "manual_hardware_gate".to_string(),
+                serde_json::json!(manual_drive),
+            );
+            object.insert(
+                "why_not_moving".to_string(),
+                block_reason
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+        snapshot.action_debug = Some(action_debug);
+        self.tick_count = self.tick_count.saturating_add(1);
+        Ok((snapshot, tick))
+    }
 }
 
 fn wall_time_ms() -> u64 {
@@ -3904,6 +3994,50 @@ fn motor_command_to_motion(motor: MotorCommand) -> MotionCommand {
             turn_rad_s: motor.turn,
         }
     }
+}
+
+fn reign_input_drives_real_slow(input: &ReignInput) -> bool {
+    if input.source != ReignSource::WebRemote || input.mode != ReignMode::Direct {
+        return false;
+    }
+    matches!(
+        input.command,
+        netherwick_actions::ReignCommand::Go { .. }
+            | netherwick_actions::ReignCommand::Reverse { .. }
+            | netherwick_actions::ReignCommand::Turn { .. }
+            | netherwick_actions::ReignCommand::Stop
+    )
+}
+
+fn real_slow_motor_block_reason(
+    body: &netherwick_body::BodySense,
+    tick: &RuntimeTick,
+    manual_drive: bool,
+) -> Option<String> {
+    if !manual_drive {
+        return Some("real slow mode requires active WebRemote Direct command".to_string());
+    }
+    if body.flags.wheel_drop {
+        return Some("wheel drop active".to_string());
+    }
+    if body.flags.cliff_left
+        || body.flags.cliff_front_left
+        || body.flags.cliff_front_right
+        || body.flags.cliff_right
+        || body.cliff_sensors.max() >= 0.5
+    {
+        return Some("cliff sensor active".to_string());
+    }
+    if body.battery_level <= 0.10 && !body.charging {
+        return Some("battery is critical".to_string());
+    }
+    tick.frame
+        .now
+        .extensions
+        .get("motor_gate")
+        .and_then(|value| value.get("safety_reason"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 fn pose_json(body: &netherwick_body::BodySense) -> serde_json::Value {
@@ -5832,6 +5966,7 @@ mod tests {
             _latent: ExperienceLatent,
             _futures: Vec<FuturePrediction>,
         ) -> Result<RuntimeTick> {
+            let reign_input = now.reign.latest.clone();
             let action = ActionPrimitive::Go {
                 intensity: 0.2,
                 duration_ms: 100,
@@ -5849,7 +5984,7 @@ mod tests {
                     z: Some(ExperienceLatent::default()),
                     chosen_action: Some(action.clone()),
                     conscious_command: None,
-                    reign_input: None,
+                    reign_input,
                     reign_outcome: None,
                     predicted_futures: Vec::new(),
                     behavior_runs: Vec::new(),
@@ -5874,19 +6009,19 @@ mod tests {
 
     struct CountingBody {
         motor_attempts: Arc<AtomicUsize>,
+        motors: Arc<Mutex<Vec<MotorCommand>>>,
+        body: BodySense,
     }
 
     #[async_trait::async_trait]
     impl RobotBody for CountingBody {
         async fn read_body(&mut self) -> Result<BodySense> {
-            Ok(BodySense {
-                last_update_ms: 100,
-                ..BodySense::default()
-            })
+            Ok(self.body.clone())
         }
 
-        async fn apply_motor(&mut self, _cmd: MotorCommand) -> Result<()> {
+        async fn apply_motor(&mut self, cmd: MotorCommand) -> Result<()> {
             self.motor_attempts.fetch_add(1, Ordering::SeqCst);
+            self.motors.lock().unwrap().push(cmd);
             Ok(())
         }
     }
@@ -5894,8 +6029,14 @@ mod tests {
     #[tokio::test]
     async fn real_robot_read_only_runner_never_applies_motor() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
         let body = CountingBody {
             motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
         };
         let mut runner =
             RealRobotRunner::new(RobotMode::ReadOnly, Box::new(body), Vec::new(), StubRuntime);
@@ -5907,6 +6048,7 @@ mod tests {
             Some(ActionPrimitive::Go { .. })
         ));
         assert_eq!(motor_attempts.load(Ordering::SeqCst), 0);
+        assert!(motors.lock().unwrap().is_empty());
         assert_eq!(
             tick.frame
                 .now
@@ -5914,6 +6056,115 @@ mod tests {
                 .get("safety/read_only_veto")
                 .and_then(|value| value.as_bool()),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_without_webremote_direct_sends_stop() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingBody {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let mut runner =
+            RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), StubRuntime);
+
+        let (_snapshot, _tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(motors.lock().unwrap().as_slice(), &[MotorCommand::stop()]);
+    }
+
+    struct ManualRuntime;
+
+    #[async_trait::async_trait]
+    impl RuntimeLoop for ManualRuntime {
+        async fn tick(
+            &mut self,
+            mut now: Now,
+            _latent: ExperienceLatent,
+            _futures: Vec<FuturePrediction>,
+        ) -> Result<RuntimeTick> {
+            let input = ReignInput {
+                id: Uuid::new_v4(),
+                issued_at_ms: now.t_ms,
+                expires_at_ms: now.t_ms + 300,
+                source: ReignSource::WebRemote,
+                mode: ReignMode::Direct,
+                command: netherwick_actions::ReignCommand::Go {
+                    intensity: 0.50,
+                    duration_ms: 300,
+                },
+                priority: 1.0,
+                note: None,
+            };
+            now.reign.latest = Some(input.clone());
+            let action = input.command.to_action().unwrap();
+            let experience =
+                Experience::new("test", "test", Vec::new(), Vec::new(), now.t_ms, now.t_ms);
+            Ok(RuntimeTick {
+                frame: ExperienceFrame {
+                    id: Uuid::new_v4(),
+                    t_ms: now.t_ms,
+                    now,
+                    sensations: Vec::new(),
+                    impressions: Vec::new(),
+                    experiences: vec![experience.clone()],
+                    z: Some(ExperienceLatent::default()),
+                    chosen_action: Some(action.clone()),
+                    conscious_command: None,
+                    reign_input: Some(input),
+                    reign_outcome: None,
+                    predicted_futures: Vec::new(),
+                    behavior_runs: Vec::new(),
+                    actual_next: None,
+                    reward: Reward::default(),
+                    surprise: SurpriseSense::default(),
+                    memory_recall: Vec::new(),
+                    recollections: Vec::new(),
+                    llm_teaching: Vec::new(),
+                    counterfactuals: Vec::new(),
+                    notes: Vec::new(),
+                },
+                experience,
+                chosen_action: Some(action),
+                recall: RecallBundle::default(),
+                llm: LlmTickResult::default(),
+                combobulation: None,
+                inline_learning: InlineLearningTickStatus::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_applies_only_clamped_webremote_direct_motor() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingBody {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let mut runner =
+            RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), ManualRuntime);
+
+        let (_snapshot, _tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            motors.lock().unwrap().as_slice(),
+            &[MotorCommand {
+                forward: 0.15,
+                turn: 0.0
+            }]
         );
     }
 
