@@ -2791,7 +2791,7 @@ where
         if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
             baseline_action = action.clone();
         }
-        if sim_stuck_active(&now) && is_recovery_locomotion_action(&baseline_action) {
+        if recovery_candidate_context(&now) && is_recovery_locomotion_action(&baseline_action) {
             push_unique_action(&mut action_value_candidates, baseline_action.clone());
         }
 
@@ -4682,7 +4682,7 @@ fn recovery_candidate_bonus(
     action: &ActionPrimitive,
     baseline_action: Option<&ActionPrimitive>,
 ) -> f32 {
-    if !sim_stuck_active(now) || !is_recovery_locomotion_action(action) {
+    if !recovery_candidate_context(now) || !is_recovery_locomotion_action(action) {
         return 0.0;
     }
     if baseline_action == Some(action) {
@@ -4690,6 +4690,16 @@ fn recovery_candidate_bonus(
     } else {
         0.75
     }
+}
+
+fn recovery_candidate_context(now: &Now) -> bool {
+    let contact = now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall;
+    let close_range = now
+        .range
+        .nearest_m
+        .map(|nearest| nearest < 0.35)
+        .unwrap_or(false);
+    contact || close_range || sim_stuck_active(now)
 }
 
 fn is_recovery_locomotion_action(action: &ActionPrimitive) -> bool {
@@ -6073,6 +6083,47 @@ mod tests {
         assert_ne!(decision.selected_action, Some(baseline));
         assert!(!decision.safety_overrode);
         assert!(decision.fallback_warnings.is_empty());
+    }
+
+    #[test]
+    fn close_range_scores_baseline_recovery_candidate() {
+        let body = BodySense::default();
+        let mut now = Now::blank(100, body);
+        now.range.nearest_m = Some(0.12);
+        let baseline = ActionPrimitive::Turn {
+            direction: TurnDir::Left,
+            intensity: 0.75,
+            duration_ms: 500,
+        };
+        let model_signals = CandidateModelSignals {
+            danger: Some(DangerOutput {
+                confidence: 1.0,
+                ..Default::default()
+            }),
+            charge: Some(ChargeOutput {
+                confidence: 1.0,
+                ..Default::default()
+            }),
+            action_value: Some(ActionValueOutput {
+                confidence: 1.0,
+                ..Default::default()
+            }),
+        };
+
+        let recovery = score_action_candidate(&now, &baseline, model_signals, Some(&baseline));
+        let default_turn = score_action_candidate(
+            &now,
+            &ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.25,
+                duration_ms: 750,
+            },
+            model_signals,
+            Some(&baseline),
+        );
+
+        assert!(recovery.score > default_turn.score);
+        assert!(!recovery.fallback_used);
     }
 
     #[test]

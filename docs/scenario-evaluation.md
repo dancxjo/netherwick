@@ -136,14 +136,27 @@ As of 2026-06-25, the golden locomotion path has a measurable baseline and a gua
 - `data/reports/golden-column-trap.json` and `data/reports/golden-corner-trap.json` establish the hardcoded recovery baseline for the trap scenarios.
 - `data/models/danger_golden_column_v0` and `data/models/action_value_golden_column_v0` have held-out behavior reports showing model predictions beat the hardcoded behavior targets.
 - `data/models/charge_golden_charger_v0` has a held-out charger-seeking behavior report at `data/reports/charge-golden-charger-heldout-eval.json`; keep it in shadow mode for locomotion reports.
-- `data/reports/golden-column-trap-model-assisted-full-shadow.json` runs `danger`, `charge`, and `action-value` checkpoints in shadow with `--action-selector model-assisted`.
+- `data/reports/golden-column-trap-model-assisted-full-shadow.json` and `data/reports/golden-corner-trap-model-assisted-full-shadow.json` run `danger`, `charge`, and `action-value` checkpoints in shadow with `--action-selector model-assisted`.
 
 The latest 5-episode full-shadow column-trap report has:
 
 ```json
 {
   "success_rate": 1.0,
-  "mean_collisions_per_episode": 4.8,
+  "mean_collisions_per_episode": 5.0,
+  "model_fallbacks": 0,
+  "action_selector_fallbacks": 0,
+  "action_selector_guard_yields": 0,
+  "model_assisted_decisions": 1500
+}
+```
+
+The latest 5-episode full-shadow corner-trap report has:
+
+```json
+{
+  "success_rate": 1.0,
+  "mean_collisions_per_episode": 0.4,
   "model_fallbacks": 0,
   "action_selector_fallbacks": 0,
   "action_selector_guard_yields": 0,
