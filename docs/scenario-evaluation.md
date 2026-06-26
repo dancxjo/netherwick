@@ -113,19 +113,45 @@ just run eval-scenario \
   --scenario column-trap \
   --episodes 5 \
   --steps 300 \
-  --seed 3007 \
+  --seed 6007 \
   --action-selector model-assisted \
   --danger-checkpoint data/models/danger_golden_column_v0 \
   --danger-mode shadow-infer \
+  --charge-checkpoint data/models/charge_golden_charger_v0 \
+  --charge-mode shadow-infer \
   --action-value-checkpoint data/models/action_value_golden_column_v0 \
   --action-value-mode shadow-infer \
-  --out data/reports/golden-column-trap-model-assisted.json \
+  --out data/reports/golden-column-trap-model-assisted-full-shadow.json \
   --memory-report
 ```
 
-The held-out behavior reports must show `model_better_than_hardcoded: true` before checkpoints are registered as shadow candidates. The combined shadow scenario report should preserve baseline success, collision, and veto metrics. The model-assisted scenario report is only a candidate-scoring gate: it may choose among typed actions, but close-range trap recovery must still yield to the baseline conductor. Do not use `danger-mode model-infer` or `action-value-mode model-infer` for the golden loop.
+The held-out behavior reports must show `model_better_than_hardcoded: true` before checkpoints are registered as shadow candidates. The combined shadow scenario report should preserve baseline success, collision, and veto metrics. The model-assisted scenario report is only a candidate-scoring gate: it may choose among typed actions, but contact and active `sim.stuck` recovery still yield to the baseline conductor. Close range alone should influence candidate scores, not force a guard yield. Do not use `danger-mode model-infer`, `charge-mode model-infer`, or `action-value-mode model-infer` for the golden loop.
 
 Place-memory steering is part of the baseline conductor, not a learned-model privilege. A dangerous current place should turn toward `nearby_best_safe_direction_rad` when available. Low battery with known charger memory should first turn toward `nearby_best_charge_direction_rad`, then approach the charger once roughly aligned. Novel, low-danger places may inspect before default exploration.
+
+## Current Salvage Checkpoint
+
+As of 2026-06-25, the golden locomotion path has a measurable baseline and a guarded model-assisted shadow path:
+
+- `data/reports/golden-column-trap.json` and `data/reports/golden-corner-trap.json` establish the hardcoded recovery baseline for the trap scenarios.
+- `data/models/danger_golden_column_v0` and `data/models/action_value_golden_column_v0` have held-out behavior reports showing model predictions beat the hardcoded behavior targets.
+- `data/models/charge_golden_charger_v0` has a held-out charger-seeking behavior report at `data/reports/charge-golden-charger-heldout-eval.json`; keep it in shadow mode for locomotion reports.
+- `data/reports/golden-column-trap-model-assisted-full-shadow.json` runs `danger`, `charge`, and `action-value` checkpoints in shadow with `--action-selector model-assisted`.
+
+The latest 5-episode full-shadow column-trap report has:
+
+```json
+{
+  "success_rate": 1.0,
+  "mean_collisions_per_episode": 4.8,
+  "model_fallbacks": 0,
+  "action_selector_fallbacks": 0,
+  "action_selector_guard_yields": 415,
+  "model_assisted_decisions": 1500
+}
+```
+
+Interpretation: all requested behavior checkpoints are loading and producing candidate signals. The remaining guard yields are deliberate baseline recovery protection, not missing-model fallbacks. Model-assisted selection now gets authority outside contact or active `sim.stuck` recovery.
 
 ## Comparing Runs
 
