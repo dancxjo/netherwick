@@ -16,6 +16,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+mod surface;
+
+pub use surface::{
+    Bounds2, ClusterObservation, OccupancyCell, OccupancyGrid, OccupancyState, PlaneObservation,
+    Point3, SceneGraphSummary, SurfaceExtractor, SurfaceExtractorConfig,
+    SurfaceExtractorDiagnostics, SurfaceExtractorOutput, SurfaceKind, SurfaceTrack, Vec3,
+};
+
 type TimeMs = u64;
 
 #[cfg(feature = "linux-hardware")]

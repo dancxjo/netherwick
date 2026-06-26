@@ -1,0 +1,995 @@
+use netherwick_core::Pose2;
+use netherwick_now::KinectSense;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Vec3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl Vec3 {
+    fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    fn dot(self, other: Self) -> f32 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn cross(self, other: Self) -> Self {
+        Self {
+            x: self.y * other.z - self.z * other.y,
+            y: self.z * other.x - self.x * other.z,
+            z: self.x * other.y - self.y * other.x,
+        }
+    }
+
+    fn length(self) -> f32 {
+        self.dot(self).sqrt()
+    }
+
+    fn normalized(self) -> Option<Self> {
+        let length = self.length();
+        if length <= f32::EPSILON || !length.is_finite() {
+            None
+        } else {
+            Some(self / length)
+        }
+    }
+
+    fn distance(self, other: Self) -> f32 {
+        (self - other).length()
+    }
+}
+
+impl std::ops::Add for Vec3 {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
+    }
+}
+
+impl std::ops::AddAssign for Vec3 {
+    fn add_assign(&mut self, rhs: Self) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+        self.z += rhs.z;
+    }
+}
+
+impl std::ops::Sub for Vec3 {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+    }
+}
+
+impl std::ops::Mul<f32> for Vec3 {
+    type Output = Self;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Self::new(self.x * rhs, self.y * rhs, self.z * rhs)
+    }
+}
+
+impl std::ops::Div<f32> for Vec3 {
+    type Output = Self;
+
+    fn div(self, rhs: f32) -> Self::Output {
+        Self::new(self.x / rhs, self.y / rhs, self.z / rhs)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Point3 {
+    pub position: Vec3,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceExtractorConfig {
+    pub min_depth_m: f32,
+    pub max_depth_m: f32,
+    pub voxel_size_m: f32,
+    pub temporal_frames: usize,
+    pub outlier_radius_m: f32,
+    pub outlier_min_neighbors: usize,
+    pub plane_distance_threshold_m: f32,
+    pub min_plane_points: usize,
+    pub max_planes: usize,
+    pub track_normal_max_angle_rad: f32,
+    pub track_distance_threshold_m: f32,
+    pub track_centroid_threshold_m: f32,
+    pub track_seen_gain: f32,
+    pub track_missing_decay: f32,
+    pub track_smoothing_alpha: f32,
+    pub cluster_distance_m: f32,
+    pub min_cluster_points: usize,
+    pub occupancy_resolution_m: f32,
+    pub occupancy_half_extent_m: f32,
+    pub obstacle_min_height_m: f32,
+    pub obstacle_max_height_m: f32,
+}
+
+impl Default for SurfaceExtractorConfig {
+    fn default() -> Self {
+        Self {
+            min_depth_m: 0.35,
+            max_depth_m: 8.0,
+            voxel_size_m: 0.075,
+            temporal_frames: 4,
+            outlier_radius_m: 0.18,
+            outlier_min_neighbors: 2,
+            plane_distance_threshold_m: 0.05,
+            min_plane_points: 24,
+            max_planes: 6,
+            track_normal_max_angle_rad: 12.0_f32.to_radians(),
+            track_distance_threshold_m: 0.12,
+            track_centroid_threshold_m: 0.45,
+            track_seen_gain: 0.18,
+            track_missing_decay: 0.08,
+            track_smoothing_alpha: 0.2,
+            cluster_distance_m: 0.22,
+            min_cluster_points: 4,
+            occupancy_resolution_m: 0.1,
+            occupancy_half_extent_m: 3.0,
+            obstacle_min_height_m: 0.08,
+            obstacle_max_height_m: 1.8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Bounds2 {
+    pub min_u: f32,
+    pub max_u: f32,
+    pub min_v: f32,
+    pub max_v: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaneObservation {
+    pub normal: Vec3,
+    pub centroid: Vec3,
+    pub distance_from_origin_m: f32,
+    pub bounds_2d: Bounds2,
+    pub point_count: usize,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceKind {
+    Floor,
+    HorizontalPlane,
+    VerticalPlane,
+    #[default]
+    UnknownPlane,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceTrack {
+    pub id: String,
+    pub kind: SurfaceKind,
+    pub normal: Vec3,
+    pub centroid: Vec3,
+    pub distance_from_origin_m: f32,
+    pub bounds_2d: Bounds2,
+    pub confidence: f32,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    pub seen_count: u32,
+    pub missing_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OccupancyState {
+    Free,
+    Occupied,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OccupancyCell {
+    pub x: i32,
+    pub y: i32,
+    pub state: OccupancyState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OccupancyGrid {
+    pub resolution_m: f32,
+    pub half_extent_m: f32,
+    pub cells: Vec<OccupancyCell>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClusterObservation {
+    pub id: String,
+    pub centroid: Vec3,
+    pub size_m: Vec3,
+    pub point_count: usize,
+    pub moving: bool,
+    pub above_surface_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceExtractorDiagnostics {
+    pub raw_points: usize,
+    pub downsampled_points: usize,
+    pub smoothed_points: usize,
+    pub filtered_points: usize,
+    pub plane_points: usize,
+    pub leftover_points: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SceneGraphSummary {
+    pub floor: Option<SurfaceTrack>,
+    pub surfaces: Vec<SurfaceTrack>,
+    pub clusters: Vec<ClusterObservation>,
+    pub navigation: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceExtractorOutput {
+    pub raw_cloud: Vec<Point3>,
+    pub filtered_cloud: Vec<Point3>,
+    pub plane_observations: Vec<PlaneObservation>,
+    pub stable_surfaces: Vec<SurfaceTrack>,
+    pub floor: Option<SurfaceTrack>,
+    pub obstacle_grid: OccupancyGrid,
+    pub clusters: Vec<ClusterObservation>,
+    pub scene_graph: SceneGraphSummary,
+    pub diagnostics: SurfaceExtractorDiagnostics,
+}
+
+#[derive(Clone, Debug)]
+pub struct SurfaceExtractor {
+    config: SurfaceExtractorConfig,
+    temporal_clouds: VecDeque<Vec<Point3>>,
+    tracks: Vec<SurfaceTrack>,
+    next_surface_id: u64,
+    next_cluster_id: u64,
+}
+
+impl Default for SurfaceExtractor {
+    fn default() -> Self {
+        Self::new(SurfaceExtractorConfig::default())
+    }
+}
+
+impl SurfaceExtractor {
+    pub fn new(config: SurfaceExtractorConfig) -> Self {
+        Self {
+            config,
+            temporal_clouds: VecDeque::new(),
+            tracks: Vec::new(),
+            next_surface_id: 1,
+            next_cluster_id: 1,
+        }
+    }
+
+    pub fn process(
+        &mut self,
+        kinect: &KinectSense,
+        robot_pose: Pose2,
+        t_ms: u64,
+    ) -> SurfaceExtractorOutput {
+        let raw_cloud = depth_to_world_points(kinect, robot_pose, &self.config);
+        let downsampled = voxel_downsample(&raw_cloud, self.config.voxel_size_m);
+        self.temporal_clouds.push_back(downsampled.clone());
+        while self.temporal_clouds.len() > self.config.temporal_frames.max(1) {
+            self.temporal_clouds.pop_front();
+        }
+        let smoothed = temporal_voxel_average(&self.temporal_clouds, self.config.voxel_size_m);
+        let filtered = remove_outliers(
+            &smoothed,
+            self.config.outlier_radius_m,
+            self.config.outlier_min_neighbors,
+        );
+        let (plane_observations, leftover_points) = extract_planes(&filtered, &self.config);
+        let stable_surfaces = self.update_tracks(&plane_observations, t_ms);
+        let floor = stable_surfaces
+            .iter()
+            .find(|surface| surface.kind == SurfaceKind::Floor)
+            .cloned();
+        let obstacle_grid = project_obstacles(&filtered, floor.as_ref(), robot_pose, &self.config);
+        let clusters = self.cluster_leftovers(&leftover_points, floor.as_ref());
+        let scene_graph = scene_graph(&stable_surfaces, floor.clone(), &clusters, &obstacle_grid);
+        let diagnostics = SurfaceExtractorDiagnostics {
+            raw_points: raw_cloud.len(),
+            downsampled_points: downsampled.len(),
+            smoothed_points: smoothed.len(),
+            filtered_points: filtered.len(),
+            plane_points: plane_observations
+                .iter()
+                .map(|plane| plane.point_count)
+                .sum(),
+            leftover_points: leftover_points.len(),
+        };
+
+        SurfaceExtractorOutput {
+            raw_cloud,
+            filtered_cloud: filtered,
+            plane_observations,
+            stable_surfaces,
+            floor,
+            obstacle_grid,
+            clusters,
+            scene_graph,
+            diagnostics,
+        }
+    }
+
+    fn update_tracks(&mut self, observations: &[PlaneObservation], t_ms: u64) -> Vec<SurfaceTrack> {
+        let mut matched_tracks = vec![false; self.tracks.len()];
+
+        for observation in observations {
+            let kind = classify_surface(observation, observations);
+            let match_index = self
+                .tracks
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !matched_tracks[*index])
+                .filter_map(|(index, track)| {
+                    track_match_score(track, observation, &self.config).map(|score| (index, score))
+                })
+                .min_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index);
+
+            if let Some(index) = match_index {
+                matched_tracks[index] = true;
+                smooth_track(
+                    &mut self.tracks[index],
+                    observation,
+                    kind,
+                    self.config.track_smoothing_alpha,
+                    self.config.track_seen_gain,
+                    t_ms,
+                );
+            } else {
+                let id = match kind {
+                    SurfaceKind::Floor => "floor".to_string(),
+                    SurfaceKind::VerticalPlane => format!("wall_{}", self.next_surface_id),
+                    SurfaceKind::HorizontalPlane => format!("surface_{}", self.next_surface_id),
+                    SurfaceKind::UnknownPlane => format!("plane_{}", self.next_surface_id),
+                };
+                self.next_surface_id += 1;
+                self.tracks.push(SurfaceTrack {
+                    id,
+                    kind,
+                    normal: observation.normal,
+                    centroid: observation.centroid,
+                    distance_from_origin_m: observation.distance_from_origin_m,
+                    bounds_2d: observation.bounds_2d,
+                    confidence: observation.confidence.clamp(0.15, 0.55),
+                    first_seen_ms: t_ms,
+                    last_seen_ms: t_ms,
+                    seen_count: 1,
+                    missing_count: 0,
+                });
+                matched_tracks.push(true);
+            }
+        }
+
+        for (index, track) in self.tracks.iter_mut().enumerate() {
+            if !matched_tracks.get(index).copied().unwrap_or(false) {
+                track.confidence = (track.confidence - self.config.track_missing_decay).max(0.0);
+                track.missing_count += 1;
+            }
+        }
+        self.tracks.retain(|track| track.confidence > 0.02);
+        self.tracks.clone()
+    }
+
+    fn cluster_leftovers(
+        &mut self,
+        points: &[Point3],
+        floor: Option<&SurfaceTrack>,
+    ) -> Vec<ClusterObservation> {
+        let mut clusters = euclidean_clusters(
+            points,
+            self.config.cluster_distance_m,
+            self.config.min_cluster_points,
+        );
+        for cluster in &mut clusters {
+            cluster.id = format!("cluster_{}", self.next_cluster_id);
+            self.next_cluster_id += 1;
+            cluster.above_surface_id = floor.map(|floor| floor.id.clone());
+        }
+        clusters
+    }
+}
+
+fn depth_to_world_points(
+    kinect: &KinectSense,
+    robot_pose: Pose2,
+    config: &SurfaceExtractorConfig,
+) -> Vec<Point3> {
+    let Some(frame) = DepthProjection::from_kinect(kinect, config) else {
+        return Vec::new();
+    };
+    let mut points = Vec::new();
+    for (index, depth) in kinect.depth_m.iter().enumerate() {
+        if !depth.is_finite() || *depth <= 0.0 {
+            continue;
+        }
+        if *depth < frame.min_depth_m || *depth > frame.max_depth_m {
+            continue;
+        }
+        let u = (index % frame.width) as f32;
+        let v = (index / frame.width) as f32;
+        let z = *depth;
+        let camera = Vec3::new(
+            (u - frame.cx) * z / frame.fx,
+            (v - frame.cy) * z / frame.fy,
+            z,
+        );
+        let robot = Vec3::new(camera.z, -camera.x, -camera.y);
+        points.push(Point3 {
+            position: robot_to_world(robot, robot_pose),
+        });
+    }
+    points
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DepthProjection {
+    width: usize,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    min_depth_m: f32,
+    max_depth_m: f32,
+}
+
+impl DepthProjection {
+    fn from_kinect(kinect: &KinectSense, config: &SurfaceExtractorConfig) -> Option<Self> {
+        let width = usize::try_from(kinect.depth_width).ok()?;
+        let height = usize::try_from(kinect.depth_height).ok()?;
+        if width == 0 || height == 0 || width.checked_mul(height)? != kinect.depth_m.len() {
+            return None;
+        }
+        Some(Self {
+            width,
+            fx: positive_or(kinect.depth_fx, 594.0),
+            fy: positive_or(kinect.depth_fy, 591.0),
+            cx: positive_or(kinect.depth_cx, (width as f32 - 1.0) * 0.5),
+            cy: positive_or(kinect.depth_cy, (height as f32 - 1.0) * 0.5),
+            min_depth_m: positive_or(kinect.min_depth_m, config.min_depth_m),
+            max_depth_m: positive_or(kinect.max_depth_m, config.max_depth_m),
+        })
+    }
+}
+
+fn positive_or(value: f32, fallback: f32) -> f32 {
+    if value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn robot_to_world(point: Vec3, pose: Pose2) -> Vec3 {
+    let (sin, cos) = pose.heading_rad.sin_cos();
+    Vec3::new(
+        pose.x_m + point.x * cos - point.y * sin,
+        pose.y_m + point.x * sin + point.y * cos,
+        point.z,
+    )
+}
+
+fn world_to_robot(point: Vec3, pose: Pose2) -> Vec3 {
+    let dx = point.x - pose.x_m;
+    let dy = point.y - pose.y_m;
+    let (sin, cos) = pose.heading_rad.sin_cos();
+    Vec3::new(dx * cos + dy * sin, -dx * sin + dy * cos, point.z)
+}
+
+fn voxel_downsample(points: &[Point3], voxel_size_m: f32) -> Vec<Point3> {
+    let mut voxels: HashMap<(i32, i32, i32), (Vec3, usize)> = HashMap::new();
+    for point in points {
+        let key = voxel_key(point.position, voxel_size_m);
+        let entry = voxels.entry(key).or_insert((Vec3::default(), 0));
+        entry.0 += point.position;
+        entry.1 += 1;
+    }
+    voxels
+        .into_values()
+        .map(|(sum, count)| Point3 {
+            position: sum / count as f32,
+        })
+        .collect()
+}
+
+fn temporal_voxel_average(clouds: &VecDeque<Vec<Point3>>, voxel_size_m: f32) -> Vec<Point3> {
+    let mut voxels: HashMap<(i32, i32, i32), (Vec3, usize)> = HashMap::new();
+    for cloud in clouds {
+        for point in cloud {
+            let key = voxel_key(point.position, voxel_size_m);
+            let entry = voxels.entry(key).or_insert((Vec3::default(), 0));
+            entry.0 += point.position;
+            entry.1 += 1;
+        }
+    }
+    voxels
+        .into_values()
+        .map(|(sum, count)| Point3 {
+            position: sum / count as f32,
+        })
+        .collect()
+}
+
+fn voxel_key(point: Vec3, voxel_size_m: f32) -> (i32, i32, i32) {
+    let scale = voxel_size_m.max(0.01);
+    (
+        (point.x / scale).floor() as i32,
+        (point.y / scale).floor() as i32,
+        (point.z / scale).floor() as i32,
+    )
+}
+
+fn remove_outliers(points: &[Point3], radius_m: f32, min_neighbors: usize) -> Vec<Point3> {
+    if min_neighbors == 0 || points.len() <= min_neighbors {
+        return points.to_vec();
+    }
+    let radius_sq = radius_m * radius_m;
+    points
+        .iter()
+        .enumerate()
+        .filter(|(index, point)| {
+            points
+                .iter()
+                .enumerate()
+                .filter(|(other_index, other)| {
+                    index != other_index
+                        && (point.position - other.position).dot(point.position - other.position)
+                            <= radius_sq
+                })
+                .take(min_neighbors)
+                .count()
+                >= min_neighbors
+        })
+        .map(|(_, point)| *point)
+        .collect()
+}
+
+fn extract_planes(
+    points: &[Point3],
+    config: &SurfaceExtractorConfig,
+) -> (Vec<PlaneObservation>, Vec<Point3>) {
+    let mut remaining = points.to_vec();
+    let mut planes = Vec::new();
+    for _ in 0..config.max_planes {
+        if remaining.len() < config.min_plane_points {
+            break;
+        }
+        let Some(model) = best_plane_model(&remaining, config) else {
+            break;
+        };
+        let (inliers, outliers): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|point| {
+            plane_distance(model, point.position) <= config.plane_distance_threshold_m
+        });
+        if inliers.len() < config.min_plane_points {
+            remaining = outliers;
+            break;
+        }
+        planes.push(plane_observation(model, &inliers, points.len()));
+        remaining = outliers;
+    }
+    (planes, remaining)
+}
+
+fn best_plane_model(points: &[Point3], config: &SurfaceExtractorConfig) -> Option<(Vec3, f32)> {
+    let mut best: Option<((Vec3, f32), usize)> = None;
+    let n = points.len();
+    let step_a = (n / 17).max(1);
+    let step_b = (n / 11).max(2);
+    let step_c = (n / 7).max(3);
+    for a in (0..n).step_by(step_a) {
+        for b in ((a + step_b)..n).step_by(step_b) {
+            for c in ((b + step_c)..n).step_by(step_c) {
+                let Some(model) =
+                    plane_from_points(points[a].position, points[b].position, points[c].position)
+                else {
+                    continue;
+                };
+                let inliers = points
+                    .iter()
+                    .filter(|point| {
+                        plane_distance(model, point.position) <= config.plane_distance_threshold_m
+                    })
+                    .count();
+                if best
+                    .as_ref()
+                    .map_or(true, |(_, best_count)| inliers > *best_count)
+                {
+                    best = Some((model, inliers));
+                }
+            }
+        }
+    }
+    best.map(|(model, _)| model)
+}
+
+fn plane_from_points(a: Vec3, b: Vec3, c: Vec3) -> Option<(Vec3, f32)> {
+    let normal = canonical_normal((b - a).cross(c - a).normalized()?);
+    let distance = -normal.dot(a);
+    Some((normal, distance))
+}
+
+fn canonical_normal(mut normal: Vec3) -> Vec3 {
+    let ax = normal.x.abs();
+    let ay = normal.y.abs();
+    let az = normal.z.abs();
+    let dominant = if ax >= ay && ax >= az {
+        normal.x
+    } else if ay >= ax && ay >= az {
+        normal.y
+    } else {
+        normal.z
+    };
+    if dominant < 0.0 {
+        normal = normal * -1.0;
+    }
+    normal
+}
+
+fn plane_distance((normal, distance): (Vec3, f32), point: Vec3) -> f32 {
+    (normal.dot(point) + distance).abs()
+}
+
+fn plane_observation(
+    (normal, distance): (Vec3, f32),
+    inliers: &[Point3],
+    total_points: usize,
+) -> PlaneObservation {
+    let centroid = inliers
+        .iter()
+        .fold(Vec3::default(), |sum, point| sum + point.position)
+        / inliers.len() as f32;
+    PlaneObservation {
+        normal,
+        centroid,
+        distance_from_origin_m: distance,
+        bounds_2d: plane_bounds(normal, centroid, inliers),
+        point_count: inliers.len(),
+        confidence: (inliers.len() as f32 / total_points.max(1) as f32).clamp(0.0, 1.0),
+    }
+}
+
+fn plane_bounds(normal: Vec3, centroid: Vec3, points: &[Point3]) -> Bounds2 {
+    let basis_a = if normal.z.abs() < 0.9 {
+        normal.cross(Vec3::new(0.0, 0.0, 1.0))
+    } else {
+        normal.cross(Vec3::new(1.0, 0.0, 0.0))
+    }
+    .normalized()
+    .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+    let basis_b = normal
+        .cross(basis_a)
+        .normalized()
+        .unwrap_or(Vec3::new(0.0, 1.0, 0.0));
+    let mut bounds = Bounds2 {
+        min_u: f32::INFINITY,
+        max_u: f32::NEG_INFINITY,
+        min_v: f32::INFINITY,
+        max_v: f32::NEG_INFINITY,
+    };
+    for point in points {
+        let relative = point.position - centroid;
+        let u = relative.dot(basis_a);
+        let v = relative.dot(basis_b);
+        bounds.min_u = bounds.min_u.min(u);
+        bounds.max_u = bounds.max_u.max(u);
+        bounds.min_v = bounds.min_v.min(v);
+        bounds.max_v = bounds.max_v.max(v);
+    }
+    bounds
+}
+
+fn classify_surface(
+    observation: &PlaneObservation,
+    observations: &[PlaneObservation],
+) -> SurfaceKind {
+    if observation.normal.z.abs() > 0.88 {
+        let lowest_horizontal = observations
+            .iter()
+            .filter(|plane| plane.normal.z.abs() > 0.88)
+            .map(|plane| plane.centroid.z)
+            .fold(f32::INFINITY, f32::min);
+        if observation.centroid.z <= lowest_horizontal + 0.08 {
+            SurfaceKind::Floor
+        } else {
+            SurfaceKind::HorizontalPlane
+        }
+    } else if observation.normal.z.abs() < 0.35 {
+        SurfaceKind::VerticalPlane
+    } else {
+        SurfaceKind::UnknownPlane
+    }
+}
+
+fn track_match_score(
+    track: &SurfaceTrack,
+    observation: &PlaneObservation,
+    config: &SurfaceExtractorConfig,
+) -> Option<f32> {
+    let normal_dot = track.normal.dot(observation.normal).abs().clamp(0.0, 1.0);
+    let normal_angle = normal_dot.acos();
+    let distance_delta = (track.distance_from_origin_m - observation.distance_from_origin_m).abs();
+    let centroid_delta = track.centroid.distance(observation.centroid);
+    if normal_angle > config.track_normal_max_angle_rad
+        || distance_delta > config.track_distance_threshold_m
+        || centroid_delta > config.track_centroid_threshold_m
+    {
+        None
+    } else {
+        Some(normal_angle + distance_delta + centroid_delta)
+    }
+}
+
+fn smooth_track(
+    track: &mut SurfaceTrack,
+    observation: &PlaneObservation,
+    kind: SurfaceKind,
+    alpha: f32,
+    seen_gain: f32,
+    t_ms: u64,
+) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    track.kind = if track.kind == SurfaceKind::Floor {
+        SurfaceKind::Floor
+    } else {
+        kind
+    };
+    track.normal = (track.normal * (1.0 - alpha) + observation.normal * alpha)
+        .normalized()
+        .unwrap_or(observation.normal);
+    track.centroid = track.centroid * (1.0 - alpha) + observation.centroid * alpha;
+    track.distance_from_origin_m =
+        track.distance_from_origin_m * (1.0 - alpha) + observation.distance_from_origin_m * alpha;
+    track.bounds_2d = observation.bounds_2d;
+    track.confidence = (track.confidence + seen_gain + observation.confidence * 0.1).min(1.0);
+    track.last_seen_ms = t_ms;
+    track.seen_count += 1;
+    track.missing_count = 0;
+}
+
+fn project_obstacles(
+    points: &[Point3],
+    floor: Option<&SurfaceTrack>,
+    robot_pose: Pose2,
+    config: &SurfaceExtractorConfig,
+) -> OccupancyGrid {
+    let floor_z = floor.map_or(0.0, |floor| floor.centroid.z);
+    let mut cells = HashMap::<(i32, i32), OccupancyState>::new();
+    for point in points {
+        let local = world_to_robot(point.position, robot_pose);
+        if local.x.abs() > config.occupancy_half_extent_m
+            || local.y.abs() > config.occupancy_half_extent_m
+        {
+            continue;
+        }
+        let point_key = occupancy_key(local, config.occupancy_resolution_m);
+        let height = point.position.z - floor_z;
+        if height < config.obstacle_min_height_m {
+            cells.entry(point_key).or_insert(OccupancyState::Free);
+            continue;
+        }
+        if height > config.obstacle_max_height_m {
+            continue;
+        }
+        mark_free_ray(&mut cells, local, config.occupancy_resolution_m);
+        cells.insert(point_key, OccupancyState::Occupied);
+    }
+    OccupancyGrid {
+        resolution_m: config.occupancy_resolution_m,
+        half_extent_m: config.occupancy_half_extent_m,
+        cells: cells
+            .into_iter()
+            .map(|((x, y), state)| OccupancyCell { x, y, state })
+            .collect(),
+    }
+}
+
+fn occupancy_key(point: Vec3, resolution_m: f32) -> (i32, i32) {
+    (
+        (point.x / resolution_m).floor() as i32,
+        (point.y / resolution_m).floor() as i32,
+    )
+}
+
+fn mark_free_ray(cells: &mut HashMap<(i32, i32), OccupancyState>, point: Vec3, resolution_m: f32) {
+    let distance = (point.x * point.x + point.y * point.y).sqrt();
+    let steps = (distance / resolution_m).floor().max(0.0) as usize;
+    if steps == 0 {
+        return;
+    }
+    for step in 0..steps {
+        let t = step as f32 / steps as f32;
+        let key = occupancy_key(Vec3::new(point.x * t, point.y * t, 0.0), resolution_m);
+        cells.entry(key).or_insert(OccupancyState::Free);
+    }
+}
+
+fn euclidean_clusters(
+    points: &[Point3],
+    distance_m: f32,
+    min_points: usize,
+) -> Vec<ClusterObservation> {
+    let mut visited = vec![false; points.len()];
+    let mut clusters = Vec::new();
+    let distance_sq = distance_m * distance_m;
+    for seed in 0..points.len() {
+        if visited[seed] {
+            continue;
+        }
+        let mut stack = vec![seed];
+        let mut members = Vec::new();
+        visited[seed] = true;
+        while let Some(index) = stack.pop() {
+            members.push(index);
+            for other in 0..points.len() {
+                if visited[other] {
+                    continue;
+                }
+                let delta = points[index].position - points[other].position;
+                if delta.dot(delta) <= distance_sq {
+                    visited[other] = true;
+                    stack.push(other);
+                }
+            }
+        }
+        if members.len() >= min_points {
+            clusters.push(cluster_from_members(points, &members));
+        }
+    }
+    clusters
+}
+
+fn cluster_from_members(points: &[Point3], members: &[usize]) -> ClusterObservation {
+    let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut centroid = Vec3::default();
+    for index in members {
+        let position = points[*index].position;
+        centroid += position;
+        min.x = min.x.min(position.x);
+        min.y = min.y.min(position.y);
+        min.z = min.z.min(position.z);
+        max.x = max.x.max(position.x);
+        max.y = max.y.max(position.y);
+        max.z = max.z.max(position.z);
+    }
+    ClusterObservation {
+        id: String::new(),
+        centroid: centroid / members.len() as f32,
+        size_m: max - min,
+        point_count: members.len(),
+        moving: false,
+        above_surface_id: None,
+    }
+}
+
+fn scene_graph(
+    surfaces: &[SurfaceTrack],
+    floor: Option<SurfaceTrack>,
+    clusters: &[ClusterObservation],
+    grid: &OccupancyGrid,
+) -> SceneGraphSummary {
+    SceneGraphSummary {
+        floor,
+        surfaces: surfaces.to_vec(),
+        clusters: clusters.to_vec(),
+        navigation: serde_json::json!({
+            "front_clear_m": clear_distance(grid, 0.0, 0.4),
+            "left_clear_m": clear_distance(grid, 0.6, 1.2),
+            "right_clear_m": clear_distance(grid, -1.2, -0.6),
+            "occupied_cells": grid.cells.iter().filter(|cell| cell.state == OccupancyState::Occupied).count(),
+            "free_cells": grid.cells.iter().filter(|cell| cell.state == OccupancyState::Free).count(),
+        }),
+    }
+}
+
+fn clear_distance(grid: &OccupancyGrid, min_y: f32, max_y: f32) -> Option<f32> {
+    grid.cells
+        .iter()
+        .filter(|cell| cell.state == OccupancyState::Occupied)
+        .filter_map(|cell| {
+            let x = (cell.x as f32 + 0.5) * grid.resolution_m;
+            let y = (cell.y as f32 + 0.5) * grid.resolution_m;
+            if x >= 0.0 && y >= min_y && y <= max_y {
+                Some(x)
+            } else {
+                None
+            }
+        })
+        .min_by(|left, right| left.total_cmp(right))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_and_tracks_a_floor_plane() {
+        let mut extractor = SurfaceExtractor::new(SurfaceExtractorConfig {
+            min_plane_points: 12,
+            outlier_min_neighbors: 1,
+            ..SurfaceExtractorConfig::default()
+        });
+        let kinect = synthetic_floor_depth(24, 18, 1.2);
+
+        let first = extractor.process(&kinect, Pose2::default(), 1_000);
+        let second = extractor.process(&kinect, Pose2::default(), 1_100);
+
+        assert!(first.diagnostics.raw_points > 0);
+        assert!(second.floor.is_some());
+        assert_eq!(second.floor.as_ref().unwrap().id, "floor");
+        assert!(second.floor.as_ref().unwrap().confidence > first.floor.unwrap().confidence);
+    }
+
+    #[test]
+    fn clusters_leftover_points_after_plane_removal() {
+        let config = SurfaceExtractorConfig {
+            min_plane_points: 8,
+            min_cluster_points: 3,
+            cluster_distance_m: 0.35,
+            ..SurfaceExtractorConfig::default()
+        };
+        let mut points = Vec::new();
+        for x in 0..5 {
+            for y in 0..5 {
+                points.push(Point3 {
+                    position: Vec3::new(x as f32 * 0.1, y as f32 * 0.1, 0.0),
+                });
+            }
+        }
+        for z in 0..4 {
+            points.push(Point3 {
+                position: Vec3::new(1.0, 1.0, 0.3 + z as f32 * 0.05),
+            });
+        }
+        let (_planes, leftovers) = extract_planes(&points, &config);
+        let clusters = euclidean_clusters(&leftovers, config.cluster_distance_m, 3);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].point_count, 4);
+    }
+
+    fn synthetic_floor_depth(width: u32, height: u32, camera_height_m: f32) -> KinectSense {
+        let fx = 80.0;
+        let fy = 20.0;
+        let cx = (width as f32 - 1.0) * 0.5;
+        let cy = (height as f32 - 1.0) * 0.5;
+        let mut depth_m = Vec::new();
+        for v in 0..height {
+            for _u in 0..width {
+                let ray_y = (v as f32 - cy) / fy;
+                if ray_y <= 0.05 {
+                    depth_m.push(0.0);
+                } else {
+                    depth_m.push(camera_height_m / ray_y);
+                }
+            }
+        }
+        KinectSense {
+            depth_m,
+            depth_width: width,
+            depth_height: height,
+            depth_fx: fx,
+            depth_fy: fy,
+            depth_cx: cx,
+            depth_cy: cy,
+            min_depth_m: 0.1,
+            max_depth_m: 8.0,
+            ..KinectSense::default()
+        }
+    }
+}
