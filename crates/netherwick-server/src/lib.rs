@@ -4794,7 +4794,9 @@ function updateScene(packet){
   if(surface){
     const nav = surface.scene_graph?.navigation || {};
     const movingClusters = (surface.clusters || []).filter(cluster => cluster.moving).length;
-    fields.surfaces.textContent = `${surface.stable_surfaces?.length || 0} stable / ${surface.plane_observations?.length || 0} planes / ${surface.clusters?.length || 0} clusters (${movingClusters} moving) | front ${nav.front_clear_m == null ? '-' : fmt(nav.front_clear_m)}m`;
+    const hint = surface.diagnostics?.calibration_hint;
+    const calText = hint ? ` | floor z ${fmt(hint.floor_height_error_m, 2)}m tilt ${fmt(hint.floor_tilt_rad * 180 / Math.PI, 1)}°` : '';
+    fields.surfaces.textContent = `${surface.stable_surfaces?.length || 0} stable / ${surface.plane_observations?.length || 0} planes / ${surface.clusters?.length || 0} clusters (${movingClusters} moving) | front ${nav.front_clear_m == null ? '-' : fmt(nav.front_clear_m)}m${calText}`;
   }else{
     fields.surfaces.textContent = '-';
   }

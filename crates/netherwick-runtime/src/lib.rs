@@ -2606,6 +2606,7 @@ where
                     "surfaces": surface_output.stable_surfaces,
                     "clusters": surface_output.clusters,
                     "navigation": surface_output.scene_graph.navigation,
+                    "calibration_hint": surface_output.diagnostics.calibration_hint,
                     "obstacle_grid": {
                         "resolution_m": surface_output.obstacle_grid.resolution_m,
                         "half_extent_m": surface_output.obstacle_grid.half_extent_m,
@@ -5704,8 +5705,9 @@ fn summarize_surface_scene_graph(value: &serde_json::Value) -> String {
         .get("navigation")
         .and_then(|navigation| navigation.get("right_clear_m"))
         .and_then(|clearance| clearance.as_f64());
+    let calibration = summarize_surface_calibration_hint(value.get("calibration_hint"));
     format!(
-        "I perceive persistent geometry: floor confidence {}, {} stable surfaces, {} leftover clusters ({} moving; hints: {}), and navigation clearance front {}, left {}, right {}.",
+        "I perceive persistent geometry: floor confidence {}, {} stable surfaces, {} leftover clusters ({} moving; hints: {}), navigation clearance front {}, left {}, right {}, and calibration {}.",
         format_optional_magnitude(floor_confidence, ""),
         surfaces,
         clusters,
@@ -5717,8 +5719,30 @@ fn summarize_surface_scene_graph(value: &serde_json::Value) -> String {
         },
         format_optional_magnitude(front_clear_m, "m"),
         format_optional_magnitude(left_clear_m, "m"),
-        format_optional_magnitude(right_clear_m, "m")
+        format_optional_magnitude(right_clear_m, "m"),
+        calibration
     )
+}
+
+fn summarize_surface_calibration_hint(value: Option<&serde_json::Value>) -> String {
+    let Some(value) = value else {
+        return "unknown".to_string();
+    };
+    let height_error = value
+        .get("floor_height_error_m")
+        .and_then(|value| value.as_f64());
+    let tilt_deg = value
+        .get("floor_tilt_rad")
+        .and_then(|value| value.as_f64())
+        .map(|value| value.to_degrees());
+    match (height_error, tilt_deg) {
+        (Some(height), Some(tilt)) => {
+            format!("floor offset {height:.2}m and tilt {tilt:.1} degrees")
+        }
+        (Some(height), None) => format!("floor offset {height:.2}m"),
+        (None, Some(tilt)) => format!("floor tilt {tilt:.1} degrees"),
+        (None, None) => "unknown".to_string(),
+    }
 }
 
 fn format_optional_magnitude(value: Option<f64>, unit: &str) -> String {

@@ -251,6 +251,18 @@ pub struct SurfaceExtractorDiagnostics {
     pub filtered_points: usize,
     pub plane_points: usize,
     pub leftover_points: usize,
+    pub calibration_hint: Option<SurfaceCalibrationHint>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceCalibrationHint {
+    pub floor_confidence: f32,
+    pub floor_height_error_m: f32,
+    pub floor_tilt_rad: f32,
+    pub floor_pitch_error_rad: f32,
+    pub floor_roll_error_rad: f32,
+    pub suggested_depth_height_m: f32,
+    pub suggested_depth_pitch_down_rad: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -363,6 +375,9 @@ impl SurfaceExtractor {
                 .map(|plane| plane.point_count)
                 .sum(),
             leftover_points: leftover_points.len(),
+            calibration_hint: floor
+                .as_ref()
+                .map(|floor| calibration_hint(floor, robot_pose, &self.config)),
         };
 
         SurfaceExtractorOutput {
@@ -633,6 +648,37 @@ fn world_to_robot(point: Vec3, pose: Pose2) -> Vec3 {
     let dy = point.y - pose.y_m;
     let (sin, cos) = pose.heading_rad.sin_cos();
     Vec3::new(dx * cos + dy * sin, -dx * sin + dy * cos, point.z)
+}
+
+fn world_vector_to_robot(vector: Vec3, pose: Pose2) -> Vec3 {
+    let (sin, cos) = pose.heading_rad.sin_cos();
+    Vec3::new(
+        vector.x * cos + vector.y * sin,
+        -vector.x * sin + vector.y * cos,
+        vector.z,
+    )
+}
+
+fn calibration_hint(
+    floor: &SurfaceTrack,
+    robot_pose: Pose2,
+    config: &SurfaceExtractorConfig,
+) -> SurfaceCalibrationHint {
+    let normal_robot = world_vector_to_robot(floor.normal, robot_pose)
+        .normalized()
+        .unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+    let floor_tilt_rad = normal_robot.z.abs().clamp(0.0, 1.0).acos();
+    let floor_pitch_error_rad = normal_robot.x.atan2(normal_robot.z.max(f32::EPSILON));
+    let floor_roll_error_rad = normal_robot.y.atan2(normal_robot.z.max(f32::EPSILON));
+    SurfaceCalibrationHint {
+        floor_confidence: floor.confidence,
+        floor_height_error_m: floor.centroid.z,
+        floor_tilt_rad,
+        floor_pitch_error_rad,
+        floor_roll_error_rad,
+        suggested_depth_height_m: (config.depth_camera_height_m - floor.centroid.z).max(0.0),
+        suggested_depth_pitch_down_rad: config.depth_camera_pitch_down_rad + floor_pitch_error_rad,
+    }
 }
 
 fn voxel_downsample(points: &[Point3], voxel_size_m: f32) -> Vec<Point3> {
@@ -1187,6 +1233,34 @@ mod tests {
 
         assert!(center_ray.x > 1.0);
         assert!(center_ray.z < config.depth_camera_height_m);
+    }
+
+    #[test]
+    fn floor_calibration_hint_reports_height_and_tilt() {
+        let config = SurfaceExtractorConfig {
+            depth_camera_height_m: 0.3,
+            depth_camera_pitch_down_rad: 0.0,
+            ..SurfaceExtractorConfig::default()
+        };
+        let floor = SurfaceTrack {
+            id: "floor".to_string(),
+            kind: SurfaceKind::Floor,
+            normal: Vec3::new(0.1, 0.0, 0.995).normalized().unwrap(),
+            centroid: Vec3::new(0.0, 0.0, 0.05),
+            distance_from_origin_m: 0.0,
+            bounds_2d: Bounds2::default(),
+            confidence: 0.8,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            seen_count: 1,
+            missing_count: 0,
+        };
+
+        let hint = calibration_hint(&floor, Pose2::default(), &config);
+
+        assert!(hint.floor_tilt_rad > 0.0);
+        assert_eq!(hint.floor_height_error_m, 0.05);
+        assert!(hint.suggested_depth_height_m < config.depth_camera_height_m);
     }
 
     #[test]
