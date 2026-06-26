@@ -125,7 +125,7 @@ just run eval-scenario \
   --memory-report
 ```
 
-The held-out behavior reports must show `model_better_than_hardcoded: true` before checkpoints are registered as shadow candidates. The combined shadow scenario report should preserve baseline success, collision, and veto metrics. The model-assisted scenario report is only a candidate-scoring gate: it may choose among typed actions, but contact and active `sim.stuck` recovery still yield to the baseline conductor. Close range alone should influence candidate scores, not force a guard yield. Do not use `danger-mode model-infer`, `charge-mode model-infer`, or `action-value-mode model-infer` for the golden loop.
+The held-out behavior reports must show `model_better_than_hardcoded: true` before checkpoints are registered as shadow candidates. The combined shadow scenario report should preserve baseline success, collision, and veto metrics. The model-assisted scenario report is only a candidate-scoring gate: it may choose among typed actions, and active `sim.stuck` recovery is injected as a scored candidate rather than a hard selector yield. Contact, cliff, wheel-drop, and critical battery still belong to the hard safety path. Do not use `danger-mode model-infer`, `charge-mode model-infer`, or `action-value-mode model-infer` for the golden loop.
 
 Place-memory steering is part of the baseline conductor, not a learned-model privilege. A dangerous current place should turn toward `nearby_best_safe_direction_rad` when available. Low battery with known charger memory should first turn toward `nearby_best_charge_direction_rad`, then approach the charger once roughly aligned. Novel, low-danger places may inspect before default exploration.
 
@@ -146,12 +146,12 @@ The latest 5-episode full-shadow column-trap report has:
   "mean_collisions_per_episode": 4.8,
   "model_fallbacks": 0,
   "action_selector_fallbacks": 0,
-  "action_selector_guard_yields": 415,
+  "action_selector_guard_yields": 0,
   "model_assisted_decisions": 1500
 }
 ```
 
-Interpretation: all requested behavior checkpoints are loading and producing candidate signals. The remaining guard yields are deliberate baseline recovery protection, not missing-model fallbacks. Model-assisted selection now gets authority outside contact or active `sim.stuck` recovery.
+Interpretation: all requested behavior checkpoints are loading and producing candidate signals. Active `sim.stuck` recovery is represented as a scored model-assisted candidate, so the selector no longer needs baseline trap-recovery guard yields in this report. Hard safety still overrides contact, cliff, wheel-drop, and critical battery conditions.
 
 ## Comparing Runs
 
@@ -168,7 +168,7 @@ Run a baseline first with no model checkpoints, then run the same scenario and e
 - `summary.mean_distance_to_charger_final_m`: whether the policy ends closer to dock.
 - `summary.model_fallbacks` and `warnings`: whether requested behavior checkpoints actually ran.
 - `summary.action_selector_fallbacks`: model-assisted selector ticks where at least one candidate score used fallback estimates because a model signal was missing.
-- `summary.action_selector_guard_yields`: model-assisted selector ticks that deliberately yielded to a hardcoded guard such as trap recovery.
+- `summary.action_selector_guard_yields`: model-assisted selector ticks that deliberately yielded to a hardcoded guard. This should stay near zero in the golden loop now that trap recovery is a scored candidate.
 
 Shadow inference never grants a model direct motor authority for safety-critical behavior. Model-controlled modes are limited to the replaceable behavior they configure, and the hardcoded safety layer still filters actions.
 

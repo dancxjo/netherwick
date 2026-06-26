@@ -2772,7 +2772,7 @@ where
             notes.push(format!("LlmActionProposal: proposed {:?}", action));
             proposals.push(action);
         }
-        let action_value_candidates =
+        let mut action_value_candidates =
             action_value_candidate_actions(&proposals, reign_action.as_ref(), &llm_tick);
 
         let mut baseline_action = self.conductor.choose(ConductorInput {
@@ -2790,6 +2790,9 @@ where
         })?;
         if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
             baseline_action = action.clone();
+        }
+        if sim_stuck_active(&now) && is_recovery_locomotion_action(&baseline_action) {
+            push_unique_action(&mut action_value_candidates, baseline_action.clone());
         }
 
         let mut model_predictions = Vec::new();
@@ -4554,9 +4557,10 @@ fn score_action_candidate(
     } else {
         0.0
     };
+    let recovery_bonus = recovery_candidate_bonus(now, action, previous_action);
     let fallback_used =
         signals.danger.is_none() || signals.charge.is_none() || signals.action_value.is_none();
-    let score = (-1.6 * danger) + (1.2 * charge) + action_value + curiosity
+    let score = (-1.6 * danger) + (1.2 * charge) + action_value + curiosity + recovery_bonus
         - (0.8 * collision_risk)
         - low_battery_risk
         - repeat_penalty;
@@ -4606,21 +4610,6 @@ fn select_action_from_scores(
                 selected_score: None,
                 safety_overrode: true,
                 fallback_warnings: fallback_warnings_for_mode(mode),
-            };
-        }
-        if mode == ActionSelectorMode::ModelAssisted
-            && baseline_recovery_guard_active(now, &baseline_action)
-        {
-            return ActionSelectionDecision {
-                mode,
-                candidates,
-                selected_action: Some(baseline_action.clone()),
-                baseline_action: Some(baseline_action),
-                selected_score: None,
-                safety_overrode: false,
-                fallback_warnings: vec![
-                    "model-assisted selector yielded to baseline trap recovery".to_string(),
-                ],
             };
         }
     }
@@ -4688,9 +4677,19 @@ fn fallback_warnings_for_mode(mode: ActionSelectorMode) -> Vec<String> {
     }
 }
 
-fn baseline_recovery_guard_active(now: &Now, baseline_action: &ActionPrimitive) -> bool {
-    let contact = now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall;
-    (contact || sim_stuck_active(now)) && is_recovery_locomotion_action(baseline_action)
+fn recovery_candidate_bonus(
+    now: &Now,
+    action: &ActionPrimitive,
+    baseline_action: Option<&ActionPrimitive>,
+) -> f32 {
+    if !sim_stuck_active(now) || !is_recovery_locomotion_action(action) {
+        return 0.0;
+    }
+    if baseline_action == Some(action) {
+        3.0
+    } else {
+        0.75
+    }
 }
 
 fn is_recovery_locomotion_action(action: &ActionPrimitive) -> bool {
@@ -6077,7 +6076,7 @@ mod tests {
     }
 
     #[test]
-    fn model_assisted_yields_to_active_stuck_recovery() {
+    fn model_assisted_scores_active_stuck_recovery_candidate() {
         let body = BodySense::default();
         let mut now = Now::blank(100, body);
         now.extensions.insert(
@@ -6091,27 +6090,42 @@ mod tests {
             intensity: -0.18,
             duration_ms: 300,
         };
+        let model_signals = CandidateModelSignals {
+            danger: Some(DangerOutput {
+                confidence: 1.0,
+                ..Default::default()
+            }),
+            charge: Some(ChargeOutput {
+                confidence: 1.0,
+                ..Default::default()
+            }),
+            action_value: Some(ActionValueOutput {
+                confidence: 1.0,
+                ..Default::default()
+            }),
+        };
+        let recovery = score_action_candidate(&now, &baseline, model_signals, Some(&baseline));
+        let turn = score_action_candidate(
+            &now,
+            &ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.25,
+                duration_ms: 750,
+            },
+            model_signals,
+            Some(&baseline),
+        );
         let decision = select_action_from_scores(
             ActionSelectorMode::ModelAssisted,
             &now,
             baseline.clone(),
-            vec![ActionSelectionCandidateScore {
-                action: ActionPrimitive::Turn {
-                    direction: TurnDir::Right,
-                    intensity: 0.25,
-                    duration_ms: 750,
-                },
-                score: 10.0,
-                ..ActionSelectionCandidateScore::default()
-            }],
+            vec![turn, recovery],
         );
 
         assert_eq!(decision.selected_action, Some(baseline));
+        assert!(decision.selected_score.unwrap_or_default() > 0.0);
         assert!(!decision.safety_overrode);
-        assert!(decision
-            .fallback_warnings
-            .iter()
-            .any(|warning| warning.contains("baseline trap recovery")));
+        assert!(decision.fallback_warnings.is_empty());
     }
 
     #[test]

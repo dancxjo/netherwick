@@ -7,23 +7,23 @@
   "tick_ms": 100,
   "action_selector_mode": "model-assisted",
   "model_modes": {
-    "action_value": "shadow-infer",
-    "danger": "shadow-infer",
     "ear_next": "off",
     "charge": "shadow-infer",
+    "eye_next": "off",
     "experience": "off",
     "future": "hardcoded",
-    "eye_next": "off"
+    "action_value": "shadow-infer",
+    "danger": "shadow-infer"
   },
   "model_loading": {
     "requested_checkpoints": {
+      "charge": "data/models/charge_golden_charger_v0",
       "action_value": "data/models/action_value_golden_column_v0",
       "danger": "data/models/danger_golden_column_v0",
-      "charge": "data/models/charge_golden_charger_v0",
+      "future": null,
       "eye_next": null,
       "experience": null,
-      "ear_next": null,
-      "future": null
+      "ear_next": null
     },
     "loaded_checkpoints": {
       "charge": "data/models/charge_golden_charger_v0",
@@ -31,13 +31,13 @@
       "danger": "data/models/danger_golden_column_v0"
     },
     "active_modes": {
-      "eye_next": "off",
+      "action_value": "shadow-infer",
       "experience": "off",
+      "eye_next": "off",
       "danger": "shadow-infer",
       "charge": "shadow-infer",
-      "action_value": "shadow-infer",
-      "ear_next": "off",
-      "future": "hardcoded"
+      "future": "hardcoded",
+      "ear_next": "off"
     },
     "blocked_model_infer": [],
     "warnings": []
@@ -56,8 +56,8 @@
     "action_histogram": {
       "TurnLeft": 24,
       "TurnRight": 1156,
-      "Inspect": 47,
-      "Reverse": 273
+      "Reverse": 273,
+      "Inspect": 47
     },
     "wall_cliff_veto_count": 0,
     "escape_progress_score": 0.48510084,
@@ -75,14 +75,14 @@
     "dead_battery_tick": null,
     "distance_after_recovery_m": 0.09200014,
     "mean_safety_interventions": 0.0,
-    "behavior_run_records": 93096,
+    "behavior_run_records": 94389,
     "model_fallbacks": 0,
     "action_selector_fallbacks": 0,
-    "action_selector_guard_yields": 415,
+    "action_selector_guard_yields": 0,
     "model_assisted_decisions": 1500,
     "action_selector_safety_overrides": 24,
-    "mean_chosen_score": -0.0019444067,
-    "mean_candidate_score": -0.18767631
+    "mean_chosen_score": 0.837056,
+    "mean_candidate_score": -0.025730457
   },
   "memory": {
     "places_visited": 2,
@@ -115,10 +115,10 @@
       "final_distance_to_speaker_m": null,
       "distance_traveled_m": 0.898001,
       "action_histogram": {
-        "TurnLeft": 6,
+        "Inspect": 9,
         "TurnRight": 226,
         "Reverse": 59,
-        "Inspect": 9
+        "TurnLeft": 6
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 0.50883436,
@@ -144,14 +144,14 @@
         "Turn { direction: Right, intensity: 0.75, duration_ms: 500 }"
       ],
       "safety_interventions": 0,
-      "behavior_run_records": 18624,
+      "behavior_run_records": 18942,
       "model_fallbacks": 0,
       "model_assisted_decisions": 300,
       "action_selector_safety_overrides": 6,
       "action_selector_fallbacks": 0,
-      "action_selector_guard_yields": 102,
-      "mean_chosen_score": 0.0017494195,
-      "mean_candidate_score": -0.2166151,
+      "action_selector_guard_yields": 0,
+      "mean_chosen_score": 1.0329398,
+      "mean_candidate_score": -0.017497158,
       "ticks_with_eye_frames": 300,
       "ticks_with_ear_features": 0,
       "ticks_with_voice_embeddings": 0,
@@ -197,10 +197,10 @@
       "final_distance_to_speaker_m": null,
       "distance_traveled_m": 0.898001,
       "action_histogram": {
-        "TurnLeft": 6,
-        "TurnRight": 226,
         "Reverse": 59,
-        "Inspect": 9
+        "TurnRight": 226,
+        "Inspect": 9,
+        "TurnLeft": 6
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 0.50883436,
@@ -226,14 +226,14 @@
         "Turn { direction: Right, intensity: 0.75, duration_ms: 500 }"
       ],
       "safety_interventions": 0,
-      "behavior_run_records": 18624,
+      "behavior_run_records": 18942,
       "model_fallbacks": 0,
       "model_assisted_decisions": 300,
       "action_selector_safety_overrides": 6,
       "action_selector_fallbacks": 0,
-      "action_selector_guard_yields": 102,
-      "mean_chosen_score": 0.0017494195,
-      "mean_candidate_score": -0.2166151,
+      "action_selector_guard_yields": 0,
+      "mean_chosen_score": 1.0329398,
+      "mean_candidate_score": -0.017497158,
       "ticks_with_eye_frames": 300,
       "ticks_with_ear_features": 0,
       "ticks_with_voice_embeddings": 0,
@@ -280,9 +280,9 @@
       "distance_traveled_m": 0.898001,
       "action_histogram": {
         "Inspect": 9,
-        "Reverse": 59,
         "TurnRight": 226,
-        "TurnLeft": 6
+        "TurnLeft": 6,
+        "Reverse": 59
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 0.50883436,
@@ -308,14 +308,14 @@
         "Turn { direction: Right, intensity: 0.75, duration_ms: 500 }"
       ],
       "safety_interventions": 0,
-      "behavior_run_records": 18624,
+      "behavior_run_records": 18942,
       "model_fallbacks": 0,
       "model_assisted_decisions": 300,
       "action_selector_safety_overrides": 6,
       "action_selector_fallbacks": 0,
-      "action_selector_guard_yields": 102,
-      "mean_chosen_score": 0.0017494195,
-      "mean_candidate_score": -0.2166151,
+      "action_selector_guard_yields": 0,
+      "mean_chosen_score": 1.0329398,
+      "mean_candidate_score": -0.017497158,
       "ticks_with_eye_frames": 300,
       "ticks_with_ear_features": 0,
       "ticks_with_voice_embeddings": 0,
@@ -361,10 +361,10 @@
       "final_distance_to_speaker_m": null,
       "distance_traveled_m": 0.898001,
       "action_histogram": {
+        "TurnLeft": 6,
         "Inspect": 9,
-        "Reverse": 59,
         "TurnRight": 226,
-        "TurnLeft": 6
+        "Reverse": 59
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 0.50883436,
@@ -390,14 +390,14 @@
         "Turn { direction: Right, intensity: 0.75, duration_ms: 500 }"
       ],
       "safety_interventions": 0,
-      "behavior_run_records": 18624,
+      "behavior_run_records": 18942,
       "model_fallbacks": 0,
       "model_assisted_decisions": 300,
       "action_selector_safety_overrides": 6,
       "action_selector_fallbacks": 0,
-      "action_selector_guard_yields": 102,
-      "mean_chosen_score": 0.0012382371,
-      "mean_candidate_score": -0.21662392,
+      "action_selector_guard_yields": 0,
+      "mean_chosen_score": 1.0325582,
+      "mean_candidate_score": -0.017511183,
       "ticks_with_eye_frames": 300,
       "ticks_with_ear_features": 0,
       "ticks_with_voice_embeddings": 0,
@@ -443,9 +443,9 @@
       "final_distance_to_speaker_m": null,
       "distance_traveled_m": 0.46400008,
       "action_histogram": {
-        "Reverse": 37,
+        "TurnRight": 252,
         "Inspect": 11,
-        "TurnRight": 252
+        "Reverse": 37
       },
       "wall_cliff_veto_count": 0,
       "escape_progress_score": 0.3901668,
@@ -471,14 +471,14 @@
         "Turn { direction: Right, intensity: 0.75, duration_ms: 500 }"
       ],
       "safety_interventions": 0,
-      "behavior_run_records": 18600,
+      "behavior_run_records": 18621,
       "model_fallbacks": 0,
       "model_assisted_decisions": 300,
       "action_selector_safety_overrides": 0,
       "action_selector_fallbacks": 0,
-      "action_selector_guard_yields": 7,
-      "mean_chosen_score": -0.01620853,
-      "mean_candidate_score": -0.071912356,
+      "action_selector_guard_yields": 0,
+      "mean_chosen_score": 0.053902544,
+      "mean_candidate_score": -0.058649637,
       "ticks_with_eye_frames": 300,
       "ticks_with_ear_features": 0,
       "ticks_with_voice_embeddings": 0,
