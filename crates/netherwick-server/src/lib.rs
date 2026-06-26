@@ -3539,9 +3539,13 @@ const learningStatus = document.getElementById('learning-status');
 const learningApply = document.getElementById('learning-apply');
 const learningChecks = Array.from(document.querySelectorAll('#learning-behaviors input[type="checkbox"]'));
 const cockpitHeldKeys = new Set();
+const COCKPIT_TTL_MS = 300;
+const COCKPIT_REFRESH_MS = 220;
 const traceState = {poses: [], events: [], occupied: new Map(), free: new Map()};
 let cockpitAvailable = false;
 let cockpitArmed = false;
+let cockpitHoldKind = null;
+let cockpitHoldTimer = null;
 
 // Initialize Babylon Engine & Scene
 const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
@@ -4154,7 +4158,7 @@ function postWebReign(command, ttl_ms, label, priority=.95){
 }
 
 function cockpitCommand(kind){
-  const duration_ms = 300;
+  const duration_ms = COCKPIT_TTL_MS;
   if(kind === 'forward') return {type:'Go', intensity:.12, duration_ms};
   if(kind === 'back') return {type:'Reverse', intensity:.10, duration_ms};
   if(kind === 'left') return {type:'Turn', direction:'Left', intensity:.20, duration_ms};
@@ -4163,7 +4167,7 @@ function cockpitCommand(kind){
 }
 
 function sendCockpitStop(){
-  return postWebReign({type:'Stop'}, 300, 'hardware stop', 1);
+  return postWebReign({type:'Stop'}, COCKPIT_TTL_MS, 'hardware stop', 1);
 }
 
 function sendCockpit(kind){
@@ -4172,7 +4176,32 @@ function sendCockpit(kind){
     hardwareState.textContent = cockpitAvailable ? 'disarmed' : 'hardware cockpit unavailable';
     return Promise.resolve();
   }
-  return postWebReign(cockpitCommand(kind), 300, `hardware ${kind}`, 1);
+  return postWebReign(cockpitCommand(kind), COCKPIT_TTL_MS, `hardware ${kind}`, 1);
+}
+
+function startCockpitHold(kind){
+  if(kind === 'stop'){
+    endCockpitHold(false);
+    return sendCockpitStop();
+  }
+  if(cockpitHoldKind === kind && cockpitHoldTimer) return Promise.resolve();
+  endCockpitHold(false);
+  cockpitHoldKind = kind;
+  sendCockpit(kind);
+  cockpitHoldTimer = setInterval(() => {
+    if(cockpitHoldKind) sendCockpit(cockpitHoldKind);
+  }, COCKPIT_REFRESH_MS);
+  return Promise.resolve();
+}
+
+function endCockpitHold(sendStop=true){
+  cockpitHoldKind = null;
+  if(cockpitHoldTimer){
+    clearInterval(cockpitHoldTimer);
+    cockpitHoldTimer = null;
+  }
+  if(sendStop) return sendCockpitStop();
+  return Promise.resolve();
 }
 
 function keyCockpitKind(key){
@@ -4181,6 +4210,14 @@ function keyCockpitKind(key){
   if(key === 'a' || key === 'ArrowLeft') return 'left';
   if(key === 'd' || key === 'ArrowRight') return 'right';
   if(key === ' ') return 'stop';
+  return null;
+}
+
+function heldCockpitKind(){
+  for(const key of Array.from(cockpitHeldKeys).reverse()){
+    const kind = keyCockpitKind(key);
+    if(kind && kind !== 'stop') return kind;
+  }
   return null;
 }
 
@@ -4222,6 +4259,7 @@ async function setHardwareArmed(armed){
 
 function disarmHardwareOnExit(){
   cockpitHeldKeys.clear();
+  endCockpitHold(false);
   if(navigator.sendBeacon){
     const body = new Blob([JSON.stringify({armed:false})], {type:'application/json'});
     navigator.sendBeacon('/reign/hardware-arm', body);
@@ -4392,13 +4430,13 @@ hardwareArm.addEventListener('change', () => setHardwareArmed(hardwareArm.checke
 cockpitButtons.forEach(button => {
   const kind = button.dataset.cockpit;
   button.addEventListener('pointerdown', event => {
-    sendCockpit(kind);
+    startCockpitHold(kind);
     event.preventDefault();
   });
-  button.addEventListener('pointerup', () => sendCockpitStop());
-  button.addEventListener('pointercancel', () => sendCockpitStop());
+  button.addEventListener('pointerup', () => endCockpitHold());
+  button.addEventListener('pointercancel', () => endCockpitHold());
   button.addEventListener('mouseleave', event => {
-    if(event.buttons) sendCockpitStop();
+    if(event.buttons) endCockpitHold();
   });
 });
 window.addEventListener('keydown', event => {
@@ -4408,21 +4446,24 @@ window.addEventListener('keydown', event => {
   event.preventDefault();
   if(kind === 'stop'){
     cockpitHeldKeys.clear();
+    endCockpitHold(false);
     sendCockpitStop();
     return;
   }
   cockpitHeldKeys.add(event.key);
-  sendCockpit(kind);
+  startCockpitHold(kind);
 });
 window.addEventListener('keyup', event => {
   const kind = keyCockpitKind(event.key);
   if(!kind) return;
   cockpitHeldKeys.delete(event.key);
-  sendCockpitStop();
+  const nextKind = heldCockpitKind();
+  if(nextKind) startCockpitHold(nextKind);
+  else endCockpitHold();
 });
 window.addEventListener('blur', () => {
   cockpitHeldKeys.clear();
-  sendCockpitStop();
+  endCockpitHold();
 });
 window.addEventListener('pagehide', disarmHardwareOnExit);
 window.addEventListener('beforeunload', disarmHardwareOnExit);
@@ -5483,6 +5524,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hardware_armed_drive_uses_cautious_ttl_and_clamps_command() {
+        let state = hardware_reign_state_with_snapshot(recent_snapshot());
+        let _ = post_hardware_arm(
+            State(state.clone()),
+            Json(HardwareArmRequest { armed: true }),
+        )
+        .await
+        .unwrap();
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Go {
+                intensity: 0.9,
+                duration_ms: 5_000,
+            },
+            priority: 1.0,
+            ttl_ms: Some(5_000),
+            note: None,
+            source: Some(ReignSource::WebRemote),
+        };
+
+        let Json(input) = post_reign_command(State(state), Json(request))
+            .await
+            .unwrap();
+
+        assert_eq!(input.source, ReignSource::WebRemote);
+        assert_eq!(input.mode, ReignMode::Direct);
+        assert_eq!(
+            input.expires_at_ms - input.issued_at_ms,
+            HARDWARE_TTL_MAX_MS
+        );
+        assert!(matches!(
+            input.command,
+            ReignCommand::Go {
+                intensity,
+                duration_ms
+            } if intensity <= HARDWARE_MAX_FORWARD_INTENSITY && duration_ms == HARDWARE_TTL_MAX_MS
+        ));
+    }
+
+    #[tokio::test]
     async fn hardware_drive_rejected_on_cliff_even_when_armed() {
         let mut snapshot = recent_snapshot();
         snapshot.body.flags.cliff_front_left = true;
@@ -5926,6 +6007,12 @@ mod tests {
         assert!(page.contains("window.addEventListener('keyup'"));
         assert!(page.contains("window.addEventListener('pagehide'"));
         assert!(page.contains("navigator.sendBeacon"));
+        assert!(page.contains("const COCKPIT_TTL_MS = 300"));
+        assert!(page.contains("const COCKPIT_REFRESH_MS = 220"));
+        assert!(page.contains("function startCockpitHold"));
+        assert!(page.contains("function endCockpitHold"));
+        assert!(page.contains("setInterval(() =>"));
+        assert!(page.contains("'WebRemote'"));
         assert!(page.contains("function projectRangeBeam"));
         assert!(page.contains("Odometry/range trace, not SLAM."));
         assert!(page.contains("createDefaultXRExperienceAsync"));
