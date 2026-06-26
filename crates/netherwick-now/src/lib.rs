@@ -711,6 +711,24 @@ pub struct KinectSense {
     pub schema_version: u32,
     pub color_features: Vec<Vec<f32>>,
     pub depth_m: Vec<f32>,
+    #[serde(default)]
+    pub depth_width: u32,
+    #[serde(default)]
+    pub depth_height: u32,
+    #[serde(default)]
+    pub depth_fx: f32,
+    #[serde(default)]
+    pub depth_fy: f32,
+    #[serde(default)]
+    pub depth_cx: f32,
+    #[serde(default)]
+    pub depth_cy: f32,
+    #[serde(default)]
+    pub min_depth_m: f32,
+    #[serde(default)]
+    pub max_depth_m: f32,
+    #[serde(default)]
+    pub depth_coordinate_system: Option<String>,
     pub ir: Vec<f32>,
     pub player_index: Vec<u8>,
     pub audio_angle_rad: Option<f32>,

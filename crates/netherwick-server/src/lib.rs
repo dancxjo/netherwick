@@ -21,7 +21,7 @@ use netherwick_actions::{
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use netherwick_body::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
-use netherwick_now::{KinectSkeletonSense, ReignSense};
+use netherwick_now::{KinectSense, KinectSkeletonSense, ReignSense};
 use netherwick_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
     NudgeStatus, ReignQueue, RuntimeModelStack,
@@ -810,8 +810,23 @@ pub struct SceneEye {
 pub struct SceneKinect {
     pub points: Vec<ScenePoint>,
     pub skeletons: Vec<KinectSkeletonSense>,
+    pub diagnostics: SceneKinectDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coordinate_system: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SceneKinectDiagnostics {
+    pub depth_width: u32,
+    pub depth_height: u32,
+    pub valid_depth_count: usize,
+    pub skipped_depth_count: usize,
+    pub clipped_depth_count: usize,
+    pub min_depth_m: Option<f32>,
+    pub median_depth_m: Option<f32>,
+    pub max_depth_m: Option<f32>,
+    pub sample_stride: usize,
+    pub coordinate_system: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2567,38 +2582,70 @@ fn scene_kinect_from_snapshot(
     calibration: Option<SceneSensorCalibration>,
     warnings: &mut Vec<String>,
 ) -> SceneKinect {
-    let points = depth_points(&snapshot.kinect.depth_m, calibration);
+    let (points, diagnostics) = depth_points(&snapshot.kinect, calibration);
     if points.is_empty() {
         warnings.push("no point cloud stream".to_string());
     }
-    let coordinate_system = if snapshot.kinect.depth_m.len()
-        == calibration.map_or(32, |c| c.compact_depth_beam_count)
-    {
-        "robot".to_string()
-    } else {
-        "camera".to_string()
-    };
+    if diagnostics.coordinate_system == "depth_image_unknown" {
+        warnings.push(
+            "Kinect depth frame has no width/height metadata; using legacy approximate projection"
+                .to_string(),
+        );
+    }
     SceneKinect {
         points,
         skeletons: snapshot.kinect.skeletons.clone(),
-        coordinate_system: Some(coordinate_system),
+        coordinate_system: Some(diagnostics.coordinate_system.clone()),
+        diagnostics,
     }
 }
 
-fn depth_points(depth_m: &[f32], calibration: Option<SceneSensorCalibration>) -> Vec<ScenePoint> {
+fn depth_points(
+    kinect: &KinectSense,
+    calibration: Option<SceneSensorCalibration>,
+) -> (Vec<ScenePoint>, SceneKinectDiagnostics) {
     const MAX_POINTS: usize = 2_000;
+    let depth_m = &kinect.depth_m;
     if depth_m.is_empty() {
-        return Vec::new();
+        return (
+            Vec::new(),
+            SceneKinectDiagnostics {
+                coordinate_system: "none".to_string(),
+                sample_stride: 1,
+                ..SceneKinectDiagnostics::default()
+            },
+        );
     }
     if let Some(calibration) = calibration {
         if depth_m.len() == calibration.compact_depth_beam_count {
-            return range_beam_points(depth_m, calibration);
+            let points = range_beam_points(depth_m, calibration);
+            let stats = depth_stats(depth_m, 1, 0.0, 8.0, "robot", 0, 0);
+            return (points, stats);
         }
+    }
+    if let Some(frame) = KinectDepthProjection::from_kinect(kinect) {
+        return project_depth_image(depth_m, frame);
+    }
+    if depth_m.len() == 640 * 480 {
+        return project_depth_image(
+            depth_m,
+            KinectDepthProjection {
+                width: 640,
+                height: 480,
+                fx: 594.0,
+                fy: 591.0,
+                cx: 339.0,
+                cy: 242.0,
+                min_depth_m: 0.4,
+                max_depth_m: 8.0,
+                coordinate_system: "kinect_camera".to_string(),
+            },
+        );
     }
     let width = (depth_m.len() as f32).sqrt().ceil().max(1.0) as usize;
     let height = depth_m.len().div_ceil(width).max(1);
     let stride = (depth_m.len().div_ceil(MAX_POINTS)).max(1);
-    depth_m
+    let points = depth_m
         .iter()
         .enumerate()
         .step_by(stride)
@@ -2622,7 +2669,165 @@ fn depth_points(depth_m: &[f32], calibration: Option<SceneSensorCalibration>) ->
                 b: shade,
             })
         })
-        .collect()
+        .collect();
+    (
+        points,
+        depth_stats(
+            depth_m,
+            stride,
+            0.0,
+            8.0,
+            "depth_image_unknown",
+            width as u32,
+            height as u32,
+        ),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct KinectDepthProjection {
+    width: usize,
+    height: usize,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    min_depth_m: f32,
+    max_depth_m: f32,
+    coordinate_system: String,
+}
+
+impl KinectDepthProjection {
+    fn from_kinect(kinect: &KinectSense) -> Option<Self> {
+        let width = usize::try_from(kinect.depth_width).ok()?;
+        let height = usize::try_from(kinect.depth_height).ok()?;
+        if width == 0 || height == 0 || width.checked_mul(height)? != kinect.depth_m.len() {
+            return None;
+        }
+        let fx = if kinect.depth_fx > 0.0 {
+            kinect.depth_fx
+        } else {
+            594.0
+        };
+        let fy = if kinect.depth_fy > 0.0 {
+            kinect.depth_fy
+        } else {
+            591.0
+        };
+        let cx = if kinect.depth_cx > 0.0 {
+            kinect.depth_cx
+        } else {
+            (width as f32 - 1.0) * 0.5
+        };
+        let cy = if kinect.depth_cy > 0.0 {
+            kinect.depth_cy
+        } else {
+            (height as f32 - 1.0) * 0.5
+        };
+        let max_depth_m = if kinect.max_depth_m > 0.0 {
+            kinect.max_depth_m
+        } else {
+            8.0
+        };
+        Some(Self {
+            width,
+            height,
+            fx,
+            fy,
+            cx,
+            cy,
+            min_depth_m: kinect.min_depth_m.max(0.0),
+            max_depth_m,
+            coordinate_system: kinect
+                .depth_coordinate_system
+                .clone()
+                .filter(|system| system != "kinect_depth_image")
+                .unwrap_or_else(|| "kinect_camera".to_string()),
+        })
+    }
+}
+
+fn project_depth_image(
+    depth_m: &[f32],
+    frame: KinectDepthProjection,
+) -> (Vec<ScenePoint>, SceneKinectDiagnostics) {
+    const MAX_POINTS: usize = 2_000;
+    let stride = (depth_m.len().div_ceil(MAX_POINTS)).max(1);
+    let mut points = Vec::with_capacity(MAX_POINTS.min(depth_m.len()));
+    for (index, depth) in depth_m.iter().enumerate().step_by(stride) {
+        if !depth.is_finite() || *depth <= 0.0 {
+            continue;
+        }
+        if *depth < frame.min_depth_m || *depth > frame.max_depth_m {
+            continue;
+        }
+        let u = (index % frame.width) as f32;
+        let v = (index / frame.width) as f32;
+        let z = *depth;
+        let x = (u - frame.cx) * z / frame.fx.max(f32::EPSILON);
+        let y = (v - frame.cy) * z / frame.fy.max(f32::EPSILON);
+        let shade =
+            ((1.0 - (z / frame.max_depth_m.max(f32::EPSILON))).clamp(0.15, 1.0) * 255.0) as u8;
+        points.push(ScenePoint {
+            x,
+            y,
+            z,
+            r: shade,
+            g: shade,
+            b: shade,
+        });
+    }
+    let diagnostics = depth_stats(
+        depth_m,
+        stride,
+        frame.min_depth_m,
+        frame.max_depth_m,
+        &frame.coordinate_system,
+        frame.width as u32,
+        frame.height as u32,
+    );
+    (points, diagnostics)
+}
+
+fn depth_stats(
+    depth_m: &[f32],
+    sample_stride: usize,
+    min_depth_m: f32,
+    max_depth_m: f32,
+    coordinate_system: &str,
+    depth_width: u32,
+    depth_height: u32,
+) -> SceneKinectDiagnostics {
+    let mut valid = Vec::new();
+    let mut skipped = 0usize;
+    let mut clipped = 0usize;
+    for depth in depth_m {
+        if !depth.is_finite() || *depth <= 0.0 {
+            skipped = skipped.saturating_add(1);
+        } else if *depth < min_depth_m || *depth > max_depth_m {
+            clipped = clipped.saturating_add(1);
+        } else {
+            valid.push(*depth);
+        }
+    }
+    valid.sort_by(|left, right| left.total_cmp(right));
+    let median_depth_m = if valid.is_empty() {
+        None
+    } else {
+        Some(valid[valid.len() / 2])
+    };
+    SceneKinectDiagnostics {
+        depth_width,
+        depth_height,
+        valid_depth_count: valid.len(),
+        skipped_depth_count: skipped,
+        clipped_depth_count: clipped,
+        min_depth_m: valid.first().copied(),
+        median_depth_m,
+        max_depth_m: valid.last().copied(),
+        sample_stride,
+        coordinate_system: coordinate_system.to_string(),
+    }
 }
 
 fn range_beam_points(depth_m: &[f32], calibration: SceneSensorCalibration) -> Vec<ScenePoint> {
@@ -3580,6 +3785,7 @@ canvas{display:block}
     <dt>nearest</dt><dd id="nearest">-</dd>
     <dt>eye</dt><dd id="eye">-</dd>
     <dt>points</dt><dd id="points">-</dd>
+    <dt>depth</dt><dd id="depth_stats">-</dd>
     <dt>audio</dt><dd id="audio">-</dd>
     <dt>mind</dt><dd id="mind">-</dd>
     <dt>scheme</dt><dd id="scheme">-</dd>
@@ -3753,7 +3959,7 @@ const behaviorInspector = document.getElementById('behavior-inspector');
 const virtualPipelineSection = document.getElementById('virtual-pipeline-section');
 const virtualReportSummary = document.getElementById('virtual-report-summary');
 const virtualModelRecommendations = document.getElementById('virtual-model-recommendations');
-const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
+const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','depth_stats','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const learningMode = document.getElementById('learning-mode');
 const learningSteps = document.getElementById('learning-steps');
 const learningStatus = document.getElementById('learning-status');
@@ -4067,13 +4273,26 @@ function renderPoints(points, coordinateSystem){
   const indices = [];
   
   const isRobot = coordinateSystem === 'robot';
+  const isKinectCamera = coordinateSystem === 'kinect_camera' || coordinateSystem === 'camera' || coordinateSystem === 'depth_image_unknown';
+  const robotMatrix = robot.getWorldMatrix();
+  const kinectMatrix = eyeCamera.getWorldMatrix();
   
   points.forEach((p, i) => {
+    let worldPoint;
     if (isRobot) {
-      positions.push(p.x, p.y, -p.z);
+      worldPoint = BABYLON.Vector3.TransformCoordinates(
+        new BABYLON.Vector3(p.x, p.y, -p.z),
+        robotMatrix
+      );
+    } else if (isKinectCamera) {
+      worldPoint = BABYLON.Vector3.TransformCoordinates(
+        new BABYLON.Vector3(-p.x, -p.y, p.z),
+        kinectMatrix
+      );
     } else {
-      positions.push(p.x, p.y, p.z);
+      worldPoint = new BABYLON.Vector3(p.x, p.y, p.z);
     }
+    positions.push(worldPoint.x, worldPoint.y, worldPoint.z);
     colors.push(p.r / 255, p.g / 255, p.b / 255, 1.0);
     indices.push(i);
   });
@@ -4091,11 +4310,7 @@ function renderPoints(points, coordinateSystem){
   mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
   pointCloud.material = mat;
   
-  if (isRobot) {
-    pointCloud.parent = robot;
-  } else {
-    pointCloud.parent = eyeCamera;
-  }
+  pointCloud.parent = null;
 }
 
 function shouldUseGeneratedEye(packet){
@@ -4336,7 +4551,11 @@ function updateScene(packet){
     fields.eye.style.color = '';
     fields.eye.style.fontWeight = '';
   }
-  fields.points.textContent = String(packet.kinect?.points?.length || 0);
+  const depth = packet.kinect?.diagnostics || {};
+  fields.points.textContent = `${packet.kinect?.points?.length || 0} drawn / ${depth.valid_depth_count || 0} valid`;
+  fields.depth_stats.textContent = depth.depth_width
+    ? `${depth.depth_width}x${depth.depth_height} ${depth.coordinate_system || '-'} med ${depth.median_depth_m == null ? '-' : fmt(depth.median_depth_m)}m skip ${depth.skipped_depth_count || 0} clip ${depth.clipped_depth_count || 0} stride ${depth.sample_stride || '-'}`
+    : '-';
   fields.audio.textContent = packet.audio?.heading_rad == null && packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio?.bearing_rad ?? packet.audio?.heading_rad)} rad`;
   fields.mind.textContent = packet.mind?.combobulation || packet.warnings?.[0] || '-';
   fields.scheme.textContent = location.protocol.replace(':', '');
@@ -6299,9 +6518,15 @@ mod tests {
     #[test]
     fn compact_kinect_depth_projects_as_meter_range_fan() {
         let depths = vec![2.0; 32];
-        let points = depth_points(&depths, Some(SceneSensorCalibration::sim_default()));
+        let kinect = KinectSense {
+            depth_m: depths,
+            ..KinectSense::default()
+        };
+        let (points, diagnostics) =
+            depth_points(&kinect, Some(SceneSensorCalibration::sim_default()));
 
         assert_eq!(points.len(), 32);
+        assert_eq!(diagnostics.coordinate_system, "robot");
         assert!((points[0].x + 1.847759).abs() < 0.001);
         assert!((points[0].z - 0.765367).abs() < 0.001);
         assert!((points[31].x - 1.847759).abs() < 0.001);
@@ -6310,6 +6535,39 @@ mod tests {
         let near_center = &points[15];
         assert!(near_center.z > 1.99);
         assert!(near_center.x.abs() < 0.11);
+    }
+
+    #[test]
+    fn kinect_depth_image_projects_with_pinhole_intrinsics() {
+        let kinect = KinectSense {
+            depth_m: vec![1.0, 2.0, 0.0, 4.0],
+            depth_width: 2,
+            depth_height: 2,
+            depth_fx: 2.0,
+            depth_fy: 2.0,
+            depth_cx: 0.5,
+            depth_cy: 0.5,
+            min_depth_m: 0.4,
+            max_depth_m: 3.0,
+            depth_coordinate_system: Some("kinect_camera".to_string()),
+            ..KinectSense::default()
+        };
+
+        let (points, diagnostics) = depth_points(&kinect, None);
+
+        assert_eq!(points.len(), 2);
+        assert_eq!(diagnostics.depth_width, 2);
+        assert_eq!(diagnostics.depth_height, 2);
+        assert_eq!(diagnostics.valid_depth_count, 2);
+        assert_eq!(diagnostics.skipped_depth_count, 1);
+        assert_eq!(diagnostics.clipped_depth_count, 1);
+        assert_eq!(diagnostics.coordinate_system, "kinect_camera");
+        assert!((points[0].x + 0.25).abs() < 0.001);
+        assert!((points[0].y + 0.25).abs() < 0.001);
+        assert!((points[0].z - 1.0).abs() < 0.001);
+        assert!((points[1].x - 0.5).abs() < 0.001);
+        assert!((points[1].y + 0.5).abs() < 0.001);
+        assert!((points[1].z - 2.0).abs() < 0.001);
     }
 
     #[tokio::test]

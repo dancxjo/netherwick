@@ -77,6 +77,14 @@ const FREENECT_DEPTH_HEIGHT: usize = 480;
 const FREENECT_DEPTH_PIXELS: usize = FREENECT_DEPTH_WIDTH * FREENECT_DEPTH_HEIGHT;
 #[cfg(feature = "kinect-freenect")]
 const FREENECT_RGB_BYTES: usize = FREENECT_DEPTH_PIXELS * 3;
+#[cfg(feature = "kinect-freenect")]
+const KINECT_V1_DEPTH_FX: f32 = 594.0;
+#[cfg(feature = "kinect-freenect")]
+const KINECT_V1_DEPTH_FY: f32 = 591.0;
+#[cfg(feature = "kinect-freenect")]
+const KINECT_V1_DEPTH_CX: f32 = 339.0;
+#[cfg(feature = "kinect-freenect")]
+const KINECT_V1_DEPTH_CY: f32 = 242.0;
 
 #[async_trait]
 pub trait SenseProducer {
@@ -1190,7 +1198,7 @@ fn parse_nmea_coord(value: &str, hemi: &str) -> Option<f64> {
     Some(decimal)
 }
 
-#[cfg(any(feature = "linux-hardware", test))]
+#[cfg(any(feature = "linux-hardware", feature = "kinect-freenect", test))]
 fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1352,6 +1360,15 @@ impl SenseProducer for FreenectKinectProvider {
         Ok(SensePacket::Kinect(KinectSense {
             schema_version: 1,
             depth_m,
+            depth_width: FREENECT_DEPTH_WIDTH as u32,
+            depth_height: FREENECT_DEPTH_HEIGHT as u32,
+            depth_fx: KINECT_V1_DEPTH_FX,
+            depth_fy: KINECT_V1_DEPTH_FY,
+            depth_cx: KINECT_V1_DEPTH_CX,
+            depth_cy: KINECT_V1_DEPTH_CY,
+            min_depth_m: 0.4,
+            max_depth_m: 8.0,
+            depth_coordinate_system: Some("kinect_depth_image".to_string()),
             ..KinectSense::default()
         }))
     }
