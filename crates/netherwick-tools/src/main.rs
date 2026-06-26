@@ -14,7 +14,7 @@ use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use netherwick_body::RobotBody;
 use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
-use netherwick_create1::{Create1Body, MockCreate1Body};
+use netherwick_create1::{Create1Body, Create1OpenMode, MockCreate1Body};
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
@@ -3368,7 +3368,13 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         device_availability["create"] = serde_json::json!({"present": true, "source": "mock"});
         Box::new(MockCreate1Body::new())
     } else if let Some(create_port) = create_port {
-        match Create1Body::connect(&create_port, args.create_baud).await {
+        match Create1Body::connect_with_mode(
+            &create_port,
+            args.create_baud,
+            Create1OpenMode::Passive,
+        )
+        .await
+        {
             Ok(body) => {
                 device_availability["create"] = serde_json::json!({
                     "present": true,
@@ -3635,9 +3641,15 @@ struct BackgroundSenseProducer {
 }
 
 impl BackgroundSenseProducer {
-    fn spawn<T>(name: &'static str, mut producer: T, poll_interval: Duration) -> Self
+    fn spawn_with_callback<T, F>(
+        name: &'static str,
+        mut producer: T,
+        poll_interval: Duration,
+        on_packet: F,
+    ) -> Self
     where
         T: SenseProducer + Send + 'static,
+        F: Fn(&SensePacket) + Send + 'static,
     {
         let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
         let worker_latest = std::sync::Arc::clone(&latest);
@@ -3660,6 +3672,9 @@ impl BackgroundSenseProducer {
                 let result = runtime
                     .block_on(producer.poll())
                     .map_err(|error| error.to_string());
+                if let Ok(packet) = &result {
+                    on_packet(packet);
+                }
                 *worker_latest
                     .lock()
                     .expect("background sensor mutex poisoned") = Some(result);
@@ -3687,15 +3702,71 @@ impl SenseProducer for BackgroundSenseProducer {
 }
 
 async fn run_robot(args: RobotArgs) -> Result<()> {
+    let create_port = if args.create_port == "auto" {
+        let env_report = collect_hardware_env_report().await;
+        env_report["serial_devices"]
+            .as_array()
+            .and_then(|devices| devices.first())
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    } else {
+        Some(args.create_port.clone())
+    };
+    let is_mock_body = create_port.as_deref() == Some("mock");
+    let mut robot_mode = match args.mode {
+        RobotModeArg::ReadOnly => RobotMode::ReadOnly,
+        RobotModeArg::Slow => RobotMode::Slow,
+        RobotModeArg::Disabled => RobotMode::Disabled,
+    };
+    if is_mock_body && robot_mode == RobotMode::Slow {
+        println!(
+            "warning: create-port mock does not support motorized slow mode; running in read-only mode instead"
+        );
+        robot_mode = RobotMode::ReadOnly;
+    }
+    if robot_mode == RobotMode::Disabled {
+        anyhow::bail!("--mode disabled does not start the real robot runner");
+    }
+
+    let live_state = args.dashboard.map(|_| {
+        let live_state = if robot_mode == RobotMode::Slow {
+            LiveViewState::new().with_real_slow_hardware_control()
+        } else {
+            LiveViewState::new()
+        };
+        live_state.update_session(SceneSession {
+            mode: match robot_mode {
+                RobotMode::ReadOnly => "read-only".to_string(),
+                RobotMode::Slow => "slow".to_string(),
+                RobotMode::Disabled => "disabled".to_string(),
+            },
+            scenario: None,
+            seed: None,
+            source: "real_robot".to_string(),
+            tick_ms: Some(args.tick_ms),
+        });
+        live_state
+    });
+
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
 
     if let Some(device) = &args.camera {
         match CameraSenseProvider::new(device) {
-            Ok(provider) => sensors.push(Box::new(BackgroundSenseProducer::spawn(
-                "camera",
-                provider,
-                Duration::from_millis(args.tick_ms.max(1)),
-            ))),
+            Ok(provider) => {
+                let live_state_for_camera = live_state.clone();
+                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                    "camera",
+                    provider,
+                    Duration::from_millis(33),
+                    move |packet| {
+                        if let (Some(live_state), SensePacket::EyeFrame(frame)) =
+                            (&live_state_for_camera, packet)
+                        {
+                            live_state.record_live_eye_frame(frame.clone());
+                        }
+                    },
+                )));
+            }
             Err(err) => {
                 if args.require_camera {
                     anyhow::bail!("failed to initialize camera: {err}");
@@ -3750,21 +3821,15 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    let create_port = if args.create_port == "auto" {
-        let env_report = collect_hardware_env_report().await;
-        env_report["serial_devices"]
-            .as_array()
-            .and_then(|devices| devices.first())
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    } else {
-        Some(args.create_port.clone())
-    };
-    let is_mock_body = create_port.as_deref() == Some("mock");
     let body: Box<dyn RobotBody + Send> = if create_port.as_deref() == Some("mock") {
         Box::new(MockCreate1Body::new())
     } else if let Some(create_port) = create_port {
-        Box::new(Create1Body::connect(&create_port, args.create_baud).await?)
+        let open_mode = match robot_mode {
+            RobotMode::ReadOnly => Create1OpenMode::Passive,
+            RobotMode::Slow => Create1OpenMode::Safe,
+            RobotMode::Disabled => unreachable!("disabled mode bailed before body open"),
+        };
+        Box::new(Create1Body::connect_with_mode(&create_port, args.create_baud, open_mode).await?)
     } else {
         anyhow::bail!(
             "no Create serial device found; pass --create-port /dev/ttyUSB0 or --create-port mock"
@@ -3781,40 +3846,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         SimpleSafety::default(),
         configured_llm_agent(&args.llm)?,
     );
-    let mut robot_mode = match args.mode {
-        RobotModeArg::ReadOnly => RobotMode::ReadOnly,
-        RobotModeArg::Slow => RobotMode::Slow,
-        RobotModeArg::Disabled => RobotMode::Disabled,
-    };
-    if is_mock_body && robot_mode == RobotMode::Slow {
-        println!(
-            "warning: create-port mock does not support motorized slow mode; running in read-only mode instead"
-        );
-        robot_mode = RobotMode::ReadOnly;
-    }
-    if robot_mode == RobotMode::Disabled {
-        anyhow::bail!("--mode disabled does not start the real robot runner");
-    }
     let mut runner = RealRobotRunner::new(robot_mode, body, sensors, runtime);
     runner.tick_ms = args.tick_ms;
 
-    let live_state = args.dashboard.map(|addr| {
-        let live_state = if robot_mode == RobotMode::Slow {
-            LiveViewState::new().with_real_slow_hardware_control()
-        } else {
-            LiveViewState::new()
-        };
-        live_state.update_session(SceneSession {
-            mode: match robot_mode {
-                RobotMode::ReadOnly => "read-only".to_string(),
-                RobotMode::Slow => "slow".to_string(),
-                RobotMode::Disabled => "disabled".to_string(),
-            },
-            scenario: None,
-            seed: None,
-            source: "real_robot".to_string(),
-            tick_ms: Some(args.tick_ms),
-        });
+    if let (Some(addr), Some(live_state)) = (args.dashboard, live_state.clone()) {
         let server_state = live_state.clone();
         let reign_state = netherwick_server::ReignServerState::with_live_view(
             runner.runtime.reign_queue.clone(),
@@ -3828,8 +3863,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             }
         });
         println!("robot {:?} dashboard: http://{addr}/view", robot_mode);
-        live_state
-    });
+    }
 
     let mut capture = match &args.capture {
         Some(path) => {

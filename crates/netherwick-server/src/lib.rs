@@ -425,6 +425,28 @@ impl LiveViewState {
         state.frames_written_to_ledger += 1;
     }
 
+    pub fn record_live_eye_frame(&self, frame: netherwick_sensors::EyeFrame) {
+        {
+            let mut state = self
+                .retina_state
+                .lock()
+                .expect("retina state mutex poisoned");
+            state.latest_frame = Some(frame.clone());
+            state.has_new_frame = true;
+            state.last_received_at = Some(std::time::Instant::now());
+            state.frames_received += 1;
+        }
+
+        if let Some(snapshot) = self
+            .latest
+            .lock()
+            .expect("live view snapshot mutex poisoned")
+            .as_mut()
+        {
+            snapshot.eye_frame = Some(frame);
+        }
+    }
+
     pub fn update(&self, snapshot: WorldSnapshot) {
         *self
             .latest

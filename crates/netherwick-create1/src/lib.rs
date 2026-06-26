@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "serial")]
 use serialport::SerialPort;
 #[cfg(feature = "serial")]
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(feature = "serial")]
 use std::time::Duration;
 
@@ -17,7 +17,18 @@ pub struct Create1Config {
     pub baud_rate: u32,
     pub wheel_base_m: f32,
     pub max_velocity_m_s: f32,
+    #[serde(default)]
+    pub open_mode: Create1OpenMode,
     pub use_safe_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Create1OpenMode {
+    #[default]
+    Passive,
+    Safe,
+    Full,
 }
 
 impl Create1Config {
@@ -30,6 +41,9 @@ impl Create1Config {
         }
         if self.max_velocity_m_s <= 0.0 {
             self.max_velocity_m_s = 0.3;
+        }
+        if self.use_safe_mode {
+            self.open_mode = Create1OpenMode::Safe;
         }
         self
     }
@@ -68,7 +82,7 @@ impl Create1Body {
         #[cfg(feature = "serial")]
         if let Some(path) = body.config.port.clone() {
             let port = serialport::new(path, body.config.baud_rate)
-                .timeout(Duration::from_millis(100))
+                .timeout(Duration::from_millis(500))
                 .open()?;
             body.port = Some(port);
             body.initialize()?;
@@ -83,10 +97,18 @@ impl Create1Body {
     }
 
     pub async fn connect(path: &str, baud: u32) -> Result<Self> {
+        Self::connect_with_mode(path, baud, Create1OpenMode::Passive).await
+    }
+
+    pub async fn connect_with_mode(
+        path: &str,
+        baud: u32,
+        open_mode: Create1OpenMode,
+    ) -> Result<Self> {
         Self::new(Create1Config {
             port: Some(path.to_string()),
             baud_rate: baud,
-            use_safe_mode: false,
+            open_mode,
             ..Create1Config::default()
         })
     }
@@ -94,7 +116,15 @@ impl Create1Body {
     #[cfg(feature = "serial")]
     fn initialize(&mut self) -> Result<()> {
         self.write_bytes(&[128])?;
-        self.write_bytes(&[if self.config.use_safe_mode { 131 } else { 132 }])?;
+        std::thread::sleep(Duration::from_millis(250));
+        match self.config.open_mode {
+            Create1OpenMode::Passive => {}
+            Create1OpenMode::Safe => self.write_bytes(&[131])?,
+            Create1OpenMode::Full => self.write_bytes(&[132])?,
+        }
+        if self.config.open_mode != Create1OpenMode::Passive {
+            std::thread::sleep(Duration::from_millis(250));
+        }
         Ok(())
     }
 
@@ -130,14 +160,27 @@ impl Create1Body {
         let Some(port) = self.port.as_mut() else {
             return Ok(());
         };
-        const PACKETS: [u8; 12] = [7, 8, 9, 10, 11, 12, 13, 21, 28, 29, 30, 31];
-        let mut query = vec![149, PACKETS.len() as u8];
-        query.extend_from_slice(&PACKETS);
-        port.write_all(&query)?;
-        port.flush()?;
-
-        let mut bytes = [0u8; 16];
-        port.read_exact(&mut bytes)?;
+        const PACKETS: [(u8, usize); 12] = [
+            (7, 1),
+            (8, 1),
+            (9, 1),
+            (10, 1),
+            (11, 1),
+            (12, 1),
+            (13, 1),
+            (21, 1),
+            (28, 2),
+            (29, 2),
+            (30, 2),
+            (31, 2),
+        ];
+        let mut bytes = Vec::with_capacity(16);
+        for (packet_id, packet_len) in PACKETS {
+            read_sensor_packet(port.as_mut(), packet_id, packet_len, &mut bytes)?;
+        }
+        let bytes: [u8; 16] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            anyhow::anyhow!("expected 16 Create sensor bytes, got {}", bytes.len())
+        })?;
         let bumps = bytes[0];
         self.body.flags.bump_right = bumps & 0b0000_0001 != 0;
         self.body.flags.bump_left = bumps & 0b0000_0010 != 0;
@@ -241,4 +284,19 @@ fn create1_cliff_risk(signal: u16, tripped: bool) -> f32 {
     } else {
         (1.0 - signal as f32 / 4095.0).clamp(0.0, 1.0)
     }
+}
+
+#[cfg(feature = "serial")]
+fn read_sensor_packet(
+    port: &mut dyn SerialPort,
+    packet_id: u8,
+    packet_len: usize,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    port.write_all(&[142, packet_id])?;
+    port.flush()?;
+    let start_len = output.len();
+    output.resize(start_len + packet_len, 0);
+    port.read_exact(&mut output[start_len..])?;
+    Ok(())
 }
