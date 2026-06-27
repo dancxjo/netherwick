@@ -81,7 +81,7 @@ cargo run --bin netherwick -- hardware-env
 cargo run --bin netherwick -- hardware-env --json
 ```
 
-Bring up the default real hardware stack in read-only mode:
+Bring up the default real hardware stack in slow mode with Kinect depth when available:
 
 ```bash
 just robot

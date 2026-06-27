@@ -131,13 +131,14 @@ clippy:
 sim:
     cargo run -p netherwick-tools -- sim
 
-# Bring up the real robot in read-only mode with default hardware auto-detection.
+# Bring up the real robot in slow mode with default hardware auto-detection.
 robot *args:
     cargo run -p netherwick-tools -- robot \
-        --mode "${NETHERWICK_ROBOT_MODE:-read-only}" \
+        --mode "${NETHERWICK_ROBOT_MODE:-slow}" \
         --create-port "{{create1_port}}" \
         --ledger "${NETHERWICK_ROBOT_LEDGER:-data/ledger/real/robot}" \
         --camera "{{camera_device}}" \
+        --kinect-depth \
         --mic "{{mic_device}}" \
         --imu "{{imu_device}}" \
         --gps "{{gps_serial_port}}" \
