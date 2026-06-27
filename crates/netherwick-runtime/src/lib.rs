@@ -6005,8 +6005,10 @@ mod tests {
     use netherwick_autonomic::SimpleSafety;
     use netherwick_body::{BodySense, MotorCommand, RobotBody};
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
-    use netherwick_experience::experience_encode_input_from_now;
-    use netherwick_ledger::{ExperienceTransition, JsonlLedger, LedgerReader};
+    use netherwick_experience::{
+        embody_now, experience_encode_input_from_now, SensationPayloadKind,
+    };
+    use netherwick_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_llm::{ConsciousCommand, LlmDecision, LlmTickResult};
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_models::{
@@ -6018,6 +6020,7 @@ mod tests {
     use netherwick_sim::{
         build_scenario, ArenaConfig, ScenarioConfig, ScenarioKind, SimObject, VirtualWorld,
     };
+    use serde_json::Value;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6030,6 +6033,62 @@ mod tests {
         now.range.nearest_m = Some(1.0);
         now.range.beams = vec![1.0, 1.0, 1.0];
         now
+    }
+
+    #[tokio::test]
+    async fn ledger_frame_with_asr_metadata_shows_audio_child_sensations() {
+        let root = test_ledger_root("asr-audio-child-sensations");
+        let ledger = JsonlLedger::new(&root);
+        let mut now = Now::blank(1_000, BodySense::default());
+        now.ear.asr = netherwick_now::AsrSense {
+            transcript: Some("hello from replay".to_string()),
+            is_final: true,
+            confidence: 0.84,
+            start_ms: Some(250),
+            end_ms: Some(950),
+            duration_ms: Some(700),
+            word_count: Some(3),
+            ..netherwick_now::AsrSense::default()
+        };
+
+        let embodied = embody_now(&now).await.unwrap();
+        let frame = ExperienceFrame {
+            id: Uuid::new_v4(),
+            t_ms: now.t_ms,
+            now,
+            sensations: embodied.sensations,
+            impressions: embodied.impressions,
+            experiences: vec![embodied.experience],
+            z: None,
+            chosen_action: None,
+            conscious_command: None,
+            reign_input: None,
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Reward::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: vec!["asr ledger smoke".to_string()],
+        };
+        ledger.append(&frame).await.unwrap();
+
+        let frames = ledger.recent(1).await.unwrap();
+        let readback = frames.first().expect("ledger frame");
+        assert!(readback.sensations.iter().any(|sensation| {
+            sensation.payload_kind == SensationPayloadKind::SpeechSegment
+                && sensation.parent_id.is_some()
+                && sensation.payload.get("text").and_then(Value::as_str)
+                    == Some("hello from replay")
+        }));
+        assert!(readback.sensations.iter().any(|sensation| {
+            sensation.payload_kind == SensationPayloadKind::TranscriptSpan
+                && sensation.parent_id.is_some()
+        }));
     }
 
     fn test_conductor_input(action: ActionPrimitive) -> ConductorInput {

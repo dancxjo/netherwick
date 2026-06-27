@@ -49,6 +49,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/reign/state",
     "/reign/clear",
     "/reign/hardware-arm",
+    "/debug/embodied",
     "/stream/now",
     "/stream/mind",
     "/stream/logs",
@@ -1093,6 +1094,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view", get(live_view_page))
         .route("/view/snapshot", get(get_live_snapshot))
         .route("/view/embodied", get(get_live_embodied))
+        .route("/debug/embodied", get(get_live_embodied))
         .route("/view/scene", get(get_live_scene))
         .route("/view/behavior-nodes", get(get_behavior_nodes))
         .route("/view/behavior-nodes/{id}", post(post_behavior_node))
@@ -6980,6 +6982,7 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/view/3d"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/scene"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/embodied"));
+        assert!(HTTP_ENDPOINTS.contains(&"/debug/embodied"));
         assert!(HTTP_ENDPOINTS.contains(&"/models"));
         assert!(HTTP_ENDPOINTS.contains(&"/stream/llm"));
         let Html(page) = live_view_3d_page().await;

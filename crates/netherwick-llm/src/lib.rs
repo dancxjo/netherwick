@@ -919,8 +919,9 @@ fn render_embodied_context(context: Option<&EmbodiedContext>) -> String {
         ));
     }
     lines.push(format!(
-        "- counts: sensations={}, impressions={}, lineage_edges={}",
+        "- counts: sensations={}, derived_sensations={}, impressions={}, lineage_edges={}",
         context.sensations.len(),
+        context.derived_sensation_count(),
         context.impressions.len(),
         context.lineage.len()
     ));
@@ -984,10 +985,21 @@ fn render_embodied_context(context: Option<&EmbodiedContext>) -> String {
         ));
     }
     for prediction in context.predictions.iter().take(4) {
+        let vector = prediction
+            .vector
+            .as_ref()
+            .map(|vector| {
+                format!(
+                    " vector_model={} vector_dim={}",
+                    vector.model_id, vector.dim
+                )
+            })
+            .unwrap_or_default();
         lines.push(format!(
-            "- prediction +{}ms confidence={:.2}: {}",
+            "- prediction +{}ms confidence={:.2}{}: {}",
             prediction.offset_ms,
             prediction.confidence,
+            vector,
             compact_line(&prediction.text, 140)
         ));
     }
@@ -1768,7 +1780,7 @@ mod tests {
             summary: "I see a frame and focus on part of it.".to_string(),
             sensations: vec![netherwick_experience::EmbodiedSensationRef {
                 id: sensation_id,
-                parent_id: None,
+                parent_id: Some(Uuid::new_v4()),
                 modality: netherwick_experience::Modality::Vision,
                 payload_kind: netherwick_experience::SensationPayloadKind::ImageBytes,
                 kind: "vision.image_bytes".to_string(),
@@ -1802,6 +1814,7 @@ mod tests {
 
         assert!(prompt.contains("Current embodied experience:"));
         assert!(prompt.contains(&format!("experience_id: {experience_id}")));
+        assert!(prompt.contains("derived_sensations=1"));
         assert!(prompt.contains("fused_vector: model=fuser.v0 dim=16"));
         assert!(prompt.contains("payload=image_bytes"));
         assert!(!prompt.contains("[0."));

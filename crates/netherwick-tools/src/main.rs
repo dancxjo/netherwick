@@ -6270,6 +6270,14 @@ fn print_frame(frame: &ExperienceFrame) {
     println!("  recollections: {}", frame.recollections.len());
     let embodied = frame.embodied_context();
     println!(
+        "  embodied_summary: {}",
+        if embodied.summary.trim().is_empty() {
+            "none"
+        } else {
+            embodied.summary.trim()
+        }
+    );
+    println!(
         "  embodied_experience_id: {}",
         embodied
             .experience_id
@@ -6279,10 +6287,27 @@ fn print_frame(frame: &ExperienceFrame) {
     println!("  sensation_count: {}", embodied.sensations.len());
     println!("  impression_count: {}", embodied.impressions.len());
     println!(
-        "  parent_child_derived_sensation_count: {}",
-        embodied.lineage.len()
+        "  derived_sensation_count: {}",
+        embodied.derived_sensation_count()
     );
-    if let Some(vector) = embodied.fused_vector {
+    println!("  lineage_edge_count: {}", embodied.lineage.len());
+    if embodied.lineage.is_empty() {
+        println!("  lineage_graph: none");
+    } else {
+        println!("  lineage_graph:");
+        for edge in embodied.lineage.iter().take(8) {
+            println!("    - {} -> {}", edge.parent_id, edge.child_id);
+        }
+    }
+    println!(
+        "  embodied_prediction_count: {}",
+        embodied.predictions.len()
+    );
+    println!(
+        "  embodied_memory_link_count: {}",
+        embodied.memory_links.len()
+    );
+    if let Some(vector) = embodied.fused_vector.as_ref() {
         println!(
             "  fused_vector: model={} dim={}",
             vector.model_id, vector.dim
