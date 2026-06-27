@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use netherwick_actions::ActionPrimitive;
 use netherwick_core::{Goal, Pose2};
@@ -8,8 +8,11 @@ use netherwick_now::{
     GraphEdge, GraphEntity, MemorySense, Now, RecallHit, VectorArtifact, FACE_VECTOR_COLLECTION,
     SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
 };
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_CELL_SIZE_M: f32 = 0.5;
@@ -20,6 +23,16 @@ const RECALL_RADIUS_CELLS: i32 = 4;
 #[async_trait]
 pub trait MemoryStore {
     async fn store(&self, frame: &ExperienceFrame) -> Result<()>;
+}
+
+#[async_trait]
+pub trait VectorStore: Send + Sync {
+    async fn upsert_vectors(&self, record: &MemoryRecord) -> Result<()>;
+}
+
+#[async_trait]
+pub trait GraphStore: Send + Sync {
+    async fn upsert_graph(&self, record: &MemoryRecord) -> Result<()>;
 }
 
 #[async_trait]
@@ -350,6 +363,279 @@ pub struct MemoryRecord {
     pub experience: Option<Experience>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QdrantConfig {
+    pub url: String,
+}
+
+impl QdrantConfig {
+    pub fn from_env() -> Option<Self> {
+        std::env::var("NETHERWICK_QDRANT_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .map(|url| Self { url })
+    }
+}
+
+#[derive(Clone)]
+pub struct QdrantVectorStore {
+    client: reqwest::Client,
+    config: QdrantConfig,
+}
+
+impl QdrantVectorStore {
+    pub fn new(config: QdrantConfig) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            config,
+        }
+    }
+
+    pub fn from_env() -> Option<Self> {
+        QdrantConfig::from_env().map(Self::new)
+    }
+
+    async fn ensure_collection(&self, collection: &str, vector_size: usize) -> Result<()> {
+        if vector_size == 0 {
+            return Ok(());
+        }
+        let url = format!(
+            "{}/collections/{}",
+            self.config.url.trim_end_matches('/'),
+            collection
+        );
+        let response = self
+            .client
+            .put(url)
+            .json(&json!({
+                "vectors": {
+                    "size": vector_size,
+                    "distance": "Cosine"
+                }
+            }))
+            .send()
+            .await
+            .context("creating qdrant collection")?;
+        if response.status().is_success() || response.status() == StatusCode::CONFLICT {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "qdrant collection create failed for {collection}: HTTP {}",
+            response.status()
+        ))
+    }
+}
+
+#[async_trait]
+impl VectorStore for QdrantVectorStore {
+    async fn upsert_vectors(&self, record: &MemoryRecord) -> Result<()> {
+        let mut by_collection: BTreeMap<&str, Vec<&VectorArtifact>> = BTreeMap::new();
+        for artifact in record_all_vectors(record) {
+            by_collection
+                .entry(artifact.collection.as_str())
+                .or_default()
+                .push(artifact);
+        }
+
+        for (collection, artifacts) in by_collection {
+            let Some(first) = artifacts.first() else {
+                continue;
+            };
+            self.ensure_collection(collection, first.vector.len())
+                .await?;
+            let points = artifacts
+                .into_iter()
+                .filter(|artifact| !artifact.vector.is_empty())
+                .map(|artifact| {
+                    json!({
+                        "id": stable_qdrant_point_id(&artifact.collection, &artifact.point_id),
+                        "vector": artifact.vector,
+                        "payload": {
+                            "collection": artifact.collection,
+                            "point_id": artifact.point_id,
+                            "frame_id": record.frame_id.to_string(),
+                            "source_frame_id": artifact.source_frame_id,
+                            "source_id": artifact.source_id,
+                            "model": artifact.model,
+                            "occurred_at_ms": artifact.occurred_at_ms.or(Some(record.t_ms)),
+                            "summary": record.summary,
+                            "neo4j_node_id": vector_node_id(artifact),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            if points.is_empty() {
+                continue;
+            }
+            let url = format!(
+                "{}/collections/{}/points?wait=true",
+                self.config.url.trim_end_matches('/'),
+                collection
+            );
+            let response = self
+                .client
+                .put(url)
+                .json(&json!({ "points": points }))
+                .send()
+                .await
+                .with_context(|| format!("upserting qdrant points into {collection}"))?;
+            if !response.status().is_success() {
+                return Err(anyhow!(
+                    "qdrant upsert failed for {collection}: HTTP {}",
+                    response.status()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Neo4jConfig {
+    pub http_url: String,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+}
+
+impl Neo4jConfig {
+    pub fn from_env() -> Option<Self> {
+        let user = std::env::var("NETHERWICK_NEO4J_USER").ok()?;
+        let password = std::env::var("NETHERWICK_NEO4J_PASSWORD").ok()?;
+        let http_url = std::env::var("NETHERWICK_NEO4J_HTTP_URL")
+            .ok()
+            .or_else(|| {
+                std::env::var("NETHERWICK_NEO4J_URI")
+                    .ok()
+                    .and_then(|uri| neo4j_http_url_from_uri(&uri))
+            })
+            .unwrap_or_else(|| "http://localhost:7474".to_string());
+        let database =
+            std::env::var("NETHERWICK_NEO4J_DATABASE").unwrap_or_else(|_| "neo4j".to_string());
+        Some(Self {
+            http_url,
+            user,
+            password,
+            database,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct Neo4jGraphStore {
+    client: reqwest::Client,
+    config: Neo4jConfig,
+}
+
+impl Neo4jGraphStore {
+    pub fn new(config: Neo4jConfig) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            config,
+        }
+    }
+
+    pub fn from_env() -> Option<Self> {
+        Neo4jConfig::from_env().map(Self::new)
+    }
+
+    async fn run_cypher(&self, statement: &str, parameters: serde_json::Value) -> Result<()> {
+        let url = format!(
+            "{}/db/{}/tx/commit",
+            self.config.http_url.trim_end_matches('/'),
+            self.config.database
+        );
+        let response = self
+            .client
+            .post(url)
+            .basic_auth(&self.config.user, Some(&self.config.password))
+            .json(&json!({
+                "statements": [{
+                    "statement": statement,
+                    "parameters": parameters
+                }]
+            }))
+            .send()
+            .await
+            .context("running neo4j cypher")?;
+        if !response.status().is_success() {
+            return Err(anyhow!("neo4j cypher failed: HTTP {}", response.status()));
+        }
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .context("reading neo4j response")?;
+        let errors = body
+            .get("errors")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if !errors.is_empty() {
+            return Err(anyhow!("neo4j cypher errors: {errors:?}"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl GraphStore for Neo4jGraphStore {
+    async fn upsert_graph(&self, record: &MemoryRecord) -> Result<()> {
+        let entities = record
+            .graph_entities
+            .iter()
+            .map(|entity| {
+                json!({
+                    "id": entity.id,
+                    "labels": entity.labels,
+                    "summary": entity.summary,
+                    "score": entity.score,
+                    "frame_id": record.frame_id.to_string(),
+                    "t_ms": record.t_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        let relationships = record
+            .graph_relationships
+            .iter()
+            .map(|edge| {
+                json!({
+                    "from": edge.from,
+                    "to": edge.to,
+                    "kind": edge.relationship,
+                    "summary": edge.summary,
+                    "frame_id": record.frame_id.to_string(),
+                    "t_ms": record.t_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        self.run_cypher(
+            r#"
+UNWIND $entities AS entity
+MERGE (n:MemoryNode {id: entity.id})
+SET n.labels = entity.labels,
+    n.summary = entity.summary,
+    n.score = entity.score,
+    n.frame_id = entity.frame_id,
+    n.t_ms = entity.t_ms
+WITH collect(n) AS ignored
+UNWIND $relationships AS relationship
+MATCH (from:MemoryNode {id: relationship.from})
+MATCH (to:MemoryNode {id: relationship.to})
+MERGE (from)-[r:RELATED {kind: relationship.kind}]->(to)
+SET r.summary = relationship.summary,
+    r.frame_id = relationship.frame_id,
+    r.t_ms = relationship.t_ms
+"#,
+            json!({
+                "entities": entities,
+                "relationships": relationships,
+            }),
+        )
+        .await
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct InMemoryExperienceStore {
     records: Arc<Mutex<Vec<MemoryRecord>>>,
@@ -380,48 +666,97 @@ impl InMemoryExperienceStore {
 #[async_trait]
 impl MemoryStore for InMemoryExperienceStore {
     async fn store(&self, frame: &ExperienceFrame) -> Result<()> {
-        let warning = frame
-            .memory_recall
-            .iter()
-            .find_map(|hit| hit.warning.clone())
-            .or_else(|| frame.now.memory.remembered_warning.clone());
-        let scene_vectors = scene_vectors_from_now(&frame.now, frame.id, frame.t_ms);
-        let face_vectors = vector_artifacts_from_now(
-            FACE_VECTOR_COLLECTION,
-            &frame.now.face.vectors,
-            &frame.now.face.embeddings,
-            frame.id,
-            frame.t_ms,
-        );
-        let voice_vectors = vector_artifacts_from_now(
-            VOICE_VECTOR_COLLECTION,
-            &frame.now.voice.vectors,
-            &frame.now.voice.embeddings,
-            frame.id,
-            frame.t_ms,
-        );
-        let (graph_entities, graph_relationships) =
-            graph_context_from_frame(frame, &scene_vectors, &face_vectors, &voice_vectors);
-        let record = MemoryRecord {
-            frame_id: frame.id,
-            t_ms: frame.t_ms,
-            summary: frame.summary_text(),
-            graph_entities,
-            graph_relationships,
-            scene_vectors,
-            face_vectors,
-            voice_vectors,
-            battery: frame.now.body.battery_level,
-            active_goal: RecallQuery::from_now(&frame.now).active_goal,
-            chosen_action: frame.chosen_action.clone(),
-            warning,
-            experience: frame.experiences.last().cloned(),
-        };
+        self.store_record(memory_record_from_frame(frame)?).await
+    }
+}
+
+impl InMemoryExperienceStore {
+    async fn store_record(&self, record: MemoryRecord) -> Result<()> {
         self.records
             .lock()
             .expect("memory mutex poisoned")
             .push(record);
         Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct DurableExperienceStore {
+    inner: InMemoryExperienceStore,
+    vector_stores: Vec<Arc<dyn VectorStore>>,
+    graph_stores: Vec<Arc<dyn GraphStore>>,
+}
+
+impl DurableExperienceStore {
+    pub fn new(inner: InMemoryExperienceStore) -> Self {
+        Self {
+            inner,
+            vector_stores: Vec::new(),
+            graph_stores: Vec::new(),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let mut store = Self::new(InMemoryExperienceStore::new());
+        if let Some(qdrant) = QdrantVectorStore::from_env() {
+            store = store.with_vector_store(qdrant);
+        }
+        if let Some(neo4j) = Neo4jGraphStore::from_env() {
+            store = store.with_graph_store(neo4j);
+        }
+        store
+    }
+
+    pub fn with_vector_store(mut self, store: impl VectorStore + 'static) -> Self {
+        self.vector_stores.push(Arc::new(store));
+        self
+    }
+
+    pub fn with_graph_store(mut self, store: impl GraphStore + 'static) -> Self {
+        self.graph_stores.push(Arc::new(store));
+        self
+    }
+
+    pub fn snapshot(&self) -> Vec<MemoryRecord> {
+        self.inner.snapshot()
+    }
+
+    pub fn place_snapshot(&self) -> PlaceMemory {
+        self.inner.place_snapshot()
+    }
+
+    pub fn place_report(&self) -> PlaceMemoryReport {
+        self.inner.place_report()
+    }
+}
+
+#[async_trait]
+impl MemoryStore for DurableExperienceStore {
+    async fn store(&self, frame: &ExperienceFrame) -> Result<()> {
+        let record = memory_record_from_frame(frame)?;
+        self.inner.store_record(record.clone()).await?;
+        for vector_store in &self.vector_stores {
+            if let Err(error) = vector_store.upsert_vectors(&record).await {
+                eprintln!("memory vector store write failed: {error:#}");
+            }
+        }
+        for graph_store in &self.graph_stores {
+            if let Err(error) = graph_store.upsert_graph(&record).await {
+                eprintln!("memory graph store write failed: {error:#}");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Recall for DurableExperienceStore {
+    async fn observe_now(&self, now: &Now) -> Result<()> {
+        self.inner.observe_now(now).await
+    }
+
+    async fn recall(&self, query: RecallQuery) -> Result<RecallBundle> {
+        self.inner.recall(query).await
     }
 }
 
@@ -570,6 +905,46 @@ impl Recall for InMemoryExperienceStore {
             recollections,
         })
     }
+}
+
+pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord> {
+    let warning = frame
+        .memory_recall
+        .iter()
+        .find_map(|hit| hit.warning.clone())
+        .or_else(|| frame.now.memory.remembered_warning.clone());
+    let scene_vectors = scene_vectors_from_now(&frame.now, frame.id, frame.t_ms);
+    let face_vectors = vector_artifacts_from_now(
+        FACE_VECTOR_COLLECTION,
+        &frame.now.face.vectors,
+        &frame.now.face.embeddings,
+        frame.id,
+        frame.t_ms,
+    );
+    let voice_vectors = vector_artifacts_from_now(
+        VOICE_VECTOR_COLLECTION,
+        &frame.now.voice.vectors,
+        &frame.now.voice.embeddings,
+        frame.id,
+        frame.t_ms,
+    );
+    let (graph_entities, graph_relationships) =
+        graph_context_from_frame(frame, &scene_vectors, &face_vectors, &voice_vectors);
+    Ok(MemoryRecord {
+        frame_id: frame.id,
+        t_ms: frame.t_ms,
+        summary: frame.summary_text(),
+        graph_entities,
+        graph_relationships,
+        scene_vectors,
+        face_vectors,
+        voice_vectors,
+        battery: frame.now.body.battery_level,
+        active_goal: RecallQuery::from_now(&frame.now).active_goal,
+        chosen_action: frame.chosen_action.clone(),
+        warning,
+        experience: frame.experiences.last().cloned(),
+    })
 }
 
 pub fn place_memory_report_from_frames(frames: &[ExperienceFrame]) -> PlaceMemoryReport {
@@ -1086,6 +1461,26 @@ fn query_pose_time_hint(query: &RecallQuery, ordinal: u64) -> u64 {
     pose_hint.saturating_add(ordinal)
 }
 
+fn stable_qdrant_point_id(collection: &str, point_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    collection.hash(&mut hasher);
+    point_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn neo4j_http_url_from_uri(uri: &str) -> Option<String> {
+    let trimmed = uri.trim();
+    let rest = trimmed
+        .strip_prefix("bolt://")
+        .or_else(|| trimmed.strip_prefix("neo4j://"))?;
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host_without_port = host.split(':').next().unwrap_or(host);
+    if host_without_port.is_empty() {
+        return None;
+    }
+    Some(format!("http://{host_without_port}:7474"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,6 +1637,31 @@ mod tests {
         );
 
         assert!((score - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn qdrant_point_ids_are_stable() {
+        assert_eq!(
+            stable_qdrant_point_id("faces", "frame:face:0"),
+            stable_qdrant_point_id("faces", "frame:face:0")
+        );
+        assert_ne!(
+            stable_qdrant_point_id("faces", "frame:face:0"),
+            stable_qdrant_point_id("voices", "frame:face:0")
+        );
+    }
+
+    #[test]
+    fn neo4j_http_url_can_be_derived_from_bolt_uri() {
+        assert_eq!(
+            neo4j_http_url_from_uri("bolt://neo4j:7687"),
+            Some("http://neo4j:7474".to_string())
+        );
+        assert_eq!(
+            neo4j_http_url_from_uri("neo4j://localhost:7687"),
+            Some("http://localhost:7474".to_string())
+        );
+        assert_eq!(neo4j_http_url_from_uri("http://localhost:7474"), None);
     }
 
     fn now_at(t_ms: u64, x_m: f32, y_m: f32) -> Now {

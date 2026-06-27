@@ -1,6 +1,6 @@
 set shell := ["bash", "-euxo", "pipefail", "-c"]
 
-create1_port := env_var_or_default("CREATE1_PORT", "/dev/ttyUSB0")
+create1_port := env_var_or_default("CREATE1_PORT", "auto")
 gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "/dev/ttyACM0")
 camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 
@@ -25,6 +25,7 @@ setup-system:
         curl \
         just \
         ffmpeg \
+        i2c-tools \
         v4l-utils \
         libasound2-dev \
         libudev-dev \
@@ -104,6 +105,14 @@ clippy:
 # Run simulator mode through netherwick-tools.
 sim:
     cargo run -p netherwick-tools -- sim
+
+# Bring up the real robot in read-only mode with default hardware auto-detection.
+robot *args:
+    cargo run -p netherwick-tools -- robot \
+        --mode "${NETHERWICK_ROBOT_MODE:-read-only}" \
+        --create-port "{{create1_port}}" \
+        --ledger "${NETHERWICK_ROBOT_LEDGER:-data/ledger/real/robot}" \
+        {{args}}
 
 # Launch the virtual dream world with HTTPS live view.
 go target="virtual":

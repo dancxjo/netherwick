@@ -4776,6 +4776,7 @@ dependencies = [
  "netherwick-experience",
  "netherwick-ledger",
  "netherwick-now",
+ "reqwest 0.11.27",
  "serde",
  "serde_json",
  "tokio",

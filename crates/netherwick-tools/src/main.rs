@@ -20,7 +20,8 @@ use netherwick_ledger::{
 };
 use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
 use netherwick_memory::{
-    place_memory_report_from_frames, InMemoryExperienceStore, PlaceMemoryReport,
+    place_memory_report_from_frames, DurableExperienceStore, InMemoryExperienceStore,
+    PlaceMemoryReport,
 };
 use netherwick_models::MODEL_REGISTRY;
 use netherwick_now::{EarSense, KinectSense, RangeSense};
@@ -55,6 +56,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const DEFAULT_LIVE_LLM_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_MPU6050_IMU_DEVICE: &str = "/dev/i2c-1";
 
 #[derive(Parser)]
 #[command(name = "netherwick")]
@@ -896,7 +898,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
         );
         live_action_selector_label = format!("reign-passthrough+{}", action_selector_mode.as_str());
     }
-    let memory = InMemoryExperienceStore::new();
+    let memory = DurableExperienceStore::from_env();
     let recall = memory.clone();
     let llm = configured_llm_agent_for_sim(&args.llm, args.live)?;
     let mut runtime = MinimalRuntime::with_default_events(
@@ -3329,6 +3331,20 @@ async fn hardware_env(args: HardwareEnvArgs) -> Result<()> {
         report["raspberry_pi_like"].as_bool().unwrap_or(false)
     );
     print_json_list("  create serial candidates", &report["serial_devices"]);
+    print_json_list("  gps serial candidates", &report["gps_serial_candidates"]);
+    println!(
+        "  default gps: {}",
+        report["default_gps"]["device"]
+            .as_str()
+            .unwrap_or("not detected")
+    );
+    print_json_list("  i2c devices", &report["i2c_devices"]);
+    println!(
+        "  default imu: {}",
+        report["default_imu"]["device"]
+            .as_str()
+            .unwrap_or("unknown")
+    );
     print_json_list("  cameras", &report["camera_devices"]);
     print_json_list("  audio inputs", &report["audio_input_devices"]);
     println!(
@@ -3364,22 +3380,14 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         "kinect": env_report["kinect"].clone(),
     });
 
-    let create_port = if args.create_port == "auto" {
-        env_report["serial_devices"]
-            .as_array()
-            .and_then(|devices| devices.first())
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    } else {
-        Some(args.create_port.clone())
-    };
+    let create_port = selected_create_port(&args.create_port, &env_report);
 
     let body: Box<dyn RobotBody + Send> = if args.mock || create_port.as_deref() == Some("mock") {
         device_availability["create"] = serde_json::json!({"present": true, "source": "mock"});
         Box::new(MockCreate1Body::new())
-    } else if let Some(create_port) = create_port {
+    } else if let Some(create_port) = &create_port {
         match Create1Body::connect_with_mode(
-            &create_port,
+            create_port,
             args.create_baud,
             Create1OpenMode::Passive,
         )
@@ -3415,7 +3423,14 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         device_availability["microphone"] = serde_json::json!({"present": true, "source": "mock"});
         device_availability["kinect"] = serde_json::json!({"present": true, "source": "mock"});
     } else {
-        add_optional_real_sensors(&args, &mut sensors, &mut device_availability, &mut warnings);
+        add_optional_real_sensors(
+            &args,
+            &env_report,
+            create_port.as_deref(),
+            &mut sensors,
+            &mut device_availability,
+            &mut warnings,
+        );
     }
     let no_real_create = device_availability["create"]["present"].as_bool() != Some(true);
     if !args.mock && no_real_create && sensors.is_empty() {
@@ -3730,16 +3745,8 @@ impl SenseProducer for BackgroundSenseProducer {
 }
 
 async fn run_robot(args: RobotArgs) -> Result<()> {
-    let create_port = if args.create_port == "auto" {
-        let env_report = collect_hardware_env_report().await;
-        env_report["serial_devices"]
-            .as_array()
-            .and_then(|devices| devices.first())
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    } else {
-        Some(args.create_port.clone())
-    };
+    let env_report = collect_hardware_env_report().await;
+    let create_port = selected_create_port(&args.create_port, &env_report);
     let is_mock_body = create_port.as_deref() == Some("mock");
     let mut robot_mode = match args.mode {
         RobotModeArg::ReadOnly => RobotMode::ReadOnly,
@@ -3857,8 +3864,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    if let Some(device) = &args.gps {
-        match GpsSenseProvider::new(device, 9600) {
+    if let Some(device) = selected_gps_device(
+        args.gps.as_deref(),
+        is_mock_body,
+        &env_report,
+        create_port.as_deref(),
+    ) {
+        match GpsSenseProvider::new(&device, 9600) {
             Ok(provider) => sensors.push(Box::new(provider)),
             Err(err) => {
                 if args.require_gps {
@@ -3870,7 +3882,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    if let Some(device) = &args.imu {
+    if let Some(device) = selected_imu_device(args.imu.as_deref(), is_mock_body) {
         match ImuSenseProvider::new(device) {
             Ok(provider) => sensors.push(Box::new(provider)),
             Err(err) => {
@@ -4029,6 +4041,8 @@ fn duration_to_steps(duration_seconds: u64, tick_ms: u64) -> usize {
 
 fn add_optional_real_sensors(
     args: &CaptureRealArgs,
+    env_report: &Value,
+    create_port: Option<&str>,
     sensors: &mut Vec<Box<dyn SenseProducer + Send>>,
     availability: &mut Value,
     warnings: &mut Vec<String>,
@@ -4111,8 +4125,8 @@ fn add_optional_real_sensors(
         warnings.push("microphone not requested; audio stream missing".to_string());
     }
 
-    if let Some(device) = &args.gps {
-        match GpsSenseProvider::new(device, 9600) {
+    if let Some(device) = selected_gps_device(args.gps.as_deref(), false, env_report, create_port) {
+        match GpsSenseProvider::new(&device, 9600) {
             Ok(provider) => {
                 sensors.push(Box::new(provider));
                 availability["gps"] = serde_json::json!({"present": true, "device": device});
@@ -4123,10 +4137,11 @@ fn add_optional_real_sensors(
             }
         }
     } else {
-        availability["gps"] = serde_json::json!({"present": false, "reason": "not requested"});
+        availability["gps"] =
+            serde_json::json!({"present": false, "reason": "disabled or not detected"});
     }
 
-    if let Some(device) = &args.imu {
+    if let Some(device) = selected_imu_device(args.imu.as_deref(), false) {
         match ImuSenseProvider::new(device) {
             Ok(provider) => {
                 sensors.push(Box::new(provider));
@@ -4138,7 +4153,7 @@ fn add_optional_real_sensors(
             }
         }
     } else {
-        availability["imu"] = serde_json::json!({"present": false, "reason": "not requested"});
+        availability["imu"] = serde_json::json!({"present": false, "reason": "disabled"});
     }
 
     if availability["kinect"]["present"].as_bool() != Some(true)
@@ -4146,6 +4161,102 @@ fn add_optional_real_sensors(
     {
         warnings.push("Kinect/libfreenect not detected; depth stream missing".to_string());
     }
+}
+
+fn selected_create_port(requested: &str, env_report: &Value) -> Option<String> {
+    if requested != "auto" {
+        return Some(requested.to_string());
+    }
+    let mut candidates = serial_device_strings(env_report)
+        .into_iter()
+        .filter(|device| !looks_like_gps_serial_device(device))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|device| create_serial_priority(device));
+    candidates.into_iter().next()
+}
+
+fn create_serial_priority(device: &str) -> u8 {
+    if device.contains("/dev/ttyUSB") {
+        0
+    } else if device.contains("/dev/serial/by-id") {
+        1
+    } else if device.contains("/dev/ttyACM") {
+        2
+    } else {
+        3
+    }
+}
+
+fn selected_gps_device(
+    requested: Option<&str>,
+    suppress_default: bool,
+    env_report: &Value,
+    create_port: Option<&str>,
+) -> Option<String> {
+    match requested.map(str::trim) {
+        Some(value) if gps_disabled_value(value) => return None,
+        Some(value) if !value.is_empty() => return Some(value.to_string()),
+        _ if suppress_default => return None,
+        _ => {}
+    }
+
+    let available = serial_device_strings(env_report)
+        .into_iter()
+        .filter(|device| {
+            create_port
+                .map(|port| port != device.as_str())
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    available
+        .iter()
+        .find(|device| looks_like_gps_serial_device(device))
+        .cloned()
+        .or_else(|| {
+            available
+                .iter()
+                .find(|device| device.contains("/dev/ttyACM"))
+                .cloned()
+        })
+}
+
+fn serial_device_strings(env_report: &Value) -> Vec<String> {
+    env_report["serial_devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn looks_like_gps_serial_device(device: &str) -> bool {
+    let lower = device.to_lowercase();
+    lower.contains("u-blox")
+        || lower.contains("ublox")
+        || lower.contains("gps")
+        || lower.contains("gnss")
+}
+
+fn gps_disabled_value(value: &str) -> bool {
+    value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("disabled")
+}
+
+fn selected_imu_device(requested: Option<&str>, suppress_default: bool) -> Option<&str> {
+    match requested.map(str::trim) {
+        Some(value) if imu_disabled_value(value) => None,
+        Some(value) if !value.is_empty() => Some(value),
+        _ if suppress_default => None,
+        _ => Some(DEFAULT_MPU6050_IMU_DEVICE),
+    }
+}
+
+fn imu_disabled_value(value: &str) -> bool {
+    value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("disabled")
 }
 
 #[derive(Default)]
@@ -4244,15 +4355,56 @@ impl LedgerWriter for NoopLedger {
 
 async fn collect_hardware_env_report() -> Value {
     let serial_devices = list_matching_paths(&["/dev/ttyUSB", "/dev/ttyACM", "/dev/serial/by-id/"]);
+    let gps_serial_candidates = serial_devices
+        .iter()
+        .filter(|device| looks_like_gps_serial_device(device))
+        .cloned()
+        .collect::<Vec<_>>();
+    let default_gps_device = gps_serial_candidates.first().cloned().or_else(|| {
+        serial_devices
+            .iter()
+            .find(|device| device.contains("/dev/ttyACM"))
+            .cloned()
+    });
+    let i2c_devices = list_matching_paths(&["/dev/i2c-"]);
     let camera_devices = list_matching_paths(&["/dev/video"]);
     let audio_input_devices = audio_input_devices();
-    let warnings = hardware_env_warnings(&serial_devices, &camera_devices, &audio_input_devices);
+    let warnings = hardware_env_warnings(
+        &serial_devices,
+        &i2c_devices,
+        &camera_devices,
+        &audio_input_devices,
+    );
     serde_json::json!({
         "os": std::env::consts::OS,
         "architecture": std::env::consts::ARCH,
         "cpu_model": cpu_model(),
         "memory_total_kb": memory_total_kb(),
         "serial_devices": serial_devices,
+        "gps_serial_candidates": gps_serial_candidates,
+        "default_gps": {
+            "kind": "u-blox7",
+            "device": default_gps_device,
+            "baud": 9600,
+            "protocol": "nmea"
+        },
+        "i2c_devices": i2c_devices,
+        "default_imu": {
+            "kind": "mpu6050",
+            "device": DEFAULT_MPU6050_IMU_DEVICE,
+            "address": "0x68",
+            "raspberry_pi_header_pins": {
+                "sda": 3,
+                "scl": 5,
+                "power_3v3": 1,
+                "ground": 6
+            },
+            "gpio_bcm": {
+                "sda": 2,
+                "scl": 3
+            },
+            "present": Path::new(DEFAULT_MPU6050_IMU_DEVICE).exists()
+        },
         "camera_devices": camera_devices,
         "audio_input_devices": audio_input_devices,
         "kinect": {
@@ -4264,6 +4416,7 @@ async fn collect_hardware_env_report() -> Value {
         "permissions": {
             "groups": current_groups(),
             "serial_group_hint": "dialout",
+            "i2c_group_hint": "i2c",
             "video_group_hint": "video",
             "audio_group_hint": "audio",
         },
@@ -4279,6 +4432,7 @@ async fn collect_hardware_env_report() -> Value {
 
 fn hardware_env_warnings(
     serial_devices: &[String],
+    i2c_devices: &[String],
     camera_devices: &[String],
     audio_input_devices: &[String],
 ) -> Vec<String> {
@@ -4287,13 +4441,26 @@ fn hardware_env_warnings(
     if serial_devices.is_empty() {
         warnings.push("no likely Create serial devices found under /dev/ttyUSB*, /dev/ttyACM*, or /dev/serial/by-id".to_string());
     }
+    if i2c_devices.is_empty() {
+        warnings.push(
+            "no /dev/i2c-* buses found; enable Raspberry Pi I2C before using the MPU-6050"
+                .to_string(),
+        );
+    } else if !i2c_devices
+        .iter()
+        .any(|device| device == DEFAULT_MPU6050_IMU_DEVICE)
+    {
+        warnings.push(format!(
+            "default MPU-6050 bus {DEFAULT_MPU6050_IMU_DEVICE} not found; pass --imu /dev/i2c-N if your Pi exposes a different bus"
+        ));
+    }
     if camera_devices.is_empty() {
         warnings.push("no /dev/video* camera devices found".to_string());
     }
     if audio_input_devices.is_empty() {
         warnings.push("no audio input devices detected by arecord or /proc/asound".to_string());
     }
-    for group in ["dialout", "video", "audio"] {
+    for group in ["dialout", "i2c", "video", "audio"] {
         if !groups.iter().any(|item| item == group) {
             warnings.push(format!(
                 "current user is not in `{group}` group; hardware permissions may fail"
@@ -7441,10 +7608,59 @@ mod tests {
         assert!(report.get("os").is_some());
         assert!(report.get("architecture").is_some());
         assert!(report.get("serial_devices").unwrap().is_array());
+        assert!(report.get("gps_serial_candidates").unwrap().is_array());
+        assert_eq!(report["default_gps"]["baud"].as_u64(), Some(9600));
+        assert!(report.get("i2c_devices").unwrap().is_array());
+        assert_eq!(
+            report["default_imu"]["device"].as_str(),
+            Some(DEFAULT_MPU6050_IMU_DEVICE)
+        );
         assert!(report.get("camera_devices").unwrap().is_array());
         assert!(report.get("audio_input_devices").unwrap().is_array());
         assert!(report.get("kinect").unwrap().is_object());
         assert!(report.get("data_dirs_writable").unwrap().is_object());
+    }
+
+    #[test]
+    fn imu_device_defaults_can_be_overridden_or_disabled() {
+        assert_eq!(
+            selected_imu_device(None, false),
+            Some(DEFAULT_MPU6050_IMU_DEVICE)
+        );
+        assert_eq!(selected_imu_device(None, true), None);
+        assert_eq!(
+            selected_imu_device(Some("/dev/i2c-1@0x69"), true),
+            Some("/dev/i2c-1@0x69")
+        );
+        assert_eq!(selected_imu_device(Some("none"), false), None);
+    }
+
+    #[test]
+    fn serial_auto_selection_keeps_gps_and_create_separate() {
+        let report = serde_json::json!({
+            "serial_devices": [
+                "/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_7-if00",
+                "/dev/ttyACM0",
+                "/dev/ttyUSB0"
+            ]
+        });
+
+        assert_eq!(
+            selected_create_port("auto", &report),
+            Some("/dev/ttyUSB0".to_string())
+        );
+        assert_eq!(
+            selected_gps_device(None, false, &report, Some("/dev/ttyUSB0")),
+            Some("/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_7-if00".to_string())
+        );
+        assert_eq!(
+            selected_gps_device(Some("/dev/ttyACM1"), false, &report, Some("/dev/ttyUSB0")),
+            Some("/dev/ttyACM1".to_string())
+        );
+        assert_eq!(
+            selected_gps_device(Some("none"), false, &report, Some("/dev/ttyUSB0")),
+            None
+        );
     }
 
     #[test]

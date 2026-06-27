@@ -16,6 +16,12 @@ cargo run -p netherwick-tools -- robot \
   --steps 10
 ```
 
+Default Raspberry Pi hardware:
+
+```bash
+just robot
+```
+
 Create 1 body over serial:
 
 ```bash
@@ -63,20 +69,34 @@ Log out and back in after changing group membership. A missing device or permiss
 
 ## Optional Sensors
 
-The CLI accepts `--camera`, `--mic`, `--imu`, and `--gps`. These are optional by default, so absent devices do not block read-only body bring-up. Passing `--require-camera`, `--require-mic`, `--require-imu`, or `--require-gps` makes the command fail if that provider is unavailable.
+The CLI accepts `--camera`, `--mic`, `--imu`, and `--gps`. Camera and microphone are optional by default, so absent devices do not block read-only body bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Netherwick finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. Passing `--require-camera`, `--require-mic`, `--require-imu`, or `--require-gps` makes the command fail if that provider is unavailable.
 
 Current minimum support is robust no-data handling plus mock/body capture. Rich camera, microphone, IMU, and GPS producers can be wired behind hardware features without changing the read-only runner.
 
-MPU-6050 IMUs are supported on Linux I2C buses when `netherwick-tools` is built with the existing `linux-hardware` sensor feature. Pass the bus path to `--imu`, for example:
+MPU-6050 IMUs are supported on Linux I2C buses when `netherwick-tools` is built with the existing `linux-hardware` sensor feature. On a Raspberry Pi, wire VCC to 3.3V physical pin 1, GND to pin 6, SDA to GPIO 2 physical pin 3, and SCL to GPIO 3 physical pin 5. Enable I2C, add the user to the `i2c` group, and reboot:
 
 ```bash
-cargo run -p netherwick-tools -- robot --imu /dev/i2c-1
+sudo raspi-config nonint do_i2c 0
+sudo usermod -aG i2c "$USER"
+sudo reboot
 ```
 
-The default MPU-6050 address is `0x68`. If AD0 is high, include the address in the device string:
+The default bus is `/dev/i2c-1` and the default MPU-6050 address is `0x68`, so this reads real IMU data with normal Pi wiring:
+
+```bash
+cargo run -p netherwick-tools -- robot
+```
+
+If AD0 is high, include the address in the device string:
 
 ```bash
 cargo run -p netherwick-tools -- robot --imu /dev/i2c-1@0x69
+```
+
+u-blox7 GPS receivers are read over USB serial at 9600 baud using NMEA. Auto-detection prefers stable `/dev/serial/by-id/*u-blox*`, `*gps*`, or `*gnss*` paths and avoids the selected Create serial port. Pin a receiver explicitly when needed:
+
+```bash
+cargo run -p netherwick-tools -- robot --gps /dev/serial/by-id/<u-blox-device>
 ```
 
 ## Capture Output
