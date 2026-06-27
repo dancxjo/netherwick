@@ -11,8 +11,8 @@ robot_dashboard := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD", "0.0.0.0:300
 default:
     @just --list
 
-# Install Linux dependencies, Rust toolchain, and Kinect prerequisites.
-setup: setup-system setup-rust setup-kinect
+# Install Linux dependencies, Rust toolchain, Docker, and Kinect prerequisites.
+setup: setup-system setup-docker setup-rust setup-kinect
     @echo "netherwick Linux setup complete"
     @echo "next: cargo check && just sim"
 
@@ -36,6 +36,13 @@ setup-system:
         libudev-dev \
         libusb-1.0-0-dev \
         libv4l-dev
+
+# Install Docker and Docker Compose.
+setup-docker:
+    if ! command -v docker >/dev/null 2>&1; then \
+        curl -fsSL https://get.docker.com | sudo sh; \
+        sudo usermod -aG docker $(whoami) || true; \
+    fi
 
 # Install Rust with rustup if cargo is missing.
 setup-rust:
