@@ -12,7 +12,7 @@ default:
     @just --list
 
 # Install Linux dependencies, Rust toolchain, Docker, and Kinect prerequisites.
-setup: setup-system setup-docker setup-rust setup-kinect
+setup: setup-system setup-docker setup-user setup-rust setup-kinect
     @echo "netherwick Linux setup complete"
     @echo "next: cargo check && just sim"
 
@@ -41,8 +41,21 @@ setup-system:
 setup-docker:
     if ! command -v docker >/dev/null 2>&1; then \
         curl -fsSL https://get.docker.com | sudo sh; \
-        sudo usermod -aG docker $(whoami) || true; \
     fi
+
+# Configure user permissions for hardware and docker access.
+setup-user:
+    #!/usr/bin/env bash
+    set -e
+    for group in docker dialout video audio i2c plugdev; do
+        if getent group "$group" >/dev/null 2>&1; then
+            sudo usermod -aG "$group" "$(whoami)"
+            echo "Added $(whoami) to group: $group"
+        else
+            echo "Group $group does not exist, skipping."
+        fi
+    done
+    echo "User setup complete. Please reboot or log out and back in for group changes to take effect."
 
 # Install Rust with rustup if cargo is missing.
 setup-rust:
