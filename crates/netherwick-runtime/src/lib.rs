@@ -37,7 +37,9 @@ use netherwick_ledger::{
 };
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_map::{LocalMap, MAP_EXTENSION_NAME};
-use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
+use netherwick_memory::{
+    attach_memory_links_to_frame, MemoryStore, Recall, RecallBundle, RecallQuery,
+};
 use netherwick_models::{
     read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
     read_experience_autoencoder_metadata, read_eye_next_metadata, read_future_metadata,
@@ -3314,7 +3316,7 @@ where
         }
 
         self.last_behavior_runs = behavior_runs.clone();
-        let frame = ExperienceFrame {
+        let mut frame = ExperienceFrame {
             id: Uuid::new_v4(),
             t_ms: now.t_ms,
             now: now.clone(),
@@ -3340,6 +3342,7 @@ where
                 .collect(),
             notes,
         };
+        attach_memory_links_to_frame(&mut frame);
 
         self.ledger.append(&frame).await?;
         self.memory_recall.observe_frame(&frame).await?;

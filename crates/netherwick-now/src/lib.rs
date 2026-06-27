@@ -624,6 +624,10 @@ pub struct GraphEdge {
     pub to: String,
     pub relationship: String,
     pub summary: Option<String>,
+    #[serde(default)]
+    pub score: f32,
+    #[serde(default)]
+    pub payload: Value,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

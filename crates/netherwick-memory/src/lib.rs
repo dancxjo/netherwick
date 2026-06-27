@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use netherwick_actions::ActionPrimitive;
 use netherwick_core::{Goal, Pose2};
-use netherwick_experience::{Experience, Impression, RecalledExperience, VectorEmbedding};
+use netherwick_experience::{
+    Experience, Impression, MemoryLink, RecalledExperience, VectorEmbedding,
+};
 use netherwick_ledger::{ExperienceFrame, ExperienceTransition};
 use netherwick_now::{
     GraphEdge, GraphEntity, MemorySense, Now, RecallHit, VectorArtifact, FACE_VECTOR_COLLECTION,
@@ -749,6 +751,8 @@ impl GraphStore for Neo4jGraphStore {
                     "to": edge.to,
                     "kind": edge.relationship,
                     "summary": edge.summary,
+                    "score": edge.score,
+                    "payload": edge.payload,
                     "frame_id": record.frame_id.to_string(),
                     "t_ms": record.t_ms,
                 })
@@ -770,6 +774,8 @@ MATCH (from:MemoryNode {id: relationship.from})
 MATCH (to:MemoryNode {id: relationship.to})
 MERGE (from)-[r:RELATED {kind: relationship.kind}]->(to)
 SET r.summary = relationship.summary,
+    r.score = relationship.score,
+    r.payload = relationship.payload,
     r.frame_id = relationship.frame_id,
     r.t_ms = relationship.t_ms
 "#,
@@ -1112,11 +1118,19 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         frame.id,
         frame.t_ms,
     );
+    let linked_experiences =
+        experiences_with_memory_links(frame, &scene_vectors, &face_vectors, &voice_vectors);
     let (sensation_vectors, mut vector_payloads) = sensation_vectors_from_frame(frame);
-    let (experience_vectors, experience_payloads) = experience_vectors_from_frame(frame);
+    let (experience_vectors, experience_payloads) =
+        experience_vectors_from_experiences(frame, &linked_experiences);
     vector_payloads.extend(experience_payloads);
-    let (graph_entities, graph_relationships) =
-        graph_context_from_frame(frame, &scene_vectors, &face_vectors, &voice_vectors);
+    let (graph_entities, graph_relationships) = graph_context_from_frame(
+        frame,
+        &linked_experiences,
+        &scene_vectors,
+        &face_vectors,
+        &voice_vectors,
+    );
     Ok(MemoryRecord {
         frame_id: frame.id,
         t_ms: frame.t_ms,
@@ -1133,8 +1147,48 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         active_goal: RecallQuery::from_now(&frame.now).active_goal,
         chosen_action: frame.chosen_action.clone(),
         warning,
-        experience: frame.experiences.last().cloned(),
+        experience: linked_experiences.last().cloned(),
     })
+}
+
+pub fn attach_memory_links_to_frame(frame: &mut ExperienceFrame) {
+    let scene_vectors = scene_vectors_from_now(&frame.now, frame.id, frame.t_ms);
+    let face_vectors = vector_artifacts_from_now(
+        FACE_VECTOR_COLLECTION,
+        &frame.now.face.vectors,
+        &frame.now.face.embeddings,
+        frame.id,
+        frame.t_ms,
+    );
+    let voice_vectors = vector_artifacts_from_now(
+        VOICE_VECTOR_COLLECTION,
+        &frame.now.voice.vectors,
+        &frame.now.voice.embeddings,
+        frame.id,
+        frame.t_ms,
+    );
+    let links = memory_links_from_frame(frame, &scene_vectors, &face_vectors, &voice_vectors);
+    for experience in &mut frame.experiences {
+        merge_memory_links(&mut experience.memory_links, links.clone());
+    }
+}
+
+fn experiences_with_memory_links(
+    frame: &ExperienceFrame,
+    scene_vectors: &[VectorArtifact],
+    face_vectors: &[VectorArtifact],
+    voice_vectors: &[VectorArtifact],
+) -> Vec<Experience> {
+    let links = memory_links_from_frame(frame, scene_vectors, face_vectors, voice_vectors);
+    frame
+        .experiences
+        .iter()
+        .cloned()
+        .map(|mut experience| {
+            merge_memory_links(&mut experience.memory_links, links.clone());
+            experience
+        })
+        .collect()
 }
 
 pub fn place_memory_report_from_frames(frames: &[ExperienceFrame]) -> PlaceMemoryReport {
@@ -1356,6 +1410,7 @@ fn score_record(query: &RecallQuery, record: MemoryRecord) -> Option<(f32, Memor
 
 fn graph_context_from_frame(
     frame: &ExperienceFrame,
+    experiences: &[Experience],
     scene_vectors: &[VectorArtifact],
     face_vectors: &[VectorArtifact],
     voice_vectors: &[VectorArtifact],
@@ -1376,12 +1431,12 @@ fn graph_context_from_frame(
             score: 1.0,
         },
     ];
-    let mut relationships = vec![GraphEdge {
-        from: format!("frame:{frame_id}"),
-        to: experience_id.clone(),
-        relationship: "HAS_MEMORY_SUMMARY".to_string(),
-        summary: None,
-    }];
+    let mut relationships = vec![graph_edge(
+        format!("frame:{frame_id}"),
+        experience_id.clone(),
+        "HAS_MEMORY_SUMMARY",
+        None,
+    )];
 
     let pose = frame.now.body.odometry;
     let place_id = place_id_for_pose(pose);
@@ -1391,22 +1446,22 @@ fn graph_context_from_frame(
         summary: format!("place near x={:.1}m y={:.1}m", pose.x_m, pose.y_m),
         score: 1.0,
     });
-    relationships.push(GraphEdge {
-        from: experience_id.clone(),
-        to: place_id,
-        relationship: "OCCURRED_AT".to_string(),
-        summary: None,
-    });
+    relationships.push(graph_edge(
+        experience_id.clone(),
+        place_id,
+        "OCCURRED_AT",
+        None,
+    ));
 
     for artifact in scene_vectors {
         let vector_id = vector_node_id(artifact);
         entities.push(vector_entity(artifact, "scene"));
-        relationships.push(GraphEdge {
-            from: experience_id.clone(),
-            to: vector_id,
-            relationship: "HAS_SCENE_VECTOR".to_string(),
-            summary: None,
-        });
+        relationships.push(graph_edge(
+            experience_id.clone(),
+            vector_id,
+            "HAS_SCENE_VECTOR",
+            None,
+        ));
     }
 
     for sensation in &frame.sensations {
@@ -1424,19 +1479,19 @@ fn graph_context_from_frame(
                 .unwrap_or_else(|| sensation.kind.clone()),
             score: sensation.metadata.confidence.unwrap_or(1.0),
         });
-        relationships.push(GraphEdge {
-            from: format!("frame:{frame_id}"),
-            to: sensation_id.clone(),
-            relationship: "HAS_SENSATION".to_string(),
-            summary: Some(sensation.kind.clone()),
-        });
+        relationships.push(graph_edge(
+            format!("frame:{frame_id}"),
+            sensation_id.clone(),
+            "HAS_SENSATION",
+            Some(sensation.kind.clone()),
+        ));
         if let Some(parent_id) = sensation.parent_id {
-            relationships.push(GraphEdge {
-                from: sensation_id.clone(),
-                to: sensation_node_id(parent_id),
-                relationship: "DERIVED_FROM_SENSATION".to_string(),
-                summary: None,
-            });
+            relationships.push(graph_edge(
+                sensation_id.clone(),
+                sensation_node_id(parent_id),
+                "DERIVED_FROM_SENSATION",
+                None,
+            ));
         }
         if let Some(embedding) = &sensation.vector {
             let artifact = embodied_vector_artifact(
@@ -1448,38 +1503,38 @@ fn graph_context_from_frame(
                 sensation.occurred_at_ms,
             );
             entities.push(vector_entity(&artifact, "sensation"));
-            relationships.push(GraphEdge {
-                from: sensation_id.clone(),
-                to: vector_node_id(&artifact),
-                relationship: "HAS_SENSATION_VECTOR".to_string(),
-                summary: Some(format!("{} dimensions", embedding.dim)),
-            });
+            relationships.push(graph_edge(
+                sensation_id.clone(),
+                vector_node_id(&artifact),
+                "HAS_SENSATION_VECTOR",
+                Some(format!("{} dimensions", embedding.dim)),
+            ));
         }
         if let Some(impression) = &sensation.impression {
             let impression_id = impression_node_id(impression.id);
             entities.push(impression_entity(impression));
-            relationships.push(GraphEdge {
-                from: sensation_id,
-                to: impression_id,
-                relationship: "HAS_IMPRESSION".to_string(),
-                summary: Some(impression.text.clone()),
-            });
+            relationships.push(graph_edge(
+                sensation_id,
+                impression_id,
+                "HAS_IMPRESSION",
+                Some(impression.text.clone()),
+            ));
         }
     }
 
     for impression in &frame.impressions {
         entities.push(impression_entity(impression));
         for sensation_id in &impression.about {
-            relationships.push(GraphEdge {
-                from: sensation_node_id(*sensation_id),
-                to: impression_node_id(impression.id),
-                relationship: "HAS_IMPRESSION".to_string(),
-                summary: Some(impression.text.clone()),
-            });
+            relationships.push(graph_edge(
+                sensation_node_id(*sensation_id),
+                impression_node_id(impression.id),
+                "HAS_IMPRESSION",
+                Some(impression.text.clone()),
+            ));
         }
     }
 
-    for experience in &frame.experiences {
+    for experience in experiences {
         let canonical_experience_id = experience_node_id(experience.id);
         entities.push(GraphEntity {
             id: canonical_experience_id.clone(),
@@ -1487,42 +1542,42 @@ fn graph_context_from_frame(
             summary: experience_summary_text(experience),
             score: experience.salience,
         });
-        relationships.push(GraphEdge {
-            from: format!("frame:{frame_id}"),
-            to: canonical_experience_id.clone(),
-            relationship: "HAS_EXPERIENCE".to_string(),
-            summary: Some(experience.kind.clone()),
-        });
-        relationships.push(GraphEdge {
-            from: experience_id.clone(),
-            to: canonical_experience_id.clone(),
-            relationship: "SUMMARIZES_EXPERIENCE".to_string(),
-            summary: None,
-        });
+        relationships.push(graph_edge(
+            format!("frame:{frame_id}"),
+            canonical_experience_id.clone(),
+            "HAS_EXPERIENCE",
+            Some(experience.kind.clone()),
+        ));
+        relationships.push(graph_edge(
+            experience_id.clone(),
+            canonical_experience_id.clone(),
+            "SUMMARIZES_EXPERIENCE",
+            None,
+        ));
         for sensation_id in &experience.sensation_ids {
-            relationships.push(GraphEdge {
-                from: canonical_experience_id.clone(),
-                to: sensation_node_id(*sensation_id),
-                relationship: "INTEGRATES_SENSATION".to_string(),
-                summary: None,
-            });
+            relationships.push(graph_edge(
+                canonical_experience_id.clone(),
+                sensation_node_id(*sensation_id),
+                "INTEGRATES_SENSATION",
+                None,
+            ));
         }
         for impression_id in &experience.impression_ids {
-            relationships.push(GraphEdge {
-                from: canonical_experience_id.clone(),
-                to: impression_node_id(*impression_id),
-                relationship: "INTEGRATES_IMPRESSION".to_string(),
-                summary: None,
-            });
+            relationships.push(graph_edge(
+                canonical_experience_id.clone(),
+                impression_node_id(*impression_id),
+                "INTEGRATES_IMPRESSION",
+                None,
+            ));
         }
         if let Some(impression) = &experience.summary_impression {
             entities.push(impression_entity(impression));
-            relationships.push(GraphEdge {
-                from: canonical_experience_id.clone(),
-                to: impression_node_id(impression.id),
-                relationship: "HAS_SUMMARY_IMPRESSION".to_string(),
-                summary: Some(impression.text.clone()),
-            });
+            relationships.push(graph_edge(
+                canonical_experience_id.clone(),
+                impression_node_id(impression.id),
+                "HAS_SUMMARY_IMPRESSION",
+                Some(impression.text.clone()),
+            ));
         }
         if let Some(embedding) = &experience.fused_vector {
             let artifact = embodied_vector_artifact(
@@ -1534,12 +1589,18 @@ fn graph_context_from_frame(
                 experience.occurred_at_ms,
             );
             entities.push(vector_entity(&artifact, "experience"));
-            relationships.push(GraphEdge {
-                from: canonical_experience_id,
-                to: vector_node_id(&artifact),
-                relationship: "HAS_FUSED_VECTOR".to_string(),
-                summary: Some(format!("{} dimensions", embedding.dim)),
-            });
+            relationships.push(graph_edge(
+                canonical_experience_id.clone(),
+                vector_node_id(&artifact),
+                "HAS_FUSED_VECTOR",
+                Some(format!("{} dimensions", embedding.dim)),
+            ));
+        }
+        for link in &experience.memory_links {
+            if let Some(entity) = memory_link_entity(link) {
+                entities.push(entity);
+            }
+            relationships.push(memory_link_edge(canonical_experience_id.clone(), link));
         }
     }
 
@@ -1559,18 +1620,18 @@ fn graph_context_from_frame(
             score: 1.0,
         });
         entities.push(vector_entity(artifact, "face"));
-        relationships.push(GraphEdge {
-            from: experience_id.clone(),
-            to: person_id.clone(),
-            relationship: "SAW_PERSON".to_string(),
-            summary: None,
-        });
-        relationships.push(GraphEdge {
-            from: person_id,
-            to: vector_node_id(artifact),
-            relationship: "HAS_FACE_VECTOR".to_string(),
-            summary: None,
-        });
+        relationships.push(graph_edge(
+            experience_id.clone(),
+            person_id.clone(),
+            "SAW_PERSON",
+            None,
+        ));
+        relationships.push(graph_edge(
+            person_id,
+            vector_node_id(artifact),
+            "HAS_FACE_VECTOR",
+            None,
+        ));
     }
 
     for (index, artifact) in voice_vectors.iter().enumerate() {
@@ -1589,18 +1650,18 @@ fn graph_context_from_frame(
             score: 1.0,
         });
         entities.push(vector_entity(artifact, "voice"));
-        relationships.push(GraphEdge {
-            from: experience_id.clone(),
-            to: person_id.clone(),
-            relationship: "HEARD_PERSON".to_string(),
-            summary: None,
-        });
-        relationships.push(GraphEdge {
-            from: person_id,
-            to: vector_node_id(artifact),
-            relationship: "HAS_VOICE_VECTOR".to_string(),
-            summary: None,
-        });
+        relationships.push(graph_edge(
+            experience_id.clone(),
+            person_id.clone(),
+            "HEARD_PERSON",
+            None,
+        ));
+        relationships.push(graph_edge(
+            person_id,
+            vector_node_id(artifact),
+            "HAS_VOICE_VECTOR",
+            None,
+        ));
     }
 
     (
@@ -1615,6 +1676,70 @@ fn place_id_for_pose(pose: Pose2) -> String {
         (pose.x_m * 2.0).round(),
         (pose.y_m * 2.0).round()
     )
+}
+
+fn graph_edge(
+    from: impl Into<String>,
+    to: impl Into<String>,
+    relationship: impl Into<String>,
+    summary: Option<String>,
+) -> GraphEdge {
+    GraphEdge {
+        from: from.into(),
+        to: to.into(),
+        relationship: relationship.into(),
+        summary,
+        score: 1.0,
+        payload: serde_json::Value::Null,
+    }
+}
+
+fn memory_link_edge(from: impl Into<String>, link: &MemoryLink) -> GraphEdge {
+    GraphEdge {
+        from: from.into(),
+        to: link.target_id.clone(),
+        relationship: link.relation.clone(),
+        summary: link
+            .payload
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        score: link.score,
+        payload: link.payload.clone(),
+    }
+}
+
+fn memory_link_entity(link: &MemoryLink) -> Option<GraphEntity> {
+    let target_kind = link
+        .payload
+        .get("target_kind")
+        .and_then(|value| value.as_str())?;
+    let text = link
+        .payload
+        .get("text")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&link.target_id)
+        .to_string();
+    let labels = match target_kind {
+        "place" => vec!["Place".to_string(), "Entity".to_string()],
+        "object" => {
+            let mut labels = vec!["Object".to_string(), "Entity".to_string()];
+            if let Some(class) = link.payload.get("class").and_then(|value| value.as_str()) {
+                labels.push(class.to_string());
+            }
+            labels
+        }
+        "person" => vec!["Person".to_string(), "Entity".to_string()],
+        "surface" => vec!["Surface".to_string(), "Entity".to_string()],
+        "experience" => vec!["Experience".to_string(), "Memory".to_string()],
+        _ => return None,
+    };
+    Some(GraphEntity {
+        id: link.target_id.clone(),
+        labels,
+        summary: text,
+        score: link.score,
+    })
 }
 
 fn vector_node_id(artifact: &VectorArtifact) -> String {
@@ -1822,12 +1947,12 @@ fn sensation_vectors_from_frame(
     (artifacts, payloads)
 }
 
-fn experience_vectors_from_frame(
+fn experience_vectors_from_experiences(
     frame: &ExperienceFrame,
+    experiences: &[Experience],
 ) -> (Vec<VectorArtifact>, BTreeMap<String, serde_json::Value>) {
     let mut payloads = BTreeMap::new();
-    let artifacts = frame
-        .experiences
+    let artifacts = experiences
         .iter()
         .filter_map(|experience| {
             let embedding = experience.fused_vector.as_ref()?;
@@ -1860,12 +1985,237 @@ fn experience_vectors_from_frame(
                     "summary_impression_text": experience.summary_impression.as_ref().map(|impression| impression.text.clone()),
                     "salience": experience.salience,
                     "tags": experience.tags,
+                    "memory_links": experience.memory_links,
                 }),
             );
             Some(artifact)
         })
         .collect();
     (artifacts, payloads)
+}
+
+fn memory_links_from_frame(
+    frame: &ExperienceFrame,
+    _scene_vectors: &[VectorArtifact],
+    face_vectors: &[VectorArtifact],
+    voice_vectors: &[VectorArtifact],
+) -> Vec<MemoryLink> {
+    let mut links = Vec::new();
+    let pose = frame.now.body.odometry;
+    let place_score = if frame.now.memory.places_visited > 0 {
+        frame.now.memory.place_familiarity.max(0.75)
+    } else {
+        frame.now.memory.place_familiarity.max(0.5)
+    };
+    links.push(MemoryLink {
+        target_id: place_id_for_pose(pose),
+        relation: "occurred_at_place".to_string(),
+        score: place_score.clamp(0.0, 1.0),
+        payload: json!({
+            "target_kind": "place",
+            "text": format!("place near x={:.1}m y={:.1}m", pose.x_m, pose.y_m),
+            "x_m": pose.x_m,
+            "y_m": pose.y_m,
+            "heading_rad": pose.heading_rad,
+        }),
+    });
+
+    for observation in &frame.now.objects.observations {
+        let target_id = object_observation_id(observation);
+        links.push(MemoryLink {
+            target_id,
+            relation: "observed_object".to_string(),
+            score: observation.confidence.clamp(0.0, 1.0),
+            payload: json!({
+                "target_kind": "object",
+                "text": observation.label,
+                "label": observation.label,
+                "class": object_class_slug(&observation.class),
+                "bearing_rad": observation.bearing_rad,
+                "distance_m": observation.distance_m,
+                "source": object_source_slug(&observation.source),
+            }),
+        });
+    }
+
+    for (index, artifact) in face_vectors.iter().enumerate() {
+        let target_id = artifact
+            .source_id
+            .clone()
+            .unwrap_or_else(|| format!("person:face:{}:{index}", frame.id));
+        links.push(MemoryLink {
+            target_id,
+            relation: "saw_face".to_string(),
+            score: 1.0,
+            payload: json!({
+                "target_kind": "person",
+                "text": "face observed",
+                "vector_id": vector_node_id(artifact),
+                "collection": artifact.collection,
+                "point_id": artifact.point_id,
+            }),
+        });
+    }
+
+    for (index, artifact) in voice_vectors.iter().enumerate() {
+        let target_id = artifact
+            .source_id
+            .clone()
+            .unwrap_or_else(|| format!("person:voice:{}:{index}", frame.id));
+        links.push(MemoryLink {
+            target_id,
+            relation: "heard_voice".to_string(),
+            score: 1.0,
+            payload: json!({
+                "target_kind": "person",
+                "text": "voice observed",
+                "vector_id": vector_node_id(artifact),
+                "collection": artifact.collection,
+                "point_id": artifact.point_id,
+            }),
+        });
+    }
+
+    if let Some(surface_graph) = frame.now.extensions.get("surface.scene_graph") {
+        links.extend(surface_memory_links(surface_graph));
+    }
+
+    links.extend(frame.recollections.iter().map(|recollection| MemoryLink {
+        target_id: experience_node_id(recollection.experience.id),
+        relation: "similar_to_experience".to_string(),
+        score: recollection.score.clamp(0.0, 1.0),
+        payload: json!({
+            "target_kind": "experience",
+            "text": recollection.experience.text,
+            "original_frame_id": recollection.original_frame_id.map(|id| id.to_string()),
+            "original_vector_ids": recollection.original_vector_ids,
+        }),
+    }));
+
+    dedupe_memory_links(links)
+}
+
+fn surface_memory_links(surface_graph: &serde_json::Value) -> Vec<MemoryLink> {
+    let mut links = Vec::new();
+    if let Some(floor) = surface_graph.get("floor") {
+        if let Some(link) = surface_link_from_value(floor, "near_surface") {
+            links.push(link);
+        }
+    }
+    if let Some(surfaces) = surface_graph
+        .get("surfaces")
+        .and_then(|value| value.as_array())
+    {
+        links.extend(
+            surfaces
+                .iter()
+                .filter_map(|surface| surface_link_from_value(surface, "near_surface")),
+        );
+    }
+    if let Some(clusters) = surface_graph
+        .get("clusters")
+        .and_then(|value| value.as_array())
+    {
+        links.extend(
+            clusters
+                .iter()
+                .filter_map(|cluster| surface_link_from_value(cluster, "observed_surface_cluster")),
+        );
+    }
+    links
+}
+
+fn surface_link_from_value(value: &serde_json::Value, relation: &str) -> Option<MemoryLink> {
+    let id = value.get("id").and_then(|id| id.as_str())?;
+    let confidence = value
+        .get("confidence")
+        .and_then(|confidence| confidence.as_f64())
+        .unwrap_or(1.0) as f32;
+    Some(MemoryLink {
+        target_id: format!("surface:{id}"),
+        relation: relation.to_string(),
+        score: confidence.clamp(0.0, 1.0),
+        payload: json!({
+            "target_kind": "surface",
+            "text": format!("surface {id}"),
+            "surface_id": id,
+            "kind": value.get("kind").cloned(),
+        }),
+    })
+}
+
+fn merge_memory_links(existing: &mut Vec<MemoryLink>, incoming: Vec<MemoryLink>) {
+    let mut seen = existing
+        .iter()
+        .map(memory_link_key)
+        .collect::<BTreeSet<_>>();
+    for link in incoming {
+        if seen.insert(memory_link_key(&link)) {
+            existing.push(link);
+        }
+    }
+}
+
+fn dedupe_memory_links(links: Vec<MemoryLink>) -> Vec<MemoryLink> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for link in links {
+        if seen.insert(memory_link_key(&link)) {
+            out.push(link);
+        }
+    }
+    out
+}
+
+fn memory_link_key(link: &MemoryLink) -> String {
+    format!("{}:{}", link.relation, link.target_id)
+}
+
+fn object_observation_id(observation: &netherwick_now::ObjectObservation) -> String {
+    format!(
+        "object:{}:{}:{}",
+        object_source_slug(&observation.source),
+        object_class_slug(&observation.class),
+        stable_slug(&observation.label)
+    )
+}
+
+fn object_class_slug(class: &netherwick_now::ObjectClass) -> &'static str {
+    match class {
+        netherwick_now::ObjectClass::Obstacle => "obstacle",
+        netherwick_now::ObjectClass::Charger => "charger",
+        netherwick_now::ObjectClass::Person => "person",
+        netherwick_now::ObjectClass::SoundSource => "sound_source",
+        netherwick_now::ObjectClass::Landmark => "landmark",
+        netherwick_now::ObjectClass::Unknown => "unknown",
+    }
+}
+
+fn object_source_slug(source: &netherwick_now::ObjectObservationSource) -> &'static str {
+    match source {
+        netherwick_now::ObjectObservationSource::Sim => "sim",
+        netherwick_now::ObjectObservationSource::Kinect => "kinect",
+        netherwick_now::ObjectObservationSource::Captioner => "captioner",
+        netherwick_now::ObjectObservationSource::HumanLabel => "human_label",
+        netherwick_now::ObjectObservationSource::Unknown => "unknown",
+    }
+}
+
+fn stable_slug(value: &str) -> String {
+    let mut slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    slug.trim_matches('-').to_string()
 }
 
 fn embodied_vector_artifact(
@@ -2049,12 +2399,13 @@ mod tests {
     use super::*;
     use netherwick_body::BodySense;
     use netherwick_experience::{
-        Experience, Impression, Modality, Sensation, SensationMetadata, SensationPayload,
-        SensationPayloadKind, SensationSource, VectorEmbedding,
+        Experience, Impression, Modality, RecalledExperience, Sensation, SensationMetadata,
+        SensationPayload, SensationPayloadKind, SensationSource, VectorEmbedding,
     };
     use netherwick_ledger::ExperienceFrame;
     use netherwick_now::{
-        FaceSense, SurpriseSense, VectorArtifact, FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
+        FaceSense, ObjectClass, ObjectObservation, ObjectObservationSource, SurpriseSense,
+        VectorArtifact, FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
     };
 
     fn empty_frame(now: Now) -> ExperienceFrame {
@@ -2429,6 +2780,116 @@ mod tests {
         assert!(record.graph_relationships.iter().any(|edge| {
             edge.from == experience_node_id(experience.id)
                 && edge.relationship == "HAS_FUSED_VECTOR"
+        }));
+    }
+
+    #[test]
+    fn memory_record_links_experience_to_place_objects_people_surfaces_and_recalls() {
+        let mut now = now_at(1_000, 1.25, -0.25);
+        now.memory.places_visited = 3;
+        now.memory.place_familiarity = 0.62;
+        now.objects.observations.push(ObjectObservation {
+            label: "Charging Dock".to_string(),
+            class: ObjectClass::Charger,
+            bearing_rad: 0.2,
+            distance_m: Some(1.4),
+            confidence: 0.83,
+            source: ObjectObservationSource::Sim,
+        });
+        now.face.vectors.push(
+            VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-link-1", vec![1.0, 0.0])
+                .with_source_id("person:ada"),
+        );
+        now.voice.vectors.push(
+            VectorArtifact::new(VOICE_VECTOR_COLLECTION, "voice-link-1", vec![0.0, 1.0])
+                .with_source_id("person:ada"),
+        );
+        now.extensions.insert(
+            "surface.scene_graph".to_string(),
+            json!({
+                "floor": {"id": "floor", "kind": "floor", "confidence": 0.91},
+                "surfaces": [{"id": "wall-east", "kind": "vertical_plane", "confidence": 0.77}],
+                "clusters": [{"id": "box-1", "confidence": 0.66}],
+            }),
+        );
+
+        let mut frame = empty_frame(now);
+        let source_sensation_id = uuid::Uuid::new_v4();
+        let experience = Experience::new(
+            "embodied.now",
+            "I see the charging dock near the wall.",
+            Vec::new(),
+            vec![source_sensation_id],
+            950,
+            1_000,
+        );
+        let recalled = Experience::new(
+            "embodied.now",
+            "I previously found the dock here.",
+            Vec::new(),
+            Vec::new(),
+            500,
+            550,
+        );
+        let recalled_id = recalled.id;
+        frame.recollections.push(RecalledExperience {
+            experience: recalled,
+            score: 0.72,
+            original_frame_id: Some(uuid::Uuid::new_v4()),
+            original_vector_ids: vec!["experiences:prior".to_string()],
+            sensation: Sensation::primary(
+                Modality::Memory,
+                SensationSource::default(),
+                500,
+                1_000,
+                SensationPayload::structured(json!({})),
+            ),
+        });
+        frame.experiences = vec![experience.clone()];
+
+        let record = memory_record_from_frame(&frame).unwrap();
+        let stored_experience = record.experience.as_ref().expect("stored experience");
+        let links = &stored_experience.memory_links;
+
+        assert!(links.iter().any(|link| {
+            link.relation == "occurred_at_place"
+                && link.target_id == place_id_for_pose(frame.now.body.odometry)
+                && link.score >= 0.62
+        }));
+        assert!(links.iter().any(|link| {
+            link.relation == "observed_object"
+                && link.target_id == "object:sim:charger:charging-dock"
+                && (link.score - 0.83).abs() < f32::EPSILON
+        }));
+        assert!(links
+            .iter()
+            .any(|link| link.relation == "saw_face" && link.target_id == "person:ada"));
+        assert!(links
+            .iter()
+            .any(|link| link.relation == "heard_voice" && link.target_id == "person:ada"));
+        assert!(links.iter().any(|link| {
+            link.relation == "near_surface" && link.target_id == "surface:wall-east"
+        }));
+        assert!(links.iter().any(|link| {
+            link.relation == "similar_to_experience"
+                && link.target_id == experience_node_id(recalled_id)
+                && (link.score - 0.72).abs() < f32::EPSILON
+        }));
+
+        let graph_experience_id = experience_node_id(experience.id);
+        let object_edge = record
+            .graph_relationships
+            .iter()
+            .find(|edge| {
+                edge.from == graph_experience_id
+                    && edge.to == "object:sim:charger:charging-dock"
+                    && edge.relationship == "observed_object"
+            })
+            .expect("object memory link edge");
+        assert!((object_edge.score - 0.83).abs() < f32::EPSILON);
+        assert_eq!(object_edge.payload["class"], "charger");
+        assert!(record.graph_entities.iter().any(|entity| {
+            entity.id == "object:sim:charger:charging-dock" && entity.has_label("Object")
         }));
     }
 
