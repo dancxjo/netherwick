@@ -21,6 +21,7 @@ use netherwick_actions::{
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use netherwick_body::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
+use netherwick_experience::EmbodiedContext;
 use netherwick_now::{KinectSense, KinectSkeletonSense, ReignSense};
 use netherwick_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
@@ -54,6 +55,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/stream/llm",
     "/view",
     "/view/snapshot",
+    "/view/embodied",
     "/view/scene",
     "/view/behavior-nodes",
     "/view/3d",
@@ -322,6 +324,7 @@ pub fn reign_router(state: ReignServerState) -> Router {
 #[derive(Clone, Debug)]
 pub struct LiveViewState {
     latest: Arc<Mutex<Option<WorldSnapshot>>>,
+    latest_embodied: Arc<Mutex<Option<EmbodiedContext>>>,
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
     session: Arc<Mutex<Option<SceneSession>>>,
     hardware_control: Arc<Mutex<HardwareControlState>>,
@@ -352,6 +355,7 @@ impl Default for LiveViewState {
     fn default() -> Self {
         Self {
             latest: Arc::new(Mutex::new(None)),
+            latest_embodied: Arc::new(Mutex::new(None)),
             scene_metadata: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
             hardware_control: Arc::new(Mutex::new(HardwareControlState::default())),
@@ -462,6 +466,20 @@ impl LiveViewState {
         self.latest
             .lock()
             .expect("live view snapshot mutex poisoned")
+            .clone()
+    }
+
+    pub fn update_embodied_context(&self, context: EmbodiedContext) {
+        *self
+            .latest_embodied
+            .lock()
+            .expect("live embodied context mutex poisoned") = Some(context);
+    }
+
+    pub fn latest_embodied_context(&self) -> Option<EmbodiedContext> {
+        self.latest_embodied
+            .lock()
+            .expect("live embodied context mutex poisoned")
             .clone()
     }
 
@@ -1074,6 +1092,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/models", get(get_models))
         .route("/view", get(live_view_page))
         .route("/view/snapshot", get(get_live_snapshot))
+        .route("/view/embodied", get(get_live_embodied))
         .route("/view/scene", get(get_live_scene))
         .route("/view/behavior-nodes", get(get_behavior_nodes))
         .route("/view/behavior-nodes/{id}", post(post_behavior_node))
@@ -1155,6 +1174,15 @@ async fn get_live_snapshot(
         gps: snapshot.gps,
         ear_pcm: snapshot.ear_pcm,
     }))
+}
+
+async fn get_live_embodied(
+    State(state): State<LiveViewState>,
+) -> Result<Json<EmbodiedContext>, LiveViewError> {
+    state
+        .latest_embodied_context()
+        .map(Json)
+        .ok_or_else(|| LiveViewError::unavailable("no embodied experience has arrived yet"))
 }
 
 async fn get_live_scene(
@@ -6951,6 +6979,7 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/view"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/3d"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/scene"));
+        assert!(HTTP_ENDPOINTS.contains(&"/view/embodied"));
         assert!(HTTP_ENDPOINTS.contains(&"/models"));
         assert!(HTTP_ENDPOINTS.contains(&"/stream/llm"));
         let Html(page) = live_view_3d_page().await;
@@ -6988,6 +7017,21 @@ mod tests {
         assert!(page.contains(
             ".panel-window.is-shaded{height:32px!important;min-height:32px!important;max-height:32px!important;"
         ));
+    }
+
+    #[tokio::test]
+    async fn live_embodied_endpoint_returns_latest_context() {
+        let state = LiveViewState::new();
+        let context = EmbodiedContext {
+            experience_id: Some(uuid::Uuid::new_v4()),
+            summary: "I see a frame.".to_string(),
+            ..EmbodiedContext::default()
+        };
+        state.update_embodied_context(context.clone());
+
+        let Json(response) = get_live_embodied(State(state)).await.unwrap();
+
+        assert_eq!(response, context);
     }
 
     #[test]

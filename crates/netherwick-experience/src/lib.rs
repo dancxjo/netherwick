@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -2351,6 +2351,245 @@ pub struct MemoryLink {
     pub relation: String,
     pub score: f32,
     pub payload: Value,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedContext {
+    pub experience_id: Option<ExperienceId>,
+    pub summary: String,
+    pub sensations: Vec<EmbodiedSensationRef>,
+    pub impressions: Vec<EmbodiedImpressionRef>,
+    pub lineage: Vec<EmbodiedLineageEdge>,
+    pub fused_vector: Option<EmbodiedVectorRef>,
+    pub sensation_vectors: Vec<EmbodiedVectorRef>,
+    pub predictions: Vec<EmbodiedPredictionRef>,
+    pub memory_links: Vec<EmbodiedMemoryLinkRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedSensationRef {
+    pub id: SensationId,
+    pub parent_id: Option<SensationId>,
+    pub modality: Modality,
+    pub payload_kind: SensationPayloadKind,
+    pub kind: String,
+    pub source: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedImpressionRef {
+    pub id: ImpressionId,
+    pub sensation_id: Option<SensationId>,
+    pub experience_id: Option<ExperienceId>,
+    pub kind: String,
+    pub text: String,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbodiedLineageEdge {
+    pub parent_id: SensationId,
+    pub child_id: SensationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedVectorRef {
+    pub model_id: String,
+    pub dim: usize,
+    pub modality: Modality,
+    pub payload_kind: SensationPayloadKind,
+    pub source_sensation_id: SensationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedPredictionRef {
+    pub offset_ms: TimeMs,
+    pub text: String,
+    pub confidence: f32,
+    pub vector: Option<EmbodiedVectorRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedMemoryLinkRef {
+    pub target_id: String,
+    pub relation: String,
+    pub score: f32,
+    pub text: Option<String>,
+}
+
+impl EmbodiedContext {
+    pub fn from_current_experience(
+        experience: Option<&Experience>,
+        sensations: &[Sensation],
+        impressions: &[Impression],
+        futures: &[FuturePrediction],
+        recollections: &[RecalledExperience],
+    ) -> Self {
+        let sensation_scope = experience
+            .map(|experience| {
+                experience
+                    .sensation_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_else(|| sensations.iter().map(|sensation| sensation.id).collect());
+        let impression_scope = experience
+            .map(|experience| {
+                experience
+                    .impression_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+
+        let sensation_refs = sensations
+            .iter()
+            .filter(|sensation| sensation_scope.contains(&sensation.id))
+            .map(|sensation| EmbodiedSensationRef {
+                id: sensation.id,
+                parent_id: sensation.parent_id,
+                modality: sensation.modality.clone(),
+                payload_kind: sensation.payload_kind.clone(),
+                kind: sensation.kind.clone(),
+                source: sensation.source.clone(),
+                summary: sensation.summary.clone(),
+            })
+            .collect::<Vec<_>>();
+        let scoped_sensation_ids = sensation_refs
+            .iter()
+            .map(|sensation| sensation.id)
+            .collect::<BTreeSet<_>>();
+        let impression_refs = impressions
+            .iter()
+            .filter(|impression| {
+                impression_scope.contains(&impression.id)
+                    || impression
+                        .sensation_id
+                        .map(|id| scoped_sensation_ids.contains(&id))
+                        .unwrap_or(false)
+                    || impression
+                        .about
+                        .iter()
+                        .any(|id| scoped_sensation_ids.contains(id))
+            })
+            .map(|impression| EmbodiedImpressionRef {
+                id: impression.id,
+                sensation_id: impression.sensation_id,
+                experience_id: impression.experience_id,
+                kind: impression.kind.clone(),
+                text: impression.text.clone(),
+                confidence: impression.confidence,
+            })
+            .collect::<Vec<_>>();
+        let lineage = sensation_refs
+            .iter()
+            .filter_map(|sensation| {
+                let parent_id = sensation.parent_id?;
+                if scoped_sensation_ids.contains(&parent_id) {
+                    Some(EmbodiedLineageEdge {
+                        parent_id,
+                        child_id: sensation.id,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let sensation_vectors = sensations
+            .iter()
+            .filter(|sensation| scoped_sensation_ids.contains(&sensation.id))
+            .filter_map(|sensation| sensation.vector.as_ref().map(vector_ref))
+            .collect::<Vec<_>>();
+        let fused_vector = experience
+            .and_then(|experience| experience.fused_vector.as_ref())
+            .map(vector_ref);
+        let mut predictions = experience
+            .map(|experience| {
+                experience
+                    .predictions
+                    .iter()
+                    .map(|prediction| EmbodiedPredictionRef {
+                        offset_ms: prediction.offset_ms,
+                        text: prediction.text.clone(),
+                        confidence: prediction.confidence,
+                        vector: prediction.vector.as_ref().map(vector_ref),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        predictions.extend(futures.iter().filter_map(|future| {
+            future
+                .summary
+                .as_ref()
+                .map(|summary| EmbodiedPredictionRef {
+                    offset_ms: future.offset_ms,
+                    text: summary.clone(),
+                    confidence: future.confidence,
+                    vector: None,
+                })
+        }));
+        let mut memory_links = experience
+            .map(|experience| {
+                experience
+                    .memory_links
+                    .iter()
+                    .map(|link| EmbodiedMemoryLinkRef {
+                        target_id: link.target_id.clone(),
+                        relation: link.relation.clone(),
+                        score: link.score,
+                        text: link
+                            .payload
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        memory_links.extend(
+            recollections
+                .iter()
+                .map(|recollection| EmbodiedMemoryLinkRef {
+                    target_id: recollection.experience.id.to_string(),
+                    relation: "recalled_experience".to_string(),
+                    score: recollection.score,
+                    text: Some(recollection.experience.text.clone()),
+                }),
+        );
+
+        let summary = experience
+            .map(|experience| experience.text.clone())
+            .or_else(|| {
+                impression_refs
+                    .last()
+                    .map(|impression| impression.text.clone())
+            })
+            .unwrap_or_default();
+        Self {
+            experience_id: experience.map(|experience| experience.id),
+            summary,
+            sensations: sensation_refs,
+            impressions: impression_refs,
+            lineage,
+            fused_vector,
+            sensation_vectors,
+            predictions,
+            memory_links,
+        }
+    }
+}
+
+fn vector_ref(vector: &VectorEmbedding) -> EmbodiedVectorRef {
+    EmbodiedVectorRef {
+        model_id: vector.model_id.clone(),
+        dim: vector.dim,
+        modality: vector.modality.clone(),
+        payload_kind: vector.payload_kind.clone(),
+        source_sensation_id: vector.source_sensation_id,
+    }
 }
 
 #[async_trait]

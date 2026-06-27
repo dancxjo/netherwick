@@ -8,8 +8,8 @@ use netherwick_actions::{ActionPrimitive, ReignInput, ReignOutcome};
 use netherwick_behaviors::ErasedBehaviorRunRecord;
 use netherwick_core::Reward;
 use netherwick_experience::{
-    Experience, ExperienceLatent, FutureInput, FuturePrediction, Impression, RecalledExperience,
-    Sensation,
+    EmbodiedContext, Experience, ExperienceLatent, FutureInput, FuturePrediction, Impression,
+    RecalledExperience, Sensation,
 };
 use netherwick_llm::{ConsciousCommand, CounterfactualAction, LlmTeaching};
 use netherwick_now::{Now, RecallHit, SurpriseSense};
@@ -117,6 +117,16 @@ impl TransitionBuilder {
 }
 
 impl ExperienceFrame {
+    pub fn embodied_context(&self) -> EmbodiedContext {
+        EmbodiedContext::from_current_experience(
+            self.experiences.last(),
+            &self.sensations,
+            &self.impressions,
+            &self.predicted_futures,
+            &self.recollections,
+        )
+    }
+
     pub fn summary_text(&self) -> String {
         if let Some(experience) = self.experiences.last() {
             return experience.text.clone();
@@ -324,6 +334,11 @@ impl LedgerReader for JsonlLedger {
 mod tests {
     use super::*;
     use netherwick_body::BodySense;
+    use netherwick_experience::{
+        EmbodiedLineageEdge, Modality, SensationPayload, SensationPayloadKind, SensationSource,
+        VectorEmbedding,
+    };
+    use serde_json::json;
 
     #[test]
     fn transition_builder_pairs_second_frame_with_first() {
@@ -421,5 +436,101 @@ mod tests {
             input.flat_features().len(),
             transition.before_z.z.len() + netherwick_experience::action_features(None).len() + 1
         );
+    }
+
+    #[test]
+    fn embodied_context_tracks_primary_and_derived_sensation_lineage() {
+        let primary = Sensation::primary(
+            Modality::Vision,
+            SensationSource::new("camera"),
+            100,
+            105,
+            SensationPayload::image_metadata(64, 48, "rgb", 9_216),
+        )
+        .with_summary("I see a camera frame.");
+        let child = Sensation::descendant(
+            &primary,
+            "vision.crop.focus",
+            SensationPayloadKind::Crop,
+            json!({"x": 2, "y": 3, "width": 12, "height": 10}),
+            Default::default(),
+            "focus",
+        )
+        .with_summary("I focus on part of the frame.")
+        .with_vector(VectorEmbedding::new(
+            vec![0.1, 0.2, 0.3],
+            "crop-vectorizer.v0",
+            Modality::Vision,
+            SensationPayloadKind::Crop,
+            primary.id,
+            110,
+        ));
+        let impression = Impression::new(
+            "vision.focus.impression",
+            "I see a frame and focus on part of it.",
+            vec![primary.id, child.id],
+            100,
+            110,
+        );
+        let mut experience = Experience::new(
+            "embodied.now",
+            "I see a frame and focus on part of it.",
+            vec![impression.id],
+            vec![primary.id, child.id],
+            100,
+            110,
+        );
+        experience.fused_vector = Some(VectorEmbedding::new(
+            vec![0.5, 0.6, 0.7, 0.8],
+            "embodied-fuser.v0",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            child.id,
+            110,
+        ));
+        let frame = ExperienceFrame {
+            id: Uuid::new_v4(),
+            t_ms: 110,
+            now: Now::blank(110, BodySense::default()),
+            sensations: vec![primary.clone(), child.clone()],
+            impressions: vec![impression],
+            experiences: vec![experience],
+            z: None,
+            chosen_action: None,
+            conscious_command: None,
+            reign_input: None,
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Reward::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        let context = frame.embodied_context();
+
+        assert_eq!(context.sensations.len(), 2);
+        assert_eq!(context.impressions.len(), 1);
+        assert_eq!(
+            context.lineage,
+            vec![EmbodiedLineageEdge {
+                parent_id: primary.id,
+                child_id: child.id,
+            }]
+        );
+        assert_eq!(
+            context
+                .fused_vector
+                .as_ref()
+                .map(|vector| (vector.model_id.as_str(), vector.dim)),
+            Some(("embodied-fuser.v0", 4))
+        );
+        assert_eq!(context.sensation_vectors[0].model_id, "crop-vectorizer.v0");
+        assert_eq!(context.sensation_vectors[0].dim, 3);
     }
 }

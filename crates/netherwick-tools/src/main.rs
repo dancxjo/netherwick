@@ -1044,8 +1044,9 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             }
             let mut live_snapshot = None;
             runner
-                .run_steps_observing(1, |snapshot| {
+                .run_steps_observing_ticks(1, |snapshot, tick| {
                     live_snapshot = Some(snapshot.clone());
+                    live_state.update_embodied_context(tick.frame.embodied_context());
                 })
                 .await?;
             live_state.update_behavior_nodes(runner.runtime.behavior_node_states());
@@ -3983,6 +3984,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         };
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
+            live_state.update_embodied_context(tick.frame.embodied_context());
         }
         if let Some(writer) = capture.as_mut() {
             writer
@@ -6266,6 +6268,28 @@ fn print_frame(frame: &ExperienceFrame) {
     println!("  action: {:?}", frame.chosen_action);
     println!("  recalls: {}", frame.memory_recall.len());
     println!("  recollections: {}", frame.recollections.len());
+    let embodied = frame.embodied_context();
+    println!(
+        "  embodied_experience_id: {}",
+        embodied
+            .experience_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!("  sensation_count: {}", embodied.sensations.len());
+    println!("  impression_count: {}", embodied.impressions.len());
+    println!(
+        "  parent_child_derived_sensation_count: {}",
+        embodied.lineage.len()
+    );
+    if let Some(vector) = embodied.fused_vector {
+        println!(
+            "  fused_vector: model={} dim={}",
+            vector.model_id, vector.dim
+        );
+    } else {
+        println!("  fused_vector: none");
+    }
     if let Some(experience) = frame.experiences.last() {
         println!("  experience: {}", experience.text);
     }

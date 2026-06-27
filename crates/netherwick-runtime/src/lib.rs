@@ -26,11 +26,11 @@ use netherwick_experience::{
     ear_next_target_from_now, experience_decode_target_from_now,
     eye_next_input_from_transition_like, eye_next_target_from_now, ActionValueInput,
     ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput,
-    DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience, ExperienceBehaviorInput,
-    ExperienceBehaviorOutput, ExperienceDecodeOutput, ExperienceEncodeInput, ExperienceEncoder,
-    ExperienceLatent, EyeNextInput, EyeNextOutput, FeatureExperienceEncoder, FutureInput,
-    FuturePrediction, FuturePredictor, Impression, RewardComputer, Sensation,
-    StasisFuturePredictor, SurpriseComputer,
+    DangerInput, DangerOutput, EarNextInput, EarNextOutput, EmbodiedContext, Experience,
+    ExperienceBehaviorInput, ExperienceBehaviorOutput, ExperienceDecodeOutput,
+    ExperienceEncodeInput, ExperienceEncoder, ExperienceLatent, EyeNextInput, EyeNextOutput,
+    FeatureExperienceEncoder, FutureInput, FuturePrediction, FuturePredictor, Impression,
+    RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -2728,12 +2728,20 @@ where
         let (event_script_forced_action, event_script_records) =
             self.run_event_scripts(&mut now, &recall, &mut notes, &mut proposed_actions)?;
         behavior_runs.extend(event_script_records);
+        let embodied_context = EmbodiedContext::from_current_experience(
+            Some(&embodied_experience),
+            &sensations,
+            &impressions,
+            &futures,
+            &recall.recollections,
+        );
 
         let combobulation = match self
             .llm
             .combobulate(
                 &now,
                 &impressions,
+                Some(&embodied_context),
                 &latent,
                 &futures,
                 &recall.first_person_summary,
@@ -2752,6 +2760,7 @@ where
             .llm
             .maybe_tick(
                 &now,
+                Some(&embodied_context),
                 &latent,
                 &futures,
                 &recall.first_person_summary,
@@ -8586,6 +8595,7 @@ mod tests {
             &mut self,
             _now: &Now,
             _impressions: &[Impression],
+            _embodied: Option<&EmbodiedContext>,
             _z: &ExperienceLatent,
             _futures: &[FuturePrediction],
             _recall_summary: &str,
@@ -8596,6 +8606,7 @@ mod tests {
         async fn maybe_tick(
             &mut self,
             _now: &Now,
+            _embodied: Option<&EmbodiedContext>,
             _z: &ExperienceLatent,
             _futures: &[FuturePrediction],
             _recall_summary: &str,

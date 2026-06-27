@@ -14,6 +14,7 @@ netherwick-actions = { path = "../netherwick-actions" }
 netherwick-behaviors = { path = "../netherwick-behaviors" }
 netherwick-body = { path = "../netherwick-body" }
 netherwick-core = { path = "../netherwick-core" }
+netherwick-experience = { path = "../netherwick-experience" }
 netherwick-llm = { path = "../netherwick-llm" }
 netherwick-now = { path = "../netherwick-now" }
 netherwick-runtime = { path = "../netherwick-runtime" }
@@ -31,7 +32,6 @@ anyhow.workspace = true
 netherwick-autonomic = { path = "../netherwick-autonomic" }
 netherwick-body = { path = "../netherwick-body" }
 netherwick-conductor = { path = "../netherwick-conductor" }
-netherwick-experience = { path = "../netherwick-experience" }
 netherwick-ledger = { path = "../netherwick-ledger" }
 netherwick-memory = { path = "../netherwick-memory" }
 tokio.workspace = true

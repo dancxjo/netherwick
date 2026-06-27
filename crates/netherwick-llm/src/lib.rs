@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use netherwick_actions::{
     ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle, InspectTarget, TurnDir,
 };
-use netherwick_experience::{ExperienceLatent, FuturePrediction, Impression};
+use netherwick_experience::{EmbodiedContext, ExperienceLatent, FuturePrediction, Impression};
 use netherwick_now::{LlmSense, Now, ReignSense};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -154,6 +154,7 @@ pub trait LlmAgent: Send {
         &mut self,
         now: &Now,
         impressions: &[Impression],
+        embodied: Option<&EmbodiedContext>,
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
@@ -162,6 +163,7 @@ pub trait LlmAgent: Send {
     async fn maybe_tick(
         &mut self,
         now: &Now,
+        embodied: Option<&EmbodiedContext>,
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
@@ -178,6 +180,7 @@ impl LlmAgent for NoopLlmAgent {
         &mut self,
         _now: &Now,
         _impressions: &[Impression],
+        _embodied: Option<&EmbodiedContext>,
         _z: &ExperienceLatent,
         _futures: &[FuturePrediction],
         _recall_summary: &str,
@@ -188,6 +191,7 @@ impl LlmAgent for NoopLlmAgent {
     async fn maybe_tick(
         &mut self,
         _now: &Now,
+        _embodied: Option<&EmbodiedContext>,
         _z: &ExperienceLatent,
         _futures: &[FuturePrediction],
         _recall_summary: &str,
@@ -372,6 +376,7 @@ impl LlmAgent for ConfiguredLlmAgent {
         &mut self,
         now: &Now,
         impressions: &[Impression],
+        embodied: Option<&EmbodiedContext>,
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
@@ -379,12 +384,12 @@ impl LlmAgent for ConfiguredLlmAgent {
         match self {
             Self::Disabled(agent) => {
                 agent
-                    .combobulate(now, impressions, z, futures, recall_summary)
+                    .combobulate(now, impressions, embodied, z, futures, recall_summary)
                     .await
             }
             Self::Ollama(agent) => {
                 agent
-                    .combobulate(now, impressions, z, futures, recall_summary)
+                    .combobulate(now, impressions, embodied, z, futures, recall_summary)
                     .await
             }
         }
@@ -393,6 +398,7 @@ impl LlmAgent for ConfiguredLlmAgent {
     async fn maybe_tick(
         &mut self,
         now: &Now,
+        embodied: Option<&EmbodiedContext>,
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
@@ -401,12 +407,12 @@ impl LlmAgent for ConfiguredLlmAgent {
         match self {
             Self::Disabled(agent) => {
                 agent
-                    .maybe_tick(now, z, futures, recall_summary, awareness_summary)
+                    .maybe_tick(now, embodied, z, futures, recall_summary, awareness_summary)
                     .await
             }
             Self::Ollama(agent) => {
                 agent
-                    .maybe_tick(now, z, futures, recall_summary, awareness_summary)
+                    .maybe_tick(now, embodied, z, futures, recall_summary, awareness_summary)
                     .await
             }
         }
@@ -590,11 +596,13 @@ impl LlmAgent for OllamaLlmAgent {
         &mut self,
         now: &Now,
         impressions: &[Impression],
+        embodied: Option<&EmbodiedContext>,
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
     ) -> Result<Option<Combobulation>> {
-        let prompt = build_combobulator_prompt(now, impressions, z, futures, recall_summary);
+        let prompt =
+            build_combobulator_prompt(now, impressions, embodied, z, futures, recall_summary);
         let model = self
             .config
             .combobulator_model
@@ -615,6 +623,7 @@ impl LlmAgent for OllamaLlmAgent {
     async fn maybe_tick(
         &mut self,
         now: &Now,
+        embodied: Option<&EmbodiedContext>,
         z: &ExperienceLatent,
         futures: &[FuturePrediction],
         recall_summary: &str,
@@ -626,6 +635,7 @@ impl LlmAgent for OllamaLlmAgent {
 
         let prompt = build_agent_prompt(
             now,
+            embodied,
             z,
             futures,
             recall_summary,
@@ -793,11 +803,13 @@ struct CounterfactualSpec {
 fn build_combobulator_prompt(
     now: &Now,
     impressions: &[Impression],
+    embodied: Option<&EmbodiedContext>,
     z: &ExperienceLatent,
     futures: &[FuturePrediction],
     recall_summary: &str,
 ) -> String {
     let timeline = render_combobulator_timeline(impressions);
+    let embodied = render_embodied_context(embodied);
     let futures = summarize_futures(futures);
     format!(
         "You are the combobulator for an embodied robot.\n\
@@ -826,14 +838,16 @@ HOW\n\
 Latent confidence: {:.2}\n\
 Latent prediction error: {:.2}\n\
 Recall summary: {}\n\
+Current embodied experience:\n{}\n\
 Timeline evidence:\n{}\n\
 Predicted futures:\n{}\n",
-        now.t_ms, z.confidence, z.prediction_error, recall_summary, timeline, futures
+        now.t_ms, z.confidence, z.prediction_error, recall_summary, embodied, timeline, futures
     )
 }
 
 fn build_agent_prompt(
     now: &Now,
+    embodied: Option<&EmbodiedContext>,
     z: &ExperienceLatent,
     futures: &[FuturePrediction],
     recall_summary: &str,
@@ -845,6 +859,7 @@ fn build_agent_prompt(
         .map(|line| format!("- {line}"))
         .collect::<Vec<_>>()
         .join("\n");
+    let embodied = render_embodied_context(embodied);
     let futures = summarize_futures(futures);
     format!(
         "You are the conscious LLM layer for an embodied robot.\n\
@@ -867,6 +882,7 @@ Return JSON only with this schema:\n\
 }}\n\n\
 Current time: {} ms\n\
 Awareness summary: {}\n\
+Current embodied experience:\n{}\n\
 Recall summary: {}\n\
 Battery: {:.2}\n\
 Surprise: {:.2}\n\
@@ -877,6 +893,7 @@ Summarized senses:\n{}\n",
         config.allow_teaching,
         now.t_ms,
         awareness_summary.unwrap_or("none"),
+        embodied,
         recall_summary,
         now.body.battery_level,
         now.surprise.total,
@@ -884,6 +901,121 @@ Summarized senses:\n{}\n",
         futures,
         senses
     )
+}
+
+fn render_embodied_context(context: Option<&EmbodiedContext>) -> String {
+    let Some(context) = context else {
+        return "- unavailable".to_string();
+    };
+
+    let mut lines = Vec::new();
+    if let Some(id) = context.experience_id {
+        lines.push(format!("- experience_id: {id}"));
+    }
+    if !context.summary.trim().is_empty() {
+        lines.push(format!(
+            "- summary: {}",
+            compact_line(&context.summary, 240)
+        ));
+    }
+    lines.push(format!(
+        "- counts: sensations={}, impressions={}, lineage_edges={}",
+        context.sensations.len(),
+        context.impressions.len(),
+        context.lineage.len()
+    ));
+    if let Some(vector) = &context.fused_vector {
+        lines.push(format!(
+            "- fused_vector: model={} dim={} source_sensation={}",
+            vector.model_id, vector.dim, vector.source_sensation_id
+        ));
+    }
+    for sensation in context.sensations.iter().take(8) {
+        let parent = sensation
+            .parent_id
+            .map(|id| format!(" parent={id}"))
+            .unwrap_or_default();
+        let summary = sensation
+            .summary
+            .as_deref()
+            .map(|text| format!(" summary=\"{}\"", compact_line(text, 120)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- sensation {}: modality={} payload={} kind={}{}{}",
+            sensation.id,
+            sensation.modality.as_str(),
+            sensation.payload_kind.as_str(),
+            sensation.kind,
+            parent,
+            summary
+        ));
+    }
+    for impression in context.impressions.iter().rev().take(6).rev() {
+        let target = impression
+            .sensation_id
+            .map(|id| format!("sensation={id}"))
+            .or_else(|| {
+                impression
+                    .experience_id
+                    .map(|id| format!("experience={id}"))
+            })
+            .unwrap_or_else(|| "target=unknown".to_string());
+        lines.push(format!(
+            "- impression {}: {} \"{}\"",
+            impression.id,
+            target,
+            compact_line(&impression.text, 160)
+        ));
+    }
+    for edge in context.lineage.iter().take(8) {
+        lines.push(format!(
+            "- lineage: {} -> {}",
+            edge.parent_id, edge.child_id
+        ));
+    }
+    for vector in context.sensation_vectors.iter().take(6) {
+        lines.push(format!(
+            "- sensation_vector: sensation={} model={} dim={} modality={} payload={}",
+            vector.source_sensation_id,
+            vector.model_id,
+            vector.dim,
+            vector.modality.as_str(),
+            vector.payload_kind.as_str()
+        ));
+    }
+    for prediction in context.predictions.iter().take(4) {
+        lines.push(format!(
+            "- prediction +{}ms confidence={:.2}: {}",
+            prediction.offset_ms,
+            prediction.confidence,
+            compact_line(&prediction.text, 140)
+        ));
+    }
+    for link in context.memory_links.iter().take(4) {
+        let text = link
+            .text
+            .as_deref()
+            .map(|text| format!(" \"{}\"", compact_line(text, 120)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- memory_link: target={} relation={} score={:.2}{}",
+            link.target_id, link.relation, link.score, text
+        ));
+    }
+    lines.join("\n")
+}
+
+fn compact_line(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut out = compact
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn summarize_reign_command(input: &netherwick_actions::ReignInput) -> String {
@@ -1531,6 +1663,7 @@ mod tests {
         let now = Now::blank(100, BodySense::default());
         let prompt = build_agent_prompt(
             &now,
+            None,
             &ExperienceLatent::default(),
             &[],
             "none",
@@ -1592,6 +1725,7 @@ mod tests {
         let prompt = build_combobulator_prompt(
             &now,
             &[impression],
+            None,
             &ExperienceLatent::default(),
             &[],
             "I remember Tim.",
@@ -1623,6 +1757,54 @@ mod tests {
         assert!(prompt.contains("Do not assume a human is currently present"));
         assert!(prompt.contains("CONTEXT FRAME"));
         assert!(prompt.contains("text=\"I hear: \\u003chello there\\u003e\""));
+    }
+
+    #[test]
+    fn prompts_include_embodied_context_without_raw_vectors() {
+        let sensation_id = Uuid::new_v4();
+        let experience_id = Uuid::new_v4();
+        let context = EmbodiedContext {
+            experience_id: Some(experience_id),
+            summary: "I see a frame and focus on part of it.".to_string(),
+            sensations: vec![netherwick_experience::EmbodiedSensationRef {
+                id: sensation_id,
+                parent_id: None,
+                modality: netherwick_experience::Modality::Vision,
+                payload_kind: netherwick_experience::SensationPayloadKind::ImageBytes,
+                kind: "vision.image_bytes".to_string(),
+                source: "camera".to_string(),
+                summary: Some("A camera frame is visible.".to_string()),
+            }],
+            impressions: Vec::new(),
+            lineage: Vec::new(),
+            fused_vector: Some(netherwick_experience::EmbodiedVectorRef {
+                model_id: "fuser.v0".to_string(),
+                dim: 16,
+                modality: netherwick_experience::Modality::Other,
+                payload_kind: netherwick_experience::SensationPayloadKind::Structured,
+                source_sensation_id: sensation_id,
+            }),
+            sensation_vectors: Vec::new(),
+            predictions: Vec::new(),
+            memory_links: Vec::new(),
+        };
+        let now = Now::blank(100, BodySense::default());
+
+        let prompt = build_agent_prompt(
+            &now,
+            Some(&context),
+            &ExperienceLatent::default(),
+            &[],
+            "none",
+            None,
+            &LlmConfig::default(),
+        );
+
+        assert!(prompt.contains("Current embodied experience:"));
+        assert!(prompt.contains(&format!("experience_id: {experience_id}")));
+        assert!(prompt.contains("fused_vector: model=fuser.v0 dim=16"));
+        assert!(prompt.contains("payload=image_bytes"));
+        assert!(!prompt.contains("[0."));
     }
 
     #[test]
