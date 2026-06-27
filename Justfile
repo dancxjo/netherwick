@@ -24,6 +24,8 @@ setup-system:
         git \
         curl \
         just \
+        clang \
+        libclang-dev \
         ffmpeg \
         i2c-tools \
         v4l-utils \

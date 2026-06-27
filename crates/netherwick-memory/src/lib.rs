@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use netherwick_actions::ActionPrimitive;
 use netherwick_core::{Goal, Pose2};
-use netherwick_experience::{Experience, RecalledExperience};
+use netherwick_experience::{Experience, Impression, RecalledExperience, VectorEmbedding};
 use netherwick_ledger::ExperienceFrame;
 use netherwick_now::{
     GraphEdge, GraphEntity, MemorySense, Now, RecallHit, VectorArtifact, FACE_VECTOR_COLLECTION,
@@ -19,6 +19,8 @@ const DEFAULT_CELL_SIZE_M: f32 = 0.5;
 const SCORE_DECAY_PER_TICK: f32 = 0.995;
 const CELL_CONFIDENCE_DECAY_PER_TICK: f32 = 0.999;
 const RECALL_RADIUS_CELLS: i32 = 4;
+pub const SENSATION_VECTOR_COLLECTION: &str = "sensations";
+pub const EXPERIENCE_VECTOR_COLLECTION: &str = "experiences";
 
 #[async_trait]
 pub trait MemoryStore {
@@ -356,6 +358,12 @@ pub struct MemoryRecord {
     pub face_vectors: Vec<VectorArtifact>,
     #[serde(default)]
     pub voice_vectors: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub sensation_vectors: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub experience_vectors: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub vector_payloads: BTreeMap<String, serde_json::Value>,
     pub battery: f32,
     pub active_goal: Option<Goal>,
     pub chosen_action: Option<ActionPrimitive>,
@@ -447,20 +455,25 @@ impl VectorStore for QdrantVectorStore {
                 .into_iter()
                 .filter(|artifact| !artifact.vector.is_empty())
                 .map(|artifact| {
+                    let mut payload = json!({
+                        "collection": artifact.collection,
+                        "point_id": artifact.point_id,
+                        "frame_id": record.frame_id.to_string(),
+                        "source_frame_id": artifact.source_frame_id,
+                        "source_id": artifact.source_id,
+                        "model": artifact.model,
+                        "dim": artifact.vector.len(),
+                        "occurred_at_ms": artifact.occurred_at_ms.or(Some(record.t_ms)),
+                        "summary": record.summary,
+                        "neo4j_node_id": vector_node_id(artifact),
+                    });
+                    if let Some(extra) = record.vector_payloads.get(&vector_payload_key(artifact)) {
+                        merge_json_object(&mut payload, extra);
+                    }
                     json!({
                         "id": stable_qdrant_point_id(&artifact.collection, &artifact.point_id),
                         "vector": artifact.vector,
-                        "payload": {
-                            "collection": artifact.collection,
-                            "point_id": artifact.point_id,
-                            "frame_id": record.frame_id.to_string(),
-                            "source_frame_id": artifact.source_frame_id,
-                            "source_id": artifact.source_id,
-                            "model": artifact.model,
-                            "occurred_at_ms": artifact.occurred_at_ms.or(Some(record.t_ms)),
-                            "summary": record.summary,
-                            "neo4j_node_id": vector_node_id(artifact),
-                        }
+                        "payload": payload
                     })
                 })
                 .collect::<Vec<_>>();
@@ -928,6 +941,9 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         frame.id,
         frame.t_ms,
     );
+    let (sensation_vectors, mut vector_payloads) = sensation_vectors_from_frame(frame);
+    let (experience_vectors, experience_payloads) = experience_vectors_from_frame(frame);
+    vector_payloads.extend(experience_payloads);
     let (graph_entities, graph_relationships) =
         graph_context_from_frame(frame, &scene_vectors, &face_vectors, &voice_vectors);
     Ok(MemoryRecord {
@@ -939,6 +955,9 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         scene_vectors,
         face_vectors,
         voice_vectors,
+        sensation_vectors,
+        experience_vectors,
+        vector_payloads,
         battery: frame.now.body.battery_level,
         active_goal: RecallQuery::from_now(&frame.now).active_goal,
         chosen_action: frame.chosen_action.clone(),
@@ -1110,13 +1129,26 @@ fn graph_context_from_frame(
 ) -> (Vec<GraphEntity>, Vec<GraphEdge>) {
     let frame_id = frame.id.to_string();
     let experience_id = format!("experience:{frame_id}");
-    let mut entities = vec![GraphEntity {
-        id: experience_id.clone(),
-        labels: vec!["Experience".to_string(), "Memory".to_string()],
-        summary: frame.summary_text(),
-        score: 1.0,
+    let mut entities = vec![
+        GraphEntity {
+            id: format!("frame:{frame_id}"),
+            labels: vec!["Frame".to_string(), "Memory".to_string()],
+            summary: format!("runtime frame {frame_id}"),
+            score: 1.0,
+        },
+        GraphEntity {
+            id: experience_id.clone(),
+            labels: vec!["Experience".to_string(), "Memory".to_string()],
+            summary: frame.summary_text(),
+            score: 1.0,
+        },
+    ];
+    let mut relationships = vec![GraphEdge {
+        from: format!("frame:{frame_id}"),
+        to: experience_id.clone(),
+        relationship: "HAS_MEMORY_SUMMARY".to_string(),
+        summary: None,
     }];
-    let mut relationships = Vec::new();
 
     let pose = frame.now.body.odometry;
     let place_id = place_id_for_pose(pose);
@@ -1142,6 +1174,140 @@ fn graph_context_from_frame(
             relationship: "HAS_SCENE_VECTOR".to_string(),
             summary: None,
         });
+    }
+
+    for sensation in &frame.sensations {
+        let sensation_id = sensation_node_id(sensation.id);
+        entities.push(GraphEntity {
+            id: sensation_id.clone(),
+            labels: vec![
+                "Sensation".to_string(),
+                sensation.modality.as_str().to_string(),
+                sensation.payload_kind.as_str().to_string(),
+            ],
+            summary: sensation
+                .summary
+                .clone()
+                .unwrap_or_else(|| sensation.kind.clone()),
+            score: sensation.metadata.confidence.unwrap_or(1.0),
+        });
+        relationships.push(GraphEdge {
+            from: format!("frame:{frame_id}"),
+            to: sensation_id.clone(),
+            relationship: "HAS_SENSATION".to_string(),
+            summary: Some(sensation.kind.clone()),
+        });
+        if let Some(parent_id) = sensation.parent_id {
+            relationships.push(GraphEdge {
+                from: sensation_id.clone(),
+                to: sensation_node_id(parent_id),
+                relationship: "DERIVED_FROM_SENSATION".to_string(),
+                summary: None,
+            });
+        }
+        if let Some(embedding) = &sensation.vector {
+            let artifact = embodied_vector_artifact(
+                SENSATION_VECTOR_COLLECTION,
+                &format!("{}:sensation:{}", frame.id, sensation.id),
+                embedding,
+                frame.id,
+                sensation.id.to_string(),
+                sensation.occurred_at_ms,
+            );
+            entities.push(vector_entity(&artifact, "sensation"));
+            relationships.push(GraphEdge {
+                from: sensation_id.clone(),
+                to: vector_node_id(&artifact),
+                relationship: "HAS_SENSATION_VECTOR".to_string(),
+                summary: Some(format!("{} dimensions", embedding.dim)),
+            });
+        }
+        if let Some(impression) = &sensation.impression {
+            let impression_id = impression_node_id(impression.id);
+            entities.push(impression_entity(impression));
+            relationships.push(GraphEdge {
+                from: sensation_id,
+                to: impression_id,
+                relationship: "HAS_IMPRESSION".to_string(),
+                summary: Some(impression.text.clone()),
+            });
+        }
+    }
+
+    for impression in &frame.impressions {
+        entities.push(impression_entity(impression));
+        for sensation_id in &impression.about {
+            relationships.push(GraphEdge {
+                from: sensation_node_id(*sensation_id),
+                to: impression_node_id(impression.id),
+                relationship: "HAS_IMPRESSION".to_string(),
+                summary: Some(impression.text.clone()),
+            });
+        }
+    }
+
+    for experience in &frame.experiences {
+        let canonical_experience_id = experience_node_id(experience.id);
+        entities.push(GraphEntity {
+            id: canonical_experience_id.clone(),
+            labels: vec!["Experience".to_string(), "EmbodiedExperience".to_string()],
+            summary: experience_summary_text(experience),
+            score: experience.salience,
+        });
+        relationships.push(GraphEdge {
+            from: format!("frame:{frame_id}"),
+            to: canonical_experience_id.clone(),
+            relationship: "HAS_EXPERIENCE".to_string(),
+            summary: Some(experience.kind.clone()),
+        });
+        relationships.push(GraphEdge {
+            from: experience_id.clone(),
+            to: canonical_experience_id.clone(),
+            relationship: "SUMMARIZES_EXPERIENCE".to_string(),
+            summary: None,
+        });
+        for sensation_id in &experience.sensation_ids {
+            relationships.push(GraphEdge {
+                from: canonical_experience_id.clone(),
+                to: sensation_node_id(*sensation_id),
+                relationship: "INTEGRATES_SENSATION".to_string(),
+                summary: None,
+            });
+        }
+        for impression_id in &experience.impression_ids {
+            relationships.push(GraphEdge {
+                from: canonical_experience_id.clone(),
+                to: impression_node_id(*impression_id),
+                relationship: "INTEGRATES_IMPRESSION".to_string(),
+                summary: None,
+            });
+        }
+        if let Some(impression) = &experience.summary_impression {
+            entities.push(impression_entity(impression));
+            relationships.push(GraphEdge {
+                from: canonical_experience_id.clone(),
+                to: impression_node_id(impression.id),
+                relationship: "HAS_SUMMARY_IMPRESSION".to_string(),
+                summary: Some(impression.text.clone()),
+            });
+        }
+        if let Some(embedding) = &experience.fused_vector {
+            let artifact = embodied_vector_artifact(
+                EXPERIENCE_VECTOR_COLLECTION,
+                &format!("{}:experience:{}", frame.id, experience.id),
+                embedding,
+                frame.id,
+                experience.id.to_string(),
+                experience.occurred_at_ms,
+            );
+            entities.push(vector_entity(&artifact, "experience"));
+            relationships.push(GraphEdge {
+                from: canonical_experience_id,
+                to: vector_node_id(&artifact),
+                relationship: "HAS_FUSED_VECTOR".to_string(),
+                summary: Some(format!("{} dimensions", embedding.dim)),
+            });
+        }
     }
 
     for (index, artifact) in face_vectors.iter().enumerate() {
@@ -1220,6 +1386,35 @@ fn place_id_for_pose(pose: Pose2) -> String {
 
 fn vector_node_id(artifact: &VectorArtifact) -> String {
     format!("vector:{}:{}", artifact.collection, artifact.point_id)
+}
+
+fn sensation_node_id(id: uuid::Uuid) -> String {
+    format!("sensation:{id}")
+}
+
+fn impression_node_id(id: uuid::Uuid) -> String {
+    format!("impression:{id}")
+}
+
+fn experience_node_id(id: uuid::Uuid) -> String {
+    format!("embodied_experience:{id}")
+}
+
+fn impression_entity(impression: &Impression) -> GraphEntity {
+    GraphEntity {
+        id: impression_node_id(impression.id),
+        labels: vec!["Impression".to_string(), impression.kind.clone()],
+        summary: impression.text.clone(),
+        score: impression.confidence,
+    }
+}
+
+fn experience_summary_text(experience: &Experience) -> String {
+    experience
+        .summary_impression
+        .as_ref()
+        .map(|impression| impression.text.clone())
+        .unwrap_or_else(|| experience.text.clone())
 }
 
 fn vector_entity(artifact: &VectorArtifact, kind: &str) -> GraphEntity {
@@ -1350,6 +1545,111 @@ fn vector_artifacts_from_now(
         .collect()
 }
 
+fn sensation_vectors_from_frame(
+    frame: &ExperienceFrame,
+) -> (Vec<VectorArtifact>, BTreeMap<String, serde_json::Value>) {
+    let mut payloads = BTreeMap::new();
+    let artifacts = frame
+        .sensations
+        .iter()
+        .filter_map(|sensation| {
+            let embedding = sensation.vector.as_ref()?;
+            let artifact = embodied_vector_artifact(
+                SENSATION_VECTOR_COLLECTION,
+                &format!("{}:sensation:{}", frame.id, sensation.id),
+                embedding,
+                frame.id,
+                sensation.id.to_string(),
+                sensation.occurred_at_ms,
+            );
+            payloads.insert(
+                vector_payload_key(&artifact),
+                json!({
+                    "payload_kind": sensation.payload_kind.as_str(),
+                    "modality": sensation.modality.as_str(),
+                    "sensation_id": sensation.id.to_string(),
+                    "parent_sensation_id": sensation.parent_id.map(|id| id.to_string()),
+                    "source_sensation_id": embedding.source_sensation_id.to_string(),
+                    "model_id": embedding.model_id,
+                    "dim": embedding.dim,
+                    "observed_at_ms": sensation.observed_at_ms,
+                    "occurred_at_ms": sensation.occurred_at_ms,
+                    "generated_at_ms": embedding.generated_at_ms,
+                    "sensation_kind": sensation.kind,
+                    "source": sensation.source,
+                    "summary": sensation.summary,
+                    "labels": sensation.metadata.labels,
+                    "confidence": sensation.metadata.confidence,
+                    "provenance": sensation.provenance,
+                }),
+            );
+            Some(artifact)
+        })
+        .collect();
+    (artifacts, payloads)
+}
+
+fn experience_vectors_from_frame(
+    frame: &ExperienceFrame,
+) -> (Vec<VectorArtifact>, BTreeMap<String, serde_json::Value>) {
+    let mut payloads = BTreeMap::new();
+    let artifacts = frame
+        .experiences
+        .iter()
+        .filter_map(|experience| {
+            let embedding = experience.fused_vector.as_ref()?;
+            let artifact = embodied_vector_artifact(
+                EXPERIENCE_VECTOR_COLLECTION,
+                &format!("{}:experience:{}", frame.id, experience.id),
+                embedding,
+                frame.id,
+                experience.id.to_string(),
+                experience.occurred_at_ms,
+            );
+            payloads.insert(
+                vector_payload_key(&artifact),
+                json!({
+                    "payload_kind": embedding.payload_kind.as_str(),
+                    "modality": embedding.modality.as_str(),
+                    "experience_id": experience.id.to_string(),
+                    "source_sensation_id": embedding.source_sensation_id.to_string(),
+                    "sensation_ids": experience.sensation_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "impression_ids": experience.impression_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "model_id": embedding.model_id,
+                    "dim": embedding.dim,
+                    "observed_at_ms": experience.observed_at_ms,
+                    "occurred_at_ms": experience.occurred_at_ms,
+                    "window_start_ms": experience.window_start_ms,
+                    "window_end_ms": experience.window_end_ms,
+                    "generated_at_ms": embedding.generated_at_ms,
+                    "experience_kind": experience.kind,
+                    "summary": experience_summary_text(experience),
+                    "summary_impression_text": experience.summary_impression.as_ref().map(|impression| impression.text.clone()),
+                    "salience": experience.salience,
+                    "tags": experience.tags,
+                }),
+            );
+            Some(artifact)
+        })
+        .collect();
+    (artifacts, payloads)
+}
+
+fn embodied_vector_artifact(
+    collection: &str,
+    point_id: &str,
+    embedding: &VectorEmbedding,
+    frame_id: uuid::Uuid,
+    source_id: String,
+    occurred_at_ms: u64,
+) -> VectorArtifact {
+    VectorArtifact::new(collection, point_id, embedding.vector.clone())
+        .with_model(embedding.model_id.clone())
+        .with_source_id(source_id)
+        .with_source_frame_id(frame_id.to_string())
+        .with_occurred_at_ms(occurred_at_ms)
+}
+
 fn query_scene_vectors(query: &RecallQuery) -> Vec<&[f32]> {
     let mut vectors = query
         .scene_vectors
@@ -1395,7 +1695,22 @@ fn record_all_vectors(record: &MemoryRecord) -> Vec<&VectorArtifact> {
         .iter()
         .chain(record.face_vectors.iter())
         .chain(record.voice_vectors.iter())
+        .chain(record.sensation_vectors.iter())
+        .chain(record.experience_vectors.iter())
         .collect()
+}
+
+fn vector_payload_key(artifact: &VectorArtifact) -> String {
+    format!("{}:{}", artifact.collection, artifact.point_id)
+}
+
+fn merge_json_object(base: &mut serde_json::Value, extra: &serde_json::Value) {
+    let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (key, value) in extra {
+        base.insert(key.clone(), value.clone());
+    }
 }
 
 fn has_face_query(query: &RecallQuery) -> bool {
@@ -1485,6 +1800,10 @@ fn neo4j_http_url_from_uri(uri: &str) -> Option<String> {
 mod tests {
     use super::*;
     use netherwick_body::BodySense;
+    use netherwick_experience::{
+        Experience, Impression, Modality, Sensation, SensationMetadata, SensationPayload,
+        SensationPayloadKind, SensationSource, VectorEmbedding,
+    };
     use netherwick_ledger::ExperienceFrame;
     use netherwick_now::{
         FaceSense, SurpriseSense, VectorArtifact, FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
@@ -1637,6 +1956,170 @@ mod tests {
         );
 
         assert!((score - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn memory_record_includes_embodied_vectors_and_lineage() {
+        let now = Now::blank(123, BodySense::default());
+        let mut frame = empty_frame(now);
+
+        let primary = Sensation::primary(
+            Modality::Vision,
+            SensationSource {
+                name: "camera.front".to_string(),
+                device_id: Some("cam-1".to_string()),
+                frame_id: Some("camera-frame-1".to_string()),
+            },
+            120,
+            123,
+            SensationPayload::image_metadata(640, 480, "rgb8", 921_600),
+        )
+        .with_summary("wide camera frame")
+        .with_vector(VectorEmbedding::new(
+            vec![1.0, 0.0, 0.0],
+            "vision.sensation.test",
+            Modality::Vision,
+            SensationPayloadKind::ImageBytes,
+            uuid::Uuid::nil(),
+            124,
+        ));
+        let primary_id = primary.id;
+        let mut primary = primary;
+        primary.vector.as_mut().unwrap().source_sensation_id = primary_id;
+
+        let crop_impression = Impression::new(
+            "focus",
+            "I focus on a bright crop.",
+            vec![primary_id],
+            120,
+            123,
+        )
+        .with_confidence(0.82);
+        let mut crop = Sensation::descendant(
+            &primary,
+            "vision.crop",
+            SensationPayloadKind::Crop,
+            serde_json::json!({"bbox": [10, 20, 64, 64]}),
+            SensationMetadata {
+                confidence: Some(0.91),
+                labels: vec!["bright".to_string()],
+                ..SensationMetadata::default()
+            },
+            "cropper",
+        )
+        .with_summary("bright crop")
+        .with_vector(VectorEmbedding::new(
+            vec![0.0, 1.0, 0.0],
+            "vision.crop.test",
+            Modality::Vision,
+            SensationPayloadKind::Crop,
+            uuid::Uuid::nil(),
+            125,
+        ))
+        .with_impression(crop_impression.clone());
+        crop.vector.as_mut().unwrap().source_sensation_id = crop.id;
+
+        let experience_impression = Impression::new(
+            "summary",
+            "I see and focus on something bright.",
+            vec![primary_id, crop.id],
+            120,
+            126,
+        )
+        .with_confidence(0.9);
+        let mut experience = Experience::new(
+            "visual_focus",
+            "I see and focus on something bright.",
+            vec![crop_impression.id, experience_impression.id],
+            vec![primary_id, crop.id],
+            120,
+            126,
+        );
+        experience.fused_vector = Some(VectorEmbedding::new(
+            vec![0.5, 0.5, 0.0],
+            "netherwick.fusion.test",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            primary_id,
+            126,
+        ));
+        experience.summary_impression =
+            Some(experience_impression.clone().for_experience(experience.id));
+
+        frame.sensations = vec![primary.clone(), crop.clone()];
+        frame.impressions = vec![crop_impression.clone(), experience_impression.clone()];
+        frame.experiences = vec![experience.clone()];
+
+        let record = memory_record_from_frame(&frame).unwrap();
+
+        assert_eq!(record.sensation_vectors.len(), 2);
+        assert_eq!(record.experience_vectors.len(), 1);
+        assert!(record
+            .sensation_vectors
+            .iter()
+            .all(|artifact| artifact.collection == SENSATION_VECTOR_COLLECTION));
+        assert_eq!(
+            record.experience_vectors[0].collection,
+            EXPERIENCE_VECTOR_COLLECTION
+        );
+
+        let crop_id = crop.id.to_string();
+        let crop_artifact = record
+            .sensation_vectors
+            .iter()
+            .find(|artifact| artifact.source_id.as_deref() == Some(crop_id.as_str()))
+            .unwrap();
+        let crop_payload = record
+            .vector_payloads
+            .get(&vector_payload_key(crop_artifact))
+            .unwrap();
+        assert_eq!(
+            crop_payload["parent_sensation_id"],
+            serde_json::json!(primary_id.to_string())
+        );
+        assert_eq!(crop_payload["payload_kind"], "crop");
+        assert_eq!(crop_payload["model_id"], "vision.crop.test");
+        assert_eq!(crop_payload["dim"], 3);
+
+        let exp_payload = record
+            .vector_payloads
+            .get(&vector_payload_key(&record.experience_vectors[0]))
+            .unwrap();
+        assert_eq!(
+            exp_payload["summary_impression_text"],
+            "I see and focus on something bright."
+        );
+        assert_eq!(exp_payload["experience_id"], experience.id.to_string());
+
+        assert!(record.graph_relationships.iter().any(|edge| {
+            edge.from == format!("frame:{}", frame.id)
+                && edge.to == experience_node_id(experience.id)
+                && edge.relationship == "HAS_EXPERIENCE"
+        }));
+        assert!(record.graph_relationships.iter().any(|edge| {
+            edge.from == experience_node_id(experience.id)
+                && edge.to == sensation_node_id(crop.id)
+                && edge.relationship == "INTEGRATES_SENSATION"
+        }));
+        assert!(record.graph_relationships.iter().any(|edge| {
+            edge.from == experience_node_id(experience.id)
+                && edge.to == impression_node_id(experience_impression.id)
+                && edge.relationship == "INTEGRATES_IMPRESSION"
+        }));
+        assert!(record.graph_relationships.iter().any(|edge| {
+            edge.from == sensation_node_id(crop.id)
+                && edge.to == sensation_node_id(primary_id)
+                && edge.relationship == "DERIVED_FROM_SENSATION"
+        }));
+        assert!(record.graph_relationships.iter().any(|edge| {
+            edge.from == sensation_node_id(crop.id)
+                && edge.to == impression_node_id(crop_impression.id)
+                && edge.relationship == "HAS_IMPRESSION"
+        }));
+        assert!(record.graph_relationships.iter().any(|edge| {
+            edge.from == experience_node_id(experience.id)
+                && edge.relationship == "HAS_FUSED_VECTOR"
+        }));
     }
 
     #[test]
