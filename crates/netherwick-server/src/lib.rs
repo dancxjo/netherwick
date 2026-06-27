@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/reign/clear",
     "/reign/hardware-arm",
     "/debug/embodied",
+    "/debug/embodied/graph",
     "/stream/now",
     "/stream/mind",
     "/stream/logs",
@@ -57,6 +58,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/view",
     "/view/snapshot",
     "/view/embodied",
+    "/view/embodied/graph",
     "/view/scene",
     "/view/behavior-nodes",
     "/view/3d",
@@ -1094,7 +1096,9 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view", get(live_view_page))
         .route("/view/snapshot", get(get_live_snapshot))
         .route("/view/embodied", get(get_live_embodied))
+        .route("/view/embodied/graph", get(get_live_embodied_graph))
         .route("/debug/embodied", get(get_live_embodied))
+        .route("/debug/embodied/graph", get(get_live_embodied_graph))
         .route("/view/scene", get(get_live_scene))
         .route("/view/behavior-nodes", get(get_behavior_nodes))
         .route("/view/behavior-nodes/{id}", post(post_behavior_node))
@@ -1185,6 +1189,301 @@ async fn get_live_embodied(
         .latest_embodied_context()
         .map(Json)
         .ok_or_else(|| LiveViewError::unavailable("no embodied experience has arrived yet"))
+}
+
+async fn get_live_embodied_graph(
+    State(state): State<LiveViewState>,
+) -> Result<Json<EmbodiedLineageGraph>, LiveViewError> {
+    let context = state
+        .latest_embodied_context()
+        .ok_or_else(|| LiveViewError::unavailable("no embodied experience has arrived yet"))?;
+    Ok(Json(EmbodiedLineageGraph::from_context(&context)))
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EmbodiedLineageGraph {
+    pub schema_version: u32,
+    pub experience_id: Option<String>,
+    pub summary: String,
+    pub nodes: Vec<EmbodiedGraphNode>,
+    pub edges: Vec<EmbodiedGraphEdge>,
+    pub vector_metadata: Vec<EmbodiedGraphVector>,
+    pub recent_memories: Vec<EmbodiedGraphMemory>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EmbodiedGraphNode {
+    pub id: String,
+    pub node_type: EmbodiedGraphNodeType,
+    pub label: String,
+    pub detail: Option<String>,
+    pub entity_id: String,
+    pub modality: Option<String>,
+    pub payload_kind: Option<String>,
+    pub derived: bool,
+    pub vector_refs: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbodiedGraphNodeType {
+    Sensation,
+    Impression,
+    Experience,
+    Prediction,
+    MemoryLink,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EmbodiedGraphEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: EmbodiedGraphEdgeType,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbodiedGraphEdgeType {
+    ParentSensation,
+    AboutSensation,
+    SensationMember,
+    ImpressionMember,
+    SummarizesExperience,
+    Predicts,
+    MemoryLink,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EmbodiedGraphVector {
+    pub index: usize,
+    pub owner_node_id: String,
+    pub model_id: String,
+    pub dim: usize,
+    pub modality: String,
+    pub payload_kind: String,
+    pub source_sensation_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EmbodiedGraphMemory {
+    pub node_id: String,
+    pub target_id: String,
+    pub relation: String,
+    pub score: f32,
+    pub text: Option<String>,
+}
+
+impl EmbodiedLineageGraph {
+    pub fn from_context(context: &EmbodiedContext) -> Self {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut vectors = Vec::new();
+        let mut recent_memories = Vec::new();
+        let experience_node_id = context.experience_id.map(|id| format!("experience:{id}"));
+
+        if let Some(experience_id) = context.experience_id {
+            nodes.push(EmbodiedGraphNode {
+                id: format!("experience:{experience_id}"),
+                node_type: EmbodiedGraphNodeType::Experience,
+                label: "fused experience".to_string(),
+                detail: non_empty(context.summary.clone()),
+                entity_id: experience_id.to_string(),
+                modality: None,
+                payload_kind: None,
+                derived: false,
+                vector_refs: vector_refs_for_node(
+                    &mut vectors,
+                    format!("experience:{experience_id}"),
+                    context.fused_vector.as_ref().into_iter(),
+                ),
+            });
+        }
+
+        let sensation_ids = context
+            .sensations
+            .iter()
+            .map(|sensation| sensation.id)
+            .collect::<BTreeSet<_>>();
+        let impression_ids = context
+            .impressions
+            .iter()
+            .map(|impression| impression.id)
+            .collect::<BTreeSet<_>>();
+
+        for sensation in &context.sensations {
+            let node_id = format!("sensation:{}", sensation.id);
+            let owned_vectors = context
+                .sensation_vectors
+                .iter()
+                .filter(|vector| vector.source_sensation_id == sensation.id);
+            let vector_refs = vector_refs_for_node(&mut vectors, node_id.clone(), owned_vectors);
+            nodes.push(EmbodiedGraphNode {
+                id: node_id.clone(),
+                node_type: EmbodiedGraphNodeType::Sensation,
+                label: sensation.kind.clone(),
+                detail: sensation.summary.clone(),
+                entity_id: sensation.id.to_string(),
+                modality: Some(sensation.modality.as_str().to_string()),
+                payload_kind: Some(sensation.payload_kind.as_str().to_string()),
+                derived: sensation.parent_id.is_some(),
+                vector_refs,
+            });
+            if let Some(experience_node_id) = &experience_node_id {
+                edges.push(EmbodiedGraphEdge {
+                    from: node_id,
+                    to: experience_node_id.clone(),
+                    relation: EmbodiedGraphEdgeType::SensationMember,
+                });
+            }
+        }
+
+        for edge in &context.lineage {
+            if sensation_ids.contains(&edge.parent_id) && sensation_ids.contains(&edge.child_id) {
+                edges.push(EmbodiedGraphEdge {
+                    from: format!("sensation:{}", edge.parent_id),
+                    to: format!("sensation:{}", edge.child_id),
+                    relation: EmbodiedGraphEdgeType::ParentSensation,
+                });
+            }
+        }
+
+        for impression in &context.impressions {
+            let node_id = format!("impression:{}", impression.id);
+            nodes.push(EmbodiedGraphNode {
+                id: node_id.clone(),
+                node_type: EmbodiedGraphNodeType::Impression,
+                label: impression.kind.clone(),
+                detail: Some(impression.text.clone()),
+                entity_id: impression.id.to_string(),
+                modality: None,
+                payload_kind: None,
+                derived: false,
+                vector_refs: Vec::new(),
+            });
+            if let Some(sensation_id) = impression.sensation_id {
+                if sensation_ids.contains(&sensation_id) {
+                    edges.push(EmbodiedGraphEdge {
+                        from: format!("sensation:{sensation_id}"),
+                        to: node_id.clone(),
+                        relation: EmbodiedGraphEdgeType::AboutSensation,
+                    });
+                }
+            }
+            if let (Some(experience_id), Some(experience_node_id)) =
+                (context.experience_id, experience_node_id.as_ref())
+            {
+                if impression.experience_id.unwrap_or(experience_id) == experience_id
+                    && impression_ids.contains(&impression.id)
+                {
+                    edges.push(EmbodiedGraphEdge {
+                        from: node_id.clone(),
+                        to: experience_node_id.clone(),
+                        relation: EmbodiedGraphEdgeType::ImpressionMember,
+                    });
+                }
+            }
+        }
+
+        for (index, prediction) in context.predictions.iter().enumerate() {
+            let node_id = format!("prediction:{index}");
+            let vector_refs = vector_refs_for_node(
+                &mut vectors,
+                node_id.clone(),
+                prediction.vector.as_ref().into_iter(),
+            );
+            nodes.push(EmbodiedGraphNode {
+                id: node_id.clone(),
+                node_type: EmbodiedGraphNodeType::Prediction,
+                label: format!("+{}ms", prediction.offset_ms),
+                detail: Some(format!(
+                    "{} ({:.0}% confidence)",
+                    prediction.text,
+                    prediction.confidence.clamp(0.0, 1.0) * 100.0
+                )),
+                entity_id: index.to_string(),
+                modality: None,
+                payload_kind: None,
+                derived: false,
+                vector_refs,
+            });
+            if let Some(experience_node_id) = &experience_node_id {
+                edges.push(EmbodiedGraphEdge {
+                    from: experience_node_id.clone(),
+                    to: node_id,
+                    relation: EmbodiedGraphEdgeType::Predicts,
+                });
+            }
+        }
+
+        for (index, link) in context.memory_links.iter().enumerate() {
+            let node_id = format!("memory:{index}");
+            nodes.push(EmbodiedGraphNode {
+                id: node_id.clone(),
+                node_type: EmbodiedGraphNodeType::MemoryLink,
+                label: format!("{} {:.2}", link.relation, link.score),
+                detail: link.text.clone().or_else(|| Some(link.target_id.clone())),
+                entity_id: link.target_id.clone(),
+                modality: Some("memory".to_string()),
+                payload_kind: None,
+                derived: false,
+                vector_refs: Vec::new(),
+            });
+            if let Some(experience_node_id) = &experience_node_id {
+                edges.push(EmbodiedGraphEdge {
+                    from: experience_node_id.clone(),
+                    to: node_id.clone(),
+                    relation: EmbodiedGraphEdgeType::MemoryLink,
+                });
+            }
+            recent_memories.push(EmbodiedGraphMemory {
+                node_id,
+                target_id: link.target_id.clone(),
+                relation: link.relation.clone(),
+                score: link.score,
+                text: link.text.clone(),
+            });
+        }
+
+        Self {
+            schema_version: 1,
+            experience_id: context.experience_id.map(|id| id.to_string()),
+            summary: context.summary.clone(),
+            nodes,
+            edges,
+            vector_metadata: vectors,
+            recent_memories,
+        }
+    }
+}
+
+fn vector_refs_for_node<'a>(
+    vectors: &mut Vec<EmbodiedGraphVector>,
+    owner_node_id: String,
+    source: impl Iterator<Item = &'a netherwick_experience::EmbodiedVectorRef>,
+) -> Vec<usize> {
+    source
+        .map(|vector| {
+            let index = vectors.len();
+            vectors.push(EmbodiedGraphVector {
+                index,
+                owner_node_id: owner_node_id.clone(),
+                model_id: vector.model_id.clone(),
+                dim: vector.dim,
+                modality: vector.modality.as_str().to_string(),
+                payload_kind: vector.payload_kind.as_str().to_string(),
+                source_sensation_id: vector.source_sensation_id.to_string(),
+            });
+            index
+        })
+        .collect()
+}
+
+fn non_empty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 async fn get_live_scene(
@@ -3453,11 +3752,12 @@ const LIVE_VIEW_PAGE: &str = r#"<!doctype html>
 <title>Netherwick Robot View</title>
 <style>
 :root{color-scheme:dark;background:#101214;color:#eef1f3;font:14px system-ui}
-body{margin:0;min-height:100vh;display:grid;grid-template-columns:minmax(0,1fr) 320px}
+body{margin:0;min-height:100vh;display:grid;grid-template-columns:minmax(0,1fr) minmax(360px,460px)}
 main{display:grid;place-items:center;background:#070809}
 canvas{width:min(100vw,calc((100vh - 28px)*1.333));height:auto;image-rendering:pixelated;background:#111;border:1px solid #34383c}
-aside{border-left:1px solid #2f3337;padding:16px;background:#171a1d}
+aside{border-left:1px solid #2f3337;padding:16px;background:#171a1d;overflow:auto;max-height:100vh}
 h1{font-size:16px;margin:0 0 14px}
+h2{font-size:13px;margin:18px 0 8px;color:#c9d2da}
 a{color:#8bd3ff}
 dl{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;margin:0 0 18px}
 dt{color:#9aa4ad}
@@ -3465,6 +3765,21 @@ dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
 #status{color:#ffcf7a;margin-bottom:12px;min-height:20px}
 .beams{display:flex;align-items:end;gap:5px;height:96px;margin-top:8px}
 .beam{flex:1;background:#60d394;min-height:2px}
+.graph-controls{display:grid;grid-template-columns:1fr auto;gap:8px;margin:8px 0}
+.graph-controls input,.graph-controls select,.graph-controls button{min-width:0;background:#101316;color:#eef1f3;border:1px solid #394049;border-radius:6px;padding:7px}
+.graph-controls select{grid-column:1 / 3}
+.graph-summary{color:#9aa4ad;font-size:12px;margin:4px 0 8px}
+.graph-list{display:grid;gap:6px;margin:0}
+.graph-node,.graph-edge,.graph-memory{border:1px solid #30363d;border-radius:6px;background:#111519;padding:8px;overflow-wrap:anywhere}
+.graph-node[data-type="sensation"]{border-left:3px solid #60d394}
+.graph-node[data-type="impression"]{border-left:3px solid #8bd3ff}
+.graph-node[data-type="experience"]{border-left:3px solid #ffcf7a}
+.graph-node[data-type="prediction"]{border-left:3px solid #d7a8ff}
+.graph-node[data-type="memory_link"]{border-left:3px solid #f5a97f}
+.graph-title{font-weight:650;font-size:12px}
+.graph-meta{color:#9aa4ad;font-size:11px;margin-top:3px}
+.graph-detail{font-size:12px;margin-top:5px;line-height:1.35}
+.graph-edge{font-size:12px;color:#c9d2da}
 @media(max-width:760px){body{display:block}aside{border-left:0;border-top:1px solid #2f3337}canvas{width:100vw}}
 </style>
 <main><canvas id="eye" width="64" height="48"></canvas></main>
@@ -3489,6 +3804,29 @@ dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
   </dl>
   <div>Range</div>
   <div class="beams" id="beams"></div>
+  <h2>Embodied lineage</h2>
+  <div class="graph-controls">
+    <input id="graph_query" placeholder="Search ids, text, model">
+    <button id="graph_refresh" type="button">Refresh</button>
+    <select id="graph_modality">
+      <option value="">All modalities</option>
+      <option value="vision">Vision</option>
+      <option value="audio">Audio</option>
+      <option value="depth">Depth</option>
+      <option value="lidar">Lidar</option>
+      <option value="touch">Touch</option>
+      <option value="odometry">Odometry</option>
+      <option value="memory">Memory</option>
+      <option value="language">Language</option>
+      <option value="other">Other</option>
+    </select>
+  </div>
+  <div class="graph-summary" id="graph_summary">waiting for embodied experience...</div>
+  <div class="graph-list" id="graph_nodes"></div>
+  <h2>Edges</h2>
+  <div class="graph-list" id="graph_edges"></div>
+  <h2>Recent memories</h2>
+  <div class="graph-list" id="graph_memories"></div>
 </aside>
 <script>
 const canvas = document.getElementById('eye');
@@ -3496,6 +3834,13 @@ const ctx = canvas.getContext('2d');
 const fields = Object.fromEntries(['t','x','y','heading','battery','nearest','gps_lat','gps_lon','gps_alt','eye_format','eye_age','ear_age'].map(id => [id, document.getElementById(id)]));
 const status = document.getElementById('status');
 const beams = document.getElementById('beams');
+const graphQuery = document.getElementById('graph_query');
+const graphModality = document.getElementById('graph_modality');
+const graphSummary = document.getElementById('graph_summary');
+const graphNodes = document.getElementById('graph_nodes');
+const graphEdges = document.getElementById('graph_edges');
+const graphMemories = document.getElementById('graph_memories');
+let latestGraph = null;
 function fmt(value, digits = 2){
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '-';
 }
@@ -3659,6 +4004,83 @@ function drawBeams(values){
     return bar;
   }));
 }
+function graphMatches(node, query, modality){
+  if(modality && node.modality !== modality) return false;
+  if(!query) return true;
+  return JSON.stringify(node).toLowerCase().includes(query);
+}
+function escapeHtml(value){
+  return String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+function renderGraph(){
+  if(!latestGraph){
+    graphSummary.textContent = 'waiting for embodied experience...';
+    graphNodes.replaceChildren();
+    graphEdges.replaceChildren();
+    graphMemories.replaceChildren();
+    return;
+  }
+  const query = graphQuery.value.trim().toLowerCase();
+  const modality = graphModality.value;
+  const vectorsByNode = new Map();
+  for(const vector of latestGraph.vector_metadata || []){
+    const list = vectorsByNode.get(vector.owner_node_id) || [];
+    list.push(vector);
+    vectorsByNode.set(vector.owner_node_id, list);
+  }
+  const visibleNodes = (latestGraph.nodes || []).filter(node => graphMatches(node, query, modality));
+  const visibleIds = new Set(visibleNodes.map(node => node.id));
+  graphSummary.textContent = `${visibleNodes.length}/${(latestGraph.nodes || []).length} nodes, ${(latestGraph.edges || []).length} edges | ${latestGraph.summary || 'no summary'}`;
+  graphNodes.replaceChildren(...visibleNodes.map(node => {
+    const item = document.createElement('div');
+    item.className = 'graph-node';
+    item.dataset.type = node.node_type;
+    const vectorText = (vectorsByNode.get(node.id) || [])
+      .map(vector => `${vector.model_id} dim=${vector.dim} source=${vector.source_sensation_id}`)
+      .join(' | ');
+    item.innerHTML = `
+      <div class="graph-title">${escapeHtml(node.label)} ${node.derived ? '<span class="graph-meta">(derived)</span>' : ''}</div>
+      <div class="graph-meta">${escapeHtml(node.node_type)} ${escapeHtml(node.modality || '')} ${escapeHtml(node.payload_kind || '')} | ${escapeHtml(node.entity_id)}</div>
+      ${node.detail ? `<div class="graph-detail">${escapeHtml(node.detail)}</div>` : ''}
+      ${vectorText ? `<div class="graph-meta">vector: ${escapeHtml(vectorText)}</div>` : ''}
+    `;
+    return item;
+  }));
+  const visibleEdges = (latestGraph.edges || []).filter(edge =>
+    visibleIds.has(edge.from) || visibleIds.has(edge.to) || (!query && !modality)
+  );
+  graphEdges.replaceChildren(...visibleEdges.slice(0, 80).map(edge => {
+    const item = document.createElement('div');
+    item.className = 'graph-edge';
+    item.textContent = `${edge.from} -> ${edge.to} (${edge.relation})`;
+    return item;
+  }));
+  const visibleMemories = (latestGraph.recent_memories || []).filter(memory =>
+    !query || JSON.stringify(memory).toLowerCase().includes(query)
+  );
+  graphMemories.replaceChildren(...visibleMemories.map(memory => {
+    const item = document.createElement('div');
+    item.className = 'graph-memory';
+    item.innerHTML = `<div class="graph-title">${escapeHtml(memory.relation)} ${fmt(memory.score, 2)}</div><div class="graph-meta">${escapeHtml(memory.target_id)}</div>${memory.text ? `<div class="graph-detail">${escapeHtml(memory.text)}</div>` : ''}`;
+    return item;
+  }));
+  if(!visibleMemories.length){
+    const item = document.createElement('div');
+    item.className = 'graph-meta';
+    item.textContent = 'none';
+    graphMemories.replaceChildren(item);
+  }
+}
+async function refreshGraph(){
+  try{
+    const response = await fetch('/view/embodied/graph', {cache:'no-store'});
+    if(!response.ok) throw new Error(await response.text());
+    latestGraph = await response.json();
+    renderGraph();
+  }catch(error){
+    graphSummary.textContent = error.message || String(error);
+  }
+}
 async function refresh(){
   try{
     const sceneResponse = await fetch('/view/scene', {cache:'no-store'});
@@ -3690,6 +4112,7 @@ async function refresh(){
       fields.ear_age.textContent = '-';
       drawBeams((scenePacket.range?.beams || []).map(beam => beam.distance_m));
       status.textContent = 'live';
+      refreshGraph();
       return;
     }
     const response = await fetch('/view/snapshot', {cache:'no-store'});
@@ -3749,12 +4172,16 @@ async function refresh(){
     const generated = shouldGenerateEye(scenePacket) && drawGeneratedEye(scenePacket);
     drawBeams(snapshot.range.beams);
     status.textContent = generated ? 'live generated eye' : 'live';
+    refreshGraph();
   }catch(error){
     status.textContent = 'waiting for frames...';
   }finally{
     setTimeout(refresh, 250);
   }
 }
+graphQuery.addEventListener('input', renderGraph);
+graphModality.addEventListener('change', renderGraph);
+document.getElementById('graph_refresh').addEventListener('click', refreshGraph);
 refresh();
 </script>"#;
 
@@ -6200,7 +6627,11 @@ mod tests {
     use netherwick_autonomic::SimpleSafety;
     use netherwick_body::BodySense;
     use netherwick_conductor::{Conductor, ConductorInput};
-    use netherwick_experience::ExperienceLatent;
+    use netherwick_experience::{
+        Experience, ExperienceLatent, Impression, MemoryLink, Modality, Prediction, Sensation,
+        SensationMetadata, SensationPayload, SensationPayloadKind, SensationSource,
+        VectorEmbedding,
+    };
     use netherwick_ledger::JsonlLedger;
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_now::Now;
@@ -6982,9 +7413,16 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/view/3d"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/scene"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/embodied"));
+        assert!(HTTP_ENDPOINTS.contains(&"/view/embodied/graph"));
         assert!(HTTP_ENDPOINTS.contains(&"/debug/embodied"));
+        assert!(HTTP_ENDPOINTS.contains(&"/debug/embodied/graph"));
         assert!(HTTP_ENDPOINTS.contains(&"/models"));
         assert!(HTTP_ENDPOINTS.contains(&"/stream/llm"));
+        let Html(live_page) = live_view_page().await;
+        assert!(live_page.contains("Embodied lineage"));
+        assert!(live_page.contains("/view/embodied/graph"));
+        assert!(live_page.contains("graph_query"));
+        assert!(live_page.contains("graph_modality"));
         let Html(page) = live_view_3d_page().await;
         assert!(page.contains("Sensorium 3D"));
         assert!(page.contains("/view/snapshot"));
@@ -7035,6 +7473,116 @@ mod tests {
         let Json(response) = get_live_embodied(State(state)).await.unwrap();
 
         assert_eq!(response, context);
+    }
+
+    #[test]
+    fn embodied_lineage_graph_traces_current_experience() {
+        let primary = Sensation::primary(
+            Modality::Vision,
+            SensationSource::new("unit-camera"),
+            100,
+            101,
+            SensationPayload::image_metadata(32, 24, "rgb8", 32 * 24 * 3),
+        )
+        .with_summary("I receive a visual frame.");
+        let child = Sensation::descendant(
+            &primary,
+            "vision.crop.focus",
+            SensationPayloadKind::Crop,
+            serde_json::json!({"x": 4, "y": 3, "width": 12, "height": 9}),
+            SensationMetadata::default(),
+            "focus",
+        )
+        .with_summary("I focus on a patch.")
+        .with_vector(VectorEmbedding::new(
+            vec![0.1, 0.2, 0.3],
+            "unit.crop.v0",
+            Modality::Vision,
+            SensationPayloadKind::Crop,
+            primary.id,
+            102,
+        ));
+        let impression = Impression::new(
+            "vision.focus.impression",
+            "I see and focus.",
+            vec![primary.id, child.id],
+            100,
+            102,
+        );
+        let mut experience = Experience::new(
+            "embodied.now",
+            "I see and focus.",
+            vec![impression.id],
+            vec![primary.id, child.id],
+            100,
+            102,
+        );
+        experience.fused_vector = Some(VectorEmbedding::new(
+            vec![0.5, 0.6, 0.7, 0.8],
+            "unit.fuser.v0",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            child.id,
+            102,
+        ));
+        experience.predictions.push(Prediction {
+            offset_ms: 750,
+            text: "The focused view should remain stable.".to_string(),
+            confidence: 0.6,
+            vector: None,
+        });
+        experience.memory_links.push(MemoryLink {
+            target_id: "memory-1".to_string(),
+            relation: "similar".to_string(),
+            score: 0.8,
+            payload: serde_json::json!({"text": "A previous focused camera moment."}),
+        });
+        let context = EmbodiedContext::from_current_experience(
+            Some(&experience),
+            &[primary.clone(), child.clone()],
+            &[impression.clone()],
+            &[],
+            &[],
+        );
+
+        let graph = EmbodiedLineageGraph::from_context(&context);
+
+        assert_eq!(graph.schema_version, 1);
+        assert_eq!(graph.experience_id, Some(experience.id.to_string()));
+        assert!(graph.nodes.iter().any(|node| {
+            node.id == format!("sensation:{}", child.id)
+                && node.derived
+                && node.modality.as_deref() == Some("vision")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == format!("sensation:{}", primary.id)
+                && edge.to == format!("sensation:{}", child.id)
+                && edge.relation == EmbodiedGraphEdgeType::ParentSensation
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == format!("sensation:{}", child.id)
+                && edge.to == format!("experience:{}", experience.id)
+                && edge.relation == EmbodiedGraphEdgeType::SensationMember
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == format!("impression:{}", impression.id)
+                && edge.to == format!("experience:{}", experience.id)
+                && edge.relation == EmbodiedGraphEdgeType::ImpressionMember
+        }));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == EmbodiedGraphNodeType::Prediction));
+        assert!(graph
+            .vector_metadata
+            .iter()
+            .any(|vector| { vector.model_id == "unit.fuser.v0" && vector.dim == 4 }));
+        assert!(graph
+            .vector_metadata
+            .iter()
+            .any(|vector| { vector.model_id == "unit.crop.v0" && vector.dim == 3 }));
+        assert_eq!(graph.recent_memories.len(), 1);
+        assert_eq!(graph.recent_memories[0].target_id, "memory-1");
     }
 
     #[test]

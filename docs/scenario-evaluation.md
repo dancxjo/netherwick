@@ -57,6 +57,8 @@ just run eval-scenario \
 
 Use `--ledger data/ledger/eval/foo` when you also want normal `ExperienceFrame` and `ExperienceTransition` output. Use `--capture-root data/captures/eval/foo` to write one Worldlab capture per episode.
 
+Ledger frames include the embodied prediction path. Inspect `experiences[-1].fused_vector` and `experiences[-1].predictions` to confirm that future, hazard, charge, action-value, event-change, and uncertainty predictions were attached to the embodied experience that memory will store.
+
 ## Golden Behavior Training
 
 Train `danger` and `action-value` only after the golden locomotion baseline is passing. Keep checkpoints in shadow/off modes for scenario control; this step proves prediction quality, not motor authority.

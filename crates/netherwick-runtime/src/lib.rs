@@ -30,7 +30,7 @@ use netherwick_experience::{
     ExperienceBehaviorInput, ExperienceBehaviorOutput, ExperienceDecodeOutput,
     ExperienceEncodeInput, ExperienceEncoder, ExperienceLatent, EyeNextInput, EyeNextOutput,
     FeatureExperienceEncoder, FutureInput, FuturePrediction, FuturePredictor, Impression,
-    RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
+    Prediction, RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -1444,6 +1444,28 @@ pub struct SituatedEarNextInput {
     pub now: Now,
 }
 
+fn adapt_prediction_z_len(
+    behavior: &str,
+    z: &mut Vec<f32>,
+    feature_len: usize,
+    expected_input_dim: usize,
+) -> Result<()> {
+    if feature_len == expected_input_dim {
+        return Ok(());
+    }
+    let context_len = feature_len.saturating_sub(z.len());
+    if expected_input_dim < context_len {
+        return Err(anyhow::anyhow!(
+            "{behavior} checkpoint input dimension mismatch: checkpoint expects {}, runtime context without latent already needs {}",
+            expected_input_dim,
+            context_len
+        ));
+    }
+    z.resize(expected_input_dim - context_len, 0.0);
+    z.truncate(expected_input_dim - context_len);
+    Ok(())
+}
+
 struct HardcodedExperienceBehavior {
     pub encoder: FeatureExperienceEncoder,
 }
@@ -1534,7 +1556,15 @@ impl FunctionBehavior<SituatedDangerInput, DangerOutput> for DangerModelBehavior
     }
 
     fn infer(&mut self, input: &SituatedDangerInput) -> Result<DangerOutput> {
-        self.trainer.predict(&input.input)
+        let mut input = input.input.clone();
+        let feature_len = input.flat_features().len();
+        adapt_prediction_z_len(
+            "danger",
+            &mut input.z,
+            feature_len,
+            self.trainer.input_dim(),
+        )?;
+        self.trainer.predict(&input)
     }
 
     fn observe(
@@ -1574,7 +1604,15 @@ impl FunctionBehavior<SituatedChargeInput, ChargeOutput> for ChargeModelBehavior
     }
 
     fn infer(&mut self, input: &SituatedChargeInput) -> Result<ChargeOutput> {
-        self.trainer.predict(&input.input)
+        let mut input = input.input.clone();
+        let feature_len = input.flat_features().len();
+        adapt_prediction_z_len(
+            "charge",
+            &mut input.z,
+            feature_len,
+            self.trainer.input_dim(),
+        )?;
+        self.trainer.predict(&input)
     }
 
     fn observe(
@@ -1615,7 +1653,15 @@ impl FunctionBehavior<SituatedActionValueInput, ActionValueOutput> for ActionVal
     }
 
     fn infer(&mut self, input: &SituatedActionValueInput) -> Result<ActionValueOutput> {
-        self.trainer.predict(&input.input)
+        let mut input = input.input.clone();
+        let feature_len = input.flat_features().len();
+        adapt_prediction_z_len(
+            "action-value",
+            &mut input.z,
+            feature_len,
+            self.trainer.input_dim(),
+        )?;
+        self.trainer.predict(&input)
     }
 
     fn observe(
@@ -1652,7 +1698,15 @@ impl FunctionBehavior<SituatedEyeNextInput, EyeNextOutput> for EyeNextModelBehav
     }
 
     fn infer(&mut self, input: &SituatedEyeNextInput) -> Result<EyeNextOutput> {
-        self.trainer.predict(&input.input)
+        let mut input = input.input.clone();
+        let feature_len = input.flat_features().len();
+        adapt_prediction_z_len(
+            "eye-next",
+            &mut input.z,
+            feature_len,
+            self.trainer.input_dim(),
+        )?;
+        self.trainer.predict(&input)
     }
 
     fn observe(
@@ -1691,7 +1745,15 @@ impl FunctionBehavior<SituatedEarNextInput, EarNextOutput> for EarNextModelBehav
     }
 
     fn infer(&mut self, input: &SituatedEarNextInput) -> Result<EarNextOutput> {
-        self.trainer.predict(&input.input)
+        let mut input = input.input.clone();
+        let feature_len = input.flat_features().len();
+        adapt_prediction_z_len(
+            "ear-next",
+            &mut input.z,
+            feature_len,
+            self.trainer.input_dim(),
+        )?;
+        self.trainer.predict(&input)
     }
 
     fn observe(
@@ -2580,12 +2642,6 @@ where
         }
         behavior_runs.push(experience_record.erase());
         let latent = experience_run.chosen.latent.clone();
-        if futures.is_empty() {
-            let (predicted, records) =
-                predict_baseline_futures(&mut self.models.behaviors.future, &latent, now.t_ms)?;
-            futures = predicted;
-            behavior_runs.extend(records);
-        }
 
         let recall = self
             .memory_recall
@@ -2667,6 +2723,18 @@ where
         embodied_experience
             .impression_ids
             .extend(recall_impression_ids);
+        let prediction_latent =
+            netherwick_experience::latent_from_fused_experience(&embodied_experience)
+                .unwrap_or_else(|| latent.clone());
+        if futures.is_empty() {
+            let (predicted, records) = predict_baseline_futures(
+                &mut self.models.behaviors.future,
+                &prediction_latent,
+                now.t_ms,
+            )?;
+            futures = predicted;
+            behavior_runs.extend(records);
+        }
         let mut teachings = Vec::new();
         let mut notes = Vec::new();
         if let Some(stuck_values) = now
@@ -2900,7 +2968,7 @@ where
                 action,
             );
             let candidate_danger_input =
-                danger_behavior_input(&candidate_now, &latent, Some(action));
+                danger_behavior_input(&candidate_now, &prediction_latent, Some(action));
             let candidate_danger = self
                 .models
                 .behaviors
@@ -2921,7 +2989,8 @@ where
             let candidate_danger_had_fallback = candidate_danger_record.model_output.is_none();
             behavior_runs.push(candidate_danger_record.erase());
 
-            let candidate_charge_input = charge_behavior_input(&now, &latent, Some(action));
+            let candidate_charge_input =
+                charge_behavior_input(&now, &prediction_latent, Some(action));
             let candidate_charge = self
                 .models
                 .behaviors
@@ -2944,7 +3013,7 @@ where
 
             let candidate_action_value_input = action_value_behavior_input(
                 &candidate_now,
-                &latent,
+                &prediction_latent,
                 Some(action),
                 candidate_danger_output,
                 candidate_charge_output,
@@ -3091,7 +3160,7 @@ where
             }
         }
 
-        let danger_input = danger_behavior_input(&now, &latent, Some(&chosen_action));
+        let danger_input = danger_behavior_input(&now, &prediction_latent, Some(&chosen_action));
         let danger_run = self
             .models
             .behaviors
@@ -3112,7 +3181,7 @@ where
         }
         behavior_runs.push(danger_record.erase());
 
-        let charge_input = charge_behavior_input(&now, &latent, Some(&chosen_action));
+        let charge_input = charge_behavior_input(&now, &prediction_latent, Some(&chosen_action));
         let charge_run = self
             .models
             .behaviors
@@ -3133,7 +3202,8 @@ where
         }
         behavior_runs.push(charge_record.erase());
 
-        let eye_next_input = eye_next_behavior_input(&now, &latent, Some(&chosen_action), 100);
+        let eye_next_input =
+            eye_next_behavior_input(&now, &prediction_latent, Some(&chosen_action), 100);
         let eye_next_run = self
             .models
             .behaviors
@@ -3154,7 +3224,8 @@ where
         }
         behavior_runs.push(eye_next_record.erase());
 
-        let ear_next_input = ear_next_behavior_input(&now, &latent, Some(&chosen_action), 100);
+        let ear_next_input =
+            ear_next_behavior_input(&now, &prediction_latent, Some(&chosen_action), 100);
         let ear_next_run = self
             .models
             .behaviors
@@ -3279,6 +3350,12 @@ where
             );
         }
 
+        attach_structured_predictions_to_experience(
+            &mut embodied_experience,
+            &futures,
+            &now,
+            Some(&chosen_action),
+        );
         experiences.push(embodied_experience);
 
         let reign_outcome = reign_input.as_ref().map(|input| {
@@ -4894,6 +4971,103 @@ fn predict_baseline_futures(
         }
     }
     Ok((out, records))
+}
+
+fn attach_structured_predictions_to_experience(
+    experience: &mut Experience,
+    futures: &[FuturePrediction],
+    now: &Now,
+    action: Option<&ActionPrimitive>,
+) {
+    let vector = experience.fused_vector.clone();
+    for future in futures.iter().take(2) {
+        let text = future
+            .summary
+            .clone()
+            .unwrap_or_else(|| "latent future estimated from embodied vector".to_string());
+        experience.predictions.push(Prediction {
+            offset_ms: future.offset_ms,
+            text: format!("next_state: {text}"),
+            confidence: future.confidence.clamp(0.0, 1.0),
+            vector: vector.clone(),
+        });
+    }
+
+    let danger = now
+        .predictions
+        .danger_model
+        .or(now.predictions.danger_hardcoded);
+    if let Some(danger) = danger {
+        experience.predictions.push(Prediction {
+            offset_ms: 100,
+            text: format!(
+                "hazard: bump={:.2} cliff={:.2} wheel_drop={:.2} stuck={:.2}",
+                danger.bump_risk, danger.cliff_risk, danger.wheel_drop_risk, danger.stuck_risk
+            ),
+            confidence: danger.confidence.clamp(0.0, 1.0),
+            vector: vector.clone(),
+        });
+    }
+
+    let charge = now
+        .predictions
+        .charge_model
+        .or(now.predictions.charge_hardcoded);
+    if let Some(charge) = charge {
+        experience.predictions.push(Prediction {
+            offset_ms: 500,
+            text: format!(
+                "charge: probability={:.2} battery_delta={:.3} dock={:.2}",
+                charge.charge_probability, charge.expected_battery_delta, charge.dock_likelihood
+            ),
+            confidence: charge.confidence.clamp(0.0, 1.0),
+            vector: vector.clone(),
+        });
+    }
+
+    let action_value = now
+        .predictions
+        .action_values_model
+        .iter()
+        .chain(now.predictions.action_values_hardcoded.iter())
+        .find(|prediction| {
+            action
+                .map(|action| prediction.action == *action)
+                .unwrap_or(true)
+        });
+    if let Some(action_value) = action_value {
+        experience.predictions.push(Prediction {
+            offset_ms: 250,
+            text: format!(
+                "action_value: action={:?} value={:.2}",
+                action_value.action, action_value.value
+            ),
+            confidence: action_value.confidence.clamp(0.0, 1.0),
+            vector: vector.clone(),
+        });
+    }
+
+    if !now.predictions.expected_events.is_empty() {
+        experience.predictions.push(Prediction {
+            offset_ms: 500,
+            text: format!(
+                "social_object_changes: expected_events={}",
+                now.predictions.expected_events.join(", ")
+            ),
+            confidence: (1.0 - now.predictions.uncertainty).clamp(0.0, 1.0),
+            vector: vector.clone(),
+        });
+    }
+
+    experience.predictions.push(Prediction {
+        offset_ms: 500,
+        text: format!(
+            "uncertainty: {:.2}",
+            now.predictions.uncertainty.clamp(0.0, 1.0)
+        ),
+        confidence: (1.0 - now.predictions.uncertainty).clamp(0.05, 1.0),
+        vector,
+    });
 }
 
 fn default_candidate_actions() -> Vec<ActionPrimitive> {
@@ -8152,6 +8326,32 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn sim_attaches_fallback_predictions_to_embodied_experience() {
+        let root = test_ledger_root("sim-runner-embodied-predictions");
+        let ledger = JsonlLedger::new(&root);
+        let runtime = test_runtime(ledger.clone(), FixedConductor::new(ActionPrimitive::Stop));
+        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        world.set_body(test_body(1.0, 1.0, 0.8, 7));
+        let mut runner = SimRunner::new(runtime, world, motors);
+
+        runner.run_steps(1).await.unwrap();
+        let frames = ledger.recent(5).await.unwrap();
+        let experience = frames.last().unwrap().experiences.last().unwrap();
+
+        assert!(experience.fused_vector.is_some());
+        assert!(experience
+            .predictions
+            .iter()
+            .any(|prediction| prediction.text.starts_with("hazard:")));
+        assert!(experience
+            .predictions
+            .iter()
+            .any(|prediction| prediction.text.starts_with("uncertainty:")));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

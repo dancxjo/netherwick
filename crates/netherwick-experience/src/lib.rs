@@ -59,6 +59,18 @@ pub struct FutureInput {
 }
 
 impl FutureInput {
+    pub fn from_embodied_experience(
+        experience: &Experience,
+        action: ActionPrimitive,
+        offset_ms: TimeMs,
+    ) -> Option<Self> {
+        Some(Self {
+            latent: latent_from_fused_experience(experience)?,
+            action,
+            offset_ms,
+        })
+    }
+
     pub fn flat_features(&self) -> Vec<f32> {
         let mut out =
             Vec::with_capacity(self.latent.z.len() + action_features(Some(&self.action)).len() + 1);
@@ -140,6 +152,18 @@ pub fn danger_input_from_transition_like(
     before: &Now,
 ) -> DangerInput {
     DangerInput::from_parts(before_z.z.clone(), action, before)
+}
+
+pub fn danger_input_from_embodied_experience(
+    experience: &Experience,
+    action: Option<&ActionPrimitive>,
+    now: &Now,
+) -> Option<DangerInput> {
+    Some(DangerInput::from_parts(
+        latent_from_fused_experience(experience)?.z,
+        action,
+        now,
+    ))
 }
 
 pub fn danger_target_from_transition_like(
@@ -238,6 +262,18 @@ pub fn charge_input_from_transition_like(
     before: &Now,
 ) -> ChargeInput {
     ChargeInput::from_parts(before_z.z.clone(), action, before)
+}
+
+pub fn charge_input_from_embodied_experience(
+    experience: &Experience,
+    action: Option<&ActionPrimitive>,
+    now: &Now,
+) -> Option<ChargeInput> {
+    Some(ChargeInput::from_parts(
+        latent_from_fused_experience(experience)?.z,
+        action,
+        now,
+    ))
 }
 
 pub fn charge_target_from_transition_like(
@@ -556,6 +592,20 @@ pub fn eye_next_input_from_transition_like(
     EyeNextInput::from_parts(before_z.z.clone(), action, before, offset_ms)
 }
 
+pub fn eye_next_input_from_embodied_experience(
+    experience: &Experience,
+    action: Option<&ActionPrimitive>,
+    before: &Now,
+    offset_ms: TimeMs,
+) -> Option<EyeNextInput> {
+    Some(EyeNextInput::from_parts(
+        latent_from_fused_experience(experience)?.z,
+        action,
+        before,
+        offset_ms,
+    ))
+}
+
 pub fn eye_next_target_from_now(after: &Now) -> Option<EyeNextTarget> {
     eye_frame_rgb(after).map(|(width, height, rgb)| EyeNextTarget { width, height, rgb })
 }
@@ -567,6 +617,20 @@ pub fn ear_next_input_from_transition_like(
     offset_ms: TimeMs,
 ) -> EarNextInput {
     EarNextInput::from_parts(before_z.z.clone(), action, before, offset_ms)
+}
+
+pub fn ear_next_input_from_embodied_experience(
+    experience: &Experience,
+    action: Option<&ActionPrimitive>,
+    before: &Now,
+    offset_ms: TimeMs,
+) -> Option<EarNextInput> {
+    Some(EarNextInput::from_parts(
+        latent_from_fused_experience(experience)?.z,
+        action,
+        before,
+        offset_ms,
+    ))
 }
 
 pub fn ear_next_target_from_now(after: &Now) -> Option<EarNextTarget> {
@@ -623,6 +687,32 @@ pub fn action_value_input_from_transition_like(
     before: &Now,
 ) -> ActionValueInput {
     ActionValueInput::from_parts(before_z.z.clone(), action, before)
+}
+
+pub fn action_value_input_from_embodied_experience(
+    experience: &Experience,
+    action: Option<&ActionPrimitive>,
+    before: &Now,
+) -> Option<ActionValueInput> {
+    Some(ActionValueInput::from_parts(
+        latent_from_fused_experience(experience)?.z,
+        action,
+        before,
+    ))
+}
+
+pub fn latent_from_fused_experience(experience: &Experience) -> Option<ExperienceLatent> {
+    let fused = experience.fused_vector.as_ref()?;
+    if fused.vector.is_empty() {
+        return None;
+    }
+    Some(ExperienceLatent {
+        t_ms: experience.window_end_ms,
+        z: fused.vector.iter().copied().map(sanitize_feature).collect(),
+        reconstruction_error: 0.0,
+        prediction_error: 0.0,
+        confidence: 0.7,
+    })
 }
 
 pub fn action_value_target_from_reward_surprise(
@@ -1481,6 +1571,47 @@ mod tests {
         assert_eq!(input.flat_features().len(), target.flat_features().len());
         assert_eq!(target.eye_features.len(), 16);
         assert_eq!(target.ear_features.len(), 16);
+    }
+
+    #[test]
+    fn prediction_inputs_can_be_built_from_fused_experience_vector() {
+        let source_sensation_id = Uuid::new_v4();
+        let mut experience = Experience::new(
+            "embodied.now",
+            "I am near a charger.",
+            Vec::new(),
+            vec![source_sensation_id],
+            100,
+            175,
+        );
+        experience.fused_vector = Some(VectorEmbedding::new(
+            vec![0.2, f32::NAN, 0.8],
+            "unit.fuser.v0",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            source_sensation_id,
+            175,
+        ));
+        let action = ActionPrimitive::Dock;
+        let now = Now::blank(175, BodySense::default());
+
+        let latent = latent_from_fused_experience(&experience).unwrap();
+        let future =
+            FutureInput::from_embodied_experience(&experience, action.clone(), 500).unwrap();
+        let danger =
+            danger_input_from_embodied_experience(&experience, Some(&action), &now).unwrap();
+        let charge =
+            charge_input_from_embodied_experience(&experience, Some(&action), &now).unwrap();
+        let action_value =
+            action_value_input_from_embodied_experience(&experience, Some(&action), &now).unwrap();
+
+        assert_eq!(latent.t_ms, 175);
+        assert_eq!(latent.z, vec![0.2, 0.0, 0.8]);
+        assert_eq!(future.latent.z, latent.z);
+        assert_eq!(danger.z, latent.z);
+        assert_eq!(charge.z, latent.z);
+        assert_eq!(action_value.z, latent.z);
+        assert!(!future.flat_features().is_empty());
     }
 
     #[test]
