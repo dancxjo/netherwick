@@ -4724,6 +4724,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
  "uuid",
 ]
 
@@ -4765,6 +4766,17 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "uuid",
+]
+
+[[package]]
+name = "netherwick-map"
+version = "0.1.0"
+dependencies = [
+ "netherwick-core",
+ "netherwick-now",
+ "netherwick-sensors",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4830,6 +4842,7 @@ dependencies = [
  "netherwick-experience",
  "netherwick-ledger",
  "netherwick-llm",
+ "netherwick-map",
  "netherwick-memory",
  "netherwick-models",
  "netherwick-now",

@@ -1,0 +1,522 @@
+use std::collections::BTreeMap;
+
+use netherwick_core::{Pose2, TimeMs};
+use netherwick_now::Now;
+use netherwick_sensors::WorldSnapshot;
+use serde::{Deserialize, Serialize};
+
+pub const MAP_EXTENSION_NAME: &str = "map.odometry";
+pub const MAP_LABEL: &str = "SLAM-lite / odometry map, not full SLAM";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PoseEstimate {
+    pub pose: Pose2,
+    pub confidence: f32,
+    pub covariance: [f32; 3],
+    pub source: String,
+    pub t_ms: TimeMs,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct CellKey {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OccupancyCell {
+    pub key: CellKey,
+    pub occupied_score: f32,
+    pub free_score: f32,
+    pub confidence: f32,
+    pub last_seen_ms: TimeMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RangeBeam {
+    pub angle_rad: f32,
+    pub distance_m: f32,
+    pub hit: bool,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapObservation {
+    pub pose: PoseEstimate,
+    pub range_beams: Vec<RangeBeam>,
+    pub source_snapshot: serde_json::Value,
+    pub t_ms: TimeMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocalMap {
+    pub cells: BTreeMap<CellKey, OccupancyCell>,
+    pub pose_history: Vec<PoseEstimate>,
+    pub observations: Vec<MapObservation>,
+    pub config: MapConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapConfig {
+    pub resolution_m: f32,
+    pub range_fov_rad: f32,
+    pub max_range_m: f32,
+    pub hit_epsilon_m: f32,
+    pub free_increment: f32,
+    pub occupied_increment: f32,
+    pub decay_after_ms: TimeMs,
+    pub decay_per_tick: f32,
+    pub max_pose_history: usize,
+    pub max_observations: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapSummary {
+    pub label: &'static str,
+    pub resolution_m: f32,
+    pub cells: usize,
+    pub occupied_cells: usize,
+    pub free_cells: usize,
+    pub observations: usize,
+    pub latest_pose: Option<PoseEstimate>,
+    pub latest_observation: Option<MapObservationSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapObservationSummary {
+    pub t_ms: TimeMs,
+    pub beam_count: usize,
+    pub hit_count: usize,
+}
+
+impl Default for MapConfig {
+    fn default() -> Self {
+        Self {
+            resolution_m: 0.10,
+            range_fov_rad: std::f32::consts::PI,
+            max_range_m: 4.0,
+            hit_epsilon_m: 0.05,
+            free_increment: 0.18,
+            occupied_increment: 0.35,
+            decay_after_ms: 10_000,
+            decay_per_tick: 0.04,
+            max_pose_history: 1_000,
+            max_observations: 250,
+        }
+    }
+}
+
+impl Default for LocalMap {
+    fn default() -> Self {
+        Self::new(MapConfig::default())
+    }
+}
+
+impl LocalMap {
+    pub fn new(config: MapConfig) -> Self {
+        assert!(config.resolution_m > 0.0, "map resolution must be positive");
+        Self {
+            cells: BTreeMap::new(),
+            pose_history: Vec::new(),
+            observations: Vec::new(),
+            config,
+        }
+    }
+
+    pub fn observe_snapshot(&mut self, snapshot: &WorldSnapshot, t_ms: TimeMs) -> MapSummary {
+        let observation = observation_from_snapshot(snapshot, t_ms, self.config);
+        self.integrate_observation(observation);
+        self.decay_stale(t_ms);
+        self.summary()
+    }
+
+    pub fn observe_now(&mut self, now: &Now) -> MapSummary {
+        let observation = observation_from_now(now, self.config);
+        self.integrate_observation(observation);
+        self.decay_stale(now.t_ms);
+        self.summary()
+    }
+
+    pub fn integrate_observation(&mut self, observation: MapObservation) {
+        self.pose_history.push(observation.pose.clone());
+        cap_vec(&mut self.pose_history, self.config.max_pose_history);
+
+        for beam in &observation.range_beams {
+            self.integrate_beam(observation.pose.pose, beam, observation.t_ms);
+        }
+
+        self.observations.push(observation);
+        cap_vec(&mut self.observations, self.config.max_observations);
+    }
+
+    pub fn decay_stale(&mut self, now_ms: TimeMs) {
+        for cell in self.cells.values_mut() {
+            if now_ms.saturating_sub(cell.last_seen_ms) <= self.config.decay_after_ms {
+                continue;
+            }
+            cell.occupied_score = (cell.occupied_score - self.config.decay_per_tick).max(0.0);
+            cell.free_score = (cell.free_score - self.config.decay_per_tick).max(0.0);
+            cell.confidence = cell.occupied_score.max(cell.free_score).clamp(0.0, 1.0);
+        }
+        self.cells.retain(|_, cell| cell.confidence > 0.001);
+    }
+
+    pub fn summary(&self) -> MapSummary {
+        let occupied_cells = self
+            .cells
+            .values()
+            .filter(|cell| cell.occupied_score > cell.free_score && cell.confidence > 0.0)
+            .count();
+        let free_cells = self
+            .cells
+            .values()
+            .filter(|cell| cell.free_score >= cell.occupied_score && cell.confidence > 0.0)
+            .count();
+        MapSummary {
+            label: MAP_LABEL,
+            resolution_m: self.config.resolution_m,
+            cells: self.cells.len(),
+            occupied_cells,
+            free_cells,
+            observations: self.observations.len(),
+            latest_pose: self.pose_history.last().cloned(),
+            latest_observation: self
+                .observations
+                .last()
+                .map(|observation| MapObservationSummary {
+                    t_ms: observation.t_ms,
+                    beam_count: observation.range_beams.len(),
+                    hit_count: observation
+                        .range_beams
+                        .iter()
+                        .filter(|beam| beam.hit)
+                        .count(),
+                }),
+        }
+    }
+
+    fn integrate_beam(&mut self, pose: Pose2, beam: &RangeBeam, t_ms: TimeMs) {
+        if !beam.distance_m.is_finite() || beam.distance_m <= 0.0 {
+            return;
+        }
+
+        let distance = beam.distance_m.min(self.config.max_range_m);
+        let end = project_beam_endpoint(pose, beam.angle_rad, distance);
+        let origin_key = cell_key(pose.x_m, pose.y_m, self.config.resolution_m);
+        let end_key = cell_key(end.x_m, end.y_m, self.config.resolution_m);
+        let free_end = if beam.hit {
+            distance - self.config.resolution_m
+        } else {
+            distance
+        };
+        for key in trace_cells(
+            pose,
+            beam.angle_rad,
+            free_end.max(0.0),
+            self.config.resolution_m,
+        ) {
+            if beam.hit && key == end_key {
+                continue;
+            }
+            if key == origin_key {
+                continue;
+            }
+            self.bump_free(key, t_ms, beam.confidence);
+        }
+
+        if beam.hit && beam.confidence > 0.0 && beam.distance_m <= self.config.max_range_m {
+            self.bump_occupied(end_key, t_ms, beam.confidence);
+        }
+    }
+
+    fn bump_free(&mut self, key: CellKey, t_ms: TimeMs, confidence: f32) {
+        let increment = self.config.free_increment * confidence.clamp(0.0, 1.0);
+        let cell = self.cell_mut(key, t_ms);
+        cell.free_score = (cell.free_score + increment).clamp(0.0, 1.0);
+        cell.occupied_score = (cell.occupied_score - increment * 0.25).max(0.0);
+        cell.confidence = cell.free_score.max(cell.occupied_score).clamp(0.0, 1.0);
+        cell.last_seen_ms = t_ms;
+    }
+
+    fn bump_occupied(&mut self, key: CellKey, t_ms: TimeMs, confidence: f32) {
+        let increment = self.config.occupied_increment * confidence.clamp(0.0, 1.0);
+        let cell = self.cell_mut(key, t_ms);
+        cell.occupied_score = (cell.occupied_score + increment).clamp(0.0, 1.0);
+        cell.free_score = (cell.free_score - increment * 0.20).max(0.0);
+        cell.confidence = cell.free_score.max(cell.occupied_score).clamp(0.0, 1.0);
+        cell.last_seen_ms = t_ms;
+    }
+
+    fn cell_mut(&mut self, key: CellKey, t_ms: TimeMs) -> &mut OccupancyCell {
+        self.cells.entry(key).or_insert_with(|| OccupancyCell {
+            key,
+            occupied_score: 0.0,
+            free_score: 0.0,
+            confidence: 0.0,
+            last_seen_ms: t_ms,
+        })
+    }
+}
+
+pub fn observation_from_snapshot(
+    snapshot: &WorldSnapshot,
+    t_ms: TimeMs,
+    config: MapConfig,
+) -> MapObservation {
+    observation_from_parts(
+        snapshot.body.odometry,
+        odometry_confidence_from_motion(
+            snapshot.body.velocity.forward_m_s,
+            snapshot.body.velocity.turn_rad_s,
+        ),
+        &snapshot.range.beams,
+        snapshot.range.nearest_m,
+        serde_json::json!({
+            "body": {
+                "odometry": snapshot.body.odometry,
+                "velocity": snapshot.body.velocity,
+            },
+            "range": snapshot.range,
+        }),
+        t_ms,
+        config,
+    )
+}
+
+pub fn observation_from_now(now: &Now, config: MapConfig) -> MapObservation {
+    observation_from_parts(
+        now.body.odometry,
+        odometry_confidence_from_motion(
+            now.body.velocity.forward_m_s,
+            now.body.velocity.turn_rad_s,
+        ),
+        &now.range.beams,
+        now.range.nearest_m,
+        serde_json::json!({
+            "body": {
+                "odometry": now.body.odometry,
+                "velocity": now.body.velocity,
+            },
+            "range": now.range,
+            "source": now.extensions.get("source"),
+            "mode": now.extensions.get("mode"),
+        }),
+        now.t_ms,
+        config,
+    )
+}
+
+fn observation_from_parts(
+    odometry: Pose2,
+    pose_confidence: f32,
+    beams: &[f32],
+    nearest_m: Option<f32>,
+    source_snapshot: serde_json::Value,
+    t_ms: TimeMs,
+    config: MapConfig,
+) -> MapObservation {
+    let pose = PoseEstimate {
+        pose: odometry,
+        confidence: pose_confidence,
+        covariance: [0.05, 0.05, 0.10],
+        source: "odometry".to_string(),
+        t_ms,
+    };
+    let beam_count = beams.len();
+    let range_beams = beams
+        .iter()
+        .enumerate()
+        .filter_map(|(index, distance)| {
+            let distance = *distance;
+            if !distance.is_finite() || distance <= 0.0 {
+                return None;
+            }
+            let ratio = if beam_count <= 1 {
+                0.5
+            } else {
+                index as f32 / (beam_count - 1) as f32
+            };
+            let angle_rad = -config.range_fov_rad * 0.5 + ratio * config.range_fov_rad;
+            let hit = nearest_m
+                .filter(|nearest| nearest.is_finite())
+                .map(|nearest| (distance - nearest).abs() <= config.hit_epsilon_m)
+                .unwrap_or(false)
+                && distance <= config.max_range_m;
+            Some(RangeBeam {
+                angle_rad,
+                distance_m: distance,
+                hit,
+                confidence: if hit { 0.9 } else { 0.65 },
+            })
+        })
+        .collect();
+
+    MapObservation {
+        pose,
+        range_beams,
+        source_snapshot,
+        t_ms,
+    }
+}
+
+pub fn project_beam_endpoint(pose: Pose2, beam_angle_rad: f32, distance_m: f32) -> Pose2 {
+    let heading = pose.heading_rad + beam_angle_rad;
+    Pose2 {
+        x_m: pose.x_m + heading.cos() * distance_m,
+        y_m: pose.y_m + heading.sin() * distance_m,
+        heading_rad: heading,
+    }
+}
+
+pub fn cell_key(x_m: f32, y_m: f32, resolution_m: f32) -> CellKey {
+    CellKey {
+        x: (x_m / resolution_m).floor() as i32,
+        y: (y_m / resolution_m).floor() as i32,
+    }
+}
+
+pub fn trace_cells(
+    pose: Pose2,
+    beam_angle_rad: f32,
+    distance_m: f32,
+    resolution_m: f32,
+) -> Vec<CellKey> {
+    if distance_m <= 0.0 {
+        return Vec::new();
+    }
+    let steps = (distance_m / (resolution_m * 0.5)).ceil().max(1.0) as usize;
+    let heading = pose.heading_rad + beam_angle_rad;
+    let mut cells = Vec::new();
+    let mut last = None;
+    for step in 1..=steps {
+        let d = (step as f32 / steps as f32) * distance_m;
+        let key = cell_key(
+            pose.x_m + heading.cos() * d,
+            pose.y_m + heading.sin() * d,
+            resolution_m,
+        );
+        if last != Some(key) {
+            cells.push(key);
+            last = Some(key);
+        }
+    }
+    cells
+}
+
+fn odometry_confidence_from_motion(forward_m_s: f32, turn_rad_s: f32) -> f32 {
+    let moving = forward_m_s.abs() + turn_rad_s.abs();
+    if moving > 0.001 {
+        0.85
+    } else {
+        0.75
+    }
+}
+
+fn cap_vec<T>(items: &mut Vec<T>, max_len: usize) {
+    if max_len == 0 {
+        items.clear();
+        return;
+    }
+    let overflow = items.len().saturating_sub(max_len);
+    if overflow > 0 {
+        items.drain(0..overflow);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netherwick_now::RangeSense;
+
+    fn snapshot_at(x_m: f32, y_m: f32, heading_rad: f32, beams: Vec<f32>) -> WorldSnapshot {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.odometry = Pose2 {
+            x_m,
+            y_m,
+            heading_rad,
+        };
+        snapshot.range = RangeSense {
+            schema_version: 1,
+            nearest_m: beams.iter().copied().reduce(f32::min),
+            beams,
+        };
+        snapshot
+    }
+
+    #[test]
+    fn beam_projection_uses_pose_heading_and_relative_angle() {
+        let pose = Pose2 {
+            x_m: 1.0,
+            y_m: 2.0,
+            heading_rad: std::f32::consts::FRAC_PI_2,
+        };
+        let endpoint = project_beam_endpoint(pose, 0.0, 1.5);
+        assert!((endpoint.x_m - 1.0).abs() < 0.001);
+        assert!((endpoint.y_m - 3.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn occupancy_update_accumulates_endpoint_hits() {
+        let mut map = LocalMap::new(MapConfig {
+            resolution_m: 0.5,
+            ..MapConfig::default()
+        });
+        let snapshot = snapshot_at(0.0, 0.0, 0.0, vec![1.0]);
+        map.observe_snapshot(&snapshot, 100);
+        map.observe_snapshot(&snapshot, 200);
+
+        let key = cell_key(1.0, 0.0, map.config.resolution_m);
+        let cell = map.cells.get(&key).expect("endpoint cell should exist");
+        assert!(cell.occupied_score > 0.5);
+        assert!(cell.occupied_score > cell.free_score);
+    }
+
+    #[test]
+    fn free_space_is_marked_along_beam_before_hit() {
+        let mut map = LocalMap::new(MapConfig {
+            resolution_m: 0.25,
+            ..MapConfig::default()
+        });
+        let snapshot = snapshot_at(0.0, 0.0, 0.0, vec![1.0]);
+        map.observe_snapshot(&snapshot, 100);
+
+        let free_key = cell_key(0.5, 0.0, map.config.resolution_m);
+        let free = map.cells.get(&free_key).expect("free cell should exist");
+        assert!(free.free_score > free.occupied_score);
+    }
+
+    #[test]
+    fn stale_observations_decay_and_empty_cells_are_removed() {
+        let mut map = LocalMap::new(MapConfig {
+            resolution_m: 0.5,
+            decay_after_ms: 10,
+            decay_per_tick: 1.0,
+            ..MapConfig::default()
+        });
+        let snapshot = snapshot_at(0.0, 0.0, 0.0, vec![1.0]);
+        map.observe_snapshot(&snapshot, 100);
+        assert!(!map.cells.is_empty());
+
+        map.decay_stale(111);
+        assert!(map.cells.is_empty());
+    }
+
+    #[test]
+    fn map_grows_as_odometry_moves_through_sim_like_snapshots() {
+        let mut map = LocalMap::new(MapConfig {
+            resolution_m: 0.25,
+            ..MapConfig::default()
+        });
+
+        map.observe_snapshot(&snapshot_at(0.0, 0.0, 0.0, vec![1.0]), 100);
+        let first_cells = map.cells.len();
+        map.observe_snapshot(&snapshot_at(1.0, 0.0, 0.0, vec![1.0]), 200);
+
+        assert!(first_cells > 0);
+        assert!(map.cells.len() > first_cells);
+        assert_eq!(map.pose_history.len(), 2);
+        assert_eq!(map.summary().label, MAP_LABEL);
+    }
+}

@@ -67,3 +67,48 @@ hardcoded = "script.on_face_detected.v0"
 model = "event.face_detected.shadow.v0"
 checkpoint = "data/models/event_face_detected_v0"
 fallback = "use_hardcoded"
+
+[vectorizer.vision_image]
+enabled = true
+model = "netherwick.image.frame_stats.v1"
+fallback = "placeholder"
+
+[vectorizer.vision_crop]
+enabled = true
+model = "netherwick.image.frame_stats.v1"
+fallback = "placeholder"
+
+[vectorizer.vision_features]
+enabled = true
+model = "netherwick.image.feature_artifact.v1"
+fallback = "placeholder"
+
+[vectorizer.audio_pcm]
+enabled = true
+model = "netherwick.audio.window_stats.v1"
+fallback = "placeholder"
+
+[vectorizer.audio_voice]
+enabled = true
+model = "netherwick.audio.window_stats.v1"
+fallback = "placeholder"
+
+[vectorizer.audio_speech]
+enabled = true
+model = "netherwick.text.hash_embedding.v1"
+fallback = "placeholder"
+
+[vectorizer.audio_transcript]
+enabled = true
+model = "netherwick.text.hash_embedding.v1"
+fallback = "placeholder"
+
+[vectorizer.audio_phoneme]
+enabled = true
+model = "netherwick.text.hash_embedding.v1"
+fallback = "placeholder"
+
+[vectorizer.depth_scene]
+enabled = true
+model = "netherwick.depth.scene_stats.v1"
+fallback = "placeholder"

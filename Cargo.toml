@@ -15,6 +15,7 @@ members = [
     "crates/netherwick-training",
     "crates/netherwick-experience",
     "crates/netherwick-memory",
+    "crates/netherwick-map",
     "crates/netherwick-events",
     "crates/netherwick-llm",
     "crates/netherwick-conductor",

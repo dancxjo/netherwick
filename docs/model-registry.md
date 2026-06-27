@@ -2,6 +2,8 @@
 
 The model registry is Netherwick's file-backed card catalog for learned behavior checkpoints. It records which checkpoint exists, which behavior it belongs to, what ledger and reports produced it, what scenario metrics it has earned, and which runtime modes it may enter.
 
+Embodied sensation vectorizers are configured beside behavior models in `configs/models.toml` under `[vectorizer.*]`. They are deliberately lightweight selectors: when an upstream sensor has already produced a model-backed `VectorArtifact`, the embodied pipeline preserves that vector, model id, dimension, source sensation id, timestamp, modality, and payload kind. When no upstream vector is present, configured feature vectorizers produce bounded deterministic embeddings for image frames/crops, audio/voice windows, transcript spans, and depth scenes. Setting `enabled = false` for a vectorizer keeps the deterministic placeholder fallback available.
+
 The default registry lives at:
 
 ```bash

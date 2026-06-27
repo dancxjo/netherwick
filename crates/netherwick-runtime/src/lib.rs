@@ -36,6 +36,7 @@ use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
 };
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
+use netherwick_map::{LocalMap, MAP_EXTENSION_NAME};
 use netherwick_memory::{MemoryStore, Recall, RecallBundle, RecallQuery};
 use netherwick_models::{
     read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
@@ -86,6 +87,7 @@ where
     pub surface_extractor: SurfaceExtractor,
     pub inline_learning: InlineLearningConfig,
     pub nudge_policy: NudgePolicy,
+    pub local_map: LocalMap,
     pub last_behavior_runs: Vec<ErasedBehaviorRunRecord>,
     nudge: NudgeController,
 }
@@ -2439,6 +2441,7 @@ where
             surface_extractor: SurfaceExtractor::default(),
             inline_learning: InlineLearningConfig::default(),
             nudge_policy: NudgePolicy::default(),
+            local_map: LocalMap::default(),
             last_behavior_runs: Vec::new(),
             nudge: NudgeController::default(),
         }
@@ -2474,6 +2477,7 @@ where
             surface_extractor: SurfaceExtractor::default(),
             inline_learning: InlineLearningConfig::default(),
             nudge_policy: NudgePolicy::default(),
+            local_map: LocalMap::default(),
             last_behavior_runs: Vec::new(),
             nudge: NudgeController::default(),
         }
@@ -2507,6 +2511,11 @@ where
 
     pub fn with_nudge_policy(mut self, policy: NudgePolicy) -> Self {
         self.nudge_policy = policy;
+        self
+    }
+
+    pub fn with_local_map(mut self, local_map: LocalMap) -> Self {
+        self.local_map = local_map;
         self
     }
 
@@ -2703,6 +2712,15 @@ where
             notes.push("motor_applied = false".to_string());
             notes.push("ReadOnlyActionSuppressed: motion suppressed by read-only mode".to_string());
         }
+        let map_summary = self.local_map.observe_now(&now);
+        now.extensions.insert(
+            MAP_EXTENSION_NAME.to_string(),
+            serde_json::to_value(&map_summary)?,
+        );
+        notes.push(format!(
+            "OdometryMap: {} cells ({} occupied, {} free); SLAM-lite / odometry map, not full SLAM",
+            map_summary.cells, map_summary.occupied_cells, map_summary.free_cells
+        ));
         let mut proposed_actions = Vec::new();
 
         let events = self.extractor.events_from_now(&now, Some(&recall));

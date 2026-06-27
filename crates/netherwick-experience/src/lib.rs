@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -14,6 +15,7 @@ use uuid::Uuid;
 
 const DEFAULT_WINDOW_MS: TimeMs = 750;
 const PLACEHOLDER_VECTOR_DIM: usize = 16;
+const EMBODIED_FEATURE_VECTOR_DIM: usize = 32;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExperienceLatent {
@@ -2029,11 +2031,73 @@ mod tests {
             .find(|sensation| sensation.kind == "vision.face_crop")
             .expect("face crop sensation");
         assert!(crop.vector.is_some(), "crop should be vectorized");
+        assert_eq!(
+            crop.vector.as_ref().map(|vector| vector.model_id.as_str()),
+            Some("netherwick.image.frame_stats.v1")
+        );
+        assert_eq!(
+            crop.vector.as_ref().map(|vector| vector.dim),
+            Some(EMBODIED_FEATURE_VECTOR_DIM)
+        );
         assert!(batch
             .impressions
             .iter()
             .any(|impression| impression.sensation_id == Some(crop.id)
                 && impression.text == "I see a face close to me."));
+    }
+
+    #[tokio::test]
+    async fn vectorizer_registry_uses_configured_placeholder_fallback() {
+        let mut config = EmbodiedVectorizerRegistryConfig::default();
+        config.vectorizer.insert(
+            "vision_crop".to_string(),
+            EmbodiedVectorizerConfig {
+                enabled: false,
+                model: None,
+                fallback: Some("placeholder".to_string()),
+            },
+        );
+        let registry = SensationVectorizerRegistry::from_config(&config);
+        let primary = visual_primary_with_rgb(16, 16, vec![9; 16 * 16 * 3]);
+        let crop = Sensation::descendant(
+            &primary,
+            "vision.crop",
+            SensationPayloadKind::Crop,
+            json!({"width": 8, "height": 8}),
+            SensationMetadata::default(),
+            "test",
+        );
+
+        let vector = registry.vectorize(&crop).await.unwrap().expect("vector");
+
+        assert_eq!(vector.model_id, "netherwick.placeholder.v0");
+        assert_eq!(vector.dim, PLACEHOLDER_VECTOR_DIM);
+        assert_eq!(vector.source_sensation_id, crop.id);
+        assert_eq!(vector.payload_kind, SensationPayloadKind::Crop);
+    }
+
+    #[tokio::test]
+    async fn vectorizer_registry_preserves_precomputed_model_metadata() {
+        let registry = SensationVectorizerRegistry::with_defaults();
+        let mut now = Now::blank(310, BodySense::default());
+        now.face.vectors.push(
+            netherwick_now::VectorArtifact::new("faces", "face-vector-1", vec![0.2, 0.4, 0.6])
+                .with_model("arcface.test.v0")
+                .with_source_id("face-1")
+                .with_occurred_at_ms(300),
+        );
+        let face = primary_sensations_from_now(&now)
+            .into_iter()
+            .find(|sensation| sensation.source == "face.features")
+            .expect("face feature sensation");
+
+        let vector = registry.vectorize(&face).await.unwrap().expect("vector");
+
+        assert_eq!(vector.model_id, "arcface.test.v0");
+        assert_eq!(vector.dim, 3);
+        assert_eq!(vector.vector, vec![0.2, 0.4, 0.6]);
+        assert_eq!(vector.source_sensation_id, face.id);
+        assert_eq!(vector.generated_at_ms, face.observed_at_ms);
     }
 
     #[test]
@@ -2168,6 +2232,13 @@ mod tests {
             .expect("speech child sensation");
         assert!(speech.parent_id.is_some());
         assert!(speech.vector.is_some());
+        assert_eq!(
+            speech
+                .vector
+                .as_ref()
+                .map(|vector| vector.model_id.as_str()),
+            Some("netherwick.text.hash_embedding.v1")
+        );
         assert_eq!(
             speech
                 .impression
@@ -2990,9 +3061,27 @@ fn vector_ref(vector: &VectorEmbedding) -> EmbodiedVectorRef {
 pub trait SensationVectorizer: Send + Sync {
     fn modality(&self) -> Modality;
     fn payload_kind(&self) -> SensationPayloadKind;
-    fn model_id(&self) -> &'static str;
+    fn model_id(&self) -> &str;
     fn output_dim(&self) -> usize;
     async fn vectorize(&self, sensation: &Sensation) -> Result<VectorEmbedding>;
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedVectorizerRegistryConfig {
+    #[serde(default)]
+    pub vectorizer: BTreeMap<String, EmbodiedVectorizerConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedVectorizerConfig {
+    #[serde(default = "default_vectorizer_enabled")]
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub fallback: Option<String>,
+}
+
+fn default_vectorizer_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Default)]
@@ -3006,24 +3095,98 @@ impl SensationVectorizerRegistry {
     }
 
     pub fn with_defaults() -> Self {
+        Self::from_config(&EmbodiedVectorizerRegistryConfig::default())
+    }
+
+    pub fn from_config(config: &EmbodiedVectorizerRegistryConfig) -> Self {
         let mut registry = Self::new();
-        for (modality, payload_kind) in [
-            (Modality::Vision, SensationPayloadKind::ImageBytes),
-            (Modality::Vision, SensationPayloadKind::Crop),
-            (Modality::Audio, SensationPayloadKind::AudioPcm),
-            (Modality::Audio, SensationPayloadKind::VoiceSegment),
-            (Modality::Audio, SensationPayloadKind::SpeechSegment),
-            (Modality::Audio, SensationPayloadKind::TranscriptSpan),
-            (Modality::Audio, SensationPayloadKind::PhonemeSpan),
-            (Modality::Depth, SensationPayloadKind::DepthFrame),
-            (Modality::Touch, SensationPayloadKind::ContactEvent),
-            (Modality::Odometry, SensationPayloadKind::OdometryEvent),
-            (Modality::Memory, SensationPayloadKind::MemoryRecall),
-            (Modality::Other, SensationPayloadKind::Structured),
-        ] {
-            registry.register(PlaceholderSensationVectorizer::new(modality, payload_kind));
+
+        registry.register_configured(
+            config,
+            "vision_image",
+            EmbodiedFeatureSensationVectorizer::image(SensationPayloadKind::ImageBytes),
+        );
+        registry.register_configured(
+            config,
+            "vision_crop",
+            EmbodiedFeatureSensationVectorizer::image(SensationPayloadKind::Crop),
+        );
+        registry.register_configured(
+            config,
+            "vision_features",
+            EmbodiedFeatureSensationVectorizer {
+                modality: Modality::Vision,
+                payload_kind: SensationPayloadKind::Structured,
+                model_id: "netherwick.image.feature_artifact.v1".to_string(),
+                kind: EmbodiedFeatureKind::Image,
+            },
+        );
+        registry.register_configured(
+            config,
+            "audio_pcm",
+            EmbodiedFeatureSensationVectorizer::audio(SensationPayloadKind::AudioPcm),
+        );
+        registry.register_configured(
+            config,
+            "audio_voice",
+            EmbodiedFeatureSensationVectorizer::audio(SensationPayloadKind::VoiceSegment),
+        );
+        registry.register_configured(
+            config,
+            "audio_speech",
+            EmbodiedFeatureSensationVectorizer::text(SensationPayloadKind::SpeechSegment),
+        );
+        registry.register_configured(
+            config,
+            "audio_transcript",
+            EmbodiedFeatureSensationVectorizer::text(SensationPayloadKind::TranscriptSpan),
+        );
+        registry.register_configured(
+            config,
+            "audio_phoneme",
+            EmbodiedFeatureSensationVectorizer::text(SensationPayloadKind::PhonemeSpan),
+        );
+        registry.register_configured(
+            config,
+            "depth_scene",
+            EmbodiedFeatureSensationVectorizer::depth(SensationPayloadKind::DepthFrame),
+        );
+
+        for (modality, payload_kind) in default_vectorizer_keys() {
+            if registry.get(&modality, &payload_kind).is_none() {
+                registry.register(PlaceholderSensationVectorizer::new(modality, payload_kind));
+            }
         }
         registry
+    }
+
+    pub fn from_models_toml(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| anyhow!("read vectorizer config {}: {error}", path.display()))?;
+        let config: EmbodiedVectorizerRegistryConfig = toml::from_str(&text)
+            .map_err(|error| anyhow!("parse vectorizer config {}: {error}", path.display()))?;
+        Ok(Self::from_config(&config))
+    }
+
+    fn register_configured(
+        &mut self,
+        config: &EmbodiedVectorizerRegistryConfig,
+        key: &str,
+        mut vectorizer: EmbodiedFeatureSensationVectorizer,
+    ) {
+        let entry = config.vectorizer.get(key);
+        if entry.is_some_and(|entry| !entry.enabled) {
+            self.register(PlaceholderSensationVectorizer::new(
+                vectorizer.modality(),
+                vectorizer.payload_kind(),
+            ));
+            return;
+        }
+        if let Some(model) = entry.and_then(|entry| entry.model.clone()) {
+            vectorizer.model_id = model;
+        }
+        self.register(vectorizer);
     }
 
     pub fn register<V>(&mut self, vectorizer: V)
@@ -3054,6 +3217,390 @@ impl SensationVectorizerRegistry {
     }
 }
 
+fn default_vectorizer_keys() -> [(Modality, SensationPayloadKind); 13] {
+    [
+        (Modality::Vision, SensationPayloadKind::ImageBytes),
+        (Modality::Vision, SensationPayloadKind::Crop),
+        (Modality::Vision, SensationPayloadKind::Structured),
+        (Modality::Audio, SensationPayloadKind::AudioPcm),
+        (Modality::Audio, SensationPayloadKind::VoiceSegment),
+        (Modality::Audio, SensationPayloadKind::SpeechSegment),
+        (Modality::Audio, SensationPayloadKind::TranscriptSpan),
+        (Modality::Audio, SensationPayloadKind::PhonemeSpan),
+        (Modality::Depth, SensationPayloadKind::DepthFrame),
+        (Modality::Touch, SensationPayloadKind::ContactEvent),
+        (Modality::Odometry, SensationPayloadKind::OdometryEvent),
+        (Modality::Memory, SensationPayloadKind::MemoryRecall),
+        (Modality::Other, SensationPayloadKind::Structured),
+    ]
+}
+
+#[derive(Clone, Debug)]
+enum EmbodiedFeatureKind {
+    Image,
+    Audio,
+    Text,
+    Depth,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbodiedFeatureSensationVectorizer {
+    modality: Modality,
+    payload_kind: SensationPayloadKind,
+    model_id: String,
+    kind: EmbodiedFeatureKind,
+}
+
+impl EmbodiedFeatureSensationVectorizer {
+    pub fn image(payload_kind: SensationPayloadKind) -> Self {
+        Self {
+            modality: Modality::Vision,
+            payload_kind,
+            model_id: "netherwick.image.frame_stats.v1".to_string(),
+            kind: EmbodiedFeatureKind::Image,
+        }
+    }
+
+    pub fn audio(payload_kind: SensationPayloadKind) -> Self {
+        Self {
+            modality: Modality::Audio,
+            payload_kind,
+            model_id: "netherwick.audio.window_stats.v1".to_string(),
+            kind: EmbodiedFeatureKind::Audio,
+        }
+    }
+
+    pub fn text(payload_kind: SensationPayloadKind) -> Self {
+        Self {
+            modality: Modality::Audio,
+            payload_kind,
+            model_id: "netherwick.text.hash_embedding.v1".to_string(),
+            kind: EmbodiedFeatureKind::Text,
+        }
+    }
+
+    pub fn depth(payload_kind: SensationPayloadKind) -> Self {
+        Self {
+            modality: Modality::Depth,
+            payload_kind,
+            model_id: "netherwick.depth.scene_stats.v1".to_string(),
+            kind: EmbodiedFeatureKind::Depth,
+        }
+    }
+}
+
+#[async_trait]
+impl SensationVectorizer for EmbodiedFeatureSensationVectorizer {
+    fn modality(&self) -> Modality {
+        self.modality.clone()
+    }
+
+    fn payload_kind(&self) -> SensationPayloadKind {
+        self.payload_kind.clone()
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn output_dim(&self) -> usize {
+        EMBODIED_FEATURE_VECTOR_DIM
+    }
+
+    async fn vectorize(&self, sensation: &Sensation) -> Result<VectorEmbedding> {
+        if let Some((vector, model_id)) = precomputed_payload_embedding(sensation) {
+            return Ok(VectorEmbedding::new(
+                sanitize_vector(vector),
+                model_id,
+                self.modality.clone(),
+                self.payload_kind.clone(),
+                sensation.id,
+                sensation.observed_at_ms,
+            ));
+        }
+
+        let vector = match self.kind {
+            EmbodiedFeatureKind::Image => image_feature_vector(sensation),
+            EmbodiedFeatureKind::Audio => audio_feature_vector(sensation),
+            EmbodiedFeatureKind::Text => text_feature_vector(sensation),
+            EmbodiedFeatureKind::Depth => depth_feature_vector(sensation),
+        };
+        Ok(VectorEmbedding::new(
+            vector,
+            self.model_id.clone(),
+            self.modality.clone(),
+            self.payload_kind.clone(),
+            sensation.id,
+            sensation.observed_at_ms,
+        ))
+    }
+}
+
+fn precomputed_payload_embedding(sensation: &Sensation) -> Option<(Vec<f32>, String)> {
+    let artifacts = sensation.payload.get("vector_artifacts")?.as_array()?;
+    for artifact in artifacts {
+        let vector = artifact
+            .get("vector")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|value| value.as_f64().map(|value| value as f32))
+            .collect::<Vec<_>>();
+        if vector.is_empty() {
+            continue;
+        }
+        let model_id = artifact
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or("netherwick.precomputed_vector.v0")
+            .to_string();
+        return Some((vector, model_id));
+    }
+    None
+}
+
+fn image_feature_vector(sensation: &Sensation) -> Vec<f32> {
+    let mut vector = base_sensation_features(sensation);
+    let Some(frame) = VisualFrame::from_sensation(sensation) else {
+        return pad_feature_vector(vector);
+    };
+    let pixels = (frame.width as usize).saturating_mul(frame.height as usize);
+    if pixels == 0 {
+        return pad_feature_vector(vector);
+    }
+    let mut sums = [0.0_f32; 3];
+    let mut sq_sums = [0.0_f32; 3];
+    let mut mins = [1.0_f32; 3];
+    let mut maxs = [0.0_f32; 3];
+    let mut luma_sum = 0.0_f32;
+    let mut skin_like = 0_usize;
+    for pixel in frame.rgb.chunks_exact(3).take(pixels) {
+        let rgb = [
+            pixel[0] as f32 / 255.0,
+            pixel[1] as f32 / 255.0,
+            pixel[2] as f32 / 255.0,
+        ];
+        for channel in 0..3 {
+            sums[channel] += rgb[channel];
+            sq_sums[channel] += rgb[channel] * rgb[channel];
+            mins[channel] = mins[channel].min(rgb[channel]);
+            maxs[channel] = maxs[channel].max(rgb[channel]);
+        }
+        luma_sum += 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+        if is_skin_like_rgb(pixel[0], pixel[1], pixel[2]) {
+            skin_like += 1;
+        }
+    }
+    for channel in 0..3 {
+        let mean = sums[channel] / pixels as f32;
+        let variance = (sq_sums[channel] / pixels as f32) - mean * mean;
+        vector.push(mean);
+        vector.push(variance.max(0.0).sqrt());
+        vector.push(mins[channel]);
+        vector.push(maxs[channel]);
+    }
+    vector.push(luma_sum / pixels as f32);
+    vector.push(skin_like as f32 / pixels as f32);
+    if let Some(bbox) = sensation.metadata.bbox {
+        vector.push((bbox.x as f32 / frame.width.max(1) as f32).clamp(0.0, 1.0));
+        vector.push((bbox.y as f32 / frame.height.max(1) as f32).clamp(0.0, 1.0));
+        vector.push((bbox.width as f32 / frame.width.max(1) as f32).clamp(0.0, 1.0));
+        vector.push((bbox.height as f32 / frame.height.max(1) as f32).clamp(0.0, 1.0));
+    }
+    push_grid_luma(&mut vector, &frame);
+    pad_feature_vector(vector)
+}
+
+fn push_grid_luma(vector: &mut Vec<f32>, frame: &VisualFrame) {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    if width == 0 || height == 0 {
+        return;
+    }
+    for gy in 0..2 {
+        for gx in 0..2 {
+            let x0 = gx * width / 2;
+            let x1 = ((gx + 1) * width / 2).max(x0 + 1).min(width);
+            let y0 = gy * height / 2;
+            let y1 = ((gy + 1) * height / 2).max(y0 + 1).min(height);
+            let mut sum = 0.0_f32;
+            let mut count = 0_usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = (y * width + x) * 3;
+                    let r = frame.rgb[idx] as f32 / 255.0;
+                    let g = frame.rgb[idx + 1] as f32 / 255.0;
+                    let b = frame.rgb[idx + 2] as f32 / 255.0;
+                    sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    count += 1;
+                }
+            }
+            vector.push(if count > 0 { sum / count as f32 } else { 0.0 });
+        }
+    }
+}
+
+fn audio_feature_vector(sensation: &Sensation) -> Vec<f32> {
+    let mut vector = base_sensation_features(sensation);
+    vector.push(
+        sensation
+            .metadata
+            .duration_ms
+            .map(|value| (value as f32 / 10_000.0).clamp(0.0, 1.0))
+            .unwrap_or_default(),
+    );
+    for key in [
+        "feature_sets",
+        "duration_ms",
+        "start_offset_ms",
+        "end_offset_ms",
+        "confidence",
+    ] {
+        vector.push(payload_number_unit(&sensation.payload, key));
+    }
+    if let Some(asr) = sensation.payload.get("asr") {
+        vector.push(payload_number_unit(asr, "confidence"));
+        vector.push(
+            asr.get("is_final")
+                .and_then(Value::as_bool)
+                .map(bool01)
+                .unwrap_or_default(),
+        );
+        vector.push(
+            asr.get("word_count")
+                .and_then(Value::as_u64)
+                .map(|value| (value as f32 / 32.0).clamp(0.0, 1.0))
+                .unwrap_or_default(),
+        );
+    }
+    if let Some(text) = sensation
+        .payload
+        .get("transcript")
+        .and_then(Value::as_str)
+        .or_else(|| sensation.payload.get("text").and_then(Value::as_str))
+    {
+        push_text_hash_features(&mut vector, text, 8);
+    }
+    pad_feature_vector(vector)
+}
+
+fn text_feature_vector(sensation: &Sensation) -> Vec<f32> {
+    let mut vector = base_sensation_features(sensation);
+    let text = sensation
+        .payload
+        .get("text")
+        .and_then(Value::as_str)
+        .or(sensation.summary.as_deref())
+        .unwrap_or_default();
+    let chars = text.chars().count();
+    let words = text.split_whitespace().count();
+    vector.push((chars as f32 / 280.0).clamp(0.0, 1.0));
+    vector.push((words as f32 / 48.0).clamp(0.0, 1.0));
+    vector.push(bool01(
+        text.chars()
+            .last()
+            .is_some_and(|ch| matches!(ch, '?' | '!')),
+    ));
+    push_text_hash_features(&mut vector, text, EMBODIED_FEATURE_VECTOR_DIM);
+    pad_feature_vector(vector)
+}
+
+fn depth_feature_vector(sensation: &Sensation) -> Vec<f32> {
+    let mut vector = base_sensation_features(sensation);
+    for key in [
+        "sample_count",
+        "width",
+        "height",
+        "min_depth_m",
+        "max_depth_m",
+        "skeleton_count",
+    ] {
+        vector.push(payload_number_unit(&sensation.payload, key));
+    }
+    let min_depth = sensation
+        .payload
+        .get("min_depth_m")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or_default();
+    let max_depth = sensation
+        .payload
+        .get("max_depth_m")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or_default();
+    vector.push((max_depth - min_depth).max(0.0).min(10.0) / 10.0);
+    pad_feature_vector(vector)
+}
+
+fn base_sensation_features(sensation: &Sensation) -> Vec<f32> {
+    let mut vector = Vec::with_capacity(EMBODIED_FEATURE_VECTOR_DIM);
+    vector.push(stable_unit(&sensation.kind));
+    vector.push(stable_unit(&sensation.source));
+    vector.push((sensation.occurred_at_ms % 10_000) as f32 / 10_000.0);
+    vector.push(sensation.metadata.confidence.unwrap_or(0.5).clamp(0.0, 1.0));
+    vector.push(bool01(sensation.parent_id.is_some()));
+    for label in sensation.metadata.labels.iter().take(4) {
+        vector.push(stable_unit(label));
+    }
+    vector
+}
+
+fn push_text_hash_features(vector: &mut Vec<f32>, text: &str, max_dim: usize) {
+    let reserve = max_dim.saturating_sub(vector.len());
+    if reserve == 0 {
+        return;
+    }
+    let mut buckets = vec![0.0_f32; reserve.min(16)];
+    for token in text.split_whitespace() {
+        let mut hash = 0_u32;
+        for byte in token.bytes() {
+            hash = hash.wrapping_mul(16777619) ^ u32::from(byte.to_ascii_lowercase());
+        }
+        let idx = (hash as usize) % buckets.len();
+        buckets[idx] += 1.0;
+    }
+    let norm = buckets
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    for bucket in buckets {
+        vector.push(if norm > 0.0 { bucket / norm } else { 0.0 });
+    }
+}
+
+fn payload_number_unit(payload: &Value, key: &str) -> f32 {
+    payload
+        .get(key)
+        .and_then(Value::as_f64)
+        .map(|value| (value as f32).abs())
+        .map(|value| (value / (value + 1.0)).clamp(0.0, 1.0))
+        .unwrap_or_default()
+}
+
+fn pad_feature_vector(mut vector: Vec<f32>) -> Vec<f32> {
+    vector = sanitize_vector(vector);
+    vector.truncate(EMBODIED_FEATURE_VECTOR_DIM);
+    while vector.len() < EMBODIED_FEATURE_VECTOR_DIM {
+        vector.push(0.0);
+    }
+    vector
+}
+
+fn sanitize_vector(vector: Vec<f32>) -> Vec<f32> {
+    vector
+        .into_iter()
+        .map(|value| {
+            if value.is_finite() {
+                value.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct PlaceholderSensationVectorizer {
     modality: Modality,
@@ -3079,7 +3626,7 @@ impl SensationVectorizer for PlaceholderSensationVectorizer {
         self.payload_kind.clone()
     }
 
-    fn model_id(&self) -> &'static str {
+    fn model_id(&self) -> &str {
         "netherwick.placeholder.v0"
     }
 
@@ -4326,6 +4873,9 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
         || !now.eye.image_vectors.is_empty()
         || !now.eye.scene_vectors.is_empty()
     {
+        let mut vector_artifacts = now.eye.image_vectors.clone();
+        vector_artifacts.extend(now.eye.scene_vectors.clone());
+        vector_artifacts.extend(now.eye.image_description_vectors.clone());
         let mut sensation = Sensation::primary(
             Modality::Vision,
             SensationSource::new("eye.features"),
@@ -4336,10 +4886,37 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
                 "image_vectors": now.eye.image_vectors.len(),
                 "image_description_vectors": now.eye.image_description_vectors.len(),
                 "scene_vectors": now.eye.scene_vectors.len(),
+                "vector_artifacts": vector_artifacts,
             })),
         )
         .with_summary("I have visual features from my eye.");
         sensation.metadata.confidence = Some(0.55);
+        sensations.push(sensation);
+    }
+
+    if !now.face.embeddings.is_empty() || !now.face.vectors.is_empty() {
+        let vector_artifacts = if now.face.vectors.is_empty() {
+            legacy_vector_artifacts("faces", "legacy-face", &now.face.embeddings, now.t_ms)
+        } else {
+            now.face.vectors.clone()
+        };
+        let mut sensation = Sensation::primary(
+            Modality::Vision,
+            SensationSource::new("face.features"),
+            now.t_ms,
+            now.t_ms,
+            SensationPayload {
+                kind: SensationPayloadKind::Crop,
+                value: json!({
+                    "face_embeddings": now.face.embeddings.len(),
+                    "face_vectors": now.face.vectors.len(),
+                    "vector_artifacts": vector_artifacts,
+                }),
+            },
+        )
+        .with_summary("I have a face embedding from vision.");
+        sensation.metadata.confidence = Some(0.6);
+        sensation.metadata.labels.push("face".to_string());
         sensations.push(sensation);
     }
 
@@ -4400,6 +4977,32 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
         if transcript.is_some() {
             sensation.metadata.labels.push("asr available".to_string());
         }
+        sensations.push(sensation);
+    }
+
+    if !now.voice.embeddings.is_empty() || !now.voice.vectors.is_empty() {
+        let vector_artifacts = if now.voice.vectors.is_empty() {
+            legacy_vector_artifacts("voices", "legacy-voice", &now.voice.embeddings, now.t_ms)
+        } else {
+            now.voice.vectors.clone()
+        };
+        let mut sensation = Sensation::primary(
+            Modality::Audio,
+            SensationSource::new("voice.features"),
+            now.t_ms,
+            now.t_ms,
+            SensationPayload {
+                kind: SensationPayloadKind::VoiceSegment,
+                value: json!({
+                    "voice_embeddings": now.voice.embeddings.len(),
+                    "voice_vectors": now.voice.vectors.len(),
+                    "vector_artifacts": vector_artifacts,
+                }),
+            },
+        )
+        .with_summary("I have a voice embedding from hearing.");
+        sensation.metadata.confidence = Some(0.6);
+        sensation.metadata.labels.push("voice identity".to_string());
         sensations.push(sensation);
     }
 
@@ -4471,6 +5074,27 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
     }
 
     sensations
+}
+
+fn legacy_vector_artifacts(
+    collection: &str,
+    prefix: &str,
+    embeddings: &[Vec<f32>],
+    t_ms: TimeMs,
+) -> Vec<netherwick_now::VectorArtifact> {
+    embeddings
+        .iter()
+        .enumerate()
+        .map(|(idx, embedding)| {
+            netherwick_now::VectorArtifact::new(
+                collection,
+                format!("{prefix}:{t_ms}:{idx}"),
+                embedding.clone(),
+            )
+            .with_model("netherwick.legacy_sensor_embedding.v0")
+            .with_occurred_at_ms(t_ms)
+        })
+        .collect()
 }
 
 fn fuse_vectors(sensations: &[Sensation], generated_at_ms: TimeMs) -> Option<VectorEmbedding> {
