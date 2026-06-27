@@ -1364,6 +1364,7 @@ mod tests {
             },
             first_person_summary: "I remember danger here.".to_string(),
             recollections: Vec::new(),
+            semantic_map: None,
         };
         let ctx = EventContext {
             now: &now,

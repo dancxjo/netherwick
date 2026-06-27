@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use netherwick_actions::ActionPrimitive;
 use netherwick_core::{Goal, Pose2};
 use netherwick_experience::{Experience, Impression, RecalledExperience, VectorEmbedding};
-use netherwick_ledger::ExperienceFrame;
+use netherwick_ledger::{ExperienceFrame, ExperienceTransition};
 use netherwick_now::{
     GraphEdge, GraphEntity, MemorySense, Now, RecallHit, VectorArtifact, FACE_VECTOR_COLLECTION,
     SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
@@ -40,6 +40,14 @@ pub trait GraphStore: Send + Sync {
 #[async_trait]
 pub trait Recall {
     async fn observe_now(&self, _now: &Now) -> Result<()> {
+        Ok(())
+    }
+
+    async fn observe_frame(&self, frame: &ExperienceFrame) -> Result<()> {
+        self.observe_now(&frame.now).await
+    }
+
+    async fn observe_transition(&self, _transition: &ExperienceTransition) -> Result<()> {
         Ok(())
     }
 
@@ -104,6 +112,8 @@ pub struct RecallBundle {
     pub sense: MemorySense,
     pub first_person_summary: String,
     pub recollections: Vec<RecalledExperience>,
+    #[serde(default)]
+    pub semantic_map: Option<SemanticMapOverlay>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -112,9 +122,30 @@ pub struct PlaceCellKey {
     pub y: i32,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionOutcomeSummary {
+    pub action: ActionPrimitive,
+    pub count: u32,
+    pub mean_reward: f32,
+    pub last_seen_tick: u64,
+}
+
+impl Default for ActionOutcomeSummary {
+    fn default() -> Self {
+        Self {
+            action: ActionPrimitive::Stop,
+            count: 0,
+            mean_reward: 0.0,
+            last_seen_tick: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct PlaceCell {
+pub struct SemanticCell {
     pub key: PlaceCellKey,
+    #[serde(default)]
+    pub occupancy_cell: Option<PlaceCellKey>,
     pub center_x_m: f32,
     pub center_y_m: f32,
     pub visit_count: u32,
@@ -126,7 +157,19 @@ pub struct PlaceCell {
     pub confidence: f32,
     #[serde(default)]
     pub last_observed_objects: Vec<String>,
+    #[serde(default)]
+    pub associated_scene_vectors: Vec<String>,
+    #[serde(default)]
+    pub associated_face_vectors: Vec<String>,
+    #[serde(default)]
+    pub associated_voice_vectors: Vec<String>,
+    #[serde(default)]
+    pub successful_actions: Vec<ActionOutcomeSummary>,
+    #[serde(default)]
+    pub failed_actions: Vec<ActionOutcomeSummary>,
 }
+
+pub type PlaceCell = SemanticCell;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlaceMemoryConfig {
@@ -165,6 +208,16 @@ pub struct PlaceCellSummary {
     pub confidence: f32,
     #[serde(default)]
     pub last_observed_objects: Vec<String>,
+    #[serde(default)]
+    pub associated_scene_vectors: Vec<String>,
+    #[serde(default)]
+    pub associated_face_vectors: Vec<String>,
+    #[serde(default)]
+    pub associated_voice_vectors: Vec<String>,
+    #[serde(default)]
+    pub successful_actions: Vec<ActionOutcomeSummary>,
+    #[serde(default)]
+    pub failed_actions: Vec<ActionOutcomeSummary>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -176,6 +229,19 @@ pub struct PlaceMemoryReport {
     pub top_social_cells: Vec<PlaceCellSummary>,
     pub novelty_mean: f32,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SemanticMapOverlay {
+    pub schema_version: u32,
+    pub cell_size_m: f32,
+    pub places_visited: usize,
+    pub coverage_m2: f32,
+    pub current: Option<PlaceCellSummary>,
+    pub danger_cells: Vec<PlaceCellSummary>,
+    pub charge_cells: Vec<PlaceCellSummary>,
+    pub social_cells: Vec<PlaceCellSummary>,
+    pub novelty_cells: Vec<PlaceCellSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -226,6 +292,7 @@ impl PlaceMemory {
         let objects = observed_object_summary(now);
         let cell = self.cells.entry(key).or_insert_with(|| PlaceCell {
             key,
+            occupancy_cell: Some(key),
             center_x_m: (key.x as f32 + 0.5) * cell_size,
             center_y_m: (key.y as f32 + 0.5) * cell_size,
             novelty_score: 1.0,
@@ -245,7 +312,36 @@ impl PlaceMemory {
         if !objects.is_empty() {
             cell.last_observed_objects = objects;
         }
+        merge_vector_ids(&mut cell.associated_scene_vectors, &now.eye.scene_vectors);
+        merge_vector_ids(&mut cell.associated_face_vectors, &now.face.vectors);
+        merge_vector_ids(&mut cell.associated_voice_vectors, &now.voice.vectors);
         self.features_at(now.body.odometry.x_m, now.body.odometry.y_m)
+    }
+
+    pub fn observe_frame(&mut self, frame: &ExperienceFrame) -> PlaceMemoryFeatures {
+        let features = self.observe_now(&frame.now);
+        let Some(action) = frame.chosen_action.as_ref() else {
+            return features;
+        };
+        let key = self.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m);
+        self.observe_action_outcome(key, action, frame.reward.value, frame.now.t_ms);
+        features
+    }
+
+    pub fn observe_transition(&mut self, transition: &ExperienceTransition) {
+        let Some(action) = transition.action.as_ref() else {
+            return;
+        };
+        let key = self.quantize(
+            transition.before.body.odometry.x_m,
+            transition.before.body.odometry.y_m,
+        );
+        self.observe_action_outcome(
+            key,
+            action,
+            transition.reward.value,
+            transition.created_at_ms,
+        );
     }
 
     pub fn features_at(&self, x_m: f32, y_m: f32) -> PlaceMemoryFeatures {
@@ -265,6 +361,27 @@ impl PlaceMemory {
                 (1.0 - cell.danger_score) * cell.confidence * (0.25 + cell.visit_count as f32)
             }),
             places_visited: self.cells.len().try_into().unwrap_or(u32::MAX),
+        }
+    }
+
+    pub fn semantic_overlay_at(&self, x_m: f32, y_m: f32) -> SemanticMapOverlay {
+        self.semantic_overlay(Some(self.quantize(x_m, y_m)))
+    }
+
+    pub fn semantic_overlay(&self, current_key: Option<PlaceCellKey>) -> SemanticMapOverlay {
+        let report = self.report();
+        SemanticMapOverlay {
+            schema_version: 1,
+            cell_size_m: self.config.cell_size_m,
+            places_visited: report.places_visited,
+            coverage_m2: report.coverage_m2,
+            current: current_key
+                .and_then(|key| self.cells.get(&key))
+                .map(|cell| summarize_cell(cell, cell.confidence)),
+            danger_cells: top_cells(&self.cells, |cell| cell.danger_score),
+            charge_cells: top_cells(&self.cells, |cell| cell.charge_score),
+            social_cells: top_cells(&self.cells, |cell| cell.social_score),
+            novelty_cells: top_cells(&self.cells, |cell| cell.novelty_score),
         }
     }
 
@@ -313,6 +430,22 @@ impl PlaceMemory {
             cell.charge_score *= score_factor;
             cell.social_score *= score_factor;
             cell.confidence *= confidence_factor;
+        }
+    }
+
+    fn observe_action_outcome(
+        &mut self,
+        key: PlaceCellKey,
+        action: &ActionPrimitive,
+        reward: f32,
+        t_ms: u64,
+    ) {
+        if let Some(cell) = self.cells.get_mut(&key) {
+            if reward >= 0.05 {
+                update_action_outcome(&mut cell.successful_actions, action, reward, t_ms);
+            } else if reward <= -0.05 {
+                update_action_outcome(&mut cell.failed_actions, action, reward, t_ms);
+            }
         }
     }
 
@@ -768,6 +901,14 @@ impl Recall for DurableExperienceStore {
         self.inner.observe_now(now).await
     }
 
+    async fn observe_frame(&self, frame: &ExperienceFrame) -> Result<()> {
+        self.inner.observe_frame(frame).await
+    }
+
+    async fn observe_transition(&self, transition: &ExperienceTransition) -> Result<()> {
+        self.inner.observe_transition(transition).await
+    }
+
     async fn recall(&self, query: RecallQuery) -> Result<RecallBundle> {
         self.inner.recall(query).await
     }
@@ -780,6 +921,22 @@ impl Recall for InMemoryExperienceStore {
             .lock()
             .expect("place memory mutex poisoned")
             .observe_now(now);
+        Ok(())
+    }
+
+    async fn observe_frame(&self, frame: &ExperienceFrame) -> Result<()> {
+        self.places
+            .lock()
+            .expect("place memory mutex poisoned")
+            .observe_frame(frame);
+        Ok(())
+    }
+
+    async fn observe_transition(&self, transition: &ExperienceTransition) -> Result<()> {
+        self.places
+            .lock()
+            .expect("place memory mutex poisoned")
+            .observe_transition(transition);
         Ok(())
     }
 
@@ -866,16 +1023,23 @@ impl Recall for InMemoryExperienceStore {
             }
             remembered_entities.extend(scored_entities(&record, score));
             remembered_relationships.extend(record.graph_relationships.clone());
-            if let Some(experience) = record.experience {
-                let sensation = experience.to_recall_sensation(
+            if let Some(experience) = record.experience.as_ref() {
+                let original_vector_ids = recall_vector_ids(&record);
+                let mut sensation = experience.to_recall_sensation_with_lineage(
                     query_pose_time_hint(&query, index as u64),
                     score,
                     "memory-recall",
+                    Some(record.frame_id),
+                    original_vector_ids.clone(),
                 );
+                let impression = experience.to_recall_impression(&sensation, score);
+                sensation.impression = Some(impression);
                 recollections.push(RecalledExperience {
                     score,
-                    experience,
+                    experience: experience.clone(),
                     sensation,
+                    original_frame_id: Some(record.frame_id),
+                    original_vector_ids,
                 });
             }
         }
@@ -901,6 +1065,12 @@ impl Recall for InMemoryExperienceStore {
             remembered_relationships,
             graph_context_summary,
         };
+        let semantic_map = query.pose.map(|pose| {
+            self.places
+                .lock()
+                .expect("place memory mutex poisoned")
+                .semantic_overlay_at(pose.x_m, pose.y_m)
+        });
         let first_person_summary = if hits.is_empty() {
             "I do not remember a similar situation yet.".to_string()
         } else {
@@ -916,6 +1086,7 @@ impl Recall for InMemoryExperienceStore {
             sense,
             first_person_summary,
             recollections,
+            semantic_map,
         })
     }
 }
@@ -967,11 +1138,15 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
 }
 
 pub fn place_memory_report_from_frames(frames: &[ExperienceFrame]) -> PlaceMemoryReport {
+    place_memory_from_frames(frames).report()
+}
+
+pub fn place_memory_from_frames(frames: &[ExperienceFrame]) -> PlaceMemory {
     let mut memory = PlaceMemory::new();
     for frame in frames {
-        memory.observe_now(&frame.now);
+        memory.observe_frame(frame);
     }
-    memory.report()
+    memory
 }
 
 fn danger_signal(now: &Now) -> f32 {
@@ -1060,6 +1235,55 @@ fn push_unique_object(objects: &mut Vec<String>, value: &str) {
     }
 }
 
+fn merge_vector_ids(target: &mut Vec<String>, artifacts: &[VectorArtifact]) {
+    for artifact in artifacts {
+        if artifact.point_id.trim().is_empty() {
+            continue;
+        }
+        if !target.iter().any(|existing| existing == &artifact.point_id) {
+            target.push(artifact.point_id.clone());
+        }
+    }
+    const MAX_ASSOCIATED_VECTORS: usize = 12;
+    if target.len() > MAX_ASSOCIATED_VECTORS {
+        target.drain(0..target.len() - MAX_ASSOCIATED_VECTORS);
+    }
+}
+
+fn update_action_outcome(
+    outcomes: &mut Vec<ActionOutcomeSummary>,
+    action: &ActionPrimitive,
+    reward: f32,
+    t_ms: u64,
+) {
+    if let Some(existing) = outcomes
+        .iter_mut()
+        .find(|candidate| candidate.action == *action)
+    {
+        let prior_total = existing.mean_reward * existing.count as f32;
+        existing.count = existing.count.saturating_add(1);
+        existing.mean_reward = (prior_total + reward) / existing.count.max(1) as f32;
+        existing.last_seen_tick = t_ms;
+    } else {
+        outcomes.push(ActionOutcomeSummary {
+            action: action.clone(),
+            count: 1,
+            mean_reward: reward,
+            last_seen_tick: t_ms,
+        });
+    }
+    outcomes.sort_by(|left, right| {
+        right
+            .mean_reward
+            .abs()
+            .partial_cmp(&left.mean_reward.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.last_seen_tick.cmp(&left.last_seen_tick))
+    });
+    const MAX_ACTION_OUTCOMES: usize = 8;
+    outcomes.truncate(MAX_ACTION_OUTCOMES);
+}
+
 fn top_cells(
     cells: &BTreeMap<PlaceCellKey, PlaceCell>,
     score: impl Fn(&PlaceCell) -> f32,
@@ -1078,18 +1302,27 @@ fn top_cells(
     scored
         .into_iter()
         .take(5)
-        .map(|(score, cell)| PlaceCellSummary {
-            x: cell.key.x,
-            y: cell.key.y,
-            center_x_m: cell.center_x_m,
-            center_y_m: cell.center_y_m,
-            score,
-            visit_count: cell.visit_count,
-            last_seen_tick: cell.last_seen_tick,
-            confidence: cell.confidence,
-            last_observed_objects: cell.last_observed_objects.clone(),
-        })
+        .map(|(score, cell)| summarize_cell(cell, score))
         .collect()
+}
+
+fn summarize_cell(cell: &PlaceCell, score: f32) -> PlaceCellSummary {
+    PlaceCellSummary {
+        x: cell.key.x,
+        y: cell.key.y,
+        center_x_m: cell.center_x_m,
+        center_y_m: cell.center_y_m,
+        score,
+        visit_count: cell.visit_count,
+        last_seen_tick: cell.last_seen_tick,
+        confidence: cell.confidence,
+        last_observed_objects: cell.last_observed_objects.clone(),
+        associated_scene_vectors: cell.associated_scene_vectors.clone(),
+        associated_face_vectors: cell.associated_face_vectors.clone(),
+        associated_voice_vectors: cell.associated_voice_vectors.clone(),
+        successful_actions: cell.successful_actions.clone(),
+        failed_actions: cell.failed_actions.clone(),
+    }
 }
 
 fn score_record(query: &RecallQuery, record: MemoryRecord) -> Option<(f32, MemoryRecord)> {
@@ -1682,6 +1915,21 @@ fn query_voice_vectors(query: &RecallQuery) -> Vec<&[f32]> {
     vectors
 }
 
+fn recall_vector_ids(record: &MemoryRecord) -> Vec<String> {
+    let mut ids = record
+        .experience_vectors
+        .iter()
+        .chain(record.sensation_vectors.iter())
+        .chain(record.scene_vectors.iter())
+        .chain(record.face_vectors.iter())
+        .chain(record.voice_vectors.iter())
+        .map(|artifact| format!("{}:{}", artifact.collection, artifact.point_id))
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 fn query_all_vectors(query: &RecallQuery) -> Vec<&[f32]> {
     let mut vectors = query_scene_vectors(query);
     vectors.extend(query_face_vectors(query));
@@ -1919,6 +2167,68 @@ mod tests {
             .graph_context
             .iter()
             .any(|entity| entity.has_label("Person")));
+    }
+
+    #[tokio::test]
+    async fn recall_returns_embodied_memory_recall_sensations_with_lineage() {
+        let now = Now::blank(500, BodySense::default());
+        let mut frame = empty_frame(now);
+        let source_sensation_id = uuid::Uuid::new_v4();
+        let mut experience = Experience::new(
+            "embodied.now",
+            "I notice a familiar charger alcove.",
+            Vec::new(),
+            vec![source_sensation_id],
+            450,
+            500,
+        );
+        experience.fused_vector = Some(VectorEmbedding::new(
+            vec![1.0, 0.0, 0.0],
+            "unit.experience.v0",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            source_sensation_id,
+            500,
+        ));
+        frame.experiences = vec![experience.clone()];
+        let frame_id = frame.id;
+
+        let store = InMemoryExperienceStore::new();
+        store.store(&frame).await.unwrap();
+        let recall = store
+            .recall(RecallQuery {
+                scene_vectors: vec![VectorArtifact::new(
+                    EXPERIENCE_VECTOR_COLLECTION,
+                    "query-experience",
+                    vec![1.0, 0.0, 0.0],
+                )],
+                battery: frame.now.body.battery_level,
+                ..RecallQuery::default()
+            })
+            .await
+            .unwrap();
+
+        let recollection = recall.recollections.first().expect("recollection");
+        assert_eq!(recollection.original_frame_id, Some(frame_id));
+        assert!(recollection
+            .original_vector_ids
+            .iter()
+            .any(|id| id.contains(&experience.id.to_string())));
+        assert_eq!(recollection.sensation.modality, Modality::Memory);
+        assert_eq!(
+            recollection.sensation.payload_kind,
+            SensationPayloadKind::MemoryRecall
+        );
+        assert!(matches!(
+            recollection.sensation.provenance.kind,
+            netherwick_core::ProvenanceKind::MemoryRecall { experience_id }
+                if experience_id == experience.id
+        ));
+        assert!(recollection
+            .sensation
+            .impression
+            .as_ref()
+            .is_some_and(|impression| impression.text.starts_with("I remember")));
     }
 
     #[test]
@@ -2229,6 +2539,86 @@ mod tests {
 
         let direction = features.nearby_best_charge_direction_rad.unwrap();
         assert!(direction.abs() < 0.4);
+    }
+
+    #[test]
+    fn semantic_cells_keep_vector_and_action_associations() {
+        let mut memory = PlaceMemory::new();
+        let mut now = now_at(100, 1.0, 1.0);
+        now.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-place-1",
+            vec![0.0, 1.0],
+        ));
+        now.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-place-1",
+            vec![1.0, 0.0],
+        ));
+        let mut frame = empty_frame(now);
+        frame.chosen_action = Some(ActionPrimitive::Inspect {
+            target: netherwick_actions::InspectTarget::Charger,
+        });
+        frame.reward.value = 0.4;
+
+        memory.observe_frame(&frame);
+        let cell = memory
+            .cells
+            .values()
+            .next()
+            .expect("semantic cell should be created");
+
+        assert_eq!(cell.occupancy_cell, Some(cell.key));
+        assert_eq!(cell.associated_scene_vectors, vec!["scene-place-1"]);
+        assert_eq!(cell.associated_face_vectors, vec!["face-place-1"]);
+        assert_eq!(cell.successful_actions.len(), 1);
+        assert_eq!(cell.successful_actions[0].count, 1);
+    }
+
+    #[test]
+    fn semantic_overlay_exposes_scores_for_dashboard() {
+        let mut memory = PlaceMemory::new();
+        let mut danger_now = now_at(100, 1.0, 1.0);
+        danger_now.body.flags.bump_left = true;
+        memory.observe_now(&danger_now);
+        let mut charge_now = now_at(200, 1.5, 1.0);
+        add_sim_world_extension(&mut charge_now, 1.0, 0.0);
+        memory.observe_now(&charge_now);
+
+        let overlay = memory.semantic_overlay_at(1.0, 1.0);
+
+        assert_eq!(overlay.schema_version, 1);
+        assert!(overlay.current.is_some());
+        assert!(!overlay.danger_cells.is_empty());
+        assert!(!overlay.charge_cells.is_empty());
+    }
+
+    #[test]
+    fn ledger_replay_reconstructs_semantic_map_cells() {
+        let mut first = empty_frame(now_at(100, 1.0, 1.0));
+        first.now.body.flags.bump_left = true;
+        first.chosen_action = Some(ActionPrimitive::Go {
+            intensity: 0.3,
+            duration_ms: 200,
+        });
+        first.reward.value = -0.6;
+        let mut second = empty_frame(now_at(200, 1.0, 1.0));
+        second.chosen_action = first.chosen_action.clone();
+        second.reward.value = 0.3;
+
+        let memory = place_memory_from_frames(&[first, second]);
+        let report = memory.report();
+        let cell = memory
+            .cells
+            .values()
+            .next()
+            .expect("replayed semantic cell");
+
+        assert_eq!(report.places_visited, 1);
+        assert!(cell.danger_score > 0.0);
+        assert_eq!(cell.failed_actions.len(), 1);
+        assert_eq!(cell.successful_actions.len(), 1);
+        assert!(cell.novelty_score < 1.0);
     }
 
     #[test]

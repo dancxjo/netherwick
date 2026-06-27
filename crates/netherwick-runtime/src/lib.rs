@@ -2602,6 +2602,12 @@ where
                 "nearby_best_safe_direction_rad": now.memory.nearby_best_safe_direction_rad,
             }),
         );
+        if let Some(semantic_map) = &recall.semantic_map {
+            now.extensions.insert(
+                "memory.semantic_map".to_string(),
+                serde_json::to_value(semantic_map)?,
+            );
+        }
 
         let mut surface_output_for_anticipation: Option<SurfaceExtractorOutput> = None;
         if !now.kinect.depth_m.is_empty()
@@ -2639,8 +2645,26 @@ where
         let (direct_sensations, direct_impressions) = derive_direct_impressions_from_now(&now);
         sensations.extend(direct_sensations);
         impressions.extend(direct_impressions);
+        let (recall_sensations, recall_impressions) =
+            embodied_recall_sensations_and_impressions(&recall);
+        let recall_sensation_ids = recall_sensations
+            .iter()
+            .map(|sensation| sensation.id)
+            .collect::<Vec<_>>();
+        let recall_impression_ids = recall_impressions
+            .iter()
+            .map(|impression| impression.id)
+            .collect::<Vec<_>>();
+        sensations.extend(recall_sensations);
+        impressions.extend(recall_impressions);
         let mut experiences = derive_direct_experiences(&impressions, &sensations, now.t_ms);
-        let embodied_experience = embodied_now.experience;
+        let mut embodied_experience = embodied_now.experience;
+        embodied_experience
+            .sensation_ids
+            .extend(recall_sensation_ids);
+        embodied_experience
+            .impression_ids
+            .extend(recall_impression_ids);
         let mut teachings = Vec::new();
         let mut notes = Vec::new();
         if let Some(stuck_values) = now
@@ -3318,7 +3342,7 @@ where
         };
 
         self.ledger.append(&frame).await?;
-        self.memory_recall.observe_now(&frame.now).await?;
+        self.memory_recall.observe_frame(&frame).await?;
         let surprise_computer = self.surprise_computer.clone();
         let reward_computer = self.reward_computer.clone();
         let mut inline_learning = InlineLearningTickStatus {
@@ -3353,6 +3377,7 @@ where
             },
         ) {
             self.ledger.append_transition(&transition).await?;
+            self.memory_recall.observe_transition(&transition).await?;
             inline_learning = self.observe_inline_learning(&transition)?;
         }
         self.memory_store.store(&frame).await?;
@@ -5444,6 +5469,21 @@ fn append_combobulation(
     experiences.push(experience);
 }
 
+fn embodied_recall_sensations_and_impressions(
+    recall: &RecallBundle,
+) -> (Vec<Sensation>, Vec<Impression>) {
+    let mut sensations = Vec::new();
+    let mut impressions = Vec::new();
+    for recollection in &recall.recollections {
+        let sensation = recollection.sensation.clone();
+        if let Some(impression) = sensation.impression.clone() {
+            impressions.push(impression);
+        }
+        sensations.push(sensation);
+    }
+    (sensations, impressions)
+}
+
 fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impression>) {
     let mut sensations = Vec::new();
     let mut impressions = Vec::new();
@@ -6024,7 +6064,7 @@ mod tests {
     use netherwick_body::{BodySense, MotorCommand, RobotBody};
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_experience::{
-        embody_now, experience_encode_input_from_now, SensationPayloadKind,
+        embody_now, experience_encode_input_from_now, Modality, SensationPayloadKind,
     };
     use netherwick_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_llm::{ConsciousCommand, LlmDecision, LlmTickResult};
@@ -6769,6 +6809,60 @@ mod tests {
             .experiences
             .iter()
             .any(|experience| experience.text.contains("hello world")));
+    }
+
+    #[tokio::test]
+    async fn tick_persists_recalled_experiences_as_memory_sensations() {
+        let ledger = JsonlLedger::new("/tmp/netherwick-runtime-memory-recall-sensations-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            netherwick_llm::NoopLlmAgent,
+        );
+        let mut first = Now::blank(100, BodySense::default());
+        first.ear.transcript = Some("charger alcove".to_string());
+        runtime
+            .tick(first, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        let mut second = Now::blank(200, BodySense::default());
+        second.ear.transcript = Some("charger alcove".to_string());
+        let tick = runtime
+            .tick(second, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        let recall_sensation = tick
+            .frame
+            .sensations
+            .iter()
+            .find(|sensation| {
+                sensation.modality == Modality::Memory
+                    && sensation.payload_kind == SensationPayloadKind::MemoryRecall
+                    && sensation.kind == "memory.recall.experience"
+            })
+            .expect("memory recall sensation");
+        assert!(recall_sensation
+            .payload
+            .get("original_frame_id")
+            .and_then(Value::as_str)
+            .is_some());
+        assert!(tick.frame.impressions.iter().any(|impression| {
+            impression.sensation_id == Some(recall_sensation.id)
+                && impression.text.starts_with("I remember")
+        }));
+        let context = tick.frame.embodied_context();
+        assert!(context.sensations.iter().any(|sensation| {
+            sensation.id == recall_sensation.id
+                && sensation.modality == Modality::Memory
+                && sensation.payload_kind == SensationPayloadKind::MemoryRecall
+        }));
     }
 
     #[test]

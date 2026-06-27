@@ -2355,6 +2355,72 @@ mod tests {
         assert_eq!(context.predictions.len(), 1);
         assert_eq!(context.memory_links.len(), 1);
     }
+
+    #[test]
+    fn recalled_experience_becomes_memory_recall_sensation_with_impression() {
+        let source_sensation_id = Uuid::new_v4();
+        let original_frame_id = Uuid::new_v4();
+        let mut experience = Experience::new(
+            "embodied.now",
+            "I see a charger by the wall.",
+            Vec::new(),
+            vec![source_sensation_id],
+            1_000,
+            1_100,
+        );
+        experience.fused_vector = Some(VectorEmbedding::new(
+            vec![0.2, 0.3, 0.4],
+            "unit.fusion.v0",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            source_sensation_id,
+            1_100,
+        ));
+
+        let sensation = experience.to_recall_sensation_with_lineage(
+            2_000,
+            0.82,
+            "unit-recall",
+            Some(original_frame_id),
+            vec!["experiences:vector-1".to_string()],
+        );
+        let impression = experience.to_recall_impression(&sensation, 0.82);
+
+        assert_eq!(sensation.modality, Modality::Memory);
+        assert_eq!(sensation.payload_kind, SensationPayloadKind::MemoryRecall);
+        assert!(matches!(
+            sensation.provenance.kind,
+            netherwick_core::ProvenanceKind::MemoryRecall { experience_id }
+                if experience_id == experience.id
+        ));
+        assert_eq!(
+            sensation
+                .payload
+                .get("original_frame_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Some(original_frame_id.to_string())
+        );
+        assert_eq!(
+            sensation
+                .payload
+                .get("original_vector_ids")
+                .and_then(Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(Value::as_str),
+            Some("experiences:vector-1")
+        );
+        assert_eq!(
+            sensation
+                .vector
+                .as_ref()
+                .map(|vector| (&vector.modality, &vector.payload_kind)),
+            Some((&Modality::Memory, &SensationPayloadKind::MemoryRecall))
+        );
+        assert!(impression.text.starts_with("I remember"));
+        assert!(impression.text.contains("near here"));
+        assert_eq!(impression.sensation_id, Some(sensation.id));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2591,22 +2657,96 @@ impl Experience {
         score: f32,
         stage: impl Into<String>,
     ) -> Sensation {
+        self.to_recall_sensation_with_lineage(recall_at_ms, score, stage, None, Vec::new())
+    }
+
+    pub fn to_recall_sensation_with_lineage(
+        &self,
+        recall_at_ms: TimeMs,
+        score: f32,
+        stage: impl Into<String>,
+        original_frame_id: Option<Uuid>,
+        original_vector_ids: Vec<String>,
+    ) -> Sensation {
+        let stage = stage.into();
         let payload = json!({
             "experience": self,
+            "recall_kind": "recalled_experience",
+            "original_frame_id": original_frame_id,
             "original_experience_id": self.id,
+            "original_sensation_ids": self.sensation_ids,
+            "original_impression_ids": self.impression_ids,
+            "original_vector_ids": original_vector_ids,
+            "original_fused_vector": self.fused_vector.as_ref().map(vector_ref),
             "original_occurred_at_ms": self.occurred_at_ms,
             "original_observed_at_ms": self.observed_at_ms,
             "score": score,
         });
-        Sensation::new(
-            "memory.related_experience",
-            "memory",
+        let mut provenance = Provenance::memory_recall(self.id).with_stage(stage);
+        provenance.metadata = json!({
+            "original_frame_id": original_frame_id,
+            "original_experience_id": self.id,
+            "original_vector_ids": payload.get("original_vector_ids").cloned().unwrap_or(Value::Null),
+        });
+        let mut sensation = Sensation::primary(
+            Modality::Memory,
+            SensationSource::new("memory.recall"),
             recall_at_ms,
             recall_at_ms,
-            payload,
+            SensationPayload {
+                kind: SensationPayloadKind::MemoryRecall,
+                value: payload,
+            },
         )
-        .with_summary(format!("I remember: {}", self.text))
-        .with_provenance(Provenance::memory_recall(self.id).with_stage(stage))
+        .with_summary(format!(
+            "I remember a similar moment near here: {}",
+            self.text
+        ))
+        .with_provenance(provenance);
+        sensation.kind = "memory.recall.experience".to_string();
+        sensation.metadata.confidence = Some(score.clamp(0.0, 1.0));
+        sensation.metadata.labels.push("memory_recall".to_string());
+        sensation
+            .metadata
+            .labels
+            .push("recalled_experience".to_string());
+        if let Some(frame_id) = original_frame_id {
+            sensation.metadata.properties.insert(
+                "original_frame_id".to_string(),
+                Value::String(frame_id.to_string()),
+            );
+        }
+        sensation.metadata.properties.insert(
+            "original_experience_id".to_string(),
+            Value::String(self.id.to_string()),
+        );
+        sensation.metadata.properties.insert(
+            "original_vector_count".to_string(),
+            json!(original_vector_ids.len()),
+        );
+        if let Some(mut vector) = self.fused_vector.clone() {
+            vector.modality = Modality::Memory;
+            vector.payload_kind = SensationPayloadKind::MemoryRecall;
+            vector.generated_at_ms = recall_at_ms;
+            sensation.vector = Some(vector);
+        }
+        sensation
+    }
+
+    pub fn to_recall_impression(&self, sensation: &Sensation, score: f32) -> Impression {
+        Impression::new(
+            "memory.recall.impression",
+            format!("I remember a similar moment near here: {}", self.text),
+            vec![sensation.id],
+            sensation.occurred_at_ms,
+            sensation.observed_at_ms,
+        )
+        .with_confidence(score.clamp(0.0, 1.0))
+        .with_payload(json!({
+            "generator": "memory_recall",
+            "original_experience_id": self.id,
+            "score": score,
+        }))
     }
 }
 
@@ -5155,6 +5295,10 @@ pub struct RecalledExperience {
     pub score: f32,
     pub experience: Experience,
     pub sensation: Sensation,
+    #[serde(default)]
+    pub original_frame_id: Option<Uuid>,
+    #[serde(default)]
+    pub original_vector_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
