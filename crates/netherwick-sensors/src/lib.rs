@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 mod surface;
 
 pub use surface::{
-    Bounds2, ClusterObservation, OccupancyCell, OccupancyGrid, OccupancyState, PlaneObservation,
-    Point3, SceneGraphSummary, SurfaceExtractor, SurfaceExtractorConfig,
-    SurfaceExtractorDiagnostics, SurfaceExtractorOutput, SurfaceKind, SurfaceTrack, Vec3,
+    anticipate_surface_frame, anticipate_surfaces, AnticipatedNavigation, Bounds2,
+    ClusterObservation, OccupancyCell, OccupancyGrid, OccupancyState, PlaneObservation, Point3,
+    ProjectedCluster, ProjectedSurface, SceneGraphSummary, SurfaceAnticipationFrame,
+    SurfaceExtractor, SurfaceExtractorConfig, SurfaceExtractorDiagnostics, SurfaceExtractorOutput,
+    SurfaceKind, SurfaceTrack, Vec3,
 };
 
 type TimeMs = u64;
@@ -1328,7 +1330,7 @@ impl SenseProducer for KinectReplayProvider {
 pub struct FreenectKinectProvider {
     index: i32,
     pending: VecDeque<SensePacket>,
-    failed_error: Option<String>,
+    last_rgb_error: Option<String>,
 }
 
 #[cfg(feature = "kinect-freenect")]
@@ -1341,7 +1343,7 @@ impl FreenectKinectProvider {
         Ok(Self {
             index,
             pending: VecDeque::new(),
-            failed_error: None,
+            last_rgb_error: None,
         })
     }
 }
@@ -1353,18 +1355,22 @@ impl SenseProducer for FreenectKinectProvider {
         if let Some(packet) = self.pending.pop_front() {
             return Ok(packet);
         }
-        if let Some(error) = &self.failed_error {
-            anyhow::bail!("{error}");
-        }
-        let (depth_m, rgb_frame) = match read_freenect_rgbd(self.index) {
-            Ok(rgbd) => rgbd,
+        let depth_m = read_freenect_depth_m(self.index)?;
+        match read_freenect_rgb_frame(self.index) {
+            Ok(rgb_frame) => {
+                self.last_rgb_error = None;
+                self.pending.push_back(SensePacket::EyeFrame(rgb_frame));
+            }
             Err(error) => {
                 let error = error.to_string();
-                self.failed_error = Some(error.clone());
-                anyhow::bail!("{error}");
+                if self.last_rgb_error.as_deref() != Some(error.as_str()) {
+                    eprintln!(
+                        "Kinect RGB frame unavailable; continuing with depth-only frame: {error}"
+                    );
+                }
+                self.last_rgb_error = Some(error);
             }
-        };
-        self.pending.push_back(SensePacket::EyeFrame(rgb_frame));
+        }
         Ok(SensePacket::Kinect(KinectSense {
             schema_version: 1,
             depth_m,
@@ -1380,13 +1386,6 @@ impl SenseProducer for FreenectKinectProvider {
             ..KinectSense::default()
         }))
     }
-}
-
-#[cfg(feature = "kinect-freenect")]
-fn read_freenect_rgbd(index: i32) -> Result<(Vec<f32>, EyeFrame)> {
-    let depth_m = read_freenect_depth_m(index)?;
-    let rgb_frame = read_freenect_rgb_frame(index)?;
-    Ok((depth_m, rgb_frame))
 }
 
 #[cfg(feature = "kinect-freenect")]

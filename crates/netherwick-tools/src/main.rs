@@ -3647,7 +3647,13 @@ async fn inspect_capture(args: InspectCaptureArgs) -> Result<()> {
 
 struct BackgroundSenseProducer {
     name: &'static str,
-    latest: std::sync::Arc<std::sync::Mutex<Option<Result<SensePacket, String>>>>,
+    state: std::sync::Arc<std::sync::Mutex<BackgroundSenseState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BackgroundSenseState {
+    latest: Option<SensePacket>,
+    last_error: Option<String>,
 }
 
 impl BackgroundSenseProducer {
@@ -3661,8 +3667,8 @@ impl BackgroundSenseProducer {
         T: SenseProducer + Send + 'static,
         F: Fn(&SensePacket) + Send + 'static,
     {
-        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let worker_latest = std::sync::Arc::clone(&latest);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(BackgroundSenseState::default()));
+        let worker_state = std::sync::Arc::clone(&state);
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3670,43 +3676,55 @@ impl BackgroundSenseProducer {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    *worker_latest
+                    let mut state = worker_state
                         .lock()
-                        .expect("background sensor mutex poisoned") = Some(Err(format!(
+                        .expect("background sensor mutex poisoned");
+                    state.last_error = Some(format!(
                         "failed to start background sensor runtime: {error}"
-                    )));
+                    ));
                     return;
                 }
             };
             loop {
-                let result = runtime
-                    .block_on(producer.poll())
-                    .map_err(|error| error.to_string());
-                if let Ok(packet) = &result {
-                    on_packet(packet);
+                match runtime.block_on(producer.poll()) {
+                    Ok(packet) => {
+                        on_packet(&packet);
+                        let mut state = worker_state
+                            .lock()
+                            .expect("background sensor mutex poisoned");
+                        if name != "kinect-depth" || !matches!(packet, SensePacket::EyeFrame(_)) {
+                            state.latest = Some(packet);
+                        }
+                        state.last_error = None;
+                    }
+                    Err(error) => {
+                        let mut state = worker_state
+                            .lock()
+                            .expect("background sensor mutex poisoned");
+                        state.last_error = Some(error.to_string());
+                    }
                 }
-                *worker_latest
-                    .lock()
-                    .expect("background sensor mutex poisoned") = Some(result);
                 std::thread::sleep(poll_interval);
             }
         });
-        Self { name, latest }
+        Self { name, state }
     }
 }
 
 #[async_trait::async_trait]
 impl SenseProducer for BackgroundSenseProducer {
     async fn poll(&mut self) -> Result<SensePacket> {
-        match self
-            .latest
+        let state = self
+            .state
             .lock()
             .expect("background sensor mutex poisoned")
-            .clone()
-        {
-            Some(Ok(packet)) => Ok(packet),
-            Some(Err(error)) => anyhow::bail!("{} sensor unavailable: {error}", self.name),
-            None => anyhow::bail!("{} sensor has no frame yet", self.name),
+            .clone();
+        if let Some(packet) = state.latest {
+            Ok(packet)
+        } else if let Some(error) = state.last_error {
+            anyhow::bail!("{} sensor unavailable: {error}", self.name)
+        } else {
+            anyhow::bail!("{} sensor has no frame yet", self.name)
         }
     }
 }

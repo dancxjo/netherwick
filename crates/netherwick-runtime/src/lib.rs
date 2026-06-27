@@ -49,7 +49,10 @@ use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
     ExtensionSense, EyePrediction, Now, ReignSense, SafetySense, SurpriseSense,
 };
-use netherwick_sensors::{NowBuilder, SenseProducer, SurfaceExtractor, World, WorldSnapshot};
+use netherwick_sensors::{
+    anticipate_surfaces, NowBuilder, SenseProducer, SurfaceExtractor, SurfaceExtractorOutput,
+    World, WorldSnapshot,
+};
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -2591,6 +2594,7 @@ where
             }),
         );
 
+        let mut surface_output_for_anticipation: Option<SurfaceExtractorOutput> = None;
         if !now.kinect.depth_m.is_empty()
             && now.kinect.depth_width > 0
             && now.kinect.depth_height > 0
@@ -2598,19 +2602,20 @@ where
             let surface_output =
                 self.surface_extractor
                     .process(&now.kinect, now.body.odometry, now.t_ms);
+            surface_output_for_anticipation = Some(surface_output.clone());
             now.extensions.insert(
                 "surface.scene_graph".to_string(),
                 serde_json::json!({
-                    "diagnostics": surface_output.diagnostics,
-                    "floor": surface_output.floor,
-                    "surfaces": surface_output.stable_surfaces,
-                    "clusters": surface_output.clusters,
-                    "navigation": surface_output.scene_graph.navigation,
+                    "diagnostics": surface_output.diagnostics.clone(),
+                    "floor": surface_output.floor.clone(),
+                    "surfaces": surface_output.stable_surfaces.clone(),
+                    "clusters": surface_output.clusters.clone(),
+                    "navigation": surface_output.scene_graph.navigation.clone(),
                     "calibration_hint": surface_output.diagnostics.calibration_hint,
                     "obstacle_grid": {
                         "resolution_m": surface_output.obstacle_grid.resolution_m,
                         "half_extent_m": surface_output.obstacle_grid.half_extent_m,
-                        "cells": surface_output.obstacle_grid.cells,
+                        "cells": surface_output.obstacle_grid.cells.clone(),
                     },
                 }),
             );
@@ -2827,7 +2832,13 @@ where
         let mut hardcoded_predictions = Vec::new();
         let mut candidate_scores = Vec::new();
         for action in &action_value_candidates {
-            let candidate_danger_input = danger_behavior_input(&now, &latent, Some(action));
+            let candidate_now = now_with_surface_anticipation(
+                &now,
+                surface_output_for_anticipation.as_ref(),
+                action,
+            );
+            let candidate_danger_input =
+                danger_behavior_input(&candidate_now, &latent, Some(action));
             let candidate_danger = self
                 .models
                 .behaviors
@@ -2870,7 +2881,7 @@ where
             behavior_runs.push(candidate_charge_record.erase());
 
             let candidate_action_value_input = action_value_behavior_input(
-                &now,
+                &candidate_now,
                 &latent,
                 Some(action),
                 candidate_danger_output,
@@ -2903,7 +2914,7 @@ where
             behavior_runs.push(action_value_record.erase());
 
             let mut candidate_score = score_action_candidate(
-                &now,
+                &candidate_now,
                 action,
                 CandidateModelSignals {
                     danger: candidate_danger_output,
@@ -2992,6 +3003,11 @@ where
             .clone()
             .or_else(|| event_script_forced_action.clone())
             .unwrap_or(conductor_selected_action);
+        now = now_with_surface_anticipation(
+            &now,
+            surface_output_for_anticipation.as_ref(),
+            &chosen_action,
+        );
         let conductor_selected_output = conductor_record.selected_output.clone();
         behavior_runs.push(conductor_record.erase());
 
@@ -5125,9 +5141,7 @@ fn charge_score(output: ChargeOutput) -> f32 {
 
 fn fallback_collision_risk(now: &Now, action: &ActionPrimitive) -> f32 {
     let forward = action_to_motor_command(Some(action)).forward;
-    if forward <= 0.0 {
-        return 0.0;
-    }
+    let anticipated_risk = anticipated_surface_collision_risk(now);
     let nearest_risk = now
         .range
         .nearest_m
@@ -5139,7 +5153,54 @@ fn fallback_collision_risk(now: &Now, action: &ActionPrimitive) -> f32 {
         } else {
             0.0
         };
-    nearest_risk.max(contact_risk)
+    if forward <= 0.0 {
+        return anticipated_risk.max(contact_risk);
+    }
+    nearest_risk.max(contact_risk).max(anticipated_risk)
+}
+
+fn now_with_surface_anticipation(
+    now: &Now,
+    surface_output: Option<&SurfaceExtractorOutput>,
+    action: &ActionPrimitive,
+) -> Now {
+    let Some(surface_output) = surface_output else {
+        return now.clone();
+    };
+    let mut next = now.clone();
+    let frames = anticipate_surfaces(surface_output, now.body.odometry, action);
+    let max_risk = frames
+        .iter()
+        .map(|frame| frame.navigation.collision_risk)
+        .fold(0.0f32, f32::max);
+    let nearest_front = frames
+        .iter()
+        .filter_map(|frame| frame.navigation.front_clear_m)
+        .min_by(|left, right| left.total_cmp(right));
+    let anticipation_value = serde_json::json!({
+        "action": action,
+        "frames": frames,
+        "max_collision_risk": max_risk,
+        "nearest_front_clear_m": nearest_front,
+    });
+    let entry = next
+        .extensions
+        .entry("surface.scene_graph".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("anticipation".to_string(), anticipation_value);
+    }
+    next
+}
+
+fn anticipated_surface_collision_risk(now: &Now) -> f32 {
+    now.extensions
+        .get("surface.scene_graph")
+        .and_then(|value| value.get("anticipation"))
+        .and_then(|value| value.get("max_collision_risk"))
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0) as f32
 }
 
 fn action_value_candidate_actions(

@@ -543,6 +543,7 @@ impl LiveViewState {
         &self,
         snapshot: &WorldSnapshot,
         calibration: Option<SceneSensorCalibration>,
+        action: Option<&ActionPrimitive>,
     ) -> Option<SceneSurfacePerception> {
         if snapshot.kinect.depth_m.is_empty()
             || snapshot.kinect.depth_width == 0
@@ -560,11 +561,38 @@ impl LiveViewState {
             calibration.depth_forward_offset_m,
             calibration.depth_pitch_down_rad,
         );
-        Some(SceneSurfacePerception::from(extractor.process(
+        let mut perception = SceneSurfacePerception::from(extractor.process(
             &snapshot.kinect,
             snapshot.body.odometry,
             snapshot.body.last_update_ms,
-        )))
+        ));
+        if let Some(action) = action {
+            let frames = netherwick_sensors::anticipate_surfaces(
+                &netherwick_sensors::SurfaceExtractorOutput {
+                    plane_observations: perception.plane_observations.clone(),
+                    stable_surfaces: perception.stable_surfaces.clone(),
+                    floor: perception.floor.clone(),
+                    obstacle_grid: perception.obstacle_grid.clone(),
+                    clusters: perception.clusters.clone(),
+                    scene_graph: perception.scene_graph.clone(),
+                    diagnostics: perception.diagnostics.clone(),
+                    raw_cloud: Vec::new(),
+                    filtered_cloud: Vec::new(),
+                },
+                snapshot.body.odometry,
+                action,
+            );
+            if let Some(object) = perception.scene_graph.navigation.as_object_mut() {
+                object.insert(
+                    "anticipation".to_string(),
+                    serde_json::json!({
+                        "action": action,
+                        "frames": frames,
+                    }),
+                );
+            }
+        }
+        Some(perception)
     }
 
     pub fn update_behavior_nodes(&self, nodes: Vec<BehaviorNodeState>) {
@@ -1166,7 +1194,11 @@ async fn get_live_scene(
         retina_status,
         state.hardware_control_status(),
     );
-    scene.surface_perception = state.surface_perception(&snapshot, calibration);
+    scene.surface_perception = state.surface_perception(
+        &snapshot,
+        calibration,
+        scene.action.final_selected_action.as_ref(),
+    );
     Ok(Json(scene))
 }
 
@@ -4433,6 +4465,23 @@ function surfacePoint(value){
   const p = v3(value);
   return world(p.x, p.y, p.z);
 }
+function localSurfaceToWorld(surface, pose){
+  const heading = Number(pose?.heading_rad) || 0;
+  const sin = Math.sin(heading), cos = Math.cos(heading);
+  const centroid = v3(surface.centroid);
+  const normal = v3(surface.normal);
+  const worldCentroid = {
+    x: (Number(pose?.x_m) || 0) + centroid.x * cos - centroid.y * sin,
+    y: (Number(pose?.y_m) || 0) + centroid.x * sin + centroid.y * cos,
+    z: centroid.z
+  };
+  const worldNormal = {
+    x: normal.x * cos - normal.y * sin,
+    y: normal.x * sin + normal.y * cos,
+    z: normal.z
+  };
+  return {...surface, centroid: worldCentroid, normal: worldNormal};
+}
 function surfaceColor(kind, confidence=1){
   const alpha = Math.max(.18, Math.min(.56, .16 + confidence * .34));
   if(kind === 'floor') return {color:new BABYLON.Color3(0.32, 0.82, 0.58), alpha};
@@ -4447,8 +4496,8 @@ function planeBasis(normal){
   const basisB = norm3(cross3(n, basisA));
   return {basisA, basisB};
 }
-function planeCorners(surface){
-  const bounds = surface.bounds_2d || {};
+function planeCorners(surface, boundsName='bounds_2d'){
+  const bounds = surface[boundsName] || surface.bounds_2d || {};
   const minU = Number.isFinite(bounds.min_u) ? bounds.min_u : -.25;
   const maxU = Number.isFinite(bounds.max_u) ? bounds.max_u : .25;
   const minV = Number.isFinite(bounds.min_v) ? bounds.min_v : -.25;
@@ -4462,8 +4511,8 @@ function planeCorners(surface){
     add3(add3(centroid, mul3(basisA, minU)), mul3(basisB, maxV))
   ];
 }
-function createPlanePatch(surface){
-  const corners = planeCorners(surface).map(surfacePoint);
+function createPlanePatch(surface, options={}){
+  const corners = planeCorners(surface, options.boundsName || 'bounds_2d').map(surfacePoint);
   const mesh = new BABYLON.Mesh(`surface_${surface.id || 'plane'}`, scene);
   const vertexData = new BABYLON.VertexData();
   vertexData.positions = corners.flatMap(p => [p.x, p.y, p.z]);
@@ -4473,14 +4522,16 @@ function createPlanePatch(surface){
   const mat = new BABYLON.StandardMaterial(`surfaceMat_${surface.id || 'plane'}`, scene);
   mat.diffuseColor = style.color;
   mat.emissiveColor = style.color.scale(.45);
-  mat.alpha = style.alpha;
+  mat.alpha = options.alpha ?? style.alpha;
   mat.backFaceCulling = false;
+  mat.wireframe = !!options.wireframe;
   mesh.material = mat;
   mesh.parent = surfaceOverlays;
   const outline = BABYLON.MeshBuilder.CreateLines(`surfaceOutline_${surface.id || 'plane'}`, {
     points: [corners[0], corners[1], corners[2], corners[3], corners[0]]
   }, scene);
-  outline.color = style.color;
+  outline.color = options.outlineColor || style.color;
+  outline.alpha = options.outlineAlpha ?? .9;
   outline.parent = surfaceOverlays;
   return mesh;
 }
@@ -4543,6 +4594,21 @@ function renderSurfacePerception(packet){
   }
   for(const cluster of perception.clusters || []){
     createClusterBox(cluster);
+  }
+  const frames = perception.scene_graph?.navigation?.anticipation?.frames || perception.scene_graph?.anticipation?.frames || [];
+  const future = frames[frames.length - 1];
+  if(future){
+    const pose = packet.body || {};
+    for(const projected of future.projected_surfaces || []){
+      const surface = localSurfaceToWorld(projected, pose);
+      createPlanePatch(surface, {
+        boundsName: 'extrapolated_bounds_2d',
+        alpha: .08,
+        wireframe: true,
+        outlineAlpha: .45,
+        outlineColor: new BABYLON.Color3(1.0, 0.88, 0.28)
+      });
+    }
   }
 }
 

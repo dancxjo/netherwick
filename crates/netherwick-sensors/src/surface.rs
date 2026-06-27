@@ -1,3 +1,4 @@
+use netherwick_actions::{action_to_motor_command, ActionPrimitive};
 use netherwick_core::Pose2;
 use netherwick_now::KinectSense;
 use serde::{Deserialize, Serialize};
@@ -286,6 +287,48 @@ pub struct SurfaceExtractorOutput {
     pub diagnostics: SurfaceExtractorDiagnostics,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AnticipatedNavigation {
+    pub front_clear_m: Option<f32>,
+    pub left_clear_m: Option<f32>,
+    pub right_clear_m: Option<f32>,
+    pub collision_risk: f32,
+    pub occupied_cells: usize,
+    pub free_cells: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedSurface {
+    pub id: String,
+    pub kind: SurfaceKind,
+    pub normal: Vec3,
+    pub centroid: Vec3,
+    pub bounds_2d: Bounds2,
+    pub confidence: f32,
+    pub observed_bounds_2d: Bounds2,
+    pub extrapolated_bounds_2d: Bounds2,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedCluster {
+    pub id: String,
+    pub centroid: Vec3,
+    pub size_m: Vec3,
+    pub confidence: f32,
+    pub moving: bool,
+    pub semantic_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceAnticipationFrame {
+    pub offset_ms: u64,
+    pub expected_pose: Pose2,
+    pub projected_surfaces: Vec<ProjectedSurface>,
+    pub projected_clusters: Vec<ProjectedCluster>,
+    pub projected_obstacle_grid: OccupancyGrid,
+    pub navigation: AnticipatedNavigation,
+}
+
 #[derive(Clone, Debug)]
 pub struct SurfaceExtractor {
     config: SurfaceExtractorConfig,
@@ -549,6 +592,46 @@ impl SurfaceExtractor {
         }
         self.cluster_tracks.retain(|track| track.confidence > 0.04);
         output
+    }
+}
+
+pub fn anticipate_surfaces(
+    current: &SurfaceExtractorOutput,
+    current_pose: Pose2,
+    action: &ActionPrimitive,
+) -> Vec<SurfaceAnticipationFrame> {
+    [500, 1_000, 2_000]
+        .into_iter()
+        .map(|offset_ms| anticipate_surface_frame(current, current_pose, action, offset_ms))
+        .collect()
+}
+
+pub fn anticipate_surface_frame(
+    current: &SurfaceExtractorOutput,
+    current_pose: Pose2,
+    action: &ActionPrimitive,
+    offset_ms: u64,
+) -> SurfaceAnticipationFrame {
+    let expected_pose = predict_pose(current_pose, action, offset_ms);
+    let projected_surfaces = current
+        .stable_surfaces
+        .iter()
+        .map(|surface| project_surface(surface, expected_pose))
+        .collect::<Vec<_>>();
+    let projected_clusters = current
+        .clusters
+        .iter()
+        .map(|cluster| project_cluster(cluster, expected_pose))
+        .collect::<Vec<_>>();
+    let projected_obstacle_grid = projected_obstacle_grid(current, current_pose, expected_pose);
+    let navigation = anticipated_navigation(&projected_obstacle_grid, action);
+    SurfaceAnticipationFrame {
+        offset_ms,
+        expected_pose,
+        projected_surfaces,
+        projected_clusters,
+        projected_obstacle_grid,
+        navigation,
     }
 }
 
@@ -913,14 +996,31 @@ fn track_match_score(
     let normal_dot = track.normal.dot(observation.normal).abs().clamp(0.0, 1.0);
     let normal_angle = normal_dot.acos();
     let distance_delta = (track.distance_from_origin_m - observation.distance_from_origin_m).abs();
-    let centroid_delta = track.centroid.distance(observation.centroid);
+    let centroid_delta = track_centroid_delta(track, observation);
     if normal_angle > config.track_normal_max_angle_rad
         || distance_delta > config.track_distance_threshold_m
-        || centroid_delta > config.track_centroid_threshold_m
+        || centroid_delta > track_centroid_threshold(track, config)
     {
         None
     } else {
         Some(normal_angle + distance_delta + centroid_delta)
+    }
+}
+
+fn track_centroid_delta(track: &SurfaceTrack, observation: &PlaneObservation) -> f32 {
+    let delta = observation.centroid - track.centroid;
+    if track.kind == SurfaceKind::VerticalPlane && track.normal.z.abs() < 0.35 {
+        delta.dot(track.normal).abs()
+    } else {
+        delta.length()
+    }
+}
+
+fn track_centroid_threshold(track: &SurfaceTrack, config: &SurfaceExtractorConfig) -> f32 {
+    if track.kind == SurfaceKind::VerticalPlane && track.normal.z.abs() < 0.35 {
+        (config.track_centroid_threshold_m * 2.5).max(0.9)
+    } else {
+        config.track_centroid_threshold_m
     }
 }
 
@@ -1135,6 +1235,241 @@ fn semantic_hint_for_cluster(cluster: &ClusterObservation) -> Option<String> {
     }
 }
 
+fn predict_pose(pose: Pose2, action: &ActionPrimitive, offset_ms: u64) -> Pose2 {
+    let motor = action_to_motor_command(Some(action));
+    let active_ms = match action {
+        ActionPrimitive::Go { duration_ms, .. }
+        | ActionPrimitive::Turn { duration_ms, .. }
+        | ActionPrimitive::Explore { duration_ms, .. } => offset_ms.min(*duration_ms),
+        _ => offset_ms,
+    };
+    let dt_s = active_ms as f32 / 1_000.0;
+    let forward = motor.forward;
+    let turn = motor.turn;
+    if dt_s <= 0.0 || (!forward.is_finite()) || (!turn.is_finite()) {
+        return pose;
+    }
+    if turn.abs() < 1.0e-4 {
+        Pose2 {
+            x_m: pose.x_m + forward * dt_s * pose.heading_rad.cos(),
+            y_m: pose.y_m + forward * dt_s * pose.heading_rad.sin(),
+            heading_rad: pose.heading_rad,
+        }
+    } else {
+        let heading = pose.heading_rad + turn * dt_s;
+        let radius = forward / turn;
+        Pose2 {
+            x_m: pose.x_m + radius * (heading.sin() - pose.heading_rad.sin()),
+            y_m: pose.y_m - radius * (heading.cos() - pose.heading_rad.cos()),
+            heading_rad: wrap_angle(heading),
+        }
+    }
+}
+
+fn wrap_angle(angle: f32) -> f32 {
+    let two_pi = std::f32::consts::TAU;
+    (angle + std::f32::consts::PI).rem_euclid(two_pi) - std::f32::consts::PI
+}
+
+fn project_surface(surface: &SurfaceTrack, expected_pose: Pose2) -> ProjectedSurface {
+    ProjectedSurface {
+        id: surface.id.clone(),
+        kind: surface.kind,
+        normal: world_vector_to_robot(surface.normal, expected_pose)
+            .normalized()
+            .unwrap_or(surface.normal),
+        centroid: world_to_robot(surface.centroid, expected_pose),
+        bounds_2d: surface.bounds_2d,
+        confidence: surface.confidence,
+        observed_bounds_2d: surface.bounds_2d,
+        extrapolated_bounds_2d: extrapolated_bounds(surface),
+    }
+}
+
+fn extrapolated_bounds(surface: &SurfaceTrack) -> Bounds2 {
+    if surface.kind != SurfaceKind::VerticalPlane {
+        return surface.bounds_2d;
+    }
+    let horizontal = (surface.bounds_2d.max_u - surface.bounds_2d.min_u).abs();
+    let vertical = (surface.bounds_2d.max_v - surface.bounds_2d.min_v).abs();
+    let grow_u = ((1.2 - horizontal) * 0.5).max(0.0).min(0.4);
+    let grow_v = ((0.9 - vertical) * 0.5).max(0.0).min(0.25);
+    Bounds2 {
+        min_u: surface.bounds_2d.min_u - grow_u,
+        max_u: surface.bounds_2d.max_u + grow_u,
+        min_v: surface.bounds_2d.min_v - grow_v,
+        max_v: surface.bounds_2d.max_v + grow_v,
+    }
+}
+
+fn project_cluster(cluster: &ClusterObservation, expected_pose: Pose2) -> ProjectedCluster {
+    ProjectedCluster {
+        id: cluster.id.clone(),
+        centroid: world_to_robot(cluster.centroid, expected_pose),
+        size_m: cluster.size_m,
+        confidence: cluster.confidence,
+        moving: cluster.moving,
+        semantic_hint: cluster.semantic_hint.clone(),
+    }
+}
+
+fn projected_obstacle_grid(
+    current: &SurfaceExtractorOutput,
+    current_pose: Pose2,
+    expected_pose: Pose2,
+) -> OccupancyGrid {
+    let mut cells = HashMap::<(i32, i32), OccupancyState>::new();
+    let resolution_m = current.obstacle_grid.resolution_m.max(0.05);
+    let half_extent_m = current.obstacle_grid.half_extent_m.max(1.0);
+    for cell in &current.obstacle_grid.cells {
+        let local = Vec3::new(
+            (cell.x as f32 + 0.5) * resolution_m,
+            (cell.y as f32 + 0.5) * resolution_m,
+            0.0,
+        );
+        let world = robot_to_world(local, current_pose);
+        let future = world_to_robot(world, expected_pose);
+        if future.x.abs() <= half_extent_m && future.y.abs() <= half_extent_m {
+            let key = occupancy_key(future, resolution_m);
+            cells.insert(key, cell.state.clone());
+        }
+    }
+    for surface in &current.stable_surfaces {
+        if surface.kind == SurfaceKind::VerticalPlane && surface.confidence >= 0.2 {
+            mark_projected_surface_cells(
+                &mut cells,
+                surface,
+                expected_pose,
+                resolution_m,
+                half_extent_m,
+            );
+        }
+    }
+    for cluster in &current.clusters {
+        mark_projected_cluster_cells(
+            &mut cells,
+            cluster,
+            expected_pose,
+            resolution_m,
+            half_extent_m,
+        );
+    }
+    OccupancyGrid {
+        resolution_m,
+        half_extent_m,
+        cells: cells
+            .into_iter()
+            .map(|((x, y), state)| OccupancyCell { x, y, state })
+            .collect(),
+    }
+}
+
+fn mark_projected_surface_cells(
+    cells: &mut HashMap<(i32, i32), OccupancyState>,
+    surface: &SurfaceTrack,
+    expected_pose: Pose2,
+    resolution_m: f32,
+    half_extent_m: f32,
+) {
+    let bounds = extrapolated_bounds(surface);
+    let normal = surface.normal;
+    let basis_a = if normal.z.abs() < 0.9 {
+        normal.cross(Vec3::new(0.0, 0.0, 1.0))
+    } else {
+        normal.cross(Vec3::new(1.0, 0.0, 0.0))
+    }
+    .normalized()
+    .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+    let basis_b = normal
+        .cross(basis_a)
+        .normalized()
+        .unwrap_or(Vec3::new(0.0, 1.0, 0.0));
+    let span_u = (bounds.max_u - bounds.min_u).abs().max(resolution_m);
+    let span_v = (bounds.max_v - bounds.min_v).abs().max(resolution_m);
+    let steps_u = (span_u / resolution_m).ceil().clamp(1.0, 48.0) as usize;
+    let steps_v = (span_v / resolution_m).ceil().clamp(1.0, 24.0) as usize;
+    for u_step in 0..=steps_u {
+        let u = bounds.min_u + (bounds.max_u - bounds.min_u) * u_step as f32 / steps_u as f32;
+        for v_step in 0..=steps_v {
+            let v = bounds.min_v + (bounds.max_v - bounds.min_v) * v_step as f32 / steps_v as f32;
+            let world = surface.centroid + basis_a * u + basis_b * v;
+            let local = world_to_robot(world, expected_pose);
+            if local.z >= 0.05
+                && local.z <= 1.8
+                && local.x.abs() <= half_extent_m
+                && local.y.abs() <= half_extent_m
+            {
+                cells.insert(occupancy_key(local, resolution_m), OccupancyState::Occupied);
+            }
+        }
+    }
+}
+
+fn mark_projected_cluster_cells(
+    cells: &mut HashMap<(i32, i32), OccupancyState>,
+    cluster: &ClusterObservation,
+    expected_pose: Pose2,
+    resolution_m: f32,
+    half_extent_m: f32,
+) {
+    let local = world_to_robot(cluster.centroid, expected_pose);
+    if local.x.abs() > half_extent_m || local.y.abs() > half_extent_m {
+        return;
+    }
+    let radius = cluster
+        .size_m
+        .x
+        .abs()
+        .max(cluster.size_m.y.abs())
+        .max(resolution_m)
+        * 0.5;
+    let steps = (radius / resolution_m).ceil().clamp(1.0, 6.0) as i32;
+    let center = occupancy_key(local, resolution_m);
+    for dx in -steps..=steps {
+        for dy in -steps..=steps {
+            cells.insert((center.0 + dx, center.1 + dy), OccupancyState::Occupied);
+        }
+    }
+}
+
+fn anticipated_navigation(grid: &OccupancyGrid, action: &ActionPrimitive) -> AnticipatedNavigation {
+    let front_clear_m = clear_distance(grid, -0.25, 0.25);
+    let left_clear_m = clear_distance(grid, 0.25, 1.1);
+    let right_clear_m = clear_distance(grid, -1.1, -0.25);
+    let motor = action_to_motor_command(Some(action));
+    let mut collision_risk = clearance_risk(front_clear_m, 0.85);
+    if motor.turn > 0.02 {
+        collision_risk = collision_risk.max(clearance_risk(left_clear_m, 0.65));
+    } else if motor.turn < -0.02 {
+        collision_risk = collision_risk.max(clearance_risk(right_clear_m, 0.65));
+    }
+    if motor.forward <= 0.0 && motor.turn.abs() <= 0.02 {
+        collision_risk *= 0.25;
+    }
+    AnticipatedNavigation {
+        front_clear_m,
+        left_clear_m,
+        right_clear_m,
+        collision_risk: collision_risk.clamp(0.0, 1.0),
+        occupied_cells: grid
+            .cells
+            .iter()
+            .filter(|cell| cell.state == OccupancyState::Occupied)
+            .count(),
+        free_cells: grid
+            .cells
+            .iter()
+            .filter(|cell| cell.state == OccupancyState::Free)
+            .count(),
+    }
+}
+
+fn clearance_risk(clearance_m: Option<f32>, caution_m: f32) -> f32 {
+    clearance_m
+        .map(|clearance| ((caution_m - clearance) / caution_m).clamp(0.0, 1.0))
+        .unwrap_or(0.0)
+}
+
 fn scene_graph(
     surfaces: &[SurfaceTrack],
     floor: Option<SurfaceTrack>,
@@ -1328,6 +1663,164 @@ mod tests {
         assert_eq!(first[0].id, second[0].id);
         assert!(second[0].moving);
         assert_eq!(second[0].above_surface_id.as_deref(), Some("floor"));
+    }
+
+    #[test]
+    fn wall_ahead_forward_anticipation_increases_forward_risk() {
+        let output = output_with_wall("wall_1", Vec3::new(0.7, 0.0, 0.6));
+        let action = ActionPrimitive::Go {
+            intensity: 0.2,
+            duration_ms: 2_000,
+        };
+
+        let frames = anticipate_surfaces(&output, Pose2::default(), &action);
+
+        assert!(frames[0].navigation.front_clear_m.unwrap() < 0.7);
+        assert!(
+            frames[2].navigation.front_clear_m.unwrap()
+                < frames[0].navigation.front_clear_m.unwrap()
+        );
+        assert!(frames[2].navigation.collision_risk > frames[0].navigation.collision_risk);
+    }
+
+    #[test]
+    fn wall_left_turn_left_anticipation_becomes_risky() {
+        let output = output_with_wall("wall_1", Vec3::new(0.0, 0.45, 0.6));
+        let action = ActionPrimitive::Turn {
+            direction: netherwick_actions::TurnDir::Left,
+            intensity: 0.8,
+            duration_ms: 2_000,
+        };
+
+        let frames = anticipate_surfaces(&output, Pose2::default(), &action);
+
+        assert!(frames[0].navigation.left_clear_m.unwrap() < 0.6);
+        assert!(frames[0].navigation.collision_risk > 0.0);
+        assert!(frames[2]
+            .projected_surfaces
+            .iter()
+            .any(|surface| surface.centroid.x > 0.0 && surface.centroid.y.abs() < 0.35));
+    }
+
+    #[test]
+    fn open_floor_forward_anticipation_stays_low_risk() {
+        let output = SurfaceExtractorOutput {
+            stable_surfaces: vec![floor_track()],
+            floor: Some(floor_track()),
+            obstacle_grid: OccupancyGrid {
+                resolution_m: 0.1,
+                half_extent_m: 3.0,
+                cells: Vec::new(),
+            },
+            ..SurfaceExtractorOutput::default()
+        };
+        let action = ActionPrimitive::Go {
+            intensity: 0.2,
+            duration_ms: 2_000,
+        };
+
+        let frames = anticipate_surfaces(&output, Pose2::default(), &action);
+
+        assert!(frames
+            .iter()
+            .all(|frame| frame.navigation.front_clear_m.is_none()
+                && frame.navigation.collision_risk <= 0.01));
+    }
+
+    #[test]
+    fn visible_wall_centroid_shift_keeps_existing_wall_id() {
+        let mut extractor = SurfaceExtractor::new(SurfaceExtractorConfig {
+            track_centroid_threshold_m: 0.35,
+            ..SurfaceExtractorConfig::default()
+        });
+        let first = PlaneObservation {
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            centroid: Vec3::new(0.8, -0.4, 0.6),
+            distance_from_origin_m: -0.8,
+            bounds_2d: Bounds2 {
+                min_u: -0.25,
+                max_u: 0.25,
+                min_v: -0.4,
+                max_v: 0.4,
+            },
+            point_count: 64,
+            confidence: 0.7,
+        };
+        let second = PlaneObservation {
+            centroid: Vec3::new(0.81, 0.55, 0.62),
+            bounds_2d: Bounds2 {
+                min_u: -0.2,
+                max_u: 0.2,
+                min_v: -0.45,
+                max_v: 0.35,
+            },
+            ..first
+        };
+
+        let tracks = extractor.update_tracks(&[first], 1_000);
+        let id = tracks[0].id.clone();
+        let tracks = extractor.update_tracks(&[second], 1_100);
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, id);
+        assert_eq!(extractor.next_surface_id, 2);
+    }
+
+    fn output_with_wall(id: &str, centroid: Vec3) -> SurfaceExtractorOutput {
+        let normal = if centroid.x.abs() >= centroid.y.abs() {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 1.0, 0.0)
+        };
+        let wall = SurfaceTrack {
+            id: id.to_string(),
+            kind: SurfaceKind::VerticalPlane,
+            normal,
+            centroid,
+            distance_from_origin_m: -normal.dot(centroid),
+            bounds_2d: Bounds2 {
+                min_u: -0.45,
+                max_u: 0.45,
+                min_v: -0.55,
+                max_v: 0.55,
+            },
+            confidence: 0.85,
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_000,
+            seen_count: 3,
+            missing_count: 0,
+        };
+        SurfaceExtractorOutput {
+            stable_surfaces: vec![floor_track(), wall],
+            floor: Some(floor_track()),
+            obstacle_grid: OccupancyGrid {
+                resolution_m: 0.1,
+                half_extent_m: 3.0,
+                cells: Vec::new(),
+            },
+            ..SurfaceExtractorOutput::default()
+        }
+    }
+
+    fn floor_track() -> SurfaceTrack {
+        SurfaceTrack {
+            id: "floor".to_string(),
+            kind: SurfaceKind::Floor,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            centroid: Vec3::default(),
+            distance_from_origin_m: 0.0,
+            bounds_2d: Bounds2 {
+                min_u: -2.0,
+                max_u: 2.0,
+                min_v: -2.0,
+                max_v: 2.0,
+            },
+            confidence: 1.0,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            seen_count: 1,
+            missing_count: 0,
+        }
     }
 
     fn synthetic_floor_depth(width: u32, height: u32, camera_height_m: f32) -> KinectSense {

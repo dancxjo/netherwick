@@ -167,6 +167,7 @@ impl HardcodedDangerPredictor {
         if now.body.flags.bump_left || now.body.flags.bump_right {
             bump_risk = 1.0;
         }
+        bump_risk = bump_risk.max(surface_anticipated_collision_risk(now));
 
         let cliff_risk = if now.body.flags.cliff_left
             || now.body.flags.cliff_front_left
@@ -306,6 +307,7 @@ impl HardcodedActionValuePredictor {
         let dock_likelihood = input.prediction_features.get(7).copied().unwrap_or(0.0);
         let prediction_uncertainty = input.prediction_features.get(9).copied().unwrap_or(0.0);
         let safety_veto_likely = input.prediction_features.get(11).copied().unwrap_or(0.0);
+        let surface_collision_risk = surface_anticipated_collision_risk(now);
         let memory_danger = input.memory_features.get(1).copied().unwrap_or(0.0);
         let memory_charge = input.memory_features.get(2).copied().unwrap_or(0.0);
         let remembered_best = input.memory_features.get(6).copied().unwrap_or(0.0);
@@ -331,6 +333,7 @@ impl HardcodedActionValuePredictor {
             value -= 0.35;
         }
         value -= bump_risk * (0.45 + forward * 0.25);
+        value -= surface_collision_risk * (0.35 + forward * 0.35);
         value -= cliff_risk * 0.9;
         value -= wheel_drop_risk * 0.95;
         value -= stuck_risk * 0.25;
@@ -347,6 +350,16 @@ impl HardcodedActionValuePredictor {
                 .clamp(0.0, 1.0),
         }
     }
+}
+
+fn surface_anticipated_collision_risk(now: &Now) -> f32 {
+    now.extensions
+        .get("surface.scene_graph")
+        .and_then(|value| value.get("anticipation"))
+        .and_then(|value| value.get("max_collision_risk"))
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0) as f32
 }
 
 impl NeuralModel<(ActionValueInput, Now), ActionValueOutput> for HardcodedActionValuePredictor {
