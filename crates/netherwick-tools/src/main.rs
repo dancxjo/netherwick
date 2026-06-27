@@ -12,7 +12,7 @@ use netherwick_actions::ActionPrimitive;
 use netherwick_actions::{ApproachTarget, ExploreStyle, TurnDir};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
-use netherwick_body::RobotBody;
+use netherwick_body::{BodySense, RobotBody};
 use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
 use netherwick_create1::{Create1Body, Create1OpenMode, MockCreate1Body};
 use netherwick_ledger::{
@@ -24,7 +24,7 @@ use netherwick_memory::{
     PlaceMemoryReport,
 };
 use netherwick_models::MODEL_REGISTRY;
-use netherwick_now::{EarSense, KinectSense, RangeSense};
+use netherwick_now::{EarSense, KinectSense, Now, RangeSense, SurpriseSense};
 use netherwick_runtime::{
     ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
     InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, RobotMode, RuntimeLoop,
@@ -93,6 +93,7 @@ enum Command {
     Dashboard,
     VirtualReport(VirtualReportArgs),
     RetinaMockSend(RetinaMockSendArgs),
+    EmbodiedDemo(EmbodiedDemoArgs),
 }
 
 #[tokio::main]
@@ -123,6 +124,7 @@ async fn main() -> Result<()> {
         Command::CompareScenarioReports(args) => compare_scenario_reports_command(args),
         Command::VirtualReport(args) => run_virtual_report(args).await,
         Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
+        Command::EmbodiedDemo(args) => run_embodied_demo(args).await,
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -752,6 +754,14 @@ struct VirtualReportArgs {
     ledger: String,
     #[arg(long, default_value = "data/reports/virtual/latest.json")]
     out: String,
+}
+
+#[derive(Debug, Parser)]
+struct EmbodiedDemoArgs {
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    ledger: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -6330,6 +6340,72 @@ async fn run_virtual_report(args: VirtualReportArgs) -> Result<()> {
     let content = serde_json::to_string_pretty(&report)?;
     fs::write(&args.out, content)?;
     println!("virtual run report written to {}", args.out);
+    Ok(())
+}
+
+async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let demo = netherwick_experience::demo_embodied_experience(now_ms).await?;
+    let mut impressions = demo.impressions.clone();
+    if let Some(summary) = demo.experience.summary_impression.clone() {
+        impressions.push(summary);
+    }
+
+    if let Some(root) = args.ledger.as_deref() {
+        let ledger = JsonlLedger::new(root);
+        let frame = ExperienceFrame {
+            id: uuid::Uuid::new_v4(),
+            t_ms: now_ms,
+            now: Now::blank(now_ms, BodySense::default()),
+            sensations: demo.sensations.clone(),
+            impressions: impressions.clone(),
+            experiences: vec![demo.experience.clone()],
+            z: None,
+            chosen_action: None,
+            conscious_command: None,
+            reign_input: None,
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Default::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: vec!["embodied demo pipeline".to_string()],
+        };
+        ledger.append(&frame).await?;
+        println!("wrote embodied demo frame to {}", root);
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&demo)?);
+        return Ok(());
+    }
+
+    println!("embodied experience {}", demo.experience.id);
+    println!("  summary: {}", demo.experience.text);
+    println!("  sensations: {}", demo.sensations.len());
+    for sensation in &demo.sensations {
+        let vector = sensation
+            .vector
+            .as_ref()
+            .map(|embedding| format!("{}d {}", embedding.dim, embedding.model_id))
+            .unwrap_or_else(|| "none".to_string());
+        println!(
+            "    - {} {:?}/{:?} parent={:?} vector={}",
+            sensation.kind, sensation.modality, sensation.payload_kind, sensation.parent_id, vector
+        );
+    }
+    println!("  impressions:");
+    for impression in &impressions {
+        println!("    - {}", impression.text);
+    }
+    if let Some(fused) = &demo.experience.fused_vector {
+        println!("  fused vector: {}d {}", fused.dim, fused.model_id);
+    }
     Ok(())
 }
 

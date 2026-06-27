@@ -1,4 +1,8 @@
-use anyhow::Result;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use netherwick_actions::{action_to_motor_command, ActionPrimitive, ExploreStyle, TurnDir};
 use netherwick_body::BodySense;
 use netherwick_core::{ExperienceId, ImpressionId, Provenance, Reward, SensationId, TimeMs};
@@ -6,6 +10,9 @@ use netherwick_now::{DriveSense, MemorySense, Now, SenseVectorizer, SurpriseSens
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+const DEFAULT_WINDOW_MS: TimeMs = 750;
+const PLACEHOLDER_VECTOR_DIM: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExperienceLatent {
@@ -1803,11 +1810,76 @@ mod tests {
         assert!(input.prediction_features.contains(&0.7));
         assert!(input.prediction_features.contains(&0.6));
     }
+
+    #[test]
+    fn deterministic_extractor_preserves_visual_lineage() {
+        let primary = Sensation::primary(
+            Modality::Vision,
+            SensationSource::new("test-camera"),
+            100,
+            100,
+            SensationPayload::image_metadata(64, 48, "rgb8", 64 * 48 * 3),
+        );
+
+        let descendants = DeterministicDescendantExtractor.extract(&primary).unwrap();
+
+        assert_eq!(descendants.len(), 1);
+        assert_eq!(descendants[0].parent_id, Some(primary.id));
+        assert_eq!(descendants[0].payload_kind, SensationPayloadKind::Crop);
+        assert!(matches!(
+            descendants[0].provenance.kind,
+            netherwick_core::ProvenanceKind::DerivedFromSensations { .. }
+        ));
+    }
+
+    #[test]
+    fn experience_fuser_links_sensations_impressions_and_summary() {
+        let mut sensation = Sensation::primary(
+            Modality::Vision,
+            SensationSource::new("test-camera"),
+            100,
+            110,
+            SensationPayload::image_metadata(64, 48, "rgb8", 64 * 48 * 3),
+        );
+        sensation.vector = Some(VectorEmbedding::new(
+            vec![0.1, 0.2, 0.3],
+            "test-vectorizer",
+            Modality::Vision,
+            SensationPayloadKind::ImageBytes,
+            sensation.id,
+            110,
+        ));
+        let impression = TemplateImpressionGenerator.generate_for_sensation(&sensation);
+
+        let experience = ExperienceFuser::new(750)
+            .fuse(&[sensation.clone()], &[impression.clone()])
+            .unwrap();
+
+        assert_eq!(experience.sensation_ids, vec![sensation.id]);
+        assert_eq!(experience.impression_ids, vec![impression.id]);
+        assert_eq!(experience.window_start_ms, 100);
+        assert_eq!(experience.window_end_ms, 110);
+        assert!(experience.fused_vector.is_some());
+        assert_eq!(
+            experience
+                .summary_impression
+                .as_ref()
+                .and_then(|summary| summary.experience_id),
+            Some(experience.id)
+        );
+        assert!(experience.text.starts_with("I see"));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sensation {
     pub id: SensationId,
+    #[serde(default)]
+    pub parent_id: Option<SensationId>,
+    #[serde(default)]
+    pub modality: Modality,
+    #[serde(default)]
+    pub payload_kind: SensationPayloadKind,
     pub kind: String,
     pub source: String,
     pub occurred_at_ms: TimeMs,
@@ -1815,6 +1887,12 @@ pub struct Sensation {
     pub summary: Option<String>,
     pub provenance: Provenance,
     pub payload: Value,
+    #[serde(default)]
+    pub metadata: SensationMetadata,
+    #[serde(default)]
+    pub vector: Option<VectorEmbedding>,
+    #[serde(default)]
+    pub impression: Option<Impression>,
 }
 
 impl Sensation {
@@ -1827,6 +1905,9 @@ impl Sensation {
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
+            parent_id: None,
+            modality: Modality::Other,
+            payload_kind: SensationPayloadKind::Structured,
             kind: kind.into(),
             source: source.into(),
             occurred_at_ms,
@@ -1834,7 +1915,54 @@ impl Sensation {
             summary: None,
             provenance: Provenance::direct(),
             payload,
+            metadata: SensationMetadata::default(),
+            vector: None,
+            impression: None,
         }
+    }
+
+    pub fn primary(
+        modality: Modality,
+        source: SensationSource,
+        occurred_at_ms: TimeMs,
+        observed_at_ms: TimeMs,
+        payload: SensationPayload,
+    ) -> Self {
+        let kind = format!("{}.{}", modality.as_str(), payload.kind().as_str());
+        let mut sensation = Self::new(
+            kind,
+            source.name.clone(),
+            occurred_at_ms,
+            observed_at_ms,
+            payload.value,
+        );
+        sensation.modality = modality;
+        sensation.payload_kind = payload.kind;
+        sensation.metadata.source = source;
+        sensation
+    }
+
+    pub fn descendant(
+        parent: &Sensation,
+        kind: impl Into<String>,
+        payload_kind: SensationPayloadKind,
+        payload: Value,
+        metadata: SensationMetadata,
+        stage: impl Into<String>,
+    ) -> Self {
+        let mut sensation = Self::new(
+            kind,
+            parent.source.clone(),
+            parent.occurred_at_ms,
+            parent.observed_at_ms,
+            payload,
+        );
+        sensation.parent_id = Some(parent.id);
+        sensation.modality = parent.modality.clone();
+        sensation.payload_kind = payload_kind;
+        sensation.metadata = metadata;
+        sensation.provenance = Provenance::derived_from_sensations([parent.id]).with_stage(stage);
+        sensation
     }
 
     pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
@@ -1846,6 +1974,16 @@ impl Sensation {
         self.provenance = provenance;
         self
     }
+
+    pub fn with_vector(mut self, vector: VectorEmbedding) -> Self {
+        self.vector = Some(vector);
+        self
+    }
+
+    pub fn with_impression(mut self, impression: Impression) -> Self {
+        self.impression = Some(impression);
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1854,9 +1992,15 @@ pub struct Impression {
     pub kind: String,
     pub text: String,
     pub about: Vec<SensationId>,
+    #[serde(default)]
+    pub sensation_id: Option<SensationId>,
+    #[serde(default)]
+    pub experience_id: Option<ExperienceId>,
     pub occurred_at_ms: TimeMs,
     pub observed_at_ms: TimeMs,
     pub confidence: f32,
+    #[serde(default)]
+    pub generator: ImpressionGenerator,
     pub payload: Value,
 }
 
@@ -1872,10 +2016,13 @@ impl Impression {
             id: Uuid::new_v4(),
             kind: kind.into(),
             text: text.into(),
+            sensation_id: about.first().copied(),
+            experience_id: None,
             about,
             occurred_at_ms,
             observed_at_ms,
             confidence: 0.5,
+            generator: ImpressionGenerator::Template,
             payload: Value::Null,
         }
     }
@@ -1889,6 +2036,12 @@ impl Impression {
         self.payload = payload;
         self
     }
+
+    pub fn for_experience(mut self, experience_id: ExperienceId) -> Self {
+        self.experience_id = Some(experience_id);
+        self.sensation_id = None;
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1898,6 +2051,18 @@ pub struct Experience {
     pub text: String,
     pub impression_ids: Vec<ImpressionId>,
     pub sensation_ids: Vec<SensationId>,
+    #[serde(default)]
+    pub window_start_ms: TimeMs,
+    #[serde(default)]
+    pub window_end_ms: TimeMs,
+    #[serde(default)]
+    pub fused_vector: Option<VectorEmbedding>,
+    #[serde(default)]
+    pub summary_impression: Option<Impression>,
+    #[serde(default)]
+    pub predictions: Vec<Prediction>,
+    #[serde(default)]
+    pub memory_links: Vec<MemoryLink>,
     pub occurred_at_ms: TimeMs,
     pub observed_at_ms: TimeMs,
     pub salience: f32,
@@ -1920,6 +2085,12 @@ impl Experience {
             text: text.into(),
             impression_ids,
             sensation_ids,
+            window_start_ms: occurred_at_ms,
+            window_end_ms: observed_at_ms,
+            fused_vector: None,
+            summary_impression: None,
+            predictions: Vec::new(),
+            memory_links: Vec::new(),
             occurred_at_ms,
             observed_at_ms,
             salience: 0.5,
@@ -1951,6 +2122,804 @@ impl Experience {
         .with_summary(format!("I remember: {}", self.text))
         .with_provenance(Provenance::memory_recall(self.id).with_stage(stage))
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Modality {
+    Vision,
+    Audio,
+    Depth,
+    Lidar,
+    Touch,
+    Odometry,
+    Memory,
+    Language,
+    #[default]
+    Other,
+}
+
+impl Modality {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vision => "vision",
+            Self::Audio => "audio",
+            Self::Depth => "depth",
+            Self::Lidar => "lidar",
+            Self::Touch => "touch",
+            Self::Odometry => "odometry",
+            Self::Memory => "memory",
+            Self::Language => "language",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensationPayloadKind {
+    ImageBytes,
+    AudioPcm,
+    DepthFrame,
+    PointCloud,
+    LidarScan,
+    ContactEvent,
+    OdometryEvent,
+    Crop,
+    SpeechSegment,
+    MemoryRecall,
+    #[default]
+    Structured,
+}
+
+impl SensationPayloadKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ImageBytes => "image_bytes",
+            Self::AudioPcm => "audio_pcm",
+            Self::DepthFrame => "depth_frame",
+            Self::PointCloud => "point_cloud",
+            Self::LidarScan => "lidar_scan",
+            Self::ContactEvent => "contact_event",
+            Self::OdometryEvent => "odometry_event",
+            Self::Crop => "crop",
+            Self::SpeechSegment => "speech_segment",
+            Self::MemoryRecall => "memory_recall",
+            Self::Structured => "structured",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SensationSource {
+    pub name: String,
+    pub device_id: Option<String>,
+    pub frame_id: Option<String>,
+}
+
+impl SensationSource {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            device_id: None,
+            frame_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SensationPayload {
+    pub kind: SensationPayloadKind,
+    pub value: Value,
+}
+
+impl SensationPayload {
+    pub fn image_metadata(
+        width: u32,
+        height: u32,
+        format: impl Into<String>,
+        byte_len: usize,
+    ) -> Self {
+        Self {
+            kind: SensationPayloadKind::ImageBytes,
+            value: json!({
+                "width": width,
+                "height": height,
+                "format": format.into(),
+                "byte_len": byte_len,
+            }),
+        }
+    }
+
+    pub fn structured(value: Value) -> Self {
+        Self {
+            kind: SensationPayloadKind::Structured,
+            value,
+        }
+    }
+
+    pub fn kind(&self) -> SensationPayloadKind {
+        self.kind.clone()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SensationMetadata {
+    pub source: SensationSource,
+    pub labels: Vec<String>,
+    pub bbox: Option<BoundingBox>,
+    pub duration_ms: Option<TimeMs>,
+    pub confidence: Option<f32>,
+    pub properties: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BoundingBox {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorEmbedding {
+    pub vector: Vec<f32>,
+    pub dim: usize,
+    pub model_id: String,
+    pub modality: Modality,
+    pub payload_kind: SensationPayloadKind,
+    pub source_sensation_id: SensationId,
+    pub generated_at_ms: TimeMs,
+}
+
+impl VectorEmbedding {
+    pub fn new(
+        vector: Vec<f32>,
+        model_id: impl Into<String>,
+        modality: Modality,
+        payload_kind: SensationPayloadKind,
+        source_sensation_id: SensationId,
+        generated_at_ms: TimeMs,
+    ) -> Self {
+        let dim = vector.len();
+        Self {
+            vector,
+            dim,
+            model_id: model_id.into(),
+            modality,
+            payload_kind,
+            source_sensation_id,
+            generated_at_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpressionGenerator {
+    #[default]
+    Template,
+    Llm,
+    Human,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Prediction {
+    pub offset_ms: TimeMs,
+    pub text: String,
+    pub confidence: f32,
+    pub vector: Option<VectorEmbedding>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoryLink {
+    pub target_id: String,
+    pub relation: String,
+    pub score: f32,
+    pub payload: Value,
+}
+
+#[async_trait]
+pub trait SensationVectorizer: Send + Sync {
+    fn modality(&self) -> Modality;
+    fn payload_kind(&self) -> SensationPayloadKind;
+    fn model_id(&self) -> &'static str;
+    fn output_dim(&self) -> usize;
+    async fn vectorize(&self, sensation: &Sensation) -> Result<VectorEmbedding>;
+}
+
+#[derive(Clone, Default)]
+pub struct SensationVectorizerRegistry {
+    vectorizers: BTreeMap<(Modality, SensationPayloadKind), Arc<dyn SensationVectorizer>>,
+}
+
+impl SensationVectorizerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+        for (modality, payload_kind) in [
+            (Modality::Vision, SensationPayloadKind::ImageBytes),
+            (Modality::Vision, SensationPayloadKind::Crop),
+            (Modality::Audio, SensationPayloadKind::AudioPcm),
+            (Modality::Audio, SensationPayloadKind::SpeechSegment),
+            (Modality::Depth, SensationPayloadKind::DepthFrame),
+            (Modality::Touch, SensationPayloadKind::ContactEvent),
+            (Modality::Odometry, SensationPayloadKind::OdometryEvent),
+            (Modality::Memory, SensationPayloadKind::MemoryRecall),
+            (Modality::Other, SensationPayloadKind::Structured),
+        ] {
+            registry.register(PlaceholderSensationVectorizer::new(modality, payload_kind));
+        }
+        registry
+    }
+
+    pub fn register<V>(&mut self, vectorizer: V)
+    where
+        V: SensationVectorizer + 'static,
+    {
+        self.vectorizers.insert(
+            (vectorizer.modality(), vectorizer.payload_kind()),
+            Arc::new(vectorizer),
+        );
+    }
+
+    pub fn get(
+        &self,
+        modality: &Modality,
+        payload_kind: &SensationPayloadKind,
+    ) -> Option<Arc<dyn SensationVectorizer>> {
+        self.vectorizers
+            .get(&(modality.clone(), payload_kind.clone()))
+            .cloned()
+    }
+
+    pub async fn vectorize(&self, sensation: &Sensation) -> Result<Option<VectorEmbedding>> {
+        let Some(vectorizer) = self.get(&sensation.modality, &sensation.payload_kind) else {
+            return Ok(None);
+        };
+        vectorizer.vectorize(sensation).await.map(Some)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaceholderSensationVectorizer {
+    modality: Modality,
+    payload_kind: SensationPayloadKind,
+}
+
+impl PlaceholderSensationVectorizer {
+    pub fn new(modality: Modality, payload_kind: SensationPayloadKind) -> Self {
+        Self {
+            modality,
+            payload_kind,
+        }
+    }
+}
+
+#[async_trait]
+impl SensationVectorizer for PlaceholderSensationVectorizer {
+    fn modality(&self) -> Modality {
+        self.modality.clone()
+    }
+
+    fn payload_kind(&self) -> SensationPayloadKind {
+        self.payload_kind.clone()
+    }
+
+    fn model_id(&self) -> &'static str {
+        "netherwick.placeholder.v0"
+    }
+
+    fn output_dim(&self) -> usize {
+        PLACEHOLDER_VECTOR_DIM
+    }
+
+    async fn vectorize(&self, sensation: &Sensation) -> Result<VectorEmbedding> {
+        let mut vector = vec![0.0; self.output_dim()];
+        vector[0] = stable_unit(&sensation.kind);
+        vector[1] = stable_unit(&sensation.source);
+        vector[2] = (sensation.occurred_at_ms % 10_000) as f32 / 10_000.0;
+        vector[3] = sensation.metadata.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
+        vector[4] = sensation
+            .payload
+            .get("width")
+            .and_then(Value::as_u64)
+            .map(|value| (value as f32 / 1920.0).clamp(0.0, 1.0))
+            .unwrap_or_default();
+        vector[5] = sensation
+            .payload
+            .get("height")
+            .and_then(Value::as_u64)
+            .map(|value| (value as f32 / 1080.0).clamp(0.0, 1.0))
+            .unwrap_or_default();
+        vector[6] = sensation
+            .metadata
+            .duration_ms
+            .map(|value| (value as f32 / 5_000.0).clamp(0.0, 1.0))
+            .unwrap_or_default();
+        if sensation.parent_id.is_some() {
+            vector[7] = 1.0;
+        }
+        for (idx, label) in sensation.metadata.labels.iter().take(4).enumerate() {
+            vector[8 + idx] = stable_unit(label);
+        }
+        Ok(VectorEmbedding::new(
+            vector,
+            self.model_id(),
+            self.modality.clone(),
+            self.payload_kind.clone(),
+            sensation.id,
+            sensation.observed_at_ms,
+        ))
+    }
+}
+
+pub trait DescendantExtractor {
+    fn extract(&self, sensation: &Sensation) -> Result<Vec<Sensation>>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeterministicDescendantExtractor;
+
+impl DescendantExtractor for DeterministicDescendantExtractor {
+    fn extract(&self, sensation: &Sensation) -> Result<Vec<Sensation>> {
+        match (&sensation.modality, &sensation.payload_kind) {
+            (Modality::Vision, SensationPayloadKind::ImageBytes) => {
+                let width = sensation
+                    .payload
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                let height = sensation
+                    .payload
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                if width < 16 || height < 16 {
+                    return Ok(Vec::new());
+                }
+                let bbox = BoundingBox {
+                    x: width / 4,
+                    y: height / 4,
+                    width: (width / 2).max(1),
+                    height: (height / 2).max(1),
+                };
+                let mut metadata = sensation.metadata.clone();
+                metadata.bbox = Some(bbox);
+                metadata.labels.push("central visual crop".to_string());
+                metadata.confidence = Some(0.35);
+                let crop = Sensation::descendant(
+                    sensation,
+                    "vision.crop",
+                    SensationPayloadKind::Crop,
+                    json!({
+                        "parent_image": sensation.id,
+                        "bbox": bbox,
+                        "method": "deterministic_center_crop",
+                    }),
+                    metadata,
+                    "descendant.center_crop",
+                )
+                .with_summary("I narrow my sight toward the middle of the frame.");
+                Ok(vec![crop])
+            }
+            (Modality::Audio, SensationPayloadKind::AudioPcm) => {
+                let duration_ms = sensation.metadata.duration_ms.unwrap_or(0);
+                if duration_ms == 0 {
+                    return Ok(Vec::new());
+                }
+                let mut metadata = sensation.metadata.clone();
+                metadata.labels.push("voice-like audio segment".to_string());
+                metadata.confidence = Some(0.25);
+                Ok(vec![Sensation::descendant(
+                    sensation,
+                    "audio.voice_segment",
+                    SensationPayloadKind::SpeechSegment,
+                    json!({
+                        "parent_audio": sensation.id,
+                        "start_ms": 0,
+                        "end_ms": duration_ms,
+                        "method": "deterministic_window",
+                    }),
+                    metadata,
+                    "descendant.audio_window",
+                )
+                .with_summary("I pick out a short sound within what I hear.")])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TemplateImpressionGenerator;
+
+impl TemplateImpressionGenerator {
+    pub fn generate_for_sensation(&self, sensation: &Sensation) -> Impression {
+        let text = match (&sensation.modality, &sensation.payload_kind) {
+            (Modality::Vision, SensationPayloadKind::ImageBytes) => {
+                let width = sensation
+                    .payload
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let height = sensation
+                    .payload
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if width > 0 && height > 0 {
+                    format!("I see a {} by {} frame in front of me.", width, height)
+                } else {
+                    "I see light and shape in front of me.".to_string()
+                }
+            }
+            (Modality::Vision, SensationPayloadKind::Crop) => {
+                "I focus on a smaller part of what I see.".to_string()
+            }
+            (Modality::Audio, SensationPayloadKind::AudioPcm) => {
+                "I hear a short sound nearby.".to_string()
+            }
+            (Modality::Audio, SensationPayloadKind::SpeechSegment) => {
+                "I hear a voice-like piece of sound.".to_string()
+            }
+            (Modality::Touch, SensationPayloadKind::ContactEvent) => {
+                "I feel contact against my body.".to_string()
+            }
+            (Modality::Odometry, SensationPayloadKind::OdometryEvent) => {
+                "I feel my position changing through the room.".to_string()
+            }
+            (Modality::Depth, _) => "I sense distance and surface in front of me.".to_string(),
+            (Modality::Memory, _) => sensation
+                .summary
+                .clone()
+                .unwrap_or_else(|| "I remember something related to now.".to_string()),
+            _ => sensation
+                .summary
+                .clone()
+                .unwrap_or_else(|| "I notice something happening now.".to_string()),
+        };
+        Impression::new(
+            "sensation.template",
+            text,
+            vec![sensation.id],
+            sensation.occurred_at_ms,
+            sensation.observed_at_ms,
+        )
+        .with_confidence(
+            sensation
+                .metadata
+                .confidence
+                .unwrap_or(0.55)
+                .clamp(0.0, 1.0),
+        )
+        .with_payload(json!({
+            "modality": sensation.modality,
+            "payload_kind": sensation.payload_kind,
+            "source": sensation.source,
+        }))
+    }
+
+    pub fn generate_for_experience(
+        &self,
+        experience_id: ExperienceId,
+        window_start_ms: TimeMs,
+        window_end_ms: TimeMs,
+        impressions: &[Impression],
+    ) -> Impression {
+        let mut parts = impressions
+            .iter()
+            .map(|impression| impression.text.trim().trim_end_matches('.').to_string())
+            .filter(|text| !text.is_empty())
+            .take(3)
+            .collect::<Vec<_>>();
+        let text = if parts.is_empty() {
+            "I am here in a quiet moment.".to_string()
+        } else if parts.len() == 1 {
+            format!("{}.", parts.remove(0))
+        } else {
+            format!("{}.", parts.join(", and "))
+        };
+        Impression::new(
+            "experience.template",
+            text,
+            Vec::new(),
+            window_start_ms,
+            window_end_ms,
+        )
+        .for_experience(experience_id)
+        .with_confidence(0.6)
+    }
+}
+
+#[derive(Clone)]
+pub struct EmbodiedPipeline {
+    extractor: DeterministicDescendantExtractor,
+    vectorizers: SensationVectorizerRegistry,
+    impressions: TemplateImpressionGenerator,
+}
+
+impl Default for EmbodiedPipeline {
+    fn default() -> Self {
+        Self {
+            extractor: DeterministicDescendantExtractor,
+            vectorizers: SensationVectorizerRegistry::with_defaults(),
+            impressions: TemplateImpressionGenerator,
+        }
+    }
+}
+
+impl EmbodiedPipeline {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn ingest_primary(&self, primary: Sensation) -> Result<EmbodiedBatch> {
+        let mut sensations = vec![primary];
+        let descendants = self.extractor.extract(&sensations[0])?;
+        sensations.extend(descendants);
+        let mut impressions = Vec::with_capacity(sensations.len());
+        for sensation in &mut sensations {
+            if let Some(vector) = self.vectorizers.vectorize(sensation).await? {
+                sensation.vector = Some(vector);
+            }
+            let impression = self.impressions.generate_for_sensation(sensation);
+            sensation.impression = Some(impression.clone());
+            impressions.push(impression);
+        }
+        Ok(EmbodiedBatch {
+            sensations,
+            impressions,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedBatch {
+    pub sensations: Vec<Sensation>,
+    pub impressions: Vec<Impression>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExperienceFuser {
+    window_ms: TimeMs,
+    impressions: TemplateImpressionGenerator,
+}
+
+impl Default for ExperienceFuser {
+    fn default() -> Self {
+        Self {
+            window_ms: DEFAULT_WINDOW_MS,
+            impressions: TemplateImpressionGenerator,
+        }
+    }
+}
+
+impl ExperienceFuser {
+    pub fn new(window_ms: TimeMs) -> Self {
+        Self {
+            window_ms: window_ms.max(1),
+            ..Self::default()
+        }
+    }
+
+    pub fn fuse(&self, sensations: &[Sensation], impressions: &[Impression]) -> Result<Experience> {
+        if sensations.is_empty() && impressions.is_empty() {
+            return Err(anyhow!("cannot fuse an empty embodied window"));
+        }
+        let window_start_ms = sensations
+            .iter()
+            .map(|sensation| sensation.occurred_at_ms)
+            .chain(
+                impressions
+                    .iter()
+                    .map(|impression| impression.occurred_at_ms),
+            )
+            .min()
+            .unwrap_or_default();
+        let window_end_ms = sensations
+            .iter()
+            .map(|sensation| sensation.observed_at_ms)
+            .chain(
+                impressions
+                    .iter()
+                    .map(|impression| impression.observed_at_ms),
+            )
+            .max()
+            .unwrap_or(window_start_ms + self.window_ms);
+        let sensation_ids = sensations
+            .iter()
+            .map(|sensation| sensation.id)
+            .collect::<Vec<_>>();
+        let impression_ids = impressions
+            .iter()
+            .map(|impression| impression.id)
+            .collect::<Vec<_>>();
+        let fused_vector = fuse_vectors(sensations, window_end_ms);
+        let experience_id = Uuid::new_v4();
+        let summary = self.impressions.generate_for_experience(
+            experience_id,
+            window_start_ms,
+            window_end_ms,
+            impressions,
+        );
+        let mut experience = Experience::new(
+            "embodied.now",
+            summary.text.clone(),
+            impression_ids,
+            sensation_ids,
+            window_start_ms,
+            window_end_ms,
+        );
+        experience.id = experience_id;
+        experience.window_start_ms = window_start_ms;
+        experience.window_end_ms = window_end_ms;
+        experience.fused_vector = fused_vector;
+        experience.summary_impression = Some(summary);
+        experience.predictions = vec![Prediction {
+            offset_ms: self.window_ms,
+            text:
+                "I expect the next moment to resemble this one unless I move or something changes."
+                    .to_string(),
+            confidence: 0.35,
+            vector: experience.fused_vector.clone(),
+        }];
+        experience.tags = embodied_tags(sensations);
+        experience.payload = json!({
+            "pipeline": "embodied.v0",
+            "sensation_count": sensations.len(),
+            "impression_count": impressions.len(),
+            "window_ms": window_end_ms.saturating_sub(window_start_ms),
+        });
+        Ok(experience)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RollingExperienceWindow {
+    window_ms: TimeMs,
+    sensations: VecDeque<Sensation>,
+    impressions: VecDeque<Impression>,
+    fuser: ExperienceFuser,
+}
+
+impl RollingExperienceWindow {
+    pub fn new(window_ms: TimeMs) -> Self {
+        Self {
+            window_ms: window_ms.max(1),
+            sensations: VecDeque::new(),
+            impressions: VecDeque::new(),
+            fuser: ExperienceFuser::new(window_ms),
+        }
+    }
+
+    pub fn push(&mut self, batch: EmbodiedBatch) {
+        let newest = batch
+            .sensations
+            .iter()
+            .map(|sensation| sensation.observed_at_ms)
+            .chain(
+                batch
+                    .impressions
+                    .iter()
+                    .map(|impression| impression.observed_at_ms),
+            )
+            .max()
+            .unwrap_or_default();
+        self.sensations.extend(batch.sensations);
+        self.impressions.extend(batch.impressions);
+        self.prune(newest);
+    }
+
+    pub fn fuse_current(&self) -> Result<Experience> {
+        let sensations = self.sensations.iter().cloned().collect::<Vec<_>>();
+        let impressions = self.impressions.iter().cloned().collect::<Vec<_>>();
+        self.fuser.fuse(&sensations, &impressions)
+    }
+
+    fn prune(&mut self, newest_observed_at_ms: TimeMs) {
+        let cutoff = newest_observed_at_ms.saturating_sub(self.window_ms);
+        while self
+            .sensations
+            .front()
+            .map(|sensation| sensation.observed_at_ms < cutoff)
+            .unwrap_or(false)
+        {
+            self.sensations.pop_front();
+        }
+        while self
+            .impressions
+            .front()
+            .map(|impression| impression.observed_at_ms < cutoff)
+            .unwrap_or(false)
+        {
+            self.impressions.pop_front();
+        }
+    }
+}
+
+pub async fn demo_embodied_experience(now_ms: TimeMs) -> Result<EmbodiedDemo> {
+    let primary = Sensation::primary(
+        Modality::Vision,
+        SensationSource::new("demo.synthetic_camera"),
+        now_ms,
+        now_ms,
+        SensationPayload::image_metadata(64, 48, "rgb8", 64 * 48 * 3),
+    )
+    .with_summary("I receive a synthetic visual frame.");
+    let pipeline = EmbodiedPipeline::new();
+    let batch = pipeline.ingest_primary(primary).await?;
+    let mut window = RollingExperienceWindow::new(DEFAULT_WINDOW_MS);
+    window.push(batch.clone());
+    let experience = window.fuse_current()?;
+    Ok(EmbodiedDemo {
+        sensations: batch.sensations,
+        impressions: batch.impressions,
+        experience,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedDemo {
+    pub sensations: Vec<Sensation>,
+    pub impressions: Vec<Impression>,
+    pub experience: Experience,
+}
+
+fn fuse_vectors(sensations: &[Sensation], generated_at_ms: TimeMs) -> Option<VectorEmbedding> {
+    let vectors = sensations
+        .iter()
+        .filter_map(|sensation| sensation.vector.as_ref())
+        .collect::<Vec<_>>();
+    let first = vectors.first()?;
+    let dim = first.dim;
+    let source_sensation_id = first.source_sensation_id;
+    let mut pooled = vec![0.0; dim];
+    let mut count = 0.0_f32;
+    for embedding in vectors {
+        if embedding.dim != dim {
+            continue;
+        }
+        for (slot, value) in pooled.iter_mut().zip(embedding.vector.iter()) {
+            *slot += *value;
+        }
+        count += 1.0;
+    }
+    if count == 0.0 {
+        return None;
+    }
+    for value in &mut pooled {
+        *value /= count;
+    }
+    Some(VectorEmbedding::new(
+        pooled,
+        "netherwick.fusion.mean_pool.v0",
+        Modality::Other,
+        SensationPayloadKind::Structured,
+        source_sensation_id,
+        generated_at_ms,
+    ))
+}
+
+fn embodied_tags(sensations: &[Sensation]) -> Vec<String> {
+    let mut tags = sensations
+        .iter()
+        .map(|sensation| sensation.modality.as_str().to_string())
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn stable_unit(text: &str) -> f32 {
+    let mut hash = 0_u32;
+    for byte in text.as_bytes() {
+        hash = hash.wrapping_mul(16777619) ^ u32::from(*byte);
+    }
+    (hash % 10_000) as f32 / 10_000.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

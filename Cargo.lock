@@ -4715,6 +4715,7 @@ name = "netherwick-experience"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "netherwick-actions",
  "netherwick-body",
  "netherwick-core",
