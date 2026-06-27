@@ -2621,8 +2621,17 @@ where
             );
         }
 
-        let (mut sensations, mut impressions) = derive_direct_impressions_from_now(&now);
+        let embodied_now = netherwick_experience::embody_now(&now).await?;
+        let mut sensations = embodied_now.sensations;
+        let mut impressions = embodied_now.impressions;
+        if let Some(summary) = embodied_now.experience.summary_impression.clone() {
+            impressions.push(summary);
+        }
+        let (direct_sensations, direct_impressions) = derive_direct_impressions_from_now(&now);
+        sensations.extend(direct_sensations);
+        impressions.extend(direct_impressions);
         let mut experiences = derive_direct_experiences(&impressions, &sensations, now.t_ms);
+        let embodied_experience = embodied_now.experience;
         let mut teachings = Vec::new();
         let mut notes = Vec::new();
         if let Some(stuck_values) = now
@@ -3216,6 +3225,8 @@ where
                 combobulation,
             );
         }
+
+        experiences.push(embodied_experience);
 
         let reign_outcome = reign_input.as_ref().map(|input| {
             let accepted_by_conductor = reign_action

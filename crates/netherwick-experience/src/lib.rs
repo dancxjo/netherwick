@@ -1869,6 +1869,40 @@ mod tests {
         );
         assert!(experience.text.starts_with("I see"));
     }
+
+    #[test]
+    fn primary_sensations_from_now_lifts_live_sensor_surfaces() {
+        let mut now = Now::blank(200, BodySense::default());
+        now.eye_frame = Some(netherwick_now::EyeFrame {
+            captured_at_ms: 190,
+            width: 32,
+            height: 24,
+            format: netherwick_now::EyeFrameFormat::Rgb8,
+            bytes: vec![0; 32 * 24 * 3],
+            source: Some("unit-camera".to_string()),
+        });
+        now.ear.asr.transcript = Some("hello".to_string());
+        now.ear.asr.confidence = 0.8;
+        now.range.nearest_m = Some(0.4);
+        now.kinect.depth_m = vec![1.0, 1.2, 1.4, 1.6];
+        now.kinect.depth_width = 2;
+        now.kinect.depth_height = 2;
+
+        let sensations = primary_sensations_from_now(&now);
+
+        assert!(sensations
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::ImageBytes));
+        assert!(sensations
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::SpeechSegment));
+        assert!(sensations
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::LidarScan));
+        assert!(sensations
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::DepthFrame));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2867,6 +2901,233 @@ pub struct EmbodiedDemo {
     pub sensations: Vec<Sensation>,
     pub impressions: Vec<Impression>,
     pub experience: Experience,
+}
+
+pub async fn embody_now(now: &Now) -> Result<EmbodiedNow> {
+    let pipeline = EmbodiedPipeline::new();
+    let mut sensations = Vec::new();
+    let mut impressions = Vec::new();
+
+    for primary in primary_sensations_from_now(now) {
+        let batch = pipeline.ingest_primary(primary).await?;
+        sensations.extend(batch.sensations);
+        impressions.extend(batch.impressions);
+    }
+
+    let experience = ExperienceFuser::new(DEFAULT_WINDOW_MS).fuse(&sensations, &impressions)?;
+    Ok(EmbodiedNow {
+        sensations,
+        impressions,
+        experience,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedNow {
+    pub sensations: Vec<Sensation>,
+    pub impressions: Vec<Impression>,
+    pub experience: Experience,
+}
+
+pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
+    let mut sensations = Vec::new();
+
+    let mut body = Sensation::primary(
+        if now.body.flags.bump_left
+            || now.body.flags.bump_right
+            || now.body.flags.wall
+            || now.body.flags.virtual_wall
+            || now.body.flags.wheel_drop
+        {
+            Modality::Touch
+        } else {
+            Modality::Odometry
+        },
+        SensationSource::new("body"),
+        now.t_ms,
+        now.t_ms,
+        SensationPayload {
+            kind: if now.body.flags.bump_left
+                || now.body.flags.bump_right
+                || now.body.flags.wall
+                || now.body.flags.virtual_wall
+                || now.body.flags.wheel_drop
+            {
+                SensationPayloadKind::ContactEvent
+            } else {
+                SensationPayloadKind::OdometryEvent
+            },
+            value: json!({
+                "battery_level": now.body.battery_level,
+                "charging": now.body.charging,
+                "flags": now.body.flags,
+                "odometry": now.body.odometry,
+                "velocity": now.body.velocity,
+                "cliff_sensors": now.body.cliff_sensors,
+            }),
+        },
+    )
+    .with_summary("I feel the state and motion of my body.");
+    body.metadata.confidence = Some(0.9);
+    sensations.push(body);
+
+    if let Some(frame) = &now.eye_frame {
+        let mut source = SensationSource::new("eye.frame");
+        source.device_id = frame.source.clone();
+        source.frame_id = Some(frame.captured_at_ms.to_string());
+        let mut sensation = Sensation::primary(
+            Modality::Vision,
+            source,
+            frame.captured_at_ms,
+            now.t_ms,
+            SensationPayload::image_metadata(
+                frame.width,
+                frame.height,
+                format!("{:?}", frame.format),
+                frame.bytes.len(),
+            ),
+        )
+        .with_summary("I receive a camera frame.");
+        sensation.metadata.confidence = Some(0.65);
+        sensation.metadata.properties.insert(
+            "raw_bytes_present".to_string(),
+            json!(!frame.bytes.is_empty()),
+        );
+        sensations.push(sensation);
+    } else if !now.eye.frames.is_empty()
+        || !now.eye.image_vectors.is_empty()
+        || !now.eye.scene_vectors.is_empty()
+    {
+        let mut sensation = Sensation::primary(
+            Modality::Vision,
+            SensationSource::new("eye.features"),
+            now.t_ms,
+            now.t_ms,
+            SensationPayload::structured(json!({
+                "frame_feature_sets": now.eye.frames.len(),
+                "image_vectors": now.eye.image_vectors.len(),
+                "image_description_vectors": now.eye.image_description_vectors.len(),
+                "scene_vectors": now.eye.scene_vectors.len(),
+            })),
+        )
+        .with_summary("I have visual features from my eye.");
+        sensation.metadata.confidence = Some(0.55);
+        sensations.push(sensation);
+    }
+
+    if !now.ear.features.is_empty()
+        || now
+            .ear
+            .transcript
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+        || now
+            .ear
+            .asr
+            .transcript
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        let transcript = now
+            .ear
+            .asr
+            .transcript
+            .as_deref()
+            .or(now.ear.transcript.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let mut sensation = Sensation::primary(
+            Modality::Audio,
+            SensationSource::new("ear"),
+            now.ear.asr.start_ms.unwrap_or(now.t_ms),
+            now.ear.asr.end_ms.unwrap_or(now.t_ms),
+            SensationPayload {
+                kind: if transcript.is_some() {
+                    SensationPayloadKind::SpeechSegment
+                } else {
+                    SensationPayloadKind::AudioPcm
+                },
+                value: json!({
+                    "feature_sets": now.ear.features.len(),
+                    "transcript": transcript,
+                    "asr": now.ear.asr,
+                }),
+            },
+        )
+        .with_summary("I hear sound through my ear.");
+        sensation.metadata.duration_ms = now.ear.asr.duration_ms;
+        sensation.metadata.confidence = Some(now.ear.asr.confidence.max(0.35).clamp(0.0, 1.0));
+        sensations.push(sensation);
+    }
+
+    if !now.range.beams.is_empty() || now.range.nearest_m.is_some() {
+        let mut sensation = Sensation::primary(
+            Modality::Lidar,
+            SensationSource::new("range"),
+            now.t_ms,
+            now.t_ms,
+            SensationPayload {
+                kind: SensationPayloadKind::LidarScan,
+                value: json!({
+                    "beam_count": now.range.beams.len(),
+                    "nearest_m": now.range.nearest_m,
+                }),
+            },
+        )
+        .with_summary("I sense nearby distance around me.");
+        sensation.metadata.confidence = Some(0.7);
+        sensations.push(sensation);
+    }
+
+    if !now.kinect.depth_m.is_empty() {
+        let mut sensation = Sensation::primary(
+            Modality::Depth,
+            SensationSource::new("kinect.depth"),
+            now.t_ms,
+            now.t_ms,
+            SensationPayload {
+                kind: SensationPayloadKind::DepthFrame,
+                value: json!({
+                    "sample_count": now.kinect.depth_m.len(),
+                    "width": now.kinect.depth_width,
+                    "height": now.kinect.depth_height,
+                    "min_depth_m": now.kinect.min_depth_m,
+                    "max_depth_m": now.kinect.max_depth_m,
+                    "coordinate_system": now.kinect.depth_coordinate_system,
+                    "skeleton_count": now.kinect.skeletons.len(),
+                }),
+            },
+        )
+        .with_summary("I sense depth and surfaces ahead of me.");
+        sensation.metadata.confidence = Some(0.65);
+        sensations.push(sensation);
+    }
+
+    if now.memory.similar_situation_count > 0
+        || now.memory.remembered_warning.is_some()
+        || now.memory.graph_context_summary.is_some()
+    {
+        let mut sensation = Sensation::primary(
+            Modality::Memory,
+            SensationSource::new("memory"),
+            now.t_ms,
+            now.t_ms,
+            SensationPayload {
+                kind: SensationPayloadKind::MemoryRecall,
+                value: json!({
+                    "similar_situation_count": now.memory.similar_situation_count,
+                    "remembered_warning": now.memory.remembered_warning,
+                    "graph_context_summary": now.memory.graph_context_summary,
+                    "remembered_entities": now.memory.remembered_entities,
+                }),
+            },
+        )
+        .with_summary("I remember related context for this moment.");
+        sensation.metadata.confidence = Some(0.6);
+        sensations.push(sensation);
+    }
+
+    sensations
 }
 
 fn fuse_vectors(sensations: &[Sensation], generated_at_ms: TimeMs) -> Option<VectorEmbedding> {
