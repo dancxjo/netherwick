@@ -466,10 +466,8 @@ impl PlaceMemory {
                     continue;
                 }
                 let similarity = cosine_similarity(&query.vector, &stored.artifact.vector);
-                let confidence = (similarity
-                    * cell.confidence.max(0.2)
-                    * (cell.visit_count as f32 / 2.0).clamp(0.5, 1.0))
-                .clamp(0.0, 1.0);
+                let confidence =
+                    (similarity * (0.5 + cell.confidence.clamp(0.0, 1.0) * 0.5)).clamp(0.0, 1.0);
                 if confidence < min_confidence {
                     continue;
                 }
@@ -1201,19 +1199,20 @@ impl Recall for InMemoryExperienceStore {
             remembered_relationships,
             graph_context_summary,
         };
+        let place_query_vectors = place_query_vectors_from_query(&query);
         let (semantic_map, place_recognition_candidates) = {
             let places = self.places.lock().expect("place memory mutex poisoned");
             let current_key = query.pose.map(|pose| places.quantize(pose.x_m, pose.y_m));
             let semantic_map = current_key.map(|key| {
                 places.semantic_overlay_with_query(
                     Some(key),
-                    &query.scene_vectors,
+                    &place_query_vectors,
                     PLACE_RECOGNITION_MIN_CONFIDENCE,
                 )
             });
             let candidates = places.recognize_places(
                 current_key,
-                &query.scene_vectors,
+                &place_query_vectors,
                 PLACE_RECOGNITION_MIN_CONFIDENCE,
                 5,
             );
@@ -2400,6 +2399,18 @@ fn query_scene_vectors(query: &RecallQuery) -> Vec<&[f32]> {
     vectors
 }
 
+fn place_query_vectors_from_query(query: &RecallQuery) -> Vec<VectorArtifact> {
+    let mut vectors = query.scene_vectors.clone();
+    if let Some(vector) = &query.scene_vector {
+        vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "query:legacy-scene-vector",
+            vector.clone(),
+        ));
+    }
+    vectors
+}
+
 fn query_face_vectors(query: &RecallQuery) -> Vec<&[f32]> {
     let mut vectors = query
         .face_vector_artifacts
@@ -3221,8 +3232,12 @@ mod tests {
         );
         let mut unrelated = now_at(200, 4.0, 1.0);
         unrelated.eye.scene_vectors.push(
-            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-unrelated", vec![0.0, 1.0, 0.0])
-                .with_source_frame_id(unrelated_frame_id.to_string()),
+            VectorArtifact::new(
+                SCENE_VECTOR_COLLECTION,
+                "scene-unrelated",
+                vec![0.0, 1.0, 0.0],
+            )
+            .with_source_frame_id(unrelated_frame_id.to_string()),
         );
         memory.observe_now(&first);
         memory.observe_now(&first);
@@ -3242,7 +3257,10 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].source_vector_id, "scene-first");
-        assert!(matches!(candidates[0].kind, PlaceRecognitionKind::SamePlace));
+        assert!(matches!(
+            candidates[0].kind,
+            PlaceRecognitionKind::SamePlace
+        ));
         assert!(candidates[0].similarity > 0.99);
         assert!(candidates[0].confidence >= PLACE_RECOGNITION_MIN_CONFIDENCE);
         assert_eq!(
