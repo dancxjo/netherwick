@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "baseline_report_path": "data/reports/golden-column-trap.json",
+  "candidate_report_path": "data/reports/golden-column-trap-model-assisted.json",
+  "baseline_scenario": "column-trap",
+  "candidate_scenario": "column-trap",
+  "baseline_episodes": 20,
+  "candidate_episodes": 5,
+  "compared_metrics": {
+    "success_rate": {
+      "baseline": 1.0,
+      "candidate": 1.0,
+      "delta": 0.0,
+      "regression": false
+    },
+    "collision_rate": {
+      "baseline": 0.016666668,
+      "candidate": 0.016666668,
+      "delta": 0.0,
+      "regression": false
+    },
+    "mean_collisions_per_episode": {
+      "baseline": 5.0,
+      "candidate": 5.0,
+      "delta": 0.0,
+      "regression": false
+    },
+    "mean_safety_interventions": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "regression": false
+    },
+    "model_fallbacks": {
+      "baseline": 20.0,
+      "candidate": 5.0,
+      "delta": -15.0,
+      "regression": false
+    },
+    "action_selector_fallbacks": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "regression": false
+    },
+    "action_selector_guard_yields": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "regression": false
+    },
+    "mean_battery_delta": {
+      "baseline": -0.8646022,
+      "candidate": -0.8719021,
+      "delta": -0.0072999,
+      "regression": false
+    },
+    "stuck_count": {
+      "baseline": 580.0,
+      "candidate": 140.0,
+      "delta": -440.0,
+      "regression": false
+    },
+    "recovery_attempts": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "regression": false
+    },
+    "repeated_trap_count": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "regression": false
+    },
+    "recovery_success_rate": {
+      "baseline": 0.96551716,
+      "candidate": 0.96428573,
+      "delta": -0.001231432,
+      "regression": false
+    },
+    "mean_recovery_ticks": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "regression": false
+    },
+    "mean_stuck_duration": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "regression": false
+    }
+  },
+  "deltas": {
+    "recovery_attempts": 0.0,
+    "action_selector_guard_yields": 0.0,
+    "repeated_trap_count": 0.0,
+    "action_selector_fallbacks": 0.0,
+    "mean_recovery_ticks": 0.0,
+    "mean_stuck_duration": 0.0,
+    "mean_collisions_per_episode": 0.0,
+    "recovery_success_rate": -0.001231432,
+    "collision_rate": 0.0,
+    "mean_safety_interventions": 0.0,
+    "success_rate": 0.0,
+    "model_fallbacks": -15.0,
+    "mean_battery_delta": -0.0072999,
+    "stuck_count": -440.0
+  },
+  "recommendation": "needs_more_eval",
+  "warnings": [
+    "episode count mismatch: baseline=20 candidate=5"
+  ]
+}

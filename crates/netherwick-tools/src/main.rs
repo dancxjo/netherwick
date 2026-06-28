@@ -905,6 +905,8 @@ struct ModelRegisterArgs {
     #[arg(long)]
     scenario_report: Option<String>,
     #[arg(long)]
+    comparison_report: Option<String>,
+    #[arg(long)]
     name: String,
     #[arg(long)]
     notes: Vec<String>,
@@ -928,6 +930,8 @@ struct ModelPromoteArgs {
     baseline_report: Option<String>,
     #[arg(long)]
     candidate_report: Option<String>,
+    #[arg(long)]
+    comparison_report: Option<String>,
     #[arg(long, default_value = "data/models/registry.json")]
     registry: String,
     #[arg(long)]
@@ -942,6 +946,10 @@ struct CompareScenarioReportsArgs {
     baseline: String,
     #[arg(long)]
     candidate: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    out: Option<String>,
 }
 
 async fn run_sim(args: SimArgs) -> Result<()> {
@@ -6031,6 +6039,8 @@ struct ModelTrainingRecord {
 struct ModelReportRecord {
     behavior: Option<String>,
     scenario: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -6065,28 +6075,63 @@ impl ModelStatus {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ScenarioReportComparison {
-    outcome: ComparisonOutcome,
-    success_rate_delta: f32,
-    collision_rate_delta: f32,
-    battery_delta_delta: f32,
-    fallback_delta: isize,
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ScenarioComparisonReport {
+    schema_version: u32,
+    baseline_report_path: String,
+    candidate_report_path: String,
+    baseline_scenario: String,
+    candidate_scenario: String,
+    baseline_episodes: usize,
+    candidate_episodes: usize,
+    compared_metrics: ScenarioComparisonMetrics,
+    deltas: HashMap<String, f32>,
+    recommendation: ScenarioComparisonRecommendation,
+    warnings: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ComparisonOutcome {
-    Improved,
-    Regressed,
-    Inconclusive,
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioComparisonMetrics {
+    success_rate: MetricComparison,
+    collision_rate: MetricComparison,
+    mean_collisions_per_episode: MetricComparison,
+    mean_safety_interventions: MetricComparison,
+    model_fallbacks: MetricComparison,
+    action_selector_fallbacks: MetricComparison,
+    action_selector_guard_yields: MetricComparison,
+    mean_battery_delta: MetricComparison,
+    stuck_count: MetricComparison,
+    recovery_attempts: MetricComparison,
+    repeated_trap_count: MetricComparison,
+    recovery_success_rate: MetricComparison,
+    mean_recovery_ticks: MetricComparison,
+    mean_stuck_duration: MetricComparison,
 }
 
-impl ComparisonOutcome {
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct MetricComparison {
+    baseline: Option<f32>,
+    candidate: Option<f32>,
+    delta: Option<f32>,
+    regression: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScenarioComparisonRecommendation {
+    PassCandidate,
+    NeedsMoreEval,
+    RegressionDetected,
+    InsufficientData,
+}
+
+impl ScenarioComparisonRecommendation {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Improved => "improved",
-            Self::Regressed => "regressed",
-            Self::Inconclusive => "inconclusive",
+            Self::PassCandidate => "pass_candidate",
+            Self::NeedsMoreEval => "needs_more_eval",
+            Self::RegressionDetected => "regression_detected",
+            Self::InsufficientData => "insufficient_data",
         }
     }
 }
@@ -6166,6 +6211,7 @@ fn model_register(args: ModelRegisterArgs) -> Result<()> {
         reports: ModelReportRecord {
             behavior: args.behavior_report,
             scenario: args.scenario_report,
+            comparison: args.comparison_report,
         },
         scenario_names: scenario_report
             .as_ref()
@@ -6217,8 +6263,20 @@ fn model_promote(args: ModelPromoteArgs) -> Result<()> {
         .as_deref()
         .map(load_scenario_report)
         .transpose()?;
-    let comparison = match (&baseline_report, &candidate_report) {
-        (Some(baseline), Some(candidate)) => Some(compare_scenario_reports(baseline, candidate)),
+    let comparison_report = args
+        .comparison_report
+        .as_deref()
+        .or_else(|| registry.entries[index].reports.comparison.as_deref())
+        .map(load_scenario_comparison_report)
+        .transpose()?;
+    let comparison = match (&comparison_report, &baseline_report, &candidate_report) {
+        (Some(comparison), _, _) => Some(comparison.clone()),
+        (None, Some(baseline), Some(candidate)) => Some(compare_scenario_reports(
+            args.baseline_report.as_deref().unwrap_or("baseline"),
+            candidate_path.as_deref().unwrap_or("candidate"),
+            baseline,
+            candidate,
+        )),
         _ => None,
     };
     let decision = promotion_gate(
@@ -6251,6 +6309,9 @@ fn model_promote(args: ModelPromoteArgs) -> Result<()> {
         if let Some(path) = args.candidate_report {
             entry.reports.scenario = Some(path);
         }
+        if let Some(path) = args.comparison_report {
+            entry.reports.comparison = Some(path);
+        }
         if let Some(report) = candidate_report {
             entry.scenario_names = vec![report.scenario.clone()];
             entry.metrics.scenario_success_rate = Some(report.summary.success_rate);
@@ -6276,8 +6337,14 @@ fn model_promote(args: ModelPromoteArgs) -> Result<()> {
 fn compare_scenario_reports_command(args: CompareScenarioReportsArgs) -> Result<()> {
     let baseline = load_scenario_report(&args.baseline)?;
     let candidate = load_scenario_report(&args.candidate)?;
-    let comparison = compare_scenario_reports(&baseline, &candidate);
+    let comparison =
+        compare_scenario_reports(&args.baseline, &args.candidate, &baseline, &candidate);
+    let out = args.out.unwrap_or_else(|| {
+        default_comparison_report_path(args.name.as_deref(), &baseline, &candidate)
+    });
+    write_scenario_comparison_report(Path::new(&out), &comparison)?;
     print_scenario_comparison(&comparison);
+    println!("comparison report written: {out}");
     Ok(())
 }
 
@@ -6308,51 +6375,321 @@ fn load_scenario_report(path: &str) -> Result<ScenarioEvaluationReport> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+fn load_scenario_comparison_report(path: &str) -> Result<ScenarioComparisonReport> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_scenario_comparison_report(path: &Path, report: &ScenarioComparisonReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(path, serde_json::to_vec_pretty(report)?)?;
+    Ok(())
+}
+
 fn compare_scenario_reports(
+    baseline_path: &str,
+    candidate_path: &str,
     baseline: &ScenarioEvaluationReport,
     candidate: &ScenarioEvaluationReport,
-) -> ScenarioReportComparison {
-    let success_rate_delta = candidate.summary.success_rate - baseline.summary.success_rate;
-    let collision_rate_delta = candidate.summary.collision_rate - baseline.summary.collision_rate;
-    let battery_delta_delta =
-        candidate.summary.mean_battery_delta - baseline.summary.mean_battery_delta;
-    let fallback_delta =
-        candidate.summary.model_fallbacks as isize - baseline.summary.model_fallbacks as isize;
-    let outcome =
-        if baseline.scenario != candidate.scenario || baseline.episodes != candidate.episodes {
-            ComparisonOutcome::Inconclusive
-        } else if success_rate_delta < -0.01
-            || collision_rate_delta > 0.005
-            || battery_delta_delta < -0.02
-            || fallback_delta > 0
-        {
-            ComparisonOutcome::Regressed
-        } else if success_rate_delta > 0.01
-            || collision_rate_delta < -0.005
-            || battery_delta_delta > 0.02
-        {
-            ComparisonOutcome::Improved
-        } else {
-            ComparisonOutcome::Inconclusive
-        };
-    ScenarioReportComparison {
-        outcome,
-        success_rate_delta,
-        collision_rate_delta,
-        battery_delta_delta,
-        fallback_delta,
+) -> ScenarioComparisonReport {
+    let metrics = ScenarioComparisonMetrics {
+        success_rate: metric_cmp(
+            Some(baseline.summary.success_rate),
+            Some(candidate.summary.success_rate),
+            RegressionDirection::LowerIsWorse,
+            0.01,
+        ),
+        collision_rate: metric_cmp(
+            Some(baseline.summary.collision_rate),
+            Some(candidate.summary.collision_rate),
+            RegressionDirection::HigherIsWorse,
+            0.005,
+        ),
+        mean_collisions_per_episode: metric_cmp(
+            Some(baseline.summary.mean_collisions_per_episode),
+            Some(candidate.summary.mean_collisions_per_episode),
+            RegressionDirection::HigherIsWorse,
+            0.05,
+        ),
+        mean_safety_interventions: metric_cmp(
+            Some(baseline.summary.mean_safety_interventions),
+            Some(candidate.summary.mean_safety_interventions),
+            RegressionDirection::HigherIsWorse,
+            0.05,
+        ),
+        model_fallbacks: metric_cmp(
+            Some(baseline.summary.model_fallbacks as f32),
+            Some(candidate.summary.model_fallbacks as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        action_selector_fallbacks: metric_cmp(
+            Some(baseline.summary.action_selector_fallbacks as f32),
+            Some(candidate.summary.action_selector_fallbacks as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        action_selector_guard_yields: metric_cmp(
+            Some(baseline.summary.action_selector_guard_yields as f32),
+            Some(candidate.summary.action_selector_guard_yields as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        mean_battery_delta: metric_cmp(
+            Some(baseline.summary.mean_battery_delta),
+            Some(candidate.summary.mean_battery_delta),
+            RegressionDirection::LowerIsWorse,
+            0.02,
+        ),
+        stuck_count: metric_cmp(
+            Some(baseline.summary.stuck_count as f32),
+            Some(candidate.summary.stuck_count as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        recovery_attempts: metric_cmp(
+            Some(baseline.summary.recovery_attempts as f32),
+            Some(candidate.summary.recovery_attempts as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        repeated_trap_count: metric_cmp(
+            Some(baseline.summary.repeated_trap_count as f32),
+            Some(candidate.summary.repeated_trap_count as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        recovery_success_rate: metric_cmp(
+            baseline.summary.recovery_success_rate,
+            candidate.summary.recovery_success_rate,
+            RegressionDirection::LowerIsWorse,
+            0.05,
+        ),
+        mean_recovery_ticks: metric_cmp(
+            baseline.summary.mean_recovery_ticks,
+            candidate.summary.mean_recovery_ticks,
+            RegressionDirection::HigherIsWorse,
+            1.0,
+        ),
+        mean_stuck_duration: metric_cmp(
+            baseline.summary.mean_stuck_duration,
+            candidate.summary.mean_stuck_duration,
+            RegressionDirection::HigherIsWorse,
+            50.0,
+        ),
+    };
+    let mut warnings = comparison_warnings(baseline, candidate, &metrics);
+    let recommendation = comparison_recommendation(baseline, candidate, &metrics, &warnings);
+    if matches!(
+        recommendation,
+        ScenarioComparisonRecommendation::NeedsMoreEval
+    ) && baseline.episodes < 10
+    {
+        warnings.push(format!(
+            "candidate has only {} episodes; run at least 10 for promotion confidence",
+            candidate.episodes
+        ));
+    }
+    let deltas = comparison_deltas(&metrics);
+    ScenarioComparisonReport {
+        schema_version: 1,
+        baseline_report_path: baseline_path.to_string(),
+        candidate_report_path: candidate_path.to_string(),
+        baseline_scenario: baseline.scenario.clone(),
+        candidate_scenario: candidate.scenario.clone(),
+        baseline_episodes: baseline.episodes,
+        candidate_episodes: candidate.episodes,
+        compared_metrics: metrics,
+        deltas,
+        recommendation,
+        warnings,
     }
 }
 
-fn print_scenario_comparison(comparison: &ScenarioReportComparison) {
-    println!("comparison: {}", comparison.outcome.as_str());
-    println!("success_rate_delta: {:.6}", comparison.success_rate_delta);
-    println!(
-        "collision_rate_delta: {:.6}",
-        comparison.collision_rate_delta
-    );
-    println!("battery_delta_delta: {:.6}", comparison.battery_delta_delta);
-    println!("fallback_delta: {}", comparison.fallback_delta);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegressionDirection {
+    HigherIsWorse,
+    LowerIsWorse,
+}
+
+fn metric_cmp(
+    baseline: Option<f32>,
+    candidate: Option<f32>,
+    direction: RegressionDirection,
+    tolerance: f32,
+) -> MetricComparison {
+    let delta = baseline
+        .zip(candidate)
+        .map(|(baseline, candidate)| candidate - baseline);
+    let regression = delta
+        .map(|delta| match direction {
+            RegressionDirection::HigherIsWorse => delta > tolerance,
+            RegressionDirection::LowerIsWorse => delta < -tolerance,
+        })
+        .unwrap_or(false);
+    MetricComparison {
+        baseline,
+        candidate,
+        delta,
+        regression,
+    }
+}
+
+fn comparison_warnings(
+    baseline: &ScenarioEvaluationReport,
+    candidate: &ScenarioEvaluationReport,
+    metrics: &ScenarioComparisonMetrics,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if baseline.scenario != candidate.scenario {
+        warnings.push(format!(
+            "scenario mismatch: baseline={} candidate={}",
+            baseline.scenario, candidate.scenario
+        ));
+    }
+    if baseline.episodes != candidate.episodes {
+        warnings.push(format!(
+            "episode count mismatch: baseline={} candidate={}",
+            baseline.episodes, candidate.episodes
+        ));
+    }
+    for (name, metric) in [
+        ("success_rate", &metrics.success_rate),
+        ("collision_rate", &metrics.collision_rate),
+        (
+            "mean_collisions_per_episode",
+            &metrics.mean_collisions_per_episode,
+        ),
+        (
+            "mean_safety_interventions",
+            &metrics.mean_safety_interventions,
+        ),
+        ("model_fallbacks", &metrics.model_fallbacks),
+        (
+            "action_selector_fallbacks",
+            &metrics.action_selector_fallbacks,
+        ),
+        (
+            "action_selector_guard_yields",
+            &metrics.action_selector_guard_yields,
+        ),
+        ("mean_battery_delta", &metrics.mean_battery_delta),
+        ("stuck_count", &metrics.stuck_count),
+        ("recovery_attempts", &metrics.recovery_attempts),
+        ("repeated_trap_count", &metrics.repeated_trap_count),
+        ("recovery_success_rate", &metrics.recovery_success_rate),
+        ("mean_recovery_ticks", &metrics.mean_recovery_ticks),
+        ("mean_stuck_duration", &metrics.mean_stuck_duration),
+    ] {
+        if metric.regression {
+            warnings.push(format!(
+                "{name} regressed by {:.4}",
+                metric.delta.unwrap_or_default()
+            ));
+        }
+    }
+    warnings
+}
+
+fn comparison_recommendation(
+    baseline: &ScenarioEvaluationReport,
+    candidate: &ScenarioEvaluationReport,
+    metrics: &ScenarioComparisonMetrics,
+    warnings: &[String],
+) -> ScenarioComparisonRecommendation {
+    if baseline.episodes < 3 || candidate.episodes < 3 {
+        return ScenarioComparisonRecommendation::InsufficientData;
+    }
+    if warnings.iter().any(|warning| warning.contains("regressed")) {
+        return ScenarioComparisonRecommendation::RegressionDetected;
+    }
+    if baseline.scenario != candidate.scenario {
+        return ScenarioComparisonRecommendation::NeedsMoreEval;
+    }
+    if candidate.episodes < 10 {
+        return ScenarioComparisonRecommendation::NeedsMoreEval;
+    }
+    if metrics.success_rate.delta.unwrap_or_default() >= -0.01
+        && metrics.collision_rate.delta.unwrap_or_default() <= 0.005
+        && metrics.mean_battery_delta.delta.unwrap_or_default() >= -0.02
+    {
+        ScenarioComparisonRecommendation::PassCandidate
+    } else {
+        ScenarioComparisonRecommendation::NeedsMoreEval
+    }
+}
+
+fn comparison_deltas(metrics: &ScenarioComparisonMetrics) -> HashMap<String, f32> {
+    let mut deltas = HashMap::new();
+    for (name, metric) in [
+        ("success_rate", &metrics.success_rate),
+        ("collision_rate", &metrics.collision_rate),
+        (
+            "mean_collisions_per_episode",
+            &metrics.mean_collisions_per_episode,
+        ),
+        (
+            "mean_safety_interventions",
+            &metrics.mean_safety_interventions,
+        ),
+        ("model_fallbacks", &metrics.model_fallbacks),
+        (
+            "action_selector_fallbacks",
+            &metrics.action_selector_fallbacks,
+        ),
+        (
+            "action_selector_guard_yields",
+            &metrics.action_selector_guard_yields,
+        ),
+        ("mean_battery_delta", &metrics.mean_battery_delta),
+        ("stuck_count", &metrics.stuck_count),
+        ("recovery_attempts", &metrics.recovery_attempts),
+        ("repeated_trap_count", &metrics.repeated_trap_count),
+        ("recovery_success_rate", &metrics.recovery_success_rate),
+        ("mean_recovery_ticks", &metrics.mean_recovery_ticks),
+        ("mean_stuck_duration", &metrics.mean_stuck_duration),
+    ] {
+        if let Some(delta) = metric.delta {
+            deltas.insert(name.to_string(), delta);
+        }
+    }
+    deltas
+}
+
+fn default_comparison_report_path(
+    name: Option<&str>,
+    baseline: &ScenarioEvaluationReport,
+    candidate: &ScenarioEvaluationReport,
+) -> String {
+    let name = name
+        .map(safe_report_name)
+        .unwrap_or_else(|| format!("{}-{}-candidate", baseline.scenario, candidate.scenario));
+    format!("data/reports/comparisons/{name}.json")
+}
+
+fn safe_report_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn print_scenario_comparison(comparison: &ScenarioComparisonReport) {
+    println!("recommendation: {}", comparison.recommendation.as_str());
+    for (name, delta) in &comparison.deltas {
+        println!("{name}_delta: {delta:.6}");
+    }
+    for warning in &comparison.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -6366,7 +6703,7 @@ fn promotion_gate(
     target: ModelStatus,
     baseline: Option<&ScenarioEvaluationReport>,
     candidate: Option<&ScenarioEvaluationReport>,
-    comparison: Option<&ScenarioReportComparison>,
+    comparison: Option<&ScenarioComparisonReport>,
     allow_safety_critical_inference: bool,
 ) -> PromotionGateDecision {
     let mut warnings = Vec::new();
@@ -6428,7 +6765,7 @@ fn promotion_gate(
         ));
     }
     if let Some(comparison) = comparison {
-        if comparison.outcome == ComparisonOutcome::Regressed {
+        if comparison.recommendation == ScenarioComparisonRecommendation::RegressionDetected {
             warnings.push("candidate scenario report regressed against baseline".to_string());
         }
     } else if baseline.is_none() && is_safety_critical_behavior(&entry.behavior) {
@@ -6438,10 +6775,20 @@ fn promotion_gate(
     match entry.behavior {
         TrainableBehavior::Danger => {
             if let Some(comparison) = comparison {
-                if comparison.collision_rate_delta > 0.002 {
+                if comparison
+                    .compared_metrics
+                    .collision_rate
+                    .delta
+                    .unwrap_or_default()
+                    > 0.002
+                {
                     warnings.push(format!(
                         "danger collision rate worse than baseline by {:.4}",
-                        comparison.collision_rate_delta
+                        comparison
+                            .compared_metrics
+                            .collision_rate
+                            .delta
+                            .unwrap_or_default()
                     ));
                 }
             }
@@ -7396,8 +7743,18 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
     let candidate_report = load_scenario_report(&candidate_report_path.to_string_lossy())?;
 
     // Compare scenario reports
-    let comparison = compare_scenario_reports(&baseline_report, &candidate_report);
-    println!("Evaluation comparison result: {:?}", comparison.outcome);
+    let comparison_report_path = Path::new(&args.out_dir).join("comparison-scenario.json");
+    let comparison = compare_scenario_reports(
+        &baseline_report_path.to_string_lossy(),
+        &candidate_report_path.to_string_lossy(),
+        &baseline_report,
+        &candidate_report,
+    );
+    write_scenario_comparison_report(&comparison_report_path, &comparison)?;
+    println!(
+        "Evaluation comparison recommendation: {}",
+        comparison.recommendation.as_str()
+    );
 
     // 4. Update/register models and run promotion gates
     let registry_path = Path::new("data/models/registry.json");
@@ -7420,6 +7777,7 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
             training_command: Some("just train virtual".to_string()),
             behavior_report: Some(behavior_report.to_string_lossy().to_string()),
             scenario_report: Some(candidate_report_path.to_string_lossy().to_string()),
+            comparison_report: Some(comparison_report_path.to_string_lossy().to_string()),
             name: name.clone(),
             notes: vec!["Automatically trained via virtual pipeline".to_string()],
             parent: None,
@@ -7483,6 +7841,7 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
                 target: new_status,
                 baseline_report: Some(baseline_report_path.to_string_lossy().to_string()),
                 candidate_report: Some(candidate_report_path.to_string_lossy().to_string()),
+                comparison_report: Some(comparison_report_path.to_string_lossy().to_string()),
                 registry: registry_path.to_string_lossy().to_string(),
                 allow_safety_critical_inference: args.allow_safety_critical_inference,
                 notes: vec!["Automatically promoted via virtual pipeline".to_string()],
@@ -7514,7 +7873,9 @@ async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
         timestamp: Utc::now().to_rfc3339(),
         run_report,
         models: model_statuses,
-        warnings: if comparison.outcome == ComparisonOutcome::Regressed {
+        warnings: if comparison.recommendation
+            == ScenarioComparisonRecommendation::RegressionDetected
+        {
             vec![
                 "Candidate models overall regressed on MixedRoom scenario against baseline"
                     .to_string(),
@@ -8049,6 +8410,52 @@ mod tests {
         }
     }
 
+    fn scenario_report_for_comparison(
+        scenario: &str,
+        episodes: usize,
+        success_rate: f32,
+        collision_rate: f32,
+        mean_battery_delta: f32,
+        model_fallbacks: usize,
+    ) -> ScenarioEvaluationReport {
+        ScenarioEvaluationReport {
+            schema_version: 1,
+            scenario: scenario.to_string(),
+            base_seed: 7,
+            episodes,
+            steps_per_episode: 100,
+            tick_ms: 100,
+            action_selector_mode: "baseline".to_string(),
+            model_modes: HashMap::new(),
+            model_loading: RuntimeModelLoadReport::default(),
+            ledger: None,
+            capture_root: None,
+            summary: ScenarioEvaluationSummary {
+                success_rate,
+                collision_rate,
+                mean_collisions_per_episode: collision_rate * episodes as f32,
+                mean_battery_delta,
+                mean_final_battery: 0.5,
+                mean_distance_to_charger_final_m: None,
+                mean_nearest_obstacle_m: None,
+                mean_distance_traveled_m: 1.0,
+                mean_ticks_survived: 100.0,
+                mean_safety_interventions: 0.0,
+                behavior_run_records: 0,
+                model_fallbacks,
+                model_assisted_decisions: 0,
+                action_selector_safety_overrides: 0,
+                mean_chosen_score: None,
+                mean_candidate_score: None,
+                ..ScenarioEvaluationSummary::default()
+            },
+            memory: None,
+            episodes_detail: Vec::new(),
+            recommendation: "pass".to_string(),
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn scenario_report_round_trips_json() {
         let report = ScenarioEvaluationReport {
@@ -8073,6 +8480,93 @@ mod tests {
         let decoded: ScenarioEvaluationReport = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.scenario, "empty-room");
         assert_eq!(decoded.schema_version, 1);
+    }
+
+    #[test]
+    fn scenario_comparison_recommends_pass_candidate() {
+        let baseline = scenario_report_for_comparison("column-trap", 10, 0.7, 0.2, -0.02, 0);
+        let candidate = scenario_report_for_comparison("column-trap", 10, 0.8, 0.15, 0.01, 0);
+
+        let comparison =
+            compare_scenario_reports("baseline.json", "candidate.json", &baseline, &candidate);
+
+        assert_eq!(
+            comparison.recommendation,
+            ScenarioComparisonRecommendation::PassCandidate
+        );
+        assert_eq!(comparison.baseline_report_path, "baseline.json");
+        assert!(
+            comparison
+                .deltas
+                .get("success_rate")
+                .copied()
+                .unwrap_or_default()
+                > 0.0
+        );
+        assert!(comparison.warnings.is_empty());
+    }
+
+    #[test]
+    fn scenario_comparison_detects_regression() {
+        let baseline = scenario_report_for_comparison("column-trap", 10, 0.8, 0.1, 0.02, 0);
+        let candidate = scenario_report_for_comparison("column-trap", 10, 0.7, 0.3, -0.05, 2);
+
+        let comparison =
+            compare_scenario_reports("baseline.json", "candidate.json", &baseline, &candidate);
+
+        assert_eq!(
+            comparison.recommendation,
+            ScenarioComparisonRecommendation::RegressionDetected
+        );
+        assert!(comparison.compared_metrics.collision_rate.regression);
+        assert!(comparison.compared_metrics.model_fallbacks.regression);
+        assert!(comparison
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("collision_rate regressed")));
+    }
+
+    #[test]
+    fn scenario_comparison_reports_insufficient_data() {
+        let baseline = scenario_report_for_comparison("column-trap", 2, 0.8, 0.1, 0.0, 0);
+        let candidate = scenario_report_for_comparison("column-trap", 2, 0.8, 0.1, 0.0, 0);
+
+        let comparison =
+            compare_scenario_reports("baseline.json", "candidate.json", &baseline, &candidate);
+
+        assert_eq!(
+            comparison.recommendation,
+            ScenarioComparisonRecommendation::InsufficientData
+        );
+    }
+
+    #[test]
+    fn scenario_comparison_report_writes_json_artifact() {
+        let baseline = scenario_report_for_comparison("column-trap", 10, 0.7, 0.2, -0.02, 0);
+        let candidate = scenario_report_for_comparison("column-trap", 10, 0.8, 0.15, 0.01, 0);
+        let comparison =
+            compare_scenario_reports("baseline.json", "candidate.json", &baseline, &candidate);
+        let root = temp_path("netherwick_comparison_report");
+        let out = root.join("data/reports/comparisons/column-trap.json");
+
+        write_scenario_comparison_report(&out, &comparison).unwrap();
+        let decoded = load_scenario_comparison_report(&out.to_string_lossy()).unwrap();
+
+        assert_eq!(
+            decoded.recommendation,
+            ScenarioComparisonRecommendation::PassCandidate
+        );
+        assert!(
+            (decoded
+                .compared_metrics
+                .success_rate
+                .delta
+                .unwrap_or_default()
+                - 0.1)
+                .abs()
+                < 0.001
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
