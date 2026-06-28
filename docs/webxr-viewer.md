@@ -31,6 +31,7 @@ Open:
 - `http://127.0.0.1:8787/view` for the original 2D panel.
 - `http://127.0.0.1:8787/view/3d` for the 3D Instant view.
 - `http://127.0.0.1:8787/view/scene` for the compact scene JSON packet.
+- `http://127.0.0.1:8787/api/experience/lineage` for the current embodied lineage graph payload.
 
 ## WebXR Mode
 

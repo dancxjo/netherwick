@@ -66,6 +66,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/view/snapshot",
     "/view/embodied",
     "/view/embodied/graph",
+    "/api/experience/lineage",
     "/view/scene",
     "/view/map",
     "/view/experience-forge",
@@ -1305,6 +1306,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view/snapshot", get(get_live_snapshot))
         .route("/view/embodied", get(get_live_embodied))
         .route("/view/embodied/graph", get(get_live_embodied_graph))
+        .route("/api/experience/lineage", get(get_live_embodied_graph))
         .route("/debug/embodied", get(get_live_embodied))
         .route("/debug/embodied/graph", get(get_live_embodied_graph))
         .route("/view/scene", get(get_live_scene))
@@ -5350,7 +5352,7 @@ function renderGraph(){
 }
 async function refreshGraph(){
   try{
-    const response = await fetch('/view/embodied/graph', {cache:'no-store'});
+    const response = await fetch('/api/experience/lineage', {cache:'no-store'});
     if(!response.ok) throw new Error(await response.text());
     latestGraph = await response.json();
     renderGraph();
@@ -9171,13 +9173,14 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/view/map"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/embodied"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/embodied/graph"));
+        assert!(HTTP_ENDPOINTS.contains(&"/api/experience/lineage"));
         assert!(HTTP_ENDPOINTS.contains(&"/debug/embodied"));
         assert!(HTTP_ENDPOINTS.contains(&"/debug/embodied/graph"));
         assert!(HTTP_ENDPOINTS.contains(&"/models"));
         assert!(HTTP_ENDPOINTS.contains(&"/stream/llm"));
         let Html(live_page) = live_view_page().await;
         assert!(live_page.contains("Embodied lineage"));
-        assert!(live_page.contains("/view/embodied/graph"));
+        assert!(live_page.contains("/api/experience/lineage"));
         assert!(live_page.contains("graph_query"));
         assert!(live_page.contains("graph_modality"));
         let Html(page) = live_view_3d_page().await;
