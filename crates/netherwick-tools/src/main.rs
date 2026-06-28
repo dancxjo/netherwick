@@ -753,6 +753,10 @@ struct TrainExperienceArgs {
 struct TrainLatentRoundTripArgs {
     #[arg(long, default_value = "data/ledger")]
     ledger: String,
+    #[arg(long)]
+    forge_checkpoint: Option<String>,
+    #[arg(long)]
+    forge_log: Option<String>,
     #[arg(long, default_value_t = 5)]
     epochs: usize,
     #[arg(long, default_value = "data/models/latent_round_trip_v0")]
@@ -5943,6 +5947,8 @@ async fn train_behavior_command(args: TrainBehaviorArgs) -> Result<()> {
 async fn run_train_latent_round_trip(args: TrainLatentRoundTripArgs) -> Result<()> {
     let report = train_latent_round_trip(TrainLatentRoundTripRequest {
         ledger_path: args.ledger.into(),
+        forge_checkpoint_path: args.forge_checkpoint.map(Into::into),
+        forge_log_path: args.forge_log.map(Into::into),
         checkpoint_path: args.checkpoint.clone().into(),
         report_path: args.report.clone().into(),
         epochs: args.epochs,

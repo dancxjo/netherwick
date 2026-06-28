@@ -1,0 +1,2154 @@
+{
+  "schema_version": 1,
+  "ledger": "data/ledger/sim1",
+  "frame_count": 400,
+  "checkpoint_path": "data/models/experience_forge/issue25-sim1/forge.json",
+  "log_path": "data/reports/experience-forge/issue25-sim1.jsonl",
+  "snapshot": {
+    "t_ms": 19907,
+    "tiny_now_vector": [
+      1.0,
+      0.99851114,
+      0.99979526,
+      0.99938834,
+      -0.5898968,
+      0.70883834,
+      0.7901721,
+      0.7634313,
+      -0.2723117,
+      0.8006445,
+      -0.78897977,
+      0.7647652,
+      -0.7494426,
+      -0.59706783,
+      -0.69287616,
+      0.4135477
+    ],
+    "channels": [
+      {
+        "name": "body",
+        "values": [
+          0.57659966,
+          0.0,
+          -0.18,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "contact",
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      {
+        "name": "extension.sim.stuck",
+        "values": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          1.0,
+          -1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.25712562
+        ]
+      },
+      {
+        "name": "extension.sim.world",
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "kinect_depth",
+        "values": [
+          0.7843521,
+          0.41352758,
+          0.2,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      {
+        "name": "llm",
+        "values": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "memory",
+        "values": [
+          1.0,
+          0.71967417,
+          0.3588538,
+          7.653905e-19,
+          0.0,
+          0.15625,
+          0.0
+        ]
+      },
+      {
+        "name": "odometry",
+        "values": [
+          0.9678267,
+          0.86557865,
+          -0.16303031,
+          0.9866211,
+          -0.18,
+          0.0
+        ]
+      },
+      {
+        "name": "range",
+        "values": [
+          0.78435725,
+          0.0625,
+          0.70351565,
+          0.76358587,
+          0.74742055,
+          0.57851154
+        ]
+      },
+      {
+        "name": "reign",
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "surprise",
+        "values": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    ],
+    "top_filters": [
+      {
+        "id": 133,
+        "slot": 0,
+        "score": 1.147243,
+        "age_ticks": 48,
+        "output": 1.0,
+        "channels": [
+          "extension.sim.stuck"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18207,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18307,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18407,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.97229147,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.99922967,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.9999786,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.9999994,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 111,
+        "slot": 1,
+        "score": 1.1059722,
+        "age_ticks": 144,
+        "output": 0.99851114,
+        "channels": [
+          "extension.sim.stuck"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18207,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18307,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18407,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.6620867,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.8858124,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.96141374,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.986961,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.9955939,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 134,
+        "slot": 2,
+        "score": 1.1020466,
+        "age_ticks": 48,
+        "output": 0.99979526,
+        "channels": [
+          "extension.sim.stuck"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18207,
+            "value": 0.99185944,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18307,
+            "value": 0.9918395,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18407,
+            "value": 0.9918348,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.7561201,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.9358151,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.9847462,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.9963749,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.9991385,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 104,
+        "slot": 3,
+        "score": 1.0170248,
+        "age_ticks": 176,
+        "output": 0.99938834,
+        "channels": [
+          "extension.sim.stuck"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18207,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18307,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18407,
+            "value": 1.0,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.7548803,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.9260732,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.97770405,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.99327564,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.997972,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 120,
+        "slot": 4,
+        "score": 0.71448797,
+        "age_ticks": 112,
+        "output": -0.5898968,
+        "channels": [
+          "extension.sim.stuck"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18107,
+            "value": -0.5508418,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18207,
+            "value": -0.55064005,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18307,
+            "value": -0.5506028,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": -0.4422496,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": -0.5306006,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": -0.5790105,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": -0.58794403,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": -0.5895926,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 112,
+        "slot": 5,
+        "score": 0.6375327,
+        "age_ticks": 144,
+        "output": 0.70883834,
+        "channels": [
+          "extension.sim.stuck"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18307,
+            "value": 0.83920753,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18407,
+            "value": 0.8392165,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": 0.49879792,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.7875685,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.8313816,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.72737586,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.7115958,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.7092016,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "slot": 6,
+        "score": 0.59569955,
+        "age_ticks": 400,
+        "output": 0.7901721,
+        "channels": [
+          "body"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18407,
+            "value": 0.86548984,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 18507,
+            "value": 0.7875525,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": true,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": 0.57736236,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.68612283,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.76466334,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.7839716,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.78871834,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.7898852,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 91,
+        "slot": 7,
+        "score": 0.57865345,
+        "age_ticks": 208,
+        "output": 0.7634313,
+        "channels": [
+          "odometry"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18207,
+            "value": 0.74063444,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18307,
+            "value": 0.7119006,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": 0.66596395,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.70552784,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.7516088,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.7610305,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.76295686,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.7633507,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 43,
+        "slot": 8,
+        "score": 0.4957423,
+        "age_ticks": 400,
+        "output": -0.2723117,
+        "channels": [
+          "body"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 17707,
+            "value": -0.9398954,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 17807,
+            "value": -0.94007885,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 17907,
+            "value": -0.94011605,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18007,
+            "value": -0.9401236,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18107,
+            "value": -0.94012517,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18207,
+            "value": -0.94012547,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18307,
+            "value": -0.9401255,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18407,
+            "value": -0.9401256,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": true,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 62,
+        "slot": 9,
+        "score": 0.48672983,
+        "age_ticks": 336,
+        "output": 0.8006445,
+        "channels": [
+          "memory"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 19207,
+            "value": 0.8023943,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19307,
+            "value": 0.8021607,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": 0.8023741,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.80243075,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.802427,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.80200374,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.801551,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.80109715,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 124,
+        "slot": 10,
+        "score": 0.4786269,
+        "age_ticks": 80,
+        "output": -0.78897977,
+        "channels": [
+          "extension.sim.world"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 19207,
+            "value": -0.78897977,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19307,
+            "value": -0.78897977,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": -0.78897977,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": -0.78897977,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": -0.78897977,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": -0.78897977,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": -0.78897977,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": -0.78897977,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 36,
+        "slot": 11,
+        "score": 0.4703683,
+        "age_ticks": 400,
+        "output": 0.7647652,
+        "channels": [
+          "kinect_depth"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 19207,
+            "value": 0.7647652,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19307,
+            "value": 0.7647652,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": 0.7647652,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.7647652,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.7647652,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.7647652,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.7647652,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.7647652,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "slot": 12,
+        "score": 0.46957198,
+        "age_ticks": 400,
+        "output": -0.7494426,
+        "channels": [
+          "odometry"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 19207,
+            "value": -0.73587614,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19307,
+            "value": -0.7442126,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": -0.7501209,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": -0.750463,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": -0.75028205,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": -0.75007194,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": -0.7498611,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": -0.7496513,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 84,
+        "slot": 13,
+        "score": 0.4675518,
+        "age_ticks": 240,
+        "output": -0.59706783,
+        "channels": [
+          "odometry"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18207,
+            "value": -0.53807604,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18307,
+            "value": -0.5025574,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": -0.59460175,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": -0.59505963,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": -0.59546685,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": -0.5958705,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": -0.596272,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": -0.596671,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 122,
+        "slot": 14,
+        "score": 0.4379476,
+        "age_ticks": 80,
+        "output": -0.69287616,
+        "channels": [
+          "odometry"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 19207,
+            "value": -0.693338,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19307,
+            "value": -0.693338,
+            "labels": {
+              "bump": false,
+              "stuck": false,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": -0.693338,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": -0.693338,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": -0.69326603,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": -0.6931813,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": -0.6930881,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": -0.6929865,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      },
+      {
+        "id": 23,
+        "slot": 15,
+        "score": 0.42841354,
+        "age_ticks": 400,
+        "output": 0.4135477,
+        "channels": [
+          "odometry"
+        ],
+        "fired_events": [
+          {
+            "t_ms": 18107,
+            "value": 0.40105152,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 18207,
+            "value": 0.35164845,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": true,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": true
+            }
+          },
+          {
+            "t_ms": 19407,
+            "value": 0.39812905,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19507,
+            "value": 0.40915933,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19607,
+            "value": 0.41287577,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19707,
+            "value": 0.41396487,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19807,
+            "value": 0.41410407,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          },
+          {
+            "t_ms": 19907,
+            "value": 0.4138935,
+            "labels": {
+              "bump": false,
+              "stuck": true,
+              "blocked_forward": false,
+              "free_motion": false,
+              "novelty": false,
+              "intervention": false,
+              "action_changed_scene": false,
+              "stable_scene": false
+            }
+          }
+        ]
+      }
+    ],
+    "population_size": 48,
+    "buffer_len": 256,
+    "ticks": 400
+  },
+  "warnings": []
+}

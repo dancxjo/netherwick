@@ -381,6 +381,10 @@ impl ExperienceForge {
         &self.filters
     }
 
+    pub fn transitions(&self) -> &VecDeque<ExperienceTransition> {
+        &self.buffer
+    }
+
     fn bootstrap_population(&mut self) {
         for channel in [
             "contact",

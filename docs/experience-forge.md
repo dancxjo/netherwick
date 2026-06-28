@@ -19,4 +19,18 @@ Outputs:
 - `log`: optional JSONL snapshots after each replayed frame.
 - `report`: replay summary with frame count, final snapshot, checkpoint path, and warnings.
 
+The first #25 latent round-trip slice trains directly from those forge artifacts:
+
+```bash
+cargo run --bin netherwick -- train latent-round-trip \
+  --forge-checkpoint data/models/experience_forge/latest \
+  --forge-log data/reports/experience-forge/latest.jsonl \
+  --checkpoint data/models/latent_round_trip_v0 \
+  --report data/reports/latent-round-trip.json \
+  --epochs 3 \
+  --z-dim 8
+```
+
+In forge mode the replay buffer in `forge.json` is the training source because it preserves paired `TinyNowVector` values, actions, and original `Now` frames. Training examples use `[TinyNowVector, action features]` as input, predict the next `TinyNowVector`, and decode a compact range/depth/contact sensor summary. The report compares a random projection baseline, the evolved forge vector baseline, and the trained `Experience` latent predictor, plus decoder reconstruction loss against a zero decoder baseline.
+
 This keeps #22 focused on the online/evolved filter machine. #25 then consumes replay data after #22: train or compare learned encoders/decoders/predictors against the evolved forge and random baselines. In that framing, #31's vectorizers are teacher/fallback scaffolding, while the learned `Experience` latent in #25 is the second-stage compression of the whole present moment.
