@@ -38,7 +38,8 @@ use netherwick_ledger::{
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
 use netherwick_map::{LocalMap, MAP_EXTENSION_NAME};
 use netherwick_memory::{
-    attach_memory_links_to_frame, MemoryStore, Recall, RecallBundle, RecallQuery,
+    attach_memory_links_to_frame, place_recognition_input_from_query_now, MemoryStore, Recall,
+    RecallBundle, RecallQuery,
 };
 use netherwick_models::{
     read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
@@ -2731,10 +2732,13 @@ where
         behavior_runs.push(experience_record.erase());
         let latent = experience_run.chosen.latent.clone();
 
-        let recall = self
-            .memory_recall
-            .recall(RecallQuery::from_now(&now))
-            .await?;
+        let mut recall_query = RecallQuery::from_now(&now);
+        recall_query.place_recognition_input = Some(place_recognition_input_from_query_now(
+            &now,
+            Some(&latent),
+            "runtime-pre-frame",
+        ));
+        let recall = self.memory_recall.recall(recall_query).await?;
         now.memory = recall.sense.clone();
         apply_recent_trap_memory_hints(&mut now);
         now.extensions.insert(

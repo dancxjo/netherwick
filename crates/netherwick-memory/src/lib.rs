@@ -68,6 +68,8 @@ pub struct RecallQuery {
     pub scene_vector: Option<Vec<f32>>,
     #[serde(default)]
     pub scene_vectors: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub place_recognition_input: Option<PlaceRecognitionInput>,
     pub face_vectors: Vec<Vec<f32>>,
     #[serde(default)]
     pub face_vector_artifacts: Vec<VectorArtifact>,
@@ -90,6 +92,7 @@ impl RecallQuery {
                 .last()
                 .map(|artifact| artifact.vector.clone()),
             scene_vectors: now.eye.scene_vectors.clone(),
+            place_recognition_input: None,
             face_vectors: now.face.embeddings.clone(),
             face_vector_artifacts: now.face.vectors.clone(),
             voice_vectors: now.voice.embeddings.clone(),
@@ -193,15 +196,82 @@ pub struct PlaceRecognitionCandidate {
     pub cell: PlaceCellSummary,
     pub source_vector_id: String,
     pub source_frame_id: Option<String>,
+    #[serde(default)]
+    pub source_experience_id: Option<String>,
+    #[serde(default)]
+    pub source_instant_frame_id: Option<String>,
+    #[serde(default)]
+    pub source_vector_refs: Vec<String>,
     pub query_vector_id: Option<String>,
+    #[serde(default)]
+    pub query_experience_id: Option<String>,
     pub similarity: f32,
     pub confidence: f32,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlaceSceneEmbedding {
     pub cell_key: PlaceCellKey,
     pub artifact: VectorArtifact,
+    #[serde(default)]
+    pub input: Option<PlaceRecognitionInput>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaceRecognitionInput {
+    pub experience_id: Option<String>,
+    pub instant_frame_id: Option<String>,
+    pub fused_experience_vector: Option<VectorArtifact>,
+    #[serde(default)]
+    pub teacher_vector_refs: Vec<String>,
+    #[serde(default)]
+    pub compact_range_summary: Option<CompactRangeSummary>,
+    #[serde(default)]
+    pub compact_depth_summary: Option<CompactDepthSummary>,
+    #[serde(default)]
+    pub object_labels: Vec<String>,
+    #[serde(default)]
+    pub person_labels: Vec<String>,
+    #[serde(default)]
+    pub voice_labels: Vec<String>,
+    pub action: Option<ActionPrimitive>,
+    pub pose: Option<Pose2>,
+    pub window_start_ms: u64,
+    pub window_end_ms: u64,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompactRangeSummary {
+    pub beam_count: usize,
+    pub nearest_m: Option<f32>,
+    pub mean_m: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompactDepthSummary {
+    pub sample_count: usize,
+    pub min_m: Option<f32>,
+    pub max_m: Option<f32>,
+    pub mean_m: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaceRecognitionOutput {
+    pub candidates: Vec<PlaceRecognitionCandidate>,
+    pub rejected: Vec<PlaceRecognitionRejection>,
+    pub not_enough_evidence: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlaceRecognitionRejection {
+    pub source_vector_id: String,
+    pub query_vector_id: Option<String>,
+    pub similarity: f32,
+    pub confidence: f32,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -363,11 +433,19 @@ impl PlaceMemory {
         let features = self.observe_now(&frame.now);
         let key = self.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m);
         let scene_vectors = scene_vectors_from_now(&frame.now, frame.id, frame.t_ms);
+        let place_input = place_recognition_input_from_frame(frame);
+        let place_vectors = place_recognition_vectors_from_input(&place_input);
         if !scene_vectors.is_empty() {
             if let Some(cell) = self.cells.get_mut(&key) {
                 merge_vector_ids(&mut cell.associated_scene_vectors, &scene_vectors);
             }
             self.store_scene_embeddings(key, &scene_vectors);
+        }
+        if !place_vectors.is_empty() {
+            if let Some(cell) = self.cells.get_mut(&key) {
+                merge_vector_ids(&mut cell.associated_scene_vectors, &place_vectors);
+            }
+            self.store_place_embeddings(key, &place_vectors, Some(place_input));
         }
         let Some(action) = frame.chosen_action.as_ref() else {
             return features;
@@ -464,6 +542,39 @@ impl PlaceMemory {
         limit: usize,
     ) -> Vec<PlaceRecognitionCandidate> {
         let mut candidates = Vec::new();
+        let output =
+            self.recognize_places_report(current_key, query_vectors, min_confidence, limit);
+        candidates.extend(output.candidates);
+        candidates
+    }
+
+    pub fn recognize_places_report(
+        &self,
+        current_key: Option<PlaceCellKey>,
+        query_vectors: &[VectorArtifact],
+        min_confidence: f32,
+        limit: usize,
+    ) -> PlaceRecognitionOutput {
+        let mut candidates = Vec::new();
+        let mut rejected = Vec::new();
+        if query_vectors.iter().all(|query| query.vector.is_empty()) {
+            return PlaceRecognitionOutput {
+                candidates,
+                rejected,
+                not_enough_evidence: Some(
+                    "no fused Experience latent or teacher vector was available".to_string(),
+                ),
+            };
+        }
+        if self.scene_embeddings.is_empty() {
+            return PlaceRecognitionOutput {
+                candidates,
+                rejected,
+                not_enough_evidence: Some(
+                    "no stored place-recognition vectors have been observed".to_string(),
+                ),
+            };
+        }
         for query in query_vectors {
             if query.vector.is_empty() {
                 continue;
@@ -479,6 +590,16 @@ impl PlaceMemory {
                 let confidence =
                     (similarity * (0.5 + cell.confidence.clamp(0.0, 1.0) * 0.5)).clamp(0.0, 1.0);
                 if confidence < min_confidence {
+                    rejected.push(PlaceRecognitionRejection {
+                        source_vector_id: stored.artifact.point_id.clone(),
+                        query_vector_id: Some(query.point_id.clone()),
+                        similarity,
+                        confidence,
+                        reason: format!(
+                            "confidence {:.3} below threshold {:.3}",
+                            confidence, min_confidence
+                        ),
+                    });
                     continue;
                 }
                 candidates.push(PlaceRecognitionCandidate {
@@ -486,9 +607,26 @@ impl PlaceMemory {
                     cell: summarize_cell(cell, confidence),
                     source_vector_id: stored.artifact.point_id.clone(),
                     source_frame_id: stored.artifact.source_frame_id.clone(),
+                    source_experience_id: stored
+                        .input
+                        .as_ref()
+                        .and_then(|input| input.experience_id.clone())
+                        .or_else(|| stored.artifact.source_id.clone()),
+                    source_instant_frame_id: stored
+                        .input
+                        .as_ref()
+                        .and_then(|input| input.instant_frame_id.clone())
+                        .or_else(|| stored.artifact.source_frame_id.clone()),
+                    source_vector_refs: stored
+                        .input
+                        .as_ref()
+                        .map(|input| input.teacher_vector_refs.clone())
+                        .unwrap_or_default(),
                     query_vector_id: Some(query.point_id.clone()),
+                    query_experience_id: query.source_id.clone(),
                     similarity,
                     confidence,
+                    reason: candidate_reason(similarity, confidence, current_key, stored.cell_key),
                 });
             }
         }
@@ -500,7 +638,20 @@ impl PlaceMemory {
                 .then_with(|| right.cell.last_seen_tick.cmp(&left.cell.last_seen_tick))
         });
         candidates.truncate(limit);
-        candidates
+        rejected.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rejected.truncate(limit);
+        PlaceRecognitionOutput {
+            not_enough_evidence: candidates
+                .is_empty()
+                .then_some("no stored place candidate met the confidence threshold".to_string()),
+            candidates,
+            rejected,
+        }
     }
 
     pub fn report(&self) -> PlaceMemoryReport {
@@ -577,6 +728,35 @@ impl PlaceMemory {
                 PlaceSceneEmbedding {
                     cell_key: key,
                     artifact: artifact.clone(),
+                    input: None,
+                },
+            );
+        }
+        const MAX_PLACE_SCENE_EMBEDDINGS: usize = 512;
+        while self.scene_embeddings.len() > MAX_PLACE_SCENE_EMBEDDINGS {
+            let Some(oldest_key) = self.scene_embeddings.keys().next().cloned() else {
+                break;
+            };
+            self.scene_embeddings.remove(&oldest_key);
+        }
+    }
+
+    fn store_place_embeddings(
+        &mut self,
+        key: PlaceCellKey,
+        artifacts: &[VectorArtifact],
+        input: Option<PlaceRecognitionInput>,
+    ) {
+        for artifact in artifacts {
+            if artifact.point_id.trim().is_empty() || artifact.vector.is_empty() {
+                continue;
+            }
+            self.scene_embeddings.insert(
+                artifact.point_id.clone(),
+                PlaceSceneEmbedding {
+                    cell_key: key,
+                    artifact: artifact.clone(),
+                    input: input.clone(),
                 },
             );
         }
@@ -1409,6 +1589,7 @@ pub struct EmbodiedPipelineCoverageReport {
     pub memory_link_count: usize,
     pub recall_sensation_count: usize,
     pub recall_impression_count: usize,
+    pub place_recognition_candidate_count: usize,
     pub lineage_edge_count: usize,
     pub input_modalities: Vec<String>,
     pub vector_coverage: EmbodiedVectorCoverage,
@@ -1460,6 +1641,10 @@ pub async fn deterministic_embodied_eval_report_with_omissions(
     let persisted_frame_count = store.snapshot().len();
     let mut frames = vec![prior, current];
     let mut report = coverage_report_from_frames("deterministic", &frames);
+    report.place_recognition_candidate_count = recall
+        .as_ref()
+        .map(|recall| recall.place_recognition_candidates.len())
+        .unwrap_or_default();
     report.frame_count = persisted_frame_count.max(frames.len());
     if omitted(omissions, EmbodiedEvalOmission::MemoryPersistence) {
         report.frame_count = persisted_frame_count;
@@ -1871,6 +2056,11 @@ fn evaluate_required_embodied_coverage(report: &mut EmbodiedPipelineCoverageRepo
         &mut report.failures,
     );
     required_stage(
+        report.place_recognition_candidate_count,
+        "no place recognition",
+        &mut report.failures,
+    );
+    required_stage(
         report.lineage_edge_count,
         "no lineage",
         &mut report.warnings,
@@ -2073,6 +2263,22 @@ fn recognition_kind(
     } else {
         PlaceRecognitionKind::SimilarPlace
     }
+}
+
+fn candidate_reason(
+    similarity: f32,
+    confidence: f32,
+    current_key: Option<PlaceCellKey>,
+    candidate_key: PlaceCellKey,
+) -> String {
+    let kind = if current_key == Some(candidate_key) {
+        "same map cell"
+    } else if similarity >= 0.92 {
+        "high latent similarity"
+    } else {
+        "moderate latent similarity"
+    };
+    format!("{kind}; similarity={similarity:.3}; confidence={confidence:.3}")
 }
 
 fn score_record(query: &RecallQuery, record: MemoryRecord) -> Option<(f32, MemoryRecord)> {
@@ -2950,7 +3156,194 @@ fn place_query_vectors_from_query(query: &RecallQuery) -> Vec<VectorArtifact> {
             vector.clone(),
         ));
     }
+    if let Some(input) = &query.place_recognition_input {
+        vectors.extend(place_recognition_vectors_from_input(input));
+    }
     vectors
+}
+
+pub fn place_recognition_input_from_frame(frame: &ExperienceFrame) -> PlaceRecognitionInput {
+    let instant = frame.experience_instant();
+    let fused_experience_vector = frame
+        .experiences
+        .last()
+        .and_then(|experience| {
+            experience.fused_vector.as_ref().map(|embedding| {
+                embodied_vector_artifact(
+                    EXPERIENCE_VECTOR_COLLECTION,
+                    &format!("{}:experience:{}", frame.id, experience.id),
+                    embedding,
+                    frame.id,
+                    experience.id.to_string(),
+                    experience.occurred_at_ms,
+                )
+            })
+        })
+        .or_else(|| {
+            frame.z.as_ref().map(|latent| {
+                VectorArtifact::new(
+                    EXPERIENCE_VECTOR_COLLECTION,
+                    format!("{}:experience-latent", frame.id),
+                    latent.z.clone(),
+                )
+                .with_model("netherwick.experience.latent")
+                .with_source_frame_id(frame.id.to_string())
+                .with_occurred_at_ms(frame.t_ms)
+            })
+        });
+    PlaceRecognitionInput {
+        experience_id: instant.experience_id.map(|id| id.to_string()),
+        instant_frame_id: Some(frame.id.to_string()),
+        fused_experience_vector,
+        teacher_vector_refs: instant
+            .teacher_vectors
+            .iter()
+            .map(|vector| embodied_vector_ref_id(&vector.metadata))
+            .collect(),
+        compact_range_summary: compact_range_summary(&frame.now),
+        compact_depth_summary: compact_depth_summary(&frame.now),
+        object_labels: object_labels(&frame.now, None),
+        person_labels: object_labels(&frame.now, Some(ObjectClass::Person)),
+        voice_labels: voice_labels(&frame.now),
+        action: frame.chosen_action.clone(),
+        pose: Some(frame.now.body.odometry),
+        window_start_ms: instant.window_start_ms,
+        window_end_ms: instant.window_end_ms,
+        provenance: format!(
+            "{}:{}",
+            instant.provenance.source,
+            instant
+                .provenance
+                .source_frame_id
+                .as_deref()
+                .unwrap_or("unknown-frame")
+        ),
+    }
+}
+
+pub fn place_recognition_input_from_query_now(
+    now: &Now,
+    latent: Option<&netherwick_experience::ExperienceLatent>,
+    provenance: impl Into<String>,
+) -> PlaceRecognitionInput {
+    let fused_experience_vector = latent.map(|latent| {
+        VectorArtifact::new(
+            EXPERIENCE_VECTOR_COLLECTION,
+            format!("query:{}:experience-latent", now.t_ms),
+            latent.z.clone(),
+        )
+        .with_model("netherwick.experience.latent")
+        .with_occurred_at_ms(now.t_ms)
+    });
+    PlaceRecognitionInput {
+        experience_id: None,
+        instant_frame_id: None,
+        fused_experience_vector,
+        teacher_vector_refs: now
+            .eye
+            .scene_vectors
+            .iter()
+            .chain(now.face.vectors.iter())
+            .chain(now.voice.vectors.iter())
+            .map(|artifact| format!("{}:{}", artifact.collection, artifact.point_id))
+            .collect(),
+        compact_range_summary: compact_range_summary(now),
+        compact_depth_summary: compact_depth_summary(now),
+        object_labels: object_labels(now, None),
+        person_labels: object_labels(now, Some(ObjectClass::Person)),
+        voice_labels: voice_labels(now),
+        action: now.memory.best_remembered_action.clone(),
+        pose: Some(now.body.odometry),
+        window_start_ms: now.t_ms,
+        window_end_ms: now.t_ms,
+        provenance: provenance.into(),
+    }
+}
+
+pub fn place_recognition_vectors_from_input(input: &PlaceRecognitionInput) -> Vec<VectorArtifact> {
+    input
+        .fused_experience_vector
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn compact_range_summary(now: &Now) -> Option<CompactRangeSummary> {
+    let finite = now
+        .range
+        .beams
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if finite.is_empty() && now.range.nearest_m.is_none() {
+        return None;
+    }
+    let mean_m = (!finite.is_empty()).then(|| finite.iter().sum::<f32>() / finite.len() as f32);
+    Some(CompactRangeSummary {
+        beam_count: now.range.beams.len(),
+        nearest_m: now.range.nearest_m,
+        mean_m,
+    })
+}
+
+fn compact_depth_summary(now: &Now) -> Option<CompactDepthSummary> {
+    let finite = now
+        .kinect
+        .depth_m
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    if finite.is_empty() {
+        return None;
+    }
+    let min_m = finite.iter().copied().reduce(f32::min);
+    let max_m = finite.iter().copied().reduce(f32::max);
+    let mean_m = Some(finite.iter().sum::<f32>() / finite.len() as f32);
+    Some(CompactDepthSummary {
+        sample_count: finite.len(),
+        min_m,
+        max_m,
+        mean_m,
+    })
+}
+
+fn object_labels(now: &Now, class: Option<ObjectClass>) -> Vec<String> {
+    let mut labels = now
+        .objects
+        .observations
+        .iter()
+        .filter(|observation| {
+            class
+                .as_ref()
+                .map(|class| observation.class == *class)
+                .unwrap_or(true)
+        })
+        .map(|observation| observation.label.clone())
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn voice_labels(now: &Now) -> Vec<String> {
+    now.ear
+        .transcript
+        .as_ref()
+        .into_iter()
+        .chain(now.ear.asr.transcript.as_ref())
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn embodied_vector_ref_id(vector: &netherwick_experience::EmbodiedVectorRef) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        vector.collection, vector.model_id, vector.source_sensation_id, vector.dim
+    )
 }
 
 fn query_face_vectors(query: &RecallQuery) -> Vec<&[f32]> {
@@ -3107,8 +3500,9 @@ mod tests {
     use super::*;
     use netherwick_body::BodySense;
     use netherwick_experience::{
-        Experience, Impression, Modality, RecalledExperience, Sensation, SensationMetadata,
-        SensationPayload, SensationPayloadKind, SensationSource, VectorEmbedding,
+        Experience, ExperienceLatent, Impression, Modality, RecalledExperience, Sensation,
+        SensationMetadata, SensationPayload, SensationPayloadKind, SensationSource,
+        VectorEmbedding,
     };
     use netherwick_ledger::ExperienceFrame;
     use netherwick_now::{
@@ -3383,6 +3777,7 @@ mod tests {
         assert!(report.memory_link_count > 0);
         assert!(report.recall_sensation_count > 0);
         assert!(report.recall_impression_count > 0);
+        assert!(report.place_recognition_candidate_count > 0);
         assert!(report.lineage_edge_count > 0);
         assert!(report.input_modalities.contains(&"vision".to_string()));
         assert!(report.input_modalities.contains(&"depth".to_string()));
@@ -3405,6 +3800,10 @@ mod tests {
             .iter()
             .any(|failure| failure == "no vectors"));
         assert!(report.failures.iter().any(|failure| failure == "no recall"));
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure == "no place recognition"));
         assert!(report
             .warnings
             .iter()
@@ -4005,6 +4404,105 @@ mod tests {
             .semantic_map
             .as_ref()
             .is_some_and(|overlay| !overlay.place_recognition_candidates.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn place_recognition_uses_fused_experience_latents_and_lineage() {
+        let store = InMemoryExperienceStore::new();
+        let mut frame = empty_frame(now_at(100, 1.0, 1.0));
+        frame.now.range.beams = vec![0.4, 0.7, 1.0];
+        frame.now.range.nearest_m = Some(0.4);
+        frame.now.objects.observations.push(ObjectObservation {
+            label: "charger alcove".to_string(),
+            class: ObjectClass::Landmark,
+            confidence: 0.9,
+            source: ObjectObservationSource::Sim,
+            ..ObjectObservation::default()
+        });
+        let sensation_id = uuid::Uuid::new_v4();
+        let mut experience = Experience::new(
+            "embodied.place",
+            "charger alcove near the wall",
+            Vec::new(),
+            vec![sensation_id],
+            80,
+            100,
+        );
+        experience.fused_vector = Some(VectorEmbedding::new(
+            vec![1.0, 0.0, 0.0, 0.0],
+            "test.fused-experience",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            sensation_id,
+            100,
+        ));
+        let experience_id = experience.id.to_string();
+        frame.experiences.push(experience);
+        store.observe_frame(&frame).await.unwrap();
+
+        let query_now = now_at(140, 1.02, 1.01);
+        let latent = ExperienceLatent {
+            t_ms: 140,
+            z: vec![0.99, 0.01, 0.0, 0.0],
+            confidence: 0.95,
+            ..ExperienceLatent::default()
+        };
+        let mut query = RecallQuery::from_now(&query_now);
+        query.place_recognition_input = Some(place_recognition_input_from_query_now(
+            &query_now,
+            Some(&latent),
+            "test-query",
+        ));
+        let recall = store.recall(query).await.unwrap();
+
+        let candidate = recall
+            .place_recognition_candidates
+            .first()
+            .expect("place candidate from fused latent");
+        assert_eq!(
+            candidate.source_experience_id.as_deref(),
+            Some(experience_id.as_str())
+        );
+        assert_eq!(
+            candidate.source_instant_frame_id.as_deref(),
+            Some(frame.id.to_string().as_str())
+        );
+        assert!(candidate.source_vector_id.contains(":experience:"));
+        assert!(candidate.reason.contains("confidence="));
+    }
+
+    #[test]
+    fn place_recognition_report_marks_not_enough_evidence_and_rejections() {
+        let mut memory = PlaceMemory::new();
+        let mut observed = now_at(100, 2.0, 1.0);
+        observed.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-observed",
+            vec![1.0, 0.0, 0.0],
+        ));
+        memory.observe_now(&observed);
+
+        let empty = memory.recognize_places_report(
+            Some(memory.quantize(2.0, 1.0)),
+            &[],
+            PLACE_RECOGNITION_MIN_CONFIDENCE,
+            5,
+        );
+        assert!(empty.not_enough_evidence.is_some());
+
+        let low = memory.recognize_places_report(
+            Some(memory.quantize(2.0, 1.0)),
+            &[VectorArtifact::new(
+                SCENE_VECTOR_COLLECTION,
+                "scene-query",
+                vec![0.0, 1.0, 0.0],
+            )],
+            PLACE_RECOGNITION_MIN_CONFIDENCE,
+            5,
+        );
+        assert!(low.candidates.is_empty());
+        assert_eq!(low.rejected.len(), 1);
+        assert!(low.rejected[0].reason.contains("below threshold"));
     }
 
     #[test]

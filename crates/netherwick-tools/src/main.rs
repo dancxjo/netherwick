@@ -25,6 +25,7 @@ use netherwick_map::{
 };
 use netherwick_memory::{
     deterministic_embodied_eval_report_with_omissions, place_memory_report_from_frames,
+    place_recognition_input_from_frame, place_recognition_vectors_from_input,
     DurableExperienceStore, EmbodiedEvalOmission, InMemoryExperienceStore, PlaceMemory,
     PlaceMemoryReport, PlaceRecognitionCandidate, PlaceRecognitionKind,
 };
@@ -7541,12 +7542,7 @@ async fn generate_pose_graph_report(args: &PoseGraphReportArgs) -> Result<PoseGr
         let mut frames = ledger.range(0, u64::MAX).await?;
         frames.sort_by_key(|frame| frame.t_ms);
         for frame in &frames {
-            observe_pose_graph_now(
-                &mut builder,
-                &mut memory,
-                &frame.now,
-                Some(frame.id.to_string()),
-            );
+            observe_pose_graph_frame(&mut builder, &mut memory, frame);
             memory.observe_frame(frame);
         }
     }
@@ -7574,6 +7570,29 @@ fn observe_pose_graph_now(
     );
 }
 
+fn observe_pose_graph_frame(
+    builder: &mut PoseGraphBuilder,
+    memory: &mut PlaceMemory,
+    frame: &ExperienceFrame,
+) {
+    let current_key =
+        Some(memory.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m));
+    let place_input = place_recognition_input_from_frame(frame);
+    let mut query_vectors = frame.now.eye.scene_vectors.clone();
+    query_vectors.extend(place_recognition_vectors_from_input(&place_input));
+    let place_candidates = memory.recognize_places(current_key, &query_vectors, 0.0, 20);
+    let loop_candidates = place_candidates
+        .iter()
+        .map(|candidate| place_candidate_to_loop_input(candidate, Some(frame.id.to_string())))
+        .collect::<Vec<_>>();
+    builder.observe(
+        frame.now.body.odometry,
+        frame.t_ms,
+        Some(frame.id.to_string()),
+        &loop_candidates,
+    );
+}
+
 fn place_candidate_to_loop_input(
     candidate: &PlaceRecognitionCandidate,
     source_frame_id: Option<String>,
@@ -7591,10 +7610,17 @@ fn place_candidate_to_loop_input(
             PlaceRecognitionKind::SimilarPlace => "similar_place",
         }
         .to_string(),
-        target_frame_id: candidate.source_frame_id.clone(),
+        target_frame_id: candidate
+            .source_instant_frame_id
+            .clone()
+            .or_else(|| candidate.source_frame_id.clone()),
         source_frame_id,
+        source_experience_id: candidate.source_experience_id.clone(),
+        source_instant_frame_id: candidate.source_instant_frame_id.clone(),
+        source_vector_refs: candidate.source_vector_refs.clone(),
         source_vector_id: Some(candidate.source_vector_id.clone()),
         query_vector_id: candidate.query_vector_id.clone(),
+        query_experience_id: candidate.query_experience_id.clone(),
     }
 }
 
@@ -8448,7 +8474,9 @@ mod tests {
     use netherwick_actions::ActionPrimitive;
     use netherwick_body::BodySense;
     use netherwick_core::Reward;
-    use netherwick_experience::ExperienceLatent;
+    use netherwick_experience::{
+        Experience, ExperienceLatent, Modality, SensationPayloadKind, VectorEmbedding,
+    };
     use netherwick_now::{
         ExtensionSense, Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION,
     };
@@ -9595,6 +9623,131 @@ mod tests {
             "confidence 0.000 below gate 0.550"
         );
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn pose_graph_report_uses_ledger_place_recognition_latents() {
+        let temp_dir = temp_path("netherwick_pose_graph_ledger");
+        let ledger = JsonlLedger::new(&temp_dir);
+
+        let first = pose_graph_test_frame(100, 0.0, vec![1.0, 0.0, 0.0]);
+        let first_experience_id = first.experiences[0].id.to_string();
+        let first_frame_id = first.id.to_string();
+        let second = pose_graph_test_frame(200, 1.0, vec![0.99, 0.01, 0.0]);
+        let second_experience_id = second.experiences[0].id.to_string();
+        ledger.append(&first).await.unwrap();
+        ledger.append(&second).await.unwrap();
+
+        let args = PoseGraphReportArgs {
+            ledger: temp_dir.to_string_lossy().to_string(),
+            capture: None,
+            out: temp_dir
+                .join("pose-graph.json")
+                .to_string_lossy()
+                .to_string(),
+            min_node_distance_m: 0.5,
+            min_node_degrees: 15.0,
+            max_ticks_between_nodes: 10,
+            min_loop_confidence: 0.55,
+        };
+        let report = generate_pose_graph_report(&args).await.unwrap();
+
+        assert_eq!(report.nodes, 2);
+        assert_eq!(report.odometry_edges, 1);
+        assert_eq!(report.loop_candidate_edges, 1);
+        assert_eq!(report.active_loop_candidate_edges, 1);
+        assert_eq!(report.rejected_loop_candidates, 0);
+        let loop_edge = report
+            .graph
+            .edges
+            .iter()
+            .find(|edge| {
+                matches!(
+                    edge.source,
+                    netherwick_map::PoseEdgeSource::LoopClosureCandidate { .. }
+                )
+            })
+            .expect("loop edge");
+        match &loop_edge.source {
+            netherwick_map::PoseEdgeSource::LoopClosureCandidate {
+                target_frame_id,
+                source_frame_id,
+                source_experience_id,
+                source_instant_frame_id,
+                query_experience_id,
+                ..
+            } => {
+                assert_eq!(target_frame_id.as_deref(), Some(first_frame_id.as_str()));
+                assert_eq!(
+                    source_frame_id.as_deref(),
+                    Some(second.id.to_string().as_str())
+                );
+                assert_eq!(
+                    source_experience_id.as_deref(),
+                    Some(first_experience_id.as_str())
+                );
+                assert_eq!(
+                    source_instant_frame_id.as_deref(),
+                    Some(first_frame_id.as_str())
+                );
+                assert_eq!(
+                    query_experience_id.as_deref(),
+                    Some(second_experience_id.as_str())
+                );
+            }
+            netherwick_map::PoseEdgeSource::Odometry => panic!("expected loop edge"),
+        }
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn pose_graph_test_frame(t_ms: u64, x_m: f32, fused_vector: Vec<f32>) -> ExperienceFrame {
+        let mut now = Now::blank(t_ms, BodySense::default());
+        now.body.odometry.x_m = x_m;
+        let sensation_id = uuid::Uuid::new_v4();
+        let mut experience = Experience::new(
+            "test.place",
+            format!("test place at {x_m:.1}m"),
+            Vec::new(),
+            vec![sensation_id],
+            t_ms,
+            t_ms,
+        );
+        experience.fused_vector = Some(VectorEmbedding::new(
+            fused_vector.clone(),
+            "test.fused-place",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            sensation_id,
+            t_ms,
+        ));
+        ExperienceFrame {
+            id: uuid::Uuid::new_v4(),
+            t_ms,
+            now,
+            sensations: Vec::new(),
+            impressions: Vec::new(),
+            experiences: vec![experience],
+            z: Some(ExperienceLatent {
+                t_ms,
+                z: fused_vector,
+                confidence: 1.0,
+                ..ExperienceLatent::default()
+            }),
+            chosen_action: None,
+            conscious_command: None,
+            reign_input: None,
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Reward::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: Vec::new(),
+        }
     }
 
     #[tokio::test]

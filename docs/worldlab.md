@@ -57,7 +57,7 @@ cargo run -p netherwick-tools -- pose-graph-report \
   --out data/reports/pose-graph/sim-test.json
 ```
 
-The report includes odometry edges, gated loop-closure candidate edges from conservative place recognition, confidence buckets, and rejected low-confidence candidates.
+The report includes odometry edges, gated loop-closure candidate edges from conservative place recognition, confidence buckets, and rejected low-confidence candidates. Ledger replay feeds loop candidates from canonical `PlaceRecognitionInput` with Experience/Instant provenance; direct capture replay uses available scene vectors as a capture-only fallback.
 
 Record a bounded real read-only session:
 

@@ -206,11 +206,21 @@ pub enum PoseEdgeSource {
     LoopClosureCandidate {
         kind: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_frame_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source_frame_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_experience_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_instant_frame_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_vector_refs: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_vector_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_vector_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_experience_id: Option<String>,
     },
 }
 
@@ -253,9 +263,17 @@ pub struct LoopClosureCandidateInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_frame_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_experience_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instant_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_vector_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_vector_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_vector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_experience_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -287,6 +305,18 @@ pub struct PoseGraphRejectedCandidate {
     pub confidence: f32,
     pub reason: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_experience_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instant_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_vector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_vector_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -585,9 +615,14 @@ impl PoseGraphBuilder {
         let from = current.id.clone();
         let source = PoseEdgeSource::LoopClosureCandidate {
             kind: candidate.kind.clone(),
+            target_frame_id: candidate.target_frame_id.clone(),
             source_frame_id: candidate.source_frame_id.clone(),
+            source_experience_id: candidate.source_experience_id.clone(),
+            source_instant_frame_id: candidate.source_instant_frame_id.clone(),
+            source_vector_refs: candidate.source_vector_refs.clone(),
             source_vector_id: candidate.source_vector_id.clone(),
             query_vector_id: candidate.query_vector_id.clone(),
+            query_experience_id: candidate.query_experience_id.clone(),
         };
         let target = self.find_loop_target(candidate, &from);
         let to = target
@@ -675,9 +710,36 @@ impl PoseGraph {
             .iter()
             .filter_map(|edge| {
                 let reason = edge.rejection_reason.clone()?;
-                let kind = match &edge.source {
-                    PoseEdgeSource::LoopClosureCandidate { kind, .. } => kind.clone(),
-                    PoseEdgeSource::Odometry => "odometry".to_string(),
+                let (
+                    kind,
+                    target_frame_id,
+                    source_frame_id,
+                    source_experience_id,
+                    source_instant_frame_id,
+                    source_vector_id,
+                    query_vector_id,
+                ) = match &edge.source {
+                    PoseEdgeSource::LoopClosureCandidate {
+                        kind,
+                        target_frame_id,
+                        source_frame_id,
+                        source_experience_id,
+                        source_instant_frame_id,
+                        source_vector_id,
+                        query_vector_id,
+                        ..
+                    } => (
+                        kind.clone(),
+                        target_frame_id.clone(),
+                        source_frame_id.clone(),
+                        source_experience_id.clone(),
+                        source_instant_frame_id.clone(),
+                        source_vector_id.clone(),
+                        query_vector_id.clone(),
+                    ),
+                    PoseEdgeSource::Odometry => {
+                        ("odometry".to_string(), None, None, None, None, None, None)
+                    }
                 };
                 Some(PoseGraphRejectedCandidate {
                     from: edge.from.clone(),
@@ -685,6 +747,12 @@ impl PoseGraph {
                     confidence: edge.confidence,
                     reason,
                     kind,
+                    target_frame_id,
+                    source_frame_id,
+                    source_experience_id,
+                    source_instant_frame_id,
+                    source_vector_id,
+                    query_vector_id,
                 })
             })
             .collect::<Vec<_>>();
@@ -1526,8 +1594,12 @@ mod tests {
             kind: "same_place".to_string(),
             target_frame_id: Some("frame-a".to_string()),
             source_frame_id: Some("frame-a".to_string()),
+            source_experience_id: Some("experience-a".to_string()),
+            source_instant_frame_id: Some("frame-a".to_string()),
+            source_vector_refs: vec!["teacher:a".to_string()],
             source_vector_id: Some("scene-a".to_string()),
             query_vector_id: Some("scene-b".to_string()),
+            query_experience_id: Some("experience-b".to_string()),
         };
         let rejected = LoopClosureCandidateInput {
             confidence: 0.60,
