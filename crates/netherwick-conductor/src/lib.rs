@@ -24,6 +24,10 @@ pub struct ConductorInput {
     pub reign: ReignSense,
     pub range: RangeSense,
     pub body: BodySense,
+    #[serde(default)]
+    pub charger_near_score: f32,
+    #[serde(default)]
+    pub charger_visible_score: f32,
     pub proposals: Vec<ActionPrimitive>,
 }
 
@@ -79,9 +83,10 @@ impl Conductor for SimpleConductor {
             self.recovery = RecoveryState::default();
             return Ok(ActionPrimitive::Stop);
         }
+        let charge_context = charge_context(&input);
         if input.body.battery_level <= self.config.critical_battery {
             self.recovery = RecoveryState::default();
-            return Ok(ActionPrimitive::Dock);
+            return Ok(critical_battery_charge_action(&input, charge_context));
         }
         if self.recovery.step == RecoveryStep::Idle {
             if contact_recovery_triggered(&input) {
@@ -119,23 +124,43 @@ impl Conductor for SimpleConductor {
                 duration_ms: 1_000,
             });
         }
-        if input.body.battery_level <= self.config.low_battery
-            && input.memory.place_charge_value > 0.5
-        {
-            if let Some(direction) = input
-                .memory
-                .nearby_best_charge_direction_rad
-                .and_then(charge_alignment_turn)
-            {
-                return Ok(ActionPrimitive::Turn {
-                    direction,
-                    intensity: 0.4,
-                    duration_ms: 700,
+        if input.body.battery_level <= self.config.low_battery {
+            if charge_context.dock_plausible {
+                return Ok(ActionPrimitive::Dock);
+            }
+            if charge_context.should_approach {
+                if let Some(direction) = input
+                    .memory
+                    .nearby_best_charge_direction_rad
+                    .and_then(charge_alignment_turn)
+                {
+                    return Ok(ActionPrimitive::Turn {
+                        direction,
+                        intensity: 0.4,
+                        duration_ms: 700,
+                    });
+                }
+                return Ok(ActionPrimitive::Approach {
+                    target: ApproachTarget::Charger,
                 });
             }
-            return Ok(ActionPrimitive::Approach {
-                target: ApproachTarget::Charger,
-            });
+            if charge_context.should_search {
+                if let Some(direction) = input
+                    .memory
+                    .nearby_best_charge_direction_rad
+                    .map(direction_from_bearing)
+                {
+                    return Ok(ActionPrimitive::Turn {
+                        direction,
+                        intensity: 0.35,
+                        duration_ms: 700,
+                    });
+                }
+                return Ok(ActionPrimitive::Explore {
+                    style: ExploreStyle::Wander,
+                    duration_ms: 1_000,
+                });
+            }
         }
         if let Some(action) = input.proposals.last() {
             return Ok(action.clone());
@@ -284,6 +309,66 @@ fn charge_alignment_turn(bearing_rad: f32) -> Option<TurnDir> {
     (bearing_rad.abs() > 0.20).then(|| direction_from_bearing(bearing_rad))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ChargeContext {
+    dock_plausible: bool,
+    should_approach: bool,
+    should_search: bool,
+}
+
+fn charge_context(input: &ConductorInput) -> ChargeContext {
+    let near = input.charger_near_score.clamp(0.0, 1.0);
+    let visible = input.charger_visible_score.clamp(0.0, 1.0);
+    let memory = input.memory.place_charge_value.clamp(0.0, 1.0);
+    let prediction = input
+        .predictions
+        .charge_model
+        .or(input.predictions.charge_hardcoded)
+        .unwrap_or_default();
+    let prediction_probability = prediction.charge_probability.clamp(0.0, 1.0);
+    let dock_likelihood = prediction.dock_likelihood.clamp(0.0, 1.0);
+    let dock_plausible =
+        input.body.charging || near >= 0.92 || (near >= 0.80 && dock_likelihood >= 0.85);
+    let should_approach = !dock_plausible
+        && (visible >= 0.20 || near >= 0.25 || memory > 0.5 || prediction_probability >= 0.70);
+    let should_search = !dock_plausible
+        && !should_approach
+        && (input.body.battery_level <= 0.20 || memory >= 0.25 || prediction_probability >= 0.35);
+    ChargeContext {
+        dock_plausible,
+        should_approach,
+        should_search,
+    }
+}
+
+fn critical_battery_charge_action(
+    input: &ConductorInput,
+    charge_context: ChargeContext,
+) -> ActionPrimitive {
+    if charge_context.dock_plausible {
+        ActionPrimitive::Dock
+    } else if charge_context.should_approach {
+        ActionPrimitive::Approach {
+            target: ApproachTarget::Charger,
+        }
+    } else if let Some(direction) = input
+        .memory
+        .nearby_best_charge_direction_rad
+        .map(direction_from_bearing)
+    {
+        ActionPrimitive::Turn {
+            direction,
+            intensity: 0.35,
+            duration_ms: 700,
+        }
+    } else {
+        ActionPrimitive::Explore {
+            style: ExploreStyle::Wander,
+            duration_ms: 1_000,
+        }
+    }
+}
+
 fn range_clearance_sides(beams: &[f32]) -> (f32, f32) {
     if beams.is_empty() {
         return (1.0, 1.0);
@@ -340,18 +425,72 @@ mod tests {
             reign: ReignSense::default(),
             range: RangeSense::default(),
             body,
+            charger_near_score: 0.0,
+            charger_visible_score: 0.0,
             proposals: Vec::new(),
         }
     }
 
     #[test]
-    fn docks_on_critical_battery() {
+    fn critical_battery_searches_instead_of_docking_when_charger_unknown() {
         let mut conductor = SimpleConductor::default();
         let mut body = BodySense::default();
         body.battery_level = 0.05;
         let input = input_with_body(body);
 
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Explore {
+                style: ExploreStyle::Wander,
+                duration_ms: 1_000
+            }
+        );
+    }
+
+    #[test]
+    fn critical_battery_docks_only_when_charger_contact_is_plausible() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        let mut input = input_with_body(body);
+        input.charger_near_score = 0.95;
+
         assert_eq!(conductor.choose(input).unwrap(), ActionPrimitive::Dock);
+    }
+
+    #[test]
+    fn visible_charger_is_approached_before_docking() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.15;
+        let mut input = input_with_body(body);
+        input.charger_visible_score = 0.45;
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Approach {
+                target: ApproachTarget::Charger
+            }
+        );
+    }
+
+    #[test]
+    fn low_confidence_charger_memory_searches_by_bearing() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.15;
+        let mut input = input_with_body(body);
+        input.memory.place_charge_value = 0.3;
+        input.memory.nearby_best_charge_direction_rad = Some(-0.7);
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.35,
+                duration_ms: 700
+            }
+        );
     }
 
     #[test]
@@ -578,6 +717,8 @@ mod tests {
             reign,
             range: RangeSense::default(),
             body: BodySense::default(),
+            charger_near_score: 0.0,
+            charger_visible_score: 0.0,
             proposals: Vec::new(),
         };
 
@@ -621,6 +762,8 @@ mod tests {
             reign,
             range: RangeSense::default(),
             body: BodySense::default(),
+            charger_near_score: 0.0,
+            charger_visible_score: 0.0,
             proposals: Vec::new(),
         };
 

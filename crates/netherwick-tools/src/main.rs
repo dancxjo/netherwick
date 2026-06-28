@@ -1389,6 +1389,14 @@ struct ScenarioEvaluationSummary {
     mean_battery_delta: f32,
     mean_final_battery: f32,
     mean_distance_to_charger_final_m: Option<f32>,
+    #[serde(default)]
+    ticks_with_charger_visible: usize,
+    #[serde(default)]
+    ticks_with_charger_near: usize,
+    #[serde(default)]
+    ticks_approaching_charger: usize,
+    #[serde(default)]
+    ticks_docking_from_too_far: usize,
     mean_nearest_obstacle_m: Option<f32>,
     mean_distance_traveled_m: f32,
     #[serde(default)]
@@ -1462,9 +1470,21 @@ struct ScenarioEpisodeReport {
     min_nearest_obstacle_m: Option<f32>,
     mean_nearest_obstacle_m: Option<f32>,
     final_distance_to_charger_m: Option<f32>,
+    #[serde(default)]
+    final_heading_rad: Option<f32>,
+    #[serde(default)]
+    final_bearing_to_charger_rad: Option<f32>,
     final_distance_to_person_m: Option<f32>,
     final_distance_to_speaker_m: Option<f32>,
     distance_traveled_m: f32,
+    #[serde(default)]
+    ticks_with_charger_visible: usize,
+    #[serde(default)]
+    ticks_with_charger_near: usize,
+    #[serde(default)]
+    ticks_approaching_charger: usize,
+    #[serde(default)]
+    ticks_docking_from_too_far: usize,
     #[serde(default)]
     action_histogram: HashMap<String, usize>,
     #[serde(default)]
@@ -1578,7 +1598,12 @@ struct EpisodeMetricBuilder {
     nearest_obstacle_count: usize,
     start_position: Option<(f32, f32)>,
     last_position: Option<(f32, f32)>,
+    last_heading_rad: Option<f32>,
     distance_traveled_m: f32,
+    ticks_with_charger_visible: usize,
+    ticks_with_charger_near: usize,
+    ticks_approaching_charger: usize,
+    ticks_docking_from_too_far: usize,
     stuck_ticks: usize,
     stuck_count: usize,
     trap_kind_counts: HashMap<String, usize>,
@@ -1651,7 +1676,12 @@ impl EpisodeMetricBuilder {
             nearest_obstacle_count: 0,
             start_position: None,
             last_position: None,
+            last_heading_rad: None,
             distance_traveled_m: 0.0,
+            ticks_with_charger_visible: 0,
+            ticks_with_charger_near: 0,
+            ticks_approaching_charger: 0,
+            ticks_docking_from_too_far: 0,
             stuck_ticks: 0,
             stuck_count: 0,
             trap_kind_counts: HashMap::new(),
@@ -1708,9 +1738,18 @@ impl EpisodeMetricBuilder {
         if self.start_position.is_none() {
             self.start_position = Some(position);
         }
+        self.last_heading_rad = Some(body.odometry.heading_rad);
         if let Some(last) = self.last_position.replace(position) {
             let step_distance = distance_between(last, position);
             self.distance_traveled_m += step_distance;
+        }
+        let charger_near_score = sim_world_score(snapshot, 3);
+        let charger_visible_score = sim_world_score(snapshot, 4);
+        if charger_visible_score >= 0.20 {
+            self.ticks_with_charger_visible = self.ticks_with_charger_visible.saturating_add(1);
+        }
+        if charger_near_score >= 0.25 || body.charging {
+            self.ticks_with_charger_near = self.ticks_with_charger_near.saturating_add(1);
         }
 
         let bumper = body.flags.bump_left || body.flags.bump_right;
@@ -1752,6 +1791,20 @@ impl EpisodeMetricBuilder {
                 .action_histogram
                 .entry(action_histogram_label(action).to_string())
                 .or_default() += 1;
+            if matches!(
+                action,
+                ActionPrimitive::Approach {
+                    target: ApproachTarget::Charger
+                }
+            ) {
+                self.ticks_approaching_charger = self.ticks_approaching_charger.saturating_add(1);
+            }
+            if matches!(action, ActionPrimitive::Dock)
+                && !body.charging
+                && charger_near_score < 0.80
+            {
+                self.ticks_docking_from_too_far = self.ticks_docking_from_too_far.saturating_add(1);
+            }
         }
         self.observe_stuck(snapshot);
         if tick
@@ -1945,6 +1998,12 @@ impl EpisodeMetricBuilder {
             nearest_object_distance(final_position, &self.metadata.objects, |kind| {
                 matches!(kind, netherwick_sim::SimObjectKind::Charger)
             });
+        let final_bearing_to_charger_rad = nearest_object_bearing(
+            final_position,
+            self.last_heading_rad.unwrap_or(0.0),
+            &self.metadata.objects,
+            |kind| matches!(kind, netherwick_sim::SimObjectKind::Charger),
+        );
         let final_distance_to_person_m =
             nearest_object_distance(final_position, &self.metadata.objects, |kind| {
                 matches!(kind, netherwick_sim::SimObjectKind::Person { .. })
@@ -1983,9 +2042,15 @@ impl EpisodeMetricBuilder {
             min_nearest_obstacle_m: self.min_nearest_obstacle_m,
             mean_nearest_obstacle_m,
             final_distance_to_charger_m,
+            final_heading_rad: self.last_heading_rad,
+            final_bearing_to_charger_rad,
             final_distance_to_person_m,
             final_distance_to_speaker_m,
             distance_traveled_m: self.distance_traveled_m,
+            ticks_with_charger_visible: self.ticks_with_charger_visible,
+            ticks_with_charger_near: self.ticks_with_charger_near,
+            ticks_approaching_charger: self.ticks_approaching_charger,
+            ticks_docking_from_too_far: self.ticks_docking_from_too_far,
             action_histogram: self.action_histogram,
             wall_cliff_veto_count: self.wall_cliff_veto_count,
             escape_progress_score: escape_progress_score(
@@ -2416,6 +2481,22 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
                 .iter()
                 .filter_map(|episode| episode.final_distance_to_charger_m),
         ),
+        ticks_with_charger_visible: episodes
+            .iter()
+            .map(|episode| episode.ticks_with_charger_visible)
+            .sum(),
+        ticks_with_charger_near: episodes
+            .iter()
+            .map(|episode| episode.ticks_with_charger_near)
+            .sum(),
+        ticks_approaching_charger: episodes
+            .iter()
+            .map(|episode| episode.ticks_approaching_charger)
+            .sum(),
+        ticks_docking_from_too_far: episodes
+            .iter()
+            .map(|episode| episode.ticks_docking_from_too_far)
+            .sum(),
         mean_nearest_obstacle_m: mean_optional(
             episodes
                 .iter()
@@ -2802,6 +2883,33 @@ where
             (distance_between(position, (object.x_m, object.y_m)) - object.radius_m).max(0.0)
         })
         .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn nearest_object_bearing<F>(
+    position: (f32, f32),
+    heading_rad: f32,
+    objects: &[netherwick_sim::SimObject],
+    matches_kind: F,
+) -> Option<f32>
+where
+    F: Fn(&netherwick_sim::SimObjectKind) -> bool,
+{
+    objects
+        .iter()
+        .filter(|object| matches_kind(&object.kind))
+        .min_by(|left, right| {
+            let left_distance = distance_between(position, (left.x_m, left.y_m));
+            let right_distance = distance_between(position, (right.x_m, right.y_m));
+            left_distance
+                .partial_cmp(&right_distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|object| {
+            let dx = object.x_m - position.0;
+            let dy = object.y_m - position.1;
+            (dy.atan2(dx) - heading_rad + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI
+        })
 }
 
 fn distance_between(left: (f32, f32), right: (f32, f32)) -> f32 {
@@ -7982,6 +8090,45 @@ mod tests {
         assert_eq!(report.charging_ticks, 1);
         assert!(report.battery_delta > 0.05);
         assert!(report.success);
+    }
+
+    #[test]
+    fn charger_metrics_report_visibility_approach_and_bad_dock_boundaries() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 12));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::ChargerSeeking,
+            scenario.metadata,
+            0,
+            12,
+            None,
+            None,
+        );
+        let mut visible = WorldSnapshot::default();
+        visible.body.odometry.heading_rad = 0.25;
+        visible.extensions.push(netherwick_now::ExtensionSense {
+            schema_version: 1,
+            name: "sim.world".to_string(),
+            values: vec![4.0, 4.0, 1.0, 0.4, 0.6],
+        });
+        metrics.observe(
+            &visible,
+            &tick_with_action(ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            }),
+        );
+
+        let mut far = visible.clone();
+        far.extensions[0].values[3] = 0.1;
+        far.extensions[0].values[4] = 0.0;
+        metrics.observe(&far, &tick_with_action(ActionPrimitive::Dock));
+
+        let report = metrics.finish();
+        assert_eq!(report.ticks_with_charger_visible, 1);
+        assert_eq!(report.ticks_with_charger_near, 1);
+        assert_eq!(report.ticks_approaching_charger, 1);
+        assert_eq!(report.ticks_docking_from_too_far, 1);
+        assert_eq!(report.final_heading_rad, Some(0.25));
+        assert!(report.final_bearing_to_charger_rad.is_some());
     }
 
     #[test]

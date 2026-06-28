@@ -478,6 +478,17 @@ fn sim_stuck_active(now: &Now) -> bool {
         > 0.0
 }
 
+fn sim_world_extension_score(now: &Now, index: usize) -> f32 {
+    now.extensions
+        .get("sim.world")
+        .and_then(|value| value.get("values"))
+        .and_then(|value| value.as_array())
+        .and_then(|values| values.get(index))
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0) as f32
+}
+
 fn apply_recent_trap_memory_hints(now: &mut Now) {
     let Some(values) = now
         .extensions
@@ -3015,6 +3026,8 @@ where
             reign: now.reign.clone(),
             range: now.range.clone(),
             body: now.body.clone(),
+            charger_near_score: sim_world_extension_score(&now, 3),
+            charger_visible_score: sim_world_extension_score(&now, 4),
             proposals,
         })?;
         if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
@@ -3168,6 +3181,8 @@ where
             reign: now.reign.clone(),
             range: now.range.clone(),
             body: now.body.clone(),
+            charger_near_score: sim_world_extension_score(&now, 3),
+            charger_visible_score: sim_world_extension_score(&now, 4),
             proposals: conductor_proposals,
         };
         let teacher_source = if now.reign.active {
@@ -5178,6 +5193,9 @@ fn default_candidate_actions() -> Vec<ActionPrimitive> {
         ActionPrimitive::Inspect {
             target: InspectTarget::Novelty,
         },
+        ActionPrimitive::Approach {
+            target: ApproachTarget::Charger,
+        },
         ActionPrimitive::Dock,
         ActionPrimitive::Explore {
             style: ExploreStyle::Wander,
@@ -5217,6 +5235,34 @@ fn score_action_candidate(
         }
     });
     let action_value = signals.action_value.map(|value| value.value).unwrap_or(0.0);
+    let charger_near = sim_world_extension_score(now, 3);
+    let charger_visible = sim_world_extension_score(now, 4);
+    let charger_contact_plausible = now.body.charging || charger_near >= 0.92;
+    let charger_approach_bonus = if matches!(
+        action,
+        ActionPrimitive::Approach {
+            target: ApproachTarget::Charger
+        }
+    ) {
+        if charger_contact_plausible {
+            0.08
+        } else {
+            let memory = now.memory.place_charge_value.clamp(0.0, 1.0);
+            (charger_visible.max(charger_near) * 0.35 + memory * 0.18).min(0.45)
+        }
+    } else {
+        0.0
+    };
+    let dock_distance_penalty =
+        if matches!(action, ActionPrimitive::Dock) && !charger_contact_plausible {
+            if charger_visible >= 0.20 || charger_near >= 0.25 {
+                0.65
+            } else {
+                0.95
+            }
+        } else {
+            0.0
+        };
     let curiosity = curiosity_action_bonus(now, action);
     let collision_risk = fallback_collision_risk(now, action).max(danger);
     let low_battery_risk = if now.body.battery_level <= 0.2
@@ -5236,9 +5282,15 @@ fn score_action_candidate(
     let recovery_bonus = recovery_candidate_bonus(now, action, previous_action);
     let fallback_used =
         signals.danger.is_none() || signals.charge.is_none() || signals.action_value.is_none();
-    let score = (-1.6 * danger) + (1.2 * charge) + action_value + curiosity + recovery_bonus
+    let score = (-1.6 * danger)
+        + (1.2 * charge)
+        + action_value
+        + curiosity
+        + recovery_bonus
+        + charger_approach_bonus
         - (0.8 * collision_risk)
         - low_battery_risk
+        - dock_distance_penalty
         - repeat_penalty;
 
     ActionSelectionCandidateScore {
@@ -5528,7 +5580,7 @@ fn hard_safety_action(now: &Now) -> Option<ActionPrimitive> {
             duration_ms: 1_200,
         });
     }
-    if now.body.battery_level <= 0.10 {
+    if now.body.battery_level <= 0.10 && !charger_reachable_signal(now) {
         return Some(ActionPrimitive::Stop);
     }
     let danger = now
@@ -5551,6 +5603,20 @@ fn hard_safety_action(now: &Now) -> Option<ActionPrimitive> {
         });
     }
     None
+}
+
+fn charger_reachable_signal(now: &Now) -> bool {
+    now.body.charging
+        || sim_world_extension_score(now, 3) >= 0.25
+        || sim_world_extension_score(now, 4) >= 0.20
+        || now.memory.place_charge_value >= 0.5
+        || now.memory.nearby_best_charge_direction_rad.is_some()
+        || now
+            .predictions
+            .charge_model
+            .or(now.predictions.charge_hardcoded)
+            .map(|prediction| prediction.charge_probability >= 0.7)
+            .unwrap_or(false)
 }
 
 fn range_clearer_on_right(beams: &[f32]) -> bool {
@@ -6542,6 +6608,8 @@ mod tests {
             reign: ReignSense::default(),
             range: netherwick_now::RangeSense::default(),
             body: BodySense::default(),
+            charger_near_score: 0.0,
+            charger_visible_score: 0.0,
             proposals: vec![action],
         }
     }
@@ -7572,6 +7640,54 @@ mod tests {
         );
 
         assert!(charger.score > stop.score);
+    }
+
+    #[test]
+    fn charger_approach_is_a_default_action_value_candidate() {
+        let candidates = action_value_candidate_actions(&[], None, &LlmTickResult::default());
+
+        assert!(candidates.contains(&ActionPrimitive::Approach {
+            target: ApproachTarget::Charger
+        }));
+    }
+
+    #[test]
+    fn scoring_prefers_approach_over_dock_when_charger_visible_but_not_contacted() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.body.battery_level = 0.15;
+        now.memory.place_charge_value = 0.7;
+        now.extensions.insert(
+            "sim.world".to_string(),
+            serde_json::json!({
+                "schema_version": 1,
+                "values": [4.0, 4.0, 1.0, 0.35, 0.65]
+            }),
+        );
+        let signals = CandidateModelSignals {
+            charge: Some(ChargeOutput {
+                charge_probability: 0.85,
+                expected_battery_delta: 0.02,
+                dock_likelihood: 0.35,
+                confidence: 1.0,
+            }),
+            action_value: Some(ActionValueOutput {
+                value: 0.1,
+                confidence: 1.0,
+            }),
+            ..CandidateModelSignals::default()
+        };
+
+        let approach = score_action_candidate(
+            &now,
+            &ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            },
+            signals,
+            None,
+        );
+        let dock = score_action_candidate(&now, &ActionPrimitive::Dock, signals, None);
+
+        assert!(approach.score > dock.score);
     }
 
     #[test]

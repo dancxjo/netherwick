@@ -248,17 +248,22 @@ impl HardcodedChargePredictor {
             charge_probability = charge_probability.max(0.45);
             dock_likelihood = dock_likelihood.max(0.45);
         }
-        if dock_action && low_battery {
+        if dock_action && low_battery && (already_charging || charger_near >= 0.5) {
             charge_probability = charge_probability.max(0.55);
             expected_battery_delta = expected_battery_delta.max(0.015);
             dock_likelihood = dock_likelihood.max(0.7);
             confidence = confidence.max(0.7);
         }
-        if charger_near >= 0.5 || charger_visible >= 0.5 {
+        if charger_near >= 0.5 {
             charge_probability = charge_probability.max(0.85);
             expected_battery_delta = expected_battery_delta.max(0.025);
             dock_likelihood = dock_likelihood.max(0.9);
             confidence = confidence.max(0.85);
+        } else if charger_visible >= 0.5 {
+            charge_probability = charge_probability.max(0.80);
+            expected_battery_delta = expected_battery_delta.max(0.015);
+            dock_likelihood = dock_likelihood.max(0.35);
+            confidence = confidence.max(0.80);
         } else if ir_bright >= 0.7 {
             charge_probability = charge_probability.max(0.35);
             dock_likelihood = dock_likelihood.max(0.35);
@@ -2690,6 +2695,20 @@ mod tests {
 
         assert!(output.charge_probability > 0.9);
         assert!(output.expected_battery_delta > 0.0);
+    }
+
+    #[test]
+    fn hardcoded_charge_distinguishes_visible_from_dock_contact() {
+        let mut now = Now::blank(1, BodySense::default());
+        now.body.battery_level = 0.2;
+        let mut input = ChargeInput::from_parts(vec![0.0], Some(&ActionPrimitive::Dock), &now);
+        input.body_features.resize(10, 0.0);
+        input.body_features[7] = 0.8;
+
+        let output = HardcodedChargePredictor.predict_from_now(&now, &input);
+
+        assert!(output.charge_probability >= 0.8);
+        assert!(output.dock_likelihood < 0.6);
     }
 
     #[test]
