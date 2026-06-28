@@ -6694,7 +6694,8 @@ mod tests {
     use netherwick_body::{BodySense, MotorCommand, RobotBody};
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_experience::{
-        embody_now, experience_encode_input_from_now, Modality, SensationPayloadKind,
+        embody_now, experience_encode_input_from_now, EmbodiedContext, Modality,
+        SensationPayloadKind,
     };
     use netherwick_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_llm::{ConsciousCommand, LlmDecision, LlmTickResult};
