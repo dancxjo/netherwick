@@ -503,6 +503,18 @@ pub struct ActionSelectionCandidateScore {
     pub fallback_used: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MapMemoryDecisionDebug {
+    pub influenced: bool,
+    pub reason: Option<String>,
+    pub place_danger: f32,
+    pub place_charge_value: f32,
+    pub place_novelty: f32,
+    pub safe_direction_rad: Option<f32>,
+    pub charge_direction_rad: Option<f32>,
+    pub selected_action: Option<ActionPrimitive>,
+}
+
 impl Default for ActionSelectionCandidateScore {
     fn default() -> Self {
         Self {
@@ -3134,6 +3146,12 @@ where
             .clone()
             .or_else(|| event_script_forced_action.clone())
             .unwrap_or(conductor_selected_action);
+        let map_memory_decision = map_memory_decision_debug(
+            &now,
+            &chosen_action,
+            action_selection.baseline_action.as_ref(),
+            mechanical_reign_action_for_selection.is_some() || event_script_forced_action.is_some(),
+        );
         now = now_with_surface_anticipation(
             &now,
             surface_output_for_anticipation.as_ref(),
@@ -3267,12 +3285,23 @@ where
                 "selected_action": action_selection.selected_action.clone(),
                 "conductor_selected_action": conductor_selected_output.clone(),
                 "chosen_action": chosen_action.clone(),
+                "map_memory_decision": map_memory_decision.clone(),
                 "desired_motor": action_to_motor_command(Some(&chosen_action)),
                 "final_motor": safety.command,
                 "safety_override": safety.vetoed,
                 "safety_reason": safety.reason.clone().map(Some).map(describe_safety_reason),
             }),
         );
+        if map_memory_decision.influenced {
+            notes.push(format!(
+                "MapMemoryDecision reason={:?} action={:?} danger={:.2} charge={:.2} novelty={:.2}",
+                map_memory_decision.reason,
+                map_memory_decision.selected_action,
+                map_memory_decision.place_danger,
+                map_memory_decision.place_charge_value,
+                map_memory_decision.place_novelty
+            ));
+        }
         notes.push(format!(
             "ActionMotorBridge llm_action={:?} selected_action={:?} conductor_selected_action={:?} chosen_action={:?} desired_motor={:?} final_motor={:?} safety_override={}",
             llm_action_proposal.proposed_action,
@@ -5184,6 +5213,87 @@ fn curiosity_action_bonus(now: &Now, action: &ActionPrimitive) -> f32 {
         ActionPrimitive::Go { intensity, .. } if *intensity > 0.0 => pressure * 0.06,
         _ => 0.0,
     }
+}
+
+fn map_memory_decision_debug(
+    now: &Now,
+    chosen_action: &ActionPrimitive,
+    baseline_action: Option<&ActionPrimitive>,
+    forced_action: bool,
+) -> MapMemoryDecisionDebug {
+    let mut debug = MapMemoryDecisionDebug {
+        place_danger: now.memory.place_danger,
+        place_charge_value: now.memory.place_charge_value,
+        place_novelty: now.memory.place_novelty,
+        safe_direction_rad: now.memory.nearby_best_safe_direction_rad,
+        charge_direction_rad: now.memory.nearby_best_charge_direction_rad,
+        selected_action: Some(chosen_action.clone()),
+        ..MapMemoryDecisionDebug::default()
+    };
+    if forced_action || baseline_action != Some(chosen_action) {
+        return debug;
+    }
+
+    debug.reason = map_memory_decision_reason(now, chosen_action);
+    debug.influenced = debug.reason.is_some();
+    debug
+}
+
+fn map_memory_decision_reason(now: &Now, action: &ActionPrimitive) -> Option<String> {
+    const LOW_BATTERY: f32 = 0.20;
+    const DANGER_THRESHOLD: f32 = 0.70;
+    const NOVELTY_THRESHOLD: f32 = 0.50;
+
+    if now.memory.place_danger >= DANGER_THRESHOLD {
+        if let ActionPrimitive::Turn { direction, .. } = action {
+            if let Some(bearing) = now.memory.nearby_best_safe_direction_rad {
+                let expected = if bearing < 0.0 {
+                    TurnDir::Right
+                } else {
+                    TurnDir::Left
+                };
+                if direction == &expected {
+                    return Some("danger_safe_direction".to_string());
+                }
+            }
+            return Some("danger_current_cell".to_string());
+        }
+    }
+
+    if now.body.battery_level <= LOW_BATTERY && now.memory.place_charge_value > 0.5 {
+        match action {
+            ActionPrimitive::Turn { direction, .. } => {
+                if let Some(bearing) = now.memory.nearby_best_charge_direction_rad {
+                    let expected = if bearing < 0.0 {
+                        TurnDir::Right
+                    } else {
+                        TurnDir::Left
+                    };
+                    if bearing.abs() > 0.20 && direction == &expected {
+                        return Some("charge_direction_turn".to_string());
+                    }
+                }
+            }
+            ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            } => return Some("charge_direction_aligned".to_string()),
+            _ => {}
+        }
+    }
+
+    if now.memory.place_novelty >= NOVELTY_THRESHOLD
+        && now.memory.place_danger < DANGER_THRESHOLD
+        && matches!(
+            action,
+            ActionPrimitive::Inspect {
+                target: InspectTarget::Novelty
+            }
+        )
+    {
+        return Some("safe_novelty_inspect".to_string());
+    }
+
+    None
 }
 
 fn select_action_from_scores(

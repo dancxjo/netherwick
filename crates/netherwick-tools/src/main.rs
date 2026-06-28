@@ -1399,6 +1399,14 @@ struct ScenarioEvaluationSummary {
     action_selector_fallbacks: usize,
     #[serde(default)]
     action_selector_guard_yields: usize,
+    #[serde(default)]
+    map_memory_decisions: usize,
+    #[serde(default)]
+    danger_memory_decisions: usize,
+    #[serde(default)]
+    charge_memory_decisions: usize,
+    #[serde(default)]
+    novelty_memory_decisions: usize,
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
     mean_chosen_score: Option<f32>,
@@ -1463,6 +1471,14 @@ struct ScenarioEpisodeReport {
     action_selector_fallbacks: usize,
     #[serde(default)]
     action_selector_guard_yields: usize,
+    #[serde(default)]
+    map_memory_decisions: usize,
+    #[serde(default)]
+    danger_memory_decisions: usize,
+    #[serde(default)]
+    charge_memory_decisions: usize,
+    #[serde(default)]
+    novelty_memory_decisions: usize,
     mean_chosen_score: Option<f32>,
     mean_candidate_score: Option<f32>,
     ticks_with_eye_frames: usize,
@@ -1551,6 +1567,10 @@ struct EpisodeMetricBuilder {
     action_selector_safety_overrides: usize,
     action_selector_fallbacks: usize,
     action_selector_guard_yields: usize,
+    map_memory_decisions: usize,
+    danger_memory_decisions: usize,
+    charge_memory_decisions: usize,
+    novelty_memory_decisions: usize,
     chosen_score_sum: f32,
     chosen_score_count: usize,
     candidate_score_sum: f32,
@@ -1618,6 +1638,10 @@ impl EpisodeMetricBuilder {
             action_selector_safety_overrides: 0,
             action_selector_fallbacks: 0,
             action_selector_guard_yields: 0,
+            map_memory_decisions: 0,
+            danger_memory_decisions: 0,
+            charge_memory_decisions: 0,
+            novelty_memory_decisions: 0,
             chosen_score_sum: 0.0,
             chosen_score_count: 0,
             candidate_score_sum: 0.0,
@@ -1706,6 +1730,7 @@ impl EpisodeMetricBuilder {
         }
         self.observe_behavior_runs(&tick.frame.behavior_runs);
         self.observe_action_selector(tick);
+        self.observe_map_memory_decision(tick);
         if snapshot.eye_frame.is_some() || !snapshot.eye.frames.is_empty() {
             self.ticks_with_eye_frames = self.ticks_with_eye_frames.saturating_add(1);
         }
@@ -1832,6 +1857,37 @@ impl EpisodeMetricBuilder {
         }
     }
 
+    fn observe_map_memory_decision(&mut self, tick: &RuntimeTick) {
+        let Some(decision) = tick
+            .frame
+            .now
+            .extensions
+            .get("action.motion_bridge")
+            .and_then(|value| value.get("map_memory_decision"))
+        else {
+            return;
+        };
+        if !decision
+            .get("influenced")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.map_memory_decisions = self.map_memory_decisions.saturating_add(1);
+        let reason = decision
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if reason.starts_with("danger_") {
+            self.danger_memory_decisions = self.danger_memory_decisions.saturating_add(1);
+        } else if reason.starts_with("charge_") {
+            self.charge_memory_decisions = self.charge_memory_decisions.saturating_add(1);
+        } else if reason.starts_with("safe_novelty_") {
+            self.novelty_memory_decisions = self.novelty_memory_decisions.saturating_add(1);
+        }
+    }
+
     fn finish(self) -> ScenarioEpisodeReport {
         let final_position = self.last_position.unwrap_or_else(|| {
             (
@@ -1920,6 +1976,10 @@ impl EpisodeMetricBuilder {
             action_selector_safety_overrides: self.action_selector_safety_overrides,
             action_selector_fallbacks: self.action_selector_fallbacks,
             action_selector_guard_yields: self.action_selector_guard_yields,
+            map_memory_decisions: self.map_memory_decisions,
+            danger_memory_decisions: self.danger_memory_decisions,
+            charge_memory_decisions: self.charge_memory_decisions,
+            novelty_memory_decisions: self.novelty_memory_decisions,
             mean_chosen_score: (self.chosen_score_count > 0)
                 .then_some(self.chosen_score_sum / self.chosen_score_count as f32),
             mean_candidate_score: (self.candidate_score_count > 0)
@@ -2376,6 +2436,22 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
         action_selector_guard_yields: episodes
             .iter()
             .map(|episode| episode.action_selector_guard_yields)
+            .sum(),
+        map_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.map_memory_decisions)
+            .sum(),
+        danger_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.danger_memory_decisions)
+            .sum(),
+        charge_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.charge_memory_decisions)
+            .sum(),
+        novelty_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.novelty_memory_decisions)
             .sum(),
         model_assisted_decisions: episodes
             .iter()
@@ -7548,6 +7624,50 @@ mod tests {
         let summary = summarize_episodes(&[episode]);
         assert_eq!(summary.action_selector_fallbacks, 0);
         assert_eq!(summary.action_selector_guard_yields, 1);
+    }
+
+    #[test]
+    fn map_memory_decisions_are_counted_in_scenario_reports() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 17));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            17,
+            None,
+            None,
+        );
+        let mut tick = tick_with_action(ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.5,
+            duration_ms: 1_000,
+        });
+        tick.frame.now.extensions.insert(
+            "action.motion_bridge".to_string(),
+            serde_json::json!({
+                "map_memory_decision": {
+                    "influenced": true,
+                    "reason": "danger_safe_direction",
+                    "place_danger": 0.9,
+                    "place_charge_value": 0.0,
+                    "place_novelty": 0.2,
+                    "safe_direction_rad": -0.8,
+                    "charge_direction_rad": null,
+                    "selected_action": tick.chosen_action.clone(),
+                }
+            }),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.map_memory_decisions, 1);
+        assert_eq!(episode.danger_memory_decisions, 1);
+        assert_eq!(episode.charge_memory_decisions, 0);
+        assert_eq!(episode.novelty_memory_decisions, 0);
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.map_memory_decisions, 1);
+        assert_eq!(summary.danger_memory_decisions, 1);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+[package]
+name = "netherwick-mouth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+cpal.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
