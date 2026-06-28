@@ -3503,6 +3503,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embodied_demo_reports_multimodal_vector_coverage() {
+        let demo = demo_embodied_experience(1_000).await.unwrap();
+
+        assert!(demo.coverage.image > 0);
+        assert!(demo.coverage.face > 0);
+        assert!(demo.coverage.voice > 0);
+        assert!(demo.coverage.transcript > 0);
+        assert!(demo.coverage.impression > 0);
+        assert!(demo.coverage.experience > 0);
+        assert!(demo.coverage.fallback_count > 0);
+        assert!(demo
+            .sensations
+            .iter()
+            .filter_map(|sensation| sensation.vector.as_ref())
+            .any(|vector| vector.vectorizer_id == "precomputed.faces.face_id/0.4.1"
+                && vector.collection == "faces"
+                && vector.purpose == "face_identity"));
+        assert!(demo
+            .sensations
+            .iter()
+            .filter_map(|sensation| sensation.vector.as_ref())
+            .any(|vector| vector.vectorizer_id == "precomputed.voices.listenbury/voice_vector/16d"
+                && vector.collection == "voices"
+                && vector.purpose == "voice_identity"));
+    }
+
+    #[tokio::test]
     async fn duplicate_image_frames_do_not_repeat_embeddings() {
         let registry = SensationVectorizerRegistry::with_defaults();
         let first = visual_primary_with_rgb(16, 16, vec![13; 16 * 16 * 3]);
@@ -4866,7 +4893,7 @@ impl SensationVectorizerRegistry {
             config,
             "audio_speech",
             EmbodiedFeatureSensationVectorizer::text(
-                "netherwick.vectorizer.audio_speech.hash_embedding.v1",
+                "netherwick.vectorizer.audio_speech.text_hashing.v1",
                 SensationPayloadKind::SpeechSegment,
                 "transcript_semantic",
             ),
@@ -4875,7 +4902,7 @@ impl SensationVectorizerRegistry {
             config,
             "audio_transcript",
             EmbodiedFeatureSensationVectorizer::text(
-                "netherwick.vectorizer.audio_transcript.hash_embedding.v1",
+                "netherwick.vectorizer.audio_transcript.text_hashing.v1",
                 SensationPayloadKind::TranscriptSpan,
                 "transcript_semantic",
             ),
@@ -4884,7 +4911,7 @@ impl SensationVectorizerRegistry {
             config,
             "audio_phoneme",
             EmbodiedFeatureSensationVectorizer::text(
-                "netherwick.vectorizer.audio_phoneme.hash_embedding.v1",
+                "netherwick.vectorizer.audio_phoneme.text_hashing.v1",
                 SensationPayloadKind::PhonemeSpan,
                 "transcript_semantic",
             ),
