@@ -15,9 +15,10 @@ use netherwick_experience::{
     ear_next_input_from_transition_like, ear_next_target_from_now,
     experience_decode_target_from_now, experience_encode_input_from_now,
     eye_next_input_from_transition_like, eye_next_target_from_now, ActionValueInput,
-    ActionValueTarget, ChargeInput, ChargeTarget, DangerInput, DangerTarget, EarNextInput,
-    EarNextTarget, ExperienceDecodeOutput, ExperienceEncodeInput, EyeNextInput, EyeNextTarget,
-    FutureInput, FuturePredictor, StasisFuturePredictor,
+    ActionValueTarget, ChargeInput, ChargeTarget, CodebookQuantizer, CodebookUsageReport,
+    DangerInput, DangerTarget, EarNextInput, EarNextTarget, ExperienceDecodeOutput,
+    ExperienceEncodeInput, ExperienceLatent, EyeNextInput, EyeNextTarget, FutureInput,
+    FuturePredictor, LatentEncoder, RandomProjectionExperienceEncoder, StasisFuturePredictor,
 };
 use netherwick_ledger::{
     future_input_from_transition, future_target_from_transition, ExperienceTransition, JsonlLedger,
@@ -1538,6 +1539,61 @@ pub struct TrainSummary {
     pub evaluation: BehaviorEvaluationReport,
 }
 
+#[derive(Clone, Debug)]
+pub struct TrainLatentRoundTripRequest {
+    pub ledger_path: PathBuf,
+    pub checkpoint_path: PathBuf,
+    pub report_path: PathBuf,
+    pub epochs: usize,
+    pub validation_split: f32,
+    pub seed: u64,
+    pub z_dim: usize,
+    pub codebook_size: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainLatentRoundTripReport {
+    pub schema_version: u32,
+    pub transition_count: usize,
+    pub train_transition_count: usize,
+    pub eval_transition_count: usize,
+    pub epochs: usize,
+    pub z_dim: usize,
+    pub checkpoints: LatentRoundTripCheckpoints,
+    pub reconstruction: LatentReconstructionReport,
+    pub predictors: Vec<LatentPredictorReport>,
+    pub codebook: Option<CodebookUsageReport>,
+    pub verdict: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LatentRoundTripCheckpoints {
+    pub experience: PathBuf,
+    pub future_evolved: PathBuf,
+    pub future_trained: PathBuf,
+    pub future_random: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LatentReconstructionReport {
+    pub sample_count: usize,
+    pub trained_decoder_loss_mean: f32,
+    pub target_kind: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LatentPredictorReport {
+    pub encoder: String,
+    pub train_sample_count: usize,
+    pub eval_sample_count: usize,
+    pub latent_dim: usize,
+    pub model_loss_mean: f32,
+    pub stasis_loss_mean: f32,
+    pub improvement_ratio: Option<f32>,
+    pub predictive: bool,
+}
+
 pub trait BehaviorTrainer {
     type Input;
     type Output;
@@ -1917,6 +1973,129 @@ pub async fn train_behavior(request: TrainBehaviorRequest) -> Result<TrainSummar
         checkpoint_path: request.checkpoint_path,
         evaluation,
     })
+}
+
+pub async fn train_latent_round_trip(
+    request: TrainLatentRoundTripRequest,
+) -> Result<TrainLatentRoundTripReport> {
+    let transitions = load_transitions(&request.ledger_path).await?;
+    let transition_count = transitions.len();
+    let (train, eval) = split_transitions(transitions, request.validation_split, request.seed);
+    let eval_transitions = if eval.is_empty() { &train } else { &eval };
+    let checkpoints = LatentRoundTripCheckpoints {
+        experience: request.checkpoint_path.join("experience"),
+        future_evolved: request.checkpoint_path.join("future-evolved"),
+        future_trained: request.checkpoint_path.join("future-trained"),
+        future_random: request.checkpoint_path.join("future-random"),
+    };
+
+    let experience_train = experience_samples(&train);
+    let (input_dim, decode_lengths) = experience_train
+        .first()
+        .map(|(_, input, target, _)| (input.flat_features().len(), target.feature_lengths()))
+        .ok_or_else(|| anyhow!("no usable experience samples for latent round-trip training"))?;
+    let z_dim = request.z_dim.clamp(2, input_dim.max(2));
+    let mut autoencoder = ExperienceAutoencoderTrainer::new(input_dim, z_dim, decode_lengths);
+    for _epoch in 0..request.epochs {
+        for (_, input, target, _) in &experience_train {
+            if input.flat_features().len() == autoencoder.input_dim()
+                && target.feature_lengths() == autoencoder.decode_lengths()
+            {
+                autoencoder.train_step(input, target)?;
+            }
+        }
+    }
+    autoencoder.save_checkpoint(&checkpoints.experience)?;
+
+    let reconstruction = evaluate_trained_reconstruction(&autoencoder, eval_transitions)?;
+    let evolved_report = train_and_evaluate_future_latents(
+        "online-evolved-filters",
+        replay_latent_future_samples(&train),
+        replay_latent_future_samples(eval_transitions),
+        request.epochs,
+        &checkpoints.future_evolved,
+    )?;
+
+    let trained_train = trained_latent_future_samples(&autoencoder, &train)?;
+    let trained_eval = trained_latent_future_samples(&autoencoder, eval_transitions)?;
+    let trained_report = train_and_evaluate_future_latents(
+        "trainable-autoencoder",
+        trained_train.clone(),
+        trained_eval,
+        request.epochs,
+        &checkpoints.future_trained,
+    )?;
+
+    let mut random_train_encoder = RandomProjectionExperienceEncoder::new(z_dim, request.seed);
+    let mut random_eval_encoder = RandomProjectionExperienceEncoder::new(z_dim, request.seed);
+    let random_train = encoded_future_samples(&mut random_train_encoder, &train)?;
+    let random_eval = encoded_future_samples(&mut random_eval_encoder, eval_transitions)?;
+    let random_report = train_and_evaluate_future_latents(
+        "random-projection",
+        random_train,
+        random_eval,
+        request.epochs,
+        &checkpoints.future_random,
+    )?;
+
+    let codebook = if let Some(codebook_size) = request.codebook_size {
+        let mut quantizer = CodebookQuantizer::from_latents(
+            &trained_train
+                .iter()
+                .map(|(_, input, _)| input.latent.z.clone())
+                .collect::<Vec<_>>(),
+            codebook_size,
+        );
+        for (_, input, target) in &trained_train {
+            let code_id = quantizer.encode(&input.latent.z);
+            let decoded = quantizer.decode(code_id);
+            let _ = mse_vec(&decoded, target);
+        }
+        Some(quantizer.report())
+    } else {
+        None
+    };
+
+    let predictors = vec![evolved_report, trained_report, random_report];
+    let mut warnings = Vec::new();
+    if transition_count < 50 {
+        warnings.push(format!(
+            "insufficient data: {transition_count} transitions is below the conservative 50-transition floor"
+        ));
+    }
+    if predictors.iter().all(|report| !report.predictive) {
+        warnings.push("no encoder beat the stasis baseline on held-out prediction".to_string());
+    }
+    let verdict = if predictors
+        .iter()
+        .any(|report| report.encoder == "trainable-autoencoder" && report.predictive)
+    {
+        "trained latent is predictive on held-out replay".to_string()
+    } else if predictors.iter().any(|report| report.predictive) {
+        "a latent is predictive, but the trained encoder is not yet strongest".to_string()
+    } else {
+        "latent remains compact but not proven predictive".to_string()
+    };
+
+    let report = TrainLatentRoundTripReport {
+        schema_version: 1,
+        transition_count,
+        train_transition_count: train.len(),
+        eval_transition_count: eval_transitions.len(),
+        epochs: request.epochs,
+        z_dim,
+        checkpoints,
+        reconstruction,
+        predictors,
+        codebook,
+        verdict,
+        warnings,
+    };
+    if let Some(parent) = request.report_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&request.report_path, serde_json::to_vec_pretty(&report)?)?;
+    Ok(report)
 }
 
 pub async fn evaluate_behavior(
@@ -2476,6 +2655,162 @@ fn train_metric(
     }
 }
 
+fn replay_latent_future_samples(
+    transitions: &[ExperienceTransition],
+) -> Vec<(TimeMs, FutureInput, Vec<f32>)> {
+    future_samples(transitions)
+}
+
+fn trained_latent_future_samples(
+    autoencoder: &ExperienceAutoencoderTrainer,
+    transitions: &[ExperienceTransition],
+) -> Result<Vec<(TimeMs, FutureInput, Vec<f32>)>> {
+    let mut samples = Vec::new();
+    for transition in transitions {
+        let Some(action) = transition.action.clone() else {
+            continue;
+        };
+        let before_input = experience_encode_input_from_now(&transition.before);
+        let after_input = experience_encode_input_from_now(&transition.after);
+        if before_input.flat_features().len() != autoencoder.input_dim()
+            || after_input.flat_features().len() != autoencoder.input_dim()
+        {
+            continue;
+        }
+        let before_z = autoencoder.encode(&before_input)?.z;
+        let after_z = autoencoder.encode(&after_input)?.z;
+        samples.push((
+            transition.created_at_ms,
+            FutureInput {
+                latent: ExperienceLatent {
+                    t_ms: transition.before.t_ms,
+                    z: before_z,
+                    reconstruction_error: 0.0,
+                    prediction_error: 0.0,
+                    confidence: 0.6,
+                },
+                action,
+                offset_ms: transition
+                    .after
+                    .t_ms
+                    .saturating_sub(transition.before.t_ms)
+                    .max(1),
+            },
+            after_z,
+        ));
+    }
+    Ok(samples)
+}
+
+fn encoded_future_samples(
+    encoder: &mut impl LatentEncoder,
+    transitions: &[ExperienceTransition],
+) -> Result<Vec<(TimeMs, FutureInput, Vec<f32>)>> {
+    let mut samples = Vec::new();
+    for transition in transitions {
+        let Some(action) = transition.action.clone() else {
+            continue;
+        };
+        let before_input = experience_encode_input_from_now(&transition.before);
+        let after_input = experience_encode_input_from_now(&transition.after);
+        let before_z = encoder.encode_input(&before_input, transition.before.t_ms)?;
+        let after_z = encoder.encode_input(&after_input, transition.after.t_ms)?;
+        samples.push((
+            transition.created_at_ms,
+            FutureInput {
+                latent: before_z,
+                action,
+                offset_ms: transition
+                    .after
+                    .t_ms
+                    .saturating_sub(transition.before.t_ms)
+                    .max(1),
+            },
+            after_z.z,
+        ));
+    }
+    Ok(samples)
+}
+
+fn evaluate_trained_reconstruction(
+    autoencoder: &ExperienceAutoencoderTrainer,
+    transitions: &[ExperienceTransition],
+) -> Result<LatentReconstructionReport> {
+    let mut losses = Vec::new();
+    for (_, input, target, _) in experience_samples(transitions) {
+        if input.flat_features().len() != autoencoder.input_dim()
+            || target.feature_lengths() != autoencoder.decode_lengths()
+        {
+            continue;
+        }
+        let prediction = autoencoder.predict(&input)?;
+        losses.push(mse_vec(
+            &prediction.decoded.flat_features(),
+            &target.flat_features(),
+        ));
+    }
+    if losses.is_empty() {
+        bail!("no usable reconstruction samples for latent round-trip evaluation");
+    }
+    Ok(LatentReconstructionReport {
+        sample_count: losses.len(),
+        trained_decoder_loss_mean: mean(&losses),
+        target_kind: "compact body/memory/drive/prediction/range-depth/audio-summary features"
+            .to_string(),
+    })
+}
+
+fn train_and_evaluate_future_latents(
+    encoder: &str,
+    train_samples: Vec<(TimeMs, FutureInput, Vec<f32>)>,
+    eval_samples: Vec<(TimeMs, FutureInput, Vec<f32>)>,
+    epochs: usize,
+    checkpoint_path: &Path,
+) -> Result<LatentPredictorReport> {
+    let input_dim = first_dim(&train_samples, |(_, input, _)| input.flat_features().len())?;
+    let latent_dim = first_dim(&train_samples, |(_, _, target)| target.len())?;
+    let mut trainer = FutureNetTrainer::new(input_dim, latent_dim);
+    for _epoch in 0..epochs {
+        for (_, input, target) in &train_samples {
+            if input.flat_features().len() == trainer.input_dim()
+                && target.len() == trainer.latent_dim()
+            {
+                trainer.train_step(input, target)?;
+            }
+        }
+    }
+    trainer.save_checkpoint(checkpoint_path)?;
+
+    let mut stasis = StasisFuturePredictor;
+    let mut model_losses = Vec::new();
+    let mut stasis_losses = Vec::new();
+    for (_, input, target) in eval_samples.iter().filter(|(_, input, target)| {
+        input.flat_features().len() == trainer.input_dim() && target.len() == trainer.latent_dim()
+    }) {
+        let model = trainer.predict(input)?;
+        let hard = stasis.predict(&input.latent, &input.action, input.offset_ms)?;
+        model_losses.push(mse_vec(&model.predicted_z, target));
+        stasis_losses.push(mse_vec(&hard.predicted_z, target));
+    }
+    if model_losses.is_empty() {
+        bail!("no usable future samples for {encoder} latent evaluation");
+    }
+    let model_loss_mean = mean(&model_losses);
+    let stasis_loss_mean = mean(&stasis_losses);
+    let improvement_ratio =
+        (stasis_loss_mean > 0.0).then(|| (stasis_loss_mean - model_loss_mean) / stasis_loss_mean);
+    Ok(LatentPredictorReport {
+        encoder: encoder.to_string(),
+        train_sample_count: train_samples.len(),
+        eval_sample_count: model_losses.len(),
+        latent_dim,
+        model_loss_mean,
+        stasis_loss_mean,
+        improvement_ratio,
+        predictive: model_loss_mean < stasis_loss_mean,
+    })
+}
+
 fn danger_samples(
     transitions: &[ExperienceTransition],
 ) -> Vec<(TimeMs, Now, DangerInput, DangerTarget)> {
@@ -2776,6 +3111,80 @@ mod tests {
         assert_eq!(report.behavior, TrainableBehavior::Danger);
 
         // Clean up
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_train_latent_round_trip_writes_predictive_report() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("netherwick_latent_round_trip_test_{}", now_ms()));
+        let ledger_dir = temp_dir.join("ledger");
+        let session_dir = ledger_dir.join("2026-06-27");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let mut transitions = Vec::new();
+        for i in 0..6 {
+            let mut before_body = BodySense::default();
+            before_body.battery_level = 0.8;
+            before_body.odometry.x_m = i as f32 * 0.01;
+            let mut after_body = before_body.clone();
+            after_body.odometry.x_m += 0.01;
+            let before = Now::blank(100 + i * 100, before_body);
+            let after = Now::blank(200 + i * 100, after_body);
+            transitions.push(ExperienceTransition {
+                id: uuid::Uuid::new_v4(),
+                before_frame_id: uuid::Uuid::new_v4(),
+                before,
+                before_z: ExperienceLatent {
+                    t_ms: 100 + i * 100,
+                    z: vec![0.1 + i as f32 * 0.01, 0.2],
+                    ..ExperienceLatent::default()
+                },
+                action: Some(ActionPrimitive::Stop),
+                predicted_futures: Vec::new(),
+                after,
+                after_z: ExperienceLatent {
+                    t_ms: 200 + i * 100,
+                    z: vec![0.11 + i as f32 * 0.01, 0.2],
+                    ..ExperienceLatent::default()
+                },
+                reward: Reward { value: 0.0 },
+                surprise: SurpriseSense::default(),
+                created_at_ms: 200 + i * 100,
+            });
+        }
+
+        let transitions_file = session_dir.join("transitions.jsonl");
+        let content = transitions
+            .iter()
+            .map(|transition| serde_json::to_string(transition).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&transitions_file, format!("{content}\n")).unwrap();
+
+        let report_path = temp_dir.join("latent-report.json");
+        let report = train_latent_round_trip(TrainLatentRoundTripRequest {
+            ledger_path: ledger_dir,
+            checkpoint_path: temp_dir.join("checkpoint"),
+            report_path: report_path.clone(),
+            epochs: 0,
+            validation_split: 0.34,
+            seed: 7,
+            z_dim: 2,
+            codebook_size: Some(2),
+        })
+        .await
+        .unwrap();
+
+        assert!(report_path.exists());
+        assert_eq!(report.predictors.len(), 3);
+        assert!(report
+            .predictors
+            .iter()
+            .any(|predictor| predictor.encoder == "trainable-autoencoder"));
+        assert!(report.reconstruction.sample_count > 0);
+        assert_eq!(report.codebook.unwrap().code_count, 2);
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

@@ -239,6 +239,136 @@
       ],
       "parent_model": null,
       "git_commit": "4483deb"
+    },
+    {
+      "schema_version": 1,
+      "name": "danger_golden_column_v0",
+      "behavior": "danger",
+      "checkpoint": "data/models/danger_golden_column_v0",
+      "created_at": "2026-06-27T00:00:00+00:00",
+      "training": {
+        "ledger": "data/ledger/golden-column-trap",
+        "command": "just run train behavior danger --ledger data/ledger/golden-column-trap --checkpoint data/models/danger_golden_column_v0",
+        "epochs": null
+      },
+      "reports": {
+        "behavior": "data/reports/danger-golden-column-heldout-eval.json",
+        "scenario": "data/reports/golden-column-trap-model-assisted-full-shadow.json"
+      },
+      "scenario_names": [
+        "column-trap"
+      ],
+      "metrics": {
+        "behavior_loss": 0.0087624965,
+        "scenario_success_rate": 1.0,
+        "collision_rate": 0.016666668,
+        "battery_delta": -0.8719021,
+        "fallback_count": 0,
+        "episodes": 5
+      },
+      "allowed_modes": [
+        "off",
+        "hardcoded",
+        "shadow-infer"
+      ],
+      "status": "shadow",
+      "warnings": [
+        "checkpoint path is registered from golden reports but the checkpoint artifact is not present in this checkout",
+        "shadow registration is simulation evidence only and is not hardware safety approval"
+      ],
+      "notes": [
+        "Held-out behavior evaluation beats hardcoded targets and recommends shadow inference.",
+        "Model-assisted column-trap scenario preserved baseline success with hard safety still in control."
+      ],
+      "parent_model": null,
+      "git_commit": "0368177"
+    },
+    {
+      "schema_version": 1,
+      "name": "action_value_golden_column_v0",
+      "behavior": "action_value",
+      "checkpoint": "data/models/action_value_golden_column_v0",
+      "created_at": "2026-06-27T00:00:00+00:00",
+      "training": {
+        "ledger": "data/ledger/golden-column-trap",
+        "command": "just run train behavior action-value --ledger data/ledger/golden-column-trap --checkpoint data/models/action_value_golden_column_v0",
+        "epochs": null
+      },
+      "reports": {
+        "behavior": "data/reports/action-value-golden-column-heldout-eval.json",
+        "scenario": "data/reports/golden-column-trap-model-assisted-full-shadow.json"
+      },
+      "scenario_names": [
+        "column-trap"
+      ],
+      "metrics": {
+        "behavior_loss": 0.0023444477,
+        "scenario_success_rate": 1.0,
+        "collision_rate": 0.016666668,
+        "battery_delta": -0.8719021,
+        "fallback_count": 0,
+        "episodes": 5
+      },
+      "allowed_modes": [
+        "off",
+        "hardcoded",
+        "shadow-infer"
+      ],
+      "status": "shadow",
+      "warnings": [
+        "checkpoint path is registered from golden reports but the checkpoint artifact is not present in this checkout",
+        "shadow registration is simulation evidence only and is not hardware safety approval"
+      ],
+      "notes": [
+        "Held-out behavior evaluation beats hardcoded targets and recommends shadow inference.",
+        "Action-value can score candidates in model-assisted shadow runs but must not bypass hard safety."
+      ],
+      "parent_model": null,
+      "git_commit": "0368177"
+    },
+    {
+      "schema_version": 1,
+      "name": "charge_golden_charger_v0",
+      "behavior": "charge",
+      "checkpoint": "data/models/charge_golden_charger_v0",
+      "created_at": "2026-06-27T00:00:00+00:00",
+      "training": {
+        "ledger": "data/ledger/golden-charger-seeking",
+        "command": "just run train behavior charge --ledger data/ledger/golden-charger-seeking --checkpoint data/models/charge_golden_charger_v0",
+        "epochs": null
+      },
+      "reports": {
+        "behavior": "data/reports/charge-golden-charger-heldout-eval.json",
+        "scenario": "data/reports/golden-charger-seeking-heldout.json"
+      },
+      "scenario_names": [
+        "charger-seeking"
+      ],
+      "metrics": {
+        "behavior_loss": 0.000088089975,
+        "scenario_success_rate": 0.0,
+        "collision_rate": 0.0,
+        "battery_delta": -0.079500295,
+        "fallback_count": 0,
+        "episodes": 5
+      },
+      "allowed_modes": [
+        "off",
+        "hardcoded",
+        "shadow-infer"
+      ],
+      "status": "shadow",
+      "warnings": [
+        "checkpoint path is registered from golden reports but the checkpoint artifact is not present in this checkout",
+        "charger-seeking held-out scenario recommends continue_training with zero success, so keep this model shadow until charger policy is fixed",
+        "shadow registration is simulation evidence only and is not hardware safety approval"
+      ],
+      "notes": [
+        "Behavior evaluation recommends promote_to_model_infer, but scenario policy evidence is not sufficient for active charger authority.",
+        "Registered for dashboard visibility and promotion-gate tracking only."
+      ],
+      "parent_model": null,
+      "git_commit": "0368177"
     }
   ]
 }

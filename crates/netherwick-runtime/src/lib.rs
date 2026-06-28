@@ -14,7 +14,7 @@ use netherwick_behaviors::{
     ReplaceableBehavior, TargetExtractor, TrainingSample, TrainingSource,
 };
 use netherwick_body::{MotionCommand, MotorCommand, MotorComplex, RobotBody};
-use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
+use netherwick_conductor::{Conductor, ConductorInput, NavigationIntent, SimpleConductor};
 use netherwick_core::{Provenance, Reward, TimeMs};
 use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
@@ -562,7 +562,15 @@ pub struct ActionSelectionCandidateScore {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MapMemoryDecisionDebug {
     pub influenced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_intent: Option<NavigationIntent>,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    #[serde(default)]
+    pub confidence: f32,
     pub place_danger: f32,
     pub place_charge_value: f32,
     pub place_novelty: f32,
@@ -5347,6 +5355,12 @@ fn map_memory_decision_debug(
 
     debug.reason = map_memory_decision_reason(now, chosen_action);
     debug.influenced = debug.reason.is_some();
+    if let Some(reason) = debug.reason.as_deref() {
+        debug.navigation_intent = Some(map_memory_navigation_intent(reason));
+        debug.reason_string = Some(map_memory_reason_string(reason, now));
+        debug.signal = Some(map_memory_signal(reason));
+        debug.confidence = map_memory_confidence(reason, now);
+    }
     debug
 }
 
@@ -5432,6 +5446,93 @@ fn map_memory_decision_reason(now: &Now, action: &ActionPrimitive) -> Option<Str
     }
 
     None
+}
+
+fn map_memory_navigation_intent(reason: &str) -> NavigationIntent {
+    if reason.starts_with("danger_") {
+        NavigationIntent::AvoidKnownDangerCell
+    } else if reason.starts_with("recent_trap_") {
+        NavigationIntent::ReturnToFamiliarSafeCell
+    } else if reason.starts_with("charge_") {
+        NavigationIntent::GoTowardKnownCharger
+    } else if reason.starts_with("frontier_") || reason.starts_with("safe_novelty_") {
+        NavigationIntent::InspectSafeNovelFrontier
+    } else {
+        NavigationIntent::Explore
+    }
+}
+
+fn map_memory_signal(reason: &str) -> String {
+    match reason {
+        "danger_safe_direction" => "memory.nearby_best_safe_direction_rad",
+        "danger_current_cell" => "memory.place_danger",
+        "recent_trap_safe_direction" => {
+            "memory.recent_trap_confidence+nearby_best_safe_direction_rad"
+        }
+        "recent_trap_turn" => "memory.recent_trap_confidence",
+        "charge_direction_turn" => "memory.nearby_best_charge_direction_rad",
+        "charge_direction_aligned" => "memory.place_charge_value",
+        "frontier_direction_turn" => "memory.nearby_frontier_direction_rad",
+        "safe_novelty_inspect" => "memory.place_novelty",
+        _ => "memory.map",
+    }
+    .to_string()
+}
+
+fn map_memory_confidence(reason: &str, now: &Now) -> f32 {
+    let charge_confidence = sim_world_extension_score(now, 3)
+        .max(sim_world_extension_score(now, 4))
+        .max(now.memory.place_charge_value)
+        .clamp(0.0, 1.0);
+    match reason {
+        reason if reason.starts_with("danger_") => now.memory.place_danger.clamp(0.0, 1.0),
+        reason if reason.starts_with("recent_trap_") => {
+            now.memory.recent_trap_confidence.clamp(0.0, 1.0)
+        }
+        reason if reason.starts_with("charge_") => charge_confidence,
+        "frontier_direction_turn" | "safe_novelty_inspect" => {
+            now.memory.place_novelty.clamp(0.0, 1.0)
+        }
+        _ => now.memory.map_confidence.clamp(0.0, 1.0),
+    }
+}
+
+fn map_memory_reason_string(reason: &str, now: &Now) -> String {
+    match reason {
+        "danger_safe_direction" => format!(
+            "avoiding remembered danger {:.2} using safe bearing {:?}",
+            now.memory.place_danger, now.memory.nearby_best_safe_direction_rad
+        ),
+        "danger_current_cell" => format!(
+            "avoiding remembered/current danger {:.2} with local range clearance",
+            now.memory.place_danger
+        ),
+        "recent_trap_safe_direction" => format!(
+            "returning toward familiar safe cell from trap confidence {:.2}",
+            now.memory.recent_trap_confidence
+        ),
+        "recent_trap_turn" => format!(
+            "turning away from recent trap confidence {:.2}",
+            now.memory.recent_trap_confidence
+        ),
+        "charge_direction_turn" => format!(
+            "turning toward remembered charger bearing {:?} with charge value {:.2}",
+            now.memory.nearby_best_charge_direction_rad, now.memory.place_charge_value
+        ),
+        "charge_direction_aligned" => format!(
+            "approaching charger from remembered charge value {:.2}",
+            now.memory.place_charge_value
+        ),
+        "frontier_direction_turn" => format!(
+            "inspecting safe novel frontier bearing {:?} with novelty {:.2}",
+            now.memory.nearby_frontier_direction_rad, now.memory.place_novelty
+        ),
+        "safe_novelty_inspect" => format!(
+            "inspecting safe novel place with novelty {:.2}",
+            now.memory.place_novelty
+        ),
+        _ => "memory/map signal influenced navigation".to_string(),
+    }
 }
 
 fn select_action_from_scores(
@@ -6530,6 +6631,33 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn map_memory_debug_records_intent_confidence_and_signal() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.memory.place_danger = 0.9;
+        now.memory.nearby_best_safe_direction_rad = Some(-0.8);
+        let action = ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.5,
+            duration_ms: 1_000,
+        };
+
+        let debug = map_memory_decision_debug(&now, &action, Some(&action), false);
+
+        assert!(debug.influenced);
+        assert_eq!(
+            debug.navigation_intent,
+            Some(NavigationIntent::AvoidKnownDangerCell)
+        );
+        assert_eq!(debug.reason.as_deref(), Some("danger_safe_direction"));
+        assert_eq!(
+            debug.signal.as_deref(),
+            Some("memory.nearby_best_safe_direction_rad")
+        );
+        assert_eq!(debug.confidence, 0.9);
+        assert!(debug.reason_string.unwrap().contains("remembered danger"));
+    }
 
     fn idle_now(t_ms: u64) -> Now {
         let mut body = BodySense::default();

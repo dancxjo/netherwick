@@ -38,6 +38,15 @@ pub trait ExperienceEncoder {
     fn encode(&mut self, now: &Now) -> Result<ExperienceLatent>;
 }
 
+pub trait LatentEncoder {
+    fn encoder_kind(&self) -> &'static str;
+    fn encode_input(
+        &mut self,
+        input: &ExperienceEncodeInput,
+        t_ms: TimeMs,
+    ) -> Result<ExperienceLatent>;
+}
+
 pub trait ExperienceDecoder {
     fn decode(&mut self, latent: &ExperienceLatent) -> Result<NowReconstruction>;
 }
@@ -49,6 +58,927 @@ pub trait FuturePredictor {
         action: &ActionPrimitive,
         offset_ms: TimeMs,
     ) -> Result<FuturePrediction>;
+}
+
+pub const TINY_NOW_VECTOR_DIM: usize = 16;
+
+const EXPERIENCE_FORGE_POPULATION: usize = 48;
+const EXPERIENCE_FORGE_BUFFER: usize = 256;
+const EXPERIENCE_FORGE_MUTATION_TICKS: u64 = 32;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FeatureChannel {
+    pub name: String,
+    pub values: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FeatureChannelRegistry {
+    pub channels: BTreeMap<String, Vec<f32>>,
+}
+
+impl FeatureChannelRegistry {
+    pub fn from_now(now: &Now) -> Self {
+        let mut registry = Self::default();
+        registry.insert("body", body_channel(now));
+        registry.insert("range", range_channel(now));
+        registry.insert("kinect_depth", kinect_depth_channel(now));
+        registry.insert("odometry", odometry_channel(now));
+        registry.insert("contact", contact_channel(now));
+        registry.insert("reign", reign_channel(now));
+        registry.insert("llm", llm_channel(now));
+        registry.insert("memory", memory_channel(now));
+        registry.insert("surprise", surprise_channel(now));
+        for (name, value) in &now.extensions {
+            if let Some(values) = extension_values(value) {
+                registry.insert(format!("extension.{name}"), values);
+            }
+        }
+        registry
+    }
+
+    pub fn insert(&mut self, name: impl Into<String>, values: Vec<f32>) {
+        self.channels.insert(
+            name.into(),
+            values.into_iter().map(sanitize_feature).collect(),
+        );
+    }
+
+    pub fn channel_names(&self) -> Vec<String> {
+        self.channels.keys().cloned().collect()
+    }
+
+    pub fn get(&self, name: &str, index: usize) -> Option<f32> {
+        self.channels
+            .get(name)
+            .and_then(|values| values.get(index))
+            .copied()
+            .map(sanitize_feature)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterActivation {
+    #[default]
+    Tanh,
+    Sigmoid,
+    Relu,
+    Linear,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelSelector {
+    pub channel: String,
+    pub start: usize,
+    pub len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FilterGenome {
+    pub selectors: Vec<ChannelSelector>,
+    pub weights: Vec<f32>,
+    pub bias: f32,
+    pub activation: FilterActivation,
+    pub smoothing: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScalarFilter {
+    pub id: u64,
+    pub genome: FilterGenome,
+    pub score: f32,
+    pub age_ticks: u64,
+    pub last_output: f32,
+    pub fired_events: Vec<FilterFireEvent>,
+    stats: FilterStats,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FilterFireEvent {
+    pub t_ms: TimeMs,
+    pub value: f32,
+    pub labels: ExperienceOutcomeLabels,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceOutcomeLabels {
+    pub bump: bool,
+    pub stuck: bool,
+    pub blocked_forward: bool,
+    pub free_motion: bool,
+    pub novelty: bool,
+    pub intervention: bool,
+    pub action_changed_scene: bool,
+    pub stable_scene: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceFrame {
+    pub t_ms: TimeMs,
+    pub now: Now,
+    pub tiny_now_vector: Vec<f32>,
+    pub action: Option<ActionPrimitive>,
+    pub labels: ExperienceOutcomeLabels,
+    pub filter_outputs: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceTransition {
+    pub now: ExperienceFrame,
+    pub next_now: ExperienceFrame,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceForgeSnapshot {
+    pub t_ms: TimeMs,
+    pub tiny_now_vector: Vec<f32>,
+    pub channels: Vec<FeatureChannel>,
+    pub top_filters: Vec<FilterSummary>,
+    pub population_size: usize,
+    pub buffer_len: usize,
+    pub ticks: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FilterSummary {
+    pub id: u64,
+    pub slot: Option<usize>,
+    pub score: f32,
+    pub age_ticks: u64,
+    pub output: f32,
+    pub channels: Vec<String>,
+    pub fired_events: Vec<FilterFireEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceForge {
+    filters: Vec<ScalarFilter>,
+    champion_ids: Vec<u64>,
+    buffer: VecDeque<ExperienceTransition>,
+    last_frame: Option<ExperienceFrame>,
+    latest_registry: FeatureChannelRegistry,
+    latest_vector: Vec<f32>,
+    ticks: u64,
+    next_filter_id: u64,
+    rng: SmallForgeRng,
+}
+
+impl Default for ExperienceForge {
+    fn default() -> Self {
+        Self::new(0x51EED_u64)
+    }
+}
+
+impl ExperienceForge {
+    pub fn new(seed: u64) -> Self {
+        let mut forge = Self {
+            filters: Vec::new(),
+            champion_ids: Vec::new(),
+            buffer: VecDeque::with_capacity(EXPERIENCE_FORGE_BUFFER),
+            last_frame: None,
+            latest_registry: FeatureChannelRegistry::default(),
+            latest_vector: vec![0.0; TINY_NOW_VECTOR_DIM],
+            ticks: 0,
+            next_filter_id: 1,
+            rng: SmallForgeRng::new(seed),
+        };
+        forge.bootstrap_population();
+        forge.refresh_champions();
+        forge
+    }
+
+    pub fn tick(&mut self, now: &Now, action: Option<ActionPrimitive>) -> ExperienceForgeSnapshot {
+        self.ticks = self.ticks.saturating_add(1);
+        self.latest_registry = FeatureChannelRegistry::from_now(now);
+        let labels = labels_from_now(now, action.as_ref(), self.last_frame.as_ref());
+        let registry = self.latest_registry.clone();
+        let outputs = self.evaluate_filters(&registry);
+        let vector = self.champion_vector(&outputs);
+        let frame = ExperienceFrame {
+            t_ms: now.t_ms,
+            now: now.clone(),
+            tiny_now_vector: vector.clone(),
+            action,
+            labels,
+            filter_outputs: outputs,
+        };
+        if let Some(previous) = self.last_frame.take() {
+            let transition = ExperienceTransition {
+                now: previous,
+                next_now: frame.clone(),
+            };
+            self.score_transition(&transition);
+            self.buffer.push_back(transition);
+            while self.buffer.len() > EXPERIENCE_FORGE_BUFFER {
+                self.buffer.pop_front();
+            }
+        }
+        self.last_frame = Some(frame);
+        self.refresh_champions();
+        if self.ticks % EXPERIENCE_FORGE_MUTATION_TICKS == 0 {
+            self.mutate_weak_filters();
+            self.refresh_champions();
+        }
+        self.latest_vector = self.champion_vector_from_filters();
+        self.snapshot()
+    }
+
+    pub fn snapshot(&self) -> ExperienceForgeSnapshot {
+        let mut top_filters: Vec<_> = self
+            .filters
+            .iter()
+            .map(|filter| self.summary(filter))
+            .collect();
+        top_filters.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        top_filters.truncate(TINY_NOW_VECTOR_DIM);
+        ExperienceForgeSnapshot {
+            t_ms: self
+                .last_frame
+                .as_ref()
+                .map(|frame| frame.t_ms)
+                .unwrap_or_default(),
+            tiny_now_vector: self.latest_vector.clone(),
+            channels: self
+                .latest_registry
+                .channels
+                .iter()
+                .map(|(name, values)| FeatureChannel {
+                    name: name.clone(),
+                    values: values.clone(),
+                })
+                .collect(),
+            top_filters,
+            population_size: self.filters.len(),
+            buffer_len: self.buffer.len(),
+            ticks: self.ticks,
+        }
+    }
+
+    pub fn replay_score(
+        filters: Vec<ScalarFilter>,
+        frames: impl IntoIterator<Item = ExperienceFrame>,
+    ) -> Vec<ScalarFilter> {
+        let mut forge = Self {
+            filters,
+            champion_ids: Vec::new(),
+            buffer: VecDeque::new(),
+            last_frame: None,
+            latest_registry: FeatureChannelRegistry::default(),
+            latest_vector: vec![0.0; TINY_NOW_VECTOR_DIM],
+            ticks: 0,
+            next_filter_id: 1,
+            rng: SmallForgeRng::new(0xA11CE),
+        };
+        for frame in frames {
+            if let Some(previous) = forge.last_frame.take() {
+                forge.score_transition(&ExperienceTransition {
+                    now: previous,
+                    next_now: frame.clone(),
+                });
+            }
+            forge.last_frame = Some(frame);
+        }
+        forge.filters
+    }
+
+    pub fn filters(&self) -> &[ScalarFilter] {
+        &self.filters
+    }
+
+    fn bootstrap_population(&mut self) {
+        for channel in [
+            "contact",
+            "range",
+            "reign",
+            "odometry",
+            "body",
+            "kinect_depth",
+            "memory",
+            "llm",
+        ] {
+            let filter = self.new_filter_for_channel(channel);
+            self.filters.push(filter);
+        }
+        while self.filters.len() < EXPERIENCE_FORGE_POPULATION {
+            let channel = random_bootstrap_channel(self.rng.next_usize(8));
+            let filter = self.new_filter_for_channel(channel);
+            self.filters.push(filter);
+        }
+    }
+
+    fn new_filter_for_channel(&mut self, channel: &str) -> ScalarFilter {
+        let len = 1 + self.rng.next_usize(4);
+        let weights = (0..len)
+            .map(|_| self.rng.next_f32_signed())
+            .collect::<Vec<_>>();
+        let filter = ScalarFilter {
+            id: self.next_filter_id,
+            genome: FilterGenome {
+                selectors: vec![ChannelSelector {
+                    channel: channel.to_string(),
+                    start: self.rng.next_usize(4),
+                    len,
+                }],
+                weights,
+                bias: self.rng.next_f32_signed() * 0.2,
+                activation: match self.rng.next_usize(4) {
+                    0 => FilterActivation::Tanh,
+                    1 => FilterActivation::Sigmoid,
+                    2 => FilterActivation::Relu,
+                    _ => FilterActivation::Linear,
+                },
+                smoothing: self.rng.next_f32() * 0.45,
+            },
+            score: 0.0,
+            age_ticks: 0,
+            last_output: 0.0,
+            fired_events: Vec::new(),
+            stats: FilterStats::default(),
+        };
+        self.next_filter_id = self.next_filter_id.saturating_add(1);
+        filter
+    }
+
+    fn evaluate_filters(&mut self, registry: &FeatureChannelRegistry) -> Vec<f32> {
+        self.filters
+            .iter_mut()
+            .map(|filter| filter.evaluate(registry))
+            .collect()
+    }
+
+    fn champion_vector(&self, outputs: &[f32]) -> Vec<f32> {
+        let mut vector = Vec::with_capacity(TINY_NOW_VECTOR_DIM);
+        for id in &self.champion_ids {
+            let value = self
+                .filters
+                .iter()
+                .position(|filter| filter.id == *id)
+                .and_then(|index| outputs.get(index))
+                .copied()
+                .unwrap_or_default();
+            vector.push(value);
+        }
+        vector.resize(TINY_NOW_VECTOR_DIM, 0.0);
+        vector
+    }
+
+    fn champion_vector_from_filters(&self) -> Vec<f32> {
+        let mut vector = self
+            .champion_ids
+            .iter()
+            .filter_map(|id| self.filters.iter().find(|filter| filter.id == *id))
+            .map(|filter| filter.last_output)
+            .collect::<Vec<_>>();
+        vector.resize(TINY_NOW_VECTOR_DIM, 0.0);
+        vector.truncate(TINY_NOW_VECTOR_DIM);
+        vector
+    }
+
+    fn score_transition(&mut self, transition: &ExperienceTransition) {
+        let scene_delta = normalized_distance(
+            &transition.now.tiny_now_vector,
+            &transition.next_now.tiny_now_vector,
+        );
+        let important = transition.next_now.labels.bump
+            || transition.next_now.labels.stuck
+            || transition.next_now.labels.blocked_forward
+            || transition.next_now.labels.intervention
+            || transition.next_now.labels.action_changed_scene;
+        for (index, filter) in self.filters.iter_mut().enumerate() {
+            let before = transition
+                .now
+                .filter_outputs
+                .get(index)
+                .copied()
+                .unwrap_or_default();
+            let after = transition
+                .next_now
+                .filter_outputs
+                .get(index)
+                .copied()
+                .unwrap_or_default();
+            filter.update_score(
+                before,
+                after,
+                scene_delta,
+                &transition.next_now.labels,
+                important,
+                transition.next_now.t_ms,
+            );
+        }
+    }
+
+    fn refresh_champions(&mut self) {
+        let mut ranked = self
+            .filters
+            .iter()
+            .map(|filter| (filter.id, filter.score))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.champion_ids = ranked
+            .into_iter()
+            .take(TINY_NOW_VECTOR_DIM)
+            .map(|(id, _)| id)
+            .collect();
+    }
+
+    fn mutate_weak_filters(&mut self) {
+        let champion_ids = self.champion_ids.clone();
+        let channels = self.latest_registry.channel_names();
+        let mut ranked = self
+            .filters
+            .iter()
+            .enumerate()
+            .map(|(index, filter)| (index, filter.score))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (index, _) in ranked.into_iter().take(TINY_NOW_VECTOR_DIM / 2) {
+            if champion_ids.contains(&self.filters[index].id) {
+                continue;
+            }
+            let channel = channels
+                .get(self.rng.next_usize(channels.len().max(1)))
+                .map(String::as_str)
+                .unwrap_or_else(|| random_bootstrap_channel(self.rng.next_usize(8)));
+            self.filters[index] = self.new_filter_for_channel(channel);
+        }
+        self.penalize_duplicates();
+    }
+
+    fn penalize_duplicates(&mut self) {
+        for left in 0..self.filters.len() {
+            for right in (left + 1)..self.filters.len() {
+                let duplicate = self.filters[left].genome.selectors.first()
+                    == self.filters[right].genome.selectors.first();
+                if duplicate
+                    && (self.filters[left].last_output - self.filters[right].last_output).abs()
+                        < 0.02
+                {
+                    self.filters[right].score -= 0.03;
+                }
+            }
+        }
+    }
+
+    fn summary(&self, filter: &ScalarFilter) -> FilterSummary {
+        FilterSummary {
+            id: filter.id,
+            slot: self
+                .champion_ids
+                .iter()
+                .position(|candidate| *candidate == filter.id),
+            score: filter.score,
+            age_ticks: filter.age_ticks,
+            output: filter.last_output,
+            channels: filter
+                .genome
+                .selectors
+                .iter()
+                .map(|selector| selector.channel.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            fired_events: filter.fired_events.clone(),
+        }
+    }
+}
+
+impl ScalarFilter {
+    pub fn evaluate(&mut self, registry: &FeatureChannelRegistry) -> f32 {
+        let mut weighted = self.genome.bias;
+        let mut weight_index = 0;
+        let mut missing = 0usize;
+        for selector in &self.genome.selectors {
+            for offset in 0..selector.len {
+                let value = registry
+                    .get(&selector.channel, selector.start.saturating_add(offset))
+                    .unwrap_or_else(|| {
+                        missing = missing.saturating_add(1);
+                        0.0
+                    });
+                let weight = self
+                    .genome
+                    .weights
+                    .get(weight_index)
+                    .copied()
+                    .unwrap_or_default();
+                weighted += value * weight;
+                weight_index += 1;
+            }
+        }
+        let activated = match self.genome.activation {
+            FilterActivation::Tanh => weighted.tanh(),
+            FilterActivation::Sigmoid => 1.0 / (1.0 + (-weighted).exp()),
+            FilterActivation::Relu => weighted.max(0.0).min(1.0),
+            FilterActivation::Linear => weighted.clamp(-1.0, 1.0),
+        };
+        let smoothing = self.genome.smoothing.clamp(0.0, 0.95);
+        let output = self.last_output * smoothing + activated * (1.0 - smoothing);
+        self.last_output = output.clamp(-1.0, 1.0);
+        self.age_ticks = self.age_ticks.saturating_add(1);
+        self.stats.missing_ratio = missing as f32 / self.genome.weights.len().max(1) as f32;
+        self.last_output
+    }
+
+    fn update_score(
+        &mut self,
+        before: f32,
+        after: f32,
+        scene_delta: f32,
+        labels: &ExperienceOutcomeLabels,
+        important: bool,
+        t_ms: TimeMs,
+    ) {
+        let output = before.abs().clamp(0.0, 1.0);
+        let delta = (after - before).abs().clamp(0.0, 1.0);
+        let event = labels.bump || labels.stuck || labels.blocked_forward || labels.intervention;
+        self.stats.event_pos = ewma(self.stats.event_pos, if event { output } else { 0.0 }, 0.08);
+        self.stats.event_neg = ewma(self.stats.event_neg, if event { 0.0 } else { output }, 0.08);
+        self.stats.important_change = ewma(
+            self.stats.important_change,
+            if important { delta } else { 0.0 },
+            0.08,
+        );
+        self.stats.stability = ewma(
+            self.stats.stability,
+            if labels.stable_scene {
+                1.0 - delta
+            } else {
+                0.0
+            },
+            0.06,
+        );
+        self.stats.jitter = ewma(
+            self.stats.jitter,
+            if labels.stable_scene { delta } else { 0.0 },
+            0.06,
+        );
+        self.stats.activity = ewma(self.stats.activity, output, 0.04);
+        let predictiveness = (self.stats.event_pos - self.stats.event_neg).max(0.0);
+        let collapse = if self.stats.activity < 0.03 {
+            0.25
+        } else {
+            0.0
+        };
+        self.score =
+            predictiveness * 1.8 + self.stats.important_change + self.stats.stability * 0.35
+                - self.stats.jitter * 0.8
+                - collapse
+                - self.stats.missing_ratio * 0.4;
+        if output > 0.68 || (event && output > 0.35) {
+            self.fired_events.push(FilterFireEvent {
+                t_ms,
+                value: before,
+                labels: labels.clone(),
+            });
+            while self.fired_events.len() > 8 {
+                self.fired_events.remove(0);
+            }
+        }
+        let action_scene_bonus = if labels.action_changed_scene && scene_delta > 0.05 {
+            0.02
+        } else {
+            0.0
+        };
+        self.score += action_scene_bonus;
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct FilterStats {
+    event_pos: f32,
+    event_neg: f32,
+    important_change: f32,
+    stability: f32,
+    jitter: f32,
+    activity: f32,
+    missing_ratio: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SmallForgeRng {
+    state: u64,
+}
+
+impl SmallForgeRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.state >> 32) as u32
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        self.next_u32() as f32 / u32::MAX as f32
+    }
+
+    fn next_f32_signed(&mut self) -> f32 {
+        self.next_f32() * 2.0 - 1.0
+    }
+
+    fn next_usize(&mut self, limit: usize) -> usize {
+        if limit == 0 {
+            0
+        } else {
+            self.next_u32() as usize % limit
+        }
+    }
+}
+
+fn body_channel(now: &Now) -> Vec<f32> {
+    vec![
+        now.body.battery_level.clamp(0.0, 1.0),
+        bool01(now.body.charging),
+        now.body.velocity.forward_m_s.clamp(-1.0, 1.0),
+        now.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
+        now.body.health.strain.clamp(0.0, 1.0),
+        now.body.health.health.clamp(0.0, 1.0),
+        now.body.cliff_sensors.left.clamp(0.0, 1.0),
+        now.body.cliff_sensors.front_left.clamp(0.0, 1.0),
+        now.body.cliff_sensors.front_right.clamp(0.0, 1.0),
+        now.body.cliff_sensors.right.clamp(0.0, 1.0),
+    ]
+}
+
+fn contact_channel(now: &Now) -> Vec<f32> {
+    vec![
+        bool01(now.body.flags.bump_left),
+        bool01(now.body.flags.bump_right),
+        bool01(now.body.flags.bump_left || now.body.flags.bump_right),
+        bool01(cliff_detected(now)),
+        bool01(now.body.flags.wheel_drop),
+        bool01(now.body.flags.wall),
+        bool01(now.body.flags.virtual_wall),
+        now.extensions
+            .get("sim.stuck")
+            .and_then(|value| extension_values(value))
+            .and_then(|values| values.first().copied())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+    ]
+}
+
+fn range_channel(now: &Now) -> Vec<f32> {
+    let beams = finite_values(&now.range.beams);
+    let nearest = now
+        .range
+        .nearest_m
+        .or_else(|| beams.iter().copied().reduce(f32::min));
+    let mean = mean(&beams).unwrap_or_default();
+    let len = beams.len().max(1);
+    let third = len / 3;
+    let front = window_mean(&beams, third, len.saturating_sub(third * 2).max(1));
+    vec![
+        nearest.map(inverse_distance).unwrap_or_default(),
+        (beams.len() as f32 / 128.0).clamp(0.0, 1.0),
+        inverse_distance(mean),
+        inverse_distance(front),
+        inverse_distance(window_mean(&beams, 0, third.max(1))),
+        inverse_distance(window_mean(
+            &beams,
+            len.saturating_sub(third.max(1)),
+            third.max(1),
+        )),
+    ]
+}
+
+fn kinect_depth_channel(now: &Now) -> Vec<f32> {
+    let depths = finite_values(&now.kinect.depth_m);
+    let nonzero = depths.iter().filter(|value| **value > 0.01).count();
+    let min = depths.iter().copied().reduce(f32::min).unwrap_or_default();
+    let max = depths.iter().copied().reduce(f32::max).unwrap_or_default();
+    let mean = mean(&depths).unwrap_or_default();
+    vec![
+        inverse_distance(min),
+        inverse_distance(mean),
+        inverse_distance(max),
+        nonzero as f32 / depths.len().max(1) as f32,
+        (now.kinect.depth_width as f32 / 640.0).clamp(0.0, 1.0),
+        (now.kinect.depth_height as f32 / 480.0).clamp(0.0, 1.0),
+        now.kinect.audio_confidence.clamp(0.0, 1.0),
+        now.kinect.audio_angle_rad.unwrap_or_default().sin(),
+        now.kinect.audio_angle_rad.unwrap_or_default().cos(),
+    ]
+}
+
+fn odometry_channel(now: &Now) -> Vec<f32> {
+    vec![
+        now.body.odometry.x_m.tanh(),
+        now.body.odometry.y_m.tanh(),
+        now.body.odometry.heading_rad.sin(),
+        now.body.odometry.heading_rad.cos(),
+        now.body.velocity.forward_m_s.clamp(-1.0, 1.0),
+        now.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
+    ]
+}
+
+fn reign_channel(now: &Now) -> Vec<f32> {
+    let action = now
+        .reign
+        .latest
+        .as_ref()
+        .and_then(|input| input.command.to_action());
+    let motor = action_to_motor_command(action.as_ref());
+    vec![
+        bool01(now.reign.active),
+        now.reign.human_override_pressure.clamp(0.0, 1.0),
+        (now.reign.pending_count as f32 / 8.0).clamp(0.0, 1.0),
+        bool01(matches!(action, Some(ActionPrimitive::Stop))),
+        bool01(matches!(
+            action,
+            Some(ActionPrimitive::Go { .. } | ActionPrimitive::Drive { .. })
+        )),
+        bool01(matches!(action, Some(ActionPrimitive::Turn { .. }))),
+        motor.forward.clamp(-1.0, 1.0),
+        motor.turn.clamp(-1.0, 1.0),
+    ]
+}
+
+fn llm_channel(now: &Now) -> Vec<f32> {
+    vec![
+        bool01(
+            now.llm
+                .command_summary
+                .as_ref()
+                .map(|text| !text.trim().is_empty())
+                .unwrap_or(false),
+        ),
+        bool01(
+            now.llm
+                .critique
+                .as_ref()
+                .map(|text| !text.trim().is_empty())
+                .unwrap_or(false),
+        ),
+        now.llm.confidence.clamp(0.0, 1.0),
+    ]
+}
+
+fn memory_channel(now: &Now) -> Vec<f32> {
+    vec![
+        now.memory.place_familiarity.clamp(0.0, 1.0),
+        now.memory.place_danger.clamp(0.0, 1.0),
+        now.memory.place_charge_value.clamp(0.0, 1.0),
+        now.memory.place_novelty.clamp(0.0, 1.0),
+        now.memory.recent_trap_confidence.clamp(0.0, 1.0),
+        (now.memory.similar_situation_count as f32 / 32.0).clamp(0.0, 1.0),
+        bool01(now.memory.remembered_warning.is_some()),
+    ]
+}
+
+fn surprise_channel(now: &Now) -> Vec<f32> {
+    vec![
+        now.surprise.total.clamp(0.0, 1.0),
+        now.surprise.prediction_error.clamp(0.0, 1.0),
+        now.predictions.uncertainty.clamp(0.0, 1.0),
+    ]
+}
+
+fn extension_values(value: &Value) -> Option<Vec<f32>> {
+    value.get("values")?.as_array().map(|values| {
+        values
+            .iter()
+            .filter_map(|value| value.as_f64())
+            .map(|value| sanitize_feature(value as f32))
+            .collect()
+    })
+}
+
+fn labels_from_now(
+    now: &Now,
+    action: Option<&ActionPrimitive>,
+    previous: Option<&ExperienceFrame>,
+) -> ExperienceOutcomeLabels {
+    let bump = now.body.flags.bump_left || now.body.flags.bump_right;
+    let stuck = now
+        .extensions
+        .get("sim.stuck")
+        .and_then(|value| extension_values(value))
+        .and_then(|values| values.first().copied())
+        .unwrap_or(0.0)
+        > 0.0;
+    let commanded_forward = matches!(
+        action,
+        Some(
+            ActionPrimitive::Go { .. }
+                | ActionPrimitive::Drive { .. }
+                | ActionPrimitive::Explore { .. }
+        )
+    ) || now
+        .reign
+        .latest
+        .as_ref()
+        .and_then(|input| input.command.to_action())
+        .map(|action| {
+            matches!(
+                action,
+                ActionPrimitive::Go { .. }
+                    | ActionPrimitive::Drive { .. }
+                    | ActionPrimitive::Explore { .. }
+            )
+        })
+        .unwrap_or(false);
+    let odom_delta = previous
+        .map(|previous| {
+            ((now.body.odometry.x_m - previous.now.body.odometry.x_m).powi(2)
+                + (now.body.odometry.y_m - previous.now.body.odometry.y_m).powi(2))
+            .sqrt()
+        })
+        .unwrap_or_default();
+    let scene_delta = previous
+        .map(|previous| {
+            normalized_distance(
+                &flat_registry_values(&previous.now),
+                &flat_registry_values(now),
+            )
+        })
+        .unwrap_or_default();
+    ExperienceOutcomeLabels {
+        bump,
+        stuck,
+        blocked_forward: commanded_forward
+            && odom_delta < 0.005
+            && now.body.velocity.forward_m_s.abs() < 0.01,
+        free_motion: commanded_forward && odom_delta > 0.01 && !bump && !stuck,
+        novelty: now.memory.place_novelty > 0.5 || now.surprise.total > 0.4,
+        intervention: now.reign.active || now.reign.human_override_pressure > 0.1,
+        action_changed_scene: commanded_forward && scene_delta > 0.04,
+        stable_scene: scene_delta < 0.025 && odom_delta < 0.005,
+    }
+}
+
+fn finite_values(values: &[f32]) -> Vec<f32> {
+    values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect()
+}
+
+fn mean(values: &[f32]) -> Option<f32> {
+    (!values.is_empty()).then(|| values.iter().sum::<f32>() / values.len() as f32)
+}
+
+fn window_mean(values: &[f32], start: usize, len: usize) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let start = start.min(values.len());
+    let end = start.saturating_add(len).min(values.len());
+    mean(&values[start..end]).unwrap_or_default()
+}
+
+fn inverse_distance(value: f32) -> f32 {
+    if value <= 0.0 {
+        0.0
+    } else {
+        (1.0 / (1.0 + value)).clamp(0.0, 1.0)
+    }
+}
+
+fn ewma(previous: f32, next: f32, alpha: f32) -> f32 {
+    previous * (1.0 - alpha) + next * alpha
+}
+
+fn random_bootstrap_channel(index: usize) -> &'static str {
+    match index {
+        0 => "body",
+        1 => "range",
+        2 => "kinect_depth",
+        3 => "odometry",
+        4 => "contact",
+        5 => "reign",
+        6 => "memory",
+        _ => "surprise",
+    }
+}
+
+fn flat_registry_values(now: &Now) -> Vec<f32> {
+    FeatureChannelRegistry::from_now(now)
+        .channels
+        .values()
+        .flat_map(|values| values.iter().copied())
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -776,6 +1706,159 @@ impl ExperienceEncoder for FeatureExperienceEncoder {
             prediction_error: now.surprise.prediction_error,
             confidence: 0.65,
         })
+    }
+}
+
+impl LatentEncoder for FeatureExperienceEncoder {
+    fn encoder_kind(&self) -> &'static str {
+        "online-evolved-filters"
+    }
+
+    fn encode_input(
+        &mut self,
+        input: &ExperienceEncodeInput,
+        t_ms: TimeMs,
+    ) -> Result<ExperienceLatent> {
+        let z = input
+            .flat_features()
+            .into_iter()
+            .map(sanitize_feature)
+            .collect::<Vec<_>>();
+        Ok(ExperienceLatent {
+            t_ms,
+            z,
+            reconstruction_error: 0.0,
+            prediction_error: 0.0,
+            confidence: 0.55,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RandomProjectionExperienceEncoder {
+    z_dim: usize,
+    seed: u64,
+}
+
+impl RandomProjectionExperienceEncoder {
+    pub fn new(z_dim: usize, seed: u64) -> Self {
+        Self {
+            z_dim: z_dim.max(1),
+            seed,
+        }
+    }
+
+    fn weight(&self, output_index: usize, input_index: usize) -> f32 {
+        let mut x = self.seed
+            ^ ((output_index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ ((input_index as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        match x % 6 {
+            0 | 1 => -1.0,
+            2 | 3 => 0.0,
+            _ => 1.0,
+        }
+    }
+}
+
+impl LatentEncoder for RandomProjectionExperienceEncoder {
+    fn encoder_kind(&self) -> &'static str {
+        "random-projection"
+    }
+
+    fn encode_input(
+        &mut self,
+        input: &ExperienceEncodeInput,
+        t_ms: TimeMs,
+    ) -> Result<ExperienceLatent> {
+        let features = input.flat_features();
+        let scale = (features.len().max(1) as f32).sqrt();
+        let mut z = vec![0.0; self.z_dim];
+        for (out_index, out) in z.iter_mut().enumerate() {
+            let sum = features
+                .iter()
+                .enumerate()
+                .map(|(in_index, value)| {
+                    sanitize_feature(*value) * self.weight(out_index, in_index)
+                })
+                .sum::<f32>();
+            *out = (sum / scale).tanh();
+        }
+        Ok(ExperienceLatent {
+            t_ms,
+            z,
+            reconstruction_error: 1.0,
+            prediction_error: 0.0,
+            confidence: 0.35,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CodebookQuantizer {
+    pub codes: Vec<Vec<f32>>,
+    pub usage: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CodebookUsageReport {
+    pub code_count: usize,
+    pub used_codes: usize,
+    pub dead_codes: usize,
+    pub usage: Vec<u64>,
+}
+
+impl CodebookQuantizer {
+    pub fn from_latents(latents: &[Vec<f32>], code_count: usize) -> Self {
+        let code_count = code_count.max(1);
+        let mut codes = Vec::new();
+        for index in 0..code_count {
+            let code = latents
+                .get(index.saturating_mul(latents.len().max(1)) / code_count)
+                .cloned()
+                .unwrap_or_default();
+            codes.push(code);
+        }
+        Self {
+            codes,
+            usage: vec![0; code_count],
+        }
+    }
+
+    pub fn encode(&mut self, latent: &[f32]) -> usize {
+        let (index, _) = self
+            .codes
+            .iter()
+            .enumerate()
+            .map(|(index, code)| (index, normalized_distance(code, latent)))
+            .min_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or((0, 0.0));
+        if let Some(count) = self.usage.get_mut(index) {
+            *count = count.saturating_add(1);
+        }
+        index
+    }
+
+    pub fn decode(&self, code_id: usize) -> Vec<f32> {
+        self.codes.get(code_id).cloned().unwrap_or_default()
+    }
+
+    pub fn report(&self) -> CodebookUsageReport {
+        let used_codes = self.usage.iter().filter(|count| **count > 0).count();
+        CodebookUsageReport {
+            code_count: self.codes.len(),
+            used_codes,
+            dead_codes: self.codes.len().saturating_sub(used_codes),
+            usage: self.usage.clone(),
+        }
     }
 }
 
@@ -1660,6 +2743,69 @@ mod tests {
     }
 
     #[test]
+    fn experience_forge_emits_fixed_tiny_now_vector_and_channels() {
+        let mut forge = ExperienceForge::new(7);
+        let mut now = Now::blank(100, BodySense::default());
+        now.range.nearest_m = Some(0.4);
+        now.reign.active = true;
+
+        let snapshot = forge.tick(&now, Some(ActionPrimitive::Stop));
+
+        assert_eq!(snapshot.tiny_now_vector.len(), TINY_NOW_VECTOR_DIM);
+        assert_eq!(snapshot.population_size, EXPERIENCE_FORGE_POPULATION);
+        assert!(snapshot
+            .channels
+            .iter()
+            .any(|channel| channel.name == "range"));
+        assert!(snapshot
+            .top_filters
+            .iter()
+            .any(|filter| filter.slot.is_some()));
+    }
+
+    #[test]
+    fn replay_scoring_rewards_filter_that_fires_before_bumps() {
+        let filter = ScalarFilter {
+            id: 1,
+            genome: FilterGenome {
+                selectors: vec![ChannelSelector {
+                    channel: "contact".to_string(),
+                    start: 2,
+                    len: 1,
+                }],
+                weights: vec![1.0],
+                bias: 0.0,
+                activation: FilterActivation::Linear,
+                smoothing: 0.0,
+            },
+            score: 0.0,
+            age_ticks: 0,
+            last_output: 0.0,
+            fired_events: Vec::new(),
+            stats: FilterStats::default(),
+        };
+        let quiet = experience_frame_for_replay(100, 0.0, ExperienceOutcomeLabels::default());
+        let bump = experience_frame_for_replay(
+            200,
+            0.9,
+            ExperienceOutcomeLabels {
+                bump: true,
+                ..ExperienceOutcomeLabels::default()
+            },
+        );
+
+        let scored = ExperienceForge::replay_score(
+            vec![filter],
+            std::iter::repeat([quiet.clone(), bump.clone()])
+                .take(16)
+                .flatten(),
+        );
+
+        assert!(scored[0].score > 0.0);
+        assert!(!scored[0].fired_events.is_empty());
+    }
+
+    #[test]
     fn stasis_predictor_clones_latent_and_decays_confidence() {
         let mut predictor = StasisFuturePredictor;
         let latent = ExperienceLatent {
@@ -1683,6 +2829,21 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("stable"));
+    }
+
+    fn experience_frame_for_replay(
+        t_ms: TimeMs,
+        output: f32,
+        labels: ExperienceOutcomeLabels,
+    ) -> ExperienceFrame {
+        ExperienceFrame {
+            t_ms,
+            now: Now::blank(t_ms, BodySense::default()),
+            tiny_now_vector: vec![output; TINY_NOW_VECTOR_DIM],
+            action: None,
+            labels,
+            filter_outputs: vec![output],
+        }
     }
 
     #[test]

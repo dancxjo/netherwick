@@ -48,7 +48,8 @@ use netherwick_training::dream_policy::{
 };
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
-    EvaluateBehaviorRequest, TrainBehaviorRequest, TrainableBehavior,
+    train_latent_round_trip, EvaluateBehaviorRequest, TrainBehaviorRequest,
+    TrainLatentRoundTripRequest, TrainableBehavior,
 };
 use netherwick_worldlab::{
     export_pointcloud_for_frame, export_snapshot_assets, rewrite_frames, update_manifest,
@@ -653,6 +654,7 @@ enum TrainModel {
     EyeNext(TrainEyeNextArgs),
     EarNext(TrainEarNextArgs),
     Experience(TrainExperienceArgs),
+    LatentRoundTrip(TrainLatentRoundTripArgs),
     Virtual(TrainVirtualArgs),
 }
 
@@ -742,6 +744,26 @@ struct TrainExperienceArgs {
 }
 
 #[derive(Debug, Parser)]
+struct TrainLatentRoundTripArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/latent_round_trip_v0")]
+    checkpoint: String,
+    #[arg(long, default_value = "data/reports/latent-round-trip.json")]
+    report: String,
+    #[arg(long, default_value_t = 16)]
+    z_dim: usize,
+    #[arg(long, default_value_t = 0.2)]
+    validation_split: f32,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long)]
+    codebook_size: Option<usize>,
+}
+
+#[derive(Debug, Parser)]
 struct InspectLedgerArgs {
     #[arg(
         long,
@@ -771,6 +793,8 @@ struct PoseGraphReportArgs {
         env = "NETHERWICK_LEDGER"
     )]
     ledger: String,
+    #[arg(long)]
+    capture: Option<String>,
     #[arg(long, default_value = "data/reports/pose-graph/latest.json")]
     out: String,
     #[arg(long, default_value_t = 0.25)]
@@ -1446,6 +1470,12 @@ struct ScenarioEvaluationSummary {
     frontier_memory_decisions: usize,
     #[serde(default)]
     trap_memory_decisions: usize,
+    #[serde(default)]
+    memory_navigation_intents: HashMap<String, usize>,
+    #[serde(default)]
+    memory_navigation_reasons: HashMap<String, usize>,
+    #[serde(default)]
+    low_confidence_navigation_fallbacks: usize,
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
     mean_chosen_score: Option<f32>,
@@ -1534,6 +1564,12 @@ struct ScenarioEpisodeReport {
     frontier_memory_decisions: usize,
     #[serde(default)]
     trap_memory_decisions: usize,
+    #[serde(default)]
+    memory_navigation_intents: HashMap<String, usize>,
+    #[serde(default)]
+    memory_navigation_reasons: HashMap<String, usize>,
+    #[serde(default)]
+    low_confidence_navigation_fallbacks: usize,
     mean_chosen_score: Option<f32>,
     mean_candidate_score: Option<f32>,
     ticks_with_eye_frames: usize,
@@ -1633,6 +1669,9 @@ struct EpisodeMetricBuilder {
     novelty_memory_decisions: usize,
     frontier_memory_decisions: usize,
     trap_memory_decisions: usize,
+    memory_navigation_intents: HashMap<String, usize>,
+    memory_navigation_reasons: HashMap<String, usize>,
+    low_confidence_navigation_fallbacks: usize,
     chosen_score_sum: f32,
     chosen_score_count: usize,
     candidate_score_sum: f32,
@@ -1711,6 +1750,9 @@ impl EpisodeMetricBuilder {
             novelty_memory_decisions: 0,
             frontier_memory_decisions: 0,
             trap_memory_decisions: 0,
+            memory_navigation_intents: HashMap::new(),
+            memory_navigation_reasons: HashMap::new(),
+            low_confidence_navigation_fallbacks: 0,
             chosen_score_sum: 0.0,
             chosen_score_count: 0,
             candidate_score_sum: 0.0,
@@ -1971,6 +2013,30 @@ impl EpisodeMetricBuilder {
             .get("reason")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        if let Some(intent) = decision
+            .get("navigation_intent")
+            .and_then(|value| value.as_str())
+        {
+            *self
+                .memory_navigation_intents
+                .entry(intent.to_string())
+                .or_default() += 1;
+        }
+        if !reason.is_empty() {
+            *self
+                .memory_navigation_reasons
+                .entry(reason.to_string())
+                .or_default() += 1;
+        }
+        if decision
+            .get("confidence")
+            .and_then(|value| value.as_f64())
+            .map(|confidence| confidence < 0.35)
+            .unwrap_or(false)
+        {
+            self.low_confidence_navigation_fallbacks =
+                self.low_confidence_navigation_fallbacks.saturating_add(1);
+        }
         if reason.starts_with("danger_") {
             self.danger_memory_decisions = self.danger_memory_decisions.saturating_add(1);
         } else if reason.starts_with("charge_") {
@@ -2090,6 +2156,9 @@ impl EpisodeMetricBuilder {
             novelty_memory_decisions: self.novelty_memory_decisions,
             frontier_memory_decisions: self.frontier_memory_decisions,
             trap_memory_decisions: self.trap_memory_decisions,
+            memory_navigation_intents: self.memory_navigation_intents,
+            memory_navigation_reasons: self.memory_navigation_reasons,
+            low_confidence_navigation_fallbacks: self.low_confidence_navigation_fallbacks,
             mean_chosen_score: (self.chosen_score_count > 0)
                 .then_some(self.chosen_score_sum / self.chosen_score_count as f32),
             mean_candidate_score: (self.candidate_score_count > 0)
@@ -2587,6 +2656,12 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
             .iter()
             .map(|episode| episode.trap_memory_decisions)
             .sum(),
+        memory_navigation_intents: summarize_memory_navigation_intents(episodes),
+        memory_navigation_reasons: summarize_memory_navigation_reasons(episodes),
+        low_confidence_navigation_fallbacks: episodes
+            .iter()
+            .map(|episode| episode.low_confidence_navigation_fallbacks)
+            .sum(),
         model_assisted_decisions: episodes
             .iter()
             .map(|episode| episode.model_assisted_decisions)
@@ -2613,6 +2688,30 @@ fn summarize_action_histogram(episodes: &[ScenarioEpisodeReport]) -> HashMap<Str
     for episode in episodes {
         for (action, count) in &episode.action_histogram {
             *histogram.entry(action.clone()).or_default() += count;
+        }
+    }
+    histogram
+}
+
+fn summarize_memory_navigation_intents(
+    episodes: &[ScenarioEpisodeReport],
+) -> HashMap<String, usize> {
+    let mut histogram = HashMap::new();
+    for episode in episodes {
+        for (intent, count) in &episode.memory_navigation_intents {
+            *histogram.entry(intent.clone()).or_default() += count;
+        }
+    }
+    histogram
+}
+
+fn summarize_memory_navigation_reasons(
+    episodes: &[ScenarioEpisodeReport],
+) -> HashMap<String, usize> {
+    let mut histogram = HashMap::new();
+    for episode in episodes {
+        for (reason, count) in &episode.memory_navigation_reasons {
+            *histogram.entry(reason.clone()).or_default() += count;
         }
     }
     histogram
@@ -5613,6 +5712,7 @@ async fn run_train(command: TrainCommand) -> Result<()> {
             })
             .await
         }
+        TrainModel::LatentRoundTrip(args) => run_train_latent_round_trip(args).await,
         TrainModel::Virtual(args) => run_train_virtual(args).await,
     }
 }
@@ -5651,6 +5751,49 @@ async fn train_behavior_command(args: TrainBehaviorArgs) -> Result<()> {
     }
     println!("best_loss: {:?}", summary.best_loss);
     print_evaluation_report(&summary.evaluation)?;
+    Ok(())
+}
+
+async fn run_train_latent_round_trip(args: TrainLatentRoundTripArgs) -> Result<()> {
+    let report = train_latent_round_trip(TrainLatentRoundTripRequest {
+        ledger_path: args.ledger.into(),
+        checkpoint_path: args.checkpoint.clone().into(),
+        report_path: args.report.clone().into(),
+        epochs: args.epochs,
+        validation_split: args.validation_split,
+        seed: args.seed,
+        z_dim: args.z_dim,
+        codebook_size: args.codebook_size,
+    })
+    .await?;
+    println!(
+        "latent round-trip training complete: {} transitions, {} epochs, report {}",
+        report.transition_count, report.epochs, args.report
+    );
+    println!(
+        "reconstruction_loss_mean: {:.6}",
+        report.reconstruction.trained_decoder_loss_mean
+    );
+    for predictor in &report.predictors {
+        println!(
+            "{} predictor: model_loss={:.6} stasis_loss={:.6} improvement={:?} predictive={}",
+            predictor.encoder,
+            predictor.model_loss_mean,
+            predictor.stasis_loss_mean,
+            predictor.improvement_ratio,
+            predictor.predictive
+        );
+    }
+    if let Some(codebook) = &report.codebook {
+        println!(
+            "codebook: {} codes, {} used, {} dead",
+            codebook.code_count, codebook.used_codes, codebook.dead_codes
+        );
+    }
+    println!("verdict: {}", report.verdict);
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
     Ok(())
 }
 
@@ -6713,10 +6856,6 @@ async fn run_pose_graph_report(args: PoseGraphReportArgs) -> Result<()> {
 }
 
 async fn generate_pose_graph_report(args: &PoseGraphReportArgs) -> Result<PoseGraphReport> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let mut frames = ledger.range(0, u64::MAX).await?;
-    frames.sort_by_key(|frame| frame.t_ms);
-
     let config = PoseGraphConfig {
         min_node_distance_m: args.min_node_distance_m,
         min_node_heading_delta_rad: args.min_node_degrees.to_radians(),
@@ -6727,29 +6866,57 @@ async fn generate_pose_graph_report(args: &PoseGraphReportArgs) -> Result<PoseGr
     let mut builder = PoseGraphBuilder::new(config);
     let mut memory = PlaceMemory::new();
 
-    for frame in &frames {
-        let current_key =
-            Some(memory.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m));
-        let place_candidates =
-            memory.recognize_places(current_key, &frame.now.eye.scene_vectors, 0.0, 20);
-        let loop_candidates = place_candidates
-            .iter()
-            .map(place_candidate_to_loop_input)
-            .collect::<Vec<_>>();
-        builder.observe(
-            frame.now.body.odometry,
-            frame.t_ms,
-            Some(frame.id.to_string()),
-            &loop_candidates,
-        );
-        memory.observe_frame(frame);
+    if let Some(capture) = args.capture.as_deref() {
+        let reader = CaptureReader::open(capture).await?;
+        let mut records = reader.read_frames().await?;
+        records.sort_by_key(|record| record.t_ms);
+        for record in &records {
+            let frame_id = format!("capture-frame-{}", record.index);
+            let now = record.snapshot.to_now(record.t_ms);
+            observe_pose_graph_now(&mut builder, &mut memory, &now, Some(frame_id));
+            memory.observe_now(&now);
+        }
+    } else {
+        let ledger = JsonlLedger::new(&args.ledger);
+        let mut frames = ledger.range(0, u64::MAX).await?;
+        frames.sort_by_key(|frame| frame.t_ms);
+        for frame in &frames {
+            observe_pose_graph_now(
+                &mut builder,
+                &mut memory,
+                &frame.now,
+                Some(frame.id.to_string()),
+            );
+            memory.observe_frame(frame);
+        }
     }
 
     Ok(builder.finish_report())
 }
 
+fn observe_pose_graph_now(
+    builder: &mut PoseGraphBuilder,
+    memory: &mut PlaceMemory,
+    now: &Now,
+    source_frame_id: Option<String>,
+) {
+    let current_key = Some(memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+    let place_candidates = memory.recognize_places(current_key, &now.eye.scene_vectors, 0.0, 20);
+    let loop_candidates = place_candidates
+        .iter()
+        .map(|candidate| place_candidate_to_loop_input(candidate, source_frame_id.clone()))
+        .collect::<Vec<_>>();
+    builder.observe(
+        now.body.odometry,
+        now.t_ms,
+        source_frame_id,
+        &loop_candidates,
+    );
+}
+
 fn place_candidate_to_loop_input(
     candidate: &PlaceRecognitionCandidate,
+    source_frame_id: Option<String>,
 ) -> LoopClosureCandidateInput {
     LoopClosureCandidateInput {
         target_pose: netherwick_core::Pose2 {
@@ -6765,7 +6932,7 @@ fn place_candidate_to_loop_input(
         }
         .to_string(),
         target_frame_id: candidate.source_frame_id.clone(),
-        source_frame_id: candidate.source_frame_id.clone(),
+        source_frame_id,
         source_vector_id: Some(candidate.source_vector_id.clone()),
         query_vector_id: candidate.query_vector_id.clone(),
     }
@@ -7439,7 +7606,9 @@ mod tests {
     use netherwick_body::BodySense;
     use netherwick_core::Reward;
     use netherwick_experience::ExperienceLatent;
-    use netherwick_now::{ExtensionSense, Now, SurpriseSense};
+    use netherwick_now::{
+        ExtensionSense, Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION,
+    };
     use netherwick_sensors::World;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7950,7 +8119,11 @@ mod tests {
             serde_json::json!({
                 "map_memory_decision": {
                     "influenced": true,
+                    "navigation_intent": "avoid_known_danger_cell",
                     "reason": "danger_safe_direction",
+                    "reason_string": "avoiding remembered danger using safe bearing",
+                    "signal": "memory.nearby_best_safe_direction_rad",
+                    "confidence": 0.9,
                     "place_danger": 0.9,
                     "place_charge_value": 0.0,
                     "place_novelty": 0.2,
@@ -7967,10 +8140,28 @@ mod tests {
         assert_eq!(episode.danger_memory_decisions, 1);
         assert_eq!(episode.charge_memory_decisions, 0);
         assert_eq!(episode.novelty_memory_decisions, 0);
+        assert_eq!(
+            episode
+                .memory_navigation_intents
+                .get("avoid_known_danger_cell"),
+            Some(&1)
+        );
+        assert_eq!(
+            episode
+                .memory_navigation_reasons
+                .get("danger_safe_direction"),
+            Some(&1)
+        );
 
         let summary = summarize_episodes(&[episode]);
         assert_eq!(summary.map_memory_decisions, 1);
         assert_eq!(summary.danger_memory_decisions, 1);
+        assert_eq!(
+            summary
+                .memory_navigation_intents
+                .get("avoid_known_danger_cell"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -8281,6 +8472,67 @@ mod tests {
         assert_eq!(report.frame_count, 1);
         assert!(report.streams_present.contains(&"rgb".to_string()));
         assert!(report.streams_missing.contains(&"audio".to_string()));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn pose_graph_report_reads_capture_frames_and_gates_loop_candidates() {
+        let temp_dir = temp_path("netherwick_pose_graph_capture");
+        let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        let mut first = WorldSnapshot::default();
+        first.body.odometry.x_m = 0.0;
+        first.eye.scene_vectors.push(
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-first", vec![1.0, 0.0])
+                .with_source_frame_id("capture-frame-0"),
+        );
+        writer
+            .append_snapshot(100, first, Vec::new())
+            .await
+            .unwrap();
+
+        let mut second = WorldSnapshot::default();
+        second.body.odometry.x_m = 1.0;
+        second.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-query-strong",
+            vec![1.0, 0.0],
+        ));
+        second.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-query-weak",
+            vec![0.0, 1.0],
+        ));
+        writer
+            .append_snapshot(200, second, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let args = PoseGraphReportArgs {
+            ledger: "unused-when-capture-is-set".to_string(),
+            capture: Some(temp_dir.to_string_lossy().to_string()),
+            out: temp_dir
+                .join("pose-graph.json")
+                .to_string_lossy()
+                .to_string(),
+            min_node_distance_m: 0.5,
+            min_node_degrees: 15.0,
+            max_ticks_between_nodes: 10,
+            min_loop_confidence: 0.55,
+        };
+        let report = generate_pose_graph_report(&args).await.unwrap();
+
+        assert_eq!(report.nodes, 2);
+        assert_eq!(report.odometry_edges, 1);
+        assert_eq!(report.loop_candidate_edges, 2);
+        assert_eq!(report.active_loop_candidate_edges, 1);
+        assert_eq!(report.rejected_loop_candidates, 1);
+        assert_eq!(
+            report.rejected_candidates[0].reason,
+            "confidence 0.000 below gate 0.550"
+        );
         let _ = fs::remove_dir_all(&temp_dir);
     }
 

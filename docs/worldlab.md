@@ -49,6 +49,16 @@ cargo run -p netherwick-tools -- replay-capture \
 
 Replay output uses the existing `JsonlLedger` conventions, so ledger frames and transitions can feed the same inspection and training paths as live simulation runs.
 
+Produce an offline pose graph report directly from a capture without correcting live pose:
+
+```bash
+cargo run -p netherwick-tools -- pose-graph-report \
+  --capture data/captures/sim-test \
+  --out data/reports/pose-graph/sim-test.json
+```
+
+The report includes odometry edges, gated loop-closure candidate edges from conservative place recognition, confidence buckets, and rejected low-confidence candidates.
+
 Record a bounded real read-only session:
 
 ```bash

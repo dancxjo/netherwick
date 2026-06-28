@@ -21,7 +21,7 @@ use netherwick_actions::{
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use netherwick_body::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
-use netherwick_experience::EmbodiedContext;
+use netherwick_experience::{EmbodiedContext, ExperienceForge, ExperienceForgeSnapshot};
 use netherwick_map::{
     project_beam_endpoint, LocalMap, MapObservation, MapSummary, OccupancyCell as OdomMapCell,
     PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
@@ -65,6 +65,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/view/embodied/graph",
     "/view/scene",
     "/view/map",
+    "/view/experience-forge",
     "/view/behavior-nodes",
     "/view/3d",
     "/view/capture-scene",
@@ -335,6 +336,7 @@ pub struct LiveViewState {
     map: Arc<Mutex<LocalMap>>,
     point_cloud: Arc<Mutex<VoxelPointCloud>>,
     latest_embodied: Arc<Mutex<Option<EmbodiedContext>>>,
+    experience_forge: Arc<Mutex<ExperienceForge>>,
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
     session: Arc<Mutex<Option<SceneSession>>>,
     hardware_control: Arc<Mutex<HardwareControlState>>,
@@ -368,6 +370,7 @@ impl Default for LiveViewState {
             map: Arc::new(Mutex::new(LocalMap::default())),
             point_cloud: Arc::new(Mutex::new(VoxelPointCloud::default())),
             latest_embodied: Arc::new(Mutex::new(None)),
+            experience_forge: Arc::new(Mutex::new(ExperienceForge::default())),
             scene_metadata: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
             hardware_control: Arc::new(Mutex::new(HardwareControlState::default())),
@@ -468,6 +471,11 @@ impl LiveViewState {
     }
 
     pub fn update(&self, snapshot: WorldSnapshot) {
+        let now = snapshot.to_now(snapshot.body.last_update_ms);
+        self.experience_forge
+            .lock()
+            .expect("experience forge mutex poisoned")
+            .tick(&now, snapshot.final_selected_action.clone());
         self.map
             .lock()
             .expect("live map mutex poisoned")
@@ -512,6 +520,13 @@ impl LiveViewState {
             .lock()
             .expect("live embodied context mutex poisoned")
             .clone()
+    }
+
+    pub fn experience_forge_snapshot(&self) -> ExperienceForgeSnapshot {
+        self.experience_forge
+            .lock()
+            .expect("experience forge mutex poisoned")
+            .snapshot()
     }
 
     pub fn update_scene_metadata(&self, metadata: LiveSceneMetadata) {
@@ -817,6 +832,8 @@ pub struct LiveSceneResponse {
     pub models_loaded: Vec<String>,
     pub model_modes: HashMap<String, String>,
     pub behavior_nodes: Vec<BehaviorNodeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experience_forge: Option<ExperienceForgeSnapshot>,
     pub action_selector_mode: String,
     pub weights_updating: bool,
     pub t_ms: TimeMs,
@@ -1222,6 +1239,9 @@ pub struct ModelRegistrySummary {
     pub name: String,
     pub behavior: String,
     pub checkpoint_path: String,
+    pub training_ledger: Option<String>,
+    pub behavior_report_path: Option<String>,
+    pub scenario_report_path: Option<String>,
     pub status: String,
     pub allowed_modes: Vec<String>,
     pub scenario_success_rate: Option<f32>,
@@ -1256,6 +1276,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/debug/embodied/graph", get(get_live_embodied_graph))
         .route("/view/scene", get(get_live_scene))
         .route("/view/map", get(get_live_map))
+        .route("/view/experience-forge", get(get_experience_forge))
         .route("/view/behavior-nodes", get(get_behavior_nodes))
         .route("/view/behavior-nodes/{id}", post(post_behavior_node))
         .route(
@@ -1685,7 +1706,12 @@ async fn get_live_scene(
         calibration,
         scene.action.final_selected_action.as_ref(),
     );
+    scene.experience_forge = Some(state.experience_forge_snapshot());
     Ok(Json(scene))
+}
+
+async fn get_experience_forge(State(state): State<LiveViewState>) -> Json<ExperienceForgeSnapshot> {
+    Json(state.experience_forge_snapshot())
 }
 
 async fn get_live_map(
@@ -2962,6 +2988,21 @@ fn read_model_registry_summary(
                         name: entry.get("name")?.as_str()?.to_string(),
                         behavior: entry.get("behavior")?.as_str()?.to_string(),
                         checkpoint_path: entry.get("checkpoint")?.as_str()?.to_string(),
+                        training_ledger: entry
+                            .get("training")
+                            .and_then(|value| value.get("ledger"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        behavior_report_path: entry
+                            .get("reports")
+                            .and_then(|value| value.get("behavior"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        scenario_report_path: entry
+                            .get("reports")
+                            .and_then(|value| value.get("scenario"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
                         status: entry
                             .get("status")
                             .and_then(|value| value.as_str())
@@ -3341,6 +3382,7 @@ pub fn snapshot_to_scene(
         models_loaded,
         model_modes,
         behavior_nodes,
+        experience_forge: None,
         action_selector_mode,
         weights_updating,
         t_ms: body.last_update_ms,
@@ -5217,10 +5259,24 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #learning .checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 8px}
 #learning .checks label{display:flex;align-items:center;gap:5px;color:#d7e3ee}
 #learning button{justify-self:end;font-size:11px;padding:4px 8px;background:#243646;border:1px solid #3f607b;color:#b8e1ff;border-radius:4px;cursor:pointer}
+#experience-forge{left:12px;top:470px;width:340px;height:300px;border-color:#3c4854;background:rgba(8,11,15,.88)}
+#experience-forge .panel-content{display:grid;grid-template-rows:auto auto minmax(0,1fr);gap:8px;overflow:hidden}
+#experience-forge header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+#experience-forge h2{font-size:12px;margin:0;color:#c6e6ff}
+#forge-status{color:#ffcf7a;font-size:11px;font-variant-numeric:tabular-nums}
+#forge-vector{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:3px}
+.forge-slot{height:18px;border:1px solid #27313b;border-radius:3px;background:#111820;position:relative;overflow:hidden}
+.forge-slot span{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:9px;color:#e7eef5;font-variant-numeric:tabular-nums}
+.forge-fill{position:absolute;left:0;top:0;bottom:0;background:#5aa9e6;opacity:.72}
+#forge-filters{display:grid;gap:5px;min-height:0;overflow:auto;scrollbar-width:thin}
+.forge-filter{display:grid;gap:3px;padding:6px;border:1px solid #27313b;background:rgba(18,24,30,.72);border-radius:5px;font-size:11px}
+.forge-filter-top{display:flex;justify-content:space-between;gap:8px;color:#fff;font-weight:700;font-variant-numeric:tabular-nums}
+.forge-filter-line{color:#aeb9c3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.forge-event{color:#ffd083}
 #xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
 #xr[disabled]{opacity:.55}
 #fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
-@media(max-width:820px){.panel-window{max-width:calc(100vw - 24px)}#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{bottom:98px;max-height:46vh}#model-graph-window{display:none}#virtual-pipeline-section{left:12px;right:12px;top:128px;width:auto;max-height:28vh}#model-graph{height:220px}#learning{left:12px;right:12px;top:220px;width:auto;max-height:34vh}#calibration{display:none}}
+@media(max-width:820px){.panel-window{max-width:calc(100vw - 24px)}#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{bottom:98px;max-height:46vh}#model-graph-window{display:none}#virtual-pipeline-section{left:12px;right:12px;top:128px;width:auto;max-height:28vh}#model-graph{height:220px}#learning{left:12px;right:12px;top:220px;width:auto;max-height:34vh}#experience-forge{left:12px;right:12px;top:380px;width:auto;max-height:34vh}#calibration{display:none}}
 canvas{display:block}
 </style>
 <canvas id="scene"></canvas>
@@ -5289,6 +5345,14 @@ canvas{display:block}
     <label><input type="checkbox" data-behavior="experience">experience</label>
   </div>
   <button id="learning-apply">Apply</button>
+</aside>
+<aside id="experience-forge" data-window-title="Experience Forge">
+  <header>
+    <h2>Experience Forge</h2>
+    <div id="forge-status">waiting...</div>
+  </header>
+  <div id="forge-vector"></div>
+  <div id="forge-filters"></div>
 </aside>
 <aside id="reign" data-window-title="Reign controls">
   <strong>Reign controls</strong>
@@ -5449,6 +5513,9 @@ const learningSteps = document.getElementById('learning-steps');
 const learningStatus = document.getElementById('learning-status');
 const learningApply = document.getElementById('learning-apply');
 const learningChecks = Array.from(document.querySelectorAll('#learning-behaviors input[type="checkbox"]'));
+const forgeStatus = document.getElementById('forge-status');
+const forgeVector = document.getElementById('forge-vector');
+const forgeFilters = document.getElementById('forge-filters');
 const traceState = {poses: [], events: [], occupied: new Map(), free: new Map()};
 const entityGraphState = {positions: new Map()};
 let cockpitAvailable = false;
@@ -6170,6 +6237,35 @@ async function saveLearningConfig(){
   }
 }
 
+function renderExperienceForge(forge){
+  if(!forge){
+    forgeStatus.textContent = 'waiting...';
+    forgeVector.replaceChildren();
+    forgeFilters.replaceChildren();
+    return;
+  }
+  forgeStatus.textContent = `tick ${forge.ticks || 0} | pop ${forge.population_size || 0} | buf ${forge.buffer_len || 0}`;
+  const vector = forge.tiny_now_vector || [];
+  forgeVector.innerHTML = vector.map((value, index) => {
+    const clamped = Math.max(-1, Math.min(1, Number(value) || 0));
+    const width = Math.round(Math.abs(clamped) * 50);
+    const left = clamped < 0 ? 50 - width : 50;
+    const color = clamped < 0 ? '#f06d6d' : '#5aa9e6';
+    return `<div class="forge-slot" title="slot ${index}: ${fmt(clamped, 2)}"><div class="forge-fill" style="left:${left}%;width:${width}%;background:${color}"></div><span>${fmt(clamped, 2)}</span></div>`;
+  }).join('');
+  forgeFilters.innerHTML = (forge.top_filters || []).slice(0, 8).map(filter => {
+    const channels = (filter.channels || []).join(', ') || '-';
+    const event = (filter.fired_events || []).slice(-1)[0];
+    const labels = event?.labels || {};
+    const eventNames = ['bump','stuck','blocked_forward','intervention','action_changed_scene'].filter(name => labels[name]).join(' ');
+    return `<div class="forge-filter">
+      <div class="forge-filter-top"><span>#${filter.slot ?? '-'} f${filter.id}</span><span>${fmt(filter.score || 0, 3)}</span></div>
+      <div class="forge-filter-line">${escapeHtml(channels)}</div>
+      <div class="forge-filter-line">out ${fmt(filter.output || 0, 2)} age ${filter.age_ticks || 0}${eventNames ? ` <span class="forge-event">${escapeHtml(eventNames)}</span>` : ''}</div>
+    </div>`;
+  }).join('') || '<div class="forge-filter-line">no filters yet</div>';
+}
+
 function updateScene(packet, liveMap=null){
   lastScene = packet;
   robot.position.copyFrom(world(packet.body.x_m, packet.body.y_m, 0));
@@ -6185,6 +6281,7 @@ function updateScene(packet, liveMap=null){
   renderSurfacePerception(packet);
   renderEye(packet);
   updateHardwareControl(packet.hardware_control);
+  renderExperienceForge(packet.experience_forge);
   drawTraceMap(packet, liveMap);
   const session = packet.session || {};
   fields.mode.textContent = session.mode || '-';
@@ -7173,7 +7270,7 @@ async function setupXr(){
 
 let isInitialized = false;
 let maxZIndex = 100;
-const panelIds = ['hud', 'learning', 'reign', 'llm', 'virtual-pipeline-section', 'models', 'model-graph-window', 'calibration'];
+const panelIds = ['hud', 'learning', 'experience-forge', 'reign', 'llm', 'virtual-pipeline-section', 'models', 'model-graph-window', 'calibration'];
 
 function preparePanelWindow(el) {
   if (el.classList.contains('panel-window')) return el.querySelector('.panel-titlebar');
@@ -8760,6 +8857,37 @@ mod tests {
             .registry
             .iter()
             .any(|entry| entry.behavior == "danger"));
+        for (name, behavior_report, scenario_report) in [
+            (
+                "danger_golden_column_v0",
+                "data/reports/danger-golden-column-heldout-eval.json",
+                "data/reports/golden-column-trap-model-assisted-full-shadow.json",
+            ),
+            (
+                "action_value_golden_column_v0",
+                "data/reports/action-value-golden-column-heldout-eval.json",
+                "data/reports/golden-column-trap-model-assisted-full-shadow.json",
+            ),
+            (
+                "charge_golden_charger_v0",
+                "data/reports/charge-golden-charger-heldout-eval.json",
+                "data/reports/golden-charger-seeking-heldout.json",
+            ),
+        ] {
+            let entry = packet
+                .registry
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing registry entry {name}"));
+            assert_eq!(entry.status, "shadow");
+            assert_eq!(entry.behavior_report_path.as_deref(), Some(behavior_report));
+            assert_eq!(entry.scenario_report_path.as_deref(), Some(scenario_report));
+            assert!(entry
+                .allowed_modes
+                .iter()
+                .any(|mode| mode == "shadow-infer"));
+            assert!(!entry.allowed_modes.iter().any(|mode| mode == "model-infer"));
+        }
     }
 
     #[tokio::test]

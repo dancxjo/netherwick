@@ -14,8 +14,9 @@ use netherwick_experience::{
     ActionValueInput, ActionValueOutput, ActionValueTarget, ChargeInput, ChargeOutput,
     ChargeTarget, DangerInput, DangerOutput, DangerTarget, EarNextInput, EarNextOutput,
     EarNextTarget, ExperienceDecodeFeatureLengths, ExperienceDecodeOutput, ExperienceEncodeInput,
-    ExperienceEncodeOutput, EyeNextInput, EyeNextOutput, EyeNextTarget, FutureInput,
-    FuturePrediction, EYE_NEXT_HEIGHT, EYE_NEXT_RGB_LEN, EYE_NEXT_WIDTH,
+    ExperienceEncodeOutput, ExperienceLatent, EyeNextInput, EyeNextOutput, EyeNextTarget,
+    FutureInput, FuturePrediction, LatentEncoder, EYE_NEXT_HEIGHT, EYE_NEXT_RGB_LEN,
+    EYE_NEXT_WIDTH,
 };
 use netherwick_now::Now;
 use serde::{Deserialize, Serialize};
@@ -2200,6 +2201,27 @@ impl<B: AutodiffBackend> OnlineTrainer<ExperienceEncodeInput, ExperienceDecodeOu
             loss: stats.loss,
             samples_seen: stats.samples_seen,
             improved: stats.improved,
+        })
+    }
+}
+
+impl<B: AutodiffBackend> LatentEncoder for ExperienceAutoencoderTrainer<B> {
+    fn encoder_kind(&self) -> &'static str {
+        "trainable-autoencoder"
+    }
+
+    fn encode_input(
+        &mut self,
+        input: &ExperienceEncodeInput,
+        t_ms: TimeMs,
+    ) -> Result<ExperienceLatent> {
+        let encoded = self.encode(input)?;
+        Ok(ExperienceLatent {
+            t_ms,
+            z: encoded.z,
+            reconstruction_error: 0.0,
+            prediction_error: 0.0,
+            confidence: encoded.confidence,
         })
     }
 }

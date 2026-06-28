@@ -50,6 +50,28 @@ impl Default for ConductorConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationIntent {
+    GoTowardKnownCharger,
+    AvoidKnownDangerCell,
+    InspectSafeNovelFrontier,
+    ReturnToFamiliarSafeCell,
+    StopAskForHelpWhenUncertain,
+    FollowProposal,
+    RecoverFromContact,
+    ObeyDirectControl,
+    Explore,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NavigationGoalDecision {
+    pub intent: NavigationIntent,
+    pub action: ActionPrimitive,
+    pub confidence: f32,
+    pub reason: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RecoveryStep {
     #[default]
@@ -75,18 +97,38 @@ pub struct SimpleConductor {
 
 impl Conductor for SimpleConductor {
     fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
+        Ok(self.choose_with_navigation_goal(input)?.action)
+    }
+}
+
+impl SimpleConductor {
+    pub fn choose_with_navigation_goal(
+        &mut self,
+        input: ConductorInput,
+    ) -> Result<NavigationGoalDecision> {
         if let Some(action) = reign_action(&input) {
             self.recovery = RecoveryState::default();
-            return Ok(action);
+            return Ok(navigation_goal(
+                NavigationIntent::ObeyDirectControl,
+                action,
+                1.0,
+                "direct Reign command is active",
+            ));
         }
         if input.body.flags.wheel_drop {
             self.recovery = RecoveryState::default();
-            return Ok(ActionPrimitive::Stop);
+            return Ok(navigation_goal(
+                NavigationIntent::StopAskForHelpWhenUncertain,
+                ActionPrimitive::Stop,
+                1.0,
+                "wheel drop safety signal requires stopping",
+            ));
         }
         let charge_context = charge_context(&input);
         if input.body.battery_level <= self.config.critical_battery {
             self.recovery = RecoveryState::default();
-            return Ok(critical_battery_charge_action(&input, charge_context));
+            let decision = critical_battery_charge_goal(&input, charge_context);
+            return Ok(decision);
         }
         if self.recovery.step == RecoveryStep::Idle {
             if contact_recovery_triggered(&input) {
@@ -100,33 +142,63 @@ impl Conductor for SimpleConductor {
             }
         }
         if let Some(action) = self.next_recovery_action(&input) {
-            return Ok(action);
+            return Ok(navigation_goal(
+                NavigationIntent::RecoverFromContact,
+                action,
+                0.9,
+                "contact or cramped-range recovery is active",
+            ));
         }
         if input.memory.recent_trap_confidence >= 0.6 {
             if let Some(direction) = input.memory.nearby_best_safe_direction_rad {
-                return Ok(ActionPrimitive::Turn {
-                    direction: direction_from_bearing(direction),
-                    intensity: 0.55,
-                    duration_ms: 800,
-                });
+                return Ok(navigation_goal(
+                    NavigationIntent::ReturnToFamiliarSafeCell,
+                    ActionPrimitive::Turn {
+                        direction: direction_from_bearing(direction),
+                        intensity: 0.55,
+                        duration_ms: 800,
+                    },
+                    input.memory.recent_trap_confidence.clamp(0.0, 1.0),
+                    format!("recent trap memory points to safe bearing {direction:.2} rad"),
+                ));
             }
         }
         if input.memory.place_danger >= self.config.danger_threshold
             || input.drives.danger_avoidance >= self.config.danger_threshold
         {
-            return Ok(ActionPrimitive::Turn {
-                direction: input
+            let remembered = input.memory.nearby_best_safe_direction_rad;
+            let direction = remembered
+                .map(direction_from_bearing)
+                .unwrap_or_else(|| clearer_turn_direction(&input.range));
+            return Ok(navigation_goal(
+                NavigationIntent::AvoidKnownDangerCell,
+                ActionPrimitive::Turn {
+                    direction,
+                    intensity: 0.5,
+                    duration_ms: 1_000,
+                },
+                input
                     .memory
-                    .nearby_best_safe_direction_rad
-                    .map(direction_from_bearing)
-                    .unwrap_or_else(|| clearer_turn_direction(&input.range)),
-                intensity: 0.5,
-                duration_ms: 1_000,
-            });
+                    .place_danger
+                    .max(input.drives.danger_avoidance)
+                    .clamp(0.0, 1.0),
+                remembered
+                    .map(|bearing| {
+                        format!("danger memory marks this place and safe bearing {bearing:.2} rad")
+                    })
+                    .unwrap_or_else(|| {
+                        "danger signal is high; using range clearance as map hint".to_string()
+                    }),
+            ));
         }
         if input.body.battery_level <= self.config.low_battery {
             if charge_context.dock_plausible {
-                return Ok(ActionPrimitive::Dock);
+                return Ok(navigation_goal(
+                    NavigationIntent::GoTowardKnownCharger,
+                    ActionPrimitive::Dock,
+                    0.95,
+                    "charger contact is plausible from near/charging signal",
+                ));
             }
             if charge_context.should_approach {
                 if let Some(direction) = input
@@ -134,15 +206,31 @@ impl Conductor for SimpleConductor {
                     .nearby_best_charge_direction_rad
                     .and_then(charge_alignment_turn)
                 {
-                    return Ok(ActionPrimitive::Turn {
-                        direction,
-                        intensity: 0.4,
-                        duration_ms: 700,
-                    });
+                    return Ok(navigation_goal(
+                        NavigationIntent::GoTowardKnownCharger,
+                        ActionPrimitive::Turn {
+                            direction,
+                            intensity: 0.4,
+                            duration_ms: 700,
+                        },
+                        charger_goal_confidence(&input),
+                        format!(
+                            "charger memory/sensor signal says align toward bearing {:.2} rad",
+                            input
+                                .memory
+                                .nearby_best_charge_direction_rad
+                                .unwrap_or_default()
+                        ),
+                    ));
                 }
-                return Ok(ActionPrimitive::Approach {
-                    target: ApproachTarget::Charger,
-                });
+                return Ok(navigation_goal(
+                    NavigationIntent::GoTowardKnownCharger,
+                    ActionPrimitive::Approach {
+                        target: ApproachTarget::Charger,
+                    },
+                    charger_goal_confidence(&input),
+                    "charger signal is present or remembered and bearing is aligned",
+                ));
             }
             if charge_context.should_search {
                 if let Some(direction) = input
@@ -150,44 +238,86 @@ impl Conductor for SimpleConductor {
                     .nearby_best_charge_direction_rad
                     .map(direction_from_bearing)
                 {
-                    return Ok(ActionPrimitive::Turn {
-                        direction,
-                        intensity: 0.35,
-                        duration_ms: 700,
-                    });
+                    return Ok(navigation_goal(
+                        NavigationIntent::GoTowardKnownCharger,
+                        ActionPrimitive::Turn {
+                            direction,
+                            intensity: 0.35,
+                            duration_ms: 700,
+                        },
+                        charger_goal_confidence(&input).max(0.35),
+                        format!(
+                            "low-confidence charger memory suggests bearing {:.2} rad",
+                            input
+                                .memory
+                                .nearby_best_charge_direction_rad
+                                .unwrap_or_default()
+                        ),
+                    ));
                 }
-                return Ok(ActionPrimitive::Explore {
-                    style: ExploreStyle::Wander,
-                    duration_ms: 1_000,
-                });
+                return Ok(navigation_goal(
+                    NavigationIntent::Explore,
+                    ActionPrimitive::Explore {
+                        style: ExploreStyle::Wander,
+                        duration_ms: 1_000,
+                    },
+                    0.25,
+                    "battery is low but no charger bearing is known",
+                ));
             }
         }
         if let Some(action) = input.proposals.last() {
-            return Ok(action.clone());
+            return Ok(navigation_goal(
+                NavigationIntent::FollowProposal,
+                action.clone(),
+                0.5,
+                "using latest typed action proposal",
+            ));
         }
         if input.drives.curiosity >= self.config.novelty_threshold
             || (input.memory.place_novelty >= self.config.novelty_threshold
                 && input.memory.place_danger < self.config.danger_threshold)
         {
             if let Some(direction) = input.memory.nearby_frontier_direction_rad {
-                return Ok(ActionPrimitive::Turn {
-                    direction: direction_from_bearing(direction),
-                    intensity: 0.35,
-                    duration_ms: 500,
-                });
+                return Ok(navigation_goal(
+                    NavigationIntent::InspectSafeNovelFrontier,
+                    ActionPrimitive::Turn {
+                        direction: direction_from_bearing(direction),
+                        intensity: 0.35,
+                        duration_ms: 500,
+                    },
+                    input
+                        .memory
+                        .place_novelty
+                        .max(input.drives.curiosity)
+                        .clamp(0.0, 1.0),
+                    format!("safe novelty memory points to frontier bearing {direction:.2} rad"),
+                ));
             }
-            return Ok(ActionPrimitive::Inspect {
-                target: InspectTarget::Novelty,
-            });
+            return Ok(navigation_goal(
+                NavigationIntent::InspectSafeNovelFrontier,
+                ActionPrimitive::Inspect {
+                    target: InspectTarget::Novelty,
+                },
+                input
+                    .memory
+                    .place_novelty
+                    .max(input.drives.curiosity)
+                    .clamp(0.0, 1.0),
+                "place is novel and not remembered as dangerous",
+            ));
         }
-        Ok(ActionPrimitive::Explore {
-            style: ExploreStyle::RandomWalk,
-            duration_ms: 1_000,
-        })
+        Ok(navigation_goal(
+            NavigationIntent::Explore,
+            ActionPrimitive::Explore {
+                style: ExploreStyle::RandomWalk,
+                duration_ms: 1_000,
+            },
+            0.3,
+            "no strong memory, map, or drive signal",
+        ))
     }
-}
 
-impl SimpleConductor {
     fn start_contact_recovery(&mut self, turn_direction: TurnDir) {
         self.recovery = RecoveryState {
             step: RecoveryStep::Reverse,
@@ -341,31 +471,82 @@ fn charge_context(input: &ConductorInput) -> ChargeContext {
     }
 }
 
-fn critical_battery_charge_action(
+fn navigation_goal(
+    intent: NavigationIntent,
+    action: ActionPrimitive,
+    confidence: f32,
+    reason: impl Into<String>,
+) -> NavigationGoalDecision {
+    NavigationGoalDecision {
+        intent,
+        action,
+        confidence: confidence.clamp(0.0, 1.0),
+        reason: reason.into(),
+    }
+}
+
+fn charger_goal_confidence(input: &ConductorInput) -> f32 {
+    let prediction = input
+        .predictions
+        .charge_model
+        .or(input.predictions.charge_hardcoded)
+        .unwrap_or_default();
+    input
+        .charger_near_score
+        .max(input.charger_visible_score)
+        .max(input.memory.place_charge_value)
+        .max(prediction.charge_probability)
+        .clamp(0.0, 1.0)
+}
+
+fn critical_battery_charge_goal(
     input: &ConductorInput,
     charge_context: ChargeContext,
-) -> ActionPrimitive {
+) -> NavigationGoalDecision {
     if charge_context.dock_plausible {
-        ActionPrimitive::Dock
+        navigation_goal(
+            NavigationIntent::GoTowardKnownCharger,
+            ActionPrimitive::Dock,
+            0.95,
+            "critical battery and charger contact is plausible",
+        )
     } else if charge_context.should_approach {
-        ActionPrimitive::Approach {
-            target: ApproachTarget::Charger,
-        }
+        navigation_goal(
+            NavigationIntent::GoTowardKnownCharger,
+            ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            },
+            charger_goal_confidence(input).max(0.7),
+            "critical battery and charger signal is strong enough to approach",
+        )
     } else if let Some(direction) = input
         .memory
         .nearby_best_charge_direction_rad
         .map(direction_from_bearing)
     {
-        ActionPrimitive::Turn {
-            direction,
-            intensity: 0.35,
-            duration_ms: 700,
-        }
+        navigation_goal(
+            NavigationIntent::GoTowardKnownCharger,
+            ActionPrimitive::Turn {
+                direction,
+                intensity: 0.35,
+                duration_ms: 700,
+            },
+            charger_goal_confidence(input).max(0.35),
+            format!(
+                "critical battery and remembered charger bearing {:.2} rad",
+                input
+                    .memory
+                    .nearby_best_charge_direction_rad
+                    .unwrap_or_default()
+            ),
+        )
     } else {
-        ActionPrimitive::Explore {
-            style: ExploreStyle::Wander,
-            duration_ms: 1_000,
-        }
+        navigation_goal(
+            NavigationIntent::StopAskForHelpWhenUncertain,
+            ActionPrimitive::Stop,
+            0.2,
+            "critical battery but no charger memory, sensor, or map direction is reliable",
+        )
     }
 }
 
@@ -432,19 +613,20 @@ mod tests {
     }
 
     #[test]
-    fn critical_battery_searches_instead_of_docking_when_charger_unknown() {
+    fn critical_battery_stops_and_asks_when_charger_unknown() {
         let mut conductor = SimpleConductor::default();
         let mut body = BodySense::default();
         body.battery_level = 0.05;
         let input = input_with_body(body);
 
+        let decision = conductor.choose_with_navigation_goal(input).unwrap();
         assert_eq!(
-            conductor.choose(input).unwrap(),
-            ActionPrimitive::Explore {
-                style: ExploreStyle::Wander,
-                duration_ms: 1_000
-            }
+            decision.intent,
+            NavigationIntent::StopAskForHelpWhenUncertain
         );
+        assert_eq!(decision.action, ActionPrimitive::Stop);
+        assert!(decision.confidence < 0.35);
+        assert!(decision.reason.contains("no charger memory"));
     }
 
     #[test]
@@ -483,14 +665,17 @@ mod tests {
         input.memory.place_charge_value = 0.3;
         input.memory.nearby_best_charge_direction_rad = Some(-0.7);
 
+        let decision = conductor.choose_with_navigation_goal(input).unwrap();
+        assert_eq!(decision.intent, NavigationIntent::GoTowardKnownCharger);
         assert_eq!(
-            conductor.choose(input).unwrap(),
+            decision.action,
             ActionPrimitive::Turn {
                 direction: TurnDir::Right,
                 intensity: 0.35,
                 duration_ms: 700
             }
         );
+        assert!(decision.reason.contains("charger memory"));
     }
 
     #[test]
@@ -589,14 +774,17 @@ mod tests {
         input.memory.nearby_best_safe_direction_rad = Some(-0.8);
         input.range.beams = vec![0.9, 0.9, 0.9, 0.1, 0.1, 0.1];
 
+        let decision = conductor.choose_with_navigation_goal(input).unwrap();
+        assert_eq!(decision.intent, NavigationIntent::AvoidKnownDangerCell);
         assert_eq!(
-            conductor.choose(input).unwrap(),
+            decision.action,
             ActionPrimitive::Turn {
                 direction: TurnDir::Right,
                 intensity: 0.5,
                 duration_ms: 1_000
             }
         );
+        assert!(decision.reason.contains("danger memory"));
     }
 
     #[test]
