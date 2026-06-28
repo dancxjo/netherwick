@@ -3517,14 +3517,17 @@ mod tests {
             .sensations
             .iter()
             .filter_map(|sensation| sensation.vector.as_ref())
-            .any(|vector| vector.vectorizer_id == "precomputed.faces.face_id/0.4.1"
-                && vector.collection == "faces"
-                && vector.purpose == "face_identity"));
+            .any(
+                |vector| vector.vectorizer_id == "precomputed.faces.face_id/0.4.1"
+                    && vector.collection == "faces"
+                    && vector.purpose == "face_identity"
+            ));
         assert!(demo
             .sensations
             .iter()
             .filter_map(|sensation| sensation.vector.as_ref())
-            .any(|vector| vector.vectorizer_id == "precomputed.voices.listenbury/voice_vector/16d"
+            .any(|vector| vector.vectorizer_id
+                == "precomputed.voices.listenbury/voice_vector/16d"
                 && vector.collection == "voices"
                 && vector.purpose == "voice_identity"));
     }
