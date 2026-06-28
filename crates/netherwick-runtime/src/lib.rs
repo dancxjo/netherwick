@@ -4076,7 +4076,10 @@ pub struct RealRobotRunner<R> {
     pub tick_ms: u64,
     pub tick_count: usize,
     now_builder: NowBuilder,
+    slow_runtime_backoff_until_ms: u64,
 }
+
+const SLOW_RUNTIME_TIMEOUT_BACKOFF_MS: u64 = 5_000;
 
 impl<R> RealRobotRunner<R>
 where
@@ -4096,6 +4099,7 @@ where
             tick_ms: 100,
             tick_count: 0,
             now_builder: NowBuilder::new(),
+            slow_runtime_backoff_until_ms: 0,
         }
     }
 
@@ -4211,18 +4215,36 @@ where
         }
 
         let runtime_timeout = std::time::Duration::from_millis(self.tick_ms.clamp(25, 100));
-        let tick = match tokio::time::timeout(
-            runtime_timeout,
-            self.runtime
-                .tick(now.clone(), ExperienceLatent::default(), Vec::new()),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => synthetic_slow_idle_tick(
+        let wall_now = wall_time_ms();
+        let tick = if wall_now < self.slow_runtime_backoff_until_ms {
+            synthetic_slow_idle_tick(
                 now,
-                format!("runtime tick exceeded {} ms", runtime_timeout.as_millis()),
-            ),
+                format!(
+                    "runtime tick backed off after timeout for {} ms",
+                    self.slow_runtime_backoff_until_ms.saturating_sub(wall_now)
+                ),
+            )
+        } else {
+            match tokio::time::timeout(
+                runtime_timeout,
+                self.runtime
+                    .tick(now.clone(), ExperienceLatent::default(), Vec::new()),
+            )
+            .await
+            {
+                Ok(result) => {
+                    self.slow_runtime_backoff_until_ms = 0;
+                    result?
+                }
+                Err(_) => {
+                    self.slow_runtime_backoff_until_ms =
+                        wall_time_ms().saturating_add(SLOW_RUNTIME_TIMEOUT_BACKOFF_MS);
+                    synthetic_slow_idle_tick(
+                        now,
+                        format!("runtime tick exceeded {} ms", runtime_timeout.as_millis()),
+                    )
+                }
+            }
         };
         let chosen_motor = final_motor_from_tick(&tick).clamped(0.15, 0.25);
         let manual_drive = tick
@@ -7194,6 +7216,56 @@ mod tests {
         }
     }
 
+    struct SlowRuntime {
+        tick_attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeLoop for SlowRuntime {
+        async fn tick(
+            &mut self,
+            now: Now,
+            _latent: ExperienceLatent,
+            _futures: Vec<FuturePrediction>,
+        ) -> Result<RuntimeTick> {
+            self.tick_attempts.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let experience =
+                Experience::new("test", "test", Vec::new(), Vec::new(), now.t_ms, now.t_ms);
+            Ok(RuntimeTick {
+                frame: ExperienceFrame {
+                    id: Uuid::new_v4(),
+                    t_ms: now.t_ms,
+                    now,
+                    sensations: Vec::new(),
+                    impressions: Vec::new(),
+                    experiences: vec![experience.clone()],
+                    z: Some(ExperienceLatent::default()),
+                    chosen_action: Some(ActionPrimitive::Stop),
+                    conscious_command: None,
+                    reign_input: None,
+                    reign_outcome: None,
+                    predicted_futures: Vec::new(),
+                    behavior_runs: Vec::new(),
+                    actual_next: None,
+                    reward: Reward::default(),
+                    surprise: SurpriseSense::default(),
+                    memory_recall: Vec::new(),
+                    recollections: Vec::new(),
+                    llm_teaching: Vec::new(),
+                    counterfactuals: Vec::new(),
+                    notes: Vec::new(),
+                },
+                experience,
+                chosen_action: Some(ActionPrimitive::Stop),
+                recall: RecallBundle::default(),
+                llm: LlmTickResult::default(),
+                combobulation: None,
+                inline_learning: InlineLearningTickStatus::default(),
+            })
+        }
+    }
+
     struct CountingBody {
         motor_attempts: Arc<AtomicUsize>,
         motors: Arc<Mutex<Vec<MotorCommand>>>,
@@ -7294,6 +7366,46 @@ mod tests {
 
         assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(motors.lock().unwrap().as_slice(), &[MotorCommand::stop()]);
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_backs_off_after_runtime_timeout() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingBody {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let tick_attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = SlowRuntime {
+            tick_attempts: Arc::clone(&tick_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), runtime);
+        runner.tick_ms = 25;
+
+        let (_first_snapshot, first_tick) = runner.tick_slow_manual().await.unwrap();
+        let (_second_snapshot, second_tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            motors.lock().unwrap().as_slice(),
+            &[MotorCommand::stop(), MotorCommand::stop()]
+        );
+        assert!(first_tick
+            .frame
+            .notes
+            .iter()
+            .any(|note| note.contains("runtime tick exceeded")));
+        assert!(second_tick
+            .frame
+            .notes
+            .iter()
+            .any(|note| note.contains("runtime tick backed off after timeout")));
     }
 
     struct ManualRuntime;
