@@ -22,6 +22,10 @@ use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime
 use netherwick_body::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
 use netherwick_experience::EmbodiedContext;
+use netherwick_map::{
+    project_beam_endpoint, LocalMap, MapObservation, MapSummary, OccupancyCell as OdomMapCell,
+    MAP_LABEL,
+};
 use netherwick_now::{KinectSense, KinectSkeletonSense, ReignSense};
 use netherwick_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
@@ -60,6 +64,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/view/embodied",
     "/view/embodied/graph",
     "/view/scene",
+    "/view/map",
     "/view/behavior-nodes",
     "/view/3d",
     "/view/capture-scene",
@@ -327,6 +332,7 @@ pub fn reign_router(state: ReignServerState) -> Router {
 #[derive(Clone, Debug)]
 pub struct LiveViewState {
     latest: Arc<Mutex<Option<WorldSnapshot>>>,
+    map: Arc<Mutex<LocalMap>>,
     latest_embodied: Arc<Mutex<Option<EmbodiedContext>>>,
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
     session: Arc<Mutex<Option<SceneSession>>>,
@@ -358,6 +364,7 @@ impl Default for LiveViewState {
     fn default() -> Self {
         Self {
             latest: Arc::new(Mutex::new(None)),
+            map: Arc::new(Mutex::new(LocalMap::default())),
             latest_embodied: Arc::new(Mutex::new(None)),
             scene_metadata: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
@@ -459,6 +466,10 @@ impl LiveViewState {
     }
 
     pub fn update(&self, snapshot: WorldSnapshot) {
+        self.map
+            .lock()
+            .expect("live map mutex poisoned")
+            .observe_snapshot(&snapshot, snapshot.body.last_update_ms);
         *self
             .latest
             .lock()
@@ -470,6 +481,10 @@ impl LiveViewState {
             .lock()
             .expect("live view snapshot mutex poisoned")
             .clone()
+    }
+
+    pub fn map_snapshot(&self) -> LocalMap {
+        self.map.lock().expect("live map mutex poisoned").clone()
     }
 
     pub fn update_embodied_context(&self, context: EmbodiedContext) {
@@ -881,6 +896,75 @@ pub struct SceneRangeBeam {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LiveMapResponse {
+    pub schema_version: u32,
+    pub label: &'static str,
+    pub summary: MapSummary,
+    pub overlays: Vec<&'static str>,
+    pub pose_trail: Vec<MapPosePoint>,
+    pub current_pose: Option<MapPosePoint>,
+    pub range_beams: Vec<MapProjectedBeam>,
+    pub cells: Vec<MapViewCell>,
+    pub semantic_cells: Vec<MapSemanticCell>,
+    pub events: Vec<MapEventMarker>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapPosePoint {
+    pub x_m: f32,
+    pub y_m: f32,
+    pub heading_rad: f32,
+    pub confidence: f32,
+    pub t_ms: TimeMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapProjectedBeam {
+    pub origin_x_m: f32,
+    pub origin_y_m: f32,
+    pub end_x_m: f32,
+    pub end_y_m: f32,
+    pub angle_rad: f32,
+    pub distance_m: f32,
+    pub hit: bool,
+    pub confidence: f32,
+    pub age_ms: TimeMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapViewCell {
+    pub x: i32,
+    pub y: i32,
+    pub center_x_m: f32,
+    pub center_y_m: f32,
+    pub occupied_score: f32,
+    pub free_score: f32,
+    pub confidence: f32,
+    pub age_ms: TimeMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapSemanticCell {
+    pub x_m: f32,
+    pub y_m: f32,
+    pub kind: String,
+    pub score: f32,
+    pub confidence: f32,
+    pub age_ms: Option<TimeMs>,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapEventMarker {
+    pub x_m: f32,
+    pub y_m: f32,
+    pub kind: String,
+    pub confidence: f32,
+    pub age_ms: TimeMs,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SceneEye {
     pub width: u32,
     pub height: u32,
@@ -1100,6 +1184,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/debug/embodied", get(get_live_embodied))
         .route("/debug/embodied/graph", get(get_live_embodied_graph))
         .route("/view/scene", get(get_live_scene))
+        .route("/view/map", get(get_live_map))
         .route("/view/behavior-nodes", get(get_behavior_nodes))
         .route("/view/behavior-nodes/{id}", post(post_behavior_node))
         .route(
@@ -1529,6 +1614,292 @@ async fn get_live_scene(
         scene.action.final_selected_action.as_ref(),
     );
     Ok(Json(scene))
+}
+
+async fn get_live_map(
+    State(state): State<LiveViewState>,
+) -> Result<Json<LiveMapResponse>, LiveViewError> {
+    let snapshot = state
+        .latest()
+        .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
+    let map = state.map_snapshot();
+    Ok(Json(map_response_from_parts(
+        &map,
+        &snapshot,
+        state.scene_metadata().as_ref(),
+    )))
+}
+
+fn map_response_from_parts(
+    map: &LocalMap,
+    latest: &WorldSnapshot,
+    metadata: Option<&LiveSceneMetadata>,
+) -> LiveMapResponse {
+    let now_ms = latest.body.last_update_ms;
+    let summary = map.summary();
+    let pose_trail: Vec<_> = map
+        .pose_history
+        .iter()
+        .map(|pose| MapPosePoint {
+            x_m: pose.pose.x_m,
+            y_m: pose.pose.y_m,
+            heading_rad: pose.pose.heading_rad,
+            confidence: pose.confidence,
+            t_ms: pose.t_ms,
+        })
+        .collect();
+    let current_pose = pose_trail.last().cloned();
+    let range_beams = map
+        .observations
+        .last()
+        .map(|observation| projected_beams_from_observation(observation, now_ms))
+        .unwrap_or_default();
+    let cells = map
+        .cells
+        .values()
+        .map(|cell| map_view_cell(cell, map.config.resolution_m, now_ms))
+        .collect();
+    let semantic_cells = map_semantic_cells(latest, metadata, now_ms);
+    let events = map_event_markers(latest, metadata, now_ms);
+
+    LiveMapResponse {
+        schema_version: 1,
+        label: MAP_LABEL,
+        summary,
+        overlays: vec![
+            "occupancy",
+            "free-space rays",
+            "danger",
+            "charger/charge",
+            "social",
+            "novelty",
+            "events",
+        ],
+        pose_trail,
+        current_pose,
+        range_beams,
+        cells,
+        semantic_cells,
+        events,
+    }
+}
+
+fn projected_beams_from_observation(
+    observation: &MapObservation,
+    now_ms: TimeMs,
+) -> Vec<MapProjectedBeam> {
+    observation
+        .range_beams
+        .iter()
+        .map(|beam| {
+            let end = project_beam_endpoint(observation.pose.pose, beam.angle_rad, beam.distance_m);
+            MapProjectedBeam {
+                origin_x_m: observation.pose.pose.x_m,
+                origin_y_m: observation.pose.pose.y_m,
+                end_x_m: end.x_m,
+                end_y_m: end.y_m,
+                angle_rad: beam.angle_rad,
+                distance_m: beam.distance_m,
+                hit: beam.hit,
+                confidence: beam.confidence,
+                age_ms: now_ms.saturating_sub(observation.t_ms),
+            }
+        })
+        .collect()
+}
+
+fn map_view_cell(cell: &OdomMapCell, resolution_m: f32, now_ms: TimeMs) -> MapViewCell {
+    MapViewCell {
+        x: cell.key.x,
+        y: cell.key.y,
+        center_x_m: (cell.key.x as f32 + 0.5) * resolution_m,
+        center_y_m: (cell.key.y as f32 + 0.5) * resolution_m,
+        occupied_score: cell.occupied_score,
+        free_score: cell.free_score,
+        confidence: cell.confidence,
+        age_ms: now_ms.saturating_sub(cell.last_seen_ms),
+    }
+}
+
+fn map_semantic_cells(
+    snapshot: &WorldSnapshot,
+    metadata: Option<&LiveSceneMetadata>,
+    now_ms: TimeMs,
+) -> Vec<MapSemanticCell> {
+    let mut cells = Vec::new();
+    cells.extend(memory_semantic_cells(snapshot, now_ms));
+    if let Some(metadata) = metadata {
+        cells.extend(metadata.objects.iter().filter_map(|object| {
+            let kind = semantic_kind_for_object(&object.kind)?;
+            Some(MapSemanticCell {
+                x_m: object.x_m,
+                y_m: object.y_m,
+                kind: kind.to_string(),
+                score: 1.0,
+                confidence: 1.0,
+                age_ms: Some(0),
+                label: object.label.clone().or_else(|| Some(object.id.clone())),
+            })
+        }));
+    }
+    if snapshot.body.charging {
+        cells.push(MapSemanticCell {
+            x_m: snapshot.body.odometry.x_m,
+            y_m: snapshot.body.odometry.y_m,
+            kind: "charger/charge".to_string(),
+            score: 1.0,
+            confidence: 0.9,
+            age_ms: Some(0),
+            label: Some("charging contact".to_string()),
+        });
+    }
+    cells
+}
+
+fn memory_semantic_cells(snapshot: &WorldSnapshot, now_ms: TimeMs) -> Vec<MapSemanticCell> {
+    let Some(value) = snapshot
+        .to_now(snapshot.body.last_update_ms)
+        .extensions
+        .get("memory.semantic_map")
+        .cloned()
+    else {
+        return Vec::new();
+    };
+    let mut cells = Vec::new();
+    for (field, kind) in [
+        ("danger_cells", "danger"),
+        ("charge_cells", "charger/charge"),
+        ("social_cells", "social"),
+        ("novelty_cells", "novelty"),
+    ] {
+        if let Some(items) = value.get(field).and_then(|items| items.as_array()) {
+            cells.extend(
+                items
+                    .iter()
+                    .filter_map(|item| semantic_cell_from_value(item, kind, now_ms)),
+            );
+        }
+    }
+    if let Some(current) = value.get("current") {
+        if let Some(cell) = semantic_cell_from_value(current, "current", now_ms) {
+            cells.push(cell);
+        }
+    }
+    cells
+}
+
+fn semantic_cell_from_value(
+    value: &serde_json::Value,
+    kind: &str,
+    now_ms: TimeMs,
+) -> Option<MapSemanticCell> {
+    let x_m = value.get("center_x_m")?.as_f64()? as f32;
+    let y_m = value.get("center_y_m")?.as_f64()? as f32;
+    let last_seen = value.get("last_seen_tick").and_then(|value| value.as_u64());
+    Some(MapSemanticCell {
+        x_m,
+        y_m,
+        kind: kind.to_string(),
+        score: value
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(1.0) as f32,
+        confidence: value
+            .get("confidence")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(1.0) as f32,
+        age_ms: last_seen.map(|seen| now_ms.saturating_sub(seen)),
+        label: value
+            .get("last_observed_objects")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
+}
+
+fn semantic_kind_for_object(kind: &str) -> Option<&'static str> {
+    match kind {
+        "charger" => Some("charger/charge"),
+        "person" | "speaker" | "sound_source" => Some("social"),
+        _ => None,
+    }
+}
+
+fn map_event_markers(
+    snapshot: &WorldSnapshot,
+    metadata: Option<&LiveSceneMetadata>,
+    now_ms: TimeMs,
+) -> Vec<MapEventMarker> {
+    let pose = snapshot.body.odometry;
+    let mut events = Vec::new();
+    if snapshot.body.flags.bump_left || snapshot.body.flags.bump_right {
+        events.push(map_event_at_pose(pose.x_m, pose.y_m, "bump", 1.0, now_ms));
+    }
+    if snapshot.body.flags.cliff_left
+        || snapshot.body.flags.cliff_front_left
+        || snapshot.body.flags.cliff_front_right
+        || snapshot.body.flags.cliff_right
+        || snapshot.body.flags.wheel_drop
+    {
+        events.push(map_event_at_pose(pose.x_m, pose.y_m, "cliff", 1.0, now_ms));
+    }
+    if scene_stuck_from_snapshot(snapshot).active {
+        events.push(map_event_at_pose(pose.x_m, pose.y_m, "stuck", 0.9, now_ms));
+    }
+    if snapshot
+        .llm_action_proposal
+        .as_ref()
+        .and_then(|proposal| proposal.safety_vetoed.then_some(()))
+        .is_some()
+    {
+        events.push(map_event_at_pose(
+            pose.x_m,
+            pose.y_m,
+            "safety_override",
+            1.0,
+            now_ms,
+        ));
+    }
+    if snapshot.body.charging {
+        events.push(map_event_at_pose(
+            pose.x_m, pose.y_m, "charger", 1.0, now_ms,
+        ));
+    }
+    if let Some(metadata) = metadata {
+        events.extend(metadata.objects.iter().filter_map(|object| {
+            matches!(
+                object.kind.as_str(),
+                "charger" | "person" | "speaker" | "sound_source"
+            )
+            .then(|| MapEventMarker {
+                x_m: object.x_m,
+                y_m: object.y_m,
+                kind: object.kind.clone(),
+                confidence: 1.0,
+                age_ms: 0,
+                label: object.label.clone().or_else(|| Some(object.id.clone())),
+            })
+        }));
+    }
+    events
+}
+
+fn map_event_at_pose(
+    x_m: f32,
+    y_m: f32,
+    kind: &str,
+    confidence: f32,
+    now_ms: TimeMs,
+) -> MapEventMarker {
+    MapEventMarker {
+        x_m,
+        y_m,
+        kind: kind.to_string(),
+        confidence,
+        age_ms: now_ms.saturating_sub(now_ms),
+        label: None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -4311,6 +4682,9 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #calibration label{color:#8fa1b2;font-size:11px}
 #calibration span{color:#ffd083;font-size:11px;font-variant-numeric:tabular-nums}
 #calibration input[type="range"]{width:100%;accent-color:#52a9ff;background:#242a32;height:4px;border-radius:2px;outline:none}
+.map-toggles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 8px;margin-top:5px;font-size:10px;color:#c8d4df}
+.map-toggles label{display:flex;align-items:center;gap:4px;min-width:0}
+.map-toggles input{accent-color:#52a9ff}
 #learning{left:12px;top:318px;width:340px;border-color:#3c4854}
 #learning .panel-content{display:grid;gap:8px}
 #learning header{display:flex;align-items:center;justify-content:space-between;gap:12px}
@@ -4441,6 +4815,15 @@ canvas{display:block}
     </div>
     <div class="trace-label">Speed cautious only. TTL 300 ms.</div>
     <canvas id="trace-map" width="220" height="180" aria-label="odometry/range trace map"></canvas>
+    <div class="map-toggles" aria-label="map overlays">
+      <label><input type="checkbox" data-map-layer="occupancy" checked>occupancy</label>
+      <label><input type="checkbox" data-map-layer="free-space rays" checked>rays</label>
+      <label><input type="checkbox" data-map-layer="danger" checked>danger</label>
+      <label><input type="checkbox" data-map-layer="charger/charge" checked>charge</label>
+      <label><input type="checkbox" data-map-layer="social" checked>social</label>
+      <label><input type="checkbox" data-map-layer="novelty">novelty</label>
+      <label><input type="checkbox" data-map-layer="events" checked>events</label>
+    </div>
     <div class="trace-label">Odometry/range trace, not SLAM.</div>
   </div>
 </aside>
@@ -4561,6 +4944,7 @@ const hardwareState = document.getElementById('hardware-state');
 const cockpitButtons = Array.from(document.querySelectorAll('[data-cockpit]'));
 const traceCanvas = document.getElementById('trace-map');
 const traceCtx = traceCanvas.getContext('2d');
+const mapLayerInputs = Array.from(document.querySelectorAll('[data-map-layer]'));
 const llmStatus = document.getElementById('llm-status');
 const llmStreams = document.getElementById('llm-streams');
 const modelStatus = document.getElementById('model-status');
@@ -5298,7 +5682,7 @@ async function saveLearningConfig(){
   }
 }
 
-function updateScene(packet){
+function updateScene(packet, liveMap=null){
   lastScene = packet;
   robot.position.copyFrom(world(packet.body.x_m, packet.body.y_m, 0));
   robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
@@ -5308,7 +5692,7 @@ function updateScene(packet){
   renderSurfacePerception(packet);
   renderEye(packet);
   updateHardwareControl(packet.hardware_control);
-  drawTraceMap(packet);
+  drawTraceMap(packet, liveMap);
   const session = packet.session || {};
   fields.mode.textContent = session.mode || '-';
   fields.scenario.textContent = session.scenario || '-';
@@ -5583,23 +5967,50 @@ function updateTraceState(packet){
   }
 }
 
-function drawTraceMap(packet){
+function enabledMapLayers(){
+  return new Set(mapLayerInputs.filter(input => input.checked).map(input => input.dataset.mapLayer));
+}
+
+function drawTraceMap(packet, liveMap=null){
   updateTraceState(packet);
   const w = traceCanvas.width, h = traceCanvas.height;
   traceCtx.clearRect(0, 0, w, h);
   traceCtx.fillStyle = '#081015';
   traceCtx.fillRect(0, 0, w, h);
-  const poses = traceState.poses;
-  const latest = poses[poses.length - 1] || {x_m:0, y_m:0, heading_rad:0};
+  const layers = enabledMapLayers();
+  const poses = liveMap?.pose_trail?.length ? liveMap.pose_trail : traceState.poses;
+  const latest = liveMap?.current_pose || poses[poses.length - 1] || {x_m:0, y_m:0, heading_rad:0};
   const scale = 42;
   const sx = x => w / 2 + (x - latest.x_m) * scale;
   const sy = y => h / 2 - (y - latest.y_m) * scale;
-  traceCtx.fillStyle = 'rgba(77,144,185,.22)';
-  for(const cell of traceState.free.values()) traceCtx.fillRect(sx(cell.x)-1, sy(cell.y)-1, 2, 2);
-  traceCtx.fillStyle = 'rgba(255,182,86,.62)';
-  for(const cell of traceState.occupied.values()) traceCtx.fillRect(sx(cell.x)-2, sy(cell.y)-2, 4, 4);
+  if(layers.has('occupancy')){
+    if(liveMap?.cells?.length){
+      for(const cell of liveMap.cells){
+        const occupied = Number(cell.occupied_score) > Number(cell.free_score);
+        const alpha = Math.max(.16, Math.min(.78, Number(cell.confidence) || .2));
+        traceCtx.fillStyle = occupied ? `rgba(255,182,86,${alpha})` : `rgba(77,144,185,${alpha * .45})`;
+        const size = occupied ? 4 : 2;
+        traceCtx.fillRect(sx(cell.center_x_m)-size/2, sy(cell.center_y_m)-size/2, size, size);
+      }
+    }else{
+      traceCtx.fillStyle = 'rgba(77,144,185,.22)';
+      for(const cell of traceState.free.values()) traceCtx.fillRect(sx(cell.x)-1, sy(cell.y)-1, 2, 2);
+      traceCtx.fillStyle = 'rgba(255,182,86,.62)';
+      for(const cell of traceState.occupied.values()) traceCtx.fillRect(sx(cell.x)-2, sy(cell.y)-2, 4, 4);
+    }
+  }
+  if(layers.has('free-space rays') && liveMap?.range_beams?.length){
+    traceCtx.lineWidth = 1;
+    for(const beam of liveMap.range_beams){
+      traceCtx.strokeStyle = beam.hit ? 'rgba(255,207,102,.46)' : 'rgba(82,169,255,.22)';
+      traceCtx.beginPath();
+      traceCtx.moveTo(sx(beam.origin_x_m), sy(beam.origin_y_m));
+      traceCtx.lineTo(sx(beam.end_x_m), sy(beam.end_y_m));
+      traceCtx.stroke();
+    }
+  }
   const grid = packet.surface_perception?.obstacle_grid;
-  if(grid?.cells?.length){
+  if(layers.has('occupancy') && grid?.cells?.length){
     const res = Number(grid.resolution_m) || .1;
     for(const cell of grid.cells){
       const localX = (Number(cell.x) + .5) * res;
@@ -5611,6 +6022,18 @@ function drawTraceMap(packet){
       traceCtx.fillRect(sx(p.x)-size/2, sy(p.y)-size/2, size, size);
     }
   }
+  if(liveMap?.semantic_cells?.length){
+    for(const cell of liveMap.semantic_cells){
+      if(!layers.has(cell.kind)) continue;
+      const colors = {'danger':'#ff5a70','charger/charge':'#45d483','social':'#e8c08c','novelty':'#a889ff','current':'#dce8f2'};
+      traceCtx.fillStyle = colors[cell.kind] || '#dce8f2';
+      traceCtx.globalAlpha = Math.max(.24, Math.min(.9, Number(cell.confidence) || .6));
+      traceCtx.beginPath();
+      traceCtx.arc(sx(cell.x_m), sy(cell.y_m), 4 + 4 * Math.min(1, Number(cell.score) || .5), 0, Math.PI * 2);
+      traceCtx.fill();
+      traceCtx.globalAlpha = 1;
+    }
+  }
   traceCtx.strokeStyle = '#8df0b2';
   traceCtx.lineWidth = 1.5;
   traceCtx.beginPath();
@@ -5619,10 +6042,11 @@ function drawTraceMap(packet){
     else traceCtx.lineTo(sx(pose.x_m), sy(pose.y_m));
   });
   traceCtx.stroke();
-  for(const event of traceState.events){
+  const events = liveMap?.events?.length ? liveMap.events : traceState.events;
+  if(layers.has('events')) for(const event of events){
     traceCtx.fillStyle = event.kind === 'safety' ? '#ff4d5f' : event.kind === 'stuck' ? '#ffd166' : '#ff8b4a';
     traceCtx.beginPath();
-    traceCtx.arc(sx(event.x), sy(event.y), 3, 0, Math.PI * 2);
+    traceCtx.arc(sx(event.x_m ?? event.x), sy(event.y_m ?? event.y), 3, 0, Math.PI * 2);
     traceCtx.fill();
   }
   traceCtx.save();
@@ -5917,7 +6341,12 @@ async function poll(){
     }
     const scene = await sceneResponse.json();
     if(!scene) throw new Error('invalid snapshot payload');
-    updateScene(scene);
+    let liveMap = null;
+    try{
+      const mapResponse = await fetch('/view/map', {cache:'no-store'});
+      if(mapResponse.ok) liveMap = await mapResponse.json();
+    }catch(_error){}
+    updateScene(scene, liveMap);
     statusEl.textContent = 'live';
   }catch(error){
     statusEl.textContent = 'waiting for scene packets...';
@@ -7410,6 +7839,58 @@ mod tests {
             .starts_with("data:image/png;base64,"));
     }
 
+    #[tokio::test]
+    async fn live_map_endpoint_returns_pose_projected_beams_and_overlays() {
+        let state = LiveViewState::new();
+        state.update_scene_metadata(LiveSceneMetadata {
+            arena: None,
+            objects: vec![SceneObject {
+                id: "charger-0".to_string(),
+                kind: "charger".to_string(),
+                x_m: 2.0,
+                y_m: 0.5,
+                radius_m: 0.2,
+                label: Some("charger".to_string()),
+                color_rgb: None,
+            }],
+            sensor_calibration: None,
+        });
+
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.odometry.x_m = 0.5;
+        snapshot.body.odometry.y_m = 0.75;
+        snapshot.body.odometry.heading_rad = 0.0;
+        snapshot.body.last_update_ms = 1234;
+        snapshot.body.flags.bump_left = true;
+        snapshot.range.beams = vec![2.0, 1.0, 2.0];
+        snapshot.range.nearest_m = Some(1.0);
+        state.update(snapshot);
+
+        let Json(map) = get_live_map(State(state)).await.unwrap();
+
+        assert_eq!(map.schema_version, 1);
+        assert_eq!(map.label, MAP_LABEL);
+        assert_eq!(map.pose_trail.len(), 1);
+        assert_eq!(map.current_pose.as_ref().unwrap().x_m, 0.5);
+        assert!(map.overlays.contains(&"occupancy"));
+        assert!(map.overlays.contains(&"free-space rays"));
+        assert!(map.overlays.contains(&"charger/charge"));
+        assert!(!map.cells.is_empty());
+        assert!(map
+            .semantic_cells
+            .iter()
+            .any(|cell| cell.kind == "charger/charge" && cell.label.as_deref() == Some("charger")));
+        assert!(map.events.iter().any(|event| event.kind == "bump"));
+
+        let forward_hit = map
+            .range_beams
+            .iter()
+            .find(|beam| beam.hit)
+            .expect("nearest beam should be marked as hit");
+        assert!((forward_hit.end_x_m - 1.5).abs() < 0.001);
+        assert!((forward_hit.end_y_m - 0.75).abs() < 0.001);
+    }
+
     #[test]
     fn missing_eye_kinect_and_audio_serialize_as_empty_or_null() {
         let mut snapshot = WorldSnapshot::default();
@@ -7555,6 +8036,7 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/view"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/3d"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/scene"));
+        assert!(HTTP_ENDPOINTS.contains(&"/view/map"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/embodied"));
         assert!(HTTP_ENDPOINTS.contains(&"/view/embodied/graph"));
         assert!(HTTP_ENDPOINTS.contains(&"/debug/embodied"));
@@ -7595,6 +8077,8 @@ mod tests {
         assert!(page.contains("setInterval(() =>"));
         assert!(page.contains("'WebRemote'"));
         assert!(page.contains("function projectRangeBeam"));
+        assert!(page.contains("/view/map"));
+        assert!(page.contains("data-map-layer=\"occupancy\""));
         assert!(page.contains("Odometry/range trace, not SLAM."));
         assert!(page.contains("createDefaultXRExperienceAsync"));
         assert!(page.contains("if(!eye?.data_url)"));

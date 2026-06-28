@@ -4893,6 +4893,7 @@ dependencies = [
  "netherwick-experience",
  "netherwick-ledger",
  "netherwick-llm",
+ "netherwick-map",
  "netherwick-memory",
  "netherwick-now",
  "netherwick-runtime",

@@ -16,6 +16,7 @@ netherwick-body = { path = "../netherwick-body" }
 netherwick-core = { path = "../netherwick-core" }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-llm = { path = "../netherwick-llm" }
+netherwick-map = { path = "../netherwick-map" }
 netherwick-now = { path = "../netherwick-now" }
 netherwick-runtime = { path = "../netherwick-runtime" }
 netherwick-sensors = { path = "../netherwick-sensors" }
