@@ -1,6 +1,73 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "input_source": "forge-checkpoint:data/models/experience_forge/issue25-sim1",
+  "architecture": {
+    "pipeline": [
+      "teacher_vectors",
+      "mechanically_assembled_instant",
+      "experience_encoder",
+      "experience_latent",
+      "decode_predict_compare"
+    ],
+    "teacher_vectors": [
+      {
+        "name": "teacher.tiny_now_vector",
+        "source": "Experience Forge champion filters",
+        "purpose": "teacher/fallback present-moment vector",
+        "dim": 16,
+        "sample_count": 192
+      },
+      {
+        "name": "teacher.action_features",
+        "source": "ActionPrimitive mechanical encoder",
+        "purpose": "action conditioning for transition prediction",
+        "dim": 12,
+        "sample_count": 192
+      }
+    ],
+    "instant": {
+      "representation": "ExperienceInstant",
+      "assembly": "concatenate TinyNowVector with compact action features; keep raw Now-derived decode targets out of the latent input",
+      "sample_count": 192,
+      "input_dim": 28,
+      "decode_target_dim": 23,
+      "decode_target_kind": "compact range/depth/contact sensor summary (contact 8, range 6, depth 9)"
+    },
+    "encoder": {
+      "name": "trained-experience-latent",
+      "input_dim": 28,
+      "z_dim": 8,
+      "checkpoint_path": "data/models/latent_round_trip_issue25-sim1/experience"
+    },
+    "owned_latent": {
+      "name": "ExperienceLatent",
+      "owner": "Pete Netherwick",
+      "dim": 8,
+      "teacher_independent": true,
+      "evidence": [
+        "decoder reconstructs compact sensor summaries from z",
+        "future predictor consumes z to predict the next teacher vector",
+        "comparison report measures z against copy-current, teacher-vector, and random-projection baselines"
+      ]
+    },
+    "heads": [
+      {
+        "name": "decode",
+        "target": "compact range/depth/contact sensor summary (contact 8, range 6, depth 9)",
+        "checkpoint_path": "data/models/latent_round_trip_issue25-sim1/experience"
+      },
+      {
+        "name": "predict",
+        "target": "next teacher vector",
+        "checkpoint_path": "data/models/latent_round_trip_issue25-sim1/future-trained"
+      },
+      {
+        "name": "compare",
+        "target": "copy-current, teacher-vector, and random-projection baselines",
+        "checkpoint_path": null
+      }
+    ]
+  },
   "forge_artifacts": {
     "checkpoint_path": "data/models/experience_forge/issue25-sim1",
     "log_path": "data/reports/experience-forge/issue25-sim1.jsonl",
@@ -21,7 +88,7 @@
   },
   "reconstruction": {
     "sample_count": 64,
-    "trained_decoder_loss_mean": 0.15728915,
+    "trained_decoder_loss_mean": 0.14322378,
     "zero_decoder_loss_mean": 0.26590976,
     "target_kind": "compact range/depth/contact sensor summary (contact 8, range 6, depth 9)"
   },
@@ -33,9 +100,9 @@
       "eval_sample_count": 64,
       "latent_dim": 16,
       "target_dim": 16,
-      "model_loss_mean": 0.39278296,
+      "model_loss_mean": 0.39563194,
       "stasis_loss_mean": 0.1831729,
-      "improvement_ratio": -1.1443291,
+      "improvement_ratio": -1.1598825,
       "predictive": false
     },
     {
@@ -45,9 +112,9 @@
       "eval_sample_count": 64,
       "latent_dim": 8,
       "target_dim": 16,
-      "model_loss_mean": 0.39581046,
-      "stasis_loss_mean": 0.42095238,
-      "improvement_ratio": 0.05972629,
+      "model_loss_mean": 0.3827235,
+      "stasis_loss_mean": 0.4142726,
+      "improvement_ratio": 0.0761554,
       "predictive": true
     },
     {
@@ -57,12 +124,22 @@
       "eval_sample_count": 64,
       "latent_dim": 8,
       "target_dim": 16,
-      "model_loss_mean": 0.39463276,
+      "model_loss_mean": 0.38984877,
       "stasis_loss_mean": 0.644046,
-      "improvement_ratio": 0.38726,
+      "improvement_ratio": 0.394688,
       "predictive": true
     }
   ],
+  "baseline_comparisons": {
+    "trained_encoder": "trained-experience-latent",
+    "copy_current_loss_mean": 0.4142726,
+    "random_projection_loss_mean": 0.38984877,
+    "evolved_vector_loss_mean": 0.39563194,
+    "trained_loss_mean": 0.3827235,
+    "trained_beats_copy_current": true,
+    "trained_beats_random_projection": true,
+    "trained_beats_evolved_vector": true
+  },
   "codebook": null,
   "verdict": "trained Experience latent is predictive of the next TinyNowVector",
   "warnings": []

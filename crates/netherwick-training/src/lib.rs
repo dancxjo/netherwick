@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -1555,10 +1556,23 @@ pub struct TrainLatentRoundTripRequest {
     pub codebook_size: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TrainUnifiedExperienceRequest {
+    pub ledger_path: PathBuf,
+    pub checkpoint_path: PathBuf,
+    pub report_path: PathBuf,
+    pub epochs: usize,
+    pub validation_split: f32,
+    pub seed: u64,
+    pub z_dim: usize,
+    pub teacher_dim: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrainLatentRoundTripReport {
     pub schema_version: u32,
     pub input_source: String,
+    pub architecture: LatentRoundTripArchitectureReport,
     pub forge_artifacts: Option<LatentRoundTripForgeArtifacts>,
     pub transition_count: usize,
     pub train_transition_count: usize,
@@ -1589,6 +1603,59 @@ pub struct LatentRoundTripForgeArtifacts {
     pub log_snapshot_count: usize,
     pub checkpoint_ticks: u64,
     pub checkpoint_buffer_len: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LatentRoundTripArchitectureReport {
+    pub pipeline: Vec<String>,
+    pub teacher_vectors: Vec<TeacherVectorReport>,
+    pub instant: MechanicalInstantReport,
+    pub encoder: ExperienceEncoderReport,
+    pub owned_latent: OwnedExperienceLatentReport,
+    pub heads: Vec<LatentHeadReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TeacherVectorReport {
+    pub name: String,
+    pub source: String,
+    pub purpose: String,
+    pub dim: usize,
+    pub sample_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MechanicalInstantReport {
+    pub representation: String,
+    pub assembly: String,
+    pub sample_count: usize,
+    pub input_dim: usize,
+    pub decode_target_dim: usize,
+    pub decode_target_kind: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExperienceEncoderReport {
+    pub name: String,
+    pub input_dim: usize,
+    pub z_dim: usize,
+    pub checkpoint_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OwnedExperienceLatentReport {
+    pub name: String,
+    pub owner: String,
+    pub dim: usize,
+    pub teacher_independent: bool,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LatentHeadReport {
+    pub name: String,
+    pub target: String,
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1623,6 +1690,72 @@ pub struct LatentBaselineComparisons {
     pub trained_beats_copy_current: bool,
     pub trained_beats_random_projection: bool,
     pub trained_beats_evolved_vector: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainUnifiedExperienceReport {
+    pub schema_version: u32,
+    pub input_source: String,
+    pub example_count: usize,
+    pub train_example_count: usize,
+    pub eval_example_count: usize,
+    pub transition_count: usize,
+    pub epochs: usize,
+    pub teacher_dim: usize,
+    pub latent_dim: usize,
+    pub checkpoint_path: PathBuf,
+    pub future_checkpoint_path: PathBuf,
+    pub instant: UnifiedInstantReport,
+    pub modality_coverage: Vec<UnifiedModalityCoverage>,
+    pub reconstruction: UnifiedReconstructionReport,
+    pub predictors: Vec<LatentPredictorReport>,
+    pub baselines: UnifiedBaselineReport,
+    pub verdict: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedInstantReport {
+    pub representation: String,
+    pub teacher_slots: Vec<String>,
+    pub input_dim: usize,
+    pub mask_dim: usize,
+    pub target_dim: usize,
+    pub assembly: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedModalityCoverage {
+    pub slot: String,
+    pub source: String,
+    pub purpose: String,
+    pub dim: usize,
+    pub present_count: usize,
+    pub missing_count: usize,
+    pub coverage: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedReconstructionReport {
+    pub sample_count: usize,
+    pub total_loss_mean: f32,
+    pub zero_loss_mean: f32,
+    pub head_losses: BTreeMap<String, f32>,
+    pub zero_head_losses: BTreeMap<String, f32>,
+    pub reconstructive: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedBaselineReport {
+    pub copy_current_loss_mean: Option<f32>,
+    pub random_projection_loss_mean: Option<f32>,
+    pub mechanical_instant_loss_mean: Option<f32>,
+    pub forge_tiny_now_loss_mean: Option<f32>,
+    pub trained_loss_mean: Option<f32>,
+    pub trained_beats_copy_current: bool,
+    pub trained_beats_random_projection: bool,
+    pub trained_beats_mechanical_instant: bool,
+    pub forge_tiny_now_available: bool,
 }
 
 pub trait BehaviorTrainer {
@@ -2043,6 +2176,18 @@ pub async fn train_latent_round_trip(
     autoencoder.save_checkpoint(&checkpoints.experience)?;
 
     let reconstruction = evaluate_trained_reconstruction(&autoencoder, eval_transitions)?;
+    let architecture = latent_architecture_report(
+        "ledger-replay",
+        "trainable-autoencoder",
+        &checkpoints.experience,
+        &checkpoints.future_trained,
+        "compact body/memory/drive/prediction/range-depth/audio-summary features",
+        &experience_train
+            .iter()
+            .map(|(_, input, target, _)| (input, target))
+            .collect::<Vec<_>>(),
+        z_dim,
+    )?;
     let evolved_report = train_and_evaluate_future_latents(
         "online-evolved-filters",
         replay_latent_future_samples(&train),
@@ -2122,8 +2267,9 @@ pub async fn train_latent_round_trip(
     };
 
     let report = TrainLatentRoundTripReport {
-        schema_version: 1,
+        schema_version: 2,
         input_source: format!("ledger:{}", request.ledger_path.display()),
+        architecture,
         forge_artifacts: None,
         transition_count,
         train_transition_count: train.len(),
@@ -2135,6 +2281,173 @@ pub async fn train_latent_round_trip(
         predictors,
         baseline_comparisons,
         codebook,
+        verdict,
+        warnings,
+    };
+    if let Some(parent) = request.report_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&request.report_path, serde_json::to_vec_pretty(&report)?)?;
+    Ok(report)
+}
+
+pub async fn train_unified_experience(
+    request: TrainUnifiedExperienceRequest,
+) -> Result<TrainUnifiedExperienceReport> {
+    let transitions = load_transitions(&request.ledger_path).await?;
+    let transition_count = transitions.len();
+    let mut examples = unified_examples_from_transitions(&transitions, request.teacher_dim)?;
+    let example_count = examples.len();
+    if example_count == 0 {
+        bail!("no usable unified Experience teacher-vector examples");
+    }
+    let coverage = unified_modality_coverage(&examples);
+    let (train, eval) = split_samples(
+        std::mem::take(&mut examples),
+        request.validation_split,
+        request.seed,
+    );
+    let eval_examples = if eval.is_empty() { &train } else { &eval };
+    let first = train
+        .first()
+        .ok_or_else(|| anyhow!("no training examples for unified Experience"))?;
+    let input_dim = first.input.flat_features().len();
+    let decode_lengths = first.target.feature_lengths();
+    let z_dim = request.z_dim.clamp(2, input_dim.max(2));
+    let mut autoencoder = ExperienceAutoencoderTrainer::new(input_dim, z_dim, decode_lengths);
+    for _epoch in 0..request.epochs {
+        for sample in &train {
+            if sample.input.flat_features().len() == autoencoder.input_dim()
+                && sample.target.feature_lengths() == autoencoder.decode_lengths()
+            {
+                autoencoder.train_step(&sample.input, &sample.target)?;
+            }
+        }
+    }
+    autoencoder.save_checkpoint(&request.checkpoint_path)?;
+
+    let reconstruction = evaluate_unified_reconstruction(&autoencoder, eval_examples)?;
+    let trained_train = unified_trained_future_samples(&autoencoder, &train)?;
+    let trained_eval = unified_trained_future_samples(&autoencoder, eval_examples)?;
+    let future_checkpoint_path = request.checkpoint_path.join("future-trained");
+    let trained_report = train_and_evaluate_future_latents(
+        "unified-experience-latent",
+        trained_train.clone(),
+        trained_eval,
+        request.epochs,
+        &future_checkpoint_path,
+        "next unified Experience latent",
+    )?;
+    let mut random_train_encoder = RandomProjectionExperienceEncoder::new(z_dim, request.seed);
+    let mut random_eval_encoder = RandomProjectionExperienceEncoder::new(z_dim, request.seed);
+    let random_report = train_and_evaluate_future_latents(
+        "random-projection",
+        unified_encoded_future_samples(&mut random_train_encoder, &train)?,
+        unified_encoded_future_samples(&mut random_eval_encoder, eval_examples)?,
+        request.epochs,
+        &request.checkpoint_path.join("future-random"),
+        "next random-projected unified latent",
+    )?;
+    let mechanical_report = train_and_evaluate_future_latents(
+        "mechanical-instant",
+        unified_mechanical_future_samples(&train),
+        unified_mechanical_future_samples(eval_examples),
+        request.epochs,
+        &request.checkpoint_path.join("future-mechanical-instant"),
+        "next mechanical Instant",
+    )?;
+    let forge_report = if train.iter().any(|sample| sample.slot_presence[6] > 0.0)
+        && eval_examples
+            .iter()
+            .any(|sample| sample.slot_presence[6] > 0.0)
+    {
+        Some(train_and_evaluate_future_latents(
+            "forge-tiny-now-vector",
+            unified_slot_future_samples(&train, 6),
+            unified_slot_future_samples(eval_examples, 6),
+            request.epochs,
+            &request.checkpoint_path.join("future-forge-tiny-now"),
+            "next Forge TinyNowVector",
+        )?)
+    } else {
+        None
+    };
+
+    let mut predictors = vec![
+        trained_report.clone(),
+        random_report.clone(),
+        mechanical_report.clone(),
+    ];
+    if let Some(report) = forge_report.clone() {
+        predictors.push(report);
+    }
+    let baselines = UnifiedBaselineReport {
+        copy_current_loss_mean: Some(trained_report.stasis_loss_mean),
+        random_projection_loss_mean: Some(random_report.model_loss_mean),
+        mechanical_instant_loss_mean: Some(mechanical_report.model_loss_mean),
+        forge_tiny_now_loss_mean: forge_report.as_ref().map(|report| report.model_loss_mean),
+        trained_loss_mean: Some(trained_report.model_loss_mean),
+        trained_beats_copy_current: trained_report.model_loss_mean
+            < trained_report.stasis_loss_mean,
+        trained_beats_random_projection: trained_report.model_loss_mean
+            < random_report.model_loss_mean,
+        trained_beats_mechanical_instant: trained_report.model_loss_mean
+            < mechanical_report.model_loss_mean,
+        forge_tiny_now_available: forge_report.is_some(),
+    };
+    let mut warnings = Vec::new();
+    if example_count < 50 {
+        warnings.push(format!(
+            "insufficient data: {example_count} examples is below the conservative 50-example floor"
+        ));
+    }
+    for slot in &coverage {
+        if slot.present_count == 0 {
+            warnings.push(format!(
+                "teacher slot {} was explicitly masked as missing for every example",
+                slot.slot
+            ));
+        }
+    }
+    let collapsed_latent = unified_latent_variance(&autoencoder, eval_examples)? < 1.0e-6;
+    if collapsed_latent {
+        warnings.push(
+            "learned unified Experience latent appears collapsed on held-out examples".to_string(),
+        );
+    }
+    let verdict = if reconstruction.reconstructive && trained_report.predictive && !collapsed_latent
+    {
+        "unified Experience latent is reconstructive and predictive".to_string()
+    } else if reconstruction.reconstructive {
+        "unified Experience latent reconstructs teacher/sensor heads but is not yet predictive"
+            .to_string()
+    } else {
+        "unified Experience latent is not yet proven reconstructive or predictive".to_string()
+    };
+    let report = TrainUnifiedExperienceReport {
+        schema_version: 1,
+        input_source: format!("ledger:{}", request.ledger_path.display()),
+        example_count,
+        train_example_count: train.len(),
+        eval_example_count: eval_examples.len(),
+        transition_count,
+        epochs: request.epochs,
+        teacher_dim: request.teacher_dim,
+        latent_dim: z_dim,
+        checkpoint_path: request.checkpoint_path.clone(),
+        future_checkpoint_path,
+        instant: UnifiedInstantReport {
+            representation: "UnifiedExperienceInstant".to_string(),
+            teacher_slots: UNIFIED_TEACHER_SLOTS.iter().map(|slot| slot.name.to_string()).collect(),
+            input_dim,
+            mask_dim: UNIFIED_TEACHER_SLOTS.len(),
+            target_dim: first.target.flat_features().len(),
+            assembly: "fixed teacher-vector slots plus explicit presence mask; missing modalities stay masked instead of disappearing".to_string(),
+        },
+        modality_coverage: coverage,
+        reconstruction,
+        predictors,
+        baselines,
         verdict,
         warnings,
     };
@@ -2194,6 +2507,18 @@ async fn train_forge_latent_round_trip(
     autoencoder.save_checkpoint(&checkpoints.experience)?;
 
     let reconstruction = evaluate_forge_reconstruction(&autoencoder, eval_examples)?;
+    let architecture = latent_architecture_report(
+        "experience-forge",
+        "trained-experience-latent",
+        &checkpoints.experience,
+        &checkpoints.future_trained,
+        &reconstruction.target_kind,
+        &train
+            .iter()
+            .map(|sample| (&sample.input, &sample.decode_target))
+            .collect::<Vec<_>>(),
+        z_dim,
+    )?;
     let evolved_report = train_and_evaluate_future_latents(
         "evolved-forge-vector",
         forge_evolved_future_samples(&train),
@@ -2281,8 +2606,9 @@ async fn train_forge_latent_round_trip(
     };
 
     let report = TrainLatentRoundTripReport {
-        schema_version: 2,
+        schema_version: 3,
         input_source: format!("forge-checkpoint:{}", forge_checkpoint_path.display()),
+        architecture,
         forge_artifacts: Some(LatentRoundTripForgeArtifacts {
             checkpoint_path: forge_checkpoint_path,
             log_path: request.forge_log_path.clone(),
@@ -2873,6 +3199,668 @@ fn replay_latent_future_samples(
     future_samples(transitions)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct UnifiedTeacherSlot {
+    name: &'static str,
+    source: &'static str,
+    purpose: &'static str,
+}
+
+const UNIFIED_TEACHER_SLOTS: [UnifiedTeacherSlot; 7] = [
+    UnifiedTeacherSlot {
+        name: "scene",
+        source: "eye image/scene vectors",
+        purpose: "visual scene similarity",
+    },
+    UnifiedTeacherSlot {
+        name: "face",
+        source: "face identity vectors",
+        purpose: "person identity",
+    },
+    UnifiedTeacherSlot {
+        name: "voice",
+        source: "voice/audio identity vectors",
+        purpose: "speaker identity",
+    },
+    UnifiedTeacherSlot {
+        name: "transcript",
+        source: "ASR/transcript text hash",
+        purpose: "text semantic bridge",
+    },
+    UnifiedTeacherSlot {
+        name: "depth_range",
+        source: "range and Kinect depth summaries",
+        purpose: "near-field geometry",
+    },
+    UnifiedTeacherSlot {
+        name: "memory",
+        source: "memory recall/state vector",
+        purpose: "remembered context",
+    },
+    UnifiedTeacherSlot {
+        name: "forge_tiny_now",
+        source: "Experience Forge TinyNowVector",
+        purpose: "evolved fallback present vector",
+    },
+];
+
+#[derive(Clone, Debug)]
+struct UnifiedInstant {
+    input: ExperienceEncodeInput,
+    target: ExperienceDecodeOutput,
+    slot_vectors: Vec<Vec<f32>>,
+    slot_presence: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct UnifiedExperienceExample {
+    t_ms: TimeMs,
+    input: ExperienceEncodeInput,
+    target: ExperienceDecodeOutput,
+    next_input: ExperienceEncodeInput,
+    next_slot_vectors: Vec<Vec<f32>>,
+    slot_presence: Vec<f32>,
+    action: ActionPrimitive,
+    offset_ms: TimeMs,
+}
+
+fn unified_examples_from_transitions(
+    transitions: &[ExperienceTransition],
+    teacher_dim: usize,
+) -> Result<Vec<UnifiedExperienceExample>> {
+    let teacher_dim = teacher_dim.max(2);
+    let mut examples = Vec::new();
+    for transition in transitions {
+        let Some(action) = transition.action.clone() else {
+            continue;
+        };
+        let now = unified_instant_from_now(&transition.before, teacher_dim);
+        let next_now = unified_instant_from_now(&transition.after, teacher_dim);
+        examples.push(UnifiedExperienceExample {
+            t_ms: transition.before.t_ms,
+            input: now.input,
+            target: now.target,
+            next_input: next_now.input,
+            next_slot_vectors: next_now.slot_vectors,
+            slot_presence: now.slot_presence,
+            action,
+            offset_ms: transition
+                .after
+                .t_ms
+                .saturating_sub(transition.before.t_ms)
+                .max(1),
+        });
+    }
+    Ok(examples)
+}
+
+fn unified_instant_from_now(now: &Now, teacher_dim: usize) -> UnifiedInstant {
+    let mut slot_vectors = Vec::new();
+    let mut slot_presence = Vec::new();
+    for slot_index in 0..UNIFIED_TEACHER_SLOTS.len() {
+        let (vector, present) = unified_slot_vector(now, slot_index, teacher_dim);
+        slot_vectors.push(vector);
+        slot_presence.push(bool_feature(present));
+    }
+    let mut sense_vectors = slot_vectors.clone();
+    sense_vectors.push(slot_presence.clone());
+    UnifiedInstant {
+        input: ExperienceEncodeInput { sense_vectors },
+        target: unified_decode_target(now, &slot_vectors, &slot_presence),
+        slot_vectors,
+        slot_presence,
+    }
+}
+
+fn unified_slot_vector(now: &Now, slot_index: usize, teacher_dim: usize) -> (Vec<f32>, bool) {
+    let raw = match slot_index {
+        0 => average_artifacts(
+            now.eye
+                .scene_vectors
+                .iter()
+                .chain(now.eye.image_vectors.iter())
+                .chain(now.eye.image_description_vectors.iter()),
+        ),
+        1 => average_artifacts(now.face.vectors.iter())
+            .or_else(|| average_legacy_embeddings(&now.face.embeddings)),
+        2 => average_artifacts(now.voice.vectors.iter())
+            .or_else(|| average_legacy_embeddings(&now.voice.embeddings)),
+        3 => transcript_vector(now, teacher_dim),
+        4 => Some(
+            forge_range_features(now)
+                .into_iter()
+                .chain(forge_depth_features(now))
+                .collect(),
+        )
+        .filter(|_| !now.range.beams.is_empty() || !now.kinect.depth_m.is_empty()),
+        5 => Some(memory_teacher_vector(now)).filter(|values| values.iter().any(|v| *v != 0.0)),
+        6 => tiny_now_vector_from_extensions(now),
+        _ => None,
+    };
+    let present = raw.as_ref().is_some_and(|values| !values.is_empty());
+    (fit_vector(raw.unwrap_or_default(), teacher_dim), present)
+}
+
+fn average_artifacts<'a>(
+    artifacts: impl Iterator<Item = &'a netherwick_now::VectorArtifact>,
+) -> Option<Vec<f32>> {
+    let vectors = artifacts
+        .filter(|artifact| !artifact.vector.is_empty())
+        .map(|artifact| artifact.vector.as_slice())
+        .collect::<Vec<_>>();
+    average_slices(&vectors)
+}
+
+fn average_legacy_embeddings(embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
+    let vectors = embeddings
+        .iter()
+        .filter(|embedding| !embedding.is_empty())
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    average_slices(&vectors)
+}
+
+fn average_slices(vectors: &[&[f32]]) -> Option<Vec<f32>> {
+    let dim = vectors.iter().map(|vector| vector.len()).max()?;
+    let mut out = vec![0.0; dim];
+    let mut count = 0.0_f32;
+    for vector in vectors {
+        for (slot, value) in out.iter_mut().zip(vector.iter().copied()) {
+            *slot += clean_feature(value);
+        }
+        count += 1.0;
+    }
+    if count == 0.0 {
+        return None;
+    }
+    for value in &mut out {
+        *value /= count;
+    }
+    Some(out)
+}
+
+fn transcript_vector(now: &Now, teacher_dim: usize) -> Option<Vec<f32>> {
+    let text = now
+        .ear
+        .asr
+        .transcript
+        .as_deref()
+        .or(now.ear.transcript.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?;
+    let mut out = vec![0.0; teacher_dim.max(1)];
+    for (index, byte) in text.bytes().enumerate() {
+        let slot = index % out.len();
+        let signed = (byte as f32 / 127.5) - 1.0;
+        out[slot] = (out[slot] + signed).tanh();
+    }
+    Some(out)
+}
+
+fn memory_teacher_vector(now: &Now) -> Vec<f32> {
+    vec![
+        now.memory.place_familiarity,
+        now.memory.place_danger,
+        now.memory.place_charge_value,
+        now.memory.place_social_value,
+        now.memory.place_novelty,
+        now.memory.recent_trap_confidence,
+        now.memory.similar_situation_count as f32 / 32.0,
+        bool_feature(now.memory.remembered_warning.is_some()),
+        bool_feature(now.memory.graph_context_summary.is_some()),
+        now.memory
+            .nearby_best_safe_direction_rad
+            .unwrap_or_default()
+            .sin(),
+        now.memory
+            .nearby_best_charge_direction_rad
+            .unwrap_or_default()
+            .sin(),
+        now.memory
+            .nearby_frontier_direction_rad
+            .unwrap_or_default()
+            .sin(),
+    ]
+    .into_iter()
+    .map(clean_feature)
+    .collect()
+}
+
+fn tiny_now_vector_from_extensions(now: &Now) -> Option<Vec<f32>> {
+    [
+        "experience_forge.tiny_now_vector",
+        "tiny_now_vector",
+        "forge.tiny_now_vector",
+    ]
+    .iter()
+    .find_map(|key| now.extensions.get(*key).and_then(extension_vector_values))
+}
+
+fn extension_vector_values(value: &serde_json::Value) -> Option<Vec<f32>> {
+    if let Some(values) = value.get("values").and_then(|value| value.as_array()) {
+        return Some(
+            values
+                .iter()
+                .filter_map(|value| value.as_f64())
+                .map(|value| clean_feature(value as f32))
+                .collect(),
+        );
+    }
+    value.as_array().map(|values| {
+        values
+            .iter()
+            .filter_map(|value| value.as_f64())
+            .map(|value| clean_feature(value as f32))
+            .collect()
+    })
+}
+
+fn fit_vector(values: Vec<f32>, dim: usize) -> Vec<f32> {
+    let dim = dim.max(1);
+    if values.is_empty() {
+        return vec![0.0; dim];
+    }
+    let original_len = values.len();
+    if values.len() == dim {
+        return values.into_iter().map(clean_feature).collect();
+    }
+    let mut out = vec![0.0; dim];
+    if values.len() < dim {
+        for (slot, value) in out.iter_mut().zip(values.into_iter()) {
+            *slot = clean_feature(value);
+        }
+        return out;
+    }
+    for (index, value) in values.into_iter().enumerate() {
+        out[index % dim] += clean_feature(value);
+    }
+    let folds = (values_len_for_dim(original_len, dim) as f32).max(1.0);
+    for value in &mut out {
+        *value = (*value / folds).tanh();
+    }
+    out
+}
+
+fn values_len_for_dim(len: usize, dim: usize) -> usize {
+    len.div_ceil(dim.max(1))
+}
+
+fn unified_decode_target(
+    now: &Now,
+    slot_vectors: &[Vec<f32>],
+    slot_presence: &[f32],
+) -> ExperienceDecodeOutput {
+    let teacher_summary = slot_vectors
+        .iter()
+        .zip(slot_presence.iter().copied())
+        .flat_map(|(vector, present)| {
+            let mean_abs = if vector.is_empty() {
+                0.0
+            } else {
+                vector.iter().map(|value| value.abs()).sum::<f32>() / vector.len() as f32
+            };
+            let max_abs = vector
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f32, f32::max);
+            [present, mean_abs, max_abs]
+        })
+        .collect::<Vec<_>>();
+    ExperienceDecodeOutput {
+        body_features: forge_contact_features(now)
+            .into_iter()
+            .chain([now.body.battery_level, bool_feature(now.body.charging)])
+            .map(clean_feature)
+            .collect(),
+        memory_features: teacher_summary,
+        drive_features: slot_presence.to_vec(),
+        prediction_features: vec![
+            bool_feature(now.body.flags.bump_left || now.body.flags.bump_right),
+            now.extensions
+                .get("sim.stuck")
+                .and_then(|value| {
+                    value.as_f64().map(|value| value as f32).or_else(|| {
+                        extension_vector_values(value).and_then(|values| values.first().copied())
+                    })
+                })
+                .unwrap_or_default(),
+            now.memory.place_novelty,
+            bool_feature(now.reign.active),
+            now.predictions.uncertainty,
+        ],
+        eye_features: slot_vectors.iter().flatten().copied().collect(),
+        ear_features: forge_range_features(now)
+            .into_iter()
+            .chain(forge_depth_features(now))
+            .map(clean_feature)
+            .collect(),
+    }
+}
+
+fn unified_modality_coverage(
+    examples: &[UnifiedExperienceExample],
+) -> Vec<UnifiedModalityCoverage> {
+    UNIFIED_TEACHER_SLOTS
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            let present_count = examples
+                .iter()
+                .filter(|example| {
+                    example
+                        .slot_presence
+                        .get(index)
+                        .copied()
+                        .unwrap_or_default()
+                        > 0.0
+                })
+                .count();
+            let missing_count = examples.len().saturating_sub(present_count);
+            UnifiedModalityCoverage {
+                slot: slot.name.to_string(),
+                source: slot.source.to_string(),
+                purpose: slot.purpose.to_string(),
+                dim: examples
+                    .first()
+                    .and_then(|example| example.input.sense_vectors.get(index))
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                present_count,
+                missing_count,
+                coverage: present_count as f32 / examples.len().max(1) as f32,
+            }
+        })
+        .collect()
+}
+
+fn evaluate_unified_reconstruction(
+    autoencoder: &ExperienceAutoencoderTrainer,
+    examples: &[UnifiedExperienceExample],
+) -> Result<UnifiedReconstructionReport> {
+    let mut total_losses = Vec::new();
+    let mut zero_losses = Vec::new();
+    let mut head_losses: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    let mut zero_head_losses: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    for sample in examples {
+        if sample.input.flat_features().len() != autoencoder.input_dim()
+            || sample.target.feature_lengths() != autoencoder.decode_lengths()
+        {
+            continue;
+        }
+        let prediction = autoencoder.predict(&sample.input)?;
+        let predicted = &prediction.decoded;
+        let target = &sample.target;
+        total_losses.push(mse_vec(&predicted.flat_features(), &target.flat_features()));
+        zero_losses.push(mse_vec(
+            &vec![0.0; target.flat_features().len()],
+            &target.flat_features(),
+        ));
+        push_head_loss(
+            &mut head_losses,
+            "sensor_body",
+            &predicted.body_features,
+            &target.body_features,
+        );
+        push_head_loss(
+            &mut head_losses,
+            "teacher_summary",
+            &predicted.memory_features,
+            &target.memory_features,
+        );
+        push_head_loss(
+            &mut head_losses,
+            "modality_mask",
+            &predicted.drive_features,
+            &target.drive_features,
+        );
+        push_head_loss(
+            &mut head_losses,
+            "outcomes",
+            &predicted.prediction_features,
+            &target.prediction_features,
+        );
+        push_head_loss(
+            &mut head_losses,
+            "teacher_vectors",
+            &predicted.eye_features,
+            &target.eye_features,
+        );
+        push_head_loss(
+            &mut head_losses,
+            "range_depth",
+            &predicted.ear_features,
+            &target.ear_features,
+        );
+        push_head_loss(
+            &mut zero_head_losses,
+            "sensor_body",
+            &[],
+            &target.body_features,
+        );
+        push_head_loss(
+            &mut zero_head_losses,
+            "teacher_summary",
+            &[],
+            &target.memory_features,
+        );
+        push_head_loss(
+            &mut zero_head_losses,
+            "modality_mask",
+            &[],
+            &target.drive_features,
+        );
+        push_head_loss(
+            &mut zero_head_losses,
+            "outcomes",
+            &[],
+            &target.prediction_features,
+        );
+        push_head_loss(
+            &mut zero_head_losses,
+            "teacher_vectors",
+            &[],
+            &target.eye_features,
+        );
+        push_head_loss(
+            &mut zero_head_losses,
+            "range_depth",
+            &[],
+            &target.ear_features,
+        );
+    }
+    if total_losses.is_empty() {
+        bail!("no usable unified Experience reconstruction samples");
+    }
+    let total_loss_mean = mean(&total_losses);
+    let zero_loss_mean = mean(&zero_losses);
+    Ok(UnifiedReconstructionReport {
+        sample_count: total_losses.len(),
+        total_loss_mean,
+        zero_loss_mean,
+        head_losses: mean_loss_map(head_losses),
+        zero_head_losses: mean_loss_map(zero_head_losses),
+        reconstructive: total_loss_mean < zero_loss_mean,
+    })
+}
+
+fn push_head_loss(
+    losses: &mut BTreeMap<String, Vec<f32>>,
+    head: &str,
+    predicted: &[f32],
+    target: &[f32],
+) {
+    let zero;
+    let predicted = if predicted.is_empty() && !target.is_empty() {
+        zero = vec![0.0; target.len()];
+        &zero
+    } else {
+        predicted
+    };
+    losses
+        .entry(head.to_string())
+        .or_default()
+        .push(mse_vec(predicted, target));
+}
+
+fn mean_loss_map(losses: BTreeMap<String, Vec<f32>>) -> BTreeMap<String, f32> {
+    losses
+        .into_iter()
+        .map(|(head, values)| (head, mean(&values)))
+        .collect()
+}
+
+fn unified_trained_future_samples(
+    autoencoder: &ExperienceAutoencoderTrainer,
+    examples: &[UnifiedExperienceExample],
+) -> Result<Vec<(TimeMs, FutureInput, Vec<f32>)>> {
+    let mut samples = Vec::new();
+    for sample in examples {
+        if sample.input.flat_features().len() != autoencoder.input_dim()
+            || sample.next_input.flat_features().len() != autoencoder.input_dim()
+        {
+            continue;
+        }
+        let before_z = autoencoder.encode(&sample.input)?.z;
+        let after_z = autoencoder.encode(&sample.next_input)?.z;
+        samples.push((
+            sample.t_ms,
+            FutureInput {
+                latent: ExperienceLatent {
+                    t_ms: sample.t_ms,
+                    z: before_z,
+                    reconstruction_error: 0.0,
+                    prediction_error: 0.0,
+                    confidence: 0.65,
+                },
+                action: sample.action.clone(),
+                offset_ms: sample.offset_ms,
+            },
+            after_z,
+        ));
+    }
+    Ok(samples)
+}
+
+fn unified_encoded_future_samples(
+    encoder: &mut impl LatentEncoder,
+    examples: &[UnifiedExperienceExample],
+) -> Result<Vec<(TimeMs, FutureInput, Vec<f32>)>> {
+    let mut samples = Vec::new();
+    for sample in examples {
+        let before_z = encoder.encode_input(&sample.input, sample.t_ms)?;
+        let after_z = encoder.encode_input(
+            &sample.next_input,
+            sample.t_ms.saturating_add(sample.offset_ms),
+        )?;
+        samples.push((
+            sample.t_ms,
+            FutureInput {
+                latent: before_z,
+                action: sample.action.clone(),
+                offset_ms: sample.offset_ms,
+            },
+            after_z.z,
+        ));
+    }
+    Ok(samples)
+}
+
+fn unified_mechanical_future_samples(
+    examples: &[UnifiedExperienceExample],
+) -> Vec<(TimeMs, FutureInput, Vec<f32>)> {
+    examples
+        .iter()
+        .map(|sample| {
+            (
+                sample.t_ms,
+                FutureInput {
+                    latent: ExperienceLatent {
+                        t_ms: sample.t_ms,
+                        z: sample.input.flat_features(),
+                        reconstruction_error: 0.0,
+                        prediction_error: 0.0,
+                        confidence: 0.5,
+                    },
+                    action: sample.action.clone(),
+                    offset_ms: sample.offset_ms,
+                },
+                sample.next_input.flat_features(),
+            )
+        })
+        .collect()
+}
+
+fn unified_slot_future_samples(
+    examples: &[UnifiedExperienceExample],
+    slot_index: usize,
+) -> Vec<(TimeMs, FutureInput, Vec<f32>)> {
+    examples
+        .iter()
+        .filter(|sample| {
+            sample
+                .slot_presence
+                .get(slot_index)
+                .copied()
+                .unwrap_or_default()
+                > 0.0
+        })
+        .filter_map(|sample| {
+            let z = sample.input.sense_vectors.get(slot_index)?.clone();
+            let target = sample.next_slot_vectors.get(slot_index)?.clone();
+            Some((
+                sample.t_ms,
+                FutureInput {
+                    latent: ExperienceLatent {
+                        t_ms: sample.t_ms,
+                        z,
+                        reconstruction_error: 0.0,
+                        prediction_error: 0.0,
+                        confidence: 0.45,
+                    },
+                    action: sample.action.clone(),
+                    offset_ms: sample.offset_ms,
+                },
+                target,
+            ))
+        })
+        .collect()
+}
+
+fn unified_latent_variance(
+    autoencoder: &ExperienceAutoencoderTrainer,
+    examples: &[UnifiedExperienceExample],
+) -> Result<f32> {
+    let mut latents = Vec::new();
+    for sample in examples {
+        if sample.input.flat_features().len() == autoencoder.input_dim() {
+            latents.push(autoencoder.encode(&sample.input)?.z);
+        }
+    }
+    let Some(first) = latents.first() else {
+        return Ok(0.0);
+    };
+    let dim = first.len();
+    if dim == 0 {
+        return Ok(0.0);
+    }
+    let mut means = vec![0.0; dim];
+    for latent in &latents {
+        for (mean, value) in means.iter_mut().zip(latent.iter().copied()) {
+            *mean += value;
+        }
+    }
+    for mean in &mut means {
+        *mean /= latents.len().max(1) as f32;
+    }
+    let mut variance = 0.0;
+    for latent in &latents {
+        for (index, value) in latent.iter().copied().enumerate() {
+            variance += (value - means[index]).powi(2);
+        }
+    }
+    Ok(variance / (latents.len().max(1) * dim).max(1) as f32)
+}
+
 #[derive(Clone, Debug)]
 struct ForgeRoundTripExample {
     t_ms: TimeMs,
@@ -2902,6 +3890,128 @@ fn count_forge_log_snapshots(path: &Path) -> Result<usize> {
         count += 1;
     }
     Ok(count)
+}
+
+fn latent_architecture_report(
+    source_kind: &str,
+    encoder_name: &str,
+    checkpoint_path: &Path,
+    predict_checkpoint_path: &Path,
+    decode_target_kind: &str,
+    samples: &[(&ExperienceEncodeInput, &ExperienceDecodeOutput)],
+    z_dim: usize,
+) -> Result<LatentRoundTripArchitectureReport> {
+    let (input, target) = samples
+        .first()
+        .ok_or_else(|| anyhow!("no samples available for latent architecture report"))?;
+    let input_dim = input.flat_features().len();
+    let decode_target_dim = target.flat_features().len();
+    let teacher_vectors = input
+        .sense_vectors
+        .iter()
+        .enumerate()
+        .map(|(index, vector)| {
+            teacher_vector_report(source_kind, index, vector.len(), samples.len())
+        })
+        .collect::<Vec<_>>();
+
+    Ok(LatentRoundTripArchitectureReport {
+        pipeline: vec![
+            "teacher_vectors".to_string(),
+            "mechanically_assembled_instant".to_string(),
+            "experience_encoder".to_string(),
+            "experience_latent".to_string(),
+            "decode_predict_compare".to_string(),
+        ],
+        teacher_vectors,
+        instant: MechanicalInstantReport {
+            representation: "ExperienceInstant".to_string(),
+            assembly: match source_kind {
+                "experience-forge" => {
+                    "concatenate TinyNowVector with compact action features; keep raw Now-derived decode targets out of the latent input"
+                }
+                _ => {
+                    "concatenate deterministic Now sense vectors; keep reconstruction targets as separate supervision"
+                }
+            }
+            .to_string(),
+            sample_count: samples.len(),
+            input_dim,
+            decode_target_dim,
+            decode_target_kind: decode_target_kind.to_string(),
+        },
+        encoder: ExperienceEncoderReport {
+            name: encoder_name.to_string(),
+            input_dim,
+            z_dim,
+            checkpoint_path: checkpoint_path.to_path_buf(),
+        },
+        owned_latent: OwnedExperienceLatentReport {
+            name: "ExperienceLatent".to_string(),
+            owner: "Pete Netherwick".to_string(),
+            dim: z_dim,
+            teacher_independent: true,
+            evidence: vec![
+                "decoder reconstructs compact sensor summaries from z".to_string(),
+                "future predictor consumes z to predict the next teacher vector".to_string(),
+                "comparison report measures z against copy-current, teacher-vector, and random-projection baselines".to_string(),
+            ],
+        },
+        heads: vec![
+            LatentHeadReport {
+                name: "decode".to_string(),
+                target: decode_target_kind.to_string(),
+                checkpoint_path: Some(checkpoint_path.to_path_buf()),
+            },
+            LatentHeadReport {
+                name: "predict".to_string(),
+                target: "next teacher vector".to_string(),
+                checkpoint_path: Some(predict_checkpoint_path.to_path_buf()),
+            },
+            LatentHeadReport {
+                name: "compare".to_string(),
+                target: "copy-current, teacher-vector, and random-projection baselines".to_string(),
+                checkpoint_path: None,
+            },
+        ],
+    })
+}
+
+fn teacher_vector_report(
+    source_kind: &str,
+    index: usize,
+    dim: usize,
+    sample_count: usize,
+) -> TeacherVectorReport {
+    let (name, source, purpose) = match (source_kind, index) {
+        ("experience-forge", 0) => (
+            "teacher.tiny_now_vector",
+            "Experience Forge champion filters",
+            "teacher/fallback present-moment vector",
+        ),
+        ("experience-forge", 1) => (
+            "teacher.action_features",
+            "ActionPrimitive mechanical encoder",
+            "action conditioning for transition prediction",
+        ),
+        (_, 0) => (
+            "teacher.now_sense_vectors",
+            "ledger Now vector assembly",
+            "teacher/fallback present-moment vector",
+        ),
+        (_, _) => (
+            "teacher.aux_sense_vector",
+            "ledger Now vector assembly",
+            "auxiliary instant feature vector",
+        ),
+    };
+    TeacherVectorReport {
+        name: name.to_string(),
+        source: source.to_string(),
+        purpose: purpose.to_string(),
+        dim,
+        sample_count,
+    }
 }
 
 fn forge_examples_from_checkpoint(forge: &ExperienceForge) -> Result<Vec<ForgeRoundTripExample>> {
@@ -3703,7 +4813,7 @@ mod tests {
     use netherwick_body::BodySense;
     use netherwick_core::Reward;
     use netherwick_experience::ExperienceLatent;
-    use netherwick_now::SurpriseSense;
+    use netherwick_now::{SurpriseSense, VectorArtifact};
     use std::fs;
 
     #[tokio::test]
@@ -3840,6 +4950,14 @@ mod tests {
         .unwrap();
 
         assert!(report_path.exists());
+        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.architecture.owned_latent.name, "ExperienceLatent");
+        assert_eq!(report.architecture.owned_latent.owner, "Pete Netherwick");
+        assert!(report.architecture.owned_latent.teacher_independent);
+        assert!(report
+            .architecture
+            .pipeline
+            .contains(&"mechanically_assembled_instant".to_string()));
         assert_eq!(report.predictors.len(), 3);
         assert!(report
             .predictors
@@ -3913,10 +5031,39 @@ mod tests {
         .unwrap();
 
         assert!(report_path.exists());
+        assert_eq!(report.schema_version, 3);
         assert_eq!(
             report.input_source,
             format!("forge-checkpoint:{}", forge_checkpoint.display())
         );
+        assert_eq!(
+            report.architecture.teacher_vectors[0].name,
+            "teacher.tiny_now_vector"
+        );
+        assert_eq!(
+            report.architecture.instant.representation,
+            "ExperienceInstant"
+        );
+        assert_eq!(
+            report.architecture.instant.input_dim,
+            TINY_NOW_VECTOR_DIM + 12
+        );
+        assert_eq!(report.architecture.encoder.z_dim, report.z_dim);
+        assert!(report
+            .architecture
+            .heads
+            .iter()
+            .any(|head| head.name == "decode"));
+        assert!(report
+            .architecture
+            .heads
+            .iter()
+            .any(|head| head.name == "predict"));
+        assert!(report
+            .architecture
+            .heads
+            .iter()
+            .any(|head| head.name == "compare"));
         let artifacts = report.forge_artifacts.unwrap();
         assert_eq!(artifacts.log_path.as_deref(), Some(forge_log.as_path()));
         assert_eq!(artifacts.log_snapshot_count, 8);
@@ -3966,5 +5113,146 @@ mod tests {
         assert_eq!(loaded.z_dim(), report.z_dim);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_train_unified_experience_reports_multimodal_teacher_instant() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("netherwick_unified_experience_test_{}", now_ms()));
+        let ledger_dir = temp_dir.join("ledger");
+        let session_dir = ledger_dir.join("2026-06-28");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let mut transitions = Vec::new();
+        for i in 0..8 {
+            let before = multimodal_now(100 + i * 100, i as f32, i % 2 == 0);
+            let after = multimodal_now(200 + i * 100, i as f32 + 0.5, i % 3 == 0);
+            transitions.push(ExperienceTransition {
+                id: uuid::Uuid::new_v4(),
+                before_frame_id: uuid::Uuid::new_v4(),
+                before,
+                before_z: ExperienceLatent {
+                    t_ms: 100 + i * 100,
+                    z: vec![0.1, 0.2, 0.3, 0.4],
+                    ..ExperienceLatent::default()
+                },
+                action: Some(ActionPrimitive::Drive {
+                    forward: 0.25,
+                    turn: 0.05,
+                    duration_ms: 100,
+                }),
+                predicted_futures: Vec::new(),
+                after,
+                after_z: ExperienceLatent {
+                    t_ms: 200 + i * 100,
+                    z: vec![0.2, 0.3, 0.4, 0.5],
+                    ..ExperienceLatent::default()
+                },
+                reward: Reward { value: 0.0 },
+                surprise: SurpriseSense::default(),
+                created_at_ms: 200 + i * 100,
+            });
+        }
+        let transitions_file = session_dir.join("transitions.jsonl");
+        let content = transitions
+            .iter()
+            .map(|transition| serde_json::to_string(transition).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&transitions_file, format!("{content}\n")).unwrap();
+
+        let report_path = temp_dir.join("unified-report.json");
+        let report = train_unified_experience(TrainUnifiedExperienceRequest {
+            ledger_path: ledger_dir,
+            checkpoint_path: temp_dir.join("checkpoint"),
+            report_path: report_path.clone(),
+            epochs: 1,
+            validation_split: 0.25,
+            seed: 17,
+            z_dim: 6,
+            teacher_dim: 8,
+        })
+        .await
+        .unwrap();
+
+        assert!(report_path.exists());
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.instant.representation, "UnifiedExperienceInstant");
+        assert_eq!(report.instant.mask_dim, UNIFIED_TEACHER_SLOTS.len());
+        assert_eq!(
+            report.instant.input_dim,
+            report.teacher_dim * UNIFIED_TEACHER_SLOTS.len() + UNIFIED_TEACHER_SLOTS.len()
+        );
+        assert_eq!(report.latent_dim, 6);
+        assert!(report
+            .modality_coverage
+            .iter()
+            .any(|slot| slot.slot == "scene" && slot.present_count > 0));
+        assert!(report
+            .modality_coverage
+            .iter()
+            .any(|slot| slot.slot == "forge_tiny_now" && slot.missing_count > 0));
+        assert!(report
+            .reconstruction
+            .head_losses
+            .contains_key("teacher_vectors"));
+        assert!(report
+            .reconstruction
+            .head_losses
+            .contains_key("modality_mask"));
+        assert!(report
+            .predictors
+            .iter()
+            .any(|predictor| predictor.encoder == "unified-experience-latent"));
+        assert!(report
+            .predictors
+            .iter()
+            .any(|predictor| predictor.encoder == "mechanical-instant"));
+        assert!(report.baselines.trained_loss_mean.is_some());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn multimodal_now(t_ms: u64, value: f32, include_forge: bool) -> Now {
+        let mut body = BodySense::default();
+        body.battery_level = (0.6 + value * 0.01).clamp(0.0, 1.0);
+        body.flags.bump_left = value as i32 % 4 == 0;
+        body.odometry.x_m = value * 0.1;
+        body.velocity.forward_m_s = 0.05 + value * 0.01;
+        let mut now = Now::blank(t_ms, body);
+        now.eye.scene_vectors.push(
+            VectorArtifact::new(
+                "scene_vectors",
+                format!("scene-{t_ms}"),
+                vec![0.1 + value, 0.2, 0.3, 0.4],
+            )
+            .with_model("test.scene"),
+        );
+        now.face.vectors.push(
+            VectorArtifact::new("faces", format!("face-{t_ms}"), vec![0.4, 0.2 + value, 0.1])
+                .with_model("test.face"),
+        );
+        now.voice.vectors.push(
+            VectorArtifact::new("voices", format!("voice-{t_ms}"), vec![0.3, 0.7, value])
+                .with_model("test.voice"),
+        );
+        now.ear.asr.transcript = Some(format!("hello pete {value:.1}"));
+        now.ear.asr.confidence = 0.8;
+        now.range.nearest_m = Some(0.4 + value * 0.02);
+        now.range.beams = vec![0.4 + value * 0.01, 0.9, 1.4];
+        now.kinect.depth_m = vec![0.5 + value * 0.01, 1.0, 1.5];
+        now.kinect.depth_width = 3;
+        now.kinect.depth_height = 1;
+        now.memory.place_familiarity = 0.3 + value * 0.01;
+        now.memory.place_novelty = 0.2;
+        now.memory.similar_situation_count = 2;
+        now.predictions.uncertainty = 0.15;
+        if include_forge {
+            now.extensions.insert(
+                "experience_forge.tiny_now_vector".to_string(),
+                serde_json::json!({"values": vec![0.1 + value, 0.2, 0.3, 0.4]}),
+            );
+        }
+        now
     }
 }

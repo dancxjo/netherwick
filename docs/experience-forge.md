@@ -33,4 +33,16 @@ The top-level command defaults `--forge-checkpoint` to `data/models/experience_f
 
 Training examples use `[TinyNowVector, action features]` as input, predict the next `TinyNowVector`, and decode a compact range/depth/contact sensor summary. The report compares copy-current, random projection, evolved Forge vector, and trained `Experience` latent candidates. It records whether the trained latent is predictive, not merely smaller, and writes separate checkpoints for the autoencoder and each future predictor baseline.
 
+The report's `architecture` section is the durable #25 contract:
+
+```text
+teacher vectors
+  -> mechanically assembled ExperienceInstant
+  -> Experience encoder
+  -> Pete-owned ExperienceLatent
+  -> decode / predict / compare heads
+```
+
+In Forge mode, the teacher vectors are the evolved `TinyNowVector` plus mechanical action features. They are bridge signals, not Pete's final state. The `ExperienceInstant` is assembled deterministically from those vectors, then the trained encoder compresses it into Pete's own `ExperienceLatent`. The decode head reconstructs range/depth/contact summaries, the predict head predicts the next teacher vector, and the compare head records copy-current, evolved-vector, and random-projection baselines.
+
 This keeps #22 focused on the online/evolved filter machine. #25 then consumes replay data after #22: train or compare learned encoders/decoders/predictors against the evolved forge and random baselines. In that framing, #31's vectorizers and `TinyNowVector` are teacher/fallback bridge signals, while the learned `Experience` latent in #25 is the second-stage compression of the whole present moment. The next handoff is #34: feed this learned latent into embodied prediction input. Later #23/#24 can use those latents as compact state for entity-SLAM and the constellation viewer.

@@ -50,8 +50,9 @@ use netherwick_training::dream_policy::{
 };
 use netherwick_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
-    train_latent_round_trip, EvaluateBehaviorRequest, TrainBehaviorRequest,
-    TrainLatentRoundTripRequest, TrainableBehavior,
+    train_latent_round_trip, train_unified_experience, EvaluateBehaviorRequest,
+    TrainBehaviorRequest, TrainLatentRoundTripRequest, TrainUnifiedExperienceRequest,
+    TrainableBehavior,
 };
 use netherwick_worldlab::{
     export_pointcloud_for_frame, export_snapshot_assets, rewrite_frames, update_manifest,
@@ -663,6 +664,7 @@ enum TrainModel {
     EarNext(TrainEarNextArgs),
     Experience(TrainExperienceArgs),
     LatentRoundTrip(TrainLatentRoundTripArgs),
+    UnifiedExperience(TrainUnifiedExperienceArgs),
     Virtual(TrainVirtualArgs),
 }
 
@@ -773,6 +775,26 @@ struct TrainLatentRoundTripArgs {
     seed: u64,
     #[arg(long)]
     codebook_size: Option<usize>,
+}
+
+#[derive(Debug, Parser)]
+struct TrainUnifiedExperienceArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/unified_experience/latest")]
+    checkpoint: String,
+    #[arg(long, default_value = "data/reports/unified-experience/latest.json")]
+    report: String,
+    #[arg(long, default_value_t = 16)]
+    z_dim: usize,
+    #[arg(long, default_value_t = 16)]
+    teacher_dim: usize,
+    #[arg(long, default_value_t = 0.2)]
+    validation_split: f32,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -5931,6 +5953,7 @@ async fn run_train(command: TrainCommand) -> Result<()> {
             .await
         }
         TrainModel::LatentRoundTrip(args) => run_train_latent_round_trip(args).await,
+        TrainModel::UnifiedExperience(args) => run_train_unified_experience(args).await,
         TrainModel::Virtual(args) => run_train_virtual(args).await,
     }
 }
@@ -6010,6 +6033,47 @@ async fn run_train_latent_round_trip(args: TrainLatentRoundTripArgs) -> Result<(
             codebook.code_count, codebook.used_codes, codebook.dead_codes
         );
     }
+    println!("verdict: {}", report.verdict);
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+async fn run_train_unified_experience(args: TrainUnifiedExperienceArgs) -> Result<()> {
+    let report = train_unified_experience(TrainUnifiedExperienceRequest {
+        ledger_path: args.ledger.into(),
+        checkpoint_path: args.checkpoint.clone().into(),
+        report_path: args.report.clone().into(),
+        epochs: args.epochs,
+        validation_split: args.validation_split,
+        seed: args.seed,
+        z_dim: args.z_dim,
+        teacher_dim: args.teacher_dim,
+    })
+    .await?;
+    println!(
+        "unified Experience training complete: {} examples, {} transitions, {} epochs, checkpoint {}, report {}",
+        report.example_count,
+        report.transition_count,
+        report.epochs,
+        args.checkpoint,
+        args.report
+    );
+    println!(
+        "reconstruction_loss={:.6} zero_loss={:.6} reconstructive={}",
+        report.reconstruction.total_loss_mean,
+        report.reconstruction.zero_loss_mean,
+        report.reconstruction.reconstructive
+    );
+    println!(
+        "trained_loss={:?} copy_current_loss={:?} random_loss={:?} mechanical_loss={:?} forge_loss={:?}",
+        report.baselines.trained_loss_mean,
+        report.baselines.copy_current_loss_mean,
+        report.baselines.random_projection_loss_mean,
+        report.baselines.mechanical_instant_loss_mean,
+        report.baselines.forge_tiny_now_loss_mean
+    );
     println!("verdict: {}", report.verdict);
     for warning in &report.warnings {
         println!("warning: {warning}");
