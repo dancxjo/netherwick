@@ -871,6 +871,353 @@ impl PlaceMemory {
     }
 }
 
+/// How confident the system is that an entity is currently present.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityLifecycleState {
+    /// Entity has been recently observed.
+    #[default]
+    Active,
+    /// Entity was seen before but not in recent ticks; may return.
+    Occluded,
+    /// Entity has not been seen for a long time and is considered gone.
+    Vanished,
+}
+
+/// Which sensing modalities have contributed evidence for this entity.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModalitySupport {
+    /// Vector point IDs from the face/image collection.
+    #[serde(default)]
+    pub face_vector_ids: Vec<String>,
+    /// Vector point IDs from the voice collection.
+    #[serde(default)]
+    pub voice_vector_ids: Vec<String>,
+    /// Vector point IDs from the scene/depth collection.
+    #[serde(default)]
+    pub scene_vector_ids: Vec<String>,
+    /// Free-form text labels contributed by LLM, captions, or human labels.
+    #[serde(default)]
+    pub text_labels: Vec<String>,
+}
+
+impl ModalitySupport {
+    /// Number of distinct modalities that have contributed evidence.
+    pub fn active_modalities(&self) -> usize {
+        [
+            !self.face_vector_ids.is_empty(),
+            !self.voice_vector_ids.is_empty(),
+            !self.scene_vector_ids.is_empty(),
+            !self.text_labels.is_empty(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count()
+    }
+}
+
+/// A provisional, persistent record of an observed entity.
+///
+/// Entities begin as thin hypotheses from a single detection and grow stronger
+/// as repeated observations merge into the same record.  Multiple sensing
+/// modalities (face, voice, depth/motion, text) may support the same entity.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EntityHypothesis {
+    /// Stable identifier derived from entity class + label.
+    pub id: String,
+    /// Coarse semantic class (e.g. "person", "obstacle", "charger").
+    pub kind: String,
+    /// Labels seen for this entity, most-recently observed first.
+    pub labels: Vec<String>,
+    /// Provisional display name (may carry a trailing `?` when uncertain).
+    pub display_name: Option<String>,
+    /// Millisecond timestamp of the very first observation.
+    pub first_seen_ms: u64,
+    /// Millisecond timestamp of the most recent observation.
+    pub last_seen_ms: u64,
+    /// Total number of individual observations merged into this record.
+    pub observation_count: u32,
+    /// Belief strength in [0, 1].  Increases on re-observation, decays over time.
+    pub confidence: f32,
+    /// Current lifecycle state.
+    pub lifecycle: EntityLifecycleState,
+    /// Map cells where this entity has been observed.
+    pub location_cells: Vec<PlaceCellKey>,
+    /// Cross-modal evidence links.
+    pub modality_support: ModalitySupport,
+}
+
+impl EntityHypothesis {
+    /// Create a new hypothesis from a single `ObjectObservation`.
+    pub fn from_observation(
+        observation: &ObjectObservation,
+        t_ms: u64,
+        cell_key: Option<PlaceCellKey>,
+    ) -> Self {
+        let kind = object_class_slug(&observation.class).to_string();
+        let id = format!("entity:{}:{}", kind, stable_slug(&observation.label));
+        let label = observation.label.clone();
+        let display_name = Some(label.clone());
+        let location_cells = cell_key.into_iter().collect();
+        Self {
+            id,
+            kind,
+            labels: vec![label],
+            display_name,
+            first_seen_ms: t_ms,
+            last_seen_ms: t_ms,
+            observation_count: 1,
+            confidence: observation.confidence.clamp(0.0, 1.0),
+            lifecycle: EntityLifecycleState::Active,
+            location_cells,
+            modality_support: ModalitySupport::default(),
+        }
+    }
+
+    /// Merge a new observation into this existing hypothesis.
+    ///
+    /// Confidence is nudged upward; repeated observations strengthen the record.
+    pub fn merge_observation(
+        &mut self,
+        observation: &ObjectObservation,
+        t_ms: u64,
+        cell_key: Option<PlaceCellKey>,
+    ) {
+        self.last_seen_ms = t_ms;
+        self.observation_count = self.observation_count.saturating_add(1);
+        // Exponential moving average biased toward the new value on re-sighting.
+        self.confidence = (self.confidence * 0.7 + observation.confidence.clamp(0.0, 1.0) * 0.3)
+            .clamp(0.0, 1.0);
+        self.lifecycle = EntityLifecycleState::Active;
+        if !self.labels.contains(&observation.label) {
+            self.labels.insert(0, observation.label.clone());
+        }
+        if let Some(key) = cell_key {
+            if !self.location_cells.contains(&key) {
+                self.location_cells.push(key);
+            }
+        }
+    }
+
+    /// Add face vector evidence.
+    pub fn add_face_vector(&mut self, point_id: impl Into<String>) {
+        let id = point_id.into();
+        if !self.modality_support.face_vector_ids.contains(&id) {
+            self.modality_support.face_vector_ids.push(id);
+        }
+    }
+
+    /// Add voice vector evidence.
+    pub fn add_voice_vector(&mut self, point_id: impl Into<String>) {
+        let id = point_id.into();
+        if !self.modality_support.voice_vector_ids.contains(&id) {
+            self.modality_support.voice_vector_ids.push(id);
+        }
+    }
+
+    /// Add scene/depth vector evidence.
+    pub fn add_scene_vector(&mut self, point_id: impl Into<String>) {
+        let id = point_id.into();
+        if !self.modality_support.scene_vector_ids.contains(&id) {
+            self.modality_support.scene_vector_ids.push(id);
+        }
+    }
+}
+
+/// A lightweight summary of one entity for API responses.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EntityHypothesisSummary {
+    pub id: String,
+    pub kind: String,
+    pub display_name: Option<String>,
+    pub labels: Vec<String>,
+    pub confidence: f32,
+    pub lifecycle: EntityLifecycleState,
+    pub observation_count: u32,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    pub location_cells: Vec<PlaceCellKey>,
+    pub active_modalities: usize,
+}
+
+impl From<&EntityHypothesis> for EntityHypothesisSummary {
+    fn from(h: &EntityHypothesis) -> Self {
+        Self {
+            id: h.id.clone(),
+            kind: h.kind.clone(),
+            display_name: h.display_name.clone(),
+            labels: h.labels.clone(),
+            confidence: h.confidence,
+            lifecycle: h.lifecycle.clone(),
+            observation_count: h.observation_count,
+            first_seen_ms: h.first_seen_ms,
+            last_seen_ms: h.last_seen_ms,
+            location_cells: h.location_cells.clone(),
+            active_modalities: h.modality_support.active_modalities(),
+        }
+    }
+}
+
+/// Dashboard-level report over all entity hypotheses.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EntityMemoryReport {
+    pub total_entities: usize,
+    pub active_entities: usize,
+    pub occluded_entities: usize,
+    pub vanished_entities: usize,
+    /// Top entities ranked by confidence (active ones first).
+    pub top_entities: Vec<EntityHypothesisSummary>,
+}
+
+const ENTITY_CONFIDENCE_DECAY_PER_TICK: f32 = 0.998;
+const ENTITY_OCCLUDE_THRESHOLD: f32 = 0.25;
+const ENTITY_VANISH_THRESHOLD: f32 = 0.05;
+
+/// Stores and maintains all persistent entity hypotheses.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EntityMemory {
+    /// All known entity records keyed by entity id.
+    pub entities: BTreeMap<String, EntityHypothesis>,
+    last_tick: Option<u64>,
+}
+
+impl EntityMemory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process a single `Now` snapshot: merge object observations and update
+    /// cross-modal evidence.
+    pub fn observe_now(&mut self, now: &Now, cell_key: Option<PlaceCellKey>) {
+        let elapsed_ticks = self
+            .last_tick
+            .map(|last| now.t_ms.saturating_sub(last) / 100)
+            .unwrap_or(1)
+            .max(1);
+        self.decay(elapsed_ticks);
+        self.last_tick = Some(now.t_ms);
+
+        for observation in &now.objects.observations {
+            let kind = object_class_slug(&observation.class).to_string();
+            let id = format!("entity:{}:{}", kind, stable_slug(&observation.label));
+            if let Some(existing) = self.entities.get_mut(&id) {
+                existing.merge_observation(observation, now.t_ms, cell_key);
+            } else {
+                let hypothesis =
+                    EntityHypothesis::from_observation(observation, now.t_ms, cell_key);
+                self.entities.insert(id, hypothesis);
+            }
+        }
+
+        // Attach face vectors to any person-class entities.
+        for artifact in &now.face.vectors {
+            let person_ids: Vec<String> = self
+                .entities
+                .keys()
+                .filter(|id| id.starts_with("entity:person:"))
+                .cloned()
+                .collect();
+            for id in person_ids {
+                if let Some(entity) = self.entities.get_mut(&id) {
+                    entity.add_face_vector(&artifact.point_id);
+                }
+            }
+        }
+
+        // Attach voice vectors to any person-class entities.
+        for artifact in &now.voice.vectors {
+            let person_ids: Vec<String> = self
+                .entities
+                .keys()
+                .filter(|id| id.starts_with("entity:person:"))
+                .cloned()
+                .collect();
+            for id in person_ids {
+                if let Some(entity) = self.entities.get_mut(&id) {
+                    entity.add_voice_vector(&artifact.point_id);
+                }
+            }
+        }
+
+        // Attach scene vectors to all currently-active entities.
+        for artifact in &now.eye.scene_vectors {
+            let active_ids: Vec<String> = self
+                .entities
+                .values()
+                .filter(|e| e.lifecycle == EntityLifecycleState::Active)
+                .map(|e| e.id.clone())
+                .collect();
+            for id in active_ids {
+                if let Some(entity) = self.entities.get_mut(&id) {
+                    entity.add_scene_vector(&artifact.point_id);
+                }
+            }
+        }
+    }
+
+    /// Decay confidence of all entities.  Entities whose confidence falls
+    /// below threshold transition to `Occluded` or `Vanished`.
+    fn decay(&mut self, ticks: u64) {
+        let factor = ENTITY_CONFIDENCE_DECAY_PER_TICK.powi(ticks as i32);
+        for entity in self.entities.values_mut() {
+            if entity.lifecycle == EntityLifecycleState::Vanished {
+                continue;
+            }
+            entity.confidence = (entity.confidence * factor).clamp(0.0, 1.0);
+            entity.lifecycle = if entity.confidence < ENTITY_VANISH_THRESHOLD {
+                EntityLifecycleState::Vanished
+            } else if entity.confidence < ENTITY_OCCLUDE_THRESHOLD {
+                EntityLifecycleState::Occluded
+            } else {
+                EntityLifecycleState::Active
+            };
+        }
+    }
+
+    /// Build a summary report for dashboard/API consumption.
+    pub fn report(&self) -> EntityMemoryReport {
+        let total_entities = self.entities.len();
+        let active_entities = self
+            .entities
+            .values()
+            .filter(|e| e.lifecycle == EntityLifecycleState::Active)
+            .count();
+        let occluded_entities = self
+            .entities
+            .values()
+            .filter(|e| e.lifecycle == EntityLifecycleState::Occluded)
+            .count();
+        let vanished_entities = self
+            .entities
+            .values()
+            .filter(|e| e.lifecycle == EntityLifecycleState::Vanished)
+            .count();
+
+        let mut sorted: Vec<&EntityHypothesis> = self.entities.values().collect();
+        sorted.sort_by(|a, b| {
+            // Active before occluded before vanished, then by confidence descending.
+            let state_order = |e: &EntityHypothesis| match e.lifecycle {
+                EntityLifecycleState::Active => 0u8,
+                EntityLifecycleState::Occluded => 1,
+                EntityLifecycleState::Vanished => 2,
+            };
+            state_order(a)
+                .cmp(&state_order(b))
+                .then_with(|| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        sorted.truncate(20);
+        let top_entities = sorted.iter().map(|e| EntityHypothesisSummary::from(*e)).collect();
+
+        EntityMemoryReport {
+            total_entities,
+            active_entities,
+            occluded_entities,
+            vanished_entities,
+            top_entities,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {
     pub frame_id: uuid::Uuid,
@@ -1185,6 +1532,7 @@ SET r.summary = relationship.summary,
 pub struct InMemoryExperienceStore {
     records: Arc<Mutex<Vec<MemoryRecord>>>,
     places: Arc<Mutex<PlaceMemory>>,
+    entities: Arc<Mutex<EntityMemory>>,
 }
 
 impl InMemoryExperienceStore {
@@ -1205,6 +1553,17 @@ impl InMemoryExperienceStore {
 
     pub fn place_report(&self) -> PlaceMemoryReport {
         self.place_snapshot().report()
+    }
+
+    pub fn entity_snapshot(&self) -> EntityMemory {
+        self.entities
+            .lock()
+            .expect("entity memory mutex poisoned")
+            .clone()
+    }
+
+    pub fn entity_report(&self) -> EntityMemoryReport {
+        self.entity_snapshot().report()
     }
 }
 
@@ -1273,6 +1632,14 @@ impl DurableExperienceStore {
     pub fn place_report(&self) -> PlaceMemoryReport {
         self.inner.place_report()
     }
+
+    pub fn entity_snapshot(&self) -> EntityMemory {
+        self.inner.entity_snapshot()
+    }
+
+    pub fn entity_report(&self) -> EntityMemoryReport {
+        self.inner.entity_report()
+    }
 }
 
 #[async_trait]
@@ -1316,18 +1683,37 @@ impl Recall for DurableExperienceStore {
 #[async_trait]
 impl Recall for InMemoryExperienceStore {
     async fn observe_now(&self, now: &Now) -> Result<()> {
+        let cell_key = {
+            let places = self.places.lock().expect("place memory mutex poisoned");
+            Some(places.quantize(now.body.odometry.x_m, now.body.odometry.y_m))
+        };
         self.places
             .lock()
             .expect("place memory mutex poisoned")
             .observe_now(now);
+        self.entities
+            .lock()
+            .expect("entity memory mutex poisoned")
+            .observe_now(now, cell_key);
         Ok(())
     }
 
     async fn observe_frame(&self, frame: &ExperienceFrame) -> Result<()> {
+        let cell_key = {
+            let places = self.places.lock().expect("place memory mutex poisoned");
+            Some(places.quantize(
+                frame.now.body.odometry.x_m,
+                frame.now.body.odometry.y_m,
+            ))
+        };
         self.places
             .lock()
             .expect("place memory mutex poisoned")
             .observe_frame(frame);
+        self.entities
+            .lock()
+            .expect("entity memory mutex poisoned")
+            .observe_now(&frame.now, cell_key);
         Ok(())
     }
 
@@ -4827,5 +5213,141 @@ mod tests {
             high_gate.is_empty(),
             "low confidence candidate should be filtered by high gate"
         );
+    }
+
+    // ── EntityMemory tests ───────────────────────────────────────────────────
+
+    fn make_object_observation(label: &str, class: ObjectClass, confidence: f32) -> ObjectObservation {
+        ObjectObservation {
+            label: label.to_string(),
+            class,
+            bearing_rad: 0.0,
+            distance_m: Some(1.0),
+            confidence,
+            source: ObjectObservationSource::Sim,
+        }
+    }
+
+    #[test]
+    fn entity_memory_repeated_observation_merges_not_duplicates() {
+        let mut memory = EntityMemory::new();
+
+        let mut now1 = now_at(100, 1.0, 1.0);
+        now1.objects.observations.push(make_object_observation("chair", ObjectClass::Unknown, 0.8));
+        memory.observe_now(&now1, Some(PlaceCellKey { x: 2, y: 2 }));
+
+        let mut now2 = now_at(200, 1.0, 1.0);
+        now2.objects.observations.push(make_object_observation("chair", ObjectClass::Unknown, 0.7));
+        memory.observe_now(&now2, Some(PlaceCellKey { x: 2, y: 2 }));
+
+        assert_eq!(memory.entities.len(), 1, "repeated observation must merge, not duplicate");
+        let entity = memory.entities.values().next().unwrap();
+        assert_eq!(entity.observation_count, 2);
+        assert_eq!(entity.first_seen_ms, 100);
+        assert_eq!(entity.last_seen_ms, 200);
+    }
+
+    #[test]
+    fn entity_memory_confidence_increases_on_re_observation() {
+        let mut memory = EntityMemory::new();
+
+        let mut now1 = now_at(100, 1.0, 1.0);
+        now1.objects.observations.push(make_object_observation("desk", ObjectClass::Unknown, 0.5));
+        memory.observe_now(&now1, None);
+        let confidence_after_first = memory.entities.values().next().unwrap().confidence;
+
+        let mut now2 = now_at(200, 1.0, 1.0);
+        now2.objects.observations.push(make_object_observation("desk", ObjectClass::Unknown, 0.9));
+        memory.observe_now(&now2, None);
+        let confidence_after_second = memory.entities.values().next().unwrap().confidence;
+
+        assert!(
+            confidence_after_second > confidence_after_first * 0.9,
+            "confidence should remain stable or grow on re-observation: {confidence_after_first} -> {confidence_after_second}"
+        );
+    }
+
+    #[test]
+    fn entity_memory_stale_entity_transitions_to_occluded_then_vanished() {
+        let mut memory = EntityMemory::new();
+
+        let mut now1 = now_at(100, 0.0, 0.0);
+        now1.objects.observations.push(make_object_observation("cup", ObjectClass::Unknown, 0.6));
+        memory.observe_now(&now1, None);
+
+        // Simulate many decay ticks by calling observe_now with no objects and a large time gap
+        let mut stale = now_at(1_000_000, 0.0, 0.0); // ~10 000 ticks later
+        stale.objects.observations.clear();
+        memory.observe_now(&stale, None);
+
+        let entity = memory.entities.values().next().unwrap();
+        assert!(
+            entity.lifecycle != EntityLifecycleState::Active,
+            "entity should not remain Active after a long absence"
+        );
+    }
+
+    #[test]
+    fn entity_memory_report_counts_lifecycle_states() {
+        let mut memory = EntityMemory::new();
+
+        // Active entity
+        let mut now1 = now_at(100, 0.0, 0.0);
+        now1.objects.observations.push(make_object_observation("sofa", ObjectClass::Unknown, 0.9));
+        memory.observe_now(&now1, None);
+
+        // A second entity that will go stale
+        let mut now2 = now_at(200, 5.0, 5.0);
+        now2.objects.observations.push(make_object_observation("lamp", ObjectClass::Unknown, 0.6));
+        memory.observe_now(&now2, None);
+
+        // Age both entities hard
+        let stale = now_at(10_000_000, 0.0, 0.0);
+        memory.observe_now(&stale, None);
+
+        let report = memory.report();
+        assert_eq!(report.total_entities, 2);
+        assert!(report.active_entities < 2, "both should have decayed away from Active");
+    }
+
+    #[test]
+    fn entity_memory_records_map_cell_linkage() {
+        let mut memory = EntityMemory::new();
+        let cell_a = PlaceCellKey { x: 3, y: 4 };
+        let cell_b = PlaceCellKey { x: 7, y: 8 };
+
+        let mut now1 = now_at(100, 0.0, 0.0);
+        now1.objects.observations.push(make_object_observation("robot", ObjectClass::Obstacle, 0.85));
+        memory.observe_now(&now1, Some(cell_a));
+
+        let mut now2 = now_at(200, 3.5, 4.0);
+        now2.objects.observations.push(make_object_observation("robot", ObjectClass::Obstacle, 0.8));
+        memory.observe_now(&now2, Some(cell_b));
+
+        let entity = memory.entities.values().next().unwrap();
+        assert!(entity.location_cells.contains(&cell_a), "first observed cell must be linked");
+        assert!(entity.location_cells.contains(&cell_b), "second observed cell must be linked");
+    }
+
+    #[test]
+    fn entity_memory_revives_after_re_sighting() {
+        let mut memory = EntityMemory::new();
+
+        let mut now1 = now_at(100, 0.0, 0.0);
+        now1.objects.observations.push(make_object_observation("box", ObjectClass::Unknown, 0.7));
+        memory.observe_now(&now1, None);
+
+        // Age it into Occluded/Vanished
+        let stale = now_at(500_000, 0.0, 0.0);
+        memory.observe_now(&stale, None);
+        let lifecycle_before = memory.entities.values().next().unwrap().lifecycle.clone();
+
+        // Re-observe
+        let mut now3 = now_at(600_000, 0.0, 0.0);
+        now3.objects.observations.push(make_object_observation("box", ObjectClass::Unknown, 0.8));
+        memory.observe_now(&now3, None);
+
+        let entity = memory.entities.values().next().unwrap();
+        assert_eq!(entity.lifecycle, EntityLifecycleState::Active, "entity should revive to Active on re-sighting; was {lifecycle_before:?}");
     }
 }

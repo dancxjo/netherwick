@@ -27,6 +27,7 @@ use netherwick_map::{
     PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
 use netherwick_now::{KinectSense, KinectSkeletonSense, ReignSense};
+use netherwick_memory::{EntityMemory, EntityMemoryReport};
 use netherwick_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
     NudgeStatus, ReignQueue, RuntimeModelStack,
@@ -345,6 +346,7 @@ pub struct LiveViewState {
     prod_state: Arc<Mutex<NudgeStatus>>,
     behavior_nodes: Arc<Mutex<Vec<BehaviorNodeState>>>,
     surface_extractor: Arc<Mutex<SurfaceExtractor>>,
+    entity_memory: Arc<Mutex<EntityMemory>>,
     pub virtual_retina: bool,
     pub retina_width: u32,
     pub retina_height: u32,
@@ -379,6 +381,7 @@ impl Default for LiveViewState {
             prod_state: Arc::new(Mutex::new(NudgeStatus::default())),
             behavior_nodes: Arc::new(Mutex::new(default_behavior_nodes())),
             surface_extractor: Arc::new(Mutex::new(SurfaceExtractor::default())),
+            entity_memory: Arc::new(Mutex::new(EntityMemory::default())),
             virtual_retina: false,
             retina_width: 160,
             retina_height: 90,
@@ -484,10 +487,31 @@ impl LiveViewState {
             .lock()
             .expect("live point cloud mutex poisoned")
             .observe_snapshot(&snapshot, snapshot.body.last_update_ms);
+        {
+            use netherwick_memory::PlaceCellKey;
+            const CELL_SIZE: f32 = 0.5;
+            let x = now.body.odometry.x_m;
+            let y = now.body.odometry.y_m;
+            let cell_key = PlaceCellKey {
+                x: (x / CELL_SIZE).floor() as i32,
+                y: (y / CELL_SIZE).floor() as i32,
+            };
+            self.entity_memory
+                .lock()
+                .expect("entity memory mutex poisoned")
+                .observe_now(&now, Some(cell_key));
+        }
         *self
             .latest
             .lock()
             .expect("live view snapshot mutex poisoned") = Some(snapshot);
+    }
+
+    pub fn entity_memory_report(&self) -> EntityMemoryReport {
+        self.entity_memory
+            .lock()
+            .expect("entity memory mutex poisoned")
+            .report()
     }
 
     pub fn latest(&self) -> Option<WorldSnapshot> {
@@ -1293,6 +1317,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view/inline-learning", get(get_inline_learning))
         .route("/view/inline-learning", post(post_inline_learning))
         .route("/view/calibration", post(post_calibration))
+        .route("/memory/entities", get(get_entity_memory))
         .nest_service(
             "/static",
             ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),
@@ -1747,6 +1772,12 @@ async fn get_live_map(
         &snapshot,
         state.scene_metadata().as_ref(),
     )))
+}
+
+async fn get_entity_memory(
+    State(state): State<LiveViewState>,
+) -> Json<EntityMemoryReport> {
+    Json(state.entity_memory_report())
 }
 
 fn map_response_from_parts(
