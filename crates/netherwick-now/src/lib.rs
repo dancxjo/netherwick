@@ -647,6 +647,14 @@ pub struct MemorySense {
     #[serde(default)]
     pub nearby_best_safe_direction_rad: Option<f32>,
     #[serde(default)]
+    pub nearby_frontier_direction_rad: Option<f32>,
+    #[serde(default)]
+    pub recent_trap_direction_rad: Option<f32>,
+    #[serde(default)]
+    pub map_confidence: f32,
+    #[serde(default)]
+    pub recent_trap_confidence: f32,
+    #[serde(default)]
     pub places_visited: u32,
     pub face_familiarity: f32,
     pub voice_familiarity: f32,

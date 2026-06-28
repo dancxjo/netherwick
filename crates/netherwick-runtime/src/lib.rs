@@ -478,6 +478,51 @@ fn sim_stuck_active(now: &Now) -> bool {
         > 0.0
 }
 
+fn apply_recent_trap_memory_hints(now: &mut Now) {
+    let Some(values) = now
+        .extensions
+        .get("sim.stuck")
+        .and_then(|value| value.get("values"))
+        .and_then(|value| value.as_array())
+    else {
+        return;
+    };
+    let active = values
+        .first()
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        > 0.0;
+    let event_started = values
+        .get(6)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        > 0.0;
+    let repeated = values
+        .get(12)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .max(0.0) as f32;
+    let trap_kind = values
+        .get(10)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    if !(active || event_started || repeated > 0.0 || trap_kind > 0.0) {
+        return;
+    }
+    let turn_sign = values
+        .get(5)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0) as f32;
+    now.memory.recent_trap_confidence = (0.6 + repeated.min(2.0) * 0.15).clamp(0.0, 1.0);
+    now.memory.recent_trap_direction_rad = Some(if turn_sign < 0.0 {
+        -std::f32::consts::FRAC_PI_2
+    } else if turn_sign > 0.0 {
+        std::f32::consts::FRAC_PI_2
+    } else {
+        0.0
+    });
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ActionSelectionDecision {
     pub mode: ActionSelectorMode,
@@ -512,6 +557,10 @@ pub struct MapMemoryDecisionDebug {
     pub place_novelty: f32,
     pub safe_direction_rad: Option<f32>,
     pub charge_direction_rad: Option<f32>,
+    pub frontier_direction_rad: Option<f32>,
+    pub recent_trap_direction_rad: Option<f32>,
+    pub map_confidence: f32,
+    pub recent_trap_confidence: f32,
     pub selected_action: Option<ActionPrimitive>,
 }
 
@@ -2660,6 +2709,7 @@ where
             .recall(RecallQuery::from_now(&now))
             .await?;
         now.memory = recall.sense.clone();
+        apply_recent_trap_memory_hints(&mut now);
         now.extensions.insert(
             "memory.place".to_string(),
             serde_json::json!({
@@ -2667,9 +2717,13 @@ where
                 "charge": now.memory.place_charge_value,
                 "social": now.memory.place_social_value,
                 "novelty": now.memory.place_novelty,
+                "confidence": now.memory.map_confidence,
                 "places_visited": now.memory.places_visited,
                 "nearby_best_charge_direction_rad": now.memory.nearby_best_charge_direction_rad,
                 "nearby_best_safe_direction_rad": now.memory.nearby_best_safe_direction_rad,
+                "nearby_frontier_direction_rad": now.memory.nearby_frontier_direction_rad,
+                "recent_trap_direction_rad": now.memory.recent_trap_direction_rad,
+                "recent_trap_confidence": now.memory.recent_trap_confidence,
             }),
         );
         if let Some(semantic_map) = &recall.semantic_map {
@@ -5228,6 +5282,10 @@ fn map_memory_decision_debug(
         place_novelty: now.memory.place_novelty,
         safe_direction_rad: now.memory.nearby_best_safe_direction_rad,
         charge_direction_rad: now.memory.nearby_best_charge_direction_rad,
+        frontier_direction_rad: now.memory.nearby_frontier_direction_rad,
+        recent_trap_direction_rad: now.memory.recent_trap_direction_rad,
+        map_confidence: now.memory.map_confidence,
+        recent_trap_confidence: now.memory.recent_trap_confidence,
         selected_action: Some(chosen_action.clone()),
         ..MapMemoryDecisionDebug::default()
     };
@@ -5261,6 +5319,22 @@ fn map_memory_decision_reason(now: &Now, action: &ActionPrimitive) -> Option<Str
         }
     }
 
+    if now.memory.recent_trap_confidence >= 0.6 {
+        if let ActionPrimitive::Turn { direction, .. } = action {
+            if let Some(bearing) = now.memory.nearby_best_safe_direction_rad {
+                let expected = if bearing < 0.0 {
+                    TurnDir::Right
+                } else {
+                    TurnDir::Left
+                };
+                if direction == &expected {
+                    return Some("recent_trap_safe_direction".to_string());
+                }
+            }
+            return Some("recent_trap_turn".to_string());
+        }
+    }
+
     if now.body.battery_level <= LOW_BATTERY && now.memory.place_charge_value > 0.5 {
         match action {
             ActionPrimitive::Turn { direction, .. } => {
@@ -5282,16 +5356,27 @@ fn map_memory_decision_reason(now: &Now, action: &ActionPrimitive) -> Option<Str
         }
     }
 
-    if now.memory.place_novelty >= NOVELTY_THRESHOLD
-        && now.memory.place_danger < DANGER_THRESHOLD
-        && matches!(
+    if now.memory.place_novelty >= NOVELTY_THRESHOLD && now.memory.place_danger < DANGER_THRESHOLD {
+        if let ActionPrimitive::Turn { direction, .. } = action {
+            if let Some(bearing) = now.memory.nearby_frontier_direction_rad {
+                let expected = if bearing < 0.0 {
+                    TurnDir::Right
+                } else {
+                    TurnDir::Left
+                };
+                if direction == &expected {
+                    return Some("frontier_direction_turn".to_string());
+                }
+            }
+        }
+        if matches!(
             action,
             ActionPrimitive::Inspect {
                 target: InspectTarget::Novelty
             }
-        )
-    {
-        return Some("safe_novelty_inspect".to_string());
+        ) {
+            return Some("safe_novelty_inspect".to_string());
+        }
     }
 
     None
@@ -7441,6 +7526,23 @@ mod tests {
         assert!(decision.selected_score.unwrap_or_default() > 0.0);
         assert!(!decision.safety_overrode);
         assert!(decision.fallback_warnings.is_empty());
+    }
+
+    #[test]
+    fn sim_stuck_extension_sets_recent_trap_memory_hints() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.extensions.insert(
+            "sim.stuck".to_string(),
+            serde_json::json!({
+                "schema_version": 1,
+                "values": [1.0, 1.0, 6.0, 600.0, 1.0, -1.0, 1.0, 0.0, 0.0, 0.0, 2.0, 1.0, 1.0]
+            }),
+        );
+
+        apply_recent_trap_memory_hints(&mut now);
+
+        assert!(now.memory.recent_trap_confidence >= 0.6);
+        assert!(now.memory.recent_trap_direction_rad.unwrap() < 0.0);
     }
 
     #[test]

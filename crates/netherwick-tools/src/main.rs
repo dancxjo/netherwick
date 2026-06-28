@@ -1432,6 +1432,10 @@ struct ScenarioEvaluationSummary {
     charge_memory_decisions: usize,
     #[serde(default)]
     novelty_memory_decisions: usize,
+    #[serde(default)]
+    frontier_memory_decisions: usize,
+    #[serde(default)]
+    trap_memory_decisions: usize,
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
     mean_chosen_score: Option<f32>,
@@ -1504,6 +1508,10 @@ struct ScenarioEpisodeReport {
     charge_memory_decisions: usize,
     #[serde(default)]
     novelty_memory_decisions: usize,
+    #[serde(default)]
+    frontier_memory_decisions: usize,
+    #[serde(default)]
+    trap_memory_decisions: usize,
     mean_chosen_score: Option<f32>,
     mean_candidate_score: Option<f32>,
     ticks_with_eye_frames: usize,
@@ -1596,6 +1604,8 @@ struct EpisodeMetricBuilder {
     danger_memory_decisions: usize,
     charge_memory_decisions: usize,
     novelty_memory_decisions: usize,
+    frontier_memory_decisions: usize,
+    trap_memory_decisions: usize,
     chosen_score_sum: f32,
     chosen_score_count: usize,
     candidate_score_sum: f32,
@@ -1667,6 +1677,8 @@ impl EpisodeMetricBuilder {
             danger_memory_decisions: 0,
             charge_memory_decisions: 0,
             novelty_memory_decisions: 0,
+            frontier_memory_decisions: 0,
+            trap_memory_decisions: 0,
             chosen_score_sum: 0.0,
             chosen_score_count: 0,
             candidate_score_sum: 0.0,
@@ -1910,6 +1922,10 @@ impl EpisodeMetricBuilder {
             self.charge_memory_decisions = self.charge_memory_decisions.saturating_add(1);
         } else if reason.starts_with("safe_novelty_") {
             self.novelty_memory_decisions = self.novelty_memory_decisions.saturating_add(1);
+        } else if reason.starts_with("frontier_") {
+            self.frontier_memory_decisions = self.frontier_memory_decisions.saturating_add(1);
+        } else if reason.starts_with("recent_trap_") {
+            self.trap_memory_decisions = self.trap_memory_decisions.saturating_add(1);
         }
     }
 
@@ -2005,6 +2021,8 @@ impl EpisodeMetricBuilder {
             danger_memory_decisions: self.danger_memory_decisions,
             charge_memory_decisions: self.charge_memory_decisions,
             novelty_memory_decisions: self.novelty_memory_decisions,
+            frontier_memory_decisions: self.frontier_memory_decisions,
+            trap_memory_decisions: self.trap_memory_decisions,
             mean_chosen_score: (self.chosen_score_count > 0)
                 .then_some(self.chosen_score_sum / self.chosen_score_count as f32),
             mean_candidate_score: (self.candidate_score_count > 0)
@@ -2477,6 +2495,14 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
         novelty_memory_decisions: episodes
             .iter()
             .map(|episode| episode.novelty_memory_decisions)
+            .sum(),
+        frontier_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.frontier_memory_decisions)
+            .sum(),
+        trap_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.trap_memory_decisions)
             .sum(),
         model_assisted_decisions: episodes
             .iter()

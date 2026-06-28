@@ -220,8 +220,10 @@ pub struct PlaceMemoryFeatures {
     pub current_place_social: f32,
     pub current_place_novelty: f32,
     pub current_place_familiarity: f32,
+    pub current_place_confidence: f32,
     pub nearby_best_charge_direction_rad: Option<f32>,
     pub nearby_best_safe_direction_rad: Option<f32>,
+    pub nearby_frontier_direction_rad: Option<f32>,
     pub places_visited: u32,
 }
 
@@ -397,10 +399,14 @@ impl PlaceMemory {
             current_place_familiarity: current
                 .map(|cell| (cell.visit_count as f32 / 5.0).clamp(0.0, 1.0))
                 .unwrap_or(0.0),
+            current_place_confidence: current.map(|cell| cell.confidence).unwrap_or(0.0),
             nearby_best_charge_direction_rad: self
                 .best_direction_from(key, x_m, y_m, |cell| cell.charge_score * cell.confidence),
             nearby_best_safe_direction_rad: self.best_direction_from(key, x_m, y_m, |cell| {
                 (1.0 - cell.danger_score) * cell.confidence * (0.25 + cell.visit_count as f32)
+            }),
+            nearby_frontier_direction_rad: self.best_direction_from(key, x_m, y_m, |cell| {
+                cell.novelty_score * (1.0 - cell.danger_score) * cell.confidence
             }),
             places_visited: self.cells.len().try_into().unwrap_or(u32::MAX),
         }
@@ -1189,6 +1195,10 @@ impl Recall for InMemoryExperienceStore {
             place_novelty: place_features.current_place_novelty,
             nearby_best_charge_direction_rad: place_features.nearby_best_charge_direction_rad,
             nearby_best_safe_direction_rad: place_features.nearby_best_safe_direction_rad,
+            nearby_frontier_direction_rad: place_features.nearby_frontier_direction_rad,
+            recent_trap_direction_rad: None,
+            map_confidence: place_features.current_place_confidence,
+            recent_trap_confidence: 0.0,
             places_visited: place_features.places_visited,
             face_familiarity,
             voice_familiarity,
@@ -3169,6 +3179,19 @@ mod tests {
     }
 
     #[test]
+    fn recall_returns_safe_frontier_direction_and_confidence() {
+        let mut memory = PlaceMemory::new();
+        memory.observe_now(&now_at(100, 0.0, 0.0));
+        memory.observe_now(&now_at(200, 0.0, 1.0));
+
+        let features = memory.features_at(0.0, 0.0);
+
+        let direction = features.nearby_frontier_direction_rad.unwrap();
+        assert!(direction > 0.5);
+        assert!(features.current_place_confidence > 0.0);
+    }
+
+    #[test]
     fn semantic_cells_keep_vector_and_action_associations() {
         let mut memory = PlaceMemory::new();
         let mut now = now_at(100, 1.0, 1.0);
@@ -3363,8 +3386,10 @@ mod tests {
             current_place_social: 0.3,
             current_place_novelty: 0.4,
             current_place_familiarity: 0.5,
+            current_place_confidence: 0.6,
             nearby_best_charge_direction_rad: Some(1.0),
             nearby_best_safe_direction_rad: None,
+            nearby_frontier_direction_rad: Some(-0.5),
             places_visited: 3,
         };
 

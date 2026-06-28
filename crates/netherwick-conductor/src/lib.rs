@@ -97,6 +97,15 @@ impl Conductor for SimpleConductor {
         if let Some(action) = self.next_recovery_action(&input) {
             return Ok(action);
         }
+        if input.memory.recent_trap_confidence >= 0.6 {
+            if let Some(direction) = input.memory.nearby_best_safe_direction_rad {
+                return Ok(ActionPrimitive::Turn {
+                    direction: direction_from_bearing(direction),
+                    intensity: 0.55,
+                    duration_ms: 800,
+                });
+            }
+        }
         if input.memory.place_danger >= self.config.danger_threshold
             || input.drives.danger_avoidance >= self.config.danger_threshold
         {
@@ -135,6 +144,13 @@ impl Conductor for SimpleConductor {
             || (input.memory.place_novelty >= self.config.novelty_threshold
                 && input.memory.place_danger < self.config.danger_threshold)
         {
+            if let Some(direction) = input.memory.nearby_frontier_direction_rad {
+                return Ok(ActionPrimitive::Turn {
+                    direction: direction_from_bearing(direction),
+                    intensity: 0.35,
+                    duration_ms: 500,
+                });
+            }
             return Ok(ActionPrimitive::Inspect {
                 target: InspectTarget::Novelty,
             });
@@ -490,6 +506,40 @@ mod tests {
             conductor.choose(input).unwrap(),
             ActionPrimitive::Inspect {
                 target: InspectTarget::Novelty
+            }
+        );
+    }
+
+    #[test]
+    fn safe_novel_frontier_turns_before_inspect() {
+        let mut conductor = SimpleConductor::default();
+        let mut input = input_with_body(BodySense::default());
+        input.memory.place_novelty = 0.9;
+        input.memory.nearby_frontier_direction_rad = Some(-0.6);
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.35,
+                duration_ms: 500
+            }
+        );
+    }
+
+    #[test]
+    fn recent_trap_turns_toward_remembered_safe_direction() {
+        let mut conductor = SimpleConductor::default();
+        let mut input = input_with_body(BodySense::default());
+        input.memory.recent_trap_confidence = 0.8;
+        input.memory.nearby_best_safe_direction_rad = Some(0.7);
+
+        assert_eq!(
+            conductor.choose(input).unwrap(),
+            ActionPrimitive::Turn {
+                direction: TurnDir::Left,
+                intensity: 0.55,
+                duration_ms: 800
             }
         );
     }
