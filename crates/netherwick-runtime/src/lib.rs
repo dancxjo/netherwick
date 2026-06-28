@@ -3052,6 +3052,9 @@ where
         if recovery_candidate_context(&now) && is_recovery_locomotion_action(&baseline_action) {
             push_unique_action(&mut action_value_candidates, baseline_action.clone());
         }
+        if memory_navigation_candidate_context(&now, &baseline_action) {
+            push_unique_action(&mut action_value_candidates, baseline_action.clone());
+        }
 
         let mut model_predictions = Vec::new();
         let mut hardcoded_predictions = Vec::new();
@@ -5376,7 +5379,12 @@ fn map_memory_decision_debug(
     debug
 }
 
+fn memory_navigation_candidate_context(now: &Now, action: &ActionPrimitive) -> bool {
+    map_memory_decision_reason(now, action).is_some()
+}
+
 fn map_memory_decision_reason(now: &Now, action: &ActionPrimitive) -> Option<String> {
+    const CRITICAL_BATTERY: f32 = 0.10;
     const LOW_BATTERY: f32 = 0.20;
     const DANGER_THRESHOLD: f32 = 0.70;
     const NOVELTY_THRESHOLD: f32 = 0.50;
@@ -5434,6 +5442,14 @@ fn map_memory_decision_reason(now: &Now, action: &ActionPrimitive) -> Option<Str
         }
     }
 
+    if now.body.battery_level <= CRITICAL_BATTERY
+        && matches!(action, ActionPrimitive::Stop)
+        && now.memory.place_charge_value < 0.25
+        && now.memory.nearby_best_charge_direction_rad.is_none()
+    {
+        return Some("charge_low_confidence_fallback".to_string());
+    }
+
     if now.memory.place_novelty >= NOVELTY_THRESHOLD && now.memory.place_danger < DANGER_THRESHOLD {
         if let ActionPrimitive::Turn { direction, .. } = action {
             if let Some(bearing) = now.memory.nearby_frontier_direction_rad {
@@ -5465,6 +5481,8 @@ fn map_memory_navigation_intent(reason: &str) -> NavigationIntent {
         NavigationIntent::AvoidKnownDangerCell
     } else if reason.starts_with("recent_trap_") {
         NavigationIntent::ReturnToFamiliarSafeCell
+    } else if reason == "charge_low_confidence_fallback" {
+        NavigationIntent::StopAskForHelpWhenUncertain
     } else if reason.starts_with("charge_") {
         NavigationIntent::GoTowardKnownCharger
     } else if reason.starts_with("frontier_") || reason.starts_with("safe_novelty_") {
@@ -5484,6 +5502,7 @@ fn map_memory_signal(reason: &str) -> String {
         "recent_trap_turn" => "memory.recent_trap_confidence",
         "charge_direction_turn" => "memory.nearby_best_charge_direction_rad",
         "charge_direction_aligned" => "memory.place_charge_value",
+        "charge_low_confidence_fallback" => "memory.nearby_best_charge_direction_rad",
         "frontier_direction_turn" => "memory.nearby_frontier_direction_rad",
         "safe_novelty_inspect" => "memory.place_novelty",
         _ => "memory.map",
@@ -5500,6 +5519,7 @@ fn map_memory_signal_value(reason: &str, now: &Now) -> Option<f32> {
         "recent_trap_turn" => Some(now.memory.recent_trap_confidence),
         "charge_direction_turn" => now.memory.nearby_best_charge_direction_rad,
         "charge_direction_aligned" => Some(now.memory.place_charge_value),
+        "charge_low_confidence_fallback" => now.memory.nearby_best_charge_direction_rad,
         "frontier_direction_turn" => now.memory.nearby_frontier_direction_rad,
         "safe_novelty_inspect" => Some(now.memory.place_novelty),
         _ => None,
@@ -5549,6 +5569,10 @@ fn map_memory_reason_string(reason: &str, now: &Now) -> String {
         "charge_direction_aligned" => format!(
             "approaching charger from remembered charge value {:.2}",
             now.memory.place_charge_value
+        ),
+        "charge_low_confidence_fallback" => format!(
+            "critical battery but charger memory is too weak: charge value {:.2}, bearing {:?}",
+            now.memory.place_charge_value, now.memory.nearby_best_charge_direction_rad
         ),
         "frontier_direction_turn" => format!(
             "inspecting safe novel frontier bearing {:?} with novelty {:.2}",
@@ -6688,6 +6712,39 @@ mod tests {
         assert_eq!(debug.chosen_action.as_ref(), Some(&action));
         assert!(!debug.safety_overrode);
         assert!(debug.reason_string.unwrap().contains("remembered danger"));
+    }
+
+    #[test]
+    fn map_memory_debug_records_low_confidence_charge_fallback() {
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        let mut now = Now::blank(100, body);
+        now.memory.place_charge_value = 0.1;
+        let action = ActionPrimitive::Stop;
+
+        let debug = map_memory_decision_debug(&now, &action, Some(&action), false);
+
+        assert!(debug.influenced);
+        assert_eq!(
+            debug.navigation_intent,
+            Some(NavigationIntent::StopAskForHelpWhenUncertain)
+        );
+        assert_eq!(
+            debug.reason.as_deref(),
+            Some("charge_low_confidence_fallback")
+        );
+        assert_eq!(
+            debug.signal.as_deref(),
+            Some("memory.nearby_best_charge_direction_rad")
+        );
+        assert_eq!(debug.signal_value, None);
+        assert!(debug.signal_confidence < 0.35);
+        assert_eq!(debug.chosen_action, Some(ActionPrimitive::Stop));
+        assert!(debug
+            .reason_string
+            .as_deref()
+            .unwrap_or_default()
+            .contains("too weak"));
     }
 
     fn idle_now(t_ms: u64) -> Now {
@@ -7933,6 +7990,25 @@ mod tests {
         assert_eq!(decision.mode, ActionSelectorMode::ModelAssisted);
         assert!(!decision.candidates.is_empty());
         assert!(decision.selected_action.is_some());
+    }
+
+    #[test]
+    fn memory_backed_baseline_action_is_a_selector_candidate_context() {
+        let mut now = idle_now(100);
+        now.memory.place_danger = 0.9;
+        now.memory.nearby_best_safe_direction_rad = Some(-0.8);
+        let memory_action = ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.5,
+            duration_ms: 1_000,
+        };
+        let default_action = ActionPrimitive::Go {
+            intensity: 0.15,
+            duration_ms: 1_000,
+        };
+
+        assert!(memory_navigation_candidate_context(&now, &memory_action));
+        assert!(!memory_navigation_candidate_context(&now, &default_action));
     }
 
     #[tokio::test]

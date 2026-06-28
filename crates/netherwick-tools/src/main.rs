@@ -8290,6 +8290,65 @@ mod tests {
     }
 
     #[test]
+    fn low_confidence_memory_navigation_fallbacks_are_counted_in_reports() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 19));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::ChargerSeeking,
+            scenario.metadata,
+            0,
+            19,
+            None,
+            None,
+        );
+        let mut tick = tick_with_action(ActionPrimitive::Stop);
+        tick.frame.now.extensions.insert(
+            "action.motion_bridge".to_string(),
+            serde_json::json!({
+                "map_memory_decision": {
+                    "influenced": true,
+                    "navigation_intent": "stop_ask_for_help_when_uncertain",
+                    "reason": "charge_low_confidence_fallback",
+                    "reason_string": "critical battery but charger memory is too weak",
+                    "signal": "memory.nearby_best_charge_direction_rad",
+                    "signal_value": null,
+                    "signal_confidence": 0.1,
+                    "confidence": 0.1,
+                    "place_danger": 0.0,
+                    "place_charge_value": 0.1,
+                    "place_novelty": 0.2,
+                    "safe_direction_rad": null,
+                    "charge_direction_rad": null,
+                    "selected_action": tick.chosen_action.clone(),
+                    "chosen_action": tick.chosen_action.clone(),
+                    "safety_overrode": true,
+                }
+            }),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.map_memory_decisions, 1);
+        assert_eq!(episode.charge_memory_decisions, 1);
+        assert_eq!(episode.low_confidence_navigation_fallbacks, 1);
+        assert_eq!(episode.map_memory_safety_overrides, 1);
+        assert_eq!(
+            episode
+                .memory_navigation_reasons
+                .get("charge_low_confidence_fallback"),
+            Some(&1)
+        );
+        assert_eq!(
+            episode.map_memory_decision_samples[0].signal,
+            "memory.nearby_best_charge_direction_rad"
+        );
+        assert!(episode.map_memory_decision_samples[0].safety_overrode);
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.low_confidence_navigation_fallbacks, 1);
+        assert_eq!(summary.map_memory_safety_overrides, 1);
+    }
+
+    #[test]
     fn shadow_train_script_errors_do_not_count_as_model_fallbacks() {
         let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 15));
         let mut metrics = EpisodeMetricBuilder::new(
