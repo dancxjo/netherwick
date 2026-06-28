@@ -569,6 +569,10 @@ pub struct MapMemoryDecisionDebug {
     pub reason_string: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_value: Option<f32>,
+    #[serde(default)]
+    pub signal_confidence: f32,
     #[serde(default)]
     pub confidence: f32,
     pub place_danger: f32,
@@ -581,6 +585,10 @@ pub struct MapMemoryDecisionDebug {
     pub map_confidence: f32,
     pub recent_trap_confidence: f32,
     pub selected_action: Option<ActionPrimitive>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_action: Option<ActionPrimitive>,
+    #[serde(default)]
+    pub safety_overrode: bool,
 }
 
 impl Default for ActionSelectionCandidateScore {
@@ -3223,7 +3231,7 @@ where
             .clone()
             .or_else(|| event_script_forced_action.clone())
             .unwrap_or(conductor_selected_action);
-        let map_memory_decision = map_memory_decision_debug(
+        let mut map_memory_decision = map_memory_decision_debug(
             &now,
             &chosen_action,
             action_selection.baseline_action.as_ref(),
@@ -3344,6 +3352,7 @@ where
         let safety = self
             .safety
             .filter(&now, action_to_motor_command(Some(&chosen_action)));
+        map_memory_decision.safety_overrode = safety.vetoed;
         self.nudge.observe_motor(safety.command);
         now.extensions.insert(
             "motor_gate".to_string(),
@@ -5347,6 +5356,7 @@ fn map_memory_decision_debug(
         map_confidence: now.memory.map_confidence,
         recent_trap_confidence: now.memory.recent_trap_confidence,
         selected_action: Some(chosen_action.clone()),
+        chosen_action: Some(chosen_action.clone()),
         ..MapMemoryDecisionDebug::default()
     };
     if forced_action || baseline_action != Some(chosen_action) {
@@ -5359,7 +5369,9 @@ fn map_memory_decision_debug(
         debug.navigation_intent = Some(map_memory_navigation_intent(reason));
         debug.reason_string = Some(map_memory_reason_string(reason, now));
         debug.signal = Some(map_memory_signal(reason));
-        debug.confidence = map_memory_confidence(reason, now);
+        debug.signal_value = map_memory_signal_value(reason, now);
+        debug.signal_confidence = map_memory_confidence(reason, now);
+        debug.confidence = debug.signal_confidence;
     }
     debug
 }
@@ -5477,6 +5489,21 @@ fn map_memory_signal(reason: &str) -> String {
         _ => "memory.map",
     }
     .to_string()
+}
+
+fn map_memory_signal_value(reason: &str, now: &Now) -> Option<f32> {
+    match reason {
+        "danger_safe_direction" | "recent_trap_safe_direction" => {
+            now.memory.nearby_best_safe_direction_rad
+        }
+        "danger_current_cell" => Some(now.memory.place_danger),
+        "recent_trap_turn" => Some(now.memory.recent_trap_confidence),
+        "charge_direction_turn" => now.memory.nearby_best_charge_direction_rad,
+        "charge_direction_aligned" => Some(now.memory.place_charge_value),
+        "frontier_direction_turn" => now.memory.nearby_frontier_direction_rad,
+        "safe_novelty_inspect" => Some(now.memory.place_novelty),
+        _ => None,
+    }
 }
 
 fn map_memory_confidence(reason: &str, now: &Now) -> f32 {
@@ -6655,7 +6682,11 @@ mod tests {
             debug.signal.as_deref(),
             Some("memory.nearby_best_safe_direction_rad")
         );
+        assert_eq!(debug.signal_value, Some(-0.8));
+        assert_eq!(debug.signal_confidence, 0.9);
         assert_eq!(debug.confidence, 0.9);
+        assert_eq!(debug.chosen_action.as_ref(), Some(&action));
+        assert!(!debug.safety_overrode);
         assert!(debug.reason_string.unwrap().contains("remembered danger"));
     }
 

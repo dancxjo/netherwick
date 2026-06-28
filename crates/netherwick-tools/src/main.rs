@@ -1475,6 +1475,10 @@ struct ScenarioEvaluationSummary {
     #[serde(default)]
     memory_navigation_reasons: HashMap<String, usize>,
     #[serde(default)]
+    map_memory_signals: HashMap<String, usize>,
+    #[serde(default)]
+    map_memory_safety_overrides: usize,
+    #[serde(default)]
     low_confidence_navigation_fallbacks: usize,
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
@@ -1569,6 +1573,12 @@ struct ScenarioEpisodeReport {
     #[serde(default)]
     memory_navigation_reasons: HashMap<String, usize>,
     #[serde(default)]
+    map_memory_signals: HashMap<String, usize>,
+    #[serde(default)]
+    map_memory_safety_overrides: usize,
+    #[serde(default)]
+    map_memory_decision_samples: Vec<ScenarioMapMemoryDecisionReport>,
+    #[serde(default)]
     low_confidence_navigation_fallbacks: usize,
     mean_chosen_score: Option<f32>,
     mean_candidate_score: Option<f32>,
@@ -1593,6 +1603,19 @@ struct ScenarioMemorySummary {
     social_memory_hit_rate: Option<f32>,
     novelty_decay_sane: bool,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioMapMemoryDecisionReport {
+    signal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signal_value: Option<f32>,
+    signal_confidence: f32,
+    chosen_action: Option<ActionPrimitive>,
+    reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason_string: Option<String>,
+    safety_overrode: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1671,6 +1694,9 @@ struct EpisodeMetricBuilder {
     trap_memory_decisions: usize,
     memory_navigation_intents: HashMap<String, usize>,
     memory_navigation_reasons: HashMap<String, usize>,
+    map_memory_signals: HashMap<String, usize>,
+    map_memory_safety_overrides: usize,
+    map_memory_decision_samples: Vec<ScenarioMapMemoryDecisionReport>,
     low_confidence_navigation_fallbacks: usize,
     chosen_score_sum: f32,
     chosen_score_count: usize,
@@ -1752,6 +1778,9 @@ impl EpisodeMetricBuilder {
             trap_memory_decisions: 0,
             memory_navigation_intents: HashMap::new(),
             memory_navigation_reasons: HashMap::new(),
+            map_memory_signals: HashMap::new(),
+            map_memory_safety_overrides: 0,
+            map_memory_decision_samples: Vec::new(),
             low_confidence_navigation_fallbacks: 0,
             chosen_score_sum: 0.0,
             chosen_score_count: 0,
@@ -2028,6 +2057,24 @@ impl EpisodeMetricBuilder {
                 .entry(reason.to_string())
                 .or_default() += 1;
         }
+        if let Some(signal) = decision.get("signal").and_then(|value| value.as_str()) {
+            *self
+                .map_memory_signals
+                .entry(signal.to_string())
+                .or_default() += 1;
+        }
+        if decision
+            .get("safety_overrode")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            self.map_memory_safety_overrides = self.map_memory_safety_overrides.saturating_add(1);
+        }
+        if self.map_memory_decision_samples.len() < 16 {
+            if let Some(sample) = scenario_map_memory_decision_report(decision) {
+                self.map_memory_decision_samples.push(sample);
+            }
+        }
         if decision
             .get("confidence")
             .and_then(|value| value.as_f64())
@@ -2158,6 +2205,9 @@ impl EpisodeMetricBuilder {
             trap_memory_decisions: self.trap_memory_decisions,
             memory_navigation_intents: self.memory_navigation_intents,
             memory_navigation_reasons: self.memory_navigation_reasons,
+            map_memory_signals: self.map_memory_signals,
+            map_memory_safety_overrides: self.map_memory_safety_overrides,
+            map_memory_decision_samples: self.map_memory_decision_samples,
             low_confidence_navigation_fallbacks: self.low_confidence_navigation_fallbacks,
             mean_chosen_score: (self.chosen_score_count > 0)
                 .then_some(self.chosen_score_sum / self.chosen_score_count as f32),
@@ -2176,6 +2226,40 @@ impl EpisodeMetricBuilder {
         report.success = episode_success(self.kind, &report);
         report
     }
+}
+
+fn scenario_map_memory_decision_report(
+    decision: &serde_json::Value,
+) -> Option<ScenarioMapMemoryDecisionReport> {
+    let signal = decision.get("signal")?.as_str()?.to_string();
+    let reason = decision.get("reason")?.as_str()?.to_string();
+    let chosen_action = decision
+        .get("chosen_action")
+        .or_else(|| decision.get("selected_action"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    Some(ScenarioMapMemoryDecisionReport {
+        signal,
+        signal_value: decision
+            .get("signal_value")
+            .and_then(|value| value.as_f64())
+            .map(|value| value as f32),
+        signal_confidence: decision
+            .get("signal_confidence")
+            .or_else(|| decision.get("confidence"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0) as f32,
+        chosen_action,
+        reason,
+        reason_string: decision
+            .get("reason_string")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        safety_overrode: decision
+            .get("safety_overrode")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2658,6 +2742,11 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
             .sum(),
         memory_navigation_intents: summarize_memory_navigation_intents(episodes),
         memory_navigation_reasons: summarize_memory_navigation_reasons(episodes),
+        map_memory_signals: summarize_map_memory_signals(episodes),
+        map_memory_safety_overrides: episodes
+            .iter()
+            .map(|episode| episode.map_memory_safety_overrides)
+            .sum(),
         low_confidence_navigation_fallbacks: episodes
             .iter()
             .map(|episode| episode.low_confidence_navigation_fallbacks)
@@ -2712,6 +2801,16 @@ fn summarize_memory_navigation_reasons(
     for episode in episodes {
         for (reason, count) in &episode.memory_navigation_reasons {
             *histogram.entry(reason.clone()).or_default() += count;
+        }
+    }
+    histogram
+}
+
+fn summarize_map_memory_signals(episodes: &[ScenarioEpisodeReport]) -> HashMap<String, usize> {
+    let mut histogram = HashMap::new();
+    for episode in episodes {
+        for (signal, count) in &episode.map_memory_signals {
+            *histogram.entry(signal.clone()).or_default() += count;
         }
     }
     histogram
@@ -8123,6 +8222,8 @@ mod tests {
                     "reason": "danger_safe_direction",
                     "reason_string": "avoiding remembered danger using safe bearing",
                     "signal": "memory.nearby_best_safe_direction_rad",
+                    "signal_value": -0.8,
+                    "signal_confidence": 0.9,
                     "confidence": 0.9,
                     "place_danger": 0.9,
                     "place_charge_value": 0.0,
@@ -8130,6 +8231,8 @@ mod tests {
                     "safe_direction_rad": -0.8,
                     "charge_direction_rad": null,
                     "selected_action": tick.chosen_action.clone(),
+                    "chosen_action": tick.chosen_action.clone(),
+                    "safety_overrode": false,
                 }
             }),
         );
@@ -8152,6 +8255,22 @@ mod tests {
                 .get("danger_safe_direction"),
             Some(&1)
         );
+        assert_eq!(
+            episode
+                .map_memory_signals
+                .get("memory.nearby_best_safe_direction_rad"),
+            Some(&1)
+        );
+        assert_eq!(episode.map_memory_safety_overrides, 0);
+        assert_eq!(episode.map_memory_decision_samples.len(), 1);
+        assert_eq!(
+            episode.map_memory_decision_samples[0].chosen_action,
+            tick.chosen_action
+        );
+        assert_eq!(
+            episode.map_memory_decision_samples[0].signal_value,
+            Some(-0.8)
+        );
 
         let summary = summarize_episodes(&[episode]);
         assert_eq!(summary.map_memory_decisions, 1);
@@ -8160,6 +8279,12 @@ mod tests {
             summary
                 .memory_navigation_intents
                 .get("avoid_known_danger_cell"),
+            Some(&1)
+        );
+        assert_eq!(
+            summary
+                .map_memory_signals
+                .get("memory.nearby_best_safe_direction_rad"),
             Some(&1)
         );
     }
