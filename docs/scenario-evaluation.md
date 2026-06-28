@@ -59,6 +59,59 @@ Use `--ledger data/ledger/eval/foo` when you also want normal `ExperienceFrame` 
 
 Ledger frames include the embodied prediction path. Inspect `experiences[-1].fused_vector` and `experiences[-1].predictions` to confirm that future, hazard, charge, action-value, event-change, and uncertainty predictions were attached to the embodied experience that memory will store.
 
+## Embodied Pipeline Coverage
+
+Use `embodied-eval` when you want a fast, deterministic check of the embodied data path without Create hardware, Kinect hardware, camera, microphone, model checkpoints, or a sim episode:
+
+```bash
+cargo run --bin netherwick -- embodied-eval \
+  --fixture deterministic \
+  --json
+```
+
+The deterministic fixture contains body odometry/contact, range beams, Kinect-style depth samples, visual frame bytes, ASR transcript/audio metadata, face/voice vectors, and a prior persisted experience. The command writes a coverage report and exits non-zero if a required stage is missing. For negative checks, `--omit vectors`, `--omit recall`, `--omit predictions`, and the other stage names deliberately remove a stage and should produce failures.
+
+Example JSON shape:
+
+```json
+{
+  "schema_version": 1,
+  "fixture": "deterministic",
+  "frame_count": 2,
+  "primary_sensation_count": 15,
+  "descendant_sensation_count": 8,
+  "vectorized_sensation_count": 21,
+  "impression_count": 23,
+  "summary_impression_count": 2,
+  "fused_experience_count": 2,
+  "prediction_count": 4,
+  "memory_link_count": 9,
+  "recall_sensation_count": 1,
+  "recall_impression_count": 1,
+  "lineage_edge_count": 8,
+  "input_modalities": ["audio", "depth", "lidar", "memory", "touch", "vision"],
+  "warnings": [],
+  "failures": []
+}
+```
+
+Metric meanings:
+
+- `frame_count`: frames persisted or evaluated in the deterministic replay.
+- `primary_sensation_count`: direct sensor/body/memory sensations created from `Now`.
+- `descendant_sensation_count`: derived sensations such as visual crops and audio transcript spans.
+- `vectorized_sensation_count`: sensations carrying vector metadata with model id, dimension, purpose, and collection.
+- `impression_count`: sensation-level impressions.
+- `summary_impression_count`: fused experience summary impressions.
+- `fused_experience_count`: embodied experiences with fused vectors.
+- `prediction_count`: attached embodied or fallback future predictions.
+- `memory_link_count`: links attached before persistence, such as place/person/object/recollection links.
+- `recall_sensation_count` and `recall_impression_count`: memory recall materialized back into embodied sensation/impression form.
+- `lineage_edge_count`: parent-to-child sensation edges preserved in the embodied context.
+- `warnings` and `failures`: missing or intentionally omitted stages.
+
+This closes the end-to-end coverage gap after #34 and #35: #34 made the embodied fused vector usable by prediction inputs, #35 made vectorizer metadata explicit and deterministic, and this check proves the whole hardware-free loop reaches memory persistence and recall.
+
 ## Golden Behavior Training
 
 Train `danger` and `action-value` only after the golden locomotion baseline is passing. Keep checkpoints in shadow/off modes for scenario control; this step proves prediction quality, not motor authority.

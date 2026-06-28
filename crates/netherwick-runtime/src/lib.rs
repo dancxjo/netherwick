@@ -6812,6 +6812,22 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn embodied_eval_coverage_contract_reports_memory_recall() {
+        let report = netherwick_memory::deterministic_embodied_eval_report()
+            .await
+            .unwrap();
+
+        assert!(report.passed(), "{:?}", report.failures);
+        assert!(report.fused_experience_count > 0);
+        assert!(report.summary_impression_count > 0);
+        assert!(report.prediction_count > 0);
+        assert!(report.memory_link_count > 0);
+        assert!(report.recall_sensation_count > 0);
+        assert!(report.recall_impression_count > 0);
+        assert!(report.lineage_edge_count > 0);
+    }
+
     fn test_conductor_input(action: ActionPrimitive) -> ConductorInput {
         ConductorInput {
             latent: ExperienceLatent::default(),

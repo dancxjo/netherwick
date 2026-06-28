@@ -1,14 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use netherwick_actions::ActionPrimitive;
-use netherwick_core::{Goal, Pose2};
+use netherwick_body::{BodyFlags, BodySense, Velocity};
+use netherwick_core::{Goal, Pose2, Reward};
 use netherwick_experience::{
-    Experience, Impression, MemoryLink, RecalledExperience, VectorEmbedding,
+    EmbodiedPipeline, EmbodiedVectorCoverage, Experience, ExperienceFuser, FuturePrediction,
+    Impression, MemoryLink, Modality, RecalledExperience, SensationPayloadKind, VectorEmbedding,
 };
 use netherwick_ledger::{ExperienceFrame, ExperienceTransition};
 use netherwick_now::{
-    GraphEdge, GraphEntity, MemorySense, Now, RecallHit, VectorArtifact, FACE_VECTOR_COLLECTION,
-    SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
+    AsrSense, EarSense, EyeFrame, EyeFrameFormat, GraphEdge, GraphEntity, KinectJointSense,
+    KinectSense, KinectSkeletonSense, MemorySense, Now, ObjectClass, ObjectObservation,
+    ObjectObservationSource, RangeSense, RecallHit, SurpriseSense, VectorArtifact,
+    FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -1353,6 +1357,521 @@ pub fn place_memory_from_frames(frames: &[ExperienceFrame]) -> PlaceMemory {
         memory.observe_frame(frame);
     }
     memory
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbodiedEvalOmission {
+    PrimarySensations,
+    Descendants,
+    Vectors,
+    Impressions,
+    FusedExperience,
+    SummaryImpression,
+    Predictions,
+    MemoryPersistence,
+    MemoryLinks,
+    Recall,
+}
+
+impl EmbodiedEvalOmission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimarySensations => "primary-sensations",
+            Self::Descendants => "descendants",
+            Self::Vectors => "vectors",
+            Self::Impressions => "impressions",
+            Self::FusedExperience => "fused-experience",
+            Self::SummaryImpression => "summary-impression",
+            Self::Predictions => "predictions",
+            Self::MemoryPersistence => "memory-persistence",
+            Self::MemoryLinks => "memory-links",
+            Self::Recall => "recall",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedPipelineCoverageReport {
+    pub schema_version: u32,
+    pub fixture: String,
+    pub frame_count: usize,
+    pub primary_sensation_count: usize,
+    pub descendant_sensation_count: usize,
+    pub vectorized_sensation_count: usize,
+    pub impression_count: usize,
+    pub summary_impression_count: usize,
+    pub fused_experience_count: usize,
+    pub prediction_count: usize,
+    pub memory_link_count: usize,
+    pub recall_sensation_count: usize,
+    pub recall_impression_count: usize,
+    pub lineage_edge_count: usize,
+    pub input_modalities: Vec<String>,
+    pub vector_coverage: EmbodiedVectorCoverage,
+    pub warnings: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+impl EmbodiedPipelineCoverageReport {
+    pub fn passed(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+pub async fn deterministic_embodied_eval_report() -> Result<EmbodiedPipelineCoverageReport> {
+    deterministic_embodied_eval_report_with_omissions(&[]).await
+}
+
+pub async fn deterministic_embodied_eval_report_with_omissions(
+    omissions: &[EmbodiedEvalOmission],
+) -> Result<EmbodiedPipelineCoverageReport> {
+    let store = InMemoryExperienceStore::new();
+    let prior_now = deterministic_embodied_fixture_now(1_000, 0.0);
+    let mut prior = build_embodied_eval_frame(prior_now, None, omissions).await?;
+    if !omitted(omissions, EmbodiedEvalOmission::MemoryLinks) {
+        attach_memory_links_to_frame(&mut prior);
+    }
+    if !omitted(omissions, EmbodiedEvalOmission::MemoryPersistence) {
+        store.store(&prior).await?;
+        store.observe_frame(&prior).await?;
+    }
+
+    let current_now = deterministic_embodied_fixture_now(1_750, 0.08);
+    let recall = if omitted(omissions, EmbodiedEvalOmission::Recall)
+        || omitted(omissions, EmbodiedEvalOmission::MemoryPersistence)
+    {
+        None
+    } else {
+        Some(store.recall(RecallQuery::from_now(&current_now)).await?)
+    };
+    let mut current = build_embodied_eval_frame(current_now, recall.as_ref(), omissions).await?;
+    if !omitted(omissions, EmbodiedEvalOmission::MemoryLinks) {
+        attach_memory_links_to_frame(&mut current);
+    }
+    if !omitted(omissions, EmbodiedEvalOmission::MemoryPersistence) {
+        store.store(&current).await?;
+        store.observe_frame(&current).await?;
+    }
+
+    let persisted_frame_count = store.snapshot().len();
+    let mut frames = vec![prior, current];
+    let mut report = coverage_report_from_frames("deterministic", &frames);
+    report.frame_count = persisted_frame_count.max(frames.len());
+    if omitted(omissions, EmbodiedEvalOmission::MemoryPersistence) {
+        report.frame_count = persisted_frame_count;
+    }
+    report.warnings.extend(
+        omissions
+            .iter()
+            .map(|stage| format!("omitted {}", stage.as_str())),
+    );
+    evaluate_required_embodied_coverage(&mut report);
+    frames.clear();
+    Ok(report)
+}
+
+pub fn deterministic_embodied_fixture_now(t_ms: u64, pose_offset_m: f32) -> Now {
+    let mut body = BodySense {
+        battery_level: 0.72,
+        charging: false,
+        flags: BodyFlags {
+            wall: true,
+            ..BodyFlags::default()
+        },
+        odometry: Pose2 {
+            x_m: 1.25 + pose_offset_m,
+            y_m: -0.35,
+            heading_rad: 0.18,
+        },
+        velocity: Velocity {
+            forward_m_s: 0.06,
+            turn_rad_s: 0.01,
+        },
+        last_update_ms: t_ms,
+        ..BodySense::default()
+    };
+    body.cliff_sensors.front_left = 0.08;
+
+    let mut rgb = vec![9_u8; 12 * 8 * 3];
+    for y in 2..6 {
+        for x in 4..8 {
+            let idx = (y * 12 + x) * 3;
+            rgb[idx] = 210;
+            rgb[idx + 1] = 160;
+            rgb[idx + 2] = 80;
+        }
+    }
+
+    let mut now = Now::blank(t_ms, body);
+    now.eye_frame = Some(EyeFrame {
+        captured_at_ms: t_ms.saturating_sub(12),
+        width: 12,
+        height: 8,
+        format: EyeFrameFormat::Rgb8,
+        bytes: rgb,
+        source: Some("fixture.synthetic_camera".to_string()),
+    });
+    now.eye.scene_vectors.push(
+        VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "fixture-scene",
+            vec![1.0, 0.0, 0.25, 0.5],
+        )
+        .with_model("fixture.scene.vector.v1")
+        .with_source_frame_id("fixture-frame")
+        .with_occurred_at_ms(t_ms),
+    );
+    now.range = RangeSense {
+        schema_version: 1,
+        beams: vec![0.42, 0.55, 1.2, 0.9, 0.48],
+        nearest_m: Some(0.42),
+    };
+    now.kinect = KinectSense {
+        schema_version: 1,
+        depth_m: vec![0.72, 0.74, 0.81, 0.92, 1.05, 1.1],
+        depth_width: 3,
+        depth_height: 2,
+        min_depth_m: 0.72,
+        max_depth_m: 1.1,
+        depth_coordinate_system: Some("fixture-depth-camera".to_string()),
+        skeletons: vec![KinectSkeletonSense {
+            tracking_id: 7,
+            lean_xy: [0.02, -0.01],
+            joints: vec![KinectJointSense {
+                joint_name: "head".to_string(),
+                position_m: [0.4, 0.1, 1.2],
+                tracking_confidence: 0.8,
+                tracked: true,
+            }],
+        }],
+        ..KinectSense::default()
+    };
+    now.ear = EarSense {
+        schema_version: 1,
+        features: vec![vec![0.1, 0.2, 0.15, 0.05]],
+        transcript: Some("fixture voice says remember the charger alcove".to_string()),
+        asr: AsrSense {
+            transcript: Some("fixture voice says remember the charger alcove".to_string()),
+            is_final: true,
+            confidence: 0.91,
+            start_ms: Some(t_ms.saturating_sub(360)),
+            end_ms: Some(t_ms),
+            duration_ms: Some(360),
+            sample_rate_hz: Some(16_000),
+            word_count: Some(7),
+            speaker_confidence: Some(0.77),
+            ..AsrSense::default()
+        },
+    };
+    now.voice.vectors.push(
+        VectorArtifact::new(
+            VOICE_VECTOR_COLLECTION,
+            "fixture-voice",
+            vec![0.2, 0.4, 0.6, 0.8],
+        )
+        .with_model("fixture.voice.vector.v1")
+        .with_source_id("speaker:fixture")
+        .with_occurred_at_ms(t_ms),
+    );
+    now.face.vectors.push(
+        VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "fixture-face",
+            vec![0.8, 0.6, 0.4, 0.2],
+        )
+        .with_model("fixture.face.vector.v1")
+        .with_source_id("person:fixture")
+        .with_source_frame_id("fixture-frame")
+        .with_occurred_at_ms(t_ms),
+    );
+    now.objects.observations.push(ObjectObservation {
+        label: "charger alcove".to_string(),
+        class: ObjectClass::Charger,
+        bearing_rad: 0.15,
+        distance_m: Some(0.9),
+        confidence: 0.82,
+        source: ObjectObservationSource::Captioner,
+    });
+    now
+}
+
+async fn build_embodied_eval_frame(
+    now: Now,
+    recall: Option<&RecallBundle>,
+    omissions: &[EmbodiedEvalOmission],
+) -> Result<ExperienceFrame> {
+    let pipeline = EmbodiedPipeline::new();
+    let mut sensations = Vec::new();
+    let mut impressions = Vec::new();
+
+    if !omitted(omissions, EmbodiedEvalOmission::PrimarySensations) {
+        for primary in netherwick_experience::primary_sensations_from_now(&now) {
+            let batch = pipeline.ingest_primary(primary).await?;
+            sensations.extend(batch.sensations);
+            impressions.extend(batch.impressions);
+        }
+    }
+    if omitted(omissions, EmbodiedEvalOmission::Descendants) {
+        let retained_ids = sensations
+            .iter()
+            .filter(|sensation| sensation.parent_id.is_none())
+            .map(|sensation| sensation.id)
+            .collect::<BTreeSet<_>>();
+        sensations.retain(|sensation| sensation.parent_id.is_none());
+        impressions.retain(|impression| {
+            impression
+                .sensation_id
+                .map(|id| retained_ids.contains(&id))
+                .unwrap_or(false)
+        });
+    }
+    if omitted(omissions, EmbodiedEvalOmission::Vectors) {
+        for sensation in &mut sensations {
+            sensation.vector = None;
+            if let Some(impression) = &mut sensation.impression {
+                impression.vector = None;
+            }
+        }
+        for impression in &mut impressions {
+            impression.vector = None;
+        }
+    }
+    if omitted(omissions, EmbodiedEvalOmission::Impressions) {
+        for sensation in &mut sensations {
+            sensation.impression = None;
+        }
+        impressions.clear();
+    }
+
+    let mut experience = if omitted(omissions, EmbodiedEvalOmission::FusedExperience)
+        || sensations.is_empty()
+        || impressions.is_empty()
+    {
+        None
+    } else {
+        let mut fused = ExperienceFuser::new(750).fuse(&sensations, &impressions)?;
+        if omitted(omissions, EmbodiedEvalOmission::SummaryImpression) {
+            fused.summary_impression = None;
+        }
+        if omitted(omissions, EmbodiedEvalOmission::Predictions) {
+            fused.predictions.clear();
+        }
+        Some(fused)
+    };
+
+    if let (Some(experience), Some(recall)) = (&mut experience, recall) {
+        for recollection in &recall.recollections {
+            sensations.push(recollection.sensation.clone());
+            if let Some(impression) = recollection.sensation.impression.clone() {
+                impressions.push(impression.clone());
+                experience.impression_ids.push(impression.id);
+            }
+            experience.sensation_ids.push(recollection.sensation.id);
+        }
+    }
+
+    let summary_impression = experience
+        .as_ref()
+        .and_then(|experience| experience.summary_impression.clone());
+    if let Some(summary) = summary_impression {
+        impressions.push(summary);
+    }
+
+    Ok(ExperienceFrame {
+        id: uuid::Uuid::new_v4(),
+        t_ms: now.t_ms,
+        now,
+        sensations,
+        impressions,
+        experiences: experience.into_iter().collect(),
+        z: None,
+        chosen_action: Some(ActionPrimitive::Inspect {
+            target: netherwick_actions::InspectTarget::Novelty,
+        }),
+        conscious_command: None,
+        reign_input: None,
+        reign_outcome: None,
+        predicted_futures: vec![FuturePrediction {
+            offset_ms: 750,
+            predicted_z: vec![0.1, 0.2, 0.3, 0.4],
+            confidence: 0.31,
+            summary: Some("fallback latent future remains near the charger alcove".to_string()),
+        }],
+        behavior_runs: Vec::new(),
+        actual_next: None,
+        reward: Reward::default(),
+        surprise: SurpriseSense::default(),
+        memory_recall: recall.map(|recall| recall.hits.clone()).unwrap_or_default(),
+        recollections: recall
+            .map(|recall| recall.recollections.clone())
+            .unwrap_or_default(),
+        llm_teaching: Vec::new(),
+        counterfactuals: Vec::new(),
+        notes: vec!["deterministic embodied eval fixture".to_string()],
+    })
+}
+
+fn coverage_report_from_frames(
+    fixture: impl Into<String>,
+    frames: &[ExperienceFrame],
+) -> EmbodiedPipelineCoverageReport {
+    let mut report = EmbodiedPipelineCoverageReport {
+        schema_version: 1,
+        fixture: fixture.into(),
+        frame_count: frames.len(),
+        ..EmbodiedPipelineCoverageReport::default()
+    };
+    let mut modalities = BTreeSet::new();
+    for frame in frames {
+        let context = frame.embodied_context();
+        report.primary_sensation_count += frame
+            .sensations
+            .iter()
+            .filter(|sensation| sensation.parent_id.is_none())
+            .count();
+        report.descendant_sensation_count += frame
+            .sensations
+            .iter()
+            .filter(|sensation| sensation.parent_id.is_some())
+            .count();
+        report.vectorized_sensation_count += frame
+            .sensations
+            .iter()
+            .filter(|sensation| sensation.vector.is_some())
+            .count();
+        report.impression_count += frame
+            .impressions
+            .iter()
+            .filter(|impression| impression.sensation_id.is_some() || !impression.about.is_empty())
+            .count();
+        report.summary_impression_count += frame
+            .experiences
+            .iter()
+            .filter(|experience| experience.summary_impression.is_some())
+            .count();
+        report.fused_experience_count += frame
+            .experiences
+            .iter()
+            .filter(|experience| experience.fused_vector.is_some())
+            .count();
+        report.prediction_count += frame
+            .experiences
+            .iter()
+            .map(|experience| experience.predictions.len())
+            .sum::<usize>()
+            + frame.predicted_futures.len();
+        report.memory_link_count += frame
+            .experiences
+            .iter()
+            .map(|experience| experience.memory_links.len())
+            .sum::<usize>();
+        report.recall_sensation_count += frame
+            .sensations
+            .iter()
+            .filter(|sensation| {
+                sensation.modality == Modality::Memory
+                    && sensation.payload_kind == SensationPayloadKind::MemoryRecall
+            })
+            .count();
+        report.recall_impression_count += frame
+            .impressions
+            .iter()
+            .filter(|impression| impression.kind == "memory.recall.impression")
+            .count();
+        report.lineage_edge_count += context.lineage.len();
+        for sensation in &frame.sensations {
+            modalities.insert(sensation.modality.as_str().to_string());
+        }
+        let coverage = EmbodiedVectorCoverage::from_parts(
+            &frame.sensations,
+            &frame.impressions,
+            frame.experiences.last(),
+        );
+        merge_vector_coverage(&mut report.vector_coverage, coverage);
+    }
+    report.input_modalities = modalities.into_iter().collect();
+    report
+}
+
+fn merge_vector_coverage(target: &mut EmbodiedVectorCoverage, incoming: EmbodiedVectorCoverage) {
+    target.image += incoming.image;
+    target.face += incoming.face;
+    target.voice += incoming.voice;
+    target.transcript += incoming.transcript;
+    target.impression += incoming.impression;
+    target.experience += incoming.experience;
+    target.fallback_count += incoming.fallback_count;
+}
+
+fn evaluate_required_embodied_coverage(report: &mut EmbodiedPipelineCoverageReport) {
+    required_stage(
+        report.primary_sensation_count,
+        "no primary sensations",
+        &mut report.failures,
+    );
+    required_stage(
+        report.descendant_sensation_count,
+        "no descendants",
+        &mut report.failures,
+    );
+    required_stage(
+        report.vectorized_sensation_count,
+        "no vectors",
+        &mut report.failures,
+    );
+    required_stage(
+        report.impression_count,
+        "no impressions",
+        &mut report.failures,
+    );
+    required_stage(
+        report.fused_experience_count,
+        "no fused experience",
+        &mut report.failures,
+    );
+    required_stage(
+        report.summary_impression_count,
+        "no summary impression",
+        &mut report.failures,
+    );
+    required_stage(
+        report.prediction_count,
+        "no prediction",
+        &mut report.failures,
+    );
+    required_stage(
+        report.memory_link_count,
+        "no memory persistence/link",
+        &mut report.failures,
+    );
+    required_stage(
+        report.frame_count,
+        "no memory persistence/link",
+        &mut report.failures,
+    );
+    required_stage(
+        report
+            .recall_sensation_count
+            .min(report.recall_impression_count),
+        "no recall",
+        &mut report.failures,
+    );
+    required_stage(
+        report.lineage_edge_count,
+        "no lineage",
+        &mut report.warnings,
+    );
+}
+
+fn required_stage(count: usize, message: &str, messages: &mut Vec<String>) {
+    if count == 0 && !messages.iter().any(|existing| existing == message) {
+        messages.push(message.to_string());
+    }
+}
+
+fn omitted(omissions: &[EmbodiedEvalOmission], stage: EmbodiedEvalOmission) -> bool {
+    omissions.iter().any(|candidate| *candidate == stage)
 }
 
 fn danger_signal(now: &Now) -> f32 {
@@ -2756,6 +3275,128 @@ mod tests {
             .impression
             .as_ref()
             .is_some_and(|impression| impression.text.starts_with("I remember")));
+    }
+
+    #[test]
+    fn deterministic_embodied_fixture_exercises_hardware_free_modalities() {
+        let now = deterministic_embodied_fixture_now(1_000, 0.0);
+        assert!(now
+            .eye_frame
+            .as_ref()
+            .is_some_and(|frame| !frame.bytes.is_empty()));
+        assert_eq!(now.range.nearest_m, Some(0.42));
+        assert!(!now.kinect.depth_m.is_empty());
+        assert_eq!(now.ear.asr.sample_rate_hz, Some(16_000));
+        assert!(now.ear.asr.transcript.is_some());
+        assert!(now.body.flags.wall);
+
+        let primary = netherwick_experience::primary_sensations_from_now(&now);
+        assert!(primary
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::ImageBytes));
+        assert!(primary
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::DepthFrame));
+        assert!(primary
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::LidarScan));
+        assert!(primary
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::AudioPcm));
+        assert!(primary
+            .iter()
+            .any(|sensation| sensation.payload_kind == SensationPayloadKind::ContactEvent));
+    }
+
+    #[tokio::test]
+    async fn deterministic_embodied_frame_preserves_lineage_vectors_and_experience_outputs() {
+        let frame = super::build_embodied_eval_frame(
+            deterministic_embodied_fixture_now(1_000, 0.0),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let visual_parent_ids = frame
+            .sensations
+            .iter()
+            .filter(|sensation| {
+                sensation.modality == Modality::Vision
+                    && sensation.payload_kind == SensationPayloadKind::ImageBytes
+            })
+            .map(|sensation| sensation.id)
+            .collect::<BTreeSet<_>>();
+        assert!(frame.sensations.iter().any(|sensation| {
+            sensation.modality == Modality::Vision
+                && sensation.payload_kind == SensationPayloadKind::Crop
+                && sensation
+                    .parent_id
+                    .is_some_and(|parent_id| visual_parent_ids.contains(&parent_id))
+        }));
+        assert!(frame.sensations.iter().any(|sensation| {
+            sensation.vector.as_ref().is_some_and(|vector| {
+                !vector.model_id.is_empty()
+                    && vector.dim == vector.vector.len()
+                    && !vector.purpose.is_empty()
+            })
+        }));
+        assert!(frame
+            .impressions
+            .iter()
+            .any(|impression| impression.sensation_id.is_some()));
+        let experience = frame.experiences.last().expect("fused experience");
+        assert!(experience.fused_vector.is_some());
+        assert!(experience.summary_impression.is_some());
+        assert!(!experience.predictions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deterministic_embodied_eval_reports_full_coverage_and_recall() {
+        let report = deterministic_embodied_eval_report().await.unwrap();
+
+        assert!(report.passed(), "{:?}", report.failures);
+        assert_eq!(report.frame_count, 2);
+        assert!(report.primary_sensation_count > 0);
+        assert!(report.descendant_sensation_count > 0);
+        assert!(report.vectorized_sensation_count > 0);
+        assert!(report.impression_count > 0);
+        assert!(report.summary_impression_count > 0);
+        assert!(report.fused_experience_count > 0);
+        assert!(report.prediction_count > 0);
+        assert!(report.memory_link_count > 0);
+        assert!(report.recall_sensation_count > 0);
+        assert!(report.recall_impression_count > 0);
+        assert!(report.lineage_edge_count > 0);
+        assert!(report.input_modalities.contains(&"vision".to_string()));
+        assert!(report.input_modalities.contains(&"depth".to_string()));
+        assert!(report.input_modalities.contains(&"lidar".to_string()));
+        assert!(report.input_modalities.contains(&"audio".to_string()));
+    }
+
+    #[tokio::test]
+    async fn deterministic_embodied_eval_reports_deliberately_missing_stages() {
+        let report = deterministic_embodied_eval_report_with_omissions(&[
+            EmbodiedEvalOmission::Vectors,
+            EmbodiedEvalOmission::Recall,
+        ])
+        .await
+        .unwrap();
+
+        assert!(!report.passed());
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure == "no vectors"));
+        assert!(report.failures.iter().any(|failure| failure == "no recall"));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning == "omitted vectors"));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning == "omitted recall"));
     }
 
     #[test]

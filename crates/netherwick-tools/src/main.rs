@@ -23,7 +23,8 @@ use netherwick_map::{
     LoopClosureCandidateInput, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport, VoxelPointCloud,
 };
 use netherwick_memory::{
-    place_memory_report_from_frames, DurableExperienceStore, InMemoryExperienceStore, PlaceMemory,
+    deterministic_embodied_eval_report_with_omissions, place_memory_report_from_frames,
+    DurableExperienceStore, EmbodiedEvalOmission, InMemoryExperienceStore, PlaceMemory,
     PlaceMemoryReport, PlaceRecognitionCandidate, PlaceRecognitionKind,
 };
 use netherwick_models::MODEL_REGISTRY;
@@ -99,6 +100,7 @@ enum Command {
     VirtualReport(VirtualReportArgs),
     RetinaMockSend(RetinaMockSendArgs),
     EmbodiedDemo(EmbodiedDemoArgs),
+    EmbodiedEval(EmbodiedEvalArgs),
 }
 
 #[tokio::main]
@@ -131,6 +133,7 @@ async fn main() -> Result<()> {
         Command::VirtualReport(args) => run_virtual_report(args).await,
         Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
         Command::EmbodiedDemo(args) => run_embodied_demo(args).await,
+        Command::EmbodiedEval(args) => run_embodied_eval(args).await,
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -813,6 +816,52 @@ struct EmbodiedDemoArgs {
     json: bool,
     #[arg(long)]
     ledger: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct EmbodiedEvalArgs {
+    #[arg(long, value_enum, default_value = "deterministic")]
+    fixture: EmbodiedEvalFixtureArg,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, value_enum)]
+    omit: Vec<EmbodiedEvalOmissionArg>,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum EmbodiedEvalFixtureArg {
+    Deterministic,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum EmbodiedEvalOmissionArg {
+    PrimarySensations,
+    Descendants,
+    Vectors,
+    Impressions,
+    FusedExperience,
+    SummaryImpression,
+    Predictions,
+    MemoryPersistence,
+    MemoryLinks,
+    Recall,
+}
+
+impl From<EmbodiedEvalOmissionArg> for EmbodiedEvalOmission {
+    fn from(value: EmbodiedEvalOmissionArg) -> Self {
+        match value {
+            EmbodiedEvalOmissionArg::PrimarySensations => Self::PrimarySensations,
+            EmbodiedEvalOmissionArg::Descendants => Self::Descendants,
+            EmbodiedEvalOmissionArg::Vectors => Self::Vectors,
+            EmbodiedEvalOmissionArg::Impressions => Self::Impressions,
+            EmbodiedEvalOmissionArg::FusedExperience => Self::FusedExperience,
+            EmbodiedEvalOmissionArg::SummaryImpression => Self::SummaryImpression,
+            EmbodiedEvalOmissionArg::Predictions => Self::Predictions,
+            EmbodiedEvalOmissionArg::MemoryPersistence => Self::MemoryPersistence,
+            EmbodiedEvalOmissionArg::MemoryLinks => Self::MemoryLinks,
+            EmbodiedEvalOmissionArg::Recall => Self::Recall,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -7484,6 +7533,63 @@ async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn run_embodied_eval(args: EmbodiedEvalArgs) -> Result<()> {
+    match args.fixture {
+        EmbodiedEvalFixtureArg::Deterministic => {}
+    }
+    let omissions = args
+        .omit
+        .into_iter()
+        .map(EmbodiedEvalOmission::from)
+        .collect::<Vec<_>>();
+    let report = deterministic_embodied_eval_report_with_omissions(&omissions).await?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("embodied eval fixture={}", report.fixture);
+        println!("  frames: {}", report.frame_count);
+        println!("  primary sensations: {}", report.primary_sensation_count);
+        println!(
+            "  descendant sensations: {}",
+            report.descendant_sensation_count
+        );
+        println!(
+            "  vectorized sensations: {}",
+            report.vectorized_sensation_count
+        );
+        println!("  impressions: {}", report.impression_count);
+        println!("  summary impressions: {}", report.summary_impression_count);
+        println!("  fused experiences: {}", report.fused_experience_count);
+        println!("  predictions: {}", report.prediction_count);
+        println!("  memory links: {}", report.memory_link_count);
+        println!("  recall sensations: {}", report.recall_sensation_count);
+        println!("  recall impressions: {}", report.recall_impression_count);
+        println!("  lineage edges: {}", report.lineage_edge_count);
+        if !report.warnings.is_empty() {
+            println!("  warnings:");
+            for warning in &report.warnings {
+                println!("    - {warning}");
+            }
+        }
+        if !report.failures.is_empty() {
+            println!("  failures:");
+            for failure in &report.failures {
+                println!("    - {failure}");
+            }
+        }
+    }
+
+    if report.passed() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "embodied eval failed: {}",
+            report.failures.join(", ")
+        ))
+    }
 }
 
 async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> {
