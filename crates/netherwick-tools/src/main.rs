@@ -15,6 +15,7 @@ use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use netherwick_body::{BodySense, RobotBody};
 use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
 use netherwick_create1::{Create1Body, Create1OpenMode, MockCreate1Body};
+use netherwick_experience::{ExperienceForge, ExperienceForgeSnapshot};
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
@@ -101,6 +102,7 @@ enum Command {
     RetinaMockSend(RetinaMockSendArgs),
     EmbodiedDemo(EmbodiedDemoArgs),
     EmbodiedEval(EmbodiedEvalArgs),
+    ExperienceForgeReplay(ExperienceForgeReplayArgs),
 }
 
 #[tokio::main]
@@ -134,6 +136,7 @@ async fn main() -> Result<()> {
         Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
         Command::EmbodiedDemo(args) => run_embodied_demo(args).await,
         Command::EmbodiedEval(args) => run_embodied_eval(args).await,
+        Command::ExperienceForgeReplay(args) => run_experience_forge_replay(args).await,
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -862,6 +865,33 @@ impl From<EmbodiedEvalOmissionArg> for EmbodiedEvalOmission {
             EmbodiedEvalOmissionArg::Recall => Self::Recall,
         }
     }
+}
+
+#[derive(Debug, Parser)]
+struct ExperienceForgeReplayArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value = "data/models/experience_forge/latest")]
+    checkpoint: String,
+    #[arg(long)]
+    log: Option<String>,
+    #[arg(long, default_value = "data/reports/experience-forge-replay.json")]
+    report: String,
+    #[arg(long, default_value_t = 0x51EED_u64)]
+    seed: u64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ExperienceForgeReplayReport {
+    schema_version: u32,
+    ledger: String,
+    frame_count: usize,
+    checkpoint_path: String,
+    log_path: Option<String>,
+    snapshot: ExperienceForgeSnapshot,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -7590,6 +7620,73 @@ async fn run_embodied_eval(args: EmbodiedEvalArgs) -> Result<()> {
             report.failures.join(", ")
         ))
     }
+}
+
+async fn run_experience_forge_replay(args: ExperienceForgeReplayArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let frames = ledger.frames().await?;
+    let mut forge = ExperienceForge::new(args.seed);
+    let mut warnings = Vec::new();
+    if frames.is_empty() {
+        warnings.push(
+            "no ledger frames found; checkpoint contains initial forge population".to_string(),
+        );
+    }
+
+    if let Some(log) = args.log.as_deref() {
+        if let Some(parent) = Path::new(log).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        if Path::new(log).exists() {
+            fs::remove_file(log)?;
+        }
+    }
+
+    for frame in &frames {
+        forge.tick(&frame.now, frame.chosen_action.clone());
+        if let Some(log) = args.log.as_deref() {
+            forge.append_snapshot_jsonl(log)?;
+        }
+    }
+    let checkpoint_path = forge.save_checkpoint(&args.checkpoint)?;
+    let report = ExperienceForgeReplayReport {
+        schema_version: 1,
+        ledger: args.ledger.clone(),
+        frame_count: frames.len(),
+        checkpoint_path: checkpoint_path.display().to_string(),
+        log_path: args.log.clone(),
+        snapshot: forge.snapshot(),
+        warnings,
+    };
+
+    if let Some(parent) = Path::new(&args.report).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&args.report, serde_json::to_vec_pretty(&report)?)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "experience forge replay complete: {} frames, checkpoint {}, report {}",
+            report.frame_count, report.checkpoint_path, args.report
+        );
+        println!(
+            "forge tick {} pop {} buffer {}",
+            report.snapshot.ticks, report.snapshot.population_size, report.snapshot.buffer_len
+        );
+        if let Some(log) = &report.log_path {
+            println!("snapshot log: {log}");
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+    }
+    Ok(())
 }
 
 async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> {

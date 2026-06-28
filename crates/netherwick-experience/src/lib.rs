@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
@@ -322,6 +324,32 @@ impl ExperienceForge {
         }
     }
 
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = forge_checkpoint_path(path.as_ref());
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(self)?)?;
+        Ok(path)
+    }
+
+    pub fn load_checkpoint(path: impl AsRef<Path>) -> Result<Self> {
+        let path = forge_checkpoint_path(path.as_ref());
+        let bytes = std::fs::read(&path)?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn append_snapshot_jsonl(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(serde_json::to_string(&self.snapshot())?.as_bytes())?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+
     pub fn replay_score(
         filters: Vec<ScalarFilter>,
         frames: impl IntoIterator<Item = ExperienceFrame>,
@@ -557,6 +585,14 @@ impl ExperienceForge {
                 .collect(),
             fired_events: filter.fired_events.clone(),
         }
+    }
+}
+
+fn forge_checkpoint_path(path: &Path) -> PathBuf {
+    if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        path.to_path_buf()
+    } else {
+        path.join("forge.json")
     }
 }
 
@@ -2805,6 +2841,53 @@ mod tests {
 
         assert!(scored[0].score > 0.0);
         assert!(!scored[0].fired_events.is_empty());
+    }
+
+    #[test]
+    fn experience_forge_checkpoint_round_trips_filters_and_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("netherwick-forge-checkpoint-{}", Uuid::new_v4()));
+        let mut forge = ExperienceForge::new(11);
+        let mut now = Now::blank(100, BodySense::default());
+        now.range.nearest_m = Some(0.4);
+        now.range.beams = vec![0.4, 0.7, 1.2];
+        forge.tick(&now, Some(ActionPrimitive::Stop));
+
+        let saved_path = forge.save_checkpoint(&root).unwrap();
+        let loaded = ExperienceForge::load_checkpoint(&root).unwrap();
+
+        assert_eq!(saved_path, root.join("forge.json"));
+        assert_eq!(loaded.filters().len(), forge.filters().len());
+        assert_eq!(loaded.snapshot().ticks, forge.snapshot().ticks);
+        assert_eq!(loaded.snapshot().tiny_now_vector.len(), TINY_NOW_VECTOR_DIM);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn experience_forge_appends_snapshot_jsonl() {
+        let path = std::env::temp_dir().join(format!(
+            "netherwick-forge-snapshots-{}.jsonl",
+            Uuid::new_v4()
+        ));
+        let mut forge = ExperienceForge::new(12);
+        forge.tick(
+            &Now::blank(100, BodySense::default()),
+            Some(ActionPrimitive::Stop),
+        );
+        forge.append_snapshot_jsonl(&path).unwrap();
+        forge.tick(
+            &Now::blank(200, BodySense::default()),
+            Some(ActionPrimitive::Stop),
+        );
+        forge.append_snapshot_jsonl(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let snapshot: ExperienceForgeSnapshot = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(snapshot.ticks, 2);
+        assert_eq!(snapshot.tiny_now_vector.len(), TINY_NOW_VECTOR_DIM);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
