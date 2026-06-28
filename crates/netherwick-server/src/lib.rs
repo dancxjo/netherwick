@@ -1775,7 +1775,7 @@ fn map_response_from_parts(
         summary,
         overlays: vec![
             "occupancy",
-            "free-space rays",
+            "rays",
             "danger",
             "charger/charge",
             "social",
@@ -5374,14 +5374,14 @@ canvas{display:block}
     <canvas id="trace-map" width="220" height="180" aria-label="odometry/range trace map"></canvas>
     <div class="map-toggles" aria-label="map overlays">
       <label><input type="checkbox" data-map-layer="occupancy" checked>occupancy</label>
-      <label><input type="checkbox" data-map-layer="free-space rays" checked>rays</label>
+      <label><input type="checkbox" data-map-layer="rays" checked>rays</label>
       <label><input type="checkbox" data-map-layer="danger" checked>danger</label>
       <label><input type="checkbox" data-map-layer="charger/charge" checked>charge</label>
       <label><input type="checkbox" data-map-layer="social" checked>social</label>
       <label><input type="checkbox" data-map-layer="novelty">novelty</label>
       <label><input type="checkbox" data-map-layer="events" checked>events</label>
     </div>
-    <div class="trace-label">Odometry/range trace, not SLAM.</div>
+    <div class="trace-label">SLAM-lite / odometry map: odometry/range trace, not corrected SLAM.</div>
     <canvas id="entity-graph" width="220" height="170" aria-label="entity constellation graph"></canvas>
     <div id="entity-graph-summary">entity constellation waiting...</div>
   </div>
@@ -6703,7 +6703,7 @@ function drawTraceMap(packet, liveMap=null){
       for(const cell of traceState.occupied.values()) traceCtx.fillRect(sx(cell.x)-2, sy(cell.y)-2, 4, 4);
     }
   }
-  if(layers.has('free-space rays') && liveMap?.range_beams?.length){
+  if((layers.has('rays') || layers.has('free-space rays')) && liveMap?.range_beams?.length){
     traceCtx.lineWidth = 1;
     for(const beam of liveMap.range_beams){
       traceCtx.strokeStyle = beam.hit ? 'rgba(255,207,102,.46)' : 'rgba(82,169,255,.22)';
@@ -8449,43 +8449,110 @@ mod tests {
         let state = LiveViewState::new();
         state.update_scene_metadata(LiveSceneMetadata {
             arena: None,
-            objects: vec![SceneObject {
-                id: "charger-0".to_string(),
-                kind: "charger".to_string(),
-                x_m: 2.0,
-                y_m: 0.5,
-                radius_m: 0.2,
-                label: Some("charger".to_string()),
-                color_rgb: None,
-            }],
+            objects: vec![
+                SceneObject {
+                    id: "charger-0".to_string(),
+                    kind: "charger".to_string(),
+                    x_m: 2.0,
+                    y_m: 0.5,
+                    radius_m: 0.2,
+                    label: Some("charger".to_string()),
+                    color_rgb: None,
+                },
+                SceneObject {
+                    id: "person-0".to_string(),
+                    kind: "person".to_string(),
+                    x_m: 0.2,
+                    y_m: 1.8,
+                    radius_m: 0.25,
+                    label: Some("person".to_string()),
+                    color_rgb: None,
+                },
+                SceneObject {
+                    id: "speaker-0".to_string(),
+                    kind: "speaker".to_string(),
+                    x_m: -0.4,
+                    y_m: 1.2,
+                    radius_m: 0.15,
+                    label: Some("speaker".to_string()),
+                    color_rgb: None,
+                },
+            ],
             sensor_calibration: None,
         });
 
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.odometry.x_m = 0.5;
         snapshot.body.odometry.y_m = 0.75;
-        snapshot.body.odometry.heading_rad = 0.0;
+        snapshot.body.odometry.heading_rad = std::f32::consts::FRAC_PI_2;
         snapshot.body.last_update_ms = 1234;
         snapshot.body.flags.bump_left = true;
+        snapshot.body.flags.cliff_front_left = true;
         snapshot.range.beams = vec![2.0, 1.0, 2.0];
         snapshot.range.nearest_m = Some(1.0);
+        snapshot.llm_action_proposal = Some(netherwick_actions::LlmActionProposal {
+            safety_vetoed: true,
+            ..netherwick_actions::LlmActionProposal::default()
+        });
+        snapshot.extensions.push(netherwick_now::ExtensionSense {
+            schema_version: 1,
+            name: "sim.stuck".to_string(),
+            values: vec![1.0, 0.0, 4.0, 200.0, 1.0],
+        });
         state.update(snapshot);
 
         let Json(map) = get_live_map(State(state)).await.unwrap();
 
         assert_eq!(map.schema_version, 1);
         assert_eq!(map.label, MAP_LABEL);
+        assert!(map.summary.label.contains("SLAM-lite"));
+        assert!(map.summary.label.contains("odometry map"));
         assert_eq!(map.pose_trail.len(), 1);
         assert_eq!(map.current_pose.as_ref().unwrap().x_m, 0.5);
-        assert!(map.overlays.contains(&"occupancy"));
-        assert!(map.overlays.contains(&"free-space rays"));
-        assert!(map.overlays.contains(&"charger/charge"));
+        assert_eq!(
+            map.overlays,
+            vec![
+                "occupancy",
+                "rays",
+                "danger",
+                "charger/charge",
+                "social",
+                "novelty",
+                "events"
+            ]
+        );
+        assert_eq!(map.range_beams.len(), 3);
         assert!(!map.cells.is_empty());
+        assert!(map
+            .cells
+            .iter()
+            .any(|cell| cell.occupied_score > cell.free_score));
+        assert!(map
+            .cells
+            .iter()
+            .any(|cell| cell.free_score >= cell.occupied_score));
         assert!(map
             .semantic_cells
             .iter()
             .any(|cell| cell.kind == "charger/charge" && cell.label.as_deref() == Some("charger")));
+        assert!(map
+            .semantic_cells
+            .iter()
+            .any(|cell| cell.kind == "social" && cell.label.as_deref() == Some("person")));
+        assert!(map
+            .semantic_cells
+            .iter()
+            .any(|cell| cell.kind == "social" && cell.label.as_deref() == Some("speaker")));
         assert!(map.events.iter().any(|event| event.kind == "bump"));
+        assert!(map.events.iter().any(|event| event.kind == "cliff"));
+        assert!(map.events.iter().any(|event| event.kind == "stuck"));
+        assert!(map
+            .events
+            .iter()
+            .any(|event| event.kind == "safety_override"));
+        assert!(map.events.iter().any(|event| event.kind == "charger"));
+        assert!(map.events.iter().any(|event| event.kind == "person"));
+        assert!(map.events.iter().any(|event| event.kind == "speaker"));
         assert_eq!(map.entity_graph.schema_version, 1);
         assert!(map
             .entity_graph
@@ -8509,8 +8576,11 @@ mod tests {
             .iter()
             .find(|beam| beam.hit)
             .expect("nearest beam should be marked as hit");
-        assert!((forward_hit.end_x_m - 1.5).abs() < 0.001);
-        assert!((forward_hit.end_y_m - 0.75).abs() < 0.001);
+        assert!((forward_hit.origin_x_m - 0.5).abs() < 0.001);
+        assert!((forward_hit.origin_y_m - 0.75).abs() < 0.001);
+        assert!((forward_hit.end_x_m - 0.5).abs() < 0.001);
+        assert!((forward_hit.end_y_m - 1.75).abs() < 0.001);
+        assert!((forward_hit.angle_rad - 0.0).abs() < 0.001);
     }
 
     #[test]
@@ -8704,7 +8774,10 @@ mod tests {
         assert!(page.contains("function projectRangeBeam"));
         assert!(page.contains("/view/map"));
         assert!(page.contains("data-map-layer=\"occupancy\""));
-        assert!(page.contains("Odometry/range trace, not SLAM."));
+        assert!(page.contains("data-map-layer=\"rays\""));
+        assert!(
+            page.contains("SLAM-lite / odometry map: odometry/range trace, not corrected SLAM.")
+        );
         assert!(page.contains("id=\"entity-graph\""));
         assert!(page.contains("drawEntityGraph"));
         assert!(page.contains("createDefaultXRExperienceAsync"));
