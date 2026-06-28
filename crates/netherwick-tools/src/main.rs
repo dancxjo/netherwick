@@ -7558,8 +7558,23 @@ fn observe_pose_graph_now(
 ) {
     let current_key = Some(memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
     let place_candidates = memory.recognize_places(current_key, &now.eye.scene_vectors, 0.0, 20);
+    let entity_labels: Vec<String> = {
+        let mut labels: Vec<String> = now
+            .objects
+            .observations
+            .iter()
+            .filter(|obs| obs.confidence >= 0.3)
+            .map(|obs| obs.label.clone())
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
+    };
+    let entity_candidates =
+        memory.recognize_entity_constellations(current_key, &entity_labels, 0.0, 10);
     let loop_candidates = place_candidates
         .iter()
+        .chain(entity_candidates.iter())
         .map(|candidate| place_candidate_to_loop_input(candidate, source_frame_id.clone()))
         .collect::<Vec<_>>();
     builder.observe(
@@ -7581,8 +7596,22 @@ fn observe_pose_graph_frame(
     let mut query_vectors = frame.now.eye.scene_vectors.clone();
     query_vectors.extend(place_recognition_vectors_from_input(&place_input));
     let place_candidates = memory.recognize_places(current_key, &query_vectors, 0.0, 20);
+    let entity_labels: Vec<String> = {
+        let mut all: Vec<String> = place_input
+            .object_labels
+            .iter()
+            .chain(place_input.person_labels.iter())
+            .cloned()
+            .collect();
+        all.sort();
+        all.dedup();
+        all
+    };
+    let entity_candidates =
+        memory.recognize_entity_constellations(current_key, &entity_labels, 0.0, 10);
     let loop_candidates = place_candidates
         .iter()
+        .chain(entity_candidates.iter())
         .map(|candidate| place_candidate_to_loop_input(candidate, Some(frame.id.to_string())))
         .collect::<Vec<_>>();
     builder.observe(
@@ -7608,6 +7637,7 @@ fn place_candidate_to_loop_input(
         kind: match candidate.kind {
             PlaceRecognitionKind::SamePlace => "same_place",
             PlaceRecognitionKind::SimilarPlace => "similar_place",
+            PlaceRecognitionKind::EntityConstellation => "entity_constellation",
         }
         .to_string(),
         target_frame_id: candidate

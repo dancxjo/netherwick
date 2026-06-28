@@ -189,6 +189,7 @@ pub type PlaceCell = SemanticCell;
 pub enum PlaceRecognitionKind {
     SamePlace,
     SimilarPlace,
+    EntityConstellation,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -653,6 +654,79 @@ impl PlaceMemory {
             candidates,
             rejected,
         }
+    }
+
+    /// Produce conservative loop-closure candidates by comparing current entity labels against
+    /// previously observed cells' object labels using Jaccard overlap.  This complements the
+    /// vector-embedding path and is intentionally conservative: the confidence is scaled down
+    /// by a fixed factor so entity-constellation candidates only pass a high gate.
+    pub fn recognize_entity_constellations(
+        &self,
+        current_key: Option<PlaceCellKey>,
+        entity_labels: &[String],
+        min_confidence: f32,
+        limit: usize,
+    ) -> Vec<PlaceRecognitionCandidate> {
+        if entity_labels.is_empty() {
+            return Vec::new();
+        }
+        let query_set: std::collections::BTreeSet<String> =
+            entity_labels.iter().cloned().collect();
+        let mut candidates = Vec::new();
+        for (key, cell) in &self.cells {
+            if current_key.as_ref() == Some(key) {
+                continue;
+            }
+            if cell.last_observed_objects.is_empty() {
+                continue;
+            }
+            let stored_set: std::collections::BTreeSet<String> =
+                cell.last_observed_objects.iter().cloned().collect();
+            let overlap = token_overlap(&query_set, &stored_set);
+            if overlap <= 0.0 {
+                continue;
+            }
+            // Conservative confidence: scale by cell confidence and a fixed 0.7 factor
+            let confidence =
+                (overlap * cell.confidence.clamp(0.0, 1.0) * 0.7).clamp(0.0, 1.0);
+            if confidence < min_confidence {
+                continue;
+            }
+            let source_vector_id = format!("entity-constellation:{}:{}", key.x, key.y);
+            let shared_labels: Vec<String> = query_set
+                .intersection(&stored_set)
+                .cloned()
+                .collect();
+            candidates.push(PlaceRecognitionCandidate {
+                kind: PlaceRecognitionKind::EntityConstellation,
+                cell: summarize_cell(cell, confidence),
+                source_vector_id,
+                source_frame_id: None,
+                source_experience_id: None,
+                source_instant_frame_id: None,
+                source_vector_refs: shared_labels,
+                query_vector_id: None,
+                query_experience_id: None,
+                similarity: overlap,
+                confidence,
+                reason: format!(
+                    "entity overlap {:.2} (shared: {}, stored: {}, query: {})",
+                    overlap,
+                    query_set.intersection(&stored_set).count(),
+                    stored_set.len(),
+                    query_set.len()
+                ),
+            });
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.cell.last_seen_tick.cmp(&left.cell.last_seen_tick))
+        });
+        candidates.truncate(limit);
+        candidates
     }
 
     pub fn report(&self) -> PlaceMemoryReport {
@@ -4660,5 +4734,98 @@ mod tests {
         let charge = json["current_place_charge"].as_f64().unwrap();
         assert!((charge - 0.7).abs() < 0.000_001);
         assert_eq!(json["places_visited"], 3);
+    }
+
+    #[test]
+    fn entity_constellation_candidates_are_generated_and_gated_by_overlap() {
+        let mut memory = PlaceMemory::new();
+
+        // Observe a place with several entities at (2.0, 1.0)
+        let mut first = now_at(100, 2.0, 1.0);
+        first.objects.observations.push(ObjectObservation {
+            label: "chair".to_string(),
+            class: ObjectClass::Unknown,
+            bearing_rad: 0.1,
+            distance_m: Some(1.0),
+            confidence: 0.9,
+            source: ObjectObservationSource::Sim,
+        });
+        first.objects.observations.push(ObjectObservation {
+            label: "desk".to_string(),
+            class: ObjectClass::Unknown,
+            bearing_rad: 0.2,
+            distance_m: Some(1.5),
+            confidence: 0.8,
+            source: ObjectObservationSource::Sim,
+        });
+        memory.observe_now(&first);
+
+        // Query from a different cell (5.0, 1.0) with the same entities -> strong overlap
+        let current_key_different = Some(memory.quantize(5.0, 1.0));
+        let strong_labels = vec!["chair".to_string(), "desk".to_string()];
+        let candidates = memory.recognize_entity_constellations(
+            current_key_different,
+            &strong_labels,
+            0.0,
+            5,
+        );
+
+        assert_eq!(candidates.len(), 1, "should find the overlapping cell");
+        assert!(matches!(
+            candidates[0].kind,
+            PlaceRecognitionKind::EntityConstellation
+        ));
+        assert!((candidates[0].similarity - 1.0).abs() < 0.001, "full overlap");
+        assert!(candidates[0].confidence > 0.0);
+        assert!(candidates[0].reason.contains("entity overlap"));
+
+        // Query from a different cell with no shared entities -> no candidates
+        let weak_labels = vec!["robot".to_string(), "unknown_label".to_string()];
+        let no_candidates = memory.recognize_entity_constellations(
+            current_key_different,
+            &weak_labels,
+            0.0,
+            5,
+        );
+        assert!(no_candidates.is_empty(), "no shared entities means no candidates");
+
+        // Empty labels -> no candidates
+        let empty = memory.recognize_entity_constellations(current_key_different, &[], 0.0, 5);
+        assert!(empty.is_empty(), "empty query labels yields no candidates");
+    }
+
+    #[test]
+    fn entity_constellation_skips_current_cell_and_low_confidence() {
+        let mut memory = PlaceMemory::new();
+        let mut obs = now_at(100, 2.0, 1.0);
+        obs.objects.observations.push(ObjectObservation {
+            label: "lamp".to_string(),
+            class: ObjectClass::Unknown,
+            bearing_rad: 0.0,
+            distance_m: Some(0.8),
+            confidence: 0.9,
+            source: ObjectObservationSource::Sim,
+        });
+        memory.observe_now(&obs);
+
+        let current_key = Some(memory.quantize(2.0, 1.0));
+        let labels = vec!["lamp".to_string()];
+
+        // Should not return self-match
+        let self_candidates =
+            memory.recognize_entity_constellations(current_key, &labels, 0.0, 5);
+        assert!(
+            self_candidates.is_empty(),
+            "should not return the current cell as a loop candidate"
+        );
+
+        // High confidence gate filters low-overlap candidates
+        let different_key = Some(memory.quantize(10.0, 10.0));
+        let high_gate =
+            memory.recognize_entity_constellations(different_key, &labels, 0.99, 5);
+        assert!(
+            high_gate.is_empty(),
+            "low confidence candidate should be filtered by high gate"
+        );
     }
 }
