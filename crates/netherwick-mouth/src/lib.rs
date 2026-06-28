@@ -1,9 +1,7 @@
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -11,9 +9,9 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use serde::{Deserialize, Serialize};
+use tongues_tts::{PiperOnnxSpeech, PiperVoice, SpeechRequest};
 
-const DEFAULT_PIPER_SAMPLE_RATE_HZ: u32 = 22_050;
-const DEFAULT_PIPER_CHANNELS: u16 = 1;
+const DEFAULT_TTS_VARIETY: &str = "en-US";
 
 pub trait Mouth: Send {
     fn speak(&mut self, text: &str) -> Result<SpeechOutcome>;
@@ -58,48 +56,42 @@ pub fn mouth_from_env() -> Box<dyn Mouth + Send> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PiperConfig {
-    pub executable: PathBuf,
     pub model_path: PathBuf,
-    pub config_path: Option<PathBuf>,
-    pub num_threads: Option<usize>,
-    pub sample_rate_hz: u32,
-    pub channels: u16,
+    pub config_path: PathBuf,
+    pub variety: String,
 }
 
 impl PiperConfig {
-    pub fn new(executable: impl Into<PathBuf>, model_path: impl Into<PathBuf>) -> Self {
+    pub fn new(model_path: impl Into<PathBuf>, config_path: impl Into<PathBuf>) -> Self {
         Self {
-            executable: executable.into(),
             model_path: model_path.into(),
-            config_path: None,
-            num_threads: Some(1),
-            sample_rate_hz: DEFAULT_PIPER_SAMPLE_RATE_HZ,
-            channels: DEFAULT_PIPER_CHANNELS,
+            config_path: config_path.into(),
+            variety: DEFAULT_TTS_VARIETY.to_string(),
         }
     }
 
     pub fn from_env() -> Result<Option<Self>> {
-        let Some(executable) = env_path("NETHERWICK_TTS_PIPER_BIN") else {
-            return Ok(None);
+        let (model_path, config_path) = match env_path("NETHERWICK_TTS_PIPER_VOICE") {
+            Some(model_path) => {
+                let config_path = env_path("NETHERWICK_TTS_PIPER_CONFIG")
+                    .unwrap_or_else(|| tongues_tts::piper_voice_config_path(&model_path));
+                (model_path, config_path)
+            }
+            None => {
+                let model_path = tongues_tts::default_voice_model_path(PiperVoice::RyanMedium);
+                let config_path = tongues_tts::default_voice_config_path(PiperVoice::RyanMedium);
+                if !model_path.is_file() || !config_path.is_file() {
+                    return Ok(None);
+                }
+                (model_path, config_path)
+            }
         };
-        let model_path = env_path("NETHERWICK_TTS_PIPER_VOICE")
-            .context("NETHERWICK_TTS_PIPER_BIN is set but NETHERWICK_TTS_PIPER_VOICE is missing")?;
-        let mut config = Self::new(executable, model_path);
-        config.config_path = env_path("NETHERWICK_TTS_PIPER_CONFIG");
-        config.num_threads = std::env::var("NETHERWICK_TTS_PIPER_THREADS")
+        let mut config = Self::new(model_path, config_path);
+        config.variety = std::env::var("NETHERWICK_TTS_VARIETY")
             .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.parse::<usize>())
-            .transpose()
-            .context("failed to parse NETHERWICK_TTS_PIPER_THREADS")?;
-        if let Some(sample_rate) = std::env::var("NETHERWICK_TTS_SAMPLE_RATE_HZ")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
-            config.sample_rate_hz = sample_rate
-                .parse()
-                .context("failed to parse NETHERWICK_TTS_SAMPLE_RATE_HZ")?;
-        }
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_TTS_VARIETY.to_string());
         Ok(Some(config))
     }
 }
@@ -114,15 +106,20 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 pub struct PiperCpalMouth {
     config: PiperConfig,
+    speech: PiperOnnxSpeech,
 }
 
 impl PiperCpalMouth {
-    pub fn new(config: PiperConfig) -> Self {
-        Self { config }
+    pub fn new(config: PiperConfig) -> Result<Self> {
+        let speech = PiperOnnxSpeech::load(PiperVoice::Path {
+            model: config.model_path.clone(),
+            config: config.config_path.clone(),
+        })?;
+        Ok(Self { config, speech })
     }
 
     pub fn from_env() -> Result<Option<Self>> {
-        Ok(PiperConfig::from_env()?.map(Self::new))
+        PiperConfig::from_env()?.map(Self::new).transpose()
     }
 }
 
@@ -137,75 +134,22 @@ impl Mouth for PiperCpalMouth {
             });
         }
 
-        let samples = synthesize_piper_raw(&self.config, text)?;
-        play_interleaved_f32(
-            samples,
-            self.config.sample_rate_hz,
-            self.config.channels,
+        play_tongues_streaming(
+            &mut self.speech,
+            SpeechRequest {
+                text: text.to_string(),
+                variety: self.config.variety.clone(),
+            },
             text.len(),
-            "piper-cpal",
         )
     }
 }
 
-fn synthesize_piper_raw(config: &PiperConfig, text: &str) -> Result<Vec<f32>> {
-    let mut command = Command::new(&config.executable);
-    command
-        .arg("--model")
-        .arg(&config.model_path)
-        .arg("--output-raw")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(num_threads) = config.num_threads {
-        command.arg("--num-threads").arg(num_threads.to_string());
-    }
-    if let Some(config_path) = &config.config_path {
-        command.arg("--config").arg(config_path);
-    }
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn Piper at {}", config.executable.display()))?;
-    {
-        let mut stdin = child.stdin.take().context("failed to open Piper stdin")?;
-        stdin
-            .write_all(text.as_bytes())
-            .context("failed to write speech text to Piper stdin")?;
-        stdin
-            .write_all(b"\n")
-            .context("failed to finish Piper stdin")?;
-    }
-
-    let output = child.wait_with_output().context("failed to read Piper output")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Piper exited with {}: {}", output.status, stderr.trim());
-    }
-    anyhow::ensure!(
-        output.stdout.len() % 2 == 0,
-        "Piper returned an odd number of raw PCM bytes"
-    );
-
-    Ok(output
-        .stdout
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / i16::MAX as f32)
-        .collect())
-}
-
-fn play_interleaved_f32(
-    samples: Vec<f32>,
-    source_sample_rate_hz: u32,
-    source_channels: u16,
+fn play_tongues_streaming(
+    speech: &mut PiperOnnxSpeech,
+    request: SpeechRequest,
     text_len: usize,
-    backend: &str,
 ) -> Result<SpeechOutcome> {
-    anyhow::ensure!(!samples.is_empty(), "speech synthesis produced no audio");
-    anyhow::ensure!(source_sample_rate_hz > 0, "speech sample rate must be positive");
-    anyhow::ensure!(source_channels > 0, "speech channel count must be positive");
-
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -214,35 +158,68 @@ fn play_interleaved_f32(
         .name()
         .unwrap_or_else(|_| "<unknown output device>".to_string());
     let output_config = output_config(&device)?;
-    let converted = convert_interleaved_f32(
-        &samples,
-        source_sample_rate_hz,
-        source_channels,
-        output_config.sample_rate_hz,
-        output_config.channels,
-    );
-    let sample_count = converted.len();
-    let duration = playback_duration(sample_count, output_config.sample_rate_hz, output_config.channels);
-    let samples = Arc::new(converted);
+    let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
     let cursor = Arc::new(AtomicUsize::new(0));
-    let stream = build_output_stream(&device, &output_config, Arc::clone(&samples), Arc::clone(&cursor))?;
+    let finished = Arc::new(AtomicBool::new(false));
+    let stream = build_streaming_output_stream(
+        &device,
+        &output_config,
+        Arc::clone(&buffer),
+        Arc::clone(&cursor),
+        Arc::clone(&finished),
+    )?;
     stream
         .play()
         .with_context(|| format!("failed to start speech playback on {device_name}"))?;
 
-    while cursor.load(Ordering::Relaxed) < sample_count {
+    let mut source_sample_rate_hz = None;
+    let mut source_channels = None;
+    let mut queued_samples = 0usize;
+    speech
+        .synthesize_streaming(request, &mut |audio| {
+            anyhow::ensure!(audio.channels > 0, "speech channel count must be positive");
+            anyhow::ensure!(
+                audio.sample_rate_hz > 0,
+                "speech sample rate must be positive"
+            );
+            source_sample_rate_hz.get_or_insert(audio.sample_rate_hz);
+            source_channels.get_or_insert(audio.channels);
+            let converted = convert_interleaved_f32(
+                &audio.pcm_mono_f32,
+                audio.sample_rate_hz,
+                audio.channels,
+                output_config.sample_rate_hz,
+                output_config.channels,
+            );
+            queued_samples += converted.len();
+            buffer
+                .lock()
+                .expect("speech output buffer poisoned")
+                .extend(converted);
+            Ok(())
+        })
+        .context("Tongues Piper ONNX streaming synthesis failed")?;
+
+    anyhow::ensure!(queued_samples > 0, "speech synthesis produced no audio");
+    finished.store(true, Ordering::Release);
+    while cursor.load(Ordering::Acquire) < queued_samples {
         std::thread::sleep(Duration::from_millis(10));
     }
     std::thread::sleep(Duration::from_millis(20));
     drop(stream);
 
+    let duration = playback_duration(
+        queued_samples,
+        output_config.sample_rate_hz,
+        output_config.channels,
+    );
     Ok(SpeechOutcome {
         spoken: true,
-        backend: backend.to_string(),
+        backend: "tongues-piper-onnx-cpal".to_string(),
         text_len,
-        sample_rate_hz: Some(output_config.sample_rate_hz),
-        channels: Some(output_config.channels),
-        sample_count,
+        sample_rate_hz: source_sample_rate_hz,
+        channels: source_channels,
+        sample_count: queued_samples,
         duration_ms: Some(duration.as_millis() as u64),
         device: Some(device_name),
     })
@@ -267,33 +244,105 @@ fn output_config(device: &cpal::Device) -> Result<OutputConfig> {
     })
 }
 
-fn build_output_stream(
+fn build_streaming_output_stream(
     device: &cpal::Device,
     config: &OutputConfig,
-    samples: Arc<Vec<f32>>,
+    samples: Arc<Mutex<Vec<f32>>>,
     cursor: Arc<AtomicUsize>,
+    finished: Arc<AtomicBool>,
 ) -> Result<cpal::Stream> {
     let err_fn = |err| tracing::warn!(error = %err, "speech output stream error");
     match config.sample_format {
-        cpal::SampleFormat::F32 => build_typed_output_stream::<f32>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::F64 => build_typed_output_stream::<f64>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::I8 => build_typed_output_stream::<i8>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::I16 => build_typed_output_stream::<i16>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::I32 => build_typed_output_stream::<i32>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::I64 => build_typed_output_stream::<i64>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::U8 => build_typed_output_stream::<u8>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::U16 => build_typed_output_stream::<u16>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::U32 => build_typed_output_stream::<u32>(device, &config.stream_config, samples, cursor, err_fn),
-        cpal::SampleFormat::U64 => build_typed_output_stream::<u64>(device, &config.stream_config, samples, cursor, err_fn),
+        cpal::SampleFormat::F32 => build_typed_streaming_output_stream::<f32>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::F64 => build_typed_streaming_output_stream::<f64>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::I8 => build_typed_streaming_output_stream::<i8>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::I16 => build_typed_streaming_output_stream::<i16>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::I32 => build_typed_streaming_output_stream::<i32>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::I64 => build_typed_streaming_output_stream::<i64>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::U8 => build_typed_streaming_output_stream::<u8>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::U16 => build_typed_streaming_output_stream::<u16>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::U32 => build_typed_streaming_output_stream::<u32>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
+        cpal::SampleFormat::U64 => build_typed_streaming_output_stream::<u64>(
+            device,
+            &config.stream_config,
+            samples,
+            cursor,
+            finished,
+            err_fn,
+        ),
         sample_format => anyhow::bail!("unsupported output sample format: {sample_format:?}"),
     }
 }
 
-fn build_typed_output_stream<T>(
+fn build_typed_streaming_output_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    samples: Arc<Vec<f32>>,
+    samples: Arc<Mutex<Vec<f32>>>,
     cursor: Arc<AtomicUsize>,
+    finished: Arc<AtomicBool>,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream>
 where
@@ -304,15 +353,25 @@ where
             config,
             move |output: &mut [T], _| {
                 for out in output.iter_mut() {
-                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                    let sample = samples.get(idx).copied().unwrap_or(0.0);
-                    *out = T::from_sample(sample);
+                    let idx = cursor.load(Ordering::Relaxed);
+                    let sample = samples
+                        .lock()
+                        .expect("speech output buffer poisoned")
+                        .get(idx)
+                        .copied();
+                    if let Some(sample) = sample {
+                        cursor.store(idx + 1, Ordering::Relaxed);
+                        *out = T::from_sample(sample);
+                    } else {
+                        let _done = finished.load(Ordering::Relaxed);
+                        *out = T::from_sample(0.0);
+                    }
                 }
             },
             err_fn,
             None,
         )
-        .context("failed to build speech output stream")
+        .context("failed to build streaming speech output stream")
 }
 
 fn convert_interleaved_f32(
@@ -372,7 +431,9 @@ mod tests {
     #[test]
     fn mono_audio_converts_to_stereo_and_resamples() {
         let converted = convert_interleaved_f32(&[0.25, -0.25], 2, 1, 4, 2);
-        assert_eq!(converted, vec![0.25, 0.25, 0.25, 0.25, -0.25, -0.25, -0.25, -0.25]);
+        assert_eq!(
+            converted,
+            vec![0.25, 0.25, 0.25, 0.25, -0.25, -0.25, -0.25, -0.25]
+        );
     }
 }
-

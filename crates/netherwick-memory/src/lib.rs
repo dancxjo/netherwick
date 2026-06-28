@@ -21,6 +21,7 @@ const DEFAULT_CELL_SIZE_M: f32 = 0.5;
 const SCORE_DECAY_PER_TICK: f32 = 0.995;
 const CELL_CONFIDENCE_DECAY_PER_TICK: f32 = 0.999;
 const RECALL_RADIUS_CELLS: i32 = 4;
+const PLACE_RECOGNITION_MIN_CONFIDENCE: f32 = 0.55;
 pub const SENSATION_VECTOR_COLLECTION: &str = "sensations";
 pub const EXPERIENCE_VECTOR_COLLECTION: &str = "experiences";
 
@@ -116,6 +117,8 @@ pub struct RecallBundle {
     pub recollections: Vec<RecalledExperience>,
     #[serde(default)]
     pub semantic_map: Option<SemanticMapOverlay>,
+    #[serde(default)]
+    pub place_recognition_candidates: Vec<PlaceRecognitionCandidate>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -172,6 +175,30 @@ pub struct SemanticCell {
 }
 
 pub type PlaceCell = SemanticCell;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceRecognitionKind {
+    SamePlace,
+    SimilarPlace,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlaceRecognitionCandidate {
+    pub kind: PlaceRecognitionKind,
+    pub cell: PlaceCellSummary,
+    pub source_vector_id: String,
+    pub source_frame_id: Option<String>,
+    pub query_vector_id: Option<String>,
+    pub similarity: f32,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlaceSceneEmbedding {
+    pub cell_key: PlaceCellKey,
+    pub artifact: VectorArtifact,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlaceMemoryConfig {
@@ -244,12 +271,16 @@ pub struct SemanticMapOverlay {
     pub charge_cells: Vec<PlaceCellSummary>,
     pub social_cells: Vec<PlaceCellSummary>,
     pub novelty_cells: Vec<PlaceCellSummary>,
+    #[serde(default)]
+    pub place_recognition_candidates: Vec<PlaceRecognitionCandidate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlaceMemory {
     pub config: PlaceMemoryConfig,
     pub cells: BTreeMap<PlaceCellKey, PlaceCell>,
+    #[serde(default)]
+    pub scene_embeddings: BTreeMap<String, PlaceSceneEmbedding>,
     last_tick: Option<u64>,
 }
 
@@ -258,6 +289,7 @@ impl Default for PlaceMemory {
         Self {
             config: PlaceMemoryConfig::default(),
             cells: BTreeMap::new(),
+            scene_embeddings: BTreeMap::new(),
             last_tick: None,
         }
     }
@@ -317,15 +349,23 @@ impl PlaceMemory {
         merge_vector_ids(&mut cell.associated_scene_vectors, &now.eye.scene_vectors);
         merge_vector_ids(&mut cell.associated_face_vectors, &now.face.vectors);
         merge_vector_ids(&mut cell.associated_voice_vectors, &now.voice.vectors);
+        self.store_scene_embeddings(key, &now.eye.scene_vectors);
         self.features_at(now.body.odometry.x_m, now.body.odometry.y_m)
     }
 
     pub fn observe_frame(&mut self, frame: &ExperienceFrame) -> PlaceMemoryFeatures {
         let features = self.observe_now(&frame.now);
+        let key = self.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m);
+        let scene_vectors = scene_vectors_from_now(&frame.now, frame.id, frame.t_ms);
+        if !scene_vectors.is_empty() {
+            if let Some(cell) = self.cells.get_mut(&key) {
+                merge_vector_ids(&mut cell.associated_scene_vectors, &scene_vectors);
+            }
+            self.store_scene_embeddings(key, &scene_vectors);
+        }
         let Some(action) = frame.chosen_action.as_ref() else {
             return features;
         };
-        let key = self.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m);
         self.observe_action_outcome(key, action, frame.reward.value, frame.now.t_ms);
         features
     }
@@ -367,10 +407,23 @@ impl PlaceMemory {
     }
 
     pub fn semantic_overlay_at(&self, x_m: f32, y_m: f32) -> SemanticMapOverlay {
-        self.semantic_overlay(Some(self.quantize(x_m, y_m)))
+        self.semantic_overlay_with_query(
+            Some(self.quantize(x_m, y_m)),
+            &[],
+            PLACE_RECOGNITION_MIN_CONFIDENCE,
+        )
     }
 
     pub fn semantic_overlay(&self, current_key: Option<PlaceCellKey>) -> SemanticMapOverlay {
+        self.semantic_overlay_with_query(current_key, &[], PLACE_RECOGNITION_MIN_CONFIDENCE)
+    }
+
+    pub fn semantic_overlay_with_query(
+        &self,
+        current_key: Option<PlaceCellKey>,
+        query_vectors: &[VectorArtifact],
+        min_confidence: f32,
+    ) -> SemanticMapOverlay {
         let report = self.report();
         SemanticMapOverlay {
             schema_version: 1,
@@ -384,7 +437,62 @@ impl PlaceMemory {
             charge_cells: top_cells(&self.cells, |cell| cell.charge_score),
             social_cells: top_cells(&self.cells, |cell| cell.social_score),
             novelty_cells: top_cells(&self.cells, |cell| cell.novelty_score),
+            place_recognition_candidates: self.recognize_places(
+                current_key,
+                query_vectors,
+                min_confidence,
+                5,
+            ),
         }
+    }
+
+    pub fn recognize_places(
+        &self,
+        current_key: Option<PlaceCellKey>,
+        query_vectors: &[VectorArtifact],
+        min_confidence: f32,
+        limit: usize,
+    ) -> Vec<PlaceRecognitionCandidate> {
+        let mut candidates = Vec::new();
+        for query in query_vectors {
+            if query.vector.is_empty() {
+                continue;
+            }
+            for stored in self.scene_embeddings.values() {
+                let Some(cell) = self.cells.get(&stored.cell_key) else {
+                    continue;
+                };
+                if stored.artifact.point_id == query.point_id {
+                    continue;
+                }
+                let similarity = cosine_similarity(&query.vector, &stored.artifact.vector);
+                let confidence = (similarity
+                    * cell.confidence.max(0.2)
+                    * (cell.visit_count as f32 / 2.0).clamp(0.5, 1.0))
+                .clamp(0.0, 1.0);
+                if confidence < min_confidence {
+                    continue;
+                }
+                candidates.push(PlaceRecognitionCandidate {
+                    kind: recognition_kind(current_key, stored.cell_key, similarity),
+                    cell: summarize_cell(cell, confidence),
+                    source_vector_id: stored.artifact.point_id.clone(),
+                    source_frame_id: stored.artifact.source_frame_id.clone(),
+                    query_vector_id: Some(query.point_id.clone()),
+                    similarity,
+                    confidence,
+                });
+            }
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.cell.last_seen_tick.cmp(&left.cell.last_seen_tick))
+        });
+        candidates.truncate(limit);
+        candidates
     }
 
     pub fn report(&self) -> PlaceMemoryReport {
@@ -448,6 +556,28 @@ impl PlaceMemory {
             } else if reward <= -0.05 {
                 update_action_outcome(&mut cell.failed_actions, action, reward, t_ms);
             }
+        }
+    }
+
+    fn store_scene_embeddings(&mut self, key: PlaceCellKey, artifacts: &[VectorArtifact]) {
+        for artifact in artifacts {
+            if artifact.point_id.trim().is_empty() || artifact.vector.is_empty() {
+                continue;
+            }
+            self.scene_embeddings.insert(
+                artifact.point_id.clone(),
+                PlaceSceneEmbedding {
+                    cell_key: key,
+                    artifact: artifact.clone(),
+                },
+            );
+        }
+        const MAX_PLACE_SCENE_EMBEDDINGS: usize = 512;
+        while self.scene_embeddings.len() > MAX_PLACE_SCENE_EMBEDDINGS {
+            let Some(oldest_key) = self.scene_embeddings.keys().next().cloned() else {
+                break;
+            };
+            self.scene_embeddings.remove(&oldest_key);
         }
     }
 
@@ -1071,12 +1201,24 @@ impl Recall for InMemoryExperienceStore {
             remembered_relationships,
             graph_context_summary,
         };
-        let semantic_map = query.pose.map(|pose| {
-            self.places
-                .lock()
-                .expect("place memory mutex poisoned")
-                .semantic_overlay_at(pose.x_m, pose.y_m)
-        });
+        let (semantic_map, place_recognition_candidates) = {
+            let places = self.places.lock().expect("place memory mutex poisoned");
+            let current_key = query.pose.map(|pose| places.quantize(pose.x_m, pose.y_m));
+            let semantic_map = current_key.map(|key| {
+                places.semantic_overlay_with_query(
+                    Some(key),
+                    &query.scene_vectors,
+                    PLACE_RECOGNITION_MIN_CONFIDENCE,
+                )
+            });
+            let candidates = places.recognize_places(
+                current_key,
+                &query.scene_vectors,
+                PLACE_RECOGNITION_MIN_CONFIDENCE,
+                5,
+            );
+            (semantic_map, candidates)
+        };
         let first_person_summary = if hits.is_empty() {
             "I do not remember a similar situation yet.".to_string()
         } else {
@@ -1093,6 +1235,7 @@ impl Recall for InMemoryExperienceStore {
             first_person_summary,
             recollections,
             semantic_map,
+            place_recognition_candidates,
         })
     }
 }
@@ -1376,6 +1519,18 @@ fn summarize_cell(cell: &PlaceCell, score: f32) -> PlaceCellSummary {
         associated_voice_vectors: cell.associated_voice_vectors.clone(),
         successful_actions: cell.successful_actions.clone(),
         failed_actions: cell.failed_actions.clone(),
+    }
+}
+
+fn recognition_kind(
+    current_key: Option<PlaceCellKey>,
+    candidate_key: PlaceCellKey,
+    similarity: f32,
+) -> PlaceRecognitionKind {
+    if current_key == Some(candidate_key) || similarity >= 0.92 {
+        PlaceRecognitionKind::SamePlace
+    } else {
+        PlaceRecognitionKind::SimilarPlace
     }
 }
 
@@ -3052,6 +3207,106 @@ mod tests {
         assert!(overlay.current.is_some());
         assert!(!overlay.danger_cells.is_empty());
         assert!(!overlay.charge_cells.is_empty());
+    }
+
+    #[test]
+    fn place_recognition_scores_revisits_above_unrelated_locations() {
+        let mut memory = PlaceMemory::new();
+        let first_frame_id = uuid::Uuid::new_v4();
+        let unrelated_frame_id = uuid::Uuid::new_v4();
+        let mut first = now_at(100, 1.0, 1.0);
+        first.eye.scene_vectors.push(
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-first", vec![1.0, 0.0, 0.0])
+                .with_source_frame_id(first_frame_id.to_string()),
+        );
+        let mut unrelated = now_at(200, 4.0, 1.0);
+        unrelated.eye.scene_vectors.push(
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-unrelated", vec![0.0, 1.0, 0.0])
+                .with_source_frame_id(unrelated_frame_id.to_string()),
+        );
+        memory.observe_now(&first);
+        memory.observe_now(&first);
+        memory.observe_now(&unrelated);
+
+        let query = VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-query",
+            vec![0.98, 0.02, 0.0],
+        );
+        let candidates = memory.recognize_places(
+            Some(memory.quantize(1.02, 1.02)),
+            &[query],
+            PLACE_RECOGNITION_MIN_CONFIDENCE,
+            5,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_vector_id, "scene-first");
+        assert!(matches!(candidates[0].kind, PlaceRecognitionKind::SamePlace));
+        assert!(candidates[0].similarity > 0.99);
+        assert!(candidates[0].confidence >= PLACE_RECOGNITION_MIN_CONFIDENCE);
+        assert_eq!(
+            candidates[0].source_frame_id.as_deref(),
+            Some(first_frame_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn place_recognition_rejects_low_confidence_candidates() {
+        let mut memory = PlaceMemory::new();
+        let mut observed = now_at(100, 2.0, 1.0);
+        observed.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-observed",
+            vec![1.0, 0.0, 0.0],
+        ));
+        memory.observe_now(&observed);
+
+        let query =
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-query", vec![0.0, 1.0, 0.0]);
+        let candidates = memory.recognize_places(
+            Some(memory.quantize(2.0, 1.0)),
+            &[query],
+            PLACE_RECOGNITION_MIN_CONFIDENCE,
+            5,
+        );
+
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_and_semantic_overlay_include_place_candidates() {
+        let store = InMemoryExperienceStore::new();
+        let mut frame = empty_frame(now_at(100, 1.0, 1.0));
+        frame.now.eye.scene_vectors.push(
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-stored", vec![1.0, 0.0])
+                .with_source_frame_id(frame.id.to_string()),
+        );
+        store.observe_frame(&frame).await.unwrap();
+
+        let recall = store
+            .recall(RecallQuery {
+                pose: Some(frame.now.body.odometry),
+                scene_vectors: vec![VectorArtifact::new(
+                    SCENE_VECTOR_COLLECTION,
+                    "scene-query",
+                    vec![1.0, 0.0],
+                )],
+                battery: frame.now.body.battery_level,
+                ..RecallQuery::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(recall.place_recognition_candidates.len(), 1);
+        let candidate = &recall.place_recognition_candidates[0];
+        assert_eq!(candidate.source_vector_id, "scene-stored");
+        assert_eq!(candidate.query_vector_id.as_deref(), Some("scene-query"));
+        assert!(candidate.confidence >= PLACE_RECOGNITION_MIN_CONFIDENCE);
+        assert!(recall
+            .semantic_map
+            .as_ref()
+            .is_some_and(|overlay| !overlay.place_recognition_candidates.is_empty()));
     }
 
     #[test]
