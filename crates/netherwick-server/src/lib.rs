@@ -1434,11 +1434,19 @@ pub enum EmbodiedGraphEdgeType {
 pub struct EmbodiedGraphVector {
     pub index: usize,
     pub owner_node_id: String,
+    pub vectorizer_id: String,
     pub model_id: String,
+    pub model_label: String,
     pub dim: usize,
     pub modality: String,
     pub payload_kind: String,
+    pub source_kind: String,
     pub source_sensation_id: String,
+    pub purpose: String,
+    pub collection: String,
+    pub input_summary: String,
+    pub is_fallback: bool,
+    pub provenance: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1644,11 +1652,19 @@ fn vector_refs_for_node<'a>(
             vectors.push(EmbodiedGraphVector {
                 index,
                 owner_node_id: owner_node_id.clone(),
+                vectorizer_id: vector.vectorizer_id.clone(),
                 model_id: vector.model_id.clone(),
+                model_label: vector.model_label.clone(),
                 dim: vector.dim,
                 modality: vector.modality.as_str().to_string(),
                 payload_kind: vector.payload_kind.as_str().to_string(),
+                source_kind: vector.source_kind.clone(),
                 source_sensation_id: vector.source_sensation_id.to_string(),
+                purpose: vector.purpose.clone(),
+                collection: vector.collection.clone(),
+                input_summary: vector.input_summary.clone(),
+                is_fallback: vector.is_fallback,
+                provenance: vector.provenance.clone(),
             });
             index
         })

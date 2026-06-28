@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -3346,6 +3346,10 @@ mod tests {
             EmbodiedVectorizerConfig {
                 enabled: false,
                 model: None,
+                model_label: None,
+                model_path: None,
+                purpose: None,
+                collection: None,
                 fallback: Some("placeholder".to_string()),
             },
         );
@@ -3366,6 +3370,70 @@ mod tests {
         assert_eq!(vector.dim, PLACEHOLDER_VECTOR_DIM);
         assert_eq!(vector.source_sensation_id, crop.id);
         assert_eq!(vector.payload_kind, SensationPayloadKind::Crop);
+        assert_eq!(vector.vectorizer_id, "netherwick.vectorizer.placeholder.v0");
+        assert_eq!(vector.purpose, "face_identity");
+        assert_eq!(vector.collection, "fallback_vectors");
+        assert!(vector.is_fallback);
+        assert!(vector.input_summary.contains("kind=vision.crop"));
+    }
+
+    #[tokio::test]
+    async fn vectorizer_registry_selects_configured_real_vectorizer_metadata() {
+        let mut config = EmbodiedVectorizerRegistryConfig::default();
+        config.vectorizer.insert(
+            "vision_image".to_string(),
+            EmbodiedVectorizerConfig {
+                enabled: true,
+                model: Some("netherwick.test.real_scene.v1".to_string()),
+                model_label: Some("Test Scene Vectorizer".to_string()),
+                model_path: None,
+                purpose: Some("scene_similarity".to_string()),
+                collection: Some("scene_vectors".to_string()),
+                fallback: Some("placeholder".to_string()),
+            },
+        );
+        let registry = SensationVectorizerRegistry::from_config(&config);
+        let primary = visual_primary_with_rgb(16, 16, vec![9; 16 * 16 * 3]);
+
+        let vector = registry.vectorize(&primary).await.unwrap().expect("vector");
+
+        assert_eq!(vector.model_id, "netherwick.test.real_scene.v1");
+        assert_eq!(vector.model_label, "Test Scene Vectorizer");
+        assert_eq!(
+            vector.vectorizer_id,
+            "netherwick.vectorizer.vision_image.frame_stats.v1"
+        );
+        assert_eq!(vector.dim, EMBODIED_FEATURE_VECTOR_DIM);
+        assert_eq!(vector.source_sensation_id, primary.id);
+        assert_eq!(vector.purpose, "scene_similarity");
+        assert_eq!(vector.collection, "scene_vectors");
+        assert!(!vector.is_fallback);
+        assert!(vector.input_summary.contains("size=16x16"));
+    }
+
+    #[tokio::test]
+    async fn missing_configured_model_path_falls_back_to_placeholder() {
+        let mut config = EmbodiedVectorizerRegistryConfig::default();
+        config.vectorizer.insert(
+            "vision_image".to_string(),
+            EmbodiedVectorizerConfig {
+                enabled: true,
+                model: Some("netherwick.clip.missing.v1".to_string()),
+                model_label: None,
+                model_path: Some("data/models/definitely-missing-openclip.onnx".to_string()),
+                purpose: Some("scene_similarity".to_string()),
+                collection: Some("scene_vectors".to_string()),
+                fallback: Some("placeholder".to_string()),
+            },
+        );
+        let registry = SensationVectorizerRegistry::from_config(&config);
+        let primary = visual_primary_with_rgb(16, 16, vec![11; 16 * 16 * 3]);
+
+        let vector = registry.vectorize(&primary).await.unwrap().expect("vector");
+
+        assert_eq!(vector.model_id, "netherwick.placeholder.v0");
+        assert_eq!(vector.dim, PLACEHOLDER_VECTOR_DIM);
+        assert!(vector.is_fallback);
     }
 
     #[tokio::test]
@@ -3390,6 +3458,24 @@ mod tests {
         assert_eq!(vector.vector, vec![0.2, 0.4, 0.6]);
         assert_eq!(vector.source_sensation_id, face.id);
         assert_eq!(vector.generated_at_ms, face.observed_at_ms);
+        assert_eq!(vector.vectorizer_id, "precomputed.faces.arcface.test.v0");
+        assert_eq!(vector.purpose, "face_identity");
+        assert_eq!(vector.collection, "faces");
+        assert!(!vector.is_fallback);
+        assert!(vector.input_summary.contains("face-vector-1"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_image_frames_do_not_repeat_embeddings() {
+        let registry = SensationVectorizerRegistry::with_defaults();
+        let first = visual_primary_with_rgb(16, 16, vec![13; 16 * 16 * 3]);
+        let second = visual_primary_with_rgb(16, 16, vec![13; 16 * 16 * 3]);
+
+        let first_vector = registry.vectorize(&first).await.unwrap();
+        let second_vector = registry.vectorize(&second).await.unwrap();
+
+        assert!(first_vector.is_some());
+        assert!(second_vector.is_none());
     }
 
     #[test]
@@ -4189,10 +4275,26 @@ pub struct BoundingBox {
 pub struct VectorEmbedding {
     pub vector: Vec<f32>,
     pub dim: usize,
+    #[serde(default = "default_vectorizer_id")]
+    pub vectorizer_id: String,
     pub model_id: String,
+    #[serde(default)]
+    pub model_label: String,
     pub modality: Modality,
     pub payload_kind: SensationPayloadKind,
+    #[serde(default = "default_vector_source_kind")]
+    pub source_kind: String,
     pub source_sensation_id: SensationId,
+    #[serde(default = "default_vector_purpose")]
+    pub purpose: String,
+    #[serde(default = "default_vector_collection")]
+    pub collection: String,
+    #[serde(default)]
+    pub input_summary: String,
+    #[serde(default)]
+    pub is_fallback: bool,
+    #[serde(default)]
+    pub provenance: String,
     pub generated_at_ms: TimeMs,
 }
 
@@ -4206,16 +4308,66 @@ impl VectorEmbedding {
         generated_at_ms: TimeMs,
     ) -> Self {
         let dim = vector.len();
+        let model_id = model_id.into();
         Self {
             vector,
             dim,
-            model_id: model_id.into(),
+            vectorizer_id: model_id.clone(),
+            model_label: model_id.clone(),
+            model_id,
             modality,
             payload_kind,
+            source_kind: default_vector_source_kind(),
             source_sensation_id,
+            purpose: default_vector_purpose(),
+            collection: default_vector_collection(),
+            input_summary: String::new(),
+            is_fallback: false,
+            provenance: String::new(),
             generated_at_ms,
         }
     }
+
+    pub fn with_metadata(
+        mut self,
+        vectorizer_id: impl Into<String>,
+        model_label: impl Into<String>,
+        purpose: impl Into<String>,
+        collection: impl Into<String>,
+        input_summary: impl Into<String>,
+        is_fallback: bool,
+        provenance: impl Into<String>,
+    ) -> Self {
+        self.vectorizer_id = vectorizer_id.into();
+        self.model_label = model_label.into();
+        self.purpose = purpose.into();
+        self.collection = collection.into();
+        self.input_summary = input_summary.into();
+        self.is_fallback = is_fallback;
+        self.provenance = provenance.into();
+        self
+    }
+
+    pub fn with_source_kind(mut self, source_kind: impl Into<String>) -> Self {
+        self.source_kind = source_kind.into();
+        self
+    }
+}
+
+fn default_vectorizer_id() -> String {
+    "unknown".to_string()
+}
+
+fn default_vector_source_kind() -> String {
+    "sensation".to_string()
+}
+
+fn default_vector_purpose() -> String {
+    "unspecified".to_string()
+}
+
+fn default_vector_collection() -> String {
+    "embodied_vectors".to_string()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -4285,11 +4437,19 @@ pub struct EmbodiedLineageEdge {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbodiedVectorRef {
+    pub vectorizer_id: String,
     pub model_id: String,
+    pub model_label: String,
     pub dim: usize,
     pub modality: Modality,
     pub payload_kind: SensationPayloadKind,
+    pub source_kind: String,
     pub source_sensation_id: SensationId,
+    pub purpose: String,
+    pub collection: String,
+    pub input_summary: String,
+    pub is_fallback: bool,
+    pub provenance: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4481,20 +4641,39 @@ impl EmbodiedContext {
 
 fn vector_ref(vector: &VectorEmbedding) -> EmbodiedVectorRef {
     EmbodiedVectorRef {
+        vectorizer_id: vector.vectorizer_id.clone(),
         model_id: vector.model_id.clone(),
+        model_label: vector.model_label.clone(),
         dim: vector.dim,
         modality: vector.modality.clone(),
         payload_kind: vector.payload_kind.clone(),
+        source_kind: vector.source_kind.clone(),
         source_sensation_id: vector.source_sensation_id,
+        purpose: vector.purpose.clone(),
+        collection: vector.collection.clone(),
+        input_summary: vector.input_summary.clone(),
+        is_fallback: vector.is_fallback,
+        provenance: vector.provenance.clone(),
     }
 }
 
 #[async_trait]
 pub trait SensationVectorizer: Send + Sync {
+    fn vectorizer_id(&self) -> &str;
     fn modality(&self) -> Modality;
     fn payload_kind(&self) -> SensationPayloadKind;
     fn model_id(&self) -> &str;
+    fn model_label(&self) -> &str {
+        self.model_id()
+    }
     fn output_dim(&self) -> usize;
+    fn purpose(&self) -> &str;
+    fn collection(&self) -> &str {
+        self.purpose()
+    }
+    fn is_fallback(&self) -> bool {
+        false
+    }
     async fn vectorize(&self, sensation: &Sensation) -> Result<VectorEmbedding>;
 }
 
@@ -4509,6 +4688,10 @@ pub struct EmbodiedVectorizerConfig {
     #[serde(default = "default_vectorizer_enabled")]
     pub enabled: bool,
     pub model: Option<String>,
+    pub model_label: Option<String>,
+    pub model_path: Option<String>,
+    pub purpose: Option<String>,
+    pub collection: Option<String>,
     pub fallback: Option<String>,
 }
 
@@ -4519,6 +4702,7 @@ fn default_vectorizer_enabled() -> bool {
 #[derive(Clone, Default)]
 pub struct SensationVectorizerRegistry {
     vectorizers: BTreeMap<(Modality, SensationPayloadKind), Arc<dyn SensationVectorizer>>,
+    duplicate_state: Arc<Mutex<BTreeMap<(Modality, SensationPayloadKind), Vec<f32>>>>,
 }
 
 impl SensationVectorizerRegistry {
@@ -4536,52 +4720,88 @@ impl SensationVectorizerRegistry {
         registry.register_configured(
             config,
             "vision_image",
-            EmbodiedFeatureSensationVectorizer::image(SensationPayloadKind::ImageBytes),
+            EmbodiedFeatureSensationVectorizer::image(
+                "netherwick.vectorizer.vision_image.frame_stats.v1",
+                SensationPayloadKind::ImageBytes,
+                "scene_similarity",
+            ),
         );
         registry.register_configured(
             config,
             "vision_crop",
-            EmbodiedFeatureSensationVectorizer::image(SensationPayloadKind::Crop),
+            EmbodiedFeatureSensationVectorizer::image(
+                "netherwick.vectorizer.vision_crop.frame_stats.v1",
+                SensationPayloadKind::Crop,
+                "face_identity",
+            ),
         );
         registry.register_configured(
             config,
             "vision_features",
             EmbodiedFeatureSensationVectorizer {
+                vectorizer_id: "netherwick.vectorizer.vision_features.artifact.v1".to_string(),
                 modality: Modality::Vision,
                 payload_kind: SensationPayloadKind::Structured,
                 model_id: "netherwick.image.feature_artifact.v1".to_string(),
+                model_label: "netherwick.image.feature_artifact.v1".to_string(),
+                purpose: "visual_similarity".to_string(),
+                collection: "visual_similarity".to_string(),
                 kind: EmbodiedFeatureKind::Image,
             },
         );
         registry.register_configured(
             config,
             "audio_pcm",
-            EmbodiedFeatureSensationVectorizer::audio(SensationPayloadKind::AudioPcm),
+            EmbodiedFeatureSensationVectorizer::audio(
+                "netherwick.vectorizer.audio_pcm.window_stats.v1",
+                SensationPayloadKind::AudioPcm,
+                "voice_identity",
+            ),
         );
         registry.register_configured(
             config,
             "audio_voice",
-            EmbodiedFeatureSensationVectorizer::audio(SensationPayloadKind::VoiceSegment),
+            EmbodiedFeatureSensationVectorizer::audio(
+                "netherwick.vectorizer.audio_voice.window_stats.v1",
+                SensationPayloadKind::VoiceSegment,
+                "voice_identity",
+            ),
         );
         registry.register_configured(
             config,
             "audio_speech",
-            EmbodiedFeatureSensationVectorizer::text(SensationPayloadKind::SpeechSegment),
+            EmbodiedFeatureSensationVectorizer::text(
+                "netherwick.vectorizer.audio_speech.hash_embedding.v1",
+                SensationPayloadKind::SpeechSegment,
+                "transcript_semantic",
+            ),
         );
         registry.register_configured(
             config,
             "audio_transcript",
-            EmbodiedFeatureSensationVectorizer::text(SensationPayloadKind::TranscriptSpan),
+            EmbodiedFeatureSensationVectorizer::text(
+                "netherwick.vectorizer.audio_transcript.hash_embedding.v1",
+                SensationPayloadKind::TranscriptSpan,
+                "transcript_semantic",
+            ),
         );
         registry.register_configured(
             config,
             "audio_phoneme",
-            EmbodiedFeatureSensationVectorizer::text(SensationPayloadKind::PhonemeSpan),
+            EmbodiedFeatureSensationVectorizer::text(
+                "netherwick.vectorizer.audio_phoneme.hash_embedding.v1",
+                SensationPayloadKind::PhonemeSpan,
+                "transcript_semantic",
+            ),
         );
         registry.register_configured(
             config,
             "depth_scene",
-            EmbodiedFeatureSensationVectorizer::depth(SensationPayloadKind::DepthFrame),
+            EmbodiedFeatureSensationVectorizer::depth(
+                "netherwick.vectorizer.depth_scene.scene_stats.v1",
+                SensationPayloadKind::DepthFrame,
+                "scene_similarity",
+            ),
         );
 
         for (modality, payload_kind) in default_vectorizer_keys() {
@@ -4615,8 +4835,30 @@ impl SensationVectorizerRegistry {
             ));
             return;
         }
+        if let Some(path) = entry.and_then(|entry| entry.model_path.as_deref()) {
+            if !Path::new(path).exists() {
+                eprintln!(
+                    "warning: vectorizer {key} model_path {path} is missing; using deterministic placeholder fallback"
+                );
+                self.register(PlaceholderSensationVectorizer::new(
+                    vectorizer.modality(),
+                    vectorizer.payload_kind(),
+                ));
+                return;
+            }
+        }
         if let Some(model) = entry.and_then(|entry| entry.model.clone()) {
-            vectorizer.model_id = model;
+            vectorizer.model_id = model.clone();
+            vectorizer.model_label = model;
+        }
+        if let Some(label) = entry.and_then(|entry| entry.model_label.clone()) {
+            vectorizer.model_label = label;
+        }
+        if let Some(purpose) = entry.and_then(|entry| entry.purpose.clone()) {
+            vectorizer.purpose = purpose;
+        }
+        if let Some(collection) = entry.and_then(|entry| entry.collection.clone()) {
+            vectorizer.collection = collection;
         }
         self.register(vectorizer);
     }
@@ -4645,7 +4887,22 @@ impl SensationVectorizerRegistry {
         let Some(vectorizer) = self.get(&sensation.modality, &sensation.payload_kind) else {
             return Ok(None);
         };
-        vectorizer.vectorize(sensation).await.map(Some)
+        let embedding = vectorizer.vectorize(sensation).await?;
+        if should_suppress_duplicate_embedding(sensation, &embedding) {
+            let key = (embedding.modality.clone(), embedding.payload_kind.clone());
+            let mut duplicate_state = self
+                .duplicate_state
+                .lock()
+                .map_err(|_| anyhow!("vectorizer duplicate suppression lock poisoned"))?;
+            let duplicate = duplicate_state
+                .get(&key)
+                .is_some_and(|previous| cosine_similarity(previous, &embedding.vector) > 0.999);
+            if duplicate {
+                return Ok(None);
+            }
+            duplicate_state.insert(key, embedding.vector.clone());
+        }
+        Ok(Some(embedding))
     }
 }
 
@@ -4677,45 +4934,89 @@ enum EmbodiedFeatureKind {
 
 #[derive(Clone, Debug)]
 pub struct EmbodiedFeatureSensationVectorizer {
+    vectorizer_id: String,
     modality: Modality,
     payload_kind: SensationPayloadKind,
     model_id: String,
+    model_label: String,
+    purpose: String,
+    collection: String,
     kind: EmbodiedFeatureKind,
 }
 
 impl EmbodiedFeatureSensationVectorizer {
-    pub fn image(payload_kind: SensationPayloadKind) -> Self {
+    pub fn image(
+        vectorizer_id: impl Into<String>,
+        payload_kind: SensationPayloadKind,
+        purpose: impl Into<String>,
+    ) -> Self {
+        let model_id = "netherwick.image.frame_stats.v1".to_string();
+        let purpose = purpose.into();
         Self {
+            vectorizer_id: vectorizer_id.into(),
             modality: Modality::Vision,
             payload_kind,
-            model_id: "netherwick.image.frame_stats.v1".to_string(),
+            model_id: model_id.clone(),
+            model_label: model_id,
+            collection: purpose.clone(),
+            purpose,
             kind: EmbodiedFeatureKind::Image,
         }
     }
 
-    pub fn audio(payload_kind: SensationPayloadKind) -> Self {
+    pub fn audio(
+        vectorizer_id: impl Into<String>,
+        payload_kind: SensationPayloadKind,
+        purpose: impl Into<String>,
+    ) -> Self {
+        let model_id = "netherwick.audio.window_stats.v1".to_string();
+        let purpose = purpose.into();
         Self {
+            vectorizer_id: vectorizer_id.into(),
             modality: Modality::Audio,
             payload_kind,
-            model_id: "netherwick.audio.window_stats.v1".to_string(),
+            model_id: model_id.clone(),
+            model_label: model_id,
+            collection: purpose.clone(),
+            purpose,
             kind: EmbodiedFeatureKind::Audio,
         }
     }
 
-    pub fn text(payload_kind: SensationPayloadKind) -> Self {
+    pub fn text(
+        vectorizer_id: impl Into<String>,
+        payload_kind: SensationPayloadKind,
+        purpose: impl Into<String>,
+    ) -> Self {
+        let model_id = "netherwick.text.hash_embedding.v1".to_string();
+        let purpose = purpose.into();
         Self {
+            vectorizer_id: vectorizer_id.into(),
             modality: Modality::Audio,
             payload_kind,
-            model_id: "netherwick.text.hash_embedding.v1".to_string(),
+            model_id: model_id.clone(),
+            model_label: model_id,
+            collection: purpose.clone(),
+            purpose,
             kind: EmbodiedFeatureKind::Text,
         }
     }
 
-    pub fn depth(payload_kind: SensationPayloadKind) -> Self {
+    pub fn depth(
+        vectorizer_id: impl Into<String>,
+        payload_kind: SensationPayloadKind,
+        purpose: impl Into<String>,
+    ) -> Self {
+        let model_id = "netherwick.depth.scene_stats.v1".to_string();
+        let purpose = purpose.into();
         Self {
+            vectorizer_id: vectorizer_id.into(),
             modality: Modality::Depth,
             payload_kind,
-            model_id: "netherwick.depth.scene_stats.v1".to_string(),
+            model_id: model_id.clone(),
+            model_label: model_id,
+            collection: purpose.clone(),
+            purpose,
             kind: EmbodiedFeatureKind::Depth,
         }
     }
@@ -4723,6 +5024,10 @@ impl EmbodiedFeatureSensationVectorizer {
 
 #[async_trait]
 impl SensationVectorizer for EmbodiedFeatureSensationVectorizer {
+    fn vectorizer_id(&self) -> &str {
+        &self.vectorizer_id
+    }
+
     fn modality(&self) -> Modality {
         self.modality.clone()
     }
@@ -4735,19 +5040,40 @@ impl SensationVectorizer for EmbodiedFeatureSensationVectorizer {
         &self.model_id
     }
 
+    fn model_label(&self) -> &str {
+        &self.model_label
+    }
+
     fn output_dim(&self) -> usize {
         EMBODIED_FEATURE_VECTOR_DIM
     }
 
+    fn purpose(&self) -> &str {
+        &self.purpose
+    }
+
+    fn collection(&self) -> &str {
+        &self.collection
+    }
+
     async fn vectorize(&self, sensation: &Sensation) -> Result<VectorEmbedding> {
-        if let Some((vector, model_id)) = precomputed_payload_embedding(sensation) {
+        if let Some(artifact) = precomputed_payload_embedding(sensation) {
             return Ok(VectorEmbedding::new(
-                sanitize_vector(vector),
-                model_id,
+                sanitize_vector(artifact.vector),
+                artifact.model_id.clone(),
                 self.modality.clone(),
                 self.payload_kind.clone(),
                 sensation.id,
                 sensation.observed_at_ms,
+            )
+            .with_metadata(
+                artifact.vectorizer_id,
+                artifact.model_label,
+                artifact.purpose,
+                artifact.collection,
+                artifact.input_summary,
+                false,
+                "precomputed_vector_artifact",
             ));
         }
 
@@ -4764,11 +5090,31 @@ impl SensationVectorizer for EmbodiedFeatureSensationVectorizer {
             self.payload_kind.clone(),
             sensation.id,
             sensation.observed_at_ms,
+        )
+        .with_metadata(
+            self.vectorizer_id.clone(),
+            self.model_label.clone(),
+            self.purpose.clone(),
+            self.collection.clone(),
+            input_summary_for_sensation(sensation),
+            false,
+            "netherwick_embodied_feature_vectorizer",
         ))
     }
 }
 
-fn precomputed_payload_embedding(sensation: &Sensation) -> Option<(Vec<f32>, String)> {
+#[derive(Clone, Debug)]
+struct PrecomputedPayloadEmbedding {
+    vector: Vec<f32>,
+    model_id: String,
+    model_label: String,
+    vectorizer_id: String,
+    purpose: String,
+    collection: String,
+    input_summary: String,
+}
+
+fn precomputed_payload_embedding(sensation: &Sensation) -> Option<PrecomputedPayloadEmbedding> {
     let artifacts = sensation.payload.get("vector_artifacts")?.as_array()?;
     for artifact in artifacts {
         let vector = artifact
@@ -4786,7 +5132,31 @@ fn precomputed_payload_embedding(sensation: &Sensation) -> Option<(Vec<f32>, Str
             .filter(|model| !model.trim().is_empty())
             .unwrap_or("netherwick.precomputed_vector.v0")
             .to_string();
-        return Some((vector, model_id));
+        let collection = artifact
+            .get("collection")
+            .and_then(Value::as_str)
+            .filter(|collection| !collection.trim().is_empty())
+            .unwrap_or("precomputed_vectors")
+            .to_string();
+        let purpose = purpose_for_collection(&collection);
+        let point_id = artifact
+            .get("point_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let source_id = artifact
+            .get("source_id")
+            .and_then(Value::as_str)
+            .or_else(|| artifact.get("source_frame_id").and_then(Value::as_str))
+            .unwrap_or("unknown");
+        return Some(PrecomputedPayloadEmbedding {
+            vector,
+            model_id: model_id.clone(),
+            model_label: model_id.clone(),
+            vectorizer_id: format!("precomputed.{collection}.{model_id}"),
+            purpose,
+            collection,
+            input_summary: format!("vector_artifact point_id={point_id} source_id={source_id}"),
+        });
     }
     None
 }
@@ -5033,6 +5403,91 @@ fn sanitize_vector(vector: Vec<f32>) -> Vec<f32> {
         .collect()
 }
 
+fn purpose_for_sensation(modality: &Modality, payload_kind: &SensationPayloadKind) -> String {
+    match (modality, payload_kind) {
+        (Modality::Vision, SensationPayloadKind::ImageBytes) => "scene_similarity",
+        (Modality::Vision, SensationPayloadKind::Crop) => "face_identity",
+        (Modality::Vision, SensationPayloadKind::Structured) => "visual_similarity",
+        (Modality::Audio, SensationPayloadKind::TranscriptSpan)
+        | (Modality::Audio, SensationPayloadKind::SpeechSegment)
+        | (Modality::Audio, SensationPayloadKind::PhonemeSpan) => "transcript_semantic",
+        (Modality::Audio, SensationPayloadKind::VoiceSegment)
+        | (Modality::Audio, SensationPayloadKind::AudioPcm) => "voice_identity",
+        (Modality::Depth, SensationPayloadKind::DepthFrame) => "scene_similarity",
+        (Modality::Other, SensationPayloadKind::Structured) => "experience_semantic",
+        _ => "embodied_similarity",
+    }
+    .to_string()
+}
+
+fn purpose_for_collection(collection: &str) -> String {
+    match collection {
+        "faces" => "face_identity",
+        "voices" => "voice_identity",
+        "scene_vectors" | "images" => "scene_similarity",
+        "image_descriptions" | "memories" => "transcript_semantic",
+        "experiences" => "experience_semantic",
+        _ => collection,
+    }
+    .to_string()
+}
+
+fn input_summary_for_sensation(sensation: &Sensation) -> String {
+    let mut parts = vec![
+        format!("kind={}", sensation.kind),
+        format!("payload_kind={}", sensation.payload_kind.as_str()),
+    ];
+    if let Some(summary) = sensation
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+    {
+        parts.push(format!(
+            "summary={}",
+            summary.chars().take(96).collect::<String>()
+        ));
+    }
+    if let Some(width) = sensation.payload.get("width").and_then(Value::as_u64) {
+        if let Some(height) = sensation.payload.get("height").and_then(Value::as_u64) {
+            parts.push(format!("size={}x{}", width, height));
+        }
+    }
+    if let Some(format) = sensation.payload.get("format").and_then(Value::as_str) {
+        parts.push(format!("format={format}"));
+    }
+    parts.join(" ")
+}
+
+fn should_suppress_duplicate_embedding(sensation: &Sensation, embedding: &VectorEmbedding) -> bool {
+    !embedding.is_fallback
+        && matches!(embedding.modality, Modality::Vision)
+        && matches!(
+            embedding.payload_kind,
+            SensationPayloadKind::ImageBytes | SensationPayloadKind::Crop
+        )
+        && VisualFrame::from_sensation(sensation).is_some()
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    for (left, right) in left.iter().zip(right.iter()) {
+        dot += left * right;
+        left_norm += left * left;
+        right_norm += right * right;
+    }
+    let denom = left_norm.sqrt() * right_norm.sqrt();
+    if denom > 0.0 {
+        dot / denom
+    } else {
+        0.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PlaceholderSensationVectorizer {
     modality: Modality,
@@ -5050,6 +5505,10 @@ impl PlaceholderSensationVectorizer {
 
 #[async_trait]
 impl SensationVectorizer for PlaceholderSensationVectorizer {
+    fn vectorizer_id(&self) -> &str {
+        "netherwick.vectorizer.placeholder.v0"
+    }
+
     fn modality(&self) -> Modality {
         self.modality.clone()
     }
@@ -5064,6 +5523,18 @@ impl SensationVectorizer for PlaceholderSensationVectorizer {
 
     fn output_dim(&self) -> usize {
         PLACEHOLDER_VECTOR_DIM
+    }
+
+    fn purpose(&self) -> &str {
+        "fallback_deterministic"
+    }
+
+    fn collection(&self) -> &str {
+        "fallback_vectors"
+    }
+
+    fn is_fallback(&self) -> bool {
+        true
     }
 
     async fn vectorize(&self, sensation: &Sensation) -> Result<VectorEmbedding> {
@@ -5102,6 +5573,15 @@ impl SensationVectorizer for PlaceholderSensationVectorizer {
             self.payload_kind.clone(),
             sensation.id,
             sensation.observed_at_ms,
+        )
+        .with_metadata(
+            self.vectorizer_id(),
+            self.model_id(),
+            purpose_for_sensation(&self.modality, &self.payload_kind),
+            self.collection(),
+            input_summary_for_sensation(sensation),
+            true,
+            "deterministic_placeholder_fallback",
         ))
     }
 }
@@ -5981,6 +6461,19 @@ impl EmbodiedPipeline {
         Self::default()
     }
 
+    pub fn with_vectorizers(vectorizers: SensationVectorizerRegistry) -> Self {
+        Self {
+            vectorizers,
+            ..Self::default()
+        }
+    }
+
+    pub fn from_models_toml(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::with_vectorizers(
+            SensationVectorizerRegistry::from_models_toml(path)?,
+        ))
+    }
+
     pub async fn ingest_primary(&self, primary: Sensation) -> Result<EmbodiedBatch> {
         let mut sensations = vec![primary];
         let descendants = self.extractor.extract(&sensations[0])?;
@@ -6188,7 +6681,12 @@ pub async fn demo_embodied_experience(now_ms: TimeMs) -> Result<EmbodiedDemo> {
         },
     )
     .with_summary("I receive a synthetic visual frame.");
-    let pipeline = EmbodiedPipeline::new();
+    let pipeline = EmbodiedPipeline::from_models_toml("configs/models.toml").unwrap_or_else(|error| {
+        eprintln!(
+            "warning: embodied demo could not load configs/models.toml ({error}); using built-in vectorizer defaults"
+        );
+        EmbodiedPipeline::new()
+    });
     let batch = pipeline.ingest_primary(primary).await?;
     let mut window = RollingExperienceWindow::new(DEFAULT_WINDOW_MS);
     window.push(batch.clone());
@@ -6554,14 +7052,26 @@ fn fuse_vectors(sensations: &[Sensation], generated_at_ms: TimeMs) -> Option<Vec
     for value in &mut pooled {
         *value /= count;
     }
-    Some(VectorEmbedding::new(
-        pooled,
-        "netherwick.fusion.mean_pool.v0",
-        Modality::Other,
-        SensationPayloadKind::Structured,
-        source_sensation_id,
-        generated_at_ms,
-    ))
+    Some(
+        VectorEmbedding::new(
+            pooled,
+            "netherwick.fusion.mean_pool.v0",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            source_sensation_id,
+            generated_at_ms,
+        )
+        .with_metadata(
+            "netherwick.vectorizer.experience.mean_pool.v1",
+            "netherwick.fusion.mean_pool.v0",
+            "experience_semantic",
+            "experiences",
+            format!("mean_pool count={} dim={dim}", count as usize),
+            false,
+            "experience_fuser",
+        )
+        .with_source_kind("experience"),
+    )
 }
 
 fn embodied_tags(sensations: &[Sensation]) -> Vec<String> {

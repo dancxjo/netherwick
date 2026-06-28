@@ -71,44 +71,71 @@ fallback = "use_hardcoded"
 [vectorizer.vision_image]
 enabled = true
 model = "netherwick.image.frame_stats.v1"
+model_label = "Netherwick deterministic image frame statistics"
+purpose = "scene_similarity"
+collection = "scene_vectors"
 fallback = "placeholder"
 
 [vectorizer.vision_crop]
 enabled = true
 model = "netherwick.image.frame_stats.v1"
+model_label = "Netherwick deterministic image crop statistics"
+purpose = "face_identity"
+collection = "faces"
 fallback = "placeholder"
 
 [vectorizer.vision_features]
 enabled = true
 model = "netherwick.image.feature_artifact.v1"
+model_label = "Upstream image/scene vector artifact"
+purpose = "visual_similarity"
+collection = "images"
 fallback = "placeholder"
 
 [vectorizer.audio_pcm]
 enabled = true
 model = "netherwick.audio.window_stats.v1"
+model_label = "Netherwick deterministic audio window statistics"
+purpose = "voice_identity"
+collection = "voices"
 fallback = "placeholder"
 
 [vectorizer.audio_voice]
 enabled = true
 model = "netherwick.audio.window_stats.v1"
+model_label = "Netherwick deterministic voice window statistics"
+purpose = "voice_identity"
+collection = "voices"
 fallback = "placeholder"
 
 [vectorizer.audio_speech]
 enabled = true
 model = "netherwick.text.hash_embedding.v1"
+model_label = "Netherwick deterministic speech hash embedding"
+purpose = "transcript_semantic"
+collection = "transcripts"
 fallback = "placeholder"
 
 [vectorizer.audio_transcript]
 enabled = true
 model = "netherwick.text.hash_embedding.v1"
+model_label = "Netherwick deterministic transcript hash embedding"
+purpose = "transcript_semantic"
+collection = "transcripts"
 fallback = "placeholder"
 
 [vectorizer.audio_phoneme]
 enabled = true
 model = "netherwick.text.hash_embedding.v1"
+model_label = "Netherwick deterministic phoneme hash embedding"
+purpose = "transcript_semantic"
+collection = "transcripts"
 fallback = "placeholder"
 
 [vectorizer.depth_scene]
 enabled = true
 model = "netherwick.depth.scene_stats.v1"
+model_label = "Netherwick deterministic depth scene statistics"
+purpose = "scene_similarity"
+collection = "scene_vectors"
 fallback = "placeholder"

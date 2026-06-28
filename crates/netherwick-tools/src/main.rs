@@ -7198,8 +7198,8 @@ fn print_frame(frame: &ExperienceFrame) {
     );
     if let Some(vector) = embodied.fused_vector.as_ref() {
         println!(
-            "  fused_vector: model={} dim={}",
-            vector.model_id, vector.dim
+            "  fused_vector: model={} dim={} purpose={} vectorizer={} fallback={}",
+            vector.model_id, vector.dim, vector.purpose, vector.vectorizer_id, vector.is_fallback
         );
     } else {
         println!("  fused_vector: none");
@@ -7433,7 +7433,16 @@ async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
         let vector = sensation
             .vector
             .as_ref()
-            .map(|embedding| format!("{}d {}", embedding.dim, embedding.model_id))
+            .map(|embedding| {
+                format!(
+                    "{}d {} purpose={} vectorizer={} fallback={}",
+                    embedding.dim,
+                    embedding.model_id,
+                    embedding.purpose,
+                    embedding.vectorizer_id,
+                    embedding.is_fallback
+                )
+            })
             .unwrap_or_else(|| "none".to_string());
         println!(
             "    - {} {:?}/{:?} parent={:?} vector={}",
@@ -7445,7 +7454,10 @@ async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
         println!("    - {}", impression.text);
     }
     if let Some(fused) = &demo.experience.fused_vector {
-        println!("  fused vector: {}d {}", fused.dim, fused.model_id);
+        println!(
+            "  fused vector: {}d {} purpose={} vectorizer={} fallback={}",
+            fused.dim, fused.model_id, fused.purpose, fused.vectorizer_id, fused.is_fallback
+        );
     }
     Ok(())
 }

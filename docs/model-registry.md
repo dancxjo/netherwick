@@ -2,7 +2,22 @@
 
 The model registry is Netherwick's file-backed card catalog for learned behavior checkpoints. It records which checkpoint exists, which behavior it belongs to, what ledger and reports produced it, what scenario metrics it has earned, and which runtime modes it may enter.
 
-Embodied sensation vectorizers are configured beside behavior models in `configs/models.toml` under `[vectorizer.*]`. They are deliberately lightweight selectors: when an upstream sensor has already produced a model-backed `VectorArtifact`, the embodied pipeline preserves that vector, model id, dimension, source sensation id, timestamp, modality, and payload kind. When no upstream vector is present, configured feature vectorizers produce bounded deterministic embeddings for image frames/crops, audio/voice windows, transcript spans, and depth scenes. Setting `enabled = false` for a vectorizer keeps the deterministic placeholder fallback available.
+Embodied sensation vectorizers are configured beside behavior models in `configs/models.toml` under `[vectorizer.*]`. They are deliberately lightweight selectors: when an upstream sensor has already produced a model-backed `VectorArtifact`, the embodied pipeline preserves that vector, model id, dimension, source sensation id, timestamp, modality, payload kind, collection, and purpose. When no upstream vector is present, configured feature vectorizers produce bounded deterministic embeddings for image frames/crops, audio/voice windows, transcript spans, and depth scenes. Setting `enabled = false` for a vectorizer, or pointing `model_path` at a missing local asset, keeps the deterministic placeholder fallback available and labels the emitted vector as `is_fallback = true`.
+
+Every embodied vector now records:
+
+- `vectorizer_id`: the Netherwick registry entry that produced or preserved the vector.
+- `model_id` and `model_label`: the configured model identity or upstream sensor model label.
+- `dim`: the emitted vector width.
+- `source_kind` and `source_sensation_id`: what local object the vector represents.
+- `purpose`: why this vector should be searched, such as `visual_similarity`, `scene_similarity`, `face_identity`, `transcript_semantic`, `voice_identity`, or `experience_semantic`.
+- `collection`: the vector collection or logical search lane for that purpose.
+- `input_summary`: a small audit string, never the raw frame/audio payload.
+- `provenance`: whether the vector came from an upstream artifact, Netherwick feature vectorizer, experience fuser, or placeholder fallback.
+
+The implementation follows Daringsby's image vector work (`psyche/src/sensors/image_vector.rs`) and scene vector loop (`pete/src/bin/scene_vec.rs`) for model labels, graceful vectorization failure, and duplicate or near-identical visual frame suppression. It follows Mortar-Sea's master architecture vocabulary: a sensation or experience may have multiple purpose-specific vectors, and every vector declares what it represents, which model produced it, which collection it belongs to, what purpose it serves, and what input was vectorized.
+
+#31 is considered closed when at least one non-placeholder vectorizer is registered and used while placeholders remain deterministic and available. Netherwick currently registers deterministic feature-backed vectorizers for image, crop, audio, transcript, and depth payloads, and preserves real model-backed upstream `VectorArtifact`s when sensors provide them. Face, voice, audio, depth, and additional CLIP/OpenCLIP model runtimes can be added later without changing the metadata contract.
 
 The default registry lives at:
 
