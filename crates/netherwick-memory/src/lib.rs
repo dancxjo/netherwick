@@ -916,6 +916,90 @@ impl ModalitySupport {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingRelation {
+    #[default]
+    CooccursInTime,
+    CooccursInEstimatedSpace,
+    MovesTogether,
+    PredictsSameFutureEvents,
+    NamedBy,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObservationPoint {
+    pub id: String,
+    pub modality: Modality,
+    pub source: String,
+    pub observed_at_ms: u64,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModalityCluster {
+    pub id: String,
+    pub modality: Modality,
+    #[serde(default)]
+    pub observation_point_ids: Vec<String>,
+    pub evidence_count: u32,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingEdge {
+    pub left_cluster_id: String,
+    pub right_cluster_id: String,
+    pub relation: BindingRelation,
+    pub confidence: f32,
+    pub evidence_count: u32,
+    pub decay_per_tick: f32,
+    pub last_seen_ms: u64,
+}
+
+impl BindingEdge {
+    fn strengthen(&mut self, evidence: f32, t_ms: u64) {
+        self.evidence_count = self.evidence_count.saturating_add(1);
+        self.last_seen_ms = t_ms;
+        self.confidence = (self.confidence + evidence.clamp(0.0, 1.0) * 0.2).clamp(0.0, 1.0);
+    }
+
+    fn weaken(&mut self, amount: f32) {
+        self.confidence = (self.confidence * (1.0 - amount.clamp(0.0, 1.0))).clamp(0.0, 1.0);
+    }
+
+    pub fn is_strong(&self) -> bool {
+        self.confidence >= 0.6
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityConstellationState {
+    #[default]
+    Weak,
+    Strong,
+    Merged,
+    Split,
+    Vanished,
+    Revived,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EntityConstellation {
+    #[serde(default)]
+    pub observation_points: Vec<ObservationPoint>,
+    #[serde(default)]
+    pub modality_clusters: Vec<ModalityCluster>,
+    #[serde(default)]
+    pub binding_edges: Vec<BindingEdge>,
+    pub state: EntityConstellationState,
+    #[serde(default)]
+    pub merged_entity_ids: Vec<String>,
+    #[serde(default)]
+    pub split_entity_ids: Vec<String>,
+}
+
 /// A provisional, persistent record of an observed entity.
 ///
 /// Entities begin as thin hypotheses from a single detection and grow stronger
@@ -945,6 +1029,9 @@ pub struct EntityHypothesis {
     pub location_cells: Vec<PlaceCellKey>,
     /// Cross-modal evidence links.
     pub modality_support: ModalitySupport,
+    /// Entity-centered SLAM graph over recurring multimodal clusters.
+    #[serde(default)]
+    pub constellation: EntityConstellation,
 }
 
 impl EntityHypothesis {
@@ -959,7 +1046,7 @@ impl EntityHypothesis {
         let label = observation.label.clone();
         let display_name = Some(label.clone());
         let location_cells = cell_key.into_iter().collect();
-        Self {
+        let mut entity = Self {
             id,
             kind,
             labels: vec![label],
@@ -971,7 +1058,21 @@ impl EntityHypothesis {
             lifecycle: EntityLifecycleState::Active,
             location_cells,
             modality_support: ModalitySupport::default(),
-        }
+            constellation: EntityConstellation::default(),
+        };
+        let point = entity.push_observation_point(
+            Modality::Vision,
+            format!("object:{}", observation.label),
+            observation.confidence,
+            t_ms,
+        );
+        entity.upsert_cluster(
+            Modality::Vision,
+            format!("object:{}", stable_slug(&observation.label)),
+            point,
+            observation.confidence,
+        );
+        entity
     }
 
     /// Merge a new observation into this existing hypothesis.
@@ -983,12 +1084,16 @@ impl EntityHypothesis {
         t_ms: u64,
         cell_key: Option<PlaceCellKey>,
     ) {
+        let was_inactive = self.lifecycle != EntityLifecycleState::Active;
         self.last_seen_ms = t_ms;
         self.observation_count = self.observation_count.saturating_add(1);
         // Exponential moving average biased toward the new value on re-sighting.
-        self.confidence = (self.confidence * 0.7 + observation.confidence.clamp(0.0, 1.0) * 0.3)
-            .clamp(0.0, 1.0);
+        self.confidence =
+            (self.confidence * 0.7 + observation.confidence.clamp(0.0, 1.0) * 0.3).clamp(0.0, 1.0);
         self.lifecycle = EntityLifecycleState::Active;
+        if was_inactive {
+            self.constellation.state = EntityConstellationState::Revived;
+        }
         if !self.labels.contains(&observation.label) {
             self.labels.insert(0, observation.label.clone());
         }
@@ -997,30 +1102,240 @@ impl EntityHypothesis {
                 self.location_cells.push(key);
             }
         }
+        let point = self.push_observation_point(
+            Modality::Vision,
+            format!("object:{}", observation.label),
+            observation.confidence,
+            t_ms,
+        );
+        self.upsert_cluster(
+            Modality::Vision,
+            format!("object:{}", stable_slug(&observation.label)),
+            point,
+            observation.confidence,
+        );
     }
 
     /// Add face vector evidence.
     pub fn add_face_vector(&mut self, point_id: impl Into<String>) {
         let id = point_id.into();
         if !self.modality_support.face_vector_ids.contains(&id) {
-            self.modality_support.face_vector_ids.push(id);
+            self.modality_support.face_vector_ids.push(id.clone());
         }
+        let point = self.push_observation_point(
+            Modality::Vision,
+            format!("face:{id}"),
+            0.8,
+            self.last_seen_ms,
+        );
+        let face_cluster = self.upsert_cluster(Modality::Vision, format!("face:{id}"), point, 0.8);
+        self.bind_with_object_cluster(
+            face_cluster,
+            BindingRelation::CooccursInTime,
+            0.8,
+            self.last_seen_ms,
+        );
     }
 
     /// Add voice vector evidence.
     pub fn add_voice_vector(&mut self, point_id: impl Into<String>) {
         let id = point_id.into();
         if !self.modality_support.voice_vector_ids.contains(&id) {
-            self.modality_support.voice_vector_ids.push(id);
+            self.modality_support.voice_vector_ids.push(id.clone());
         }
+        let point = self.push_observation_point(
+            Modality::Audio,
+            format!("voice:{id}"),
+            0.8,
+            self.last_seen_ms,
+        );
+        let voice_cluster = self.upsert_cluster(Modality::Audio, format!("voice:{id}"), point, 0.8);
+        self.bind_with_object_cluster(
+            voice_cluster,
+            BindingRelation::CooccursInTime,
+            0.8,
+            self.last_seen_ms,
+        );
     }
 
     /// Add scene/depth vector evidence.
     pub fn add_scene_vector(&mut self, point_id: impl Into<String>) {
         let id = point_id.into();
         if !self.modality_support.scene_vector_ids.contains(&id) {
-            self.modality_support.scene_vector_ids.push(id);
+            self.modality_support.scene_vector_ids.push(id.clone());
         }
+        let point = self.push_observation_point(
+            Modality::Depth,
+            format!("scene:{id}"),
+            0.75,
+            self.last_seen_ms,
+        );
+        let scene_cluster =
+            self.upsert_cluster(Modality::Depth, format!("scene:{id}"), point, 0.75);
+        self.bind_with_object_cluster(
+            scene_cluster,
+            BindingRelation::CooccursInTime,
+            0.75,
+            self.last_seen_ms,
+        );
+    }
+
+    pub fn add_text_label(&mut self, label: impl Into<String>, confidence: f32, t_ms: u64) {
+        let text = label.into().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if !self.modality_support.text_labels.contains(&text) {
+            self.modality_support.text_labels.push(text.clone());
+        }
+        if self.display_name.is_none() {
+            self.display_name = Some(format!("{text}?"));
+        }
+        let point = self.push_observation_point(
+            Modality::Language,
+            format!("text:{text}"),
+            confidence,
+            t_ms,
+        );
+        let text_cluster = self.upsert_cluster(
+            Modality::Language,
+            format!("text:{}", stable_slug(&text)),
+            point,
+            confidence,
+        );
+        self.bind_with_object_cluster(text_cluster, BindingRelation::NamedBy, confidence, t_ms);
+    }
+
+    fn push_observation_point(
+        &mut self,
+        modality: Modality,
+        source: String,
+        confidence: f32,
+        t_ms: u64,
+    ) -> String {
+        let point_id = format!(
+            "point:{}:{}:{}",
+            modality.as_str(),
+            stable_slug(&source),
+            self.constellation.observation_points.len() + 1
+        );
+        self.constellation
+            .observation_points
+            .push(ObservationPoint {
+                id: point_id.clone(),
+                modality,
+                source,
+                observed_at_ms: t_ms,
+                confidence: confidence.clamp(0.0, 1.0),
+            });
+        point_id
+    }
+
+    fn upsert_cluster(
+        &mut self,
+        modality: Modality,
+        cluster_key: String,
+        point_id: String,
+        confidence: f32,
+    ) -> String {
+        let cluster_id = format!(
+            "cluster:{}:{}",
+            modality.as_str(),
+            stable_slug(&cluster_key)
+        );
+        if let Some(cluster) = self
+            .constellation
+            .modality_clusters
+            .iter_mut()
+            .find(|cluster| cluster.id == cluster_id)
+        {
+            if !cluster.observation_point_ids.contains(&point_id) {
+                cluster.observation_point_ids.push(point_id);
+            }
+            cluster.evidence_count = cluster.evidence_count.saturating_add(1);
+            cluster.confidence =
+                (cluster.confidence * 0.7 + confidence.clamp(0.0, 1.0) * 0.3).clamp(0.0, 1.0);
+        } else {
+            self.constellation.modality_clusters.push(ModalityCluster {
+                id: cluster_id.clone(),
+                modality,
+                observation_point_ids: vec![point_id],
+                evidence_count: 1,
+                confidence: confidence.clamp(0.0, 1.0),
+            });
+        }
+        cluster_id
+    }
+
+    fn bind_with_object_cluster(
+        &mut self,
+        cluster_id: String,
+        relation: BindingRelation,
+        confidence: f32,
+        t_ms: u64,
+    ) {
+        let Some(object_cluster_id) = self
+            .constellation
+            .modality_clusters
+            .iter()
+            .find(|cluster| cluster.id.starts_with("cluster:vision:object"))
+            .map(|cluster| cluster.id.clone())
+        else {
+            return;
+        };
+        if object_cluster_id == cluster_id {
+            return;
+        }
+        let (left_cluster_id, right_cluster_id) = if object_cluster_id <= cluster_id {
+            (object_cluster_id, cluster_id)
+        } else {
+            (cluster_id, object_cluster_id)
+        };
+        if let Some(edge) = self.constellation.binding_edges.iter_mut().find(|edge| {
+            edge.left_cluster_id == left_cluster_id
+                && edge.right_cluster_id == right_cluster_id
+                && edge.relation == relation
+        }) {
+            edge.strengthen(confidence, t_ms);
+        } else {
+            let mut edge = BindingEdge {
+                left_cluster_id,
+                right_cluster_id,
+                relation,
+                confidence: 0.1,
+                evidence_count: 0,
+                decay_per_tick: 0.01,
+                last_seen_ms: t_ms,
+            };
+            edge.strengthen(confidence, t_ms);
+            self.constellation.binding_edges.push(edge);
+        }
+        self.constellation.state = if self
+            .constellation
+            .binding_edges
+            .iter()
+            .any(BindingEdge::is_strong)
+        {
+            EntityConstellationState::Strong
+        } else {
+            EntityConstellationState::Weak
+        };
+    }
+
+    fn decay_bindings(&mut self, decay_factor: f32) {
+        for edge in &mut self.constellation.binding_edges {
+            edge.weaken(decay_factor * edge.decay_per_tick.max(0.01));
+        }
+        self.constellation.state = if self
+            .constellation
+            .binding_edges
+            .iter()
+            .any(BindingEdge::is_strong)
+        {
+            EntityConstellationState::Strong
+        } else {
+            EntityConstellationState::Weak
+        };
     }
 }
 
@@ -1153,6 +1468,76 @@ impl EntityMemory {
                 }
             }
         }
+
+        let text_labels = now
+            .ear
+            .transcript
+            .as_ref()
+            .into_iter()
+            .chain(now.ear.asr.transcript.as_ref())
+            .map(|text| text.trim())
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !text_labels.is_empty() {
+            let active_ids = self
+                .entities
+                .values()
+                .filter(|entity| entity.lifecycle == EntityLifecycleState::Active)
+                .map(|entity| entity.id.clone())
+                .collect::<Vec<_>>();
+            for id in active_ids {
+                if let Some(entity) = self.entities.get_mut(&id) {
+                    for text in &text_labels {
+                        entity.add_text_label(text.clone(), 0.6, now.t_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn observe_frame(&mut self, frame: &ExperienceFrame, cell_key: Option<PlaceCellKey>) {
+        self.observe_now(&frame.now, cell_key);
+        if self.entities.is_empty() {
+            return;
+        }
+        let active_ids = self
+            .entities
+            .values()
+            .filter(|entity| entity.lifecycle == EntityLifecycleState::Active)
+            .map(|entity| entity.id.clone())
+            .collect::<Vec<_>>();
+        for entity_id in active_ids {
+            if let Some(entity) = self.entities.get_mut(&entity_id) {
+                for experience in &frame.experiences {
+                    let point = entity.push_observation_point(
+                        Modality::Memory,
+                        format!("experience:{}", experience.id),
+                        experience.salience,
+                        frame.t_ms,
+                    );
+                    let cluster = entity.upsert_cluster(
+                        Modality::Memory,
+                        format!("experience:{}", experience.id),
+                        point,
+                        experience.salience,
+                    );
+                    entity.bind_with_object_cluster(
+                        cluster,
+                        BindingRelation::PredictsSameFutureEvents,
+                        experience.salience,
+                        frame.t_ms,
+                    );
+                }
+                for impression in &frame.impressions {
+                    entity.add_text_label(
+                        impression.text.clone(),
+                        impression.confidence,
+                        frame.t_ms,
+                    );
+                }
+            }
+        }
     }
 
     /// Decay confidence of all entities.  Entities whose confidence falls
@@ -1171,7 +1556,53 @@ impl EntityMemory {
             } else {
                 EntityLifecycleState::Active
             };
+            if entity.lifecycle == EntityLifecycleState::Vanished {
+                entity.constellation.state = EntityConstellationState::Vanished;
+            }
+            entity.decay_bindings((1.0 - factor).clamp(0.0, 1.0));
         }
+    }
+
+    pub fn merge_entities(&mut self, primary_id: &str, secondary_id: &str) -> bool {
+        if primary_id == secondary_id {
+            return false;
+        }
+        let Some(mut secondary) = self.entities.remove(secondary_id) else {
+            return false;
+        };
+        let Some(primary) = self.entities.get_mut(primary_id) else {
+            self.entities.insert(secondary_id.to_string(), secondary);
+            return false;
+        };
+        primary.observation_count = primary
+            .observation_count
+            .saturating_add(secondary.observation_count);
+        primary.confidence = primary.confidence.max(secondary.confidence);
+        for label in secondary.labels.drain(..) {
+            if !primary.labels.contains(&label) {
+                primary.labels.push(label);
+            }
+        }
+        primary
+            .constellation
+            .merged_entity_ids
+            .push(secondary_id.to_string());
+        primary.constellation.state = EntityConstellationState::Merged;
+        true
+    }
+
+    pub fn split_entity(&mut self, entity_id: &str, suffix: &str) -> Option<String> {
+        let mut child = self.entities.get(entity_id)?.clone();
+        let child_id = format!("{entity_id}:split:{}", stable_slug(suffix));
+        child.id = child_id.clone();
+        child.confidence = (child.confidence * 0.6).clamp(0.0, 1.0);
+        child.constellation.state = EntityConstellationState::Split;
+        if let Some(parent) = self.entities.get_mut(entity_id) {
+            parent.constellation.split_entity_ids.push(child_id.clone());
+            parent.constellation.state = EntityConstellationState::Split;
+        }
+        self.entities.insert(child_id.clone(), child);
+        Some(child_id)
     }
 
     /// Build a summary report for dashboard/API consumption.
@@ -1201,12 +1632,17 @@ impl EntityMemory {
                 EntityLifecycleState::Occluded => 1,
                 EntityLifecycleState::Vanished => 2,
             };
-            state_order(a)
-                .cmp(&state_order(b))
-                .then_with(|| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+            state_order(a).cmp(&state_order(b)).then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
         sorted.truncate(20);
-        let top_entities = sorted.iter().map(|e| EntityHypothesisSummary::from(*e)).collect();
+        let top_entities = sorted
+            .iter()
+            .map(|e| EntityHypothesisSummary::from(*e))
+            .collect();
 
         EntityMemoryReport {
             total_entities,
@@ -1701,10 +2137,7 @@ impl Recall for InMemoryExperienceStore {
     async fn observe_frame(&self, frame: &ExperienceFrame) -> Result<()> {
         let cell_key = {
             let places = self.places.lock().expect("place memory mutex poisoned");
-            Some(places.quantize(
-                frame.now.body.odometry.x_m,
-                frame.now.body.odometry.y_m,
-            ))
+            Some(places.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m))
         };
         self.places
             .lock()
@@ -1713,7 +2146,7 @@ impl Recall for InMemoryExperienceStore {
         self.entities
             .lock()
             .expect("entity memory mutex poisoned")
-            .observe_now(&frame.now, cell_key);
+            .observe_frame(frame, cell_key);
         Ok(())
     }
 
@@ -5149,31 +5582,29 @@ mod tests {
         // Query from a different cell (5.0, 1.0) with the same entities -> strong overlap
         let current_key_different = Some(memory.quantize(5.0, 1.0));
         let strong_labels = vec!["chair".to_string(), "desk".to_string()];
-        let candidates = memory.recognize_entity_constellations(
-            current_key_different,
-            &strong_labels,
-            0.0,
-            5,
-        );
+        let candidates =
+            memory.recognize_entity_constellations(current_key_different, &strong_labels, 0.0, 5);
 
         assert_eq!(candidates.len(), 1, "should find the overlapping cell");
         assert!(matches!(
             candidates[0].kind,
             PlaceRecognitionKind::EntityConstellation
         ));
-        assert!((candidates[0].similarity - 1.0).abs() < 0.001, "full overlap");
+        assert!(
+            (candidates[0].similarity - 1.0).abs() < 0.001,
+            "full overlap"
+        );
         assert!(candidates[0].confidence > 0.0);
         assert!(candidates[0].reason.contains("entity overlap"));
 
         // Query from a different cell with no shared entities -> no candidates
         let weak_labels = vec!["robot".to_string(), "unknown_label".to_string()];
-        let no_candidates = memory.recognize_entity_constellations(
-            current_key_different,
-            &weak_labels,
-            0.0,
-            5,
+        let no_candidates =
+            memory.recognize_entity_constellations(current_key_different, &weak_labels, 0.0, 5);
+        assert!(
+            no_candidates.is_empty(),
+            "no shared entities means no candidates"
         );
-        assert!(no_candidates.is_empty(), "no shared entities means no candidates");
 
         // Empty labels -> no candidates
         let empty = memory.recognize_entity_constellations(current_key_different, &[], 0.0, 5);
@@ -5198,8 +5629,7 @@ mod tests {
         let labels = vec!["lamp".to_string()];
 
         // Should not return self-match
-        let self_candidates =
-            memory.recognize_entity_constellations(current_key, &labels, 0.0, 5);
+        let self_candidates = memory.recognize_entity_constellations(current_key, &labels, 0.0, 5);
         assert!(
             self_candidates.is_empty(),
             "should not return the current cell as a loop candidate"
@@ -5207,8 +5637,7 @@ mod tests {
 
         // High confidence gate filters low-overlap candidates
         let different_key = Some(memory.quantize(10.0, 10.0));
-        let high_gate =
-            memory.recognize_entity_constellations(different_key, &labels, 0.99, 5);
+        let high_gate = memory.recognize_entity_constellations(different_key, &labels, 0.99, 5);
         assert!(
             high_gate.is_empty(),
             "low confidence candidate should be filtered by high gate"
@@ -5217,7 +5646,11 @@ mod tests {
 
     // ── EntityMemory tests ───────────────────────────────────────────────────
 
-    fn make_object_observation(label: &str, class: ObjectClass, confidence: f32) -> ObjectObservation {
+    fn make_object_observation(
+        label: &str,
+        class: ObjectClass,
+        confidence: f32,
+    ) -> ObjectObservation {
         ObjectObservation {
             label: label.to_string(),
             class,
@@ -5233,14 +5666,22 @@ mod tests {
         let mut memory = EntityMemory::new();
 
         let mut now1 = now_at(100, 1.0, 1.0);
-        now1.objects.observations.push(make_object_observation("chair", ObjectClass::Unknown, 0.8));
+        now1.objects
+            .observations
+            .push(make_object_observation("chair", ObjectClass::Unknown, 0.8));
         memory.observe_now(&now1, Some(PlaceCellKey { x: 2, y: 2 }));
 
         let mut now2 = now_at(200, 1.0, 1.0);
-        now2.objects.observations.push(make_object_observation("chair", ObjectClass::Unknown, 0.7));
+        now2.objects
+            .observations
+            .push(make_object_observation("chair", ObjectClass::Unknown, 0.7));
         memory.observe_now(&now2, Some(PlaceCellKey { x: 2, y: 2 }));
 
-        assert_eq!(memory.entities.len(), 1, "repeated observation must merge, not duplicate");
+        assert_eq!(
+            memory.entities.len(),
+            1,
+            "repeated observation must merge, not duplicate"
+        );
         let entity = memory.entities.values().next().unwrap();
         assert_eq!(entity.observation_count, 2);
         assert_eq!(entity.first_seen_ms, 100);
@@ -5252,12 +5693,16 @@ mod tests {
         let mut memory = EntityMemory::new();
 
         let mut now1 = now_at(100, 1.0, 1.0);
-        now1.objects.observations.push(make_object_observation("desk", ObjectClass::Unknown, 0.5));
+        now1.objects
+            .observations
+            .push(make_object_observation("desk", ObjectClass::Unknown, 0.5));
         memory.observe_now(&now1, None);
         let confidence_after_first = memory.entities.values().next().unwrap().confidence;
 
         let mut now2 = now_at(200, 1.0, 1.0);
-        now2.objects.observations.push(make_object_observation("desk", ObjectClass::Unknown, 0.9));
+        now2.objects
+            .observations
+            .push(make_object_observation("desk", ObjectClass::Unknown, 0.9));
         memory.observe_now(&now2, None);
         let confidence_after_second = memory.entities.values().next().unwrap().confidence;
 
@@ -5272,7 +5717,9 @@ mod tests {
         let mut memory = EntityMemory::new();
 
         let mut now1 = now_at(100, 0.0, 0.0);
-        now1.objects.observations.push(make_object_observation("cup", ObjectClass::Unknown, 0.6));
+        now1.objects
+            .observations
+            .push(make_object_observation("cup", ObjectClass::Unknown, 0.6));
         memory.observe_now(&now1, None);
 
         // Simulate many decay ticks by calling observe_now with no objects and a large time gap
@@ -5293,12 +5740,16 @@ mod tests {
 
         // Active entity
         let mut now1 = now_at(100, 0.0, 0.0);
-        now1.objects.observations.push(make_object_observation("sofa", ObjectClass::Unknown, 0.9));
+        now1.objects
+            .observations
+            .push(make_object_observation("sofa", ObjectClass::Unknown, 0.9));
         memory.observe_now(&now1, None);
 
         // A second entity that will go stale
         let mut now2 = now_at(200, 5.0, 5.0);
-        now2.objects.observations.push(make_object_observation("lamp", ObjectClass::Unknown, 0.6));
+        now2.objects
+            .observations
+            .push(make_object_observation("lamp", ObjectClass::Unknown, 0.6));
         memory.observe_now(&now2, None);
 
         // Age both entities hard
@@ -5307,7 +5758,10 @@ mod tests {
 
         let report = memory.report();
         assert_eq!(report.total_entities, 2);
-        assert!(report.active_entities < 2, "both should have decayed away from Active");
+        assert!(
+            report.active_entities < 2,
+            "both should have decayed away from Active"
+        );
     }
 
     #[test]
@@ -5317,16 +5771,30 @@ mod tests {
         let cell_b = PlaceCellKey { x: 7, y: 8 };
 
         let mut now1 = now_at(100, 0.0, 0.0);
-        now1.objects.observations.push(make_object_observation("robot", ObjectClass::Obstacle, 0.85));
+        now1.objects.observations.push(make_object_observation(
+            "robot",
+            ObjectClass::Obstacle,
+            0.85,
+        ));
         memory.observe_now(&now1, Some(cell_a));
 
         let mut now2 = now_at(200, 3.5, 4.0);
-        now2.objects.observations.push(make_object_observation("robot", ObjectClass::Obstacle, 0.8));
+        now2.objects.observations.push(make_object_observation(
+            "robot",
+            ObjectClass::Obstacle,
+            0.8,
+        ));
         memory.observe_now(&now2, Some(cell_b));
 
         let entity = memory.entities.values().next().unwrap();
-        assert!(entity.location_cells.contains(&cell_a), "first observed cell must be linked");
-        assert!(entity.location_cells.contains(&cell_b), "second observed cell must be linked");
+        assert!(
+            entity.location_cells.contains(&cell_a),
+            "first observed cell must be linked"
+        );
+        assert!(
+            entity.location_cells.contains(&cell_b),
+            "second observed cell must be linked"
+        );
     }
 
     #[test]
@@ -5334,7 +5802,9 @@ mod tests {
         let mut memory = EntityMemory::new();
 
         let mut now1 = now_at(100, 0.0, 0.0);
-        now1.objects.observations.push(make_object_observation("box", ObjectClass::Unknown, 0.7));
+        now1.objects
+            .observations
+            .push(make_object_observation("box", ObjectClass::Unknown, 0.7));
         memory.observe_now(&now1, None);
 
         // Age it into Occluded/Vanished
@@ -5344,10 +5814,149 @@ mod tests {
 
         // Re-observe
         let mut now3 = now_at(600_000, 0.0, 0.0);
-        now3.objects.observations.push(make_object_observation("box", ObjectClass::Unknown, 0.8));
+        now3.objects
+            .observations
+            .push(make_object_observation("box", ObjectClass::Unknown, 0.8));
         memory.observe_now(&now3, None);
 
         let entity = memory.entities.values().next().unwrap();
-        assert_eq!(entity.lifecycle, EntityLifecycleState::Active, "entity should revive to Active on re-sighting; was {lifecycle_before:?}");
+        assert_eq!(
+            entity.lifecycle,
+            EntityLifecycleState::Active,
+            "entity should revive to Active on re-sighting; was {lifecycle_before:?}"
+        );
+    }
+
+    #[test]
+    fn entity_constellation_strengthens_with_cross_modal_repetition() {
+        let mut memory = EntityMemory::new();
+        let mut now1 = now_at(100, 0.0, 0.0);
+        now1.objects
+            .observations
+            .push(make_object_observation("pete", ObjectClass::Person, 0.8));
+        now1.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-pete",
+            vec![1.0, 0.0],
+        ));
+        now1.voice.vectors.push(VectorArtifact::new(
+            VOICE_VECTOR_COLLECTION,
+            "voice-pete",
+            vec![1.0, 0.0],
+        ));
+        memory.observe_now(&now1, None);
+
+        let entity_id = "entity:person:pete";
+        let first_edge_evidence = memory
+            .entities
+            .get(entity_id)
+            .and_then(|entity| entity.constellation.binding_edges.first())
+            .map(|edge| (edge.evidence_count, edge.confidence))
+            .expect("binding edge on first multimodal observation");
+
+        let mut now2 = now_at(200, 0.1, 0.0);
+        now2.objects
+            .observations
+            .push(make_object_observation("pete", ObjectClass::Person, 0.9));
+        now2.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-pete",
+            vec![1.0, 0.0],
+        ));
+        now2.voice.vectors.push(VectorArtifact::new(
+            VOICE_VECTOR_COLLECTION,
+            "voice-pete",
+            vec![1.0, 0.0],
+        ));
+        memory.observe_now(&now2, None);
+
+        let entity = memory.entities.get(entity_id).expect("person entity");
+        assert!(
+            entity.constellation.binding_edges.iter().any(|edge| {
+                edge.evidence_count > first_edge_evidence.0
+                    && edge.confidence > first_edge_evidence.1
+            }),
+            "repeated co-occurrence should strengthen at least one binding edge"
+        );
+    }
+
+    #[test]
+    fn entity_constellation_attaches_provisional_text_labels() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects.observations.push(make_object_observation(
+            "person-nearby",
+            ObjectClass::Person,
+            0.8,
+        ));
+        now.ear.transcript = Some("Travis".to_string());
+        memory.observe_now(&now, None);
+
+        let entity = memory
+            .entities
+            .get("entity:person:person-nearby")
+            .expect("person entity");
+        assert!(entity
+            .modality_support
+            .text_labels
+            .contains(&"Travis".to_string()));
+        assert_eq!(
+            entity.display_name.as_deref(),
+            Some("person-nearby"),
+            "text remains provisional and does not override sensory label"
+        );
+        assert!(
+            entity
+                .constellation
+                .binding_edges
+                .iter()
+                .any(|edge| edge.relation == BindingRelation::NamedBy),
+            "named_by edge should connect text cluster to the entity constellation"
+        );
+    }
+
+    #[test]
+    fn entity_constellation_supports_experience_binding_and_merge_split_states() {
+        let mut memory = EntityMemory::new();
+        let mut frame = empty_frame(now_at(100, 1.0, 1.0));
+        frame.now.objects.observations.push(make_object_observation(
+            "charger",
+            ObjectClass::Charger,
+            0.9,
+        ));
+        let sensation_id = uuid::Uuid::new_v4();
+        let mut experience = Experience::new(
+            "embodied.place",
+            "charger alcove",
+            Vec::new(),
+            vec![sensation_id],
+            90,
+            100,
+        );
+        experience.salience = 0.9;
+        frame.experiences.push(experience);
+        frame.impressions.push(
+            Impression::new("memory.impression", "charger", Vec::new(), 90, 100)
+                .with_confidence(0.8),
+        );
+        memory.observe_frame(&frame, Some(PlaceCellKey { x: 2, y: 2 }));
+
+        let entity_id = "entity:charger:charger".to_string();
+        let entity = memory.entities.get(&entity_id).expect("charger entity");
+        assert!(
+            entity
+                .constellation
+                .modality_clusters
+                .iter()
+                .any(|cluster| cluster.modality == Modality::Memory),
+            "experience-level memory clusters should bind into the entity constellation"
+        );
+
+        let split_id = memory
+            .split_entity(&entity_id, "left")
+            .expect("split child id");
+        assert!(memory.merge_entities(&entity_id, &split_id));
+        let merged = memory.entities.get(&entity_id).expect("merged entity");
+        assert_eq!(merged.constellation.state, EntityConstellationState::Merged);
     }
 }
