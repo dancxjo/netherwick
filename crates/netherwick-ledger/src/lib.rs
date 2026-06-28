@@ -8,8 +8,8 @@ use netherwick_actions::{ActionPrimitive, ReignInput, ReignOutcome};
 use netherwick_behaviors::ErasedBehaviorRunRecord;
 use netherwick_core::Reward;
 use netherwick_experience::{
-    EmbodiedContext, Experience, ExperienceLatent, FutureInput, FuturePrediction, Impression,
-    RecalledExperience, Sensation,
+    EmbodiedContext, Experience, ExperienceInstant, ExperienceLatent, FutureInput,
+    FuturePrediction, Impression, RecalledExperience, Sensation,
 };
 use netherwick_llm::{ConsciousCommand, CounterfactualAction, LlmTeaching};
 use netherwick_now::{Now, RecallHit, SurpriseSense};
@@ -124,6 +124,20 @@ impl ExperienceFrame {
             &self.impressions,
             &self.predicted_futures,
             &self.recollections,
+        )
+    }
+
+    pub fn experience_instant(&self) -> ExperienceInstant {
+        ExperienceInstant::from_parts(
+            self.experiences.last(),
+            &self.sensations,
+            &self.impressions,
+            &self.predicted_futures,
+            &self.recollections,
+            &self.now,
+            self.chosen_action.clone(),
+            Some(self.id.to_string()),
+            "ledger-frame",
         )
     }
 

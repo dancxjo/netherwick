@@ -1,6 +1,6 @@
-# WebXR Sensorium Viewer
+# WebXR Instant Viewer
 
-Netherwick serves a browser sensorium for live sessions at `/view/3d`. The existing 2D page at `/view` remains available.
+Netherwick serves a browser Instant viewer for live embodied sessions at `/view/3d`. The existing 2D page at `/view` remains available.
 
 ## Start The Live Server
 
@@ -29,7 +29,7 @@ See [go-virtual.md](go-virtual.md) for certificate and headset setup.
 Open:
 
 - `http://127.0.0.1:8787/view` for the original 2D panel.
-- `http://127.0.0.1:8787/view/3d` for the 3D sensorium.
+- `http://127.0.0.1:8787/view/3d` for the 3D Instant view.
 - `http://127.0.0.1:8787/view/scene` for the compact scene JSON packet.
 
 ## WebXR Mode

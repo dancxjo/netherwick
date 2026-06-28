@@ -1396,6 +1396,9 @@ pub struct EmbodiedPipelineCoverageReport {
     pub schema_version: u32,
     pub fixture: String,
     pub frame_count: usize,
+    pub instant_count: usize,
+    pub instant_teacher_vector_count: usize,
+    pub instant_missing_modality_count: usize,
     pub primary_sensation_count: usize,
     pub descendant_sensation_count: usize,
     pub vectorized_sensation_count: usize,
@@ -1725,6 +1728,10 @@ fn coverage_report_from_frames(
     let mut modalities = BTreeSet::new();
     for frame in frames {
         let context = frame.embodied_context();
+        let instant = frame.experience_instant();
+        report.instant_count += 1;
+        report.instant_teacher_vector_count += instant.teacher_vectors.len();
+        report.instant_missing_modality_count += instant.missing_modalities.len();
         report.primary_sensation_count += frame
             .sensations
             .iter()
@@ -1805,6 +1812,12 @@ fn merge_vector_coverage(target: &mut EmbodiedVectorCoverage, incoming: Embodied
 }
 
 fn evaluate_required_embodied_coverage(report: &mut EmbodiedPipelineCoverageReport) {
+    required_stage(report.instant_count, "no instants", &mut report.failures);
+    required_stage(
+        report.instant_teacher_vector_count,
+        "no instant teacher vectors",
+        &mut report.failures,
+    );
     required_stage(
         report.primary_sensation_count,
         "no primary sensations",
@@ -3357,6 +3370,9 @@ mod tests {
 
         assert!(report.passed(), "{:?}", report.failures);
         assert_eq!(report.frame_count, 2);
+        assert_eq!(report.instant_count, 2);
+        assert!(report.instant_teacher_vector_count > 0);
+        assert!(report.instant_missing_modality_count > 0);
         assert!(report.primary_sensation_count > 0);
         assert!(report.descendant_sensation_count > 0);
         assert!(report.vectorized_sensation_count > 0);

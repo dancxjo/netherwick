@@ -78,6 +78,9 @@ Example JSON shape:
   "schema_version": 1,
   "fixture": "deterministic",
   "frame_count": 2,
+  "instant_count": 2,
+  "instant_teacher_vector_count": 24,
+  "instant_missing_modality_count": 4,
   "primary_sensation_count": 15,
   "descendant_sensation_count": 8,
   "vectorized_sensation_count": 21,
@@ -98,6 +101,9 @@ Example JSON shape:
 Metric meanings:
 
 - `frame_count`: frames persisted or evaluated in the deterministic replay.
+- `instant_count`: canonical `ExperienceInstant` records assembled from the evaluated frames.
+- `instant_teacher_vector_count`: teacher/modality vectors available inside those Instants.
+- `instant_missing_modality_count`: explicit missing modality records across Instants.
 - `primary_sensation_count`: direct sensor/body/memory sensations created from `Now`.
 - `descendant_sensation_count`: derived sensations such as visual crops and audio transcript spans.
 - `vectorized_sensation_count`: sensations carrying vector metadata with model id, dimension, purpose, and collection.

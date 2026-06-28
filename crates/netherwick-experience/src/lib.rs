@@ -2698,6 +2698,41 @@ mod tests {
         assert_eq!(target.ear_features.len(), 16);
     }
 
+    #[tokio::test]
+    async fn live_now_builds_canonical_experience_instant_with_missingness() {
+        let mut now = Now::blank(42, BodySense::default());
+        now.range.nearest_m = Some(0.8);
+        now.range.beams = vec![0.8, 1.2, 1.6];
+        now.kinect.depth_m = vec![0.7, 1.1, 1.5];
+        now.kinect.depth_width = 3;
+        now.kinect.depth_height = 1;
+        now.ear.asr = AsrSense {
+            transcript: Some("hello pete".to_string()),
+            confidence: 0.8,
+            ..AsrSense::default()
+        };
+
+        let instant = ExperienceInstant::from_now(&now, Some(ActionPrimitive::Stop))
+            .await
+            .unwrap();
+        let input = ExperienceEncodeInput::from_instant(&instant);
+
+        assert_eq!(instant.schema_version, 1);
+        assert!(instant.primary_sensations.len() > 0);
+        assert!(instant.descendant_sensations.len() > 0);
+        assert!(instant.teacher_vectors.len() > 0);
+        assert!(instant.lineage.len() > 0);
+        assert!(instant
+            .missing_modalities
+            .iter()
+            .any(|missing| missing.modality == Modality::Vision));
+        assert_eq!(
+            instant.modality_mask().len(),
+            expected_instant_modalities().len()
+        );
+        assert!(!input.flat_features().is_empty());
+    }
+
     #[test]
     fn prediction_inputs_can_be_built_from_fused_experience_vector() {
         let source_sensation_id = Uuid::new_v4();
@@ -4607,6 +4642,69 @@ pub struct EmbodiedContext {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceInstant {
+    pub schema_version: u32,
+    pub t_ms: TimeMs,
+    pub window_start_ms: TimeMs,
+    pub window_end_ms: TimeMs,
+    pub experience_id: Option<ExperienceId>,
+    pub summary: String,
+    pub primary_sensations: Vec<EmbodiedSensationRef>,
+    pub descendant_sensations: Vec<EmbodiedSensationRef>,
+    pub impressions: Vec<EmbodiedImpressionRef>,
+    pub summary_impression: Option<EmbodiedImpressionRef>,
+    pub teacher_vectors: Vec<InstantTeacherVector>,
+    pub fused_vector: Option<InstantTeacherVector>,
+    pub body_context: InstantBodyContext,
+    pub action_context: InstantActionContext,
+    pub lineage: Vec<EmbodiedLineageEdge>,
+    pub provenance: InstantProvenance,
+    pub missing_modalities: Vec<MissingModality>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InstantTeacherVector {
+    pub vector: Vec<f32>,
+    pub metadata: EmbodiedVectorRef,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstantBodyContext {
+    pub battery_level: f32,
+    pub charging: bool,
+    pub bump: bool,
+    pub cliff: bool,
+    pub wheel_drop: bool,
+    pub wall: bool,
+    pub x_m: f32,
+    pub y_m: f32,
+    pub heading_rad: f32,
+    pub forward_m_s: f32,
+    pub turn_rad_s: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstantActionContext {
+    pub action: Option<ActionPrimitive>,
+    pub action_features: Vec<f32>,
+    pub source: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstantProvenance {
+    pub source: String,
+    pub source_frame_id: Option<String>,
+    pub sensation_count: usize,
+    pub impression_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingModality {
+    pub modality: Modality,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbodiedSensationRef {
     pub id: SensationId,
     pub parent_id: Option<SensationId>,
@@ -4848,6 +4946,274 @@ impl EmbodiedContext {
             predictions,
             memory_links,
         }
+    }
+}
+
+impl ExperienceInstant {
+    pub async fn from_now(now: &Now, action: Option<ActionPrimitive>) -> Result<Self> {
+        let embodied = embody_now(now).await?;
+        Ok(Self::from_embodied_now(
+            &embodied, now, action, None, "live-now",
+        ))
+    }
+
+    pub fn from_embodied_now(
+        embodied: &EmbodiedNow,
+        now: &Now,
+        action: Option<ActionPrimitive>,
+        source_frame_id: Option<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self::from_parts(
+            Some(&embodied.experience),
+            &embodied.sensations,
+            &embodied.impressions,
+            &[],
+            &[],
+            now,
+            action,
+            source_frame_id,
+            source,
+        )
+    }
+
+    pub fn from_parts(
+        experience: Option<&Experience>,
+        sensations: &[Sensation],
+        impressions: &[Impression],
+        futures: &[FuturePrediction],
+        recollections: &[RecalledExperience],
+        now: &Now,
+        action: Option<ActionPrimitive>,
+        source_frame_id: Option<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        let context = EmbodiedContext::from_current_experience(
+            experience,
+            sensations,
+            impressions,
+            futures,
+            recollections,
+        );
+        let primary_sensations = context
+            .sensations
+            .iter()
+            .filter(|sensation| sensation.parent_id.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let descendant_sensations = context
+            .sensations
+            .iter()
+            .filter(|sensation| sensation.parent_id.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let scoped_sensation_ids = context
+            .sensations
+            .iter()
+            .map(|sensation| sensation.id)
+            .collect::<BTreeSet<_>>();
+        let scoped_impression_ids = context
+            .impressions
+            .iter()
+            .map(|impression| impression.id)
+            .collect::<BTreeSet<_>>();
+        let teacher_vectors = sensations
+            .iter()
+            .filter(|sensation| scoped_sensation_ids.contains(&sensation.id))
+            .filter_map(|sensation| sensation.vector.as_ref().map(instant_teacher_vector))
+            .chain(
+                impressions
+                    .iter()
+                    .filter(|impression| scoped_impression_ids.contains(&impression.id))
+                    .filter_map(|impression| {
+                        impression.vector.as_ref().map(instant_teacher_vector)
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let fused_vector = experience
+            .and_then(|experience| experience.fused_vector.as_ref())
+            .map(instant_teacher_vector);
+        let summary_impression = experience
+            .and_then(|experience| experience.summary_impression.as_ref())
+            .map(|impression| EmbodiedImpressionRef {
+                id: impression.id,
+                sensation_id: impression.sensation_id,
+                experience_id: impression.experience_id,
+                kind: impression.kind.clone(),
+                text: impression.text.clone(),
+                confidence: impression.confidence,
+                vector: impression.vector.as_ref().map(vector_ref),
+            });
+        let mut present_modalities = context
+            .sensations
+            .iter()
+            .map(|sensation| sensation.modality.clone())
+            .collect::<BTreeSet<_>>();
+        present_modalities.extend(
+            teacher_vectors
+                .iter()
+                .map(|vector| vector.metadata.modality.clone()),
+        );
+
+        Self {
+            schema_version: 1,
+            t_ms: now.t_ms,
+            window_start_ms: experience
+                .map(|experience| experience.window_start_ms)
+                .unwrap_or(now.t_ms),
+            window_end_ms: experience
+                .map(|experience| experience.window_end_ms)
+                .unwrap_or(now.t_ms),
+            experience_id: experience.map(|experience| experience.id),
+            summary: context.summary,
+            primary_sensations,
+            descendant_sensations,
+            impressions: context.impressions,
+            summary_impression,
+            teacher_vectors,
+            fused_vector,
+            body_context: InstantBodyContext::from_now(now),
+            action_context: InstantActionContext::from_action(action),
+            lineage: context.lineage,
+            provenance: InstantProvenance {
+                source: source.into(),
+                source_frame_id,
+                sensation_count: sensations.len(),
+                impression_count: impressions.len(),
+            },
+            missing_modalities: expected_instant_modalities()
+                .into_iter()
+                .filter(|modality| !present_modalities.contains(modality))
+                .map(|modality| MissingModality {
+                    modality,
+                    reason: "no sensation or teacher vector for modality in this Instant"
+                        .to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn encode_input(&self) -> ExperienceEncodeInput {
+        let mut sense_vectors = self
+            .teacher_vectors
+            .iter()
+            .map(|vector| {
+                vector
+                    .vector
+                    .iter()
+                    .copied()
+                    .map(sanitize_feature)
+                    .collect()
+            })
+            .collect::<Vec<Vec<f32>>>();
+        if let Some(vector) = &self.fused_vector {
+            sense_vectors.push(
+                vector
+                    .vector
+                    .iter()
+                    .copied()
+                    .map(sanitize_feature)
+                    .collect(),
+            );
+        }
+        sense_vectors.push(self.modality_mask());
+        sense_vectors.push(self.body_features());
+        sense_vectors.push(self.action_context.action_features.clone());
+        ExperienceEncodeInput { sense_vectors }
+    }
+
+    pub fn modality_mask(&self) -> Vec<f32> {
+        let missing = self
+            .missing_modalities
+            .iter()
+            .map(|missing| missing.modality.clone())
+            .collect::<BTreeSet<_>>();
+        expected_instant_modalities()
+            .into_iter()
+            .map(|modality| {
+                if missing.contains(&modality) {
+                    0.0
+                } else {
+                    1.0
+                }
+            })
+            .collect()
+    }
+
+    fn body_features(&self) -> Vec<f32> {
+        vec![
+            self.body_context.battery_level,
+            bool01(self.body_context.charging),
+            bool01(self.body_context.bump),
+            bool01(self.body_context.cliff),
+            bool01(self.body_context.wheel_drop),
+            bool01(self.body_context.wall),
+            self.body_context.x_m.tanh(),
+            self.body_context.y_m.tanh(),
+            self.body_context.heading_rad.sin(),
+            self.body_context.heading_rad.cos(),
+            self.body_context.forward_m_s.clamp(-1.0, 1.0),
+            self.body_context.turn_rad_s.clamp(-1.0, 1.0),
+        ]
+    }
+}
+
+impl ExperienceEncodeInput {
+    pub fn from_instant(instant: &ExperienceInstant) -> Self {
+        instant.encode_input()
+    }
+}
+
+impl InstantBodyContext {
+    pub fn from_now(now: &Now) -> Self {
+        Self {
+            battery_level: now.body.battery_level.clamp(0.0, 1.0),
+            charging: now.body.charging,
+            bump: now.body.flags.bump_left || now.body.flags.bump_right,
+            cliff: cliff_detected(now),
+            wheel_drop: now.body.flags.wheel_drop,
+            wall: now.body.flags.wall || now.body.flags.virtual_wall,
+            x_m: now.body.odometry.x_m,
+            y_m: now.body.odometry.y_m,
+            heading_rad: now.body.odometry.heading_rad,
+            forward_m_s: now.body.velocity.forward_m_s,
+            turn_rad_s: now.body.velocity.turn_rad_s,
+        }
+    }
+}
+
+impl InstantActionContext {
+    pub fn from_action(action: Option<ActionPrimitive>) -> Self {
+        Self {
+            action_features: action_features(action.as_ref()),
+            action,
+            source: Some("action_primitive".to_string()),
+        }
+    }
+}
+
+fn expected_instant_modalities() -> Vec<Modality> {
+    vec![
+        Modality::Vision,
+        Modality::Audio,
+        Modality::Depth,
+        Modality::Lidar,
+        Modality::Touch,
+        Modality::Odometry,
+        Modality::Memory,
+        Modality::Language,
+    ]
+}
+
+fn instant_teacher_vector(vector: &VectorEmbedding) -> InstantTeacherVector {
+    InstantTeacherVector {
+        vector: vector
+            .vector
+            .iter()
+            .copied()
+            .map(sanitize_feature)
+            .collect(),
+        metadata: vector_ref(vector),
     }
 }
 

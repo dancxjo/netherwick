@@ -7716,6 +7716,15 @@ async fn run_embodied_eval(args: EmbodiedEvalArgs) -> Result<()> {
     } else {
         println!("embodied eval fixture={}", report.fixture);
         println!("  frames: {}", report.frame_count);
+        println!("  instants: {}", report.instant_count);
+        println!(
+            "  instant teacher vectors: {}",
+            report.instant_teacher_vector_count
+        );
+        println!(
+            "  instant missing modalities: {}",
+            report.instant_missing_modality_count
+        );
         println!("  primary sensations: {}", report.primary_sensation_count);
         println!(
             "  descendant sensations: {}",

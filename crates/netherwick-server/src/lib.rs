@@ -5301,8 +5301,8 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 canvas{display:block}
 </style>
 <canvas id="scene"></canvas>
-<aside id="hud" data-window-title="Sensorium 3D">
-  <h1>Sensorium 3D</h1>
+<aside id="hud" data-window-title="Instant 3D">
+  <h1>Instant 3D</h1>
   <div id="status">connecting...</div>
   <dl>
     <dt>mode</dt><dd id="mode">-</dd>
@@ -8765,7 +8765,7 @@ mod tests {
         assert!(live_page.contains("graph_query"));
         assert!(live_page.contains("graph_modality"));
         let Html(page) = live_view_3d_page().await;
-        assert!(page.contains("Sensorium 3D"));
+        assert!(page.contains("Instant 3D"));
         assert!(page.contains("/view/snapshot"));
         assert!(page.contains("/models"));
         assert!(page.contains("Training stats"));
