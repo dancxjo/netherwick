@@ -32,10 +32,12 @@ netherwick-autonomic = { path = "../netherwick-autonomic" }
 netherwick-behaviors = { path = "../netherwick-behaviors" }
 netherwick-body = { path = "../netherwick-body" }
 netherwick-conductor = { path = "../netherwick-conductor" }
+netherwick-core = { path = "../netherwick-core" }
 netherwick-create1 = { path = "../netherwick-create1", features = ["serial"] }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-ledger = { path = "../netherwick-ledger" }
 netherwick-llm = { path = "../netherwick-llm" }
+netherwick-map = { path = "../netherwick-map" }
 netherwick-memory = { path = "../netherwick-memory" }
 netherwick-models = { path = "../netherwick-models" }
 netherwick-now = { path = "../netherwick-now" }
@@ -44,9 +46,6 @@ netherwick-server = { path = "../netherwick-server" }
 netherwick-sim = { path = "../netherwick-sim" }
 netherwick-training = { path = "../netherwick-training" }
 netherwick-worldlab = { path = "../netherwick-worldlab" }
-
-[dev-dependencies]
-netherwick-core = { path = "../netherwick-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netherwick-sensors = { path = "../netherwick-sensors", features = ["linux-hardware"] }

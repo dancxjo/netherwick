@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAP_EXTENSION_NAME: &str = "map.odometry";
 pub const MAP_LABEL: &str = "SLAM-lite / odometry map, not full SLAM";
+pub const POSE_GRAPH_LABEL: &str = "offline pose graph with odometry and gated loop candidates";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PoseEstimate {
@@ -91,6 +92,112 @@ pub struct MapObservationSummary {
     pub hit_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PoseNode {
+    pub id: String,
+    pub pose_estimate: PoseEstimate,
+    pub t_ms: TimeMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoseEdgeSource {
+    Odometry,
+    LoopClosureCandidate {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_frame_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_vector_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_vector_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PoseEdge {
+    pub from: String,
+    pub to: String,
+    pub transform: Pose2,
+    pub covariance: [f32; 3],
+    pub confidence: f32,
+    pub source: PoseEdgeSource,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PoseGraph {
+    pub nodes: Vec<PoseNode>,
+    pub edges: Vec<PoseEdge>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PoseGraphConfig {
+    pub min_node_distance_m: f32,
+    pub min_node_heading_delta_rad: f32,
+    pub max_ticks_between_nodes: u64,
+    pub min_loop_confidence: f32,
+    pub loop_target_max_distance_m: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoopClosureCandidateInput {
+    pub target_pose: Pose2,
+    pub confidence: f32,
+    pub similarity: f32,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_vector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_vector_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PoseGraphReport {
+    pub label: &'static str,
+    pub nodes: usize,
+    pub edges: usize,
+    pub odometry_edges: usize,
+    pub loop_candidate_edges: usize,
+    pub active_loop_candidate_edges: usize,
+    pub rejected_loop_candidates: usize,
+    pub confidence_distribution: ConfidenceDistribution,
+    pub rejected_candidates: Vec<PoseGraphRejectedCandidate>,
+    pub graph: PoseGraph,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConfidenceDistribution {
+    pub min: Option<f32>,
+    pub max: Option<f32>,
+    pub mean: Option<f32>,
+    pub buckets: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PoseGraphRejectedCandidate {
+    pub from: String,
+    pub to: String,
+    pub confidence: f32,
+    pub reason: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PoseGraphBuilder {
+    graph: PoseGraph,
+    config: PoseGraphConfig,
+    ticks_since_node: u64,
+}
+
 impl Default for MapConfig {
     fn default() -> Self {
         Self {
@@ -104,6 +211,234 @@ impl Default for MapConfig {
             decay_per_tick: 0.04,
             max_pose_history: 1_000,
             max_observations: 250,
+        }
+    }
+}
+
+impl Default for PoseGraphConfig {
+    fn default() -> Self {
+        Self {
+            min_node_distance_m: 0.25,
+            min_node_heading_delta_rad: 15.0_f32.to_radians(),
+            max_ticks_between_nodes: 10,
+            min_loop_confidence: 0.85,
+            loop_target_max_distance_m: 0.75,
+        }
+    }
+}
+
+impl PoseGraphBuilder {
+    pub fn new(config: PoseGraphConfig) -> Self {
+        assert!(
+            config.min_node_distance_m >= 0.0,
+            "node distance threshold cannot be negative"
+        );
+        assert!(
+            config.min_node_heading_delta_rad >= 0.0,
+            "heading threshold cannot be negative"
+        );
+        assert!(
+            (0.0..=1.0).contains(&config.min_loop_confidence),
+            "loop confidence gate must be between 0 and 1"
+        );
+        Self {
+            graph: PoseGraph::default(),
+            config,
+            ticks_since_node: 0,
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        pose: Pose2,
+        t_ms: TimeMs,
+        source_frame_id: Option<String>,
+        loop_candidates: &[LoopClosureCandidateInput],
+    ) {
+        self.ticks_since_node = self.ticks_since_node.saturating_add(1);
+        if self.should_add_node(pose) {
+            self.push_node(pose, t_ms, source_frame_id);
+        }
+
+        for candidate in loop_candidates {
+            self.add_loop_candidate(candidate);
+        }
+    }
+
+    pub fn finish(self) -> PoseGraph {
+        self.graph
+    }
+
+    pub fn finish_report(self) -> PoseGraphReport {
+        self.finish().report()
+    }
+
+    fn should_add_node(&self, pose: Pose2) -> bool {
+        let Some(last) = self.graph.nodes.last() else {
+            return true;
+        };
+        distance_m(last.pose_estimate.pose, pose) >= self.config.min_node_distance_m
+            || heading_delta_rad(last.pose_estimate.pose.heading_rad, pose.heading_rad)
+                >= self.config.min_node_heading_delta_rad
+            || self.ticks_since_node >= self.config.max_ticks_between_nodes.max(1)
+    }
+
+    fn push_node(&mut self, pose: Pose2, t_ms: TimeMs, source_frame_id: Option<String>) {
+        let id = format!("pose-{}", self.graph.nodes.len());
+        let previous = self.graph.nodes.last().cloned();
+        let node = PoseNode {
+            id: id.clone(),
+            pose_estimate: PoseEstimate {
+                pose,
+                confidence: 0.80,
+                covariance: [0.05, 0.05, 0.10],
+                source: "odometry".to_string(),
+                t_ms,
+            },
+            t_ms,
+            source_frame_id,
+        };
+        self.graph.nodes.push(node);
+        self.ticks_since_node = 0;
+
+        if let Some(previous) = previous {
+            self.graph.edges.push(PoseEdge {
+                from: previous.id,
+                to: id,
+                transform: pose_delta(previous.pose_estimate.pose, pose),
+                covariance: [0.08, 0.08, 0.15],
+                confidence: 0.80,
+                source: PoseEdgeSource::Odometry,
+                active: true,
+                rejection_reason: None,
+            });
+        }
+    }
+
+    fn add_loop_candidate(&mut self, candidate: &LoopClosureCandidateInput) {
+        let Some(current) = self.graph.nodes.last() else {
+            return;
+        };
+        let from = current.id.clone();
+        let source = PoseEdgeSource::LoopClosureCandidate {
+            kind: candidate.kind.clone(),
+            source_frame_id: candidate.source_frame_id.clone(),
+            source_vector_id: candidate.source_vector_id.clone(),
+            query_vector_id: candidate.query_vector_id.clone(),
+        };
+        let target = self.find_loop_target(candidate, &from);
+        let to = target
+            .as_ref()
+            .map(|node| node.id.clone())
+            .unwrap_or_else(|| "unresolved".to_string());
+        let transform = target
+            .as_ref()
+            .map(|node| pose_delta(current.pose_estimate.pose, node.pose_estimate.pose))
+            .unwrap_or_else(|| pose_delta(current.pose_estimate.pose, candidate.target_pose));
+
+        let rejection_reason = if candidate.confidence < self.config.min_loop_confidence {
+            Some(format!(
+                "confidence {:.3} below gate {:.3}",
+                candidate.confidence, self.config.min_loop_confidence
+            ))
+        } else if target.is_none() {
+            Some("no prior node close enough to candidate target".to_string())
+        } else {
+            None
+        };
+
+        self.graph.edges.push(PoseEdge {
+            from,
+            to,
+            transform,
+            covariance: loop_covariance(candidate.confidence),
+            confidence: candidate.confidence.clamp(0.0, 1.0),
+            source,
+            active: rejection_reason.is_none(),
+            rejection_reason,
+        });
+    }
+
+    fn find_loop_target(
+        &self,
+        candidate: &LoopClosureCandidateInput,
+        current_id: &str,
+    ) -> Option<&PoseNode> {
+        if let Some(target_frame_id) = candidate.target_frame_id.as_deref() {
+            if let Some(node) = self.graph.nodes.iter().find(|node| {
+                node.id != current_id && node.source_frame_id.as_deref() == Some(target_frame_id)
+            }) {
+                return Some(node);
+            }
+        }
+
+        self.graph
+            .nodes
+            .iter()
+            .filter(|node| node.id != current_id)
+            .filter_map(|node| {
+                let distance = distance_m(node.pose_estimate.pose, candidate.target_pose);
+                (distance <= self.config.loop_target_max_distance_m).then_some((distance, node))
+            })
+            .min_by(|left, right| {
+                left.0
+                    .partial_cmp(&right.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(_, node)| node)
+    }
+}
+
+impl Default for PoseGraphBuilder {
+    fn default() -> Self {
+        Self::new(PoseGraphConfig::default())
+    }
+}
+
+impl PoseGraph {
+    pub fn report(self) -> PoseGraphReport {
+        let odometry_edges = self
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge.source, PoseEdgeSource::Odometry))
+            .count();
+        let loop_edges: Vec<_> = self
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge.source, PoseEdgeSource::LoopClosureCandidate { .. }))
+            .collect();
+        let active_loop_candidate_edges = loop_edges.iter().filter(|edge| edge.active).count();
+        let rejected_candidates = loop_edges
+            .iter()
+            .filter_map(|edge| {
+                let reason = edge.rejection_reason.clone()?;
+                let kind = match &edge.source {
+                    PoseEdgeSource::LoopClosureCandidate { kind, .. } => kind.clone(),
+                    PoseEdgeSource::Odometry => "odometry".to_string(),
+                };
+                Some(PoseGraphRejectedCandidate {
+                    from: edge.from.clone(),
+                    to: edge.to.clone(),
+                    confidence: edge.confidence,
+                    reason,
+                    kind,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        PoseGraphReport {
+            label: POSE_GRAPH_LABEL,
+            nodes: self.nodes.len(),
+            edges: self.edges.len(),
+            odometry_edges,
+            loop_candidate_edges: loop_edges.len(),
+            active_loop_candidate_edges,
+            rejected_loop_candidates: rejected_candidates.len(),
+            confidence_distribution: confidence_distribution(
+                loop_edges.iter().map(|edge| edge.confidence),
+            ),
+            rejected_candidates,
+            graph: self,
         }
     }
 }
@@ -425,6 +760,74 @@ fn cap_vec<T>(items: &mut Vec<T>, max_len: usize) {
     }
 }
 
+fn pose_delta(from: Pose2, to: Pose2) -> Pose2 {
+    Pose2 {
+        x_m: to.x_m - from.x_m,
+        y_m: to.y_m - from.y_m,
+        heading_rad: normalize_angle(to.heading_rad - from.heading_rad),
+    }
+}
+
+fn distance_m(left: Pose2, right: Pose2) -> f32 {
+    ((right.x_m - left.x_m).powi(2) + (right.y_m - left.y_m).powi(2)).sqrt()
+}
+
+fn heading_delta_rad(left: f32, right: f32) -> f32 {
+    normalize_angle(right - left).abs()
+}
+
+fn normalize_angle(angle: f32) -> f32 {
+    let mut normalized = angle;
+    while normalized > std::f32::consts::PI {
+        normalized -= std::f32::consts::TAU;
+    }
+    while normalized < -std::f32::consts::PI {
+        normalized += std::f32::consts::TAU;
+    }
+    normalized
+}
+
+fn loop_covariance(confidence: f32) -> [f32; 3] {
+    let uncertainty = (1.0 - confidence.clamp(0.0, 1.0)).max(0.05);
+    [uncertainty * 0.20, uncertainty * 0.20, uncertainty * 0.35]
+}
+
+fn confidence_distribution(confidences: impl Iterator<Item = f32>) -> ConfidenceDistribution {
+    let mut values = Vec::new();
+    let mut buckets = BTreeMap::new();
+    for confidence in confidences {
+        let confidence = confidence.clamp(0.0, 1.0);
+        values.push(confidence);
+        let bucket = match confidence {
+            c if c < 0.50 => "0.00-0.49",
+            c if c < 0.70 => "0.50-0.69",
+            c if c < 0.85 => "0.70-0.84",
+            c if c < 0.95 => "0.85-0.94",
+            _ => "0.95-1.00",
+        };
+        *buckets.entry(bucket.to_string()).or_insert(0) += 1;
+    }
+
+    if values.is_empty() {
+        return ConfidenceDistribution {
+            min: None,
+            max: None,
+            mean: None,
+            buckets,
+        };
+    }
+
+    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    ConfidenceDistribution {
+        min: Some(min),
+        max: Some(max),
+        mean: Some(mean),
+        buckets,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +921,78 @@ mod tests {
         assert!(map.cells.len() > first_cells);
         assert_eq!(map.pose_history.len(), 2);
         assert_eq!(map.summary().label, MAP_LABEL);
+    }
+
+    #[test]
+    fn pose_graph_adds_nodes_by_motion_and_odometry_edges() {
+        let mut builder = PoseGraphBuilder::new(PoseGraphConfig {
+            min_node_distance_m: 0.5,
+            min_node_heading_delta_rad: 0.5,
+            max_ticks_between_nodes: 10,
+            ..PoseGraphConfig::default()
+        });
+        builder.observe(pose(0.0, 0.0, 0.0), 100, Some("frame-a".to_string()), &[]);
+        builder.observe(pose(0.2, 0.0, 0.0), 200, Some("frame-b".to_string()), &[]);
+        builder.observe(pose(0.6, 0.0, 0.0), 300, Some("frame-c".to_string()), &[]);
+
+        let graph = builder.finish();
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.edges.len(), 1);
+        assert!(matches!(graph.edges[0].source, PoseEdgeSource::Odometry));
+        assert_eq!(graph.edges[0].from, "pose-0");
+        assert_eq!(graph.edges[0].to, "pose-1");
+        assert!((graph.edges[0].transform.x_m - 0.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn pose_graph_gates_loop_candidates_and_reports_rejections() {
+        let mut builder = PoseGraphBuilder::new(PoseGraphConfig {
+            min_node_distance_m: 0.5,
+            min_loop_confidence: 0.85,
+            loop_target_max_distance_m: 0.5,
+            ..PoseGraphConfig::default()
+        });
+        builder.observe(pose(0.0, 0.0, 0.0), 100, Some("frame-a".to_string()), &[]);
+        builder.observe(pose(1.0, 0.0, 0.0), 200, Some("frame-b".to_string()), &[]);
+
+        let accepted = LoopClosureCandidateInput {
+            target_pose: pose(0.0, 0.0, 0.0),
+            confidence: 0.93,
+            similarity: 0.94,
+            kind: "same_place".to_string(),
+            target_frame_id: Some("frame-a".to_string()),
+            source_frame_id: Some("frame-a".to_string()),
+            source_vector_id: Some("scene-a".to_string()),
+            query_vector_id: Some("scene-b".to_string()),
+        };
+        let rejected = LoopClosureCandidateInput {
+            confidence: 0.60,
+            query_vector_id: Some("weak-scene".to_string()),
+            ..accepted.clone()
+        };
+        builder.observe(
+            pose(1.0, 0.0, 0.0),
+            300,
+            Some("frame-c".to_string()),
+            &[accepted, rejected],
+        );
+
+        let report = builder.finish_report();
+        assert_eq!(report.nodes, 2);
+        assert_eq!(report.odometry_edges, 1);
+        assert_eq!(report.loop_candidate_edges, 2);
+        assert_eq!(report.active_loop_candidate_edges, 1);
+        assert_eq!(report.rejected_loop_candidates, 1);
+        assert_eq!(report.confidence_distribution.buckets["0.85-0.94"], 1);
+        assert_eq!(report.confidence_distribution.buckets["0.50-0.69"], 1);
+        assert!(report.rejected_candidates[0].reason.contains("below gate"));
+    }
+
+    fn pose(x_m: f32, y_m: f32, heading_rad: f32) -> Pose2 {
+        Pose2 {
+            x_m,
+            y_m,
+            heading_rad,
+        }
     }
 }

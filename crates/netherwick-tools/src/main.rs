@@ -19,9 +19,12 @@ use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
 use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
+use netherwick_map::{
+    LoopClosureCandidateInput, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport,
+};
 use netherwick_memory::{
-    place_memory_report_from_frames, DurableExperienceStore, InMemoryExperienceStore,
-    PlaceMemoryReport,
+    place_memory_report_from_frames, DurableExperienceStore, InMemoryExperienceStore, PlaceMemory,
+    PlaceMemoryReport, PlaceRecognitionCandidate, PlaceRecognitionKind,
 };
 use netherwick_models::MODEL_REGISTRY;
 use netherwick_now::{EarSense, KinectSense, Now, RangeSense, SurpriseSense};
@@ -86,6 +89,7 @@ enum Command {
     Evaluate(EvaluateCommand),
     Promote(PromoteCommand),
     InspectLedger(InspectLedgerArgs),
+    PoseGraphReport(PoseGraphReportArgs),
     ModelRegister(ModelRegisterArgs),
     ModelStatus,
     ModelPromote(ModelPromoteArgs),
@@ -115,6 +119,7 @@ async fn main() -> Result<()> {
         Command::ReplayCapture(args) => replay_capture(args).await,
         Command::ReplayCounterfactual(args) => replay_counterfactual(args).await,
         Command::InspectLedger(args) => inspect_ledger(args).await,
+        Command::PoseGraphReport(args) => run_pose_graph_report(args).await,
         Command::Train(command) => run_train(command).await,
         Command::Evaluate(command) => run_evaluate(command).await,
         Command::Promote(command) => run_promote(command),
@@ -754,6 +759,26 @@ struct VirtualReportArgs {
     ledger: String,
     #[arg(long, default_value = "data/reports/virtual/latest.json")]
     out: String,
+}
+
+#[derive(Debug, Parser)]
+struct PoseGraphReportArgs {
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "NETHERWICK_LEDGER"
+    )]
+    ledger: String,
+    #[arg(long, default_value = "data/reports/pose-graph/latest.json")]
+    out: String,
+    #[arg(long, default_value_t = 0.25)]
+    min_node_distance_m: f32,
+    #[arg(long, default_value_t = 15.0)]
+    min_node_degrees: f32,
+    #[arg(long, default_value_t = 10)]
+    max_ticks_between_nodes: u64,
+    #[arg(long, default_value_t = 0.85)]
+    min_loop_confidence: f32,
 }
 
 #[derive(Debug, Parser)]
@@ -6467,6 +6492,85 @@ async fn run_virtual_report(args: VirtualReportArgs) -> Result<()> {
     fs::write(&args.out, content)?;
     println!("virtual run report written to {}", args.out);
     Ok(())
+}
+
+async fn run_pose_graph_report(args: PoseGraphReportArgs) -> Result<()> {
+    let report = generate_pose_graph_report(&args).await?;
+    let parent = Path::new(&args.out).parent();
+    if let Some(p) = parent {
+        if !p.as_os_str().is_empty() {
+            fs::create_dir_all(p)?;
+        }
+    }
+    fs::write(&args.out, serde_json::to_string_pretty(&report)?)?;
+    println!(
+        "pose graph report written to {} (nodes={}, odometry_edges={}, loop_candidates={}, rejected={})",
+        args.out,
+        report.nodes,
+        report.odometry_edges,
+        report.loop_candidate_edges,
+        report.rejected_loop_candidates
+    );
+    Ok(())
+}
+
+async fn generate_pose_graph_report(args: &PoseGraphReportArgs) -> Result<PoseGraphReport> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let mut frames = ledger.range(0, u64::MAX).await?;
+    frames.sort_by_key(|frame| frame.t_ms);
+
+    let config = PoseGraphConfig {
+        min_node_distance_m: args.min_node_distance_m,
+        min_node_heading_delta_rad: args.min_node_degrees.to_radians(),
+        max_ticks_between_nodes: args.max_ticks_between_nodes,
+        min_loop_confidence: args.min_loop_confidence,
+        ..PoseGraphConfig::default()
+    };
+    let mut builder = PoseGraphBuilder::new(config);
+    let mut memory = PlaceMemory::new();
+
+    for frame in &frames {
+        let current_key =
+            Some(memory.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m));
+        let place_candidates =
+            memory.recognize_places(current_key, &frame.now.eye.scene_vectors, 0.0, 20);
+        let loop_candidates = place_candidates
+            .iter()
+            .map(place_candidate_to_loop_input)
+            .collect::<Vec<_>>();
+        builder.observe(
+            frame.now.body.odometry,
+            frame.t_ms,
+            Some(frame.id.to_string()),
+            &loop_candidates,
+        );
+        memory.observe_frame(frame);
+    }
+
+    Ok(builder.finish_report())
+}
+
+fn place_candidate_to_loop_input(
+    candidate: &PlaceRecognitionCandidate,
+) -> LoopClosureCandidateInput {
+    LoopClosureCandidateInput {
+        target_pose: netherwick_core::Pose2 {
+            x_m: candidate.cell.center_x_m,
+            y_m: candidate.cell.center_y_m,
+            heading_rad: 0.0,
+        },
+        confidence: candidate.confidence,
+        similarity: candidate.similarity,
+        kind: match candidate.kind {
+            PlaceRecognitionKind::SamePlace => "same_place",
+            PlaceRecognitionKind::SimilarPlace => "similar_place",
+        }
+        .to_string(),
+        target_frame_id: candidate.source_frame_id.clone(),
+        source_frame_id: candidate.source_frame_id.clone(),
+        source_vector_id: Some(candidate.source_vector_id.clone()),
+        query_vector_id: candidate.query_vector_id.clone(),
+    }
 }
 
 async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
