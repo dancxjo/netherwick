@@ -26,11 +26,11 @@ use netherwick_experience::{
     ear_next_target_from_now, experience_decode_target_from_now,
     eye_next_input_from_transition_like, eye_next_target_from_now, ActionValueInput,
     ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput,
-    DangerInput, DangerOutput, EarNextInput, EarNextOutput, EmbodiedContext, Experience,
-    ExperienceBehaviorInput, ExperienceBehaviorOutput, ExperienceDecodeOutput,
-    ExperienceEncodeInput, ExperienceEncoder, ExperienceLatent, EyeNextInput, EyeNextOutput,
-    FeatureExperienceEncoder, FutureInput, FuturePrediction, FuturePredictor, Impression,
-    Prediction, RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
+    DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience, ExperienceBehaviorInput,
+    ExperienceBehaviorOutput, ExperienceDecodeOutput, ExperienceEncodeInput, ExperienceEncoder,
+    ExperienceInstant, ExperienceLatent, EyeNextInput, EyeNextOutput, FeatureExperienceEncoder,
+    FutureInput, FuturePrediction, FuturePredictor, Impression, Prediction, RewardComputer,
+    Sensation, StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -2937,13 +2937,18 @@ where
         let (event_script_forced_action, event_script_records) =
             self.run_event_scripts(&mut now, &recall, &mut notes, &mut proposed_actions)?;
         behavior_runs.extend(event_script_records);
-        let embodied_context = EmbodiedContext::from_current_experience(
+        let runtime_instant = ExperienceInstant::from_parts(
             Some(&embodied_experience),
             &sensations,
             &impressions,
             &futures,
             &recall.recollections,
+            &now,
+            None,
+            None,
+            "runtime-live",
         );
+        let embodied_context = runtime_instant.embodied_context();
 
         let combobulation = match self
             .llm

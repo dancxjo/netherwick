@@ -1531,16 +1531,13 @@ pub struct ExperienceDecodeFeatureLengths {
 }
 
 pub fn experience_encode_input_from_now(now: &Now) -> ExperienceEncodeInput {
-    let target = experience_decode_target_from_now(now);
+    let instant = ExperienceInstant::from_now_features(now, None);
     ExperienceEncodeInput {
-        sense_vectors: vec![
-            target.body_features,
-            target.memory_features,
-            target.drive_features,
-            target.prediction_features,
-            target.eye_features,
-            target.ear_features,
-        ],
+        sense_vectors: instant
+            .teacher_vectors
+            .iter()
+            .map(|vector| vector.vector.clone())
+            .collect(),
     }
 }
 
@@ -4658,8 +4655,24 @@ pub struct ExperienceInstant {
     pub body_context: InstantBodyContext,
     pub action_context: InstantActionContext,
     pub lineage: Vec<EmbodiedLineageEdge>,
+    #[serde(default)]
+    pub memory_links: Vec<EmbodiedMemoryLinkRef>,
+    #[serde(default)]
+    pub predictions: Vec<EmbodiedPredictionRef>,
     pub provenance: InstantProvenance,
     pub missing_modalities: Vec<MissingModality>,
+}
+
+pub type Instant = ExperienceInstant;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InstantCoverage {
+    pub present_modalities: Vec<String>,
+    pub missing_modalities: Vec<String>,
+    pub sensation_count: usize,
+    pub descendant_count: usize,
+    pub vector_count: usize,
+    pub impression_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4977,6 +4990,110 @@ impl ExperienceInstant {
         )
     }
 
+    pub fn from_now_features(now: &Now, action: Option<ActionPrimitive>) -> Self {
+        let target = experience_decode_target_from_now(now);
+        let teacher_vectors = [
+            (
+                "now.body",
+                Modality::Odometry,
+                SensationPayloadKind::OdometryEvent,
+                target.body_features,
+            ),
+            (
+                "now.memory",
+                Modality::Memory,
+                SensationPayloadKind::MemoryRecall,
+                target.memory_features,
+            ),
+            (
+                "now.drive",
+                Modality::Other,
+                SensationPayloadKind::Structured,
+                target.drive_features,
+            ),
+            (
+                "now.prediction",
+                Modality::Other,
+                SensationPayloadKind::Structured,
+                target.prediction_features,
+            ),
+            (
+                "now.eye",
+                Modality::Vision,
+                SensationPayloadKind::ImageBytes,
+                target.eye_features,
+            ),
+            (
+                "now.ear",
+                Modality::Audio,
+                SensationPayloadKind::AudioPcm,
+                target.ear_features,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(source, modality, payload_kind, vector)| InstantTeacherVector {
+                metadata: EmbodiedVectorRef {
+                    vectorizer_id: "netherwick.now.features.v1".to_string(),
+                    model_id: "netherwick.now.features.v1".to_string(),
+                    model_label: "Now deterministic feature vector".to_string(),
+                    dim: vector.len(),
+                    modality,
+                    payload_kind,
+                    source_kind: "now_feature".to_string(),
+                    source_sensation_id: Uuid::nil(),
+                    purpose: "experience_encode_feature".to_string(),
+                    collection: "experience_encode_inputs".to_string(),
+                    input_summary: source.to_string(),
+                    is_fallback: true,
+                    provenance: "now-feature-conversion".to_string(),
+                },
+                vector,
+            },
+        )
+        .collect::<Vec<_>>();
+        let present_modalities = teacher_vectors
+            .iter()
+            .map(|vector| vector.metadata.modality.clone())
+            .collect::<BTreeSet<_>>();
+        Self {
+            schema_version: 1,
+            t_ms: now.t_ms,
+            window_start_ms: now.t_ms,
+            window_end_ms: now.t_ms,
+            experience_id: None,
+            summary: format!(
+                "I am at t={}ms with battery {:.2}.",
+                now.t_ms, now.body.battery_level
+            ),
+            primary_sensations: Vec::new(),
+            descendant_sensations: Vec::new(),
+            impressions: Vec::new(),
+            summary_impression: None,
+            teacher_vectors,
+            fused_vector: None,
+            body_context: InstantBodyContext::from_now(now),
+            action_context: InstantActionContext::from_action(action),
+            lineage: Vec::new(),
+            memory_links: Vec::new(),
+            predictions: Vec::new(),
+            provenance: InstantProvenance {
+                source: "now-feature-conversion".to_string(),
+                source_frame_id: None,
+                sensation_count: 0,
+                impression_count: 0,
+            },
+            missing_modalities: expected_instant_modalities()
+                .into_iter()
+                .filter(|modality| !present_modalities.contains(modality))
+                .map(|modality| MissingModality {
+                    modality,
+                    reason: "no feature vector for modality in this Now conversion".to_string(),
+                })
+                .collect(),
+        }
+    }
+
     pub fn from_parts(
         experience: Option<&Experience>,
         sensations: &[Sensation],
@@ -5075,6 +5192,8 @@ impl ExperienceInstant {
             body_context: InstantBodyContext::from_now(now),
             action_context: InstantActionContext::from_action(action),
             lineage: context.lineage,
+            memory_links: context.memory_links,
+            predictions: context.predictions,
             provenance: InstantProvenance {
                 source: source.into(),
                 source_frame_id,
@@ -5120,6 +5239,65 @@ impl ExperienceInstant {
         sense_vectors.push(self.body_features());
         sense_vectors.push(self.action_context.action_features.clone());
         ExperienceEncodeInput { sense_vectors }
+    }
+
+    pub fn coverage(&self) -> InstantCoverage {
+        let missing = self
+            .missing_modalities
+            .iter()
+            .map(|missing| missing.modality.clone())
+            .collect::<BTreeSet<_>>();
+        let present_modalities = expected_instant_modalities()
+            .into_iter()
+            .filter(|modality| !missing.contains(modality))
+            .map(|modality| modality.as_str().to_string())
+            .collect();
+        let missing_modalities = self
+            .missing_modalities
+            .iter()
+            .map(|missing| missing.modality.as_str().to_string())
+            .collect();
+        InstantCoverage {
+            present_modalities,
+            missing_modalities,
+            sensation_count: self.primary_sensations.len() + self.descendant_sensations.len(),
+            descendant_count: self.descendant_sensations.len(),
+            vector_count: self.teacher_vectors.len() + usize::from(self.fused_vector.is_some()),
+            impression_count: self.impressions.len()
+                + usize::from(self.summary_impression.is_some()),
+        }
+    }
+
+    pub fn embodied_context(&self) -> EmbodiedContext {
+        let mut sensations = self.primary_sensations.clone();
+        sensations.extend(self.descendant_sensations.clone());
+        let sensation_vectors = self
+            .teacher_vectors
+            .iter()
+            .filter(|vector| vector.metadata.source_kind == "sensation")
+            .map(|vector| vector.metadata.clone())
+            .collect();
+        let impression_vectors = self
+            .teacher_vectors
+            .iter()
+            .filter(|vector| vector.metadata.source_kind == "impression")
+            .map(|vector| vector.metadata.clone())
+            .collect();
+        EmbodiedContext {
+            experience_id: self.experience_id,
+            summary: self.summary.clone(),
+            sensations,
+            impressions: self.impressions.clone(),
+            lineage: self.lineage.clone(),
+            fused_vector: self
+                .fused_vector
+                .as_ref()
+                .map(|vector| vector.metadata.clone()),
+            sensation_vectors,
+            impression_vectors,
+            predictions: self.predictions.clone(),
+            memory_links: self.memory_links.clone(),
+        }
     }
 
     pub fn modality_mask(&self) -> Vec<f32> {
@@ -7898,6 +8076,14 @@ pub struct ExperienceBehaviorInput {
 impl ExperienceBehaviorInput {
     pub fn from_now(now: &Now) -> Self {
         let encode_input = experience_encode_input_from_now(now);
+        Self {
+            now: now.clone(),
+            sense_vectors: encode_input.sense_vectors,
+        }
+    }
+
+    pub fn from_instant(now: &Now, instant: &ExperienceInstant) -> Self {
+        let encode_input = ExperienceEncodeInput::from_instant(instant);
         Self {
             now: now.clone(),
             sense_vectors: encode_input.sense_vectors,

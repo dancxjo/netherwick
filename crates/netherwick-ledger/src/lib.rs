@@ -118,13 +118,7 @@ impl TransitionBuilder {
 
 impl ExperienceFrame {
     pub fn embodied_context(&self) -> EmbodiedContext {
-        EmbodiedContext::from_current_experience(
-            self.experiences.last(),
-            &self.sensations,
-            &self.impressions,
-            &self.predicted_futures,
-            &self.recollections,
-        )
+        self.experience_instant().embodied_context()
     }
 
     pub fn experience_instant(&self) -> ExperienceInstant {

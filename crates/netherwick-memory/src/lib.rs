@@ -5,7 +5,8 @@ use netherwick_body::{BodyFlags, BodySense, Velocity};
 use netherwick_core::{Goal, Pose2, Reward};
 use netherwick_experience::{
     EmbodiedPipeline, EmbodiedVectorCoverage, Experience, ExperienceFuser, FuturePrediction,
-    Impression, MemoryLink, Modality, RecalledExperience, SensationPayloadKind, VectorEmbedding,
+    Impression, InstantCoverage, MemoryLink, Modality, RecalledExperience, SensationPayloadKind,
+    VectorEmbedding,
 };
 use netherwick_ledger::{ExperienceFrame, ExperienceTransition};
 use netherwick_now::{
@@ -1592,6 +1593,8 @@ pub struct EmbodiedPipelineCoverageReport {
     pub place_recognition_candidate_count: usize,
     pub lineage_edge_count: usize,
     pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub instant_coverage: Vec<InstantCoverage>,
     pub vector_coverage: EmbodiedVectorCoverage,
     pub warnings: Vec<String>,
     pub failures: Vec<String>,
@@ -1912,21 +1915,13 @@ fn coverage_report_from_frames(
     };
     let mut modalities = BTreeSet::new();
     for frame in frames {
-        let context = frame.embodied_context();
         let instant = frame.experience_instant();
+        let instant_coverage = instant.coverage();
         report.instant_count += 1;
         report.instant_teacher_vector_count += instant.teacher_vectors.len();
         report.instant_missing_modality_count += instant.missing_modalities.len();
-        report.primary_sensation_count += frame
-            .sensations
-            .iter()
-            .filter(|sensation| sensation.parent_id.is_none())
-            .count();
-        report.descendant_sensation_count += frame
-            .sensations
-            .iter()
-            .filter(|sensation| sensation.parent_id.is_some())
-            .count();
+        report.primary_sensation_count += instant.primary_sensations.len();
+        report.descendant_sensation_count += instant.descendant_sensations.len();
         report.vectorized_sensation_count += frame
             .sensations
             .iter()
@@ -1947,17 +1942,8 @@ fn coverage_report_from_frames(
             .iter()
             .filter(|experience| experience.fused_vector.is_some())
             .count();
-        report.prediction_count += frame
-            .experiences
-            .iter()
-            .map(|experience| experience.predictions.len())
-            .sum::<usize>()
-            + frame.predicted_futures.len();
-        report.memory_link_count += frame
-            .experiences
-            .iter()
-            .map(|experience| experience.memory_links.len())
-            .sum::<usize>();
+        report.prediction_count += instant.predictions.len();
+        report.memory_link_count += instant.memory_links.len();
         report.recall_sensation_count += frame
             .sensations
             .iter()
@@ -1971,10 +1957,9 @@ fn coverage_report_from_frames(
             .iter()
             .filter(|impression| impression.kind == "memory.recall.impression")
             .count();
-        report.lineage_edge_count += context.lineage.len();
-        for sensation in &frame.sensations {
-            modalities.insert(sensation.modality.as_str().to_string());
-        }
+        report.lineage_edge_count += instant.lineage.len();
+        modalities.extend(instant_coverage.present_modalities.iter().cloned());
+        report.instant_coverage.push(instant_coverage);
         let coverage = EmbodiedVectorCoverage::from_parts(
             &frame.sensations,
             &frame.impressions,
@@ -3759,6 +3744,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deterministic_replay_produces_identical_instant_shape() {
+        let left = super::build_embodied_eval_frame(
+            deterministic_embodied_fixture_now(1_000, 0.0),
+            None,
+            &[],
+        )
+        .await
+        .unwrap()
+        .experience_instant();
+        let right = super::build_embodied_eval_frame(
+            deterministic_embodied_fixture_now(1_000, 0.0),
+            None,
+            &[],
+        )
+        .await
+        .unwrap()
+        .experience_instant();
+
+        assert_eq!(stable_instant_shape(&left), stable_instant_shape(&right));
+    }
+
+    #[tokio::test]
+    async fn instant_conversion_preserves_lineage_vectors_predictions_and_memory_links() {
+        let mut frame = super::build_embodied_eval_frame(
+            deterministic_embodied_fixture_now(1_000, 0.0),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        attach_memory_links_to_frame(&mut frame);
+
+        let instant = frame.experience_instant();
+        assert!(!instant.lineage.is_empty());
+        assert!(instant.teacher_vectors.iter().any(|vector| vector
+            .metadata
+            .model_id
+            .contains("fixture")
+            || vector.metadata.model_id.contains("netherwick")));
+        assert!(instant
+            .teacher_vectors
+            .iter()
+            .all(|vector| vector.metadata.dim == vector.vector.len()));
+        assert!(!instant.predictions.is_empty());
+        assert!(!instant.memory_links.is_empty());
+
+        let context = instant.embodied_context();
+        assert_eq!(context.lineage, instant.lineage);
+        assert_eq!(context.predictions, instant.predictions);
+        assert_eq!(context.memory_links, instant.memory_links);
+    }
+
+    #[tokio::test]
+    async fn instant_missing_modalities_are_explicit_in_coverage() {
+        let frame = super::build_embodied_eval_frame(
+            deterministic_embodied_fixture_now(1_000, 0.0),
+            None,
+            &[EmbodiedEvalOmission::Vectors],
+        )
+        .await
+        .unwrap();
+        let instant = frame.experience_instant();
+        let coverage = instant.coverage();
+
+        assert!(!instant.missing_modalities.is_empty());
+        assert!(!coverage.missing_modalities.is_empty());
+        assert_eq!(
+            coverage.sensation_count,
+            instant.primary_sensations.len() + instant.descendant_sensations.len()
+        );
+        assert_eq!(
+            coverage.vector_count,
+            usize::from(instant.fused_vector.is_some())
+        );
+    }
+
+    #[tokio::test]
     async fn deterministic_embodied_eval_reports_full_coverage_and_recall() {
         let report = deterministic_embodied_eval_report().await.unwrap();
 
@@ -3783,6 +3845,11 @@ mod tests {
         assert!(report.input_modalities.contains(&"depth".to_string()));
         assert!(report.input_modalities.contains(&"lidar".to_string()));
         assert!(report.input_modalities.contains(&"audio".to_string()));
+        assert_eq!(report.instant_coverage.len(), report.instant_count);
+        assert!(report
+            .instant_coverage
+            .iter()
+            .all(|coverage| coverage.sensation_count > 0));
     }
 
     #[tokio::test]
@@ -3812,6 +3879,46 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning == "omitted recall"));
+    }
+
+    fn stable_instant_shape(
+        instant: &netherwick_experience::ExperienceInstant,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": instant.schema_version,
+            "t_ms": instant.t_ms,
+            "window_start_ms": instant.window_start_ms,
+            "window_end_ms": instant.window_end_ms,
+            "primary": instant.primary_sensations.iter().map(|sensation| {
+                serde_json::json!({
+                    "parent": sensation.parent_id.is_some(),
+                    "modality": sensation.modality.as_str(),
+                    "payload_kind": sensation.payload_kind.as_str(),
+                    "kind": sensation.kind,
+                    "source": sensation.source,
+                })
+            }).collect::<Vec<_>>(),
+            "descendant": instant.descendant_sensations.iter().map(|sensation| {
+                serde_json::json!({
+                    "parent": sensation.parent_id.is_some(),
+                    "modality": sensation.modality.as_str(),
+                    "payload_kind": sensation.payload_kind.as_str(),
+                    "kind": sensation.kind,
+                    "source": sensation.source,
+                })
+            }).collect::<Vec<_>>(),
+            "vectors": instant.teacher_vectors.iter().map(|vector| {
+                serde_json::json!({
+                    "dim": vector.metadata.dim,
+                    "model_id": vector.metadata.model_id,
+                    "purpose": vector.metadata.purpose,
+                    "collection": vector.metadata.collection,
+                    "modality": vector.metadata.modality.as_str(),
+                    "payload_kind": vector.metadata.payload_kind.as_str(),
+                })
+            }).collect::<Vec<_>>(),
+            "coverage": instant.coverage(),
+        })
     }
 
     #[test]
