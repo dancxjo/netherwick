@@ -16,6 +16,8 @@ use uuid::Uuid;
 const DEFAULT_WINDOW_MS: TimeMs = 750;
 const PLACEHOLDER_VECTOR_DIM: usize = 16;
 const EMBODIED_FEATURE_VECTOR_DIM: usize = 32;
+const TEXT_HASH_VECTOR_DIM: usize = 64;
+const TEXT_HASH_MODEL_ID: &str = "netherwick.text.hashing.v1";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExperienceLatent {
@@ -3466,6 +3468,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voice_precomputed_vectors_are_preserved_with_voice_identity_metadata() {
+        let registry = SensationVectorizerRegistry::with_defaults();
+        let mut now = Now::blank(410, BodySense::default());
+        now.voice.vectors.push(
+            netherwick_now::VectorArtifact::new(
+                "voices",
+                "voice-vector-1",
+                vec![0.1, 0.3, 0.5, 0.7],
+            )
+            .with_model("listenbury.voice.test.v0")
+            .with_source_id("voice-1")
+            .with_occurred_at_ms(405),
+        );
+        let voice = primary_sensations_from_now(&now)
+            .into_iter()
+            .find(|sensation| sensation.source == "voice.features")
+            .expect("voice feature sensation");
+
+        let vector = registry.vectorize(&voice).await.unwrap().expect("vector");
+
+        assert_eq!(vector.model_id, "listenbury.voice.test.v0");
+        assert_eq!(vector.dim, 4);
+        assert_eq!(vector.vector, vec![0.1, 0.3, 0.5, 0.7]);
+        assert_eq!(vector.source_sensation_id, voice.id);
+        assert_eq!(
+            vector.vectorizer_id,
+            "precomputed.voices.listenbury.voice.test.v0"
+        );
+        assert_eq!(vector.purpose, "voice_identity");
+        assert_eq!(vector.collection, "voices");
+        assert!(!vector.is_fallback);
+        assert!(vector.input_summary.contains("voice-vector-1"));
+    }
+
+    #[tokio::test]
     async fn duplicate_image_frames_do_not_repeat_embeddings() {
         let registry = SensationVectorizerRegistry::with_defaults();
         let first = visual_primary_with_rgb(16, 16, vec![13; 16 * 16 * 3]);
@@ -3543,6 +3580,12 @@ mod tests {
         assert_eq!(experience.window_start_ms, 100);
         assert_eq!(experience.window_end_ms, 110);
         assert!(experience.fused_vector.is_some());
+        let impression_vector = impression.vector.as_ref().expect("impression vector");
+        assert_eq!(impression_vector.model_id, "netherwick.text.hashing.v1");
+        assert_eq!(impression_vector.purpose, "impression_semantic");
+        assert_eq!(impression_vector.collection, "impressions");
+        assert_eq!(impression_vector.source_kind, "impression");
+        assert!(!impression_vector.is_fallback);
         assert_eq!(
             experience
                 .summary_impression
@@ -3550,6 +3593,17 @@ mod tests {
                 .and_then(|summary| summary.experience_id),
             Some(experience.id)
         );
+        let summary_vector = experience
+            .summary_impression
+            .as_ref()
+            .and_then(|summary| summary.vector.as_ref())
+            .expect("experience summary semantic vector");
+        assert_eq!(summary_vector.model_id, "netherwick.text.hashing.v1");
+        assert_eq!(summary_vector.purpose, "experience_semantic");
+        assert_eq!(summary_vector.collection, "experiences");
+        assert_eq!(summary_vector.source_kind, "experience");
+        assert_eq!(summary_vector.source_sensation_id, experience.id);
+        assert!(!summary_vector.is_fallback);
         assert!(experience.text.starts_with("I see"));
     }
 
@@ -3615,8 +3669,13 @@ mod tests {
                 .vector
                 .as_ref()
                 .map(|vector| vector.model_id.as_str()),
-            Some("netherwick.text.hash_embedding.v1")
+            Some("netherwick.text.hashing.v1")
         );
+        assert_eq!(
+            speech.vector.as_ref().map(|vector| vector.purpose.as_str()),
+            Some("transcript_semantic")
+        );
+        assert!(!speech.vector.as_ref().unwrap().is_fallback);
         assert_eq!(
             speech
                 .impression
@@ -3624,6 +3683,18 @@ mod tests {
                 .map(|impression| impression.text.as_str()),
             Some("I hear someone say \"come closer\".")
         );
+        let speech_impression_vector = speech
+            .impression
+            .as_ref()
+            .and_then(|impression| impression.vector.as_ref())
+            .expect("speech impression semantic vector");
+        assert_eq!(
+            speech_impression_vector.model_id,
+            "netherwick.text.hashing.v1"
+        );
+        assert_eq!(speech_impression_vector.purpose, "impression_semantic");
+        assert_eq!(speech_impression_vector.collection, "impressions");
+        assert!(!speech_impression_vector.is_fallback);
         assert!(embodied
             .sensations
             .iter()
@@ -3931,6 +4002,8 @@ pub struct Impression {
     pub confidence: f32,
     #[serde(default)]
     pub generator: ImpressionGenerator,
+    #[serde(default)]
+    pub vector: Option<VectorEmbedding>,
     pub payload: Value,
 }
 
@@ -3953,6 +4026,7 @@ impl Impression {
             observed_at_ms,
             confidence: 0.5,
             generator: ImpressionGenerator::Template,
+            vector: None,
             payload: Value::Null,
         }
     }
@@ -3964,6 +4038,11 @@ impl Impression {
 
     pub fn with_payload(mut self, payload: Value) -> Self {
         self.payload = payload;
+        self
+    }
+
+    pub fn with_vector(mut self, vector: VectorEmbedding) -> Self {
+        self.vector = Some(vector);
         self
     }
 
@@ -4404,6 +4483,8 @@ pub struct EmbodiedContext {
     pub lineage: Vec<EmbodiedLineageEdge>,
     pub fused_vector: Option<EmbodiedVectorRef>,
     pub sensation_vectors: Vec<EmbodiedVectorRef>,
+    #[serde(default)]
+    pub impression_vectors: Vec<EmbodiedVectorRef>,
     pub predictions: Vec<EmbodiedPredictionRef>,
     pub memory_links: Vec<EmbodiedMemoryLinkRef>,
 }
@@ -4427,6 +4508,7 @@ pub struct EmbodiedImpressionRef {
     pub kind: String,
     pub text: String,
     pub confidence: f32,
+    pub vector: Option<EmbodiedVectorRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -4539,6 +4621,7 @@ impl EmbodiedContext {
                 kind: impression.kind.clone(),
                 text: impression.text.clone(),
                 confidence: impression.confidence,
+                vector: impression.vector.as_ref().map(vector_ref),
             })
             .collect::<Vec<_>>();
         let lineage = sensation_refs
@@ -4559,6 +4642,17 @@ impl EmbodiedContext {
             .iter()
             .filter(|sensation| scoped_sensation_ids.contains(&sensation.id))
             .filter_map(|sensation| sensation.vector.as_ref().map(vector_ref))
+            .collect::<Vec<_>>();
+        let impression_vectors = impressions
+            .iter()
+            .filter(|impression| {
+                impression_scope.contains(&impression.id)
+                    || impression
+                        .sensation_id
+                        .map(|id| scoped_sensation_ids.contains(&id))
+                        .unwrap_or(false)
+            })
+            .filter_map(|impression| impression.vector.as_ref().map(vector_ref))
             .collect::<Vec<_>>();
         let fused_vector = experience
             .and_then(|experience| experience.fused_vector.as_ref())
@@ -4633,6 +4727,7 @@ impl EmbodiedContext {
             lineage,
             fused_vector,
             sensation_vectors,
+            impression_vectors,
             predictions,
             memory_links,
         }
@@ -4988,7 +5083,7 @@ impl EmbodiedFeatureSensationVectorizer {
         payload_kind: SensationPayloadKind,
         purpose: impl Into<String>,
     ) -> Self {
-        let model_id = "netherwick.text.hash_embedding.v1".to_string();
+        let model_id = TEXT_HASH_MODEL_ID.to_string();
         let purpose = purpose.into();
         Self {
             vectorizer_id: vectorizer_id.into(),
@@ -5403,6 +5498,83 @@ fn sanitize_vector(vector: Vec<f32>) -> Vec<f32> {
         .collect()
 }
 
+fn semantic_text_vector(
+    text: &str,
+    source_id: Uuid,
+    generated_at_ms: TimeMs,
+    source_kind: impl Into<String>,
+    purpose: impl Into<String>,
+    collection: impl Into<String>,
+    input_summary: impl Into<String>,
+) -> VectorEmbedding {
+    let purpose = purpose.into();
+    let collection = collection.into();
+    VectorEmbedding::new(
+        text_hash_vector(text, TEXT_HASH_VECTOR_DIM),
+        TEXT_HASH_MODEL_ID,
+        Modality::Other,
+        SensationPayloadKind::Structured,
+        source_id,
+        generated_at_ms,
+    )
+    .with_metadata(
+        format!("netherwick.vectorizer.{purpose}.text_hashing.v1"),
+        "Netherwick deterministic text hashing baseline",
+        purpose,
+        collection,
+        input_summary,
+        false,
+        "netherwick_text_hashing_vectorizer",
+    )
+    .with_source_kind(source_kind)
+}
+
+fn text_hash_vector(text: &str, dim: usize) -> Vec<f32> {
+    let dim = dim.max(1);
+    let mut vector = vec![0.0_f32; dim];
+    let mut token_count = 0.0_f32;
+    for token in text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        token_count += 1.0;
+        let normalized = token.to_ascii_lowercase();
+        for ngram in token_ngrams(&normalized) {
+            let mut hash = 2166136261_u32;
+            for byte in ngram.bytes() {
+                hash = hash.wrapping_mul(16777619) ^ u32::from(byte);
+            }
+            let index = (hash as usize) % dim;
+            let sign = if hash & 1 == 0 { 1.0 } else { -1.0 };
+            vector[index] += sign;
+        }
+    }
+    vector[0] += (text.chars().count() as f32 / 512.0).clamp(0.0, 1.0);
+    if dim > 1 {
+        vector[1] += (token_count / 96.0).clamp(0.0, 1.0);
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > f32::EPSILON {
+        for value in &mut vector {
+            *value = (*value / norm).clamp(-1.0, 1.0);
+        }
+    }
+    vector
+}
+
+fn token_ngrams(token: &str) -> Vec<String> {
+    let chars = token.chars().collect::<Vec<_>>();
+    if chars.len() <= 3 {
+        return vec![token.to_string()];
+    }
+    let mut ngrams = Vec::new();
+    for window in chars.windows(3) {
+        ngrams.push(window.iter().collect());
+    }
+    ngrams.push(token.to_string());
+    ngrams
+}
+
 fn purpose_for_sensation(modality: &Modality, payload_kind: &SensationPayloadKind) -> String {
     match (modality, payload_kind) {
         (Modality::Vision, SensationPayloadKind::ImageBytes) => "scene_similarity",
@@ -5425,7 +5597,8 @@ fn purpose_for_collection(collection: &str) -> String {
         "faces" => "face_identity",
         "voices" => "voice_identity",
         "scene_vectors" | "images" => "scene_similarity",
-        "image_descriptions" | "memories" => "transcript_semantic",
+        "image_descriptions" | "memories" | "transcripts" => "transcript_semantic",
+        "impressions" => "impression_semantic",
         "experiences" => "experience_semantic",
         _ => collection,
     }
@@ -6386,9 +6559,9 @@ impl TemplateImpressionGenerator {
                 .clone()
                 .unwrap_or_else(|| "I notice something happening now.".to_string()),
         };
-        Impression::new(
+        let mut impression = Impression::new(
             "sensation.template",
-            text,
+            text.clone(),
             vec![sensation.id],
             sensation.occurred_at_ms,
             sensation.observed_at_ms,
@@ -6404,7 +6577,22 @@ impl TemplateImpressionGenerator {
             "modality": sensation.modality,
             "payload_kind": sensation.payload_kind,
             "source": sensation.source,
-        }))
+        }));
+        impression.vector = Some(semantic_text_vector(
+            &text,
+            impression.id,
+            sensation.observed_at_ms,
+            "impression",
+            "impression_semantic",
+            "impressions",
+            format!(
+                "impression kind={} about_sensation={} text={}",
+                impression.kind,
+                sensation.id,
+                text.chars().take(96).collect::<String>()
+            ),
+        ));
+        impression
     }
 
     pub fn generate_for_experience(
@@ -6427,15 +6615,29 @@ impl TemplateImpressionGenerator {
         } else {
             format!("{}.", parts.join(", and "))
         };
-        Impression::new(
+        let mut impression = Impression::new(
             "experience.template",
-            text,
+            text.clone(),
             Vec::new(),
             window_start_ms,
             window_end_ms,
         )
         .for_experience(experience_id)
-        .with_confidence(0.6)
+        .with_confidence(0.6);
+        impression.vector = Some(semantic_text_vector(
+            &text,
+            experience_id,
+            window_end_ms,
+            "experience",
+            "experience_semantic",
+            "experiences",
+            format!(
+                "experience_summary id={} text={}",
+                experience_id,
+                text.chars().take(96).collect::<String>()
+            ),
+        ));
+        impression
     }
 }
 
@@ -6668,33 +6870,74 @@ pub async fn demo_embodied_experience(now_ms: TimeMs) -> Result<EmbodiedDemo> {
             rgb[idx + 2] = 120;
         }
     }
-    let primary = Sensation::primary(
-        Modality::Vision,
-        SensationSource::new("demo.synthetic_camera"),
-        now_ms,
-        now_ms,
-        {
-            let mut payload = SensationPayload::image_metadata(64, 48, "rgb8", rgb.len());
-            payload.value["raw_bytes_b64"] =
-                Value::String(base64::engine::general_purpose::STANDARD.encode(rgb));
-            payload
-        },
-    )
-    .with_summary("I receive a synthetic visual frame.");
+    let mut now = Now::blank(now_ms, BodySense::default());
+    now.eye_frame = Some(netherwick_now::EyeFrame {
+        captured_at_ms: now_ms,
+        width: 64,
+        height: 48,
+        format: netherwick_now::EyeFrameFormat::Rgb8,
+        bytes: rgb,
+        source: Some("demo.synthetic_camera".to_string()),
+    });
+    now.face.vectors.push(
+        netherwick_now::VectorArtifact::new(
+            "faces",
+            "demo-face-vector",
+            vec![0.17, 0.41, 0.73, 0.29],
+        )
+        .with_model("face_id/0.4.1")
+        .with_source_id("demo-face")
+        .with_source_frame_id("demo-synthetic-frame")
+        .with_occurred_at_ms(now_ms),
+    );
+    now.ear.transcript = Some("hello netherwick, this is a transcript vector test".to_string());
+    now.ear.asr.transcript = now.ear.transcript.clone();
+    now.ear.asr.is_final = true;
+    now.ear.asr.confidence = 0.82;
+    now.ear.asr.start_ms = Some(now_ms.saturating_sub(320));
+    now.ear.asr.end_ms = Some(now_ms);
+    now.ear.asr.duration_ms = Some(320);
+    now.ear.asr.word_count = Some(8);
+    now.voice.vectors.push(
+        netherwick_now::VectorArtifact::new(
+            "voices",
+            "demo-voice-vector",
+            vec![0.11, 0.05, 0.33, 0.78, 0.21],
+        )
+        .with_model("listenbury/voice_vector/16d")
+        .with_source_id("demo-voice")
+        .with_occurred_at_ms(now_ms),
+    );
     let pipeline = EmbodiedPipeline::from_models_toml("configs/models.toml").unwrap_or_else(|error| {
         eprintln!(
             "warning: embodied demo could not load configs/models.toml ({error}); using built-in vectorizer defaults"
         );
         EmbodiedPipeline::new()
     });
-    let batch = pipeline.ingest_primary(primary).await?;
+    let mut sensations = Vec::new();
+    let mut impressions = Vec::new();
+    for primary in primary_sensations_from_now(&now) {
+        let batch = pipeline.ingest_primary(primary).await?;
+        sensations.extend(batch.sensations);
+        impressions.extend(batch.impressions);
+    }
+    let batch = EmbodiedBatch {
+        sensations,
+        impressions,
+    };
     let mut window = RollingExperienceWindow::new(DEFAULT_WINDOW_MS);
     window.push(batch.clone());
     let experience = window.fuse_current()?;
+    let coverage = EmbodiedVectorCoverage::from_parts(
+        &batch.sensations,
+        &batch.impressions,
+        Some(&experience),
+    );
     Ok(EmbodiedDemo {
         sensations: batch.sensations,
         impressions: batch.impressions,
         experience,
+        coverage,
     })
 }
 
@@ -6703,6 +6946,66 @@ pub struct EmbodiedDemo {
     pub sensations: Vec<Sensation>,
     pub impressions: Vec<Impression>,
     pub experience: Experience,
+    pub coverage: EmbodiedVectorCoverage,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbodiedVectorCoverage {
+    pub image: usize,
+    pub face: usize,
+    pub voice: usize,
+    pub transcript: usize,
+    pub impression: usize,
+    pub experience: usize,
+    pub fallback_count: usize,
+}
+
+impl EmbodiedVectorCoverage {
+    pub fn from_parts(
+        sensations: &[Sensation],
+        impressions: &[Impression],
+        experience: Option<&Experience>,
+    ) -> Self {
+        let mut coverage = Self::default();
+        for vector in sensations
+            .iter()
+            .filter_map(|sensation| sensation.vector.as_ref())
+            .chain(
+                impressions
+                    .iter()
+                    .filter_map(|impression| impression.vector.as_ref()),
+            )
+            .chain(
+                experience
+                    .and_then(|experience| experience.fused_vector.as_ref())
+                    .into_iter(),
+            )
+            .chain(
+                experience
+                    .and_then(|experience| experience.summary_impression.as_ref())
+                    .and_then(|impression| impression.vector.as_ref())
+                    .into_iter(),
+            )
+        {
+            coverage.record(vector);
+        }
+        coverage
+    }
+
+    fn record(&mut self, vector: &VectorEmbedding) {
+        if vector.is_fallback {
+            self.fallback_count += 1;
+        }
+        match vector.purpose.as_str() {
+            "scene_similarity" | "visual_similarity" => self.image += 1,
+            "face_identity" => self.face += 1,
+            "voice_identity" => self.voice += 1,
+            "transcript_semantic" => self.transcript += 1,
+            "impression_semantic" => self.impression += 1,
+            "experience_semantic" => self.experience += 1,
+            _ => {}
+        }
+    }
 }
 
 pub async fn embody_now(now: &Now) -> Result<EmbodiedNow> {

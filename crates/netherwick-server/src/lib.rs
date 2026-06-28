@@ -1534,6 +1534,11 @@ impl EmbodiedLineageGraph {
 
         for impression in &context.impressions {
             let node_id = format!("impression:{}", impression.id);
+            let vector_refs = vector_refs_for_node(
+                &mut vectors,
+                node_id.clone(),
+                impression.vector.as_ref().into_iter(),
+            );
             nodes.push(EmbodiedGraphNode {
                 id: node_id.clone(),
                 node_type: EmbodiedGraphNodeType::Impression,
@@ -1543,7 +1548,7 @@ impl EmbodiedLineageGraph {
                 modality: None,
                 payload_kind: None,
                 derived: false,
-                vector_refs: Vec::new(),
+                vector_refs,
             });
             if let Some(sensation_id) = impression.sensation_id {
                 if sensation_ids.contains(&sensation_id) {

@@ -1823,6 +1823,7 @@ mod tests {
                 provenance: "unit_test".to_string(),
             }),
             sensation_vectors: Vec::new(),
+            impression_vectors: Vec::new(),
             predictions: Vec::new(),
             memory_links: Vec::new(),
         };

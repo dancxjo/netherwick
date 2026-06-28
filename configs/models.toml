@@ -110,7 +110,7 @@ fallback = "placeholder"
 
 [vectorizer.audio_speech]
 enabled = true
-model = "netherwick.text.hash_embedding.v1"
+model = "netherwick.text.hashing.v1"
 model_label = "Netherwick deterministic speech hash embedding"
 purpose = "transcript_semantic"
 collection = "transcripts"
@@ -118,7 +118,7 @@ fallback = "placeholder"
 
 [vectorizer.audio_transcript]
 enabled = true
-model = "netherwick.text.hash_embedding.v1"
+model = "netherwick.text.hashing.v1"
 model_label = "Netherwick deterministic transcript hash embedding"
 purpose = "transcript_semantic"
 collection = "transcripts"
@@ -126,7 +126,7 @@ fallback = "placeholder"
 
 [vectorizer.audio_phoneme]
 enabled = true
-model = "netherwick.text.hash_embedding.v1"
+model = "netherwick.text.hashing.v1"
 model_label = "Netherwick deterministic phoneme hash embedding"
 purpose = "transcript_semantic"
 collection = "transcripts"

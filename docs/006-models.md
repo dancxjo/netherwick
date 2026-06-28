@@ -9,10 +9,11 @@ Vector metadata is part of the stable contract. Each `VectorEmbedding` records t
 - `visual_similarity`: whole image or visual artifact similarity.
 - `scene_similarity`: scene layout/frame similarity.
 - `face_identity`: face crop identity matching.
-- `transcript_semantic`: speech/transcript/text semantic recall.
+- `transcript_semantic`: speech/transcript text recall, currently backed by `netherwick.text.hashing.v1` unless an upstream artifact is present.
+- `impression_semantic`: generated impression text recall, currently backed by `netherwick.text.hashing.v1`.
 - `voice_identity`: speaker or voice-window matching.
-- `experience_semantic`: fused experience recall.
+- `experience_semantic`: fused experience and experience-summary recall.
 
-This mirrors Daringsby's model-labeled image and CLIP/OpenCLIP scene embedding path while keeping Netherwick's stable crates free of heavyweight model runtimes. It also adopts Mortar-Sea's architectural rule that sensations and experiences may have multiple vectors, and each vector must declare what it represents, what produced it, and which purpose-specific collection it belongs to.
+This mirrors Daringsby's model-labeled image, face, and CLIP/OpenCLIP scene embedding path while keeping Netherwick's stable crates free of heavyweight model runtimes. Listenbury informs the voice-signature and pluggable embedding seams. It also adopts Mortar-Sea's architectural rule that sensations and experiences may have multiple vectors, and each vector must declare what it represents, what produced it, and which purpose-specific collection it belongs to.
 
 Prediction behaviors now have an embodied input path: `Experience.fused_vector` can be adapted into `FutureInput`, `DangerInput`, `ChargeInput`, `ActionValueInput`, and the next-eye/next-ear inputs. Runtime uses the current embodied fused vector when it is available, while keeping the older `ExperienceLatent` route as a fallback and adapting vector width for legacy checkpoints. The selected prediction signals are written back onto the current embodied `Experience.predictions` before ledger and memory persistence.

@@ -7428,6 +7428,16 @@ async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
 
     println!("embodied experience {}", demo.experience.id);
     println!("  summary: {}", demo.experience.text);
+    println!(
+        "  vector coverage: image={} face={} voice={} transcript={} impression={} experience={} fallback_count={}",
+        demo.coverage.image,
+        demo.coverage.face,
+        demo.coverage.voice,
+        demo.coverage.transcript,
+        demo.coverage.impression,
+        demo.coverage.experience,
+        demo.coverage.fallback_count
+    );
     println!("  sensations: {}", demo.sensations.len());
     for sensation in &demo.sensations {
         let vector = sensation
@@ -7451,7 +7461,21 @@ async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
     }
     println!("  impressions:");
     for impression in &impressions {
-        println!("    - {}", impression.text);
+        let vector = impression
+            .vector
+            .as_ref()
+            .map(|embedding| {
+                format!(
+                    "{}d {} purpose={} vectorizer={} fallback={}",
+                    embedding.dim,
+                    embedding.model_id,
+                    embedding.purpose,
+                    embedding.vectorizer_id,
+                    embedding.is_fallback
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+        println!("    - {} vector={}", impression.text, vector);
     }
     if let Some(fused) = &demo.experience.fused_vector {
         println!(
