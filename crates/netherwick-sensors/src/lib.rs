@@ -23,7 +23,7 @@ pub use surface::{
     ClusterObservation, OccupancyCell, OccupancyGrid, OccupancyState, PlaneObservation, Point3,
     ProjectedCluster, ProjectedSurface, SceneGraphSummary, SurfaceAnticipationFrame,
     SurfaceExtractor, SurfaceExtractorConfig, SurfaceExtractorDiagnostics, SurfaceExtractorOutput,
-    SurfaceKind, SurfaceTrack, Vec3,
+    SurfaceHypothesis, SurfaceKind, SurfacePrimitiveKind, SurfaceTrack, Vec3,
 };
 
 type TimeMs = u64;

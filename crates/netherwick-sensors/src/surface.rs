@@ -105,6 +105,10 @@ pub struct SurfaceExtractorConfig {
     pub outlier_min_neighbors: usize,
     pub plane_distance_threshold_m: f32,
     pub min_plane_points: usize,
+    pub min_plane_major_extent_m: f32,
+    pub min_plane_minor_extent_m: f32,
+    pub min_plane_area_m: f32,
+    pub max_plane_rms_error_m: f32,
     pub max_planes: usize,
     pub track_normal_max_angle_rad: f32,
     pub track_distance_threshold_m: f32,
@@ -138,6 +142,10 @@ impl Default for SurfaceExtractorConfig {
             outlier_min_neighbors: 2,
             plane_distance_threshold_m: 0.05,
             min_plane_points: 24,
+            min_plane_major_extent_m: 0.35,
+            min_plane_minor_extent_m: 0.12,
+            min_plane_area_m: 0.08,
+            max_plane_rms_error_m: 0.035,
             max_planes: 6,
             track_normal_max_angle_rad: 12.0_f32.to_radians(),
             track_distance_threshold_m: 0.12,
@@ -173,8 +181,19 @@ pub struct PlaneObservation {
     pub centroid: Vec3,
     pub distance_from_origin_m: f32,
     pub bounds_2d: Bounds2,
+    #[serde(default)]
+    pub extent_m: Vec3,
     pub point_count: usize,
     pub confidence: f32,
+    #[serde(default)]
+    pub rms_error_m: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfacePrimitiveKind {
+    #[default]
+    Plane,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,17 +209,27 @@ pub enum SurfaceKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceTrack {
     pub id: String,
+    #[serde(default)]
+    pub primitive_kind: SurfacePrimitiveKind,
     pub kind: SurfaceKind,
     pub normal: Vec3,
     pub centroid: Vec3,
     pub distance_from_origin_m: f32,
     pub bounds_2d: Bounds2,
+    #[serde(default)]
+    pub extent_m: Vec3,
     pub confidence: f32,
+    #[serde(default)]
+    pub supporting_point_count: usize,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub seen_count: u32,
     pub missing_count: u32,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
+
+pub type SurfaceHypothesis = SurfaceTrack;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -269,7 +298,7 @@ pub struct SurfaceCalibrationHint {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SceneGraphSummary {
     pub floor: Option<SurfaceTrack>,
-    pub surfaces: Vec<SurfaceTrack>,
+    pub surfaces: Vec<SurfaceHypothesis>,
     pub clusters: Vec<ClusterObservation>,
     pub navigation: serde_json::Value,
 }
@@ -279,7 +308,7 @@ pub struct SurfaceExtractorOutput {
     pub raw_cloud: Vec<Point3>,
     pub filtered_cloud: Vec<Point3>,
     pub plane_observations: Vec<PlaneObservation>,
-    pub stable_surfaces: Vec<SurfaceTrack>,
+    pub stable_surfaces: Vec<SurfaceHypothesis>,
     pub floor: Option<SurfaceTrack>,
     pub obstacle_grid: OccupancyGrid,
     pub clusters: Vec<ClusterObservation>,
@@ -472,16 +501,20 @@ impl SurfaceExtractor {
                 self.next_surface_id += 1;
                 self.tracks.push(SurfaceTrack {
                     id,
+                    primitive_kind: SurfacePrimitiveKind::Plane,
                     kind,
                     normal: observation.normal,
                     centroid: observation.centroid,
                     distance_from_origin_m: observation.distance_from_origin_m,
                     bounds_2d: observation.bounds_2d,
+                    extent_m: observation.extent_m,
                     confidence: observation.confidence.clamp(0.15, 0.55),
+                    supporting_point_count: observation.point_count,
                     first_seen_ms: t_ms,
                     last_seen_ms: t_ms,
                     seen_count: 1,
                     missing_count: 0,
+                    labels: surface_labels(kind),
                 });
                 matched_tracks.push(true);
             }
@@ -508,7 +541,11 @@ impl SurfaceExtractor {
             self.config.cluster_distance_m,
             self.config.min_cluster_points,
         );
-        self.update_cluster_tracks(clusters, surfaces, t_ms)
+        let object_clusters = clusters
+            .into_iter()
+            .filter(|cluster| !cluster_is_planar_room_geometry(cluster, surfaces))
+            .collect();
+        self.update_cluster_tracks(object_clusters, surfaces, t_ms)
     }
 
     fn update_cluster_tracks(
@@ -852,8 +889,15 @@ fn extract_planes(
             remaining = outliers;
             break;
         }
-        planes.push(plane_observation(model, &inliers, points.len()));
-        remaining = outliers;
+        let observation = plane_observation(model, &inliers, points.len());
+        if plane_observation_is_coherent(&observation, config) {
+            planes.push(observation);
+            remaining = outliers;
+        } else {
+            remaining = outliers;
+            remaining.extend(inliers);
+            break;
+        }
     }
     (planes, remaining)
 }
@@ -931,9 +975,56 @@ fn plane_observation(
         centroid,
         distance_from_origin_m: distance,
         bounds_2d: plane_bounds(normal, centroid, inliers),
+        extent_m: point_extent(inliers),
         point_count: inliers.len(),
         confidence: (inliers.len() as f32 / total_points.max(1) as f32).clamp(0.0, 1.0),
+        rms_error_m: plane_rms_error((normal, distance), inliers),
     }
+}
+
+fn plane_observation_is_coherent(
+    observation: &PlaneObservation,
+    config: &SurfaceExtractorConfig,
+) -> bool {
+    let span_u = (observation.bounds_2d.max_u - observation.bounds_2d.min_u).abs();
+    let span_v = (observation.bounds_2d.max_v - observation.bounds_2d.min_v).abs();
+    let major = span_u.max(span_v);
+    let minor = span_u.min(span_v);
+    let area = span_u * span_v;
+    observation.point_count >= config.min_plane_points
+        && major >= config.min_plane_major_extent_m
+        && minor >= config.min_plane_minor_extent_m
+        && area >= config.min_plane_area_m
+        && observation.rms_error_m <= config.max_plane_rms_error_m
+}
+
+fn point_extent(points: &[Point3]) -> Vec3 {
+    let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for point in points {
+        let position = point.position;
+        min.x = min.x.min(position.x);
+        min.y = min.y.min(position.y);
+        min.z = min.z.min(position.z);
+        max.x = max.x.max(position.x);
+        max.y = max.y.max(position.y);
+        max.z = max.z.max(position.z);
+    }
+    max - min
+}
+
+fn plane_rms_error((normal, distance): (Vec3, f32), points: &[Point3]) -> f32 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    let sum_sq = points
+        .iter()
+        .map(|point| {
+            let error = normal.dot(point.position) + distance;
+            error * error
+        })
+        .sum::<f32>();
+    (sum_sq / points.len() as f32).sqrt()
 }
 
 fn plane_bounds(normal: Vec3, centroid: Vec3, points: &[Point3]) -> Bounds2 {
@@ -1003,7 +1094,22 @@ fn track_match_score(
     {
         None
     } else {
-        Some(normal_angle + distance_delta + centroid_delta)
+        let overlap_bonus = bounds_overlap_ratio(track.bounds_2d, observation.bounds_2d) * 0.25;
+        Some((normal_angle + distance_delta + centroid_delta - overlap_bonus).max(0.0))
+    }
+}
+
+fn bounds_overlap_ratio(left: Bounds2, right: Bounds2) -> f32 {
+    let overlap_u = (left.max_u.min(right.max_u) - left.min_u.max(right.min_u)).max(0.0);
+    let overlap_v = (left.max_v.min(right.max_v) - left.min_v.max(right.min_v)).max(0.0);
+    let overlap = overlap_u * overlap_v;
+    let left_area = ((left.max_u - left.min_u) * (left.max_v - left.min_v)).abs();
+    let right_area = ((right.max_u - right.min_u) * (right.max_v - right.min_v)).abs();
+    let union = left_area + right_area - overlap;
+    if union <= f32::EPSILON {
+        0.0
+    } else {
+        (overlap / union).clamp(0.0, 1.0)
     }
 }
 
@@ -1045,10 +1151,13 @@ fn smooth_track(
     track.distance_from_origin_m =
         track.distance_from_origin_m * (1.0 - alpha) + observation.distance_from_origin_m * alpha;
     track.bounds_2d = observation.bounds_2d;
+    track.extent_m = observation.extent_m;
     track.confidence = (track.confidence + seen_gain + observation.confidence * 0.1).min(1.0);
+    track.supporting_point_count = observation.point_count;
     track.last_seen_ms = t_ms;
     track.seen_count += 1;
     track.missing_count = 0;
+    track.labels = surface_labels(track.kind);
 }
 
 fn project_obstacles(
@@ -1233,6 +1342,30 @@ fn semantic_hint_for_cluster(cluster: &ClusterObservation) -> Option<String> {
     } else {
         None
     }
+}
+
+fn surface_labels(kind: SurfaceKind) -> Vec<String> {
+    match kind {
+        SurfaceKind::Floor => vec!["floor_candidate".to_string()],
+        SurfaceKind::HorizontalPlane => vec!["table_candidate".to_string()],
+        SurfaceKind::VerticalPlane => vec!["wall_candidate".to_string()],
+        SurfaceKind::UnknownPlane => vec!["unknown_surface".to_string()],
+    }
+}
+
+fn cluster_is_planar_room_geometry(
+    cluster: &ClusterObservation,
+    surfaces: &[SurfaceTrack],
+) -> bool {
+    surfaces
+        .iter()
+        .filter(|surface| surface.confidence >= 0.2)
+        .any(|surface| {
+            let normal_delta = (cluster.centroid - surface.centroid)
+                .dot(surface.normal)
+                .abs();
+            normal_delta <= 0.08 && point_inside_surface_bounds(cluster.centroid, surface, 0.2)
+        })
 }
 
 fn predict_pose(pose: Pose2, action: &ActionPrimitive, offset_ms: u64) -> Pose2 {
@@ -1579,16 +1712,20 @@ mod tests {
         };
         let floor = SurfaceTrack {
             id: "floor".to_string(),
+            primitive_kind: SurfacePrimitiveKind::Plane,
             kind: SurfaceKind::Floor,
             normal: Vec3::new(0.1, 0.0, 0.995).normalized().unwrap(),
             centroid: Vec3::new(0.0, 0.0, 0.05),
             distance_from_origin_m: 0.0,
             bounds_2d: Bounds2::default(),
+            extent_m: Vec3::new(2.0, 2.0, 0.02),
             confidence: 0.8,
+            supporting_point_count: 64,
             first_seen_ms: 0,
             last_seen_ms: 0,
             seen_count: 1,
             missing_count: 0,
+            labels: surface_labels(SurfaceKind::Floor),
         };
 
         let hint = calibration_hint(&floor, Pose2::default(), &config);
@@ -1608,6 +1745,7 @@ mod tests {
         });
         let surfaces = vec![SurfaceTrack {
             id: "floor".to_string(),
+            primitive_kind: SurfacePrimitiveKind::Plane,
             kind: SurfaceKind::Floor,
             normal: Vec3::new(0.0, 0.0, 1.0),
             centroid: Vec3::default(),
@@ -1618,11 +1756,14 @@ mod tests {
                 min_v: -2.0,
                 max_v: 2.0,
             },
+            extent_m: Vec3::new(4.0, 4.0, 0.0),
             confidence: 1.0,
+            supporting_point_count: 100,
             first_seen_ms: 0,
             last_seen_ms: 0,
             seen_count: 1,
             missing_count: 0,
+            labels: surface_labels(SurfaceKind::Floor),
         }];
 
         let first = extractor.update_cluster_tracks(
@@ -1733,19 +1874,7 @@ mod tests {
             track_centroid_threshold_m: 0.35,
             ..SurfaceExtractorConfig::default()
         });
-        let first = PlaneObservation {
-            normal: Vec3::new(1.0, 0.0, 0.0),
-            centroid: Vec3::new(0.8, -0.4, 0.6),
-            distance_from_origin_m: -0.8,
-            bounds_2d: Bounds2 {
-                min_u: -0.25,
-                max_u: 0.25,
-                min_v: -0.4,
-                max_v: 0.4,
-            },
-            point_count: 64,
-            confidence: 0.7,
-        };
+        let first = wall_observation(Vec3::new(0.8, -0.4, 0.6));
         let second = PlaneObservation {
             centroid: Vec3::new(0.81, 0.55, 0.62),
             bounds_2d: Bounds2 {
@@ -1766,6 +1895,123 @@ mod tests {
         assert_eq!(extractor.next_surface_id, 2);
     }
 
+    #[test]
+    fn repeated_wall_observations_keep_id_and_raise_confidence() {
+        let mut extractor = SurfaceExtractor::new(SurfaceExtractorConfig {
+            track_seen_gain: 0.2,
+            ..SurfaceExtractorConfig::default()
+        });
+        let observation = wall_observation(Vec3::new(1.2, 0.0, 0.7));
+
+        let first = extractor.update_tracks(&[observation], 1_000);
+        let id = first[0].id.clone();
+        let first_confidence = first[0].confidence;
+        let second = extractor.update_tracks(&[observation], 1_100);
+        let third = extractor.update_tracks(&[observation], 1_200);
+
+        assert_eq!(second[0].id, id);
+        assert_eq!(third[0].id, id);
+        assert!(third[0].confidence > first_confidence);
+        assert_eq!(third[0].primitive_kind, SurfacePrimitiveKind::Plane);
+        assert_eq!(third[0].supporting_point_count, observation.point_count);
+        assert!(third[0]
+            .labels
+            .iter()
+            .any(|label| label == "wall_candidate"));
+    }
+
+    #[test]
+    fn confidence_decays_when_plane_disappears() {
+        let mut extractor = SurfaceExtractor::new(SurfaceExtractorConfig {
+            track_missing_decay: 0.12,
+            ..SurfaceExtractorConfig::default()
+        });
+        let observation = wall_observation(Vec3::new(1.2, 0.0, 0.7));
+
+        let first = extractor.update_tracks(&[observation], 1_000);
+        let confidence = first[0].confidence;
+        let missing = extractor.update_tracks(&[], 1_100);
+
+        assert_eq!(missing[0].id, first[0].id);
+        assert!(missing[0].confidence < confidence);
+        assert_eq!(missing[0].missing_count, 1);
+    }
+
+    #[test]
+    fn tiny_noisy_planar_groups_are_rejected() {
+        let config = SurfaceExtractorConfig {
+            min_plane_points: 6,
+            min_plane_major_extent_m: 0.35,
+            min_plane_minor_extent_m: 0.12,
+            min_plane_area_m: 0.08,
+            max_plane_rms_error_m: 0.03,
+            ..SurfaceExtractorConfig::default()
+        };
+        let mut points = Vec::new();
+        for x in 0..3 {
+            for z in 0..3 {
+                points.push(Point3 {
+                    position: Vec3::new(
+                        1.0 + x as f32 * 0.025,
+                        (x + z) as f32 * 0.003,
+                        0.4 + z as f32 * 0.025,
+                    ),
+                });
+            }
+        }
+
+        let (planes, leftovers) = extract_planes(&points, &config);
+
+        assert!(planes.is_empty());
+        assert_eq!(leftovers.len(), points.len());
+    }
+
+    #[test]
+    fn planar_fragments_supported_by_surfaces_do_not_become_clusters() {
+        let mut extractor = SurfaceExtractor::new(SurfaceExtractorConfig {
+            min_cluster_points: 3,
+            cluster_distance_m: 0.2,
+            ..SurfaceExtractorConfig::default()
+        });
+        let wall = SurfaceTrack {
+            id: "wall_1".to_string(),
+            primitive_kind: SurfacePrimitiveKind::Plane,
+            kind: SurfaceKind::VerticalPlane,
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            centroid: Vec3::new(1.0, 0.0, 0.6),
+            distance_from_origin_m: -1.0,
+            bounds_2d: Bounds2 {
+                min_u: -0.5,
+                max_u: 0.5,
+                min_v: -0.5,
+                max_v: 0.5,
+            },
+            extent_m: Vec3::new(0.02, 1.0, 1.0),
+            confidence: 0.8,
+            supporting_point_count: 80,
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_000,
+            seen_count: 1,
+            missing_count: 0,
+            labels: surface_labels(SurfaceKind::VerticalPlane),
+        };
+        let fragment = vec![
+            Point3 {
+                position: Vec3::new(1.01, -0.05, 0.55),
+            },
+            Point3 {
+                position: Vec3::new(1.02, 0.0, 0.6),
+            },
+            Point3 {
+                position: Vec3::new(1.01, 0.05, 0.65),
+            },
+        ];
+
+        let clusters = extractor.cluster_leftovers(&fragment, &[wall], 1_000);
+
+        assert!(clusters.is_empty());
+    }
+
     fn output_with_wall(id: &str, centroid: Vec3) -> SurfaceExtractorOutput {
         let normal = if centroid.x.abs() >= centroid.y.abs() {
             Vec3::new(1.0, 0.0, 0.0)
@@ -1774,6 +2020,7 @@ mod tests {
         };
         let wall = SurfaceTrack {
             id: id.to_string(),
+            primitive_kind: SurfacePrimitiveKind::Plane,
             kind: SurfaceKind::VerticalPlane,
             normal,
             centroid,
@@ -1784,11 +2031,14 @@ mod tests {
                 min_v: -0.55,
                 max_v: 0.55,
             },
+            extent_m: Vec3::new(0.02, 0.9, 1.1),
             confidence: 0.85,
+            supporting_point_count: 80,
             first_seen_ms: 1_000,
             last_seen_ms: 1_000,
             seen_count: 3,
             missing_count: 0,
+            labels: surface_labels(SurfaceKind::VerticalPlane),
         };
         SurfaceExtractorOutput {
             stable_surfaces: vec![floor_track(), wall],
@@ -1802,9 +2052,28 @@ mod tests {
         }
     }
 
+    fn wall_observation(centroid: Vec3) -> PlaneObservation {
+        PlaneObservation {
+            normal: Vec3::new(1.0, 0.0, 0.0),
+            centroid,
+            distance_from_origin_m: -centroid.x,
+            bounds_2d: Bounds2 {
+                min_u: -0.4,
+                max_u: 0.4,
+                min_v: -0.5,
+                max_v: 0.5,
+            },
+            extent_m: Vec3::new(0.02, 0.8, 1.0),
+            point_count: 64,
+            confidence: 0.7,
+            rms_error_m: 0.01,
+        }
+    }
+
     fn floor_track() -> SurfaceTrack {
         SurfaceTrack {
             id: "floor".to_string(),
+            primitive_kind: SurfacePrimitiveKind::Plane,
             kind: SurfaceKind::Floor,
             normal: Vec3::new(0.0, 0.0, 1.0),
             centroid: Vec3::default(),
@@ -1815,11 +2084,14 @@ mod tests {
                 min_v: -2.0,
                 max_v: 2.0,
             },
+            extent_m: Vec3::new(4.0, 4.0, 0.0),
             confidence: 1.0,
+            supporting_point_count: 100,
             first_seen_ms: 0,
             last_seen_ms: 0,
             seen_count: 1,
             missing_count: 0,
+            labels: surface_labels(SurfaceKind::Floor),
         }
     }
 

@@ -24,7 +24,7 @@ use netherwick_core::TimeMs;
 use netherwick_experience::EmbodiedContext;
 use netherwick_map::{
     project_beam_endpoint, LocalMap, MapObservation, MapSummary, OccupancyCell as OdomMapCell,
-    MAP_LABEL,
+    PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
 use netherwick_now::{KinectSense, KinectSkeletonSense, ReignSense};
 use netherwick_runtime::{
@@ -33,7 +33,7 @@ use netherwick_runtime::{
 };
 use netherwick_sensors::{
     ClusterObservation, EyeFrameFormat, OccupancyGrid, PlaneObservation, SceneGraphSummary,
-    SurfaceExtractor, SurfaceExtractorDiagnostics, SurfaceTrack, WorldSnapshot,
+    SurfaceExtractor, SurfaceExtractorDiagnostics, SurfaceHypothesis, SurfaceTrack, WorldSnapshot,
 };
 use netherwick_worldlab::CaptureReader;
 use serde::{Deserialize, Serialize};
@@ -333,6 +333,7 @@ pub fn reign_router(state: ReignServerState) -> Router {
 pub struct LiveViewState {
     latest: Arc<Mutex<Option<WorldSnapshot>>>,
     map: Arc<Mutex<LocalMap>>,
+    point_cloud: Arc<Mutex<VoxelPointCloud>>,
     latest_embodied: Arc<Mutex<Option<EmbodiedContext>>>,
     scene_metadata: Arc<Mutex<Option<LiveSceneMetadata>>>,
     session: Arc<Mutex<Option<SceneSession>>>,
@@ -365,6 +366,7 @@ impl Default for LiveViewState {
         Self {
             latest: Arc::new(Mutex::new(None)),
             map: Arc::new(Mutex::new(LocalMap::default())),
+            point_cloud: Arc::new(Mutex::new(VoxelPointCloud::default())),
             latest_embodied: Arc::new(Mutex::new(None)),
             scene_metadata: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(None)),
@@ -470,6 +472,10 @@ impl LiveViewState {
             .lock()
             .expect("live map mutex poisoned")
             .observe_snapshot(&snapshot, snapshot.body.last_update_ms);
+        self.point_cloud
+            .lock()
+            .expect("live point cloud mutex poisoned")
+            .observe_snapshot(&snapshot, snapshot.body.last_update_ms);
         *self
             .latest
             .lock()
@@ -485,6 +491,13 @@ impl LiveViewState {
 
     pub fn map_snapshot(&self) -> LocalMap {
         self.map.lock().expect("live map mutex poisoned").clone()
+    }
+
+    pub fn point_cloud_snapshot(&self) -> VoxelPointCloud {
+        self.point_cloud
+            .lock()
+            .expect("live point cloud mutex poisoned")
+            .clone()
     }
 
     pub fn update_embodied_context(&self, context: EmbodiedContext) {
@@ -907,6 +920,7 @@ pub struct LiveMapResponse {
     pub cells: Vec<MapViewCell>,
     pub semantic_cells: Vec<MapSemanticCell>,
     pub events: Vec<MapEventMarker>,
+    pub entity_graph: MapEntityGraph,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -965,6 +979,45 @@ pub struct MapEventMarker {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapEntityGraph {
+    pub schema_version: u32,
+    pub generated_from: &'static str,
+    pub nodes: Vec<MapEntityGraphNode>,
+    pub edges: Vec<MapEntityGraphEdge>,
+    pub events: Vec<MapEntityGraphEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapEntityGraphNode {
+    pub id: String,
+    pub node_type: String,
+    pub label: String,
+    pub modality: Option<String>,
+    pub x_m: Option<f32>,
+    pub y_m: Option<f32>,
+    pub confidence: f32,
+    pub age_ms: TimeMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapEntityGraphEdge {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub edge_type: String,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapEntityGraphEvent {
+    pub t_ms: TimeMs,
+    pub node_id: String,
+    pub event_type: String,
+    pub label: String,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SceneEye {
     pub width: u32,
     pub height: u32,
@@ -983,6 +1036,10 @@ pub struct SceneEye {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SceneKinect {
     pub points: Vec<ScenePoint>,
+    #[serde(default)]
+    pub accumulated_points: Vec<SceneAccumulatedPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accumulated_summary: Option<PointCloudSummary>,
     pub skeletons: Vec<KinectSkeletonSense>,
     pub diagnostics: SceneKinectDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1007,7 +1064,7 @@ pub struct SceneKinectDiagnostics {
 pub struct SceneSurfacePerception {
     pub diagnostics: SurfaceExtractorDiagnostics,
     pub plane_observations: Vec<PlaneObservation>,
-    pub stable_surfaces: Vec<SurfaceTrack>,
+    pub stable_surfaces: Vec<SurfaceHypothesis>,
     pub floor: Option<SurfaceTrack>,
     pub obstacle_grid: OccupancyGrid,
     pub clusters: Vec<ClusterObservation>,
@@ -1036,6 +1093,20 @@ pub struct ScenePoint {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SceneAccumulatedPoint {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub confidence: f32,
+    pub age_ms: TimeMs,
+    pub stable: bool,
+    pub transient: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1605,6 +1676,7 @@ async fn get_live_scene(
         state.training_status(),
         state.prod_state(),
         state.behavior_nodes(),
+        Some(&state.point_cloud_snapshot()),
         retina_status,
         state.hardware_control_status(),
     );
@@ -1654,13 +1726,22 @@ fn map_response_from_parts(
         .last()
         .map(|observation| projected_beams_from_observation(observation, now_ms))
         .unwrap_or_default();
-    let cells = map
+    let cells: Vec<_> = map
         .cells
         .values()
         .map(|cell| map_view_cell(cell, map.config.resolution_m, now_ms))
         .collect();
     let semantic_cells = map_semantic_cells(latest, metadata, now_ms);
     let events = map_event_markers(latest, metadata, now_ms);
+    let entity_graph = map_entity_graph(
+        &pose_trail,
+        &range_beams,
+        &cells,
+        &semantic_cells,
+        &events,
+        latest,
+        now_ms,
+    );
 
     LiveMapResponse {
         schema_version: 1,
@@ -1681,7 +1762,378 @@ fn map_response_from_parts(
         cells,
         semantic_cells,
         events,
+        entity_graph,
     }
+}
+
+fn map_entity_graph(
+    pose_trail: &[MapPosePoint],
+    range_beams: &[MapProjectedBeam],
+    cells: &[MapViewCell],
+    semantic_cells: &[MapSemanticCell],
+    map_events: &[MapEventMarker],
+    latest: &WorldSnapshot,
+    now_ms: TimeMs,
+) -> MapEntityGraph {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut events = Vec::new();
+    let current_pose = pose_trail.last();
+
+    if let Some(pose) = current_pose {
+        push_graph_node(
+            &mut nodes,
+            "place:current",
+            "place",
+            "current place",
+            Some("odometry"),
+            Some((pose.x_m, pose.y_m)),
+            pose.confidence,
+            now_ms.saturating_sub(pose.t_ms),
+        );
+        push_graph_node(
+            &mut nodes,
+            "cluster:odometry:trail",
+            "cluster",
+            "odometry trail",
+            Some("odometry"),
+            Some((pose.x_m, pose.y_m)),
+            pose.confidence,
+            now_ms.saturating_sub(pose.t_ms),
+        );
+        push_graph_edge(
+            &mut edges,
+            "cluster:odometry:trail",
+            "place:current",
+            "same_place_as",
+            pose.confidence,
+        );
+    }
+
+    let nearest_beams: Vec<_> = range_beams
+        .iter()
+        .enumerate()
+        .filter(|(_, beam)| beam.hit)
+        .take(8)
+        .collect();
+    let has_range_cluster = !nearest_beams.is_empty();
+    if has_range_cluster {
+        push_graph_node(
+            &mut nodes,
+            "cluster:range:nearest",
+            "cluster",
+            "nearest range returns",
+            Some("range"),
+            current_pose.map(|pose| (pose.x_m, pose.y_m)),
+            0.76,
+            nearest_beams
+                .iter()
+                .map(|(_, beam)| beam.age_ms)
+                .min()
+                .unwrap_or(0),
+        );
+        if current_pose.is_some() {
+            push_graph_edge(
+                &mut edges,
+                "cluster:range:nearest",
+                "place:current",
+                "same_time_as",
+                0.72,
+            );
+        }
+    }
+
+    for (index, beam) in nearest_beams {
+        let id = format!("observation:range:{index}");
+        push_graph_node(
+            &mut nodes,
+            &id,
+            "observation",
+            &format!("range {:.2}m", beam.distance_m),
+            Some("range"),
+            Some((beam.end_x_m, beam.end_y_m)),
+            beam.confidence,
+            beam.age_ms,
+        );
+        push_graph_edge(
+            &mut edges,
+            &id,
+            "cluster:range:nearest",
+            "belongs_to",
+            beam.confidence,
+        );
+        if current_pose.is_some() {
+            push_graph_edge(&mut edges, &id, "place:current", "same_place_as", 0.54);
+        }
+    }
+
+    for (index, cell) in cells
+        .iter()
+        .filter(|cell| cell.occupied_score > cell.free_score && cell.confidence > 0.18)
+        .take(10)
+        .enumerate()
+    {
+        let cluster_id = format!("cluster:occupancy:{}:{}", cell.x, cell.y);
+        push_graph_node(
+            &mut nodes,
+            &cluster_id,
+            "cluster",
+            "occupied cell cluster",
+            Some("range"),
+            Some((cell.center_x_m, cell.center_y_m)),
+            cell.confidence,
+            cell.age_ms,
+        );
+        if has_range_cluster {
+            push_graph_edge(
+                &mut edges,
+                &cluster_id,
+                "cluster:range:nearest",
+                "co_occurs_with",
+                cell.confidence.min(0.7),
+            );
+        }
+        if index < 4 {
+            push_graph_edge(
+                &mut edges,
+                &cluster_id,
+                "place:current",
+                "same_place_as",
+                cell.confidence.min(0.62),
+            );
+        }
+    }
+
+    for (index, cell) in semantic_cells.iter().take(12).enumerate() {
+        let clean_kind = graph_id_fragment(&cell.kind);
+        let cluster_id = format!("cluster:semantic:{clean_kind}:{index}");
+        let entity_id = format!("entity:{clean_kind}:{index}");
+        let label_id = format!("text_label:{clean_kind}:{index}");
+        let age_ms = cell.age_ms.unwrap_or(0);
+        let label = cell.label.clone().unwrap_or_else(|| cell.kind.clone());
+        push_graph_node(
+            &mut nodes,
+            &cluster_id,
+            "cluster",
+            &format!("{} cluster", cell.kind),
+            Some(cell.kind.as_str()),
+            Some((cell.x_m, cell.y_m)),
+            cell.confidence,
+            age_ms,
+        );
+        push_graph_node(
+            &mut nodes,
+            &entity_id,
+            "entity",
+            &label,
+            Some(cell.kind.as_str()),
+            Some((cell.x_m, cell.y_m)),
+            cell.confidence * cell.score,
+            age_ms,
+        );
+        push_graph_node(
+            &mut nodes,
+            &label_id,
+            "text_label",
+            &label,
+            Some("language"),
+            Some((cell.x_m, cell.y_m)),
+            cell.confidence,
+            age_ms,
+        );
+        push_graph_edge(
+            &mut edges,
+            &cluster_id,
+            &entity_id,
+            "part_of_entity",
+            cell.confidence,
+        );
+        push_graph_edge(
+            &mut edges,
+            &label_id,
+            &entity_id,
+            "named_by",
+            cell.confidence,
+        );
+        push_graph_edge(
+            &mut edges,
+            &cluster_id,
+            "place:current",
+            "same_place_as",
+            0.58,
+        );
+        push_graph_edge(
+            &mut edges,
+            &entity_id,
+            "place:current",
+            "same_place_as",
+            0.62,
+        );
+        if has_range_cluster {
+            push_graph_edge(
+                &mut edges,
+                "cluster:range:nearest",
+                &cluster_id,
+                "co_occurs_with",
+                0.48,
+            );
+        }
+        events.push(MapEntityGraphEvent {
+            t_ms: now_ms.saturating_sub(age_ms),
+            node_id: entity_id,
+            event_type: "entity_seen".to_string(),
+            label,
+            confidence: cell.confidence,
+        });
+    }
+
+    for (index, event) in map_events.iter().take(8).enumerate() {
+        let event_id = format!(
+            "observation:event:{}:{index}",
+            graph_id_fragment(&event.kind)
+        );
+        push_graph_node(
+            &mut nodes,
+            &event_id,
+            "observation",
+            event.label.as_deref().unwrap_or(&event.kind),
+            Some(event.kind.as_str()),
+            Some((event.x_m, event.y_m)),
+            event.confidence,
+            event.age_ms,
+        );
+        push_graph_edge(
+            &mut edges,
+            &event_id,
+            "place:current",
+            "same_place_as",
+            event.confidence,
+        );
+        if has_range_cluster
+            && (event.kind == "charger" || event.kind == "person" || event.kind == "speaker")
+        {
+            push_graph_edge(
+                &mut edges,
+                &event_id,
+                "cluster:range:nearest",
+                "co_occurs_with",
+                0.44,
+            );
+        }
+        events.push(MapEntityGraphEvent {
+            t_ms: now_ms.saturating_sub(event.age_ms),
+            node_id: event_id,
+            event_type: event.kind.clone(),
+            label: event.label.clone().unwrap_or_else(|| event.kind.clone()),
+            confidence: event.confidence,
+        });
+    }
+
+    if let Some(action) = &latest.final_selected_action {
+        push_graph_node(
+            &mut nodes,
+            "action_context:current",
+            "action_context",
+            &format!("{action:?}"),
+            Some("action"),
+            current_pose.map(|pose| (pose.x_m, pose.y_m)),
+            0.86,
+            0,
+        );
+        if current_pose.is_some() {
+            push_graph_edge(
+                &mut edges,
+                "action_context:current",
+                "place:current",
+                "same_time_as",
+                0.86,
+            );
+            push_graph_edge(
+                &mut edges,
+                "action_context:current",
+                "cluster:odometry:trail",
+                "predicts",
+                0.42,
+            );
+            if has_range_cluster {
+                push_graph_edge(
+                    &mut edges,
+                    "action_context:current",
+                    "cluster:range:nearest",
+                    "moves_with",
+                    0.38,
+                );
+            }
+        }
+    }
+
+    MapEntityGraph {
+        schema_version: 1,
+        generated_from: "live_map_mvp",
+        nodes,
+        edges,
+        events,
+    }
+}
+
+fn push_graph_node(
+    nodes: &mut Vec<MapEntityGraphNode>,
+    id: &str,
+    node_type: &str,
+    label: &str,
+    modality: Option<&str>,
+    position: Option<(f32, f32)>,
+    confidence: f32,
+    age_ms: TimeMs,
+) {
+    if nodes.iter().any(|node| node.id == id) {
+        return;
+    }
+    nodes.push(MapEntityGraphNode {
+        id: id.to_string(),
+        node_type: node_type.to_string(),
+        label: label.to_string(),
+        modality: modality.map(str::to_string),
+        x_m: position.map(|(x, _)| x),
+        y_m: position.map(|(_, y)| y),
+        confidence: confidence.clamp(0.0, 1.0),
+        age_ms,
+    });
+}
+
+fn push_graph_edge(
+    edges: &mut Vec<MapEntityGraphEdge>,
+    from: &str,
+    to: &str,
+    edge_type: &str,
+    confidence: f32,
+) {
+    if from == to {
+        return;
+    }
+    let id = format!("{from}->{edge_type}->{to}");
+    if edges.iter().any(|edge| edge.id == id) {
+        return;
+    }
+    edges.push(MapEntityGraphEdge {
+        id,
+        from: from.to_string(),
+        to: to.to_string(),
+        edge_type: edge_type.to_string(),
+        confidence: confidence.clamp(0.0, 1.0),
+    });
+}
+
+fn graph_id_fragment(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 fn projected_beams_from_observation(
@@ -2657,6 +3109,7 @@ async fn get_capture_scene(
         LiveTrainingStatus::default(),
         NudgeStatus::default(),
         default_behavior_nodes(),
+        Some(&accumulated_point_cloud_for_frames(&frames[..=query.frame])),
         None,
         HardwareControlStatus::unavailable("capture replay is not a hardware cockpit session"),
     );
@@ -2716,6 +3169,50 @@ async fn get_capture_scene(
     Ok(Json(scene))
 }
 
+fn accumulated_point_cloud_for_frames(
+    frames: &[netherwick_worldlab::CaptureFrameRecord],
+) -> VoxelPointCloud {
+    let mut cloud = VoxelPointCloud::default();
+    for frame in frames {
+        cloud.observe_snapshot(&frame.snapshot, frame.t_ms);
+    }
+    cloud
+}
+
+fn accumulated_scene_points(
+    point_cloud: &VoxelPointCloud,
+    now_ms: TimeMs,
+) -> Vec<SceneAccumulatedPoint> {
+    const MAX_SCENE_POINTS: usize = 8_000;
+    let points = point_cloud.points();
+    let stride = points.len().div_ceil(MAX_SCENE_POINTS).max(1);
+    points
+        .into_iter()
+        .step_by(stride)
+        .map(|point| scene_accumulated_point(point, now_ms))
+        .collect()
+}
+
+fn scene_accumulated_point(point: VoxelPoint, now_ms: TimeMs) -> SceneAccumulatedPoint {
+    let [r, g, b] = point.color_rgb.unwrap_or(if point.stable {
+        [124, 230, 174]
+    } else {
+        [190, 194, 246]
+    });
+    SceneAccumulatedPoint {
+        x: point.position.x_m,
+        y: point.position.y_m,
+        z: point.position.z_m,
+        r,
+        g,
+        b,
+        confidence: point.confidence,
+        age_ms: now_ms.saturating_sub(point.last_seen_ms),
+        stable: point.stable,
+        transient: point.transient,
+    }
+}
+
 async fn get_live_now(
     State(state): State<LiveViewState>,
 ) -> Result<Json<netherwick_now::Now>, LiveViewError> {
@@ -2762,6 +3259,7 @@ pub fn snapshot_to_scene(
     training: LiveTrainingStatus,
     prod_state: NudgeStatus,
     behavior_nodes: Vec<BehaviorNodeState>,
+    point_cloud: Option<&VoxelPointCloud>,
     retina_status: Option<RetinaStatusInfo>,
     hardware_control: HardwareControlStatus,
 ) -> LiveSceneResponse {
@@ -2802,7 +3300,15 @@ pub fn snapshot_to_scene(
         }
     };
     let sensor_calibration = metadata.and_then(|metadata| metadata.sensor_calibration);
-    let kinect = scene_kinect_from_snapshot(snapshot, sensor_calibration, &mut warnings);
+    let mut kinect = scene_kinect_from_snapshot(snapshot, sensor_calibration, &mut warnings);
+    if let Some(point_cloud) = point_cloud {
+        kinect.accumulated_points =
+            accumulated_scene_points(point_cloud, snapshot.body.last_update_ms);
+        kinect.accumulated_summary = Some(point_cloud.summary());
+        if !kinect.accumulated_points.is_empty() {
+            kinect.coordinate_system = Some("world".to_string());
+        }
+    }
     let audio = snapshot
         .kinect
         .audio_angle_rad
@@ -3399,6 +3905,8 @@ fn scene_kinect_from_snapshot(
     }
     SceneKinect {
         points,
+        accumulated_points: Vec::new(),
+        accumulated_summary: None,
         skeletons: snapshot.kinect.skeletons.clone(),
         coordinate_system: Some(diagnostics.coordinate_system.clone()),
         diagnostics,
@@ -4623,6 +5131,8 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #hardware-state{font-size:11px;color:#ffbf7a;min-height:15px}
 .trace-label{font-size:11px;color:#9fb0bf}
 #trace-map{width:100%;height:auto;display:block;background:#081015;border:1px solid #2d3d4a;border-radius:4px}
+#entity-graph{width:100%;height:auto;display:block;background:#070b0f;border:1px solid #2d3d4a;border-radius:4px;margin-top:8px}
+#entity-graph-summary{font-size:10px;color:#b7c8d8;min-height:13px;margin-top:4px;font-variant-numeric:tabular-nums}
 .reign-pad{display:grid;grid-template-columns:132px 1fr;gap:10px;align-items:center}
 #reign-joystick{position:relative;width:132px;aspect-ratio:1;border:1px solid #455565;border-radius:50%;background:radial-gradient(circle at 50% 50%,rgba(79,149,188,.24),rgba(15,23,31,.72) 64%);touch-action:none;cursor:pointer}
 #reign-joystick::before,#reign-joystick::after{content:"";position:absolute;background:rgba(170,196,216,.22)}
@@ -4808,6 +5318,8 @@ canvas{display:block}
       <label><input type="checkbox" data-map-layer="events" checked>events</label>
     </div>
     <div class="trace-label">Odometry/range trace, not SLAM.</div>
+    <canvas id="entity-graph" width="220" height="170" aria-label="entity constellation graph"></canvas>
+    <div id="entity-graph-summary">entity constellation waiting...</div>
   </div>
 </aside>
 <aside id="llm" data-window-title="LLM streams">
@@ -4918,6 +5430,9 @@ const hardwareArm = document.getElementById('hardware-arm');
 const hardwareState = document.getElementById('hardware-state');
 const traceCanvas = document.getElementById('trace-map');
 const traceCtx = traceCanvas.getContext('2d');
+const entityGraphCanvas = document.getElementById('entity-graph');
+const entityGraphCtx = entityGraphCanvas.getContext('2d');
+const entityGraphSummary = document.getElementById('entity-graph-summary');
 const mapLayerInputs = Array.from(document.querySelectorAll('[data-map-layer]'));
 const llmStatus = document.getElementById('llm-status');
 const llmStreams = document.getElementById('llm-streams');
@@ -4935,6 +5450,7 @@ const learningStatus = document.getElementById('learning-status');
 const learningApply = document.getElementById('learning-apply');
 const learningChecks = Array.from(document.querySelectorAll('#learning-behaviors input[type="checkbox"]'));
 const traceState = {poses: [], events: [], occupied: new Map(), free: new Map()};
+const entityGraphState = {positions: new Map()};
 let cockpitAvailable = false;
 let cockpitArmed = false;
 
@@ -5287,6 +5803,10 @@ function renderPoints(points, coordinateSystem){
   pointCloud.parent = null;
 }
 
+function renderAccumulatedPoints(points){
+  renderPoints(points || [], 'world');
+}
+
 function v3(value){
   return {
     x: Number(value?.x) || 0,
@@ -5337,6 +5857,14 @@ function surfaceColor(kind, confidence=1){
   if(kind === 'horizontal_plane') return {color:new BABYLON.Color3(0.36, 0.66, 1.0), alpha};
   if(kind === 'vertical_plane') return {color:new BABYLON.Color3(1.0, 0.72, 0.36), alpha};
   return {color:new BABYLON.Color3(0.84, 0.68, 1.0), alpha};
+}
+function surfaceCandidateLabel(surface){
+  const labels = Array.isArray(surface.labels) ? surface.labels : [];
+  if(labels.length) return labels[0];
+  if(surface.kind === 'floor') return 'floor_candidate';
+  if(surface.kind === 'horizontal_plane') return 'table_candidate';
+  if(surface.kind === 'vertical_plane') return 'wall_candidate';
+  return 'unknown_surface';
 }
 function planeBasis(normal){
   const n = norm3(normal);
@@ -5427,9 +5955,9 @@ function createClusterBox(cluster){
   mesh.material = mat;
   mesh.position.copyFrom(centroid);
   mesh.parent = surfaceOverlays;
-  const hint = cluster.semantic_hint ? ` ${cluster.semantic_hint}` : '';
+  const hint = cluster.semantic_hint || 'transient_cluster';
   const motion = cluster.moving ? ' moving' : '';
-  createLabel(`${cluster.id || 'cluster'}${motion}${hint}`, centroid.add(new BABYLON.Vector3(0, Math.max(size.z, .18) + .14, 0)), mat.diffuseColor);
+  createLabel(`${hint}${motion} ${fmt(cluster.confidence || 0, 2)}`, centroid.add(new BABYLON.Vector3(0, Math.max(size.z, .18) + .14, 0)), mat.diffuseColor);
 }
 function renderSurfacePerception(packet){
   clearChildren(surfaceOverlays);
@@ -5439,7 +5967,7 @@ function renderSurfacePerception(packet){
     createPlanePatch(surface);
     const style = surfaceColor(surface.kind, surface.confidence);
     const labelPosition = surfacePoint(surface.centroid).add(new BABYLON.Vector3(0, .12, 0));
-    createLabel(`${surface.id || 'surface'} ${fmt(surface.confidence, 2)}`, labelPosition, style.color);
+    createLabel(`${surfaceCandidateLabel(surface)} ${fmt(surface.confidence, 2)}`, labelPosition, style.color);
   }
   for(const cluster of perception.clusters || []){
     createClusterBox(cluster);
@@ -5648,7 +6176,12 @@ function updateScene(packet, liveMap=null){
   robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
   renderObjects(packet);
   renderBeams(packet);
-  renderPoints(packet.kinect?.points || [], packet.kinect?.coordinate_system || 'camera');
+  const accumulated = packet.kinect?.accumulated_points || [];
+  if(accumulated.length){
+    renderAccumulatedPoints(accumulated);
+  }else{
+    renderPoints(packet.kinect?.points || [], packet.kinect?.coordinate_system || 'camera');
+  }
   renderSurfacePerception(packet);
   renderEye(packet);
   updateHardwareControl(packet.hardware_control);
@@ -5701,7 +6234,10 @@ function updateScene(packet, liveMap=null){
     fields.eye.style.fontWeight = '';
   }
   const depth = packet.kinect?.diagnostics || {};
-  fields.points.textContent = `${packet.kinect?.points?.length || 0} drawn / ${depth.valid_depth_count || 0} valid`;
+  const cloudSummary = packet.kinect?.accumulated_summary;
+  fields.points.textContent = cloudSummary
+    ? `${accumulated.length} drawn / ${cloudSummary.voxels || 0} voxels / ${cloudSummary.stable_voxels || 0} stable`
+    : `${packet.kinect?.points?.length || 0} drawn / ${depth.valid_depth_count || 0} valid`;
   fields.depth_stats.textContent = depth.depth_width
     ? `${depth.depth_width}x${depth.depth_height} ${depth.coordinate_system || '-'} med ${depth.median_depth_m == null ? '-' : fmt(depth.median_depth_m)}m skip ${depth.skipped_depth_count || 0} clip ${depth.clipped_depth_count || 0} stride ${depth.sample_stride || '-'}`
     : '-';
@@ -5858,6 +6394,190 @@ function enabledMapLayers(){
   return new Set(mapLayerInputs.filter(input => input.checked).map(input => input.dataset.mapLayer));
 }
 
+function hashUnit(value){
+  let hash = 2166136261;
+  for(let i = 0; i < value.length; i++){
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 4294967295;
+}
+
+function graphNodeColor(type){
+  return {
+    observation:'#8bd3ff',
+    cluster:'#ffcf66',
+    entity:'#60d394',
+    text_label:'#f3a6ff',
+    place:'#dce8f2',
+    action_context:'#ff8b4a'
+  }[type] || '#aeb9c3';
+}
+
+function graphEdgeColor(type){
+  return {
+    belongs_to:'rgba(139,211,255,.55)',
+    co_occurs_with:'rgba(255,207,102,.48)',
+    same_place_as:'rgba(220,232,242,.42)',
+    same_time_as:'rgba(168,137,255,.44)',
+    moves_with:'rgba(96,211,148,.44)',
+    predicts:'rgba(255,139,74,.46)',
+    named_by:'rgba(243,166,255,.52)',
+    part_of_entity:'rgba(96,211,148,.58)'
+  }[type] || 'rgba(174,185,195,.38)';
+}
+
+function ensureGraphPosition(node, width, height){
+  let pos = entityGraphState.positions.get(node.id);
+  if(!pos){
+    const a = hashUnit(`${node.id}:a`) * Math.PI * 2;
+    const r = 28 + hashUnit(`${node.id}:r`) * Math.min(width, height) * .28;
+    pos = {
+      x: width / 2 + Math.cos(a) * r,
+      y: height / 2 + Math.sin(a) * r,
+      vx: 0,
+      vy: 0
+    };
+    entityGraphState.positions.set(node.id, pos);
+  }
+  return pos;
+}
+
+function updateEntityGraphLayout(graph, width, height){
+  const nodes = graph?.nodes || [];
+  const edges = graph?.edges || [];
+  const ids = new Set(nodes.map(node => node.id));
+  for(const id of Array.from(entityGraphState.positions.keys())){
+    if(!ids.has(id)) entityGraphState.positions.delete(id);
+  }
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  for(const node of nodes) ensureGraphPosition(node, width, height);
+  for(let step = 0; step < 18; step++){
+    for(let i = 0; i < nodes.length; i++){
+      const a = nodes[i];
+      const pa = entityGraphState.positions.get(a.id);
+      for(let j = i + 1; j < nodes.length; j++){
+        const b = nodes[j];
+        const pb = entityGraphState.positions.get(b.id);
+        const dx = pa.x - pb.x;
+        const dy = pa.y - pb.y;
+        const d2 = Math.max(36, dx * dx + dy * dy);
+        const force = 48 / d2;
+        pa.vx += dx * force;
+        pa.vy += dy * force;
+        pb.vx -= dx * force;
+        pb.vy -= dy * force;
+      }
+    }
+    for(const edge of edges){
+      if(!byId.has(edge.from) || !byId.has(edge.to)) continue;
+      const a = entityGraphState.positions.get(edge.from);
+      const b = entityGraphState.positions.get(edge.to);
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const target = edge.edge_type === 'part_of_entity' || edge.edge_type === 'named_by' ? 34 : 56;
+      const force = (distance - target) * .004 * (edge.confidence || .5);
+      const fx = dx / distance * force;
+      const fy = dy / distance * force;
+      a.vx += fx;
+      a.vy += fy;
+      b.vx -= fx;
+      b.vy -= fy;
+    }
+    for(const node of nodes){
+      const p = entityGraphState.positions.get(node.id);
+      p.vx += (width / 2 - p.x) * .002;
+      p.vy += ((height - 26) / 2 - p.y) * .002;
+      p.x = clamp(p.x + p.vx, 10, width - 10);
+      p.y = clamp(p.y + p.vy, 10, height - 30);
+      p.vx *= .64;
+      p.vy *= .64;
+    }
+  }
+}
+
+function drawEntityGraph(graph){
+  const width = entityGraphCanvas.width;
+  const height = entityGraphCanvas.height;
+  entityGraphCtx.clearRect(0, 0, width, height);
+  entityGraphCtx.fillStyle = '#070b0f';
+  entityGraphCtx.fillRect(0, 0, width, height);
+  const nodes = graph?.nodes || [];
+  const edges = graph?.edges || [];
+  const events = graph?.events || [];
+  if(!nodes.length){
+    entityGraphSummary.textContent = 'entity constellation waiting...';
+    return;
+  }
+  updateEntityGraphLayout(graph, width, height);
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  entityGraphCtx.lineWidth = 1;
+  for(const edge of edges){
+    if(!byId.has(edge.from) || !byId.has(edge.to)) continue;
+    const a = entityGraphState.positions.get(edge.from);
+    const b = entityGraphState.positions.get(edge.to);
+    entityGraphCtx.strokeStyle = graphEdgeColor(edge.edge_type);
+    entityGraphCtx.globalAlpha = clamp(.18 + (edge.confidence || .5) * .72, .18, .9);
+    entityGraphCtx.beginPath();
+    entityGraphCtx.moveTo(a.x, a.y);
+    entityGraphCtx.lineTo(b.x, b.y);
+    entityGraphCtx.stroke();
+  }
+  entityGraphCtx.globalAlpha = 1;
+  for(const node of nodes){
+    const p = entityGraphState.positions.get(node.id);
+    const radius = node.node_type === 'entity' ? 6 : node.node_type === 'cluster' ? 5 : 4;
+    const alpha = clamp(.35 + (node.confidence || .5) * .65, .35, 1);
+    entityGraphCtx.fillStyle = graphNodeColor(node.node_type);
+    entityGraphCtx.globalAlpha = alpha;
+    entityGraphCtx.beginPath();
+    if(node.node_type === 'text_label'){
+      entityGraphCtx.rect(p.x - radius, p.y - radius, radius * 2, radius * 2);
+    }else{
+      entityGraphCtx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    }
+    entityGraphCtx.fill();
+    if(node.age_ms > 1200){
+      entityGraphCtx.strokeStyle = 'rgba(255,255,255,.38)';
+      entityGraphCtx.setLineDash([2, 2]);
+      entityGraphCtx.stroke();
+      entityGraphCtx.setLineDash([]);
+    }
+  }
+  entityGraphCtx.globalAlpha = 1;
+  entityGraphCtx.font = '10px system-ui';
+  entityGraphCtx.textBaseline = 'top';
+  for(const node of nodes.filter(node => node.node_type === 'entity' || node.node_type === 'place' || node.node_type === 'action_context').slice(0, 6)){
+    const p = entityGraphState.positions.get(node.id);
+    const text = String(node.label || node.id).slice(0, 22);
+    entityGraphCtx.fillStyle = 'rgba(7,11,15,.72)';
+    const labelWidth = Math.min(width - p.x - 8, entityGraphCtx.measureText(text).width + 6);
+    if(labelWidth > 16) entityGraphCtx.fillRect(p.x + 7, p.y - 1, labelWidth, 13);
+    entityGraphCtx.fillStyle = '#dce8f2';
+    entityGraphCtx.fillText(text, p.x + 10, p.y);
+  }
+  const timelineY = height - 17;
+  entityGraphCtx.strokeStyle = 'rgba(174,185,195,.3)';
+  entityGraphCtx.beginPath();
+  entityGraphCtx.moveTo(8, timelineY);
+  entityGraphCtx.lineTo(width - 8, timelineY);
+  entityGraphCtx.stroke();
+  const recent = events.slice(-16);
+  recent.forEach((event, index) => {
+    const x = 10 + index * ((width - 20) / Math.max(1, recent.length - 1));
+    entityGraphCtx.fillStyle = graphNodeColor(byId.get(event.node_id)?.node_type);
+    entityGraphCtx.globalAlpha = clamp(.28 + (event.confidence || .5) * .72, .28, 1);
+    entityGraphCtx.fillRect(x - 2, timelineY - 5, 4, 10);
+  });
+  entityGraphCtx.globalAlpha = 1;
+  const typeCounts = nodes.reduce((counts, node) => {
+    counts[node.node_type] = (counts[node.node_type] || 0) + 1;
+    return counts;
+  }, {});
+  entityGraphSummary.textContent = `${nodes.length} nodes, ${edges.length} bindings | obs ${typeCounts.observation || 0} clusters ${typeCounts.cluster || 0} entities ${typeCounts.entity || 0}`;
+}
+
 function drawTraceMap(packet, liveMap=null){
   updateTraceState(packet);
   const w = traceCanvas.width, h = traceCanvas.height;
@@ -5948,6 +6668,7 @@ function drawTraceMap(packet, liveMap=null){
   traceCtx.closePath();
   traceCtx.fill();
   traceCtx.restore();
+  drawEntityGraph(liveMap?.entity_graph);
 }
 
 function resetWebJoystick(){
@@ -7668,6 +8389,23 @@ mod tests {
             .iter()
             .any(|cell| cell.kind == "charger/charge" && cell.label.as_deref() == Some("charger")));
         assert!(map.events.iter().any(|event| event.kind == "bump"));
+        assert_eq!(map.entity_graph.schema_version, 1);
+        assert!(map
+            .entity_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "entity"));
+        assert!(map
+            .entity_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "text_label"));
+        assert!(map
+            .entity_graph
+            .edges
+            .iter()
+            .any(|edge| edge.edge_type == "named_by"));
+        assert!(!map.entity_graph.events.is_empty());
 
         let forward_hit = map
             .range_beams
@@ -7689,6 +8427,7 @@ mod tests {
             LiveTrainingStatus::default(),
             NudgeStatus::default(),
             default_behavior_nodes(),
+            None,
             None,
             HardwareControlStatus::unavailable("unit test"),
         );
@@ -7714,6 +8453,7 @@ mod tests {
             NudgeStatus::default(),
             default_behavior_nodes(),
             None,
+            None,
             HardwareControlStatus::unavailable("unit test"),
         );
 
@@ -7727,6 +8467,7 @@ mod tests {
             LiveTrainingStatus::default(),
             NudgeStatus::default(),
             default_behavior_nodes(),
+            None,
             None,
             HardwareControlStatus::unavailable("unit test"),
         );
@@ -7867,6 +8608,8 @@ mod tests {
         assert!(page.contains("/view/map"));
         assert!(page.contains("data-map-layer=\"occupancy\""));
         assert!(page.contains("Odometry/range trace, not SLAM."));
+        assert!(page.contains("id=\"entity-graph\""));
+        assert!(page.contains("drawEntityGraph"));
         assert!(page.contains("createDefaultXRExperienceAsync"));
         assert!(page.contains("if(!eye?.data_url)"));
         assert!(page.contains(

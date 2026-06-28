@@ -20,7 +20,7 @@ use netherwick_ledger::{
 };
 use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
 use netherwick_map::{
-    LoopClosureCandidateInput, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport,
+    LoopClosureCandidateInput, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport, VoxelPointCloud,
 };
 use netherwick_memory::{
     place_memory_report_from_frames, DurableExperienceStore, InMemoryExperienceStore, PlaceMemory,
@@ -550,6 +550,8 @@ struct CaptureAssetsArgs {
     capture: String,
     #[arg(long)]
     pointcloud: bool,
+    #[arg(long)]
+    world_pointcloud: bool,
     #[arg(long, default_value_t = 4)]
     stride: usize,
     #[arg(long, default_value_t = 8.0)]
@@ -3726,6 +3728,7 @@ where
         capture_assets(CaptureAssetsArgs {
             capture: args.out.clone(),
             pointcloud: true,
+            world_pointcloud: false,
             stride: args.pointcloud_stride,
             max_depth_m: 8.0,
         })
@@ -3735,20 +3738,27 @@ where
 }
 
 async fn capture_assets(args: CaptureAssetsArgs) -> Result<()> {
-    if !args.pointcloud {
-        anyhow::bail!("no asset conversion requested; pass --pointcloud");
+    if !args.pointcloud && !args.world_pointcloud {
+        anyhow::bail!("no asset conversion requested; pass --pointcloud and/or --world-pointcloud");
     }
     let root = PathBuf::from(&args.capture);
     let reader = CaptureReader::open(&root).await?;
     let mut manifest = reader.manifest().clone();
     let mut frames = reader.read_frames().await?;
     let mut exported = 0usize;
-    for frame in &mut frames {
-        if export_pointcloud_for_frame(&root, frame, args.max_depth_m, args.stride)?.is_some() {
-            exported = exported.saturating_add(1);
+    if args.pointcloud {
+        for frame in &mut frames {
+            if export_pointcloud_for_frame(&root, frame, args.max_depth_m, args.stride)?.is_some() {
+                exported = exported.saturating_add(1);
+            }
         }
+        rewrite_frames(&root, &frames).await?;
     }
-    rewrite_frames(&root, &frames).await?;
+    let world_vertices = if args.world_pointcloud {
+        Some(export_world_pointcloud_for_capture(&root, &frames)?)
+    } else {
+        None
+    };
     if exported > 0
         && !manifest
             .warnings
@@ -3759,11 +3769,65 @@ async fn capture_assets(args: CaptureAssetsArgs) -> Result<()> {
             .warnings
             .push("uncalibrated point cloud: using approximate placeholder intrinsics".to_string());
     }
+    let world_vertices_count = world_vertices.unwrap_or(0);
+    if world_vertices_count > 0 {
+        manifest.asset_layout["world_pointcloud"] =
+            serde_json::json!("assets/pointcloud/world-accumulated.ply");
+        manifest.notes.push(format!(
+            "world pointcloud: assets/pointcloud/world-accumulated.ply ({world_vertices_count} voxels)"
+        ));
+    }
     update_manifest(&root, &manifest).await?;
     println!(
-        "capture-assets complete: pointcloud {} frames, capture {}, stride {}",
-        exported, args.capture, args.stride
+        "capture-assets complete: pointcloud {} frames, world {}, capture {}, stride {}",
+        exported, world_vertices_count, args.capture, args.stride
     );
+    Ok(())
+}
+
+fn export_world_pointcloud_for_capture(
+    root: &Path,
+    frames: &[netherwick_worldlab::CaptureFrameRecord],
+) -> Result<usize> {
+    let mut cloud = VoxelPointCloud::default();
+    for frame in frames {
+        cloud.observe_snapshot(&frame.snapshot, frame.t_ms);
+    }
+    let points = cloud.points();
+    let rel = Path::new("assets")
+        .join("pointcloud")
+        .join("world-accumulated.ply");
+    write_world_pointcloud_ply(&root.join(rel), &points)?;
+    Ok(points.len())
+}
+
+fn write_world_pointcloud_ply(path: &Path, points: &[netherwick_map::VoxelPoint]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = String::new();
+    out.push_str("ply\nformat ascii 1.0\n");
+    out.push_str(&format!("element vertex {}\n", points.len()));
+    out.push_str("property float x\nproperty float y\nproperty float z\n");
+    out.push_str("property uchar red\nproperty uchar green\nproperty uchar blue\n");
+    out.push_str("property float confidence\nproperty uchar stable\nproperty uchar transient\n");
+    out.push_str("end_header\n");
+    for point in points {
+        let [r, g, b] = point.color_rgb.unwrap_or([190, 194, 246]);
+        out.push_str(&format!(
+            "{:.6} {:.6} {:.6} {} {} {} {:.6} {} {}\n",
+            point.position.x_m,
+            point.position.y_m,
+            point.position.z_m,
+            r,
+            g,
+            b,
+            point.confidence,
+            u8::from(point.stable),
+            u8::from(point.transient)
+        ));
+    }
+    fs::write(path, out)?;
     Ok(())
 }
 
@@ -8138,6 +8202,7 @@ mod tests {
         capture_assets(CaptureAssetsArgs {
             capture: temp_dir.to_string_lossy().to_string(),
             pointcloud: true,
+            world_pointcloud: true,
             stride: 1,
             max_depth_m: 8.0,
         })
@@ -8151,7 +8216,7 @@ mod tests {
                 ("rgb".to_string(), 1),
                 ("depth".to_string(), 1),
                 ("audio".to_string(), 1),
-                ("pointcloud".to_string(), 1)
+                ("pointcloud".to_string(), 2)
             ]
         );
         assert!(report
@@ -8162,6 +8227,10 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("uncalibrated point cloud")));
+        let world_ply = temp_dir.join("assets/pointcloud/world-accumulated.ply");
+        let world_ply_text = fs::read_to_string(&world_ply).unwrap();
+        assert!(world_ply_text.contains("property float confidence"));
+        assert!(world_ply_text.contains("property uchar stable"));
         let replay = replay_capture(ReplayCaptureArgs {
             capture: temp_dir.to_string_lossy().to_string(),
             ledger: temp_dir.join("ledger").to_string_lossy().to_string(),

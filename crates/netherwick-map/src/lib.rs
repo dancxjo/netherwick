@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 
 use netherwick_core::{Pose2, TimeMs};
-use netherwick_now::Now;
+use netherwick_now::{KinectSense, Now};
 use netherwick_sensors::WorldSnapshot;
 use serde::{Deserialize, Serialize};
 
 pub const MAP_EXTENSION_NAME: &str = "map.odometry";
 pub const MAP_LABEL: &str = "SLAM-lite / odometry map, not full SLAM";
 pub const POSE_GRAPH_LABEL: &str = "offline pose graph with odometry and gated loop candidates";
+pub const WORLD_POINT_CLOUD_LABEL: &str =
+    "provisional odometry-frame Kinect/depth point cloud, not full SLAM";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PoseEstimate {
@@ -49,6 +51,102 @@ pub struct MapObservation {
     pub range_beams: Vec<RangeBeam>,
     pub source_snapshot: serde_json::Value,
     pub t_ms: TimeMs,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Point3D {
+    pub x_m: f32,
+    pub y_m: f32,
+    pub z_m: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct VoxelKey {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointCloudFrame {
+    KinectCamera,
+    RobotBase,
+    OdometryWorld,
+    DepthImageUnknown,
+}
+
+impl Default for PointCloudFrame {
+    fn default() -> Self {
+        Self::KinectCamera
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PointCloudPoint {
+    pub position: Point3D,
+    pub color_rgb: Option<[u8; 3]>,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PointCloudObservation {
+    pub frame: PointCloudFrame,
+    pub pose: PoseEstimate,
+    pub points: Vec<PointCloudPoint>,
+    pub source: String,
+    pub t_ms: TimeMs,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VoxelPoint {
+    pub key: VoxelKey,
+    pub position: Point3D,
+    pub color_rgb: Option<[u8; 3]>,
+    pub confidence: f32,
+    pub first_seen_ms: TimeMs,
+    pub last_seen_ms: TimeMs,
+    pub seen_count: u32,
+    pub stable: bool,
+    pub transient: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VoxelPointCloud {
+    pub voxels: BTreeMap<VoxelKey, VoxelPoint>,
+    pub config: PointCloudConfig,
+    pub observations: u64,
+    pub raw_points_seen: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PointCloudConfig {
+    pub voxel_size_m: f32,
+    pub max_voxels: usize,
+    pub max_points_per_observation: usize,
+    pub min_depth_m: f32,
+    pub max_depth_m: f32,
+    pub confidence_increment: f32,
+    pub decay_after_ms: TimeMs,
+    pub decay_per_tick: f32,
+    pub stable_seen_count: u32,
+    pub stable_confidence: f32,
+    pub transient_after_ms: TimeMs,
+    pub camera_height_m: f32,
+    pub camera_forward_m: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PointCloudSummary {
+    pub label: &'static str,
+    pub voxel_size_m: f32,
+    pub voxels: usize,
+    pub stable_voxels: usize,
+    pub transient_voxels: usize,
+    pub observations: u64,
+    pub raw_points_seen: u64,
+    pub latest_t_ms: Option<TimeMs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -211,6 +309,171 @@ impl Default for MapConfig {
             decay_per_tick: 0.04,
             max_pose_history: 1_000,
             max_observations: 250,
+        }
+    }
+}
+
+impl Default for PointCloudConfig {
+    fn default() -> Self {
+        Self {
+            voxel_size_m: 0.05,
+            max_voxels: 20_000,
+            max_points_per_observation: 2_500,
+            min_depth_m: 0.35,
+            max_depth_m: 8.0,
+            confidence_increment: 0.18,
+            decay_after_ms: 15_000,
+            decay_per_tick: 0.02,
+            stable_seen_count: 3,
+            stable_confidence: 0.45,
+            transient_after_ms: 5_000,
+            camera_height_m: 0.18,
+            camera_forward_m: 0.0,
+        }
+    }
+}
+
+impl Default for VoxelPointCloud {
+    fn default() -> Self {
+        Self::new(PointCloudConfig::default())
+    }
+}
+
+impl VoxelPointCloud {
+    pub fn new(config: PointCloudConfig) -> Self {
+        assert!(config.voxel_size_m > 0.0, "voxel size must be positive");
+        assert!(config.max_voxels > 0, "max voxels must be positive");
+        Self {
+            voxels: BTreeMap::new(),
+            config,
+            observations: 0,
+            raw_points_seen: 0,
+        }
+    }
+
+    pub fn observe_snapshot(
+        &mut self,
+        snapshot: &WorldSnapshot,
+        t_ms: TimeMs,
+    ) -> PointCloudSummary {
+        if let Some(observation) = pointcloud_observation_from_snapshot(snapshot, t_ms, self.config)
+        {
+            self.integrate_observation(observation);
+        } else {
+            self.decay_stale(t_ms);
+        }
+        self.summary()
+    }
+
+    pub fn integrate_observation(&mut self, observation: PointCloudObservation) {
+        self.observations = self.observations.saturating_add(1);
+        self.raw_points_seen = self
+            .raw_points_seen
+            .saturating_add(observation.points.len() as u64);
+
+        for point in &observation.points {
+            if !point.position.x_m.is_finite()
+                || !point.position.y_m.is_finite()
+                || !point.position.z_m.is_finite()
+            {
+                continue;
+            }
+            let world = transform_point_to_world(
+                point.position,
+                observation.frame,
+                observation.pose.pose,
+                self.config,
+            );
+            self.bump_voxel(world, point.color_rgb, point.confidence, observation.t_ms);
+        }
+        self.decay_stale(observation.t_ms);
+        self.bound_growth();
+    }
+
+    pub fn decay_stale(&mut self, now_ms: TimeMs) {
+        for voxel in self.voxels.values_mut() {
+            let age = now_ms.saturating_sub(voxel.last_seen_ms);
+            if age > self.config.decay_after_ms {
+                voxel.confidence = (voxel.confidence - self.config.decay_per_tick).max(0.0);
+            }
+            voxel.transient =
+                !voxel.stable && age >= self.config.transient_after_ms && voxel.seen_count <= 1;
+        }
+        self.voxels.retain(|_, voxel| voxel.confidence > 0.001);
+    }
+
+    pub fn points(&self) -> Vec<VoxelPoint> {
+        self.voxels.values().cloned().collect()
+    }
+
+    pub fn summary(&self) -> PointCloudSummary {
+        let stable_voxels = self.voxels.values().filter(|voxel| voxel.stable).count();
+        let transient_voxels = self.voxels.values().filter(|voxel| voxel.transient).count();
+        let latest_t_ms = self.voxels.values().map(|voxel| voxel.last_seen_ms).max();
+        PointCloudSummary {
+            label: WORLD_POINT_CLOUD_LABEL,
+            voxel_size_m: self.config.voxel_size_m,
+            voxels: self.voxels.len(),
+            stable_voxels,
+            transient_voxels,
+            observations: self.observations,
+            raw_points_seen: self.raw_points_seen,
+            latest_t_ms,
+        }
+    }
+
+    fn bump_voxel(
+        &mut self,
+        position: Point3D,
+        color_rgb: Option<[u8; 3]>,
+        confidence: f32,
+        t_ms: TimeMs,
+    ) {
+        let key = voxel_key(position, self.config.voxel_size_m);
+        let increment = self.config.confidence_increment * confidence.clamp(0.0, 1.0);
+        let voxel = self.voxels.entry(key).or_insert_with(|| VoxelPoint {
+            key,
+            position,
+            color_rgb,
+            confidence: 0.0,
+            first_seen_ms: t_ms,
+            last_seen_ms: t_ms,
+            seen_count: 0,
+            stable: false,
+            transient: false,
+        });
+        let seen = voxel.seen_count as f32;
+        voxel.position = Point3D {
+            x_m: (voxel.position.x_m * seen + position.x_m) / (seen + 1.0),
+            y_m: (voxel.position.y_m * seen + position.y_m) / (seen + 1.0),
+            z_m: (voxel.position.z_m * seen + position.z_m) / (seen + 1.0),
+        };
+        voxel.color_rgb = merge_color(voxel.color_rgb, color_rgb, voxel.seen_count);
+        voxel.confidence = (voxel.confidence + increment).clamp(0.0, 1.0);
+        voxel.last_seen_ms = t_ms;
+        voxel.seen_count = voxel.seen_count.saturating_add(1);
+        voxel.stable = voxel.seen_count >= self.config.stable_seen_count
+            && voxel.confidence >= self.config.stable_confidence;
+        voxel.transient = false;
+    }
+
+    fn bound_growth(&mut self) {
+        if self.voxels.len() <= self.config.max_voxels {
+            return;
+        }
+        let remove_count = self.voxels.len() - self.config.max_voxels;
+        let mut candidates = self
+            .voxels
+            .iter()
+            .map(|(key, voxel)| (*key, voxel.last_seen_ms, voxel.confidence))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| left.2.total_cmp(&right.2))
+        });
+        for (key, _, _) in candidates.into_iter().take(remove_count) {
+            self.voxels.remove(&key);
         }
     }
 }
@@ -740,6 +1003,215 @@ pub fn trace_cells(
     cells
 }
 
+pub fn pointcloud_observation_from_snapshot(
+    snapshot: &WorldSnapshot,
+    t_ms: TimeMs,
+    config: PointCloudConfig,
+) -> Option<PointCloudObservation> {
+    pointcloud_observation_from_kinect(
+        &snapshot.kinect,
+        snapshot.body.odometry,
+        odometry_confidence_from_motion(
+            snapshot.body.velocity.forward_m_s,
+            snapshot.body.velocity.turn_rad_s,
+        ),
+        t_ms,
+        config,
+    )
+}
+
+pub fn pointcloud_observation_from_kinect(
+    kinect: &KinectSense,
+    pose: Pose2,
+    pose_confidence: f32,
+    t_ms: TimeMs,
+    config: PointCloudConfig,
+) -> Option<PointCloudObservation> {
+    if kinect.depth_m.is_empty() {
+        return None;
+    }
+    let projection = DepthProjection::from_kinect(kinect)
+        .unwrap_or_else(|| DepthProjection::legacy(kinect.depth_m.len()));
+    let stride = kinect
+        .depth_m
+        .len()
+        .div_ceil(config.max_points_per_observation.max(1))
+        .max(1);
+    let min_depth_m = positive_or(kinect.min_depth_m, config.min_depth_m);
+    let max_depth_m = positive_or(kinect.max_depth_m, config.max_depth_m);
+    let mut skipped_depth_count = 0usize;
+    let mut clipped_depth_count = 0usize;
+    let mut points = Vec::new();
+    for (index, depth) in kinect.depth_m.iter().enumerate().step_by(stride) {
+        if !depth.is_finite() || *depth <= 0.0 {
+            skipped_depth_count = skipped_depth_count.saturating_add(1);
+            continue;
+        }
+        if *depth < min_depth_m || *depth > max_depth_m {
+            clipped_depth_count = clipped_depth_count.saturating_add(1);
+            continue;
+        }
+        let u = (index % projection.width) as f32;
+        let v = (index / projection.width) as f32;
+        let z_m = *depth;
+        let x_m = (u - projection.cx) * z_m / projection.fx.max(f32::EPSILON);
+        let y_m = (v - projection.cy) * z_m / projection.fy.max(f32::EPSILON);
+        points.push(PointCloudPoint {
+            position: Point3D { x_m, y_m, z_m },
+            color_rgb: depth_shade(z_m, max_depth_m),
+            confidence: pose_confidence,
+        });
+    }
+    if points.is_empty() {
+        return None;
+    }
+    Some(PointCloudObservation {
+        frame: projection.frame,
+        pose: PoseEstimate {
+            pose,
+            confidence: pose_confidence,
+            covariance: [0.05, 0.05, 0.10],
+            source: "odometry".to_string(),
+            t_ms,
+        },
+        points,
+        source: "kinect_depth".to_string(),
+        t_ms,
+        metadata: serde_json::json!({
+            "depth_width": projection.width,
+            "depth_height": projection.height,
+            "depth_fx": projection.fx,
+            "depth_fy": projection.fy,
+            "depth_cx": projection.cx,
+            "depth_cy": projection.cy,
+            "coordinate_frame": projection.frame,
+            "sample_stride": stride,
+            "min_depth_m": min_depth_m,
+            "max_depth_m": max_depth_m,
+            "skipped_depth_count": skipped_depth_count,
+            "clipped_depth_count": clipped_depth_count,
+        }),
+    })
+}
+
+pub fn transform_point_to_world(
+    point: Point3D,
+    frame: PointCloudFrame,
+    pose: Pose2,
+    config: PointCloudConfig,
+) -> Point3D {
+    let robot = match frame {
+        PointCloudFrame::OdometryWorld => return point,
+        PointCloudFrame::RobotBase => point,
+        PointCloudFrame::KinectCamera | PointCloudFrame::DepthImageUnknown => Point3D {
+            x_m: config.camera_forward_m + point.z_m,
+            y_m: -point.x_m,
+            z_m: config.camera_height_m - point.y_m,
+        },
+    };
+    let sin = pose.heading_rad.sin();
+    let cos = pose.heading_rad.cos();
+    Point3D {
+        x_m: pose.x_m + robot.x_m * cos - robot.y_m * sin,
+        y_m: pose.y_m + robot.x_m * sin + robot.y_m * cos,
+        z_m: robot.z_m,
+    }
+}
+
+pub fn voxel_key(point: Point3D, voxel_size_m: f32) -> VoxelKey {
+    VoxelKey {
+        x: (point.x_m / voxel_size_m).floor() as i32,
+        y: (point.y_m / voxel_size_m).floor() as i32,
+        z: (point.z_m / voxel_size_m).floor() as i32,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DepthProjection {
+    width: usize,
+    height: usize,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    frame: PointCloudFrame,
+}
+
+impl DepthProjection {
+    fn from_kinect(kinect: &KinectSense) -> Option<Self> {
+        let width = usize::try_from(kinect.depth_width).ok()?;
+        let height = usize::try_from(kinect.depth_height).ok()?;
+        if width == 0 || height == 0 || width.checked_mul(height)? != kinect.depth_m.len() {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            fx: positive_or(kinect.depth_fx, 594.0),
+            fy: positive_or(kinect.depth_fy, 591.0),
+            cx: if kinect.depth_cx > 0.0 {
+                kinect.depth_cx
+            } else {
+                (width as f32 - 1.0) * 0.5
+            },
+            cy: if kinect.depth_cy > 0.0 {
+                kinect.depth_cy
+            } else {
+                (height as f32 - 1.0) * 0.5
+            },
+            frame: PointCloudFrame::KinectCamera,
+        })
+    }
+
+    fn legacy(depth_len: usize) -> Self {
+        let width = (depth_len as f32).sqrt().ceil().max(1.0) as usize;
+        let height = depth_len.div_ceil(width).max(1);
+        Self {
+            width,
+            height,
+            fx: width.max(1) as f32,
+            fy: width.max(1) as f32,
+            cx: (width.saturating_sub(1)) as f32 * 0.5,
+            cy: (height.saturating_sub(1)) as f32 * 0.5,
+            frame: PointCloudFrame::DepthImageUnknown,
+        }
+    }
+}
+
+fn positive_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn depth_shade(depth_m: f32, max_depth_m: f32) -> Option<[u8; 3]> {
+    let shade = ((1.0 - (depth_m / max_depth_m.max(f32::EPSILON))).clamp(0.15, 1.0) * 255.0) as u8;
+    Some([shade, shade, 255])
+}
+
+fn merge_color(
+    existing: Option<[u8; 3]>,
+    incoming: Option<[u8; 3]>,
+    seen_count: u32,
+) -> Option<[u8; 3]> {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) => {
+            let seen = seen_count as u32;
+            let denom = seen.saturating_add(1).max(1);
+            Some([
+                ((existing[0] as u32 * seen + incoming[0] as u32) / denom) as u8,
+                ((existing[1] as u32 * seen + incoming[1] as u32) / denom) as u8,
+                ((existing[2] as u32 * seen + incoming[2] as u32) / denom) as u8,
+            ])
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
 fn odometry_confidence_from_motion(forward_m_s: f32, turn_rad_s: f32) -> f32 {
     let moving = forward_m_s.abs() + turn_rad_s.abs();
     if moving > 0.001 {
@@ -831,7 +1303,7 @@ fn confidence_distribution(confidences: impl Iterator<Item = f32>) -> Confidence
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netherwick_now::RangeSense;
+    use netherwick_now::{KinectSense, RangeSense};
 
     fn snapshot_at(x_m: f32, y_m: f32, heading_rad: f32, beams: Vec<f32>) -> WorldSnapshot {
         let mut snapshot = WorldSnapshot::default();
@@ -844,6 +1316,36 @@ mod tests {
             schema_version: 1,
             nearest_m: beams.iter().copied().reduce(f32::min),
             beams,
+        };
+        snapshot
+    }
+
+    fn kinect_snapshot_at(
+        x_m: f32,
+        y_m: f32,
+        heading_rad: f32,
+        depth_m: Vec<f32>,
+        width: u32,
+        height: u32,
+    ) -> WorldSnapshot {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.odometry = Pose2 {
+            x_m,
+            y_m,
+            heading_rad,
+        };
+        snapshot.kinect = KinectSense {
+            depth_m,
+            depth_width: width,
+            depth_height: height,
+            depth_fx: 1.0,
+            depth_fy: 1.0,
+            depth_cx: 0.0,
+            depth_cy: 0.0,
+            min_depth_m: 0.1,
+            max_depth_m: 8.0,
+            depth_coordinate_system: Some("kinect_camera".to_string()),
+            ..KinectSense::default()
         };
         snapshot
     }
@@ -921,6 +1423,68 @@ mod tests {
         assert!(map.cells.len() > first_cells);
         assert_eq!(map.pose_history.len(), 2);
         assert_eq!(map.summary().label, MAP_LABEL);
+    }
+
+    #[test]
+    fn kinect_point_transforms_into_odometry_world_frame() {
+        let config = PointCloudConfig {
+            voxel_size_m: 0.1,
+            camera_height_m: 0.2,
+            ..PointCloudConfig::default()
+        };
+        let point = Point3D {
+            x_m: 0.0,
+            y_m: 0.0,
+            z_m: 1.0,
+        };
+        let world = transform_point_to_world(
+            point,
+            PointCloudFrame::KinectCamera,
+            pose(1.0, 2.0, std::f32::consts::FRAC_PI_2),
+            config,
+        );
+        assert!((world.x_m - 1.0).abs() < 0.001);
+        assert!((world.y_m - 3.0).abs() < 0.001);
+        assert!((world.z_m - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn voxel_cloud_merges_points_and_marks_stable() {
+        let mut cloud = VoxelPointCloud::new(PointCloudConfig {
+            voxel_size_m: 0.25,
+            stable_seen_count: 2,
+            stable_confidence: 0.2,
+            ..PointCloudConfig::default()
+        });
+        let snapshot = kinect_snapshot_at(0.0, 0.0, 0.0, vec![1.0], 1, 1);
+
+        cloud.observe_snapshot(&snapshot, 100);
+        cloud.observe_snapshot(&snapshot, 200);
+
+        assert_eq!(cloud.voxels.len(), 1);
+        let voxel = cloud.voxels.values().next().unwrap();
+        assert!(voxel.stable);
+        assert_eq!(voxel.seen_count, 2);
+        assert!(voxel.confidence > 0.2);
+    }
+
+    #[test]
+    fn voxel_cloud_ages_transient_points_and_bounds_growth() {
+        let mut cloud = VoxelPointCloud::new(PointCloudConfig {
+            voxel_size_m: 0.1,
+            max_voxels: 2,
+            decay_after_ms: 10,
+            decay_per_tick: 0.05,
+            transient_after_ms: 20,
+            ..PointCloudConfig::default()
+        });
+        cloud.observe_snapshot(&kinect_snapshot_at(0.0, 0.0, 0.0, vec![1.0], 1, 1), 100);
+        cloud.observe_snapshot(&kinect_snapshot_at(1.0, 0.0, 0.0, vec![1.0], 1, 1), 110);
+        cloud.observe_snapshot(&kinect_snapshot_at(2.0, 0.0, 0.0, vec![1.0], 1, 1), 120);
+
+        assert_eq!(cloud.voxels.len(), 2);
+        cloud.decay_stale(200);
+        assert!(cloud.voxels.values().any(|voxel| voxel.transient));
     }
 
     #[test]
