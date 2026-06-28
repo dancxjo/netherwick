@@ -2489,6 +2489,7 @@ fn action_histogram_label(action: &ActionPrimitive) -> &'static str {
         ActionPrimitive::Stop => "Stop",
         ActionPrimitive::Go { intensity, .. } if *intensity < 0.0 => "Reverse",
         ActionPrimitive::Go { .. } => "Go",
+        ActionPrimitive::Drive { .. } => "Drive",
         ActionPrimitive::Turn {
             direction: TurnDir::Left,
             ..

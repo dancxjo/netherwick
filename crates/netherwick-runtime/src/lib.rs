@@ -4387,6 +4387,7 @@ fn reign_input_drives_real_slow(input: &ReignInput) -> bool {
         input.command,
         netherwick_actions::ReignCommand::Go { .. }
             | netherwick_actions::ReignCommand::Reverse { .. }
+            | netherwick_actions::ReignCommand::Drive { .. }
             | netherwick_actions::ReignCommand::Turn { .. }
             | netherwick_actions::ReignCommand::Stop
     )
@@ -6276,6 +6277,14 @@ fn summarize_reign_command_for_runtime(input: &netherwick_actions::ReignInput) -
             intensity,
             duration_ms,
         } => format!("Reverse intensity {:.2} for {}ms", intensity, duration_ms),
+        netherwick_actions::ReignCommand::Drive {
+            forward,
+            turn,
+            duration_ms,
+        } => format!(
+            "Drive forward {:.2}, turn {:.2} for {}ms",
+            forward, turn, duration_ms
+        ),
         netherwick_actions::ReignCommand::Turn {
             direction,
             intensity,

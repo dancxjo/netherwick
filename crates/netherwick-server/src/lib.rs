@@ -3960,6 +3960,15 @@ fn sanitize_command(command: ReignCommand) -> Result<ReignCommand, ReignApiError
             intensity: finite_intensity(intensity)?,
             duration_ms: duration_ms.clamp(50, 10_000),
         },
+        ReignCommand::Drive {
+            forward,
+            turn,
+            duration_ms,
+        } => ReignCommand::Drive {
+            forward: finite_axis(forward)?,
+            turn: finite_axis(turn)?,
+            duration_ms: duration_ms.clamp(50, 10_000),
+        },
         ReignCommand::Turn {
             direction,
             intensity,
@@ -4001,6 +4010,19 @@ fn sanitize_hardware_command(command: ReignCommand) -> Result<ReignCommand, Reig
             intensity: finite_intensity(intensity)?.min(HARDWARE_MAX_FORWARD_INTENSITY),
             duration_ms: duration_ms.clamp(HARDWARE_TTL_MIN_MS, HARDWARE_TTL_MAX_MS),
         },
+        ReignCommand::Drive {
+            forward,
+            turn,
+            duration_ms,
+        } => ReignCommand::Drive {
+            forward: finite_axis(forward)?.clamp(
+                -HARDWARE_MAX_FORWARD_INTENSITY,
+                HARDWARE_MAX_FORWARD_INTENSITY,
+            ),
+            turn: finite_axis(turn)?
+                .clamp(-HARDWARE_MAX_TURN_INTENSITY, HARDWARE_MAX_TURN_INTENSITY),
+            duration_ms: duration_ms.clamp(HARDWARE_TTL_MIN_MS, HARDWARE_TTL_MAX_MS),
+        },
         ReignCommand::Turn {
             direction,
             intensity,
@@ -4013,7 +4035,7 @@ fn sanitize_hardware_command(command: ReignCommand) -> Result<ReignCommand, Reig
         ReignCommand::Stop => ReignCommand::Stop,
         _ => {
             return Err(ReignApiError::forbidden(
-                "hardware cockpit only accepts Stop, Go, Reverse, and Turn",
+                "hardware cockpit only accepts Stop, Go, Reverse, Drive, and Turn",
             ))
         }
     })
@@ -4058,6 +4080,13 @@ fn finite_intensity(value: f32) -> Result<f32, ReignApiError> {
         return Err(ReignApiError::bad_request("intensity must be finite"));
     }
     Ok(value.clamp(0.0, 1.0))
+}
+
+fn finite_axis(value: f32) -> Result<f32, ReignApiError> {
+    if !value.is_finite() {
+        return Err(ReignApiError::bad_request("drive axis must be finite"));
+    }
+    Ok(value.clamp(-1.0, 1.0))
 }
 
 fn default_priority() -> f32 {
@@ -4583,7 +4612,7 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #hud dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 #hud dd.active-learning{color:#8df0b2;font-weight:700}
 #status{color:#ffd083}
-#reign{right:12px;top:12px;width:278px;min-width:250px;border-color:#36424d;background:rgba(11,16,22,.84);color:#dce8f2}
+#reign{right:12px;top:12px;width:282px;min-width:250px;border-color:#36424d;background:rgba(11,16,22,.84);color:#dce8f2}
 #reign .panel-content{display:grid;gap:8px}
 #reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
 #reign div{font-variant-numeric:tabular-nums}
@@ -4592,37 +4621,19 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .cockpit-arm{display:flex;align-items:center;gap:7px;font-size:12px;color:#dce8f2}
 .cockpit-arm input{width:16px;height:16px}
 #hardware-state{font-size:11px;color:#ffbf7a;min-height:15px}
-.cockpit-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
-.cockpit-grid button{min-height:32px;border:1px solid #3f607b;background:#15242e;color:#dce8f2;border-radius:5px;cursor:pointer}
-.cockpit-grid button:disabled{opacity:.45;cursor:not-allowed}
-.cockpit-grid .forward{grid-column:2}
-.cockpit-grid .left{grid-column:1}
-.cockpit-grid .back{grid-column:2}
-.cockpit-grid .right{grid-column:3}
-.cockpit-grid .stop{grid-column:1/-1;background:#681923;border-color:#b13a4a;color:#fff}
 .trace-label{font-size:11px;color:#9fb0bf}
 #trace-map{width:100%;height:auto;display:block;background:#081015;border:1px solid #2d3d4a;border-radius:4px}
-.reign-pad{display:grid;grid-template-columns:104px 1fr;gap:10px;align-items:center}
-#reign-joystick{position:relative;width:92px;aspect-ratio:1;border:1px solid #455565;border-radius:50%;background:radial-gradient(circle at 50% 50%,rgba(79,149,188,.24),rgba(15,23,31,.72) 64%);touch-action:none;cursor:pointer}
+.reign-pad{display:grid;grid-template-columns:132px 1fr;gap:10px;align-items:center}
+#reign-joystick{position:relative;width:132px;aspect-ratio:1;border:1px solid #455565;border-radius:50%;background:radial-gradient(circle at 50% 50%,rgba(79,149,188,.24),rgba(15,23,31,.72) 64%);touch-action:none;cursor:pointer}
 #reign-joystick::before,#reign-joystick::after{content:"";position:absolute;background:rgba(170,196,216,.22)}
 #reign-joystick::before{left:12px;right:12px;top:50%;height:1px}
 #reign-joystick::after{top:12px;bottom:12px;left:50%;width:1px}
 #reign-stick{position:absolute;left:50%;top:50%;width:34px;height:34px;border-radius:50%;background:#dce8f2;border:1px solid #8ec9ef;box-shadow:0 0 18px rgba(111,191,242,.42);transform:translate(-50%,-50%)}
-.reign-buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.reign-buttons{display:grid;grid-template-columns:1fr;gap:6px}
 .reign-buttons button{min-height:34px;border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer}
 .reign-buttons button:hover,.reign-buttons button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
-.reign-buttons .stop{grid-column:1/-1;background:#5b1720;border-color:#9a3443;color:#fff}
+.reign-buttons .stop{background:#5b1720;border-color:#9a3443;color:#fff}
 .reign-readout{font-size:11px;color:#b7c8d8}
-.heading-controls{display:grid;gap:6px;border-top:1px solid #344350;padding-top:8px}
-.heading-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:6px;align-items:center}
-.heading-row label{font-size:11px;color:#9fb0bf}
-.heading-row input{min-width:0;width:100%;box-sizing:border-box;background:#111820;border:1px solid #33414d;color:#e7eef5;border-radius:4px;padding:5px 6px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.heading-row button,.heading-nudges button{min-height:28px;border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer}
-.heading-row button:hover,.heading-row button:focus-visible,.heading-nudges button:hover,.heading-nudges button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
-.heading-nudges{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px}
-.heading-nudges button{padding:3px;font-size:11px}
-.heading-meta{display:grid;grid-template-columns:1fr auto;gap:6px;font-size:11px;color:#9fb0bf}
-.heading-meta span{font-variant-numeric:tabular-nums;color:#ffd083}
 .reign-hint{color:#9fb0bf;font-size:11px;line-height:1.25}
 #llm{right:12px;top:96px;width:320px;height:300px;min-width:200px;min-height:150px;border-color:#3f4c58;background:rgba(9,12,16,.88)}
 #llm .panel-content{display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;overflow:hidden}
@@ -4777,43 +4788,15 @@ canvas{display:block}
     </div>
     <div class="reign-buttons">
       <button class="stop" id="reign-stop" type="button">Stop</button>
-      <button id="reign-dock" type="button">Dock</button>
-      <button id="reign-explore" type="button">Explore</button>
       <div class="reign-readout" id="reign-readout">F 0.00 / T 0.00</div>
     </div>
   </div>
   <div id="reign-state">web reign ready</div>
-  <div class="heading-controls">
-    <div class="heading-row">
-      <label for="heading-target">Heading</label>
-      <input id="heading-target" type="number" min="-180" max="180" step="0.1" inputmode="decimal">
-      <button id="heading-apply" type="button">Set</button>
-    </div>
-    <div class="heading-nudges">
-      <button type="button" data-heading-nudge="-15">-15</button>
-      <button type="button" data-heading-nudge="-5">-5</button>
-      <button type="button" data-heading-nudge="-1">-1</button>
-      <button type="button" data-heading-nudge="1">+1</button>
-      <button type="button" data-heading-nudge="5">+5</button>
-      <button type="button" data-heading-nudge="15">+15</button>
-    </div>
-    <div class="heading-meta">
-      <div>now <span id="heading-current">-</span> / target <span id="heading-target-readout">-</span></div>
-      <button id="heading-clear" type="button">Clear</button>
-    </div>
-  </div>
-  <div class="reign-hint">Drag for analog Reign. Heading holds use short turn leases and stop near target.</div>
+  <div class="reign-hint">Drag the stick for analog forward/reverse and turn together. Release to stop.</div>
   <div class="cockpit">
     <label class="cockpit-arm"><input id="hardware-arm" type="checkbox"> Real hardware armed</label>
     <div id="hardware-state">hardware cockpit unavailable</div>
-    <div class="cockpit-grid">
-      <button class="forward" data-cockpit="forward" type="button">Forward</button>
-      <button class="left" data-cockpit="left" type="button">Left</button>
-      <button class="stop" data-cockpit="stop" type="button">STOP</button>
-      <button class="back" data-cockpit="back" type="button">Back</button>
-      <button class="right" data-cockpit="right" type="button">Right</button>
-    </div>
-    <div class="trace-label">Speed cautious only. TTL 300 ms.</div>
+    <div class="trace-label">Real hardware uses the same analog stick, with cautious speed limits.</div>
     <canvas id="trace-map" width="220" height="180" aria-label="odometry/range trace map"></canvas>
     <div class="map-toggles" aria-label="map overlays">
       <label><input type="checkbox" data-map-layer="occupancy" checked>occupancy</label>
@@ -4910,7 +4893,7 @@ canvas{display:block}
   <div id="calibration-status" style="margin-top:6px;font-size:11px;color:#aab4bd;text-align:right">status: synced</div>
 </aside>
 <button id="xr" disabled>VR unavailable</button>
-<div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers, squeeze stops, A/B dock or explore.</div>
+<div id="fallback">Desktop drag rotates, wheel zooms, right-drag pans. In VR, thumbstick steers and release stops.</div>
 <script src="https://cdn.babylonjs.com/babylon.js"></script>
 <script type="module">
 if (window.trustedTypes && window.trustedTypes.createPolicy) {
@@ -4930,18 +4913,9 @@ const reignState = document.getElementById('reign-state');
 const reignJoystick = document.getElementById('reign-joystick');
 const reignStick = document.getElementById('reign-stick');
 const reignStop = document.getElementById('reign-stop');
-const reignDock = document.getElementById('reign-dock');
-const reignExplore = document.getElementById('reign-explore');
 const reignReadout = document.getElementById('reign-readout');
-const headingTarget = document.getElementById('heading-target');
-const headingApply = document.getElementById('heading-apply');
-const headingCurrent = document.getElementById('heading-current');
-const headingTargetReadout = document.getElementById('heading-target-readout');
-const headingClear = document.getElementById('heading-clear');
-const headingNudges = Array.from(document.querySelectorAll('[data-heading-nudge]'));
 const hardwareArm = document.getElementById('hardware-arm');
 const hardwareState = document.getElementById('hardware-state');
-const cockpitButtons = Array.from(document.querySelectorAll('[data-cockpit]'));
 const traceCanvas = document.getElementById('trace-map');
 const traceCtx = traceCanvas.getContext('2d');
 const mapLayerInputs = Array.from(document.querySelectorAll('[data-map-layer]'));
@@ -4960,14 +4934,9 @@ const learningSteps = document.getElementById('learning-steps');
 const learningStatus = document.getElementById('learning-status');
 const learningApply = document.getElementById('learning-apply');
 const learningChecks = Array.from(document.querySelectorAll('#learning-behaviors input[type="checkbox"]'));
-const cockpitHeldKeys = new Set();
-const COCKPIT_TTL_MS = 300;
-const COCKPIT_REFRESH_MS = 220;
 const traceState = {poses: [], events: [], occupied: new Map(), free: new Map()};
 let cockpitAvailable = false;
 let cockpitArmed = false;
-let cockpitHoldKind = null;
-let cockpitHoldTimer = null;
 
 // Initialize Babylon Engine & Scene
 const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
@@ -5132,20 +5101,11 @@ let lastReignSentAt = 0;
 let lastReignText = 'idle';
 let webReignPointerId = null;
 let webReignVector = {x: 0, y: 0};
-let headingTargetRad = null;
-let headingStopSent = true;
 const llmCards = new Map();
 
 function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
 function world(x, y, up=0){ return new BABYLON.Vector3(x, up, y); }
 function clamp(value, min, max){ return Math.max(min, Math.min(max, value)); }
-function wrapRad(rad){
-  let wrapped = (rad + Math.PI) % (Math.PI * 2);
-  if(wrapped < 0) wrapped += Math.PI * 2;
-  return wrapped - Math.PI;
-}
-function radToDeg(rad){ return wrapRad(rad) * 180 / Math.PI; }
-function degToRad(deg){ return wrapRad(deg * Math.PI / 180); }
 function titleCase(value){
   return String(value || '-').replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
 }
@@ -5715,9 +5675,6 @@ function updateScene(packet, liveMap=null){
   fields.tick.textContent = session.tick_ms == null ? '-' : `${session.tick_ms} ms`;
   fields.t.textContent = `${packet.t_ms} ms`;
   fields.pose.textContent = `${fmt(packet.body.x_m)}, ${fmt(packet.body.y_m)}, ${fmt(packet.body.heading_rad)} rad`;
-  const headingDeg = radToDeg(Number(packet.body.heading_rad) || 0);
-  headingCurrent.textContent = `${fmt(headingDeg, 1)} deg`;
-  headingTarget.placeholder = fmt(headingDeg, 1);
   fields.battery.textContent = `${fmt(packet.body.battery_level * 100, 1)}%${packet.body.charging ? ' charging' : ''}`;
   const detail = packet.stuck_detail || {};
   fields.stuck.textContent = packet.stuck ? (detail.class || 'stuck') : (detail.recovered ? 'recovered' : 'clear');
@@ -5808,79 +5765,11 @@ function postWebReign(command, ttl_ms, label, priority=.95){
   return postReign(command, ttl_ms, label, priority, 'WebRemote', 'Web panel reign');
 }
 
-function cockpitCommand(kind){
-  const duration_ms = COCKPIT_TTL_MS;
-  if(kind === 'forward') return {type:'Go', intensity:.12, duration_ms};
-  if(kind === 'back') return {type:'Reverse', intensity:.10, duration_ms};
-  if(kind === 'left') return {type:'Turn', direction:'Left', intensity:.20, duration_ms};
-  if(kind === 'right') return {type:'Turn', direction:'Right', intensity:.20, duration_ms};
-  return {type:'Stop'};
-}
-
-function sendCockpitStop(){
-  return postWebReign({type:'Stop'}, COCKPIT_TTL_MS, 'hardware stop', 1);
-}
-
-function sendCockpit(kind){
-  if(kind === 'stop') return sendCockpitStop();
-  if(!cockpitAvailable || !cockpitArmed){
-    hardwareState.textContent = cockpitAvailable ? 'disarmed' : 'hardware cockpit unavailable';
-    return Promise.resolve();
-  }
-  return postWebReign(cockpitCommand(kind), COCKPIT_TTL_MS, `hardware ${kind}`, 1);
-}
-
-function startCockpitHold(kind){
-  if(kind === 'stop'){
-    endCockpitHold(false);
-    return sendCockpitStop();
-  }
-  if(cockpitHoldKind === kind && cockpitHoldTimer) return Promise.resolve();
-  endCockpitHold(false);
-  cockpitHoldKind = kind;
-  sendCockpit(kind);
-  cockpitHoldTimer = setInterval(() => {
-    if(cockpitHoldKind) sendCockpit(cockpitHoldKind);
-  }, COCKPIT_REFRESH_MS);
-  return Promise.resolve();
-}
-
-function endCockpitHold(sendStop=true){
-  cockpitHoldKind = null;
-  if(cockpitHoldTimer){
-    clearInterval(cockpitHoldTimer);
-    cockpitHoldTimer = null;
-  }
-  if(sendStop) return sendCockpitStop();
-  return Promise.resolve();
-}
-
-function keyCockpitKind(key){
-  if(key === 'w' || key === 'ArrowUp') return 'forward';
-  if(key === 's' || key === 'ArrowDown') return 'back';
-  if(key === 'a' || key === 'ArrowLeft') return 'left';
-  if(key === 'd' || key === 'ArrowRight') return 'right';
-  if(key === ' ') return 'stop';
-  return null;
-}
-
-function heldCockpitKind(){
-  for(const key of Array.from(cockpitHeldKeys).reverse()){
-    const kind = keyCockpitKind(key);
-    if(kind && kind !== 'stop') return kind;
-  }
-  return null;
-}
-
 function updateHardwareControl(hw){
   cockpitAvailable = !!hw?.available;
   cockpitArmed = !!hw?.armed;
   hardwareArm.disabled = !cockpitAvailable;
   hardwareArm.checked = cockpitArmed;
-  cockpitButtons.forEach(button => {
-    const isStop = button.dataset.cockpit === 'stop';
-    button.disabled = !cockpitAvailable || (!cockpitArmed && !isStop);
-  });
   const stateText = !cockpitAvailable ? 'unavailable'
     : cockpitArmed ? 'ARMED'
     : 'disarmed';
@@ -5900,7 +5789,7 @@ async function setHardwareArmed(armed){
     });
     if(!res.ok) throw new Error(await res.text());
     updateHardwareControl(await res.json());
-    if(!armed) sendCockpitStop();
+    if(!armed) postWebReign({type:'Stop'}, 900, 'hardware disarmed', 1);
   }catch(error){
     hardwareState.textContent = 'arm request rejected';
     hardwareArm.checked = false;
@@ -5909,13 +5798,11 @@ async function setHardwareArmed(armed){
 }
 
 function disarmHardwareOnExit(){
-  cockpitHeldKeys.clear();
-  endCockpitHold(false);
   if(navigator.sendBeacon){
     const body = new Blob([JSON.stringify({armed:false})], {type:'application/json'});
     navigator.sendBeacon('/reign/hardware-arm', body);
   } else {
-    sendCockpitStop();
+    postWebReign({type:'Stop'}, 900, 'hardware stop', 1);
   }
 }
 
@@ -6093,75 +5980,13 @@ function commandForWebJoystick(){
   const {x, y} = webReignVector;
   const magnitude = Math.hypot(x, y);
   if(magnitude < .18) return null;
-  const turnDominant = Math.abs(x) >= Math.abs(y) * .65;
-  const driveDominant = Math.abs(y) > Math.abs(x) * .65;
-  if(y < -.18 && (driveDominant || !turnDominant)){
-    const intensity = clamp(Math.pow(-y, 1.25), .12, 1);
-    return {command:{type:'Go', intensity, duration_ms:350}, ttl:700, label:`forward ${fmt(intensity, 2)}`, priority:.95};
-  }
-  if(y > .18 && (driveDominant || !turnDominant)){
-    const intensity = clamp(Math.pow(y, 1.25), .12, 1);
-    return {command:{type:'Reverse', intensity, duration_ms:350}, ttl:700, label:`reverse ${fmt(intensity, 2)}`, priority:.98};
-  }
-  if(Math.abs(x) > .18){
-    const intensity = clamp(Math.pow(Math.abs(x), 1.35), .10, 1);
-    return {command:{type:'Turn', direction:x < 0 ? 'Left' : 'Right', intensity, duration_ms:300}, ttl:650, label:`turn ${x < 0 ? 'left' : 'right'} ${fmt(intensity, 2)}`, priority:.95};
-  }
-  return null;
-}
-
-function setHeadingTargetRad(rad){
-  headingTargetRad = wrapRad(rad);
-  headingStopSent = false;
-  headingTarget.value = fmt(radToDeg(headingTargetRad), 1);
-  headingTargetReadout.textContent = `${fmt(radToDeg(headingTargetRad), 1)} deg`;
-  reignState.textContent = `heading target ${fmt(radToDeg(headingTargetRad), 1)} deg`;
-}
-
-function setHeadingTargetFromInput(){
-  const value = Number.parseFloat(headingTarget.value);
-  if(!Number.isFinite(value)){
-    reignState.textContent = 'enter heading degrees';
-    return;
-  }
-  setHeadingTargetRad(degToRad(clamp(value, -180, 180)));
-}
-
-function nudgeHeading(degrees){
-  const current = Number(lastScene?.body?.heading_rad);
-  const base = headingTargetRad ?? (Number.isFinite(current) ? current : 0);
-  setHeadingTargetRad(base + degToRad(degrees));
-}
-
-function clearHeadingTarget(sendStop=false){
-  headingTargetRad = null;
-  headingTargetReadout.textContent = '-';
-  if(sendStop) postWebReign({type:'Stop'}, 900, 'heading clear', 1);
-}
-
-function commandForHeadingTarget(){
-  if(headingTargetRad == null || webReignPointerId != null) return null;
-  const current = Number(lastScene?.body?.heading_rad);
-  if(!Number.isFinite(current)) return null;
-  const error = wrapRad(headingTargetRad - current);
-  const absError = Math.abs(error);
-  if(absError < degToRad(.8)){
-    if(!headingStopSent){
-      headingStopSent = true;
-      reignState.textContent = `heading set ${fmt(radToDeg(current), 1)} deg`;
-      return {command:{type:'Stop'}, ttl:900, label:'heading set', priority:1};
-    }
-    return null;
-  }
-  headingStopSent = false;
-  const intensity = clamp(absError * .9, .08, .65);
-  const direction = error > 0 ? 'Left' : 'Right';
-  const duration_ms = absError < degToRad(6) ? 180 : 280;
+  const forward = Math.abs(y) < .12 ? 0 : -Math.sign(y) * clamp(Math.pow(Math.abs(y), 1.25), .08, 1);
+  const turn = Math.abs(x) < .12 ? 0 : -Math.sign(x) * clamp(Math.pow(Math.abs(x), 1.35), .08, 1);
   return {
-    command:{type:'Turn', direction, intensity, duration_ms},
-    ttl:duration_ms + 260,
-    label:`heading ${fmt(radToDeg(error), 1)} deg`,
-    priority:.98
+    command:{type:'Drive', forward, turn, duration_ms:320},
+    ttl:680,
+    label:`drive F ${fmt(forward, 2)} T ${fmt(turn, 2)}`,
+    priority:.96
   };
 }
 
@@ -6178,7 +6003,6 @@ function pollWebReigns(){
 
 reignJoystick.addEventListener('pointerdown', event => {
   webReignPointerId = event.pointerId;
-  clearHeadingTarget(false);
   reignJoystick.setPointerCapture(event.pointerId);
   updateWebJoystick(event);
   event.preventDefault();
@@ -6200,66 +6024,9 @@ function endWebJoystick(event){
 reignJoystick.addEventListener('pointerup', endWebJoystick);
 reignJoystick.addEventListener('pointercancel', endWebJoystick);
 reignStop.addEventListener('click', () => {
-  clearHeadingTarget(false);
   postWebReign({type:'Stop'}, 2000, 'stop', 1);
 });
-reignDock.addEventListener('click', () => {
-  clearHeadingTarget(false);
-  postWebReign({type:'Dock'}, 5000, 'dock', .9);
-});
-reignExplore.addEventListener('click', () => {
-  clearHeadingTarget(false);
-  postWebReign({type:'Explore', duration_ms:3000}, 5000, 'explore', .85);
-});
-headingApply.addEventListener('click', setHeadingTargetFromInput);
-headingTarget.addEventListener('keydown', event => {
-  if(event.key !== 'Enter') return;
-  event.preventDefault();
-  setHeadingTargetFromInput();
-});
-headingClear.addEventListener('click', () => clearHeadingTarget(true));
-headingNudges.forEach(button => {
-  button.addEventListener('click', () => nudgeHeading(Number.parseFloat(button.dataset.headingNudge || '0')));
-});
 hardwareArm.addEventListener('change', () => setHardwareArmed(hardwareArm.checked));
-cockpitButtons.forEach(button => {
-  const kind = button.dataset.cockpit;
-  button.addEventListener('pointerdown', event => {
-    startCockpitHold(kind);
-    event.preventDefault();
-  });
-  button.addEventListener('pointerup', () => endCockpitHold());
-  button.addEventListener('pointercancel', () => endCockpitHold());
-  button.addEventListener('mouseleave', event => {
-    if(event.buttons) endCockpitHold();
-  });
-});
-window.addEventListener('keydown', event => {
-  if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName)) return;
-  const kind = keyCockpitKind(event.key);
-  if(!kind) return;
-  event.preventDefault();
-  if(kind === 'stop'){
-    cockpitHeldKeys.clear();
-    endCockpitHold(false);
-    sendCockpitStop();
-    return;
-  }
-  cockpitHeldKeys.add(event.key);
-  startCockpitHold(kind);
-});
-window.addEventListener('keyup', event => {
-  const kind = keyCockpitKind(event.key);
-  if(!kind) return;
-  cockpitHeldKeys.delete(event.key);
-  const nextKind = heldCockpitKind();
-  if(nextKind) startCockpitHold(nextKind);
-  else endCockpitHold();
-});
-window.addEventListener('blur', () => {
-  cockpitHeldKeys.clear();
-  endCockpitHold();
-});
 window.addEventListener('pagehide', disarmHardwareOnExit);
 window.addEventListener('beforeunload', disarmHardwareOnExit);
 
@@ -6269,27 +6036,16 @@ function commandForInputSource(inputSource){
   if(buttonPressed(gamepad, 1) || buttonPressed(gamepad, 3)) {
     return {command:{type:'Stop'}, ttl:900, label:'stop', priority:1};
   }
-  if(buttonPressed(gamepad, 4)) {
-    return {command:{type:'Dock'}, ttl:5000, label:'dock', priority:.9};
-  }
-  if(buttonPressed(gamepad, 5)) {
-    return {command:{type:'Explore', duration_ms:3000}, ttl:5000, label:'explore', priority:.85};
-  }
   const {x, y} = stickAxes(gamepad);
-  if(y < -.35) {
-    const intensity = Math.min(1, Math.max(.25, -y));
-    return {command:{type:'Go', intensity, duration_ms:350}, ttl:700, label:`forward ${fmt(intensity, 2)}`, priority:.95};
-  }
-  if(y > .35) {
-    const intensity = Math.min(1, Math.max(.25, y));
-    return {command:{type:'Reverse', intensity, duration_ms:350}, ttl:700, label:`reverse ${fmt(intensity, 2)}`, priority:.98};
-  }
-  if(Math.abs(x) > .35) {
-    const intensity = Math.min(1, Math.max(.25, Math.abs(x)));
-    return {command:{type:'Turn', direction:x < 0 ? 'Left' : 'Right', intensity, duration_ms:300}, ttl:650, label:`turn ${x < 0 ? 'left' : 'right'} ${fmt(intensity, 2)}`, priority:.95};
-  }
-  if(buttonPressed(gamepad, 0)) {
-    return {command:{type:'Go', intensity:.45, duration_ms:350}, ttl:700, label:'trigger forward', priority:.9};
+  if(Math.hypot(x, y) > .22) {
+    const forward = Math.abs(y) < .14 ? 0 : -Math.sign(y) * clamp(Math.pow(Math.abs(y), 1.25), .08, 1);
+    const turn = Math.abs(x) < .14 ? 0 : -Math.sign(x) * clamp(Math.pow(Math.abs(x), 1.35), .08, 1);
+    return {
+      command:{type:'Drive', forward, turn, duration_ms:320},
+      ttl:680,
+      label:`drive F ${fmt(forward, 2)} T ${fmt(turn, 2)}`,
+      priority:.96
+    };
   }
   return null;
 }
@@ -6297,11 +6053,6 @@ function commandForInputSource(inputSource){
 function pollXrReigns(){
   if(pollWebReigns()) return;
   if(!xrSession){
-    const headingCommand = commandForHeadingTarget();
-    if(headingCommand){
-      postWebReign(headingCommand.command, headingCommand.ttl, headingCommand.label, headingCommand.priority);
-      return;
-    }
     if(performance.now() - lastReignSentAt > 1200){
       lastReignKey = '';
       reignState.textContent = lastReignText === 'idle' ? 'web reign ready' : `ready, last ${lastReignText}`;
@@ -6314,15 +6065,9 @@ function pollXrReigns(){
     activeSources += 1;
     const next = commandForInputSource(inputSource);
     if(next){
-      clearHeadingTarget(false);
       postReign(next.command, next.ttl, next.label, next.priority);
       return;
     }
-  }
-  const headingCommand = commandForHeadingTarget();
-  if(headingCommand){
-    postWebReign(headingCommand.command, headingCommand.ttl, headingCommand.label, headingCommand.priority);
-    return;
   }
   if(activeSources === 0){
     reignState.textContent = 'no XR gamepad found';
@@ -7461,6 +7206,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hardware_armed_analog_drive_clamps_both_axes() {
+        let state = hardware_reign_state_with_snapshot(recent_snapshot());
+        let _ = post_hardware_arm(
+            State(state.clone()),
+            Json(HardwareArmRequest { armed: true }),
+        )
+        .await
+        .unwrap();
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Drive {
+                forward: 0.9,
+                turn: -0.8,
+                duration_ms: 5_000,
+            },
+            priority: 1.0,
+            ttl_ms: Some(5_000),
+            note: None,
+            source: Some(ReignSource::WebRemote),
+        };
+
+        let Json(input) = post_reign_command(State(state), Json(request))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            input.expires_at_ms - input.issued_at_ms,
+            HARDWARE_TTL_MAX_MS
+        );
+        assert!(matches!(
+            input.command,
+            ReignCommand::Drive {
+                forward,
+                turn,
+                duration_ms
+            } if forward == HARDWARE_MAX_FORWARD_INTENSITY
+                && turn == -HARDWARE_MAX_TURN_INTENSITY
+                && duration_ms == HARDWARE_TTL_MAX_MS
+        ));
+    }
+
+    #[tokio::test]
     async fn hardware_drive_rejected_on_cliff_even_when_armed() {
         let mut snapshot = recent_snapshot();
         snapshot.body.flags.cliff_front_left = true;
@@ -8064,17 +7851,17 @@ mod tests {
         assert!(page.contains("packet.behavior_nodes"));
         assert!(page.contains("const nodes = {...graphLayout}"));
         assert!(page.contains("source='Gamepad'"));
-        assert!(page.contains("type:'Reverse'"));
+        assert!(page.contains("type:'Drive'"));
         assert!(page.contains("Real hardware armed"));
         assert!(page.contains("/reign/hardware-arm"));
-        assert!(page.contains("window.addEventListener('keyup'"));
         assert!(page.contains("window.addEventListener('pagehide'"));
         assert!(page.contains("navigator.sendBeacon"));
-        assert!(page.contains("const COCKPIT_TTL_MS = 300"));
-        assert!(page.contains("const COCKPIT_REFRESH_MS = 220"));
-        assert!(page.contains("function startCockpitHold"));
-        assert!(page.contains("function endCockpitHold"));
-        assert!(page.contains("setInterval(() =>"));
+        assert!(!page.contains("id=\"reign-dock\""));
+        assert!(!page.contains("id=\"reign-explore\""));
+        assert!(!page.contains("data-cockpit"));
+        assert!(!page.contains("data-heading-nudge"));
+        assert!(!page.contains("function startCockpitHold"));
+        assert!(!page.contains("function commandForHeadingTarget"));
         assert!(page.contains("'WebRemote'"));
         assert!(page.contains("function projectRangeBeam"));
         assert!(page.contains("/view/map"));

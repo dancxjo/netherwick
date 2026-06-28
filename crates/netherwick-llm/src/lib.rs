@@ -1041,6 +1041,14 @@ fn summarize_reign_command(input: &netherwick_actions::ReignInput) -> String {
             intensity,
             duration_ms,
         } => format!("Reverse, intensity {:.2}, {}ms", intensity, duration_ms),
+        netherwick_actions::ReignCommand::Drive {
+            forward,
+            turn,
+            duration_ms,
+        } => format!(
+            "Drive, forward {:.2}, turn {:.2}, {}ms",
+            forward, turn, duration_ms
+        ),
         netherwick_actions::ReignCommand::Turn {
             direction,
             intensity,
@@ -1096,6 +1104,16 @@ fn action_spec_json(action: &ActionPrimitive) -> serde_json::Value {
         } => serde_json::json!({
             "kind": "go",
             "intensity": intensity,
+            "duration_ms": duration_ms,
+        }),
+        ActionPrimitive::Drive {
+            forward,
+            turn,
+            duration_ms,
+        } => serde_json::json!({
+            "kind": "drive",
+            "forward": forward,
+            "turn": turn,
             "duration_ms": duration_ms,
         }),
         ActionPrimitive::Turn {

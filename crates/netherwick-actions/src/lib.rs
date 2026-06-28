@@ -52,6 +52,11 @@ pub enum ActionPrimitive {
         intensity: f32,
         duration_ms: TimeMs,
     },
+    Drive {
+        forward: f32,
+        turn: f32,
+        duration_ms: TimeMs,
+    },
     Turn {
         direction: TurnDir,
         intensity: f32,
@@ -88,6 +93,11 @@ pub enum ReignCommand {
         intensity: f32,
         duration_ms: TimeMs,
     },
+    Drive {
+        forward: f32,
+        turn: f32,
+        duration_ms: TimeMs,
+    },
     Turn {
         direction: TurnDir,
         intensity: f32,
@@ -117,6 +127,7 @@ impl ReignCommand {
             Self::Stop => 2_000,
             Self::Go { duration_ms, .. }
             | Self::Reverse { duration_ms, .. }
+            | Self::Drive { duration_ms, .. }
             | Self::Turn { duration_ms, .. } => duration_ms.saturating_add(500),
             Self::Dock | Self::Explore { .. } | Self::Approach { .. } => 5_000,
             Self::Inspect { .. } => 5_000,
@@ -140,6 +151,15 @@ impl ReignCommand {
                 duration_ms,
             } => Some(ActionPrimitive::Go {
                 intensity: -*intensity,
+                duration_ms: *duration_ms,
+            }),
+            Self::Drive {
+                forward,
+                turn,
+                duration_ms,
+            } => Some(ActionPrimitive::Drive {
+                forward: *forward,
+                turn: *turn,
                 duration_ms: *duration_ms,
             }),
             Self::Turn {
@@ -251,6 +271,10 @@ pub fn action_to_motor_command(action: Option<&ActionPrimitive>) -> MotorCommand
             forward: *intensity,
             turn: 0.0,
         },
+        ActionPrimitive::Drive { forward, turn, .. } => MotorCommand {
+            forward: *forward,
+            turn: *turn,
+        },
         ActionPrimitive::Turn {
             direction,
             intensity,
@@ -327,5 +351,27 @@ mod tests {
         let motor = action_to_motor_command(action.as_ref());
         assert_eq!(motor.forward, -0.4);
         assert_eq!(motor.turn, 0.0);
+    }
+
+    #[test]
+    fn reign_drive_maps_to_combined_motor_command() {
+        let action = ReignCommand::Drive {
+            forward: 0.35,
+            turn: -0.42,
+            duration_ms: 320,
+        }
+        .to_action();
+
+        assert_eq!(
+            action,
+            Some(ActionPrimitive::Drive {
+                forward: 0.35,
+                turn: -0.42,
+                duration_ms: 320
+            })
+        );
+        let motor = action_to_motor_command(action.as_ref());
+        assert_eq!(motor.forward, 0.35);
+        assert_eq!(motor.turn, -0.42);
     }
 }
