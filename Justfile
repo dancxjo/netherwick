@@ -1,6 +1,6 @@
 set shell := ["bash", "-euxo", "pipefail", "-c"]
 
-create1_port := env_var_or_default("CREATE1_PORT", "auto")
+create1_port := env_var_or_default("CREATE1_PORT", "/dev/ttyUSB0")
 gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "/dev/ttyACM0")
 camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 mic_device := env_var_or_default("MIC_DEVICE", "default")

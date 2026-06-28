@@ -4212,7 +4212,7 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #hud dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 #hud dd.active-learning{color:#8df0b2;font-weight:700}
 #status{color:#ffd083}
-#reign{right:12px;top:12px;width:236px;min-width:220px;border-color:#36424d;background:rgba(11,16,22,.84);color:#dce8f2}
+#reign{right:12px;top:12px;width:278px;min-width:250px;border-color:#36424d;background:rgba(11,16,22,.84);color:#dce8f2}
 #reign .panel-content{display:grid;gap:8px}
 #reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
 #reign div{font-variant-numeric:tabular-nums}
@@ -4231,7 +4231,7 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .cockpit-grid .stop{grid-column:1/-1;background:#681923;border-color:#b13a4a;color:#fff}
 .trace-label{font-size:11px;color:#9fb0bf}
 #trace-map{width:100%;height:auto;display:block;background:#081015;border:1px solid #2d3d4a;border-radius:4px}
-.reign-pad{display:grid;grid-template-columns:92px 1fr;gap:10px;align-items:center}
+.reign-pad{display:grid;grid-template-columns:104px 1fr;gap:10px;align-items:center}
 #reign-joystick{position:relative;width:92px;aspect-ratio:1;border:1px solid #455565;border-radius:50%;background:radial-gradient(circle at 50% 50%,rgba(79,149,188,.24),rgba(15,23,31,.72) 64%);touch-action:none;cursor:pointer}
 #reign-joystick::before,#reign-joystick::after{content:"";position:absolute;background:rgba(170,196,216,.22)}
 #reign-joystick::before{left:12px;right:12px;top:50%;height:1px}
@@ -4241,6 +4241,17 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .reign-buttons button{min-height:34px;border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer}
 .reign-buttons button:hover,.reign-buttons button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
 .reign-buttons .stop{grid-column:1/-1;background:#5b1720;border-color:#9a3443;color:#fff}
+.reign-readout{font-size:11px;color:#b7c8d8}
+.heading-controls{display:grid;gap:6px;border-top:1px solid #344350;padding-top:8px}
+.heading-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:6px;align-items:center}
+.heading-row label{font-size:11px;color:#9fb0bf}
+.heading-row input{min-width:0;width:100%;box-sizing:border-box;background:#111820;border:1px solid #33414d;color:#e7eef5;border-radius:4px;padding:5px 6px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.heading-row button,.heading-nudges button{min-height:28px;border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer}
+.heading-row button:hover,.heading-row button:focus-visible,.heading-nudges button:hover,.heading-nudges button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
+.heading-nudges{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px}
+.heading-nudges button{padding:3px;font-size:11px}
+.heading-meta{display:grid;grid-template-columns:1fr auto;gap:6px;font-size:11px;color:#9fb0bf}
+.heading-meta span{font-variant-numeric:tabular-nums;color:#ffd083}
 .reign-hint{color:#9fb0bf;font-size:11px;line-height:1.25}
 #llm{right:12px;top:96px;width:320px;height:300px;min-width:200px;min-height:150px;border-color:#3f4c58;background:rgba(9,12,16,.88)}
 #llm .panel-content{display:grid;grid-template-rows:auto minmax(0,1fr);gap:8px;overflow:hidden}
@@ -4394,10 +4405,30 @@ canvas{display:block}
       <button class="stop" id="reign-stop" type="button">Stop</button>
       <button id="reign-dock" type="button">Dock</button>
       <button id="reign-explore" type="button">Explore</button>
+      <div class="reign-readout" id="reign-readout">F 0.00 / T 0.00</div>
     </div>
   </div>
   <div id="reign-state">web reign ready</div>
-  <div class="reign-hint">Drag up to go, left or right to turn. Release to stop.</div>
+  <div class="heading-controls">
+    <div class="heading-row">
+      <label for="heading-target">Heading</label>
+      <input id="heading-target" type="number" min="-180" max="180" step="0.1" inputmode="decimal">
+      <button id="heading-apply" type="button">Set</button>
+    </div>
+    <div class="heading-nudges">
+      <button type="button" data-heading-nudge="-15">-15</button>
+      <button type="button" data-heading-nudge="-5">-5</button>
+      <button type="button" data-heading-nudge="-1">-1</button>
+      <button type="button" data-heading-nudge="1">+1</button>
+      <button type="button" data-heading-nudge="5">+5</button>
+      <button type="button" data-heading-nudge="15">+15</button>
+    </div>
+    <div class="heading-meta">
+      <div>now <span id="heading-current">-</span> / target <span id="heading-target-readout">-</span></div>
+      <button id="heading-clear" type="button">Clear</button>
+    </div>
+  </div>
+  <div class="reign-hint">Drag for analog Reign. Heading holds use short turn leases and stop near target.</div>
   <div class="cockpit">
     <label class="cockpit-arm"><input id="hardware-arm" type="checkbox"> Real hardware armed</label>
     <div id="hardware-state">hardware cockpit unavailable</div>
@@ -4518,6 +4549,13 @@ const reignStick = document.getElementById('reign-stick');
 const reignStop = document.getElementById('reign-stop');
 const reignDock = document.getElementById('reign-dock');
 const reignExplore = document.getElementById('reign-explore');
+const reignReadout = document.getElementById('reign-readout');
+const headingTarget = document.getElementById('heading-target');
+const headingApply = document.getElementById('heading-apply');
+const headingCurrent = document.getElementById('heading-current');
+const headingTargetReadout = document.getElementById('heading-target-readout');
+const headingClear = document.getElementById('heading-clear');
+const headingNudges = Array.from(document.querySelectorAll('[data-heading-nudge]'));
 const hardwareArm = document.getElementById('hardware-arm');
 const hardwareState = document.getElementById('hardware-state');
 const cockpitButtons = Array.from(document.querySelectorAll('[data-cockpit]'));
@@ -4710,10 +4748,20 @@ let lastReignSentAt = 0;
 let lastReignText = 'idle';
 let webReignPointerId = null;
 let webReignVector = {x: 0, y: 0};
+let headingTargetRad = null;
+let headingStopSent = true;
 const llmCards = new Map();
 
 function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
 function world(x, y, up=0){ return new BABYLON.Vector3(x, up, y); }
+function clamp(value, min, max){ return Math.max(min, Math.min(max, value)); }
+function wrapRad(rad){
+  let wrapped = (rad + Math.PI) % (Math.PI * 2);
+  if(wrapped < 0) wrapped += Math.PI * 2;
+  return wrapped - Math.PI;
+}
+function radToDeg(rad){ return wrapRad(rad) * 180 / Math.PI; }
+function degToRad(deg){ return wrapRad(deg * Math.PI / 180); }
 function titleCase(value){
   return String(value || '-').replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
 }
@@ -5283,6 +5331,9 @@ function updateScene(packet){
   fields.tick.textContent = session.tick_ms == null ? '-' : `${session.tick_ms} ms`;
   fields.t.textContent = `${packet.t_ms} ms`;
   fields.pose.textContent = `${fmt(packet.body.x_m)}, ${fmt(packet.body.y_m)}, ${fmt(packet.body.heading_rad)} rad`;
+  const headingDeg = radToDeg(Number(packet.body.heading_rad) || 0);
+  headingCurrent.textContent = `${fmt(headingDeg, 1)} deg`;
+  headingTarget.placeholder = fmt(headingDeg, 1);
   fields.battery.textContent = `${fmt(packet.body.battery_level * 100, 1)}%${packet.body.charging ? ' charging' : ''}`;
   const detail = packet.stuck_detail || {};
   fields.stuck.textContent = packet.stuck ? (detail.class || 'stuck') : (detail.recovered ? 'recovered' : 'clear');
@@ -5591,42 +5642,103 @@ function drawTraceMap(packet){
 function resetWebJoystick(){
   webReignVector = {x: 0, y: 0};
   reignStick.style.transform = 'translate(-50%,-50%)';
+  reignReadout.textContent = 'F 0.00 / T 0.00';
 }
 
 function updateWebJoystick(event){
   const rect = reignJoystick.getBoundingClientRect();
   const radius = rect.width / 2;
+  const usable = Math.max(1, radius - 17);
   const cx = rect.left + radius;
   const cy = rect.top + radius;
   const dx = event.clientX - cx;
   const dy = event.clientY - cy;
-  const distance = Math.min(radius - 17, Math.hypot(dx, dy));
+  const distance = Math.min(usable, Math.hypot(dx, dy));
   const angle = Math.atan2(dy, dx);
   const knobX = Math.cos(angle) * distance;
   const knobY = Math.sin(angle) * distance;
   reignStick.style.transform = `translate(calc(-50% + ${knobX}px), calc(-50% + ${knobY}px))`;
   webReignVector = {
-    x: Math.max(-1, Math.min(1, dx / radius)),
-    y: Math.max(-1, Math.min(1, dy / radius))
+    x: clamp(dx / usable, -1, 1),
+    y: clamp(dy / usable, -1, 1)
   };
+  reignReadout.textContent = `F ${fmt(-webReignVector.y, 2)} / T ${fmt(webReignVector.x, 2)}`;
 }
 
 function commandForWebJoystick(){
   const {x, y} = webReignVector;
-  if(Math.hypot(x, y) < .28) return null;
-  if(y < -.32 && Math.abs(y) >= Math.abs(x) * .85){
-    const intensity = Math.min(1, Math.max(.25, -y));
+  const magnitude = Math.hypot(x, y);
+  if(magnitude < .18) return null;
+  const turnDominant = Math.abs(x) >= Math.abs(y) * .65;
+  const driveDominant = Math.abs(y) > Math.abs(x) * .65;
+  if(y < -.18 && (driveDominant || !turnDominant)){
+    const intensity = clamp(Math.pow(-y, 1.25), .12, 1);
     return {command:{type:'Go', intensity, duration_ms:350}, ttl:700, label:`forward ${fmt(intensity, 2)}`, priority:.95};
   }
-  if(y > .32 && Math.abs(y) >= Math.abs(x) * .85){
-    const intensity = Math.min(1, Math.max(.25, y));
+  if(y > .18 && (driveDominant || !turnDominant)){
+    const intensity = clamp(Math.pow(y, 1.25), .12, 1);
     return {command:{type:'Reverse', intensity, duration_ms:350}, ttl:700, label:`reverse ${fmt(intensity, 2)}`, priority:.98};
   }
-  if(Math.abs(x) > .32){
-    const intensity = Math.min(1, Math.max(.25, Math.abs(x)));
+  if(Math.abs(x) > .18){
+    const intensity = clamp(Math.pow(Math.abs(x), 1.35), .10, 1);
     return {command:{type:'Turn', direction:x < 0 ? 'Left' : 'Right', intensity, duration_ms:300}, ttl:650, label:`turn ${x < 0 ? 'left' : 'right'} ${fmt(intensity, 2)}`, priority:.95};
   }
   return null;
+}
+
+function setHeadingTargetRad(rad){
+  headingTargetRad = wrapRad(rad);
+  headingStopSent = false;
+  headingTarget.value = fmt(radToDeg(headingTargetRad), 1);
+  headingTargetReadout.textContent = `${fmt(radToDeg(headingTargetRad), 1)} deg`;
+  reignState.textContent = `heading target ${fmt(radToDeg(headingTargetRad), 1)} deg`;
+}
+
+function setHeadingTargetFromInput(){
+  const value = Number.parseFloat(headingTarget.value);
+  if(!Number.isFinite(value)){
+    reignState.textContent = 'enter heading degrees';
+    return;
+  }
+  setHeadingTargetRad(degToRad(clamp(value, -180, 180)));
+}
+
+function nudgeHeading(degrees){
+  const current = Number(lastScene?.body?.heading_rad);
+  const base = headingTargetRad ?? (Number.isFinite(current) ? current : 0);
+  setHeadingTargetRad(base + degToRad(degrees));
+}
+
+function clearHeadingTarget(sendStop=false){
+  headingTargetRad = null;
+  headingTargetReadout.textContent = '-';
+  if(sendStop) postWebReign({type:'Stop'}, 900, 'heading clear', 1);
+}
+
+function commandForHeadingTarget(){
+  if(headingTargetRad == null || webReignPointerId != null) return null;
+  const current = Number(lastScene?.body?.heading_rad);
+  if(!Number.isFinite(current)) return null;
+  const error = wrapRad(headingTargetRad - current);
+  const absError = Math.abs(error);
+  if(absError < degToRad(.8)){
+    if(!headingStopSent){
+      headingStopSent = true;
+      reignState.textContent = `heading set ${fmt(radToDeg(current), 1)} deg`;
+      return {command:{type:'Stop'}, ttl:900, label:'heading set', priority:1};
+    }
+    return null;
+  }
+  headingStopSent = false;
+  const intensity = clamp(absError * .9, .08, .65);
+  const direction = error > 0 ? 'Left' : 'Right';
+  const duration_ms = absError < degToRad(6) ? 180 : 280;
+  return {
+    command:{type:'Turn', direction, intensity, duration_ms},
+    ttl:duration_ms + 260,
+    label:`heading ${fmt(radToDeg(error), 1)} deg`,
+    priority:.98
+  };
 }
 
 function pollWebReigns(){
@@ -5642,6 +5754,7 @@ function pollWebReigns(){
 
 reignJoystick.addEventListener('pointerdown', event => {
   webReignPointerId = event.pointerId;
+  clearHeadingTarget(false);
   reignJoystick.setPointerCapture(event.pointerId);
   updateWebJoystick(event);
   event.preventDefault();
@@ -5662,9 +5775,28 @@ function endWebJoystick(event){
 
 reignJoystick.addEventListener('pointerup', endWebJoystick);
 reignJoystick.addEventListener('pointercancel', endWebJoystick);
-reignStop.addEventListener('click', () => postWebReign({type:'Stop'}, 2000, 'stop', 1));
-reignDock.addEventListener('click', () => postWebReign({type:'Dock'}, 5000, 'dock', .9));
-reignExplore.addEventListener('click', () => postWebReign({type:'Explore', duration_ms:3000}, 5000, 'explore', .85));
+reignStop.addEventListener('click', () => {
+  clearHeadingTarget(false);
+  postWebReign({type:'Stop'}, 2000, 'stop', 1);
+});
+reignDock.addEventListener('click', () => {
+  clearHeadingTarget(false);
+  postWebReign({type:'Dock'}, 5000, 'dock', .9);
+});
+reignExplore.addEventListener('click', () => {
+  clearHeadingTarget(false);
+  postWebReign({type:'Explore', duration_ms:3000}, 5000, 'explore', .85);
+});
+headingApply.addEventListener('click', setHeadingTargetFromInput);
+headingTarget.addEventListener('keydown', event => {
+  if(event.key !== 'Enter') return;
+  event.preventDefault();
+  setHeadingTargetFromInput();
+});
+headingClear.addEventListener('click', () => clearHeadingTarget(true));
+headingNudges.forEach(button => {
+  button.addEventListener('click', () => nudgeHeading(Number.parseFloat(button.dataset.headingNudge || '0')));
+});
 hardwareArm.addEventListener('change', () => setHardwareArmed(hardwareArm.checked));
 cockpitButtons.forEach(button => {
   const kind = button.dataset.cockpit;
@@ -5741,6 +5873,11 @@ function commandForInputSource(inputSource){
 function pollXrReigns(){
   if(pollWebReigns()) return;
   if(!xrSession){
+    const headingCommand = commandForHeadingTarget();
+    if(headingCommand){
+      postWebReign(headingCommand.command, headingCommand.ttl, headingCommand.label, headingCommand.priority);
+      return;
+    }
     if(performance.now() - lastReignSentAt > 1200){
       lastReignKey = '';
       reignState.textContent = lastReignText === 'idle' ? 'web reign ready' : `ready, last ${lastReignText}`;
@@ -5753,9 +5890,15 @@ function pollXrReigns(){
     activeSources += 1;
     const next = commandForInputSource(inputSource);
     if(next){
+      clearHeadingTarget(false);
       postReign(next.command, next.ttl, next.label, next.priority);
       return;
     }
+  }
+  const headingCommand = commandForHeadingTarget();
+  if(headingCommand){
+    postWebReign(headingCommand.command, headingCommand.ttl, headingCommand.label, headingCommand.priority);
+    return;
   }
   if(activeSources === 0){
     reignState.textContent = 'no XR gamepad found';
