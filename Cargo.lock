@@ -4815,6 +4815,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "netherwick-mouth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "netherwick-now"
 version = "0.1.0"
 dependencies = [
