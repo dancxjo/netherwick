@@ -26,8 +26,10 @@ use netherwick_map::{
     project_beam_endpoint, LocalMap, MapObservation, MapSummary, OccupancyCell as OdomMapCell,
     PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
+use netherwick_memory::{
+    EntityConstellationState, EntityLifecycleState, EntityMemory, EntityMemoryReport,
+};
 use netherwick_now::{KinectSense, KinectSkeletonSense, ReignSense};
-use netherwick_memory::{EntityMemory, EntityMemoryReport};
 use netherwick_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
     NudgeStatus, ReignQueue, RuntimeModelStack,
@@ -1038,6 +1040,11 @@ pub struct MapEntityGraphNode {
     pub y_m: Option<f32>,
     pub confidence: f32,
     pub age_ms: TimeMs,
+    pub source_channel: Option<String>,
+    pub observed_at_ms: Option<TimeMs>,
+    pub vector_shape: Option<String>,
+    pub nearest_cluster: Option<String>,
+    pub attached_text: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1047,6 +1054,7 @@ pub struct MapEntityGraphEdge {
     pub to: String,
     pub edge_type: String,
     pub confidence: f32,
+    pub observed_at_ms: Option<TimeMs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1056,6 +1064,7 @@ pub struct MapEntityGraphEvent {
     pub event_type: String,
     pub label: String,
     pub confidence: f32,
+    pub timestamp_ms: Option<TimeMs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1767,16 +1776,16 @@ async fn get_live_map(
         .latest()
         .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
     let map = state.map_snapshot();
+    let entity_report = state.entity_memory_report();
     Ok(Json(map_response_from_parts(
         &map,
         &snapshot,
         state.scene_metadata().as_ref(),
+        &entity_report,
     )))
 }
 
-async fn get_entity_memory(
-    State(state): State<LiveViewState>,
-) -> Json<EntityMemoryReport> {
+async fn get_entity_memory(State(state): State<LiveViewState>) -> Json<EntityMemoryReport> {
     Json(state.entity_memory_report())
 }
 
@@ -1784,6 +1793,7 @@ fn map_response_from_parts(
     map: &LocalMap,
     latest: &WorldSnapshot,
     metadata: Option<&LiveSceneMetadata>,
+    entity_report: &EntityMemoryReport,
 ) -> LiveMapResponse {
     let now_ms = latest.body.last_update_ms;
     let summary = map.summary();
@@ -1817,6 +1827,7 @@ fn map_response_from_parts(
         &cells,
         &semantic_cells,
         &events,
+        entity_report,
         latest,
         now_ms,
     );
@@ -1850,6 +1861,7 @@ fn map_entity_graph(
     cells: &[MapViewCell],
     semantic_cells: &[MapSemanticCell],
     map_events: &[MapEventMarker],
+    entity_report: &EntityMemoryReport,
     latest: &WorldSnapshot,
     now_ms: TimeMs,
 ) -> MapEntityGraph {
@@ -2062,6 +2074,7 @@ fn map_entity_graph(
             event_type: "entity_seen".to_string(),
             label,
             confidence: cell.confidence,
+            timestamp_ms: Some(now_ms.saturating_sub(age_ms)),
         });
     }
 
@@ -2104,7 +2117,222 @@ fn map_entity_graph(
             event_type: event.kind.clone(),
             label: event.label.clone().unwrap_or_else(|| event.kind.clone()),
             confidence: event.confidence,
+            timestamp_ms: Some(now_ms.saturating_sub(event.age_ms)),
         });
+    }
+
+    for entity in entity_report.top_entities.iter().take(8) {
+        let entity_id = entity.id.clone();
+        let entity_label = entity
+            .display_name
+            .clone()
+            .or_else(|| entity.labels.first().cloned())
+            .unwrap_or_else(|| entity.kind.clone());
+        let entity_age_ms = now_ms.saturating_sub(entity.last_seen_ms);
+        push_graph_node(
+            &mut nodes,
+            &entity_id,
+            "entity",
+            &entity_label,
+            Some(entity.kind.as_str()),
+            current_pose.map(|pose| (pose.x_m, pose.y_m)),
+            entity.confidence,
+            entity_age_ms,
+        );
+        if current_pose.is_some() {
+            push_graph_edge(
+                &mut edges,
+                &entity_id,
+                "place:current",
+                "same_place_as",
+                entity.confidence.min(0.7),
+            );
+        }
+        events.push(MapEntityGraphEvent {
+            t_ms: now_ms.saturating_sub(entity.first_seen_ms),
+            node_id: entity_id.clone(),
+            event_type: "create".to_string(),
+            label: entity_label.clone(),
+            confidence: entity.confidence,
+            timestamp_ms: Some(entity.first_seen_ms),
+        });
+        if entity.observation_count > 1 {
+            events.push(MapEntityGraphEvent {
+                t_ms: now_ms.saturating_sub(entity.last_seen_ms),
+                node_id: entity_id.clone(),
+                event_type: "strengthen".to_string(),
+                label: entity_label.clone(),
+                confidence: entity.confidence,
+                timestamp_ms: Some(entity.last_seen_ms),
+            });
+        }
+        match entity.lifecycle {
+            EntityLifecycleState::Occluded => events.push(MapEntityGraphEvent {
+                t_ms: entity_age_ms,
+                node_id: entity_id.clone(),
+                event_type: "weaken".to_string(),
+                label: entity_label.clone(),
+                confidence: entity.confidence,
+                timestamp_ms: Some(entity.last_seen_ms),
+            }),
+            EntityLifecycleState::Vanished => events.push(MapEntityGraphEvent {
+                t_ms: entity_age_ms,
+                node_id: entity_id.clone(),
+                event_type: "vanish".to_string(),
+                label: entity_label.clone(),
+                confidence: entity.confidence,
+                timestamp_ms: Some(entity.last_seen_ms),
+            }),
+            EntityLifecycleState::Active => {}
+        }
+        match entity.constellation_state {
+            EntityConstellationState::Revived => events.push(MapEntityGraphEvent {
+                t_ms: entity_age_ms,
+                node_id: entity_id.clone(),
+                event_type: "revive".to_string(),
+                label: entity_label.clone(),
+                confidence: entity.confidence,
+                timestamp_ms: Some(entity.last_seen_ms),
+            }),
+            EntityConstellationState::Split => events.push(MapEntityGraphEvent {
+                t_ms: entity_age_ms,
+                node_id: entity_id.clone(),
+                event_type: "split".to_string(),
+                label: entity_label.clone(),
+                confidence: entity.confidence,
+                timestamp_ms: Some(entity.last_seen_ms),
+            }),
+            EntityConstellationState::Merged => events.push(MapEntityGraphEvent {
+                t_ms: entity_age_ms,
+                node_id: entity_id.clone(),
+                event_type: "merge".to_string(),
+                label: entity_label.clone(),
+                confidence: entity.confidence,
+                timestamp_ms: Some(entity.last_seen_ms),
+            }),
+            EntityConstellationState::Weak
+            | EntityConstellationState::Strong
+            | EntityConstellationState::Vanished => {}
+        }
+        for (label_index, label) in entity.text_labels.iter().take(3).enumerate() {
+            let label_id = format!(
+                "text_label:{}:{label_index}",
+                graph_id_fragment(entity.id.as_str())
+            );
+            push_graph_node(
+                &mut nodes,
+                &label_id,
+                "text_label",
+                label,
+                Some("language"),
+                current_pose.map(|pose| (pose.x_m, pose.y_m)),
+                entity.confidence,
+                entity_age_ms,
+            );
+            push_graph_edge(
+                &mut edges,
+                &label_id,
+                &entity_id,
+                "named_by",
+                entity.confidence.min(0.9),
+            );
+        }
+        for cluster in entity.modality_clusters.iter().take(12) {
+            let cluster_id = format!(
+                "cluster:{}:{}",
+                graph_id_fragment(entity.id.as_str()),
+                graph_id_fragment(cluster.id.as_str())
+            );
+            push_graph_node(
+                &mut nodes,
+                &cluster_id,
+                "cluster",
+                cluster.id.as_str(),
+                Some(cluster.modality.as_str()),
+                current_pose.map(|pose| (pose.x_m, pose.y_m)),
+                cluster.confidence,
+                entity_age_ms,
+            );
+            push_graph_edge(
+                &mut edges,
+                &cluster_id,
+                &entity_id,
+                "part_of_entity",
+                cluster.confidence,
+            );
+            let edge_id = format!("{cluster_id}->part_of_entity->{entity_id}");
+            if let Some(edge) = edges.iter_mut().find(|edge| edge.id == edge_id) {
+                edge.observed_at_ms = Some(entity.last_seen_ms);
+            }
+        }
+        for point in entity.observation_points.iter().rev().take(24) {
+            let node_id = format!(
+                "observation:{}:{}",
+                graph_id_fragment(entity.id.as_str()),
+                graph_id_fragment(point.id.as_str())
+            );
+            let nearest_cluster = entity
+                .modality_clusters
+                .iter()
+                .find(|cluster| {
+                    cluster
+                        .observation_point_ids
+                        .iter()
+                        .any(|id| id == &point.id)
+                })
+                .map(|cluster| {
+                    format!(
+                        "cluster:{}:{}",
+                        graph_id_fragment(entity.id.as_str()),
+                        graph_id_fragment(cluster.id.as_str())
+                    )
+                });
+            if nodes.iter().all(|node| node.id != node_id) {
+                nodes.push(MapEntityGraphNode {
+                    id: node_id.clone(),
+                    node_type: "observation".to_string(),
+                    label: point.source.clone(),
+                    modality: Some(point.modality.as_str().to_string()),
+                    x_m: current_pose.map(|pose| pose.x_m),
+                    y_m: current_pose.map(|pose| pose.y_m),
+                    confidence: point.confidence.clamp(0.0, 1.0),
+                    age_ms: now_ms.saturating_sub(point.observed_at_ms),
+                    source_channel: Some(point.source.clone()),
+                    observed_at_ms: Some(point.observed_at_ms),
+                    vector_shape: graph_vector_shape(
+                        latest,
+                        point.source.as_str(),
+                        point.modality.as_str(),
+                    ),
+                    nearest_cluster: nearest_cluster.clone(),
+                    attached_text: point
+                        .source
+                        .strip_prefix("text:")
+                        .map(str::to_string)
+                        .filter(|text| !text.trim().is_empty()),
+                });
+            }
+            if let Some(cluster_id) = nearest_cluster.as_ref() {
+                push_graph_edge(
+                    &mut edges,
+                    &node_id,
+                    cluster_id,
+                    "belongs_to",
+                    point.confidence,
+                );
+                let edge_id = format!("{node_id}->belongs_to->{cluster_id}");
+                if let Some(edge) = edges.iter_mut().find(|edge| edge.id == edge_id) {
+                    edge.observed_at_ms = Some(point.observed_at_ms);
+                }
+            }
+            push_graph_edge(
+                &mut edges,
+                &node_id,
+                &entity_id,
+                "same_time_as",
+                point.confidence.min(entity.confidence),
+            );
+        }
     }
 
     if let Some(action) = &latest.final_selected_action {
@@ -2176,6 +2404,11 @@ fn push_graph_node(
         y_m: position.map(|(_, y)| y),
         confidence: confidence.clamp(0.0, 1.0),
         age_ms,
+        source_channel: None,
+        observed_at_ms: None,
+        vector_shape: None,
+        nearest_cluster: None,
+        attached_text: None,
     });
 }
 
@@ -2199,6 +2432,7 @@ fn push_graph_edge(
         to: to.to_string(),
         edge_type: edge_type.to_string(),
         confidence: confidence.clamp(0.0, 1.0),
+        observed_at_ms: None,
     });
 }
 
@@ -2212,6 +2446,47 @@ fn graph_id_fragment(value: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+fn graph_vector_shape(snapshot: &WorldSnapshot, source: &str, modality: &str) -> Option<String> {
+    if source.starts_with("face:") {
+        return snapshot
+            .face
+            .vectors
+            .first()
+            .map(|vector| format!("[{}]", vector.vector.len()));
+    }
+    if source.starts_with("voice:") {
+        return snapshot
+            .voice
+            .vectors
+            .first()
+            .map(|vector| format!("[{}]", vector.vector.len()));
+    }
+    if source.starts_with("scene:")
+        && snapshot.kinect.depth_width > 0
+        && snapshot.kinect.depth_height > 0
+    {
+        return Some(format!(
+            "{}x{}",
+            snapshot.kinect.depth_width, snapshot.kinect.depth_height
+        ));
+    }
+    if source.starts_with("text:") {
+        return Some(format!(
+            "tokens:{}",
+            source.split_whitespace().count().max(1)
+        ));
+    }
+    match modality {
+        "vision" => Some("vision:observation".to_string()),
+        "audio" => Some("audio:observation".to_string()),
+        "depth" | "lidar" => Some("depth:observation".to_string()),
+        "touch" => Some("touch:observation".to_string()),
+        "motor" | "action" => Some("action:observation".to_string()),
+        "language" => Some("text:observation".to_string()),
+        _ => None,
+    }
 }
 
 fn projected_beams_from_observation(
@@ -5435,7 +5710,7 @@ canvas{display:block}
     </div>
     <div class="trace-label">SLAM-lite / odometry map: odometry/range trace, not corrected SLAM.</div>
     <canvas id="entity-graph" width="220" height="170" aria-label="entity constellation graph"></canvas>
-    <div id="entity-graph-summary">entity constellation waiting...</div>
+    <div id="entity-graph-summary">sensations/experience/impressions waiting...</div>
   </div>
 </aside>
 <aside id="llm" data-window-title="LLM streams">
@@ -5569,7 +5844,7 @@ const forgeStatus = document.getElementById('forge-status');
 const forgeVector = document.getElementById('forge-vector');
 const forgeFilters = document.getElementById('forge-filters');
 const traceState = {poses: [], events: [], occupied: new Map(), free: new Map()};
-const entityGraphState = {positions: new Map()};
+const entityGraphState = {positions: new Map(), selectedNodeId: null, lastGraph: null};
 let cockpitAvailable = false;
 let cockpitArmed = false;
 
@@ -6646,6 +6921,24 @@ function updateEntityGraphLayout(graph, width, height){
   }
 }
 
+function nearestEntityGraphNode(clientX, clientY){
+  const rect = entityGraphCanvas.getBoundingClientRect();
+  const x = (clientX - rect.left) * (entityGraphCanvas.width / Math.max(1, rect.width));
+  const y = (clientY - rect.top) * (entityGraphCanvas.height / Math.max(1, rect.height));
+  let best = null;
+  let bestDistance = 16;
+  for(const node of entityGraphState.lastGraph?.nodes || []){
+    const pos = entityGraphState.positions.get(node.id);
+    if(!pos) continue;
+    const distance = Math.hypot(pos.x - x, pos.y - y);
+    if(distance < bestDistance){
+      bestDistance = distance;
+      best = node;
+    }
+  }
+  return best;
+}
+
 function drawEntityGraph(graph){
   const width = entityGraphCanvas.width;
   const height = entityGraphCanvas.height;
@@ -6655,8 +6948,12 @@ function drawEntityGraph(graph){
   const nodes = graph?.nodes || [];
   const edges = graph?.edges || [];
   const events = graph?.events || [];
+  entityGraphState.lastGraph = graph;
+  if(entityGraphState.selectedNodeId && !nodes.some(node => node.id === entityGraphState.selectedNodeId)){
+    entityGraphState.selectedNodeId = null;
+  }
   if(!nodes.length){
-    entityGraphSummary.textContent = 'entity constellation waiting...';
+    entityGraphSummary.textContent = 'constellation waiting...';
     return;
   }
   updateEntityGraphLayout(graph, width, height);
@@ -6693,6 +6990,14 @@ function drawEntityGraph(graph){
       entityGraphCtx.stroke();
       entityGraphCtx.setLineDash([]);
     }
+    if(entityGraphState.selectedNodeId === node.id){
+      entityGraphCtx.lineWidth = 1.5;
+      entityGraphCtx.strokeStyle = '#ffcf66';
+      entityGraphCtx.beginPath();
+      entityGraphCtx.arc(p.x, p.y, radius + 2, 0, Math.PI * 2);
+      entityGraphCtx.stroke();
+      entityGraphCtx.lineWidth = 1;
+    }
   }
   entityGraphCtx.globalAlpha = 1;
   entityGraphCtx.font = '10px system-ui';
@@ -6720,12 +7025,53 @@ function drawEntityGraph(graph){
     entityGraphCtx.fillRect(x - 2, timelineY - 5, 4, 10);
   });
   entityGraphCtx.globalAlpha = 1;
+  entityGraphCtx.fillStyle = 'rgba(220,232,242,.8)';
+  entityGraphCtx.font = '9px monospace';
+  entityGraphCtx.textBaseline = 'bottom';
+  edges.slice(0, 6).forEach((edge, index) => {
+    const a = entityGraphState.positions.get(edge.from);
+    const b = entityGraphState.positions.get(edge.to);
+    if(!a || !b) return;
+    const midX = (a.x + b.x) / 2;
+    const midY = (a.y + b.y) / 2;
+    entityGraphCtx.fillText((edge.confidence || 0).toFixed(2), midX + 2, midY - 2 - index % 2 * 8);
+  });
   const typeCounts = nodes.reduce((counts, node) => {
     counts[node.node_type] = (counts[node.node_type] || 0) + 1;
     return counts;
   }, {});
-  entityGraphSummary.textContent = `${nodes.length} nodes, ${edges.length} bindings | obs ${typeCounts.observation || 0} clusters ${typeCounts.cluster || 0} entities ${typeCounts.entity || 0}`;
+  const sensations = typeCounts.observation || 0;
+  const experiences = typeCounts.cluster || 0;
+  const impressions = typeCounts.text_label || 0;
+  const entities = typeCounts.entity || 0;
+  if(entityGraphState.selectedNodeId){
+    const selected = byId.get(entityGraphState.selectedNodeId);
+    if(selected?.node_type === 'entity'){
+      const clusterIds = edges
+        .filter(edge => edge.to === selected.id && edge.edge_type === 'part_of_entity')
+        .map(edge => edge.from);
+      const observationIds = edges
+        .filter(edge => edge.edge_type === 'belongs_to' && clusterIds.includes(edge.to))
+        .map(edge => edge.from);
+      const observations = observationIds
+        .map(id => byId.get(id))
+        .filter(Boolean)
+        .slice(0, 4)
+        .map(node => node.source_channel || node.label);
+      entityGraphSummary.textContent = `Sensations ${sensations} · Experience ${experiences} · Impressions ${impressions} | ${selected.label}: clusters ${clusterIds.length}, observations ${observationIds.length}${observations.length ? ` [${observations.join(', ')}]` : ''}`;
+      return;
+    }
+  }
+  entityGraphSummary.textContent = `Sensations ${sensations} · Experience ${experiences} · Impressions ${impressions} · Entities ${entities} | ${edges.length} bindings`;
 }
+
+entityGraphCanvas.addEventListener('click', (event) => {
+  const nearest = nearestEntityGraphNode(event.clientX, event.clientY);
+  entityGraphState.selectedNodeId = nearest?.id || null;
+  if(entityGraphState.lastGraph){
+    drawEntityGraph(entityGraphState.lastGraph);
+  }
+});
 
 function drawTraceMap(packet, liveMap=null){
   updateTraceState(packet);
@@ -8542,6 +8888,18 @@ mod tests {
         snapshot.body.flags.cliff_front_left = true;
         snapshot.range.beams = vec![2.0, 1.0, 2.0];
         snapshot.range.nearest_m = Some(1.0);
+        snapshot
+            .objects
+            .observations
+            .push(netherwick_now::ObjectObservation {
+                label: "person-nearby".to_string(),
+                class: netherwick_now::ObjectClass::Person,
+                bearing_rad: 0.1,
+                distance_m: Some(1.2),
+                confidence: 0.82,
+                source: netherwick_now::ObjectObservationSource::Sim,
+            });
+        snapshot.ear.transcript = Some("Travis".to_string());
         snapshot.llm_action_proposal = Some(netherwick_actions::LlmActionProposal {
             safety_vetoed: true,
             ..netherwick_actions::LlmActionProposal::default()
@@ -8551,6 +8909,8 @@ mod tests {
             name: "sim.stuck".to_string(),
             values: vec![1.0, 0.0, 4.0, 200.0, 1.0],
         });
+        state.update(snapshot.clone());
+        snapshot.body.last_update_ms = 1334;
         state.update(snapshot);
 
         let Json(map) = get_live_map(State(state)).await.unwrap();
@@ -8559,7 +8919,7 @@ mod tests {
         assert_eq!(map.label, MAP_LABEL);
         assert!(map.summary.label.contains("SLAM-lite"));
         assert!(map.summary.label.contains("odometry map"));
-        assert_eq!(map.pose_trail.len(), 1);
+        assert_eq!(map.pose_trail.len(), 2);
         assert_eq!(map.current_pose.as_ref().unwrap().x_m, 0.5);
         assert_eq!(
             map.overlays,
@@ -8618,10 +8978,35 @@ mod tests {
             .any(|node| node.node_type == "text_label"));
         assert!(map
             .entity_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "observation" && node.source_channel.is_some()));
+        assert!(map
+            .entity_graph
             .edges
             .iter()
             .any(|edge| edge.edge_type == "named_by"));
+        assert!(map
+            .entity_graph
+            .edges
+            .iter()
+            .any(|edge| edge.observed_at_ms.is_some()));
         assert!(!map.entity_graph.events.is_empty());
+        assert!(map
+            .entity_graph
+            .events
+            .iter()
+            .any(|event| event.event_type == "create"));
+        assert!(map
+            .entity_graph
+            .events
+            .iter()
+            .any(|event| event.event_type == "strengthen"));
+        assert!(map
+            .entity_graph
+            .events
+            .iter()
+            .all(|event| event.timestamp_ms.is_some()));
 
         let forward_hit = map
             .range_beams

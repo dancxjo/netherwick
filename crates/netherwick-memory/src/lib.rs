@@ -670,8 +670,7 @@ impl PlaceMemory {
         if entity_labels.is_empty() {
             return Vec::new();
         }
-        let query_set: std::collections::BTreeSet<String> =
-            entity_labels.iter().cloned().collect();
+        let query_set: std::collections::BTreeSet<String> = entity_labels.iter().cloned().collect();
         let mut candidates = Vec::new();
         for (key, cell) in &self.cells {
             if current_key.as_ref() == Some(key) {
@@ -687,16 +686,12 @@ impl PlaceMemory {
                 continue;
             }
             // Conservative confidence: scale by cell confidence and a fixed 0.7 factor
-            let confidence =
-                (overlap * cell.confidence.clamp(0.0, 1.0) * 0.7).clamp(0.0, 1.0);
+            let confidence = (overlap * cell.confidence.clamp(0.0, 1.0) * 0.7).clamp(0.0, 1.0);
             if confidence < min_confidence {
                 continue;
             }
             let source_vector_id = format!("entity-constellation:{}:{}", key.x, key.y);
-            let shared_labels: Vec<String> = query_set
-                .intersection(&stored_set)
-                .cloned()
-                .collect();
+            let shared_labels: Vec<String> = query_set.intersection(&stored_set).cloned().collect();
             candidates.push(PlaceRecognitionCandidate {
                 kind: PlaceRecognitionKind::EntityConstellation,
                 cell: summarize_cell(cell, confidence),
@@ -1346,6 +1341,7 @@ pub struct EntityHypothesisSummary {
     pub kind: String,
     pub display_name: Option<String>,
     pub labels: Vec<String>,
+    pub text_labels: Vec<String>,
     pub confidence: f32,
     pub lifecycle: EntityLifecycleState,
     pub observation_count: u32,
@@ -1353,6 +1349,10 @@ pub struct EntityHypothesisSummary {
     pub last_seen_ms: u64,
     pub location_cells: Vec<PlaceCellKey>,
     pub active_modalities: usize,
+    pub constellation_state: EntityConstellationState,
+    pub observation_points: Vec<ObservationPoint>,
+    pub modality_clusters: Vec<ModalityCluster>,
+    pub binding_edges: Vec<BindingEdge>,
 }
 
 impl From<&EntityHypothesis> for EntityHypothesisSummary {
@@ -1362,6 +1362,7 @@ impl From<&EntityHypothesis> for EntityHypothesisSummary {
             kind: h.kind.clone(),
             display_name: h.display_name.clone(),
             labels: h.labels.clone(),
+            text_labels: h.modality_support.text_labels.clone(),
             confidence: h.confidence,
             lifecycle: h.lifecycle.clone(),
             observation_count: h.observation_count,
@@ -1369,6 +1370,10 @@ impl From<&EntityHypothesis> for EntityHypothesisSummary {
             last_seen_ms: h.last_seen_ms,
             location_cells: h.location_cells.clone(),
             active_modalities: h.modality_support.active_modalities(),
+            constellation_state: h.constellation.state.clone(),
+            observation_points: h.constellation.observation_points.clone(),
+            modality_clusters: h.constellation.modality_clusters.clone(),
+            binding_edges: h.constellation.binding_edges.clone(),
         }
     }
 }
