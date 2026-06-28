@@ -30,9 +30,7 @@ const VISIBLE_FOV_RAD: f32 = std::f32::consts::FRAC_PI_2;
 const VISIBLE_MAX_M: f32 = 4.0;
 const EYE_WIDTH: usize = 160;
 const EYE_HEIGHT: usize = 90;
-const EYE_HORIZONTAL_FOV_RAD: f32 = 70.0_f32.to_radians();
-const EYE_CAMERA_HEIGHT_M: f32 = 0.25;
-const EYE_NEAR_PLANE_M: f32 = 0.05;
+
 
 #[derive(Debug)]
 pub struct SimBody {
