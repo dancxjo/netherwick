@@ -6979,6 +6979,7 @@ dependencies = [
 [[package]]
 name = "speaking"
 version = "0.1.0"
+source = "git+https://github.com/dancxjo/tongues.git#1a94aeb010acf308165698b08fc8df99fbe41d0e"
 dependencies = [
  "anyhow",
  "dirs",
@@ -7681,6 +7682,7 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 [[package]]
 name = "tongues-tts"
 version = "0.1.0"
+source = "git+https://github.com/dancxjo/tongues.git#1a94aeb010acf308165698b08fc8df99fbe41d0e"
 dependencies = [
  "anyhow",
  "dirs",
