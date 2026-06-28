@@ -1568,6 +1568,7 @@ pub struct TrainLatentRoundTripReport {
     pub checkpoints: LatentRoundTripCheckpoints,
     pub reconstruction: LatentReconstructionReport,
     pub predictors: Vec<LatentPredictorReport>,
+    pub baseline_comparisons: LatentBaselineComparisons,
     pub codebook: Option<CodebookUsageReport>,
     pub verdict: String,
     pub warnings: Vec<String>,
@@ -1610,6 +1611,18 @@ pub struct LatentPredictorReport {
     pub stasis_loss_mean: f32,
     pub improvement_ratio: Option<f32>,
     pub predictive: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LatentBaselineComparisons {
+    pub trained_encoder: String,
+    pub copy_current_loss_mean: Option<f32>,
+    pub random_projection_loss_mean: Option<f32>,
+    pub evolved_vector_loss_mean: Option<f32>,
+    pub trained_loss_mean: Option<f32>,
+    pub trained_beats_copy_current: bool,
+    pub trained_beats_random_projection: bool,
+    pub trained_beats_evolved_vector: bool,
 }
 
 pub trait BehaviorTrainer {
@@ -2082,6 +2095,12 @@ pub async fn train_latent_round_trip(
     };
 
     let predictors = vec![evolved_report, trained_report, random_report];
+    let baseline_comparisons = latent_baseline_comparisons(
+        &predictors,
+        "trainable-autoencoder",
+        "random-projection",
+        Some("online-evolved-filters"),
+    );
     let mut warnings = Vec::new();
     if transition_count < 50 {
         warnings.push(format!(
@@ -2114,6 +2133,7 @@ pub async fn train_latent_round_trip(
         checkpoints,
         reconstruction,
         predictors,
+        baseline_comparisons,
         codebook,
         verdict,
         warnings,
@@ -2221,6 +2241,12 @@ async fn train_forge_latent_round_trip(
     };
 
     let predictors = vec![evolved_report, trained_report, random_report];
+    let baseline_comparisons = latent_baseline_comparisons(
+        &predictors,
+        "trained-experience-latent",
+        "random-projection",
+        Some("evolved-forge-vector"),
+    );
     let mut warnings = Vec::new();
     if transition_count < 50 {
         warnings.push(format!(
@@ -2272,6 +2298,7 @@ async fn train_forge_latent_round_trip(
         checkpoints,
         reconstruction,
         predictors,
+        baseline_comparisons,
         codebook,
         verdict,
         warnings,
@@ -3407,6 +3434,44 @@ fn train_and_evaluate_future_latents(
     })
 }
 
+fn latent_baseline_comparisons(
+    predictors: &[LatentPredictorReport],
+    trained_encoder: &str,
+    random_encoder: &str,
+    evolved_encoder: Option<&str>,
+) -> LatentBaselineComparisons {
+    let trained = predictors
+        .iter()
+        .find(|report| report.encoder == trained_encoder);
+    let random = predictors
+        .iter()
+        .find(|report| report.encoder == random_encoder);
+    let evolved = evolved_encoder
+        .and_then(|encoder| predictors.iter().find(|report| report.encoder == encoder));
+
+    let trained_loss = trained.map(|report| report.model_loss_mean);
+    let copy_loss = trained.map(|report| report.stasis_loss_mean);
+    let random_loss = random.map(|report| report.model_loss_mean);
+    let evolved_loss = evolved.map(|report| report.model_loss_mean);
+
+    LatentBaselineComparisons {
+        trained_encoder: trained_encoder.to_string(),
+        copy_current_loss_mean: copy_loss,
+        random_projection_loss_mean: random_loss,
+        evolved_vector_loss_mean: evolved_loss,
+        trained_loss_mean: trained_loss,
+        trained_beats_copy_current: trained_loss
+            .zip(copy_loss)
+            .is_some_and(|(trained, baseline)| trained < baseline),
+        trained_beats_random_projection: trained_loss
+            .zip(random_loss)
+            .is_some_and(|(trained, baseline)| trained < baseline),
+        trained_beats_evolved_vector: trained_loss
+            .zip(evolved_loss)
+            .is_some_and(|(trained, baseline)| trained < baseline),
+    }
+}
+
 fn danger_samples(
     transitions: &[ExperienceTransition],
 ) -> Vec<(TimeMs, Now, DangerInput, DangerTarget)> {
@@ -3818,6 +3883,19 @@ mod tests {
         }
         forge.save_checkpoint(&forge_checkpoint).unwrap();
 
+        assert_eq!(count_forge_log_snapshots(&forge_log).unwrap(), 8);
+        let examples = forge_examples_from_checkpoint(&forge).unwrap();
+        assert_eq!(examples.len(), 7);
+        assert_eq!(
+            examples[0].input.flat_features().len(),
+            TINY_NOW_VECTOR_DIM + compact_action_features(&ActionPrimitive::Stop).len()
+        );
+        assert_eq!(examples[0].next_tiny.len(), TINY_NOW_VECTOR_DIM);
+        assert_eq!(
+            examples[0].decode_target.feature_lengths(),
+            forge_decode_lengths()
+        );
+
         let report_path = temp_dir.join("forge-latent-report.json");
         let report = train_latent_round_trip(TrainLatentRoundTripRequest {
             ledger_path: temp_dir.join("unused-ledger"),
@@ -3860,6 +3938,32 @@ mod tests {
             .target_kind
             .contains("range/depth/contact"));
         assert!(report.reconstruction.sample_count > 0);
+        assert!(report
+            .predictors
+            .iter()
+            .all(|predictor| predictor.model_loss_mean.is_finite()
+                && predictor.stasis_loss_mean.is_finite()));
+        assert!(report
+            .baseline_comparisons
+            .copy_current_loss_mean
+            .is_some_and(f32::is_finite));
+        assert!(report
+            .baseline_comparisons
+            .random_projection_loss_mean
+            .is_some_and(f32::is_finite));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("insufficient forge data")));
+
+        let checkpoint_input =
+            forge_encode_input(&vec![0.0; TINY_NOW_VECTOR_DIM], &ActionPrimitive::Stop);
+        let loaded = ExperienceAutoencoderTrainer::load_checkpoint(
+            &report.checkpoints.experience,
+            checkpoint_input.flat_features().len(),
+        )
+        .unwrap();
+        assert_eq!(loaded.z_dim(), report.z_dim);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

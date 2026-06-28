@@ -103,6 +103,7 @@ enum Command {
     EmbodiedDemo(EmbodiedDemoArgs),
     EmbodiedEval(EmbodiedEvalArgs),
     ExperienceForgeReplay(ExperienceForgeReplayArgs),
+    LatentRoundtrip(LatentRoundtripArgs),
 }
 
 #[tokio::main]
@@ -137,6 +138,7 @@ async fn main() -> Result<()> {
         Command::EmbodiedDemo(args) => run_embodied_demo(args).await,
         Command::EmbodiedEval(args) => run_embodied_eval(args).await,
         Command::ExperienceForgeReplay(args) => run_experience_forge_replay(args).await,
+        Command::LatentRoundtrip(args) => run_latent_roundtrip(args).await,
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -771,6 +773,32 @@ struct TrainLatentRoundTripArgs {
     seed: u64,
     #[arg(long)]
     codebook_size: Option<usize>,
+}
+
+#[derive(Debug, Parser)]
+struct LatentRoundtripArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value = "data/models/experience_forge/latest")]
+    forge_checkpoint: String,
+    #[arg(long)]
+    forge_log: Option<String>,
+    #[arg(long, default_value = "data/models/latent_roundtrip/latest")]
+    checkpoint_out: String,
+    #[arg(long, default_value = "data/reports/latent-roundtrip/latest.json")]
+    report: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value_t = 16)]
+    z_dim: usize,
+    #[arg(long, default_value_t = 0.2)]
+    validation_split: f32,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long)]
+    codebook_size: Option<usize>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -5985,6 +6013,43 @@ async fn run_train_latent_round_trip(args: TrainLatentRoundTripArgs) -> Result<(
     println!("verdict: {}", report.verdict);
     for warning in &report.warnings {
         println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+async fn run_latent_roundtrip(args: LatentRoundtripArgs) -> Result<()> {
+    let report = train_latent_round_trip(TrainLatentRoundTripRequest {
+        ledger_path: args.ledger.into(),
+        forge_checkpoint_path: Some(args.forge_checkpoint.clone().into()),
+        forge_log_path: args.forge_log.clone().map(Into::into),
+        checkpoint_path: args.checkpoint_out.clone().into(),
+        report_path: args.report.clone().into(),
+        epochs: args.epochs,
+        validation_split: args.validation_split,
+        seed: args.seed,
+        z_dim: args.z_dim,
+        codebook_size: args.codebook_size,
+    })
+    .await?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "latent roundtrip complete: {} transitions, {} epochs, checkpoint {}, report {}",
+            report.transition_count, report.epochs, args.checkpoint_out, args.report
+        );
+        println!(
+            "trained_loss={:?} copy_current_loss={:?} random_loss={:?} evolved_loss={:?}",
+            report.baseline_comparisons.trained_loss_mean,
+            report.baseline_comparisons.copy_current_loss_mean,
+            report.baseline_comparisons.random_projection_loss_mean,
+            report.baseline_comparisons.evolved_vector_loss_mean
+        );
+        println!("verdict: {}", report.verdict);
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
     }
     Ok(())
 }
