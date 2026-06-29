@@ -31,7 +31,6 @@ const VISIBLE_MAX_M: f32 = 4.0;
 const EYE_WIDTH: usize = 160;
 const EYE_HEIGHT: usize = 90;
 
-
 #[derive(Debug)]
 pub struct SimBody {
     body: BodySense,

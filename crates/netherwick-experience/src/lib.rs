@@ -65,6 +65,7 @@ pub trait FuturePredictor {
 }
 
 pub const TINY_NOW_VECTOR_DIM: usize = 16;
+pub const EXPERIENCE_FORGE_VECTOR_EXTENSION_KEY: &str = "experience.forge.vector_artifact";
 
 const EXPERIENCE_FORGE_POPULATION: usize = 48;
 const EXPERIENCE_FORGE_BUFFER: usize = 256;
@@ -197,11 +198,34 @@ pub struct ExperienceTransition {
 pub struct ExperienceForgeSnapshot {
     pub t_ms: TimeMs,
     pub tiny_now_vector: Vec<f32>,
+    #[serde(default)]
+    pub compact_vector_artifact: Option<ExperienceVectorArtifact>,
     pub channels: Vec<FeatureChannel>,
     pub top_filters: Vec<FilterSummary>,
     pub population_size: usize,
     pub buffer_len: usize,
     pub ticks: u64,
+}
+
+/// Compact learned representation from ExperienceForge.
+/// This is contextual/temporal evidence and not a semantic label by itself.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceVectorArtifact {
+    pub tick: u64,
+    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub champion_ids: Vec<u64>,
+    #[serde(default)]
+    pub checkpoint_ref: Option<String>,
+    pub provenance: ExperienceVectorProvenance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceVectorProvenance {
+    pub source_snapshot_ms: TimeMs,
+    #[serde(default)]
+    pub source_frame_id: Option<String>,
+    pub channel: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -308,6 +332,7 @@ impl ExperienceForge {
                 .map(|frame| frame.t_ms)
                 .unwrap_or_default(),
             tiny_now_vector: self.latest_vector.clone(),
+            compact_vector_artifact: self.compact_vector_artifact(),
             channels: self
                 .latest_registry
                 .channels
@@ -322,6 +347,21 @@ impl ExperienceForge {
             buffer_len: self.buffer.len(),
             ticks: self.ticks,
         }
+    }
+
+    pub fn compact_vector_artifact(&self) -> Option<ExperienceVectorArtifact> {
+        let frame = self.last_frame.as_ref()?;
+        Some(ExperienceVectorArtifact {
+            tick: self.ticks,
+            vector: self.latest_vector.clone(),
+            champion_ids: self.champion_ids.clone(),
+            checkpoint_ref: None,
+            provenance: ExperienceVectorProvenance {
+                source_snapshot_ms: frame.t_ms,
+                source_frame_id: None,
+                channel: "experience_forge.champion_vector".to_string(),
+            },
+        })
     }
 
     pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -590,6 +630,44 @@ impl ExperienceForge {
             fired_events: filter.fired_events.clone(),
         }
     }
+}
+
+impl ExperienceVectorArtifact {
+    pub fn vector_artifact(&self) -> netherwick_now::VectorArtifact {
+        let mut artifact = netherwick_now::VectorArtifact::new(
+            "experience_forge_vectors",
+            format!("experience-forge:tick:{}", self.tick),
+            self.vector.clone(),
+        )
+        .with_model("netherwick.experience_forge.champion_vector")
+        .with_source_id(format!(
+            "champions:{}",
+            self.champion_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .with_occurred_at_ms(self.provenance.source_snapshot_ms);
+        if let Some(source_frame_id) = &self.provenance.source_frame_id {
+            artifact = artifact.with_source_frame_id(source_frame_id.clone());
+        }
+        artifact
+    }
+}
+
+pub fn attach_experience_forge_vector(now: &mut Now, artifact: &ExperienceVectorArtifact) {
+    if let Ok(value) = serde_json::to_value(artifact) {
+        now.extensions
+            .insert(EXPERIENCE_FORGE_VECTOR_EXTENSION_KEY.to_string(), value);
+    }
+}
+
+pub fn experience_forge_vector_from_now(now: &Now) -> Option<ExperienceVectorArtifact> {
+    now.extensions
+        .get(EXPERIENCE_FORGE_VECTOR_EXTENSION_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 fn forge_checkpoint_path(path: &Path) -> PathBuf {
@@ -2835,6 +2913,20 @@ mod tests {
             .top_filters
             .iter()
             .any(|filter| filter.slot.is_some()));
+        let compact = snapshot
+            .compact_vector_artifact
+            .as_ref()
+            .expect("compact vector artifact");
+        assert_eq!(compact.tick, snapshot.ticks);
+        assert_eq!(compact.vector.len(), TINY_NOW_VECTOR_DIM);
+        assert!(!compact.champion_ids.is_empty());
+    }
+
+    #[test]
+    fn experience_forge_snapshot_has_no_compact_vector_before_first_tick() {
+        let forge = ExperienceForge::new(7);
+        let snapshot = forge.snapshot();
+        assert!(snapshot.compact_vector_artifact.is_none());
     }
 
     #[test]

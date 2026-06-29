@@ -21,7 +21,9 @@ use netherwick_actions::{
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use netherwick_body::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
-use netherwick_experience::{EmbodiedContext, ExperienceForge, ExperienceForgeSnapshot};
+use netherwick_experience::{
+    attach_experience_forge_vector, EmbodiedContext, ExperienceForge, ExperienceForgeSnapshot,
+};
 use netherwick_map::{
     project_beam_endpoint, LocalMap, MapObservation, MapSummary, OccupancyCell as OdomMapCell,
     PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
@@ -477,11 +479,15 @@ impl LiveViewState {
     }
 
     pub fn update(&self, snapshot: WorldSnapshot) {
-        let now = snapshot.to_now(snapshot.body.last_update_ms);
-        self.experience_forge
+        let mut now = snapshot.to_now(snapshot.body.last_update_ms);
+        let forge_snapshot = self
+            .experience_forge
             .lock()
             .expect("experience forge mutex poisoned")
             .tick(&now, snapshot.final_selected_action.clone());
+        if let Some(compact_vector) = forge_snapshot.compact_vector_artifact.as_ref() {
+            attach_experience_forge_vector(&mut now, compact_vector);
+        }
         self.map
             .lock()
             .expect("live map mutex poisoned")

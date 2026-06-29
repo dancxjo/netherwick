@@ -15,7 +15,9 @@ use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use netherwick_body::{BodySense, RobotBody};
 use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
 use netherwick_create1::{Create1Body, Create1OpenMode, MockCreate1Body};
-use netherwick_experience::{ExperienceForge, ExperienceForgeSnapshot};
+use netherwick_experience::{
+    attach_experience_forge_vector, ExperienceForge, ExperienceForgeSnapshot,
+};
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
@@ -26,8 +28,8 @@ use netherwick_map::{
 use netherwick_memory::{
     deterministic_embodied_eval_report_with_omissions, place_memory_report_from_frames,
     place_recognition_input_from_frame, place_recognition_vectors_from_input,
-    DurableExperienceStore, EmbodiedEvalOmission, InMemoryExperienceStore, PlaceMemory,
-    PlaceMemoryReport, PlaceRecognitionCandidate, PlaceRecognitionKind,
+    DurableExperienceStore, EmbodiedEvalOmission, EntityMemory, InMemoryExperienceStore,
+    PlaceMemory, PlaceMemoryReport, PlaceRecognitionCandidate, PlaceRecognitionKind,
 };
 use netherwick_models::MODEL_REGISTRY;
 use netherwick_now::{EarSense, KinectSense, Now, RangeSense, SurpriseSense};
@@ -946,6 +948,9 @@ struct ExperienceForgeReplayReport {
     checkpoint_path: String,
     log_path: Option<String>,
     snapshot: ExperienceForgeSnapshot,
+    forge_vector_frames: usize,
+    place_candidate_frames: usize,
+    entity_binding_frames: usize,
     warnings: Vec<String>,
 }
 
@@ -7826,7 +7831,12 @@ async fn run_experience_forge_replay(args: ExperienceForgeReplayArgs) -> Result<
     let ledger = JsonlLedger::new(&args.ledger);
     let frames = ledger.frames().await?;
     let mut forge = ExperienceForge::new(args.seed);
+    let mut place_memory = PlaceMemory::new();
+    let mut entity_memory = EntityMemory::new();
     let mut warnings = Vec::new();
+    let mut forge_vector_frames = 0usize;
+    let mut place_candidate_frames = 0usize;
+    let mut entity_binding_frames = 0usize;
     if frames.is_empty() {
         warnings.push(
             "no ledger frames found; checkpoint contains initial forge population".to_string(),
@@ -7845,7 +7855,39 @@ async fn run_experience_forge_replay(args: ExperienceForgeReplayArgs) -> Result<
     }
 
     for frame in &frames {
-        forge.tick(&frame.now, frame.chosen_action.clone());
+        let snapshot = forge.tick(&frame.now, frame.chosen_action.clone());
+        let mut now = frame.now.clone();
+        if let Some(compact_vector) = snapshot.compact_vector_artifact.as_ref() {
+            forge_vector_frames = forge_vector_frames.saturating_add(1);
+            attach_experience_forge_vector(&mut now, compact_vector);
+        } else {
+            warnings.push(format!(
+                "frame {} missing ExperienceForge compact vector artifact",
+                frame.id
+            ));
+        }
+        let cell_key = Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+        place_memory.observe_now(&now);
+        entity_memory.observe_now(&now, cell_key);
+        let place_input = netherwick_memory::place_recognition_input_from_query_now(
+            &now,
+            None,
+            "experience-forge-replay",
+        );
+        let query_vectors = place_recognition_vectors_from_input(&place_input);
+        let candidates = place_memory.recognize_places(cell_key, &query_vectors, 0.0, 5);
+        if !candidates.is_empty() {
+            place_candidate_frames = place_candidate_frames.saturating_add(1);
+        }
+        if entity_memory.entities.values().any(|entity| {
+            entity
+                .constellation
+                .modality_clusters
+                .iter()
+                .any(|cluster| cluster.id.contains("experience-forge"))
+        }) {
+            entity_binding_frames = entity_binding_frames.saturating_add(1);
+        }
         if let Some(log) = args.log.as_deref() {
             forge.append_snapshot_jsonl(log)?;
         }
@@ -7858,6 +7900,9 @@ async fn run_experience_forge_replay(args: ExperienceForgeReplayArgs) -> Result<
         checkpoint_path: checkpoint_path.display().to_string(),
         log_path: args.log.clone(),
         snapshot: forge.snapshot(),
+        forge_vector_frames,
+        place_candidate_frames,
+        entity_binding_frames,
         warnings,
     };
 
@@ -7878,6 +7923,10 @@ async fn run_experience_forge_replay(args: ExperienceForgeReplayArgs) -> Result<
         println!(
             "forge tick {} pop {} buffer {}",
             report.snapshot.ticks, report.snapshot.population_size, report.snapshot.buffer_len
+        );
+        println!(
+            "forge vectors: {} frames, place-candidate frames: {}, entity-binding frames: {}",
+            report.forge_vector_frames, report.place_candidate_frames, report.entity_binding_frames
         );
         if let Some(log) = &report.log_path {
             println!("snapshot log: {log}");
@@ -9727,6 +9776,60 @@ mod tests {
             }
             netherwick_map::PoseEdgeSource::Odometry => panic!("expected loop edge"),
         }
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn experience_forge_replay_reports_compact_vector_usage() {
+        let temp_dir = temp_path("netherwick_experience_forge_replay");
+        let ledger_dir = temp_dir.join("ledger");
+        let report_path = temp_dir.join("report.json");
+        let checkpoint_path = temp_dir.join("checkpoint");
+        let ledger = JsonlLedger::new(&ledger_dir);
+
+        let mut first = pose_graph_test_frame(100, 0.0, vec![1.0, 0.0, 0.0]);
+        first
+            .now
+            .objects
+            .observations
+            .push(netherwick_now::ObjectObservation {
+                label: "guide".to_string(),
+                class: netherwick_now::ObjectClass::Person,
+                confidence: 0.9,
+                source: netherwick_now::ObjectObservationSource::Sim,
+                ..netherwick_now::ObjectObservation::default()
+            });
+        let mut second = pose_graph_test_frame(200, 0.2, vec![0.99, 0.01, 0.0]);
+        second
+            .now
+            .objects
+            .observations
+            .push(netherwick_now::ObjectObservation {
+                label: "guide".to_string(),
+                class: netherwick_now::ObjectClass::Person,
+                confidence: 0.9,
+                source: netherwick_now::ObjectObservationSource::Sim,
+                ..netherwick_now::ObjectObservation::default()
+            });
+        ledger.append(&first).await.unwrap();
+        ledger.append(&second).await.unwrap();
+
+        run_experience_forge_replay(ExperienceForgeReplayArgs {
+            ledger: ledger_dir.to_string_lossy().to_string(),
+            checkpoint: checkpoint_path.to_string_lossy().to_string(),
+            log: None,
+            report: report_path.to_string_lossy().to_string(),
+            seed: 7,
+            json: false,
+        })
+        .await
+        .unwrap();
+
+        let report: ExperienceForgeReplayReport =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report.frame_count, 2);
+        assert_eq!(report.forge_vector_frames, 2);
+        assert!(report.entity_binding_frames > 0);
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
