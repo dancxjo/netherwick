@@ -8731,7 +8731,7 @@ pollVirtualTraining();
 // Sensor Calibration Panel Wiring
 const defaults = {
   depthScale: 1.0,
-  pointY: 0.18,
+  pointY: 0.46,
   depthZ: 0.0,
   depthPitch: 0,
   depthRoll: 0,
@@ -8744,6 +8744,7 @@ const defaults = {
 };
 
 let cal = { ...defaults };
+let calibrationLoadedFromStorage = false;
 
 const depthScaleEl = document.getElementById('cal-depth-scale');
 const pointYEl = document.getElementById('cal-point-y');
@@ -8776,6 +8777,7 @@ function loadCalibration() {
   if (stored) {
     try {
       cal = { ...defaults, ...JSON.parse(stored) };
+      calibrationLoadedFromStorage = true;
     } catch (e) {
       console.error('Failed to parse calibration:', e);
     }
@@ -8889,7 +8891,11 @@ resetBtn.onclick = () => {
 loadCalibration();
 applyCalibrationToUI();
 applyVisionCalibration();
-sendCalibrationToServer();
+if (calibrationLoadedFromStorage) {
+  sendCalibrationToServer();
+} else {
+  statusEl2.textContent = 'status: using server default';
+}
 
 setupDraggableAndResizable();
 </script>"#;

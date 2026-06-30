@@ -1526,6 +1526,41 @@ fn live_scene_metadata_from_scenario(
     }
 }
 
+fn real_robot_depth_calibration_from_env() -> SceneSensorCalibration {
+    let height_m = env_f32("NETHERWICK_DEPTH_CAMERA_HEIGHT_M", 0.46);
+    let forward_m = env_f32("NETHERWICK_DEPTH_CAMERA_FORWARD_M", 0.0);
+    let pitch_rad = env_f32("NETHERWICK_DEPTH_CAMERA_PITCH_DEG", 0.0).to_radians();
+    let roll_rad = env_f32("NETHERWICK_DEPTH_CAMERA_ROLL_DEG", 0.0).to_radians();
+    let yaw_rad = env_f32("NETHERWICK_DEPTH_CAMERA_YAW_DEG", 0.0).to_radians();
+    SceneSensorCalibration {
+        compact_depth_beam_count: env_usize("NETHERWICK_COMPACT_DEPTH_BEAM_COUNT", 32),
+        compact_depth_fov_rad: env_f32("NETHERWICK_DEPTH_FOV_DEG", 122.0).to_radians(),
+        depth_scale: env_f32("NETHERWICK_DEPTH_SCALE", 1.0),
+        point_y_m: height_m,
+        depth_forward_offset_m: forward_m,
+        depth_pitch_down_rad: pitch_rad,
+        camera_forward_m: forward_m,
+        camera_height_m: height_m,
+        camera_pitch_rad: pitch_rad,
+        camera_roll_rad: roll_rad,
+        camera_yaw_rad: yaw_rad,
+    }
+}
+
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 async fn run_sim_curriculum(args: SimCurriculumArgs) -> Result<()> {
     if args.validation_ratio < 0.0 || args.test_ratio < 0.0 {
         anyhow::bail!("validation and test ratios must be non-negative");
@@ -4644,6 +4679,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             seed: None,
             source: "real_robot".to_string(),
             tick_ms: Some(args.tick_ms),
+        });
+        live_state.update_scene_metadata(LiveSceneMetadata {
+            arena: None,
+            objects: Vec::new(),
+            sensor_calibration: Some(real_robot_depth_calibration_from_env()),
         });
         live_state
     });
