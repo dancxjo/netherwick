@@ -1951,6 +1951,33 @@ mod tests {
     }
 
     #[test]
+    fn kinect_point_transform_applies_camera_pitch_before_world_yaw() {
+        let config = PointCloudConfig {
+            camera_height_m: 0.5,
+            camera_pitch_rad: 0.25,
+            ..PointCloudConfig::default()
+        };
+        let point = Point3D {
+            x_m: 0.0,
+            y_m: 0.0,
+            z_m: 2.0,
+        };
+
+        let robot = camera_point_to_robot(point, config);
+        let world = transform_point_to_world(
+            point,
+            PointCloudFrame::KinectCamera,
+            pose(0.0, 0.0, std::f32::consts::FRAC_PI_2),
+            config,
+        );
+
+        assert!(robot.z_m < 0.5);
+        assert!((world.x_m + robot.y_m).abs() < 0.001);
+        assert!((world.y_m - robot.x_m).abs() < 0.001);
+        assert!((world.z_m - robot.z_m).abs() < 0.001);
+    }
+
+    #[test]
     fn voxel_cloud_merges_points_and_marks_stable() {
         let mut cloud = VoxelPointCloud::new(PointCloudConfig {
             voxel_size_m: 0.25,
