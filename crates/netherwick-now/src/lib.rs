@@ -499,8 +499,13 @@ pub struct RangeSense {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImuSense {
     pub schema_version: u32,
+    /// Orientation uses radians in `[roll, pitch, yaw]` order when all axes are available.
+    /// Hardware MPU-6050 samples provide roll/pitch from gravity and no absolute yaw, so they
+    /// emit two values. Legacy one-value samples are treated as yaw-only heading.
     pub orientation: Vec<f32>,
+    /// Linear acceleration in g units, `[x, y, z]`.
     pub acceleration: Vec<f32>,
+    /// Angular velocity in radians per second, `[x, y, z]`.
     pub angular_velocity: Vec<f32>,
 }
 

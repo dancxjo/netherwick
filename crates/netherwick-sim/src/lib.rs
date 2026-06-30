@@ -286,7 +286,7 @@ impl VirtualWorld {
         };
         state.snapshot.imu = ImuSense {
             schema_version: 1,
-            orientation: vec![body.odometry.heading_rad],
+            orientation: vec![0.0, 0.0, body.odometry.heading_rad],
             acceleration: vec![body.velocity.forward_m_s, 0.0, 0.0],
             angular_velocity: vec![0.0, 0.0, body.velocity.turn_rad_s],
         };
@@ -1009,6 +1009,22 @@ mod tests {
         assert!(body.odometry.x_m >= 0.2 - f32::EPSILON);
         assert!(body.flags.bump_left && body.flags.bump_right);
         assert!(body.flags.wall);
+    }
+
+    #[tokio::test]
+    async fn simulator_imu_orientation_is_roll_pitch_yaw() {
+        let (mut world, _motor) = VirtualWorld::new_with_motor(0, arena());
+        {
+            let mut guard = world.state.lock().unwrap();
+            guard.snapshot.body.odometry.heading_rad = 1.25;
+        }
+
+        let snapshot = world.snapshot().await.unwrap();
+
+        assert_eq!(snapshot.imu.schema_version, 1);
+        assert_eq!(snapshot.imu.orientation, vec![0.0, 0.0, 1.25]);
+        assert_eq!(snapshot.imu.acceleration.len(), 3);
+        assert_eq!(snapshot.imu.angular_velocity.len(), 3);
     }
 
     #[tokio::test]

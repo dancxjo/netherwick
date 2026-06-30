@@ -1094,9 +1094,9 @@ fn mpu6050_samples_to_imu(bytes: [u8; 14]) -> ImuSense {
     let accel_x = read_i16_be(bytes[0], bytes[1]) as f32 / 16_384.0;
     let accel_y = read_i16_be(bytes[2], bytes[3]) as f32 / 16_384.0;
     let accel_z = read_i16_be(bytes[4], bytes[5]) as f32 / 16_384.0;
-    let gyro_x = read_i16_be(bytes[8], bytes[9]) as f32 / 131.0;
-    let gyro_y = read_i16_be(bytes[10], bytes[11]) as f32 / 131.0;
-    let gyro_z = read_i16_be(bytes[12], bytes[13]) as f32 / 131.0;
+    let gyro_x = (read_i16_be(bytes[8], bytes[9]) as f32 / 131.0).to_radians();
+    let gyro_y = (read_i16_be(bytes[10], bytes[11]) as f32 / 131.0).to_radians();
+    let gyro_z = (read_i16_be(bytes[12], bytes[13]) as f32 / 131.0).to_radians();
 
     let roll_rad = accel_y.atan2(accel_z);
     let pitch_rad = (-accel_x).atan2((accel_y * accel_y + accel_z * accel_z).sqrt());
@@ -1740,14 +1740,16 @@ mod tests {
             0x00, 0x00, // accel y = 0 g
             0x40, 0x00, // accel z = 1 g
             0x00, 0x00, // temperature, ignored
-            0x00, 0x83, // gyro x = 1 deg/s
-            0xff, 0x7d, // gyro y = -1 deg/s
-            0x01, 0x06, // gyro z = 2 deg/s
+            0x00, 0x83, // gyro x = 1 deg/s => rad/s
+            0xff, 0x7d, // gyro y = -1 deg/s => rad/s
+            0x01, 0x06, // gyro z = 2 deg/s => rad/s
         ]);
 
         assert_eq!(imu.schema_version, 1);
         assert_eq!(imu.acceleration, vec![0.0, 0.0, 1.0]);
-        assert_eq!(imu.angular_velocity, vec![1.0, -1.0, 2.0]);
+        assert!((imu.angular_velocity[0] - 1.0_f32.to_radians()).abs() < 0.0001);
+        assert!((imu.angular_velocity[1] - (-1.0_f32).to_radians()).abs() < 0.0001);
+        assert!((imu.angular_velocity[2] - 2.0_f32.to_radians()).abs() < 0.0001);
         assert_eq!(imu.orientation, vec![0.0, -0.0]);
     }
 }

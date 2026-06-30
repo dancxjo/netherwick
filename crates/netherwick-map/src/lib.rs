@@ -1295,21 +1295,18 @@ pub fn orientation_from_snapshot(snapshot: &WorldSnapshot) -> OrientationEstimat
 }
 
 pub fn orientation_from_imu(imu: &ImuSense, odometry_heading_rad: f32) -> OrientationEstimate {
-    let roll = imu
-        .orientation
-        .first()
-        .copied()
-        .filter(|value| value.is_finite());
-    let pitch = imu
-        .orientation
-        .get(1)
-        .copied()
-        .filter(|value| value.is_finite());
-    let imu_yaw = imu
-        .orientation
-        .get(2)
-        .copied()
-        .filter(|value| value.is_finite());
+    let finite = |index: usize| {
+        imu.orientation
+            .get(index)
+            .copied()
+            .filter(|value| value.is_finite())
+    };
+    let (roll, pitch, imu_yaw) = match imu.orientation.len() {
+        0 => (None, None, None),
+        1 => (None, None, finite(0)),
+        2 => (finite(0), finite(1), None),
+        _ => (finite(0), finite(1), finite(2)),
+    };
     OrientationEstimate {
         roll_rad: roll,
         pitch_rad: pitch,
@@ -1968,6 +1965,11 @@ mod tests {
             point,
             PointCloudFrame::KinectCamera,
             pose(0.0, 0.0, std::f32::consts::FRAC_PI_2),
+            OrientationEstimate {
+                yaw_rad: Some(std::f32::consts::FRAC_PI_2),
+                yaw_source: YawSource::OdometryHeading,
+                ..OrientationEstimate::default()
+            },
             config,
         );
 
@@ -1975,6 +1977,47 @@ mod tests {
         assert!((world.x_m + robot.y_m).abs() < 0.001);
         assert!((world.y_m - robot.x_m).abs() < 0.001);
         assert!((world.z_m - robot.z_m).abs() < 0.001);
+    }
+
+    #[test]
+    fn imu_orientation_contract_handles_hardware_sim_and_legacy_shapes() {
+        let hardware = orientation_from_imu(
+            &ImuSense {
+                orientation: vec![0.1, -0.2],
+                ..ImuSense::default()
+            },
+            0.7,
+        );
+        assert_eq!(hardware.roll_rad, Some(0.1));
+        assert_eq!(hardware.pitch_rad, Some(-0.2));
+        assert_eq!(hardware.yaw_rad, Some(0.7));
+        assert_eq!(hardware.yaw_source, YawSource::OdometryHeading);
+        assert!(hardware.roll_pitch_from_imu);
+
+        let sim = orientation_from_imu(
+            &ImuSense {
+                orientation: vec![0.0, 0.0, 1.2],
+                ..ImuSense::default()
+            },
+            0.7,
+        );
+        assert_eq!(sim.roll_rad, Some(0.0));
+        assert_eq!(sim.pitch_rad, Some(0.0));
+        assert_eq!(sim.yaw_rad, Some(1.2));
+        assert_eq!(sim.yaw_source, YawSource::ImuOrientation);
+
+        let legacy_heading_only = orientation_from_imu(
+            &ImuSense {
+                orientation: vec![1.4],
+                ..ImuSense::default()
+            },
+            0.7,
+        );
+        assert_eq!(legacy_heading_only.roll_rad, None);
+        assert_eq!(legacy_heading_only.pitch_rad, None);
+        assert_eq!(legacy_heading_only.yaw_rad, Some(1.4));
+        assert_eq!(legacy_heading_only.yaw_source, YawSource::ImuOrientation);
+        assert!(!legacy_heading_only.roll_pitch_from_imu);
     }
 
     #[test]

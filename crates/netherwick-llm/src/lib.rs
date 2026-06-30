@@ -1861,7 +1861,7 @@ mod tests {
         )
         .expect("stream line should parse");
 
-        let event = rx.try_recv().expect("delta event should be emitted");
+        let event = next_stream_event_for_id(&mut rx, 7);
         assert_eq!(event.phase, LlmStreamPhase::Delta);
         assert_eq!(event.delta.as_deref(), Some("hello"));
         assert_eq!(body, "\n");
@@ -1882,10 +1882,23 @@ mod tests {
         )
         .expect("stream line should parse");
 
-        let event = rx.try_recv().expect("delta event should be emitted");
+        let event = next_stream_event_for_id(&mut rx, 8);
         assert_eq!(event.phase, LlmStreamPhase::Delta);
         assert_eq!(event.delta.as_deref(), Some("ok"));
         assert_eq!(body, "ok");
+    }
+
+    fn next_stream_event_for_id(
+        rx: &mut tokio::sync::broadcast::Receiver<LlmStreamEvent>,
+        id: u64,
+    ) -> LlmStreamEvent {
+        for _ in 0..64 {
+            let event = rx.try_recv().expect("delta event should be emitted");
+            if event.id == id {
+                return event;
+            }
+        }
+        panic!("delta event for stream {id} was not emitted");
     }
 
     #[test]
