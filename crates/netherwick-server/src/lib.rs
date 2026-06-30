@@ -20,14 +20,13 @@ use netherwick_actions::{
 };
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use netherwick_body::{MotionCommand, MotorCommand};
-use netherwick_core::{Pose2, TimeMs};
+use netherwick_core::TimeMs;
 use netherwick_experience::{
     attach_experience_forge_vector, EmbodiedContext, ExperienceForge, ExperienceForgeSnapshot,
 };
 use netherwick_map::{
     project_beam_endpoint, LocalMap, MapObservation, MapSummary, OccupancyCell as OdomMapCell,
-    Point3D, PointCloudFrame, PointCloudObservation, PointCloudPoint, PointCloudSummary,
-    PoseEstimate, VoxelPoint, VoxelPointCloud, MAP_LABEL,
+    PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
 use netherwick_memory::{
     EntityConstellationState, EntityLifecycleState, EntityMemory, EntityMemoryReport,
@@ -8190,6 +8189,10 @@ setupDraggableAndResizable();
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netherwick_core::Pose2;
+    use netherwick_map::{
+        Point3D, PointCloudFrame, PointCloudObservation, PointCloudPoint, PoseEstimate,
+    };
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
@@ -8963,6 +8966,9 @@ mod tests {
             vec![
                 "occupancy",
                 "rays",
+                "raw point cloud",
+                "accumulated occupancy",
+                "stable wall candidates",
                 "danger",
                 "charger/charge",
                 "social",
