@@ -11287,6 +11287,7 @@ mod tests {
                 );
             }
             netherwick_map::PoseEdgeSource::Odometry => panic!("expected loop edge"),
+            netherwick_map::PoseEdgeSource::ScanMatch { .. } => panic!("expected loop edge"),
         }
         let _ = fs::remove_dir_all(&temp_dir);
     }

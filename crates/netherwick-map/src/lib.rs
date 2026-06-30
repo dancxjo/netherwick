@@ -245,7 +245,13 @@ pub struct LocalMap {
     pub cells: BTreeMap<CellKey, OccupancyCell>,
     pub pose_history: Vec<PoseEstimate>,
     pub observations: Vec<MapObservation>,
+    #[serde(default)]
+    pub pose_graph: PoseGraph,
+    #[serde(default)]
+    pub pose_graph_optimization: PoseGraphOptimizationSummary,
     pub config: MapConfig,
+    #[serde(default)]
+    pose_graph_ticks_since_node: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -265,6 +271,12 @@ pub struct MapConfig {
     pub scan_match_theta_window_rad: f32,
     pub scan_match_min_occupied_cells: usize,
     pub scan_match_min_hit_beams: usize,
+    pub pose_graph_min_node_distance_m: f32,
+    pub pose_graph_min_node_heading_delta_rad: f32,
+    pub pose_graph_max_ticks_between_nodes: u64,
+    pub pose_graph_optimize_enabled: bool,
+    pub pose_graph_optimize_iterations: usize,
+    pub pose_graph_optimize_step: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -275,6 +287,10 @@ pub struct MapSummary {
     pub occupied_cells: usize,
     pub free_cells: usize,
     pub observations: usize,
+    pub pose_graph_nodes: usize,
+    pub pose_graph_edges: usize,
+    pub scan_match_edges: usize,
+    pub pose_graph_optimization: PoseGraphOptimizationSummary,
     pub latest_pose: Option<PoseEstimate>,
     pub latest_observation: Option<MapObservationSummary>,
 }
@@ -305,10 +321,15 @@ pub struct PoseNode {
     pub source_frame_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PoseEdgeSource {
     Odometry,
+    ScanMatch {
+        algorithm: String,
+        score: f32,
+        odometry_score: f32,
+    },
     LoopClosureCandidate {
         kind: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,6 +377,38 @@ pub struct PoseGraphConfig {
     pub max_ticks_between_nodes: u64,
     pub min_loop_confidence: f32,
     pub loop_target_max_distance_m: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PoseGraphOptimizationConfig {
+    pub iterations: usize,
+    pub step_size: f32,
+    pub max_translation_update_m: f32,
+    pub max_heading_update_rad: f32,
+    pub convergence_epsilon: f32,
+}
+
+impl Default for PoseGraphOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            iterations: 12,
+            step_size: 0.45,
+            max_translation_update_m: 0.12,
+            max_heading_update_rad: 8.0_f32.to_radians(),
+            convergence_epsilon: 0.0005,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PoseGraphOptimizationSummary {
+    pub iterations: usize,
+    pub initial_mean_error: f32,
+    pub final_mean_error: f32,
+    pub max_node_update_m: f32,
+    pub optimized_nodes: usize,
+    pub active_edges: usize,
+    pub converged: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -450,6 +503,12 @@ impl Default for MapConfig {
             scan_match_theta_window_rad: 8.0_f32.to_radians(),
             scan_match_min_occupied_cells: 4,
             scan_match_min_hit_beams: 2,
+            pose_graph_min_node_distance_m: 0.20,
+            pose_graph_min_node_heading_delta_rad: 10.0_f32.to_radians(),
+            pose_graph_max_ticks_between_nodes: 8,
+            pose_graph_optimize_enabled: true,
+            pose_graph_optimize_iterations: 12,
+            pose_graph_optimize_step: 0.45,
         }
     }
 }
@@ -815,6 +874,134 @@ impl Default for PoseGraphBuilder {
 }
 
 impl PoseGraph {
+    pub fn optimize_anchored(
+        &mut self,
+        config: PoseGraphOptimizationConfig,
+    ) -> PoseGraphOptimizationSummary {
+        let active_edges = self.edges.iter().filter(|edge| edge.active).count();
+        let initial_mean_error = self.mean_edge_error();
+        if self.nodes.len() < 2 || active_edges == 0 || config.iterations == 0 {
+            return PoseGraphOptimizationSummary {
+                iterations: 0,
+                initial_mean_error,
+                final_mean_error: initial_mean_error,
+                max_node_update_m: 0.0,
+                optimized_nodes: self.nodes.len(),
+                active_edges,
+                converged: true,
+            };
+        }
+
+        let node_indices = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut max_node_update_m = 0.0_f32;
+        let mut iterations_run = 0usize;
+        let mut converged = false;
+
+        for iteration in 0..config.iterations {
+            iterations_run = iteration + 1;
+            let mut corrections = vec![Pose2::default(); self.nodes.len()];
+            let mut weights = vec![0.0_f32; self.nodes.len()];
+
+            for edge in self.edges.iter().filter(|edge| edge.active) {
+                let (Some(&from_index), Some(&to_index)) =
+                    (node_indices.get(&edge.from), node_indices.get(&edge.to))
+                else {
+                    continue;
+                };
+                if from_index == to_index {
+                    continue;
+                }
+
+                let from_pose = self.nodes[from_index].pose_estimate.pose;
+                let to_pose = self.nodes[to_index].pose_estimate.pose;
+                let predicted_to = apply_pose_delta(from_pose, edge.transform);
+                let residual = pose_delta(predicted_to, to_pose);
+                let weight = edge_constraint_weight(edge) * config.step_size;
+
+                if to_index != 0 {
+                    corrections[to_index].x_m -= residual.x_m * weight;
+                    corrections[to_index].y_m -= residual.y_m * weight;
+                    corrections[to_index].heading_rad -= residual.heading_rad * weight;
+                    weights[to_index] += weight;
+                }
+                if from_index != 0 {
+                    corrections[from_index].x_m += residual.x_m * weight;
+                    corrections[from_index].y_m += residual.y_m * weight;
+                    corrections[from_index].heading_rad += residual.heading_rad * weight;
+                    weights[from_index] += weight;
+                }
+            }
+
+            let mut iteration_max_update = 0.0_f32;
+            for (index, node) in self.nodes.iter_mut().enumerate().skip(1) {
+                if weights[index] <= 0.0 {
+                    continue;
+                }
+                let mut correction = corrections[index];
+                correction.x_m /= weights[index];
+                correction.y_m /= weights[index];
+                correction.heading_rad = normalize_angle(correction.heading_rad / weights[index]);
+                correction = clamp_pose_update(correction, config);
+                let update_m = (correction.x_m.powi(2) + correction.y_m.powi(2)).sqrt();
+                iteration_max_update = iteration_max_update.max(update_m);
+                node.pose_estimate.pose.x_m += correction.x_m;
+                node.pose_estimate.pose.y_m += correction.y_m;
+                node.pose_estimate.pose.heading_rad =
+                    normalize_angle(node.pose_estimate.pose.heading_rad + correction.heading_rad);
+            }
+
+            max_node_update_m = max_node_update_m.max(iteration_max_update);
+            if iteration_max_update < config.convergence_epsilon {
+                converged = true;
+                break;
+            }
+        }
+
+        PoseGraphOptimizationSummary {
+            iterations: iterations_run,
+            initial_mean_error,
+            final_mean_error: self.mean_edge_error(),
+            max_node_update_m,
+            optimized_nodes: self.nodes.len(),
+            active_edges,
+            converged,
+        }
+    }
+
+    fn mean_edge_error(&self) -> f32 {
+        let node_indices = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id.as_str(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut total = 0.0;
+        let mut count = 0usize;
+        for edge in self.edges.iter().filter(|edge| edge.active) {
+            let (Some(&from_index), Some(&to_index)) = (
+                node_indices.get(edge.from.as_str()),
+                node_indices.get(edge.to.as_str()),
+            ) else {
+                continue;
+            };
+            let predicted_to =
+                apply_pose_delta(self.nodes[from_index].pose_estimate.pose, edge.transform);
+            let residual = pose_delta(predicted_to, self.nodes[to_index].pose_estimate.pose);
+            total += residual.x_m.hypot(residual.y_m) + residual.heading_rad.abs() * 0.25;
+            count = count.saturating_add(1);
+        }
+        if count == 0 {
+            0.0
+        } else {
+            total / count as f32
+        }
+    }
+
     pub fn report(self) -> PoseGraphReport {
         let odometry_edges = self
             .edges
@@ -860,6 +1047,9 @@ impl PoseGraph {
                     ),
                     PoseEdgeSource::Odometry => {
                         ("odometry".to_string(), None, None, None, None, None, None)
+                    }
+                    PoseEdgeSource::ScanMatch { .. } => {
+                        ("scan_match".to_string(), None, None, None, None, None, None)
                     }
                 };
                 Some(PoseGraphRejectedCandidate {
@@ -908,7 +1098,10 @@ impl LocalMap {
             cells: BTreeMap::new(),
             pose_history: Vec::new(),
             observations: Vec::new(),
+            pose_graph: PoseGraph::default(),
+            pose_graph_optimization: PoseGraphOptimizationSummary::default(),
             config,
+            pose_graph_ticks_since_node: 0,
         }
     }
 
@@ -927,7 +1120,18 @@ impl LocalMap {
     }
 
     pub fn integrate_observation(&mut self, observation: MapObservation) {
-        let observation = self.scan_matched_observation(observation);
+        let (mut observation, scan_match) = self.scan_matched_observation(observation);
+        self.update_pose_graph(&observation, scan_match.as_ref());
+        self.optimize_pose_graph();
+        if let Some(latest) = self.pose_graph.nodes.last() {
+            if latest.t_ms == observation.t_ms {
+                observation.pose.pose = latest.pose_estimate.pose;
+                observation.pose.confidence = observation
+                    .pose
+                    .confidence
+                    .max(latest.pose_estimate.confidence);
+            }
+        }
         self.pose_history.push(observation.pose.clone());
         cap_vec(&mut self.pose_history, self.config.max_pose_history);
 
@@ -939,10 +1143,13 @@ impl LocalMap {
         cap_vec(&mut self.observations, self.config.max_observations);
     }
 
-    fn scan_matched_observation(&self, mut observation: MapObservation) -> MapObservation {
+    fn scan_matched_observation(
+        &self,
+        mut observation: MapObservation,
+    ) -> (MapObservation, Option<ScanMatchCorrection>) {
         let correction = self.scan_match_pose(&observation);
         let Some(correction) = correction else {
-            return observation;
+            return (observation, None);
         };
         observation.pose.pose = correction.pose;
         observation.pose.confidence =
@@ -966,7 +1173,83 @@ impl LocalMap {
                 }),
             );
         }
-        observation
+        (observation, Some(correction))
+    }
+
+    fn update_pose_graph(
+        &mut self,
+        observation: &MapObservation,
+        scan_match: Option<&ScanMatchCorrection>,
+    ) {
+        self.pose_graph_ticks_since_node = self.pose_graph_ticks_since_node.saturating_add(1);
+        if !self.should_add_live_pose_node(observation.pose.pose) {
+            return;
+        }
+
+        let id = format!("live-pose-{}", self.pose_graph.nodes.len());
+        let previous = self.pose_graph.nodes.last().cloned();
+        self.pose_graph.nodes.push(PoseNode {
+            id: id.clone(),
+            pose_estimate: observation.pose.clone(),
+            t_ms: observation.t_ms,
+            source_frame_id: source_frame_id_from_observation(observation),
+        });
+        self.pose_graph_ticks_since_node = 0;
+
+        if let Some(previous) = previous {
+            let (source, covariance, confidence) = if let Some(scan_match) = scan_match {
+                (
+                    PoseEdgeSource::ScanMatch {
+                        algorithm: "correlative_occupancy_grid".to_string(),
+                        score: scan_match.score,
+                        odometry_score: scan_match.odometry_score,
+                    },
+                    observation.pose.covariance,
+                    observation.pose.confidence,
+                )
+            } else {
+                (
+                    PoseEdgeSource::Odometry,
+                    [0.08, 0.08, 0.15],
+                    observation.pose.confidence.min(0.85),
+                )
+            };
+            self.pose_graph.edges.push(PoseEdge {
+                from: previous.id,
+                to: id,
+                transform: pose_delta(previous.pose_estimate.pose, observation.pose.pose),
+                covariance,
+                confidence,
+                source,
+                active: true,
+                rejection_reason: None,
+            });
+        }
+    }
+
+    fn should_add_live_pose_node(&self, pose: Pose2) -> bool {
+        let Some(last) = self.pose_graph.nodes.last() else {
+            return true;
+        };
+        distance_m(last.pose_estimate.pose, pose) >= self.config.pose_graph_min_node_distance_m
+            || heading_delta_rad(last.pose_estimate.pose.heading_rad, pose.heading_rad)
+                >= self.config.pose_graph_min_node_heading_delta_rad
+            || self.pose_graph_ticks_since_node
+                >= self.config.pose_graph_max_ticks_between_nodes.max(1)
+    }
+
+    fn optimize_pose_graph(&mut self) {
+        if !self.config.pose_graph_optimize_enabled {
+            self.pose_graph_optimization = PoseGraphOptimizationSummary::default();
+            return;
+        }
+        self.pose_graph_optimization =
+            self.pose_graph
+                .optimize_anchored(PoseGraphOptimizationConfig {
+                    iterations: self.config.pose_graph_optimize_iterations,
+                    step_size: self.config.pose_graph_optimize_step,
+                    ..PoseGraphOptimizationConfig::default()
+                });
     }
 
     fn scan_match_pose(&self, observation: &MapObservation) -> Option<ScanMatchCorrection> {
@@ -1116,6 +1399,15 @@ impl LocalMap {
             occupied_cells,
             free_cells,
             observations: self.observations.len(),
+            pose_graph_nodes: self.pose_graph.nodes.len(),
+            pose_graph_edges: self.pose_graph.edges.len(),
+            scan_match_edges: self
+                .pose_graph
+                .edges
+                .iter()
+                .filter(|edge| matches!(edge.source, PoseEdgeSource::ScanMatch { .. }))
+                .count(),
+            pose_graph_optimization: self.pose_graph_optimization,
             latest_pose: self.pose_history.last().cloned(),
             latest_observation: self
                 .observations
@@ -1218,6 +1510,15 @@ pub fn observation_from_snapshot(
         t_ms,
         config,
     )
+}
+
+fn source_frame_id_from_observation(observation: &MapObservation) -> Option<String> {
+    observation
+        .source_snapshot
+        .get("frame_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| Some(format!("t:{}", observation.t_ms)))
 }
 
 pub fn observation_from_now(now: &Now, config: MapConfig) -> MapObservation {
@@ -1913,6 +2214,40 @@ fn pose_delta(from: Pose2, to: Pose2) -> Pose2 {
     }
 }
 
+fn apply_pose_delta(from: Pose2, delta: Pose2) -> Pose2 {
+    Pose2 {
+        x_m: from.x_m + delta.x_m,
+        y_m: from.y_m + delta.y_m,
+        heading_rad: normalize_angle(from.heading_rad + delta.heading_rad),
+    }
+}
+
+fn edge_constraint_weight(edge: &PoseEdge) -> f32 {
+    let covariance = edge
+        .covariance
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum::<f32>()
+        / edge.covariance.len().max(1) as f32;
+    let covariance_weight = 1.0 / (1.0 + covariance.max(0.001) * 4.0);
+    (edge.confidence.clamp(0.05, 1.0) * covariance_weight).clamp(0.01, 1.0)
+}
+
+fn clamp_pose_update(mut update: Pose2, config: PoseGraphOptimizationConfig) -> Pose2 {
+    let translation = update.x_m.hypot(update.y_m);
+    if translation > config.max_translation_update_m && translation > f32::EPSILON {
+        let scale = config.max_translation_update_m / translation;
+        update.x_m *= scale;
+        update.y_m *= scale;
+    }
+    update.heading_rad = update.heading_rad.clamp(
+        -config.max_heading_update_rad,
+        config.max_heading_update_rad,
+    );
+    update
+}
+
 fn distance_m(left: Pose2, right: Pose2) -> f32 {
     ((right.x_m - left.x_m).powi(2) + (right.y_m - left.y_m).powi(2)).sqrt()
 }
@@ -2095,6 +2430,12 @@ mod tests {
         assert!(first_cells > 0);
         assert!(map.cells.len() > first_cells);
         assert_eq!(map.pose_history.len(), 2);
+        assert_eq!(map.pose_graph.nodes.len(), 2);
+        assert_eq!(map.pose_graph.edges.len(), 1);
+        assert!(matches!(
+            map.pose_graph.edges[0].source,
+            PoseEdgeSource::Odometry
+        ));
         assert_eq!(map.summary().label, MAP_LABEL);
     }
 
@@ -2106,6 +2447,8 @@ mod tests {
             scan_match_theta_window_rad: 0.0,
             scan_match_min_occupied_cells: 1,
             scan_match_min_hit_beams: 1,
+            pose_graph_min_node_distance_m: 0.01,
+            pose_graph_max_ticks_between_nodes: 1,
             ..MapConfig::default()
         };
         let mut map = LocalMap::new(config);
@@ -2124,11 +2467,22 @@ mod tests {
         }
 
         let observation = observation_from_parts(
+            pose(0.0, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"seed"}),
+            150,
+            map.config,
+        );
+        map.integrate_observation(observation);
+
+        let observation = observation_from_parts(
             pose(0.12, 0.0, 0.0),
             0.75,
             &[1.0],
             Some(1.0),
-            serde_json::json!({}),
+            serde_json::json!({"frame_id":"drifted"}),
             200,
             map.config,
         );
@@ -2138,6 +2492,13 @@ mod tests {
         assert_eq!(corrected.source, "odometry+occupancy_scan_match");
         assert!(corrected.pose.x_m.abs() < 0.08);
         assert!(corrected.confidence > 0.75);
+        assert_eq!(map.pose_graph.nodes.len(), 2);
+        assert_eq!(map.pose_graph.edges.len(), 1);
+        assert!(matches!(
+            map.pose_graph.edges[0].source,
+            PoseEdgeSource::ScanMatch { .. }
+        ));
+        assert_eq!(map.summary().scan_match_edges, 1);
     }
 
     #[test]
@@ -2613,11 +2974,100 @@ mod tests {
         assert!(report.rejected_candidates[0].reason.contains("below gate"));
     }
 
+    #[test]
+    fn pose_graph_optimizer_reduces_loop_closure_error() {
+        let mut graph = PoseGraph {
+            nodes: vec![
+                test_pose_node("pose-0", 0.0, 0),
+                test_pose_node("pose-1", 1.2, 100),
+                test_pose_node("pose-2", 2.4, 200),
+            ],
+            edges: vec![
+                test_edge(
+                    "pose-0",
+                    "pose-1",
+                    pose(1.0, 0.0, 0.0),
+                    PoseEdgeSource::Odometry,
+                    0.7,
+                ),
+                test_edge(
+                    "pose-1",
+                    "pose-2",
+                    pose(1.0, 0.0, 0.0),
+                    PoseEdgeSource::Odometry,
+                    0.7,
+                ),
+                test_edge(
+                    "pose-0",
+                    "pose-2",
+                    pose(2.0, 0.0, 0.0),
+                    PoseEdgeSource::LoopClosureCandidate {
+                        kind: "same_place_geometry".to_string(),
+                        target_frame_id: Some("pose-2".to_string()),
+                        source_frame_id: Some("pose-0".to_string()),
+                        source_experience_id: None,
+                        source_instant_frame_id: None,
+                        source_vector_refs: Vec::new(),
+                        source_vector_id: None,
+                        query_vector_id: None,
+                        query_experience_id: None,
+                    },
+                    0.95,
+                ),
+            ],
+        };
+
+        let summary = graph.optimize_anchored(PoseGraphOptimizationConfig {
+            iterations: 30,
+            step_size: 0.6,
+            ..PoseGraphOptimizationConfig::default()
+        });
+
+        assert!(summary.final_mean_error < summary.initial_mean_error);
+        assert!(graph.nodes[2].pose_estimate.pose.x_m < 2.4);
+        assert_eq!(graph.nodes[0].pose_estimate.pose.x_m, 0.0);
+        assert!(summary.active_edges >= 3);
+    }
+
     fn pose(x_m: f32, y_m: f32, heading_rad: f32) -> Pose2 {
         Pose2 {
             x_m,
             y_m,
             heading_rad,
+        }
+    }
+
+    fn test_pose_node(id: &str, x_m: f32, t_ms: TimeMs) -> PoseNode {
+        PoseNode {
+            id: id.to_string(),
+            pose_estimate: PoseEstimate {
+                pose: pose(x_m, 0.0, 0.0),
+                confidence: 0.8,
+                covariance: [0.05, 0.05, 0.1],
+                source: "test".to_string(),
+                t_ms,
+            },
+            t_ms,
+            source_frame_id: Some(id.to_string()),
+        }
+    }
+
+    fn test_edge(
+        from: &str,
+        to: &str,
+        transform: Pose2,
+        source: PoseEdgeSource,
+        confidence: f32,
+    ) -> PoseEdge {
+        PoseEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            transform,
+            covariance: [0.05, 0.05, 0.08],
+            confidence,
+            source,
+            active: true,
+            rejection_reason: None,
         }
     }
 }

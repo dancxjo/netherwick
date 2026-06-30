@@ -26,8 +26,8 @@ use netherwick_experience::{
 };
 use netherwick_map::{
     orientation_from_imu, project_beam_endpoint, LocalMap, LocalWorldBelief, MapObservation,
-    MapSummary, OccupancyCell as OdomMapCell, PointCloudSummary, VoxelPoint, VoxelPointCloud,
-    MAP_LABEL,
+    MapSummary, OccupancyCell as OdomMapCell, PointCloudSummary, PoseEdgeSource,
+    PoseGraphOptimizationSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
 use netherwick_memory::{
     EntityConstellationState, EntityLifecycleState, EntityMemory, EntityMemoryReport,
@@ -1015,7 +1015,20 @@ pub struct LiveMapResponse {
     pub cells: Vec<MapViewCell>,
     pub semantic_cells: Vec<MapSemanticCell>,
     pub events: Vec<MapEventMarker>,
+    pub pose_graph: MapPoseGraphSummary,
     pub entity_graph: MapEntityGraph,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapPoseGraphSummary {
+    pub nodes: usize,
+    pub edges: usize,
+    pub odometry_edges: usize,
+    pub scan_match_edges: usize,
+    pub loop_candidate_edges: usize,
+    pub latest_node_id: Option<String>,
+    pub latest_edge_source: Option<String>,
+    pub optimization: PoseGraphOptimizationSummary,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1905,6 +1918,7 @@ fn map_response_from_parts(
         .collect();
     let semantic_cells = map_semantic_cells(latest, metadata, now_ms);
     let events = map_event_markers(latest, metadata, now_ms);
+    let pose_graph = map_pose_graph_summary(map);
     let entity_graph = map_entity_graph(
         &pose_trail,
         &range_beams,
@@ -1938,7 +1952,40 @@ fn map_response_from_parts(
         cells,
         semantic_cells,
         events,
+        pose_graph,
         entity_graph,
+    }
+}
+
+fn map_pose_graph_summary(map: &LocalMap) -> MapPoseGraphSummary {
+    let mut odometry_edges = 0usize;
+    let mut scan_match_edges = 0usize;
+    let mut loop_candidate_edges = 0usize;
+    for edge in &map.pose_graph.edges {
+        match &edge.source {
+            PoseEdgeSource::Odometry => odometry_edges = odometry_edges.saturating_add(1),
+            PoseEdgeSource::ScanMatch { .. } => {
+                scan_match_edges = scan_match_edges.saturating_add(1)
+            }
+            PoseEdgeSource::LoopClosureCandidate { .. } => {
+                loop_candidate_edges = loop_candidate_edges.saturating_add(1)
+            }
+        }
+    }
+
+    MapPoseGraphSummary {
+        nodes: map.pose_graph.nodes.len(),
+        edges: map.pose_graph.edges.len(),
+        odometry_edges,
+        scan_match_edges,
+        loop_candidate_edges,
+        latest_node_id: map.pose_graph.nodes.last().map(|node| node.id.clone()),
+        latest_edge_source: map.pose_graph.edges.last().map(|edge| match &edge.source {
+            PoseEdgeSource::Odometry => "odometry".to_string(),
+            PoseEdgeSource::ScanMatch { .. } => "scan_match".to_string(),
+            PoseEdgeSource::LoopClosureCandidate { .. } => "loop_closure_candidate".to_string(),
+        }),
+        optimization: map.pose_graph_optimization,
     }
 }
 
@@ -9559,6 +9606,9 @@ mod tests {
         assert!(map.summary.label.contains("occupancy"));
         assert_eq!(map.pose_trail.len(), 2);
         assert_eq!(map.current_pose.as_ref().unwrap().x_m, 0.5);
+        assert_eq!(map.pose_graph.nodes, map.summary.pose_graph_nodes);
+        assert_eq!(map.pose_graph.edges, map.summary.pose_graph_edges);
+        assert_eq!(map.pose_graph.nodes, 1);
         assert_eq!(
             map.overlays,
             vec![
