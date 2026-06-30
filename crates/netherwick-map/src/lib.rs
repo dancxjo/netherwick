@@ -246,12 +246,27 @@ pub struct LocalMap {
     pub pose_history: Vec<PoseEstimate>,
     pub observations: Vec<MapObservation>,
     #[serde(default)]
+    pub submaps: Vec<OccupancySubmap>,
+    #[serde(default)]
     pub pose_graph: PoseGraph,
     #[serde(default)]
     pub pose_graph_optimization: PoseGraphOptimizationSummary,
+    #[serde(default)]
+    pub remap_summary: RemapSummary,
     pub config: MapConfig,
     #[serde(default)]
     pose_graph_ticks_since_node: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OccupancySubmap {
+    pub id: String,
+    pub node_id: String,
+    pub local_pose: Pose2,
+    pub range_beams: Vec<RangeBeam>,
+    pub t_ms: TimeMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frame_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -266,6 +281,7 @@ pub struct MapConfig {
     pub decay_per_tick: f32,
     pub max_pose_history: usize,
     pub max_observations: usize,
+    pub max_submaps: usize,
     pub scan_match_enabled: bool,
     pub scan_match_xy_window_m: f32,
     pub scan_match_theta_window_rad: f32,
@@ -291,8 +307,19 @@ pub struct MapSummary {
     pub pose_graph_edges: usize,
     pub scan_match_edges: usize,
     pub pose_graph_optimization: PoseGraphOptimizationSummary,
+    pub remap: RemapSummary,
     pub latest_pose: Option<PoseEstimate>,
     pub latest_observation: Option<MapObservationSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RemapSummary {
+    pub generation: u64,
+    pub submaps: usize,
+    pub cells: usize,
+    pub occupied_cells: usize,
+    pub free_cells: usize,
+    pub latest_t_ms: Option<TimeMs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -498,6 +525,7 @@ impl Default for MapConfig {
             decay_per_tick: 0.04,
             max_pose_history: 1_000,
             max_observations: 250,
+            max_submaps: 250,
             scan_match_enabled: true,
             scan_match_xy_window_m: 0.18,
             scan_match_theta_window_rad: 8.0_f32.to_radians(),
@@ -1098,8 +1126,10 @@ impl LocalMap {
             cells: BTreeMap::new(),
             pose_history: Vec::new(),
             observations: Vec::new(),
+            submaps: Vec::new(),
             pose_graph: PoseGraph::default(),
             pose_graph_optimization: PoseGraphOptimizationSummary::default(),
+            remap_summary: RemapSummary::default(),
             config,
             pose_graph_ticks_since_node: 0,
         }
@@ -1121,7 +1151,7 @@ impl LocalMap {
 
     pub fn integrate_observation(&mut self, observation: MapObservation) {
         let (mut observation, scan_match) = self.scan_matched_observation(observation);
-        self.update_pose_graph(&observation, scan_match.as_ref());
+        let pose_node_id = self.update_pose_graph(&observation, scan_match.as_ref());
         self.optimize_pose_graph();
         if let Some(latest) = self.pose_graph.nodes.last() {
             if latest.t_ms == observation.t_ms {
@@ -1135,12 +1165,11 @@ impl LocalMap {
         self.pose_history.push(observation.pose.clone());
         cap_vec(&mut self.pose_history, self.config.max_pose_history);
 
-        for beam in &observation.range_beams {
-            self.integrate_beam(observation.pose.pose, beam, observation.t_ms);
-        }
+        self.store_submap(&observation, pose_node_id);
 
         self.observations.push(observation);
         cap_vec(&mut self.observations, self.config.max_observations);
+        self.rebuild_occupancy_from_submaps();
     }
 
     fn scan_matched_observation(
@@ -1180,10 +1209,10 @@ impl LocalMap {
         &mut self,
         observation: &MapObservation,
         scan_match: Option<&ScanMatchCorrection>,
-    ) {
+    ) -> Option<String> {
         self.pose_graph_ticks_since_node = self.pose_graph_ticks_since_node.saturating_add(1);
         if !self.should_add_live_pose_node(observation.pose.pose) {
-            return;
+            return self.pose_graph.nodes.last().map(|node| node.id.clone());
         }
 
         let id = format!("live-pose-{}", self.pose_graph.nodes.len());
@@ -1216,7 +1245,7 @@ impl LocalMap {
             };
             self.pose_graph.edges.push(PoseEdge {
                 from: previous.id,
-                to: id,
+                to: id.clone(),
                 transform: pose_delta(previous.pose_estimate.pose, observation.pose.pose),
                 covariance,
                 confidence,
@@ -1225,6 +1254,7 @@ impl LocalMap {
                 rejection_reason: None,
             });
         }
+        Some(id)
     }
 
     fn should_add_live_pose_node(&self, pose: Pose2) -> bool {
@@ -1250,6 +1280,65 @@ impl LocalMap {
                     step_size: self.config.pose_graph_optimize_step,
                     ..PoseGraphOptimizationConfig::default()
                 });
+    }
+
+    fn store_submap(&mut self, observation: &MapObservation, pose_node_id: Option<String>) {
+        let Some(node_id) = pose_node_id else {
+            return;
+        };
+        let Some(node) = self.pose_graph.nodes.iter().find(|node| node.id == node_id) else {
+            return;
+        };
+        self.submaps.push(OccupancySubmap {
+            id: format!("submap-{}", self.submaps.len()),
+            node_id,
+            local_pose: pose_delta(node.pose_estimate.pose, observation.pose.pose),
+            range_beams: observation.range_beams.clone(),
+            t_ms: observation.t_ms,
+            source_frame_id: source_frame_id_from_observation(observation),
+        });
+        cap_vec(&mut self.submaps, self.config.max_submaps);
+    }
+
+    fn rebuild_occupancy_from_submaps(&mut self) {
+        let submaps = self.submaps.clone();
+        self.cells.clear();
+        for submap in &submaps {
+            let Some(node) = self
+                .pose_graph
+                .nodes
+                .iter()
+                .find(|node| node.id == submap.node_id)
+            else {
+                continue;
+            };
+            let pose = apply_pose_delta(node.pose_estimate.pose, submap.local_pose);
+            for beam in &submap.range_beams {
+                self.integrate_beam(pose, beam, submap.t_ms);
+            }
+        }
+        self.update_remap_summary();
+    }
+
+    fn update_remap_summary(&mut self) {
+        let occupied_cells = self
+            .cells
+            .values()
+            .filter(|cell| cell.occupied_score > cell.free_score && cell.confidence > 0.0)
+            .count();
+        let free_cells = self
+            .cells
+            .values()
+            .filter(|cell| cell.free_score >= cell.occupied_score && cell.confidence > 0.0)
+            .count();
+        self.remap_summary = RemapSummary {
+            generation: self.remap_summary.generation.saturating_add(1),
+            submaps: self.submaps.len(),
+            cells: self.cells.len(),
+            occupied_cells,
+            free_cells,
+            latest_t_ms: self.submaps.iter().map(|submap| submap.t_ms).max(),
+        };
     }
 
     fn scan_match_pose(&self, observation: &MapObservation) -> Option<ScanMatchCorrection> {
@@ -1408,6 +1497,7 @@ impl LocalMap {
                 .filter(|edge| matches!(edge.source, PoseEdgeSource::ScanMatch { .. }))
                 .count(),
             pose_graph_optimization: self.pose_graph_optimization,
+            remap: self.remap_summary,
             latest_pose: self.pose_history.last().cloned(),
             latest_observation: self
                 .observations
@@ -2436,7 +2526,40 @@ mod tests {
             map.pose_graph.edges[0].source,
             PoseEdgeSource::Odometry
         ));
+        assert_eq!(map.submaps.len(), 2);
+        assert_eq!(map.summary().remap.submaps, 2);
         assert_eq!(map.summary().label, MAP_LABEL);
+    }
+
+    #[test]
+    fn remap_rebuilds_occupancy_from_optimized_submap_node_poses() {
+        let mut map = LocalMap::new(MapConfig {
+            resolution_m: 0.1,
+            pose_graph_min_node_distance_m: 0.01,
+            ..MapConfig::default()
+        });
+        map.observe_snapshot(&snapshot_at(0.0, 0.0, 0.0, vec![1.0]), 100);
+
+        let original_key = cell_key(1.0, 0.0, map.config.resolution_m);
+        assert!(map
+            .cells
+            .get(&original_key)
+            .is_some_and(|cell| cell.occupied_score > cell.free_score));
+
+        map.pose_graph.nodes[0].pose_estimate.pose.x_m = 0.5;
+        map.rebuild_occupancy_from_submaps();
+
+        let remapped_key = cell_key(1.5, 0.0, map.config.resolution_m);
+        assert!(map
+            .cells
+            .get(&remapped_key)
+            .is_some_and(|cell| cell.occupied_score > cell.free_score));
+        assert!(map
+            .cells
+            .get(&original_key)
+            .map_or(true, |cell| cell.occupied_score <= cell.free_score));
+        assert_eq!(map.summary().remap.submaps, 1);
+        assert!(map.summary().remap.generation >= 2);
     }
 
     #[test]
@@ -2452,6 +2575,16 @@ mod tests {
             ..MapConfig::default()
         };
         let mut map = LocalMap::new(config);
+        let observation = observation_from_parts(
+            pose(0.0, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"seed"}),
+            150,
+            map.config,
+        );
+        map.integrate_observation(observation);
         for y in [-0.1, 0.0, 0.1] {
             let key = cell_key(1.0, y, map.config.resolution_m);
             map.cells.insert(
@@ -2465,17 +2598,6 @@ mod tests {
                 },
             );
         }
-
-        let observation = observation_from_parts(
-            pose(0.0, 0.0, 0.0),
-            0.75,
-            &[1.0],
-            Some(1.0),
-            serde_json::json!({"frame_id":"seed"}),
-            150,
-            map.config,
-        );
-        map.integrate_observation(observation);
 
         let observation = observation_from_parts(
             pose(0.12, 0.0, 0.0),

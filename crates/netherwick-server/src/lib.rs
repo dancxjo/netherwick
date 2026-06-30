@@ -27,7 +27,7 @@ use netherwick_experience::{
 use netherwick_map::{
     orientation_from_imu, project_beam_endpoint, LocalMap, LocalWorldBelief, MapObservation,
     MapSummary, OccupancyCell as OdomMapCell, PointCloudSummary, PoseEdgeSource,
-    PoseGraphOptimizationSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
+    PoseGraphOptimizationSummary, RemapSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
 use netherwick_memory::{
     EntityConstellationState, EntityLifecycleState, EntityMemory, EntityMemoryReport,
@@ -1016,6 +1016,7 @@ pub struct LiveMapResponse {
     pub semantic_cells: Vec<MapSemanticCell>,
     pub events: Vec<MapEventMarker>,
     pub pose_graph: MapPoseGraphSummary,
+    pub remap: RemapSummary,
     pub entity_graph: MapEntityGraph,
 }
 
@@ -1953,6 +1954,7 @@ fn map_response_from_parts(
         semantic_cells,
         events,
         pose_graph,
+        remap: map.remap_summary,
         entity_graph,
     }
 }
@@ -9609,6 +9611,9 @@ mod tests {
         assert_eq!(map.pose_graph.nodes, map.summary.pose_graph_nodes);
         assert_eq!(map.pose_graph.edges, map.summary.pose_graph_edges);
         assert_eq!(map.pose_graph.nodes, 1);
+        assert_eq!(map.remap.submaps, map.summary.remap.submaps);
+        assert_eq!(map.remap.cells, map.summary.remap.cells);
+        assert!(map.remap.submaps >= 1);
         assert_eq!(
             map.overlays,
             vec![
