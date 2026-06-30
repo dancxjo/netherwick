@@ -571,6 +571,19 @@ fn handle_ollama_stream_line(
             response: None,
             error: None,
         });
+    } else if !chunk.thinking.is_empty() {
+        emit_llm_stream(LlmStreamEvent {
+            id: stream_id,
+            t_ms: wall_now_ms(),
+            phase: LlmStreamPhase::Delta,
+            purpose: purpose.to_string(),
+            provider: "ollama".to_string(),
+            model: model.to_string(),
+            prompt: None,
+            delta: Some(chunk.thinking),
+            response: None,
+            error: None,
+        });
     }
     Ok(())
 }
@@ -745,7 +758,10 @@ struct OllamaGenerateOptions {
 
 #[derive(Deserialize)]
 struct OllamaGenerateResponse {
+    #[serde(default)]
     response: String,
+    #[serde(default)]
+    thinking: String,
 }
 
 #[derive(Deserialize)]
