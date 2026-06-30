@@ -37,8 +37,9 @@ use netherwick_runtime::{
     NudgeStatus, ReignQueue, RuntimeModelStack,
 };
 use netherwick_sensors::{
-    ClusterObservation, EyeFrameFormat, OccupancyGrid, PlaneObservation, SceneGraphSummary,
-    SurfaceExtractor, SurfaceExtractorDiagnostics, SurfaceHypothesis, SurfaceTrack, WorldSnapshot,
+    ClusterObservation, EyeFrame, EyeFrameFormat, OccupancyGrid, PlaneObservation,
+    SceneGraphSummary, SurfaceExtractor, SurfaceExtractorDiagnostics, SurfaceHypothesis,
+    SurfaceTrack, WorldSnapshot,
 };
 use netherwick_worldlab::CaptureReader;
 use serde::{Deserialize, Serialize};
@@ -4328,7 +4329,11 @@ fn scene_kinect_from_snapshot(
     calibration: Option<SceneSensorCalibration>,
     warnings: &mut Vec<String>,
 ) -> SceneKinect {
-    let (points, diagnostics) = depth_points(&snapshot.kinect, calibration);
+    let color = snapshot
+        .eye_frame
+        .as_ref()
+        .and_then(DepthColorImage::from_eye_frame);
+    let (points, diagnostics) = depth_points(&snapshot.kinect, calibration, color.as_ref());
     if points.is_empty() {
         warnings.push("no point cloud stream".to_string());
     }
@@ -4352,6 +4357,7 @@ fn scene_kinect_from_snapshot(
 fn depth_points(
     kinect: &KinectSense,
     calibration: Option<SceneSensorCalibration>,
+    color: Option<&DepthColorImage>,
 ) -> (Vec<ScenePoint>, SceneKinectDiagnostics) {
     const MAX_POINTS: usize = 2_000;
     let depth_m = &kinect.depth_m;
@@ -4374,7 +4380,7 @@ fn depth_points(
         }
     }
     if let Some(frame) = KinectDepthProjection::from_kinect(kinect) {
-        return project_depth_image(depth_m, frame, calibration);
+        return project_depth_image(depth_m, frame, calibration, color);
     }
     if depth_m.len() == 640 * 480 {
         return project_depth_image(
@@ -4391,6 +4397,7 @@ fn depth_points(
                 coordinate_system: "kinect_camera".to_string(),
             },
             calibration,
+            color,
         );
     }
     let width = (depth_m.len() as f32).sqrt().ceil().max(1.0) as usize;
@@ -4410,14 +4417,16 @@ fn depth_points(
             let ny = (y as f32 / height as f32) - 0.5;
             let z = (depth * calibration.map_or(1.0, |calibration| calibration.depth_scale))
                 .clamp(0.0, 8.0);
-            let shade = ((1.0 - (z / 8.0)).clamp(0.15, 1.0) * 255.0) as u8;
+            let [r, g, b] = color
+                .and_then(|color| color.sample_depth_pixel(x, y, width, height))
+                .unwrap_or_else(|| depth_shade(z, 8.0));
             Some(ScenePoint {
                 x: nx * z,
                 y: ny * z,
                 z,
-                r: shade,
-                g: shade,
-                b: shade,
+                r,
+                g,
+                b,
             })
         })
         .collect();
@@ -4498,10 +4507,62 @@ impl KinectDepthProjection {
     }
 }
 
+#[derive(Clone, Debug)]
+struct DepthColorImage {
+    width: usize,
+    height: usize,
+    rgb: Vec<u8>,
+}
+
+impl DepthColorImage {
+    fn from_eye_frame(frame: &EyeFrame) -> Option<Self> {
+        let width = usize::try_from(frame.width).ok()?;
+        let height = usize::try_from(frame.height).ok()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let rgb = eye_frame_to_rgb(frame).ok()?;
+        if rgb.len() < width.checked_mul(height)?.checked_mul(3)? {
+            return None;
+        }
+        Some(Self { width, height, rgb })
+    }
+
+    fn sample_depth_pixel(
+        &self,
+        depth_x: usize,
+        depth_y: usize,
+        depth_width: usize,
+        depth_height: usize,
+    ) -> Option<[u8; 3]> {
+        if depth_width == 0 || depth_height == 0 {
+            return None;
+        }
+        let color_x = (depth_x.saturating_mul(self.width) / depth_width).min(self.width - 1);
+        let color_y = (depth_y.saturating_mul(self.height) / depth_height).min(self.height - 1);
+        self.sample(color_x, color_y)
+    }
+
+    fn sample(&self, x: usize, y: usize) -> Option<[u8; 3]> {
+        let offset = y.checked_mul(self.width)?.checked_add(x)?.checked_mul(3)?;
+        Some([
+            *self.rgb.get(offset)?,
+            *self.rgb.get(offset + 1)?,
+            *self.rgb.get(offset + 2)?,
+        ])
+    }
+}
+
+fn depth_shade(depth_m: f32, max_depth_m: f32) -> [u8; 3] {
+    let shade = ((1.0 - (depth_m / max_depth_m.max(f32::EPSILON))).clamp(0.15, 1.0) * 255.0) as u8;
+    [shade, shade, shade]
+}
+
 fn project_depth_image(
     depth_m: &[f32],
     frame: KinectDepthProjection,
     calibration: Option<SceneSensorCalibration>,
+    color: Option<&DepthColorImage>,
 ) -> (Vec<ScenePoint>, SceneKinectDiagnostics) {
     const MAX_POINTS: usize = 2_000;
     let stride = (depth_m.len().div_ceil(MAX_POINTS)).max(1);
@@ -4519,27 +4580,28 @@ fn project_depth_image(
         let z = *depth;
         let x = (u - frame.cx) * z / frame.fx.max(f32::EPSILON);
         let y = (v - frame.cy) * z / frame.fy.max(f32::EPSILON);
-        let shade =
-            ((1.0 - (z / frame.max_depth_m.max(f32::EPSILON))).clamp(0.15, 1.0) * 255.0) as u8;
+        let [r, g, b] = color
+            .and_then(|color| {
+                color.sample_depth_pixel(
+                    index % frame.width,
+                    index / frame.width,
+                    frame.width,
+                    frame.height,
+                )
+            })
+            .unwrap_or_else(|| depth_shade(z, frame.max_depth_m));
         let point = if let Some(extrinsics) = calibrated {
             let robot = camera_point_to_robot([x, y, z], extrinsics);
             ScenePoint {
                 x: robot[1],
                 y: robot[2],
                 z: robot[0],
-                r: shade,
-                g: shade,
-                b: shade,
+                r,
+                g,
+                b,
             }
         } else {
-            ScenePoint {
-                x,
-                y,
-                z,
-                r: shade,
-                g: shade,
-                b: shade,
-            }
+            ScenePoint { x, y, z, r, g, b }
         };
         points.push(point);
     }
@@ -9512,7 +9574,7 @@ mod tests {
             ..KinectSense::default()
         };
         let (points, diagnostics) =
-            depth_points(&kinect, Some(SceneSensorCalibration::sim_default()));
+            depth_points(&kinect, Some(SceneSensorCalibration::sim_default()), None);
 
         assert_eq!(points.len(), 32);
         assert_eq!(diagnostics.coordinate_system, "robot");
@@ -9542,7 +9604,7 @@ mod tests {
             ..KinectSense::default()
         };
 
-        let (points, diagnostics) = depth_points(&kinect, None);
+        let (points, diagnostics) = depth_points(&kinect, None, None);
 
         assert_eq!(points.len(), 2);
         assert_eq!(diagnostics.depth_width, 2);
@@ -9557,6 +9619,41 @@ mod tests {
         assert!((points[1].x - 0.5).abs() < 0.001);
         assert!((points[1].y + 0.5).abs() < 0.001);
         assert!((points[1].z - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn kinect_depth_image_projects_rgb_frame_colors_onto_points() {
+        let kinect = KinectSense {
+            depth_m: vec![1.0, 1.0, 1.0, 1.0],
+            depth_width: 2,
+            depth_height: 2,
+            depth_fx: 2.0,
+            depth_fy: 2.0,
+            depth_cx: 0.5,
+            depth_cy: 0.5,
+            min_depth_m: 0.1,
+            max_depth_m: 3.0,
+            depth_coordinate_system: Some("kinect_camera".to_string()),
+            ..KinectSense::default()
+        };
+        let eye = EyeFrame {
+            captured_at_ms: 10,
+            width: 2,
+            height: 2,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0],
+            source: Some("kinect-freenect-rgb".to_string()),
+        };
+        let color = DepthColorImage::from_eye_frame(&eye).unwrap();
+
+        let (points, diagnostics) = depth_points(&kinect, None, Some(&color));
+
+        assert_eq!(diagnostics.coordinate_system, "kinect_camera");
+        assert_eq!(points.len(), 4);
+        assert_eq!((points[0].r, points[0].g, points[0].b), (255, 0, 0));
+        assert_eq!((points[1].r, points[1].g, points[1].b), (0, 255, 0));
+        assert_eq!((points[2].r, points[2].g, points[2].b), (0, 0, 255));
+        assert_eq!((points[3].r, points[3].g, points[3].b), (255, 255, 0));
     }
 
     #[test]
@@ -9580,7 +9677,7 @@ mod tests {
             ..SceneSensorCalibration::sim_default()
         };
 
-        let (points, diagnostics) = depth_points(&kinect, Some(calibration));
+        let (points, diagnostics) = depth_points(&kinect, Some(calibration), None);
 
         assert_eq!(points.len(), 1);
         assert_eq!(diagnostics.coordinate_system, "robot");
