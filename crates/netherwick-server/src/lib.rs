@@ -494,10 +494,20 @@ impl LiveViewState {
             .lock()
             .expect("live map mutex poisoned")
             .observe_snapshot(&snapshot, snapshot.body.last_update_ms);
-        self.point_cloud
-            .lock()
-            .expect("live point cloud mutex poisoned")
-            .observe_snapshot(&snapshot, snapshot.body.last_update_ms);
+        {
+            let calibration = self
+                .scene_metadata()
+                .and_then(|metadata| metadata.sensor_calibration);
+            let mut cloud = self
+                .point_cloud
+                .lock()
+                .expect("live point cloud mutex poisoned");
+            if apply_live_point_cloud_calibration(&mut cloud, calibration, &snapshot) {
+                cloud.observe_snapshot(&snapshot, snapshot.body.last_update_ms);
+            } else {
+                reset_point_cloud(&mut cloud);
+            }
+        }
         {
             use netherwick_memory::PlaceCellKey;
             const CELL_SIZE: f32 = 0.5;
@@ -775,6 +785,51 @@ impl LiveViewState {
                         .unwrap_or(true));
         Some(node.clone())
     }
+}
+
+fn apply_live_point_cloud_calibration(
+    cloud: &mut VoxelPointCloud,
+    calibration: Option<SceneSensorCalibration>,
+    snapshot: &WorldSnapshot,
+) -> bool {
+    if snapshot.kinect.depth_m.is_empty() {
+        return true;
+    }
+    let full_depth_image = snapshot.kinect.depth_width > 0 && snapshot.kinect.depth_height > 0;
+    let Some(calibration) = calibration else {
+        return !full_depth_image;
+    };
+
+    let previous = cloud.config;
+    cloud.config.camera_height_m = calibration.depth_camera_height_m();
+    cloud.config.camera_forward_m = calibration.depth_camera_forward_m();
+    cloud.config.camera_pitch_rad = calibration.depth_camera_pitch_rad();
+    cloud.config.camera_roll_rad = calibration.camera_roll_rad;
+    cloud.config.camera_yaw_rad = calibration.camera_yaw_rad;
+
+    if point_cloud_extrinsics_changed(previous, cloud.config) {
+        reset_point_cloud(cloud);
+    }
+    true
+}
+
+fn point_cloud_extrinsics_changed(
+    previous: netherwick_map::PointCloudConfig,
+    current: netherwick_map::PointCloudConfig,
+) -> bool {
+    const EPS: f32 = 1.0e-4;
+    (previous.camera_height_m - current.camera_height_m).abs() > EPS
+        || (previous.camera_forward_m - current.camera_forward_m).abs() > EPS
+        || (previous.camera_pitch_rad - current.camera_pitch_rad).abs() > EPS
+        || (previous.camera_roll_rad - current.camera_roll_rad).abs() > EPS
+        || (previous.camera_yaw_rad - current.camera_yaw_rad).abs() > EPS
+}
+
+fn reset_point_cloud(cloud: &mut VoxelPointCloud) {
+    cloud.voxels.clear();
+    cloud.observations = 0;
+    cloud.raw_points_seen = 0;
+    cloud.orientation_status = Default::default();
 }
 
 fn default_behavior_nodes() -> Vec<BehaviorNodeState> {
@@ -4485,6 +4540,13 @@ fn scene_kinect_from_snapshot(
     if diagnostics.coordinate_system == "depth_image_unknown" {
         warnings.push(
             "Kinect depth frame has no width/height metadata; using legacy approximate projection"
+                .to_string(),
+        );
+    }
+    if calibration.is_none() && snapshot.kinect.depth_width > 0 && snapshot.kinect.depth_height > 0
+    {
+        warnings.push(
+            "Kinect depth image has no explicit calibration; accumulated world cloud is disabled"
                 .to_string(),
         );
     }
@@ -9849,6 +9911,80 @@ mod tests {
         assert_eq!(belief.stable_voxels, 1);
         assert!(belief.orientation_status.roll_pitch_corrected);
         assert_eq!(scene.kinect.coordinate_system.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn live_state_does_not_accumulate_uncalibrated_real_depth_images() {
+        let state = LiveViewState::new();
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.last_update_ms = 100;
+        snapshot.kinect = KinectSense {
+            depth_m: vec![1.0],
+            depth_width: 1,
+            depth_height: 1,
+            depth_fx: 1.0,
+            depth_fy: 1.0,
+            min_depth_m: 0.1,
+            max_depth_m: 3.0,
+            depth_coordinate_system: Some("kinect_camera".to_string()),
+            ..KinectSense::default()
+        };
+
+        state.update(snapshot.clone());
+
+        assert_eq!(state.point_cloud_snapshot().summary().observations, 0);
+        let scene = snapshot_to_scene(
+            &snapshot,
+            None,
+            None,
+            LiveTrainingStatus::default(),
+            NudgeStatus::default(),
+            default_behavior_nodes(),
+            Some(&state.point_cloud_snapshot()),
+            None,
+            HardwareControlStatus::unavailable("unit test"),
+        );
+        assert!(scene
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("accumulated world cloud is disabled")));
+    }
+
+    #[test]
+    fn live_state_applies_scene_calibration_to_accumulated_point_cloud() {
+        let state = LiveViewState::new();
+        let calibration = SceneSensorCalibration {
+            camera_height_m: 0.50,
+            camera_forward_m: 0.10,
+            camera_pitch_rad: 12.0_f32.to_radians(),
+            ..SceneSensorCalibration::sim_default()
+        };
+        state.update_scene_metadata(LiveSceneMetadata {
+            arena: None,
+            objects: Vec::new(),
+            sensor_calibration: Some(calibration),
+        });
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.last_update_ms = 100;
+        snapshot.kinect = KinectSense {
+            depth_m: vec![1.0],
+            depth_width: 1,
+            depth_height: 1,
+            depth_fx: 1.0,
+            depth_fy: 1.0,
+            min_depth_m: 0.1,
+            max_depth_m: 3.0,
+            depth_coordinate_system: Some("kinect_camera".to_string()),
+            ..KinectSense::default()
+        };
+
+        state.update(snapshot);
+
+        let cloud = state.point_cloud_snapshot();
+        assert_eq!(cloud.summary().observations, 1);
+        assert!((cloud.config.camera_height_m - 0.50).abs() < 0.001);
+        assert!((cloud.config.camera_forward_m - 0.10).abs() < 0.001);
+        assert!((cloud.config.camera_pitch_rad - 12.0_f32.to_radians()).abs() < 0.001);
     }
 
     #[test]
