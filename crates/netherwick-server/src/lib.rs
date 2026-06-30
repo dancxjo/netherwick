@@ -6356,7 +6356,9 @@ function renderObjects(scenePacket){
   if(arena){
     ground.scaling.set(arena.width_m / 10, 1, arena.height_m / 10);
     ground.position.set(arena.width_m / 2, 0, arena.height_m / 2);
+    ground.rotationQuaternion = null;
     gridMesh.position.set(arena.width_m / 2, 0, arena.height_m / 2);
+    gridMesh.rotationQuaternion = null;
     viewerCamera.setTarget(new BABYLON.Vector3(arena.width_m / 2, 0, arena.height_m / 2));
   }
   for(const item of scenePacket.objects || []){
@@ -6392,6 +6394,60 @@ function renderObjects(scenePacket){
     mesh.metadata = { id: item.id };
     mesh.parent = objects;
   }
+}
+
+function selectProjectedFloor(packet){
+  const perception = packet.surface_perception;
+  if(!perception) return null;
+  if(perception.floor) return perception.floor;
+  if(perception.scene_graph?.floor) return perception.scene_graph.floor;
+  return (perception.stable_surfaces || []).find(surface => surface.kind === 'floor') || null;
+}
+
+function floorHeightAt(surface, x, y){
+  const centroid = v3(surface?.centroid);
+  const normal = norm3(v3(surface?.normal));
+  if(Math.abs(normal.z) < 1e-4) return centroid.z;
+  return centroid.z - (normal.x * (x - centroid.x) + normal.y * (y - centroid.y)) / normal.z;
+}
+
+function upwardFloorNormal(surface){
+  const normal = norm3(v3(surface?.normal));
+  return normal.z < 0 ? mul3(normal, -1) : normal;
+}
+
+function quaternionFromFloorNormal(normal){
+  const n = norm3(normal);
+  const target = new BABYLON.Vector3(n.x, n.z, n.y).normalize();
+  const up = BABYLON.Axis.Y;
+  const dot = BABYLON.Vector3.Dot(up, target);
+  if(dot < -0.999) return BABYLON.Quaternion.RotationAxis(BABYLON.Axis.X, Math.PI);
+  const cross = BABYLON.Vector3.Cross(up, target);
+  const q = new BABYLON.Quaternion(cross.x, cross.y, cross.z, 1 + dot);
+  q.normalize();
+  return q;
+}
+
+function syncVisualFloor(packet){
+  const arena = packet.arena || {};
+  const centerX = Number.isFinite(arena.width_m) ? arena.width_m / 2 : Number(packet.body?.x_m) || 0;
+  const centerY = Number.isFinite(arena.height_m) ? arena.height_m / 2 : Number(packet.body?.y_m) || 0;
+  const floor = selectProjectedFloor(packet);
+  if(!floor){
+    ground.position.set(centerX, 0, centerY);
+    gridMesh.position.set(centerX, 0, centerY);
+    ground.rotationQuaternion = null;
+    gridMesh.rotationQuaternion = null;
+    viewerCamera.setTarget(new BABYLON.Vector3(centerX, 0, centerY));
+    return;
+  }
+  const height = floorHeightAt(floor, centerX, centerY);
+  const rotation = quaternionFromFloorNormal(upwardFloorNormal(floor));
+  ground.position.set(centerX, height, centerY);
+  gridMesh.position.set(centerX, height + 0.002, centerY);
+  ground.rotationQuaternion = rotation.clone();
+  gridMesh.rotationQuaternion = rotation.clone();
+  viewerCamera.setTarget(new BABYLON.Vector3(centerX, height, centerY));
 }
 
 function renderBeams(packet){
@@ -6920,6 +6976,7 @@ function updateScene(packet, liveMap=null){
   robot.position.copyFrom(world(packet.body.x_m, packet.body.y_m, 0));
   robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
   renderObjects(packet);
+  syncVisualFloor(packet);
   renderBeams(packet);
   renderWorldBeliefPoints(packet);
   renderSurfacePerception(packet);
@@ -9755,6 +9812,9 @@ mod tests {
         assert!(page.contains("keyboardReignCodes"));
         assert!(page.contains("KeyW"));
         assert!(page.contains("ArrowUp"));
+        assert!(page.contains("function syncVisualFloor"));
+        assert!(page.contains("selectProjectedFloor"));
+        assert!(page.contains("quaternionFromFloorNormal"));
         assert!(page.contains("Real hardware armed"));
         assert!(page.contains("/reign/hardware-arm"));
         assert!(page.contains("window.addEventListener('pagehide'"));

@@ -2950,58 +2950,43 @@ where
         );
         let embodied_context = runtime_instant.embodied_context();
 
-        let skip_llm_for_slow_real_runtime = now.self_sense.mode.as_deref() == Some("slow")
-            && now
-                .extensions
-                .get("source")
-                .and_then(|value| value.as_str())
-                == Some("real_robot");
+        let combobulation = match self
+            .llm
+            .combobulate(
+                &now,
+                &impressions,
+                Some(&embodied_context),
+                &latent,
+                &futures,
+                &recall.first_person_summary,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                notes.push(format!("LlmCombobulationSkipped: {error}"));
+                None
+            }
+        };
 
-        let (combobulation, llm_tick) = if skip_llm_for_slow_real_runtime {
-            notes.push(
-                "LlmSkipped: real slow control loop uses a tight runtime budget".to_string(),
-            );
-            (None, LlmTickResult::default())
-        } else {
-            let combobulation = match self
-                .llm
-                .combobulate(
-                    &now,
-                    &impressions,
-                    Some(&embodied_context),
-                    &latent,
-                    &futures,
-                    &recall.first_person_summary,
-                )
-                .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    notes.push(format!("LlmCombobulationSkipped: {error}"));
-                    None
-                }
-            };
-
-            let awareness_summary = combobulation.as_ref().map(|value| value.summary.as_str());
-            let llm_tick = match self
-                .llm
-                .maybe_tick(
-                    &now,
-                    Some(&embodied_context),
-                    &latent,
-                    &futures,
-                    &recall.first_person_summary,
-                    awareness_summary,
-                )
-                .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    notes.push(format!("LlmTickSkipped: {error}"));
-                    LlmTickResult::default()
-                }
-            };
-            (combobulation, llm_tick)
+        let awareness_summary = combobulation.as_ref().map(|value| value.summary.as_str());
+        let llm_tick = match self
+            .llm
+            .maybe_tick(
+                &now,
+                Some(&embodied_context),
+                &latent,
+                &futures,
+                &recall.first_person_summary,
+                awareness_summary,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                notes.push(format!("LlmTickSkipped: {error}"));
+                LlmTickResult::default()
+            }
         };
         now.llm = llm_tick.sense.clone();
         apply_llm_tick(
