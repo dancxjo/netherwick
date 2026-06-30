@@ -23,9 +23,9 @@ use netherwick_ledger::{
 };
 use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
 use netherwick_map::{
-    transform_point_to_world, LocalMap, LoopClosureCandidateInput, OrientationEstimate, Point3D,
-    PointCloudConfig, PointCloudFrame, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport,
-    VoxelPointCloud,
+    observation_from_now, transform_point_to_world, LocalMap, LoopClosureCandidateInput,
+    OrientationEstimate, Point3D, PointCloudConfig, PointCloudFrame, PoseGraphBuilder,
+    PoseGraphConfig, PoseGraphReport, VoxelPointCloud,
 };
 use netherwick_memory::{
     deterministic_embodied_eval_report_with_omissions, place_memory_report_from_frames,
@@ -8769,9 +8769,17 @@ async fn generate_representation_report(
 
             let current_key =
                 Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+            let live_loop_candidates = live_loop_candidates_from_now(
+                &place_memory,
+                &now,
+                current_key,
+                Some(frame_id.clone()),
+            );
             place_memory.observe_now(&now);
             entity_memory.observe_now(&now, current_key);
-            local_map.observe_now(&now);
+            let map_observation = observation_from_now(&now, local_map.config);
+            local_map
+                .integrate_observation_with_loop_candidates(map_observation, &live_loop_candidates);
             point_cloud.observe_snapshot(&record.snapshot, record.t_ms);
             observe_pose_graph_now(&mut pose_graph, &mut place_memory, &now, Some(frame_id));
 
@@ -8810,9 +8818,13 @@ async fn generate_representation_report(
 
             let current_key =
                 Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+            let live_loop_candidates =
+                live_loop_candidates_from_frame(&place_memory, frame, current_key);
             place_memory.observe_frame(frame);
             entity_memory.observe_now(now, current_key);
-            local_map.observe_now(now);
+            let map_observation = observation_from_now(now, local_map.config);
+            local_map
+                .integrate_observation_with_loop_candidates(map_observation, &live_loop_candidates);
             point_cloud.decay_stale(now.t_ms);
             observe_pose_graph_frame(&mut pose_graph, &mut place_memory, frame);
 
@@ -9115,18 +9127,7 @@ fn observe_pose_graph_now(
 ) {
     let current_key = Some(memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
     let place_candidates = memory.recognize_places(current_key, &now.eye.scene_vectors, 0.0, 20);
-    let entity_labels: Vec<String> = {
-        let mut labels: Vec<String> = now
-            .objects
-            .observations
-            .iter()
-            .filter(|obs| obs.confidence >= 0.3)
-            .map(|obs| obs.label.clone())
-            .collect();
-        labels.sort();
-        labels.dedup();
-        labels
-    };
+    let entity_labels = entity_labels_from_now(now);
     let entity_candidates =
         memory.recognize_entity_constellations(current_key, &entity_labels, 0.0, 10);
     let loop_candidates = place_candidates
@@ -9142,6 +9143,23 @@ fn observe_pose_graph_now(
     );
 }
 
+fn live_loop_candidates_from_now(
+    memory: &PlaceMemory,
+    now: &Now,
+    current_key: Option<netherwick_memory::PlaceCellKey>,
+    source_frame_id: Option<String>,
+) -> Vec<LoopClosureCandidateInput> {
+    let place_candidates = memory.recognize_places(current_key, &now.eye.scene_vectors, 0.85, 10);
+    let entity_labels = entity_labels_from_now(now);
+    let entity_candidates =
+        memory.recognize_entity_constellations(current_key, &entity_labels, 0.85, 10);
+    place_candidates
+        .iter()
+        .chain(entity_candidates.iter())
+        .map(|candidate| place_candidate_to_loop_input(candidate, source_frame_id.clone()))
+        .collect()
+}
+
 fn observe_pose_graph_frame(
     builder: &mut PoseGraphBuilder,
     memory: &mut PlaceMemory,
@@ -9153,17 +9171,7 @@ fn observe_pose_graph_frame(
     let mut query_vectors = frame.now.eye.scene_vectors.clone();
     query_vectors.extend(place_recognition_vectors_from_input(&place_input));
     let place_candidates = memory.recognize_places(current_key, &query_vectors, 0.0, 20);
-    let entity_labels: Vec<String> = {
-        let mut all: Vec<String> = place_input
-            .object_labels
-            .iter()
-            .chain(place_input.person_labels.iter())
-            .cloned()
-            .collect();
-        all.sort();
-        all.dedup();
-        all
-    };
+    let entity_labels = entity_labels_from_place_input(&place_input);
     let entity_candidates =
         memory.recognize_entity_constellations(current_key, &entity_labels, 0.0, 10);
     let loop_candidates = place_candidates
@@ -9177,6 +9185,50 @@ fn observe_pose_graph_frame(
         Some(frame.id.to_string()),
         &loop_candidates,
     );
+}
+
+fn live_loop_candidates_from_frame(
+    memory: &PlaceMemory,
+    frame: &ExperienceFrame,
+    current_key: Option<netherwick_memory::PlaceCellKey>,
+) -> Vec<LoopClosureCandidateInput> {
+    let place_input = place_recognition_input_from_frame(frame);
+    let mut query_vectors = frame.now.eye.scene_vectors.clone();
+    query_vectors.extend(place_recognition_vectors_from_input(&place_input));
+    let place_candidates = memory.recognize_places(current_key, &query_vectors, 0.85, 10);
+    let entity_labels = entity_labels_from_place_input(&place_input);
+    let entity_candidates =
+        memory.recognize_entity_constellations(current_key, &entity_labels, 0.85, 10);
+    place_candidates
+        .iter()
+        .chain(entity_candidates.iter())
+        .map(|candidate| place_candidate_to_loop_input(candidate, Some(frame.id.to_string())))
+        .collect()
+}
+
+fn entity_labels_from_now(now: &Now) -> Vec<String> {
+    let mut labels: Vec<String> = now
+        .objects
+        .observations
+        .iter()
+        .filter(|obs| obs.confidence >= 0.3)
+        .map(|obs| obs.label.clone())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn entity_labels_from_place_input(input: &netherwick_memory::PlaceRecognitionInput) -> Vec<String> {
+    let mut labels: Vec<String> = input
+        .object_labels
+        .iter()
+        .chain(input.person_labels.iter())
+        .cloned()
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
 }
 
 fn place_candidate_to_loop_input(

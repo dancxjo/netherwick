@@ -59,6 +59,15 @@ pub trait Recall {
         Ok(())
     }
 
+    async fn loop_closure_candidates(
+        &self,
+        _query: &RecallQuery,
+        _min_confidence: f32,
+        _limit: usize,
+    ) -> Result<Vec<PlaceRecognitionCandidate>> {
+        Ok(Vec::new())
+    }
+
     async fn recall(&self, query: RecallQuery) -> Result<RecallBundle>;
 }
 
@@ -2155,6 +2164,17 @@ impl Recall for DurableExperienceStore {
         self.inner.observe_transition(transition).await
     }
 
+    async fn loop_closure_candidates(
+        &self,
+        query: &RecallQuery,
+        min_confidence: f32,
+        limit: usize,
+    ) -> Result<Vec<PlaceRecognitionCandidate>> {
+        self.inner
+            .loop_closure_candidates(query, min_confidence, limit)
+            .await
+    }
+
     async fn recall(&self, query: RecallQuery) -> Result<RecallBundle> {
         self.inner.recall(query).await
     }
@@ -2200,6 +2220,51 @@ impl Recall for InMemoryExperienceStore {
             .expect("place memory mutex poisoned")
             .observe_transition(transition);
         Ok(())
+    }
+
+    async fn loop_closure_candidates(
+        &self,
+        query: &RecallQuery,
+        min_confidence: f32,
+        limit: usize,
+    ) -> Result<Vec<PlaceRecognitionCandidate>> {
+        let places = self.places.lock().expect("place memory mutex poisoned");
+        let current_key = query.pose.map(|pose| places.quantize(pose.x_m, pose.y_m));
+        let mut query_vectors = query.scene_vectors.clone();
+        if let Some(input) = query.place_recognition_input.as_ref() {
+            query_vectors.extend(place_recognition_vectors_from_input(input));
+        }
+        let mut candidates =
+            places.recognize_places(current_key, &query_vectors, min_confidence, limit);
+        let mut entity_labels = query
+            .place_recognition_input
+            .as_ref()
+            .map(|input| {
+                input
+                    .object_labels
+                    .iter()
+                    .chain(input.person_labels.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        entity_labels.sort();
+        entity_labels.dedup();
+        candidates.extend(places.recognize_entity_constellations(
+            current_key,
+            &entity_labels,
+            min_confidence,
+            limit,
+        ));
+        candidates.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.cell.last_seen_tick.cmp(&left.cell.last_seen_tick))
+        });
+        candidates.truncate(limit);
+        Ok(candidates)
     }
 
     async fn recall(&self, query: RecallQuery) -> Result<RecallBundle> {
@@ -5456,6 +5521,41 @@ mod tests {
             .semantic_map
             .as_ref()
             .is_some_and(|overlay| !overlay.place_recognition_candidates.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn recall_loop_closure_candidates_use_place_memory_evidence() {
+        let store = InMemoryExperienceStore::new();
+        let mut observed = now_at(100, 1.0, 1.0);
+        observed.eye.scene_vectors.push(
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-stored", vec![1.0, 0.0])
+                .with_source_frame_id("stored-frame"),
+        );
+        store.observe_now(&observed).await.unwrap();
+
+        let candidates = store
+            .loop_closure_candidates(
+                &RecallQuery {
+                    pose: Some(now_at(200, 1.1, 1.0).body.odometry),
+                    scene_vectors: vec![VectorArtifact::new(
+                        SCENE_VECTOR_COLLECTION,
+                        "scene-query",
+                        vec![1.0, 0.0],
+                    )],
+                    ..RecallQuery::default()
+                },
+                PLACE_RECOGNITION_MIN_CONFIDENCE,
+                5,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_vector_id, "scene-stored");
+        assert_eq!(
+            candidates[0].source_frame_id.as_deref(),
+            Some("stored-frame")
+        );
     }
 
     #[tokio::test]

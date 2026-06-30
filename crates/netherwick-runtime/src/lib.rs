@@ -15,7 +15,7 @@ use netherwick_behaviors::{
 };
 use netherwick_body::{MotionCommand, MotorCommand, MotorComplex, RobotBody};
 use netherwick_conductor::{Conductor, ConductorInput, NavigationIntent, SimpleConductor};
-use netherwick_core::{Provenance, Reward, TimeMs};
+use netherwick_core::{Pose2, Provenance, Reward, TimeMs};
 use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
@@ -36,10 +36,12 @@ use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
 };
 use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
-use netherwick_map::{LocalMap, MAP_EXTENSION_NAME};
+use netherwick_map::{
+    observation_from_now, LocalMap, LoopClosureCandidateInput, MAP_EXTENSION_NAME,
+};
 use netherwick_memory::{
-    attach_memory_links_to_frame, place_recognition_input_from_query_now, MemoryStore, Recall,
-    RecallBundle, RecallQuery,
+    attach_memory_links_to_frame, place_recognition_input_from_query_now, MemoryStore,
+    PlaceRecognitionCandidate, PlaceRecognitionKind, Recall, RecallBundle, RecallQuery,
 };
 use netherwick_models::{
     read_action_value_metadata, read_charge_metadata, read_danger_metadata, read_ear_next_metadata,
@@ -533,6 +535,45 @@ fn apply_recent_trap_memory_hints(now: &mut Now) {
     } else {
         0.0
     });
+}
+
+fn place_candidate_to_loop_input(
+    candidate: &PlaceRecognitionCandidate,
+    source_frame_id: Option<String>,
+    query_input: Option<&netherwick_memory::PlaceRecognitionInput>,
+) -> LoopClosureCandidateInput {
+    LoopClosureCandidateInput {
+        target_pose: Pose2 {
+            x_m: candidate.cell.center_x_m,
+            y_m: candidate.cell.center_y_m,
+            heading_rad: query_input
+                .and_then(|input| input.pose)
+                .map(|pose| pose.heading_rad)
+                .unwrap_or(0.0),
+        },
+        confidence: candidate.confidence,
+        similarity: candidate.similarity,
+        kind: match candidate.kind {
+            PlaceRecognitionKind::SamePlace => "same_place",
+            PlaceRecognitionKind::SimilarPlace => "similar_place",
+            PlaceRecognitionKind::EntityConstellation => "entity_constellation",
+        }
+        .to_string(),
+        target_frame_id: candidate
+            .source_instant_frame_id
+            .clone()
+            .or_else(|| candidate.source_frame_id.clone()),
+        source_frame_id,
+        source_experience_id: candidate.source_experience_id.clone(),
+        source_instant_frame_id: candidate.source_instant_frame_id.clone(),
+        source_vector_refs: candidate.source_vector_refs.clone(),
+        source_vector_id: Some(candidate.source_vector_id.clone()),
+        query_vector_id: candidate.query_vector_id.clone(),
+        query_experience_id: candidate
+            .query_experience_id
+            .clone()
+            .or_else(|| query_input.and_then(|input| input.experience_id.clone())),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2733,11 +2774,23 @@ where
         let latent = experience_run.chosen.latent.clone();
 
         let mut recall_query = RecallQuery::from_now(&now);
-        recall_query.place_recognition_input = Some(place_recognition_input_from_query_now(
-            &now,
-            Some(&latent),
-            "runtime-pre-frame",
-        ));
+        let place_recognition_input =
+            place_recognition_input_from_query_now(&now, Some(&latent), "runtime-pre-frame");
+        recall_query.place_recognition_input = Some(place_recognition_input.clone());
+        let loop_min_confidence = self.local_map.config.pose_graph_min_loop_confidence;
+        let live_loop_candidates = self
+            .memory_recall
+            .loop_closure_candidates(&recall_query, loop_min_confidence, 10)
+            .await?
+            .iter()
+            .map(|candidate| {
+                place_candidate_to_loop_input(
+                    candidate,
+                    Some(format!("runtime-now:{}", now.t_ms)),
+                    Some(&place_recognition_input),
+                )
+            })
+            .collect::<Vec<_>>();
         let recall = self.memory_recall.recall(recall_query).await?;
         now.memory = recall.sense.clone();
         apply_recent_trap_memory_hints(&mut now);
@@ -2903,7 +2956,10 @@ where
             notes.push("motor_applied = false".to_string());
             notes.push("ReadOnlyActionSuppressed: motion suppressed by read-only mode".to_string());
         }
-        let map_summary = self.local_map.observe_now(&now);
+        let map_observation = observation_from_now(&now, self.local_map.config);
+        let map_summary = self
+            .local_map
+            .integrate_observation_with_loop_candidates(map_observation, &live_loop_candidates);
         now.extensions.insert(
             MAP_EXTENSION_NAME.to_string(),
             serde_json::to_value(&map_summary)?,

@@ -74,6 +74,8 @@ Now
 
 `LocalMap` only promotes candidates when a live pose node is created. Accepted candidates become active `PoseEdgeSource::LoopClosureCandidate` edges; rejected candidates remain inactive edges with `rejection_reason` values for replay/debugging. The live gates are intentionally conservative: confidence must clear the loop threshold, the target must not be the current/source frame, the target pose must be close enough to the current pose to avoid teleportation, and current range geometry must overlap existing occupied cells at the proposed prior node. `MapSummary` surfaces total, accepted, and rejected loop-closure counts.
 
+The runtime now asks the configured `Recall` implementation for conservative loop candidates before storing the current frame, converts those memory candidates into `LoopClosureCandidateInput`, and feeds them into `LocalMap` for the same tick. Representation reports also run `LocalMap` through this candidate-aware path, while the standalone `pose-graph-report` command remains an offline diagnostic view of the same place/entity evidence.
+
 Build a replay-first representation health report from capture or ledger input:
 
 ```bash
