@@ -5892,7 +5892,7 @@ canvas{display:block}
     </div>
   </div>
   <div id="reign-state">web reign ready</div>
-  <div class="reign-hint">Drag the stick for analog forward/reverse and turn together. Release to stop.</div>
+  <div class="reign-hint">Drag the stick or hold WASD / arrow keys. Space stops.</div>
   <div class="cockpit">
     <label class="cockpit-arm"><input id="hardware-arm" type="checkbox"> Real hardware armed</label>
     <div id="hardware-state">hardware cockpit unavailable</div>
@@ -7432,6 +7432,19 @@ function resetWebJoystick(){
   reignReadout.textContent = 'F 0.00 / T 0.00';
 }
 
+function setWebReignVector(x, y){
+  webReignVector = {
+    x: clamp(x, -1, 1),
+    y: clamp(y, -1, 1)
+  };
+  const rect = reignJoystick.getBoundingClientRect();
+  const usable = Math.max(1, rect.width / 2 - 17);
+  const knobX = webReignVector.x * usable;
+  const knobY = webReignVector.y * usable;
+  reignStick.style.transform = `translate(calc(-50% + ${knobX}px), calc(-50% + ${knobY}px))`;
+  reignReadout.textContent = `F ${fmt(-webReignVector.y, 2)} / T ${fmt(webReignVector.x, 2)}`;
+}
+
 function updateWebJoystick(event){
   const rect = reignJoystick.getBoundingClientRect();
   const radius = rect.width / 2;
@@ -7444,12 +7457,7 @@ function updateWebJoystick(event){
   const angle = Math.atan2(dy, dx);
   const knobX = Math.cos(angle) * distance;
   const knobY = Math.sin(angle) * distance;
-  reignStick.style.transform = `translate(calc(-50% + ${knobX}px), calc(-50% + ${knobY}px))`;
-  webReignVector = {
-    x: clamp(dx / usable, -1, 1),
-    y: clamp(dy / usable, -1, 1)
-  };
-  reignReadout.textContent = `F ${fmt(-webReignVector.y, 2)} / T ${fmt(webReignVector.x, 2)}`;
+  setWebReignVector(knobX / usable, knobY / usable);
 }
 
 function commandForWebJoystick(){
@@ -7467,7 +7475,7 @@ function commandForWebJoystick(){
 }
 
 function pollWebReigns(){
-  if(webReignPointerId == null) return false;
+  if(webReignPointerId == null && !keyboardReignActive()) return false;
   const next = commandForWebJoystick();
   if(next){
     postWebReign(next.command, next.ttl, next.label, next.priority);
@@ -7505,6 +7513,63 @@ reignStop.addEventListener('click', () => {
 hardwareArm.addEventListener('change', () => setHardwareArmed(hardwareArm.checked));
 window.addEventListener('pagehide', disarmHardwareOnExit);
 window.addEventListener('beforeunload', disarmHardwareOnExit);
+
+const keyboardReignKeys = new Set();
+const keyboardReignCodes = new Set(['KeyW','KeyA','KeyS','KeyD','ArrowUp','ArrowLeft','ArrowDown','ArrowRight']);
+
+function keyboardReignActive(){
+  return keyboardReignKeys.size > 0;
+}
+
+function shouldIgnoreKeyboardReign(event){
+  if(event.altKey || event.ctrlKey || event.metaKey) return true;
+  const target = event.target;
+  const tag = target?.tagName;
+  return !!target?.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+function updateKeyboardReignVector(){
+  let forward = 0;
+  let turn = 0;
+  if(keyboardReignKeys.has('KeyW') || keyboardReignKeys.has('ArrowUp')) forward += 1;
+  if(keyboardReignKeys.has('KeyS') || keyboardReignKeys.has('ArrowDown')) forward -= 1;
+  if(keyboardReignKeys.has('KeyA') || keyboardReignKeys.has('ArrowLeft')) turn += 1;
+  if(keyboardReignKeys.has('KeyD') || keyboardReignKeys.has('ArrowRight')) turn -= 1;
+  if(forward === 0 && turn === 0){
+    resetWebJoystick();
+    postWebReign({type:'Stop'}, 900, 'keyboard stop', 1);
+    return;
+  }
+  setWebReignVector(-turn, -forward);
+}
+
+window.addEventListener('keydown', event => {
+  if(event.code === 'Space' && !shouldIgnoreKeyboardReign(event)){
+    keyboardReignKeys.clear();
+    resetWebJoystick();
+    postWebReign({type:'Stop'}, 1200, 'keyboard stop', 1);
+    event.preventDefault();
+    return;
+  }
+  if(!keyboardReignCodes.has(event.code) || shouldIgnoreKeyboardReign(event)) return;
+  keyboardReignKeys.add(event.code);
+  updateKeyboardReignVector();
+  event.preventDefault();
+});
+
+window.addEventListener('keyup', event => {
+  if(!keyboardReignCodes.has(event.code)) return;
+  keyboardReignKeys.delete(event.code);
+  updateKeyboardReignVector();
+  event.preventDefault();
+});
+
+window.addEventListener('blur', () => {
+  if(!keyboardReignActive()) return;
+  keyboardReignKeys.clear();
+  resetWebJoystick();
+  postWebReign({type:'Stop'}, 900, 'keyboard blur stop', 1);
+});
 
 function commandForInputSource(inputSource){
   const gamepad = inputSource.gamepad;
@@ -9589,6 +9654,10 @@ mod tests {
         assert!(page.contains("const nodes = {...graphLayout}"));
         assert!(page.contains("source='Gamepad'"));
         assert!(page.contains("type:'Drive'"));
+        assert!(page.contains("WASD / arrow keys"));
+        assert!(page.contains("keyboardReignCodes"));
+        assert!(page.contains("KeyW"));
+        assert!(page.contains("ArrowUp"));
         assert!(page.contains("Real hardware armed"));
         assert!(page.contains("/reign/hardware-arm"));
         assert!(page.contains("window.addEventListener('pagehide'"));

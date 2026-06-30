@@ -4440,48 +4440,6 @@ fn synthetic_slow_manual_tick(
     })
 }
 
-fn synthetic_slow_idle_tick(now: Now, reason: String) -> RuntimeTick {
-    let experience = Experience::new(
-        "real_robot_slow_idle",
-        "Slow hardware runtime tick did not finish before the control deadline.",
-        Vec::new(),
-        Vec::new(),
-        now.t_ms,
-        now.t_ms,
-    );
-    RuntimeTick {
-        frame: ExperienceFrame {
-            id: Uuid::new_v4(),
-            t_ms: now.t_ms,
-            now,
-            sensations: Vec::new(),
-            impressions: Vec::new(),
-            experiences: vec![experience.clone()],
-            z: Some(ExperienceLatent::default()),
-            chosen_action: Some(ActionPrimitive::Stop),
-            conscious_command: None,
-            reign_input: None,
-            reign_outcome: None,
-            predicted_futures: Vec::new(),
-            behavior_runs: Vec::new(),
-            actual_next: None,
-            reward: Reward::default(),
-            surprise: SurpriseSense::default(),
-            memory_recall: Vec::new(),
-            recollections: Vec::new(),
-            llm_teaching: Vec::new(),
-            counterfactuals: Vec::new(),
-            notes: vec![format!("RealSlowRuntimeSkipped: {reason}")],
-        },
-        experience,
-        chosen_action: Some(ActionPrimitive::Stop),
-        recall: RecallBundle::default(),
-        llm: LlmTickResult::default(),
-        combobulation: None,
-        inline_learning: InlineLearningTickStatus::default(),
-    }
-}
-
 fn reign_input_drives_real_slow(input: &ReignInput) -> bool {
     if input.source != ReignSource::WebRemote || input.mode != ReignMode::Direct {
         return false;
