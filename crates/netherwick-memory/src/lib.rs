@@ -4,9 +4,9 @@ use netherwick_actions::ActionPrimitive;
 use netherwick_body::{BodyFlags, BodySense, Velocity};
 use netherwick_core::{Goal, Pose2, Reward};
 use netherwick_experience::{
-    EmbodiedPipeline, EmbodiedVectorCoverage, Experience, ExperienceFuser, FuturePrediction,
-    Impression, InstantCoverage, MemoryLink, Modality, RecalledExperience, SensationPayloadKind,
-    VectorEmbedding,
+    experience_forge_vector_from_now, EmbodiedPipeline, EmbodiedVectorCoverage, Experience,
+    ExperienceFuser, ExperienceVectorArtifact, FuturePrediction, Impression, InstantCoverage,
+    MemoryLink, Modality, RecalledExperience, SensationPayloadKind, VectorEmbedding,
 };
 use netherwick_ledger::{ExperienceFrame, ExperienceTransition};
 use netherwick_now::{
@@ -226,6 +226,8 @@ pub struct PlaceRecognitionInput {
     pub experience_id: Option<String>,
     pub instant_frame_id: Option<String>,
     pub fused_experience_vector: Option<VectorArtifact>,
+    #[serde(default)]
+    pub experience_forge_vector: Option<ExperienceVectorArtifact>,
     #[serde(default)]
     pub teacher_vector_refs: Vec<String>,
     #[serde(default)]
@@ -1175,6 +1177,30 @@ impl EntityHypothesis {
         );
     }
 
+    /// Add ExperienceForge compact vector evidence.
+    /// This is learned contextual evidence and not a semantic identity label.
+    pub fn add_experience_forge_vector(&mut self, artifact: &ExperienceVectorArtifact) {
+        let point_id = artifact.vector_artifact().point_id;
+        let point = self.push_observation_point(
+            Modality::Memory,
+            format!("experience-forge:{point_id}"),
+            0.65,
+            artifact.provenance.source_snapshot_ms,
+        );
+        let cluster = self.upsert_cluster(
+            Modality::Memory,
+            format!("experience-forge:{point_id}"),
+            point,
+            0.65,
+        );
+        self.bind_with_object_cluster(
+            cluster,
+            BindingRelation::PredictsSameFutureEvents,
+            0.65,
+            artifact.provenance.source_snapshot_ms,
+        );
+    }
+
     pub fn add_text_label(&mut self, label: impl Into<String>, confidence: f32, t_ms: u64) {
         let text = label.into().trim().to_string();
         if text.is_empty() {
@@ -1496,6 +1522,19 @@ impl EntityMemory {
                     for text in &text_labels {
                         entity.add_text_label(text.clone(), 0.6, now.t_ms);
                     }
+                }
+            }
+        }
+        if let Some(forge_vector) = experience_forge_vector_from_now(now) {
+            let active_ids = self
+                .entities
+                .values()
+                .filter(|entity| entity.lifecycle == EntityLifecycleState::Active)
+                .map(|entity| entity.id.clone())
+                .collect::<Vec<_>>();
+            for id in active_ids {
+                if let Some(entity) = self.entities.get_mut(&id) {
+                    entity.add_experience_forge_vector(&forge_vector);
                 }
             }
         }
@@ -4047,6 +4086,7 @@ fn place_query_vectors_from_query(query: &RecallQuery) -> Vec<VectorArtifact> {
 
 pub fn place_recognition_input_from_frame(frame: &ExperienceFrame) -> PlaceRecognitionInput {
     let instant = frame.experience_instant();
+    let experience_forge_vector = experience_forge_vector_from_now(&frame.now);
     let fused_experience_vector = frame
         .experiences
         .last()
@@ -4078,6 +4118,7 @@ pub fn place_recognition_input_from_frame(frame: &ExperienceFrame) -> PlaceRecog
         experience_id: instant.experience_id.map(|id| id.to_string()),
         instant_frame_id: Some(frame.id.to_string()),
         fused_experience_vector,
+        experience_forge_vector,
         teacher_vector_refs: instant
             .teacher_vectors
             .iter()
@@ -4109,6 +4150,7 @@ pub fn place_recognition_input_from_query_now(
     latent: Option<&netherwick_experience::ExperienceLatent>,
     provenance: impl Into<String>,
 ) -> PlaceRecognitionInput {
+    let experience_forge_vector = experience_forge_vector_from_now(now);
     let fused_experience_vector = latent.map(|latent| {
         VectorArtifact::new(
             EXPERIENCE_VECTOR_COLLECTION,
@@ -4122,6 +4164,7 @@ pub fn place_recognition_input_from_query_now(
         experience_id: None,
         instant_frame_id: None,
         fused_experience_vector,
+        experience_forge_vector,
         teacher_vector_refs: now
             .eye
             .scene_vectors
@@ -4144,11 +4187,15 @@ pub fn place_recognition_input_from_query_now(
 }
 
 pub fn place_recognition_vectors_from_input(input: &PlaceRecognitionInput) -> Vec<VectorArtifact> {
-    input
+    let mut vectors = input
         .fused_experience_vector
         .iter()
         .cloned()
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+    if let Some(forge) = &input.experience_forge_vector {
+        vectors.push(forge.vector_artifact());
+    }
+    vectors
 }
 
 fn compact_range_summary(now: &Now) -> Option<CompactRangeSummary> {
@@ -5477,6 +5524,30 @@ mod tests {
     }
 
     #[test]
+    fn place_recognition_vectors_include_optional_forge_vector_artifact() {
+        let now = now_at(100, 0.0, 0.0);
+        let artifact = ExperienceVectorArtifact {
+            tick: 3,
+            vector: vec![0.3, 0.1, 0.9],
+            champion_ids: vec![7, 11],
+            checkpoint_ref: None,
+            provenance: netherwick_experience::ExperienceVectorProvenance {
+                source_snapshot_ms: now.t_ms,
+                source_frame_id: None,
+                channel: "test.experience_forge".to_string(),
+            },
+        };
+        let input = PlaceRecognitionInput {
+            experience_forge_vector: Some(artifact.clone()),
+            ..PlaceRecognitionInput::default()
+        };
+        let vectors = place_recognition_vectors_from_input(&input);
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].vector, artifact.vector);
+        assert!(vectors[0].point_id.contains("experience-forge:tick:3"));
+    }
+
+    #[test]
     fn place_recognition_report_marks_not_enough_evidence_and_rejections() {
         let mut memory = PlaceMemory::new();
         let mut observed = now_at(100, 2.0, 1.0);
@@ -5963,5 +6034,63 @@ mod tests {
         assert!(memory.merge_entities(&entity_id, &split_id));
         let merged = memory.entities.get(&entity_id).expect("merged entity");
         assert_eq!(merged.constellation.state, EntityConstellationState::Merged);
+    }
+
+    #[test]
+    fn entity_constellation_records_forge_vector_evidence_when_present() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("guide", ObjectClass::Person, 0.85));
+        let forge_vector = ExperienceVectorArtifact {
+            tick: 5,
+            vector: vec![0.1, 0.2, 0.3],
+            champion_ids: vec![1, 2],
+            checkpoint_ref: None,
+            provenance: netherwick_experience::ExperienceVectorProvenance {
+                source_snapshot_ms: now.t_ms,
+                source_frame_id: None,
+                channel: "test.experience_forge".to_string(),
+            },
+        };
+        netherwick_experience::attach_experience_forge_vector(&mut now, &forge_vector);
+
+        memory.observe_now(&now, None);
+
+        let entity = memory
+            .entities
+            .get("entity:person:guide")
+            .expect("person entity");
+        assert!(entity
+            .constellation
+            .modality_clusters
+            .iter()
+            .any(|cluster| {
+                cluster.modality == Modality::Memory && cluster.id.contains("experience-forge")
+            }));
+    }
+
+    #[test]
+    fn entity_constellation_skips_forge_vector_when_absent() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("guide", ObjectClass::Person, 0.85));
+
+        memory.observe_now(&now, None);
+
+        let entity = memory
+            .entities
+            .get("entity:person:guide")
+            .expect("person entity");
+        assert!(!entity
+            .constellation
+            .modality_clusters
+            .iter()
+            .any(|cluster| {
+                cluster.modality == Modality::Memory && cluster.id.contains("experience-forge")
+            }));
     }
 }
