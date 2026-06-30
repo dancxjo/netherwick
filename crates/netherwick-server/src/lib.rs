@@ -4601,8 +4601,8 @@ fn depth_stats(
         coordinate_system: coordinate_system.to_string(),
         below_floor_count: 0,
         below_floor_ratio: 0.0,
-        min_z_m: valid.first().copied(),
-        median_z_m: median_depth_m,
+        min_z_m: None,
+        median_z_m: None,
     }
 }
 
@@ -4683,7 +4683,12 @@ fn apply_robot_extrinsics(base: [f32; 3], extrinsics: DepthExtrinsics) -> [f32; 
     ]
 }
 
-fn rotate_robot_extrinsic(point: [f32; 3], pitch_rad: f32, roll_rad: f32, yaw_rad: f32) -> [f32; 3] {
+fn rotate_robot_extrinsic(
+    point: [f32; 3],
+    pitch_rad: f32,
+    roll_rad: f32,
+    yaw_rad: f32,
+) -> [f32; 3] {
     let (pitch_sin, pitch_cos) = pitch_rad.sin_cos();
     let mut x = point[0] * pitch_cos + point[2] * pitch_sin;
     let y = point[1];
@@ -5953,14 +5958,24 @@ canvas{display:block}
       <span id="val-point-y" style="width:40px;text-align:right;font-family:monospace">0.18m</span>
     </div>
     <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
-      <label for="cal-depth-z" style="width:90px">Depth Offset</label>
+      <label for="cal-depth-z" style="width:90px">Depth Forward</label>
       <input type="range" id="cal-depth-z" min="-0.50" max="0.50" step="0.01" value="0.00">
       <span id="val-depth-z" style="width:40px;text-align:right;font-family:monospace">0.00m</span>
     </div>
     <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
-      <label for="cal-depth-pitch" style="width:90px">Depth Tilt</label>
+      <label for="cal-depth-pitch" style="width:90px">Depth Pitch</label>
       <input type="range" id="cal-depth-pitch" min="-30" max="30" step="1" value="0">
       <span id="val-depth-pitch" style="width:40px;text-align:right;font-family:monospace">0°</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-depth-roll" style="width:90px">Depth Roll</label>
+      <input type="range" id="cal-depth-roll" min="-30" max="30" step="1" value="0">
+      <span id="val-depth-roll" style="width:40px;text-align:right;font-family:monospace">0°</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-depth-yaw" style="width:90px">Depth Yaw</label>
+      <input type="range" id="cal-depth-yaw" min="-45" max="45" step="1" value="0">
+      <span id="val-depth-yaw" style="width:40px;text-align:right;font-family:monospace">0°</span>
     </div>
     <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
       <label for="cal-depth-fov" style="width:90px">Depth FOV</label>
@@ -6904,7 +6919,7 @@ function updateScene(packet, liveMap=null){
     ? `${accumulated.length} drawn / ${cloudSummary.voxels || 0} voxels / ${cloudSummary.stable_voxels || 0} stable`
     : `${packet.kinect?.points?.length || 0} drawn / ${depth.valid_depth_count || 0} valid`;
   fields.depth_stats.textContent = depth.depth_width
-    ? `${depth.depth_width}x${depth.depth_height} ${depth.coordinate_system || '-'} med ${depth.median_depth_m == null ? '-' : fmt(depth.median_depth_m)}m skip ${depth.skipped_depth_count || 0} clip ${depth.clipped_depth_count || 0} stride ${depth.sample_stride || '-'}`
+    ? `${depth.depth_width}x${depth.depth_height} ${depth.coordinate_system || '-'} med ${depth.median_depth_m == null ? '-' : fmt(depth.median_depth_m)}m floor min ${depth.min_z_m == null ? '-' : fmt(depth.min_z_m)} med ${depth.median_z_m == null ? '-' : fmt(depth.median_z_m)} below ${depth.below_floor_count || 0}/${fmt(depth.below_floor_ratio || 0, 2)} skip ${depth.skipped_depth_count || 0} clip ${depth.clipped_depth_count || 0} stride ${depth.sample_stride || '-'}`
     : '-';
   const surface = packet.surface_perception;
   if(surface){
@@ -8252,6 +8267,8 @@ const defaults = {
   pointY: 0.18,
   depthZ: 0.0,
   depthPitch: 0,
+  depthRoll: 0,
+  depthYaw: 0,
   depthFov: 122,
   cameraFov: 62,
   cameraY: 0.46,
@@ -8265,6 +8282,8 @@ const depthScaleEl = document.getElementById('cal-depth-scale');
 const pointYEl = document.getElementById('cal-point-y');
 const depthZEl = document.getElementById('cal-depth-z');
 const depthPitchEl = document.getElementById('cal-depth-pitch');
+const depthRollEl = document.getElementById('cal-depth-roll');
+const depthYawEl = document.getElementById('cal-depth-yaw');
 const depthFovEl = document.getElementById('cal-depth-fov');
 const cameraFovEl = document.getElementById('cal-camera-fov');
 const cameraYEl = document.getElementById('cal-camera-y');
@@ -8277,6 +8296,8 @@ const valDepthScale = document.getElementById('val-depth-scale');
 const valPointY = document.getElementById('val-point-y');
 const valDepthZ = document.getElementById('val-depth-z');
 const valDepthPitch = document.getElementById('val-depth-pitch');
+const valDepthRoll = document.getElementById('val-depth-roll');
+const valDepthYaw = document.getElementById('val-depth-yaw');
 const valDepthFov = document.getElementById('val-depth-fov');
 const valCameraFov = document.getElementById('val-camera-fov');
 const valCameraY = document.getElementById('val-camera-y');
@@ -8303,6 +8324,8 @@ function applyCalibrationToUI() {
   pointYEl.value = cal.pointY;
   depthZEl.value = cal.depthZ;
   depthPitchEl.value = cal.depthPitch;
+  depthRollEl.value = cal.depthRoll;
+  depthYawEl.value = cal.depthYaw;
   depthFovEl.value = cal.depthFov;
   cameraFovEl.value = cal.cameraFov;
   cameraYEl.value = cal.cameraY;
@@ -8313,6 +8336,8 @@ function applyCalibrationToUI() {
   valPointY.textContent = cal.pointY.toFixed(2) + 'm';
   valDepthZ.textContent = cal.depthZ.toFixed(2) + 'm';
   valDepthPitch.textContent = cal.depthPitch + '°';
+  valDepthRoll.textContent = cal.depthRoll + '°';
+  valDepthYaw.textContent = cal.depthYaw + '°';
   valDepthFov.textContent = cal.depthFov + '°';
   valCameraFov.textContent = cal.cameraFov + '°';
   valCameraY.textContent = cal.cameraY.toFixed(2) + 'm';
@@ -8344,7 +8369,12 @@ function sendCalibrationToServer() {
           depth_scale: cal.depthScale,
           point_y_m: cal.pointY,
           depth_forward_offset_m: cal.depthZ,
-          depth_pitch_down_rad: cal.depthPitch * Math.PI / 180
+          depth_pitch_down_rad: cal.depthPitch * Math.PI / 180,
+          camera_forward_m: cal.depthZ,
+          camera_height_m: cal.pointY,
+          camera_pitch_rad: cal.depthPitch * Math.PI / 180,
+          camera_roll_rad: cal.depthRoll * Math.PI / 180,
+          camera_yaw_rad: cal.depthYaw * Math.PI / 180
         })
       });
       if (res.ok) {
@@ -8363,6 +8393,8 @@ function onCalChange() {
   cal.pointY = parseFloat(pointYEl.value);
   cal.depthZ = parseFloat(depthZEl.value);
   cal.depthPitch = parseInt(depthPitchEl.value, 10);
+  cal.depthRoll = parseInt(depthRollEl.value, 10);
+  cal.depthYaw = parseInt(depthYawEl.value, 10);
   cal.depthFov = parseInt(depthFovEl.value, 10);
   cal.cameraFov = parseInt(cameraFovEl.value, 10);
   cal.cameraY = parseFloat(cameraYEl.value);
@@ -8375,7 +8407,7 @@ function onCalChange() {
   sendCalibrationToServer();
 }
 
-[depthScaleEl, pointYEl, depthZEl, depthPitchEl, depthFovEl, cameraFovEl, cameraYEl, cameraZEl, cameraPitchEl].forEach(el => {
+[depthScaleEl, pointYEl, depthZEl, depthPitchEl, depthRollEl, depthYawEl, depthFovEl, cameraFovEl, cameraYEl, cameraZEl, cameraPitchEl].forEach(el => {
   el.addEventListener('input', onCalChange);
 });
 
