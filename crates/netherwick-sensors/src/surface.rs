@@ -99,6 +99,8 @@ pub struct SurfaceExtractorConfig {
     pub depth_camera_height_m: f32,
     pub depth_camera_forward_offset_m: f32,
     pub depth_camera_pitch_down_rad: f32,
+    pub depth_camera_roll_rad: f32,
+    pub depth_camera_yaw_rad: f32,
     pub voxel_size_m: f32,
     pub temporal_frames: usize,
     pub outlier_radius_m: f32,
@@ -136,6 +138,8 @@ impl Default for SurfaceExtractorConfig {
             depth_camera_height_m: 0.18,
             depth_camera_forward_offset_m: 0.0,
             depth_camera_pitch_down_rad: 0.0,
+            depth_camera_roll_rad: 0.0,
+            depth_camera_yaw_rad: 0.0,
             voxel_size_m: 0.075,
             temporal_frames: 4,
             outlier_radius_m: 0.18,
@@ -403,11 +407,15 @@ impl SurfaceExtractor {
         &mut self,
         height_m: f32,
         forward_offset_m: f32,
-        pitch_down_rad: f32,
+        pitch_rad: f32,
+        roll_rad: f32,
+        yaw_rad: f32,
     ) {
         self.config.depth_camera_height_m = height_m;
         self.config.depth_camera_forward_offset_m = forward_offset_m;
-        self.config.depth_camera_pitch_down_rad = pitch_down_rad;
+        self.config.depth_camera_pitch_down_rad = pitch_rad;
+        self.config.depth_camera_roll_rad = roll_rad;
+        self.config.depth_camera_yaw_rad = yaw_rad;
     }
 
     pub fn process(
@@ -752,15 +760,36 @@ fn robot_to_world(point: Vec3, pose: Pose2) -> Vec3 {
 }
 
 fn camera_to_robot(camera: Vec3, config: &SurfaceExtractorConfig) -> Vec3 {
-    let base_x = camera.z;
-    let base_y = -camera.x;
-    let base_z = -camera.y;
-    let (sin, cos) = config.depth_camera_pitch_down_rad.sin_cos();
+    let base = Vec3::new(camera.z, -camera.x, -camera.y);
+    let rotated = rotate_robot_extrinsic(
+        base,
+        config.depth_camera_pitch_down_rad,
+        config.depth_camera_roll_rad,
+        config.depth_camera_yaw_rad,
+    );
     Vec3::new(
-        base_x * cos - base_z * sin + config.depth_camera_forward_offset_m,
-        base_y,
-        -base_x * sin + base_z * cos + config.depth_camera_height_m,
+        rotated.x + config.depth_camera_forward_offset_m,
+        rotated.y,
+        rotated.z + config.depth_camera_height_m,
     )
+}
+
+fn rotate_robot_extrinsic(point: Vec3, pitch_rad: f32, roll_rad: f32, yaw_rad: f32) -> Vec3 {
+    let (pitch_sin, pitch_cos) = pitch_rad.sin_cos();
+    let mut x = point.x * pitch_cos + point.z * pitch_sin;
+    let y = point.y;
+    let mut z = -point.x * pitch_sin + point.z * pitch_cos;
+
+    let (roll_sin, roll_cos) = roll_rad.sin_cos();
+    let rolled_y = y * roll_cos - z * roll_sin;
+    z = y * roll_sin + z * roll_cos;
+
+    let (yaw_sin, yaw_cos) = yaw_rad.sin_cos();
+    let yawed_x = x * yaw_cos - rolled_y * yaw_sin;
+    let yawed_y = x * yaw_sin + rolled_y * yaw_cos;
+    x = yawed_x;
+
+    Vec3::new(x, yawed_y, z)
 }
 
 fn world_to_robot(point: Vec3, pose: Pose2) -> Vec3 {
