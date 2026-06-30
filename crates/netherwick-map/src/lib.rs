@@ -119,6 +119,8 @@ pub enum YawSource {
     Unavailable,
 }
 
+const MAX_TRUSTED_GRAVITY_TILT_RAD: f32 = std::f32::consts::FRAC_PI_4;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VoxelPoint {
     pub key: VoxelKey,
@@ -1307,11 +1309,19 @@ pub fn orientation_from_imu(imu: &ImuSense, odometry_heading_rad: f32) -> Orient
         2 => (finite(0), finite(1), None),
         _ => (finite(0), finite(1), finite(2)),
     };
+    let roll_pitch_plausible = roll
+        .map(|value| value.abs() <= MAX_TRUSTED_GRAVITY_TILT_RAD)
+        .unwrap_or(true)
+        && pitch
+            .map(|value| value.abs() <= MAX_TRUSTED_GRAVITY_TILT_RAD)
+            .unwrap_or(true);
+    let trusted_roll = roll.filter(|_| roll_pitch_plausible);
+    let trusted_pitch = pitch.filter(|_| roll_pitch_plausible);
     OrientationEstimate {
-        roll_rad: roll,
-        pitch_rad: pitch,
+        roll_rad: trusted_roll,
+        pitch_rad: trusted_pitch,
         yaw_rad: imu_yaw.or(Some(odometry_heading_rad)),
-        roll_pitch_from_imu: roll.is_some() || pitch.is_some(),
+        roll_pitch_from_imu: trusted_roll.is_some() || trusted_pitch.is_some(),
         yaw_source: if imu_yaw.is_some() {
             YawSource::ImuOrientation
         } else {
@@ -2159,6 +2169,23 @@ mod tests {
         assert_eq!(legacy_heading_only.yaw_rad, Some(1.4));
         assert_eq!(legacy_heading_only.yaw_source, YawSource::ImuOrientation);
         assert!(!legacy_heading_only.roll_pitch_from_imu);
+    }
+
+    #[test]
+    fn implausible_gravity_roll_pitch_is_not_applied_to_world_cloud() {
+        let orientation = orientation_from_imu(
+            &ImuSense {
+                orientation: vec![120.0_f32.to_radians(), 62.0_f32.to_radians()],
+                ..ImuSense::default()
+            },
+            0.3,
+        );
+
+        assert_eq!(orientation.roll_rad, None);
+        assert_eq!(orientation.pitch_rad, None);
+        assert_eq!(orientation.yaw_rad, Some(0.3));
+        assert_eq!(orientation.yaw_source, YawSource::OdometryHeading);
+        assert!(!orientation.roll_pitch_from_imu);
     }
 
     #[test]

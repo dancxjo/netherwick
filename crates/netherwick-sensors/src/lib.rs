@@ -1695,6 +1695,8 @@ impl SenseProducer for GpsSenseProvider {
 pub struct ImuSenseProvider {
     #[cfg(feature = "linux-hardware")]
     imu: Mpu6050Imu,
+    #[cfg(feature = "linux-hardware")]
+    flat_orientation_zero: Option<(f32, f32)>,
 }
 
 impl ImuSenseProvider {
@@ -1703,6 +1705,7 @@ impl ImuSenseProvider {
         {
             Ok(Self {
                 imu: Mpu6050Imu::new(device)?,
+                flat_orientation_zero: None,
             })
         }
         #[cfg(not(feature = "linux-hardware"))]
@@ -1718,13 +1721,33 @@ impl SenseProducer for ImuSenseProvider {
     async fn poll(&mut self) -> Result<SensePacket> {
         #[cfg(feature = "linux-hardware")]
         {
-            Ok(SensePacket::Imu(self.imu.read_sense()?))
+            let mut sense = self.imu.read_sense()?;
+            zero_mpu6050_orientation_to_flat(&mut sense, &mut self.flat_orientation_zero);
+            Ok(SensePacket::Imu(sense))
         }
         #[cfg(not(feature = "linux-hardware"))]
         {
             anyhow::bail!("linux-hardware feature is not enabled");
         }
     }
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn zero_mpu6050_orientation_to_flat(
+    sense: &mut ImuSense,
+    flat_orientation_zero: &mut Option<(f32, f32)>,
+) {
+    let Some((&roll, &pitch)) = sense.orientation.first().zip(sense.orientation.get(1)) else {
+        return;
+    };
+    let (zero_roll, zero_pitch) = flat_orientation_zero.get_or_insert((roll, pitch));
+    sense.orientation[0] = normalize_angle_rad(roll - *zero_roll);
+    sense.orientation[1] = normalize_angle_rad(pitch - *zero_pitch);
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn normalize_angle_rad(angle: f32) -> f32 {
+    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 
 #[cfg(test)]
@@ -1850,5 +1873,25 @@ mod tests {
         assert!((imu.angular_velocity[1] - (-1.0_f32).to_radians()).abs() < 0.0001);
         assert!((imu.angular_velocity[2] - 2.0_f32.to_radians()).abs() < 0.0001);
         assert_eq!(imu.orientation, vec![0.0, -0.0]);
+    }
+
+    #[test]
+    fn mpu6050_orientation_is_zeroed_to_first_flat_sample() {
+        let mut zero = None;
+        let mut first = ImuSense {
+            orientation: vec![120.0_f32.to_radians(), 62.0_f32.to_radians()],
+            ..ImuSense::default()
+        };
+        zero_mpu6050_orientation_to_flat(&mut first, &mut zero);
+        assert!(first.orientation[0].abs() < 0.0001);
+        assert!(first.orientation[1].abs() < 0.0001);
+
+        let mut next = ImuSense {
+            orientation: vec![121.0_f32.to_radians(), 60.0_f32.to_radians()],
+            ..ImuSense::default()
+        };
+        zero_mpu6050_orientation_to_flat(&mut next, &mut zero);
+        assert!((next.orientation[0] - 1.0_f32.to_radians()).abs() < 0.0001);
+        assert!((next.orientation[1] - (-2.0_f32).to_radians()).abs() < 0.0001);
     }
 }

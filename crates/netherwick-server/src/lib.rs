@@ -3684,7 +3684,7 @@ fn scene_imu_debug(snapshot: &WorldSnapshot) -> SceneImuDebug {
         yaw_deg: orientation.yaw_rad.map(f32::to_degrees),
         roll_pitch_correction_active: orientation.roll_pitch_from_imu,
         yaw_source: format!("{:?}", orientation.yaw_source),
-        contract_known: false,
+        contract_known: matches!(snapshot.imu.orientation.len(), 2..),
     }
 }
 
@@ -3816,15 +3816,27 @@ pub fn snapshot_to_scene(
             kinect.coordinate_system = Some("world".to_string());
         }
     }
-    let audio = snapshot
+    let audio_bearing = snapshot
         .kinect
         .audio_angle_rad
-        .or_else(|| audio_bearing_from_objects(body.odometry.x_m, body.odometry.y_m, metadata))
+        .or_else(|| audio_bearing_from_objects(body.odometry.x_m, body.odometry.y_m, metadata));
+    let pcm_energy = snapshot.ear_pcm.as_ref().map(pcm_audio_energy);
+    let audio = audio_bearing
         .map(|bearing_rad| SceneAudio {
             bearing_rad: Some(bearing_rad),
-            energy: snapshot.kinect.audio_confidence.clamp(0.0, 1.0),
+            energy: snapshot
+                .kinect
+                .audio_confidence
+                .max(pcm_energy.unwrap_or(0.0))
+                .clamp(0.0, 1.0),
+        })
+        .or_else(|| {
+            pcm_energy.map(|energy| SceneAudio {
+                bearing_rad: None,
+                energy,
+            })
         });
-    if audio.is_none() {
+    if audio_bearing.is_none() {
         warnings.push("no audio bearing stream".to_string());
     }
     let stuck = scene_stuck_from_snapshot(snapshot);
@@ -4925,6 +4937,22 @@ fn audio_bearing_from_objects(
             object.kind == "person" || object.kind == "speaker" || object.kind == "sound_source"
         })
         .map(|object| (object.y_m - robot_y_m).atan2(object.x_m - robot_x_m))
+}
+
+fn pcm_audio_energy(frame: &netherwick_sensors::PcmAudioFrame) -> f32 {
+    if frame.samples.is_empty() {
+        return 0.0;
+    }
+    let mean_square = frame
+        .samples
+        .iter()
+        .map(|sample| {
+            let normalized = *sample as f32 / i16::MAX as f32;
+            normalized * normalized
+        })
+        .sum::<f32>()
+        / frame.samples.len() as f32;
+    mean_square.sqrt().clamp(0.0, 1.0)
 }
 
 fn scene_object_kind(debug_kind: &str) -> String {
@@ -9655,6 +9683,37 @@ mod tests {
         assert_eq!(value["kinect"]["points"].as_array().unwrap().len(), 0);
         assert!(value["audio"].is_null());
         assert!(value["warnings"].as_array().unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn mono_pcm_audio_reports_energy_without_bearing() {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.ear_pcm = Some(netherwick_sensors::PcmAudioFrame {
+            captured_at_ms: 100,
+            sample_rate_hz: 44_100,
+            channels: 1,
+            samples: vec![0, i16::MAX / 2, -(i16::MAX / 2)],
+        });
+        let scene = snapshot_to_scene(
+            &snapshot,
+            None,
+            None,
+            LiveTrainingStatus::default(),
+            NudgeStatus::default(),
+            default_behavior_nodes(),
+            None,
+            None,
+            HardwareControlStatus::unavailable("unit test"),
+        );
+        let value = serde_json::to_value(scene).unwrap();
+
+        assert!(value["audio"]["bearing_rad"].is_null());
+        assert!(value["audio"]["energy"].as_f64().unwrap() > 0.0);
+        assert!(value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning == "no audio bearing stream"));
     }
 
     #[test]

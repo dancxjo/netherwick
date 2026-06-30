@@ -1,0 +1,309 @@
+{
+  "schema_version": 1,
+  "input_source": "live-now:http://127.0.0.1:3000/now",
+  "frame_index": 0,
+  "t_ms": 1782849589646,
+  "sensor_truth": {
+    "ready_for_real_slam": false,
+    "gates": [
+      {
+        "name": "depth_intrinsics_non_fallback",
+        "status": "pass",
+        "detail": "depth frame carries usable width/height and fx/fy intrinsics"
+      },
+      {
+        "name": "below_floor_ratio",
+        "status": "fail",
+        "detail": "below_floor_ratio=0.1667, threshold=0.0200"
+      },
+      {
+        "name": "frame_timestamps_monotonic",
+        "status": "pass",
+        "detail": "frames=1, median_dt_ms=None, max_dt_ms=None"
+      },
+      {
+        "name": "body_timestamp_fresh",
+        "status": "pass",
+        "detail": "body_last_update_age_ms=Some(0), threshold=200"
+      },
+      {
+        "name": "kinect_timestamp_carried",
+        "status": "pass",
+        "detail": "kinect_captured_at_ms_present=true, age_ms=Some(7)"
+      },
+      {
+        "name": "imu_timestamp_carried",
+        "status": "fail",
+        "detail": "imu_captured_at_ms_present=false, age_ms=None"
+      },
+      {
+        "name": "imu_roll_pitch_contract",
+        "status": "fail",
+        "detail": "no orientation vector; roll_pitch_active=false"
+      },
+      {
+        "name": "stationary_rotation_cloud_stability",
+        "status": "not_applicable",
+        "detail": "capture has fewer than two depth frames; heading_delta_deg=0.0, translation_delta_m=0.000, stable_ratio=0.000, stable_z_span_m=None"
+      }
+    ]
+  },
+  "depth_projection": {
+    "width": 640,
+    "height": 480,
+    "vector_len": 307200,
+    "projection_source": "real_intrinsics",
+    "fx": 594.0,
+    "fy": 591.0,
+    "cx": 339.0,
+    "cy": 242.0,
+    "min_depth_m": 0.46400002,
+    "median_depth_m": 1.9360001,
+    "max_depth_m": 2.443,
+    "skipped_depth_count": 81555,
+    "clipped_depth_count": 0,
+    "sample_stride": 19200
+  },
+  "calibration_extrinsics": {
+    "camera_height_m": 0.18,
+    "camera_forward_m": 0.0,
+    "camera_pitch_rad": 0.0,
+    "camera_roll_rad": 0.0,
+    "camera_yaw_rad": 0.0,
+    "rotation_order": "camera -> base [z,-x,-y], then pitch, roll, yaw, then translate",
+    "base_mapping": "Kinect camera +x right, +y down, +z forward -> robot +x forward, +y left, +z up"
+  },
+  "imu_orientation": {
+    "raw_orientation": [],
+    "assumed_units": "radians",
+    "assumed_axis_order": "none",
+    "roll_deg": null,
+    "pitch_deg": null,
+    "yaw_deg": 0.0,
+    "roll_pitch_correction_active": false,
+    "yaw_source": "OdometryHeading",
+    "contract_known": false,
+    "contract_source": "no orientation vector",
+    "note": "no IMU orientation was present in this frame"
+  },
+  "timestamp_diagnostics": {
+    "frame_count": 1,
+    "depth_frame_count": 1,
+    "first_frame_t_ms": 1782849589646,
+    "last_frame_t_ms": 1782849589646,
+    "frame_timestamps_monotonic": true,
+    "median_frame_dt_ms": null,
+    "max_frame_dt_ms": null,
+    "body_last_update_age_ms": 0,
+    "eye_frame_age_ms": 335,
+    "ear_pcm_age_ms": null,
+    "kinect_capture_timestamp_present": true,
+    "kinect_capture_age_ms": 7,
+    "imu_capture_timestamp_present": false,
+    "imu_capture_age_ms": null,
+    "note": "KinectSense and ImuSense carry individual capture timestamps when produced by current sensor providers; old captures may deserialize as 0 and fail these gates"
+  },
+  "stationary_rotation_diagnostics": {
+    "evaluated": false,
+    "reason": "capture has fewer than two depth frames",
+    "frame_count": 1,
+    "heading_delta_deg": 0.0,
+    "translation_delta_m": 0.0,
+    "raw_points_seen": 0,
+    "voxel_count": 0,
+    "stable_voxel_count": 0,
+    "stable_voxel_ratio": 0.0,
+    "stable_z_span_m": null,
+    "stable_z_median_m": null
+  },
+  "coordinate_frame_conventions": [
+    "Kinect camera frame: +x right, +y down, +z forward",
+    "Robot/base math frame: +x forward, +y left, +z up; floor is z=0",
+    "World/odometry math frame: +x odom forward/east, +y odom left/north, +z up",
+    "Scene render frame: Babylon +x world x/left-local, +y up, +z world y; robot forward is local -z",
+    "ScenePoint for calibrated live depth is scene_robot_render: x=robot_y, y=robot_z, z=robot_x"
+  ],
+  "sample_transformed_points": [
+    {
+      "pixel_index": 96000,
+      "u": 0,
+      "v": 150,
+      "depth_m": 0.739,
+      "camera_frame": {
+        "x_m": -0.42175254,
+        "y_m": -0.11503892,
+        "z_m": 0.739
+      },
+      "robot_base_frame": {
+        "x_m": 0.739,
+        "y_m": 0.42175254,
+        "z_m": 0.29503894
+      },
+      "world_frame": {
+        "x_m": 0.739,
+        "y_m": 0.42175254,
+        "z_m": 0.29503894
+      },
+      "render_scene_frame": {
+        "x_m": 0.42175254,
+        "y_m": 0.29503894,
+        "z_m": 0.739
+      }
+    },
+    {
+      "pixel_index": 134400,
+      "u": 0,
+      "v": 210,
+      "depth_m": 0.72800004,
+      "camera_frame": {
+        "x_m": -0.41547477,
+        "y_m": -0.039417937,
+        "z_m": 0.72800004
+      },
+      "robot_base_frame": {
+        "x_m": 0.72800004,
+        "y_m": 0.41547477,
+        "z_m": 0.21941794
+      },
+      "world_frame": {
+        "x_m": 0.72800004,
+        "y_m": 0.41547477,
+        "z_m": 0.21941794
+      },
+      "render_scene_frame": {
+        "x_m": 0.41547477,
+        "y_m": 0.21941794,
+        "z_m": 0.72800004
+      }
+    },
+    {
+      "pixel_index": 153600,
+      "u": 0,
+      "v": 240,
+      "depth_m": 0.73200005,
+      "camera_frame": {
+        "x_m": -0.41775763,
+        "y_m": -0.0024771576,
+        "z_m": 0.73200005
+      },
+      "robot_base_frame": {
+        "x_m": 0.73200005,
+        "y_m": 0.41775763,
+        "z_m": 0.18247716
+      },
+      "world_frame": {
+        "x_m": 0.73200005,
+        "y_m": 0.41775763,
+        "z_m": 0.18247716
+      },
+      "render_scene_frame": {
+        "x_m": 0.41775763,
+        "y_m": 0.18247716,
+        "z_m": 0.73200005
+      }
+    },
+    {
+      "pixel_index": 192000,
+      "u": 0,
+      "v": 300,
+      "depth_m": 0.731,
+      "camera_frame": {
+        "x_m": -0.4171869,
+        "y_m": 0.07173942,
+        "z_m": 0.731
+      },
+      "robot_base_frame": {
+        "x_m": 0.731,
+        "y_m": 0.4171869,
+        "z_m": 0.10826059
+      },
+      "world_frame": {
+        "x_m": 0.731,
+        "y_m": 0.4171869,
+        "z_m": 0.10826059
+      },
+      "render_scene_frame": {
+        "x_m": 0.4171869,
+        "y_m": 0.10826059,
+        "z_m": 0.731
+      }
+    },
+    {
+      "pixel_index": 211200,
+      "u": 0,
+      "v": 330,
+      "depth_m": 0.726,
+      "camera_frame": {
+        "x_m": -0.41433334,
+        "y_m": 0.108101524,
+        "z_m": 0.726
+      },
+      "robot_base_frame": {
+        "x_m": 0.726,
+        "y_m": 0.41433334,
+        "z_m": 0.07189848
+      },
+      "world_frame": {
+        "x_m": 0.726,
+        "y_m": 0.41433334,
+        "z_m": 0.07189848
+      },
+      "render_scene_frame": {
+        "x_m": 0.41433334,
+        "y_m": 0.07189848,
+        "z_m": 0.726
+      }
+    },
+    {
+      "pixel_index": 249600,
+      "u": 0,
+      "v": 390,
+      "depth_m": 0.81500006,
+      "camera_frame": {
+        "x_m": -0.4651263,
+        "y_m": 0.20409477,
+        "z_m": 0.81500006
+      },
+      "robot_base_frame": {
+        "x_m": 0.81500006,
+        "y_m": 0.4651263,
+        "z_m": -0.02409476
+      },
+      "world_frame": {
+        "x_m": 0.81500006,
+        "y_m": 0.4651263,
+        "z_m": -0.02409476
+      },
+      "render_scene_frame": {
+        "x_m": 0.4651263,
+        "y_m": -0.02409476,
+        "z_m": 0.81500006
+      }
+    }
+  ],
+  "floor_statistics": {
+    "sampled_points": 6,
+    "below_floor_count": 1,
+    "below_floor_ratio": 0.16666667,
+    "robot_base_below_floor_count": 1,
+    "robot_base_below_floor_ratio": 0.16666667,
+    "min_robot_base_z_m": -0.02409476,
+    "median_robot_base_z_m": 0.18247716,
+    "max_robot_base_z_m": 0.29503894,
+    "min_math_frame_z_m": -0.02409476,
+    "median_math_frame_z_m": 0.18247716,
+    "max_math_frame_z_m": 0.29503894,
+    "min_render_vertical_axis_m": -0.02409476,
+    "median_render_vertical_axis_m": 0.18247716,
+    "max_render_vertical_axis_m": 0.29503894
+  },
+  "warnings": [
+    "depth coordinate system metadata is Some(\"kinect_depth_image\"); assuming Kinect camera frame",
+    "IMU orientation contract is not sufficient for roll/pitch correction: no IMU orientation was present in this frame"
+  ],
+  "hard_failures": [
+    "below_floor_ratio: below_floor_ratio=0.1667, threshold=0.0200",
+    "imu_timestamp_carried: imu_captured_at_ms_present=false, age_ms=None",
+    "imu_roll_pitch_contract: no orientation vector; roll_pitch_active=false"
+  ]
+}

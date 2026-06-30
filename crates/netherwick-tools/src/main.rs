@@ -4698,7 +4698,21 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             Some(device.as_str())
         };
         match MicrophoneSenseProvider::new(pref_name) {
-            Ok(provider) => sensors.push(Box::new(provider)),
+            Ok(provider) => {
+                let live_state_for_mic = live_state.clone();
+                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                    "microphone",
+                    provider,
+                    Duration::from_millis(25),
+                    move |packet| {
+                        if let Some(live_state) = &live_state_for_mic {
+                            if matches!(packet, SensePacket::EarPcm(_) | SensePacket::Ear(_)) {
+                                publish_live_sensor_only_snapshot(live_state, packet);
+                            }
+                        }
+                    },
+                )));
+            }
             Err(err) => {
                 if args.require_mic {
                     anyhow::bail!("failed to initialize mic: {err}");
@@ -4729,7 +4743,21 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
 
     if let Some(device) = selected_imu_device(args.imu.as_deref(), is_mock_body) {
         match ImuSenseProvider::new(device) {
-            Ok(provider) => sensors.push(Box::new(provider)),
+            Ok(provider) => {
+                let live_state_for_imu = live_state.clone();
+                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                    "imu",
+                    provider,
+                    Duration::from_millis(25),
+                    move |packet| {
+                        if let Some(live_state) = &live_state_for_imu {
+                            if matches!(packet, SensePacket::Imu(_)) {
+                                publish_live_sensor_only_snapshot(live_state, packet);
+                            }
+                        }
+                    },
+                )));
+            }
             Err(err) => {
                 if args.require_imu {
                     anyhow::bail!("failed to initialize imu: {err}");
@@ -7864,6 +7892,11 @@ struct GeometryFloorStatistics {
     sampled_points: usize,
     below_floor_count: usize,
     below_floor_ratio: f32,
+    robot_base_below_floor_count: usize,
+    robot_base_below_floor_ratio: f32,
+    min_robot_base_z_m: Option<f32>,
+    median_robot_base_z_m: Option<f32>,
+    max_robot_base_z_m: Option<f32>,
     min_math_frame_z_m: Option<f32>,
     median_math_frame_z_m: Option<f32>,
     max_math_frame_z_m: Option<f32>,
@@ -7908,8 +7941,9 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
     full_valid_depths.sort_by(|a, b| a.total_cmp(b));
     let mut samples = Vec::new();
     let mut robot_heights = Vec::new();
+    let mut world_heights = Vec::new();
     let mut render_heights = Vec::new();
-    for (index, depth) in kinect.depth_m.iter().enumerate().step_by(sample_stride) {
+    for (index, depth) in kinect.depth_m.iter().enumerate() {
         if !depth.is_finite() || *depth <= 0.0 {
             continue;
         }
@@ -7931,8 +7965,9 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
             z_m: robot.x_m,
         };
         robot_heights.push(robot.z_m);
+        world_heights.push(world.z_m);
         render_heights.push(render.y_m);
-        if samples.len() < args.samples {
+        if samples.len() < args.samples && index % sample_stride == 0 {
             samples.push(GeometryPointSample {
                 pixel_index: index,
                 u,
@@ -7945,11 +7980,17 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
             });
         }
     }
-    let below_floor_count = robot_heights.iter().filter(|z| **z < 0.0).count();
-    let below_floor_ratio = if robot_heights.is_empty() {
+    let robot_base_below_floor_count = robot_heights.iter().filter(|z| **z < 0.0).count();
+    let robot_base_below_floor_ratio = if robot_heights.is_empty() {
         0.0
     } else {
-        below_floor_count as f32 / robot_heights.len() as f32
+        robot_base_below_floor_count as f32 / robot_heights.len() as f32
+    };
+    let below_floor_count = world_heights.iter().filter(|z| **z < 0.0).count();
+    let below_floor_ratio = if world_heights.is_empty() {
+        0.0
+    } else {
+        below_floor_count as f32 / world_heights.len() as f32
     };
     if projection.source_is_fallback {
         warnings.push(
@@ -8029,12 +8070,17 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
         ],
         sample_transformed_points: samples,
         floor_statistics: GeometryFloorStatistics {
-            sampled_points: robot_heights.len(),
+            sampled_points: world_heights.len(),
             below_floor_count,
             below_floor_ratio,
-            min_math_frame_z_m: min_sorted(robot_heights.clone()),
-            median_math_frame_z_m: median_values(robot_heights.clone()),
-            max_math_frame_z_m: max_sorted(robot_heights.clone()),
+            robot_base_below_floor_count,
+            robot_base_below_floor_ratio,
+            min_robot_base_z_m: min_sorted(robot_heights.clone()),
+            median_robot_base_z_m: median_values(robot_heights.clone()),
+            max_robot_base_z_m: max_sorted(robot_heights.clone()),
+            min_math_frame_z_m: min_sorted(world_heights.clone()),
+            median_math_frame_z_m: median_values(world_heights.clone()),
+            max_math_frame_z_m: max_sorted(world_heights.clone()),
             min_render_vertical_axis_m: min_sorted(render_heights.clone()),
             median_render_vertical_axis_m: median_values(render_heights.clone()),
             max_render_vertical_axis_m: max_sorted(render_heights),
