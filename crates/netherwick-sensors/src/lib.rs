@@ -1032,7 +1032,7 @@ impl Mpu6050Imu {
     pub fn read_sense(&mut self) -> Result<ImuSense> {
         let mut bytes = [0u8; 14];
         self.read_registers(MPU6050_ACCEL_XOUT_H, &mut bytes)?;
-        Ok(mpu6050_samples_to_imu(bytes))
+        Ok(mpu6050_samples_to_imu(bytes, unix_time_ms()))
     }
 
     fn write_register(&mut self, register: u8, value: u8) -> Result<()> {
@@ -1113,7 +1113,7 @@ fn parse_i2c_address(value: &str) -> Result<u16> {
 }
 
 #[cfg(any(feature = "linux-hardware", test))]
-fn mpu6050_samples_to_imu(bytes: [u8; 14]) -> ImuSense {
+fn mpu6050_samples_to_imu(bytes: [u8; 14], captured_at_ms: TimeMs) -> ImuSense {
     let accel_x = read_i16_be(bytes[0], bytes[1]) as f32 / 16_384.0;
     let accel_y = read_i16_be(bytes[2], bytes[3]) as f32 / 16_384.0;
     let accel_z = read_i16_be(bytes[4], bytes[5]) as f32 / 16_384.0;
@@ -1126,6 +1126,7 @@ fn mpu6050_samples_to_imu(bytes: [u8; 14]) -> ImuSense {
 
     ImuSense {
         schema_version: 1,
+        captured_at_ms,
         orientation: vec![roll_rad, pitch_rad],
         acceleration: vec![accel_x, accel_y, accel_z],
         angular_velocity: vec![gyro_x, gyro_y, gyro_z],
@@ -1378,6 +1379,7 @@ impl KinectReplayProvider {
         });
         let kinect = KinectSense {
             schema_version: 1,
+            captured_at_ms: frame.t_ms,
             color_features,
             depth_m,
             audio_angle_rad: frame.audio_angle_rad,
@@ -1436,7 +1438,7 @@ impl SenseProducer for FreenectKinectProvider {
         if let Some(packet) = self.pending.pop_front() {
             return Ok(packet);
         }
-        let depth_m = read_freenect_depth_m(self.index)?;
+        let depth = read_freenect_depth_m(self.index)?;
         match read_freenect_rgb_frame(self.index) {
             Ok(rgb_frame) => {
                 self.last_rgb_error = None;
@@ -1454,7 +1456,8 @@ impl SenseProducer for FreenectKinectProvider {
         }
         Ok(SensePacket::Kinect(KinectSense {
             schema_version: 1,
-            depth_m,
+            captured_at_ms: depth.captured_at_ms,
+            depth_m: depth.depth_m,
             depth_width: FREENECT_DEPTH_WIDTH as u32,
             depth_height: FREENECT_DEPTH_HEIGHT as u32,
             depth_fx: KINECT_V1_DEPTH_FX,
@@ -1470,7 +1473,13 @@ impl SenseProducer for FreenectKinectProvider {
 }
 
 #[cfg(feature = "kinect-freenect")]
-fn read_freenect_depth_m(index: i32) -> Result<Vec<f32>> {
+struct FreenectDepthFrame {
+    captured_at_ms: TimeMs,
+    depth_m: Vec<f32>,
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn read_freenect_depth_m(index: i32) -> Result<FreenectDepthFrame> {
     let mut depth_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut timestamp = 0u32;
     let result = unsafe {
@@ -1490,9 +1499,10 @@ fn read_freenect_depth_m(index: i32) -> Result<Vec<f32>> {
     if depth_ptr.is_null() {
         anyhow::bail!("libfreenect returned a null Kinect depth frame for device index {index}");
     }
+    let captured_at_ms = unix_time_ms();
     let depth_mm =
         unsafe { std::slice::from_raw_parts(depth_ptr as *const u16, FREENECT_DEPTH_PIXELS) };
-    Ok(depth_mm
+    let depth_m = depth_mm
         .iter()
         .map(|value| {
             if *value == 0 {
@@ -1501,7 +1511,11 @@ fn read_freenect_depth_m(index: i32) -> Result<Vec<f32>> {
                 (*value as f32 * 0.001).clamp(0.0, 8.0)
             }
         })
-        .collect())
+        .collect();
+    Ok(FreenectDepthFrame {
+        captured_at_ms,
+        depth_m,
+    })
 }
 
 #[cfg(feature = "kinect-freenect")]
@@ -1816,17 +1830,21 @@ mod tests {
 
     #[test]
     fn converts_mpu6050_raw_samples_to_imu_sense() {
-        let imu = mpu6050_samples_to_imu([
-            0x00, 0x00, // accel x = 0 g
-            0x00, 0x00, // accel y = 0 g
-            0x40, 0x00, // accel z = 1 g
-            0x00, 0x00, // temperature, ignored
-            0x00, 0x83, // gyro x = 1 deg/s => rad/s
-            0xff, 0x7d, // gyro y = -1 deg/s => rad/s
-            0x01, 0x06, // gyro z = 2 deg/s => rad/s
-        ]);
+        let imu = mpu6050_samples_to_imu(
+            [
+                0x00, 0x00, // accel x = 0 g
+                0x00, 0x00, // accel y = 0 g
+                0x40, 0x00, // accel z = 1 g
+                0x00, 0x00, // temperature, ignored
+                0x00, 0x83, // gyro x = 1 deg/s => rad/s
+                0xff, 0x7d, // gyro y = -1 deg/s => rad/s
+                0x01, 0x06, // gyro z = 2 deg/s => rad/s
+            ],
+            1234,
+        );
 
         assert_eq!(imu.schema_version, 1);
+        assert_eq!(imu.captured_at_ms, 1234);
         assert_eq!(imu.acceleration, vec![0.0, 0.0, 1.0]);
         assert!((imu.angular_velocity[0] - 1.0_f32.to_radians()).abs() < 0.0001);
         assert!((imu.angular_velocity[1] - (-1.0_f32).to_radians()).abs() < 0.0001);

@@ -19,6 +19,19 @@ cargo run -p netherwick-tools -- geometry-debug \
 
 Read the warnings first. Fallback intrinsics, unknown depth dimensions, or an assumed IMU contract mean the geometry is not trustworthy yet.
 
+The report also includes `sensor_truth.ready_for_real_slam`. Do not start real SLAM integration until it is `true`. The gate list must show:
+
+- `depth_intrinsics_non_fallback`: depth has real dimensions and `fx/fy` values.
+- `below_floor_ratio`: current-frame transformed floor leakage is under the selected threshold.
+- `frame_timestamps_monotonic`: capture frame timestamps are ordered and sane.
+- `body_timestamp_fresh`: odometry/body time is close to the selected depth frame time.
+- `kinect_timestamp_carried`: Kinect depth has its own capture timestamp, not only an enclosing capture-frame timestamp.
+- `imu_timestamp_carried`: IMU has its own capture timestamp, not only an enclosing capture-frame timestamp.
+- `imu_roll_pitch_contract`: IMU shape is recognized as `[roll, pitch]` or `[roll, pitch, yaw]` radians and roll/pitch correction is active.
+- `stationary_rotation_cloud_stability`: a rotate-in-place capture has enough stable voxels with limited vertical spread.
+
+For the stationary rotation gate, use a capture where the robot turns at least 45 degrees while translating less than 0.20 m. A normal driving capture will be marked `not_applicable` for that gate and is not enough to clear SLAM readiness.
+
 ## Calibration Procedure
 
 1. Disable accumulation or visually separate it from current-frame points.
@@ -31,7 +44,8 @@ Read the warnings first. Fallback intrinsics, unknown depth dimensions, or an as
 8. Check yaw by rotating a known forward point into the expected world axis.
 9. Enable IMU roll/pitch correction only after confirming the producer emits radians in `[roll, pitch]` or `[roll, pitch, yaw]` order.
 10. Enable world accumulation. Rotate in place and verify stable voxels stay fixed instead of smearing or sinking.
-11. Trust `LocalWorldBelief` surfaces/blobs only when below-floor ratio is near zero and accumulated voxels remain stable under in-place rotation.
+11. Re-run `geometry-debug` on the rotation capture and require `sensor_truth.ready_for_real_slam = true`.
+12. Trust `LocalWorldBelief` surfaces/blobs only when below-floor ratio is near zero and accumulated voxels remain stable under in-place rotation.
 
 ## Live View Checks
 

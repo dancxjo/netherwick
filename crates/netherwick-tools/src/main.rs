@@ -885,6 +885,18 @@ struct GeometryDebugArgs {
     out: String,
     #[arg(long, default_value_t = 16)]
     samples: usize,
+    #[arg(long, default_value_t = 0.02)]
+    max_below_floor_ratio: f32,
+    #[arg(long, default_value_t = 200)]
+    max_body_timestamp_age_ms: u64,
+    #[arg(long, default_value_t = 45.0)]
+    min_stationary_rotation_deg: f32,
+    #[arg(long, default_value_t = 0.20)]
+    max_stationary_translation_m: f32,
+    #[arg(long, default_value_t = 0.05)]
+    min_stationary_stable_voxel_ratio: f32,
+    #[arg(long, default_value_t = 1.50)]
+    max_stationary_stable_z_span_m: f32,
 }
 
 #[derive(Debug, Parser)]
@@ -5103,6 +5115,7 @@ impl SenseProducer for MockKinectProducer {
     async fn poll(&mut self) -> Result<SensePacket> {
         Ok(SensePacket::Kinect(KinectSense {
             schema_version: 1,
+            captured_at_ms: Utc::now().timestamp_millis().max(0) as u64,
             color_features: vec![vec![0.2, 0.4, 0.6]],
             depth_m: vec![0.8, 1.0, 1.2],
             audio_angle_rad: Some(0.0),
@@ -7646,8 +7659,11 @@ async fn run_geometry_debug(args: GeometryDebugArgs) -> Result<()> {
     }
     fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
     println!(
-        "geometry debug report written to {} (frame={}, below_floor_ratio={:.3})",
-        args.out, report.frame_index, report.floor_statistics.below_floor_ratio
+        "geometry debug report written to {} (frame={}, below_floor_ratio={:.3}, ready_for_real_slam={})",
+        args.out,
+        report.frame_index,
+        report.floor_statistics.below_floor_ratio,
+        report.sensor_truth.ready_for_real_slam
     );
     Ok(())
 }
@@ -7658,9 +7674,12 @@ struct GeometryDebugReport {
     input_source: String,
     frame_index: u64,
     t_ms: u64,
+    sensor_truth: SensorTruthReport,
     depth_projection: GeometryDepthProjection,
     calibration_extrinsics: GeometryExtrinsics,
     imu_orientation: GeometryImuInterpretation,
+    timestamp_diagnostics: GeometryTimestampDiagnostics,
+    stationary_rotation_diagnostics: StationaryRotationDiagnostics,
     coordinate_frame_conventions: Vec<String>,
     sample_transformed_points: Vec<GeometryPointSample>,
     floor_statistics: GeometryFloorStatistics,
@@ -7687,6 +7706,27 @@ struct GeometryDepthProjection {
 }
 
 #[derive(Debug, Serialize)]
+struct SensorTruthReport {
+    ready_for_real_slam: bool,
+    gates: Vec<SensorTruthGate>,
+}
+
+#[derive(Debug, Serialize)]
+struct SensorTruthGate {
+    name: String,
+    status: SensorTruthStatus,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SensorTruthStatus {
+    Pass,
+    Fail,
+    NotApplicable,
+}
+
+#[derive(Debug, Serialize)]
 struct GeometryExtrinsics {
     camera_height_m: f32,
     camera_forward_m: f32,
@@ -7708,7 +7748,42 @@ struct GeometryImuInterpretation {
     roll_pitch_correction_active: bool,
     yaw_source: String,
     contract_known: bool,
+    contract_source: String,
     note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryTimestampDiagnostics {
+    frame_count: usize,
+    depth_frame_count: usize,
+    first_frame_t_ms: Option<u64>,
+    last_frame_t_ms: Option<u64>,
+    frame_timestamps_monotonic: bool,
+    median_frame_dt_ms: Option<u64>,
+    max_frame_dt_ms: Option<u64>,
+    body_last_update_age_ms: Option<u64>,
+    eye_frame_age_ms: Option<u64>,
+    ear_pcm_age_ms: Option<u64>,
+    kinect_capture_timestamp_present: bool,
+    kinect_capture_age_ms: Option<u64>,
+    imu_capture_timestamp_present: bool,
+    imu_capture_age_ms: Option<u64>,
+    note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StationaryRotationDiagnostics {
+    evaluated: bool,
+    reason: String,
+    frame_count: usize,
+    heading_delta_deg: f32,
+    translation_delta_m: f32,
+    raw_points_seen: u64,
+    voxel_count: usize,
+    stable_voxel_count: usize,
+    stable_voxel_ratio: f32,
+    stable_z_span_m: Option<f32>,
+    stable_z_median_m: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7746,11 +7821,14 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
     let snapshot = &record.snapshot;
     let kinect = &snapshot.kinect;
     let mut warnings = Vec::new();
-    let hard_failures = Vec::new();
+    let mut hard_failures = Vec::new();
     let projection = geometry_projection(kinect, &mut warnings);
     let config = PointCloudConfig::default();
     let orientation = netherwick_map::orientation_from_snapshot(snapshot);
+    let imu_interpretation = geometry_imu_interpretation(&snapshot.imu.orientation, orientation);
     let pose = snapshot.body.odometry;
+    let timestamp_diagnostics = geometry_timestamp_diagnostics(&frames, record);
+    let stationary_rotation_diagnostics = stationary_rotation_diagnostics(&frames, args);
     let sample_stride = kinect.depth_m.len().div_ceil(args.samples.max(1)).max(1);
     let min_depth = positive_depth_or(kinect.min_depth_m, config.min_depth_m);
     let max_depth = positive_depth_or(kinect.max_depth_m, config.max_depth_m);
@@ -7828,12 +7906,31 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
             kinect.depth_coordinate_system
         ));
     }
-    warnings.push("IMU orientation contract is assumed from netherwick-now comments, not verified from sensor metadata".to_string());
+    if !imu_interpretation.contract_known {
+        warnings.push(format!(
+            "IMU orientation contract is not sufficient for roll/pitch correction: {}",
+            imu_interpretation.note
+        ));
+    }
+    let sensor_truth = sensor_truth_report(
+        projection.source_is_fallback,
+        &timestamp_diagnostics,
+        &imu_interpretation,
+        below_floor_ratio,
+        &stationary_rotation_diagnostics,
+        args,
+    );
+    for gate in &sensor_truth.gates {
+        if gate.status == SensorTruthStatus::Fail {
+            hard_failures.push(format!("{}: {}", gate.name, gate.detail));
+        }
+    }
     Ok(GeometryDebugReport {
         schema_version: 1,
         input_source: format!("capture:{}", args.capture),
         frame_index: record.index,
         t_ms: record.t_ms,
+        sensor_truth,
         depth_projection: GeometryDepthProjection {
             width: projection.width,
             height: projection.height,
@@ -7859,7 +7956,9 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
             rotation_order: "camera -> base [z,-x,-y], then pitch, roll, yaw, then translate".to_string(),
             base_mapping: "Kinect camera +x right, +y down, +z forward -> robot +x forward, +y left, +z up".to_string(),
         },
-        imu_orientation: geometry_imu_interpretation(&snapshot.imu.orientation, orientation),
+        imu_orientation: imu_interpretation,
+        timestamp_diagnostics,
+        stationary_rotation_diagnostics,
         coordinate_frame_conventions: vec![
             "Kinect camera frame: +x right, +y down, +z forward".to_string(),
             "Robot/base math frame: +x forward, +y left, +z up; floor is z=0".to_string(),
@@ -7934,6 +8033,258 @@ fn geometry_projection(kinect: &KinectSense, warnings: &mut Vec<String>) -> Geom
     }
 }
 
+fn sensor_truth_report(
+    depth_projection_is_fallback: bool,
+    timestamps: &GeometryTimestampDiagnostics,
+    imu: &GeometryImuInterpretation,
+    below_floor_ratio: f32,
+    stationary: &StationaryRotationDiagnostics,
+    args: &GeometryDebugArgs,
+) -> SensorTruthReport {
+    let mut gates = Vec::new();
+    gates.push(SensorTruthGate {
+        name: "depth_intrinsics_non_fallback".to_string(),
+        status: if depth_projection_is_fallback {
+            SensorTruthStatus::Fail
+        } else {
+            SensorTruthStatus::Pass
+        },
+        detail: if depth_projection_is_fallback {
+            "depth projection is using fallback intrinsics/projection".to_string()
+        } else {
+            "depth frame carries usable width/height and fx/fy intrinsics".to_string()
+        },
+    });
+    gates.push(SensorTruthGate {
+        name: "below_floor_ratio".to_string(),
+        status: if below_floor_ratio <= args.max_below_floor_ratio {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "below_floor_ratio={below_floor_ratio:.4}, threshold={:.4}",
+            args.max_below_floor_ratio
+        ),
+    });
+    gates.push(SensorTruthGate {
+        name: "frame_timestamps_monotonic".to_string(),
+        status: if timestamps.frame_timestamps_monotonic {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "frames={}, median_dt_ms={:?}, max_dt_ms={:?}",
+            timestamps.frame_count, timestamps.median_frame_dt_ms, timestamps.max_frame_dt_ms
+        ),
+    });
+    let body_age_ok = timestamps
+        .body_last_update_age_ms
+        .is_some_and(|age| age <= args.max_body_timestamp_age_ms);
+    gates.push(SensorTruthGate {
+        name: "body_timestamp_fresh".to_string(),
+        status: if body_age_ok {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "body_last_update_age_ms={:?}, threshold={}",
+            timestamps.body_last_update_age_ms, args.max_body_timestamp_age_ms
+        ),
+    });
+    gates.push(SensorTruthGate {
+        name: "kinect_timestamp_carried".to_string(),
+        status: if timestamps.kinect_capture_timestamp_present {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "kinect_captured_at_ms_present={}, age_ms={:?}",
+            timestamps.kinect_capture_timestamp_present, timestamps.kinect_capture_age_ms
+        ),
+    });
+    gates.push(SensorTruthGate {
+        name: "imu_timestamp_carried".to_string(),
+        status: if timestamps.imu_capture_timestamp_present {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "imu_captured_at_ms_present={}, age_ms={:?}",
+            timestamps.imu_capture_timestamp_present, timestamps.imu_capture_age_ms
+        ),
+    });
+    let imu_ready = imu.contract_known && imu.roll_pitch_correction_active;
+    gates.push(SensorTruthGate {
+        name: "imu_roll_pitch_contract".to_string(),
+        status: if imu_ready {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "{}; roll_pitch_active={}",
+            imu.contract_source, imu.roll_pitch_correction_active
+        ),
+    });
+    let stationary_status = if !stationary.evaluated {
+        SensorTruthStatus::NotApplicable
+    } else if stationary.stable_voxel_ratio >= args.min_stationary_stable_voxel_ratio
+        && stationary
+            .stable_z_span_m
+            .is_some_and(|span| span <= args.max_stationary_stable_z_span_m)
+    {
+        SensorTruthStatus::Pass
+    } else {
+        SensorTruthStatus::Fail
+    };
+    gates.push(SensorTruthGate {
+        name: "stationary_rotation_cloud_stability".to_string(),
+        status: stationary_status,
+        detail: format!(
+            "{}; heading_delta_deg={:.1}, translation_delta_m={:.3}, stable_ratio={:.3}, stable_z_span_m={:?}",
+            stationary.reason,
+            stationary.heading_delta_deg,
+            stationary.translation_delta_m,
+            stationary.stable_voxel_ratio,
+            stationary.stable_z_span_m
+        ),
+    });
+    let ready_for_real_slam = gates
+        .iter()
+        .all(|gate| gate.status == SensorTruthStatus::Pass);
+    SensorTruthReport {
+        ready_for_real_slam,
+        gates,
+    }
+}
+
+fn geometry_timestamp_diagnostics(
+    frames: &[netherwick_worldlab::CaptureFrameRecord],
+    selected: &netherwick_worldlab::CaptureFrameRecord,
+) -> GeometryTimestampDiagnostics {
+    let mut deltas = frames
+        .windows(2)
+        .map(|pair| pair[1].t_ms.saturating_sub(pair[0].t_ms))
+        .collect::<Vec<_>>();
+    deltas.sort_unstable();
+    let frame_timestamps_monotonic = frames.windows(2).all(|pair| pair[1].t_ms >= pair[0].t_ms);
+    let median_frame_dt_ms = if deltas.is_empty() {
+        None
+    } else {
+        Some(deltas[deltas.len() / 2])
+    };
+    let max_frame_dt_ms = deltas.last().copied();
+    let snapshot = &selected.snapshot;
+    GeometryTimestampDiagnostics {
+        frame_count: frames.len(),
+        depth_frame_count: frames
+            .iter()
+            .filter(|frame| !frame.snapshot.kinect.depth_m.is_empty())
+            .count(),
+        first_frame_t_ms: frames.first().map(|frame| frame.t_ms),
+        last_frame_t_ms: frames.last().map(|frame| frame.t_ms),
+        frame_timestamps_monotonic,
+        median_frame_dt_ms,
+        max_frame_dt_ms,
+        body_last_update_age_ms: Some(selected.t_ms.saturating_sub(snapshot.body.last_update_ms)),
+        eye_frame_age_ms: snapshot
+            .eye_frame
+            .as_ref()
+            .map(|frame| selected.t_ms.saturating_sub(frame.captured_at_ms)),
+        ear_pcm_age_ms: snapshot
+            .ear_pcm
+            .as_ref()
+            .map(|frame| selected.t_ms.saturating_sub(frame.captured_at_ms)),
+        kinect_capture_timestamp_present: snapshot.kinect.captured_at_ms > 0,
+        kinect_capture_age_ms: (snapshot.kinect.captured_at_ms > 0)
+            .then(|| selected.t_ms.saturating_sub(snapshot.kinect.captured_at_ms)),
+        imu_capture_timestamp_present: snapshot.imu.captured_at_ms > 0,
+        imu_capture_age_ms: (snapshot.imu.captured_at_ms > 0)
+            .then(|| selected.t_ms.saturating_sub(snapshot.imu.captured_at_ms)),
+        note: "KinectSense and ImuSense carry individual capture timestamps when produced by current sensor providers; old captures may deserialize as 0 and fail these gates".to_string(),
+    }
+}
+
+fn stationary_rotation_diagnostics(
+    frames: &[netherwick_worldlab::CaptureFrameRecord],
+    args: &GeometryDebugArgs,
+) -> StationaryRotationDiagnostics {
+    let depth_frames = frames
+        .iter()
+        .filter(|frame| !frame.snapshot.kinect.depth_m.is_empty())
+        .collect::<Vec<_>>();
+    if depth_frames.len() < 2 {
+        return StationaryRotationDiagnostics {
+            evaluated: false,
+            reason: "capture has fewer than two depth frames".to_string(),
+            frame_count: depth_frames.len(),
+            heading_delta_deg: 0.0,
+            translation_delta_m: 0.0,
+            raw_points_seen: 0,
+            voxel_count: 0,
+            stable_voxel_count: 0,
+            stable_voxel_ratio: 0.0,
+            stable_z_span_m: None,
+            stable_z_median_m: None,
+        };
+    }
+    let first = depth_frames.first().unwrap();
+    let last = depth_frames.last().unwrap();
+    let first_pose = first.snapshot.body.odometry;
+    let last_pose = last.snapshot.body.odometry;
+    let heading_delta_deg =
+        angle_delta_abs(last_pose.heading_rad, first_pose.heading_rad).to_degrees();
+    let translation_delta_m = ((last_pose.x_m - first_pose.x_m).powi(2)
+        + (last_pose.y_m - first_pose.y_m).powi(2))
+    .sqrt();
+    let stationary_candidate = heading_delta_deg >= args.min_stationary_rotation_deg
+        && translation_delta_m <= args.max_stationary_translation_m;
+    let mut cloud = VoxelPointCloud::default();
+    for frame in &depth_frames {
+        cloud.observe_snapshot(&frame.snapshot, frame.t_ms);
+    }
+    let summary = cloud.summary();
+    let stable_z_values = cloud
+        .points()
+        .into_iter()
+        .filter(|point| point.stable)
+        .map(|point| point.position.z_m)
+        .filter(|z| z.is_finite())
+        .collect::<Vec<_>>();
+    let stable_z_span_m = min_max_values(&stable_z_values).map(|(min, max)| max - min);
+    let stable_z_median_m = median_values(stable_z_values.clone());
+    let stable_voxel_ratio = if summary.voxels == 0 {
+        0.0
+    } else {
+        summary.stable_voxels as f32 / summary.voxels as f32
+    };
+    StationaryRotationDiagnostics {
+        evaluated: stationary_candidate,
+        reason: if stationary_candidate {
+            "capture looks like a stationary rotation test".to_string()
+        } else {
+            format!(
+                "capture is not a stationary rotation test; requires heading_delta>={:.1}deg and translation<={:.2}m",
+                args.min_stationary_rotation_deg, args.max_stationary_translation_m
+            )
+        },
+        frame_count: depth_frames.len(),
+        heading_delta_deg,
+        translation_delta_m,
+        raw_points_seen: summary.raw_points_seen,
+        voxel_count: summary.voxels,
+        stable_voxel_count: summary.stable_voxels,
+        stable_voxel_ratio,
+        stable_z_span_m,
+        stable_z_median_m,
+    }
+}
+
 fn geometry_camera_to_robot(point: Point3D, config: PointCloudConfig) -> Point3D {
     let base = Point3D {
         x_m: point.z_m,
@@ -7978,6 +8329,29 @@ fn geometry_imu_interpretation(
     raw: &[f32],
     orientation: OrientationEstimate,
 ) -> GeometryImuInterpretation {
+    let (contract_known, contract_source, note) = match raw.len() {
+        2 => (
+            true,
+            "recognized MPU-6050 hardware shape: [roll, pitch] radians from gravity".to_string(),
+            "hardware MPU-6050 has roll/pitch but no absolute yaw; yaw should come from odometry"
+                .to_string(),
+        ),
+        3.. => (
+            true,
+            "recognized full orientation shape: [roll, pitch, yaw] radians".to_string(),
+            "full orientation vector supplies roll/pitch/yaw in Netherwick order".to_string(),
+        ),
+        1 => (
+            false,
+            "legacy heading-only shape: [yaw]".to_string(),
+            "legacy one-value orientation has no roll/pitch correction".to_string(),
+        ),
+        _ => (
+            false,
+            "no orientation vector".to_string(),
+            "no IMU orientation was present in this frame".to_string(),
+        ),
+    };
     GeometryImuInterpretation {
         raw_orientation: raw.to_vec(),
         assumed_units: "radians".to_string(),
@@ -7992,8 +8366,9 @@ fn geometry_imu_interpretation(
         yaw_deg: orientation.yaw_rad.map(f32::to_degrees),
         roll_pitch_correction_active: orientation.roll_pitch_from_imu,
         yaw_source: format!("{:?}", orientation.yaw_source),
-        contract_known: false,
-        note: "contract is assumed by code comments; verify hardware producer before trusting roll/pitch correction".to_string(),
+        contract_known,
+        contract_source,
+        note,
     }
 }
 
@@ -8026,6 +8401,29 @@ fn min_sorted(mut values: Vec<f32>) -> Option<f32> {
 fn max_sorted(mut values: Vec<f32>) -> Option<f32> {
     values.sort_by(|a, b| a.total_cmp(b));
     values.last().copied()
+}
+
+fn min_max_values(values: &[f32]) -> Option<(f32, f32)> {
+    let mut iter = values.iter().copied().filter(|value| value.is_finite());
+    let first = iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for value in iter {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    Some((min, max))
+}
+
+fn angle_delta_abs(left: f32, right: f32) -> f32 {
+    let mut delta = left - right;
+    while delta > std::f32::consts::PI {
+        delta -= std::f32::consts::TAU;
+    }
+    while delta < -std::f32::consts::PI {
+        delta += std::f32::consts::TAU;
+    }
+    delta.abs()
 }
 
 async fn run_representation_report(args: RepresentationReportArgs) -> Result<()> {

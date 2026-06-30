@@ -286,6 +286,7 @@ impl VirtualWorld {
         };
         state.snapshot.imu = ImuSense {
             schema_version: 1,
+            captured_at_ms: body.last_update_ms,
             orientation: vec![0.0, 0.0, body.odometry.heading_rad],
             acceleration: vec![body.velocity.forward_m_s, 0.0, 0.0],
             angular_velocity: vec![0.0, 0.0, body.velocity.turn_rad_s],
@@ -932,6 +933,7 @@ fn project_kinect_sense(
         .collect();
     KinectSense {
         schema_version: 1,
+        captured_at_ms: body.last_update_ms,
         color_features,
         depth_m,
         skeletons,

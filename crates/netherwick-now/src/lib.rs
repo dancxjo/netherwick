@@ -499,6 +499,8 @@ pub struct RangeSense {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImuSense {
     pub schema_version: u32,
+    #[serde(default)]
+    pub captured_at_ms: u64,
     /// Orientation uses radians in `[roll, pitch, yaw]` order when all axes are available.
     /// Hardware MPU-6050 samples provide roll/pitch from gravity and no absolute yaw, so they
     /// emit two values. Legacy one-value samples are treated as yaw-only heading.
@@ -726,6 +728,8 @@ pub struct KinectSkeletonSense {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct KinectSense {
     pub schema_version: u32,
+    #[serde(default)]
+    pub captured_at_ms: u64,
     pub color_features: Vec<Vec<f32>>,
     pub depth_m: Vec<f32>,
     #[serde(default)]
