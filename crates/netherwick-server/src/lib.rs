@@ -8745,6 +8745,8 @@ const defaults = {
 
 let cal = { ...defaults };
 let calibrationLoadedFromStorage = false;
+const CALIBRATION_KEY = 'netherwick-sensor-calibration-v2';
+const LEGACY_CALIBRATION_KEY = 'netherwick-sensor-calibration';
 
 const depthScaleEl = document.getElementById('cal-depth-scale');
 const pointYEl = document.getElementById('cal-point-y');
@@ -8773,7 +8775,18 @@ const valCameraZ = document.getElementById('val-camera-z');
 const valCameraPitch = document.getElementById('val-camera-pitch');
 
 function loadCalibration() {
-  const stored = localStorage.getItem('netherwick-sensor-calibration');
+  let stored = localStorage.getItem(CALIBRATION_KEY);
+  if(!stored){
+    const legacy = localStorage.getItem(LEGACY_CALIBRATION_KEY);
+    if(legacy){
+      try{
+        const parsed = JSON.parse(legacy);
+        if(Math.abs((Number(parsed.pointY) || 0) - 0.18) > 0.01){
+          stored = legacy;
+        }
+      }catch(_e){}
+    }
+  }
   if (stored) {
     try {
       cal = { ...defaults, ...JSON.parse(stored) };
@@ -8785,7 +8798,7 @@ function loadCalibration() {
 }
 
 function saveCalibration() {
-  localStorage.setItem('netherwick-sensor-calibration', JSON.stringify(cal));
+  localStorage.setItem(CALIBRATION_KEY, JSON.stringify(cal));
 }
 
 function applyCalibrationToUI() {
