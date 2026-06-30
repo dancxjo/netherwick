@@ -25,8 +25,8 @@ use netherwick_experience::{
     attach_experience_forge_vector, EmbodiedContext, ExperienceForge, ExperienceForgeSnapshot,
 };
 use netherwick_map::{
-    project_beam_endpoint, LocalMap, MapObservation, MapSummary, OccupancyCell as OdomMapCell,
-    PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
+    project_beam_endpoint, LocalMap, LocalWorldBelief, MapObservation, MapSummary,
+    OccupancyCell as OdomMapCell, PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
 use netherwick_memory::{
     EntityConstellationState, EntityLifecycleState, EntityMemory, EntityMemoryReport,
@@ -1098,6 +1098,8 @@ pub struct SceneKinect {
     pub accumulated_points: Vec<SceneAccumulatedPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accumulated_summary: Option<PointCloudSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_world_belief: Option<LocalWorldBelief>,
     pub skeletons: Vec<KinectSkeletonSense>,
     pub diagnostics: SceneKinectDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3685,6 +3687,7 @@ pub fn snapshot_to_scene(
         kinect.accumulated_points =
             accumulated_scene_points(point_cloud, snapshot.body.last_update_ms);
         kinect.accumulated_summary = Some(point_cloud.summary());
+        kinect.local_world_belief = Some(point_cloud.local_world_belief());
         if !kinect.accumulated_points.is_empty() {
             kinect.coordinate_system = Some("world".to_string());
         }
@@ -4294,6 +4297,7 @@ fn scene_kinect_from_snapshot(
         points,
         accumulated_points: Vec::new(),
         accumulated_summary: None,
+        local_world_belief: None,
         skeletons: snapshot.kinect.skeletons.clone(),
         coordinate_system: Some(diagnostics.coordinate_system.clone()),
         diagnostics,
@@ -6389,12 +6393,41 @@ function createClusterBox(cluster){
   const motion = cluster.moving ? ' moving' : '';
   createLabel(`${hint}${motion} ${fmt(cluster.confidence || 0, 2)}`, centroid.add(new BABYLON.Vector3(0, Math.max(size.z, .18) + .14, 0)), mat.diffuseColor);
 }
+function createBeliefBox(item, kind){
+  const size = v3(item.size_m);
+  const centroid = surfacePoint(item.centroid);
+  const mesh = BABYLON.MeshBuilder.CreateBox(`belief_${item.id || kind}`, {
+    width: Math.max(size.x, .06),
+    height: Math.max(size.z, .06),
+    depth: Math.max(size.y, .06)
+  }, scene);
+  const mat = new BABYLON.StandardMaterial(`beliefMat_${item.id || kind}`, scene);
+  const isSurface = kind === 'surface';
+  const color = isSurface ? new BABYLON.Color3(0.49, 0.90, 0.68) : new BABYLON.Color3(0.39, 0.78, 1.0);
+  mat.diffuseColor = color;
+  mat.emissiveColor = color.scale(.42);
+  mat.alpha = isSurface ? .26 : .18;
+  mat.wireframe = true;
+  mesh.material = mat;
+  mesh.position.copyFrom(centroid);
+  mesh.parent = surfaceOverlays;
+  const label = isSurface ? (item.kind || 'stable_surface') : 'stable_blob';
+  createLabel(`${label} ${fmt(item.confidence || 0, 2)}`, centroid.add(new BABYLON.Vector3(0, Math.max(size.z, .16) + .22, 0)), color);
+}
+function renderPersistentWorldBelief(packet, layers){
+  if(!layers.has('stable wall candidates')) return;
+  const belief = packet.kinect?.local_world_belief;
+  if(!belief) return;
+  for(const surface of belief.stable_surfaces || []) createBeliefBox(surface, 'surface');
+  for(const blob of belief.stable_blobs || []) createBeliefBox(blob, 'blob');
+}
 function renderSurfacePerception(packet){
   clearChildren(surfaceOverlays);
   const perception = packet.surface_perception;
-  if(!perception) return;
   const layers = enabledMapLayers();
   const showStableSurfaces = layers.has('stable wall candidates');
+  renderPersistentWorldBelief(packet, layers);
+  if(!perception) return;
   if(showStableSurfaces){
     for(const surface of perception.stable_surfaces || []){
       createPlanePatch(surface);
@@ -6706,10 +6739,14 @@ function updateScene(packet, liveMap=null){
     const nav = surface.scene_graph?.navigation || {};
     const movingClusters = (surface.clusters || []).filter(cluster => cluster.moving).length;
     const hint = surface.diagnostics?.calibration_hint;
+    const belief = packet.kinect?.local_world_belief;
+    const orient = belief?.orientation_status;
+    const beliefText = belief ? ` | belief ${belief.stable_surfaces?.length || 0}s/${belief.stable_blobs?.length || 0}b ${orient?.roll_pitch_corrected ? 'imu rp' : 'odom planar'}` : '';
     const calText = hint ? ` | floor z ${fmt(hint.floor_height_error_m, 2)}m tilt ${fmt(hint.floor_tilt_rad * 180 / Math.PI, 1)}°` : '';
-    fields.surfaces.textContent = `${surface.stable_surfaces?.length || 0} stable / ${surface.plane_observations?.length || 0} planes / ${surface.clusters?.length || 0} clusters (${movingClusters} moving) | front ${nav.front_clear_m == null ? '-' : fmt(nav.front_clear_m)}m${calText}`;
+    fields.surfaces.textContent = `${surface.stable_surfaces?.length || 0} stable / ${surface.plane_observations?.length || 0} planes / ${surface.clusters?.length || 0} clusters (${movingClusters} moving) | front ${nav.front_clear_m == null ? '-' : fmt(nav.front_clear_m)}m${calText}${beliefText}`;
   }else{
-    fields.surfaces.textContent = '-';
+    const belief = packet.kinect?.local_world_belief;
+    fields.surfaces.textContent = belief ? `belief ${belief.stable_surfaces?.length || 0} surfaces / ${belief.stable_blobs?.length || 0} blobs | ${belief.orientation_status?.note || '-'}` : '-';
   }
   fields.audio.textContent = packet.audio?.heading_rad == null && packet.audio?.bearing_rad == null ? '-' : `${fmt(packet.audio?.bearing_rad ?? packet.audio?.heading_rad)} rad`;
   fields.mind.textContent = packet.mind?.combobulation || packet.warnings?.[0] || '-';
@@ -8191,7 +8228,8 @@ mod tests {
     use super::*;
     use netherwick_core::Pose2;
     use netherwick_map::{
-        Point3D, PointCloudFrame, PointCloudObservation, PointCloudPoint, PoseEstimate,
+        OrientationEstimate, Point3D, PointCloudFrame, PointCloudObservation, PointCloudPoint,
+        PoseEstimate, YawSource,
     };
     use std::sync::{Arc, Mutex};
 
@@ -9102,6 +9140,13 @@ mod tests {
                     source: "unit-test".to_string(),
                     t_ms,
                 },
+                orientation: OrientationEstimate {
+                    roll_rad: Some(0.01),
+                    pitch_rad: Some(-0.02),
+                    yaw_rad: Some(0.0),
+                    roll_pitch_from_imu: true,
+                    yaw_source: YawSource::OdometryHeading,
+                },
                 points: vec![PointCloudPoint {
                     position: Point3D {
                         x_m: 1.0,
@@ -9149,6 +9194,9 @@ mod tests {
         );
         assert_eq!(scene.kinect.accumulated_points.len(), 1);
         assert!(scene.kinect.accumulated_points[0].stable);
+        let belief = scene.kinect.local_world_belief.as_ref().unwrap();
+        assert_eq!(belief.stable_voxels, 1);
+        assert!(belief.orientation_status.roll_pitch_corrected);
         assert_eq!(scene.kinect.coordinate_system.as_deref(), Some("world"));
     }
 
@@ -9325,6 +9373,9 @@ mod tests {
         assert!(page.contains("data-map-layer=\"accumulated occupancy\""));
         assert!(page.contains("data-map-layer=\"stable wall candidates\""));
         assert!(page.contains("function renderWorldBeliefPoints"));
+        assert!(page.contains("function renderPersistentWorldBelief"));
+        assert!(page.contains("local_world_belief"));
+        assert!(page.contains("roll_pitch_corrected"));
         assert!(
             page.contains("SLAM-lite / odometry map: odometry/range trace, not corrected SLAM.")
         );

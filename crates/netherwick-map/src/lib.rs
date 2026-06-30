@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use netherwick_core::{Pose2, TimeMs};
-use netherwick_now::{KinectSense, Now};
+use netherwick_now::{ImuSense, KinectSense, Now};
 use netherwick_sensors::WorldSnapshot;
 use serde::{Deserialize, Serialize};
 
@@ -93,10 +93,30 @@ pub struct PointCloudPoint {
 pub struct PointCloudObservation {
     pub frame: PointCloudFrame,
     pub pose: PoseEstimate,
+    #[serde(default)]
+    pub orientation: OrientationEstimate,
     pub points: Vec<PointCloudPoint>,
     pub source: String,
     pub t_ms: TimeMs,
     pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrientationEstimate {
+    pub roll_rad: Option<f32>,
+    pub pitch_rad: Option<f32>,
+    pub yaw_rad: Option<f32>,
+    pub roll_pitch_from_imu: bool,
+    pub yaw_source: YawSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YawSource {
+    #[default]
+    OdometryHeading,
+    ImuOrientation,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -118,6 +138,7 @@ pub struct VoxelPointCloud {
     pub config: PointCloudConfig,
     pub observations: u64,
     pub raw_points_seen: u64,
+    pub orientation_status: OrientationStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -147,6 +168,68 @@ pub struct PointCloudSummary {
     pub observations: u64,
     pub raw_points_seen: u64,
     pub latest_t_ms: Option<TimeMs>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocalWorldBelief {
+    pub label: &'static str,
+    pub orientation_status: OrientationStatus,
+    pub stable_surfaces: Vec<WorldSurfaceHypothesis>,
+    pub stable_blobs: Vec<WorldBlobHypothesis>,
+    pub stable_voxels: usize,
+    pub transient_voxels: usize,
+    pub observations: u64,
+    pub latest_t_ms: Option<TimeMs>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OrientationStatus {
+    pub roll_pitch_corrected: bool,
+    pub yaw_source: YawSource,
+    pub note: String,
+}
+
+impl Default for OrientationStatus {
+    fn default() -> Self {
+        Self {
+            roll_pitch_corrected: false,
+            yaw_source: YawSource::Unavailable,
+            note: "no point-cloud observation has supplied orientation yet".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorldSurfaceHypothesis {
+    pub id: String,
+    pub kind: WorldSurfaceKind,
+    pub centroid: Point3D,
+    pub normal: Point3D,
+    pub size_m: Point3D,
+    pub voxel_count: usize,
+    pub confidence: f32,
+    pub first_seen_ms: TimeMs,
+    pub last_seen_ms: TimeMs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldSurfaceKind {
+    FloorLike,
+    WallLike,
+    HorizontalSurface,
+    UnknownSurface,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorldBlobHypothesis {
+    pub id: String,
+    pub centroid: Point3D,
+    pub size_m: Point3D,
+    pub voxel_count: usize,
+    pub confidence: f32,
+    pub first_seen_ms: TimeMs,
+    pub last_seen_ms: TimeMs,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -378,6 +461,7 @@ impl VoxelPointCloud {
             config,
             observations: 0,
             raw_points_seen: 0,
+            orientation_status: OrientationStatus::default(),
         }
     }
 
@@ -397,6 +481,7 @@ impl VoxelPointCloud {
 
     pub fn integrate_observation(&mut self, observation: PointCloudObservation) {
         self.observations = self.observations.saturating_add(1);
+        self.orientation_status = orientation_status(observation.orientation);
         self.raw_points_seen = self
             .raw_points_seen
             .saturating_add(observation.points.len() as u64);
@@ -412,6 +497,7 @@ impl VoxelPointCloud {
                 point.position,
                 observation.frame,
                 observation.pose.pose,
+                observation.orientation,
                 self.config,
             );
             self.bump_voxel(world, point.color_rgb, point.confidence, observation.t_ms);
@@ -450,6 +536,10 @@ impl VoxelPointCloud {
             raw_points_seen: self.raw_points_seen,
             latest_t_ms,
         }
+    }
+
+    pub fn local_world_belief(&self) -> LocalWorldBelief {
+        local_world_belief_from_voxels(self)
     }
 
     fn bump_voxel(
@@ -1079,6 +1169,7 @@ pub fn pointcloud_observation_from_snapshot(
     pointcloud_observation_from_kinect(
         &snapshot.kinect,
         snapshot.body.odometry,
+        orientation_from_snapshot(snapshot),
         odometry_confidence_from_motion(
             snapshot.body.velocity.forward_m_s,
             snapshot.body.velocity.turn_rad_s,
@@ -1091,6 +1182,7 @@ pub fn pointcloud_observation_from_snapshot(
 pub fn pointcloud_observation_from_kinect(
     kinect: &KinectSense,
     pose: Pose2,
+    orientation: OrientationEstimate,
     pose_confidence: f32,
     t_ms: TimeMs,
     config: PointCloudConfig,
@@ -1142,6 +1234,7 @@ pub fn pointcloud_observation_from_kinect(
             source: "odometry".to_string(),
             t_ms,
         },
+        orientation,
         points,
         source: "kinect_depth".to_string(),
         t_ms,
@@ -1153,6 +1246,7 @@ pub fn pointcloud_observation_from_kinect(
             "depth_cx": projection.cx,
             "depth_cy": projection.cy,
             "coordinate_frame": projection.frame,
+            "orientation": orientation,
             "sample_stride": stride,
             "min_depth_m": min_depth_m,
             "max_depth_m": max_depth_m,
@@ -1166,23 +1260,316 @@ pub fn transform_point_to_world(
     point: Point3D,
     frame: PointCloudFrame,
     pose: Pose2,
+    orientation: OrientationEstimate,
     config: PointCloudConfig,
 ) -> Point3D {
     let robot = match frame {
         PointCloudFrame::OdometryWorld => return point,
         PointCloudFrame::RobotBase => point,
-        PointCloudFrame::KinectCamera | PointCloudFrame::DepthImageUnknown => Point3D {
-            x_m: config.camera_forward_m + point.z_m,
-            y_m: -point.x_m,
-            z_m: config.camera_height_m - point.y_m,
-        },
+        PointCloudFrame::KinectCamera | PointCloudFrame::DepthImageUnknown => {
+            camera_point_to_robot(point, config)
+        }
     };
-    let sin = pose.heading_rad.sin();
-    let cos = pose.heading_rad.cos();
+    let robot = apply_roll_pitch(robot, orientation);
+    let yaw = orientation.yaw_rad.unwrap_or(pose.heading_rad);
+    let sin = yaw.sin();
+    let cos = yaw.cos();
     Point3D {
         x_m: pose.x_m + robot.x_m * cos - robot.y_m * sin,
         y_m: pose.y_m + robot.x_m * sin + robot.y_m * cos,
         z_m: robot.z_m,
+    }
+}
+
+pub fn orientation_from_snapshot(snapshot: &WorldSnapshot) -> OrientationEstimate {
+    orientation_from_imu(&snapshot.imu, snapshot.body.odometry.heading_rad)
+}
+
+pub fn orientation_from_imu(imu: &ImuSense, odometry_heading_rad: f32) -> OrientationEstimate {
+    let roll = imu
+        .orientation
+        .first()
+        .copied()
+        .filter(|value| value.is_finite());
+    let pitch = imu
+        .orientation
+        .get(1)
+        .copied()
+        .filter(|value| value.is_finite());
+    let imu_yaw = imu
+        .orientation
+        .get(2)
+        .copied()
+        .filter(|value| value.is_finite());
+    OrientationEstimate {
+        roll_rad: roll,
+        pitch_rad: pitch,
+        yaw_rad: imu_yaw.or(Some(odometry_heading_rad)),
+        roll_pitch_from_imu: roll.is_some() || pitch.is_some(),
+        yaw_source: if imu_yaw.is_some() {
+            YawSource::ImuOrientation
+        } else {
+            YawSource::OdometryHeading
+        },
+    }
+}
+
+fn camera_point_to_robot(point: Point3D, config: PointCloudConfig) -> Point3D {
+    Point3D {
+        x_m: config.camera_forward_m + point.z_m,
+        y_m: -point.x_m,
+        z_m: config.camera_height_m - point.y_m,
+    }
+}
+
+fn apply_roll_pitch(point: Point3D, orientation: OrientationEstimate) -> Point3D {
+    let mut rotated = point;
+    if let Some(roll) = orientation.roll_rad {
+        let (sin, cos) = roll.sin_cos();
+        rotated = Point3D {
+            x_m: rotated.x_m,
+            y_m: rotated.y_m * cos - rotated.z_m * sin,
+            z_m: rotated.y_m * sin + rotated.z_m * cos,
+        };
+    }
+    if let Some(pitch) = orientation.pitch_rad {
+        let (sin, cos) = pitch.sin_cos();
+        rotated = Point3D {
+            x_m: rotated.x_m * cos + rotated.z_m * sin,
+            y_m: rotated.y_m,
+            z_m: -rotated.x_m * sin + rotated.z_m * cos,
+        };
+    }
+    rotated
+}
+
+fn orientation_status(orientation: OrientationEstimate) -> OrientationStatus {
+    let roll_pitch_corrected = orientation.roll_pitch_from_imu;
+    let note = match (roll_pitch_corrected, orientation.yaw_source) {
+        (true, YawSource::ImuOrientation) => {
+            "depth cloud uses IMU roll/pitch and IMU yaw before world accumulation"
+        }
+        (true, YawSource::OdometryHeading) => {
+            "depth cloud uses IMU roll/pitch; yaw remains odometry heading because no IMU yaw is available"
+        }
+        (false, YawSource::ImuOrientation) => {
+            "depth cloud uses IMU yaw, but no IMU roll/pitch was available"
+        }
+        (false, YawSource::OdometryHeading) => {
+            "depth cloud is planar odometry-frame only; no IMU roll/pitch is available"
+        }
+        (_, YawSource::Unavailable) => "depth cloud orientation is unavailable",
+    };
+    OrientationStatus {
+        roll_pitch_corrected,
+        yaw_source: orientation.yaw_source,
+        note: note.to_string(),
+    }
+}
+
+fn local_world_belief_from_voxels(cloud: &VoxelPointCloud) -> LocalWorldBelief {
+    let components = stable_components(cloud);
+    let mut stable_surfaces = Vec::new();
+    let mut stable_blobs = Vec::new();
+
+    for (index, component) in components.iter().enumerate() {
+        let stats = component_stats(component);
+        if component.len() >= 4 {
+            if let Some(kind) = surface_kind_from_extent(stats.size_m) {
+                stable_surfaces.push(WorldSurfaceHypothesis {
+                    id: format!("surface_{}", index + 1),
+                    kind,
+                    centroid: stats.centroid,
+                    normal: normal_for_surface(kind, stats.size_m),
+                    size_m: stats.size_m,
+                    voxel_count: component.len(),
+                    confidence: stats.confidence,
+                    first_seen_ms: stats.first_seen_ms,
+                    last_seen_ms: stats.last_seen_ms,
+                });
+                continue;
+            }
+        }
+
+        stable_blobs.push(WorldBlobHypothesis {
+            id: format!("blob_{}", index + 1),
+            centroid: stats.centroid,
+            size_m: stats.size_m,
+            voxel_count: component.len(),
+            confidence: stats.confidence,
+            first_seen_ms: stats.first_seen_ms,
+            last_seen_ms: stats.last_seen_ms,
+        });
+    }
+
+    let summary = cloud.summary();
+    LocalWorldBelief {
+        label: "persistent local world belief from accumulated stable voxels, not full SLAM",
+        orientation_status: cloud.orientation_status.clone(),
+        stable_surfaces,
+        stable_blobs,
+        stable_voxels: summary.stable_voxels,
+        transient_voxels: summary.transient_voxels,
+        observations: summary.observations,
+        latest_t_ms: summary.latest_t_ms,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ComponentStats {
+    centroid: Point3D,
+    size_m: Point3D,
+    confidence: f32,
+    first_seen_ms: TimeMs,
+    last_seen_ms: TimeMs,
+}
+
+fn stable_components(cloud: &VoxelPointCloud) -> Vec<Vec<VoxelPoint>> {
+    let stable = cloud
+        .voxels
+        .iter()
+        .filter(|(_, voxel)| voxel.stable)
+        .map(|(key, voxel)| (*key, voxel.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining = stable.keys().copied().collect::<Vec<_>>();
+    let mut components = Vec::new();
+
+    while let Some(seed) = remaining.pop() {
+        if !stable.contains_key(&seed) {
+            continue;
+        }
+        let mut stack = vec![seed];
+        let mut component = Vec::new();
+        while let Some(key) = stack.pop() {
+            let Some(voxel) = stable.get(&key) else {
+                continue;
+            };
+            if component
+                .iter()
+                .any(|existing: &VoxelPoint| existing.key == key)
+            {
+                continue;
+            }
+            component.push(voxel.clone());
+            remaining.retain(|candidate| *candidate != key);
+            for neighbor in voxel_neighbors(key) {
+                if stable.contains_key(&neighbor)
+                    && !component
+                        .iter()
+                        .any(|existing: &VoxelPoint| existing.key == neighbor)
+                {
+                    stack.push(neighbor);
+                }
+            }
+        }
+        if !component.is_empty() {
+            components.push(component);
+        }
+    }
+
+    components
+}
+
+fn voxel_neighbors(key: VoxelKey) -> impl Iterator<Item = VoxelKey> {
+    (-1..=1).flat_map(move |dx| {
+        (-1..=1).flat_map(move |dy| {
+            (-1..=1).filter_map(move |dz| {
+                (dx != 0 || dy != 0 || dz != 0).then_some(VoxelKey {
+                    x: key.x + dx,
+                    y: key.y + dy,
+                    z: key.z + dz,
+                })
+            })
+        })
+    })
+}
+
+fn component_stats(component: &[VoxelPoint]) -> ComponentStats {
+    let mut min = Point3D {
+        x_m: f32::INFINITY,
+        y_m: f32::INFINITY,
+        z_m: f32::INFINITY,
+    };
+    let mut max = Point3D {
+        x_m: f32::NEG_INFINITY,
+        y_m: f32::NEG_INFINITY,
+        z_m: f32::NEG_INFINITY,
+    };
+    let mut sum = Point3D::default();
+    let mut confidence_sum = 0.0;
+    let mut first_seen_ms = TimeMs::MAX;
+    let mut last_seen_ms = 0;
+    for voxel in component {
+        min.x_m = min.x_m.min(voxel.position.x_m);
+        min.y_m = min.y_m.min(voxel.position.y_m);
+        min.z_m = min.z_m.min(voxel.position.z_m);
+        max.x_m = max.x_m.max(voxel.position.x_m);
+        max.y_m = max.y_m.max(voxel.position.y_m);
+        max.z_m = max.z_m.max(voxel.position.z_m);
+        sum.x_m += voxel.position.x_m;
+        sum.y_m += voxel.position.y_m;
+        sum.z_m += voxel.position.z_m;
+        confidence_sum += voxel.confidence;
+        first_seen_ms = first_seen_ms.min(voxel.first_seen_ms);
+        last_seen_ms = last_seen_ms.max(voxel.last_seen_ms);
+    }
+    let count = component.len().max(1) as f32;
+    ComponentStats {
+        centroid: Point3D {
+            x_m: sum.x_m / count,
+            y_m: sum.y_m / count,
+            z_m: sum.z_m / count,
+        },
+        size_m: Point3D {
+            x_m: max.x_m - min.x_m,
+            y_m: max.y_m - min.y_m,
+            z_m: max.z_m - min.z_m,
+        },
+        confidence: (confidence_sum / count).clamp(0.0, 1.0),
+        first_seen_ms,
+        last_seen_ms,
+    }
+}
+
+fn surface_kind_from_extent(size: Point3D) -> Option<WorldSurfaceKind> {
+    let thickness = size.x_m.min(size.y_m).min(size.z_m);
+    let span = size.x_m.max(size.y_m).max(size.z_m);
+    if span < 0.15 || thickness > 0.16 {
+        return None;
+    }
+    if size.z_m <= 0.12 && size.x_m.max(size.y_m) >= 0.25 {
+        Some(WorldSurfaceKind::FloorLike)
+    } else if size.x_m.min(size.y_m) <= 0.12 && size.z_m >= 0.20 {
+        Some(WorldSurfaceKind::WallLike)
+    } else if size.z_m <= 0.16 {
+        Some(WorldSurfaceKind::HorizontalSurface)
+    } else {
+        Some(WorldSurfaceKind::UnknownSurface)
+    }
+}
+
+fn normal_for_surface(kind: WorldSurfaceKind, size: Point3D) -> Point3D {
+    match kind {
+        WorldSurfaceKind::FloorLike | WorldSurfaceKind::HorizontalSurface => Point3D {
+            x_m: 0.0,
+            y_m: 0.0,
+            z_m: 1.0,
+        },
+        WorldSurfaceKind::WallLike if size.x_m <= size.y_m => Point3D {
+            x_m: 1.0,
+            y_m: 0.0,
+            z_m: 0.0,
+        },
+        WorldSurfaceKind::WallLike => Point3D {
+            x_m: 0.0,
+            y_m: 1.0,
+            z_m: 0.0,
+        },
+        WorldSurfaceKind::UnknownSurface => Point3D {
+            x_m: 0.0,
+            y_m: 0.0,
+            z_m: 0.0,
+        },
     }
 }
 
@@ -1509,6 +1896,11 @@ mod tests {
             point,
             PointCloudFrame::KinectCamera,
             pose(1.0, 2.0, std::f32::consts::FRAC_PI_2),
+            OrientationEstimate {
+                yaw_rad: Some(std::f32::consts::FRAC_PI_2),
+                yaw_source: YawSource::OdometryHeading,
+                ..OrientationEstimate::default()
+            },
             config,
         );
         assert!((world.x_m - 1.0).abs() < 0.001);
@@ -1534,6 +1926,112 @@ mod tests {
         assert!(voxel.stable);
         assert_eq!(voxel.seen_count, 2);
         assert!(voxel.confidence > 0.2);
+    }
+
+    #[test]
+    fn stationary_rotate_world_frame_observations_merge_into_stable_belief() {
+        let mut cloud = VoxelPointCloud::new(PointCloudConfig {
+            voxel_size_m: 0.25,
+            stable_seen_count: 3,
+            stable_confidence: 0.2,
+            ..PointCloudConfig::default()
+        });
+
+        for (t_ms, heading_rad) in [
+            (100, 0.0),
+            (200, std::f32::consts::FRAC_PI_2),
+            (300, std::f32::consts::PI),
+        ] {
+            cloud.integrate_observation(PointCloudObservation {
+                frame: PointCloudFrame::OdometryWorld,
+                pose: PoseEstimate {
+                    pose: pose(0.0, 0.0, heading_rad),
+                    confidence: 0.9,
+                    covariance: [0.01, 0.01, 0.02],
+                    source: "rotate-test".to_string(),
+                    t_ms,
+                },
+                orientation: OrientationEstimate {
+                    roll_rad: Some(0.02),
+                    pitch_rad: Some(-0.01),
+                    yaw_rad: Some(heading_rad),
+                    roll_pitch_from_imu: true,
+                    yaw_source: YawSource::OdometryHeading,
+                },
+                points: vec![PointCloudPoint {
+                    position: Point3D {
+                        x_m: 1.0,
+                        y_m: 0.0,
+                        z_m: 0.4,
+                    },
+                    color_rgb: None,
+                    confidence: 1.0,
+                }],
+                source: "rotate-test".to_string(),
+                t_ms,
+                metadata: serde_json::json!({}),
+            });
+        }
+
+        assert_eq!(cloud.voxels.len(), 1);
+        let voxel = cloud.voxels.values().next().unwrap();
+        assert!(voxel.stable);
+        assert!((voxel.position.x_m - 1.0).abs() < 0.001);
+        assert!((voxel.position.y_m - 0.0).abs() < 0.001);
+        assert_eq!(
+            cloud.orientation_status.yaw_source,
+            YawSource::OdometryHeading
+        );
+        assert!(cloud.orientation_status.roll_pitch_corrected);
+    }
+
+    #[test]
+    fn local_world_belief_clusters_stable_voxels_into_surface_hypotheses() {
+        let mut cloud = VoxelPointCloud::new(PointCloudConfig {
+            voxel_size_m: 0.1,
+            stable_seen_count: 1,
+            stable_confidence: 0.1,
+            ..PointCloudConfig::default()
+        });
+        for y in [0.0, 0.1, 0.2, 0.3] {
+            for z in [0.1, 0.2, 0.3, 0.4] {
+                cloud.integrate_observation(PointCloudObservation {
+                    frame: PointCloudFrame::OdometryWorld,
+                    pose: PoseEstimate {
+                        pose: pose(0.0, 0.0, 0.0),
+                        confidence: 0.9,
+                        covariance: [0.01, 0.01, 0.02],
+                        source: "surface-test".to_string(),
+                        t_ms: 100,
+                    },
+                    orientation: OrientationEstimate {
+                        yaw_rad: Some(0.0),
+                        yaw_source: YawSource::OdometryHeading,
+                        ..OrientationEstimate::default()
+                    },
+                    points: vec![PointCloudPoint {
+                        position: Point3D {
+                            x_m: 1.0,
+                            y_m: y,
+                            z_m: z,
+                        },
+                        color_rgb: None,
+                        confidence: 1.0,
+                    }],
+                    source: "surface-test".to_string(),
+                    t_ms: 100,
+                    metadata: serde_json::json!({}),
+                });
+            }
+        }
+
+        let belief = cloud.local_world_belief();
+        assert_eq!(belief.stable_voxels, 16);
+        assert!(belief
+            .stable_surfaces
+            .iter()
+            .any(|surface| surface.kind == WorldSurfaceKind::WallLike));
+        assert!(belief.stable_blobs.is_empty());
     }
 
     #[test]
