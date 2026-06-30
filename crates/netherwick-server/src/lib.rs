@@ -4368,12 +4368,13 @@ fn depth_points(
     if let Some(calibration) = calibration {
         if depth_m.len() == calibration.compact_depth_beam_count {
             let points = range_beam_points(depth_m, calibration);
-            let stats = depth_stats(depth_m, 1, 0.0, 8.0, "robot", 0, 0);
+            let stats = depth_stats(depth_m, 1, 0.0, 8.0, "robot", 0, 0)
+                .with_floor_stats(floor_stats_from_scene_points(&points));
             return (points, stats);
         }
     }
     if let Some(frame) = KinectDepthProjection::from_kinect(kinect) {
-        return project_depth_image(depth_m, frame);
+        return project_depth_image(depth_m, frame, calibration);
     }
     if depth_m.len() == 640 * 480 {
         return project_depth_image(
@@ -4389,6 +4390,7 @@ fn depth_points(
                 max_depth_m: 8.0,
                 coordinate_system: "kinect_camera".to_string(),
             },
+            calibration,
         );
     }
     let width = (depth_m.len() as f32).sqrt().ceil().max(1.0) as usize;
@@ -4499,10 +4501,12 @@ impl KinectDepthProjection {
 fn project_depth_image(
     depth_m: &[f32],
     frame: KinectDepthProjection,
+    calibration: Option<SceneSensorCalibration>,
 ) -> (Vec<ScenePoint>, SceneKinectDiagnostics) {
     const MAX_POINTS: usize = 2_000;
     let stride = (depth_m.len().div_ceil(MAX_POINTS)).max(1);
     let mut points = Vec::with_capacity(MAX_POINTS.min(depth_m.len()));
+    let calibrated = calibration.map(|calibration| DepthExtrinsics::from(calibration));
     for (index, depth) in depth_m.iter().enumerate().step_by(stride) {
         if !depth.is_finite() || *depth <= 0.0 {
             continue;
@@ -4517,24 +4521,43 @@ fn project_depth_image(
         let y = (v - frame.cy) * z / frame.fy.max(f32::EPSILON);
         let shade =
             ((1.0 - (z / frame.max_depth_m.max(f32::EPSILON))).clamp(0.15, 1.0) * 255.0) as u8;
-        points.push(ScenePoint {
-            x,
-            y,
-            z,
-            r: shade,
-            g: shade,
-            b: shade,
-        });
+        let point = if let Some(extrinsics) = calibrated {
+            let robot = camera_point_to_robot([x, y, z], extrinsics);
+            ScenePoint {
+                x: robot[1],
+                y: robot[2],
+                z: robot[0],
+                r: shade,
+                g: shade,
+                b: shade,
+            }
+        } else {
+            ScenePoint {
+                x,
+                y,
+                z,
+                r: shade,
+                g: shade,
+                b: shade,
+            }
+        };
+        points.push(point);
     }
+    let coordinate_system = if calibrated.is_some() {
+        "robot"
+    } else {
+        &frame.coordinate_system
+    };
     let diagnostics = depth_stats(
         depth_m,
         stride,
         frame.min_depth_m,
         frame.max_depth_m,
-        &frame.coordinate_system,
+        coordinate_system,
         frame.width as u32,
         frame.height as u32,
-    );
+    )
+    .with_floor_stats(floor_stats_from_scene_points(&points));
     (points, diagnostics)
 }
 
@@ -4576,11 +4599,111 @@ fn depth_stats(
         max_depth_m: valid.last().copied(),
         sample_stride,
         coordinate_system: coordinate_system.to_string(),
+        below_floor_count: 0,
+        below_floor_ratio: 0.0,
+        min_z_m: valid.first().copied(),
+        median_z_m: median_depth_m,
     }
+}
+
+impl SceneKinectDiagnostics {
+    fn with_floor_stats(mut self, stats: FloorPointStats) -> Self {
+        self.below_floor_count = stats.below_floor_count;
+        self.below_floor_ratio = stats.below_floor_ratio;
+        self.min_z_m = stats.min_z_m;
+        self.median_z_m = stats.median_z_m;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FloorPointStats {
+    below_floor_count: usize,
+    below_floor_ratio: f32,
+    min_z_m: Option<f32>,
+    median_z_m: Option<f32>,
+}
+
+fn floor_stats_from_scene_points(points: &[ScenePoint]) -> FloorPointStats {
+    let mut heights = points
+        .iter()
+        .map(|point| point.y)
+        .filter(|height| height.is_finite())
+        .collect::<Vec<_>>();
+    if heights.is_empty() {
+        return FloorPointStats::default();
+    }
+    heights.sort_by(|left, right| left.total_cmp(right));
+    let below_floor_count = heights.iter().filter(|height| **height < 0.0).count();
+    FloorPointStats {
+        below_floor_count,
+        below_floor_ratio: below_floor_count as f32 / heights.len() as f32,
+        min_z_m: heights.first().copied(),
+        median_z_m: heights.get(heights.len() / 2).copied(),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DepthExtrinsics {
+    forward_m: f32,
+    height_m: f32,
+    pitch_rad: f32,
+    roll_rad: f32,
+    yaw_rad: f32,
+}
+
+impl From<SceneSensorCalibration> for DepthExtrinsics {
+    fn from(calibration: SceneSensorCalibration) -> Self {
+        Self {
+            forward_m: calibration.depth_camera_forward_m(),
+            height_m: calibration.depth_camera_height_m(),
+            pitch_rad: calibration.depth_camera_pitch_rad(),
+            roll_rad: calibration.camera_roll_rad,
+            yaw_rad: calibration.camera_yaw_rad,
+        }
+    }
+}
+
+fn camera_point_to_robot(camera: [f32; 3], extrinsics: DepthExtrinsics) -> [f32; 3] {
+    let base = [camera[2], -camera[0], -camera[1]];
+    apply_robot_extrinsics(base, extrinsics)
+}
+
+fn apply_robot_extrinsics(base: [f32; 3], extrinsics: DepthExtrinsics) -> [f32; 3] {
+    let rotated = rotate_robot_extrinsic(
+        base,
+        extrinsics.pitch_rad,
+        extrinsics.roll_rad,
+        extrinsics.yaw_rad,
+    );
+    [
+        rotated[0] + extrinsics.forward_m,
+        rotated[1],
+        rotated[2] + extrinsics.height_m,
+    ]
+}
+
+fn rotate_robot_extrinsic(point: [f32; 3], pitch_rad: f32, roll_rad: f32, yaw_rad: f32) -> [f32; 3] {
+    let (pitch_sin, pitch_cos) = pitch_rad.sin_cos();
+    let mut x = point[0] * pitch_cos + point[2] * pitch_sin;
+    let y = point[1];
+    let mut z = -point[0] * pitch_sin + point[2] * pitch_cos;
+
+    let (roll_sin, roll_cos) = roll_rad.sin_cos();
+    let rolled_y = y * roll_cos - z * roll_sin;
+    z = y * roll_sin + z * roll_cos;
+
+    let (yaw_sin, yaw_cos) = yaw_rad.sin_cos();
+    let yawed_x = x * yaw_cos - rolled_y * yaw_sin;
+    let yawed_y = x * yaw_sin + rolled_y * yaw_cos;
+    x = yawed_x;
+
+    [x, yawed_y, z]
 }
 
 fn range_beam_points(depth_m: &[f32], calibration: SceneSensorCalibration) -> Vec<ScenePoint> {
     let beam_count = depth_m.len().max(1);
+    let extrinsics = DepthExtrinsics::from(calibration);
     let fov_rad = calibration
         .compact_depth_fov_rad
         .clamp(0.01, std::f32::consts::TAU);
@@ -4600,10 +4723,14 @@ fn range_beam_points(depth_m: &[f32], calibration: SceneSensorCalibration) -> Ve
             let distance = (depth * calibration.depth_scale).clamp(0.0, 8.0);
             let angle = start + step * index as f32;
             let shade = ((1.0 - (distance / 8.0)).clamp(0.15, 1.0) * 255.0) as u8;
+            let robot = apply_robot_extrinsics(
+                [angle.cos() * distance, angle.sin() * distance, 0.0],
+                extrinsics,
+            );
             Some(ScenePoint {
-                x: angle.sin() * distance,
-                y: calibration.point_y_m,
-                z: angle.cos() * distance,
+                x: robot[1],
+                y: robot[2],
+                z: robot[0],
                 r: shade,
                 g: shade,
                 b: shade,
