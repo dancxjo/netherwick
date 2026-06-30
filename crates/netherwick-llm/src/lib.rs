@@ -64,7 +64,7 @@ pub fn subscribe_llm_streams() -> broadcast::Receiver<LlmStreamEvent> {
 
 fn llm_stream_bus() -> &'static broadcast::Sender<LlmStreamEvent> {
     LLM_STREAM_BUS.get_or_init(|| {
-        let (tx, _rx) = broadcast::channel(256);
+        let (tx, _rx) = broadcast::channel(8_192);
         tx
     })
 }
@@ -459,7 +459,7 @@ impl OllamaLlmAgent {
             purpose: purpose.to_string(),
             provider: "ollama".to_string(),
             model: model.to_string(),
-            prompt: Some(prompt.clone()),
+            prompt: Some(prompt_preview(&prompt, 1_500)),
             delta: None,
             response: None,
             error: None,
@@ -552,6 +552,16 @@ impl OllamaLlmAgent {
 fn append_strict_json_suffix(mut prompt: String) -> String {
     prompt.push_str(STRICT_JSON_RESPONSE_RULES);
     prompt
+}
+
+fn prompt_preview(text: &str, max_chars: usize) -> String {
+    let mut iter = text.chars();
+    let preview = iter.by_ref().take(max_chars).collect::<String>();
+    if iter.next().is_some() {
+        format!("{preview}... [truncated]")
+    } else {
+        preview
+    }
 }
 
 fn handle_ollama_stream_line(

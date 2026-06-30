@@ -654,9 +654,11 @@ impl LiveViewState {
             .expect("surface extractor mutex poisoned");
         let calibration = calibration.unwrap_or_else(SceneSensorCalibration::sim_default);
         extractor.set_depth_camera_extrinsics(
-            calibration.point_y_m,
-            calibration.depth_forward_offset_m,
-            calibration.depth_pitch_down_rad,
+            calibration.depth_camera_height_m(),
+            calibration.depth_camera_forward_m(),
+            calibration.depth_camera_pitch_rad(),
+            calibration.camera_roll_rad,
+            calibration.camera_yaw_rad,
         );
         let mut perception = SceneSurfacePerception::from(extractor.process(
             &snapshot.kinect,
@@ -820,6 +822,16 @@ pub struct SceneSensorCalibration {
     pub depth_forward_offset_m: f32,
     #[serde(default)]
     pub depth_pitch_down_rad: f32,
+    #[serde(default)]
+    pub camera_forward_m: f32,
+    #[serde(default)]
+    pub camera_height_m: f32,
+    #[serde(default)]
+    pub camera_pitch_rad: f32,
+    #[serde(default)]
+    pub camera_roll_rad: f32,
+    #[serde(default)]
+    pub camera_yaw_rad: f32,
 }
 
 impl SceneSensorCalibration {
@@ -831,6 +843,35 @@ impl SceneSensorCalibration {
             point_y_m: 0.18,
             depth_forward_offset_m: 0.0,
             depth_pitch_down_rad: 0.0,
+            camera_forward_m: 0.0,
+            camera_height_m: 0.18,
+            camera_pitch_rad: 0.0,
+            camera_roll_rad: 0.0,
+            camera_yaw_rad: 0.0,
+        }
+    }
+
+    fn depth_camera_forward_m(self) -> f32 {
+        if self.camera_forward_m != 0.0 {
+            self.camera_forward_m
+        } else {
+            self.depth_forward_offset_m
+        }
+    }
+
+    fn depth_camera_height_m(self) -> f32 {
+        if self.camera_height_m != 0.0 {
+            self.camera_height_m
+        } else {
+            self.point_y_m
+        }
+    }
+
+    fn depth_camera_pitch_rad(self) -> f32 {
+        if self.camera_pitch_rad != 0.0 {
+            self.camera_pitch_rad
+        } else {
+            self.depth_pitch_down_rad
         }
     }
 }
@@ -1118,6 +1159,10 @@ pub struct SceneKinectDiagnostics {
     pub max_depth_m: Option<f32>,
     pub sample_stride: usize,
     pub coordinate_system: String,
+    pub below_floor_count: usize,
+    pub below_floor_ratio: f32,
+    pub min_z_m: Option<f32>,
+    pub median_z_m: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

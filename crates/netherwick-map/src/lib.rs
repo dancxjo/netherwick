@@ -156,6 +156,12 @@ pub struct PointCloudConfig {
     pub transient_after_ms: TimeMs,
     pub camera_height_m: f32,
     pub camera_forward_m: f32,
+    #[serde(default)]
+    pub camera_pitch_rad: f32,
+    #[serde(default)]
+    pub camera_roll_rad: f32,
+    #[serde(default)]
+    pub camera_yaw_rad: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -442,6 +448,9 @@ impl Default for PointCloudConfig {
             transient_after_ms: 5_000,
             camera_height_m: 0.18,
             camera_forward_m: 0.0,
+            camera_pitch_rad: 0.0,
+            camera_roll_rad: 0.0,
+            camera_yaw_rad: 0.0,
         }
     }
 }
@@ -1315,10 +1324,43 @@ pub fn orientation_from_imu(imu: &ImuSense, odometry_heading_rad: f32) -> Orient
 }
 
 fn camera_point_to_robot(point: Point3D, config: PointCloudConfig) -> Point3D {
-    Point3D {
-        x_m: config.camera_forward_m + point.z_m,
+    let base = Point3D {
+        x_m: point.z_m,
         y_m: -point.x_m,
-        z_m: config.camera_height_m - point.y_m,
+        z_m: -point.y_m,
+    };
+    let rotated = rotate_robot_extrinsic(
+        base,
+        config.camera_pitch_rad,
+        config.camera_roll_rad,
+        config.camera_yaw_rad,
+    );
+    Point3D {
+        x_m: rotated.x_m + config.camera_forward_m,
+        y_m: rotated.y_m,
+        z_m: rotated.z_m + config.camera_height_m,
+    }
+}
+
+fn rotate_robot_extrinsic(point: Point3D, pitch_rad: f32, roll_rad: f32, yaw_rad: f32) -> Point3D {
+    let (pitch_sin, pitch_cos) = pitch_rad.sin_cos();
+    let mut x = point.x_m * pitch_cos + point.z_m * pitch_sin;
+    let y = point.y_m;
+    let mut z = -point.x_m * pitch_sin + point.z_m * pitch_cos;
+
+    let (roll_sin, roll_cos) = roll_rad.sin_cos();
+    let rolled_y = y * roll_cos - z * roll_sin;
+    z = y * roll_sin + z * roll_cos;
+
+    let (yaw_sin, yaw_cos) = yaw_rad.sin_cos();
+    let yawed_x = x * yaw_cos - rolled_y * yaw_sin;
+    let yawed_y = x * yaw_sin + rolled_y * yaw_cos;
+    x = yawed_x;
+
+    Point3D {
+        x_m: x,
+        y_m: yawed_y,
+        z_m: z,
     }
 }
 
