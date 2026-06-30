@@ -6116,7 +6116,7 @@ canvas{display:block}
       <label><input type="checkbox" data-map-layer="novelty">novelty</label>
       <label><input type="checkbox" data-map-layer="events" checked>events</label>
     </div>
-    <div class="trace-label">SLAM-lite / odometry map: odometry/range trace, not corrected SLAM.</div>
+    <div class="trace-label">Scan-matched occupancy map: range scans correct odometry before integration.</div>
     <canvas id="entity-graph" width="220" height="170" aria-label="entity constellation graph"></canvas>
     <div id="entity-graph-summary">sensations/experience/impressions waiting...</div>
   </div>
@@ -9555,8 +9555,8 @@ mod tests {
 
         assert_eq!(map.schema_version, 1);
         assert_eq!(map.label, MAP_LABEL);
-        assert!(map.summary.label.contains("SLAM-lite"));
-        assert!(map.summary.label.contains("odometry map"));
+        assert!(map.summary.label.contains("scan-matched"));
+        assert!(map.summary.label.contains("occupancy"));
         assert_eq!(map.pose_trail.len(), 2);
         assert_eq!(map.current_pose.as_ref().unwrap().x_m, 0.5);
         assert_eq!(
@@ -9652,8 +9652,8 @@ mod tests {
         let forward_hit = map
             .range_beams
             .iter()
-            .find(|beam| beam.hit)
-            .expect("nearest beam should be marked as hit");
+            .find(|beam| beam.hit && beam.angle_rad.abs() < 0.001)
+            .expect("center beam should be marked as a hit");
         assert!((forward_hit.origin_x_m - 0.5).abs() < 0.001);
         assert!((forward_hit.origin_y_m - 0.75).abs() < 0.001);
         assert!((forward_hit.end_x_m - 0.5).abs() < 0.001);
@@ -10053,9 +10053,9 @@ mod tests {
         assert!(page.contains("function renderPersistentWorldBelief"));
         assert!(page.contains("local_world_belief"));
         assert!(page.contains("roll_pitch_corrected"));
-        assert!(
-            page.contains("SLAM-lite / odometry map: odometry/range trace, not corrected SLAM.")
-        );
+        assert!(page.contains(
+            "Scan-matched occupancy map: range scans correct odometry before integration."
+        ));
         assert!(page.contains("id=\"entity-graph\""));
         assert!(page.contains("drawEntityGraph"));
         assert!(page.contains("createDefaultXRExperienceAsync"));

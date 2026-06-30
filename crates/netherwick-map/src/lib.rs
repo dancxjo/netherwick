@@ -6,7 +6,7 @@ use netherwick_sensors::WorldSnapshot;
 use serde::{Deserialize, Serialize};
 
 pub const MAP_EXTENSION_NAME: &str = "map.odometry";
-pub const MAP_LABEL: &str = "SLAM-lite / odometry map, not full SLAM";
+pub const MAP_LABEL: &str = "scan-matched occupancy SLAM prototype";
 pub const POSE_GRAPH_LABEL: &str = "offline pose graph with odometry and gated loop candidates";
 pub const WORLD_POINT_CLOUD_LABEL: &str =
     "provisional odometry-frame Kinect/depth point cloud, not full SLAM";
@@ -260,6 +260,11 @@ pub struct MapConfig {
     pub decay_per_tick: f32,
     pub max_pose_history: usize,
     pub max_observations: usize,
+    pub scan_match_enabled: bool,
+    pub scan_match_xy_window_m: f32,
+    pub scan_match_theta_window_rad: f32,
+    pub scan_match_min_occupied_cells: usize,
+    pub scan_match_min_hit_beams: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -279,6 +284,16 @@ pub struct MapObservationSummary {
     pub t_ms: TimeMs,
     pub beam_count: usize,
     pub hit_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScanMatchCorrection {
+    pose: Pose2,
+    odometry_pose: Pose2,
+    score: f32,
+    odometry_score: f32,
+    confidence_boost: f32,
+    covariance_scale: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -430,6 +445,11 @@ impl Default for MapConfig {
             decay_per_tick: 0.04,
             max_pose_history: 1_000,
             max_observations: 250,
+            scan_match_enabled: true,
+            scan_match_xy_window_m: 0.18,
+            scan_match_theta_window_rad: 8.0_f32.to_radians(),
+            scan_match_min_occupied_cells: 4,
+            scan_match_min_hit_beams: 2,
         }
     }
 }
@@ -907,6 +927,7 @@ impl LocalMap {
     }
 
     pub fn integrate_observation(&mut self, observation: MapObservation) {
+        let observation = self.scan_matched_observation(observation);
         self.pose_history.push(observation.pose.clone());
         cap_vec(&mut self.pose_history, self.config.max_pose_history);
 
@@ -916,6 +937,153 @@ impl LocalMap {
 
         self.observations.push(observation);
         cap_vec(&mut self.observations, self.config.max_observations);
+    }
+
+    fn scan_matched_observation(&self, mut observation: MapObservation) -> MapObservation {
+        let correction = self.scan_match_pose(&observation);
+        let Some(correction) = correction else {
+            return observation;
+        };
+        observation.pose.pose = correction.pose;
+        observation.pose.confidence =
+            (observation.pose.confidence + correction.confidence_boost).clamp(0.0, 0.98);
+        observation.pose.covariance = [
+            (observation.pose.covariance[0] * correction.covariance_scale).max(0.01),
+            (observation.pose.covariance[1] * correction.covariance_scale).max(0.01),
+            (observation.pose.covariance[2] * correction.covariance_scale).max(0.02),
+        ];
+        observation.pose.source = "odometry+occupancy_scan_match".to_string();
+        if let Some(object) = observation.source_snapshot.as_object_mut() {
+            object.insert(
+                "scan_match".to_string(),
+                serde_json::json!({
+                    "dx_m": correction.pose.x_m - correction.odometry_pose.x_m,
+                    "dy_m": correction.pose.y_m - correction.odometry_pose.y_m,
+                    "dtheta_rad": normalize_angle(correction.pose.heading_rad - correction.odometry_pose.heading_rad),
+                    "score": correction.score,
+                    "odometry_score": correction.odometry_score,
+                    "confidence_boost": correction.confidence_boost,
+                }),
+            );
+        }
+        observation
+    }
+
+    fn scan_match_pose(&self, observation: &MapObservation) -> Option<ScanMatchCorrection> {
+        if !self.config.scan_match_enabled {
+            return None;
+        }
+        let occupied_cells = self
+            .cells
+            .values()
+            .filter(|cell| cell.occupied_score > cell.free_score && cell.confidence > 0.05)
+            .count();
+        if occupied_cells < self.config.scan_match_min_occupied_cells {
+            return None;
+        }
+        let hit_beams = observation
+            .range_beams
+            .iter()
+            .filter(|beam| beam.hit && beam.confidence > 0.0)
+            .count();
+        if hit_beams < self.config.scan_match_min_hit_beams {
+            return None;
+        }
+
+        let odometry_pose = observation.pose.pose;
+        let odometry_score = self.scan_match_score(odometry_pose, &observation.range_beams);
+        let mut best_pose = odometry_pose;
+        let mut best_score = odometry_score;
+        let xy_step = (self.config.resolution_m * 0.5).max(0.025);
+        let theta_step = (self.config.scan_match_theta_window_rad / 2.0).max(2.0_f32.to_radians());
+        let xy_steps = (self.config.scan_match_xy_window_m / xy_step).ceil() as i32;
+        let theta_steps = (self.config.scan_match_theta_window_rad / theta_step).ceil() as i32;
+
+        for ix in -xy_steps..=xy_steps {
+            for iy in -xy_steps..=xy_steps {
+                for itheta in -theta_steps..=theta_steps {
+                    let candidate = Pose2 {
+                        x_m: odometry_pose.x_m + ix as f32 * xy_step,
+                        y_m: odometry_pose.y_m + iy as f32 * xy_step,
+                        heading_rad: normalize_angle(
+                            odometry_pose.heading_rad + itheta as f32 * theta_step,
+                        ),
+                    };
+                    let score = self.scan_match_score(candidate, &observation.range_beams);
+                    if score > best_score {
+                        best_score = score;
+                        best_pose = candidate;
+                    }
+                }
+            }
+        }
+
+        let improvement = best_score - odometry_score;
+        if improvement < 0.20 {
+            return None;
+        }
+        let confidence_boost = (improvement / hit_beams as f32 * 0.20).clamp(0.02, 0.12);
+        Some(ScanMatchCorrection {
+            pose: best_pose,
+            odometry_pose,
+            score: best_score,
+            odometry_score,
+            confidence_boost,
+            covariance_scale: (1.0 - confidence_boost).clamp(0.75, 0.98),
+        })
+    }
+
+    fn scan_match_score(&self, pose: Pose2, beams: &[RangeBeam]) -> f32 {
+        let mut score = 0.0;
+        let mut evidence = 0usize;
+        for beam in beams.iter().filter(|beam| beam.confidence > 0.0) {
+            if !beam.distance_m.is_finite() || beam.distance_m <= 0.0 {
+                continue;
+            }
+            let distance = beam.distance_m.min(self.config.max_range_m);
+            if beam.hit {
+                let end = project_beam_endpoint(pose, beam.angle_rad, distance);
+                let end_key = cell_key(end.x_m, end.y_m, self.config.resolution_m);
+                score += self.cell_match_score(end_key) * 1.5;
+                evidence = evidence.saturating_add(1);
+            }
+            let free_end = if beam.hit {
+                distance - self.config.resolution_m
+            } else {
+                distance
+            };
+            for key in trace_cells(
+                pose,
+                beam.angle_rad,
+                free_end.max(0.0),
+                self.config.resolution_m,
+            )
+            .into_iter()
+            .step_by(2)
+            {
+                score += self.free_match_score(key) * 0.18;
+                evidence = evidence.saturating_add(1);
+            }
+        }
+        if evidence == 0 {
+            0.0
+        } else {
+            score / evidence as f32
+        }
+    }
+
+    fn cell_match_score(&self, key: CellKey) -> f32 {
+        self.cells
+            .get(&key)
+            .map(|cell| (cell.occupied_score - cell.free_score) * cell.confidence.clamp(0.0, 1.0))
+            .unwrap_or(-0.08)
+    }
+
+    fn free_match_score(&self, key: CellKey) -> f32 {
+        self.cells
+            .get(&key)
+            .map(|cell| (cell.free_score - cell.occupied_score) * cell.confidence.clamp(0.0, 1.0))
+            .unwrap_or(0.02)
     }
 
     pub fn decay_stale(&mut self, now_ms: TimeMs) {
@@ -1106,11 +1274,12 @@ fn observation_from_parts(
                 index as f32 / (beam_count - 1) as f32
             };
             let angle_rad = -config.range_fov_rad * 0.5 + ratio * config.range_fov_rad;
-            let hit = nearest_m
+            let nearest_hit = nearest_m
                 .filter(|nearest| nearest.is_finite())
                 .map(|nearest| (distance - nearest).abs() <= config.hit_epsilon_m)
-                .unwrap_or(false)
-                && distance <= config.max_range_m;
+                .unwrap_or(false);
+            let hit = distance <= config.max_range_m
+                && (nearest_hit || distance < config.max_range_m - config.hit_epsilon_m);
             Some(RangeBeam {
                 angle_rad,
                 distance_m: distance,
@@ -1927,6 +2096,48 @@ mod tests {
         assert!(map.cells.len() > first_cells);
         assert_eq!(map.pose_history.len(), 2);
         assert_eq!(map.summary().label, MAP_LABEL);
+    }
+
+    #[test]
+    fn scan_matching_corrects_small_odometry_drift_against_existing_occupancy() {
+        let config = MapConfig {
+            resolution_m: 0.1,
+            scan_match_xy_window_m: 0.2,
+            scan_match_theta_window_rad: 0.0,
+            scan_match_min_occupied_cells: 1,
+            scan_match_min_hit_beams: 1,
+            ..MapConfig::default()
+        };
+        let mut map = LocalMap::new(config);
+        for y in [-0.1, 0.0, 0.1] {
+            let key = cell_key(1.0, y, map.config.resolution_m);
+            map.cells.insert(
+                key,
+                OccupancyCell {
+                    key,
+                    occupied_score: 0.9,
+                    free_score: 0.0,
+                    confidence: 0.9,
+                    last_seen_ms: 100,
+                },
+            );
+        }
+
+        let observation = observation_from_parts(
+            pose(0.12, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({}),
+            200,
+            map.config,
+        );
+        map.integrate_observation(observation);
+
+        let corrected = map.pose_history.last().unwrap();
+        assert_eq!(corrected.source, "odometry+occupancy_scan_match");
+        assert!(corrected.pose.x_m.abs() < 0.08);
+        assert!(corrected.confidence > 0.75);
     }
 
     #[test]

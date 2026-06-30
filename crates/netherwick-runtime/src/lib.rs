@@ -2909,7 +2909,7 @@ where
             serde_json::to_value(&map_summary)?,
         );
         notes.push(format!(
-            "OdometryMap: {} cells ({} occupied, {} free); SLAM-lite / odometry map, not full SLAM",
+            "ScanMatchedMap: {} cells ({} occupied, {} free); occupancy scan matching corrects odometry before integration",
             map_summary.cells, map_summary.occupied_cells, map_summary.free_cells
         ));
         let mut proposed_actions = Vec::new();
