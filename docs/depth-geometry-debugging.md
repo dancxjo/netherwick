@@ -25,12 +25,14 @@ The report also includes `sensor_truth.ready_for_real_slam`. Do not start real S
 - `below_floor_ratio`: current-frame transformed floor leakage is under the selected threshold.
 - `frame_timestamps_monotonic`: capture frame timestamps are ordered and sane.
 - `body_timestamp_fresh`: odometry/body time is close to the selected depth frame time.
-- `kinect_timestamp_carried`: Kinect depth has its own capture timestamp, not only an enclosing capture-frame timestamp.
-- `imu_timestamp_carried`: IMU has its own capture timestamp, not only an enclosing capture-frame timestamp.
+- `kinect_timestamp_carried`: Kinect depth has its own `captured_at_ms`, not only an enclosing capture-frame timestamp.
+- `imu_timestamp_carried`: IMU has its own `captured_at_ms`, not only an enclosing capture-frame timestamp.
 - `imu_roll_pitch_contract`: IMU shape is recognized as `[roll, pitch]` or `[roll, pitch, yaw]` radians and roll/pitch correction is active.
 - `stationary_rotation_cloud_stability`: a rotate-in-place capture has enough stable voxels with limited vertical spread.
 
 For the stationary rotation gate, use a capture where the robot turns at least 45 degrees while translating less than 0.20 m. A normal driving capture will be marked `not_applicable` for that gate and is not enough to clear SLAM readiness.
+
+Old captures made before sensor `captured_at_ms` fields were added deserialize those timestamps as `0` and will fail the timestamp-carried gates. Re-capture after this change before judging SLAM readiness.
 
 ## Calibration Procedure
 
