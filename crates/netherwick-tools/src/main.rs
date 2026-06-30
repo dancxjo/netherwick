@@ -23,13 +23,15 @@ use netherwick_ledger::{
 };
 use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
 use netherwick_map::{
-    LoopClosureCandidateInput, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport, VoxelPointCloud,
+    LocalMap, LoopClosureCandidateInput, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport,
+    VoxelPointCloud,
 };
 use netherwick_memory::{
     deterministic_embodied_eval_report_with_omissions, place_memory_report_from_frames,
-    place_recognition_input_from_frame, place_recognition_vectors_from_input,
-    DurableExperienceStore, EmbodiedEvalOmission, EntityMemory, InMemoryExperienceStore,
-    PlaceMemory, PlaceMemoryReport, PlaceRecognitionCandidate, PlaceRecognitionKind,
+    place_recognition_input_from_frame, place_recognition_vectors_from_input, BindingRelation,
+    DurableExperienceStore, EmbodiedEvalOmission, EntityConstellationState, EntityMemory,
+    InMemoryExperienceStore, PlaceMemory, PlaceMemoryReport, PlaceRecognitionCandidate,
+    PlaceRecognitionKind,
 };
 use netherwick_models::MODEL_REGISTRY;
 use netherwick_now::{EarSense, KinectSense, Now, RangeSense, SurpriseSense};
@@ -97,6 +99,7 @@ enum Command {
     Promote(PromoteCommand),
     InspectLedger(InspectLedgerArgs),
     PoseGraphReport(PoseGraphReportArgs),
+    RepresentationReport(RepresentationReportArgs),
     ModelRegister(ModelRegisterArgs),
     ModelStatus,
     ModelPromote(ModelPromoteArgs),
@@ -130,6 +133,7 @@ async fn main() -> Result<()> {
         Command::ReplayCounterfactual(args) => replay_counterfactual(args).await,
         Command::InspectLedger(args) => inspect_ledger(args).await,
         Command::PoseGraphReport(args) => run_pose_graph_report(args).await,
+        Command::RepresentationReport(args) => run_representation_report(args).await,
         Command::Train(command) => run_train(command).await,
         Command::Evaluate(command) => run_evaluate(command).await,
         Command::Promote(command) => run_promote(command),
@@ -871,6 +875,20 @@ struct PoseGraphReportArgs {
 }
 
 #[derive(Debug, Parser)]
+struct RepresentationReportArgs {
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "NETHERWICK_LEDGER"
+    )]
+    ledger: String,
+    #[arg(long)]
+    capture: Option<String>,
+    #[arg(long, default_value = "data/reports/representation/latest.json")]
+    out: String,
+}
+
+#[derive(Debug, Parser)]
 struct EmbodiedDemoArgs {
     #[arg(long)]
     json: bool,
@@ -952,6 +970,91 @@ struct ExperienceForgeReplayReport {
     place_candidate_frames: usize,
     entity_binding_frames: usize,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationHealthReport {
+    schema_version: u32,
+    frame_count: usize,
+    input: RepresentationInputSummary,
+    warnings: Vec<String>,
+    experience_forge: RepresentationExperienceForgeSummary,
+    entity_memory: RepresentationEntityMemorySummary,
+    map: RepresentationMapSummary,
+    pose_graph: RepresentationPoseGraphSummary,
+    place_recognition: RepresentationPlaceRecognitionSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationInputSummary {
+    source_type: String,
+    source_path: String,
+    provenance: HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationExperienceForgeSummary {
+    checkpoint_loaded: Option<String>,
+    checkpoint_saved: Option<String>,
+    population_count: usize,
+    champion_count: usize,
+    latest_champion_ids: Vec<u64>,
+    latest_filter_ids: Vec<u64>,
+    tiny_now_vector_stability: RepresentationVectorStability,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationVectorStability {
+    samples: usize,
+    mean_abs_delta: Option<f32>,
+    max_abs_delta: Option<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationEntityMemorySummary {
+    total_entities: usize,
+    active_entities: usize,
+    occluded_entities: usize,
+    vanished_entities: usize,
+    revived_entities: usize,
+    modality_support_counts: HashMap<String, usize>,
+    constellation_edges_by_relation: HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationMapSummary {
+    local_occupancy_cell_count: usize,
+    pose_history_length: usize,
+    point_cloud_voxel_count: usize,
+    stable_voxel_count: usize,
+    transient_voxel_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationPoseGraphSummary {
+    node_count: usize,
+    odometry_edge_count: usize,
+    loop_candidate_count: usize,
+    loop_accepted_count: usize,
+    loop_rejected_count: usize,
+    confidence_distribution: RepresentationConfidenceDistribution,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationPlaceRecognitionSummary {
+    candidates_emitted: usize,
+    candidate_kinds: HashMap<String, usize>,
+    confidence_distribution: RepresentationConfidenceDistribution,
+    repeated_place_hints: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationConfidenceDistribution {
+    min: Option<f32>,
+    max: Option<f32>,
+    mean: Option<f32>,
+    buckets: HashMap<String, usize>,
 }
 
 #[derive(Debug, Parser)]
@@ -7521,6 +7624,372 @@ async fn run_pose_graph_report(args: PoseGraphReportArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_representation_report(args: RepresentationReportArgs) -> Result<()> {
+    let report = generate_representation_report(&args).await?;
+    if let Some(parent) = Path::new(&args.out).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "representation report written to {} (frames={}, entities={}, voxels={})",
+        args.out,
+        report.frame_count,
+        report.entity_memory.total_entities,
+        report.map.point_cloud_voxel_count
+    );
+    Ok(())
+}
+
+async fn generate_representation_report(
+    args: &RepresentationReportArgs,
+) -> Result<RepresentationHealthReport> {
+    let mut warnings = BTreeSet::new();
+    let mut provenance: HashMap<String, usize> = HashMap::new();
+    let mut forge = ExperienceForge::new(0x51EED_u64);
+    let mut place_memory = PlaceMemory::new();
+    let mut entity_memory = EntityMemory::new();
+    let mut local_map = LocalMap::default();
+    let mut point_cloud = VoxelPointCloud::default();
+    let mut pose_graph = PoseGraphBuilder::new(PoseGraphConfig::default());
+    let mut tiny_vectors = Vec::new();
+    let mut place_candidates = Vec::new();
+    let mut place_recognition_warnings = BTreeSet::new();
+    let mut frame_count = 0usize;
+
+    let mut saw_range = false;
+    let mut saw_scene_vectors = false;
+    let mut saw_objects = false;
+    let mut saw_depth = false;
+    let mut saw_audio = false;
+
+    let input = if let Some(capture) = args.capture.as_deref() {
+        let reader = CaptureReader::open(capture).await?;
+        let mut records = reader.read_frames().await?;
+        records.sort_by_key(|record| record.t_ms);
+        for record in records {
+            frame_count += 1;
+            *provenance
+                .entry("capture_snapshot".to_string())
+                .or_default() += 1;
+            let frame_id = format!("capture-frame-{}", record.index);
+            let now = record.snapshot.to_now(record.t_ms);
+            saw_range |= !now.range.beams.is_empty() || now.range.nearest_m.is_some();
+            saw_scene_vectors |= !now.eye.scene_vectors.is_empty();
+            saw_objects |= !now.objects.observations.is_empty();
+            saw_depth |= !record.snapshot.kinect.depth_m.is_empty();
+            saw_audio |= !now.ear.features.is_empty() || now.ear.transcript.is_some();
+
+            let snapshot = forge.tick(&now, None);
+            tiny_vectors.push(snapshot.tiny_now_vector.clone());
+
+            let current_key =
+                Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+            place_memory.observe_now(&now);
+            entity_memory.observe_now(&now, current_key);
+            local_map.observe_now(&now);
+            point_cloud.observe_snapshot(&record.snapshot, record.t_ms);
+            observe_pose_graph_now(&mut pose_graph, &mut place_memory, &now, Some(frame_id));
+
+            let output =
+                place_memory.recognize_places_report(current_key, &now.eye.scene_vectors, 0.0, 20);
+            if let Some(reason) = output.not_enough_evidence {
+                place_recognition_warnings.insert(reason);
+            }
+            place_candidates.extend(output.candidates);
+        }
+        RepresentationInputSummary {
+            source_type: "capture".to_string(),
+            source_path: capture.to_string(),
+            provenance,
+        }
+    } else {
+        let ledger = JsonlLedger::new(&args.ledger);
+        let mut frames = ledger.range(0, u64::MAX).await?;
+        frames.sort_by_key(|frame| frame.t_ms);
+        for frame in &frames {
+            frame_count += 1;
+            let place_input = place_recognition_input_from_frame(frame);
+            *provenance
+                .entry(place_input.provenance.clone())
+                .or_default() += 1;
+
+            let now = &frame.now;
+            saw_range |= !now.range.beams.is_empty() || now.range.nearest_m.is_some();
+            saw_scene_vectors |= !now.eye.scene_vectors.is_empty();
+            saw_objects |= !now.objects.observations.is_empty();
+            saw_depth |= !now.kinect.depth_m.is_empty();
+            saw_audio |= !now.ear.features.is_empty() || now.ear.transcript.is_some();
+
+            let snapshot = forge.tick(now, frame.chosen_action.clone());
+            tiny_vectors.push(snapshot.tiny_now_vector.clone());
+
+            let current_key =
+                Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+            place_memory.observe_frame(frame);
+            entity_memory.observe_now(now, current_key);
+            local_map.observe_now(now);
+            point_cloud.decay_stale(now.t_ms);
+            observe_pose_graph_frame(&mut pose_graph, &mut place_memory, frame);
+
+            let mut query_vectors = now.eye.scene_vectors.clone();
+            query_vectors.extend(place_recognition_vectors_from_input(&place_input));
+            let output = place_memory.recognize_places_report(current_key, &query_vectors, 0.0, 20);
+            if let Some(reason) = output.not_enough_evidence {
+                place_recognition_warnings.insert(reason);
+            }
+            place_candidates.extend(output.candidates);
+        }
+        RepresentationInputSummary {
+            source_type: "ledger".to_string(),
+            source_path: args.ledger.clone(),
+            provenance,
+        }
+    };
+
+    if frame_count == 0 {
+        warnings.insert("no frames found in input".to_string());
+    }
+    if !saw_range {
+        warnings.insert("range sensor data missing across all frames".to_string());
+    }
+    if !saw_scene_vectors {
+        warnings.insert("scene vectors missing across all frames".to_string());
+    }
+    if !saw_objects {
+        warnings.insert("object observations missing across all frames".to_string());
+    }
+    if !saw_depth {
+        warnings.insert("depth channel missing across all frames".to_string());
+    }
+    if !saw_audio {
+        warnings.insert("audio/transcript channel missing across all frames".to_string());
+    }
+
+    let forge_snapshot = forge.snapshot();
+    let mut champion_ids = forge_snapshot
+        .top_filters
+        .iter()
+        .filter_map(|filter| filter.slot.map(|slot| (slot, filter.id)))
+        .collect::<Vec<_>>();
+    champion_ids.sort_by_key(|(slot, _)| *slot);
+    let latest_champion_ids = champion_ids
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect::<Vec<_>>();
+    let latest_filter_ids = forge_snapshot
+        .top_filters
+        .iter()
+        .map(|filter| filter.id)
+        .collect::<Vec<_>>();
+    let tiny_now_vector_stability = summarize_tiny_vector_stability(&tiny_vectors);
+
+    let entity_report = entity_memory.report();
+    let revived_entities = entity_memory
+        .entities
+        .values()
+        .filter(|entity| entity.constellation.state == EntityConstellationState::Revived)
+        .count();
+    let mut modality_support_counts = HashMap::new();
+    let mut constellation_edges_by_relation = HashMap::new();
+    for entity in entity_memory.entities.values() {
+        if !entity.modality_support.face_vector_ids.is_empty() {
+            *modality_support_counts
+                .entry("face".to_string())
+                .or_default() += 1;
+        }
+        if !entity.modality_support.voice_vector_ids.is_empty() {
+            *modality_support_counts
+                .entry("voice".to_string())
+                .or_default() += 1;
+        }
+        if !entity.modality_support.scene_vector_ids.is_empty() {
+            *modality_support_counts
+                .entry("scene".to_string())
+                .or_default() += 1;
+        }
+        if !entity.modality_support.text_labels.is_empty() {
+            *modality_support_counts
+                .entry("text".to_string())
+                .or_default() += 1;
+        }
+        for edge in &entity.constellation.binding_edges {
+            *constellation_edges_by_relation
+                .entry(binding_relation_label(edge.relation.clone()).to_string())
+                .or_default() += 1;
+        }
+    }
+
+    let map_summary = local_map.summary();
+    let point_cloud_summary = point_cloud.summary();
+    if point_cloud_summary.observations == 0 {
+        warnings.insert("point cloud received no usable observations".to_string());
+    }
+
+    let pose_graph_report = pose_graph.finish_report();
+    let confidence_values = place_candidates
+        .iter()
+        .map(|candidate| candidate.confidence)
+        .collect::<Vec<_>>();
+    let mut candidate_kinds = HashMap::new();
+    let mut same_place_cells: HashMap<(i32, i32), usize> = HashMap::new();
+    for candidate in &place_candidates {
+        let kind = match &candidate.kind {
+            PlaceRecognitionKind::SamePlace => "same_place",
+            PlaceRecognitionKind::SimilarPlace => "similar_place",
+            PlaceRecognitionKind::EntityConstellation => "entity_constellation",
+        };
+        *candidate_kinds.entry(kind.to_string()).or_default() += 1;
+        if matches!(&candidate.kind, PlaceRecognitionKind::SamePlace) {
+            *same_place_cells
+                .entry((candidate.cell.x, candidate.cell.y))
+                .or_default() += 1;
+        }
+    }
+    let repeated_place_hints = same_place_cells
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|((x, y), count)| format!("cell ({x}, {y}) recognized {count} times"))
+        .take(5)
+        .collect::<Vec<_>>();
+    if place_candidates.is_empty() {
+        place_recognition_warnings.insert("no place-recognition candidates emitted".to_string());
+    }
+
+    Ok(RepresentationHealthReport {
+        schema_version: 1,
+        frame_count,
+        input,
+        warnings: warnings.into_iter().collect(),
+        experience_forge: RepresentationExperienceForgeSummary {
+            checkpoint_loaded: None,
+            checkpoint_saved: None,
+            population_count: forge_snapshot.population_size,
+            champion_count: latest_champion_ids.len(),
+            latest_champion_ids,
+            latest_filter_ids,
+            tiny_now_vector_stability,
+        },
+        entity_memory: RepresentationEntityMemorySummary {
+            total_entities: entity_report.total_entities,
+            active_entities: entity_report.active_entities,
+            occluded_entities: entity_report.occluded_entities,
+            vanished_entities: entity_report.vanished_entities,
+            revived_entities,
+            modality_support_counts,
+            constellation_edges_by_relation,
+        },
+        map: RepresentationMapSummary {
+            local_occupancy_cell_count: map_summary.occupied_cells,
+            pose_history_length: local_map.pose_history.len(),
+            point_cloud_voxel_count: point_cloud_summary.voxels,
+            stable_voxel_count: point_cloud_summary.stable_voxels,
+            transient_voxel_count: point_cloud_summary.transient_voxels,
+        },
+        pose_graph: RepresentationPoseGraphSummary {
+            node_count: pose_graph_report.nodes,
+            odometry_edge_count: pose_graph_report.odometry_edges,
+            loop_candidate_count: pose_graph_report.loop_candidate_edges,
+            loop_accepted_count: pose_graph_report.active_loop_candidate_edges,
+            loop_rejected_count: pose_graph_report.rejected_loop_candidates,
+            confidence_distribution: RepresentationConfidenceDistribution {
+                min: pose_graph_report.confidence_distribution.min,
+                max: pose_graph_report.confidence_distribution.max,
+                mean: pose_graph_report.confidence_distribution.mean,
+                buckets: pose_graph_report
+                    .confidence_distribution
+                    .buckets
+                    .into_iter()
+                    .collect(),
+            },
+        },
+        place_recognition: RepresentationPlaceRecognitionSummary {
+            candidates_emitted: place_candidates.len(),
+            candidate_kinds,
+            confidence_distribution: summarize_confidence_distribution(&confidence_values),
+            repeated_place_hints,
+            warnings: place_recognition_warnings.into_iter().collect(),
+        },
+    })
+}
+
+fn summarize_tiny_vector_stability(vectors: &[Vec<f32>]) -> RepresentationVectorStability {
+    let mut deltas = Vec::new();
+    for pair in vectors.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        let len = left.len().min(right.len());
+        if len == 0 {
+            continue;
+        }
+        let delta = left
+            .iter()
+            .zip(right.iter())
+            .take(len)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / len as f32;
+        deltas.push(delta);
+    }
+    let samples = deltas.len();
+    let mean_abs_delta = if samples == 0 {
+        None
+    } else {
+        Some(deltas.iter().sum::<f32>() / samples as f32)
+    };
+    let max_abs_delta = deltas
+        .iter()
+        .copied()
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    RepresentationVectorStability {
+        samples,
+        mean_abs_delta,
+        max_abs_delta,
+    }
+}
+
+fn summarize_confidence_distribution(values: &[f32]) -> RepresentationConfidenceDistribution {
+    let mut buckets = HashMap::new();
+    for value in values {
+        let bucket = if *value < 0.25 {
+            "0.00-0.24"
+        } else if *value < 0.5 {
+            "0.25-0.49"
+        } else if *value < 0.75 {
+            "0.50-0.74"
+        } else {
+            "0.75-1.00"
+        };
+        *buckets.entry(bucket.to_string()).or_default() += 1;
+    }
+    let min = values
+        .iter()
+        .copied()
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let max = values
+        .iter()
+        .copied()
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = (!values.is_empty()).then_some(values.iter().sum::<f32>() / values.len() as f32);
+    RepresentationConfidenceDistribution {
+        min,
+        max,
+        mean,
+        buckets,
+    }
+}
+
+fn binding_relation_label(relation: BindingRelation) -> &'static str {
+    match relation {
+        BindingRelation::CooccursInTime => "cooccurs_in_time",
+        BindingRelation::CooccursInEstimatedSpace => "cooccurs_in_estimated_space",
+        BindingRelation::MovesTogether => "moves_together",
+        BindingRelation::PredictsSameFutureEvents => "predicts_same_future_events",
+        BindingRelation::NamedBy => "named_by",
+    }
+}
+
 async fn generate_pose_graph_report(args: &PoseGraphReportArgs) -> Result<PoseGraphReport> {
     let config = PoseGraphConfig {
         min_node_distance_m: args.min_node_distance_m,
@@ -9830,6 +10299,59 @@ mod tests {
         assert_eq!(report.frame_count, 2);
         assert_eq!(report.forge_vector_frames, 2);
         assert!(report.entity_binding_frames > 0);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn representation_report_writes_json_from_capture_fixture() {
+        let temp_dir = temp_path("netherwick_representation_report_capture");
+        let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+
+        let mut first = WorldSnapshot::default();
+        first.body.odometry.x_m = 0.0;
+        first.range.nearest_m = Some(0.5);
+        first.eye.scene_vectors.push(
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-a", vec![1.0, 0.0])
+                .with_source_frame_id("capture-frame-0"),
+        );
+        writer
+            .append_snapshot(100, first, Vec::new())
+            .await
+            .unwrap();
+
+        let mut second = WorldSnapshot::default();
+        second.body.odometry.x_m = 0.8;
+        second.range.nearest_m = Some(0.45);
+        second.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-b",
+            vec![0.98, 0.02],
+        ));
+        writer
+            .append_snapshot(200, second, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let out = temp_dir.join("reports/representation/report.json");
+        run_representation_report(RepresentationReportArgs {
+            ledger: "unused-when-capture-is-set".to_string(),
+            capture: Some(temp_dir.to_string_lossy().to_string()),
+            out: out.to_string_lossy().to_string(),
+        })
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+        assert_eq!(value["frame_count"], 2);
+        assert_eq!(value["input"]["source_type"], "capture");
+        assert!(value["experience_forge"].is_object());
+        assert!(value["entity_memory"].is_object());
+        assert!(value["map"].is_object());
+        assert!(value["pose_graph"].is_object());
+        assert!(value["place_recognition"].is_object());
         let _ = fs::remove_dir_all(&temp_dir);
     }
 

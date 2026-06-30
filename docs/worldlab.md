@@ -59,6 +59,20 @@ cargo run -p netherwick-tools -- pose-graph-report \
 
 The report includes odometry edges, gated loop-closure candidate edges from conservative place recognition, confidence buckets, and rejected low-confidence candidates. Ledger replay feeds loop candidates from canonical `PlaceRecognitionInput` with Experience/Instant provenance; direct capture replay uses available scene vectors as a capture-only fallback.
 
+Build a replay-first representation health report from capture or ledger input:
+
+```bash
+cargo run --bin netherwick -- representation-report \
+  --capture data/captures/real/rpi5-smoke \
+  --out data/reports/representation/rpi5-smoke.json
+```
+
+```bash
+cargo run --bin netherwick -- representation-report \
+  --ledger data/ledger/virtual-live \
+  --out data/reports/representation/latest.json
+```
+
 Record a bounded real read-only session:
 
 ```bash
