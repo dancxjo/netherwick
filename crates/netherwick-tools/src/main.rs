@@ -35,7 +35,7 @@ use netherwick_memory::{
     PlaceRecognitionKind,
 };
 use netherwick_models::MODEL_REGISTRY;
-use netherwick_now::{EarSense, KinectSense, Now, RangeSense, SurpriseSense};
+use netherwick_now::{EarSense, ExtensionSense, KinectSense, Now, RangeSense, SurpriseSense};
 use netherwick_runtime::{
     ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
     InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, RobotMode, RuntimeLoop,
@@ -4530,6 +4530,61 @@ impl SenseProducer for BackgroundSenseProducer {
     }
 }
 
+fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SensePacket) {
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let mut snapshot = live_state.latest().unwrap_or_default();
+    snapshot.body.last_update_ms = now_ms;
+    snapshot
+        .extensions
+        .retain(|extension| extension.name != "live/startup_sensor_only");
+    snapshot.extensions.push(ExtensionSense {
+        schema_version: 1,
+        name: "live/startup_sensor_only".to_string(),
+        values: vec![now_ms as f32],
+    });
+
+    match packet {
+        SensePacket::Kinect(kinect) => {
+            snapshot.kinect = kinect.clone();
+        }
+        SensePacket::EyeFrame(frame) => {
+            snapshot.eye_frame = Some(frame.clone());
+        }
+        SensePacket::Range(range) => {
+            snapshot.range = range.clone();
+        }
+        SensePacket::Imu(imu) => {
+            snapshot.imu = imu.clone();
+        }
+        SensePacket::Gps(gps) => {
+            snapshot.gps = Some(gps.clone());
+        }
+        SensePacket::Ear(ear) => {
+            snapshot.ear = ear.clone();
+        }
+        SensePacket::EarPcm(frame) => {
+            snapshot.ear_pcm = Some(frame.clone());
+        }
+        SensePacket::Eye(eye) => {
+            snapshot.eye = eye.clone();
+        }
+        SensePacket::Face(face) => {
+            snapshot.face = face.clone();
+        }
+        SensePacket::Voice(voice) => {
+            snapshot.voice = voice.clone();
+        }
+        SensePacket::Objects(objects) => {
+            snapshot.objects = objects.clone();
+        }
+        SensePacket::Extension(extension) => {
+            snapshot.extensions.push(extension.clone());
+        }
+    }
+
+    live_state.update(snapshot);
+}
+
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
     let create_port = selected_create_port(&args.create_port, &env_report);
@@ -4590,6 +4645,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                             (&live_state_for_camera, packet)
                         {
                             live_state.record_live_eye_frame(frame.clone());
+                            publish_live_sensor_only_snapshot(live_state, packet);
                         }
                     },
                 )));
@@ -4614,10 +4670,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                     provider,
                     Duration::from_millis(33),
                     move |packet| {
-                        if let (Some(live_state), SensePacket::EyeFrame(frame)) =
-                            (&live_state_for_kinect, packet)
-                        {
-                            live_state.record_live_eye_frame(frame.clone());
+                        if let Some(live_state) = &live_state_for_kinect {
+                            if let SensePacket::EyeFrame(frame) = packet {
+                                live_state.record_live_eye_frame(frame.clone());
+                            }
+                            if matches!(packet, SensePacket::EyeFrame(_) | SensePacket::Kinect(_)) {
+                                publish_live_sensor_only_snapshot(live_state, packet);
+                            }
                         }
                     },
                 )));
