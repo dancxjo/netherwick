@@ -20,13 +20,14 @@ use netherwick_actions::{
 };
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use netherwick_body::{MotionCommand, MotorCommand};
-use netherwick_core::TimeMs;
+use netherwick_core::{Pose2, TimeMs};
 use netherwick_experience::{
     attach_experience_forge_vector, EmbodiedContext, ExperienceForge, ExperienceForgeSnapshot,
 };
 use netherwick_map::{
     project_beam_endpoint, LocalMap, MapObservation, MapSummary, OccupancyCell as OdomMapCell,
-    PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
+    Point3D, PointCloudFrame, PointCloudObservation, PointCloudPoint, PointCloudSummary,
+    PoseEstimate, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
 use netherwick_memory::{
     EntityConstellationState, EntityLifecycleState, EntityMemory, EntityMemoryReport,
@@ -876,6 +877,7 @@ pub struct LiveSceneResponse {
     pub kinect: SceneKinect,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface_perception: Option<SceneSurfacePerception>,
+    pub world_belief_layers: Vec<&'static str>,
     pub audio: Option<SceneAudio>,
     pub objects: Vec<SceneObject>,
     pub arena: Option<SceneArena>,
@@ -1847,6 +1849,9 @@ fn map_response_from_parts(
         overlays: vec![
             "occupancy",
             "rays",
+            "raw point cloud",
+            "accumulated occupancy",
+            "stable wall candidates",
             "danger",
             "charger/charge",
             "social",
@@ -3739,6 +3744,12 @@ pub fn snapshot_to_scene(
         eye,
         kinect,
         surface_perception: None,
+        world_belief_layers: vec![
+            "current rays",
+            "raw point cloud",
+            "accumulated occupancy",
+            "stable wall candidates",
+        ],
         audio,
         objects: metadata
             .map(|metadata| metadata.objects.clone())
@@ -5710,6 +5721,9 @@ canvas{display:block}
     <div class="map-toggles" aria-label="map overlays">
       <label><input type="checkbox" data-map-layer="occupancy" checked>occupancy</label>
       <label><input type="checkbox" data-map-layer="rays" checked>rays</label>
+      <label><input type="checkbox" data-map-layer="raw point cloud">raw cloud</label>
+      <label><input type="checkbox" data-map-layer="accumulated occupancy" checked>accum</label>
+      <label><input type="checkbox" data-map-layer="stable wall candidates" checked>stable</label>
       <label><input type="checkbox" data-map-layer="danger" checked>danger</label>
       <label><input type="checkbox" data-map-layer="charger/charge" checked>charge</label>
       <label><input type="checkbox" data-map-layer="social" checked>social</label>
@@ -6209,6 +6223,21 @@ function renderAccumulatedPoints(points){
   renderPoints(points || [], 'world');
 }
 
+function renderWorldBeliefPoints(packet){
+  const layers = enabledMapLayers();
+  const accumulated = packet.kinect?.accumulated_points || [];
+  const raw = packet.kinect?.points || [];
+  if(layers.has('stable wall candidates') && accumulated.some(point => point.stable)){
+    renderAccumulatedPoints(accumulated.filter(point => point.stable));
+  }else if(layers.has('accumulated occupancy') && accumulated.length){
+    renderAccumulatedPoints(accumulated);
+  }else if(layers.has('raw point cloud')){
+    renderPoints(raw, packet.kinect?.coordinate_system || 'camera');
+  }else{
+    renderPoints([], 'world');
+  }
+}
+
 function v3(value){
   return {
     x: Number(value?.x) || 0,
@@ -6365,18 +6394,22 @@ function renderSurfacePerception(packet){
   clearChildren(surfaceOverlays);
   const perception = packet.surface_perception;
   if(!perception) return;
-  for(const surface of perception.stable_surfaces || []){
-    createPlanePatch(surface);
-    const style = surfaceColor(surface.kind, surface.confidence);
-    const labelPosition = surfacePoint(surface.centroid).add(new BABYLON.Vector3(0, .12, 0));
-    createLabel(`${surfaceCandidateLabel(surface)} ${fmt(surface.confidence, 2)}`, labelPosition, style.color);
+  const layers = enabledMapLayers();
+  const showStableSurfaces = layers.has('stable wall candidates');
+  if(showStableSurfaces){
+    for(const surface of perception.stable_surfaces || []){
+      createPlanePatch(surface);
+      const style = surfaceColor(surface.kind, surface.confidence);
+      const labelPosition = surfacePoint(surface.centroid).add(new BABYLON.Vector3(0, .12, 0));
+      createLabel(`${surfaceCandidateLabel(surface)} ${fmt(surface.confidence, 2)}`, labelPosition, style.color);
+    }
   }
   for(const cluster of perception.clusters || []){
     createClusterBox(cluster);
   }
   const frames = perception.scene_graph?.navigation?.anticipation?.frames || perception.scene_graph?.anticipation?.frames || [];
   const future = frames[frames.length - 1];
-  if(future){
+  if(showStableSurfaces && future){
     const pose = packet.body || {};
     for(const projected of future.projected_surfaces || []){
       const surface = localSurfaceToWorld(projected, pose);
@@ -6607,12 +6640,7 @@ function updateScene(packet, liveMap=null){
   robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
   renderObjects(packet);
   renderBeams(packet);
-  const accumulated = packet.kinect?.accumulated_points || [];
-  if(accumulated.length){
-    renderAccumulatedPoints(accumulated);
-  }else{
-    renderPoints(packet.kinect?.points || [], packet.kinect?.coordinate_system || 'camera');
-  }
+  renderWorldBeliefPoints(packet);
   renderSurfacePerception(packet);
   renderEye(packet);
   updateHardwareControl(packet.hardware_control);
@@ -6667,6 +6695,7 @@ function updateScene(packet, liveMap=null){
   }
   const depth = packet.kinect?.diagnostics || {};
   const cloudSummary = packet.kinect?.accumulated_summary;
+  const accumulated = packet.kinect?.accumulated_points || [];
   fields.points.textContent = cloudSummary
     ? `${accumulated.length} drawn / ${cloudSummary.voxels || 0} voxels / ${cloudSummary.stable_voxels || 0} stable`
     : `${packet.kinect?.points?.length || 0} drawn / ${depth.valid_depth_count || 0} valid`;
@@ -9053,6 +9082,71 @@ mod tests {
     }
 
     #[test]
+    fn scene_packet_exposes_persistent_stable_world_belief_points() {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.last_update_ms = 300;
+        let mut cloud = VoxelPointCloud::default();
+        for t_ms in [100, 200, 300] {
+            cloud.integrate_observation(PointCloudObservation {
+                frame: PointCloudFrame::OdometryWorld,
+                pose: PoseEstimate {
+                    pose: Pose2::default(),
+                    confidence: 0.9,
+                    covariance: [0.01, 0.01, 0.02],
+                    source: "unit-test".to_string(),
+                    t_ms,
+                },
+                points: vec![PointCloudPoint {
+                    position: Point3D {
+                        x_m: 1.0,
+                        y_m: 0.5,
+                        z_m: 0.2,
+                    },
+                    color_rgb: None,
+                    confidence: 1.0,
+                }],
+                source: "unit-test".to_string(),
+                t_ms,
+                metadata: serde_json::json!({}),
+            });
+        }
+
+        let scene = snapshot_to_scene(
+            &snapshot,
+            None,
+            None,
+            LiveTrainingStatus::default(),
+            NudgeStatus::default(),
+            default_behavior_nodes(),
+            Some(&cloud),
+            None,
+            HardwareControlStatus::unavailable("unit test"),
+        );
+
+        assert_eq!(
+            scene.world_belief_layers,
+            vec![
+                "current rays",
+                "raw point cloud",
+                "accumulated occupancy",
+                "stable wall candidates"
+            ]
+        );
+        assert_eq!(
+            scene
+                .kinect
+                .accumulated_summary
+                .as_ref()
+                .unwrap()
+                .stable_voxels,
+            1
+        );
+        assert_eq!(scene.kinect.accumulated_points.len(), 1);
+        assert!(scene.kinect.accumulated_points[0].stable);
+        assert_eq!(scene.kinect.coordinate_system.as_deref(), Some("world"));
+    }
+
+    #[test]
     fn scene_body_cliff_uses_create_flags_not_analog_risk() {
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.cliff_sensors.front_left = 0.96;
@@ -9221,6 +9315,10 @@ mod tests {
         assert!(page.contains("/view/map"));
         assert!(page.contains("data-map-layer=\"occupancy\""));
         assert!(page.contains("data-map-layer=\"rays\""));
+        assert!(page.contains("data-map-layer=\"raw point cloud\""));
+        assert!(page.contains("data-map-layer=\"accumulated occupancy\""));
+        assert!(page.contains("data-map-layer=\"stable wall candidates\""));
+        assert!(page.contains("function renderWorldBeliefPoints"));
         assert!(
             page.contains("SLAM-lite / odometry map: odometry/range trace, not corrected SLAM.")
         );
