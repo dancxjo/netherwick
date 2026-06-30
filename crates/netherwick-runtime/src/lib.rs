@@ -2731,6 +2731,11 @@ where
         _latent: ExperienceLatent,
         mut futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick> {
+        let frame_id = Uuid::new_v4();
+        now.extensions.insert(
+            "frame_id".to_string(),
+            serde_json::Value::String(frame_id.to_string()),
+        );
         {
             let mut reign_queue = self
                 .reign_queue
@@ -2786,7 +2791,7 @@ where
             .map(|candidate| {
                 place_candidate_to_loop_input(
                     candidate,
-                    Some(format!("runtime-now:{}", now.t_ms)),
+                    Some(frame_id.to_string()),
                     Some(&place_recognition_input),
                 )
             })
@@ -3577,7 +3582,7 @@ where
 
         self.last_behavior_runs = behavior_runs.clone();
         let mut frame = ExperienceFrame {
-            id: Uuid::new_v4(),
+            id: frame_id,
             t_ms: now.t_ms,
             now: now.clone(),
             sensations,
@@ -6681,12 +6686,13 @@ mod tests {
     };
     use netherwick_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader};
     use netherwick_llm::{ConsciousCommand, LlmDecision, LlmTickResult};
+    use netherwick_map::MapConfig;
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_models::{
         ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
         ExperienceAutoencoderTrainer, FutureNetTrainer,
     };
-    use netherwick_now::{Now, SurpriseSense};
+    use netherwick_now::{Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION};
     use netherwick_sensors::World;
     use netherwick_sim::{
         build_scenario, ArenaConfig, ScenarioConfig, ScenarioKind, SimObject, VirtualWorld,
@@ -6767,6 +6773,20 @@ mod tests {
         let mut now = Now::blank(t_ms, body);
         now.range.nearest_m = Some(1.0);
         now.range.beams = vec![1.0, 1.0, 1.0];
+        now
+    }
+
+    fn mapped_scene_now(t_ms: u64, x_m: f32, point_id: &str) -> Now {
+        let mut body = test_body(x_m, 0.0, 0.8, t_ms);
+        body.odometry.heading_rad = 0.0;
+        let mut now = Now::blank(t_ms, body);
+        now.range.nearest_m = Some(1.0);
+        now.range.beams = vec![1.0];
+        now.eye.scene_vectors =
+            vec![
+                VectorArtifact::new(SCENE_VECTOR_COLLECTION, point_id, vec![1.0, 0.0, 0.0])
+                    .with_occurred_at_ms(t_ms),
+            ];
         now
     }
 
@@ -7640,6 +7660,57 @@ mod tests {
                 && sensation.modality == Modality::Memory
                 && sensation.payload_kind == SensationPayloadKind::MemoryRecall
         }));
+    }
+
+    #[tokio::test]
+    async fn tick_feeds_memory_loop_candidates_into_live_map() {
+        let root = test_ledger_root("runtime-live-loop-closure");
+        let ledger = JsonlLedger::new(&root);
+        let config = MapConfig {
+            resolution_m: 0.25,
+            pose_graph_min_node_distance_m: 0.01,
+            pose_graph_max_ticks_between_nodes: 1,
+            ..MapConfig::default()
+        };
+        let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop))
+            .with_local_map(LocalMap::new(config));
+
+        for step in 0..5 {
+            runtime
+                .tick(
+                    mapped_scene_now(100 + step * 100, 0.0, &format!("seed-{step}")),
+                    ExperienceLatent::default(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let tick = runtime
+            .tick(
+                mapped_scene_now(700, 0.05, "return"),
+                ExperienceLatent::default(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let frame_id = tick.frame.id.to_string();
+
+        assert_eq!(
+            tick.frame
+                .now
+                .extensions
+                .get("frame_id")
+                .and_then(Value::as_str),
+            Some(frame_id.as_str())
+        );
+        let summary = runtime.local_map.summary();
+        assert!(
+            summary.loop_closures_accepted > 0,
+            "expected live map to accept a memory loop closure, got {summary:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

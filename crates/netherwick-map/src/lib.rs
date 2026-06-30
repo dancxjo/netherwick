@@ -1839,6 +1839,7 @@ pub fn observation_from_now(now: &Now, config: MapConfig) -> MapObservation {
             "range": now.range,
             "source": now.extensions.get("source"),
             "mode": now.extensions.get("mode"),
+            "frame_id": now.extensions.get("frame_id"),
         }),
         now.t_ms,
         config,
