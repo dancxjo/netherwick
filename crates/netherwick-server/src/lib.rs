@@ -25,8 +25,9 @@ use netherwick_experience::{
     attach_experience_forge_vector, EmbodiedContext, ExperienceForge, ExperienceForgeSnapshot,
 };
 use netherwick_map::{
-    project_beam_endpoint, LocalMap, LocalWorldBelief, MapObservation, MapSummary,
-    OccupancyCell as OdomMapCell, PointCloudSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
+    orientation_from_imu, project_beam_endpoint, LocalMap, LocalWorldBelief, MapObservation,
+    MapSummary, OccupancyCell as OdomMapCell, PointCloudSummary, VoxelPoint, VoxelPointCloud,
+    MAP_LABEL,
 };
 use netherwick_memory::{
     EntityConstellationState, EntityLifecycleState, EntityMemory, EntityMemoryReport,
@@ -916,6 +917,7 @@ pub struct LiveSceneResponse {
     pub range: SceneRange,
     pub eye: Option<SceneEye>,
     pub kinect: SceneKinect,
+    pub imu: SceneImuDebug,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface_perception: Option<SceneSurfacePerception>,
     pub world_belief_layers: Vec<&'static str>,
@@ -1149,6 +1151,19 @@ pub struct SceneKinect {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SceneImuDebug {
+    pub raw_orientation: Vec<f32>,
+    pub assumed_units: String,
+    pub assumed_axis_order: String,
+    pub roll_deg: Option<f32>,
+    pub pitch_deg: Option<f32>,
+    pub yaw_deg: Option<f32>,
+    pub roll_pitch_correction_active: bool,
+    pub yaw_source: String,
+    pub contract_known: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SceneKinectDiagnostics {
     pub depth_width: u32,
     pub depth_height: u32,
@@ -1160,10 +1175,22 @@ pub struct SceneKinectDiagnostics {
     pub max_depth_m: Option<f32>,
     pub sample_stride: usize,
     pub coordinate_system: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_coordinate_system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub math_frame: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_frame: Option<String>,
     pub below_floor_count: usize,
     pub below_floor_ratio: f32,
     pub min_z_m: Option<f32>,
     pub median_z_m: Option<f32>,
+    pub min_math_z_m: Option<f32>,
+    pub median_math_z_m: Option<f32>,
+    pub min_render_vertical_m: Option<f32>,
+    pub median_render_vertical_m: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -3641,6 +3668,26 @@ fn scene_accumulated_point(point: VoxelPoint, now_ms: TimeMs) -> SceneAccumulate
     }
 }
 
+fn scene_imu_debug(snapshot: &WorldSnapshot) -> SceneImuDebug {
+    let orientation = orientation_from_imu(&snapshot.imu, snapshot.body.odometry.heading_rad);
+    SceneImuDebug {
+        raw_orientation: snapshot.imu.orientation.clone(),
+        assumed_units: "radians".to_string(),
+        assumed_axis_order: match snapshot.imu.orientation.len() {
+            0 => "none".to_string(),
+            1 => "[yaw] legacy heading-only".to_string(),
+            2 => "[roll, pitch]".to_string(),
+            _ => "[roll, pitch, yaw]".to_string(),
+        },
+        roll_deg: orientation.roll_rad.map(f32::to_degrees),
+        pitch_deg: orientation.pitch_rad.map(f32::to_degrees),
+        yaw_deg: orientation.yaw_rad.map(f32::to_degrees),
+        roll_pitch_correction_active: orientation.roll_pitch_from_imu,
+        yaw_source: format!("{:?}", orientation.yaw_source),
+        contract_known: false,
+    }
+}
+
 async fn get_live_now(
     State(state): State<LiveViewState>,
 ) -> Result<Json<netherwick_now::Now>, LiveViewError> {
@@ -3791,11 +3838,17 @@ pub fn snapshot_to_scene(
         range: scene_range_from_snapshot(snapshot),
         eye,
         kinect,
+        imu: scene_imu_debug(snapshot),
         surface_perception: None,
         world_belief_layers: vec![
             "current rays",
             "raw point cloud",
+            "raw camera-frame points",
+            "robot-frame points",
+            "world-frame points",
             "accumulated occupancy",
+            "floor plane",
+            "axes gizmo",
             "stable wall candidates",
         ],
         audio,
@@ -4374,8 +4427,13 @@ fn depth_points(
     if let Some(calibration) = calibration {
         if depth_m.len() == calibration.compact_depth_beam_count {
             let points = range_beam_points(depth_m, calibration);
-            let stats = depth_stats(depth_m, 1, 0.0, 8.0, "robot", 0, 0)
+            let mut stats = depth_stats(depth_m, 1, 0.0, 8.0, "scene_robot_render", 0, 0)
                 .with_floor_stats(floor_stats_from_scene_points(&points));
+            stats.point_coordinate_system =
+                Some("scene axes derived from robot math frame".to_string());
+            stats.math_frame =
+                Some("robot/base: +x forward, +y left, +z up; floor z=0".to_string());
+            stats.render_frame = Some("scene: +x left, +y up, +z forward".to_string());
             return (points, stats);
         }
     }
@@ -4592,25 +4650,18 @@ fn project_depth_image(
             .unwrap_or_else(|| depth_shade(z, frame.max_depth_m));
         let point = if let Some(extrinsics) = calibrated {
             let robot = camera_point_to_robot([x, y, z], extrinsics);
-            ScenePoint {
-                x: robot[1],
-                y: robot[2],
-                z: robot[0],
-                r,
-                g,
-                b,
-            }
+            scene_point_from_robot(robot, r, g, b)
         } else {
             ScenePoint { x, y, z, r, g, b }
         };
         points.push(point);
     }
     let coordinate_system = if calibrated.is_some() {
-        "robot"
+        "scene_robot_render"
     } else {
         &frame.coordinate_system
     };
-    let diagnostics = depth_stats(
+    let mut diagnostics = depth_stats(
         depth_m,
         stride,
         frame.min_depth_m,
@@ -4620,7 +4671,25 @@ fn project_depth_image(
         frame.height as u32,
     )
     .with_floor_stats(floor_stats_from_scene_points(&points));
+    if calibrated.is_some() {
+        diagnostics.point_coordinate_system =
+            Some("scene axes derived from robot math frame".to_string());
+        diagnostics.math_frame =
+            Some("robot/base: +x forward, +y left, +z up; floor z=0".to_string());
+        diagnostics.render_frame = Some("scene: +x left, +y up, +z forward".to_string());
+    }
     (points, diagnostics)
+}
+
+fn scene_point_from_robot(robot: [f32; 3], r: u8, g: u8, b: u8) -> ScenePoint {
+    ScenePoint {
+        x: robot[1],
+        y: robot[2],
+        z: robot[0],
+        r,
+        g,
+        b,
+    }
 }
 
 fn depth_stats(
@@ -4661,10 +4730,18 @@ fn depth_stats(
         max_depth_m: valid.last().copied(),
         sample_stride,
         coordinate_system: coordinate_system.to_string(),
+        point_coordinate_system: None,
+        math_frame: None,
+        render_frame: None,
         below_floor_count: 0,
         below_floor_ratio: 0.0,
         min_z_m: None,
         median_z_m: None,
+        min_math_z_m: None,
+        median_math_z_m: None,
+        min_render_vertical_m: None,
+        median_render_vertical_m: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -4674,6 +4751,12 @@ impl SceneKinectDiagnostics {
         self.below_floor_ratio = stats.below_floor_ratio;
         self.min_z_m = stats.min_z_m;
         self.median_z_m = stats.median_z_m;
+        self.min_render_vertical_m = stats.min_z_m;
+        self.median_render_vertical_m = stats.median_z_m;
+        if self.coordinate_system == "scene_robot_render" {
+            self.min_math_z_m = stats.min_z_m;
+            self.median_math_z_m = stats.median_z_m;
+        }
         self
     }
 }
@@ -4794,14 +4877,7 @@ fn range_beam_points(depth_m: &[f32], calibration: SceneSensorCalibration) -> Ve
                 [angle.cos() * distance, angle.sin() * distance, 0.0],
                 extrinsics,
             );
-            Some(ScenePoint {
-                x: robot[1],
-                y: robot[2],
-                z: robot[0],
-                r: shade,
-                g: shade,
-                b: shade,
-            })
+            Some(scene_point_from_robot(robot, shade, shade, shade))
         })
         .collect()
 }
@@ -5898,6 +5974,10 @@ canvas{display:block}
     <dt>eye</dt><dd id="eye">-</dd>
     <dt>points</dt><dd id="points">-</dd>
     <dt>depth</dt><dd id="depth_stats">-</dd>
+    <dt>frames</dt><dd id="geometry_frames">-</dd>
+    <dt>IMU</dt><dd id="imu_orientation">-</dd>
+    <dt>calibration</dt><dd id="calibration_readout">-</dd>
+    <dt>geometry warnings</dt><dd id="geometry_warnings">-</dd>
     <dt>surfaces</dt><dd id="surfaces">-</dd>
     <dt>audio</dt><dd id="audio">-</dd>
     <dt>mind</dt><dd id="mind">-</dd>
@@ -5964,7 +6044,12 @@ canvas{display:block}
       <label><input type="checkbox" data-map-layer="occupancy" checked>occupancy</label>
       <label><input type="checkbox" data-map-layer="rays" checked>rays</label>
       <label><input type="checkbox" data-map-layer="raw point cloud">raw cloud</label>
+      <label><input type="checkbox" data-map-layer="raw camera-frame points">camera frame</label>
+      <label><input type="checkbox" data-map-layer="robot-frame points">robot frame</label>
+      <label><input type="checkbox" data-map-layer="world-frame points">world frame</label>
       <label><input type="checkbox" data-map-layer="accumulated occupancy" checked>accum</label>
+      <label><input type="checkbox" data-map-layer="floor plane" checked>floor</label>
+      <label><input type="checkbox" data-map-layer="axes gizmo" checked>axes</label>
       <label><input type="checkbox" data-map-layer="stable wall candidates" checked>stable</label>
       <label><input type="checkbox" data-map-layer="danger" checked>danger</label>
       <label><input type="checkbox" data-map-layer="charger/charge" checked>charge</label>
@@ -6108,7 +6193,7 @@ const behaviorInspector = document.getElementById('behavior-inspector');
 const virtualPipelineSection = document.getElementById('virtual-pipeline-section');
 const virtualReportSummary = document.getElementById('virtual-report-summary');
 const virtualModelRecommendations = document.getElementById('virtual-model-recommendations');
-const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','depth_stats','surfaces','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
+const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','depth_stats','geometry_frames','imu_orientation','calibration_readout','geometry_warnings','surfaces','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const learningMode = document.getElementById('learning-mode');
 const learningSteps = document.getElementById('learning-steps');
 const learningStatus = document.getElementById('learning-status');
@@ -6429,6 +6514,16 @@ function quaternionFromFloorNormal(normal){
 }
 
 function syncVisualFloor(packet){
+  if(!enabledMapLayers().has('floor plane')){
+    const arena = packet.arena || {};
+    const centerX = Number.isFinite(arena.width_m) ? arena.width_m / 2 : Number(packet.body?.x_m) || 0;
+    const centerY = Number.isFinite(arena.height_m) ? arena.height_m / 2 : Number(packet.body?.y_m) || 0;
+    ground.position.set(centerX, 0, centerY);
+    gridMesh.position.set(centerX, 0, centerY);
+    ground.rotationQuaternion = null;
+    gridMesh.rotationQuaternion = null;
+    return;
+  }
   const arena = packet.arena || {};
   const centerX = Number.isFinite(arena.width_m) ? arena.width_m / 2 : Number(packet.body?.x_m) || 0;
   const centerY = Number.isFinite(arena.height_m) ? arena.height_m / 2 : Number(packet.body?.y_m) || 0;
@@ -6487,6 +6582,7 @@ function renderPoints(points, coordinateSystem){
   const indices = [];
   
   const isRobot = coordinateSystem === 'robot';
+  const isSceneRobotRender = coordinateSystem === 'scene_robot_render';
   const isKinectCamera = coordinateSystem === 'kinect_camera' || coordinateSystem === 'camera' || coordinateSystem === 'depth_image_unknown';
   const robotMatrix = robot.getWorldMatrix();
   const kinectMatrix = eyeCamera.getWorldMatrix();
@@ -6494,6 +6590,11 @@ function renderPoints(points, coordinateSystem){
   points.forEach((p, i) => {
     let worldPoint;
     if (isRobot) {
+      worldPoint = BABYLON.Vector3.TransformCoordinates(
+        new BABYLON.Vector3(p.x, p.y, -p.z),
+        robotMatrix
+      );
+    } else if (isSceneRobotRender) {
       worldPoint = BABYLON.Vector3.TransformCoordinates(
         new BABYLON.Vector3(p.x, p.y, -p.z),
         robotMatrix
@@ -6535,12 +6636,15 @@ function renderWorldBeliefPoints(packet){
   const layers = enabledMapLayers();
   const accumulated = packet.kinect?.accumulated_points || [];
   const raw = packet.kinect?.points || [];
+  const rawFrame = packet.kinect?.coordinate_system || packet.kinect?.diagnostics?.coordinate_system || 'camera';
   if(layers.has('stable wall candidates') && accumulated.some(point => point.stable)){
     renderAccumulatedPoints(accumulated.filter(point => point.stable));
   }else if(layers.has('accumulated occupancy') && accumulated.length){
     renderAccumulatedPoints(accumulated);
-  }else if(layers.has('raw point cloud')){
-    renderPoints(raw, packet.kinect?.coordinate_system || 'camera');
+  }else if(layers.has('world-frame points') && accumulated.length){
+    renderAccumulatedPoints(accumulated);
+  }else if(layers.has('raw point cloud') || layers.has('raw camera-frame points') || layers.has('robot-frame points')){
+    renderPoints(raw, rawFrame);
   }else{
     renderPoints([], 'world');
   }
@@ -7038,8 +7142,17 @@ function updateScene(packet, liveMap=null){
     ? `${accumulated.length} drawn / ${cloudSummary.voxels || 0} voxels / ${cloudSummary.stable_voxels || 0} stable`
     : `${packet.kinect?.points?.length || 0} drawn / ${depth.valid_depth_count || 0} valid`;
   fields.depth_stats.textContent = depth.depth_width
-    ? `${depth.depth_width}x${depth.depth_height} ${depth.coordinate_system || '-'} med ${depth.median_depth_m == null ? '-' : fmt(depth.median_depth_m)}m floor min ${depth.min_z_m == null ? '-' : fmt(depth.min_z_m)} med ${depth.median_z_m == null ? '-' : fmt(depth.median_z_m)} below ${depth.below_floor_count || 0}/${fmt(depth.below_floor_ratio || 0, 2)} skip ${depth.skipped_depth_count || 0} clip ${depth.clipped_depth_count || 0} stride ${depth.sample_stride || '-'}`
+    ? `${depth.depth_width}x${depth.depth_height} ${depth.coordinate_system || '-'} med ${depth.median_depth_m == null ? '-' : fmt(depth.median_depth_m)}m math z ${depth.min_math_z_m == null ? '-' : fmt(depth.min_math_z_m)}/${depth.median_math_z_m == null ? '-' : fmt(depth.median_math_z_m)} render y ${depth.min_render_vertical_m == null ? '-' : fmt(depth.min_render_vertical_m)}/${depth.median_render_vertical_m == null ? '-' : fmt(depth.median_render_vertical_m)} below ${depth.below_floor_count || 0}/${fmt(depth.below_floor_ratio || 0, 2)} skip ${depth.skipped_depth_count || 0} clip ${depth.clipped_depth_count || 0} stride ${depth.sample_stride || '-'}`
     : '-';
+  fields.geometry_frames.textContent = `${depth.point_coordinate_system || packet.kinect?.coordinate_system || '-'} | current ${packet.kinect?.coordinate_system || '-'} | accum ${cloudSummary ? 'world' : '-'}`;
+  const imu = packet.imu || {};
+  fields.imu_orientation.textContent = `raw [${(imu.raw_orientation || []).map(v => fmt(v, 3)).join(', ')}] ${imu.assumed_axis_order || '-'} ${imu.assumed_units || '-'} roll ${imu.roll_deg == null ? '-' : fmt(imu.roll_deg, 1)}° pitch ${imu.pitch_deg == null ? '-' : fmt(imu.pitch_deg, 1)}° yaw ${imu.yaw_deg == null ? '-' : fmt(imu.yaw_deg, 1)}° ${imu.roll_pitch_correction_active ? 'rp active' : 'rp off'} yaw ${imu.yaw_source || '-'}`;
+  const cal = packet.sensor_calibration || {};
+  fields.calibration_readout.textContent = `h ${fmt(cal.camera_height_m ?? cal.point_y_m ?? 0)}m fwd ${fmt(cal.camera_forward_m ?? cal.depth_forward_offset_m ?? 0)}m pitch ${fmt((cal.camera_pitch_rad ?? cal.depth_pitch_down_rad ?? 0) * 180 / Math.PI, 1)}° roll ${fmt((cal.camera_roll_rad ?? 0) * 180 / Math.PI, 1)}° yaw ${fmt((cal.camera_yaw_rad ?? 0) * 180 / Math.PI, 1)}°`;
+  const geometryWarnings = [...(depth.warnings || []), ...(packet.warnings || []).filter(w => /intrinsics|coordinate|geometry|imu|floor|point cloud/i.test(w))];
+  if(imu.contract_known === false) geometryWarnings.push('IMU orientation contract unknown/assumed');
+  if((depth.coordinate_system || '').includes('unknown')) geometryWarnings.push('fallback depth projection active');
+  fields.geometry_warnings.textContent = geometryWarnings.length ? Array.from(new Set(geometryWarnings)).join(' | ') : '-';
   const surface = packet.surface_perception;
   if(surface){
     const nav = surface.scene_graph?.navigation || {};
@@ -9567,7 +9680,12 @@ mod tests {
             vec![
                 "current rays",
                 "raw point cloud",
+                "raw camera-frame points",
+                "robot-frame points",
+                "world-frame points",
                 "accumulated occupancy",
+                "floor plane",
+                "axes gizmo",
                 "stable wall candidates"
             ]
         );
@@ -9634,7 +9752,11 @@ mod tests {
             depth_points(&kinect, Some(SceneSensorCalibration::sim_default()), None);
 
         assert_eq!(points.len(), 32);
-        assert_eq!(diagnostics.coordinate_system, "robot");
+        assert_eq!(diagnostics.coordinate_system, "scene_robot_render");
+        assert_eq!(
+            diagnostics.render_frame.as_deref(),
+            Some("scene: +x left, +y up, +z forward")
+        );
         assert!((points[0].x + 1.847759).abs() < 0.001);
         assert!((points[0].z - 0.765367).abs() < 0.001);
         assert!((points[31].x - 1.847759).abs() < 0.001);
@@ -9737,7 +9859,11 @@ mod tests {
         let (points, diagnostics) = depth_points(&kinect, Some(calibration), None);
 
         assert_eq!(points.len(), 1);
-        assert_eq!(diagnostics.coordinate_system, "robot");
+        assert_eq!(diagnostics.coordinate_system, "scene_robot_render");
+        assert_eq!(
+            diagnostics.point_coordinate_system.as_deref(),
+            Some("scene axes derived from robot math frame")
+        );
         assert_eq!(diagnostics.below_floor_count, 1);
         assert_eq!(diagnostics.below_floor_ratio, 1.0);
         assert!(diagnostics.min_z_m.unwrap() < 0.0);

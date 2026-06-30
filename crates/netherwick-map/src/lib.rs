@@ -1948,6 +1948,48 @@ mod tests {
     }
 
     #[test]
+    fn camera_to_robot_zero_rotation_maps_forward_and_height() {
+        let config = PointCloudConfig {
+            camera_height_m: 0.25,
+            camera_forward_m: 0.10,
+            ..PointCloudConfig::default()
+        };
+
+        let robot = camera_point_to_robot(
+            Point3D {
+                x_m: 0.0,
+                y_m: 0.0,
+                z_m: 1.0,
+            },
+            config,
+        );
+
+        assert!((robot.x_m - 1.10).abs() < 0.001);
+        assert!(robot.y_m.abs() < 0.001);
+        assert!((robot.z_m - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn plausible_floor_ray_lands_near_robot_floor() {
+        let config = PointCloudConfig {
+            camera_height_m: 0.5,
+            ..PointCloudConfig::default()
+        };
+        let robot = camera_point_to_robot(
+            Point3D {
+                x_m: 0.0,
+                y_m: 0.5,
+                z_m: 1.0,
+            },
+            config,
+        );
+
+        assert!(robot.x_m > 0.9);
+        assert!(robot.y_m.abs() < 0.001);
+        assert!(robot.z_m.abs() < 0.001);
+    }
+
+    #[test]
     fn kinect_point_transform_applies_camera_pitch_before_world_yaw() {
         let config = PointCloudConfig {
             camera_height_m: 0.5,
@@ -1977,6 +2019,105 @@ mod tests {
         assert!((world.x_m + robot.y_m).abs() < 0.001);
         assert!((world.y_m - robot.x_m).abs() < 0.001);
         assert!((world.z_m - robot.z_m).abs() < 0.001);
+    }
+
+    #[test]
+    fn positive_pitch_lowers_straight_ahead_points() {
+        let zero = camera_point_to_robot(
+            Point3D {
+                x_m: 0.0,
+                y_m: 0.0,
+                z_m: 1.0,
+            },
+            PointCloudConfig {
+                camera_height_m: 0.5,
+                ..PointCloudConfig::default()
+            },
+        );
+        let pitched = camera_point_to_robot(
+            Point3D {
+                x_m: 0.0,
+                y_m: 0.0,
+                z_m: 1.0,
+            },
+            PointCloudConfig {
+                camera_height_m: 0.5,
+                camera_pitch_rad: 10.0_f32.to_radians(),
+                ..PointCloudConfig::default()
+            },
+        );
+
+        assert!(pitched.z_m < zero.z_m);
+        assert!(pitched.x_m < zero.x_m);
+    }
+
+    #[test]
+    fn positive_roll_raises_left_floor_relative_to_right() {
+        let config = PointCloudConfig {
+            camera_height_m: 0.5,
+            camera_roll_rad: 10.0_f32.to_radians(),
+            ..PointCloudConfig::default()
+        };
+        let left = camera_point_to_robot(
+            Point3D {
+                x_m: -0.25,
+                y_m: 0.5,
+                z_m: 1.0,
+            },
+            config,
+        );
+        let right = camera_point_to_robot(
+            Point3D {
+                x_m: 0.25,
+                y_m: 0.5,
+                z_m: 1.0,
+            },
+            config,
+        );
+
+        assert!(left.y_m > 0.0);
+        assert!(right.y_m < 0.0);
+        assert!(left.z_m > right.z_m);
+    }
+
+    #[test]
+    fn imu_roll_pitch_correction_changes_world_height_before_yaw() {
+        let config = PointCloudConfig {
+            camera_height_m: 0.5,
+            ..PointCloudConfig::default()
+        };
+        let point = Point3D {
+            x_m: 0.0,
+            y_m: 0.0,
+            z_m: 1.0,
+        };
+        let uncorrected = transform_point_to_world(
+            point,
+            PointCloudFrame::KinectCamera,
+            pose(0.0, 0.0, 0.0),
+            OrientationEstimate {
+                yaw_rad: Some(0.0),
+                yaw_source: YawSource::OdometryHeading,
+                ..OrientationEstimate::default()
+            },
+            config,
+        );
+        let corrected = transform_point_to_world(
+            point,
+            PointCloudFrame::KinectCamera,
+            pose(0.0, 0.0, 0.0),
+            OrientationEstimate {
+                pitch_rad: Some(10.0_f32.to_radians()),
+                yaw_rad: Some(0.0),
+                roll_pitch_from_imu: true,
+                yaw_source: YawSource::OdometryHeading,
+                ..OrientationEstimate::default()
+            },
+            config,
+        );
+
+        assert!(corrected.z_m < uncorrected.z_m);
+        assert!(corrected.x_m > uncorrected.x_m);
     }
 
     #[test]

@@ -23,7 +23,8 @@ use netherwick_ledger::{
 };
 use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
 use netherwick_map::{
-    LocalMap, LoopClosureCandidateInput, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport,
+    transform_point_to_world, LocalMap, LoopClosureCandidateInput, OrientationEstimate, Point3D,
+    PointCloudConfig, PointCloudFrame, PoseGraphBuilder, PoseGraphConfig, PoseGraphReport,
     VoxelPointCloud,
 };
 use netherwick_memory::{
@@ -99,6 +100,7 @@ enum Command {
     Promote(PromoteCommand),
     InspectLedger(InspectLedgerArgs),
     PoseGraphReport(PoseGraphReportArgs),
+    GeometryDebug(GeometryDebugArgs),
     RepresentationReport(RepresentationReportArgs),
     ModelRegister(ModelRegisterArgs),
     ModelStatus,
@@ -133,6 +135,7 @@ async fn main() -> Result<()> {
         Command::ReplayCounterfactual(args) => replay_counterfactual(args).await,
         Command::InspectLedger(args) => inspect_ledger(args).await,
         Command::PoseGraphReport(args) => run_pose_graph_report(args).await,
+        Command::GeometryDebug(args) => run_geometry_debug(args).await,
         Command::RepresentationReport(args) => run_representation_report(args).await,
         Command::Train(command) => run_train(command).await,
         Command::Evaluate(command) => run_evaluate(command).await,
@@ -872,6 +875,16 @@ struct PoseGraphReportArgs {
     max_ticks_between_nodes: u64,
     #[arg(long, default_value_t = 0.85)]
     min_loop_confidence: f32,
+}
+
+#[derive(Debug, Parser)]
+struct GeometryDebugArgs {
+    #[arg(long)]
+    capture: String,
+    #[arg(long, default_value = "data/reports/geometry/latest.json")]
+    out: String,
+    #[arg(long, default_value_t = 16)]
+    samples: usize,
 }
 
 #[derive(Debug, Parser)]
@@ -7622,6 +7635,397 @@ async fn run_pose_graph_report(args: PoseGraphReportArgs) -> Result<()> {
         report.rejected_loop_candidates
     );
     Ok(())
+}
+
+async fn run_geometry_debug(args: GeometryDebugArgs) -> Result<()> {
+    let report = generate_geometry_debug_report(&args).await?;
+    if let Some(parent) = Path::new(&args.out).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "geometry debug report written to {} (frame={}, below_floor_ratio={:.3})",
+        args.out, report.frame_index, report.floor_statistics.below_floor_ratio
+    );
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryDebugReport {
+    schema_version: u32,
+    input_source: String,
+    frame_index: u64,
+    t_ms: u64,
+    depth_projection: GeometryDepthProjection,
+    calibration_extrinsics: GeometryExtrinsics,
+    imu_orientation: GeometryImuInterpretation,
+    coordinate_frame_conventions: Vec<String>,
+    sample_transformed_points: Vec<GeometryPointSample>,
+    floor_statistics: GeometryFloorStatistics,
+    warnings: Vec<String>,
+    hard_failures: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryDepthProjection {
+    width: usize,
+    height: usize,
+    vector_len: usize,
+    projection_source: String,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    min_depth_m: Option<f32>,
+    median_depth_m: Option<f32>,
+    max_depth_m: Option<f32>,
+    skipped_depth_count: usize,
+    clipped_depth_count: usize,
+    sample_stride: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryExtrinsics {
+    camera_height_m: f32,
+    camera_forward_m: f32,
+    camera_pitch_rad: f32,
+    camera_roll_rad: f32,
+    camera_yaw_rad: f32,
+    rotation_order: String,
+    base_mapping: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryImuInterpretation {
+    raw_orientation: Vec<f32>,
+    assumed_units: String,
+    assumed_axis_order: String,
+    roll_deg: Option<f32>,
+    pitch_deg: Option<f32>,
+    yaw_deg: Option<f32>,
+    roll_pitch_correction_active: bool,
+    yaw_source: String,
+    contract_known: bool,
+    note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryPointSample {
+    pixel_index: usize,
+    u: usize,
+    v: usize,
+    depth_m: f32,
+    camera_frame: Point3D,
+    robot_base_frame: Point3D,
+    world_frame: Point3D,
+    render_scene_frame: Point3D,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryFloorStatistics {
+    sampled_points: usize,
+    below_floor_count: usize,
+    below_floor_ratio: f32,
+    min_math_frame_z_m: Option<f32>,
+    median_math_frame_z_m: Option<f32>,
+    max_math_frame_z_m: Option<f32>,
+    min_render_vertical_axis_m: Option<f32>,
+    median_render_vertical_axis_m: Option<f32>,
+    max_render_vertical_axis_m: Option<f32>,
+}
+
+async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<GeometryDebugReport> {
+    let reader = CaptureReader::open(&args.capture).await?;
+    let frames = reader.read_frames().await?;
+    let record = frames
+        .iter()
+        .find(|frame| !frame.snapshot.kinect.depth_m.is_empty())
+        .context("capture contains no frame with Kinect/depth data")?;
+    let snapshot = &record.snapshot;
+    let kinect = &snapshot.kinect;
+    let mut warnings = Vec::new();
+    let hard_failures = Vec::new();
+    let projection = geometry_projection(kinect, &mut warnings);
+    let config = PointCloudConfig::default();
+    let orientation = netherwick_map::orientation_from_snapshot(snapshot);
+    let pose = snapshot.body.odometry;
+    let sample_stride = kinect.depth_m.len().div_ceil(args.samples.max(1)).max(1);
+    let min_depth = positive_depth_or(kinect.min_depth_m, config.min_depth_m);
+    let max_depth = positive_depth_or(kinect.max_depth_m, config.max_depth_m);
+    let mut full_skipped = 0usize;
+    let mut full_clipped = 0usize;
+    let mut full_valid_depths = Vec::new();
+    for depth in &kinect.depth_m {
+        if !depth.is_finite() || *depth <= 0.0 {
+            full_skipped = full_skipped.saturating_add(1);
+        } else if *depth < min_depth || *depth > max_depth {
+            full_clipped = full_clipped.saturating_add(1);
+        } else {
+            full_valid_depths.push(*depth);
+        }
+    }
+    full_valid_depths.sort_by(|a, b| a.total_cmp(b));
+    let mut samples = Vec::new();
+    let mut robot_heights = Vec::new();
+    let mut render_heights = Vec::new();
+    for (index, depth) in kinect.depth_m.iter().enumerate().step_by(sample_stride) {
+        if !depth.is_finite() || *depth <= 0.0 {
+            continue;
+        }
+        if *depth < min_depth || *depth > max_depth {
+            continue;
+        }
+        let u = index % projection.width;
+        let v = index / projection.width;
+        let camera = Point3D {
+            x_m: (u as f32 - projection.cx) * *depth / projection.fx.max(f32::EPSILON),
+            y_m: (v as f32 - projection.cy) * *depth / projection.fy.max(f32::EPSILON),
+            z_m: *depth,
+        };
+        let robot = geometry_camera_to_robot(camera, config);
+        let world = transform_point_to_world(camera, projection.frame, pose, orientation, config);
+        let render = Point3D {
+            x_m: robot.y_m,
+            y_m: robot.z_m,
+            z_m: robot.x_m,
+        };
+        robot_heights.push(robot.z_m);
+        render_heights.push(render.y_m);
+        if samples.len() < args.samples {
+            samples.push(GeometryPointSample {
+                pixel_index: index,
+                u,
+                v,
+                depth_m: *depth,
+                camera_frame: camera,
+                robot_base_frame: robot,
+                world_frame: world,
+                render_scene_frame: render,
+            });
+        }
+    }
+    let below_floor_count = robot_heights.iter().filter(|z| **z < 0.0).count();
+    let below_floor_ratio = if robot_heights.is_empty() {
+        0.0
+    } else {
+        below_floor_count as f32 / robot_heights.len() as f32
+    };
+    if projection.source_is_fallback {
+        warnings.push(
+            "fallback intrinsics/projection are active; real Kinect geometry is not trustworthy"
+                .to_string(),
+        );
+    }
+    if !kinect
+        .depth_coordinate_system
+        .as_deref()
+        .is_some_and(|s| s == "kinect_camera")
+    {
+        warnings.push(format!(
+            "depth coordinate system metadata is {:?}; assuming Kinect camera frame",
+            kinect.depth_coordinate_system
+        ));
+    }
+    warnings.push("IMU orientation contract is assumed from netherwick-now comments, not verified from sensor metadata".to_string());
+    Ok(GeometryDebugReport {
+        schema_version: 1,
+        input_source: format!("capture:{}", args.capture),
+        frame_index: record.index,
+        t_ms: record.t_ms,
+        depth_projection: GeometryDepthProjection {
+            width: projection.width,
+            height: projection.height,
+            vector_len: kinect.depth_m.len(),
+            projection_source: projection.source,
+            fx: projection.fx,
+            fy: projection.fy,
+            cx: projection.cx,
+            cy: projection.cy,
+            min_depth_m: full_valid_depths.first().copied(),
+            median_depth_m: median_sorted(&full_valid_depths),
+            max_depth_m: full_valid_depths.last().copied(),
+            skipped_depth_count: full_skipped,
+            clipped_depth_count: full_clipped,
+            sample_stride,
+        },
+        calibration_extrinsics: GeometryExtrinsics {
+            camera_height_m: config.camera_height_m,
+            camera_forward_m: config.camera_forward_m,
+            camera_pitch_rad: config.camera_pitch_rad,
+            camera_roll_rad: config.camera_roll_rad,
+            camera_yaw_rad: config.camera_yaw_rad,
+            rotation_order: "camera -> base [z,-x,-y], then pitch, roll, yaw, then translate".to_string(),
+            base_mapping: "Kinect camera +x right, +y down, +z forward -> robot +x forward, +y left, +z up".to_string(),
+        },
+        imu_orientation: geometry_imu_interpretation(&snapshot.imu.orientation, orientation),
+        coordinate_frame_conventions: vec![
+            "Kinect camera frame: +x right, +y down, +z forward".to_string(),
+            "Robot/base math frame: +x forward, +y left, +z up; floor is z=0".to_string(),
+            "World/odometry math frame: +x odom forward/east, +y odom left/north, +z up".to_string(),
+            "Scene render frame: Babylon +x world x/left-local, +y up, +z world y; robot forward is local -z".to_string(),
+            "ScenePoint for calibrated live depth is scene_robot_render: x=robot_y, y=robot_z, z=robot_x".to_string(),
+        ],
+        sample_transformed_points: samples,
+        floor_statistics: GeometryFloorStatistics {
+            sampled_points: robot_heights.len(),
+            below_floor_count,
+            below_floor_ratio,
+            min_math_frame_z_m: min_sorted(robot_heights.clone()),
+            median_math_frame_z_m: median_values(robot_heights.clone()),
+            max_math_frame_z_m: max_sorted(robot_heights.clone()),
+            min_render_vertical_axis_m: min_sorted(render_heights.clone()),
+            median_render_vertical_axis_m: median_values(render_heights.clone()),
+            max_render_vertical_axis_m: max_sorted(render_heights),
+        },
+        warnings,
+        hard_failures,
+    })
+}
+
+struct GeometryProjection {
+    width: usize,
+    height: usize,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    frame: PointCloudFrame,
+    source: String,
+    source_is_fallback: bool,
+}
+
+fn geometry_projection(kinect: &KinectSense, warnings: &mut Vec<String>) -> GeometryProjection {
+    let width = usize::try_from(kinect.depth_width).unwrap_or(0);
+    let height = usize::try_from(kinect.depth_height).unwrap_or(0);
+    if width > 0 && height > 0 && width.saturating_mul(height) == kinect.depth_m.len() {
+        return GeometryProjection {
+            width,
+            height,
+            fx: positive_depth_or(kinect.depth_fx, 594.0),
+            fy: positive_depth_or(kinect.depth_fy, 591.0),
+            cx: positive_depth_or(kinect.depth_cx, (width as f32 - 1.0) * 0.5),
+            cy: positive_depth_or(kinect.depth_cy, (height as f32 - 1.0) * 0.5),
+            frame: PointCloudFrame::KinectCamera,
+            source: if kinect.depth_fx > 0.0 && kinect.depth_fy > 0.0 {
+                "real_intrinsics".to_string()
+            } else {
+                "metadata_dimensions_with_fallback_intrinsics".to_string()
+            },
+            source_is_fallback: !(kinect.depth_fx > 0.0 && kinect.depth_fy > 0.0),
+        };
+    }
+    warnings.push(
+        "depth width/height do not match vector length; using legacy square fallback projection"
+            .to_string(),
+    );
+    let width = (kinect.depth_m.len() as f32).sqrt().ceil().max(1.0) as usize;
+    GeometryProjection {
+        width,
+        height: kinect.depth_m.len().div_ceil(width).max(1),
+        fx: width as f32,
+        fy: width as f32,
+        cx: (width as f32 - 1.0) * 0.5,
+        cy: (kinect.depth_m.len().div_ceil(width).max(1) as f32 - 1.0) * 0.5,
+        frame: PointCloudFrame::DepthImageUnknown,
+        source: "fallback_legacy_square_projection".to_string(),
+        source_is_fallback: true,
+    }
+}
+
+fn geometry_camera_to_robot(point: Point3D, config: PointCloudConfig) -> Point3D {
+    let base = Point3D {
+        x_m: point.z_m,
+        y_m: -point.x_m,
+        z_m: -point.y_m,
+    };
+    let rotated = geometry_rotate_robot_extrinsic(
+        base,
+        config.camera_pitch_rad,
+        config.camera_roll_rad,
+        config.camera_yaw_rad,
+    );
+    Point3D {
+        x_m: rotated.x_m + config.camera_forward_m,
+        y_m: rotated.y_m,
+        z_m: rotated.z_m + config.camera_height_m,
+    }
+}
+
+fn geometry_rotate_robot_extrinsic(
+    point: Point3D,
+    pitch_rad: f32,
+    roll_rad: f32,
+    yaw_rad: f32,
+) -> Point3D {
+    let (pitch_sin, pitch_cos) = pitch_rad.sin_cos();
+    let x = point.x_m * pitch_cos + point.z_m * pitch_sin;
+    let y = point.y_m;
+    let mut z = -point.x_m * pitch_sin + point.z_m * pitch_cos;
+    let (roll_sin, roll_cos) = roll_rad.sin_cos();
+    let rolled_y = y * roll_cos - z * roll_sin;
+    z = y * roll_sin + z * roll_cos;
+    let (yaw_sin, yaw_cos) = yaw_rad.sin_cos();
+    Point3D {
+        x_m: x * yaw_cos - rolled_y * yaw_sin,
+        y_m: x * yaw_sin + rolled_y * yaw_cos,
+        z_m: z,
+    }
+}
+
+fn geometry_imu_interpretation(
+    raw: &[f32],
+    orientation: OrientationEstimate,
+) -> GeometryImuInterpretation {
+    GeometryImuInterpretation {
+        raw_orientation: raw.to_vec(),
+        assumed_units: "radians".to_string(),
+        assumed_axis_order: match raw.len() {
+            0 => "none".to_string(),
+            1 => "[yaw] legacy heading-only".to_string(),
+            2 => "[roll, pitch]".to_string(),
+            _ => "[roll, pitch, yaw]".to_string(),
+        },
+        roll_deg: orientation.roll_rad.map(f32::to_degrees),
+        pitch_deg: orientation.pitch_rad.map(f32::to_degrees),
+        yaw_deg: orientation.yaw_rad.map(f32::to_degrees),
+        roll_pitch_correction_active: orientation.roll_pitch_from_imu,
+        yaw_source: format!("{:?}", orientation.yaw_source),
+        contract_known: false,
+        note: "contract is assumed by code comments; verify hardware producer before trusting roll/pitch correction".to_string(),
+    }
+}
+
+fn positive_depth_or(value: f32, fallback: f32) -> f32 {
+    if value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn median_values(mut values: Vec<f32>) -> Option<f32> {
+    values.sort_by(|a, b| a.total_cmp(b));
+    median_sorted(&values)
+}
+
+fn median_sorted(values: &[f32]) -> Option<f32> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values[values.len() / 2])
+    }
+}
+
+fn min_sorted(mut values: Vec<f32>) -> Option<f32> {
+    values.sort_by(|a, b| a.total_cmp(b));
+    values.first().copied()
+}
+
+fn max_sorted(mut values: Vec<f32>) -> Option<f32> {
+    values.sort_by(|a, b| a.total_cmp(b));
+    values.last().copied()
 }
 
 async fn run_representation_report(args: RepresentationReportArgs) -> Result<()> {
