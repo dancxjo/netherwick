@@ -17,6 +17,14 @@ cargo run -p netherwick-tools -- geometry-debug \
   --out data/reports/geometry/rpi5-smoke.json
 ```
 
+Or report directly from a running live robot dashboard:
+
+```bash
+cargo run -p netherwick-tools -- geometry-debug \
+  --live-now-url http://127.0.0.1:3000/now \
+  --out data/reports/geometry/live-now.json
+```
+
 Read the warnings first. Fallback intrinsics, unknown depth dimensions, or an assumed IMU contract mean the geometry is not trustworthy yet.
 
 The report also includes `sensor_truth.ready_for_real_slam`. Do not start real SLAM integration until it is `true`. The gate list must show:

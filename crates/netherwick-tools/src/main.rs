@@ -880,7 +880,9 @@ struct PoseGraphReportArgs {
 #[derive(Debug, Parser)]
 struct GeometryDebugArgs {
     #[arg(long)]
-    capture: String,
+    capture: Option<String>,
+    #[arg(long)]
+    live_now_url: Option<String>,
     #[arg(long, default_value = "data/reports/geometry/latest.json")]
     out: String,
     #[arg(long, default_value_t = 16)]
@@ -7812,8 +7814,8 @@ struct GeometryFloorStatistics {
 }
 
 async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<GeometryDebugReport> {
-    let reader = CaptureReader::open(&args.capture).await?;
-    let frames = reader.read_frames().await?;
+    let input = geometry_debug_input(args).await?;
+    let frames = input.frames;
     let record = frames
         .iter()
         .find(|frame| !frame.snapshot.kinect.depth_m.is_empty())
@@ -7927,7 +7929,7 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
     }
     Ok(GeometryDebugReport {
         schema_version: 1,
-        input_source: format!("capture:{}", args.capture),
+        input_source: input.source,
         frame_index: record.index,
         t_ms: record.t_ms,
         sensor_truth,
@@ -7981,6 +7983,74 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
         warnings,
         hard_failures,
     })
+}
+
+struct GeometryDebugInput {
+    source: String,
+    frames: Vec<netherwick_worldlab::CaptureFrameRecord>,
+}
+
+async fn geometry_debug_input(args: &GeometryDebugArgs) -> Result<GeometryDebugInput> {
+    match (&args.capture, &args.live_now_url) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("pass only one of --capture or --live-now-url");
+        }
+        (Some(capture), None) => {
+            let reader = CaptureReader::open(capture).await?;
+            Ok(GeometryDebugInput {
+                source: format!("capture:{capture}"),
+                frames: reader.read_frames().await?,
+            })
+        }
+        (None, Some(url)) => {
+            let now = reqwest::Client::new()
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("fetching live Now snapshot from {url}"))?
+                .error_for_status()
+                .with_context(|| format!("live Now endpoint returned an error for {url}"))?
+                .json::<Now>()
+                .await
+                .with_context(|| format!("decoding live Now JSON from {url}"))?;
+            let t_ms = now.t_ms;
+            Ok(GeometryDebugInput {
+                source: format!("live-now:{url}"),
+                frames: vec![netherwick_worldlab::CaptureFrameRecord {
+                    index: 0,
+                    t_ms,
+                    snapshot: world_snapshot_from_now(now),
+                    events: Vec::new(),
+                    assets: netherwick_worldlab::CaptureFrameAssets::default(),
+                    stream_metadata: Some(serde_json::json!({
+                        "source": "live_now_url",
+                        "url": url
+                    })),
+                }],
+            })
+        }
+        (None, None) => {
+            anyhow::bail!("pass --capture <dir> or --live-now-url <url>");
+        }
+    }
+}
+
+fn world_snapshot_from_now(now: Now) -> WorldSnapshot {
+    WorldSnapshot {
+        body: now.body,
+        eye_frame: now.eye_frame,
+        eye: now.eye,
+        ear: now.ear,
+        range: now.range,
+        imu: now.imu,
+        gps: now.gps,
+        kinect: now.kinect,
+        objects: now.objects,
+        face: now.face,
+        voice: now.voice,
+        extensions: Vec::new(),
+        ..WorldSnapshot::default()
+    }
 }
 
 struct GeometryProjection {

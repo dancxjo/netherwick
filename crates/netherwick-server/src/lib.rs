@@ -3688,6 +3688,34 @@ fn scene_imu_debug(snapshot: &WorldSnapshot) -> SceneImuDebug {
     }
 }
 
+fn local_world_belief_trust_warning(kinect: &SceneKinect) -> Option<String> {
+    let belief = kinect.local_world_belief.as_ref()?;
+    let mut reasons = Vec::new();
+    if kinect.diagnostics.coordinate_system == "depth_image_unknown" {
+        reasons.push("fallback depth projection is active".to_string());
+    }
+    if kinect.diagnostics.below_floor_ratio > 0.02 {
+        reasons.push(format!(
+            "below_floor_ratio {:.3} exceeds 0.020",
+            kinect.diagnostics.below_floor_ratio
+        ));
+    }
+    if !belief.orientation_status.roll_pitch_corrected {
+        reasons.push("IMU roll/pitch correction is not active".to_string());
+    }
+    if belief.stable_surfaces.is_empty() && belief.stable_blobs.is_empty() {
+        reasons.push("no stable LocalWorldBelief surfaces or blobs yet".to_string());
+    }
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "LocalWorldBelief geometry not trustworthy: {}",
+            reasons.join("; ")
+        ))
+    }
+}
+
 async fn get_live_now(
     State(state): State<LiveViewState>,
 ) -> Result<Json<netherwick_now::Now>, LiveViewError> {
@@ -3781,6 +3809,9 @@ pub fn snapshot_to_scene(
             accumulated_scene_points(point_cloud, snapshot.body.last_update_ms);
         kinect.accumulated_summary = Some(point_cloud.summary());
         kinect.local_world_belief = Some(point_cloud.local_world_belief());
+        if let Some(warning) = local_world_belief_trust_warning(&kinect) {
+            warnings.push(warning);
+        }
         if !kinect.accumulated_points.is_empty() {
             kinect.coordinate_system = Some("world".to_string());
         }
