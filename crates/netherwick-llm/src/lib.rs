@@ -27,6 +27,8 @@ const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what th
 const LIVE_EVENT_RULES: &str = "Live events may arrive while generation is happening. Treat them as observations from outside. Do not assume a human is currently present or addressing me; there may be nobody nearby. Clock and status events help track timing, pauses, and elapsed time, but do not narrate every tick, quiet moment, or idle thought.";
 const STRICT_JSON_RESPONSE_RULES: &str = "\n\nFINAL OUTPUT REQUIREMENT (MANDATORY):\nReturn exactly one JSON object and nothing else.\nDo not include markdown fences, prose, explanations, preambles, or trailing text.\nOutput must start with '{' and end with '}'.\nIf unsure, still emit the best-effort valid JSON object matching the schema.";
 const COMBOBULATOR_CLUSTER_GAP_MS: u64 = 1_000;
+const COMBOBULATOR_MIN_INTERVAL_MS: u64 = 2_000;
+const AGENT_MIN_INTERVAL_MS: u64 = 1_500;
 const MILLIS_PER_SECOND: f64 = 1_000.0;
 const DEFAULT_OLLAMA_TIMEOUT_MS: u64 = 300_000;
 
@@ -422,6 +424,10 @@ impl LlmAgent for ConfiguredLlmAgent {
 pub struct OllamaLlmAgent {
     config: LlmConfig,
     client: Client,
+    last_combobulate_ms: Option<u64>,
+    last_combobulation: Option<Combobulation>,
+    last_agent_tick_ms: Option<u64>,
+    last_tick_result: LlmTickResult,
 }
 
 impl OllamaLlmAgent {
@@ -430,7 +436,14 @@ impl OllamaLlmAgent {
             .timeout(Duration::from_millis(config.timeout_ms))
             .build()
             .context("failed to build ollama http client")?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            last_combobulate_ms: None,
+            last_combobulation: None,
+            last_agent_tick_ms: None,
+            last_tick_result: LlmTickResult::default(),
+        })
     }
 
     async fn generate_json<T>(&self, purpose: &str, model: &str, prompt: String) -> Result<T>
@@ -557,8 +570,17 @@ fn handle_ollama_stream_line(
         );
         "failed to decode ollama stream line"
     })?;
+    let mut live_delta = String::new();
     if !chunk.response.is_empty() {
         body.push_str(&chunk.response);
+        if !chunk.response.trim().is_empty() {
+            live_delta = chunk.response;
+        }
+    }
+    if live_delta.is_empty() && !chunk.thinking.is_empty() {
+        live_delta = chunk.thinking;
+    }
+    if !live_delta.is_empty() {
         emit_llm_stream(LlmStreamEvent {
             id: stream_id,
             t_ms: wall_now_ms(),
@@ -567,20 +589,7 @@ fn handle_ollama_stream_line(
             provider: "ollama".to_string(),
             model: model.to_string(),
             prompt: None,
-            delta: Some(chunk.response),
-            response: None,
-            error: None,
-        });
-    } else if !chunk.thinking.is_empty() {
-        emit_llm_stream(LlmStreamEvent {
-            id: stream_id,
-            t_ms: wall_now_ms(),
-            phase: LlmStreamPhase::Delta,
-            purpose: purpose.to_string(),
-            provider: "ollama".to_string(),
-            model: model.to_string(),
-            prompt: None,
-            delta: Some(chunk.thinking),
+            delta: Some(live_delta),
             response: None,
             error: None,
         });
@@ -614,6 +623,12 @@ impl LlmAgent for OllamaLlmAgent {
         futures: &[FuturePrediction],
         recall_summary: &str,
     ) -> Result<Option<Combobulation>> {
+        if let Some(previous_ms) = self.last_combobulate_ms {
+            if now.t_ms.saturating_sub(previous_ms) < COMBOBULATOR_MIN_INTERVAL_MS {
+                return Ok(self.last_combobulation.clone());
+            }
+        }
+        self.last_combobulate_ms = Some(now.t_ms);
         let prompt =
             build_combobulator_prompt(now, impressions, embodied, z, futures, recall_summary);
         let model = self
@@ -625,11 +640,19 @@ impl LlmAgent for OllamaLlmAgent {
             .generate_json::<CombobulatorReply>("combobulator", model, prompt)
             .await
         {
-            Ok(reply) => Ok(Some(Combobulation {
-                summary: reply.summary.trim().to_string(),
-                confidence: reply.confidence.clamp(0.0, 1.0),
-            })),
-            Err(_) => Ok(Some(heuristic_combobulation(now, recall_summary))),
+            Ok(reply) => {
+                let combobulation = Combobulation {
+                    summary: reply.summary.trim().to_string(),
+                    confidence: reply.confidence.clamp(0.0, 1.0),
+                };
+                self.last_combobulation = Some(combobulation.clone());
+                Ok(Some(combobulation))
+            }
+            Err(_) => {
+                let fallback = heuristic_combobulation(now, recall_summary);
+                self.last_combobulation = Some(fallback.clone());
+                Ok(Some(fallback))
+            }
         }
     }
 
@@ -645,6 +668,12 @@ impl LlmAgent for OllamaLlmAgent {
         if !self.config.allow_commands && !self.config.allow_teaching {
             return Ok(LlmTickResult::default());
         }
+        if let Some(previous_ms) = self.last_agent_tick_ms {
+            if now.t_ms.saturating_sub(previous_ms) < AGENT_MIN_INTERVAL_MS {
+                return Ok(self.last_tick_result.clone());
+            }
+        }
+        self.last_agent_tick_ms = Some(now.t_ms);
 
         let prompt = build_agent_prompt(
             now,
@@ -729,7 +758,7 @@ impl LlmAgent for OllamaLlmAgent {
             Vec::new()
         };
 
-        Ok(LlmTickResult {
+        let tick_result = LlmTickResult {
             sense: LlmSense {
                 schema_version: 1,
                 command_summary: conscious_command.as_ref().map(|cmd| cmd.summary.clone()),
@@ -739,7 +768,9 @@ impl LlmAgent for OllamaLlmAgent {
             conscious_command,
             decision: Some(decision),
             teaching,
-        })
+        };
+        self.last_tick_result = tick_result.clone();
+        Ok(tick_result)
     }
 }
 
@@ -1803,6 +1834,48 @@ mod tests {
         assert!(prompt.contains("Do not assume a human is currently present"));
         assert!(prompt.contains("CONTEXT FRAME"));
         assert!(prompt.contains("text=\"I hear: \\u003chello there\\u003e\""));
+    }
+
+    #[test]
+    fn stream_line_uses_thinking_when_response_is_whitespace() {
+        let mut rx = subscribe_llm_streams();
+        while rx.try_recv().is_ok() {}
+
+        let mut body = String::new();
+        handle_ollama_stream_line(
+            7,
+            "combobulator",
+            "gpt-oss:20b",
+            r#"{"response":"\n","thinking":"hello","done":false}"#,
+            &mut body,
+        )
+        .expect("stream line should parse");
+
+        let event = rx.try_recv().expect("delta event should be emitted");
+        assert_eq!(event.phase, LlmStreamPhase::Delta);
+        assert_eq!(event.delta.as_deref(), Some("hello"));
+        assert_eq!(body, "\n");
+    }
+
+    #[test]
+    fn stream_line_prefers_response_when_non_whitespace() {
+        let mut rx = subscribe_llm_streams();
+        while rx.try_recv().is_ok() {}
+
+        let mut body = String::new();
+        handle_ollama_stream_line(
+            8,
+            "agent",
+            "llama3.2",
+            r#"{"response":"ok","thinking":"ignored","done":false}"#,
+            &mut body,
+        )
+        .expect("stream line should parse");
+
+        let event = rx.try_recv().expect("delta event should be emitted");
+        assert_eq!(event.phase, LlmStreamPhase::Delta);
+        assert_eq!(event.delta.as_deref(), Some("ok"));
+        assert_eq!(body, "ok");
     }
 
     #[test]
