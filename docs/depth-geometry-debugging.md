@@ -42,6 +42,8 @@ For the stationary rotation gate, use a capture where the robot turns at least 4
 
 Old captures made before sensor `captured_at_ms` fields were added deserialize those timestamps as `0` and will fail the timestamp-carried gates. Re-capture after this change before judging SLAM readiness.
 
+The live `LocalMap` can now consume place/entity loop-closure candidates through `integrate_observation_with_loop_candidates`, optimize the anchored pose graph, and rebuild occupancy from corrected submaps. That path is for replay, simulation, and geometry-ready hardware only. On real captures, require `sensor_truth.ready_for_real_slam = true` first; failed gates should be fixed in projection, extrinsics, timestamp plumbing, IMU interpretation, or the camera/world transform chain. Do not change renderer coordinates to hide below-floor leakage or unstable accumulated clouds.
+
 ## Calibration Procedure
 
 1. Disable accumulation or visually separate it from current-frame points.

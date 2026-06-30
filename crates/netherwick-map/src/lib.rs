@@ -293,6 +293,12 @@ pub struct MapConfig {
     pub pose_graph_optimize_enabled: bool,
     pub pose_graph_optimize_iterations: usize,
     pub pose_graph_optimize_step: f32,
+    #[serde(default = "default_pose_graph_min_loop_confidence")]
+    pub pose_graph_min_loop_confidence: f32,
+    #[serde(default = "default_pose_graph_loop_target_max_distance_m")]
+    pub pose_graph_loop_target_max_distance_m: f32,
+    #[serde(default = "default_pose_graph_loop_min_geometric_overlap")]
+    pub pose_graph_loop_min_geometric_overlap: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -306,6 +312,9 @@ pub struct MapSummary {
     pub pose_graph_nodes: usize,
     pub pose_graph_edges: usize,
     pub scan_match_edges: usize,
+    pub loop_closure_edges: usize,
+    pub loop_closures_accepted: usize,
+    pub loop_closures_rejected: usize,
     pub pose_graph_optimization: PoseGraphOptimizationSummary,
     pub remap: RemapSummary,
     pub latest_pose: Option<PoseEstimate>,
@@ -537,8 +546,23 @@ impl Default for MapConfig {
             pose_graph_optimize_enabled: true,
             pose_graph_optimize_iterations: 12,
             pose_graph_optimize_step: 0.45,
+            pose_graph_min_loop_confidence: default_pose_graph_min_loop_confidence(),
+            pose_graph_loop_target_max_distance_m: default_pose_graph_loop_target_max_distance_m(),
+            pose_graph_loop_min_geometric_overlap: default_pose_graph_loop_min_geometric_overlap(),
         }
     }
+}
+
+fn default_pose_graph_min_loop_confidence() -> f32 {
+    0.85
+}
+
+fn default_pose_graph_loop_target_max_distance_m() -> f32 {
+    0.75
+}
+
+fn default_pose_graph_loop_min_geometric_overlap() -> f32 {
+    0.40
 }
 
 impl Default for PointCloudConfig {
@@ -1149,9 +1173,18 @@ impl LocalMap {
         self.summary()
     }
 
-    pub fn integrate_observation(&mut self, observation: MapObservation) {
+    pub fn integrate_observation(&mut self, observation: MapObservation) -> MapSummary {
+        self.integrate_observation_with_loop_candidates(observation, &[])
+    }
+
+    pub fn integrate_observation_with_loop_candidates(
+        &mut self,
+        observation: MapObservation,
+        loop_candidates: &[LoopClosureCandidateInput],
+    ) -> MapSummary {
         let (mut observation, scan_match) = self.scan_matched_observation(observation);
-        let pose_node_id = self.update_pose_graph(&observation, scan_match.as_ref());
+        let pose_node_id =
+            self.update_pose_graph(&observation, scan_match.as_ref(), loop_candidates);
         self.optimize_pose_graph();
         if let Some(latest) = self.pose_graph.nodes.last() {
             if latest.t_ms == observation.t_ms {
@@ -1170,6 +1203,7 @@ impl LocalMap {
         self.observations.push(observation);
         cap_vec(&mut self.observations, self.config.max_observations);
         self.rebuild_occupancy_from_submaps();
+        self.summary()
     }
 
     fn scan_matched_observation(
@@ -1209,6 +1243,7 @@ impl LocalMap {
         &mut self,
         observation: &MapObservation,
         scan_match: Option<&ScanMatchCorrection>,
+        loop_candidates: &[LoopClosureCandidateInput],
     ) -> Option<String> {
         self.pose_graph_ticks_since_node = self.pose_graph_ticks_since_node.saturating_add(1);
         if !self.should_add_live_pose_node(observation.pose.pose) {
@@ -1254,7 +1289,164 @@ impl LocalMap {
                 rejection_reason: None,
             });
         }
+        for candidate in loop_candidates {
+            self.add_live_loop_candidate(&id, observation, candidate);
+        }
         Some(id)
+    }
+
+    fn add_live_loop_candidate(
+        &mut self,
+        current_node_id: &str,
+        observation: &MapObservation,
+        candidate: &LoopClosureCandidateInput,
+    ) {
+        let Some(current) = self
+            .pose_graph
+            .nodes
+            .iter()
+            .find(|node| node.id == current_node_id)
+            .cloned()
+        else {
+            return;
+        };
+        let source = PoseEdgeSource::LoopClosureCandidate {
+            kind: candidate.kind.clone(),
+            target_frame_id: candidate.target_frame_id.clone(),
+            source_frame_id: candidate.source_frame_id.clone(),
+            source_experience_id: candidate.source_experience_id.clone(),
+            source_instant_frame_id: candidate.source_instant_frame_id.clone(),
+            source_vector_refs: candidate.source_vector_refs.clone(),
+            source_vector_id: candidate.source_vector_id.clone(),
+            query_vector_id: candidate.query_vector_id.clone(),
+            query_experience_id: candidate.query_experience_id.clone(),
+        };
+        let target = self.find_live_loop_target(candidate, &current.id).cloned();
+        let to = target
+            .as_ref()
+            .map(|node| node.id.clone())
+            .unwrap_or_else(|| "unresolved".to_string());
+        let target_pose = target
+            .as_ref()
+            .map(|node| node.pose_estimate.pose)
+            .unwrap_or(candidate.target_pose);
+        let rejection_reason =
+            self.live_loop_rejection_reason(&current, target.as_ref(), observation, candidate);
+
+        self.pose_graph.edges.push(PoseEdge {
+            from: current.id,
+            to,
+            transform: pose_delta(current.pose_estimate.pose, target_pose),
+            covariance: loop_covariance(candidate.confidence),
+            confidence: candidate.confidence.clamp(0.0, 1.0),
+            source,
+            active: rejection_reason.is_none(),
+            rejection_reason,
+        });
+    }
+
+    fn live_loop_rejection_reason(
+        &self,
+        current: &PoseNode,
+        target: Option<&PoseNode>,
+        observation: &MapObservation,
+        candidate: &LoopClosureCandidateInput,
+    ) -> Option<String> {
+        let current_source_frame_id = current.source_frame_id.as_deref();
+        if candidate.target_frame_id.as_deref() == Some(current.id.as_str())
+            || candidate.target_frame_id.as_deref() == current_source_frame_id
+        {
+            return Some("candidate targets the current/source frame".to_string());
+        }
+        if candidate.confidence < self.config.pose_graph_min_loop_confidence {
+            return Some(format!(
+                "confidence {:.3} below gate {:.3}",
+                candidate.confidence, self.config.pose_graph_min_loop_confidence
+            ));
+        }
+        let target_distance = distance_m(current.pose_estimate.pose, candidate.target_pose);
+        if target_distance > self.config.pose_graph_loop_target_max_distance_m {
+            return Some(format!(
+                "target pose {:.3}m from current pose exceeds gate {:.3}m",
+                target_distance, self.config.pose_graph_loop_target_max_distance_m
+            ));
+        }
+        let Some(target) = target else {
+            return Some("no prior node close enough to candidate target".to_string());
+        };
+        let overlap = self.loop_candidate_geometric_overlap(target.pose_estimate.pose, observation);
+        if overlap < self.config.pose_graph_loop_min_geometric_overlap {
+            return Some(format!(
+                "geometric occupancy agreement {:.3} below gate {:.3}",
+                overlap, self.config.pose_graph_loop_min_geometric_overlap
+            ));
+        }
+        None
+    }
+
+    fn find_live_loop_target(
+        &self,
+        candidate: &LoopClosureCandidateInput,
+        current_id: &str,
+    ) -> Option<&PoseNode> {
+        if let Some(target_frame_id) = candidate.target_frame_id.as_deref() {
+            if let Some(node) = self.pose_graph.nodes.iter().find(|node| {
+                node.id != current_id && node.source_frame_id.as_deref() == Some(target_frame_id)
+            }) {
+                return Some(node);
+            }
+        }
+
+        self.pose_graph
+            .nodes
+            .iter()
+            .filter(|node| node.id != current_id)
+            .filter_map(|node| {
+                let distance = distance_m(node.pose_estimate.pose, candidate.target_pose);
+                (distance <= self.config.pose_graph_loop_target_max_distance_m)
+                    .then_some((distance, node))
+            })
+            .min_by(|left, right| {
+                left.0
+                    .partial_cmp(&right.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(_, node)| node)
+    }
+
+    fn loop_candidate_geometric_overlap(
+        &self,
+        candidate_pose: Pose2,
+        observation: &MapObservation,
+    ) -> f32 {
+        let mut hits = 0usize;
+        let mut matched_hits = 0usize;
+        for beam in observation
+            .range_beams
+            .iter()
+            .filter(|beam| beam.hit && beam.confidence > 0.0)
+        {
+            if !beam.distance_m.is_finite() || beam.distance_m <= 0.0 {
+                continue;
+            }
+            hits = hits.saturating_add(1);
+            let end = project_beam_endpoint(
+                candidate_pose,
+                beam.angle_rad,
+                beam.distance_m.min(self.config.max_range_m),
+            );
+            let key = cell_key(end.x_m, end.y_m, self.config.resolution_m);
+            if self.cells.get(&key).is_some_and(|cell| {
+                cell.occupied_score > cell.free_score && cell.confidence >= 0.05
+            }) {
+                matched_hits = matched_hits.saturating_add(1);
+            }
+        }
+        if hits == 0 {
+            0.0
+        } else {
+            matched_hits as f32 / hits as f32
+        }
     }
 
     fn should_add_live_pose_node(&self, pose: Pose2) -> bool {
@@ -1481,6 +1673,22 @@ impl LocalMap {
             .values()
             .filter(|cell| cell.free_score >= cell.occupied_score && cell.confidence > 0.0)
             .count();
+        let loop_closure_edges = self
+            .pose_graph
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge.source, PoseEdgeSource::LoopClosureCandidate { .. }))
+            .count();
+        let loop_closures_accepted = self
+            .pose_graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                matches!(edge.source, PoseEdgeSource::LoopClosureCandidate { .. }) && edge.active
+            })
+            .count();
+        let loop_closures_rejected = loop_closure_edges.saturating_sub(loop_closures_accepted);
+
         MapSummary {
             label: MAP_LABEL,
             resolution_m: self.config.resolution_m,
@@ -1496,6 +1704,9 @@ impl LocalMap {
                 .iter()
                 .filter(|edge| matches!(edge.source, PoseEdgeSource::ScanMatch { .. }))
                 .count(),
+            loop_closure_edges,
+            loop_closures_accepted,
+            loop_closures_rejected,
             pose_graph_optimization: self.pose_graph_optimization,
             remap: self.remap_summary,
             latest_pose: self.pose_history.last().cloned(),
@@ -2624,6 +2835,164 @@ mod tests {
     }
 
     #[test]
+    fn live_loop_candidate_empty_path_preserves_scan_matched_behavior() {
+        let config = MapConfig {
+            resolution_m: 0.25,
+            pose_graph_min_node_distance_m: 0.01,
+            ..MapConfig::default()
+        };
+        let mut baseline = LocalMap::new(config);
+        let mut candidate_aware = LocalMap::new(config);
+        let first = observation_from_parts(
+            pose(0.0, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"seed"}),
+            100,
+            config,
+        );
+        let second = observation_from_parts(
+            pose(1.0, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"next"}),
+            200,
+            config,
+        );
+
+        baseline.integrate_observation(first.clone());
+        baseline.integrate_observation(second.clone());
+        candidate_aware.integrate_observation_with_loop_candidates(first, &[]);
+        candidate_aware.integrate_observation_with_loop_candidates(second, &[]);
+
+        assert_eq!(candidate_aware.pose_history, baseline.pose_history);
+        assert_eq!(candidate_aware.pose_graph, baseline.pose_graph);
+        assert_eq!(candidate_aware.summary().loop_closure_edges, 0);
+    }
+
+    #[test]
+    fn live_loop_candidate_low_confidence_is_rejected_with_reason() {
+        let config = live_loop_test_config();
+        let mut map = seeded_live_loop_map(config);
+        let weak = live_loop_candidate("entity_constellation", 0.60, "seed", "return");
+        let observation = observation_from_parts(
+            pose(0.05, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"return"}),
+            300,
+            config,
+        );
+
+        let summary = map.integrate_observation_with_loop_candidates(observation, &[weak]);
+
+        assert_eq!(summary.loop_closure_edges, 1);
+        assert_eq!(summary.loop_closures_accepted, 0);
+        assert_eq!(summary.loop_closures_rejected, 1);
+        let edge = map.pose_graph.edges.last().unwrap();
+        assert!(!edge.active);
+        assert!(edge
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("below gate")));
+    }
+
+    #[test]
+    fn live_entity_constellation_candidate_adds_active_loop_edge() {
+        let config = live_loop_test_config();
+        let mut map = seeded_live_loop_map(config);
+        let candidate = live_loop_candidate("entity_constellation", 0.94, "seed", "return");
+        let observation = observation_from_parts(
+            pose(0.05, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"return"}),
+            300,
+            config,
+        );
+
+        let summary = map.integrate_observation_with_loop_candidates(observation, &[candidate]);
+
+        assert_eq!(summary.loop_closure_edges, 1);
+        assert_eq!(summary.loop_closures_accepted, 1);
+        assert_eq!(summary.loop_closures_rejected, 0);
+        let edge = map.pose_graph.edges.last().unwrap();
+        assert!(edge.active);
+        assert_eq!(edge.to, "live-pose-0");
+        assert!(matches!(
+            edge.source,
+            PoseEdgeSource::LoopClosureCandidate { ref kind, .. } if kind == "entity_constellation"
+        ));
+    }
+
+    #[test]
+    fn live_loop_rejections_explain_bad_targets_and_weak_geometry() {
+        let config = live_loop_test_config();
+        let mut map = seeded_live_loop_map(config);
+        let current_target = live_loop_candidate("entity_constellation", 0.94, "return", "return");
+        let weak_geometry = LoopClosureCandidateInput {
+            target_frame_id: Some("seed".to_string()),
+            source_frame_id: Some("return".to_string()),
+            ..live_loop_candidate("entity_constellation", 0.94, "seed", "return")
+        };
+        let observation = observation_from_parts(
+            pose(0.05, 0.0, 0.0),
+            0.75,
+            &[3.0],
+            Some(3.0),
+            serde_json::json!({"frame_id":"return"}),
+            300,
+            config,
+        );
+
+        map.integrate_observation_with_loop_candidates(
+            observation,
+            &[current_target, weak_geometry],
+        );
+
+        let reasons = map
+            .pose_graph
+            .edges
+            .iter()
+            .filter_map(|edge| edge.rejection_reason.as_deref())
+            .collect::<Vec<_>>();
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.contains("current/source frame")));
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.contains("geometric occupancy agreement")));
+    }
+
+    #[test]
+    fn live_loop_candidate_rebuilds_occupancy_after_optimization() {
+        let config = live_loop_test_config();
+        let mut map = seeded_live_loop_map(config);
+        let generation_before = map.remap_summary.generation;
+        let candidate = live_loop_candidate("entity_constellation", 0.94, "seed", "return");
+        let observation = observation_from_parts(
+            pose(0.05, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"return"}),
+            300,
+            config,
+        );
+
+        let summary = map.integrate_observation_with_loop_candidates(observation, &[candidate]);
+
+        assert!(summary.pose_graph_optimization.active_edges >= 2);
+        assert_eq!(summary.remap.submaps, map.submaps.len());
+        assert!(summary.remap.generation > generation_before);
+        assert!(!map.cells.is_empty());
+    }
+
+    #[test]
     fn kinect_point_transforms_into_odometry_world_frame() {
         let config = PointCloudConfig {
             voxel_size_m: 0.1,
@@ -3190,6 +3559,65 @@ mod tests {
             source,
             active: true,
             rejection_reason: None,
+        }
+    }
+
+    fn live_loop_test_config() -> MapConfig {
+        MapConfig {
+            resolution_m: 0.1,
+            scan_match_enabled: false,
+            pose_graph_min_node_distance_m: 0.01,
+            pose_graph_max_ticks_between_nodes: 1,
+            pose_graph_optimize_iterations: 8,
+            pose_graph_min_loop_confidence: 0.85,
+            pose_graph_loop_target_max_distance_m: 0.75,
+            pose_graph_loop_min_geometric_overlap: 0.40,
+            ..MapConfig::default()
+        }
+    }
+
+    fn seeded_live_loop_map(config: MapConfig) -> LocalMap {
+        let mut map = LocalMap::new(config);
+        map.integrate_observation(observation_from_parts(
+            pose(0.0, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"seed"}),
+            100,
+            config,
+        ));
+        map.integrate_observation(observation_from_parts(
+            pose(1.0, 0.0, 0.0),
+            0.75,
+            &[1.0],
+            Some(1.0),
+            serde_json::json!({"frame_id":"away"}),
+            200,
+            config,
+        ));
+        map
+    }
+
+    fn live_loop_candidate(
+        kind: &str,
+        confidence: f32,
+        target_frame_id: &str,
+        source_frame_id: &str,
+    ) -> LoopClosureCandidateInput {
+        LoopClosureCandidateInput {
+            target_pose: pose(0.0, 0.0, 0.0),
+            confidence,
+            similarity: confidence,
+            kind: kind.to_string(),
+            target_frame_id: Some(target_frame_id.to_string()),
+            source_frame_id: Some(source_frame_id.to_string()),
+            source_experience_id: Some("experience-seed".to_string()),
+            source_instant_frame_id: Some(target_frame_id.to_string()),
+            source_vector_refs: vec!["entity:charger".to_string()],
+            source_vector_id: Some("constellation-seed".to_string()),
+            query_vector_id: Some("constellation-return".to_string()),
+            query_experience_id: Some("experience-return".to_string()),
         }
     }
 }

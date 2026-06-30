@@ -59,6 +59,21 @@ cargo run -p netherwick-tools -- pose-graph-report \
 
 The report includes odometry edges, gated loop-closure candidate edges from conservative place recognition, confidence buckets, and rejected low-confidence candidates. Ledger replay feeds loop candidates from canonical `PlaceRecognitionInput` with Experience/Instant provenance; direct capture replay uses available scene vectors as a capture-only fallback.
 
+Live map integration now uses the same conservative candidate shape:
+
+```text
+Now
+  -> PlaceRecognitionInput
+  -> PlaceMemory.recognize_places(...)
+  -> PlaceMemory.recognize_entity_constellations(...)
+  -> Vec<LoopClosureCandidateInput>
+  -> LocalMap.integrate_observation_with_loop_candidates(...)
+  -> anchored pose graph optimization
+  -> occupancy rebuild from corrected submaps
+```
+
+`LocalMap` only promotes candidates when a live pose node is created. Accepted candidates become active `PoseEdgeSource::LoopClosureCandidate` edges; rejected candidates remain inactive edges with `rejection_reason` values for replay/debugging. The live gates are intentionally conservative: confidence must clear the loop threshold, the target must not be the current/source frame, the target pose must be close enough to the current pose to avoid teleportation, and current range geometry must overlap existing occupied cells at the proposed prior node. `MapSummary` surfaces total, accepted, and rejected loop-closure counts.
+
 Build a replay-first representation health report from capture or ledger input:
 
 ```bash
@@ -113,4 +128,4 @@ See [worldlab-assets.md](worldlab-assets.md) for the asset formats and calibrati
 
 ## Future Path
 
-Planned layers include real Kinect raw-frame hooks, calibrated camera intrinsics, a game-engine renderer, semantic editing, and counterfactual replay.
+Planned layers include real Kinect raw-frame hooks, calibrated camera intrinsics, a game-engine renderer, semantic editing, and counterfactual replay. Real hardware should still be treated as gated: do not rely on live SLAM corrections from a real capture until the geometry report says `sensor_truth.ready_for_real_slam = true`.
