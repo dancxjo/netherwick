@@ -817,20 +817,43 @@ unsafe impl Sync for CpalMicrophone {}
 impl CpalMicrophone {
     pub fn new(preferred_name: Option<&str>, sample_rate_hz: u32, channels: u16) -> Result<Self> {
         let host = cpal::default_host();
-        let device = select_input_device(&host, preferred_name)?;
-        let config = cpal::StreamConfig {
-            channels,
-            sample_rate: cpal::SampleRate(sample_rate_hz),
-            buffer_size: cpal::BufferSize::Default,
-        };
+        let mut errors = Vec::new();
+        for device in input_device_candidates(&host, preferred_name)? {
+            let device_name = device.name().unwrap_or_else(|_| "<unnamed>".to_string());
+            match Self::open_device(device, sample_rate_hz, channels) {
+                Ok(microphone) => {
+                    eprintln!("microphone input active: {device_name}");
+                    return Ok(microphone);
+                }
+                Err(error) => errors.push(format!("{device_name}: {error}")),
+            }
+        }
+        anyhow::bail!(
+            "no usable CPAL input device for requested mic {:?}; tried {}",
+            preferred_name.unwrap_or("default"),
+            if errors.is_empty() {
+                "no input devices".to_string()
+            } else {
+                errors.join("; ")
+            }
+        )
+    }
+
+    fn open_device(device: cpal::Device, sample_rate_hz: u32, channels: u16) -> Result<Self> {
+        let supported = select_input_config(&device, sample_rate_hz, channels)?;
+        let sample_format = supported.sample_format();
+        let config = supported.config();
+        let actual_sample_rate_hz = config.sample_rate.0;
+        let actual_channels = config.channels;
         let latest = Arc::new(Mutex::new(None));
         let shared = Arc::clone(&latest);
         let err_fn = |err| eprintln!("cpal input stream error: {err}");
-        let sample_format = device.default_input_config()?.sample_format();
         let stream = match sample_format {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config,
-                move |data: &[i16], _| store_i16_pcm_frame(&shared, data, sample_rate_hz, channels),
+                move |data: &[i16], _| {
+                    store_i16_pcm_frame(&shared, data, actual_sample_rate_hz, actual_channels)
+                },
                 err_fn,
                 None,
             )?,
@@ -841,7 +864,7 @@ impl CpalMicrophone {
                         .iter()
                         .map(|sample| (*sample as i32 - 32_768) as i16)
                         .collect::<Vec<_>>();
-                    store_i16_pcm_frame(&shared, &pcm, sample_rate_hz, channels);
+                    store_i16_pcm_frame(&shared, &pcm, actual_sample_rate_hz, actual_channels);
                 },
                 err_fn,
                 None,
@@ -853,7 +876,7 @@ impl CpalMicrophone {
                         .iter()
                         .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
                         .collect::<Vec<_>>();
-                    store_i16_pcm_frame(&shared, &pcm, sample_rate_hz, channels);
+                    store_i16_pcm_frame(&shared, &pcm, actual_sample_rate_hz, actual_channels);
                 },
                 err_fn,
                 None,
@@ -1115,16 +1138,74 @@ fn read_i16_be(high: u8, low: u8) -> i16 {
 }
 
 #[cfg(feature = "linux-hardware")]
-fn select_input_device(host: &cpal::Host, preferred_name: Option<&str>) -> Result<cpal::Device> {
+fn input_device_candidates(
+    host: &cpal::Host,
+    preferred_name: Option<&str>,
+) -> Result<Vec<cpal::Device>> {
+    let mut candidates = Vec::new();
+    let devices = host.input_devices()?.collect::<Vec<_>>();
     if let Some(name) = preferred_name {
-        for device in host.input_devices()? {
-            if device.name().ok().as_deref() == Some(name) {
-                return Ok(device);
+        candidates.extend(devices.iter().filter_map(|device| {
+            let device_name = device.name().ok()?;
+            if device_name == name || device_name.contains(name) {
+                Some(device.clone())
+            } else {
+                None
             }
+        }));
+        if candidates.is_empty() {
+            anyhow::bail!("requested CPAL input device '{name}' was not found");
+        }
+        return Ok(candidates);
+    }
+    for device in devices {
+        let name = device.name().unwrap_or_default();
+        let already_added = candidates
+            .iter()
+            .any(|candidate| candidate.name().unwrap_or_default() == name);
+        if !already_added {
+            candidates.push(device);
         }
     }
-    host.default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("no CPAL input device available"))
+    if let Some(default) = host.default_input_device() {
+        let name = default.name().unwrap_or_default();
+        let already_added = candidates
+            .iter()
+            .any(|candidate| candidate.name().unwrap_or_default() == name);
+        if !already_added {
+            candidates.push(default);
+        }
+    }
+    Ok(candidates)
+}
+
+#[cfg(feature = "linux-hardware")]
+fn select_input_config(
+    device: &cpal::Device,
+    sample_rate_hz: u32,
+    channels: u16,
+) -> Result<cpal::SupportedStreamConfig> {
+    let requested_rate = cpal::SampleRate(sample_rate_hz);
+    if let Ok(configs) = device.supported_input_configs() {
+        let mut fallback = None;
+        for config in configs {
+            if fallback.is_none() {
+                fallback = Some(config.clone().with_max_sample_rate());
+            }
+            if config.channels() == channels
+                && config.min_sample_rate() <= requested_rate
+                && config.max_sample_rate() >= requested_rate
+            {
+                return Ok(config.with_sample_rate(requested_rate));
+            }
+        }
+        if let Some(config) = fallback {
+            return Ok(config);
+        }
+    }
+    device
+        .default_input_config()
+        .context("reading default input config")
 }
 
 #[cfg(feature = "linux-hardware")]
