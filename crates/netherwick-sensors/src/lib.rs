@@ -1414,6 +1414,7 @@ pub struct FreenectKinectProvider {
     index: i32,
     pending: VecDeque<SensePacket>,
     last_rgb_error: Option<String>,
+    rgb_adjustment: KinectRgbAdjustment,
 }
 
 #[cfg(feature = "kinect-freenect")]
@@ -1427,7 +1428,13 @@ impl FreenectKinectProvider {
             index,
             pending: VecDeque::new(),
             last_rgb_error: None,
+            rgb_adjustment: KinectRgbAdjustment::default(),
         })
+    }
+
+    pub fn with_rgb_adjustment(mut self, rgb_adjustment: KinectRgbAdjustment) -> Self {
+        self.rgb_adjustment = rgb_adjustment;
+        self
     }
 }
 
@@ -1439,7 +1446,7 @@ impl SenseProducer for FreenectKinectProvider {
             return Ok(packet);
         }
         let depth = read_freenect_depth_m(self.index)?;
-        match read_freenect_rgb_frame(self.index) {
+        match read_freenect_rgb_frame(self.index, self.rgb_adjustment) {
             Ok(rgb_frame) => {
                 self.last_rgb_error = None;
                 self.pending.push_back(SensePacket::EyeFrame(rgb_frame));
@@ -1518,8 +1525,31 @@ fn read_freenect_depth_m(index: i32) -> Result<FreenectDepthFrame> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KinectRgbAdjustment {
+    pub enabled: bool,
+    pub gain: f32,
+    pub gamma: f32,
+    pub target_luma: f32,
+    pub auto_gain_max: f32,
+    pub brightness: f32,
+}
+
+impl Default for KinectRgbAdjustment {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            gain: 1.0,
+            gamma: 0.80,
+            target_luma: 0.32,
+            auto_gain_max: 3.0,
+            brightness: 0.0,
+        }
+    }
+}
+
 #[cfg(feature = "kinect-freenect")]
-fn read_freenect_rgb_frame(index: i32) -> Result<EyeFrame> {
+fn read_freenect_rgb_frame(index: i32, adjustment: KinectRgbAdjustment) -> Result<EyeFrame> {
     let mut video_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut timestamp = 0u32;
     let result = unsafe {
@@ -1540,14 +1570,57 @@ fn read_freenect_rgb_frame(index: i32) -> Result<EyeFrame> {
         anyhow::bail!("libfreenect returned a null Kinect RGB frame for device index {index}");
     }
     let rgb = unsafe { std::slice::from_raw_parts(video_ptr as *const u8, FREENECT_RGB_BYTES) };
+    let bytes = adjust_kinect_rgb(rgb, adjustment);
     Ok(EyeFrame {
         captured_at_ms: unix_time_ms(),
         width: FREENECT_DEPTH_WIDTH as u32,
         height: FREENECT_DEPTH_HEIGHT as u32,
         format: EyeFrameFormat::Rgb8,
-        bytes: rgb.to_vec(),
-        source: Some("kinect-freenect-rgb".to_string()),
+        bytes,
+        source: Some(if adjustment.enabled {
+            "kinect-freenect-rgb-adjusted".to_string()
+        } else {
+            "kinect-freenect-rgb".to_string()
+        }),
     })
+}
+
+pub fn adjust_kinect_rgb(rgb: &[u8], adjustment: KinectRgbAdjustment) -> Vec<u8> {
+    if !adjustment.enabled || rgb.is_empty() {
+        return rgb.to_vec();
+    }
+    let mean = mean_rgb_luma(rgb);
+    let auto_gain = if mean > f32::EPSILON {
+        (adjustment.target_luma.clamp(0.0, 1.0) / mean)
+            .clamp(1.0, adjustment.auto_gain_max.max(1.0))
+    } else {
+        adjustment.auto_gain_max.max(1.0)
+    };
+    let gain = (adjustment.gain.max(0.0) * auto_gain).max(0.0);
+    let gamma = adjustment.gamma.clamp(0.10, 5.0);
+    let brightness = adjustment.brightness.clamp(-1.0, 1.0);
+    rgb.iter()
+        .map(|byte| {
+            let linear = (*byte as f32 / 255.0) * gain + brightness;
+            let corrected = linear.clamp(0.0, 1.0).powf(gamma);
+            (corrected * 255.0).round().clamp(0.0, 255.0) as u8
+        })
+        .collect()
+}
+
+pub fn mean_rgb_luma(rgb: &[u8]) -> f32 {
+    let mut sum = 0.0;
+    let mut pixels = 0usize;
+    for pixel in rgb.chunks_exact(3) {
+        sum += (0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32)
+            / 255.0;
+        pixels += 1;
+    }
+    if pixels == 0 {
+        0.0
+    } else {
+        sum / pixels as f32
+    }
 }
 
 #[cfg(feature = "kinect-freenect")]
@@ -1893,5 +1966,38 @@ mod tests {
         zero_mpu6050_orientation_to_flat(&mut next, &mut zero);
         assert!((next.orientation[0] - 1.0_f32.to_radians()).abs() < 0.0001);
         assert!((next.orientation[1] - (-2.0_f32).to_radians()).abs() < 0.0001);
+    }
+
+    #[test]
+    fn kinect_rgb_adjustment_brightens_dark_frames_without_changing_length() {
+        let dark = vec![12_u8, 10, 8, 20, 18, 16];
+        let adjusted = adjust_kinect_rgb(
+            &dark,
+            KinectRgbAdjustment {
+                enabled: true,
+                target_luma: 0.35,
+                auto_gain_max: 4.0,
+                gamma: 0.75,
+                ..KinectRgbAdjustment::default()
+            },
+        );
+
+        assert_eq!(adjusted.len(), dark.len());
+        assert!(mean_rgb_luma(&adjusted) > mean_rgb_luma(&dark));
+        assert!(adjusted.iter().zip(dark.iter()).any(|(new, old)| new > old));
+    }
+
+    #[test]
+    fn disabled_kinect_rgb_adjustment_preserves_bytes() {
+        let rgb = vec![8_u8, 16, 24, 128, 96, 64];
+        let adjusted = adjust_kinect_rgb(
+            &rgb,
+            KinectRgbAdjustment {
+                enabled: false,
+                ..KinectRgbAdjustment::default()
+            },
+        );
+
+        assert_eq!(adjusted, rgb);
     }
 }

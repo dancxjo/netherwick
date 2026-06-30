@@ -41,12 +41,12 @@ use netherwick_runtime::{
     InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, RobotMode, RuntimeLoop,
     RuntimeModelStack, RuntimeTick, SimRunner,
 };
-#[cfg(feature = "kinect-freenect")]
-use netherwick_sensors::FreenectKinectProvider;
 use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
     MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World, WorldSnapshot,
 };
+#[cfg(feature = "kinect-freenect")]
+use netherwick_sensors::{FreenectKinectProvider, KinectRgbAdjustment};
 use netherwick_server::{
     LiveSceneMetadata, LiveViewState, SceneArena, SceneObject, SceneSensorCalibration, SceneSession,
 };
@@ -467,6 +467,18 @@ struct RobotArgs {
     kinect_depth: bool,
     #[arg(long, default_value_t = 0)]
     kinect_index: i32,
+    #[arg(long, default_value_t = 0.32)]
+    kinect_rgb_target_luma: f32,
+    #[arg(long, default_value_t = 3.0)]
+    kinect_rgb_auto_gain_max: f32,
+    #[arg(long, default_value_t = 1.0)]
+    kinect_rgb_gain: f32,
+    #[arg(long, default_value_t = 0.80)]
+    kinect_rgb_gamma: f32,
+    #[arg(long, default_value_t = 0.0)]
+    kinect_rgb_brightness: f32,
+    #[arg(long)]
+    kinect_rgb_raw: bool,
     #[arg(long)]
     mic: Option<String>,
     #[arg(long)]
@@ -542,6 +554,18 @@ struct CaptureRealArgs {
     kinect_depth: bool,
     #[arg(long, default_value_t = 0)]
     kinect_index: i32,
+    #[arg(long, default_value_t = 0.32)]
+    kinect_rgb_target_luma: f32,
+    #[arg(long, default_value_t = 3.0)]
+    kinect_rgb_auto_gain_max: f32,
+    #[arg(long, default_value_t = 1.0)]
+    kinect_rgb_gain: f32,
+    #[arg(long, default_value_t = 0.80)]
+    kinect_rgb_gamma: f32,
+    #[arg(long, default_value_t = 0.0)]
+    kinect_rgb_brightness: f32,
+    #[arg(long)]
+    kinect_rgb_raw: bool,
     #[arg(long)]
     mic: Option<String>,
     #[arg(long)]
@@ -4662,7 +4686,9 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
 
     if args.kinect_depth {
         #[cfg(feature = "kinect-freenect")]
-        match FreenectKinectProvider::with_index(args.kinect_index) {
+        match FreenectKinectProvider::with_index(args.kinect_index)
+            .map(|provider| provider.with_rgb_adjustment(kinect_rgb_adjustment_for_robot(&args)))
+        {
             Ok(provider) => {
                 let live_state_for_kinect = live_state.clone();
                 sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
@@ -4945,18 +4971,22 @@ fn add_optional_real_sensors(
 
     if args.kinect_depth {
         #[cfg(feature = "kinect-freenect")]
-        match FreenectKinectProvider::with_index(args.kinect_index) {
+        match FreenectKinectProvider::with_index(args.kinect_index)
+            .map(|provider| provider.with_rgb_adjustment(kinect_rgb_adjustment_for_capture(&args)))
+        {
             Ok(provider) => {
                 sensors.push(Box::new(provider));
                 availability["kinect"] = serde_json::json!({
                     "present": true,
                     "source": "libfreenect",
-                    "index": args.kinect_index
+                    "index": args.kinect_index,
+                    "rgb_adjustment": kinect_rgb_adjustment_json(kinect_rgb_adjustment_for_capture(args))
                 });
                 availability["camera"] = serde_json::json!({
                     "present": true,
                     "source": "libfreenect",
-                    "index": args.kinect_index
+                    "index": args.kinect_index,
+                    "rgb_adjustment": kinect_rgb_adjustment_json(kinect_rgb_adjustment_for_capture(args))
                 });
             }
             Err(error) => {
@@ -5125,6 +5155,42 @@ fn selected_imu_device(requested: Option<&str>, suppress_default: bool) -> Optio
         _ if suppress_default => None,
         _ => Some(DEFAULT_MPU6050_IMU_DEVICE),
     }
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn kinect_rgb_adjustment_for_robot(args: &RobotArgs) -> KinectRgbAdjustment {
+    KinectRgbAdjustment {
+        enabled: !args.kinect_rgb_raw,
+        gain: args.kinect_rgb_gain,
+        gamma: args.kinect_rgb_gamma,
+        target_luma: args.kinect_rgb_target_luma,
+        auto_gain_max: args.kinect_rgb_auto_gain_max,
+        brightness: args.kinect_rgb_brightness,
+    }
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn kinect_rgb_adjustment_for_capture(args: &CaptureRealArgs) -> KinectRgbAdjustment {
+    KinectRgbAdjustment {
+        enabled: !args.kinect_rgb_raw,
+        gain: args.kinect_rgb_gain,
+        gamma: args.kinect_rgb_gamma,
+        target_luma: args.kinect_rgb_target_luma,
+        auto_gain_max: args.kinect_rgb_auto_gain_max,
+        brightness: args.kinect_rgb_brightness,
+    }
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn kinect_rgb_adjustment_json(adjustment: KinectRgbAdjustment) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": adjustment.enabled,
+        "gain": adjustment.gain,
+        "gamma": adjustment.gamma,
+        "target_luma": adjustment.target_luma,
+        "auto_gain_max": adjustment.auto_gain_max,
+        "brightness": adjustment.brightness,
+    })
 }
 
 fn imu_disabled_value(value: &str) -> bool {
@@ -11395,6 +11461,12 @@ mod tests {
             camera: None,
             kinect_depth: false,
             kinect_index: 0,
+            kinect_rgb_target_luma: 0.32,
+            kinect_rgb_auto_gain_max: 3.0,
+            kinect_rgb_gain: 1.0,
+            kinect_rgb_gamma: 0.80,
+            kinect_rgb_brightness: 0.0,
+            kinect_rgb_raw: false,
             mic: None,
             imu: None,
             gps: None,
@@ -11431,6 +11503,12 @@ mod tests {
             camera: None,
             kinect_depth: false,
             kinect_index: 0,
+            kinect_rgb_target_luma: 0.32,
+            kinect_rgb_auto_gain_max: 3.0,
+            kinect_rgb_gain: 1.0,
+            kinect_rgb_gamma: 0.80,
+            kinect_rgb_brightness: 0.0,
+            kinect_rgb_raw: false,
             mic: None,
             imu: None,
             gps: None,

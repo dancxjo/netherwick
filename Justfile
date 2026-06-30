@@ -6,6 +6,11 @@ camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 mic_device := env_var_or_default("MIC_DEVICE", "default")
 imu_device := env_var_or_default("IMU_DEVICE", "/dev/i2c-1")
 robot_dashboard := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD", "0.0.0.0:3000")
+kinect_rgb_target_luma := env_var_or_default("KINECT_RGB_TARGET_LUMA", "0.32")
+kinect_rgb_auto_gain_max := env_var_or_default("KINECT_RGB_AUTO_GAIN_MAX", "3.0")
+kinect_rgb_gain := env_var_or_default("KINECT_RGB_GAIN", "1.0")
+kinect_rgb_gamma := env_var_or_default("KINECT_RGB_GAMMA", "0.80")
+kinect_rgb_brightness := env_var_or_default("KINECT_RGB_BRIGHTNESS", "0.0")
 
 # Show the recipe catalog.
 default:
@@ -139,6 +144,11 @@ robot *args:
         --ledger "${NETHERWICK_ROBOT_LEDGER:-data/ledger/real/robot}" \
         --camera "{{camera_device}}" \
         --kinect-depth \
+        --kinect-rgb-target-luma "{{kinect_rgb_target_luma}}" \
+        --kinect-rgb-auto-gain-max "{{kinect_rgb_auto_gain_max}}" \
+        --kinect-rgb-gain "{{kinect_rgb_gain}}" \
+        --kinect-rgb-gamma "{{kinect_rgb_gamma}}" \
+        --kinect-rgb-brightness "{{kinect_rgb_brightness}}" \
         --mic "{{mic_device}}" \
         --imu "{{imu_device}}" \
         --gps "{{gps_serial_port}}" \

@@ -8,10 +8,10 @@ Netherwick keeps Kinect support optional so the default simulator and Linux sens
 cargo check -p netherwick-sensors --features kinect-freenect
 ```
 
-The `kinect-freenect` feature exposes `FreenectKinectProvider`. It is currently a skeleton for a libfreenect FFI wrapper or a subprocess-backed first pass, and should emit:
+The `kinect-freenect` feature exposes `FreenectKinectProvider`, which uses libfreenect sync reads and emits:
 
 - `SensePacket::Kinect(KinectSense)` for depth/color-derived features
-- `SensePacket::Eye(EyeSense)` when RGB frames are available
+- `SensePacket::EyeFrame(EyeFrame)` when RGB frames are available
 
 Kinect audio should be added later. OpenKinect/libfreenect audio support can require firmware handling, and vision should not be blocked on that.
 
@@ -38,6 +38,26 @@ sudo apt-get install freeglut3-dev libxmu-dev libxi-dev
 ```
 
 Install the libfreenect udev rules for non-root device access. The exact rules file depends on the libfreenect package or checkout you use; after installing it, reload udev rules and replug the Kinect.
+
+## Dark RGB Frames
+
+Kinect RGB frames are read through libfreenect, not `/dev/video*`, so V4L exposure controls usually do not apply. Netherwick applies a software RGB correction before the frame enters the dashboard or capture ledger.
+
+The default `just robot` path enables auto-gain with a moderate gamma lift:
+
+```sh
+KINECT_RGB_TARGET_LUMA=0.38 KINECT_RGB_AUTO_GAIN_MAX=4.0 KINECT_RGB_GAMMA=0.70 just robot
+```
+
+Useful knobs:
+
+- `KINECT_RGB_TARGET_LUMA`: desired mean luma, `0.0..1.0`; raise this if the Kinect image is too dark.
+- `KINECT_RGB_AUTO_GAIN_MAX`: cap for automatic gain; raise cautiously if the room is very dim.
+- `KINECT_RGB_GAIN`: fixed multiplier applied before auto gain.
+- `KINECT_RGB_GAMMA`: values below `1.0` lift shadows; values above `1.0` darken.
+- `KINECT_RGB_BRIGHTNESS`: additive offset in normalized RGB units, usually keep near `0.0`.
+
+Pass `--kinect-rgb-raw` to `netherwick-tools robot` or `capture-real` to disable software correction and inspect the raw libfreenect RGB frame.
 
 ## Replay Recordings
 
