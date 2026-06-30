@@ -2950,43 +2950,58 @@ where
         );
         let embodied_context = runtime_instant.embodied_context();
 
-        let combobulation = match self
-            .llm
-            .combobulate(
-                &now,
-                &impressions,
-                Some(&embodied_context),
-                &latent,
-                &futures,
-                &recall.first_person_summary,
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                notes.push(format!("LlmCombobulationSkipped: {error}"));
-                None
-            }
-        };
+        let skip_llm_for_slow_real_runtime = now.self_sense.mode.as_deref() == Some("slow")
+            && now
+                .extensions
+                .get("source")
+                .and_then(|value| value.as_str())
+                == Some("real_robot");
 
-        let awareness_summary = combobulation.as_ref().map(|value| value.summary.as_str());
-        let llm_tick = match self
-            .llm
-            .maybe_tick(
-                &now,
-                Some(&embodied_context),
-                &latent,
-                &futures,
-                &recall.first_person_summary,
-                awareness_summary,
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                notes.push(format!("LlmTickSkipped: {error}"));
-                LlmTickResult::default()
-            }
+        let (combobulation, llm_tick) = if skip_llm_for_slow_real_runtime {
+            notes.push(
+                "LlmSkipped: real slow control loop uses a tight runtime budget".to_string(),
+            );
+            (None, LlmTickResult::default())
+        } else {
+            let combobulation = match self
+                .llm
+                .combobulate(
+                    &now,
+                    &impressions,
+                    Some(&embodied_context),
+                    &latent,
+                    &futures,
+                    &recall.first_person_summary,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    notes.push(format!("LlmCombobulationSkipped: {error}"));
+                    None
+                }
+            };
+
+            let awareness_summary = combobulation.as_ref().map(|value| value.summary.as_str());
+            let llm_tick = match self
+                .llm
+                .maybe_tick(
+                    &now,
+                    Some(&embodied_context),
+                    &latent,
+                    &futures,
+                    &recall.first_person_summary,
+                    awareness_summary,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    notes.push(format!("LlmTickSkipped: {error}"));
+                    LlmTickResult::default()
+                }
+            };
+            (combobulation, llm_tick)
         };
         now.llm = llm_tick.sense.clone();
         apply_llm_tick(
@@ -4085,10 +4100,7 @@ pub struct RealRobotRunner<R> {
     pub tick_ms: u64,
     pub tick_count: usize,
     now_builder: NowBuilder,
-    slow_runtime_backoff_until_ms: u64,
 }
-
-const SLOW_RUNTIME_TIMEOUT_BACKOFF_MS: u64 = 5_000;
 
 impl<R> RealRobotRunner<R>
 where
@@ -4108,7 +4120,6 @@ where
             tick_ms: 100,
             tick_count: 0,
             now_builder: NowBuilder::new(),
-            slow_runtime_backoff_until_ms: 0,
         }
     }
 
@@ -4223,38 +4234,10 @@ where
             }
         }
 
-        let runtime_timeout = std::time::Duration::from_millis(self.tick_ms.clamp(25, 100));
-        let wall_now = wall_time_ms();
-        let tick = if wall_now < self.slow_runtime_backoff_until_ms {
-            synthetic_slow_idle_tick(
-                now,
-                format!(
-                    "runtime tick backed off after timeout for {} ms",
-                    self.slow_runtime_backoff_until_ms.saturating_sub(wall_now)
-                ),
-            )
-        } else {
-            match tokio::time::timeout(
-                runtime_timeout,
-                self.runtime
-                    .tick(now.clone(), ExperienceLatent::default(), Vec::new()),
-            )
-            .await
-            {
-                Ok(result) => {
-                    self.slow_runtime_backoff_until_ms = 0;
-                    result?
-                }
-                Err(_) => {
-                    self.slow_runtime_backoff_until_ms =
-                        wall_time_ms().saturating_add(SLOW_RUNTIME_TIMEOUT_BACKOFF_MS);
-                    synthetic_slow_idle_tick(
-                        now,
-                        format!("runtime tick exceeded {} ms", runtime_timeout.as_millis()),
-                    )
-                }
-            }
-        };
+        let tick = self
+            .runtime
+            .tick(now.clone(), ExperienceLatent::default(), Vec::new())
+            .await?;
         let chosen_motor = final_motor_from_tick(&tick).clamped(0.15, 0.25);
         let manual_drive = tick
             .frame
@@ -7379,7 +7362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_robot_slow_runner_backs_off_after_runtime_timeout() {
+    async fn real_robot_slow_runner_waits_for_runtime_tick_without_backoff() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
         let body = CountingBody {
@@ -7400,22 +7383,14 @@ mod tests {
         let (_first_snapshot, first_tick) = runner.tick_slow_manual().await.unwrap();
         let (_second_snapshot, second_tick) = runner.tick_slow_manual().await.unwrap();
 
-        assert_eq!(tick_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(tick_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(motor_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             motors.lock().unwrap().as_slice(),
             &[MotorCommand::stop(), MotorCommand::stop()]
         );
-        assert!(first_tick
-            .frame
-            .notes
-            .iter()
-            .any(|note| note.contains("runtime tick exceeded")));
-        assert!(second_tick
-            .frame
-            .notes
-            .iter()
-            .any(|note| note.contains("runtime tick backed off after timeout")));
+        assert!(first_tick.frame.notes.is_empty());
+        assert!(second_tick.frame.notes.is_empty());
     }
 
     struct ManualRuntime;

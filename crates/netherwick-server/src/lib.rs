@@ -9494,6 +9494,37 @@ mod tests {
         assert!((points[1].z - 2.0).abs() < 0.001);
     }
 
+    #[test]
+    fn calibrated_kinect_depth_image_reports_below_floor_points() {
+        let kinect = KinectSense {
+            depth_m: vec![1.0],
+            depth_width: 1,
+            depth_height: 1,
+            depth_fx: 1.0,
+            depth_fy: 1.0,
+            depth_cx: 0.0,
+            depth_cy: 0.0,
+            min_depth_m: 0.1,
+            max_depth_m: 3.0,
+            depth_coordinate_system: Some("kinect_camera".to_string()),
+            ..KinectSense::default()
+        };
+        let calibration = SceneSensorCalibration {
+            camera_height_m: 0.1,
+            camera_pitch_rad: 0.25,
+            ..SceneSensorCalibration::sim_default()
+        };
+
+        let (points, diagnostics) = depth_points(&kinect, Some(calibration));
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(diagnostics.coordinate_system, "robot");
+        assert_eq!(diagnostics.below_floor_count, 1);
+        assert_eq!(diagnostics.below_floor_ratio, 1.0);
+        assert!(diagnostics.min_z_m.unwrap() < 0.0);
+        assert!(diagnostics.median_z_m.unwrap() < 0.0);
+    }
+
     #[tokio::test]
     async fn capture_frame_to_scene_conversion_works_for_tiny_capture() {
         let root = unique_test_dir("capture-scene");
