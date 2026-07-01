@@ -40,8 +40,8 @@ use netherwick_runtime::{
 };
 use netherwick_sensors::{
     CameraSenseProvider, EyeFrame, EyeFrameFormat, FrameProcessor, GpsSenseProvider,
-    ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World,
-    WorldSnapshot,
+    ImuSenseProvider, ListenburyAsrConfig, MicrophoneSenseProvider, PcmAudioFrame, SensePacket,
+    SenseProducer, World, WorldSnapshot,
 };
 #[cfg(feature = "kinect-freenect")]
 use netherwick_sensors::{FreenectKinectProvider, KinectRgbAdjustment};
@@ -475,6 +475,8 @@ struct RobotArgs {
     kinect_rgb_raw: bool,
     #[arg(long)]
     mic: Option<String>,
+    #[arg(long)]
+    asr_command: Option<String>,
     #[arg(long)]
     imu: Option<String>,
     #[arg(long)]
@@ -4681,7 +4683,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         } else {
             Some(device.as_str())
         };
-        match MicrophoneSenseProvider::new(pref_name) {
+        let mut asr_config = ListenburyAsrConfig::default();
+        if let Some(command) = args.asr_command.clone() {
+            asr_config.command = Some(command);
+        }
+        match MicrophoneSenseProvider::with_asr_config(pref_name, asr_config) {
             Ok(provider) => {
                 let live_state_for_mic = live_state.clone();
                 sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(

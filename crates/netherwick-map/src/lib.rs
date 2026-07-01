@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use netherwick_core::{Pose2, TimeMs};
-use netherwick_now::{ImuSense, KinectSense, Now};
+use netherwick_now::{EyeFrame, EyeFrameFormat, ImuSense, KinectSense, Now};
 use netherwick_sensors::WorldSnapshot;
 use serde::{Deserialize, Serialize};
 
@@ -598,9 +598,9 @@ fn default_pose_graph_loop_min_geometric_overlap() -> f32 {
 impl Default for PointCloudConfig {
     fn default() -> Self {
         Self {
-            voxel_size_m: 0.05,
-            max_voxels: 20_000,
-            max_points_per_observation: 2_500,
+            voxel_size_m: 0.035,
+            max_voxels: 45_000,
+            max_points_per_observation: 4_000,
             min_depth_m: 0.35,
             max_depth_m: 8.0,
             confidence_increment: 0.18,
@@ -2038,7 +2038,11 @@ pub fn pointcloud_observation_from_snapshot(
     t_ms: TimeMs,
     config: PointCloudConfig,
 ) -> Option<PointCloudObservation> {
-    pointcloud_observation_from_kinect(
+    let color = snapshot
+        .eye_frame
+        .as_ref()
+        .and_then(DepthColorImage::from_eye_frame);
+    pointcloud_observation_from_kinect_with_color(
         &snapshot.kinect,
         snapshot.body.odometry,
         orientation_from_snapshot(snapshot),
@@ -2048,6 +2052,7 @@ pub fn pointcloud_observation_from_snapshot(
         ),
         t_ms,
         config,
+        color.as_ref(),
     )
 }
 
@@ -2058,6 +2063,26 @@ pub fn pointcloud_observation_from_kinect(
     pose_confidence: f32,
     t_ms: TimeMs,
     config: PointCloudConfig,
+) -> Option<PointCloudObservation> {
+    pointcloud_observation_from_kinect_with_color(
+        kinect,
+        pose,
+        orientation,
+        pose_confidence,
+        t_ms,
+        config,
+        None,
+    )
+}
+
+fn pointcloud_observation_from_kinect_with_color(
+    kinect: &KinectSense,
+    pose: Pose2,
+    orientation: OrientationEstimate,
+    pose_confidence: f32,
+    t_ms: TimeMs,
+    config: PointCloudConfig,
+    color: Option<&DepthColorImage>,
 ) -> Option<PointCloudObservation> {
     if kinect.depth_m.is_empty() {
         return None;
@@ -2090,9 +2115,19 @@ pub fn pointcloud_observation_from_kinect(
         let z_m = *depth;
         let x_m = (u - projection.cx) * z_m / projection.fx.max(f32::EPSILON);
         let y_m = (v - projection.cy) * z_m / projection.fy.max(f32::EPSILON);
+        let color_rgb = color
+            .and_then(|color| {
+                color.sample_depth_pixel(
+                    index % projection.width,
+                    index / projection.width,
+                    projection.width,
+                    projection.height,
+                )
+            })
+            .or_else(|| depth_shade(z_m, max_depth_m));
         points.push(PointCloudPoint {
             position: Point3D { x_m, y_m, z_m },
-            color_rgb: depth_shade(z_m, max_depth_m),
+            color_rgb,
             confidence: pose_confidence,
             depth_index: Some(index),
             depth_uv: Some([u as u32, v as u32]),
@@ -2132,6 +2167,84 @@ pub fn pointcloud_observation_from_kinect(
             "clipped_depth_count": clipped_depth_count,
         }),
     })
+}
+
+#[derive(Clone, Debug)]
+struct DepthColorImage {
+    width: usize,
+    height: usize,
+    rgb: Vec<u8>,
+}
+
+impl DepthColorImage {
+    fn from_eye_frame(frame: &EyeFrame) -> Option<Self> {
+        let width = usize::try_from(frame.width).ok()?;
+        let height = usize::try_from(frame.height).ok()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let rgb = eye_frame_to_rgb(frame)?;
+        if rgb.len() < width.checked_mul(height)?.checked_mul(3)? {
+            return None;
+        }
+        Some(Self { width, height, rgb })
+    }
+
+    fn sample_depth_pixel(
+        &self,
+        depth_x: usize,
+        depth_y: usize,
+        depth_width: usize,
+        depth_height: usize,
+    ) -> Option<[u8; 3]> {
+        if depth_width == 0 || depth_height == 0 {
+            return None;
+        }
+        let color_x = (depth_x.saturating_mul(self.width) / depth_width).min(self.width - 1);
+        let color_y = (depth_y.saturating_mul(self.height) / depth_height).min(self.height - 1);
+        self.sample(color_x, color_y)
+    }
+
+    fn sample(&self, x: usize, y: usize) -> Option<[u8; 3]> {
+        let offset = y.checked_mul(self.width)?.checked_add(x)?.checked_mul(3)?;
+        Some([
+            *self.rgb.get(offset)?,
+            *self.rgb.get(offset + 1)?,
+            *self.rgb.get(offset + 2)?,
+        ])
+    }
+}
+
+fn eye_frame_to_rgb(frame: &EyeFrame) -> Option<Vec<u8>> {
+    let pixels = usize::try_from(frame.width)
+        .ok()?
+        .checked_mul(usize::try_from(frame.height).ok()?)?;
+    match frame.format {
+        EyeFrameFormat::Rgb8 => {
+            (frame.bytes.len() >= pixels.checked_mul(3)?).then(|| frame.bytes.clone())
+        }
+        EyeFrameFormat::Bgr8 => {
+            if frame.bytes.len() < pixels.checked_mul(3)? {
+                return None;
+            }
+            let mut rgb = Vec::with_capacity(pixels * 3);
+            for pixel in frame.bytes.chunks_exact(3).take(pixels) {
+                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+            Some(rgb)
+        }
+        EyeFrameFormat::Gray8 => {
+            if frame.bytes.len() < pixels {
+                return None;
+            }
+            let mut rgb = Vec::with_capacity(pixels * 3);
+            for value in frame.bytes.iter().take(pixels) {
+                rgb.extend_from_slice(&[*value, *value, *value]);
+            }
+            Some(rgb)
+        }
+        _ => None,
+    }
 }
 
 pub fn transform_point_to_world(
@@ -2708,7 +2821,7 @@ fn confidence_distribution(confidences: impl Iterator<Item = f32>) -> Confidence
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netherwick_now::{KinectSense, RangeSense};
+    use netherwick_now::{EyeFrame, EyeFrameFormat, KinectSense, RangeSense};
 
     fn snapshot_at(x_m: f32, y_m: f32, heading_rad: f32, beams: Vec<f32>) -> WorldSnapshot {
         let mut snapshot = WorldSnapshot::default();
@@ -3403,6 +3516,35 @@ mod tests {
             observation.points[1].source_frame_id.as_deref(),
             Some("kinect-depth-123")
         );
+    }
+
+    #[test]
+    fn pointcloud_projection_samples_rgb_eye_frame_by_depth_pixel() {
+        let mut snapshot = kinect_snapshot_at(0.0, 0.0, 0.0, vec![1.0, 1.0, 1.0, 1.0], 2, 2);
+        snapshot.eye_frame = Some(EyeFrame {
+            captured_at_ms: 123,
+            width: 2,
+            height: 2,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0],
+            source: Some("kinect-freenect-rgb".to_string()),
+        });
+
+        let observation = pointcloud_observation_from_snapshot(
+            &snapshot,
+            500,
+            PointCloudConfig {
+                max_points_per_observation: 16,
+                ..PointCloudConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observation.points.len(), 4);
+        assert_eq!(observation.points[0].color_rgb, Some([255, 0, 0]));
+        assert_eq!(observation.points[1].color_rgb, Some([0, 255, 0]));
+        assert_eq!(observation.points[2].color_rgb, Some([0, 0, 255]));
+        assert_eq!(observation.points[3].color_rgb, Some([255, 255, 0]));
     }
 
     #[test]

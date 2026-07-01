@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use netherwick_actions::{ActionPrimitive, LlmActionProposal};
 use netherwick_body::BodySense;
 use netherwick_now::{
-    EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense, ObjectSense,
-    RangeSense, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
+    AsrSense, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense,
+    ObjectSense, RangeSense, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
     IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
 };
 use netherwick_now::{Now, PredictionSense, SurpriseSense};
@@ -15,8 +15,10 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
 #[cfg(any(feature = "face", feature = "linux-hardware"))]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 mod surface;
 
@@ -699,6 +701,159 @@ pub struct PcmAudioFrame {
     pub sample_rate_hz: u32,
     pub channels: u16,
     pub samples: Vec<i16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListenburyAsrConfig {
+    pub command: Option<String>,
+    pub min_voice_rms: f32,
+    pub min_chunk_ms: u64,
+    pub max_chunk_ms: u64,
+    pub silence_finalize_ms: u64,
+}
+
+impl Default for ListenburyAsrConfig {
+    fn default() -> Self {
+        Self {
+            command: std::env::var("NETHERWICK_ASR_COMMAND")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            min_voice_rms: std::env::var("NETHERWICK_ASR_MIN_RMS")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(0.012),
+            min_chunk_ms: std::env::var("NETHERWICK_ASR_MIN_CHUNK_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(450),
+            max_chunk_ms: std::env::var("NETHERWICK_ASR_MAX_CHUNK_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(8_000),
+            silence_finalize_ms: std::env::var("NETHERWICK_ASR_SILENCE_FINALIZE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(700),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ListenburyAsrAdapter {
+    config: ListenburyAsrConfig,
+    chunk: Vec<i16>,
+    chunk_start_ms: Option<u64>,
+    chunk_end_ms: Option<u64>,
+    last_voice_ms: Option<u64>,
+    sequence: u64,
+}
+
+impl ListenburyAsrAdapter {
+    pub fn new(config: ListenburyAsrConfig) -> Self {
+        Self {
+            config,
+            chunk: Vec::new(),
+            chunk_start_ms: None,
+            chunk_end_ms: None,
+            last_voice_ms: None,
+            sequence: 0,
+        }
+    }
+
+    pub fn observe_frame(&mut self, frame: &PcmAudioFrame) -> Option<EarSense> {
+        if frame.samples.is_empty() || frame.sample_rate_hz == 0 || frame.channels == 0 {
+            return self.try_finalize(frame.captured_at_ms, frame.sample_rate_hz, frame.channels);
+        }
+        let rms = pcm_rms(&frame.samples);
+        let voice = rms >= self.config.min_voice_rms;
+        let duration_ms =
+            pcm_duration_ms(frame.samples.len(), frame.sample_rate_hz, frame.channels);
+        let frame_start = frame.captured_at_ms;
+        let frame_end = frame_start.saturating_add(duration_ms);
+
+        if voice {
+            if self.chunk_start_ms.is_none() {
+                self.chunk_start_ms = Some(frame_start);
+            }
+            self.chunk.extend_from_slice(&frame.samples);
+            self.chunk_end_ms = Some(frame_end);
+            self.last_voice_ms = Some(frame_end);
+        } else if self.chunk_start_ms.is_some() {
+            self.chunk_end_ms = Some(frame_end);
+        }
+
+        let chunk_duration = self
+            .chunk_start_ms
+            .zip(self.chunk_end_ms)
+            .map(|(start, end)| end.saturating_sub(start))
+            .unwrap_or_default();
+        let silence_ms = self
+            .last_voice_ms
+            .map(|last| frame_end.saturating_sub(last))
+            .unwrap_or_default();
+        let should_finalize = chunk_duration >= self.config.max_chunk_ms
+            || (chunk_duration >= self.config.min_chunk_ms
+                && silence_ms >= self.config.silence_finalize_ms);
+        if should_finalize {
+            self.try_finalize(frame_end, frame.sample_rate_hz, frame.channels)
+        } else {
+            None
+        }
+    }
+
+    fn try_finalize(
+        &mut self,
+        fallback_end_ms: u64,
+        sample_rate_hz: u32,
+        channels: u16,
+    ) -> Option<EarSense> {
+        let start_ms = self.chunk_start_ms?;
+        let end_ms = self.chunk_end_ms.unwrap_or(fallback_end_ms);
+        if end_ms.saturating_sub(start_ms) < self.config.min_chunk_ms || self.chunk.is_empty() {
+            self.clear_chunk();
+            return None;
+        }
+        let transcript = self
+            .config
+            .command
+            .as_deref()
+            .and_then(|command| {
+                transcribe_with_command(command, &self.chunk, sample_rate_hz, channels).ok()
+            })
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())?;
+
+        let sequence = self.sequence;
+        self.sequence = self.sequence.saturating_add(1);
+        let word_count = transcript.split_whitespace().count().min(u16::MAX as usize) as u16;
+        let confidence = command_transcript_confidence(&transcript);
+        self.clear_chunk();
+        Some(EarSense {
+            schema_version: 1,
+            features: Vec::new(),
+            transcript: Some(transcript.clone()),
+            asr: AsrSense {
+                transcript: Some(transcript),
+                is_final: true,
+                confidence,
+                sequence_start: Some(sequence),
+                sequence_end: Some(sequence),
+                start_ms: Some(start_ms),
+                end_ms: Some(end_ms),
+                duration_ms: Some(end_ms.saturating_sub(start_ms)),
+                sample_rate_hz: Some(sample_rate_hz),
+                word_count: Some(word_count),
+                speaker_confidence: None,
+            },
+        })
+    }
+
+    fn clear_chunk(&mut self) {
+        self.chunk.clear();
+        self.chunk_start_ms = None;
+        self.chunk_end_ms = None;
+        self.last_voice_ms = None;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1388,6 +1543,93 @@ fn store_i16_pcm_frame(
     }
 }
 
+fn pcm_rms(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum = samples
+        .iter()
+        .map(|sample| {
+            let normalized = *sample as f32 / i16::MAX as f32;
+            normalized * normalized
+        })
+        .sum::<f32>();
+    (sum / samples.len() as f32).sqrt()
+}
+
+fn pcm_duration_ms(sample_count: usize, sample_rate_hz: u32, channels: u16) -> u64 {
+    if sample_rate_hz == 0 || channels == 0 {
+        return 0;
+    }
+    let frames = sample_count as u64 / channels as u64;
+    frames.saturating_mul(1_000) / sample_rate_hz as u64
+}
+
+fn command_transcript_confidence(transcript: &str) -> f32 {
+    let words = transcript.split_whitespace().count() as f32;
+    (0.55 + words.min(8.0) * 0.04).clamp(0.55, 0.92)
+}
+
+fn transcribe_with_command(
+    command_line: &str,
+    samples: &[i16],
+    sample_rate_hz: u32,
+    channels: u16,
+) -> Result<String> {
+    let mut parts = command_line.split_whitespace();
+    let Some(program) = parts.next() else {
+        anyhow::bail!("ASR command is empty");
+    };
+    let mut args = parts.map(str::to_string).collect::<Vec<_>>();
+    let wav_path = std::env::temp_dir().join(format!(
+        "netherwick-asr-{}-{}.wav",
+        std::process::id(),
+        unix_time_ms()
+    ));
+    write_pcm_wav(&wav_path, samples, sample_rate_hz, channels)?;
+    args.push(wav_path.to_string_lossy().to_string());
+    let output = Command::new(program).args(args).output();
+    let _ = std::fs::remove_file(&wav_path);
+    let output = output?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ASR command exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn write_pcm_wav(path: &Path, samples: &[i16], sample_rate_hz: u32, channels: u16) -> Result<()> {
+    let channels = channels.max(1);
+    let sample_rate_hz = sample_rate_hz.max(1);
+    let data_bytes = samples.len().saturating_mul(2);
+    let riff_size = 36usize.saturating_add(data_bytes);
+    let mut bytes = Vec::with_capacity(44 + data_bytes);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(riff_size as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate_hz.to_le_bytes());
+    let byte_rate = sample_rate_hz
+        .saturating_mul(channels as u32)
+        .saturating_mul(2);
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    let block_align = channels.saturating_mul(2);
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
 fn bytes_to_unit_signal(bytes: &[u8]) -> Vec<f32> {
     bytes
         .iter()
@@ -1844,19 +2086,39 @@ impl SenseProducer for CameraSenseProvider {
 pub struct MicrophoneSenseProvider {
     #[cfg(feature = "linux-hardware")]
     microphone: CpalMicrophone,
+    #[cfg_attr(not(feature = "linux-hardware"), allow(dead_code))]
+    asr: Option<ListenburyAsrAdapter>,
+    pending: VecDeque<SensePacket>,
+    #[cfg_attr(not(feature = "linux-hardware"), allow(dead_code))]
+    last_pcm_ms: Option<u64>,
 }
 
 impl MicrophoneSenseProvider {
     pub fn new(preferred_name: Option<&str>) -> Result<Self> {
+        Self::with_asr_config(preferred_name, ListenburyAsrConfig::default())
+    }
+
+    pub fn with_asr_config(
+        preferred_name: Option<&str>,
+        asr_config: ListenburyAsrConfig,
+    ) -> Result<Self> {
         #[cfg(feature = "linux-hardware")]
         {
+            let asr = asr_config
+                .command
+                .is_some()
+                .then(|| ListenburyAsrAdapter::new(asr_config));
             Ok(Self {
                 microphone: CpalMicrophone::new(preferred_name, 16000, 1)?,
+                asr,
+                pending: VecDeque::new(),
+                last_pcm_ms: None,
             })
         }
         #[cfg(not(feature = "linux-hardware"))]
         {
             let _ = preferred_name;
+            let _ = asr_config;
             anyhow::bail!("linux-hardware feature is not enabled");
         }
     }
@@ -1865,6 +2127,9 @@ impl MicrophoneSenseProvider {
 #[async_trait]
 impl SenseProducer for MicrophoneSenseProvider {
     async fn poll(&mut self) -> Result<SensePacket> {
+        if let Some(packet) = self.pending.pop_front() {
+            return Ok(packet);
+        }
         #[cfg(feature = "linux-hardware")]
         {
             let frame = self
@@ -1876,6 +2141,14 @@ impl SenseProducer for MicrophoneSenseProvider {
                     channels: 1,
                     samples: Vec::new(),
                 });
+            if self.last_pcm_ms != Some(frame.captured_at_ms) {
+                self.last_pcm_ms = Some(frame.captured_at_ms);
+                if let Some(asr) = self.asr.as_mut() {
+                    if let Some(ear) = asr.observe_frame(&frame) {
+                        self.pending.push_back(SensePacket::Ear(ear));
+                    }
+                }
+            }
             Ok(SensePacket::EarPcm(frame))
         }
         #[cfg(not(feature = "linux-hardware"))]
@@ -2320,5 +2593,51 @@ mod tests {
         );
 
         assert_eq!(adjusted, rgb);
+    }
+
+    #[test]
+    fn listenbury_asr_adapter_emits_final_ear_sense_from_command_transcript() {
+        let mut adapter = ListenburyAsrAdapter::new(ListenburyAsrConfig {
+            command: Some("printf hello".to_string()),
+            min_voice_rms: 0.01,
+            min_chunk_ms: 100,
+            max_chunk_ms: 8_000,
+            silence_finalize_ms: 0,
+        });
+        let frame = PcmAudioFrame {
+            captured_at_ms: 1_000,
+            sample_rate_hz: 1_000,
+            channels: 1,
+            samples: vec![10_000; 250],
+        };
+
+        let ear = adapter.observe_frame(&frame).expect("final ASR sense");
+
+        assert_eq!(ear.transcript.as_deref(), Some("hello"));
+        assert_eq!(ear.asr.transcript.as_deref(), Some("hello"));
+        assert!(ear.asr.is_final);
+        assert_eq!(ear.asr.start_ms, Some(1_000));
+        assert_eq!(ear.asr.duration_ms, Some(250));
+        assert_eq!(ear.asr.sample_rate_hz, Some(1_000));
+        assert_eq!(ear.asr.word_count, Some(1));
+    }
+
+    #[test]
+    fn listenbury_asr_adapter_without_command_does_not_fabricate_words() {
+        let mut adapter = ListenburyAsrAdapter::new(ListenburyAsrConfig {
+            command: None,
+            min_voice_rms: 0.01,
+            min_chunk_ms: 100,
+            max_chunk_ms: 8_000,
+            silence_finalize_ms: 0,
+        });
+        let frame = PcmAudioFrame {
+            captured_at_ms: 1_000,
+            sample_rate_hz: 1_000,
+            channels: 1,
+            samples: vec![10_000; 250],
+        };
+
+        assert!(adapter.observe_frame(&frame).is_none());
     }
 }

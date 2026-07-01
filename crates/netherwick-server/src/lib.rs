@@ -6184,6 +6184,8 @@ canvas{display:block}
       <label><input type="checkbox" data-map-layer="robot-frame points">robot frame</label>
       <label><input type="checkbox" data-map-layer="world-frame points">world frame</label>
       <label><input type="checkbox" data-map-layer="accumulated occupancy" checked>accum</label>
+      <label><input type="checkbox" data-map-layer="flat image" checked>image</label>
+      <label><input type="checkbox" data-map-layer="hypotheses" checked>hypotheses</label>
       <label><input type="checkbox" data-map-layer="floor plane" checked>floor</label>
       <label><input type="checkbox" data-map-layer="axes gizmo" checked>axes</label>
       <label><input type="checkbox" data-map-layer="stable wall candidates" checked>stable</label>
@@ -6495,6 +6497,7 @@ const objects = new BABYLON.TransformNode("objects", scene);
 const surfaceOverlays = new BABYLON.TransformNode("surfaceOverlays", scene);
 
 let pointCloud = null;
+let voxelCloud = null;
 let lastScene = null;
 let xrSession = null;
 let lastReignKey = '';
@@ -6686,6 +6689,10 @@ function renderPoints(points, coordinateSystem){
     pointCloud.dispose();
     pointCloud = null;
   }
+  if(voxelCloud){
+    voxelCloud.dispose();
+    voxelCloud = null;
+  }
   if(!points || !points.length) return;
   
   const positions = [];
@@ -6719,8 +6726,62 @@ function renderPoints(points, coordinateSystem){
   pointCloud.parent = null;
 }
 
-function renderAccumulatedPoints(points){
-  renderPoints(points || [], 'world');
+function clearPointGeometry(){
+  if(pointCloud){
+    pointCloud.dispose();
+    pointCloud = null;
+  }
+  if(voxelCloud){
+    voxelCloud.dispose();
+    voxelCloud = null;
+  }
+}
+
+function renderAccumulatedVoxels(points, voxelSizeM){
+  clearPointGeometry();
+  if(!points || !points.length) return;
+
+  const positions = [];
+  const colors = [];
+  const indices = [];
+  const half = Math.max(0.015, Math.min(0.12, (Number(voxelSizeM) || 0.05) * 0.42));
+  const corners = [
+    [-half,-half,-half], [half,-half,-half], [half,half,-half], [-half,half,-half],
+    [-half,-half,half], [half,-half,half], [half,half,half], [-half,half,half]
+  ];
+  const faces = [
+    [0,1,2,3], [4,7,6,5], [0,4,5,1],
+    [1,5,6,2], [2,6,7,3], [3,7,4,0]
+  ];
+
+  for(const p of points){
+    const center = worldMathPointToBabylonWorld(p);
+    const base = positions.length / 3;
+    const alpha = p.stable ? 1.0 : clamp((p.confidence || 0.35) * 0.9 + 0.18, 0.22, 0.82);
+    for(const corner of corners){
+      positions.push(center.x + corner[0], center.y + corner[1], center.z + corner[2]);
+      colors.push((p.r ?? 190) / 255, (p.g ?? 194) / 255, (p.b ?? 246) / 255, alpha);
+    }
+    for(const face of faces){
+      indices.push(base + face[0], base + face[1], base + face[2], base + face[0], base + face[2], base + face[3]);
+    }
+  }
+
+  voxelCloud = new BABYLON.Mesh("voxelCloud", scene);
+  const vertexData = new BABYLON.VertexData();
+  vertexData.positions = positions;
+  vertexData.colors = colors;
+  vertexData.indices = indices;
+  vertexData.applyToMesh(voxelCloud);
+
+  const mat = new BABYLON.StandardMaterial("voxelCloudMat", scene);
+  mat.disableLighting = true;
+  mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
+  mat.useVertexColors = true;
+  mat.hasVertexAlpha = true;
+  mat.backFaceCulling = false;
+  voxelCloud.material = mat;
+  voxelCloud.parent = null;
 }
 
 function renderWorldBeliefPoints(packet){
@@ -6731,13 +6792,13 @@ function renderWorldBeliefPoints(packet){
   if(layers.has('raw point cloud') || layers.has('raw camera-frame points') || layers.has('robot-frame points')){
     renderPoints(raw, rawFrame);
   }else if(layers.has('stable wall candidates') && accumulated.some(point => point.stable)){
-    renderAccumulatedPoints(accumulated.filter(point => point.stable));
+    renderAccumulatedVoxels(accumulated.filter(point => point.stable), packet.kinect?.accumulated_summary?.voxel_size_m);
   }else if(layers.has('accumulated occupancy') && accumulated.length){
-    renderAccumulatedPoints(accumulated);
+    renderAccumulatedVoxels(accumulated, packet.kinect?.accumulated_summary?.voxel_size_m);
   }else if(layers.has('world-frame points') && accumulated.length){
-    renderAccumulatedPoints(accumulated);
+    renderAccumulatedVoxels(accumulated, packet.kinect?.accumulated_summary?.voxel_size_m);
   }else{
-    renderPoints([], 'world');
+    clearPointGeometry();
   }
 }
 
@@ -6923,8 +6984,9 @@ function renderPersistentWorldBelief(packet, layers){
 }
 function renderSurfacePerception(packet){
   clearChildren(surfaceOverlays);
-  const perception = packet.surface_perception;
   const layers = enabledMapLayers();
+  if(!layers.has('hypotheses')) return;
+  const perception = packet.surface_perception;
   const showStableSurfaces = layers.has('stable wall candidates');
   renderPersistentWorldBelief(packet, layers);
   if(!perception) return;
@@ -7158,6 +7220,7 @@ async function saveLearningConfig(){
 
 function updateScene(packet, liveMap=null){
   lastScene = packet;
+  syncDisplayToggles();
   robot.position.copyFrom(world(packet.body.x_m, packet.body.y_m, 0));
   robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
   renderObjects(packet);
@@ -7392,6 +7455,11 @@ function updateTraceState(packet){
 
 function enabledMapLayers(){
   return new Set(mapLayerInputs.filter(input => input.checked).map(input => input.dataset.mapLayer));
+}
+
+function syncDisplayToggles(){
+  const layers = enabledMapLayers();
+  eyePanel.setEnabled(layers.has('flat image'));
 }
 
 function hashUnit(value){
@@ -10270,6 +10338,9 @@ mod tests {
         assert!(page.contains("data-map-layer=\"rays\""));
         assert!(page.contains("data-map-layer=\"raw point cloud\""));
         assert!(page.contains("data-map-layer=\"accumulated occupancy\""));
+        assert!(page.contains("data-map-layer=\"flat image\""));
+        assert!(page.contains("data-map-layer=\"hypotheses\""));
+        assert!(page.contains("function syncDisplayToggles"));
         assert!(page.contains("data-map-layer=\"stable wall candidates\""));
         assert!(page.contains("function renderWorldBeliefPoints"));
         assert!(page.contains("function pointCloudFrameKind"));
