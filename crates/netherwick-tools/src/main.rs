@@ -4569,21 +4569,17 @@ fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SenseP
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
     let create_port = selected_create_port(&args.create_port, &env_report);
-    let is_mock_body = create_port.as_deref() == Some("mock");
-    let mut robot_mode = match args.mode {
+    let robot_mode = match args.mode {
         RobotModeArg::ReadOnly => RobotMode::ReadOnly,
         RobotModeArg::Slow => RobotMode::Slow,
         RobotModeArg::Disabled => RobotMode::Disabled,
     };
-    if is_mock_body && robot_mode == RobotMode::Slow {
-        println!(
-            "warning: create-port mock does not support motorized slow mode; running in read-only mode instead"
-        );
-        robot_mode = RobotMode::ReadOnly;
-    }
     if robot_mode == RobotMode::Disabled {
         anyhow::bail!("--mode disabled does not start the real robot runner");
     }
+
+    let (body, robot_mode, is_mock_body) =
+        open_robot_body_or_fallback(create_port.as_deref(), args.create_baud, robot_mode).await?;
 
     let live_state = args.dashboard.map(|_| {
         let live_state = if robot_mode == RobotMode::Slow {
@@ -4756,20 +4752,6 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    let body: Box<dyn RobotBody + Send> = if create_port.as_deref() == Some("mock") {
-        Box::new(MockCreate1Body::new())
-    } else if let Some(create_port) = create_port {
-        let open_mode = match robot_mode {
-            RobotMode::ReadOnly => Create1OpenMode::Passive,
-            RobotMode::Slow => Create1OpenMode::Safe,
-            RobotMode::Disabled => unreachable!("disabled mode bailed before body open"),
-        };
-        Box::new(Create1Body::connect_with_mode(&create_port, args.create_baud, open_mode).await?)
-    } else {
-        anyhow::bail!(
-            "no Create serial device found; pass --create-port /dev/ttyUSB0 or --create-port mock"
-        );
-    };
     let ledger = JsonlLedger::new(&args.ledger);
     let memory = DurableExperienceStore::from_env();
     let recall = memory.clone();
@@ -4873,6 +4855,56 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         capture_summary
     );
     Ok(())
+}
+
+async fn open_robot_body_or_fallback(
+    create_port: Option<&str>,
+    create_baud: u32,
+    mut robot_mode: RobotMode,
+) -> Result<(Box<dyn RobotBody + Send>, RobotMode, bool)> {
+    if create_port == Some("mock") {
+        if robot_mode == RobotMode::Slow {
+            println!(
+                "warning: create-port mock does not support motorized slow mode; running in read-only mode instead"
+            );
+            robot_mode = RobotMode::ReadOnly;
+        }
+        return Ok((Box::new(MockCreate1Body::new()), robot_mode, true));
+    }
+
+    let Some(create_port) = create_port else {
+        if robot_mode == RobotMode::Slow {
+            println!(
+                "warning: no Create serial device found; falling back to mock body in read-only mode"
+            );
+            robot_mode = RobotMode::ReadOnly;
+        } else {
+            println!("warning: no Create serial device found; falling back to mock body");
+        }
+        return Ok((Box::new(MockCreate1Body::new()), robot_mode, true));
+    };
+
+    let open_mode = match robot_mode {
+        RobotMode::ReadOnly => Create1OpenMode::Passive,
+        RobotMode::Slow => Create1OpenMode::Safe,
+        RobotMode::Disabled => unreachable!("disabled mode bailed before body open"),
+    };
+    match Create1Body::connect_with_mode(create_port, create_baud, open_mode).await {
+        Ok(body) => Ok((Box::new(body), robot_mode, false)),
+        Err(error) => {
+            if robot_mode == RobotMode::Slow {
+                println!(
+                    "warning: failed to open Create serial device {create_port}: {error}; falling back to mock body in read-only mode"
+                );
+                robot_mode = RobotMode::ReadOnly;
+            } else {
+                println!(
+                    "warning: failed to open Create serial device {create_port}: {error}; falling back to mock body"
+                );
+            }
+            Ok((Box::new(MockCreate1Body::new()), robot_mode, true))
+        }
+    }
 }
 
 fn default_runtime(
@@ -10965,6 +10997,18 @@ mod tests {
             selected_gps_device(Some("none"), false, &report, Some("/dev/ttyUSB0")),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn robot_body_fallback_uses_mock_readonly_when_create_missing() {
+        let (mut body, mode, is_mock_body) =
+            open_robot_body_or_fallback(None, 57_600, RobotMode::Slow)
+                .await
+                .unwrap();
+
+        assert_eq!(mode, RobotMode::ReadOnly);
+        assert!(is_mock_body);
+        assert_eq!(body.read_body().await.unwrap().last_update_ms, 100);
     }
 
     #[test]

@@ -20,7 +20,8 @@ use netherwick_events::{
     default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
 };
 use netherwick_experience::{
-    action_features, action_value_input_from_transition_like, charge_input_from_transition_like,
+    action_features, action_value_input_from_transition_like,
+    action_value_target_from_reward_surprise, charge_input_from_transition_like,
     charge_target_from_transition_like, danger_input_from_transition_like,
     danger_target_from_transition_like, ear_next_input_from_transition_like,
     ear_next_target_from_now, experience_decode_target_from_now,
@@ -1458,6 +1459,8 @@ impl TargetExtractor<ExperienceTransition, ActionValueInput, ActionValueOutput>
         &self,
         transition: &ExperienceTransition,
     ) -> Result<Option<TrainingSample<ActionValueInput, ActionValueOutput>>> {
+        let target =
+            action_value_target_from_reward_surprise(&transition.reward, &transition.surprise);
         Ok(Some(TrainingSample {
             input: action_value_input_from_transition_like(
                 &transition.before_z,
@@ -1465,7 +1468,7 @@ impl TargetExtractor<ExperienceTransition, ActionValueInput, ActionValueOutput>
                 &transition.before,
             ),
             expected: ActionValueOutput {
-                value: transition.reward.value.clamp(-1.0, 1.0),
+                value: target.value.clamp(-1.0, 1.0),
                 confidence: 1.0,
             },
             actual: None,
@@ -8788,7 +8791,11 @@ mod tests {
                 confidence: 0.9,
             },
             reward: Reward { value: 0.25 },
-            surprise: SurpriseSense::default(),
+            surprise: SurpriseSense {
+                total: 0.6,
+                prediction_error: 0.1,
+                ..SurpriseSense::default()
+            },
             created_at_ms: 200,
         };
 
@@ -8812,7 +8819,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(action_value.source, TrainingSource::WorldOutcome);
-        assert_eq!(action_value.expected.value, 0.25);
+        assert!((action_value.expected.value - 0.18).abs() < 0.0001);
         assert_eq!(action_value.expected.confidence, 1.0);
 
         let eye_next = EyeNextTargetExtractor { offset_ms: 100 }
