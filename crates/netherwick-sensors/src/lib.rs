@@ -6,7 +6,8 @@ use netherwick_actions::{ActionPrimitive, LlmActionProposal};
 use netherwick_body::BodySense;
 use netherwick_now::{
     AsrSense, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense,
-    ObjectSense, RangeSense, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
+    ObjectSense, RangeSense, TranscriptCandidateEvent, TranscriptCandidateTracker,
+    TranscriptStabilityState, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
     IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
 };
 use netherwick_now::{Now, PredictionSense, SurpriseSense};
@@ -746,6 +747,7 @@ pub struct ListenburyAsrAdapter {
     chunk_end_ms: Option<u64>,
     last_voice_ms: Option<u64>,
     sequence: u64,
+    transcript_tracker: TranscriptCandidateTracker,
 }
 
 impl ListenburyAsrAdapter {
@@ -757,6 +759,7 @@ impl ListenburyAsrAdapter {
             chunk_end_ms: None,
             last_voice_ms: None,
             sequence: 0,
+            transcript_tracker: TranscriptCandidateTracker::new(),
         }
     }
 
@@ -827,23 +830,39 @@ impl ListenburyAsrAdapter {
         self.sequence = self.sequence.saturating_add(1);
         let word_count = transcript.split_whitespace().count().min(u16::MAX as usize) as u16;
         let confidence = command_transcript_confidence(&transcript);
+        let candidate_events =
+            self.transcript_tracker
+                .ingest_candidate(transcript.clone(), Some(confidence), true);
+        let stability = transcript_stability_from_events(&candidate_events);
         self.clear_chunk();
         Some(EarSense {
             schema_version: 1,
             features: Vec::new(),
             transcript: Some(transcript.clone()),
             asr: AsrSense {
-                transcript: Some(transcript),
+                transcript: Some(transcript.clone()),
+                possible_transcript: None,
+                committed_transcript: Some(transcript),
                 is_final: true,
                 confidence,
                 sequence_start: Some(sequence),
                 sequence_end: Some(sequence),
+                candidate_id: stability.as_ref().map(|state| state.candidate_id.0),
+                stable_text: stability.as_ref().map(|state| state.stable_text.clone()),
+                unstable_text: stability.as_ref().map(|state| state.unstable_text.clone()),
+                stable_word_prefix: stability
+                    .as_ref()
+                    .and_then(|state| state.stable_word_prefix.clone()),
+                stable_word_count: stability
+                    .as_ref()
+                    .map(|state| state.stable_word_count.min(u16::MAX as usize) as u16),
                 start_ms: Some(start_ms),
                 end_ms: Some(end_ms),
                 duration_ms: Some(end_ms.saturating_sub(start_ms)),
                 sample_rate_hz: Some(sample_rate_hz),
                 word_count: Some(word_count),
                 speaker_confidence: None,
+                candidate_events,
             },
         })
     }
@@ -854,6 +873,37 @@ impl ListenburyAsrAdapter {
         self.chunk_end_ms = None;
         self.last_voice_ms = None;
     }
+}
+
+fn transcript_stability_from_events(
+    events: &[TranscriptCandidateEvent],
+) -> Option<TranscriptStabilityState> {
+    events.iter().rev().find_map(|event| match event {
+        TranscriptCandidateEvent::CandidateUpdated {
+            id,
+            text,
+            stable_prefix_len,
+            confidence,
+        } => Some(TranscriptStabilityState::from_parts(
+            *id,
+            text,
+            *stable_prefix_len,
+            *confidence,
+        )),
+        TranscriptCandidateEvent::CandidateFinalized {
+            id,
+            text,
+            confidence,
+        } => Some(TranscriptStabilityState::from_parts(
+            *id,
+            text,
+            text.len(),
+            *confidence,
+        )),
+        TranscriptCandidateEvent::CandidateStarted { .. }
+        | TranscriptCandidateEvent::CandidateReplaced { .. }
+        | TranscriptCandidateEvent::CandidateCancelled { .. } => None,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2647,6 +2697,15 @@ mod tests {
         assert_eq!(ear.asr.duration_ms, Some(250));
         assert_eq!(ear.asr.sample_rate_hz, Some(1_000));
         assert_eq!(ear.asr.word_count, Some(1));
+        assert_eq!(ear.asr.committed_transcript.as_deref(), Some("hello"));
+        assert!(ear.asr.possible_transcript.is_none());
+        assert_eq!(ear.asr.candidate_id, Some(1));
+        assert_eq!(ear.asr.stable_text.as_deref(), Some("hello"));
+        assert!(ear
+            .asr
+            .candidate_events
+            .iter()
+            .any(|event| matches!(event, TranscriptCandidateEvent::CandidateFinalized { .. })));
     }
 
     #[test]

@@ -2435,8 +2435,8 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
     );
     let linked_experiences =
         experiences_with_memory_links(frame, &scene_vectors, &face_vectors, &voice_vectors);
-    let (sensation_vectors, vector_payloads) = sensation_vectors_from_frame(frame);
-    let experience_vectors = Vec::new();
+    let (sensation_vectors, mut vector_payloads) = sensation_vectors_from_frame(frame);
+    let experience_vectors = experience_vectors_from_frame(frame, &mut vector_payloads);
     let (graph_entities, graph_relationships) = graph_context_from_frame(
         frame,
         &linked_experiences,
@@ -3459,6 +3459,14 @@ fn graph_context_from_frame(
             "SUMMARIZES_EXPERIENCE",
             None,
         ));
+        let (artifact, _, _, _) = experience_vector_artifact(frame, experience);
+        entities.push(vector_entity(&artifact, "experience"));
+        relationships.push(graph_edge(
+            canonical_experience_id.clone(),
+            vector_node_id(&artifact),
+            "HAS_FUSED_VECTOR",
+            Some(format!("{} dimensions", artifact.vector.len())),
+        ));
         for sensation_id in &experience.sensation_ids {
             relationships.push(graph_edge(
                 canonical_experience_id.clone(),
@@ -3835,6 +3843,100 @@ fn sensation_vectors_from_frame(
     (artifacts, payloads)
 }
 
+fn experience_vectors_from_frame(
+    frame: &ExperienceFrame,
+    payloads: &mut BTreeMap<String, serde_json::Value>,
+) -> Vec<VectorArtifact> {
+    frame
+        .experiences
+        .iter()
+        .map(|experience| {
+            let summary_impression = experience.summary_impression.as_ref();
+            let (artifact, model_id, generated_at_ms, summary_text) =
+                experience_vector_artifact(frame, experience);
+            payloads.insert(
+                vector_payload_key(&artifact),
+                json!({
+                    "experience_id": experience.id.to_string(),
+                    "experience_kind": experience.kind,
+                    "summary": experience.text,
+                    "summary_impression_id": summary_impression.map(|impression| impression.id.to_string()),
+                    "summary_impression_text": summary_text,
+                    "impression_ids": experience.impression_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "sensation_ids": experience.sensation_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "model_id": model_id,
+                    "dim": artifact.vector.len(),
+                    "observed_at_ms": experience.observed_at_ms,
+                    "occurred_at_ms": experience.occurred_at_ms,
+                    "generated_at_ms": generated_at_ms,
+                }),
+            );
+            artifact
+        })
+        .collect()
+}
+
+fn deterministic_text_vector(text: &str, dim: usize) -> Vec<f32> {
+    let dim = dim.max(1);
+    let mut vector = vec![0.0; dim];
+    for token in text.split_whitespace() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.to_ascii_lowercase().hash(&mut hasher);
+        let hash = hasher.finish();
+        let index = hash as usize % dim;
+        let sign = if (hash >> 63) == 0 { 1.0 } else { -1.0 };
+        vector[index] += sign;
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > f32::EPSILON {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
+fn experience_vector_artifact(
+    frame: &ExperienceFrame,
+    experience: &Experience,
+) -> (VectorArtifact, String, u64, String) {
+    let summary_impression = experience.summary_impression.as_ref();
+    let summary_text = summary_impression
+        .map(|impression| impression.text.clone())
+        .unwrap_or_else(|| experience.text.clone());
+    let (vector, model_id, generated_at_ms) = if let Some(latent) = &frame.z {
+        (
+            latent.z.clone(),
+            "netherwick.experience.latent".to_string(),
+            latent.t_ms,
+        )
+    } else if let Some(embedding) =
+        summary_impression.and_then(|impression| impression.vector.as_ref())
+    {
+        (
+            embedding.vector.clone(),
+            embedding.model_id.clone(),
+            embedding.generated_at_ms,
+        )
+    } else {
+        (
+            deterministic_text_vector(&summary_text, 16),
+            "netherwick.text.hashing.v1".to_string(),
+            frame.t_ms,
+        )
+    };
+    let artifact = VectorArtifact::new(
+        EXPERIENCE_VECTOR_COLLECTION,
+        format!("{}:experience:{}", frame.id, experience.id),
+        vector,
+    )
+    .with_model(model_id.clone())
+    .with_source_id(experience.id.to_string())
+    .with_source_frame_id(frame.id.to_string())
+    .with_occurred_at_ms(experience.occurred_at_ms);
+    (artifact, model_id, generated_at_ms, summary_text)
+}
+
 fn memory_links_from_frame(
     frame: &ExperienceFrame,
     _scene_vectors: &[VectorArtifact],
@@ -4103,18 +4205,24 @@ fn place_query_vectors_from_query(query: &RecallQuery) -> Vec<VectorArtifact> {
 
 pub fn place_recognition_input_from_frame(frame: &ExperienceFrame) -> PlaceRecognitionInput {
     let instant = frame.experience_instant();
+    let experience_id = instant.experience_id.map(|id| id.to_string());
     let experience_latent_vector = frame.z.as_ref().map(|latent| {
-        VectorArtifact::new(
+        let artifact = VectorArtifact::new(
             EXPERIENCE_VECTOR_COLLECTION,
             format!("{}:experience-latent", frame.id),
             latent.z.clone(),
         )
         .with_model("netherwick.experience.latent")
         .with_source_frame_id(frame.id.to_string())
-        .with_occurred_at_ms(frame.t_ms)
+        .with_occurred_at_ms(frame.t_ms);
+        if let Some(experience_id) = &experience_id {
+            artifact.with_source_id(experience_id.clone())
+        } else {
+            artifact
+        }
     });
     PlaceRecognitionInput {
-        experience_id: instant.experience_id.map(|id| id.to_string()),
+        experience_id,
         instant_frame_id: Some(frame.id.to_string()),
         experience_latent_vector,
         teacher_vector_refs: instant

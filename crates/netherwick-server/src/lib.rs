@@ -10439,14 +10439,31 @@ mod tests {
             100,
             102,
         );
+        let summary_impression = Impression::new(
+            "experience.summary",
+            "I see and focus.",
+            vec![primary.id, child.id],
+            100,
+            102,
+        )
+        .with_vector(VectorEmbedding::new(
+            vec![0.1, 0.2, 0.3, 0.4],
+            "unit.fuser.v0",
+            Modality::Other,
+            SensationPayloadKind::Structured,
+            child.id,
+            103,
+        ));
         let mut experience = Experience::new(
             "embodied.now",
             "I see and focus.",
-            vec![impression.id],
+            vec![impression.id, summary_impression.id],
             vec![primary.id, child.id],
             100,
             102,
         );
+        experience.summary_impression =
+            Some(summary_impression.clone().for_experience(experience.id));
         experience.predictions.push(Prediction {
             offset_ms: 750,
             text: "The focused view should remain stable.".to_string(),
@@ -10462,7 +10479,7 @@ mod tests {
         let context = EmbodiedContext::from_current_experience(
             Some(&experience),
             &[primary.clone(), child.clone()],
-            &[impression.clone()],
+            &[impression.clone(), summary_impression.clone()],
             &[],
             &[],
         );

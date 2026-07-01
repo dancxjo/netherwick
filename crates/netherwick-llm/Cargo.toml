@@ -18,7 +18,7 @@ chrono.workspace = true
 netherwick-actions = { path = "../netherwick-actions" }
 netherwick-experience = { path = "../netherwick-experience" }
 netherwick-now = { path = "../netherwick-now" }
+uuid.workspace = true
 
 [dev-dependencies]
 netherwick-body = { path = "../netherwick-body" }
-uuid.workspace = true

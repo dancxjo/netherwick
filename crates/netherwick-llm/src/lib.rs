@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 pub const IMAGE_CAPTION_PROMPT: &str = "The attached visual input is what I am seeing now. Describe only what you see from my viewpoint. Start from the fact that this is my own vision looking out, so first person should mean phrases like \"I see...\" or \"in front of me,\" not that visible people, faces, hands, eyes, or bodies are mine. Prefer concrete scene details over lighting or color summaries. Stay grounded in visible evidence and do not speculate beyond what can be seen. Do not interpret this as an image, screenshot, photo, frame, camera feed, metadata, data URL, or analysis; interpret it as the robot's own live view. When looking out, one does not see oneself: anyone visible is most likely someone I am looking at, not myself, unless I am clearly looking in a mirror or reflection. Describe visible people in third person, as someone in front of me.";
 
@@ -31,6 +32,7 @@ const COMBOBULATOR_MIN_INTERVAL_MS: u64 = 2_000;
 const AGENT_MIN_INTERVAL_MS: u64 = 1_500;
 const MILLIS_PER_SECOND: f64 = 1_000.0;
 const DEFAULT_OLLAMA_TIMEOUT_MS: u64 = 300_000;
+const PROMPT_UUID_OPTION_COUNT: usize = 5;
 
 static LLM_STREAM_BUS: OnceLock<broadcast::Sender<LlmStreamEvent>> = OnceLock::new();
 static LLM_STREAM_ID: AtomicU64 = AtomicU64::new(1);
@@ -868,6 +870,7 @@ fn build_combobulator_prompt(
     let timeline = render_combobulator_timeline(impressions);
     let embodied = render_embodied_context(embodied);
     let futures = summarize_futures(futures);
+    let uuid_options = render_prompt_uuid_options();
     format!(
         "You are the combobulator for an embodied robot.\n\
 Given recent impressions and predicted futures in timeline order, distill what appears to be happening right now.\n\
@@ -879,6 +882,8 @@ Use only the evidence below. The impressions are first-person present-tense embo
 {LIVE_EVENT_RULES}\n\
 Return JSON only with this schema:\n\
 {{\"summary\":\"...\",\"confidence\":0.0}}\n\n\
+If any output field calls for a new UUID or id, choose one of these exact UUID options and do not invent your own:\n\
+{}\n\n\
 CONTEXT FRAME\n\
 WHO\n\
 - embodied robot\n\
@@ -898,7 +903,14 @@ Recall summary: {}\n\
 Current embodied experience:\n{}\n\
 Timeline evidence:\n{}\n\
 Predicted futures:\n{}\n",
-        now.t_ms, z.confidence, z.prediction_error, recall_summary, embodied, timeline, futures
+        uuid_options,
+        now.t_ms,
+        z.confidence,
+        z.prediction_error,
+        recall_summary,
+        embodied,
+        timeline,
+        futures
     )
 }
 
@@ -918,6 +930,7 @@ fn build_agent_prompt(
         .join("\n");
     let embodied = render_embodied_context(embodied);
     let futures = summarize_futures(futures);
+    let uuid_options = render_prompt_uuid_options();
     format!(
         "You are the conscious LLM layer for an embodied robot.\n\
 When commands are enabled, choose a high-level action primitive whenever movement, speech, inspection, docking, or stopping is appropriate.\n\
@@ -937,6 +950,8 @@ Return JSON only with this schema:\n\
   \"counterfactuals\":[{{\"instead_of\":null,\"proposed\":{{\"kind\":\"turn\",\"direction\":\"left\",\"intensity\":0.4,\"duration_ms\":1000}},\"reason\":\"...\",\"weight\":0.5}}],\n\
   \"memory_notes\":[\"...\"]\n\
 }}\n\n\
+If any output field calls for a new UUID or id, choose one of these exact UUID options and do not invent your own:\n\
+{}\n\n\
 Current time: {} ms\n\
 Awareness summary: {}\n\
 Current embodied experience:\n{}\n\
@@ -948,6 +963,7 @@ Predicted futures:\n{}\n\
 Summarized senses:\n{}\n",
         config.allow_commands,
         config.allow_teaching,
+        uuid_options,
         now.t_ms,
         awareness_summary.unwrap_or("none"),
         embodied,
@@ -958,6 +974,13 @@ Summarized senses:\n{}\n",
         futures,
         senses
     )
+}
+
+fn render_prompt_uuid_options() -> String {
+    (0..PROMPT_UUID_OPTION_COUNT)
+        .map(|_| format!("- {}", Uuid::new_v4()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_embodied_context(context: Option<&EmbodiedContext>) -> String {
@@ -1759,6 +1782,36 @@ mod tests {
         assert!(prompt.contains("Treat Reign controls as present-tense command input"));
         assert!(prompt.contains("set action to the matching allowed action"));
         assert!(!prompt.contains("Do not override active Direct reign"));
+    }
+
+    #[test]
+    fn prompts_offer_generated_uuid_options_instead_of_asking_llm_to_invent_ids() {
+        let now = Now::blank(100, BodySense::default());
+        let prompt = build_agent_prompt(
+            &now,
+            None,
+            &ExperienceLatent::default(),
+            &[],
+            "none",
+            Some("I am awake."),
+            &LlmConfig::default(),
+        );
+
+        assert!(prompt.contains("choose one of these exact UUID options"));
+        assert!(prompt.contains("do not invent your own"));
+
+        let options = prompt
+            .lines()
+            .skip_while(|line| !line.contains("choose one of these exact UUID options"))
+            .skip(1)
+            .take_while(|line| line.starts_with("- "))
+            .map(|line| line.trim_start_matches("- "))
+            .collect::<Vec<_>>();
+
+        assert_eq!(options.len(), PROMPT_UUID_OPTION_COUNT);
+        for option in options {
+            Uuid::parse_str(option).expect("prompt UUID option should be valid");
+        }
     }
 
     #[test]

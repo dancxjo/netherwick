@@ -6263,6 +6263,43 @@ fn derive_direct_impressions_from_now(now: &Now) -> (Vec<Sensation>, Vec<Impress
             );
         }
     }
+    if let Some(possible) = now
+        .ear
+        .asr
+        .possible_transcript
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        push_now_input_impression(
+            &mut sensations,
+            &mut impressions,
+            now.t_ms,
+            "audio.possible_speech",
+            "ear",
+            asr_possible_speech_impression_text(possible, now.ear.asr.confidence),
+            now.ear.asr.confidence.max(0.25),
+        );
+    }
+    if let Some(committed) = now
+        .ear
+        .asr
+        .committed_transcript
+        .as_deref()
+        .or_else(|| now.ear.asr.is_final.then_some(transcript).flatten())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        push_now_input_impression(
+            &mut sensations,
+            &mut impressions,
+            now.t_ms,
+            "audio.committed_speech",
+            "ear",
+            asr_committed_speech_impression_text(committed, now.ear.asr.confidence),
+            now.ear.asr.confidence.max(0.35),
+        );
+    }
     push_now_input_impression(
         &mut sensations,
         &mut impressions,
@@ -6636,6 +6673,28 @@ fn asr_hearing_impression_text(transcript: &str, is_final: bool, confidence: f32
         format!("I think I heard \"{transcript}\".")
     } else {
         format!("I may have heard \"{transcript}\".")
+    }
+}
+
+fn asr_possible_speech_impression_text(transcript: &str, confidence: f32) -> String {
+    let transcript = transcript.trim();
+    if confidence >= 0.75 {
+        format!("I'm probably hearing the possible speech \"{transcript}\".")
+    } else if confidence >= 0.45 {
+        format!("I think the possible speech is \"{transcript}\".")
+    } else {
+        format!("I may be hearing possible speech like \"{transcript}\".")
+    }
+}
+
+fn asr_committed_speech_impression_text(transcript: &str, confidence: f32) -> String {
+    let transcript = transcript.trim();
+    if confidence >= 0.85 {
+        format!("I'm confident I can commit the heard speech as \"{transcript}\".")
+    } else if confidence >= 0.60 {
+        format!("I'm pretty sure I can commit the heard speech as \"{transcript}\".")
+    } else {
+        format!("I think I can commit the heard speech as \"{transcript}\".")
     }
 }
 
@@ -8012,6 +8071,38 @@ mod tests {
             final_text,
             "I'm confident I finally heard \"come over here\"."
         );
+    }
+
+    #[test]
+    fn asr_possible_and_committed_speech_become_direct_impressions() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.ear.asr = netherwick_now::AsrSense {
+            transcript: Some("open the door".to_string()),
+            possible_transcript: Some("open the".to_string()),
+            committed_transcript: Some("open the door".to_string()),
+            is_final: true,
+            confidence: 0.72,
+            ..netherwick_now::AsrSense::default()
+        };
+
+        let (sensations, impressions) = derive_direct_impressions_from_now(&now);
+
+        assert!(sensations
+            .iter()
+            .any(|sensation| sensation.kind == "audio.possible_speech"));
+        assert!(sensations
+            .iter()
+            .any(|sensation| sensation.kind == "audio.committed_speech"));
+        assert!(impressions.iter().any(|impression| {
+            impression.kind == "audio.possible_speech.impression"
+                && impression.text.contains("possible speech")
+                && impression.text.contains("open the")
+        }));
+        assert!(impressions.iter().any(|impression| {
+            impression.kind == "audio.committed_speech.impression"
+                && impression.text.contains("commit")
+                && impression.text.contains("open the door")
+        }));
     }
 
     #[test]
@@ -10380,8 +10471,8 @@ mod tests {
             action,
             offset_ms: 100,
         };
-        let mut trainer = FutureNetTrainer::new(input.flat_features().len(), input.latent.z.len());
-        trainer.train_step(&input, &latent.z).unwrap();
+        let mut trainer = FutureNetTrainer::new(input.flat_features().len(), 1);
+        trainer.train_step(&input, &[0.0]).unwrap();
         trainer.save_checkpoint(root).unwrap();
     }
 

@@ -165,16 +165,32 @@ pub struct EarSense {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AsrSense {
     pub transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possible_transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_transcript: Option<String>,
     pub is_final: bool,
     pub confidence: f32,
     pub sequence_start: Option<u64>,
     pub sequence_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstable_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_word_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_word_count: Option<u16>,
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
     pub duration_ms: Option<u64>,
     pub sample_rate_hz: Option<u32>,
     pub word_count: Option<u16>,
     pub speaker_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_events: Vec<TranscriptCandidateEvent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

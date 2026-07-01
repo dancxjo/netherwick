@@ -1513,8 +1513,10 @@ fn asr_features(now: &Now) -> Vec<f32> {
     let transcript = now
         .ear
         .asr
-        .transcript
+        .committed_transcript
         .as_deref()
+        .or(now.ear.asr.transcript.as_deref())
+        .or(now.ear.asr.possible_transcript.as_deref())
         .or(now.ear.transcript.as_deref())
         .map(str::trim)
         .filter(|text| !text.is_empty());
@@ -1546,7 +1548,7 @@ fn asr_features(now: &Now) -> Vec<f32> {
 
     vec![
         1.0,
-        bool01(now.ear.asr.is_final),
+        bool01(now.ear.asr.is_final || now.ear.asr.committed_transcript.is_some()),
         now.ear.asr.confidence.clamp(0.0, 1.0),
         (word_count / 32.0).clamp(0.0, 1.0),
         (char_count / 160.0).clamp(0.0, 1.0),
@@ -1716,6 +1718,7 @@ mod tests {
             sample_rate_hz: Some(16_000),
             word_count: Some(3),
             speaker_confidence: Some(0.6),
+            ..AsrSense::default()
         };
 
         let features = ear_next_features(&now);
@@ -2110,6 +2113,77 @@ mod tests {
                 .as_deref()
                 .is_some_and(|summary| summary == "I hear someone say \"hello there\".")
         }));
+    }
+
+    #[test]
+    fn audio_extractor_reports_possible_and_committed_speech() {
+        let mut primary = Sensation::primary(
+            Modality::Audio,
+            SensationSource::new("test-ear"),
+            2_000,
+            2_600,
+            SensationPayload {
+                kind: SensationPayloadKind::AudioPcm,
+                value: json!({
+                    "feature_sets": 2,
+                    "transcript": "turn left",
+                    "asr": {
+                        "transcript": "turn left",
+                        "possible_transcript": "turn le",
+                        "committed_transcript": "turn left",
+                        "is_final": true,
+                        "confidence": 0.78,
+                        "candidate_id": 4,
+                        "stable_text": "turn left",
+                        "unstable_text": "",
+                        "stable_word_prefix": "turn left",
+                        "stable_word_count": 2,
+                        "start_ms": 2_000,
+                        "end_ms": 2_600,
+                        "duration_ms": 600,
+                        "word_count": 2,
+                    },
+                }),
+            },
+        );
+        primary.metadata.duration_ms = Some(600);
+        primary.metadata.confidence = Some(0.78);
+
+        let descendants = AudioDescendantExtractor.extract(&primary).unwrap();
+
+        let possible = descendants
+            .iter()
+            .find(|sensation| sensation.kind == "audio.possible_speech")
+            .expect("possible speech sensation");
+        assert_eq!(
+            possible.payload.get("commitment").and_then(Value::as_str),
+            Some("possible")
+        );
+        assert_eq!(
+            possible.payload.get("text").and_then(Value::as_str),
+            Some("turn le")
+        );
+        assert!(possible
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("may be hearing")));
+
+        let committed = descendants
+            .iter()
+            .find(|sensation| sensation.kind == "audio.committed_speech")
+            .expect("committed speech sensation");
+        assert_eq!(
+            committed.payload.get("commitment").and_then(Value::as_str),
+            Some("committed")
+        );
+        assert_eq!(
+            committed.payload.get("text").and_then(Value::as_str),
+            Some("turn left")
+        );
+        assert!(committed
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("commit")));
     }
 
     #[test]
@@ -5602,6 +5676,17 @@ impl AudioDescendantExtractor {
         } else if !window.has_asr_timing {
             descendants = fallback_audio_voice_segments(sensation, &window);
         }
+        if let Some(text) = window.possible_transcript.as_deref() {
+            descendants.push(audio_possible_speech(sensation, &window, text));
+        }
+        if let Some(text) = window.committed_transcript.as_deref().or_else(|| {
+            window
+                .is_final
+                .then_some(window.transcript.as_deref())
+                .flatten()
+        }) {
+            descendants.push(audio_committed_speech(sensation, &window, text));
+        }
         descendants
     }
 }
@@ -5631,6 +5716,13 @@ struct AudioWindow {
     sample_rate_hz: Option<u64>,
     feature_sets: u64,
     has_asr_timing: bool,
+    possible_transcript: Option<String>,
+    committed_transcript: Option<String>,
+    candidate_id: Option<u64>,
+    stable_text: Option<String>,
+    unstable_text: Option<String>,
+    stable_word_prefix: Option<String>,
+    stable_word_count: Option<u64>,
 }
 
 impl AudioWindow {
@@ -5695,6 +5787,32 @@ impl AudioWindow {
             sample_rate_hz: asr.get("sample_rate_hz").and_then(Value::as_u64),
             feature_sets,
             has_asr_timing: asr_start.is_some() || asr_end.is_some(),
+            possible_transcript: asr
+                .get("possible_transcript")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToOwned::to_owned),
+            committed_transcript: asr
+                .get("committed_transcript")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToOwned::to_owned),
+            candidate_id: asr.get("candidate_id").and_then(Value::as_u64),
+            stable_text: asr
+                .get("stable_text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            unstable_text: asr
+                .get("unstable_text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            stable_word_prefix: asr
+                .get("stable_word_prefix")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            stable_word_count: asr.get("stable_word_count").and_then(Value::as_u64),
         })
     }
 }
@@ -5858,6 +5976,93 @@ fn audio_transcript_span(parent: &Sensation, window: &AudioWindow, transcript: &
         "descendant.audio_transcript_span",
     )
     .with_summary(format!("I hear someone say \"{transcript}\"."));
+    sensation.occurred_at_ms = window.start_ms;
+    sensation
+}
+
+fn audio_possible_speech(parent: &Sensation, window: &AudioWindow, transcript: &str) -> Sensation {
+    let mut metadata = parent.metadata.clone();
+    metadata.duration_ms = Some(window.duration_ms);
+    metadata.confidence = Some(window.confidence.max(0.25));
+    push_label(&mut metadata, "speech");
+    push_label(&mut metadata, "possible speech");
+    metadata
+        .properties
+        .insert("start_ms".to_string(), json!(window.start_ms));
+    metadata
+        .properties
+        .insert("end_ms".to_string(), json!(window.end_ms));
+    metadata
+        .properties
+        .insert("commitment".to_string(), json!("possible"));
+    let mut sensation = Sensation::descendant(
+        parent,
+        "audio.possible_speech",
+        SensationPayloadKind::SpeechSegment,
+        json!({
+            "parent_audio": parent.id,
+            "start_ms": window.start_ms,
+            "end_ms": window.end_ms,
+            "duration_ms": window.duration_ms,
+            "text": transcript,
+            "commitment": "possible",
+            "is_final": false,
+            "confidence": window.confidence,
+            "candidate_id": window.candidate_id,
+            "stable_text": window.stable_text,
+            "unstable_text": window.unstable_text,
+            "stable_word_prefix": window.stable_word_prefix,
+            "stable_word_count": window.stable_word_count,
+            "method": "listenbury_transcript_candidate",
+        }),
+        metadata,
+        "descendant.audio_possible_speech",
+    )
+    .with_summary(format!("I may be hearing someone say \"{transcript}\"."));
+    sensation.occurred_at_ms = window.start_ms;
+    sensation
+}
+
+fn audio_committed_speech(parent: &Sensation, window: &AudioWindow, transcript: &str) -> Sensation {
+    let mut metadata = parent.metadata.clone();
+    metadata.duration_ms = Some(window.duration_ms);
+    metadata.confidence = Some(window.confidence.max(0.35));
+    push_label(&mut metadata, "speech");
+    push_label(&mut metadata, "committed speech");
+    metadata
+        .properties
+        .insert("start_ms".to_string(), json!(window.start_ms));
+    metadata
+        .properties
+        .insert("end_ms".to_string(), json!(window.end_ms));
+    metadata
+        .properties
+        .insert("commitment".to_string(), json!("committed"));
+    let mut sensation = Sensation::descendant(
+        parent,
+        "audio.committed_speech",
+        SensationPayloadKind::TranscriptSpan,
+        json!({
+            "parent_audio": parent.id,
+            "start_ms": window.start_ms,
+            "end_ms": window.end_ms,
+            "duration_ms": window.duration_ms,
+            "text": transcript,
+            "commitment": "committed",
+            "is_final": true,
+            "confidence": window.confidence,
+            "candidate_id": window.candidate_id,
+            "stable_text": window.stable_text,
+            "stable_word_prefix": window.stable_word_prefix,
+            "stable_word_count": window.stable_word_count,
+            "method": "listenbury_transcript_commit",
+        }),
+        metadata,
+        "descendant.audio_committed_speech",
+    )
+    .with_summary(format!(
+        "I commit that I heard someone say \"{transcript}\"."
+    ));
     sensation.occurred_at_ms = window.start_ms;
     sensation
 }
@@ -6557,8 +6762,30 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
             .transcript
             .as_deref()
             .is_some_and(|text| !text.trim().is_empty())
+        || now
+            .ear
+            .asr
+            .possible_transcript
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+        || now
+            .ear
+            .asr
+            .committed_transcript
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
     {
         let transcript = now
+            .ear
+            .asr
+            .committed_transcript
+            .as_deref()
+            .or(now.ear.asr.transcript.as_deref())
+            .or(now.ear.asr.possible_transcript.as_deref())
+            .or(now.ear.transcript.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let legacy_transcript = now
             .ear
             .asr
             .transcript
@@ -6590,7 +6817,7 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
                 kind: SensationPayloadKind::AudioPcm,
                 value: json!({
                     "feature_sets": now.ear.features.len(),
-                    "transcript": transcript,
+                    "transcript": legacy_transcript.or(transcript),
                     "asr": now.ear.asr,
                 }),
             },
