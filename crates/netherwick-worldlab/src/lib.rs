@@ -451,8 +451,17 @@ pub fn snapshot_depth_image(snapshot: &WorldSnapshot) -> Option<DepthImage> {
     if snapshot.kinect.depth_m.is_empty() {
         return None;
     }
-    let width = snapshot.kinect.depth_m.len() as u32;
-    let height = 1;
+    let sample_count = snapshot.kinect.depth_m.len();
+    let declared_width = usize::try_from(snapshot.kinect.depth_width).unwrap_or(0);
+    let declared_height = usize::try_from(snapshot.kinect.depth_height).unwrap_or(0);
+    let (width, height) = if declared_width > 0
+        && declared_height > 0
+        && declared_width.saturating_mul(declared_height) == sample_count
+    {
+        (snapshot.kinect.depth_width, snapshot.kinect.depth_height)
+    } else {
+        (sample_count as u32, 1)
+    };
     let values_mm = snapshot
         .kinect
         .depth_m
@@ -799,6 +808,34 @@ mod tests {
             .skip(1)
             .count();
         assert_eq!(vertex_rows, 2);
+    }
+
+    #[test]
+    fn snapshot_depth_image_preserves_declared_dimensions() {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.kinect.depth_width = 2;
+        snapshot.kinect.depth_height = 2;
+        snapshot.kinect.depth_m = vec![1.0, 0.0, f32::NAN, 65.536];
+
+        let depth = snapshot_depth_image(&snapshot).unwrap();
+
+        assert_eq!(depth.width, 2);
+        assert_eq!(depth.height, 2);
+        assert_eq!(depth.values_mm, vec![1000, 0, 0, u16::MAX]);
+    }
+
+    #[test]
+    fn snapshot_depth_image_falls_back_to_legacy_row_for_invalid_dimensions() {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.kinect.depth_width = 2;
+        snapshot.kinect.depth_height = 2;
+        snapshot.kinect.depth_m = vec![1.0, 2.0, 3.0];
+
+        let depth = snapshot_depth_image(&snapshot).unwrap();
+
+        assert_eq!(depth.width, 3);
+        assert_eq!(depth.height, 1);
+        assert_eq!(depth.values_mm, vec![1000, 2000, 3000]);
     }
 
     #[tokio::test]
