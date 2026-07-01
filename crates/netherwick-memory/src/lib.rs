@@ -438,7 +438,13 @@ impl PlaceMemory {
         merge_vector_ids(&mut cell.associated_scene_vectors, &now.eye.scene_vectors);
         merge_vector_ids(&mut cell.associated_face_vectors, &now.face.vectors);
         merge_vector_ids(&mut cell.associated_voice_vectors, &now.voice.vectors);
-        self.store_scene_embeddings(key, &now.eye.scene_vectors);
+        let scene_vectors = scene_vectors_with_frame_id(
+            &now.eye.scene_vectors,
+            now.extensions
+                .get("frame_id")
+                .and_then(|value| value.as_str()),
+        );
+        self.store_scene_embeddings(key, &scene_vectors);
         self.features_at(now.body.odometry.x_m, now.body.odometry.y_m)
     }
 
@@ -3150,6 +3156,25 @@ fn push_unique_object(objects: &mut Vec<String>, value: &str) {
     }
 }
 
+fn scene_vectors_with_frame_id(
+    artifacts: &[VectorArtifact],
+    frame_id: Option<&str>,
+) -> Vec<VectorArtifact> {
+    let Some(frame_id) = frame_id else {
+        return artifacts.to_vec();
+    };
+    artifacts
+        .iter()
+        .cloned()
+        .map(|mut artifact| {
+            if artifact.source_frame_id.is_none() {
+                artifact.source_frame_id = Some(frame_id.to_string());
+            }
+            artifact
+        })
+        .collect()
+}
+
 fn merge_vector_ids(target: &mut Vec<String>, artifacts: &[VectorArtifact]) {
     for artifact in artifacts {
         if artifact.point_id.trim().is_empty() {
@@ -5462,6 +5487,41 @@ mod tests {
         assert_eq!(
             candidates[0].source_frame_id.as_deref(),
             Some(first_frame_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn observe_now_stamps_scene_vectors_with_frame_id_extension() {
+        let mut memory = PlaceMemory::new();
+        let mut observed = now_at(100, 1.0, 1.0);
+        observed.extensions.insert(
+            "frame_id".to_string(),
+            serde_json::Value::String("live-frame-1".to_string()),
+        );
+        observed.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-observed",
+            vec![1.0, 0.0, 0.0],
+        ));
+        memory.observe_now(&observed);
+
+        let query =
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-query", vec![1.0, 0.0, 0.0]);
+        let candidates = memory.recognize_places(
+            Some(memory.quantize(1.0, 1.0)),
+            &[query],
+            PLACE_RECOGNITION_MIN_CONFIDENCE,
+            5,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].source_frame_id.as_deref(),
+            Some("live-frame-1")
+        );
+        assert_eq!(
+            candidates[0].source_instant_frame_id.as_deref(),
+            Some("live-frame-1")
         );
     }
 

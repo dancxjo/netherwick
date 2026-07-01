@@ -8757,7 +8757,8 @@ async fn generate_representation_report(
                 .entry("capture_snapshot".to_string())
                 .or_default() += 1;
             let frame_id = format!("capture-frame-{}", record.index);
-            let now = record.snapshot.to_now(record.t_ms);
+            let mut now = record.snapshot.to_now(record.t_ms);
+            set_now_frame_id(&mut now, &frame_id);
             saw_range |= !now.range.beams.is_empty() || now.range.nearest_m.is_some();
             saw_scene_vectors |= !now.eye.scene_vectors.is_empty();
             saw_objects |= !now.objects.observations.is_empty();
@@ -8822,7 +8823,8 @@ async fn generate_representation_report(
                 live_loop_candidates_from_frame(&place_memory, frame, current_key);
             place_memory.observe_frame(frame);
             entity_memory.observe_now(now, current_key);
-            let map_observation = observation_from_now(now, local_map.config);
+            let map_now = now_with_frame_id(now, &frame.id.to_string());
+            let map_observation = observation_from_now(&map_now, local_map.config);
             local_map
                 .integrate_observation_with_loop_candidates(map_observation, &live_loop_candidates);
             point_cloud.decay_stale(now.t_ms);
@@ -9102,7 +9104,8 @@ async fn generate_pose_graph_report(args: &PoseGraphReportArgs) -> Result<PoseGr
         records.sort_by_key(|record| record.t_ms);
         for record in &records {
             let frame_id = format!("capture-frame-{}", record.index);
-            let now = record.snapshot.to_now(record.t_ms);
+            let mut now = record.snapshot.to_now(record.t_ms);
+            set_now_frame_id(&mut now, &frame_id);
             observe_pose_graph_now(&mut builder, &mut memory, &now, Some(frame_id));
             memory.observe_now(&now);
         }
@@ -9204,6 +9207,19 @@ fn live_loop_candidates_from_frame(
         .chain(entity_candidates.iter())
         .map(|candidate| place_candidate_to_loop_input(candidate, Some(frame.id.to_string())))
         .collect()
+}
+
+fn now_with_frame_id(now: &Now, frame_id: &str) -> Now {
+    let mut now = now.clone();
+    set_now_frame_id(&mut now, frame_id);
+    now
+}
+
+fn set_now_frame_id(now: &mut Now, frame_id: &str) {
+    now.extensions.insert(
+        "frame_id".to_string(),
+        serde_json::Value::String(frame_id.to_string()),
+    );
 }
 
 fn entity_labels_from_now(now: &Now) -> Vec<String> {
