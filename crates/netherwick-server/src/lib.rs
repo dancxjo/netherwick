@@ -6756,6 +6756,38 @@ function renderBeams(packet){
   }
 }
 
+function pointCloudFrameKind(coordinateSystem){
+  if(coordinateSystem === 'robot' || coordinateSystem === 'scene_robot_render') return 'robot_render';
+  if(coordinateSystem === 'world' || coordinateSystem === 'odometry_world') return 'world_math';
+  if(coordinateSystem === 'kinect_camera' || coordinateSystem === 'camera' || coordinateSystem === 'depth_image_unknown') return 'kinect_camera';
+  return 'babylon_world';
+}
+
+function robotRenderPointToBabylonLocal(p){
+  return new BABYLON.Vector3(-p.x, p.y, p.z);
+}
+
+function kinectCameraPointToBabylonLocal(p){
+  return new BABYLON.Vector3(p.x, -p.y, p.z);
+}
+
+function worldMathPointToBabylonWorld(p){
+  return new BABYLON.Vector3(-p.y, p.z, p.x);
+}
+
+function pointCloudPointToBabylonWorld(p, frameKind, robotMatrix, kinectMatrix){
+  if(frameKind === 'robot_render'){
+    return BABYLON.Vector3.TransformCoordinates(robotRenderPointToBabylonLocal(p), robotMatrix);
+  }
+  if(frameKind === 'kinect_camera'){
+    return BABYLON.Vector3.TransformCoordinates(kinectCameraPointToBabylonLocal(p), kinectMatrix);
+  }
+  if(frameKind === 'world_math'){
+    return worldMathPointToBabylonWorld(p);
+  }
+  return new BABYLON.Vector3(p.x, p.y, p.z);
+}
+
 function renderPoints(points, coordinateSystem){
   if(pointCloud){
     pointCloud.dispose();
@@ -6767,35 +6799,12 @@ function renderPoints(points, coordinateSystem){
   const colors = [];
   const indices = [];
   
-  const isRobot = coordinateSystem === 'robot';
-  const isSceneRobotRender = coordinateSystem === 'scene_robot_render';
-  const isWorldMath = coordinateSystem === 'world' || coordinateSystem === 'odometry_world';
-  const isKinectCamera = coordinateSystem === 'kinect_camera' || coordinateSystem === 'camera' || coordinateSystem === 'depth_image_unknown';
+  const frameKind = pointCloudFrameKind(coordinateSystem);
   const robotMatrix = robot.getWorldMatrix();
   const kinectMatrix = eyeCamera.getWorldMatrix();
   
   points.forEach((p, i) => {
-    let worldPoint;
-    if (isRobot) {
-      worldPoint = BABYLON.Vector3.TransformCoordinates(
-        new BABYLON.Vector3(-p.x, p.y, p.z),
-        robotMatrix
-      );
-    } else if (isSceneRobotRender) {
-      worldPoint = BABYLON.Vector3.TransformCoordinates(
-        new BABYLON.Vector3(-p.x, p.y, p.z),
-        robotMatrix
-      );
-    } else if (isKinectCamera) {
-      worldPoint = BABYLON.Vector3.TransformCoordinates(
-        new BABYLON.Vector3(p.x, -p.y, p.z),
-        kinectMatrix
-      );
-    } else if (isWorldMath) {
-      worldPoint = new BABYLON.Vector3(-p.y, p.z, p.x);
-    } else {
-      worldPoint = new BABYLON.Vector3(p.x, p.y, p.z);
-    }
+    const worldPoint = pointCloudPointToBabylonWorld(p, frameKind, robotMatrix, kinectMatrix);
     positions.push(worldPoint.x, worldPoint.y, worldPoint.z);
     colors.push(p.r / 255, p.g / 255, p.b / 255, 1.0);
     indices.push(i);
@@ -6864,7 +6873,7 @@ function norm3(a){
 }
 function surfacePoint(value){
   const p = v3(value);
-  return world(p.x, p.y, p.z);
+  return worldMathPointToBabylonWorld(p);
 }
 function localSurfaceToWorld(surface, pose){
   const heading = Number(pose?.heading_rad) || 0;
@@ -6974,9 +6983,9 @@ function createClusterBox(cluster){
   const size = v3(cluster.size_m);
   const centroid = surfacePoint(cluster.centroid);
   const mesh = BABYLON.MeshBuilder.CreateBox(`cluster_${cluster.id || 'cluster'}`, {
-    width: Math.max(size.x, .04),
+    width: Math.max(size.y, .04),
     height: Math.max(size.z, .04),
-    depth: Math.max(size.y, .04)
+    depth: Math.max(size.x, .04)
   }, scene);
   const mat = new BABYLON.StandardMaterial(`clusterMat_${cluster.id || 'cluster'}`, scene);
   const color = cluster.moving ? new BABYLON.Color3(1.0, 0.92, 0.32) : new BABYLON.Color3(1.0, 0.35, 0.48);
@@ -6995,9 +7004,9 @@ function createBeliefBox(item, kind){
   const size = v3(item.size_m);
   const centroid = surfacePoint(item.centroid);
   const mesh = BABYLON.MeshBuilder.CreateBox(`belief_${item.id || kind}`, {
-    width: Math.max(size.x, .06),
+    width: Math.max(size.y, .06),
     height: Math.max(size.z, .06),
-    depth: Math.max(size.y, .06)
+    depth: Math.max(size.x, .06)
   }, scene);
   const mat = new BABYLON.StandardMaterial(`beliefMat_${item.id || kind}`, scene);
   const isSurface = kind === 'surface';
@@ -10391,8 +10400,12 @@ mod tests {
         assert!(page.contains("data-map-layer=\"accumulated occupancy\""));
         assert!(page.contains("data-map-layer=\"stable wall candidates\""));
         assert!(page.contains("function renderWorldBeliefPoints"));
-        assert!(page.contains("const isWorldMath = coordinateSystem === 'world'"));
+        assert!(page.contains("function pointCloudFrameKind"));
+        assert!(page.contains("function robotRenderPointToBabylonLocal"));
+        assert!(page.contains("function kinectCameraPointToBabylonLocal"));
+        assert!(page.contains("function worldMathPointToBabylonWorld"));
         assert!(page.contains("new BABYLON.Vector3(-p.y, p.z, p.x)"));
+        assert!(page.contains("return worldMathPointToBabylonWorld(p);"));
         assert!(!page.contains("eyePanel.scaling.x = -1"));
         assert!(page.contains("function drawMirroredImageToEyeCanvas"));
         assert!(page.contains("mirroredImageTargetOffset"));

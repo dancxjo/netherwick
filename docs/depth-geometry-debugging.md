@@ -5,7 +5,18 @@ Netherwick uses these depth geometry conventions:
 - Kinect camera frame: `+x` right, `+y` down, `+z` forward.
 - Robot/base math frame: `+x` forward, `+y` left, `+z` up. The floor is `z = 0`.
 - World/odometry math frame: `+x` and `+y` are odometry planar axes, `+z` is up.
-- Live 3D scene frame: Babylon `+y` is vertical. Calibrated `ScenePoint` depth uses `scene_robot_render`, with `x = robot_y`, `y = robot_z`, `z = robot_x`, and the browser maps local forward to robot local `-z`.
+- Live 3D scene frame: Babylon `+y` is vertical. Calibrated `ScenePoint` depth uses `scene_robot_render`, with `x = robot_y`, `y = robot_z`, `z = robot_x`. The browser must convert every point cloud through the named frame helpers in `renderPoints`: `robotRenderPointToBabylonLocal`, `kinectCameraPointToBabylonLocal`, and `worldMathPointToBabylonWorld`.
+
+The coordinated-grid rule is:
+
+```text
+raw depth image -> kinect_camera -> robot/base math -> world/odometry math -> Babylon display
+```
+
+Only the boundary between two named frames may change handedness. Do not add sign
+flips at call sites. If a cloud appears mirrored or behind the robot, fix the
+named conversion for that source frame and add or update the corresponding
+viewer regression.
 
 ## Report First
 
