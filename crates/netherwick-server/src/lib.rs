@@ -6489,7 +6489,6 @@ eyeRTT.uScale = -1;
 // Eye Panel
 const eyePanel = BABYLON.MeshBuilder.CreatePlane("eyePanel", {width: 0.96, height: 0.72, sideOrientation: BABYLON.Mesh.DOUBLESIDE}, scene);
 eyePanel.position.set(0, 0.65, -0.78);
-eyePanel.scaling.x = -1;
 eyePanel.parent = robot;
 eyePanel.layerMask = 0x10000000;
 
@@ -10375,6 +10374,7 @@ mod tests {
         assert!(page.contains("function renderWorldBeliefPoints"));
         assert!(page.contains("const isWorldMath = coordinateSystem === 'world'"));
         assert!(page.contains("new BABYLON.Vector3(p.y, p.z, -p.x)"));
+        assert!(!page.contains("eyePanel.scaling.x = -1"));
         assert!(page.contains("function renderPersistentWorldBelief"));
         assert!(page.contains("local_world_belief"));
         assert!(page.contains("roll_pitch_corrected"));
