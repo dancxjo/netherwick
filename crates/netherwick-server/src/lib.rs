@@ -4554,7 +4554,7 @@ fn depth_points(
     calibration: Option<SceneSensorCalibration>,
     color: Option<&DepthColorImage>,
 ) -> (Vec<ScenePoint>, SceneKinectDiagnostics) {
-    const MAX_POINTS: usize = 2_000;
+    const MAX_POINTS: usize = 12_000;
     let depth_m = &kinect.depth_m;
     if depth_m.is_empty() {
         return (
@@ -6712,7 +6712,7 @@ function renderPoints(points, coordinateSystem){
   
   const mat = new BABYLON.StandardMaterial("pointCloudMat", scene);
   mat.pointsCloud = true;
-  mat.pointSize = 3.5;
+  mat.pointSize = points.length > 6000 ? 2.0 : 3.5;
   mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
   pointCloud.material = mat;
   
@@ -6728,14 +6728,14 @@ function renderWorldBeliefPoints(packet){
   const accumulated = packet.kinect?.accumulated_points || [];
   const raw = packet.kinect?.points || [];
   const rawFrame = packet.kinect?.coordinate_system || packet.kinect?.diagnostics?.coordinate_system || 'camera';
-  if(layers.has('stable wall candidates') && accumulated.some(point => point.stable)){
+  if(layers.has('raw point cloud') || layers.has('raw camera-frame points') || layers.has('robot-frame points')){
+    renderPoints(raw, rawFrame);
+  }else if(layers.has('stable wall candidates') && accumulated.some(point => point.stable)){
     renderAccumulatedPoints(accumulated.filter(point => point.stable));
   }else if(layers.has('accumulated occupancy') && accumulated.length){
     renderAccumulatedPoints(accumulated);
   }else if(layers.has('world-frame points') && accumulated.length){
     renderAccumulatedPoints(accumulated);
-  }else if(layers.has('raw point cloud') || layers.has('raw camera-frame points') || layers.has('robot-frame points')){
-    renderPoints(raw, rawFrame);
   }else{
     renderPoints([], 'world');
   }
@@ -7218,8 +7218,12 @@ function updateScene(packet, liveMap=null){
   const depth = packet.kinect?.diagnostics || {};
   const cloudSummary = packet.kinect?.accumulated_summary;
   const accumulated = packet.kinect?.accumulated_points || [];
-  fields.points.textContent = cloudSummary
-    ? `${accumulated.length} drawn / ${cloudSummary.voxels || 0} voxels / ${cloudSummary.stable_voxels || 0} stable`
+  const rawPoints = packet.kinect?.points || [];
+  const showingRawCloud = enabledMapLayers().has('raw point cloud') || enabledMapLayers().has('raw camera-frame points') || enabledMapLayers().has('robot-frame points');
+  fields.points.textContent = showingRawCloud
+    ? `${rawPoints.length} raw drawn / ${depth.valid_depth_count || 0} valid / stride ${depth.sample_stride || '-'}`
+    : cloudSummary
+    ? `${accumulated.length} voxel drawn / ${cloudSummary.voxels || 0} voxels / ${cloudSummary.stable_voxels || 0} stable`
     : `${packet.kinect?.points?.length || 0} drawn / ${depth.valid_depth_count || 0} valid`;
   fields.depth_stats.textContent = depth.depth_width
     ? `${depth.depth_width}x${depth.depth_height} ${depth.coordinate_system || '-'} med ${depth.median_depth_m == null ? '-' : fmt(depth.median_depth_m)}m math z ${depth.min_math_z_m == null ? '-' : fmt(depth.min_math_z_m)}/${depth.median_math_z_m == null ? '-' : fmt(depth.median_math_z_m)} render y ${depth.min_render_vertical_m == null ? '-' : fmt(depth.min_render_vertical_m)}/${depth.median_render_vertical_m == null ? '-' : fmt(depth.median_render_vertical_m)} below ${depth.below_floor_count || 0}/${fmt(depth.below_floor_ratio || 0, 2)} skip ${depth.skipped_depth_count || 0} clip ${depth.clipped_depth_count || 0} stride ${depth.sample_stride || '-'}`
