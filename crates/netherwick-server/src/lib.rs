@@ -6671,12 +6671,12 @@ function worldMathPointToBabylonWorld(p){
   return new BABYLON.Vector3(-p.y, p.z, p.x);
 }
 
-function pointCloudPointToBabylonWorld(p, frameKind, robotMatrix, kinectMatrix){
+function pointCloudPointToBabylonWorld(p, frameKind, robotMatrix){
   if(frameKind === 'robot_render'){
     return BABYLON.Vector3.TransformCoordinates(robotRenderPointToBabylonLocal(p), robotMatrix);
   }
   if(frameKind === 'kinect_camera'){
-    return BABYLON.Vector3.TransformCoordinates(kinectCameraPointToBabylonLocal(p), kinectMatrix);
+    return BABYLON.Vector3.TransformCoordinates(kinectCameraPointToBabylonLocal(p), robotMatrix);
   }
   if(frameKind === 'world_math'){
     return worldMathPointToBabylonWorld(p);
@@ -6701,10 +6701,9 @@ function renderPoints(points, coordinateSystem){
   
   const frameKind = pointCloudFrameKind(coordinateSystem);
   const robotMatrix = robot.getWorldMatrix();
-  const kinectMatrix = eyeCamera.getWorldMatrix();
   
   points.forEach((p, i) => {
-    const worldPoint = pointCloudPointToBabylonWorld(p, frameKind, robotMatrix, kinectMatrix);
+    const worldPoint = pointCloudPointToBabylonWorld(p, frameKind, robotMatrix);
     positions.push(worldPoint.x, worldPoint.y, worldPoint.z);
     colors.push(p.r / 255, p.g / 255, p.b / 255, 1.0);
     indices.push(i);
