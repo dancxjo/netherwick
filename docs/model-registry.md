@@ -13,7 +13,7 @@ Every embodied vector now records:
 - `purpose`: why this vector should be searched, such as `visual_similarity`, `scene_similarity`, `face_identity`, `transcript_semantic`, `voice_identity`, or `experience_semantic`.
 - `collection`: the vector collection or logical search lane for that purpose.
 - `input_summary`: a small audit string, never the raw frame/audio payload.
-- `provenance`: whether the vector came from an upstream artifact, Netherwick feature vectorizer, experience fuser, or placeholder fallback.
+- `provenance`: whether the vector came from an upstream artifact, Netherwick feature vectorizer, summary/impression vectorizer, or placeholder fallback.
 
 The implementation follows Daringsby's image/face vector work (`psyche/src/sensors/image_vector.rs`, `psyche/src/sensors/face.rs`) and scene vector loop (`pete/src/bin/scene_vec.rs`) for model labels, graceful vectorization failure, and duplicate or near-identical visual frame suppression. Listenbury contributes the lightweight voice-signature and text embedding seams used as baseline vocabulary. Mortar-Sea is the semantic contract: vectors are purpose-specific, and every vector declares what it represents, which model produced it, which collection it belongs to, what purpose it serves, and what input was vectorized.
 

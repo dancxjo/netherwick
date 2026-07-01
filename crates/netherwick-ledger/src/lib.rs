@@ -480,7 +480,7 @@ mod tests {
             100,
             110,
         );
-        let mut experience = Experience::new(
+        let experience = Experience::new(
             "embodied.now",
             "I see a frame and focus on part of it.",
             vec![impression.id],
@@ -488,14 +488,6 @@ mod tests {
             100,
             110,
         );
-        experience.fused_vector = Some(VectorEmbedding::new(
-            vec![0.5, 0.6, 0.7, 0.8],
-            "embodied-fuser.v0",
-            Modality::Other,
-            SensationPayloadKind::Structured,
-            child.id,
-            110,
-        ));
         let frame = ExperienceFrame {
             id: Uuid::new_v4(),
             t_ms: 110,
@@ -530,13 +522,6 @@ mod tests {
                 parent_id: primary.id,
                 child_id: child.id,
             }]
-        );
-        assert_eq!(
-            context
-                .fused_vector
-                .as_ref()
-                .map(|vector| (vector.model_id.as_str(), vector.dim)),
-            Some(("embodied-fuser.v0", 4))
         );
         assert_eq!(context.sensation_vectors[0].model_id, "crop-vectorizer.v0");
         assert_eq!(context.sensation_vectors[0].dim, 3);

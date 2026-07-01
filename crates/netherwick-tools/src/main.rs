@@ -15,9 +15,6 @@ use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use netherwick_body::{BodySense, RobotBody};
 use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
 use netherwick_create1::{Create1Body, Create1OpenMode, MockCreate1Body};
-use netherwick_experience::{
-    attach_experience_forge_vector, ExperienceForge, ExperienceForgeSnapshot,
-};
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
@@ -42,8 +39,9 @@ use netherwick_runtime::{
     RuntimeModelStack, RuntimeTick, SimRunner,
 };
 use netherwick_sensors::{
-    CameraSenseProvider, EyeFrame, EyeFrameFormat, GpsSenseProvider, ImuSenseProvider,
-    MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World, WorldSnapshot,
+    CameraSenseProvider, EyeFrame, EyeFrameFormat, FrameProcessor, GpsSenseProvider,
+    ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World,
+    WorldSnapshot,
 };
 #[cfg(feature = "kinect-freenect")]
 use netherwick_sensors::{FreenectKinectProvider, KinectRgbAdjustment};
@@ -111,8 +109,6 @@ enum Command {
     RetinaMockSend(RetinaMockSendArgs),
     EmbodiedDemo(EmbodiedDemoArgs),
     EmbodiedEval(EmbodiedEvalArgs),
-    ExperienceForgeReplay(ExperienceForgeReplayArgs),
-    LatentRoundtrip(LatentRoundtripArgs),
 }
 
 #[tokio::main]
@@ -148,8 +144,6 @@ async fn main() -> Result<()> {
         Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
         Command::EmbodiedDemo(args) => run_embodied_demo(args).await,
         Command::EmbodiedEval(args) => run_embodied_eval(args).await,
-        Command::ExperienceForgeReplay(args) => run_experience_forge_replay(args).await,
-        Command::LatentRoundtrip(args) => run_latent_roundtrip(args).await,
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -791,10 +785,6 @@ struct TrainExperienceArgs {
 struct TrainLatentRoundTripArgs {
     #[arg(long, default_value = "data/ledger")]
     ledger: String,
-    #[arg(long)]
-    forge_checkpoint: Option<String>,
-    #[arg(long)]
-    forge_log: Option<String>,
     #[arg(long, default_value_t = 5)]
     epochs: usize,
     #[arg(long, default_value = "data/models/latent_round_trip_v0")]
@@ -829,32 +819,6 @@ struct TrainUnifiedExperienceArgs {
     validation_split: f32,
     #[arg(long, default_value_t = 7)]
     seed: u64,
-}
-
-#[derive(Debug, Parser)]
-struct LatentRoundtripArgs {
-    #[arg(long, default_value = "data/ledger")]
-    ledger: String,
-    #[arg(long, default_value = "data/models/experience_forge/latest")]
-    forge_checkpoint: String,
-    #[arg(long)]
-    forge_log: Option<String>,
-    #[arg(long, default_value = "data/models/latent_roundtrip/latest")]
-    checkpoint_out: String,
-    #[arg(long, default_value = "data/reports/latent-roundtrip/latest.json")]
-    report: String,
-    #[arg(long, default_value_t = 5)]
-    epochs: usize,
-    #[arg(long, default_value_t = 16)]
-    z_dim: usize,
-    #[arg(long, default_value_t = 0.2)]
-    validation_split: f32,
-    #[arg(long, default_value_t = 7)]
-    seed: u64,
-    #[arg(long)]
-    codebook_size: Option<usize>,
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -993,43 +957,12 @@ impl From<EmbodiedEvalOmissionArg> for EmbodiedEvalOmission {
     }
 }
 
-#[derive(Debug, Parser)]
-struct ExperienceForgeReplayArgs {
-    #[arg(long, default_value = "data/ledger")]
-    ledger: String,
-    #[arg(long, default_value = "data/models/experience_forge/latest")]
-    checkpoint: String,
-    #[arg(long)]
-    log: Option<String>,
-    #[arg(long, default_value = "data/reports/experience-forge-replay.json")]
-    report: String,
-    #[arg(long, default_value_t = 0x51EED_u64)]
-    seed: u64,
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct ExperienceForgeReplayReport {
-    schema_version: u32,
-    ledger: String,
-    frame_count: usize,
-    checkpoint_path: String,
-    log_path: Option<String>,
-    snapshot: ExperienceForgeSnapshot,
-    forge_vector_frames: usize,
-    place_candidate_frames: usize,
-    entity_binding_frames: usize,
-    warnings: Vec<String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct RepresentationHealthReport {
     schema_version: u32,
     frame_count: usize,
     input: RepresentationInputSummary,
     warnings: Vec<String>,
-    experience_forge: RepresentationExperienceForgeSummary,
     entity_memory: RepresentationEntityMemorySummary,
     map: RepresentationMapSummary,
     pose_graph: RepresentationPoseGraphSummary,
@@ -1041,24 +974,6 @@ struct RepresentationInputSummary {
     source_type: String,
     source_path: String,
     provenance: HashMap<String, usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct RepresentationExperienceForgeSummary {
-    checkpoint_loaded: Option<String>,
-    checkpoint_saved: Option<String>,
-    population_count: usize,
-    champion_count: usize,
-    latest_champion_ids: Vec<u64>,
-    latest_filter_ids: Vec<u64>,
-    tiny_now_vector_stability: RepresentationVectorStability,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct RepresentationVectorStability {
-    samples: usize,
-    mean_abs_delta: Option<f32>,
-    max_abs_delta: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4230,7 +4145,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
 
     let requested_frames = duration_to_steps(args.duration_seconds, args.tick_ms);
     if let Some(ledger_path) = &args.ledger {
-        let runtime = default_runtime(JsonlLedger::new(ledger_path), &args.llm)?;
+        let runtime = durable_runtime(JsonlLedger::new(ledger_path), &args.llm)?;
         capture_real_with_runtime(
             args,
             runtime,
@@ -4272,7 +4187,8 @@ async fn capture_real_with_runtime<R>(
 where
     R: RuntimeLoop + Send,
 {
-    let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, body, sensors, runtime);
+    let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, body, sensors, runtime)
+        .with_frame_processor(real_robot_frame_processor(&mut warnings).await);
     runner.tick_ms = args.tick_ms;
     let mut writer =
         CaptureWriter::create(&args.out, CaptureSource::RealRobot, Some(args.tick_ms)).await?;
@@ -4855,7 +4771,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         );
     };
     let ledger = JsonlLedger::new(&args.ledger);
-    let memory = InMemoryExperienceStore::new();
+    let memory = DurableExperienceStore::from_env();
     let recall = memory.clone();
     let runtime = MinimalRuntime::with_default_events(
         ledger.clone(),
@@ -4865,8 +4781,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         SimpleSafety::default(),
         configured_llm_agent(&args.llm)?,
     );
-    let mut runner = RealRobotRunner::new(robot_mode, body, sensors, runtime);
+    let mut frame_processor_warnings = Vec::new();
+    let mut runner = RealRobotRunner::new(robot_mode, body, sensors, runtime)
+        .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await);
     runner.tick_ms = args.tick_ms;
+    for warning in frame_processor_warnings {
+        println!("{warning}");
+    }
 
     if let (Some(addr), Some(live_state)) = (args.dashboard, live_state.clone()) {
         let server_state = live_state.clone();
@@ -4977,6 +4898,51 @@ fn default_runtime(
         SimpleSafety::default(),
         configured_llm_agent(llm_args)?,
     ))
+}
+
+fn durable_runtime(
+    ledger: JsonlLedger,
+    llm_args: &LlmArgs,
+) -> Result<
+    MinimalRuntime<
+        JsonlLedger,
+        DurableExperienceStore,
+        DurableExperienceStore,
+        SimpleConductor,
+        SimpleSafety,
+        ConfiguredLlmAgent,
+    >,
+> {
+    let memory = DurableExperienceStore::from_env();
+    let recall = memory.clone();
+    Ok(MinimalRuntime::with_default_events(
+        ledger,
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        configured_llm_agent(llm_args)?,
+    ))
+}
+
+async fn real_robot_frame_processor(warnings: &mut Vec<String>) -> FrameProcessor {
+    if std::env::var("NETHERWICK_FACE_DETECTION")
+        .map(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(false)
+    {
+        warnings.push("face detection disabled by NETHERWICK_FACE_DETECTION".to_string());
+        return FrameProcessor::new();
+    }
+
+    match netherwick_sensors::FaceIdDetector::from_hf().await {
+        Ok(detector) => FrameProcessor::new().with_face_detector(std::sync::Arc::new(detector)),
+        Err(error) => {
+            warnings.push(format!(
+                "face detection unavailable; continuing without face vectors: {error}"
+            ));
+            FrameProcessor::new()
+        }
+    }
 }
 
 fn duration_to_steps(duration_seconds: u64, tick_ms: u64) -> usize {
@@ -6334,8 +6300,6 @@ async fn train_behavior_command(args: TrainBehaviorArgs) -> Result<()> {
 async fn run_train_latent_round_trip(args: TrainLatentRoundTripArgs) -> Result<()> {
     let report = train_latent_round_trip(TrainLatentRoundTripRequest {
         ledger_path: args.ledger.into(),
-        forge_checkpoint_path: args.forge_checkpoint.map(Into::into),
-        forge_log_path: args.forge_log.map(Into::into),
         checkpoint_path: args.checkpoint.clone().into(),
         report_path: args.report.clone().into(),
         epochs: args.epochs,
@@ -6403,53 +6367,15 @@ async fn run_train_unified_experience(args: TrainUnifiedExperienceArgs) -> Resul
         report.reconstruction.reconstructive
     );
     println!(
-        "trained_loss={:?} copy_current_loss={:?} random_loss={:?} mechanical_loss={:?} forge_loss={:?}",
+        "trained_loss={:?} copy_current_loss={:?} random_loss={:?} mechanical_loss={:?}",
         report.baselines.trained_loss_mean,
         report.baselines.copy_current_loss_mean,
         report.baselines.random_projection_loss_mean,
-        report.baselines.mechanical_instant_loss_mean,
-        report.baselines.forge_tiny_now_loss_mean
+        report.baselines.mechanical_instant_loss_mean
     );
     println!("verdict: {}", report.verdict);
     for warning in &report.warnings {
         println!("warning: {warning}");
-    }
-    Ok(())
-}
-
-async fn run_latent_roundtrip(args: LatentRoundtripArgs) -> Result<()> {
-    let report = train_latent_round_trip(TrainLatentRoundTripRequest {
-        ledger_path: args.ledger.into(),
-        forge_checkpoint_path: Some(args.forge_checkpoint.clone().into()),
-        forge_log_path: args.forge_log.clone().map(Into::into),
-        checkpoint_path: args.checkpoint_out.clone().into(),
-        report_path: args.report.clone().into(),
-        epochs: args.epochs,
-        validation_split: args.validation_split,
-        seed: args.seed,
-        z_dim: args.z_dim,
-        codebook_size: args.codebook_size,
-    })
-    .await?;
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!(
-            "latent roundtrip complete: {} transitions, {} epochs, checkpoint {}, report {}",
-            report.transition_count, report.epochs, args.checkpoint_out, args.report
-        );
-        println!(
-            "trained_loss={:?} copy_current_loss={:?} random_loss={:?} evolved_loss={:?}",
-            report.baseline_comparisons.trained_loss_mean,
-            report.baseline_comparisons.copy_current_loss_mean,
-            report.baseline_comparisons.random_projection_loss_mean,
-            report.baseline_comparisons.evolved_vector_loss_mean
-        );
-        println!("verdict: {}", report.verdict);
-        for warning in &report.warnings {
-            println!("warning: {warning}");
-        }
     }
     Ok(())
 }
@@ -7746,14 +7672,6 @@ fn print_frame(frame: &ExperienceFrame) {
         "  embodied_memory_link_count: {}",
         embodied.memory_links.len()
     );
-    if let Some(vector) = embodied.fused_vector.as_ref() {
-        println!(
-            "  fused_vector: model={} dim={} purpose={} vectorizer={} fallback={}",
-            vector.model_id, vector.dim, vector.purpose, vector.vectorizer_id, vector.is_fallback
-        );
-    } else {
-        println!("  fused_vector: none");
-    }
     if let Some(experience) = frame.experiences.last() {
         println!("  experience: {}", experience.text);
     }
@@ -8736,13 +8654,11 @@ async fn generate_representation_report(
 ) -> Result<RepresentationHealthReport> {
     let mut warnings = BTreeSet::new();
     let mut provenance: HashMap<String, usize> = HashMap::new();
-    let mut forge = ExperienceForge::new(0x51EED_u64);
     let mut place_memory = PlaceMemory::new();
     let mut entity_memory = EntityMemory::new();
     let mut local_map = LocalMap::default();
     let mut point_cloud = VoxelPointCloud::default();
     let mut pose_graph = PoseGraphBuilder::new(PoseGraphConfig::default());
-    let mut tiny_vectors = Vec::new();
     let mut place_candidates = Vec::new();
     let mut place_recognition_warnings = BTreeSet::new();
     let mut frame_count = 0usize;
@@ -8770,9 +8686,6 @@ async fn generate_representation_report(
             saw_objects |= !now.objects.observations.is_empty();
             saw_depth |= !record.snapshot.kinect.depth_m.is_empty();
             saw_audio |= !now.ear.features.is_empty() || now.ear.transcript.is_some();
-
-            let snapshot = forge.tick(&now, None);
-            tiny_vectors.push(snapshot.tiny_now_vector.clone());
 
             let current_key =
                 Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
@@ -8820,9 +8733,6 @@ async fn generate_representation_report(
             saw_depth |= !now.kinect.depth_m.is_empty();
             saw_audio |= !now.ear.features.is_empty() || now.ear.transcript.is_some();
 
-            let snapshot = forge.tick(now, frame.chosen_action.clone());
-            tiny_vectors.push(snapshot.tiny_now_vector.clone());
-
             let current_key =
                 Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
             let live_loop_candidates =
@@ -8869,24 +8779,6 @@ async fn generate_representation_report(
     if !saw_audio {
         warnings.insert("audio/transcript channel missing across all frames".to_string());
     }
-
-    let forge_snapshot = forge.snapshot();
-    let mut champion_ids = forge_snapshot
-        .top_filters
-        .iter()
-        .filter_map(|filter| filter.slot.map(|slot| (slot, filter.id)))
-        .collect::<Vec<_>>();
-    champion_ids.sort_by_key(|(slot, _)| *slot);
-    let latest_champion_ids = champion_ids
-        .into_iter()
-        .map(|(_, id)| id)
-        .collect::<Vec<_>>();
-    let latest_filter_ids = forge_snapshot
-        .top_filters
-        .iter()
-        .map(|filter| filter.id)
-        .collect::<Vec<_>>();
-    let tiny_now_vector_stability = summarize_tiny_vector_stability(&tiny_vectors);
 
     let entity_report = entity_memory.report();
     let revived_entities = entity_memory
@@ -8965,15 +8857,6 @@ async fn generate_representation_report(
         frame_count,
         input,
         warnings: warnings.into_iter().collect(),
-        experience_forge: RepresentationExperienceForgeSummary {
-            checkpoint_loaded: None,
-            checkpoint_saved: None,
-            population_count: forge_snapshot.population_size,
-            champion_count: latest_champion_ids.len(),
-            latest_champion_ids,
-            latest_filter_ids,
-            tiny_now_vector_stability,
-        },
         entity_memory: RepresentationEntityMemorySummary {
             total_entities: entity_report.total_entities,
             active_entities: entity_report.active_entities,
@@ -9015,41 +8898,6 @@ async fn generate_representation_report(
             warnings: place_recognition_warnings.into_iter().collect(),
         },
     })
-}
-
-fn summarize_tiny_vector_stability(vectors: &[Vec<f32>]) -> RepresentationVectorStability {
-    let mut deltas = Vec::new();
-    for pair in vectors.windows(2) {
-        let left = &pair[0];
-        let right = &pair[1];
-        let len = left.len().min(right.len());
-        if len == 0 {
-            continue;
-        }
-        let delta = left
-            .iter()
-            .zip(right.iter())
-            .take(len)
-            .map(|(a, b)| (a - b).abs())
-            .sum::<f32>()
-            / len as f32;
-        deltas.push(delta);
-    }
-    let samples = deltas.len();
-    let mean_abs_delta = if samples == 0 {
-        None
-    } else {
-        Some(deltas.iter().sum::<f32>() / samples as f32)
-    };
-    let max_abs_delta = deltas
-        .iter()
-        .copied()
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    RepresentationVectorStability {
-        samples,
-        mean_abs_delta,
-        max_abs_delta,
-    }
 }
 
 fn summarize_confidence_distribution(values: &[f32]) -> RepresentationConfidenceDistribution {
@@ -9378,12 +9226,6 @@ async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
             .unwrap_or_else(|| "none".to_string());
         println!("    - {} vector={}", impression.text, vector);
     }
-    if let Some(fused) = &demo.experience.fused_vector {
-        println!(
-            "  fused vector: {}d {} purpose={} vectorizer={} fallback={}",
-            fused.dim, fused.model_id, fused.purpose, fused.vectorizer_id, fused.is_fallback
-        );
-    }
     Ok(())
 }
 
@@ -9423,7 +9265,10 @@ async fn run_embodied_eval(args: EmbodiedEvalArgs) -> Result<()> {
         );
         println!("  impressions: {}", report.impression_count);
         println!("  summary impressions: {}", report.summary_impression_count);
-        println!("  fused experiences: {}", report.fused_experience_count);
+        println!(
+            "  learned experience latents: {}",
+            report.experience_latent_count
+        );
         println!("  predictions: {}", report.prediction_count);
         println!("  memory links: {}", report.memory_link_count);
         println!("  recall sensations: {}", report.recall_sensation_count);
@@ -9451,117 +9296,6 @@ async fn run_embodied_eval(args: EmbodiedEvalArgs) -> Result<()> {
             report.failures.join(", ")
         ))
     }
-}
-
-async fn run_experience_forge_replay(args: ExperienceForgeReplayArgs) -> Result<()> {
-    let ledger = JsonlLedger::new(&args.ledger);
-    let frames = ledger.frames().await?;
-    let mut forge = ExperienceForge::new(args.seed);
-    let mut place_memory = PlaceMemory::new();
-    let mut entity_memory = EntityMemory::new();
-    let mut warnings = Vec::new();
-    let mut forge_vector_frames = 0usize;
-    let mut place_candidate_frames = 0usize;
-    let mut entity_binding_frames = 0usize;
-    if frames.is_empty() {
-        warnings.push(
-            "no ledger frames found; checkpoint contains initial forge population".to_string(),
-        );
-    }
-
-    if let Some(log) = args.log.as_deref() {
-        if let Some(parent) = Path::new(log).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-        if Path::new(log).exists() {
-            fs::remove_file(log)?;
-        }
-    }
-
-    for frame in &frames {
-        let snapshot = forge.tick(&frame.now, frame.chosen_action.clone());
-        let mut now = frame.now.clone();
-        if let Some(compact_vector) = snapshot.compact_vector_artifact.as_ref() {
-            forge_vector_frames = forge_vector_frames.saturating_add(1);
-            attach_experience_forge_vector(&mut now, compact_vector);
-        } else {
-            warnings.push(format!(
-                "frame {} missing ExperienceForge compact vector artifact",
-                frame.id
-            ));
-        }
-        let cell_key = Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
-        place_memory.observe_now(&now);
-        entity_memory.observe_now(&now, cell_key);
-        let place_input = netherwick_memory::place_recognition_input_from_query_now(
-            &now,
-            None,
-            "experience-forge-replay",
-        );
-        let query_vectors = place_recognition_vectors_from_input(&place_input);
-        let candidates = place_memory.recognize_places(cell_key, &query_vectors, 0.0, 5);
-        if !candidates.is_empty() {
-            place_candidate_frames = place_candidate_frames.saturating_add(1);
-        }
-        if entity_memory.entities.values().any(|entity| {
-            entity
-                .constellation
-                .modality_clusters
-                .iter()
-                .any(|cluster| cluster.id.contains("experience-forge"))
-        }) {
-            entity_binding_frames = entity_binding_frames.saturating_add(1);
-        }
-        if let Some(log) = args.log.as_deref() {
-            forge.append_snapshot_jsonl(log)?;
-        }
-    }
-    let checkpoint_path = forge.save_checkpoint(&args.checkpoint)?;
-    let report = ExperienceForgeReplayReport {
-        schema_version: 1,
-        ledger: args.ledger.clone(),
-        frame_count: frames.len(),
-        checkpoint_path: checkpoint_path.display().to_string(),
-        log_path: args.log.clone(),
-        snapshot: forge.snapshot(),
-        forge_vector_frames,
-        place_candidate_frames,
-        entity_binding_frames,
-        warnings,
-    };
-
-    if let Some(parent) = Path::new(&args.report).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    fs::write(&args.report, serde_json::to_vec_pretty(&report)?)?;
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!(
-            "experience forge replay complete: {} frames, checkpoint {}, report {}",
-            report.frame_count, report.checkpoint_path, args.report
-        );
-        println!(
-            "forge tick {} pop {} buffer {}",
-            report.snapshot.ticks, report.snapshot.population_size, report.snapshot.buffer_len
-        );
-        println!(
-            "forge vectors: {} frames, place-candidate frames: {}, entity-binding frames: {}",
-            report.forge_vector_frames, report.place_candidate_frames, report.entity_binding_frames
-        );
-        if let Some(log) = &report.log_path {
-            println!("snapshot log: {log}");
-        }
-        for warning in &report.warnings {
-            println!("warning: {warning}");
-        }
-    }
-    Ok(())
 }
 
 async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> {
@@ -10179,9 +9913,7 @@ mod tests {
     use netherwick_actions::ActionPrimitive;
     use netherwick_body::BodySense;
     use netherwick_core::Reward;
-    use netherwick_experience::{
-        Experience, ExperienceLatent, Modality, SensationPayloadKind, VectorEmbedding,
-    };
+    use netherwick_experience::{Experience, ExperienceLatent};
     use netherwick_now::{
         ExtensionSense, Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION,
     };
@@ -11407,60 +11139,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn experience_forge_replay_reports_compact_vector_usage() {
-        let temp_dir = temp_path("netherwick_experience_forge_replay");
-        let ledger_dir = temp_dir.join("ledger");
-        let report_path = temp_dir.join("report.json");
-        let checkpoint_path = temp_dir.join("checkpoint");
-        let ledger = JsonlLedger::new(&ledger_dir);
-
-        let mut first = pose_graph_test_frame(100, 0.0, vec![1.0, 0.0, 0.0]);
-        first
-            .now
-            .objects
-            .observations
-            .push(netherwick_now::ObjectObservation {
-                label: "guide".to_string(),
-                class: netherwick_now::ObjectClass::Person,
-                confidence: 0.9,
-                source: netherwick_now::ObjectObservationSource::Sim,
-                ..netherwick_now::ObjectObservation::default()
-            });
-        let mut second = pose_graph_test_frame(200, 0.2, vec![0.99, 0.01, 0.0]);
-        second
-            .now
-            .objects
-            .observations
-            .push(netherwick_now::ObjectObservation {
-                label: "guide".to_string(),
-                class: netherwick_now::ObjectClass::Person,
-                confidence: 0.9,
-                source: netherwick_now::ObjectObservationSource::Sim,
-                ..netherwick_now::ObjectObservation::default()
-            });
-        ledger.append(&first).await.unwrap();
-        ledger.append(&second).await.unwrap();
-
-        run_experience_forge_replay(ExperienceForgeReplayArgs {
-            ledger: ledger_dir.to_string_lossy().to_string(),
-            checkpoint: checkpoint_path.to_string_lossy().to_string(),
-            log: None,
-            report: report_path.to_string_lossy().to_string(),
-            seed: 7,
-            json: false,
-        })
-        .await
-        .unwrap();
-
-        let report: ExperienceForgeReplayReport =
-            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
-        assert_eq!(report.frame_count, 2);
-        assert_eq!(report.forge_vector_frames, 2);
-        assert!(report.entity_binding_frames > 0);
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[tokio::test]
     async fn representation_report_writes_json_from_capture_fixture() {
         let temp_dir = temp_path("netherwick_representation_report_capture");
         let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::Sim, Some(100))
@@ -11505,7 +11183,6 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
         assert_eq!(value["frame_count"], 2);
         assert_eq!(value["input"]["source_type"], "capture");
-        assert!(value["experience_forge"].is_object());
         assert!(value["entity_memory"].is_object());
         assert!(value["map"].is_object());
         assert!(value["pose_graph"].is_object());
@@ -11513,11 +11190,11 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    fn pose_graph_test_frame(t_ms: u64, x_m: f32, fused_vector: Vec<f32>) -> ExperienceFrame {
+    fn pose_graph_test_frame(t_ms: u64, x_m: f32, latent_vector: Vec<f32>) -> ExperienceFrame {
         let mut now = Now::blank(t_ms, BodySense::default());
         now.body.odometry.x_m = x_m;
         let sensation_id = uuid::Uuid::new_v4();
-        let mut experience = Experience::new(
+        let experience = Experience::new(
             "test.place",
             format!("test place at {x_m:.1}m"),
             Vec::new(),
@@ -11525,14 +11202,6 @@ mod tests {
             t_ms,
             t_ms,
         );
-        experience.fused_vector = Some(VectorEmbedding::new(
-            fused_vector.clone(),
-            "test.fused-place",
-            Modality::Other,
-            SensationPayloadKind::Structured,
-            sensation_id,
-            t_ms,
-        ));
         ExperienceFrame {
             id: uuid::Uuid::new_v4(),
             t_ms,
@@ -11542,7 +11211,7 @@ mod tests {
             experiences: vec![experience],
             z: Some(ExperienceLatent {
                 t_ms,
-                z: fused_vector,
+                z: latent_vector,
                 confidence: 1.0,
                 ..ExperienceLatent::default()
             }),

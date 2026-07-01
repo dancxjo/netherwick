@@ -5,23 +5,23 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use netherwick_actions::{ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, TurnDir};
+use netherwick_actions::ActionPrimitive;
 use netherwick_behaviors::{
     BehaviorConfig, BehaviorRegime, BehaviorRegistryConfig, FallbackPolicy,
 };
 use netherwick_core::TimeMs;
 use netherwick_experience::{
-    action_value_input_from_transition_like, action_value_target_from_reward_surprise,
-    charge_input_from_transition_like, charge_target_from_transition_like,
-    danger_input_from_transition_like, danger_target_from_transition_like,
-    ear_next_input_from_transition_like, ear_next_target_from_now,
-    experience_decode_target_from_now, experience_encode_input_from_now,
+    action_features, action_value_input_from_transition_like,
+    action_value_target_from_reward_surprise, charge_input_from_transition_like,
+    charge_target_from_transition_like, danger_input_from_transition_like,
+    danger_target_from_transition_like, ear_next_input_from_transition_like,
+    ear_next_target_from_now, experience_decode_target_from_now, experience_encode_input_from_now,
     eye_next_input_from_transition_like, eye_next_target_from_now, ActionValueInput,
     ActionValueTarget, ChargeInput, ChargeTarget, CodebookQuantizer, CodebookUsageReport,
-    DangerInput, DangerTarget, EarNextInput, EarNextTarget, ExperienceDecodeFeatureLengths,
-    ExperienceDecodeOutput, ExperienceEncodeInput, ExperienceForge, ExperienceForgeSnapshot,
-    ExperienceLatent, EyeNextInput, EyeNextTarget, FutureInput, FuturePredictor, LatentEncoder,
-    RandomProjectionExperienceEncoder, StasisFuturePredictor, TINY_NOW_VECTOR_DIM,
+    DangerInput, DangerTarget, EarNextInput, EarNextTarget, ExperienceDecodeOutput,
+    ExperienceEncodeInput, ExperienceLatent, ExperienceSurprise, EyeNextInput, EyeNextTarget,
+    FutureInput, FuturePredictor, LatentEncoder, RandomProjectionExperienceEncoder,
+    StasisFuturePredictor,
 };
 use netherwick_ledger::{
     future_input_from_transition, future_target_from_transition, ExperienceTransition, JsonlLedger,
@@ -1435,7 +1435,7 @@ impl TrainableBehavior {
             Self::ActionValue => "action_value.handcoded",
             Self::EyeNext => "eye.copy_current",
             Self::EarNext => "ear.copy_current",
-            Self::Experience => "experience.feature_encoder",
+            Self::Experience => "experience.no_latent_yet",
             Self::Future => "future.stasis",
         }
     }
@@ -1545,8 +1545,6 @@ pub struct TrainSummary {
 #[derive(Clone, Debug)]
 pub struct TrainLatentRoundTripRequest {
     pub ledger_path: PathBuf,
-    pub forge_checkpoint_path: Option<PathBuf>,
-    pub forge_log_path: Option<PathBuf>,
     pub checkpoint_path: PathBuf,
     pub report_path: PathBuf,
     pub epochs: usize,
@@ -1573,7 +1571,6 @@ pub struct TrainLatentRoundTripReport {
     pub schema_version: u32,
     pub input_source: String,
     pub architecture: LatentRoundTripArchitectureReport,
-    pub forge_artifacts: Option<LatentRoundTripForgeArtifacts>,
     pub transition_count: usize,
     pub train_transition_count: usize,
     pub eval_transition_count: usize,
@@ -1591,18 +1588,8 @@ pub struct TrainLatentRoundTripReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LatentRoundTripCheckpoints {
     pub experience: PathBuf,
-    pub future_evolved: PathBuf,
     pub future_trained: PathBuf,
     pub future_random: PathBuf,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LatentRoundTripForgeArtifacts {
-    pub checkpoint_path: PathBuf,
-    pub log_path: Option<PathBuf>,
-    pub log_snapshot_count: usize,
-    pub checkpoint_ticks: u64,
-    pub checkpoint_buffer_len: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1709,6 +1696,7 @@ pub struct TrainUnifiedExperienceReport {
     pub modality_coverage: Vec<UnifiedModalityCoverage>,
     pub reconstruction: UnifiedReconstructionReport,
     pub predictors: Vec<LatentPredictorReport>,
+    pub learned_loop: UnifiedLearnedLoopReport,
     pub baselines: UnifiedBaselineReport,
     pub verdict: String,
     pub warnings: Vec<String>,
@@ -1730,6 +1718,7 @@ pub struct UnifiedModalityCoverage {
     pub source: String,
     pub purpose: String,
     pub dim: usize,
+    pub placeholder: bool,
     pub present_count: usize,
     pub missing_count: usize,
     pub coverage: f32,
@@ -1750,12 +1739,48 @@ pub struct UnifiedBaselineReport {
     pub copy_current_loss_mean: Option<f32>,
     pub random_projection_loss_mean: Option<f32>,
     pub mechanical_instant_loss_mean: Option<f32>,
-    pub forge_tiny_now_loss_mean: Option<f32>,
     pub trained_loss_mean: Option<f32>,
     pub trained_beats_copy_current: bool,
     pub trained_beats_random_projection: bool,
     pub trained_beats_mechanical_instant: bool,
-    pub forge_tiny_now_available: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedLearnedLoopReport {
+    pub canonical_instant: String,
+    pub canonical_latent: String,
+    pub prediction: String,
+    pub surprise: String,
+    pub sample_count: usize,
+    pub reconstruction_loss_mean: f32,
+    pub prediction_loss_mean: f32,
+    pub combined_surprise_mean: f32,
+    pub confidence_mean: f32,
+    pub records: Vec<UnifiedExperienceLoopRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedExperienceLoopRecord {
+    pub t_ms: TimeMs,
+    pub offset_ms: TimeMs,
+    pub encoded_latent: Vec<f32>,
+    pub predicted_next_latent: Vec<f32>,
+    pub actual_next_latent: Vec<f32>,
+    pub reconstruction_loss: f32,
+    pub prediction_loss: f32,
+    pub combined_surprise: f32,
+    pub confidence: f32,
+    pub teacher_coverage: f32,
+    pub missing_modality_mask: Vec<f32>,
+    pub baseline_comparisons: UnifiedExperienceLoopBaselines,
+    pub surprise: ExperienceSurprise,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedExperienceLoopBaselines {
+    pub copy_current_prediction_loss: f32,
+    pub random_projection_prediction_loss: Option<f32>,
+    pub mechanical_instant_prediction_loss: Option<f32>,
 }
 
 pub trait BehaviorTrainer {
@@ -2142,17 +2167,12 @@ pub async fn train_behavior(request: TrainBehaviorRequest) -> Result<TrainSummar
 pub async fn train_latent_round_trip(
     request: TrainLatentRoundTripRequest,
 ) -> Result<TrainLatentRoundTripReport> {
-    if request.forge_checkpoint_path.is_some() {
-        return train_forge_latent_round_trip(request).await;
-    }
-
     let transitions = load_transitions(&request.ledger_path).await?;
     let transition_count = transitions.len();
     let (train, eval) = split_transitions(transitions, request.validation_split, request.seed);
     let eval_transitions = if eval.is_empty() { &train } else { &eval };
     let checkpoints = LatentRoundTripCheckpoints {
         experience: request.checkpoint_path.join("experience"),
-        future_evolved: request.checkpoint_path.join("future-evolved"),
         future_trained: request.checkpoint_path.join("future-trained"),
         future_random: request.checkpoint_path.join("future-random"),
     };
@@ -2188,15 +2208,6 @@ pub async fn train_latent_round_trip(
             .collect::<Vec<_>>(),
         z_dim,
     )?;
-    let evolved_report = train_and_evaluate_future_latents(
-        "online-evolved-filters",
-        replay_latent_future_samples(&train),
-        replay_latent_future_samples(eval_transitions),
-        request.epochs,
-        &checkpoints.future_evolved,
-        "next ledger latent",
-    )?;
-
     let trained_train = trained_latent_future_samples(&autoencoder, &train)?;
     let trained_eval = trained_latent_future_samples(&autoencoder, eval_transitions)?;
     let trained_report = train_and_evaluate_future_latents(
@@ -2239,12 +2250,12 @@ pub async fn train_latent_round_trip(
         None
     };
 
-    let predictors = vec![evolved_report, trained_report, random_report];
+    let predictors = vec![trained_report, random_report];
     let baseline_comparisons = latent_baseline_comparisons(
         &predictors,
         "trainable-autoencoder",
         "random-projection",
-        Some("online-evolved-filters"),
+        None,
     );
     let mut warnings = Vec::new();
     if transition_count < 50 {
@@ -2270,7 +2281,6 @@ pub async fn train_latent_round_trip(
         schema_version: 2,
         input_source: format!("ledger:{}", request.ledger_path.display()),
         architecture,
-        forge_artifacts: None,
         transition_count,
         train_transition_count: train.len(),
         eval_transition_count: eval_transitions.len(),
@@ -2338,6 +2348,9 @@ pub async fn train_unified_experience(
         &future_checkpoint_path,
         "next unified Experience latent",
     )?;
+    let future_input_dim = first_dim(&trained_train, |(_, input, _)| input.flat_features().len())?;
+    let future_trainer =
+        FutureNetTrainer::load_checkpoint(&future_checkpoint_path, future_input_dim, z_dim)?;
     let mut random_train_encoder = RandomProjectionExperienceEncoder::new(z_dim, request.seed);
     let mut random_eval_encoder = RandomProjectionExperienceEncoder::new(z_dim, request.seed);
     let random_report = train_and_evaluate_future_latents(
@@ -2356,36 +2369,15 @@ pub async fn train_unified_experience(
         &request.checkpoint_path.join("future-mechanical-instant"),
         "next mechanical Instant",
     )?;
-    let forge_report = if train.iter().any(|sample| sample.slot_presence[6] > 0.0)
-        && eval_examples
-            .iter()
-            .any(|sample| sample.slot_presence[6] > 0.0)
-    {
-        Some(train_and_evaluate_future_latents(
-            "forge-tiny-now-vector",
-            unified_slot_future_samples(&train, 6),
-            unified_slot_future_samples(eval_examples, 6),
-            request.epochs,
-            &request.checkpoint_path.join("future-forge-tiny-now"),
-            "next Forge TinyNowVector",
-        )?)
-    } else {
-        None
-    };
-
-    let mut predictors = vec![
+    let predictors = vec![
         trained_report.clone(),
         random_report.clone(),
         mechanical_report.clone(),
     ];
-    if let Some(report) = forge_report.clone() {
-        predictors.push(report);
-    }
     let baselines = UnifiedBaselineReport {
         copy_current_loss_mean: Some(trained_report.stasis_loss_mean),
         random_projection_loss_mean: Some(random_report.model_loss_mean),
         mechanical_instant_loss_mean: Some(mechanical_report.model_loss_mean),
-        forge_tiny_now_loss_mean: forge_report.as_ref().map(|report| report.model_loss_mean),
         trained_loss_mean: Some(trained_report.model_loss_mean),
         trained_beats_copy_current: trained_report.model_loss_mean
             < trained_report.stasis_loss_mean,
@@ -2393,8 +2385,15 @@ pub async fn train_unified_experience(
             < random_report.model_loss_mean,
         trained_beats_mechanical_instant: trained_report.model_loss_mean
             < mechanical_report.model_loss_mean,
-        forge_tiny_now_available: forge_report.is_some(),
     };
+    let learned_loop = unified_learned_loop_report(
+        &autoencoder,
+        &future_trainer,
+        eval_examples,
+        &baselines,
+        random_report.model_loss_mean,
+        mechanical_report.model_loss_mean,
+    )?;
     let mut warnings = Vec::new();
     if example_count < 50 {
         warnings.push(format!(
@@ -2447,185 +2446,8 @@ pub async fn train_unified_experience(
         modality_coverage: coverage,
         reconstruction,
         predictors,
+        learned_loop,
         baselines,
-        verdict,
-        warnings,
-    };
-    if let Some(parent) = request.report_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&request.report_path, serde_json::to_vec_pretty(&report)?)?;
-    Ok(report)
-}
-
-async fn train_forge_latent_round_trip(
-    request: TrainLatentRoundTripRequest,
-) -> Result<TrainLatentRoundTripReport> {
-    let forge_checkpoint_path = request
-        .forge_checkpoint_path
-        .clone()
-        .ok_or_else(|| anyhow!("missing forge checkpoint path"))?;
-    let forge = ExperienceForge::load_checkpoint(&forge_checkpoint_path)
-        .with_context(|| format!("load forge checkpoint {}", forge_checkpoint_path.display()))?;
-    let log_snapshot_count = if let Some(log_path) = request.forge_log_path.as_ref() {
-        count_forge_log_snapshots(log_path)?
-    } else {
-        0
-    };
-    let checkpoint_snapshot = forge.snapshot();
-    let examples = forge_examples_from_checkpoint(&forge)?;
-    let transition_count = examples.len();
-    let (train, eval) = split_samples(examples, request.validation_split, request.seed);
-    let eval_examples = if eval.is_empty() { &train } else { &eval };
-    let checkpoints = LatentRoundTripCheckpoints {
-        experience: request.checkpoint_path.join("experience"),
-        future_evolved: request.checkpoint_path.join("future-evolved"),
-        future_trained: request.checkpoint_path.join("future-trained"),
-        future_random: request.checkpoint_path.join("future-random"),
-    };
-
-    let (input_dim, decode_lengths) = train
-        .first()
-        .map(|sample| {
-            (
-                sample.input.flat_features().len(),
-                sample.decode_target.feature_lengths(),
-            )
-        })
-        .ok_or_else(|| anyhow!("no usable forge samples for latent round-trip training"))?;
-    let z_dim = request.z_dim.clamp(2, input_dim.max(2));
-    let mut autoencoder = ExperienceAutoencoderTrainer::new(input_dim, z_dim, decode_lengths);
-    for _epoch in 0..request.epochs {
-        for sample in &train {
-            if sample.input.flat_features().len() == autoencoder.input_dim()
-                && sample.decode_target.feature_lengths() == autoencoder.decode_lengths()
-            {
-                autoencoder.train_step(&sample.input, &sample.decode_target)?;
-            }
-        }
-    }
-    autoencoder.save_checkpoint(&checkpoints.experience)?;
-
-    let reconstruction = evaluate_forge_reconstruction(&autoencoder, eval_examples)?;
-    let architecture = latent_architecture_report(
-        "experience-forge",
-        "trained-experience-latent",
-        &checkpoints.experience,
-        &checkpoints.future_trained,
-        &reconstruction.target_kind,
-        &train
-            .iter()
-            .map(|sample| (&sample.input, &sample.decode_target))
-            .collect::<Vec<_>>(),
-        z_dim,
-    )?;
-    let evolved_report = train_and_evaluate_future_latents(
-        "evolved-forge-vector",
-        forge_evolved_future_samples(&train),
-        forge_evolved_future_samples(eval_examples),
-        request.epochs,
-        &checkpoints.future_evolved,
-        "next TinyNowVector",
-    )?;
-    let trained_train = forge_trained_future_samples(&autoencoder, &train)?;
-    let trained_report = train_and_evaluate_future_latents(
-        "trained-experience-latent",
-        trained_train.clone(),
-        forge_trained_future_samples(&autoencoder, eval_examples)?,
-        request.epochs,
-        &checkpoints.future_trained,
-        "next TinyNowVector",
-    )?;
-    let mut random_train_encoder = RandomProjectionExperienceEncoder::new(z_dim, request.seed);
-    let mut random_eval_encoder = RandomProjectionExperienceEncoder::new(z_dim, request.seed);
-    let random_report = train_and_evaluate_future_latents(
-        "random-projection",
-        forge_encoded_future_samples(&mut random_train_encoder, &train)?,
-        forge_encoded_future_samples(&mut random_eval_encoder, eval_examples)?,
-        request.epochs,
-        &checkpoints.future_random,
-        "next TinyNowVector",
-    )?;
-
-    let codebook = if let Some(codebook_size) = request.codebook_size {
-        let mut quantizer = CodebookQuantizer::from_latents(
-            &trained_train
-                .iter()
-                .map(|(_, input, _)| input.latent.z.clone())
-                .collect::<Vec<_>>(),
-            codebook_size,
-        );
-        for (_, input, target) in &trained_train {
-            let code_id = quantizer.encode(&input.latent.z);
-            let decoded = quantizer.decode(code_id);
-            let _ = mse_vec(&decoded, target);
-        }
-        Some(quantizer.report())
-    } else {
-        None
-    };
-
-    let predictors = vec![evolved_report, trained_report, random_report];
-    let baseline_comparisons = latent_baseline_comparisons(
-        &predictors,
-        "trained-experience-latent",
-        "random-projection",
-        Some("evolved-forge-vector"),
-    );
-    let mut warnings = Vec::new();
-    if transition_count < 50 {
-        warnings.push(format!(
-            "insufficient forge data: {transition_count} transitions is below the conservative 50-transition floor"
-        ));
-    }
-    if request.forge_log_path.is_none() {
-        warnings.push(
-            "no forge JSONL log supplied; trained from checkpoint replay buffer only".to_string(),
-        );
-    }
-    if predictors.iter().all(|report| !report.predictive) {
-        warnings.push(
-            "no encoder beat the stasis baseline on held-out TinyNowVector prediction".to_string(),
-        );
-    }
-    let verdict = if predictors
-        .iter()
-        .any(|report| report.encoder == "trained-experience-latent" && report.predictive)
-    {
-        "trained Experience latent is predictive of the next TinyNowVector".to_string()
-    } else if predictors
-        .iter()
-        .any(|report| report.encoder == "evolved-forge-vector" && report.predictive)
-    {
-        "forge vector is predictive, but the trained Experience latent has not caught it yet"
-            .to_string()
-    } else if predictors.iter().any(|report| report.predictive) {
-        "a baseline is predictive, but the trained Experience latent is not yet proven".to_string()
-    } else {
-        "latent remains compact but not proven predictive from forge artifacts".to_string()
-    };
-
-    let report = TrainLatentRoundTripReport {
-        schema_version: 3,
-        input_source: format!("forge-checkpoint:{}", forge_checkpoint_path.display()),
-        architecture,
-        forge_artifacts: Some(LatentRoundTripForgeArtifacts {
-            checkpoint_path: forge_checkpoint_path,
-            log_path: request.forge_log_path.clone(),
-            log_snapshot_count,
-            checkpoint_ticks: checkpoint_snapshot.ticks,
-            checkpoint_buffer_len: checkpoint_snapshot.buffer_len,
-        }),
-        transition_count,
-        train_transition_count: train.len(),
-        eval_transition_count: eval_examples.len(),
-        epochs: request.epochs,
-        z_dim,
-        checkpoints,
-        reconstruction,
-        predictors,
-        baseline_comparisons,
-        codebook,
         verdict,
         warnings,
     };
@@ -3193,12 +3015,6 @@ fn train_metric(
     }
 }
 
-fn replay_latent_future_samples(
-    transitions: &[ExperienceTransition],
-) -> Vec<(TimeMs, FutureInput, Vec<f32>)> {
-    future_samples(transitions)
-}
-
 #[derive(Clone, Copy, Debug)]
 struct UnifiedTeacherSlot {
     name: &'static str,
@@ -3206,7 +3022,7 @@ struct UnifiedTeacherSlot {
     purpose: &'static str,
 }
 
-const UNIFIED_TEACHER_SLOTS: [UnifiedTeacherSlot; 7] = [
+const UNIFIED_TEACHER_SLOTS: [UnifiedTeacherSlot; 6] = [
     UnifiedTeacherSlot {
         name: "scene",
         source: "eye image/scene vectors",
@@ -3237,18 +3053,12 @@ const UNIFIED_TEACHER_SLOTS: [UnifiedTeacherSlot; 7] = [
         source: "memory recall/state vector",
         purpose: "remembered context",
     },
-    UnifiedTeacherSlot {
-        name: "forge_tiny_now",
-        source: "Experience Forge TinyNowVector",
-        purpose: "evolved fallback present vector",
-    },
 ];
 
 #[derive(Clone, Debug)]
 struct UnifiedInstant {
     input: ExperienceEncodeInput,
     target: ExperienceDecodeOutput,
-    slot_vectors: Vec<Vec<f32>>,
     slot_presence: Vec<f32>,
 }
 
@@ -3258,7 +3068,6 @@ struct UnifiedExperienceExample {
     input: ExperienceEncodeInput,
     target: ExperienceDecodeOutput,
     next_input: ExperienceEncodeInput,
-    next_slot_vectors: Vec<Vec<f32>>,
     slot_presence: Vec<f32>,
     action: ActionPrimitive,
     offset_ms: TimeMs,
@@ -3274,27 +3083,33 @@ fn unified_examples_from_transitions(
         let Some(action) = transition.action.clone() else {
             continue;
         };
-        let now = unified_instant_from_now(&transition.before, teacher_dim);
-        let next_now = unified_instant_from_now(&transition.after, teacher_dim);
+        let offset_ms = transition
+            .after
+            .t_ms
+            .saturating_sub(transition.before.t_ms)
+            .max(1);
+        let now =
+            unified_instant_from_now(&transition.before, teacher_dim, Some(&action), offset_ms);
+        let next_now = unified_instant_from_now(&transition.after, teacher_dim, None, offset_ms);
         examples.push(UnifiedExperienceExample {
             t_ms: transition.before.t_ms,
             input: now.input,
             target: now.target,
             next_input: next_now.input,
-            next_slot_vectors: next_now.slot_vectors,
             slot_presence: now.slot_presence,
             action,
-            offset_ms: transition
-                .after
-                .t_ms
-                .saturating_sub(transition.before.t_ms)
-                .max(1),
+            offset_ms,
         });
     }
     Ok(examples)
 }
 
-fn unified_instant_from_now(now: &Now, teacher_dim: usize) -> UnifiedInstant {
+fn unified_instant_from_now(
+    now: &Now,
+    teacher_dim: usize,
+    action: Option<&ActionPrimitive>,
+    offset_ms: TimeMs,
+) -> UnifiedInstant {
     let mut slot_vectors = Vec::new();
     let mut slot_presence = Vec::new();
     for slot_index in 0..UNIFIED_TEACHER_SLOTS.len() {
@@ -3304,12 +3119,38 @@ fn unified_instant_from_now(now: &Now, teacher_dim: usize) -> UnifiedInstant {
     }
     let mut sense_vectors = slot_vectors.clone();
     sense_vectors.push(slot_presence.clone());
+    sense_vectors.push(action_features(action));
+    sense_vectors.push(unified_time_features(now, offset_ms));
+    sense_vectors.push(unified_compact_sensor_summary(now));
     UnifiedInstant {
         input: ExperienceEncodeInput { sense_vectors },
         target: unified_decode_target(now, &slot_vectors, &slot_presence),
-        slot_vectors,
         slot_presence,
     }
+}
+
+fn unified_time_features(now: &Now, offset_ms: TimeMs) -> Vec<f32> {
+    let seconds = now.t_ms as f32 / 1_000.0;
+    vec![
+        (seconds / 60.0).sin(),
+        (seconds / 60.0).cos(),
+        (offset_ms as f32 / 5_000.0).clamp(0.0, 1.0),
+    ]
+}
+
+fn unified_compact_sensor_summary(now: &Now) -> Vec<f32> {
+    compact_contact_features(now)
+        .into_iter()
+        .chain(compact_range_features(now))
+        .chain(compact_depth_features(now))
+        .chain([
+            now.body.battery_level,
+            bool_feature(now.body.charging),
+            now.body.velocity.forward_m_s.clamp(-1.0, 1.0),
+            now.body.velocity.turn_rad_s.clamp(-1.0, 1.0),
+        ])
+        .map(clean_feature)
+        .collect()
 }
 
 fn unified_slot_vector(now: &Now, slot_index: usize, teacher_dim: usize) -> (Vec<f32>, bool) {
@@ -3327,14 +3168,13 @@ fn unified_slot_vector(now: &Now, slot_index: usize, teacher_dim: usize) -> (Vec
             .or_else(|| average_legacy_embeddings(&now.voice.embeddings)),
         3 => transcript_vector(now, teacher_dim),
         4 => Some(
-            forge_range_features(now)
+            compact_range_features(now)
                 .into_iter()
-                .chain(forge_depth_features(now))
+                .chain(compact_depth_features(now))
                 .collect(),
         )
         .filter(|_| !now.range.beams.is_empty() || !now.kinect.depth_m.is_empty()),
         5 => Some(memory_teacher_vector(now)).filter(|values| values.iter().any(|v| *v != 0.0)),
-        6 => tiny_now_vector_from_extensions(now),
         _ => None,
     };
     let present = raw.as_ref().is_some_and(|values| !values.is_empty());
@@ -3426,16 +3266,6 @@ fn memory_teacher_vector(now: &Now) -> Vec<f32> {
     .collect()
 }
 
-fn tiny_now_vector_from_extensions(now: &Now) -> Option<Vec<f32>> {
-    [
-        "experience_forge.tiny_now_vector",
-        "tiny_now_vector",
-        "forge.tiny_now_vector",
-    ]
-    .iter()
-    .find_map(|key| now.extensions.get(*key).and_then(extension_vector_values))
-}
-
 fn extension_vector_values(value: &serde_json::Value) -> Option<Vec<f32>> {
     if let Some(values) = value.get("values").and_then(|value| value.as_array()) {
         return Some(
@@ -3507,7 +3337,7 @@ fn unified_decode_target(
         })
         .collect::<Vec<_>>();
     ExperienceDecodeOutput {
-        body_features: forge_contact_features(now)
+        body_features: compact_contact_features(now)
             .into_iter()
             .chain([now.body.battery_level, bool_feature(now.body.charging)])
             .map(clean_feature)
@@ -3529,9 +3359,9 @@ fn unified_decode_target(
             now.predictions.uncertainty,
         ],
         eye_features: slot_vectors.iter().flatten().copied().collect(),
-        ear_features: forge_range_features(now)
+        ear_features: compact_range_features(now)
             .into_iter()
-            .chain(forge_depth_features(now))
+            .chain(compact_depth_features(now))
             .map(clean_feature)
             .collect(),
     }
@@ -3565,6 +3395,7 @@ fn unified_modality_coverage(
                     .and_then(|example| example.input.sense_vectors.get(index))
                     .map(Vec::len)
                     .unwrap_or_default(),
+                placeholder: slot.source.contains("placeholder"),
                 present_count,
                 missing_count,
                 coverage: present_count as f32 / examples.len().max(1) as f32,
@@ -3683,6 +3514,130 @@ fn evaluate_unified_reconstruction(
     })
 }
 
+fn unified_learned_loop_report(
+    autoencoder: &ExperienceAutoencoderTrainer,
+    future: &FutureNetTrainer,
+    examples: &[UnifiedExperienceExample],
+    baselines: &UnifiedBaselineReport,
+    random_projection_prediction_loss: f32,
+    mechanical_instant_prediction_loss: f32,
+) -> Result<UnifiedLearnedLoopReport> {
+    let mut records = Vec::new();
+    let mut reconstruction_losses = Vec::new();
+    let mut prediction_losses = Vec::new();
+    let mut combined_surprises = Vec::new();
+    let mut confidences = Vec::new();
+
+    for sample in examples {
+        if sample.input.flat_features().len() != autoencoder.input_dim()
+            || sample.next_input.flat_features().len() != autoencoder.input_dim()
+            || sample.target.feature_lengths() != autoencoder.decode_lengths()
+        {
+            continue;
+        }
+
+        let prediction = autoencoder.predict(&sample.input)?;
+        let next_z = autoencoder.encode(&sample.next_input)?.z;
+        let reconstruction_loss = mse_vec(
+            &prediction.decoded.flat_features(),
+            &sample.target.flat_features(),
+        );
+        let input = FutureInput {
+            latent: ExperienceLatent {
+                t_ms: sample.t_ms,
+                z: prediction.encoded.z.clone(),
+                reconstruction_error: reconstruction_loss,
+                prediction_error: 0.0,
+                confidence: prediction.encoded.confidence,
+            },
+            action: sample.action.clone(),
+            offset_ms: sample.offset_ms,
+        };
+        if input.flat_features().len() != future.input_dim() || next_z.len() != future.latent_dim()
+        {
+            continue;
+        }
+        let predicted = future.predict(&input)?;
+        let prediction_loss = mse_vec(&predicted.predicted_z, &next_z);
+        let copy_current_prediction_loss = mse_vec(&input.latent.z, &next_z);
+        let reconstruction_norm = normalize_loss(
+            reconstruction_loss,
+            baselines
+                .copy_current_loss_mean
+                .unwrap_or(reconstruction_loss)
+                .max(reconstruction_loss),
+        );
+        let prediction_norm = normalize_loss(prediction_loss, copy_current_prediction_loss);
+        let combined_surprise = (0.4 * reconstruction_norm + 0.6 * prediction_norm).clamp(0.0, 1.0);
+        let coverage =
+            sample.slot_presence.iter().sum::<f32>() / sample.slot_presence.len().max(1) as f32;
+        let confidence = ((prediction.encoded.confidence + predicted.confidence) * 0.5 * coverage)
+            .clamp(0.0, 1.0);
+        let surprise = ExperienceSurprise {
+            t_ms: sample.t_ms,
+            reconstruction_loss,
+            prediction_loss,
+            combined_surprise,
+            confidence,
+            reconstruction_weight: 0.4,
+            prediction_weight: 0.6,
+        };
+
+        reconstruction_losses.push(reconstruction_loss);
+        prediction_losses.push(prediction_loss);
+        combined_surprises.push(combined_surprise);
+        confidences.push(confidence);
+        records.push(UnifiedExperienceLoopRecord {
+            t_ms: sample.t_ms,
+            offset_ms: sample.offset_ms,
+            encoded_latent: input.latent.z,
+            predicted_next_latent: predicted.predicted_z,
+            actual_next_latent: next_z,
+            reconstruction_loss,
+            prediction_loss,
+            combined_surprise,
+            confidence,
+            teacher_coverage: coverage,
+            missing_modality_mask: sample
+                .slot_presence
+                .iter()
+                .map(|present| if *present > 0.0 { 0.0 } else { 1.0 })
+                .collect(),
+            baseline_comparisons: UnifiedExperienceLoopBaselines {
+                copy_current_prediction_loss,
+                random_projection_prediction_loss: Some(random_projection_prediction_loss),
+                mechanical_instant_prediction_loss: Some(mechanical_instant_prediction_loss),
+            },
+            surprise,
+        });
+    }
+
+    if records.is_empty() {
+        bail!("no usable unified Experience learned-loop records");
+    }
+
+    Ok(UnifiedLearnedLoopReport {
+        canonical_instant: "ExperienceInstant".to_string(),
+        canonical_latent: "ExperienceLatent".to_string(),
+        prediction: "ExperiencePrediction".to_string(),
+        surprise: "ExperienceSurprise".to_string(),
+        sample_count: records.len(),
+        reconstruction_loss_mean: mean(&reconstruction_losses),
+        prediction_loss_mean: mean(&prediction_losses),
+        combined_surprise_mean: mean(&combined_surprises),
+        confidence_mean: mean(&confidences),
+        records,
+    })
+}
+
+fn normalize_loss(loss: f32, baseline: f32) -> f32 {
+    if baseline.is_finite() && baseline > 1.0e-6 {
+        (loss / baseline).clamp(0.0, 1.0)
+    } else {
+        loss.clamp(0.0, 1.0)
+    }
+}
+
 fn push_head_loss(
     losses: &mut BTreeMap<String, Vec<f32>>,
     head: &str,
@@ -3790,42 +3745,6 @@ fn unified_mechanical_future_samples(
         .collect()
 }
 
-fn unified_slot_future_samples(
-    examples: &[UnifiedExperienceExample],
-    slot_index: usize,
-) -> Vec<(TimeMs, FutureInput, Vec<f32>)> {
-    examples
-        .iter()
-        .filter(|sample| {
-            sample
-                .slot_presence
-                .get(slot_index)
-                .copied()
-                .unwrap_or_default()
-                > 0.0
-        })
-        .filter_map(|sample| {
-            let z = sample.input.sense_vectors.get(slot_index)?.clone();
-            let target = sample.next_slot_vectors.get(slot_index)?.clone();
-            Some((
-                sample.t_ms,
-                FutureInput {
-                    latent: ExperienceLatent {
-                        t_ms: sample.t_ms,
-                        z,
-                        reconstruction_error: 0.0,
-                        prediction_error: 0.0,
-                        confidence: 0.45,
-                    },
-                    action: sample.action.clone(),
-                    offset_ms: sample.offset_ms,
-                },
-                target,
-            ))
-        })
-        .collect()
-}
-
 fn unified_latent_variance(
     autoencoder: &ExperienceAutoencoderTrainer,
     examples: &[UnifiedExperienceExample],
@@ -3859,37 +3778,6 @@ fn unified_latent_variance(
         }
     }
     Ok(variance / (latents.len().max(1) * dim).max(1) as f32)
-}
-
-#[derive(Clone, Debug)]
-struct ForgeRoundTripExample {
-    t_ms: TimeMs,
-    input: ExperienceEncodeInput,
-    decode_target: ExperienceDecodeOutput,
-    current_tiny: Vec<f32>,
-    next_tiny: Vec<f32>,
-    action: ActionPrimitive,
-    offset_ms: TimeMs,
-}
-
-fn count_forge_log_snapshots(path: &Path) -> Result<usize> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read forge replay log {}", path.display()))?;
-    let mut count = 0;
-    for (index, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let _: ExperienceForgeSnapshot = serde_json::from_str(line).with_context(|| {
-            format!(
-                "parse forge replay log {} line {}",
-                path.display(),
-                index + 1
-            )
-        })?;
-        count += 1;
-    }
-    Ok(count)
 }
 
 fn latent_architecture_report(
@@ -3926,15 +3814,9 @@ fn latent_architecture_report(
         teacher_vectors,
         instant: MechanicalInstantReport {
             representation: "ExperienceInstant".to_string(),
-            assembly: match source_kind {
-                "experience-forge" => {
-                    "concatenate TinyNowVector with compact action features; keep raw Now-derived decode targets out of the latent input"
-                }
-                _ => {
-                    "concatenate deterministic Now sense vectors; keep reconstruction targets as separate supervision"
-                }
-            }
-            .to_string(),
+            assembly:
+                "assemble deterministic modality teacher vectors, masks, action, time, and compact sensor summaries; keep reconstruction targets as separate supervision"
+                    .to_string(),
             sample_count: samples.len(),
             input_dim,
             decode_target_dim,
@@ -3953,8 +3835,8 @@ fn latent_architecture_report(
             teacher_independent: true,
             evidence: vec![
                 "decoder reconstructs compact sensor summaries from z".to_string(),
-                "future predictor consumes z to predict the next teacher vector".to_string(),
-                "comparison report measures z against copy-current, teacher-vector, and random-projection baselines".to_string(),
+                "future predictor consumes z to predict the next ExperienceLatent".to_string(),
+                "comparison report measures z against copy-current and research-only random-projection baselines".to_string(),
             ],
         },
         heads: vec![
@@ -3965,12 +3847,12 @@ fn latent_architecture_report(
             },
             LatentHeadReport {
                 name: "predict".to_string(),
-                target: "next teacher vector".to_string(),
+                target: "next ExperienceLatent".to_string(),
                 checkpoint_path: Some(predict_checkpoint_path.to_path_buf()),
             },
             LatentHeadReport {
                 name: "compare".to_string(),
-                target: "copy-current, teacher-vector, and random-projection baselines".to_string(),
+                target: "copy-current and research-only random-projection baselines".to_string(),
                 checkpoint_path: None,
             },
         ],
@@ -3984,16 +3866,6 @@ fn teacher_vector_report(
     sample_count: usize,
 ) -> TeacherVectorReport {
     let (name, source, purpose) = match (source_kind, index) {
-        ("experience-forge", 0) => (
-            "teacher.tiny_now_vector",
-            "Experience Forge champion filters",
-            "teacher/fallback present-moment vector",
-        ),
-        ("experience-forge", 1) => (
-            "teacher.action_features",
-            "ActionPrimitive mechanical encoder",
-            "action conditioning for transition prediction",
-        ),
         (_, 0) => (
             "teacher.now_sense_vectors",
             "ledger Now vector assembly",
@@ -4014,69 +3886,7 @@ fn teacher_vector_report(
     }
 }
 
-fn forge_examples_from_checkpoint(forge: &ExperienceForge) -> Result<Vec<ForgeRoundTripExample>> {
-    let mut examples = Vec::new();
-    for transition in forge.transitions() {
-        let Some(action) = transition.now.action.clone() else {
-            continue;
-        };
-        if transition.now.tiny_now_vector.len() != TINY_NOW_VECTOR_DIM
-            || transition.next_now.tiny_now_vector.len() != TINY_NOW_VECTOR_DIM
-        {
-            continue;
-        }
-        examples.push(ForgeRoundTripExample {
-            t_ms: transition.next_now.t_ms,
-            input: forge_encode_input(&transition.now.tiny_now_vector, &action),
-            decode_target: forge_sensor_decode_target(&transition.now.now),
-            current_tiny: transition.now.tiny_now_vector.clone(),
-            next_tiny: transition.next_now.tiny_now_vector.clone(),
-            action,
-            offset_ms: transition
-                .next_now
-                .t_ms
-                .saturating_sub(transition.now.t_ms)
-                .max(1),
-        });
-    }
-    if examples.is_empty() {
-        bail!("forge checkpoint contains no usable TinyNowVector/action transitions");
-    }
-    Ok(examples)
-}
-
-fn forge_encode_input(tiny_now_vector: &[f32], action: &ActionPrimitive) -> ExperienceEncodeInput {
-    ExperienceEncodeInput {
-        sense_vectors: vec![
-            tiny_now_vector.iter().copied().map(clean_feature).collect(),
-            compact_action_features(action),
-        ],
-    }
-}
-
-fn forge_sensor_decode_target(now: &Now) -> ExperienceDecodeOutput {
-    ExperienceDecodeOutput {
-        body_features: forge_contact_features(now),
-        memory_features: Vec::new(),
-        drive_features: Vec::new(),
-        prediction_features: Vec::new(),
-        eye_features: forge_range_features(now),
-        ear_features: forge_depth_features(now),
-    }
-}
-
-fn forge_decode_lengths() -> ExperienceDecodeFeatureLengths {
-    ExperienceDecodeFeatureLengths {
-        body: 8,
-        memory: 0,
-        drive: 0,
-        prediction: 0,
-        eye: 6,
-        ear: 9,
-    }
-}
-
-fn forge_contact_features(now: &Now) -> Vec<f32> {
+fn compact_contact_features(now: &Now) -> Vec<f32> {
     vec![
         bool_feature(now.body.flags.bump_left),
         bool_feature(now.body.flags.bump_right),
@@ -4102,7 +3912,7 @@ fn forge_contact_features(now: &Now) -> Vec<f32> {
     ]
 }
 
-fn forge_range_features(now: &Now) -> Vec<f32> {
+fn compact_range_features(now: &Now) -> Vec<f32> {
     let beams = now
         .range
         .beams
@@ -4136,7 +3946,7 @@ fn forge_range_features(now: &Now) -> Vec<f32> {
     ]
 }
 
-fn forge_depth_features(now: &Now) -> Vec<f32> {
+fn compact_depth_features(now: &Now) -> Vec<f32> {
     let depths = now
         .kinect
         .depth_m
@@ -4159,186 +3969,6 @@ fn forge_depth_features(now: &Now) -> Vec<f32> {
         now.kinect.audio_angle_rad.unwrap_or_default().sin(),
         now.kinect.audio_angle_rad.unwrap_or_default().cos(),
     ]
-}
-
-fn compact_action_features(action: &ActionPrimitive) -> Vec<f32> {
-    let mut out = vec![0.0; 12];
-    match action {
-        ActionPrimitive::Stop => out[0] = 1.0,
-        ActionPrimitive::Go {
-            intensity,
-            duration_ms,
-        } => {
-            out[1] = 1.0;
-            out[9] = intensity.clamp(0.0, 1.0);
-            out[11] = (*duration_ms as f32 / 5_000.0).clamp(0.0, 1.0);
-        }
-        ActionPrimitive::Drive {
-            forward,
-            turn,
-            duration_ms,
-        } => {
-            out[2] = 1.0;
-            out[9] = forward.clamp(-1.0, 1.0);
-            out[10] = turn.clamp(-1.0, 1.0);
-            out[11] = (*duration_ms as f32 / 5_000.0).clamp(0.0, 1.0);
-        }
-        ActionPrimitive::Turn {
-            direction,
-            intensity,
-            duration_ms,
-        } => {
-            out[3] = 1.0;
-            out[9] = intensity.clamp(0.0, 1.0);
-            out[10] = match direction {
-                TurnDir::Left => -1.0,
-                TurnDir::Right => 1.0,
-            };
-            out[11] = (*duration_ms as f32 / 5_000.0).clamp(0.0, 1.0);
-        }
-        ActionPrimitive::Inspect { target } => {
-            out[4] = 1.0;
-            out[9] = match target {
-                InspectTarget::Novelty => 0.25,
-                InspectTarget::Charger => 0.5,
-                InspectTarget::Person => 0.75,
-                InspectTarget::Sound => 1.0,
-            };
-        }
-        ActionPrimitive::Approach { target } => {
-            out[5] = 1.0;
-            out[9] = match target {
-                ApproachTarget::Charger => 0.33,
-                ApproachTarget::Person => 0.67,
-                ApproachTarget::Sound => 1.0,
-            };
-        }
-        ActionPrimitive::Dock => out[6] = 1.0,
-        ActionPrimitive::Explore { style, duration_ms } => {
-            out[7] = 1.0;
-            out[9] = match style {
-                ExploreStyle::Wander => 0.33,
-                ExploreStyle::RandomWalk => 0.67,
-                ExploreStyle::WallFollow => 1.0,
-            };
-            out[11] = (*duration_ms as f32 / 5_000.0).clamp(0.0, 1.0);
-        }
-        ActionPrimitive::Speak { text } => {
-            out[8] = 1.0;
-            out[9] = (text.chars().count() as f32 / 120.0).clamp(0.0, 1.0);
-        }
-        ActionPrimitive::Chirp { .. } => {
-            out[8] = 1.0;
-            out[10] = 1.0;
-        }
-    }
-    out
-}
-
-fn forge_evolved_future_samples(
-    examples: &[ForgeRoundTripExample],
-) -> Vec<(TimeMs, FutureInput, Vec<f32>)> {
-    examples
-        .iter()
-        .map(|sample| {
-            (
-                sample.t_ms,
-                FutureInput {
-                    latent: ExperienceLatent {
-                        t_ms: sample.t_ms,
-                        z: sample.current_tiny.clone(),
-                        reconstruction_error: 0.0,
-                        prediction_error: 0.0,
-                        confidence: 0.55,
-                    },
-                    action: sample.action.clone(),
-                    offset_ms: sample.offset_ms,
-                },
-                sample.next_tiny.clone(),
-            )
-        })
-        .collect()
-}
-
-fn forge_trained_future_samples(
-    autoencoder: &ExperienceAutoencoderTrainer,
-    examples: &[ForgeRoundTripExample],
-) -> Result<Vec<(TimeMs, FutureInput, Vec<f32>)>> {
-    let mut samples = Vec::new();
-    for sample in examples {
-        if sample.input.flat_features().len() != autoencoder.input_dim() {
-            continue;
-        }
-        let z = autoencoder.encode(&sample.input)?.z;
-        samples.push((
-            sample.t_ms,
-            FutureInput {
-                latent: ExperienceLatent {
-                    t_ms: sample.t_ms,
-                    z,
-                    reconstruction_error: 0.0,
-                    prediction_error: 0.0,
-                    confidence: 0.6,
-                },
-                action: sample.action.clone(),
-                offset_ms: sample.offset_ms,
-            },
-            sample.next_tiny.clone(),
-        ));
-    }
-    Ok(samples)
-}
-
-fn forge_encoded_future_samples(
-    encoder: &mut impl LatentEncoder,
-    examples: &[ForgeRoundTripExample],
-) -> Result<Vec<(TimeMs, FutureInput, Vec<f32>)>> {
-    let mut samples = Vec::new();
-    for sample in examples {
-        let latent = encoder.encode_input(&sample.input, sample.t_ms)?;
-        samples.push((
-            sample.t_ms,
-            FutureInput {
-                latent,
-                action: sample.action.clone(),
-                offset_ms: sample.offset_ms,
-            },
-            sample.next_tiny.clone(),
-        ));
-    }
-    Ok(samples)
-}
-
-fn evaluate_forge_reconstruction(
-    autoencoder: &ExperienceAutoencoderTrainer,
-    examples: &[ForgeRoundTripExample],
-) -> Result<LatentReconstructionReport> {
-    let mut trained_losses = Vec::new();
-    let mut zero_losses = Vec::new();
-    let lengths = forge_decode_lengths();
-    for sample in examples {
-        if sample.input.flat_features().len() != autoencoder.input_dim()
-            || sample.decode_target.feature_lengths() != autoencoder.decode_lengths()
-        {
-            continue;
-        }
-        let prediction = autoencoder.predict(&sample.input)?;
-        let target = sample.decode_target.flat_features();
-        trained_losses.push(mse_vec(&prediction.decoded.flat_features(), &target));
-        zero_losses.push(mse_vec(&vec![0.0; target.len()], &target));
-    }
-    if trained_losses.is_empty() {
-        bail!("no usable forge reconstruction samples for latent round-trip evaluation");
-    }
-    Ok(LatentReconstructionReport {
-        sample_count: trained_losses.len(),
-        trained_decoder_loss_mean: mean(&trained_losses),
-        zero_decoder_loss_mean: mean(&zero_losses),
-        target_kind: format!(
-            "compact range/depth/contact sensor summary (contact {}, range {}, depth {})",
-            lengths.body, lengths.eye, lengths.ear
-        ),
-    })
 }
 
 fn split_samples<T>(mut samples: Vec<T>, validation_split: f32, seed: u64) -> (Vec<T>, Vec<T>) {
@@ -4936,8 +4566,6 @@ mod tests {
         let report_path = temp_dir.join("latent-report.json");
         let report = train_latent_round_trip(TrainLatentRoundTripRequest {
             ledger_path: ledger_dir,
-            forge_checkpoint_path: None,
-            forge_log_path: None,
             checkpoint_path: temp_dir.join("checkpoint"),
             report_path: report_path.clone(),
             epochs: 0,
@@ -4970,152 +4598,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_train_latent_round_trip_consumes_forge_artifacts() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("netherwick_forge_latent_test_{}", now_ms()));
-        let forge_checkpoint = temp_dir.join("forge");
-        let forge_log = temp_dir.join("forge-log.jsonl");
-        let mut forge = ExperienceForge::new(13);
-
-        for i in 0..8 {
-            let mut body = BodySense::default();
-            body.battery_level = 0.7;
-            body.flags.bump_left = i % 5 == 0;
-            body.flags.wall = i % 3 == 0;
-            body.odometry.x_m = i as f32 * 0.05;
-            let mut now = Now::blank(100 + i * 100, body);
-            now.range.nearest_m = Some(0.3 + i as f32 * 0.04);
-            now.range.beams = vec![0.3 + i as f32 * 0.01, 0.8, 1.2];
-            now.kinect.depth_m = vec![0.5 + i as f32 * 0.02, 0.9, 1.5];
-            now.kinect.depth_width = 3;
-            now.kinect.depth_height = 1;
-            forge.tick(
-                &now,
-                Some(ActionPrimitive::Drive {
-                    forward: 0.2,
-                    turn: 0.1,
-                    duration_ms: 100,
-                }),
-            );
-            forge.append_snapshot_jsonl(&forge_log).unwrap();
-        }
-        forge.save_checkpoint(&forge_checkpoint).unwrap();
-
-        assert_eq!(count_forge_log_snapshots(&forge_log).unwrap(), 8);
-        let examples = forge_examples_from_checkpoint(&forge).unwrap();
-        assert_eq!(examples.len(), 7);
-        assert_eq!(
-            examples[0].input.flat_features().len(),
-            TINY_NOW_VECTOR_DIM + compact_action_features(&ActionPrimitive::Stop).len()
-        );
-        assert_eq!(examples[0].next_tiny.len(), TINY_NOW_VECTOR_DIM);
-        assert_eq!(
-            examples[0].decode_target.feature_lengths(),
-            forge_decode_lengths()
-        );
-
-        let report_path = temp_dir.join("forge-latent-report.json");
-        let report = train_latent_round_trip(TrainLatentRoundTripRequest {
-            ledger_path: temp_dir.join("unused-ledger"),
-            forge_checkpoint_path: Some(forge_checkpoint.clone()),
-            forge_log_path: Some(forge_log.clone()),
-            checkpoint_path: temp_dir.join("checkpoint"),
-            report_path: report_path.clone(),
-            epochs: 0,
-            validation_split: 0.25,
-            seed: 9,
-            z_dim: 4,
-            codebook_size: None,
-        })
-        .await
-        .unwrap();
-
-        assert!(report_path.exists());
-        assert_eq!(report.schema_version, 3);
-        assert_eq!(
-            report.input_source,
-            format!("forge-checkpoint:{}", forge_checkpoint.display())
-        );
-        assert_eq!(
-            report.architecture.teacher_vectors[0].name,
-            "teacher.tiny_now_vector"
-        );
-        assert_eq!(
-            report.architecture.instant.representation,
-            "ExperienceInstant"
-        );
-        assert_eq!(
-            report.architecture.instant.input_dim,
-            TINY_NOW_VECTOR_DIM + 12
-        );
-        assert_eq!(report.architecture.encoder.z_dim, report.z_dim);
-        assert!(report
-            .architecture
-            .heads
-            .iter()
-            .any(|head| head.name == "decode"));
-        assert!(report
-            .architecture
-            .heads
-            .iter()
-            .any(|head| head.name == "predict"));
-        assert!(report
-            .architecture
-            .heads
-            .iter()
-            .any(|head| head.name == "compare"));
-        let artifacts = report.forge_artifacts.unwrap();
-        assert_eq!(artifacts.log_path.as_deref(), Some(forge_log.as_path()));
-        assert_eq!(artifacts.log_snapshot_count, 8);
-        assert_eq!(report.predictors.len(), 3);
-        assert!(report
-            .predictors
-            .iter()
-            .all(|predictor| predictor.target_kind == "next TinyNowVector"));
-        assert!(report
-            .predictors
-            .iter()
-            .any(|predictor| predictor.encoder == "evolved-forge-vector"));
-        assert!(report
-            .predictors
-            .iter()
-            .any(|predictor| predictor.encoder == "trained-experience-latent"));
-        assert!(report
-            .reconstruction
-            .target_kind
-            .contains("range/depth/contact"));
-        assert!(report.reconstruction.sample_count > 0);
-        assert!(report
-            .predictors
-            .iter()
-            .all(|predictor| predictor.model_loss_mean.is_finite()
-                && predictor.stasis_loss_mean.is_finite()));
-        assert!(report
-            .baseline_comparisons
-            .copy_current_loss_mean
-            .is_some_and(f32::is_finite));
-        assert!(report
-            .baseline_comparisons
-            .random_projection_loss_mean
-            .is_some_and(f32::is_finite));
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("insufficient forge data")));
-
-        let checkpoint_input =
-            forge_encode_input(&vec![0.0; TINY_NOW_VECTOR_DIM], &ActionPrimitive::Stop);
-        let loaded = ExperienceAutoencoderTrainer::load_checkpoint(
-            &report.checkpoints.experience,
-            checkpoint_input.flat_features().len(),
-        )
-        .unwrap();
-        assert_eq!(loaded.z_dim(), report.z_dim);
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[tokio::test]
     async fn test_train_unified_experience_reports_multimodal_teacher_instant() {
         let temp_dir =
             std::env::temp_dir().join(format!("netherwick_unified_experience_test_{}", now_ms()));
@@ -5125,8 +4607,8 @@ mod tests {
 
         let mut transitions = Vec::new();
         for i in 0..8 {
-            let before = multimodal_now(100 + i * 100, i as f32, i % 2 == 0);
-            let after = multimodal_now(200 + i * 100, i as f32 + 0.5, i % 3 == 0);
+            let before = multimodal_now(100 + i * 100, i as f32);
+            let after = multimodal_now(200 + i * 100, i as f32 + 0.5);
             transitions.push(ExperienceTransition {
                 id: uuid::Uuid::new_v4(),
                 before_frame_id: uuid::Uuid::new_v4(),
@@ -5179,19 +4661,24 @@ mod tests {
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.instant.representation, "UnifiedExperienceInstant");
         assert_eq!(report.instant.mask_dim, UNIFIED_TEACHER_SLOTS.len());
-        assert_eq!(
-            report.instant.input_dim,
-            report.teacher_dim * UNIFIED_TEACHER_SLOTS.len() + UNIFIED_TEACHER_SLOTS.len()
-        );
+        assert!(report.instant.input_dim > report.teacher_dim * UNIFIED_TEACHER_SLOTS.len());
         assert_eq!(report.latent_dim, 6);
+        assert_eq!(
+            report.instant.teacher_slots,
+            vec![
+                "scene".to_string(),
+                "face".to_string(),
+                "voice".to_string(),
+                "transcript".to_string(),
+                "depth_range".to_string(),
+                "memory".to_string(),
+            ]
+        );
         assert!(report
             .modality_coverage
             .iter()
             .any(|slot| slot.slot == "scene" && slot.present_count > 0));
-        assert!(report
-            .modality_coverage
-            .iter()
-            .any(|slot| slot.slot == "forge_tiny_now" && slot.missing_count > 0));
+        assert_eq!(report.modality_coverage.len(), 6);
         assert!(report
             .reconstruction
             .head_losses
@@ -5209,11 +4696,19 @@ mod tests {
             .iter()
             .any(|predictor| predictor.encoder == "mechanical-instant"));
         assert!(report.baselines.trained_loss_mean.is_some());
+        assert_eq!(report.learned_loop.canonical_instant, "ExperienceInstant");
+        assert_eq!(report.learned_loop.canonical_latent, "ExperienceLatent");
+        assert!(report.learned_loop.sample_count > 0);
+        assert!(report
+            .learned_loop
+            .records
+            .iter()
+            .all(|record| record.encoded_latent.len() == report.latent_dim));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    fn multimodal_now(t_ms: u64, value: f32, include_forge: bool) -> Now {
+    fn multimodal_now(t_ms: u64, value: f32) -> Now {
         let mut body = BodySense::default();
         body.battery_level = (0.6 + value * 0.01).clamp(0.0, 1.0);
         body.flags.bump_left = value as i32 % 4 == 0;
@@ -5247,12 +4742,6 @@ mod tests {
         now.memory.place_novelty = 0.2;
         now.memory.similar_situation_count = 2;
         now.predictions.uncertainty = 0.15;
-        if include_forge {
-            now.extensions.insert(
-                "experience_forge.tiny_now_vector".to_string(),
-                serde_json::json!({"values": vec![0.1 + value, 0.2, 0.3, 0.4]}),
-            );
-        }
         now
     }
 }

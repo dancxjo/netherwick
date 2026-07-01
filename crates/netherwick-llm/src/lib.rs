@@ -982,12 +982,6 @@ fn render_embodied_context(context: Option<&EmbodiedContext>) -> String {
         context.impressions.len(),
         context.lineage.len()
     ));
-    if let Some(vector) = &context.fused_vector {
-        lines.push(format!(
-            "- fused_vector: model={} dim={} source_sensation={}",
-            vector.model_id, vector.dim, vector.source_sensation_id
-        ));
-    }
     for sensation in context.sensations.iter().take(8) {
         let parent = sensation
             .parent_id
@@ -1919,21 +1913,6 @@ mod tests {
             }],
             impressions: Vec::new(),
             lineage: Vec::new(),
-            fused_vector: Some(netherwick_experience::EmbodiedVectorRef {
-                vectorizer_id: "unit.fuser".to_string(),
-                model_id: "fuser.v0".to_string(),
-                model_label: "fuser.v0".to_string(),
-                dim: 16,
-                modality: netherwick_experience::Modality::Other,
-                payload_kind: netherwick_experience::SensationPayloadKind::Structured,
-                source_kind: "experience".to_string(),
-                source_sensation_id: sensation_id,
-                purpose: "experience_semantic".to_string(),
-                collection: "experiences".to_string(),
-                input_summary: "unit fused vector".to_string(),
-                is_fallback: false,
-                provenance: "unit_test".to_string(),
-            }),
             sensation_vectors: Vec::new(),
             impression_vectors: Vec::new(),
             predictions: Vec::new(),
@@ -1954,7 +1933,6 @@ mod tests {
         assert!(prompt.contains("Current embodied experience:"));
         assert!(prompt.contains(&format!("experience_id: {experience_id}")));
         assert!(prompt.contains("derived_sensations=1"));
-        assert!(prompt.contains("fused_vector: model=fuser.v0 dim=16"));
         assert!(prompt.contains("payload=image_bytes"));
         assert!(!prompt.contains("[0."));
     }

@@ -1,4 +1,4 @@
-#[cfg(any(feature = "linux-hardware", test))]
+#[cfg(any(feature = "face", feature = "linux-hardware", test))]
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,6 +15,8 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "face", feature = "linux-hardware"))]
+use std::sync::{Arc, Mutex};
 
 mod surface;
 
@@ -38,8 +40,6 @@ use std::io::Write;
 use std::io::{ErrorKind, Read};
 #[cfg(feature = "linux-hardware")]
 use std::os::fd::AsRawFd;
-#[cfg(feature = "linux-hardware")]
-use std::sync::{Arc, Mutex};
 #[cfg(feature = "linux-hardware")]
 use std::time::Duration;
 #[cfg(feature = "linux-hardware")]
@@ -233,9 +233,19 @@ pub struct NowBuilder {
     last_updates: SensorUpdateTimes,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct FrameProcessor {
     last_processed_frame_key: Option<FrameKey>,
+    face_detector: Option<Arc<dyn FaceDetector>>,
+}
+
+impl std::fmt::Debug for FrameProcessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameProcessor")
+            .field("last_processed_frame_key", &self.last_processed_frame_key)
+            .field("face_detector", &self.face_detector.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -358,6 +368,11 @@ impl FrameProcessor {
         Self::default()
     }
 
+    pub fn with_face_detector(mut self, detector: Arc<dyn FaceDetector>) -> Self {
+        self.face_detector = Some(detector);
+        self
+    }
+
     pub fn process_packets(&mut self, t_ms: TimeMs, packets: &mut Vec<SensePacket>) {
         let Some(frame) = packets.iter().rev().find_map(|packet| match packet {
             SensePacket::EyeFrame(frame) => Some(frame),
@@ -405,11 +420,72 @@ impl FrameProcessor {
             return None;
         }
         self.last_processed_frame_key = Some(key);
-        Some(process_eye_frame(t_ms, frame))
+        Some(process_eye_frame(
+            t_ms,
+            frame,
+            self.face_detector.as_deref(),
+        ))
     }
 }
 
-fn process_eye_frame(t_ms: TimeMs, frame: &EyeFrame) -> ProcessedFrame {
+pub trait FaceDetector: Send + Sync {
+    fn detect_faces(&self, frame: &EyeFrame) -> Result<Vec<FaceDetection>>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FaceDetection {
+    pub face_id: String,
+    pub source_frame_id: Option<String>,
+    pub embedding: Vec<f32>,
+    pub model: String,
+}
+
+#[cfg(feature = "face")]
+pub struct FaceIdDetector {
+    analyzer: Arc<Mutex<face_id::analyzer::FaceAnalyzer>>,
+}
+
+#[cfg(feature = "face")]
+impl FaceIdDetector {
+    pub async fn from_hf() -> Result<Self> {
+        let analyzer = face_id::analyzer::FaceAnalyzer::from_hf()
+            .build()
+            .await
+            .context("failed to initialize face_id analyzer")?;
+        Ok(Self {
+            analyzer: Arc::new(Mutex::new(analyzer)),
+        })
+    }
+}
+
+#[cfg(feature = "face")]
+impl FaceDetector for FaceIdDetector {
+    fn detect_faces(&self, frame: &EyeFrame) -> Result<Vec<FaceDetection>> {
+        let image = dynamic_image_from_eye_frame(frame)?;
+        let faces = self
+            .analyzer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("face analyzer lock poisoned"))?
+            .analyze(&image)
+            .context("face_id analysis failed")?;
+        Ok(faces
+            .into_iter()
+            .enumerate()
+            .map(|(index, face)| FaceDetection {
+                face_id: face_detection_id(frame, index, &face.embedding),
+                source_frame_id: None,
+                embedding: face.embedding,
+                model: "face_id.0.4.1".to_string(),
+            })
+            .collect())
+    }
+}
+
+fn process_eye_frame(
+    t_ms: TimeMs,
+    frame: &EyeFrame,
+    face_detector: Option<&dyn FaceDetector>,
+) -> ProcessedFrame {
     let source_frame_id = format!(
         "eye-{}-{}x{}-{}",
         frame.captured_at_ms,
@@ -454,20 +530,21 @@ fn process_eye_frame(t_ms: TimeMs, frame: &EyeFrame) -> ProcessedFrame {
         .with_occurred_at_ms(t_ms),
     );
 
+    let face = match face_detector {
+        Some(detector) => detected_face_sense(t_ms, frame, &source_frame_id, detector),
+        None => Ok(FaceSense {
+            schema_version: 1,
+            ..FaceSense::default()
+        }),
+    }
+    .unwrap_or_else(|_| FaceSense {
+        schema_version: 1,
+        ..FaceSense::default()
+    });
+
     ProcessedFrame {
         eye,
-        face: FaceSense {
-            schema_version: 1,
-            embeddings: Vec::new(),
-            vectors: vec![VectorArtifact::new(
-                FACE_VECTOR_COLLECTION,
-                format!("{source_frame_id}-no-face"),
-                Vec::new(),
-            )
-            .with_model("no-face-detected-v0")
-            .with_source_frame_id(source_frame_id.clone())
-            .with_occurred_at_ms(t_ms)],
-        },
+        face,
         summary: format!(
             "{:?} frame {}x{}, {} bytes",
             frame.format,
@@ -476,6 +553,91 @@ fn process_eye_frame(t_ms: TimeMs, frame: &EyeFrame) -> ProcessedFrame {
             frame.bytes.len()
         ),
         source_frame_id,
+    }
+}
+
+fn detected_face_sense(
+    t_ms: TimeMs,
+    frame: &EyeFrame,
+    source_frame_id: &str,
+    detector: &dyn FaceDetector,
+) -> Result<FaceSense> {
+    let detections = detector.detect_faces(frame)?;
+    let mut face = FaceSense {
+        schema_version: 1,
+        ..FaceSense::default()
+    };
+    for detection in detections {
+        if detection.embedding.is_empty() {
+            continue;
+        }
+        face.embeddings.push(detection.embedding.clone());
+        face.vectors.push(
+            VectorArtifact::new(
+                FACE_VECTOR_COLLECTION,
+                detection.face_id,
+                detection.embedding,
+            )
+            .with_model(detection.model)
+            .with_source_frame_id(
+                detection
+                    .source_frame_id
+                    .unwrap_or_else(|| source_frame_id.to_string()),
+            )
+            .with_occurred_at_ms(t_ms),
+        );
+    }
+    Ok(face)
+}
+
+fn face_detection_id(frame: &EyeFrame, index: usize, embedding: &[f32]) -> String {
+    let mut hash = stable_hash64(&frame.captured_at_ms.to_le_bytes());
+    hash ^= stable_hash64(&frame.width.to_le_bytes()).rotate_left(7);
+    hash ^= stable_hash64(&frame.height.to_le_bytes()).rotate_left(13);
+    hash ^= stable_hash64(&index.to_le_bytes()).rotate_left(19);
+    for value in embedding.iter().take(32) {
+        hash ^= stable_hash64(&value.to_bits().to_le_bytes()).rotate_left(3);
+    }
+    format!("face-{hash:016x}-{index}")
+}
+
+fn stable_hash64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    bytes.iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+#[cfg(feature = "face")]
+fn dynamic_image_from_eye_frame(frame: &EyeFrame) -> Result<image::DynamicImage> {
+    match frame.format {
+        EyeFrameFormat::Mjpeg => {
+            image::load_from_memory(&frame.bytes).context("failed to decode MJPEG eye frame")
+        }
+        EyeFrameFormat::Rgb8 => {
+            image::RgbImage::from_raw(frame.width, frame.height, frame.bytes.clone())
+                .map(image::DynamicImage::ImageRgb8)
+                .context("RGB eye frame byte length did not match dimensions")
+        }
+        EyeFrameFormat::Bgr8 => {
+            let mut rgb = frame.bytes.clone();
+            for pixel in rgb.chunks_exact_mut(3) {
+                pixel.swap(0, 2);
+            }
+            image::RgbImage::from_raw(frame.width, frame.height, rgb)
+                .map(image::DynamicImage::ImageRgb8)
+                .context("BGR eye frame byte length did not match dimensions")
+        }
+        EyeFrameFormat::Gray8 => {
+            image::GrayImage::from_raw(frame.width, frame.height, frame.bytes.clone())
+                .map(image::DynamicImage::ImageLuma8)
+                .context("gray eye frame byte length did not match dimensions")
+        }
+        _ => anyhow::bail!(
+            "unsupported eye frame format for face detection: {:?}",
+            frame.format
+        ),
     }
 }
 
@@ -1827,6 +1989,47 @@ fn normalize_angle_rad(angle: f32) -> f32 {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Arc;
+
+    struct StaticFaceDetector;
+
+    impl FaceDetector for StaticFaceDetector {
+        fn detect_faces(&self, _frame: &EyeFrame) -> Result<Vec<FaceDetection>> {
+            Ok(vec![FaceDetection {
+                face_id: "face-static".to_string(),
+                source_frame_id: None,
+                embedding: vec![0.1, 0.2, 0.3],
+                model: "test.face.detector".to_string(),
+            }])
+        }
+    }
+
+    #[test]
+    fn frame_processor_vectorizes_detected_faces_into_face_collection() {
+        let frame = EyeFrame {
+            captured_at_ms: 42,
+            width: 1,
+            height: 1,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![255, 128, 0],
+            source: Some("unit-camera".to_string()),
+        };
+        let mut processor = FrameProcessor::new().with_face_detector(Arc::new(StaticFaceDetector));
+
+        let processed = processor
+            .process_frame(100, &frame)
+            .expect("processed frame");
+
+        assert_eq!(processed.face.embeddings, vec![vec![0.1, 0.2, 0.3]]);
+        assert_eq!(processed.face.vectors.len(), 1);
+        let artifact = &processed.face.vectors[0];
+        assert_eq!(artifact.collection, FACE_VECTOR_COLLECTION);
+        assert_eq!(artifact.point_id, "face-static");
+        assert_eq!(artifact.vector, vec![0.1, 0.2, 0.3]);
+        assert_eq!(artifact.model.as_deref(), Some("test.face.detector"));
+        assert_eq!(artifact.source_frame_id.as_deref(), Some("eye-42-1x1-3"));
+        assert_eq!(artifact.occurred_at_ms, Some(100));
+    }
 
     #[tokio::test]
     async fn kinect_replay_emits_kinect_then_eye_packet() {

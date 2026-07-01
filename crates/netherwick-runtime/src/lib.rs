@@ -27,10 +27,9 @@ use netherwick_experience::{
     eye_next_input_from_transition_like, eye_next_target_from_now, ActionValueInput,
     ActionValueOutput, BaselineRewardComputer, BaselineSurpriseComputer, ChargeInput, ChargeOutput,
     DangerInput, DangerOutput, EarNextInput, EarNextOutput, Experience, ExperienceBehaviorInput,
-    ExperienceBehaviorOutput, ExperienceDecodeOutput, ExperienceEncodeInput, ExperienceEncoder,
-    ExperienceInstant, ExperienceLatent, EyeNextInput, EyeNextOutput, FeatureExperienceEncoder,
-    FutureInput, FuturePrediction, FuturePredictor, Impression, Prediction, RewardComputer,
-    Sensation, StasisFuturePredictor, SurpriseComputer,
+    ExperienceBehaviorOutput, ExperienceDecodeOutput, ExperienceEncodeInput, ExperienceInstant,
+    ExperienceLatent, EyeNextInput, EyeNextOutput, FutureInput, FuturePrediction, FuturePredictor,
+    Impression, Prediction, RewardComputer, Sensation, StasisFuturePredictor, SurpriseComputer,
 };
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
@@ -56,8 +55,8 @@ use netherwick_now::{
     ExtensionSense, EyePrediction, MemorySense, Now, ReignSense, SafetySense, SurpriseSense,
 };
 use netherwick_sensors::{
-    anticipate_surfaces, NowBuilder, SenseProducer, SurfaceExtractor, SurfaceExtractorOutput,
-    World, WorldSnapshot,
+    anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
+    SurfaceExtractorOutput, World, WorldSnapshot,
 };
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use serde::{Deserialize, Serialize};
@@ -81,7 +80,6 @@ where
     pub extractor: EventExtractor,
     pub bus: EventBus,
     pub reign_queue: Arc<Mutex<ReignQueue>>,
-    pub encoder: FeatureExperienceEncoder,
     pub predictor: StasisFuturePredictor,
     pub models: RuntimeModelStack,
     pub action_selector_mode: ActionSelectorMode,
@@ -996,7 +994,7 @@ impl RuntimeModelStack {
                 self.behaviors.experience.hardcoded_id(),
                 self.behaviors.experience.model_id(),
                 self.behaviors.experience.fallback,
-                vec![impl_id("experience.feature_encoder", "Feature encoder")],
+                vec![impl_id("experience.no_latent_yet", "No latent yet")],
                 vec![impl_id("experience.autoencoder.v0", "Autoencoder v0")],
                 last("experience"),
             ),
@@ -1578,46 +1576,27 @@ pub struct SituatedEarNextInput {
     pub now: Now,
 }
 
-fn adapt_prediction_z_len(
-    behavior: &str,
-    z: &mut Vec<f32>,
-    feature_len: usize,
-    expected_input_dim: usize,
-) -> Result<()> {
-    if feature_len == expected_input_dim {
-        return Ok(());
-    }
-    let context_len = feature_len.saturating_sub(z.len());
-    if expected_input_dim < context_len {
-        return Err(anyhow::anyhow!(
-            "{behavior} checkpoint input dimension mismatch: checkpoint expects {}, runtime context without latent already needs {}",
-            expected_input_dim,
-            context_len
-        ));
-    }
-    z.resize(expected_input_dim - context_len, 0.0);
-    z.truncate(expected_input_dim - context_len);
-    Ok(())
-}
-
-struct HardcodedExperienceBehavior {
-    pub encoder: FeatureExperienceEncoder,
-}
+struct HardcodedExperienceBehavior;
 
 impl FunctionBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput>
     for HardcodedExperienceBehavior
 {
     fn id(&self) -> &'static str {
-        "experience.feature_encoder"
+        "experience.no_latent_yet"
     }
 
     fn infer(&mut self, input: &ExperienceBehaviorInput) -> Result<ExperienceBehaviorOutput> {
-        let latent = self.encoder.encode(&input.now)?;
         Ok(ExperienceBehaviorOutput {
-            latent,
+            latent: ExperienceLatent {
+                t_ms: input.now.t_ms,
+                z: Vec::new(),
+                reconstruction_error: 0.0,
+                prediction_error: 0.0,
+                confidence: 0.0,
+            },
             reconstruction: None,
             reconstruction_loss: None,
-            confidence: 1.0,
+            confidence: 0.0,
         })
     }
 }
@@ -1690,15 +1669,7 @@ impl FunctionBehavior<SituatedDangerInput, DangerOutput> for DangerModelBehavior
     }
 
     fn infer(&mut self, input: &SituatedDangerInput) -> Result<DangerOutput> {
-        let mut input = input.input.clone();
-        let feature_len = input.flat_features().len();
-        adapt_prediction_z_len(
-            "danger",
-            &mut input.z,
-            feature_len,
-            self.trainer.input_dim(),
-        )?;
-        self.trainer.predict(&input)
+        self.trainer.predict(&input.input)
     }
 
     fn observe(
@@ -1738,15 +1709,7 @@ impl FunctionBehavior<SituatedChargeInput, ChargeOutput> for ChargeModelBehavior
     }
 
     fn infer(&mut self, input: &SituatedChargeInput) -> Result<ChargeOutput> {
-        let mut input = input.input.clone();
-        let feature_len = input.flat_features().len();
-        adapt_prediction_z_len(
-            "charge",
-            &mut input.z,
-            feature_len,
-            self.trainer.input_dim(),
-        )?;
-        self.trainer.predict(&input)
+        self.trainer.predict(&input.input)
     }
 
     fn observe(
@@ -1787,15 +1750,7 @@ impl FunctionBehavior<SituatedActionValueInput, ActionValueOutput> for ActionVal
     }
 
     fn infer(&mut self, input: &SituatedActionValueInput) -> Result<ActionValueOutput> {
-        let mut input = input.input.clone();
-        let feature_len = input.flat_features().len();
-        adapt_prediction_z_len(
-            "action-value",
-            &mut input.z,
-            feature_len,
-            self.trainer.input_dim(),
-        )?;
-        self.trainer.predict(&input)
+        self.trainer.predict(&input.input)
     }
 
     fn observe(
@@ -1832,15 +1787,7 @@ impl FunctionBehavior<SituatedEyeNextInput, EyeNextOutput> for EyeNextModelBehav
     }
 
     fn infer(&mut self, input: &SituatedEyeNextInput) -> Result<EyeNextOutput> {
-        let mut input = input.input.clone();
-        let feature_len = input.flat_features().len();
-        adapt_prediction_z_len(
-            "eye-next",
-            &mut input.z,
-            feature_len,
-            self.trainer.input_dim(),
-        )?;
-        self.trainer.predict(&input)
+        self.trainer.predict(&input.input)
     }
 
     fn observe(
@@ -1879,15 +1826,7 @@ impl FunctionBehavior<SituatedEarNextInput, EarNextOutput> for EarNextModelBehav
     }
 
     fn infer(&mut self, input: &SituatedEarNextInput) -> Result<EarNextOutput> {
-        let mut input = input.input.clone();
-        let feature_len = input.flat_features().len();
-        adapt_prediction_z_len(
-            "ear-next",
-            &mut input.z,
-            feature_len,
-            self.trainer.input_dim(),
-        )?;
-        self.trainer.predict(&input)
+        self.trainer.predict(&input.input)
     }
 
     fn observe(
@@ -1975,9 +1914,7 @@ fn experience_behavior(
     ReplaceableBehavior::new(
         "experience",
         regime,
-        Box::new(HardcodedExperienceBehavior {
-            encoder: FeatureExperienceEncoder::new(),
-        }),
+        Box::new(HardcodedExperienceBehavior),
         trainer.map(|trainer| Box::new(LearnedExperienceBehavior { model: trainer }) as Box<_>),
         fallback,
     )
@@ -2628,7 +2565,6 @@ where
             extractor: EventExtractor::default(),
             bus: default_event_bus(),
             reign_queue: Arc::new(Mutex::new(ReignQueue::default())),
-            encoder: FeatureExperienceEncoder::new(),
             predictor: StasisFuturePredictor,
             models: RuntimeModelStack::default(),
             action_selector_mode: ActionSelectorMode::Baseline,
@@ -2664,7 +2600,6 @@ where
             extractor: EventExtractor::default(),
             bus: default_event_bus(),
             reign_queue,
-            encoder: FeatureExperienceEncoder::new(),
             predictor: StasisFuturePredictor,
             models: RuntimeModelStack::default(),
             action_selector_mode: ActionSelectorMode::Baseline,
@@ -2882,15 +2817,9 @@ where
         embodied_experience
             .impression_ids
             .extend(recall_impression_ids);
-        let prediction_latent =
-            netherwick_experience::latent_from_fused_experience(&embodied_experience)
-                .unwrap_or_else(|| latent.clone());
         if futures.is_empty() {
-            let (predicted, records) = predict_baseline_futures(
-                &mut self.models.behaviors.future,
-                &prediction_latent,
-                now.t_ms,
-            )?;
+            let (predicted, records) =
+                predict_baseline_futures(&mut self.models.behaviors.future, &latent, now.t_ms)?;
             futures = predicted;
             behavior_runs.extend(records);
         }
@@ -3152,7 +3081,7 @@ where
                 action,
             );
             let candidate_danger_input =
-                danger_behavior_input(&candidate_now, &prediction_latent, Some(action));
+                danger_behavior_input(&candidate_now, &latent, Some(action));
             let candidate_danger = self
                 .models
                 .behaviors
@@ -3173,8 +3102,7 @@ where
             let candidate_danger_had_fallback = candidate_danger_record.model_output.is_none();
             behavior_runs.push(candidate_danger_record.erase());
 
-            let candidate_charge_input =
-                charge_behavior_input(&now, &prediction_latent, Some(action));
+            let candidate_charge_input = charge_behavior_input(&now, &latent, Some(action));
             let candidate_charge = self
                 .models
                 .behaviors
@@ -3197,7 +3125,7 @@ where
 
             let candidate_action_value_input = action_value_behavior_input(
                 &candidate_now,
-                &prediction_latent,
+                &latent,
                 Some(action),
                 candidate_danger_output,
                 candidate_charge_output,
@@ -3352,7 +3280,7 @@ where
             }
         }
 
-        let danger_input = danger_behavior_input(&now, &prediction_latent, Some(&chosen_action));
+        let danger_input = danger_behavior_input(&now, &latent, Some(&chosen_action));
         let danger_run = self
             .models
             .behaviors
@@ -3373,7 +3301,7 @@ where
         }
         behavior_runs.push(danger_record.erase());
 
-        let charge_input = charge_behavior_input(&now, &prediction_latent, Some(&chosen_action));
+        let charge_input = charge_behavior_input(&now, &latent, Some(&chosen_action));
         let charge_run = self
             .models
             .behaviors
@@ -3394,8 +3322,7 @@ where
         }
         behavior_runs.push(charge_record.erase());
 
-        let eye_next_input =
-            eye_next_behavior_input(&now, &prediction_latent, Some(&chosen_action), 100);
+        let eye_next_input = eye_next_behavior_input(&now, &latent, Some(&chosen_action), 100);
         let eye_next_run = self
             .models
             .behaviors
@@ -3416,8 +3343,7 @@ where
         }
         behavior_runs.push(eye_next_record.erase());
 
-        let ear_next_input =
-            ear_next_behavior_input(&now, &prediction_latent, Some(&chosen_action), 100);
+        let ear_next_input = ear_next_behavior_input(&now, &latent, Some(&chosen_action), 100);
         let ear_next_run = self
             .models
             .behaviors
@@ -4162,6 +4088,7 @@ pub struct RealRobotRunner<R> {
     pub tick_ms: u64,
     pub tick_count: usize,
     now_builder: NowBuilder,
+    frame_processor: FrameProcessor,
 }
 
 impl<R> RealRobotRunner<R>
@@ -4182,7 +4109,13 @@ where
             tick_ms: 100,
             tick_count: 0,
             now_builder: NowBuilder::new(),
+            frame_processor: FrameProcessor::new(),
         }
+    }
+
+    pub fn with_frame_processor(mut self, frame_processor: FrameProcessor) -> Self {
+        self.frame_processor = frame_processor;
+        self
     }
 
     pub async fn run_read_only(&mut self, steps: Option<usize>) -> Result<()> {
@@ -4215,8 +4148,9 @@ where
         }
 
         let body = self.body.read_body().await?;
-        let packets = poll_sensors_lossy(&mut self.sensors).await;
+        let mut packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body.last_update_ms.max(wall_time_ms());
+        self.frame_processor.process_packets(t_ms, &mut packets);
         let mut now = self.now_builder.build(t_ms, body, packets)?;
         now.self_sense.mode = Some("read-only".to_string());
         now.extensions.insert(
@@ -4256,8 +4190,9 @@ where
         }
 
         let body_before = self.body.read_body().await?;
-        let packets = poll_sensors_lossy(&mut self.sensors).await;
+        let mut packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
+        self.frame_processor.process_packets(t_ms, &mut packets);
         let mut now = self.now_builder.build(t_ms, body_before.clone(), packets)?;
         now.self_sense.mode = Some("slow".to_string());
         now.extensions.insert(
@@ -5132,17 +5067,16 @@ fn attach_structured_predictions_to_experience(
     now: &Now,
     action: Option<&ActionPrimitive>,
 ) {
-    let vector = experience.fused_vector.clone();
     for future in futures.iter().take(2) {
         let text = future
             .summary
             .clone()
-            .unwrap_or_else(|| "latent future estimated from embodied vector".to_string());
+            .unwrap_or_else(|| "latent future estimated from ExperienceLatent".to_string());
         experience.predictions.push(Prediction {
             offset_ms: future.offset_ms,
             text: format!("next_state: {text}"),
             confidence: future.confidence.clamp(0.0, 1.0),
-            vector: vector.clone(),
+            vector: None,
         });
     }
 
@@ -5158,7 +5092,7 @@ fn attach_structured_predictions_to_experience(
                 danger.bump_risk, danger.cliff_risk, danger.wheel_drop_risk, danger.stuck_risk
             ),
             confidence: danger.confidence.clamp(0.0, 1.0),
-            vector: vector.clone(),
+            vector: None,
         });
     }
 
@@ -5174,7 +5108,7 @@ fn attach_structured_predictions_to_experience(
                 charge.charge_probability, charge.expected_battery_delta, charge.dock_likelihood
             ),
             confidence: charge.confidence.clamp(0.0, 1.0),
-            vector: vector.clone(),
+            vector: None,
         });
     }
 
@@ -5196,7 +5130,7 @@ fn attach_structured_predictions_to_experience(
                 action_value.action, action_value.value
             ),
             confidence: action_value.confidence.clamp(0.0, 1.0),
-            vector: vector.clone(),
+            vector: None,
         });
     }
 
@@ -5208,7 +5142,7 @@ fn attach_structured_predictions_to_experience(
                 now.predictions.expected_events.join(", ")
             ),
             confidence: (1.0 - now.predictions.uncertainty).clamp(0.0, 1.0),
-            vector: vector.clone(),
+            vector: None,
         });
     }
 
@@ -5219,7 +5153,7 @@ fn attach_structured_predictions_to_experience(
             now.predictions.uncertainty.clamp(0.0, 1.0)
         ),
         confidence: (1.0 - now.predictions.uncertainty).clamp(0.05, 1.0),
-        vector,
+        vector: None,
     });
 }
 
@@ -7085,7 +7019,7 @@ mod tests {
             .unwrap();
 
         assert!(report.passed(), "{:?}", report.failures);
-        assert!(report.fused_experience_count > 0);
+        assert!(report.experience_latent_count > 0);
         assert!(report.summary_impression_count > 0);
         assert!(report.prediction_count > 0);
         assert!(report.memory_link_count > 0);
@@ -9329,7 +9263,7 @@ mod tests {
         let frames = ledger.recent(5).await.unwrap();
         let experience = frames.last().unwrap().experiences.last().unwrap();
 
-        assert!(experience.fused_vector.is_some());
+        assert!(frames.last().unwrap().z.is_some());
         assert!(experience
             .predictions
             .iter()
@@ -9680,12 +9614,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_experience_checkpoint_falls_back_to_feature_encoder() {
+    fn missing_experience_checkpoint_returns_no_latent_yet() {
         let config: BehaviorRegistryConfig = toml::from_str(
             r#"
             [behavior.experience]
             regime = "shadow_infer"
-            hardcoded = "experience.feature_encoder"
+            hardcoded = "experience.no_latent_yet"
             model = "experience.autoencoder.v0"
             checkpoint = "/tmp/netherwick-missing-experience-checkpoint"
             fallback = "use_hardcoded"
@@ -9704,6 +9638,8 @@ mod tests {
         assert!(run.record.hardcoded_output.is_some());
         assert!(run.record.model_output.is_none());
         assert_eq!(run.chosen, run.record.hardcoded_output.unwrap());
+        assert!(run.chosen.latent.z.is_empty());
+        assert_eq!(run.chosen.confidence, 0.0);
     }
 
     #[tokio::test]
@@ -10375,9 +10311,7 @@ mod tests {
         let mut body = test_body(1.0, 1.0, 0.8, 7);
         body.velocity.forward_m_s = 0.05;
         let now = Now::blank(100, body);
-        let mut encoder = FeatureExperienceEncoder::new();
-        let latent = encoder.encode(&now).unwrap();
-        let input = DangerInput::from_parts(latent.z, Some(&action), &now);
+        let input = DangerInput::from_parts(Vec::new(), Some(&action), &now);
         let mut trainer = DangerNetTrainer::new(input.flat_features().len());
         trainer
             .train_step(
@@ -10395,9 +10329,7 @@ mod tests {
         let mut body = test_body(1.0, 1.0, 0.2, 7);
         body.charging = false;
         let now = Now::blank(100, body);
-        let mut encoder = FeatureExperienceEncoder::new();
-        let latent = encoder.encode(&now).unwrap();
-        let input = ChargeInput::from_parts(latent.z, Some(&action), &now);
+        let input = ChargeInput::from_parts(Vec::new(), Some(&action), &now);
         let mut trainer = ChargeNetTrainer::new(input.flat_features().len());
         trainer
             .train_step(
@@ -10416,9 +10348,7 @@ mod tests {
         let mut body = test_body(1.0, 1.0, 0.2, 7);
         body.charging = false;
         let now = Now::blank(100, body);
-        let mut encoder = FeatureExperienceEncoder::new();
-        let latent = encoder.encode(&now).unwrap();
-        let input = ActionValueInput::from_parts(latent.z, Some(&action), &now);
+        let input = ActionValueInput::from_parts(Vec::new(), Some(&action), &now);
         let mut trainer = ActionValueNetTrainer::new(input.flat_features().len());
         trainer
             .train_step(
@@ -10431,8 +10361,13 @@ mod tests {
 
     fn write_test_future_checkpoint(root: &Path, action: ActionPrimitive) {
         let now = Now::blank(100, test_body(1.0, 1.0, 0.8, 100));
-        let mut encoder = FeatureExperienceEncoder::new();
-        let latent = encoder.encode(&now).unwrap();
+        let latent = ExperienceLatent {
+            t_ms: now.t_ms,
+            z: Vec::new(),
+            reconstruction_error: 0.0,
+            prediction_error: 0.0,
+            confidence: 0.0,
+        };
         let input = FutureInput {
             latent: latent.clone(),
             action,
@@ -10447,9 +10382,7 @@ mod tests {
         let body = test_body(1.0, 1.0, 0.8, 7);
         let mut now = Now::blank(100, body);
         now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];
-        let mut encoder = FeatureExperienceEncoder::new();
-        let latent = encoder.encode(&now).unwrap();
-        let input = EarNextInput::from_parts(latent.z, Some(&action), &now, 100);
+        let input = EarNextInput::from_parts(Vec::new(), Some(&action), &now, 100);
         let mut trainer = EarNextNetTrainer::new(input.flat_features().len(), 4);
         trainer
             .train_step(

@@ -4,9 +4,9 @@ use netherwick_actions::ActionPrimitive;
 use netherwick_body::{BodyFlags, BodySense, Velocity};
 use netherwick_core::{Goal, Pose2, Reward};
 use netherwick_experience::{
-    experience_forge_vector_from_now, EmbodiedPipeline, EmbodiedVectorCoverage, Experience,
-    ExperienceFuser, ExperienceVectorArtifact, FuturePrediction, Impression, InstantCoverage,
-    MemoryLink, Modality, RecalledExperience, SensationPayloadKind, VectorEmbedding,
+    EmbodiedPipeline, EmbodiedVectorCoverage, Experience, ExperienceFuser, FuturePrediction,
+    Impression, InstantCoverage, MemoryLink, Modality, RecalledExperience, SensationPayloadKind,
+    VectorEmbedding,
 };
 use netherwick_ledger::{ExperienceFrame, ExperienceTransition};
 use netherwick_now::{
@@ -234,9 +234,7 @@ pub struct PlaceSceneEmbedding {
 pub struct PlaceRecognitionInput {
     pub experience_id: Option<String>,
     pub instant_frame_id: Option<String>,
-    pub fused_experience_vector: Option<VectorArtifact>,
-    #[serde(default)]
-    pub experience_forge_vector: Option<ExperienceVectorArtifact>,
+    pub experience_latent_vector: Option<VectorArtifact>,
     #[serde(default)]
     pub teacher_vector_refs: Vec<String>,
     #[serde(default)]
@@ -1192,30 +1190,6 @@ impl EntityHypothesis {
         );
     }
 
-    /// Add ExperienceForge compact vector evidence.
-    /// This is learned contextual evidence and not a semantic identity label.
-    pub fn add_experience_forge_vector(&mut self, artifact: &ExperienceVectorArtifact) {
-        let point_id = artifact.vector_artifact().point_id;
-        let point = self.push_observation_point(
-            Modality::Memory,
-            format!("experience-forge:{point_id}"),
-            0.65,
-            artifact.provenance.source_snapshot_ms,
-        );
-        let cluster = self.upsert_cluster(
-            Modality::Memory,
-            format!("experience-forge:{point_id}"),
-            point,
-            0.65,
-        );
-        self.bind_with_object_cluster(
-            cluster,
-            BindingRelation::PredictsSameFutureEvents,
-            0.65,
-            artifact.provenance.source_snapshot_ms,
-        );
-    }
-
     pub fn add_text_label(&mut self, label: impl Into<String>, confidence: f32, t_ms: u64) {
         let text = label.into().trim().to_string();
         if text.is_empty() {
@@ -1537,19 +1511,6 @@ impl EntityMemory {
                     for text in &text_labels {
                         entity.add_text_label(text.clone(), 0.6, now.t_ms);
                     }
-                }
-            }
-        }
-        if let Some(forge_vector) = experience_forge_vector_from_now(now) {
-            let active_ids = self
-                .entities
-                .values()
-                .filter(|entity| entity.lifecycle == EntityLifecycleState::Active)
-                .map(|entity| entity.id.clone())
-                .collect::<Vec<_>>();
-            for id in active_ids {
-                if let Some(entity) = self.entities.get_mut(&id) {
-                    entity.add_experience_forge_vector(&forge_vector);
                 }
             }
         }
@@ -2465,10 +2426,8 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
     );
     let linked_experiences =
         experiences_with_memory_links(frame, &scene_vectors, &face_vectors, &voice_vectors);
-    let (sensation_vectors, mut vector_payloads) = sensation_vectors_from_frame(frame);
-    let (experience_vectors, experience_payloads) =
-        experience_vectors_from_experiences(frame, &linked_experiences);
-    vector_payloads.extend(experience_payloads);
+    let (sensation_vectors, vector_payloads) = sensation_vectors_from_frame(frame);
+    let experience_vectors = Vec::new();
     let (graph_entities, graph_relationships) = graph_context_from_frame(
         frame,
         &linked_experiences,
@@ -2584,6 +2543,8 @@ impl EmbodiedEvalOmission {
 pub struct EmbodiedPipelineCoverageReport {
     pub schema_version: u32,
     pub fixture: String,
+    pub placeholder: bool,
+    pub placeholder_vector_count: usize,
     pub frame_count: usize,
     pub instant_count: usize,
     pub instant_teacher_vector_count: usize,
@@ -2593,7 +2554,7 @@ pub struct EmbodiedPipelineCoverageReport {
     pub vectorized_sensation_count: usize,
     pub impression_count: usize,
     pub summary_impression_count: usize,
-    pub fused_experience_count: usize,
+    pub experience_latent_count: usize,
     pub prediction_count: usize,
     pub memory_link_count: usize,
     pub recall_sensation_count: usize,
@@ -2876,6 +2837,18 @@ async fn build_embodied_eval_frame(
     if let Some(summary) = summary_impression {
         impressions.push(summary);
     }
+    let latent = netherwick_experience::ExperienceLatent {
+        t_ms: now.t_ms,
+        z: vec![
+            (now.t_ms as f32 / 1_000.0).sin(),
+            now.body.battery_level,
+            now.body.odometry.x_m,
+            now.body.odometry.y_m,
+        ],
+        reconstruction_error: 0.0,
+        prediction_error: 0.0,
+        confidence: 0.5,
+    };
 
     Ok(ExperienceFrame {
         id: uuid::Uuid::new_v4(),
@@ -2884,7 +2857,7 @@ async fn build_embodied_eval_frame(
         sensations,
         impressions,
         experiences: experience.into_iter().collect(),
-        z: None,
+        z: Some(latent),
         chosen_action: Some(ActionPrimitive::Inspect {
             target: netherwick_actions::InspectTarget::Novelty,
         }),
@@ -2935,6 +2908,18 @@ fn coverage_report_from_frames(
             .iter()
             .filter(|sensation| sensation.vector.is_some())
             .count();
+        report.placeholder_vector_count += frame
+            .sensations
+            .iter()
+            .filter_map(|sensation| sensation.vector.as_ref())
+            .filter(|vector| vector.is_fallback)
+            .count()
+            + frame
+                .impressions
+                .iter()
+                .filter_map(|impression| impression.vector.as_ref())
+                .filter(|vector| vector.is_fallback)
+                .count();
         report.impression_count += frame
             .impressions
             .iter()
@@ -2945,11 +2930,7 @@ fn coverage_report_from_frames(
             .iter()
             .filter(|experience| experience.summary_impression.is_some())
             .count();
-        report.fused_experience_count += frame
-            .experiences
-            .iter()
-            .filter(|experience| experience.fused_vector.is_some())
-            .count();
+        report.experience_latent_count += usize::from(frame.z.is_some());
         report.prediction_count += instant.predictions.len();
         report.memory_link_count += instant.memory_links.len();
         report.recall_sensation_count += frame
@@ -2976,6 +2957,7 @@ fn coverage_report_from_frames(
         merge_vector_coverage(&mut report.vector_coverage, coverage);
     }
     report.input_modalities = modalities.into_iter().collect();
+    report.placeholder = report.placeholder_vector_count > 0;
     report
 }
 
@@ -3017,8 +2999,8 @@ fn evaluate_required_embodied_coverage(report: &mut EmbodiedPipelineCoverageRepo
         &mut report.failures,
     );
     required_stage(
-        report.fused_experience_count,
-        "no fused experience",
+        report.experience_latent_count,
+        "no learned experience latent",
         &mut report.failures,
     );
     required_stage(
@@ -3493,23 +3475,6 @@ fn graph_context_from_frame(
                 Some(impression.text.clone()),
             ));
         }
-        if let Some(embedding) = &experience.fused_vector {
-            let artifact = embodied_vector_artifact(
-                EXPERIENCE_VECTOR_COLLECTION,
-                &format!("{}:experience:{}", frame.id, experience.id),
-                embedding,
-                frame.id,
-                experience.id.to_string(),
-                experience.occurred_at_ms,
-            );
-            entities.push(vector_entity(&artifact, "experience"));
-            relationships.push(graph_edge(
-                canonical_experience_id.clone(),
-                vector_node_id(&artifact),
-                "HAS_FUSED_VECTOR",
-                Some(format!("{} dimensions", embedding.dim)),
-            ));
-        }
         for link in &experience.memory_links {
             if let Some(entity) = memory_link_entity(link) {
                 entities.push(entity);
@@ -3861,53 +3826,6 @@ fn sensation_vectors_from_frame(
     (artifacts, payloads)
 }
 
-fn experience_vectors_from_experiences(
-    frame: &ExperienceFrame,
-    experiences: &[Experience],
-) -> (Vec<VectorArtifact>, BTreeMap<String, serde_json::Value>) {
-    let mut payloads = BTreeMap::new();
-    let artifacts = experiences
-        .iter()
-        .filter_map(|experience| {
-            let embedding = experience.fused_vector.as_ref()?;
-            let artifact = embodied_vector_artifact(
-                EXPERIENCE_VECTOR_COLLECTION,
-                &format!("{}:experience:{}", frame.id, experience.id),
-                embedding,
-                frame.id,
-                experience.id.to_string(),
-                experience.occurred_at_ms,
-            );
-            payloads.insert(
-                vector_payload_key(&artifact),
-                json!({
-                    "payload_kind": embedding.payload_kind.as_str(),
-                    "modality": embedding.modality.as_str(),
-                    "experience_id": experience.id.to_string(),
-                    "source_sensation_id": embedding.source_sensation_id.to_string(),
-                    "sensation_ids": experience.sensation_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-                    "impression_ids": experience.impression_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-                    "model_id": embedding.model_id,
-                    "dim": embedding.dim,
-                    "observed_at_ms": experience.observed_at_ms,
-                    "occurred_at_ms": experience.occurred_at_ms,
-                    "window_start_ms": experience.window_start_ms,
-                    "window_end_ms": experience.window_end_ms,
-                    "generated_at_ms": embedding.generated_at_ms,
-                    "experience_kind": experience.kind,
-                    "summary": experience_summary_text(experience),
-                    "summary_impression_text": experience.summary_impression.as_ref().map(|impression| impression.text.clone()),
-                    "salience": experience.salience,
-                    "tags": experience.tags,
-                    "memory_links": experience.memory_links,
-                }),
-            );
-            Some(artifact)
-        })
-        .collect();
-    (artifacts, payloads)
-}
-
 fn memory_links_from_frame(
     frame: &ExperienceFrame,
     _scene_vectors: &[VectorArtifact],
@@ -4176,39 +4094,20 @@ fn place_query_vectors_from_query(query: &RecallQuery) -> Vec<VectorArtifact> {
 
 pub fn place_recognition_input_from_frame(frame: &ExperienceFrame) -> PlaceRecognitionInput {
     let instant = frame.experience_instant();
-    let experience_forge_vector = experience_forge_vector_from_now(&frame.now);
-    let fused_experience_vector = frame
-        .experiences
-        .last()
-        .and_then(|experience| {
-            experience.fused_vector.as_ref().map(|embedding| {
-                embodied_vector_artifact(
-                    EXPERIENCE_VECTOR_COLLECTION,
-                    &format!("{}:experience:{}", frame.id, experience.id),
-                    embedding,
-                    frame.id,
-                    experience.id.to_string(),
-                    experience.occurred_at_ms,
-                )
-            })
-        })
-        .or_else(|| {
-            frame.z.as_ref().map(|latent| {
-                VectorArtifact::new(
-                    EXPERIENCE_VECTOR_COLLECTION,
-                    format!("{}:experience-latent", frame.id),
-                    latent.z.clone(),
-                )
-                .with_model("netherwick.experience.latent")
-                .with_source_frame_id(frame.id.to_string())
-                .with_occurred_at_ms(frame.t_ms)
-            })
-        });
+    let experience_latent_vector = frame.z.as_ref().map(|latent| {
+        VectorArtifact::new(
+            EXPERIENCE_VECTOR_COLLECTION,
+            format!("{}:experience-latent", frame.id),
+            latent.z.clone(),
+        )
+        .with_model("netherwick.experience.latent")
+        .with_source_frame_id(frame.id.to_string())
+        .with_occurred_at_ms(frame.t_ms)
+    });
     PlaceRecognitionInput {
         experience_id: instant.experience_id.map(|id| id.to_string()),
         instant_frame_id: Some(frame.id.to_string()),
-        fused_experience_vector,
-        experience_forge_vector,
+        experience_latent_vector,
         teacher_vector_refs: instant
             .teacher_vectors
             .iter()
@@ -4240,8 +4139,7 @@ pub fn place_recognition_input_from_query_now(
     latent: Option<&netherwick_experience::ExperienceLatent>,
     provenance: impl Into<String>,
 ) -> PlaceRecognitionInput {
-    let experience_forge_vector = experience_forge_vector_from_now(now);
-    let fused_experience_vector = latent.map(|latent| {
+    let experience_latent_vector = latent.map(|latent| {
         VectorArtifact::new(
             EXPERIENCE_VECTOR_COLLECTION,
             format!("query:{}:experience-latent", now.t_ms),
@@ -4253,8 +4151,7 @@ pub fn place_recognition_input_from_query_now(
     PlaceRecognitionInput {
         experience_id: None,
         instant_frame_id: None,
-        fused_experience_vector,
-        experience_forge_vector,
+        experience_latent_vector,
         teacher_vector_refs: now
             .eye
             .scene_vectors
@@ -4277,15 +4174,11 @@ pub fn place_recognition_input_from_query_now(
 }
 
 pub fn place_recognition_vectors_from_input(input: &PlaceRecognitionInput) -> Vec<VectorArtifact> {
-    let mut vectors = input
-        .fused_experience_vector
+    input
+        .experience_latent_vector
         .iter()
         .cloned()
-        .collect::<Vec<_>>();
-    if let Some(forge) = &input.experience_forge_vector {
-        vectors.push(forge.vector_artifact());
-    }
-    vectors
+        .collect::<Vec<_>>()
 }
 
 fn compact_range_summary(now: &Now) -> Option<CompactRangeSummary> {
@@ -4647,7 +4540,7 @@ mod tests {
         let now = Now::blank(500, BodySense::default());
         let mut frame = empty_frame(now);
         let source_sensation_id = uuid::Uuid::new_v4();
-        let mut experience = Experience::new(
+        let experience = Experience::new(
             "embodied.now",
             "I notice a familiar charger alcove.",
             Vec::new(),
@@ -4655,14 +4548,12 @@ mod tests {
             450,
             500,
         );
-        experience.fused_vector = Some(VectorEmbedding::new(
-            vec![1.0, 0.0, 0.0],
-            "unit.experience.v0",
-            Modality::Other,
-            SensationPayloadKind::Structured,
-            source_sensation_id,
-            500,
-        ));
+        frame.z = Some(ExperienceLatent {
+            t_ms: frame.t_ms,
+            z: vec![1.0, 0.0, 0.0],
+            confidence: 0.9,
+            ..ExperienceLatent::default()
+        });
         frame.experiences = vec![experience.clone()];
         let frame_id = frame.id;
 
@@ -4772,8 +4663,7 @@ mod tests {
             .impressions
             .iter()
             .any(|impression| impression.sensation_id.is_some()));
-        let experience = frame.experiences.last().expect("fused experience");
-        assert!(experience.fused_vector.is_some());
+        let experience = frame.experiences.last().expect("experience");
         assert!(experience.summary_impression.is_some());
         assert!(!experience.predictions.is_empty());
     }
@@ -4849,10 +4739,7 @@ mod tests {
             coverage.sensation_count,
             instant.primary_sensations.len() + instant.descendant_sensations.len()
         );
-        assert_eq!(
-            coverage.vector_count,
-            usize::from(instant.fused_vector.is_some())
-        );
+        assert_eq!(coverage.vector_count, instant.teacher_vectors.len());
     }
 
     #[tokio::test]
@@ -4869,7 +4756,7 @@ mod tests {
         assert!(report.vectorized_sensation_count > 0);
         assert!(report.impression_count > 0);
         assert!(report.summary_impression_count > 0);
-        assert!(report.fused_experience_count > 0);
+        assert!(report.experience_latent_count > 0);
         assert!(report.prediction_count > 0);
         assert!(report.memory_link_count > 0);
         assert!(report.recall_sensation_count > 0);
@@ -5070,14 +4957,6 @@ mod tests {
             120,
             126,
         );
-        experience.fused_vector = Some(VectorEmbedding::new(
-            vec![0.5, 0.5, 0.0],
-            "netherwick.fusion.test",
-            Modality::Other,
-            SensationPayloadKind::Structured,
-            primary_id,
-            126,
-        ));
         experience.summary_impression =
             Some(experience_impression.clone().for_experience(experience.id));
 
@@ -5277,6 +5156,81 @@ mod tests {
             stable_qdrant_point_id("faces", "frame:face:0"),
             stable_qdrant_point_id("voices", "frame:face:0")
         );
+    }
+
+    #[tokio::test]
+    async fn qdrant_vector_store_upserts_face_vectors_into_faces_collection() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test qdrant");
+        let addr = listener.local_addr().expect("test qdrant addr");
+        let (tx, rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept qdrant request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read qdrant request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_text = String::from_utf8_lossy(&request).to_string();
+                tx.send(request_text).expect("send qdrant request");
+                let body = r#"{"result":true,"status":"ok"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write qdrant response");
+            }
+        });
+
+        let store = QdrantVectorStore::new(QdrantConfig {
+            url: format!("http://{addr}"),
+        });
+        let record = MemoryRecord {
+            frame_id: uuid::Uuid::new_v4(),
+            t_ms: 100,
+            summary: "face frame".to_string(),
+            graph_entities: Vec::new(),
+            graph_relationships: Vec::new(),
+            scene_vectors: Vec::new(),
+            face_vectors: vec![VectorArtifact::new(
+                FACE_VECTOR_COLLECTION,
+                "face-qdrant",
+                vec![0.1, 0.2],
+            )
+            .with_model("test.face.detector")
+            .with_source_frame_id("eye-frame")],
+            voice_vectors: Vec::new(),
+            sensation_vectors: Vec::new(),
+            experience_vectors: Vec::new(),
+            vector_payloads: BTreeMap::new(),
+            battery: 1.0,
+            active_goal: None,
+            chosen_action: None,
+            warning: None,
+            experience: None,
+        };
+
+        store.upsert_vectors(&record).await.expect("upsert vectors");
+
+        let create = rx.recv().expect("collection create request");
+        let upsert = rx.recv().expect("point upsert request");
+        server.join().expect("qdrant mock server");
+        assert!(create.starts_with("PUT /collections/faces "));
+        assert!(upsert.starts_with("PUT /collections/faces/points?wait=true "));
     }
 
     #[test]
@@ -5619,7 +5573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn place_recognition_uses_fused_experience_latents_and_lineage() {
+    async fn place_recognition_uses_experience_latents_and_lineage() {
         let store = InMemoryExperienceStore::new();
         let mut frame = empty_frame(now_at(100, 1.0, 1.0));
         frame.now.range.beams = vec![0.4, 0.7, 1.0];
@@ -5632,7 +5586,7 @@ mod tests {
             ..ObjectObservation::default()
         });
         let sensation_id = uuid::Uuid::new_v4();
-        let mut experience = Experience::new(
+        let experience = Experience::new(
             "embodied.place",
             "charger alcove near the wall",
             Vec::new(),
@@ -5640,14 +5594,12 @@ mod tests {
             80,
             100,
         );
-        experience.fused_vector = Some(VectorEmbedding::new(
-            vec![1.0, 0.0, 0.0, 0.0],
-            "test.fused-experience",
-            Modality::Other,
-            SensationPayloadKind::Structured,
-            sensation_id,
-            100,
-        ));
+        frame.z = Some(ExperienceLatent {
+            t_ms: frame.t_ms,
+            z: vec![1.0, 0.0, 0.0, 0.0],
+            confidence: 0.95,
+            ..ExperienceLatent::default()
+        });
         let experience_id = experience.id.to_string();
         frame.experiences.push(experience);
         store.observe_frame(&frame).await.unwrap();
@@ -5670,7 +5622,7 @@ mod tests {
         let candidate = recall
             .place_recognition_candidates
             .first()
-            .expect("place candidate from fused latent");
+            .expect("place candidate from learned latent");
         assert_eq!(
             candidate.source_experience_id.as_deref(),
             Some(experience_id.as_str())
@@ -5679,32 +5631,8 @@ mod tests {
             candidate.source_instant_frame_id.as_deref(),
             Some(frame.id.to_string().as_str())
         );
-        assert!(candidate.source_vector_id.contains(":experience:"));
+        assert!(candidate.source_vector_id.contains(":experience-latent"));
         assert!(candidate.reason.contains("confidence="));
-    }
-
-    #[test]
-    fn place_recognition_vectors_include_optional_forge_vector_artifact() {
-        let now = now_at(100, 0.0, 0.0);
-        let artifact = ExperienceVectorArtifact {
-            tick: 3,
-            vector: vec![0.3, 0.1, 0.9],
-            champion_ids: vec![7, 11],
-            checkpoint_ref: None,
-            provenance: netherwick_experience::ExperienceVectorProvenance {
-                source_snapshot_ms: now.t_ms,
-                source_frame_id: None,
-                channel: "test.experience_forge".to_string(),
-            },
-        };
-        let input = PlaceRecognitionInput {
-            experience_forge_vector: Some(artifact.clone()),
-            ..PlaceRecognitionInput::default()
-        };
-        let vectors = place_recognition_vectors_from_input(&input);
-        assert_eq!(vectors.len(), 1);
-        assert_eq!(vectors[0].vector, artifact.vector);
-        assert!(vectors[0].point_id.contains("experience-forge:tick:3"));
     }
 
     #[test]
@@ -6194,63 +6122,5 @@ mod tests {
         assert!(memory.merge_entities(&entity_id, &split_id));
         let merged = memory.entities.get(&entity_id).expect("merged entity");
         assert_eq!(merged.constellation.state, EntityConstellationState::Merged);
-    }
-
-    #[test]
-    fn entity_constellation_records_forge_vector_evidence_when_present() {
-        let mut memory = EntityMemory::new();
-        let mut now = now_at(100, 0.0, 0.0);
-        now.objects
-            .observations
-            .push(make_object_observation("guide", ObjectClass::Person, 0.85));
-        let forge_vector = ExperienceVectorArtifact {
-            tick: 5,
-            vector: vec![0.1, 0.2, 0.3],
-            champion_ids: vec![1, 2],
-            checkpoint_ref: None,
-            provenance: netherwick_experience::ExperienceVectorProvenance {
-                source_snapshot_ms: now.t_ms,
-                source_frame_id: None,
-                channel: "test.experience_forge".to_string(),
-            },
-        };
-        netherwick_experience::attach_experience_forge_vector(&mut now, &forge_vector);
-
-        memory.observe_now(&now, None);
-
-        let entity = memory
-            .entities
-            .get("entity:person:guide")
-            .expect("person entity");
-        assert!(entity
-            .constellation
-            .modality_clusters
-            .iter()
-            .any(|cluster| {
-                cluster.modality == Modality::Memory && cluster.id.contains("experience-forge")
-            }));
-    }
-
-    #[test]
-    fn entity_constellation_skips_forge_vector_when_absent() {
-        let mut memory = EntityMemory::new();
-        let mut now = now_at(100, 0.0, 0.0);
-        now.objects
-            .observations
-            .push(make_object_observation("guide", ObjectClass::Person, 0.85));
-
-        memory.observe_now(&now, None);
-
-        let entity = memory
-            .entities
-            .get("entity:person:guide")
-            .expect("person entity");
-        assert!(!entity
-            .constellation
-            .modality_clusters
-            .iter()
-            .any(|cluster| {
-                cluster.modality == Modality::Memory && cluster.id.contains("experience-forge")
-            }));
     }
 }

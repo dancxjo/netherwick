@@ -12,7 +12,7 @@ raw sensor input
   -> decoding, prediction, memory, behavior
 ```
 
-`ExperienceInstant` is the canonical DTO for one moment. It is not a policy object and it is not a separate world model. It bundles the current embodied batch: primary and descendant sensations, impressions, summary impression, teacher vectors with metadata and values, fused experience vector, body/action context, time window, lineage, provenance, and explicit missing-modality records.
+`ExperienceInstant` is the canonical DTO for one moment. It is not a policy object and it is not a separate world model. It bundles the current embodied batch: primary and descendant sensations, impressions, summary impression, teacher vectors with metadata and values, body/action context, time window, lineage, provenance, and explicit missing-modality records. The only compressed experience representation is the learned `ExperienceLatent` produced from this Instant.
 
 Creation paths:
 

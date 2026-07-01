@@ -57,7 +57,7 @@ just run eval-scenario \
 
 Use `--ledger data/ledger/eval/foo` when you also want normal `ExperienceFrame` and `ExperienceTransition` output. Use `--capture-root data/captures/eval/foo` to write one Worldlab capture per episode.
 
-Ledger frames include the embodied prediction path. Inspect `experiences[-1].fused_vector` and `experiences[-1].predictions` to confirm that future, hazard, charge, action-value, event-change, and uncertainty predictions were attached to the embodied experience that memory will store.
+Ledger frames include the learned experience path. Inspect `z` for the learned `ExperienceLatent` and `experiences[-1].predictions` to confirm that future, hazard, charge, action-value, event-change, and uncertainty predictions were attached to the embodied experience that memory will store.
 
 ## Embodied Pipeline Coverage
 
@@ -77,6 +77,8 @@ Example JSON shape:
 {
   "schema_version": 1,
   "fixture": "deterministic",
+  "placeholder": true,
+  "placeholder_vector_count": 3,
   "frame_count": 2,
   "instant_count": 2,
   "instant_teacher_vector_count": 24,
@@ -86,7 +88,7 @@ Example JSON shape:
   "vectorized_sensation_count": 21,
   "impression_count": 23,
   "summary_impression_count": 2,
-  "fused_experience_count": 2,
+  "experience_latent_count": 2,
   "prediction_count": 4,
   "memory_link_count": 9,
   "recall_sensation_count": 1,
@@ -101,6 +103,8 @@ Example JSON shape:
 Metric meanings:
 
 - `frame_count`: frames persisted or evaluated in the deterministic replay.
+- `placeholder`: true when any deterministic placeholder/fallback vectorizer contributed to the report.
+- `placeholder_vector_count`: number of reported vectors marked as placeholder/fallback.
 - `instant_count`: canonical `ExperienceInstant` records assembled from the evaluated frames.
 - `instant_teacher_vector_count`: teacher/modality vectors available inside those Instants.
 - `instant_missing_modality_count`: explicit missing modality records across Instants.
@@ -108,15 +112,15 @@ Metric meanings:
 - `descendant_sensation_count`: derived sensations such as visual crops and audio transcript spans.
 - `vectorized_sensation_count`: sensations carrying vector metadata with model id, dimension, purpose, and collection.
 - `impression_count`: sensation-level impressions.
-- `summary_impression_count`: fused experience summary impressions.
-- `fused_experience_count`: embodied experiences with fused vectors.
+- `summary_impression_count`: experience summary impressions.
+- `experience_latent_count`: frames carrying learned `ExperienceLatent`.
 - `prediction_count`: attached embodied or fallback future predictions.
 - `memory_link_count`: links attached before persistence, such as place/person/object/recollection links.
 - `recall_sensation_count` and `recall_impression_count`: memory recall materialized back into embodied sensation/impression form.
 - `lineage_edge_count`: parent-to-child sensation edges preserved in the embodied context.
 - `warnings` and `failures`: missing or intentionally omitted stages.
 
-This closes the end-to-end coverage gap after #34 and #35: #34 made the embodied fused vector usable by prediction inputs, #35 made vectorizer metadata explicit and deterministic, and this check proves the whole hardware-free loop reaches memory persistence and recall.
+This closes the end-to-end coverage gap after #34 and #35: #34 made the learned experience path usable by prediction inputs, #35 made vectorizer metadata explicit and deterministic, and this check proves the whole hardware-free loop reaches memory persistence and recall.
 
 ## Golden Behavior Training
 

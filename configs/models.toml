@@ -48,11 +48,11 @@ checkpoint = "data/models/conductor_v0"
 fallback = "return_error"
 
 [behavior.experience]
-regime = "hardcoded"
-hardcoded = "experience.feature_encoder"
+regime = "shadow_train"
+hardcoded = "experience.no_latent_yet"
 model = "experience.autoencoder.v0"
 checkpoint = "data/models/experience_v0"
-fallback = "use_hardcoded"
+fallback = "return_error"
 
 [behavior.event_bump]
 regime = "shadow_train"
