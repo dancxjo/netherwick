@@ -10347,6 +10347,9 @@ mod tests {
         assert!(page.contains("function kinectCameraPointToBabylonLocal"));
         assert!(page.contains("function worldMathPointToBabylonWorld"));
         assert!(page.contains("new BABYLON.Vector3(-p.y, p.z, p.x)"));
+        assert!(page.contains(
+            "TransformCoordinates(kinectCameraPointToBabylonLocal(p), robotMatrix)"
+        ));
         assert!(page.contains("return worldMathPointToBabylonWorld(p);"));
         assert!(!page.contains("eyePanel.scaling.x = -1"));
         assert!(page.contains("function drawMirroredImageToEyeCanvas"));
