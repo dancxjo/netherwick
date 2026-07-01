@@ -1082,6 +1082,9 @@ pub struct MapPoseGraphSummary {
     pub odometry_edges: usize,
     pub scan_match_edges: usize,
     pub loop_candidate_edges: usize,
+    pub loop_candidate_active_edges: usize,
+    pub loop_candidate_rejected_edges: usize,
+    pub loop_candidate_rejection_reasons: Vec<String>,
     pub latest_node_id: Option<String>,
     pub latest_edge_source: Option<String>,
     pub optimization: PoseGraphOptimizationSummary,
@@ -2018,6 +2021,8 @@ fn map_pose_graph_summary(map: &LocalMap) -> MapPoseGraphSummary {
     let mut odometry_edges = 0usize;
     let mut scan_match_edges = 0usize;
     let mut loop_candidate_edges = 0usize;
+    let mut loop_candidate_active_edges = 0usize;
+    let mut loop_candidate_rejection_reasons = Vec::new();
     for edge in &map.pose_graph.edges {
         match &edge.source {
             PoseEdgeSource::Odometry => odometry_edges = odometry_edges.saturating_add(1),
@@ -2025,10 +2030,19 @@ fn map_pose_graph_summary(map: &LocalMap) -> MapPoseGraphSummary {
                 scan_match_edges = scan_match_edges.saturating_add(1)
             }
             PoseEdgeSource::LoopClosureCandidate { .. } => {
-                loop_candidate_edges = loop_candidate_edges.saturating_add(1)
+                loop_candidate_edges = loop_candidate_edges.saturating_add(1);
+                if edge.active {
+                    loop_candidate_active_edges = loop_candidate_active_edges.saturating_add(1);
+                } else if let Some(reason) = edge.rejection_reason.as_ref() {
+                    loop_candidate_rejection_reasons.push(reason.clone());
+                }
             }
         }
     }
+    let loop_candidate_rejected_edges =
+        loop_candidate_edges.saturating_sub(loop_candidate_active_edges);
+    loop_candidate_rejection_reasons.sort();
+    loop_candidate_rejection_reasons.dedup();
 
     MapPoseGraphSummary {
         nodes: map.pose_graph.nodes.len(),
@@ -2036,6 +2050,9 @@ fn map_pose_graph_summary(map: &LocalMap) -> MapPoseGraphSummary {
         odometry_edges,
         scan_match_edges,
         loop_candidate_edges,
+        loop_candidate_active_edges,
+        loop_candidate_rejected_edges,
+        loop_candidate_rejection_reasons,
         latest_node_id: map.pose_graph.nodes.last().map(|node| node.id.clone()),
         latest_edge_source: map.pose_graph.edges.last().map(|edge| match &edge.source {
             PoseEdgeSource::Odometry => "odometry".to_string(),
@@ -8919,7 +8936,7 @@ mod tests {
     use netherwick_core::Pose2;
     use netherwick_map::{
         OrientationEstimate, Point3D, PointCloudFrame, PointCloudObservation, PointCloudPoint,
-        PoseEstimate, YawSource,
+        PoseEdge, PoseEstimate, PoseGraph, PoseNode, YawSource,
     };
     use std::sync::{Arc, Mutex};
 
@@ -9795,6 +9812,99 @@ mod tests {
         assert!((forward_hit.end_x_m - 0.5).abs() < 0.001);
         assert!((forward_hit.end_y_m - 1.75).abs() < 0.001);
         assert!((forward_hit.angle_rad - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn map_pose_graph_summary_exposes_loop_acceptance_and_rejection_reasons() {
+        let mut map = LocalMap::default();
+        map.pose_graph = PoseGraph {
+            nodes: vec![
+                PoseNode {
+                    id: "live-pose-0".to_string(),
+                    pose_estimate: PoseEstimate {
+                        pose: Pose2::default(),
+                        confidence: 0.9,
+                        covariance: [0.05, 0.05, 0.1],
+                        source: "test".to_string(),
+                        t_ms: 100,
+                    },
+                    t_ms: 100,
+                    source_frame_id: Some("seed".to_string()),
+                },
+                PoseNode {
+                    id: "live-pose-1".to_string(),
+                    pose_estimate: PoseEstimate {
+                        pose: Pose2 {
+                            x_m: 0.05,
+                            y_m: 0.0,
+                            heading_rad: 0.0,
+                        },
+                        confidence: 0.9,
+                        covariance: [0.05, 0.05, 0.1],
+                        source: "test".to_string(),
+                        t_ms: 200,
+                    },
+                    t_ms: 200,
+                    source_frame_id: Some("return".to_string()),
+                },
+            ],
+            edges: vec![
+                PoseEdge {
+                    from: "live-pose-1".to_string(),
+                    to: "live-pose-0".to_string(),
+                    transform: Pose2::default(),
+                    covariance: [0.04, 0.04, 0.08],
+                    confidence: 0.94,
+                    source: PoseEdgeSource::LoopClosureCandidate {
+                        kind: "entity_constellation".to_string(),
+                        target_frame_id: Some("seed".to_string()),
+                        source_frame_id: Some("return".to_string()),
+                        source_experience_id: None,
+                        source_instant_frame_id: None,
+                        source_vector_refs: Vec::new(),
+                        source_vector_id: Some("constellation-seed".to_string()),
+                        query_vector_id: Some("constellation-return".to_string()),
+                        query_experience_id: None,
+                    },
+                    active: true,
+                    rejection_reason: None,
+                },
+                PoseEdge {
+                    from: "live-pose-1".to_string(),
+                    to: "unresolved".to_string(),
+                    transform: Pose2::default(),
+                    covariance: [0.2, 0.2, 0.4],
+                    confidence: 0.6,
+                    source: PoseEdgeSource::LoopClosureCandidate {
+                        kind: "same_place".to_string(),
+                        target_frame_id: Some("far-away".to_string()),
+                        source_frame_id: Some("return".to_string()),
+                        source_experience_id: None,
+                        source_instant_frame_id: None,
+                        source_vector_refs: Vec::new(),
+                        source_vector_id: Some("place-seed".to_string()),
+                        query_vector_id: Some("place-return".to_string()),
+                        query_experience_id: None,
+                    },
+                    active: false,
+                    rejection_reason: Some("confidence 0.600 below gate 0.850".to_string()),
+                },
+            ],
+        };
+
+        let summary = map_pose_graph_summary(&map);
+
+        assert_eq!(summary.loop_candidate_edges, 2);
+        assert_eq!(summary.loop_candidate_active_edges, 1);
+        assert_eq!(summary.loop_candidate_rejected_edges, 1);
+        assert_eq!(
+            summary.loop_candidate_rejection_reasons,
+            vec!["confidence 0.600 below gate 0.850".to_string()]
+        );
+        assert_eq!(
+            summary.latest_edge_source.as_deref(),
+            Some("loop_closure_candidate")
+        );
     }
 
     #[test]
