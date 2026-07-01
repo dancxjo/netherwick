@@ -2,13 +2,77 @@
 
 `netherwick` is a Rust workspace for Pete Netherwick, an embodied self-training robot architecture.
 
-Pete gathers raw sensors, memory recalls, internal drives, model predictions, surprise, and LLM guidance into `Now`. `Now` is compressed into an `ExperienceLatent`, used to imagine futures, choose actions, and train from consequences.
+Pete now has a working real-world perception path: Kinect RGB and depth data can be fused into aligned, Minecrafty but properly colored 3D voxels that correspond to real objects in real space. The current milestone is important because Netherwick is no longer only passing sensor packets around. It is beginning to hold a visible world model that a human can inspect, debug, and eventually enter through the WebXR viewer.
+
+The project still keeps the larger PETE architecture in view. Pete gathers raw sensors, memory recalls, internal drives, model predictions, surprise, and LLM guidance into `Now`. `Now` is compressed into an `ExperienceLatent`, used to imagine futures, choose actions, and train from consequences.
 
 Pete acts through high-level action primitives. A hard-coded autonomic layer keeps the body safe. The LLM may command, reflect, critique, and teach, but cannot bypass safety.
 
 Every hard-coded behavior is replaceable. It can run directly, shadow-train a model, compare with a model, promote a model, or fall back to safe hand-written logic.
 
 Pete Netherwick is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, and an LLM consciousness that commands and teaches while safety protects the body.
+
+## Current milestone
+
+The live perception stack has matured from loose point clouds and transient hypotheses into an inspectable 3D voxel world:
+
+- Kinect depth and RGB are being aligned into colored voxels.
+- The voxel output is coarse, blocky, and intentionally debuggable.
+- Visible structures in the voxel scene correspond to real things in the room.
+- The 3D/WebXR viewer is the main inspection surface for the current world model.
+- The 2D map path needs restoration after drifting out of alignment and then failing.
+- Movement is temporarily under investigation: commands may be blocked by a safety veto, dropped by a controller path, or blocked by robot mode/state.
+
+The next good artifact is a capture set: screenshots, video capture, and a short golden run containing RGB, depth, IMU, odometry, command traces, safety decisions, and map/voxel outputs from the same session.
+
+## Architecture sketch
+
+```text
+sensors
+  -> synchronized RGB/depth/IMU/body events
+  -> point cloud / voxel projection
+  -> 3D live view and WebXR inspection
+  -> 2D map / occupancy surface
+  -> object and place hypotheses
+  -> Now / ExperienceLatent
+  -> prediction, memory, action, and training loops
+```
+
+The present engineering emphasis is not beauty. It is spatial trust. A crude voxel world that stays aligned is more useful than a polished render that cannot be believed.
+
+## Active debugging tracks
+
+### 3D voxel world
+
+The voxel path is currently the strongest signal. Keep it capture-first and regression-friendly:
+
+```bash
+just live-server
+# open the 3D/WebXR view printed by the server, or visit /view/3d
+```
+
+When the world looks right, save screenshots and a short video. When it looks wrong, preserve the input capture rather than only the rendered failure.
+
+### 2D map restoration
+
+The 2D map previously drifted out of alignment and then stopped working. Treat it as a derived product of the same spatial truth used by the voxel view:
+
+1. Verify that the coordinate frame used for voxel projection is the same frame the 2D map consumes.
+2. Confirm that map updates are still being emitted.
+3. Check whether the map renderer is alive but receiving empty or invalid data.
+4. Compare a known-good capture against the current map path.
+
+### Movement restoration
+
+Movement is expected to remain conservative. Debug it from command intent outward:
+
+1. Did a movement intent get generated?
+2. Did the controller receive it?
+3. Did the safety layer veto it?
+4. Is the base in the correct mode to accept motion?
+5. Did the robot report a fault, dock state, cliff signal, bumper signal, or stale serial/body connection?
+
+Do not bypass safety just to make the wheels turn. The goal is to make the vetoes inspectable so the system can explain why the body refuses to move.
 
 ## Setup
 
@@ -38,9 +102,9 @@ just hardware-env
 
 Scenario reports can be generated with `just run eval-scenario --scenario empty-room --episodes 2 --steps 10 --out data/reports/scenario/empty-smoke.json`. See [docs/scenario-evaluation.md](docs/scenario-evaluation.md) for baseline-vs-checkpoint comparison notes and [docs/model-registry.md](docs/model-registry.md) for checkpoint registration and promotion gates.
 
-## Hardware Bring-Up
+## Hardware bring-up
 
-Pete's Raspberry Pi 5 hardware path starts capture-first: inspect devices, run bounded read-only body/sensor ticks, record Worldlab captures, and inspect the result. Autonomous motor movement is not enabled.
+Pete's Raspberry Pi 5 hardware path starts capture-first: inspect devices, run bounded read-only body/sensor ticks, record Worldlab captures, and inspect the result. Autonomous motor movement is not enabled by default.
 
 ```bash
 cargo run --bin netherwick -- hardware-env
