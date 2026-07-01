@@ -1931,7 +1931,7 @@ pub struct ImuSenseProvider {
     #[cfg(feature = "linux-hardware")]
     imu: Mpu6050Imu,
     #[cfg(feature = "linux-hardware")]
-    flat_orientation_zero: Option<(f32, f32)>,
+    flat_orientation_zero: Option<Mpu6050GravityBaseline>,
 }
 
 impl ImuSenseProvider {
@@ -1968,21 +1968,111 @@ impl SenseProducer for ImuSenseProvider {
 }
 
 #[cfg(any(feature = "linux-hardware", test))]
-fn zero_mpu6050_orientation_to_flat(
-    sense: &mut ImuSense,
-    flat_orientation_zero: &mut Option<(f32, f32)>,
-) {
-    let Some((&roll, &pitch)) = sense.orientation.first().zip(sense.orientation.get(1)) else {
-        return;
-    };
-    let (zero_roll, zero_pitch) = flat_orientation_zero.get_or_insert((roll, pitch));
-    sense.orientation[0] = normalize_angle_rad(roll - *zero_roll);
-    sense.orientation[1] = normalize_angle_rad(pitch - *zero_pitch);
+#[derive(Clone, Copy, Debug)]
+struct Mpu6050GravityBaseline {
+    gravity_unit: Vec3Unit,
 }
 
 #[cfg(any(feature = "linux-hardware", test))]
-fn normalize_angle_rad(angle: f32) -> f32 {
-    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+#[derive(Clone, Copy, Debug)]
+struct Vec3Unit {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn zero_mpu6050_orientation_to_flat(
+    sense: &mut ImuSense,
+    flat_orientation_zero: &mut Option<Mpu6050GravityBaseline>,
+) {
+    let Some(gravity_unit) = normalized_mpu6050_gravity(sense) else {
+        return;
+    };
+    let baseline = flat_orientation_zero.get_or_insert(Mpu6050GravityBaseline { gravity_unit });
+    let leveled_gravity = rotate_gravity_to_flat_baseline(gravity_unit, baseline.gravity_unit);
+    let (roll, pitch) = roll_pitch_from_gravity(leveled_gravity);
+    if sense.orientation.len() < 2 {
+        sense.orientation.resize(2, 0.0);
+    }
+    sense.orientation[0] = roll;
+    sense.orientation[1] = pitch;
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn normalized_mpu6050_gravity(sense: &ImuSense) -> Option<Vec3Unit> {
+    let x = sense.acceleration.first().copied()?;
+    let y = sense.acceleration.get(1).copied()?;
+    let z = sense.acceleration.get(2).copied()?;
+    normalized_vec3(x, y, z)
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn normalized_vec3(x: f32, y: f32, z: f32) -> Option<Vec3Unit> {
+    if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+        return None;
+    }
+    let norm = (x * x + y * y + z * z).sqrt();
+    if norm <= 0.001 {
+        return None;
+    }
+    Some(Vec3Unit {
+        x: x / norm,
+        y: y / norm,
+        z: z / norm,
+    })
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn rotate_gravity_to_flat_baseline(gravity: Vec3Unit, baseline: Vec3Unit) -> Vec3Unit {
+    const Z_UP: Vec3Unit = Vec3Unit {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    rotate_vec3_between_unit_vectors(gravity, baseline, Z_UP)
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn rotate_vec3_between_unit_vectors(value: Vec3Unit, from: Vec3Unit, to: Vec3Unit) -> Vec3Unit {
+    let axis_x = from.y * to.z - from.z * to.y;
+    let axis_y = from.z * to.x - from.x * to.z;
+    let axis_z = from.x * to.y - from.y * to.x;
+    let sin_angle = (axis_x * axis_x + axis_y * axis_y + axis_z * axis_z).sqrt();
+    let cos_angle = (from.x * to.x + from.y * to.y + from.z * to.z).clamp(-1.0, 1.0);
+
+    if sin_angle <= 0.000001 {
+        if cos_angle > 0.0 {
+            return value;
+        }
+        return Vec3Unit {
+            x: value.x,
+            y: -value.y,
+            z: -value.z,
+        };
+    }
+
+    let ux = axis_x / sin_angle;
+    let uy = axis_y / sin_angle;
+    let uz = axis_z / sin_angle;
+    let cross_x = uy * value.z - uz * value.y;
+    let cross_y = uz * value.x - ux * value.z;
+    let cross_z = ux * value.y - uy * value.x;
+    let dot = ux * value.x + uy * value.y + uz * value.z;
+    let one_minus_cos = 1.0 - cos_angle;
+
+    Vec3Unit {
+        x: value.x * cos_angle + cross_x * sin_angle + ux * dot * one_minus_cos,
+        y: value.y * cos_angle + cross_y * sin_angle + uy * dot * one_minus_cos,
+        z: value.z * cos_angle + cross_z * sin_angle + uz * dot * one_minus_cos,
+    }
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn roll_pitch_from_gravity(gravity: Vec3Unit) -> (f32, f32) {
+    let roll_rad = gravity.y.atan2(gravity.z);
+    let pitch_rad = (-gravity.x).atan2((gravity.y * gravity.y + gravity.z * gravity.z).sqrt());
+    (roll_rad, pitch_rad)
 }
 
 #[cfg(test)]
@@ -2154,21 +2244,49 @@ mod tests {
     #[test]
     fn mpu6050_orientation_is_zeroed_to_first_flat_sample() {
         let mut zero = None;
+        let baseline_gravity =
+            test_gravity_for_roll_pitch(120.0_f32.to_radians(), 62.0_f32.to_radians());
         let mut first = ImuSense {
             orientation: vec![120.0_f32.to_radians(), 62.0_f32.to_radians()],
+            acceleration: vec![baseline_gravity.x, baseline_gravity.y, baseline_gravity.z],
             ..ImuSense::default()
         };
         zero_mpu6050_orientation_to_flat(&mut first, &mut zero);
         assert!(first.orientation[0].abs() < 0.0001);
         assert!(first.orientation[1].abs() < 0.0001);
 
+        let expected_roll = 5.0_f32.to_radians();
+        let expected_pitch = (-10.0_f32).to_radians();
+        let expected_leveled_gravity = test_gravity_for_roll_pitch(expected_roll, expected_pitch);
+        let next_gravity = rotate_vec3_between_unit_vectors(
+            expected_leveled_gravity,
+            test_z_axis(),
+            baseline_gravity,
+        );
         let mut next = ImuSense {
-            orientation: vec![121.0_f32.to_radians(), 60.0_f32.to_radians()],
+            orientation: vec![0.0, 0.0],
+            acceleration: vec![next_gravity.x, next_gravity.y, next_gravity.z],
             ..ImuSense::default()
         };
         zero_mpu6050_orientation_to_flat(&mut next, &mut zero);
-        assert!((next.orientation[0] - 1.0_f32.to_radians()).abs() < 0.0001);
-        assert!((next.orientation[1] - (-2.0_f32).to_radians()).abs() < 0.0001);
+        assert!((next.orientation[0] - expected_roll).abs() < 0.0001);
+        assert!((next.orientation[1] - expected_pitch).abs() < 0.0001);
+    }
+
+    fn test_gravity_for_roll_pitch(roll_rad: f32, pitch_rad: f32) -> Vec3Unit {
+        Vec3Unit {
+            x: -pitch_rad.sin(),
+            y: roll_rad.sin() * pitch_rad.cos(),
+            z: roll_rad.cos() * pitch_rad.cos(),
+        }
+    }
+
+    fn test_z_axis() -> Vec3Unit {
+        Vec3Unit {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        }
     }
 
     #[test]

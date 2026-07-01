@@ -1924,36 +1924,8 @@ impl Neo4jGraphStore {
 #[async_trait]
 impl GraphStore for Neo4jGraphStore {
     async fn upsert_graph(&self, record: &MemoryRecord) -> Result<()> {
-        let entities = record
-            .graph_entities
-            .iter()
-            .map(|entity| {
-                json!({
-                    "id": entity.id,
-                    "labels": entity.labels,
-                    "summary": entity.summary,
-                    "score": entity.score,
-                    "frame_id": record.frame_id.to_string(),
-                    "t_ms": record.t_ms,
-                })
-            })
-            .collect::<Vec<_>>();
-        let relationships = record
-            .graph_relationships
-            .iter()
-            .map(|edge| {
-                json!({
-                    "from": edge.from,
-                    "to": edge.to,
-                    "kind": edge.relationship,
-                    "summary": edge.summary,
-                    "score": edge.score,
-                    "payload": edge.payload,
-                    "frame_id": record.frame_id.to_string(),
-                    "t_ms": record.t_ms,
-                })
-            })
-            .collect::<Vec<_>>();
+        let entities = neo4j_entity_params(record);
+        let relationships = neo4j_relationship_params(record);
 
         self.run_cypher(
             r#"
@@ -1971,9 +1943,10 @@ MATCH (to:MemoryNode {id: relationship.to})
 MERGE (from)-[r:RELATED {kind: relationship.kind}]->(to)
 SET r.summary = relationship.summary,
     r.score = relationship.score,
-    r.payload = relationship.payload,
+    r.payload_json = relationship.payload_json,
     r.frame_id = relationship.frame_id,
     r.t_ms = relationship.t_ms
+REMOVE r.payload
 "#,
             json!({
                 "entities": entities,
@@ -1982,6 +1955,42 @@ SET r.summary = relationship.summary,
         )
         .await
     }
+}
+
+fn neo4j_entity_params(record: &MemoryRecord) -> Vec<serde_json::Value> {
+    record
+        .graph_entities
+        .iter()
+        .map(|entity| {
+            json!({
+                "id": entity.id,
+                "labels": entity.labels,
+                "summary": entity.summary,
+                "score": entity.score,
+                "frame_id": record.frame_id.to_string(),
+                "t_ms": record.t_ms,
+            })
+        })
+        .collect()
+}
+
+fn neo4j_relationship_params(record: &MemoryRecord) -> Vec<serde_json::Value> {
+    record
+        .graph_relationships
+        .iter()
+        .map(|edge| {
+            json!({
+                "from": edge.from,
+                "to": edge.to,
+                "kind": edge.relationship,
+                "summary": edge.summary,
+                "score": edge.score,
+                "payload_json": edge.payload.to_string(),
+                "frame_id": record.frame_id.to_string(),
+                "t_ms": record.t_ms,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -5244,6 +5253,52 @@ mod tests {
             Some("http://localhost:7474".to_string())
         );
         assert_eq!(neo4j_http_url_from_uri("http://localhost:7474"), None);
+    }
+
+    #[test]
+    fn neo4j_relationship_params_serialize_nested_payloads() {
+        let record = MemoryRecord {
+            frame_id: uuid::Uuid::new_v4(),
+            t_ms: 1_000,
+            summary: "place memory".to_string(),
+            graph_entities: Vec::new(),
+            graph_relationships: vec![GraphEdge {
+                from: "embodied_experience:test".to_string(),
+                to: "place:grid:0:0".to_string(),
+                relationship: "occurred_at_place".to_string(),
+                summary: Some("place near x=0.0m y=0.0m".to_string()),
+                score: 1.0,
+                payload: json!({
+                    "target_kind": "place",
+                    "text": "place near x=0.0m y=0.0m",
+                    "x_m": 0.0,
+                    "y_m": 0.0,
+                    "heading_rad": 0.0,
+                }),
+            }],
+            scene_vectors: Vec::new(),
+            face_vectors: Vec::new(),
+            voice_vectors: Vec::new(),
+            sensation_vectors: Vec::new(),
+            experience_vectors: Vec::new(),
+            vector_payloads: BTreeMap::new(),
+            battery: 1.0,
+            active_goal: None,
+            chosen_action: None,
+            warning: None,
+            experience: None,
+        };
+
+        let params = neo4j_relationship_params(&record);
+        let payload_json = params[0]["payload_json"]
+            .as_str()
+            .expect("payload serialized as string");
+        let payload: serde_json::Value =
+            serde_json::from_str(payload_json).expect("payload_json is valid json");
+
+        assert!(params[0].get("payload").is_none());
+        assert_eq!(payload["target_kind"], "place");
+        assert_eq!(payload["heading_rad"], 0.0);
     }
 
     fn now_at(t_ms: u64, x_m: f32, y_m: f32) -> Now {
