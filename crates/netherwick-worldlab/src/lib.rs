@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use image::{ImageBuffer, Luma, RgbImage};
 use netherwick_experience::{ExperienceLatent, FuturePrediction};
+use netherwick_perception::PerceptionFrame;
 use netherwick_runtime::{RuntimeLoop, RuntimeTick};
 use netherwick_sensors::{EyeFrameFormat, PcmAudioFrame, WorldSnapshot};
 use netherwick_sim::ScenarioMetadata;
@@ -94,6 +95,8 @@ pub struct CaptureFrameAssets {
     pub audio: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointcloud: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perception: Option<String>,
 }
 
 impl CaptureFrameAssets {
@@ -102,6 +105,7 @@ impl CaptureFrameAssets {
             && self.depth.is_none()
             && self.audio.is_none()
             && self.pointcloud.is_none()
+            && self.perception.is_none()
     }
 }
 
@@ -333,11 +337,13 @@ fn default_asset_layout() -> Value {
         "depth": "assets/depth/",
         "audio": "assets/audio/",
         "pointcloud": "assets/pointcloud/",
+        "perception": "assets/perception/",
         "paths": "frame asset paths are relative to capture root",
         "rgb_format": "PNG RGB8",
         "depth_format": "PNG Gray16, millimeters",
         "audio_format": "WAV PCM16",
-        "pointcloud_format": "PLY ASCII"
+        "pointcloud_format": "PLY ASCII",
+        "perception_format": "JSON PerceptionFrame"
     })
 }
 
@@ -557,6 +563,38 @@ pub fn export_pointcloud_for_frame(
     Ok(Some(metadata))
 }
 
+pub fn export_perception_for_frame(
+    root: &Path,
+    frame: &mut CaptureFrameRecord,
+) -> Result<Option<Value>> {
+    let Some(perception) = PerceptionFrame::from_world_snapshot(&frame.snapshot, frame.t_ms) else {
+        return Ok(None);
+    };
+    let rel = capture_asset_path("perception", frame.index, "json");
+    let path = root.join(&rel);
+    if let Some(parent) = path.parent() {
+        std_fs::create_dir_all(parent)?;
+    }
+    std_fs::write(&path, serde_json::to_vec_pretty(&perception)?)?;
+    frame.assets.perception = Some(rel);
+    let mut metadata = frame
+        .stream_metadata
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.insert(
+        "perception".to_string(),
+        serde_json::json!({
+            "format": "perception_frame_json",
+            "frame_id": perception.frame_id.0,
+            "points": perception.points.len()
+        }),
+    );
+    let metadata = Value::Object(metadata);
+    frame.stream_metadata = Some(metadata.clone());
+    Ok(Some(metadata))
+}
+
 pub async fn rewrite_frames(root: &Path, frames: &[CaptureFrameRecord]) -> Result<()> {
     let path = root.join(FRAMES_FILE);
     let mut file = OpenOptions::new()
@@ -760,6 +798,7 @@ mod tests {
                 depth: Some("assets/depth/000001.depth16.png".to_string()),
                 audio: None,
                 pointcloud: Some("assets/pointcloud/000001.ply".to_string()),
+                perception: None,
             },
             stream_metadata: Some(serde_json::json!({"rgb": {"width": 2, "height": 2}})),
         };
@@ -772,6 +811,38 @@ mod tests {
             "assets/pointcloud/000001.ply"
         );
         assert_eq!(encoded["stream_metadata"]["rgb"]["width"], 2);
+    }
+
+    #[test]
+    fn perception_export_writes_frame_json_asset() {
+        let dir = tempdir().unwrap();
+        let mut frame = CaptureFrameRecord {
+            index: 123,
+            t_ms: 456,
+            snapshot: WorldSnapshot::default(),
+            events: Vec::new(),
+            assets: CaptureFrameAssets::default(),
+            stream_metadata: None,
+        };
+        frame.snapshot.kinect.depth_width = 2;
+        frame.snapshot.kinect.depth_height = 1;
+        frame.snapshot.kinect.depth_m = vec![1.0, 2.0];
+        frame.snapshot.kinect.depth_fx = 1.0;
+        frame.snapshot.kinect.depth_fy = 1.0;
+        frame.snapshot.kinect.min_depth_m = 0.1;
+        frame.snapshot.kinect.max_depth_m = 8.0;
+
+        let metadata = export_perception_for_frame(dir.path(), &mut frame)
+            .unwrap()
+            .unwrap();
+        let rel = frame.assets.perception.as_deref().unwrap();
+        let encoded = std_fs::read_to_string(dir.path().join(rel)).unwrap();
+        let decoded: PerceptionFrame = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(rel, "assets/perception/000123.json");
+        assert_eq!(metadata["perception"]["points"], 2);
+        assert_eq!(decoded.points[1].depth.index, 1);
+        assert_eq!(decoded.points[1].depth.u, 1);
     }
 
     #[test]

@@ -87,6 +87,14 @@ pub struct PointCloudPoint {
     pub position: Point3D,
     pub color_rgb: Option<[u8; 3]>,
     pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_uv: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_image_size: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frame_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2063,6 +2071,8 @@ pub fn pointcloud_observation_from_kinect(
         .max(1);
     let min_depth_m = positive_or(kinect.min_depth_m, config.min_depth_m);
     let max_depth_m = positive_or(kinect.max_depth_m, config.max_depth_m);
+    let source_frame_id =
+        (kinect.captured_at_ms > 0).then(|| format!("kinect-depth-{}", kinect.captured_at_ms));
     let mut skipped_depth_count = 0usize;
     let mut clipped_depth_count = 0usize;
     let mut points = Vec::new();
@@ -2084,6 +2094,10 @@ pub fn pointcloud_observation_from_kinect(
             position: Point3D { x_m, y_m, z_m },
             color_rgb: depth_shade(z_m, max_depth_m),
             confidence: pose_confidence,
+            depth_index: Some(index),
+            depth_uv: Some([u as u32, v as u32]),
+            depth_image_size: Some([projection.width as u32, projection.height as u32]),
+            source_frame_id: source_frame_id.clone(),
         });
     }
     if points.is_empty() {
@@ -3367,6 +3381,31 @@ mod tests {
     }
 
     #[test]
+    fn pointcloud_projection_preserves_depth_pixel_provenance() {
+        let mut snapshot = kinect_snapshot_at(0.0, 0.0, 0.0, vec![1.0, 2.0, 0.0, 3.0], 2, 2);
+        snapshot.kinect.captured_at_ms = 123;
+
+        let observation = pointcloud_observation_from_snapshot(
+            &snapshot,
+            500,
+            PointCloudConfig {
+                max_points_per_observation: 16,
+                ..PointCloudConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observation.points.len(), 3);
+        assert_eq!(observation.points[1].depth_index, Some(1));
+        assert_eq!(observation.points[1].depth_uv, Some([1, 0]));
+        assert_eq!(observation.points[1].depth_image_size, Some([2, 2]));
+        assert_eq!(
+            observation.points[1].source_frame_id.as_deref(),
+            Some("kinect-depth-123")
+        );
+    }
+
+    #[test]
     fn stationary_rotate_world_frame_observations_merge_into_stable_belief() {
         let mut cloud = VoxelPointCloud::new(PointCloudConfig {
             voxel_size_m: 0.25,
@@ -3404,6 +3443,10 @@ mod tests {
                     },
                     color_rgb: None,
                     confidence: 1.0,
+                    depth_index: None,
+                    depth_uv: None,
+                    depth_image_size: None,
+                    source_frame_id: None,
                 }],
                 source: "rotate-test".to_string(),
                 t_ms,
@@ -3455,6 +3498,10 @@ mod tests {
                         },
                         color_rgb: None,
                         confidence: 1.0,
+                        depth_index: None,
+                        depth_uv: None,
+                        depth_image_size: None,
+                        source_frame_id: None,
                     }],
                     source: "surface-test".to_string(),
                     t_ms: 100,

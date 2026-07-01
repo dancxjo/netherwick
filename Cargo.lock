@@ -4838,6 +4838,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "netherwick-perception"
+version = "0.1.0"
+dependencies = [
+ "netherwick-core",
+ "netherwick-now",
+ "netherwick-sensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "netherwick-runtime"
 version = "0.1.0"
 dependencies = [
@@ -5020,6 +5031,7 @@ dependencies = [
  "netherwick-llm",
  "netherwick-memory",
  "netherwick-now",
+ "netherwick-perception",
  "netherwick-runtime",
  "netherwick-sensors",
  "netherwick-sim",

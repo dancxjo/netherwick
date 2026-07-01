@@ -16,6 +16,7 @@ members = [
     "crates/netherwick-experience",
     "crates/netherwick-memory",
     "crates/netherwick-map",
+    "crates/netherwick-perception",
     "crates/netherwick-mouth",
     "crates/netherwick-events",
     "crates/netherwick-llm",
