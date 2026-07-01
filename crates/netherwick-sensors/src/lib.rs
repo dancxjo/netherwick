@@ -1164,7 +1164,12 @@ impl CpalMicrophone {
         let actual_channels = config.channels;
         let latest = Arc::new(Mutex::new(None));
         let shared = Arc::clone(&latest);
-        let err_fn = |err| eprintln!("cpal input stream error: {err}");
+        let err_fn = |err: cpal::StreamError| {
+            let message = err.to_string();
+            if !is_muted_cpal_input_stream_error(&message) {
+                eprintln!("cpal input stream error: {message}");
+            }
+        };
         let stream = match sample_format {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config,
@@ -1212,6 +1217,12 @@ impl CpalMicrophone {
     pub fn latest_frame(&self) -> Option<PcmAudioFrame> {
         self.latest.lock().ok().and_then(|guard| guard.clone())
     }
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn is_muted_cpal_input_stream_error(message: &str) -> bool {
+    message.contains("snd_pcm_poll_descriptors")
+        && message.contains("Unknown errno (-32)")
 }
 
 #[cfg(feature = "linux-hardware")]
@@ -1694,7 +1705,6 @@ fn parse_nmea_coord(value: &str, hemi: &str) -> Option<f64> {
     Some(decimal)
 }
 
-#[cfg(any(feature = "linux-hardware", feature = "kinect-freenect", test))]
 fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2392,6 +2402,23 @@ mod tests {
         assert_eq!(artifact.model.as_deref(), Some("test.face.detector"));
         assert_eq!(artifact.source_frame_id.as_deref(), Some("eye-42-1x1-3"));
         assert_eq!(artifact.occurred_at_ms, Some(100));
+    }
+
+    #[test]
+    fn mutes_repeated_alsa_poll_descriptor_input_stream_error() {
+        assert!(is_muted_cpal_input_stream_error(
+            "A backend-specific error has occurred: ALSA function 'snd_pcm_poll_descriptors' failed with error 'Unknown errno (-32)'"
+        ));
+    }
+
+    #[test]
+    fn keeps_other_cpal_input_stream_errors_visible() {
+        assert!(!is_muted_cpal_input_stream_error(
+            "A backend-specific error has occurred: ALSA function 'snd_pcm_readi' failed with error 'Input/output error'"
+        ));
+        assert!(!is_muted_cpal_input_stream_error(
+            "A backend-specific error has occurred: ALSA function 'snd_pcm_poll_descriptors' failed with error 'Input/output error'"
+        ));
     }
 
     #[tokio::test]

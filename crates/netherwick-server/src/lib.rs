@@ -6664,7 +6664,7 @@ function robotRenderPointToBabylonLocal(p){
 }
 
 function kinectCameraPointToBabylonLocal(p){
-  return new BABYLON.Vector3(p.x, -p.y, p.z);
+  return new BABYLON.Vector3(p.x, -p.y, -p.z);
 }
 
 function worldMathPointToBabylonWorld(p){
@@ -7726,8 +7726,25 @@ function drawTraceMap(packet, liveMap=null){
   const poses = liveMap?.pose_trail?.length ? liveMap.pose_trail : traceState.poses;
   const latest = liveMap?.current_pose || poses[poses.length - 1] || {x_m:0, y_m:0, heading_rad:0};
   const scale = 42;
-  const sx = x => w / 2 + (x - latest.x_m) * scale;
-  const sy = y => h / 2 - (y - latest.y_m) * scale;
+  const heading = Number(latest.heading_rad) || 0;
+  const headingCos = Math.cos(heading);
+  const headingSin = Math.sin(heading);
+  const traceLocal = (x, y) => {
+    const dx = x - latest.x_m;
+    const dy = y - latest.y_m;
+    return {
+      forward: dx * headingCos + dy * headingSin,
+      left: -dx * headingSin + dy * headingCos
+    };
+  };
+  const sx = (x, y) => {
+    const p = traceLocal(x, y);
+    return w / 2 - p.left * scale;
+  };
+  const sy = (x, y) => {
+    const p = traceLocal(x, y);
+    return h / 2 - p.forward * scale;
+  };
   if(layers.has('occupancy')){
     if(liveMap?.cells?.length){
       for(const cell of liveMap.cells){
@@ -7735,13 +7752,13 @@ function drawTraceMap(packet, liveMap=null){
         const alpha = Math.max(.16, Math.min(.78, Number(cell.confidence) || .2));
         traceCtx.fillStyle = occupied ? `rgba(255,182,86,${alpha})` : `rgba(77,144,185,${alpha * .45})`;
         const size = occupied ? 4 : 2;
-        traceCtx.fillRect(sx(cell.center_x_m)-size/2, sy(cell.center_y_m)-size/2, size, size);
+        traceCtx.fillRect(sx(cell.center_x_m, cell.center_y_m)-size/2, sy(cell.center_x_m, cell.center_y_m)-size/2, size, size);
       }
     }else{
       traceCtx.fillStyle = 'rgba(77,144,185,.22)';
-      for(const cell of traceState.free.values()) traceCtx.fillRect(sx(cell.x)-1, sy(cell.y)-1, 2, 2);
+      for(const cell of traceState.free.values()) traceCtx.fillRect(sx(cell.x, cell.y)-1, sy(cell.x, cell.y)-1, 2, 2);
       traceCtx.fillStyle = 'rgba(255,182,86,.62)';
-      for(const cell of traceState.occupied.values()) traceCtx.fillRect(sx(cell.x)-2, sy(cell.y)-2, 4, 4);
+      for(const cell of traceState.occupied.values()) traceCtx.fillRect(sx(cell.x, cell.y)-2, sy(cell.x, cell.y)-2, 4, 4);
     }
   }
   if((layers.has('rays') || layers.has('free-space rays')) && liveMap?.range_beams?.length){
@@ -7749,8 +7766,8 @@ function drawTraceMap(packet, liveMap=null){
     for(const beam of liveMap.range_beams){
       traceCtx.strokeStyle = beam.hit ? 'rgba(255,207,102,.46)' : 'rgba(82,169,255,.22)';
       traceCtx.beginPath();
-      traceCtx.moveTo(sx(beam.origin_x_m), sy(beam.origin_y_m));
-      traceCtx.lineTo(sx(beam.end_x_m), sy(beam.end_y_m));
+      traceCtx.moveTo(sx(beam.origin_x_m, beam.origin_y_m), sy(beam.origin_x_m, beam.origin_y_m));
+      traceCtx.lineTo(sx(beam.end_x_m, beam.end_y_m), sy(beam.end_x_m, beam.end_y_m));
       traceCtx.stroke();
     }
   }
@@ -7764,7 +7781,7 @@ function drawTraceMap(packet, liveMap=null){
       const occupied = cell.state === 'occupied' || cell.state?.Occupied != null;
       traceCtx.fillStyle = occupied ? 'rgba(255,102,126,.72)' : 'rgba(91,220,159,.26)';
       const size = occupied ? 4 : 2;
-      traceCtx.fillRect(sx(p.x)-size/2, sy(p.y)-size/2, size, size);
+      traceCtx.fillRect(sx(p.x, p.y)-size/2, sy(p.x, p.y)-size/2, size, size);
     }
   }
   if(liveMap?.semantic_cells?.length){
@@ -7774,7 +7791,7 @@ function drawTraceMap(packet, liveMap=null){
       traceCtx.fillStyle = colors[cell.kind] || '#dce8f2';
       traceCtx.globalAlpha = Math.max(.24, Math.min(.9, Number(cell.confidence) || .6));
       traceCtx.beginPath();
-      traceCtx.arc(sx(cell.x_m), sy(cell.y_m), 4 + 4 * Math.min(1, Number(cell.score) || .5), 0, Math.PI * 2);
+      traceCtx.arc(sx(cell.x_m, cell.y_m), sy(cell.x_m, cell.y_m), 4 + 4 * Math.min(1, Number(cell.score) || .5), 0, Math.PI * 2);
       traceCtx.fill();
       traceCtx.globalAlpha = 1;
     }
@@ -7783,20 +7800,20 @@ function drawTraceMap(packet, liveMap=null){
   traceCtx.lineWidth = 1.5;
   traceCtx.beginPath();
   poses.forEach((pose, index) => {
-    if(index === 0) traceCtx.moveTo(sx(pose.x_m), sy(pose.y_m));
-    else traceCtx.lineTo(sx(pose.x_m), sy(pose.y_m));
+    if(index === 0) traceCtx.moveTo(sx(pose.x_m, pose.y_m), sy(pose.x_m, pose.y_m));
+    else traceCtx.lineTo(sx(pose.x_m, pose.y_m), sy(pose.x_m, pose.y_m));
   });
   traceCtx.stroke();
   const events = liveMap?.events?.length ? liveMap.events : traceState.events;
   if(layers.has('events')) for(const event of events){
     traceCtx.fillStyle = event.kind === 'safety' ? '#ff4d5f' : event.kind === 'stuck' ? '#ffd166' : '#ff8b4a';
     traceCtx.beginPath();
-    traceCtx.arc(sx(event.x_m ?? event.x), sy(event.y_m ?? event.y), 3, 0, Math.PI * 2);
+    traceCtx.arc(sx(event.x_m ?? event.x, event.y_m ?? event.y), sy(event.x_m ?? event.x, event.y_m ?? event.y), 3, 0, Math.PI * 2);
     traceCtx.fill();
   }
   traceCtx.save();
-  traceCtx.translate(sx(latest.x_m), sy(latest.y_m));
-  traceCtx.rotate(-latest.heading_rad);
+  traceCtx.translate(w / 2, h / 2);
+  traceCtx.rotate(-Math.PI / 2);
   traceCtx.fillStyle = '#dce8f2';
   traceCtx.beginPath();
   traceCtx.moveTo(9, 0);
@@ -10346,6 +10363,7 @@ mod tests {
         assert!(page.contains("function robotRenderPointToBabylonLocal"));
         assert!(page.contains("function kinectCameraPointToBabylonLocal"));
         assert!(page.contains("function worldMathPointToBabylonWorld"));
+        assert!(page.contains("new BABYLON.Vector3(p.x, -p.y, -p.z)"));
         assert!(page.contains("new BABYLON.Vector3(-p.y, p.z, p.x)"));
         assert!(page.contains(
             "TransformCoordinates(kinectCameraPointToBabylonLocal(p), robotMatrix)"
@@ -10360,6 +10378,9 @@ mod tests {
         assert!(page.contains(
             "Scan-matched occupancy map: range scans correct odometry before integration."
         ));
+        assert!(page.contains("const traceLocal = (x, y) =>"));
+        assert!(page.contains("forward: dx * headingCos + dy * headingSin"));
+        assert!(page.contains("traceCtx.rotate(-Math.PI / 2);"));
         assert!(page.contains("id=\"entity-graph\""));
         assert!(page.contains("drawEntityGraph"));
         assert!(page.contains("createDefaultXRExperienceAsync"));
