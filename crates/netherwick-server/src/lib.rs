@@ -6778,12 +6778,12 @@ function renderPoints(points, coordinateSystem){
     let worldPoint;
     if (isRobot) {
       worldPoint = BABYLON.Vector3.TransformCoordinates(
-        new BABYLON.Vector3(p.x, p.y, -p.z),
+        new BABYLON.Vector3(-p.x, p.y, p.z),
         robotMatrix
       );
     } else if (isSceneRobotRender) {
       worldPoint = BABYLON.Vector3.TransformCoordinates(
-        new BABYLON.Vector3(p.x, p.y, -p.z),
+        new BABYLON.Vector3(-p.x, p.y, p.z),
         robotMatrix
       );
     } else if (isKinectCamera) {
@@ -6792,7 +6792,7 @@ function renderPoints(points, coordinateSystem){
         kinectMatrix
       );
     } else if (isWorldMath) {
-      worldPoint = new BABYLON.Vector3(p.y, p.z, -p.x);
+      worldPoint = new BABYLON.Vector3(-p.y, p.z, p.x);
     } else {
       worldPoint = new BABYLON.Vector3(p.x, p.y, p.z);
     }
@@ -7090,6 +7090,17 @@ function writeYuvPixel(data, target, y, u, v){
   data[target] = r; data[target + 1] = g; data[target + 2] = b; data[target + 3] = 255;
 }
 
+function mirroredImageTargetOffset(x, y, width){
+  return (y * width + (width - 1 - x)) * 4;
+}
+
+function drawMirroredImageToEyeCanvas(img){
+  const ctx = eyeCanvas.getContext('2d');
+  ctx.setTransform(-1, 0, 0, 1, eyeCanvas.width, 0);
+  ctx.drawImage(img, 0, 0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
 function renderRawEyeFrame(frame){
   if(!frame) return false;
   const fmt = frame.format;
@@ -7103,21 +7114,29 @@ function renderRawEyeFrame(frame){
     eyeCanvas.width = frame.width; eyeCanvas.height = frame.height;
     const image = eyeCanvas.getContext('2d').createImageData(frame.width, frame.height);
     if(isGray){
-      for(let source = 0, target = 0; target < image.data.length && source < frame.bytes.length; source += 1, target += 4){
+      for(let source = 0; source < frame.bytes.length && source < frame.width * frame.height; source += 1){
+        const x = source % frame.width;
+        const y = Math.floor(source / frame.width);
+        const target = mirroredImageTargetOffset(x, y, frame.width);
         const value = frame.bytes[source];
         image.data[target] = value; image.data[target + 1] = value; image.data[target + 2] = value; image.data[target + 3] = 255;
       }
     }else if(isYuyv || isUyvy){
-      for(let source = 0, target = 0; target + 7 < image.data.length && source + 3 < frame.bytes.length; source += 4, target += 8){
+      for(let source = 0, pixel = 0; pixel + 1 < frame.width * frame.height && source + 3 < frame.bytes.length; source += 4, pixel += 2){
         const y0 = isUyvy ? frame.bytes[source + 1] : frame.bytes[source];
         const u = isUyvy ? frame.bytes[source] : frame.bytes[source + 1];
         const y1 = isUyvy ? frame.bytes[source + 3] : frame.bytes[source + 2];
         const v = isUyvy ? frame.bytes[source + 2] : frame.bytes[source + 3];
-        writeYuvPixel(image.data, target, y0, u, v);
-        writeYuvPixel(image.data, target + 4, y1, u, v);
+        const x0 = pixel % frame.width;
+        const row = Math.floor(pixel / frame.width);
+        writeYuvPixel(image.data, mirroredImageTargetOffset(x0, row, frame.width), y0, u, v);
+        writeYuvPixel(image.data, mirroredImageTargetOffset(x0 + 1, row, frame.width), y1, u, v);
       }
     }else{
-      for(let source = 0, target = 0; target < image.data.length && source + 2 < frame.bytes.length; source += 3, target += 4){
+      for(let source = 0, pixel = 0; pixel < frame.width * frame.height && source + 2 < frame.bytes.length; source += 3, pixel += 1){
+        const x = pixel % frame.width;
+        const y = Math.floor(pixel / frame.width);
+        const target = mirroredImageTargetOffset(x, y, frame.width);
         image.data[target] = isBgr ? frame.bytes[source + 2] : frame.bytes[source];
         image.data[target + 1] = frame.bytes[source + 1];
         image.data[target + 2] = isBgr ? frame.bytes[source] : frame.bytes[source + 2];
@@ -7135,7 +7154,7 @@ function renderRawEyeFrame(frame){
     const img = new Image();
     img.onload = () => {
       eyeCanvas.width = img.width; eyeCanvas.height = img.height;
-      eyeCanvas.getContext('2d').drawImage(img, 0, 0);
+      drawMirroredImageToEyeCanvas(img);
       eyeTexture.update();
       useDynamicTexture();
       URL.revokeObjectURL(url);
@@ -7171,7 +7190,7 @@ function renderEye(packet){
   const img = new Image();
   img.onload = () => {
     eyeCanvas.width = img.width; eyeCanvas.height = img.height;
-    eyeCanvas.getContext('2d').drawImage(img, 0, 0);
+    drawMirroredImageToEyeCanvas(img);
     eyeTexture.update();
     useDynamicTexture();
   };
@@ -10373,8 +10392,10 @@ mod tests {
         assert!(page.contains("data-map-layer=\"stable wall candidates\""));
         assert!(page.contains("function renderWorldBeliefPoints"));
         assert!(page.contains("const isWorldMath = coordinateSystem === 'world'"));
-        assert!(page.contains("new BABYLON.Vector3(p.y, p.z, -p.x)"));
+        assert!(page.contains("new BABYLON.Vector3(-p.y, p.z, p.x)"));
         assert!(!page.contains("eyePanel.scaling.x = -1"));
+        assert!(page.contains("function drawMirroredImageToEyeCanvas"));
+        assert!(page.contains("mirroredImageTargetOffset"));
         assert!(page.contains("function renderPersistentWorldBelief"));
         assert!(page.contains("local_world_belief"));
         assert!(page.contains("roll_pitch_corrected"));
