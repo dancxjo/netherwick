@@ -59,6 +59,10 @@ The live `LocalMap` can now consume place/entity loop-closure candidates through
 11. Re-run `geometry-debug` on the rotation capture and require `sensor_truth.ready_for_real_slam = true`.
 12. Trust `LocalWorldBelief` surfaces/blobs only when below-floor ratio is near zero and accumulated voxels remain stable under in-place rotation.
 
+Real robot depth calibration defaults assume the Kinect/depth cloud needs a clockwise
+90 degree yaw correction before entering the robot math frame. Override with
+`NETHERWICK_DEPTH_CAMERA_YAW_DEG` if the physical camera mount differs.
+
 ## Live View Checks
 
 In `/view/3d`, watch:

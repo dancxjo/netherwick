@@ -5446,6 +5446,28 @@ fn corrected_map_trust_status(now: &Now) -> CorrectedMapTrustStatus {
             reason: Some(format!("{MAP_EXTENSION_NAME} summary is missing")),
         };
     };
+    if let Some(slam_status) = map.get("slam_status") {
+        let mode = slam_status
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("odometry_only");
+        if mode != "loop_closed_pose_graph" {
+            let detail = slam_status
+                .get("reasons")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|reasons| reasons.iter().find_map(serde_json::Value::as_str))
+                .unwrap_or("map is not in loop-closed pose-graph SLAM mode");
+            return CorrectedMapTrustStatus {
+                trusted: false,
+                reason: Some(format!("slam_status.mode is {mode}: {detail}")),
+            };
+        }
+        return CorrectedMapTrustStatus {
+            trusted: true,
+            reason: None,
+        };
+    }
+
     let accepted = map
         .get("loop_closures_accepted")
         .and_then(serde_json::Value::as_u64)
@@ -6831,6 +6853,14 @@ mod tests {
         now.extensions.insert(
             MAP_EXTENSION_NAME.to_string(),
             serde_json::json!({
+                "slam_status": {
+                    "mode": "loop_closed_pose_graph",
+                    "local_scan_matching_active": true,
+                    "loop_closure_active": true,
+                    "pose_graph_optimized": true,
+                    "occupancy_remapped_from_pose_graph": true,
+                    "reasons": []
+                },
                 "loop_closures_accepted": 1,
                 "pose_graph_optimization": {
                     "optimized_nodes": 2,
@@ -6930,6 +6960,42 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("summary is missing"));
+        assert!(!memory_navigation_candidate_context(&now, &action));
+    }
+
+    #[test]
+    fn map_memory_debug_rejects_local_scan_match_without_loop_closed_slam() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.extensions.insert(
+            MAP_EXTENSION_NAME.to_string(),
+            serde_json::json!({
+                "slam_status": {
+                    "mode": "local_scan_matched",
+                    "local_scan_matching_active": true,
+                    "loop_closure_active": false,
+                    "pose_graph_optimized": true,
+                    "occupancy_remapped_from_pose_graph": true,
+                    "reasons": ["no loop-closure candidate has been accepted yet"]
+                }
+            }),
+        );
+        now.memory.place_danger = 0.9;
+        now.memory.nearby_best_safe_direction_rad = Some(-0.8);
+        let action = ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.5,
+            duration_ms: 1_000,
+        };
+
+        let debug = map_memory_decision_debug(&now, &action, Some(&action), false);
+
+        assert!(!debug.influenced);
+        assert!(!debug.corrected_map_trusted);
+        assert!(debug
+            .corrected_map_untrusted_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("slam_status.mode is local_scan_matched"));
         assert!(!memory_navigation_candidate_context(&now, &action));
     }
 

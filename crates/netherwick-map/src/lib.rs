@@ -304,6 +304,8 @@ pub struct MapConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MapSummary {
     pub label: &'static str,
+    #[serde(default)]
+    pub slam_status: SlamStatus,
     pub resolution_m: f32,
     pub cells: usize,
     pub occupied_cells: usize,
@@ -319,6 +321,26 @@ pub struct MapSummary {
     pub remap: RemapSummary,
     pub latest_pose: Option<PoseEstimate>,
     pub latest_observation: Option<MapObservationSummary>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlamStatus {
+    pub mode: SlamMode,
+    pub local_scan_matching_active: bool,
+    pub loop_closure_active: bool,
+    pub pose_graph_optimized: bool,
+    pub occupancy_remapped_from_pose_graph: bool,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlamMode {
+    #[default]
+    OdometryOnly,
+    MappingOnly,
+    LocalScanMatched,
+    LoopClosedPoseGraph,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1688,9 +1710,18 @@ impl LocalMap {
             })
             .count();
         let loop_closures_rejected = loop_closure_edges.saturating_sub(loop_closures_accepted);
+        let scan_match_edges = self
+            .pose_graph
+            .edges
+            .iter()
+            .filter(|edge| matches!(edge.source, PoseEdgeSource::ScanMatch { .. }))
+            .count();
+        let slam_status =
+            self.slam_status(occupied_cells, scan_match_edges, loop_closures_accepted);
 
         MapSummary {
             label: MAP_LABEL,
+            slam_status,
             resolution_m: self.config.resolution_m,
             cells: self.cells.len(),
             occupied_cells,
@@ -1698,12 +1729,7 @@ impl LocalMap {
             observations: self.observations.len(),
             pose_graph_nodes: self.pose_graph.nodes.len(),
             pose_graph_edges: self.pose_graph.edges.len(),
-            scan_match_edges: self
-                .pose_graph
-                .edges
-                .iter()
-                .filter(|edge| matches!(edge.source, PoseEdgeSource::ScanMatch { .. }))
-                .count(),
+            scan_match_edges,
             loop_closure_edges,
             loop_closures_accepted,
             loop_closures_rejected,
@@ -1722,6 +1748,61 @@ impl LocalMap {
                         .filter(|beam| beam.hit)
                         .count(),
                 }),
+        }
+    }
+
+    fn slam_status(
+        &self,
+        occupied_cells: usize,
+        scan_match_edges: usize,
+        loop_closures_accepted: usize,
+    ) -> SlamStatus {
+        let local_scan_matching_active = scan_match_edges > 0;
+        let loop_closure_active = loop_closures_accepted > 0;
+        let pose_graph_optimized = self.pose_graph_optimization.active_edges > 0
+            && self.pose_graph_optimization.optimized_nodes >= 2;
+        let occupancy_remapped_from_pose_graph =
+            self.remap_summary.generation > 0 && self.remap_summary.submaps > 0;
+        let mode =
+            if loop_closure_active && pose_graph_optimized && occupancy_remapped_from_pose_graph {
+                SlamMode::LoopClosedPoseGraph
+            } else if local_scan_matching_active && occupancy_remapped_from_pose_graph {
+                SlamMode::LocalScanMatched
+            } else if occupied_cells > 0 || self.remap_summary.submaps > 0 {
+                SlamMode::MappingOnly
+            } else {
+                SlamMode::OdometryOnly
+            };
+
+        let mut reasons = Vec::new();
+        if occupied_cells == 0 {
+            reasons.push("no occupied map cells from range/depth observations yet".to_string());
+        }
+        if self.pose_graph.nodes.len() < 2 {
+            reasons.push("pose graph has fewer than two nodes".to_string());
+        }
+        if !local_scan_matching_active {
+            reasons.push("no scan-match correction edge has been accepted yet".to_string());
+        }
+        if !loop_closure_active {
+            reasons.push("no loop-closure candidate has been accepted yet".to_string());
+        }
+        if !pose_graph_optimized {
+            reasons.push(
+                "pose graph optimization has not constrained multiple active nodes yet".to_string(),
+            );
+        }
+        if !occupancy_remapped_from_pose_graph {
+            reasons.push("occupancy has not been rebuilt from pose-graph submaps yet".to_string());
+        }
+
+        SlamStatus {
+            mode,
+            local_scan_matching_active,
+            loop_closure_active,
+            pose_graph_optimized,
+            occupancy_remapped_from_pose_graph,
+            reasons,
         }
     }
 
@@ -2741,6 +2822,13 @@ mod tests {
         assert_eq!(map.submaps.len(), 2);
         assert_eq!(map.summary().remap.submaps, 2);
         assert_eq!(map.summary().label, MAP_LABEL);
+        assert_eq!(map.summary().slam_status.mode, SlamMode::MappingOnly);
+        assert!(map
+            .summary()
+            .slam_status
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no scan-match correction")));
     }
 
     #[test]
@@ -2832,7 +2920,10 @@ mod tests {
             map.pose_graph.edges[0].source,
             PoseEdgeSource::ScanMatch { .. }
         ));
-        assert_eq!(map.summary().scan_match_edges, 1);
+        let summary = map.summary();
+        assert_eq!(summary.scan_match_edges, 1);
+        assert_eq!(summary.slam_status.mode, SlamMode::LocalScanMatched);
+        assert!(summary.slam_status.local_scan_matching_active);
     }
 
     #[test]
@@ -2921,6 +3012,9 @@ mod tests {
         assert_eq!(summary.loop_closure_edges, 1);
         assert_eq!(summary.loop_closures_accepted, 1);
         assert_eq!(summary.loop_closures_rejected, 0);
+        assert_eq!(summary.slam_status.mode, SlamMode::LoopClosedPoseGraph);
+        assert!(summary.slam_status.loop_closure_active);
+        assert!(summary.slam_status.pose_graph_optimized);
         let edge = map.pose_graph.edges.last().unwrap();
         assert!(edge.active);
         assert_eq!(edge.to, "live-pose-0");

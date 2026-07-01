@@ -1526,12 +1526,18 @@ fn live_scene_metadata_from_scenario(
     }
 }
 
+const DEFAULT_REAL_DEPTH_CAMERA_YAW_DEG: f32 = -90.0;
+
 fn real_robot_depth_calibration_from_env() -> SceneSensorCalibration {
     let height_m = env_f32("NETHERWICK_DEPTH_CAMERA_HEIGHT_M", 0.46);
     let forward_m = env_f32("NETHERWICK_DEPTH_CAMERA_FORWARD_M", 0.0);
     let pitch_rad = env_f32("NETHERWICK_DEPTH_CAMERA_PITCH_DEG", 0.0).to_radians();
     let roll_rad = env_f32("NETHERWICK_DEPTH_CAMERA_ROLL_DEG", 0.0).to_radians();
-    let yaw_rad = env_f32("NETHERWICK_DEPTH_CAMERA_YAW_DEG", 0.0).to_radians();
+    let yaw_rad = env_f32(
+        "NETHERWICK_DEPTH_CAMERA_YAW_DEG",
+        DEFAULT_REAL_DEPTH_CAMERA_YAW_DEG,
+    )
+    .to_radians();
     SceneSensorCalibration {
         compact_depth_beam_count: env_usize("NETHERWICK_COMPACT_DEPTH_BEAM_COUNT", 32),
         compact_depth_fov_rad: env_f32("NETHERWICK_DEPTH_FOV_DEG", 122.0).to_radians(),
