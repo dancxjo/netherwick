@@ -38,6 +38,7 @@ setup-system:
         i2c-tools \
         v4l-utils \
         libasound2-dev \
+        libssl-dev \
         libudev-dev \
         libusb-1.0-0-dev \
         libv4l-dev
