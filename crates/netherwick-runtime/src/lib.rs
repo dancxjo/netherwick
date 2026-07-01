@@ -53,7 +53,7 @@ use netherwick_models::{
 };
 use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
-    ExtensionSense, EyePrediction, Now, ReignSense, SafetySense, SurpriseSense,
+    ExtensionSense, EyePrediction, MemorySense, Now, ReignSense, SafetySense, SurpriseSense,
 };
 use netherwick_sensors::{
     anticipate_surfaces, NowBuilder, SenseProducer, SurfaceExtractor, SurfaceExtractorOutput,
@@ -604,6 +604,10 @@ pub struct ActionSelectionCandidateScore {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MapMemoryDecisionDebug {
     pub influenced: bool,
+    #[serde(default)]
+    pub corrected_map_trusted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrected_map_untrusted_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub navigation_intent: Option<NavigationIntent>,
     pub reason: Option<String>,
@@ -2973,6 +2977,16 @@ where
             "ScanMatchedMap: {} cells ({} occupied, {} free); occupancy scan matching corrects odometry before integration",
             map_summary.cells, map_summary.occupied_cells, map_summary.free_cells
         ));
+        let corrected_map_trust = corrected_map_trust_status(&now);
+        if !corrected_map_trust.trusted {
+            notes.push(format!(
+                "MapTrustGate: navigation will not trust spatial memory until corrected SLAM is ready ({})",
+                corrected_map_trust
+                    .reason
+                    .as_deref()
+                    .unwrap_or("corrected map is not trusted")
+            ));
+        }
         let mut proposed_actions = Vec::new();
 
         let events = self.extractor.events_from_now(&now, Some(&recall));
@@ -3101,10 +3115,12 @@ where
         let mut action_value_candidates =
             action_value_candidate_actions(&proposals, reign_action.as_ref(), &llm_tick);
 
+        let conductor_memory =
+            memory_for_navigation_with_map_trust(now.memory.clone(), corrected_map_trust);
         let mut baseline_action = self.conductor.choose(ConductorInput {
             latent: latent.clone(),
             drives: now.drives.clone(),
-            memory: now.memory.clone(),
+            memory: conductor_memory,
             predictions: now.predictions.clone(),
             surprise: now.surprise.clone(),
             llm: now.llm.clone(),
@@ -5366,7 +5382,10 @@ fn map_memory_decision_debug(
     baseline_action: Option<&ActionPrimitive>,
     forced_action: bool,
 ) -> MapMemoryDecisionDebug {
+    let corrected_map_trust = corrected_map_trust_status(now);
     let mut debug = MapMemoryDecisionDebug {
+        corrected_map_trusted: corrected_map_trust.trusted,
+        corrected_map_untrusted_reason: corrected_map_trust.reason.clone(),
         place_danger: now.memory.place_danger,
         place_charge_value: now.memory.place_charge_value,
         place_novelty: now.memory.place_novelty,
@@ -5397,11 +5416,116 @@ fn map_memory_decision_debug(
     debug
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CorrectedMapTrustStatus {
+    trusted: bool,
+    reason: Option<String>,
+}
+
+fn corrected_map_trust_status(now: &Now) -> CorrectedMapTrustStatus {
+    if let Some(sensor_truth) = now
+        .extensions
+        .get("sensor_truth")
+        .or_else(|| now.extensions.get("geometry.sensor_truth"))
+    {
+        if sensor_truth
+            .get("ready_for_real_slam")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            return CorrectedMapTrustStatus {
+                trusted: false,
+                reason: Some("sensor_truth.ready_for_real_slam is false".to_string()),
+            };
+        }
+    }
+
+    let Some(map) = now.extensions.get(MAP_EXTENSION_NAME) else {
+        return CorrectedMapTrustStatus {
+            trusted: false,
+            reason: Some(format!("{MAP_EXTENSION_NAME} summary is missing")),
+        };
+    };
+    let accepted = map
+        .get("loop_closures_accepted")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if accepted == 0 {
+        return CorrectedMapTrustStatus {
+            trusted: false,
+            reason: Some("no accepted loop-closure edges in the live pose graph".to_string()),
+        };
+    }
+    let optimized_nodes = map
+        .get("pose_graph_optimization")
+        .and_then(|value| value.get("optimized_nodes"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let active_edges = map
+        .get("pose_graph_optimization")
+        .and_then(|value| value.get("active_edges"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if optimized_nodes == 0 || active_edges == 0 {
+        return CorrectedMapTrustStatus {
+            trusted: false,
+            reason: Some("pose graph has not optimized corrected live nodes".to_string()),
+        };
+    }
+    let remap_submaps = map
+        .get("remap")
+        .and_then(|value| value.get("submaps"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let remap_generation = map
+        .get("remap")
+        .and_then(|value| value.get("generation"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if remap_submaps == 0 || remap_generation == 0 {
+        return CorrectedMapTrustStatus {
+            trusted: false,
+            reason: Some("occupancy has not been rebuilt from corrected submaps".to_string()),
+        };
+    }
+
+    CorrectedMapTrustStatus {
+        trusted: true,
+        reason: None,
+    }
+}
+
+fn memory_for_navigation_with_map_trust(
+    mut memory: MemorySense,
+    trust: CorrectedMapTrustStatus,
+) -> MemorySense {
+    if trust.trusted {
+        return memory;
+    }
+    memory.place_danger = 0.0;
+    memory.place_charge_value = 0.0;
+    memory.place_social_value = 0.0;
+    memory.place_novelty = 0.0;
+    memory.nearby_best_charge_direction_rad = None;
+    memory.nearby_best_safe_direction_rad = None;
+    memory.nearby_frontier_direction_rad = None;
+    memory.recent_trap_direction_rad = None;
+    memory.recent_trap_confidence = 0.0;
+    memory.map_confidence = 0.0;
+    memory
+}
+
 fn memory_navigation_candidate_context(now: &Now, action: &ActionPrimitive) -> bool {
+    if !corrected_map_trust_status(now).trusted {
+        return false;
+    }
     map_memory_decision_reason(now, action).is_some()
 }
 
 fn map_memory_decision_reason(now: &Now, action: &ActionPrimitive) -> Option<String> {
+    if !corrected_map_trust_status(now).trusted {
+        return None;
+    }
     const CRITICAL_BATTERY: f32 = 0.10;
     const LOW_BATTERY: f32 = 0.20;
     const DANGER_THRESHOLD: f32 = 0.70;
@@ -6703,9 +6827,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    fn mark_corrected_map_trusted(now: &mut Now) {
+        now.extensions.insert(
+            MAP_EXTENSION_NAME.to_string(),
+            serde_json::json!({
+                "loop_closures_accepted": 1,
+                "pose_graph_optimization": {
+                    "optimized_nodes": 2,
+                    "active_edges": 2
+                },
+                "remap": {
+                    "generation": 1,
+                    "submaps": 1
+                }
+            }),
+        );
+    }
+
     #[test]
     fn map_memory_debug_records_intent_confidence_and_signal() {
         let mut now = Now::blank(100, BodySense::default());
+        mark_corrected_map_trusted(&mut now);
         now.memory.place_danger = 0.9;
         now.memory.nearby_best_safe_direction_rad = Some(-0.8);
         let action = ActionPrimitive::Turn {
@@ -6739,6 +6881,7 @@ mod tests {
         let mut body = BodySense::default();
         body.battery_level = 0.05;
         let mut now = Now::blank(100, body);
+        mark_corrected_map_trusted(&mut now);
         now.memory.place_charge_value = 0.1;
         let action = ActionPrimitive::Stop;
 
@@ -6765,6 +6908,29 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("too weak"));
+    }
+
+    #[test]
+    fn map_memory_debug_rejects_navigation_when_corrected_map_is_untrusted() {
+        let mut now = Now::blank(100, BodySense::default());
+        now.memory.place_danger = 0.9;
+        now.memory.nearby_best_safe_direction_rad = Some(-0.8);
+        let action = ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.5,
+            duration_ms: 1_000,
+        };
+
+        let debug = map_memory_decision_debug(&now, &action, Some(&action), false);
+
+        assert!(!debug.influenced);
+        assert!(!debug.corrected_map_trusted);
+        assert!(debug
+            .corrected_map_untrusted_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("summary is missing"));
+        assert!(!memory_navigation_candidate_context(&now, &action));
     }
 
     fn idle_now(t_ms: u64) -> Now {
@@ -8178,6 +8344,7 @@ mod tests {
     #[test]
     fn memory_backed_baseline_action_is_a_selector_candidate_context() {
         let mut now = idle_now(100);
+        mark_corrected_map_trusted(&mut now);
         now.memory.place_danger = 0.9;
         now.memory.nearby_best_safe_direction_rad = Some(-0.8);
         let memory_action = ActionPrimitive::Turn {
