@@ -6770,6 +6770,7 @@ function renderPoints(points, coordinateSystem){
   
   const isRobot = coordinateSystem === 'robot';
   const isSceneRobotRender = coordinateSystem === 'scene_robot_render';
+  const isWorldMath = coordinateSystem === 'world' || coordinateSystem === 'odometry_world';
   const isKinectCamera = coordinateSystem === 'kinect_camera' || coordinateSystem === 'camera' || coordinateSystem === 'depth_image_unknown';
   const robotMatrix = robot.getWorldMatrix();
   const kinectMatrix = eyeCamera.getWorldMatrix();
@@ -6791,6 +6792,8 @@ function renderPoints(points, coordinateSystem){
         new BABYLON.Vector3(p.x, -p.y, p.z),
         kinectMatrix
       );
+    } else if (isWorldMath) {
+      worldPoint = new BABYLON.Vector3(p.y, p.z, -p.x);
     } else {
       worldPoint = new BABYLON.Vector3(p.x, p.y, p.z);
     }
@@ -10370,6 +10373,8 @@ mod tests {
         assert!(page.contains("data-map-layer=\"accumulated occupancy\""));
         assert!(page.contains("data-map-layer=\"stable wall candidates\""));
         assert!(page.contains("function renderWorldBeliefPoints"));
+        assert!(page.contains("const isWorldMath = coordinateSystem === 'world'"));
+        assert!(page.contains("new BABYLON.Vector3(p.y, p.z, -p.x)"));
         assert!(page.contains("function renderPersistentWorldBelief"));
         assert!(page.contains("local_world_belief"));
         assert!(page.contains("roll_pitch_corrected"));
