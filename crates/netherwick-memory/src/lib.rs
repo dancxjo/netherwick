@@ -1001,6 +1001,115 @@ pub struct BindingCandidate {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingHypothesisKind {
+    FaceIdentity,
+    VoiceIdentity,
+    CrossModalBinding,
+    PlaceMatch,
+    ObjectContinuity,
+    #[default]
+    Other,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HypothesisState {
+    #[default]
+    Active,
+    Winning,
+    Losing,
+    NeedsReview,
+    Rejected,
+    Promoted,
+    Expired,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrackingHypothesis {
+    pub id: String,
+    pub family_id: String,
+    pub kind: TrackingHypothesisKind,
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub observation_ids: Vec<String>,
+    #[serde(default)]
+    pub binding_candidate_ids: Vec<String>,
+    pub confidence: f32,
+    #[serde(default)]
+    pub evidence: Vec<BindingEvidence>,
+    #[serde(default)]
+    pub contradictions: Vec<String>,
+    pub state: HypothesisState,
+    pub first_seen_ms: u64,
+    pub last_updated_ms: u64,
+}
+
+impl TrackingHypothesis {
+    fn new(
+        kind: TrackingHypothesisKind,
+        family_id: String,
+        target_id: Option<String>,
+        observation_id: String,
+        candidate_id: String,
+        evidence: Vec<BindingEvidence>,
+        t_ms: u64,
+    ) -> Self {
+        let target_slug = target_id
+            .as_deref()
+            .map(stable_slug)
+            .unwrap_or_else(|| "new-entity".to_string());
+        let id = format!(
+            "hypothesis:{}:{}:{}",
+            tracking_kind_slug(&kind),
+            stable_slug(&family_id),
+            target_slug
+        );
+        let mut hypothesis = Self {
+            id,
+            family_id,
+            kind,
+            target_id,
+            observation_ids: vec![observation_id],
+            binding_candidate_ids: vec![candidate_id],
+            confidence: 0.0,
+            evidence: Vec::new(),
+            contradictions: Vec::new(),
+            state: HypothesisState::Active,
+            first_seen_ms: t_ms,
+            last_updated_ms: t_ms,
+        };
+        hypothesis.add_evidence(evidence, t_ms);
+        hypothesis
+    }
+
+    fn add_evidence(&mut self, evidence: Vec<BindingEvidence>, t_ms: u64) {
+        self.last_updated_ms = t_ms;
+        let previous_observations = self.observation_ids.len().max(1) as f32;
+        self.evidence.extend(evidence);
+        for item in &self.evidence {
+            if matches!(
+                item.kind,
+                BindingEvidenceKind::Contradiction | BindingEvidenceKind::SimultaneousConflict
+            ) && !self.contradictions.contains(&item.reason)
+            {
+                self.contradictions.push(item.reason.clone());
+            }
+        }
+        self.confidence = score_hypothesis_evidence(&self.evidence, previous_observations);
+        if self.state != HypothesisState::Promoted && self.state != HypothesisState::Rejected {
+            self.state = if has_hard_contradiction(&self.evidence) {
+                HypothesisState::Rejected
+            } else if !self.contradictions.is_empty() {
+                HypothesisState::NeedsReview
+            } else {
+                HypothesisState::Active
+            };
+        }
+    }
+}
+
 pub type ClusterId = String;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2036,6 +2145,14 @@ pub struct EntityMemoryReport {
     pub occluded_entities: usize,
     pub vanished_entities: usize,
     #[serde(default)]
+    pub active_tracking_hypotheses: Vec<TrackingHypothesis>,
+    #[serde(default)]
+    pub review_tracking_hypotheses: Vec<TrackingHypothesis>,
+    #[serde(default)]
+    pub promoted_tracking_hypotheses: Vec<TrackingHypothesis>,
+    #[serde(default)]
+    pub expired_tracking_hypotheses: Vec<TrackingHypothesis>,
+    #[serde(default)]
     pub accepted_binding_candidates: Vec<BindingCandidate>,
     #[serde(default)]
     pub ambiguous_binding_candidates: Vec<BindingCandidate>,
@@ -2048,6 +2165,11 @@ pub struct EntityMemoryReport {
 const ENTITY_CONFIDENCE_DECAY_PER_TICK: f32 = 0.998;
 const ENTITY_OCCLUDE_THRESHOLD: f32 = 0.25;
 const ENTITY_VANISH_THRESHOLD: f32 = 0.05;
+const HYPOTHESIS_CONFIDENCE_DECAY_PER_TICK: f32 = 0.999;
+const HYPOTHESIS_PROMOTION_THRESHOLD: f32 = 0.72;
+const HYPOTHESIS_REVIEW_MARGIN: f32 = 0.08;
+const HYPOTHESIS_STALE_MS: u64 = 30_000;
+const HYPOTHESIS_REVIEW_STALE_MS: u64 = 120_000;
 
 /// Stores and maintains all persistent entity hypotheses.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2056,6 +2178,8 @@ pub struct EntityMemory {
     pub entities: BTreeMap<String, EntityHypothesis>,
     #[serde(default)]
     pub binding_candidates: Vec<BindingCandidate>,
+    #[serde(default)]
+    pub tracking_hypotheses: BTreeMap<String, TrackingHypothesis>,
     last_tick: Option<u64>,
 }
 
@@ -2079,7 +2203,7 @@ impl EntityMemory {
             .map(|last| now.t_ms.saturating_sub(last) / 100)
             .unwrap_or(1)
             .max(1);
-        self.decay(elapsed_ticks);
+        self.decay(elapsed_ticks, now.t_ms);
         self.last_tick = Some(now.t_ms);
 
         for observation in &now.objects.observations {
@@ -2218,9 +2342,12 @@ impl EntityMemory {
                 decision: BindingDecision::CollectMoreEvidence,
                 reason: reason.to_string(),
             });
+            self.upsert_new_entity_hypothesis(artifact, kind, t_ms);
             return;
         }
 
+        let family_id = tracking_family_id(kind, &artifact.point_id);
+        let mut candidate_ids = Vec::new();
         for entity_id in plausible_ids.clone() {
             let Some(entity) = self.entities.get(&entity_id) else {
                 continue;
@@ -2240,25 +2367,23 @@ impl EntityMemory {
                 plausible_ids.len(),
                 current_entity_ids.contains(&entity_id),
             );
-            let accepted = candidate.decision == BindingDecision::Accept;
+            let candidate_id = binding_candidate_id(&candidate);
+            candidate_ids.push(candidate_id.clone());
             if let Some(entity) = self.entities.get_mut(&entity_id) {
                 entity.record_binding_candidate(candidate.clone());
-                if accepted {
-                    let actual_cluster_id = match kind {
-                        VectorBindingKind::Face => entity.add_face_vector(&artifact.point_id),
-                        VectorBindingKind::Voice => entity.add_voice_vector(&artifact.point_id),
-                        VectorBindingKind::Scene => entity.add_scene_vector(&artifact.point_id),
-                    };
-                    entity.upsert_binding_edge(
-                        candidate.left_cluster_id,
-                        actual_cluster_id,
-                        candidate.relation,
-                        candidate.confidence,
-                        t_ms,
-                    );
-                }
             }
+            self.upsert_tracking_hypothesis(
+                tracking_kind_from_vector(kind),
+                family_id.clone(),
+                Some(entity_id),
+                artifact.point_id.clone(),
+                candidate_id,
+                candidate.evidence,
+                t_ms,
+            );
         }
+        self.upsert_unknown_competitor_hypothesis(artifact, kind, &family_id, &candidate_ids, t_ms);
+        self.evaluate_hypothesis_family(&family_id, artifact, kind, t_ms);
     }
 
     fn plausible_entity_ids(
@@ -2317,6 +2442,257 @@ impl EntityMemory {
         }
     }
 
+    fn upsert_new_entity_hypothesis(
+        &mut self,
+        artifact: &VectorArtifact,
+        kind: VectorBindingKind,
+        t_ms: u64,
+    ) {
+        let family_id = tracking_family_id(kind, &artifact.point_id);
+        self.upsert_unknown_competitor_hypothesis(artifact, kind, &family_id, &[], t_ms);
+    }
+
+    fn upsert_unknown_competitor_hypothesis(
+        &mut self,
+        artifact: &VectorArtifact,
+        kind: VectorBindingKind,
+        family_id: &str,
+        competing_candidate_ids: &[String],
+        t_ms: u64,
+    ) {
+        let mut evidence = vec![BindingEvidence {
+            kind: BindingEvidenceKind::VectorSimilarity,
+            score: if competing_candidate_ids.is_empty() {
+                0.45
+            } else {
+                0.22
+            },
+            reason: match kind {
+                VectorBindingKind::Face => "face may belong to a new unknown person".to_string(),
+                VectorBindingKind::Voice => "voice may belong to a new unknown speaker".to_string(),
+                VectorBindingKind::Scene => {
+                    "scene may describe a new place or object context".to_string()
+                }
+            },
+        }];
+        if competing_candidate_ids.len() > 1 {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::SimultaneousConflict,
+                score: 0.5,
+                reason: "known-entity competitors are still unresolved".to_string(),
+            });
+        }
+        let candidate_id = format!(
+            "candidate:{}:{}:new",
+            tracking_kind_slug(&tracking_kind_from_vector(kind)),
+            stable_slug(&artifact.point_id)
+        );
+        self.upsert_tracking_hypothesis(
+            tracking_kind_from_vector(kind),
+            family_id.to_string(),
+            None,
+            artifact.point_id.clone(),
+            candidate_id,
+            evidence,
+            t_ms,
+        );
+    }
+
+    fn upsert_tracking_hypothesis(
+        &mut self,
+        kind: TrackingHypothesisKind,
+        family_id: String,
+        target_id: Option<String>,
+        observation_id: String,
+        candidate_id: String,
+        evidence: Vec<BindingEvidence>,
+        t_ms: u64,
+    ) {
+        let target_slug = target_id
+            .as_deref()
+            .map(stable_slug)
+            .unwrap_or_else(|| "new-entity".to_string());
+        let id = format!(
+            "hypothesis:{}:{}:{}",
+            tracking_kind_slug(&kind),
+            stable_slug(&family_id),
+            target_slug
+        );
+        if let Some(existing) = self.tracking_hypotheses.get_mut(&id) {
+            if !existing.observation_ids.contains(&observation_id) {
+                existing.observation_ids.push(observation_id);
+            }
+            if !existing.binding_candidate_ids.contains(&candidate_id) {
+                existing.binding_candidate_ids.push(candidate_id);
+            }
+            existing.add_evidence(evidence, t_ms);
+        } else {
+            self.tracking_hypotheses.insert(
+                id,
+                TrackingHypothesis::new(
+                    kind,
+                    family_id,
+                    target_id,
+                    observation_id,
+                    candidate_id,
+                    evidence,
+                    t_ms,
+                ),
+            );
+        }
+    }
+
+    fn evaluate_hypothesis_family(
+        &mut self,
+        family_id: &str,
+        artifact: &VectorArtifact,
+        kind: VectorBindingKind,
+        t_ms: u64,
+    ) {
+        let mut family = self
+            .tracking_hypotheses
+            .values()
+            .filter(|hypothesis| {
+                hypothesis.family_id == family_id
+                    && !matches!(
+                        hypothesis.state,
+                        HypothesisState::Rejected | HypothesisState::Expired
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if family.is_empty() {
+            return;
+        }
+        family.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let winner = family[0].clone();
+        let runner_up_confidence = family.get(1).map(|hypothesis| hypothesis.confidence);
+        let near_equal_competitor = runner_up_confidence
+            .map(|confidence| winner.confidence - confidence < HYPOTHESIS_REVIEW_MARGIN)
+            .unwrap_or(false);
+        let promotable = self.hypothesis_passes_promotion_gates(&winner, near_equal_competitor);
+
+        if promotable {
+            self.promote_tracking_hypothesis(&winner, artifact, kind, t_ms);
+            for hypothesis in family {
+                if let Some(stored) = self.tracking_hypotheses.get_mut(&hypothesis.id) {
+                    stored.state = if hypothesis.id == winner.id {
+                        HypothesisState::Promoted
+                    } else {
+                        HypothesisState::Rejected
+                    };
+                    stored.last_updated_ms = t_ms;
+                }
+            }
+            return;
+        }
+
+        for (index, hypothesis) in family.iter().enumerate() {
+            if let Some(stored) = self.tracking_hypotheses.get_mut(&hypothesis.id) {
+                if has_hard_contradiction(&stored.evidence) {
+                    stored.state = HypothesisState::Rejected;
+                } else if near_equal_competitor || !stored.contradictions.is_empty() {
+                    stored.state = HypothesisState::NeedsReview;
+                } else if index == 0 {
+                    stored.state = HypothesisState::Winning;
+                } else {
+                    stored.state = HypothesisState::Losing;
+                }
+            }
+        }
+    }
+
+    fn hypothesis_passes_promotion_gates(
+        &self,
+        hypothesis: &TrackingHypothesis,
+        near_equal_competitor: bool,
+    ) -> bool {
+        if hypothesis.target_id.is_none() || near_equal_competitor {
+            return false;
+        }
+        if hypothesis.confidence < HYPOTHESIS_PROMOTION_THRESHOLD {
+            return false;
+        }
+        if has_hard_contradiction(&hypothesis.evidence) {
+            return false;
+        }
+        let independent_evidence_types = hypothesis
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                !matches!(
+                    evidence.kind,
+                    BindingEvidenceKind::Contradiction
+                        | BindingEvidenceKind::SimultaneousConflict
+                        | BindingEvidenceKind::VectorSimilarity
+                        | BindingEvidenceKind::LlmSuggested
+                )
+            })
+            .map(|evidence| binding_evidence_kind_rank(&evidence.kind))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let human_confirmed = hypothesis
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::HumanConfirmed);
+        human_confirmed || (hypothesis.evidence.len() >= 3 && independent_evidence_types >= 2)
+    }
+
+    fn promote_tracking_hypothesis(
+        &mut self,
+        hypothesis: &TrackingHypothesis,
+        artifact: &VectorArtifact,
+        kind: VectorBindingKind,
+        t_ms: u64,
+    ) {
+        let Some(entity_id) = hypothesis.target_id.as_ref() else {
+            return;
+        };
+        let Some(entity) = self.entities.get_mut(entity_id) else {
+            return;
+        };
+        let Some(object_cluster_id) = entity.primary_object_cluster_id() else {
+            return;
+        };
+        let actual_cluster_id = match kind {
+            VectorBindingKind::Face => entity.add_face_vector(&artifact.point_id),
+            VectorBindingKind::Voice => entity.add_voice_vector(&artifact.point_id),
+            VectorBindingKind::Scene => entity.add_scene_vector(&artifact.point_id),
+        };
+        entity.upsert_binding_edge(
+            object_cluster_id,
+            actual_cluster_id,
+            match kind {
+                VectorBindingKind::Face | VectorBindingKind::Voice => {
+                    BindingRelation::LikelySameEntity
+                }
+                VectorBindingKind::Scene => BindingRelation::ProjectsTo,
+            },
+            hypothesis.confidence,
+            t_ms,
+        );
+    }
+
+    pub fn confirm_tracking_hypothesis(&mut self, hypothesis_id: &str, t_ms: u64) -> bool {
+        let Some(hypothesis) = self.tracking_hypotheses.get_mut(hypothesis_id) else {
+            return false;
+        };
+        hypothesis.add_evidence(
+            vec![BindingEvidence {
+                kind: BindingEvidenceKind::HumanConfirmed,
+                score: 1.0,
+                reason: "human confirmed this hypothesis".to_string(),
+            }],
+            t_ms,
+        );
+        true
+    }
+
     pub fn observe_frame(&mut self, frame: &ExperienceFrame, cell_key: Option<PlaceCellKey>) {
         self.observe_now(&frame.now, cell_key);
         if self.entities.is_empty() {
@@ -2363,8 +2739,9 @@ impl EntityMemory {
 
     /// Decay confidence of all entities.  Entities whose confidence falls
     /// below threshold transition to `Occluded` or `Vanished`.
-    fn decay(&mut self, ticks: u64) {
+    fn decay(&mut self, ticks: u64, now_ms: u64) {
         let factor = ENTITY_CONFIDENCE_DECAY_PER_TICK.powi(ticks as i32);
+        let hypothesis_factor = HYPOTHESIS_CONFIDENCE_DECAY_PER_TICK.powi(ticks as i32);
         for entity in self.entities.values_mut() {
             if entity.lifecycle == EntityLifecycleState::Vanished {
                 continue;
@@ -2381,6 +2758,23 @@ impl EntityMemory {
                 entity.constellation.state = EntityConstellationState::Vanished;
             }
             entity.decay_bindings((1.0 - factor).clamp(0.0, 1.0));
+        }
+        for hypothesis in self.tracking_hypotheses.values_mut() {
+            if matches!(
+                hypothesis.state,
+                HypothesisState::Promoted | HypothesisState::Rejected | HypothesisState::Expired
+            ) {
+                continue;
+            }
+            hypothesis.confidence = (hypothesis.confidence * hypothesis_factor).clamp(0.0, 1.0);
+            let stale_ms = now_ms.saturating_sub(hypothesis.last_updated_ms);
+            if hypothesis.confidence < 0.25 && stale_ms >= HYPOTHESIS_STALE_MS {
+                hypothesis.state = HypothesisState::Expired;
+            } else if hypothesis.state == HypothesisState::NeedsReview
+                && stale_ms >= HYPOTHESIS_REVIEW_STALE_MS
+            {
+                hypothesis.state = HypothesisState::Expired;
+            }
         }
     }
 
@@ -2497,12 +2891,45 @@ impl EntityMemory {
             .filter(|candidate| candidate.decision == BindingDecision::Reject)
             .cloned()
             .collect();
+        let active_tracking_hypotheses = self
+            .tracking_hypotheses
+            .values()
+            .filter(|hypothesis| {
+                matches!(
+                    hypothesis.state,
+                    HypothesisState::Active | HypothesisState::Winning | HypothesisState::Losing
+                )
+            })
+            .cloned()
+            .collect();
+        let review_tracking_hypotheses = self
+            .tracking_hypotheses
+            .values()
+            .filter(|hypothesis| hypothesis.state == HypothesisState::NeedsReview)
+            .cloned()
+            .collect();
+        let promoted_tracking_hypotheses = self
+            .tracking_hypotheses
+            .values()
+            .filter(|hypothesis| hypothesis.state == HypothesisState::Promoted)
+            .cloned()
+            .collect();
+        let expired_tracking_hypotheses = self
+            .tracking_hypotheses
+            .values()
+            .filter(|hypothesis| hypothesis.state == HypothesisState::Expired)
+            .cloned()
+            .collect();
 
         EntityMemoryReport {
             total_entities,
             active_entities,
             occluded_entities,
             vanished_entities,
+            active_tracking_hypotheses,
+            review_tracking_hypotheses,
+            promoted_tracking_hypotheses,
+            expired_tracking_hypotheses,
             accepted_binding_candidates,
             ambiguous_binding_candidates,
             rejected_binding_candidates,
@@ -3042,6 +3469,124 @@ fn binding_evidence_kind_rank(kind: &BindingEvidenceKind) -> u8 {
         BindingEvidenceKind::Contradiction => 10,
         BindingEvidenceKind::SimultaneousConflict => 11,
     }
+}
+
+fn tracking_kind_from_vector(kind: VectorBindingKind) -> TrackingHypothesisKind {
+    match kind {
+        VectorBindingKind::Face => TrackingHypothesisKind::FaceIdentity,
+        VectorBindingKind::Voice => TrackingHypothesisKind::VoiceIdentity,
+        VectorBindingKind::Scene => TrackingHypothesisKind::PlaceMatch,
+    }
+}
+
+fn tracking_kind_slug(kind: &TrackingHypothesisKind) -> &'static str {
+    match kind {
+        TrackingHypothesisKind::FaceIdentity => "face-identity",
+        TrackingHypothesisKind::VoiceIdentity => "voice-identity",
+        TrackingHypothesisKind::CrossModalBinding => "cross-modal",
+        TrackingHypothesisKind::PlaceMatch => "place",
+        TrackingHypothesisKind::ObjectContinuity => "object-continuity",
+        TrackingHypothesisKind::Other => "other",
+    }
+}
+
+fn tracking_family_id(kind: VectorBindingKind, observation_id: &str) -> String {
+    format!(
+        "{}:{}",
+        tracking_kind_slug(&tracking_kind_from_vector(kind)),
+        observation_id
+    )
+}
+
+fn binding_candidate_id(candidate: &BindingCandidate) -> String {
+    format!(
+        "candidate:{}:{}:{}",
+        stable_slug(&candidate.left_cluster_id),
+        stable_slug(&candidate.right_cluster_id),
+        binding_relation_label_for_id(&candidate.relation)
+    )
+}
+
+fn binding_relation_label_for_id(relation: &BindingRelation) -> &'static str {
+    match relation {
+        BindingRelation::CooccursInTime => "time",
+        BindingRelation::CooccursInEstimatedSpace => "space",
+        BindingRelation::MovesTogether => "moves",
+        BindingRelation::PredictsSameFutureEvents => "future",
+        BindingRelation::NamedBy => "named-by",
+        BindingRelation::ProjectsTo => "projects-to",
+        BindingRelation::HasColorAtPose => "color-pose",
+        BindingRelation::LikelySameEntity => "same-entity",
+        BindingRelation::ExplainsOutcome => "outcome",
+        BindingRelation::Contradicts => "contradicts",
+        BindingRelation::RequiresReview => "review",
+    }
+}
+
+fn has_hard_contradiction(evidence: &[BindingEvidence]) -> bool {
+    evidence
+        .iter()
+        .any(|item| item.kind == BindingEvidenceKind::Contradiction)
+}
+
+fn score_hypothesis_evidence(evidence: &[BindingEvidence], repeated_observations: f32) -> f32 {
+    if evidence.is_empty() {
+        return 0.0;
+    }
+    let human_confirmed = evidence
+        .iter()
+        .any(|item| item.kind == BindingEvidenceKind::HumanConfirmed);
+    let positive = evidence
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.kind,
+                BindingEvidenceKind::Contradiction | BindingEvidenceKind::SimultaneousConflict
+            )
+        })
+        .map(|item| item.score.clamp(0.0, 1.0))
+        .sum::<f32>();
+    let positive_count = evidence
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.kind,
+                BindingEvidenceKind::Contradiction | BindingEvidenceKind::SimultaneousConflict
+            )
+        })
+        .count()
+        .max(1) as f32;
+    let independent_positive_kinds = evidence
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.kind,
+                BindingEvidenceKind::Contradiction
+                    | BindingEvidenceKind::SimultaneousConflict
+                    | BindingEvidenceKind::VectorSimilarity
+                    | BindingEvidenceKind::LlmSuggested
+            )
+        })
+        .map(|item| binding_evidence_kind_rank(&item.kind))
+        .collect::<BTreeSet<_>>()
+        .len() as f32;
+    let contradiction_count = evidence
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.kind,
+                BindingEvidenceKind::Contradiction | BindingEvidenceKind::SimultaneousConflict
+            )
+        })
+        .count() as f32;
+    let repetition_bonus = ((repeated_observations - 1.0).max(0.0) * 0.08).min(0.18);
+    let independence_bonus = (independent_positive_kinds * 0.08).min(0.24);
+    let mut score = positive / positive_count + repetition_bonus + independence_bonus;
+    if human_confirmed {
+        score = score.max(0.92);
+    }
+    score -= contradiction_count * 0.18;
+    score.clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -7810,6 +8355,52 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_face_observation_creates_competing_tracking_hypotheses() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("travis", ObjectClass::Person, 0.8));
+        now.objects
+            .observations
+            .push(make_object_observation("tim", ObjectClass::Person, 0.8));
+        now.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-ambiguous-ticket5",
+            vec![1.0, 0.0],
+        ));
+
+        memory.observe_now(&now, Some(PlaceCellKey { x: 0, y: 0 }));
+
+        let family = memory
+            .tracking_hypotheses
+            .values()
+            .filter(|hypothesis| hypothesis.family_id == "face-identity:face-ambiguous-ticket5")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            family.len(),
+            3,
+            "two known-person hypotheses plus one unknown-person hypothesis should remain visible"
+        );
+        assert!(family
+            .iter()
+            .any(|hypothesis| { hypothesis.target_id.as_deref() == Some("entity:person:travis") }));
+        assert!(family
+            .iter()
+            .any(|hypothesis| hypothesis.target_id.as_deref() == Some("entity:person:tim")));
+        assert!(family
+            .iter()
+            .any(|hypothesis| hypothesis.target_id.is_none()));
+        assert!(family
+            .iter()
+            .any(|hypothesis| { matches!(hypothesis.state, HypothesisState::NeedsReview) }));
+        assert!(memory
+            .entities
+            .values()
+            .all(|entity| entity.modality_support.face_vector_ids.is_empty()));
+    }
+
+    #[test]
     fn voice_vector_is_not_attached_to_every_active_person() {
         let mut memory = EntityMemory::new();
         let mut now = now_at(100, 0.0, 0.0);
@@ -7832,6 +8423,219 @@ mod tests {
             .values()
             .all(|entity| entity.modality_support.voice_vector_ids.is_empty()));
         assert!(!memory.report().ambiguous_binding_candidates.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_voice_observation_creates_competing_tracking_hypotheses() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("travis", ObjectClass::Person, 0.8));
+        now.objects
+            .observations
+            .push(make_object_observation("tim", ObjectClass::Person, 0.8));
+        now.voice.vectors.push(VectorArtifact::new(
+            VOICE_VECTOR_COLLECTION,
+            "voice-ambiguous-ticket5",
+            vec![0.0, 1.0],
+        ));
+
+        memory.observe_now(&now, Some(PlaceCellKey { x: 0, y: 0 }));
+
+        let family = memory
+            .tracking_hypotheses
+            .values()
+            .filter(|hypothesis| hypothesis.family_id == "voice-identity:voice-ambiguous-ticket5")
+            .collect::<Vec<_>>();
+        assert_eq!(family.len(), 3);
+        assert!(family
+            .iter()
+            .all(|hypothesis| { hypothesis.kind == TrackingHypothesisKind::VoiceIdentity }));
+        assert!(memory
+            .entities
+            .values()
+            .all(|entity| entity.modality_support.voice_vector_ids.is_empty()));
+    }
+
+    #[test]
+    fn single_clear_candidate_promotes_identity_binding() {
+        let mut memory = EntityMemory::new();
+        let cell = PlaceCellKey { x: 1, y: 1 };
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("ada", ObjectClass::Person, 0.9));
+        now.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-ada-ticket5",
+            vec![1.0, 0.0],
+        ));
+
+        memory.observe_now(&now, Some(cell));
+
+        let ada = memory.entities.get("entity:person:ada").unwrap();
+        assert_eq!(
+            ada.modality_support.face_vector_ids,
+            vec!["face-ada-ticket5".to_string()]
+        );
+        assert!(memory
+            .tracking_hypotheses
+            .values()
+            .any(|hypothesis| hypothesis.state == HypothesisState::Promoted
+                && hypothesis.target_id.as_deref() == Some("entity:person:ada")));
+    }
+
+    #[test]
+    fn close_identity_candidates_remain_unresolved_for_review() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("travis", ObjectClass::Person, 0.8));
+        now.objects
+            .observations
+            .push(make_object_observation("tim", ObjectClass::Person, 0.8));
+        now.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-close-ticket5",
+            vec![1.0, 0.0],
+        ));
+
+        memory.observe_now(&now, Some(PlaceCellKey { x: 0, y: 0 }));
+
+        let report = memory.report();
+        assert!(
+            report.review_tracking_hypotheses.len() >= 2,
+            "near-equal known-person hypotheses should be visible for review"
+        );
+        assert!(report.promoted_tracking_hypotheses.is_empty());
+    }
+
+    #[test]
+    fn contradiction_lowers_hypothesis_confidence() {
+        let positive = score_hypothesis_evidence(
+            &[
+                BindingEvidence {
+                    kind: BindingEvidenceKind::VectorSimilarity,
+                    score: 0.8,
+                    reason: "high vector similarity".to_string(),
+                },
+                BindingEvidence {
+                    kind: BindingEvidenceKind::TemporalOverlap,
+                    score: 0.8,
+                    reason: "same time window".to_string(),
+                },
+                BindingEvidence {
+                    kind: BindingEvidenceKind::SpatialOverlap,
+                    score: 0.8,
+                    reason: "same place".to_string(),
+                },
+            ],
+            1.0,
+        );
+        let contradicted = score_hypothesis_evidence(
+            &[
+                BindingEvidence {
+                    kind: BindingEvidenceKind::VectorSimilarity,
+                    score: 0.8,
+                    reason: "high vector similarity".to_string(),
+                },
+                BindingEvidence {
+                    kind: BindingEvidenceKind::TemporalOverlap,
+                    score: 0.8,
+                    reason: "same time window".to_string(),
+                },
+                BindingEvidence {
+                    kind: BindingEvidenceKind::Contradiction,
+                    score: 1.0,
+                    reason: "same person appears in incompatible places".to_string(),
+                },
+            ],
+            1.0,
+        );
+
+        assert!(contradicted < positive);
+    }
+
+    #[test]
+    fn human_confirmation_promotes_correct_hypothesis() {
+        let mut memory = EntityMemory::new();
+        let mut first = now_at(100, 0.0, 0.0);
+        first
+            .objects
+            .observations
+            .push(make_object_observation("ada", ObjectClass::Person, 0.9));
+        memory.observe_now(&first, None);
+
+        let mut later = now_at(10_000, 3.0, 3.0);
+        later.face.vectors.push(
+            VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-human-confirmed", vec![1.0])
+                .with_source_id("entity:person:ada"),
+        );
+        memory.observe_now(&later, None);
+
+        let ada = memory.entities.get("entity:person:ada").unwrap();
+        assert_eq!(
+            ada.modality_support.face_vector_ids,
+            vec!["face-human-confirmed".to_string()]
+        );
+        assert!(memory
+            .report()
+            .promoted_tracking_hypotheses
+            .iter()
+            .any(|hypothesis| hypothesis.target_id.as_deref() == Some("entity:person:ada")));
+    }
+
+    #[test]
+    fn stale_weak_hypotheses_expire() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-stale-ticket5",
+            vec![1.0],
+        ));
+        memory.observe_now(&now, None);
+
+        let later = now_at(120_000, 0.0, 0.0);
+        memory.observe_now(&later, None);
+
+        assert!(memory
+            .tracking_hypotheses
+            .values()
+            .any(|hypothesis| hypothesis.state == HypothesisState::Expired));
+    }
+
+    #[test]
+    fn promoted_hypothesis_does_not_merge_unrelated_entities() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("ada", ObjectClass::Person, 0.9));
+        now.objects
+            .observations
+            .push(make_object_observation("grace", ObjectClass::Person, 0.9));
+        memory.observe_now(&now, None);
+
+        let mut confirmed = now_at(200, 0.0, 0.0);
+        confirmed.face.vectors.push(
+            VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-ada-confirmed", vec![1.0])
+                .with_source_id("entity:person:ada"),
+        );
+        memory.observe_now(&confirmed, None);
+
+        assert!(memory.entities.contains_key("entity:person:ada"));
+        assert!(memory.entities.contains_key("entity:person:grace"));
+        assert_eq!(memory.entities.len(), 2);
+        assert!(memory
+            .entities
+            .get("entity:person:grace")
+            .unwrap()
+            .modality_support
+            .face_vector_ids
+            .is_empty());
     }
 
     #[test]
