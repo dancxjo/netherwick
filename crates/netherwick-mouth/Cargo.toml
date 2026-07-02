@@ -9,6 +9,6 @@ publish = false
 anyhow.workspace = true
 cpal.workspace = true
 serde.workspace = true
-speaking = { git = "https://github.com/dancxjo/tongues.git" }
-tongues-tts = { git = "https://github.com/dancxjo/tongues.git", default-features = false, features = ["piper-onnx"] }
+speaking = { path = "../../../tongues/crates/speaking" }
+tongues-tts = { path = "../../../tongues/crates/tongues-tts", default-features = false, features = ["piper-onnx"] }
 tracing.workspace = true
