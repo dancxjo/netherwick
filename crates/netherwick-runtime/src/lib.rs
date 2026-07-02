@@ -3761,9 +3761,7 @@ where
                 "robot-initialized".to_string(),
                 serde_json::to_value(&sequence)?,
             );
-            notes.push(
-                "EventScript:on(robot-initialized) emitted bring-up mouth sequence".to_string(),
-            );
+            notes.push("EventScript:on(robot-initialized) emitted bring-up sequence".to_string());
             behavior_runs.push(run.record.erase());
         }
 
@@ -4206,13 +4204,7 @@ fn script_action_to_primitive(action: &EventScriptAction) -> Option<ActionPrimit
         EventScriptAction::Chirp { pattern } => Some(ActionPrimitive::Chirp {
             pattern: pattern.clone(),
         }),
-        EventScriptAction::Song { name } => Some(ActionPrimitive::Speak {
-            text: match name.as_str() {
-                "bring_up" => "doo doo dee, systems waking up".to_string(),
-                "mournful_bump" => "ohh, doo doo down, ooooh".to_string(),
-                _ => format!("little {name} song"),
-            },
-        }),
+        EventScriptAction::Song { .. } => None,
         EventScriptAction::Stop => Some(ActionPrimitive::Stop),
         EventScriptAction::Rotate { deg } => Some(ActionPrimitive::Turn {
             direction: if *deg >= 0 {

@@ -3,10 +3,41 @@ use async_trait::async_trait;
 use netherwick_core::{Pose2, TimeMs};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BodyTone {
+    pub note: u8,
+    pub duration_64ths: u8,
+}
+
+impl BodyTone {
+    pub fn new(note: u8, duration_64ths: u8) -> Self {
+        Self {
+            note,
+            duration_64ths,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BodySong {
+    pub tones: Vec<BodyTone>,
+}
+
+impl BodySong {
+    pub fn new(tones: impl Into<Vec<BodyTone>>) -> Self {
+        Self {
+            tones: tones.into(),
+        }
+    }
+}
+
 #[async_trait]
 pub trait RobotBody {
     async fn read_body(&mut self) -> Result<BodySense>;
     async fn apply_motor(&mut self, cmd: MotorCommand) -> Result<()>;
+    async fn play_song(&mut self, _song: BodySong) -> Result<()> {
+        anyhow::bail!("robot body does not support songs")
+    }
 }
 
 #[async_trait]

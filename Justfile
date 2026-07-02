@@ -13,7 +13,7 @@ kinect_rgb_auto_gain_max := env_var_or_default("KINECT_RGB_AUTO_GAIN_MAX", "3.0"
 kinect_rgb_gain := env_var_or_default("KINECT_RGB_GAIN", "1.0")
 kinect_rgb_gamma := env_var_or_default("KINECT_RGB_GAMMA", "0.80")
 kinect_rgb_brightness := env_var_or_default("KINECT_RGB_BRIGHTNESS", "0.0")
-tts_output_device := env_var_or_default("NETHERWICK_TTS_OUTPUT_DEVICE", "USB Audio Device")
+tts_output_device := env_var_or_default("NETHERWICK_TTS_OUTPUT_DEVICE", "")
 
 # Default to the real robot path.
 default *args:

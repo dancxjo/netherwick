@@ -12,7 +12,7 @@ use netherwick_actions::ActionPrimitive;
 use netherwick_actions::{ApproachTarget, ExploreStyle, TurnDir};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
-use netherwick_body::{BodySense, RobotBody};
+use netherwick_body::{BodySense, BodySong, BodyTone, RobotBody};
 use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
 use netherwick_create1::{Create1Body, Create1OpenMode, MockCreate1Body};
 use netherwick_ledger::{
@@ -4875,9 +4875,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         None => None,
     };
 
-    if let Some(mouth) = &mouth {
-        enqueue_default_bringup_mouth(mouth, &initialization);
-    }
+    enqueue_default_bringup_outputs(&mouth, runner.body.as_mut(), &initialization).await;
 
     let max_steps = args.steps.or_else(|| {
         args.duration_seconds
@@ -4904,7 +4902,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
-        play_event_script_mouth_actions(&mouth, &tick);
+        play_event_script_outputs(&mouth, runner.body.as_mut(), &tick).await;
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
             live_state.update_embodied_context(tick.frame.embodied_context());
@@ -5099,9 +5097,16 @@ fn robot_initialization_metadata(
     })
 }
 
-fn enqueue_default_bringup_mouth(mouth: &QueuedPiperCpalMouth, initialization: &serde_json::Value) {
-    enqueue_robot_mouth_text(mouth, song_text("bring_up"));
-    enqueue_robot_mouth_text(mouth, "dee doo?");
+async fn enqueue_default_bringup_outputs(
+    mouth: &Option<QueuedPiperCpalMouth>,
+    body: &mut (dyn RobotBody + Send),
+    initialization: &serde_json::Value,
+) {
+    play_robot_song(body, "bring_up").await;
+    play_robot_chirp(body, "Confirm").await;
+    let Some(mouth) = mouth.as_ref() else {
+        return;
+    };
     if let Some(mode) = initialization.get("mode").and_then(|value| value.as_str()) {
         enqueue_robot_mouth_text(
             mouth,
@@ -5150,10 +5155,11 @@ fn speak_robot_mouth_text_before_status(mouth: &QueuedPiperCpalMouth, text: &str
     }
 }
 
-fn play_event_script_mouth_actions(mouth: &Option<QueuedPiperCpalMouth>, tick: &RuntimeTick) {
-    let Some(mouth) = mouth.as_ref() else {
-        return;
-    };
+async fn play_event_script_outputs(
+    mouth: &Option<QueuedPiperCpalMouth>,
+    body: &mut (dyn RobotBody + Send),
+    tick: &RuntimeTick,
+) {
     let Some(scripts) = tick.frame.now.extensions.get("event_scripts") else {
         return;
     };
@@ -5167,12 +5173,14 @@ fn play_event_script_mouth_actions(mouth: &Option<QueuedPiperCpalMouth>, tick: &
         for action in actions {
             let requested = action.get("requested").unwrap_or(action);
             if let Some(text) = requested.get("text").and_then(|value| value.as_str()) {
-                enqueue_robot_mouth_text(mouth, text);
+                if let Some(mouth) = mouth.as_ref() {
+                    enqueue_robot_mouth_text(mouth, text);
+                }
             } else if let Some(pattern) = requested.get("pattern").and_then(|value| value.as_str())
             {
-                enqueue_robot_mouth_text(mouth, chirp_pattern_text(pattern));
+                play_robot_chirp(body, pattern).await;
             } else if let Some(name) = requested.get("name").and_then(|value| value.as_str()) {
-                enqueue_robot_mouth_text(mouth, song_text(name));
+                play_robot_song(body, name).await;
             }
         }
     }
@@ -5185,21 +5193,52 @@ fn enqueue_robot_mouth_text(mouth: &QueuedPiperCpalMouth, text: &str) {
     }
 }
 
-fn chirp_pattern_text(pattern: &str) -> &'static str {
-    match pattern {
-        "Confirm" => "beep bee bee",
-        "Warning" => "bop bop bop",
-        "Curious" => "dee doo?",
-        _ => "beep",
+async fn play_robot_chirp(body: &mut (dyn RobotBody + Send), pattern: &str) {
+    play_body_song(
+        body,
+        &format!("chirp {pattern}"),
+        chirp_pattern_song(pattern),
+    )
+    .await;
+}
+
+async fn play_robot_song(body: &mut (dyn RobotBody + Send), name: &str) {
+    play_body_song(body, name, robot_song(name)).await;
+}
+
+async fn play_body_song(body: &mut (dyn RobotBody + Send), label: &str, song: BodySong) {
+    match body.play_song(song).await {
+        Ok(()) => println!("robot body song played: {label}"),
+        Err(error) => println!("robot body song skipped: {error}; song {label}"),
     }
 }
 
-fn song_text(name: &str) -> &'static str {
-    match name {
-        "bring_up" => "doo doo dee, waking up, dee doo dee",
-        "mournful_bump" => "ohh, doo doo down, ooooh",
-        _ => "doo dee doo",
+fn chirp_pattern_song(pattern: &str) -> BodySong {
+    match pattern {
+        "Confirm" => BodySong::new([tone(76, 6), tone(79, 8)]),
+        "Warning" => BodySong::new([tone(67, 5), tone(55, 5), tone(55, 8)]),
+        "Curious" => BodySong::new([tone(72, 5), tone(76, 5), tone(74, 8)]),
+        _ => BodySong::new([tone(72, 6)]),
     }
+}
+
+fn robot_song(name: &str) -> BodySong {
+    match name {
+        "bring_up" => BodySong::new([
+            tone(60, 8),
+            tone(64, 8),
+            tone(67, 8),
+            tone(72, 12),
+            tone(67, 6),
+            tone(72, 14),
+        ]),
+        "mournful_bump" => BodySong::new([tone(64, 12), tone(63, 12), tone(60, 16), tone(55, 20)]),
+        _ => BodySong::new([tone(60, 8), tone(67, 8), tone(72, 12)]),
+    }
+}
+
+fn tone(note: u8, duration_64ths: u8) -> BodyTone {
+    BodyTone::new(note, duration_64ths)
 }
 
 fn requested_robot_sensor_count(args: &RobotArgs) -> usize {

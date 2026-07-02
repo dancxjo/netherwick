@@ -27,13 +27,13 @@ Event scripts are behavior nodes whose input is an event-specific context and wh
 
 ## Replacement Rule
 
-For event and mouth behaviors, model replacement must preserve the output boundary:
+For event and robot-output behaviors, model replacement must preserve the output boundary:
 
 - learned outputs are still `EventScriptOutput`, not raw audio or arbitrary commands,
-- `Say`, `Chirp`, and `Song` remain mouth actions,
+- `Say`, `Chirp`, and `Song` remain typed output actions,
 - body motion actions remain typed primitives and still pass safety,
 - model-controlled modes must be opt-in and observable through behavior-run records.
 
-This keeps cute/status behaviors learnable without letting a generated script or model bypass the robot safety and mouth gates.
+This keeps cute/status behaviors learnable without letting a generated script or model bypass the robot safety, mouth, and body-audio gates.
 
 Randomness belongs inside the teacher behavior input/output record, not outside the behavior system. If a TypeScript teacher uses randomness, the selected output is still recorded as the teacher sample. Shadow models learn from the emitted `EventScriptOutput`, and model inference remains constrained to the same typed output shape.

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 #[cfg(feature = "serial")]
 use netherwick_body::CliffSensors;
-use netherwick_body::{BodySense, MotionCommand, MotorCommand, MotorComplex, RobotBody};
+use netherwick_body::{BodySense, BodySong, MotionCommand, MotorCommand, MotorComplex, RobotBody};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serial")]
 use serialport::SerialPort;
@@ -252,6 +252,7 @@ impl RobotBody for MockCreate1Body {
 impl RobotBody for Create1Body {
     async fn read_body(&mut self) -> Result<BodySense> {
         self.refresh_sensors()?;
+        self.body.last_update_ms = wall_time_ms();
         Ok(self.body.clone())
     }
 
@@ -261,6 +262,10 @@ impl RobotBody for Create1Body {
         self.body.velocity.turn_rad_s = cmd.turn;
         self.body.last_update_ms = self.body.last_update_ms.saturating_add(100);
         Ok(())
+    }
+
+    async fn play_song(&mut self, song: BodySong) -> Result<()> {
+        self.play_create_song(song)
     }
 }
 
@@ -273,9 +278,33 @@ impl MotorComplex for Create1Body {
     }
 }
 
+fn wall_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn meters_per_second_to_mm_per_second(value: f32) -> i16 {
     let scaled = (value * 1000.0).round();
     scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+impl Create1Body {
+    fn play_create_song(&mut self, song: BodySong) -> Result<()> {
+        if song.tones.is_empty() {
+            return Ok(());
+        }
+        let tones = song.tones.into_iter().take(16).collect::<Vec<_>>();
+        let mut packet = Vec::with_capacity(3 + tones.len() * 2);
+        packet.extend_from_slice(&[140, 0, tones.len() as u8]);
+        for tone in tones {
+            packet.push(tone.note.clamp(31, 127));
+            packet.push(tone.duration_64ths.max(1));
+        }
+        self.write_bytes(&packet)?;
+        self.write_bytes(&[141, 0])
+    }
 }
 
 #[cfg(feature = "serial")]
