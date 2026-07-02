@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -4882,6 +4882,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         args.duration_seconds
             .map(|seconds| duration_to_steps(seconds, args.tick_ms))
     });
+    let mut played_reign_audio = HashSet::new();
     while max_steps
         .map(|limit| runner.tick_count < limit)
         .unwrap_or(true)
@@ -4904,6 +4905,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             Err(error) => return Err(error),
         };
         play_event_script_outputs(&mouth, runner.body.as_mut(), &tick).await;
+        play_reign_audio_action(&mouth, runner.body.as_mut(), &tick, &mut played_reign_audio).await;
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
             live_state.update_embodied_context(tick.frame.embodied_context());
@@ -5200,6 +5202,44 @@ async fn play_event_script_outputs(
                 play_robot_song(body, name).await;
             }
         }
+    }
+}
+
+async fn play_reign_audio_action(
+    mouth: &Option<QueuedPiperCpalMouth>,
+    body: &mut (dyn RobotBody + Send),
+    tick: &RuntimeTick,
+    played: &mut HashSet<String>,
+) {
+    let Some(action) = tick.chosen_action.as_ref() else {
+        return;
+    };
+    let action_key = match action {
+        ActionPrimitive::Speak { text } => format!("speak:{text}"),
+        ActionPrimitive::Chirp { pattern } => format!("chirp:{pattern:?}"),
+        _ => return,
+    };
+    let key = tick
+        .frame
+        .reign_input
+        .as_ref()
+        .map(|input| format!("reign:{}:{action_key}", input.id))
+        .unwrap_or_else(|| format!("frame:{}:{action_key}", tick.frame.id));
+    if !played.insert(key) {
+        return;
+    }
+    match action {
+        ActionPrimitive::Speak { text } => {
+            if let Some(mouth) = mouth.as_ref() {
+                enqueue_robot_mouth_text(mouth, text);
+            } else {
+                println!("robot mouth unavailable; skipped Reign speech {text:?}");
+            }
+        }
+        ActionPrimitive::Chirp { pattern } => {
+            play_robot_chirp(body, &format!("{pattern:?}")).await;
+        }
+        _ => {}
     }
 }
 

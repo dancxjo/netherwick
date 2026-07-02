@@ -5229,7 +5229,8 @@ async fn post_reign_command(
     let source = request.source.unwrap_or(ReignSource::WebRemote);
     let mut command = sanitize_command(request.command)?;
     let mut ttl_ms = request.ttl_ms.unwrap_or_else(|| command.default_ttl_ms());
-    if state.hardware_control_status(now_ms).available && hardware_gate_applies_to_command(&command) {
+    if state.hardware_control_status(now_ms).available && hardware_gate_applies_to_command(&command)
+    {
         command = sanitize_hardware_command(command)?;
         ttl_ms = ttl_ms.clamp(HARDWARE_TTL_MIN_MS, HARDWARE_TTL_MAX_MS);
         enforce_hardware_command_gate(&state, &source, &request.mode, &command, now_ms)?;

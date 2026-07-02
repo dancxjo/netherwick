@@ -395,6 +395,9 @@ mod tests {
                 pattern: ChirpPattern::Confirm
             })
         );
-        assert_eq!(action_to_motor_command(action.as_ref()), MotorCommand::stop());
+        assert_eq!(
+            action_to_motor_command(action.as_ref()),
+            MotorCommand::stop()
+        );
     }
 }
