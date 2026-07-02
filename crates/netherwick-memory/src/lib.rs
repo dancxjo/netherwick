@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use netherwick_actions::ActionPrimitive;
 use netherwick_body::{BodyFlags, BodySense, Velocity};
-use netherwick_core::{Goal, Pose2, Reward};
+use netherwick_core::{FeatureId, Goal, Pose2, Reward};
 use netherwick_experience::{
     EmbodiedPipeline, EmbodiedVectorCoverage, Experience, ExperienceFuser, FuturePrediction,
     Impression, InstantCoverage, MemoryLink, Modality, RecalledExperience, SensationPayloadKind,
@@ -952,7 +952,9 @@ pub enum BindingRelation {
     PredictsSameFutureEvents,
     NamedBy,
     ProjectsTo,
+    HasColorAtPose,
     LikelySameEntity,
+    ExplainsOutcome,
     Contradicts,
     RequiresReview,
 }
@@ -997,6 +999,460 @@ pub struct BindingCandidate {
     pub confidence: f32,
     pub decision: BindingDecision,
     pub reason: String,
+}
+
+pub type ClusterId = String;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveredClusterKind {
+    Face,
+    Voice,
+    RgbImage,
+    Geometry,
+    Object,
+    Place,
+    Action,
+    Outcome,
+    Label,
+    BodyState,
+    #[default]
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveredCluster {
+    pub id: ClusterId,
+    pub modality: Modality,
+    pub kind: DiscoveredClusterKind,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    pub confidence: f32,
+    #[serde(default)]
+    pub feature_ids: Vec<FeatureId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_cell: Option<PlaceCellKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_pose: Option<Pose2>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl DiscoveredCluster {
+    pub fn new(
+        id: impl Into<String>,
+        modality: Modality,
+        kind: DiscoveredClusterKind,
+        t_ms: u64,
+        confidence: f32,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            modality,
+            kind,
+            first_seen_ms: t_ms,
+            last_seen_ms: t_ms,
+            confidence: confidence.clamp(0.0, 1.0),
+            feature_ids: Vec::new(),
+            source_frame_id: None,
+            place_cell: None,
+            estimated_pose: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn with_time_span(mut self, first_seen_ms: u64, last_seen_ms: u64) -> Self {
+        self.first_seen_ms = first_seen_ms;
+        self.last_seen_ms = last_seen_ms;
+        self
+    }
+
+    pub fn with_source_frame_id(mut self, source_frame_id: impl Into<String>) -> Self {
+        self.source_frame_id = Some(source_frame_id.into());
+        self
+    }
+
+    pub fn with_place_cell(mut self, place_cell: PlaceCellKey) -> Self {
+        self.place_cell = Some(place_cell);
+        self
+    }
+
+    pub fn with_estimated_pose(mut self, estimated_pose: Pose2) -> Self {
+        self.estimated_pose = Some(estimated_pose);
+        self
+    }
+
+    pub fn with_feature_ids(mut self, feature_ids: Vec<FeatureId>) -> Self {
+        self.feature_ids = feature_ids;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingContext {
+    pub t_ms: u64,
+    pub time_window_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robot_pose: Option<Pose2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_action: Option<ActionPrimitive>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_state: Option<BodySense>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_place_cell: Option<PlaceCellKey>,
+    #[serde(default)]
+    pub recent_features: Vec<FeatureId>,
+    #[serde(default)]
+    pub recent_clusters: Vec<ClusterId>,
+}
+
+impl BindingContext {
+    pub fn new(t_ms: u64) -> Self {
+        Self {
+            t_ms,
+            time_window_ms: 1_000,
+            ..Self::default()
+        }
+    }
+}
+
+pub trait CrossModalBindingEngine {
+    fn propose_bindings(
+        &mut self,
+        context: &BindingContext,
+        clusters: &[DiscoveredCluster],
+    ) -> Vec<BindingCandidate>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefaultCrossModalBindingEngine {
+    pub projection_error_threshold_px: f32,
+    pub pose_distance_threshold_m: f32,
+    pub action_outcome_min_lag_ms: u64,
+    pub action_outcome_max_lag_ms: u64,
+}
+
+impl Default for DefaultCrossModalBindingEngine {
+    fn default() -> Self {
+        Self {
+            projection_error_threshold_px: 5.0,
+            pose_distance_threshold_m: 0.75,
+            action_outcome_min_lag_ms: 50,
+            action_outcome_max_lag_ms: 2_500,
+        }
+    }
+}
+
+impl CrossModalBindingEngine for DefaultCrossModalBindingEngine {
+    fn propose_bindings(
+        &mut self,
+        context: &BindingContext,
+        clusters: &[DiscoveredCluster],
+    ) -> Vec<BindingCandidate> {
+        let mut candidates = Vec::new();
+        for left_index in 0..clusters.len() {
+            for right_index in (left_index + 1)..clusters.len() {
+                let left = &clusters[left_index];
+                let right = &clusters[right_index];
+                if left.id == right.id || left.modality == right.modality {
+                    continue;
+                }
+                if let Some(candidate) = self.propose_pair(context, left, right, clusters) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        candidates
+    }
+}
+
+impl DefaultCrossModalBindingEngine {
+    fn propose_pair(
+        &self,
+        context: &BindingContext,
+        left: &DiscoveredCluster,
+        right: &DiscoveredCluster,
+        all_clusters: &[DiscoveredCluster],
+    ) -> Option<BindingCandidate> {
+        match (&left.kind, &right.kind) {
+            (DiscoveredClusterKind::Face, DiscoveredClusterKind::Voice)
+            | (DiscoveredClusterKind::Voice, DiscoveredClusterKind::Face) => {
+                Some(self.face_voice_candidate(context, left, right, all_clusters))
+            }
+            (DiscoveredClusterKind::RgbImage, DiscoveredClusterKind::Geometry)
+            | (DiscoveredClusterKind::Geometry, DiscoveredClusterKind::RgbImage) => {
+                self.rgb_geometry_candidate(context, left, right)
+            }
+            (DiscoveredClusterKind::Object, DiscoveredClusterKind::Place)
+            | (DiscoveredClusterKind::Place, DiscoveredClusterKind::Object) => {
+                Some(self.object_place_candidate(context, left, right))
+            }
+            (DiscoveredClusterKind::Action, DiscoveredClusterKind::Outcome)
+            | (DiscoveredClusterKind::Outcome, DiscoveredClusterKind::Action)
+            | (DiscoveredClusterKind::Action, DiscoveredClusterKind::BodyState)
+            | (DiscoveredClusterKind::BodyState, DiscoveredClusterKind::Action) => {
+                self.action_outcome_candidate(context, left, right)
+            }
+            (DiscoveredClusterKind::Label, _) | (_, DiscoveredClusterKind::Label) => {
+                Some(self.label_cluster_candidate(context, left, right))
+            }
+            _ => None,
+        }
+    }
+
+    fn face_voice_candidate(
+        &self,
+        context: &BindingContext,
+        left: &DiscoveredCluster,
+        right: &DiscoveredCluster,
+        all_clusters: &[DiscoveredCluster],
+    ) -> BindingCandidate {
+        let mut evidence = base_cross_modal_evidence(context, left, right);
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::VectorSimilarity,
+            score: left.confidence.min(right.confidence).clamp(0.0, 1.0),
+            reason: "face and voice clusters propose a possible person correspondence".to_string(),
+        });
+        add_recent_cooccurrence(context, left, right, &mut evidence);
+        add_label_support(left, right, &mut evidence);
+
+        let plausible_faces = all_clusters
+            .iter()
+            .filter(|cluster| cluster.kind == DiscoveredClusterKind::Face)
+            .filter(|cluster| temporally_compatible(context, cluster, right))
+            .count();
+        let plausible_voices = all_clusters
+            .iter()
+            .filter(|cluster| cluster.kind == DiscoveredClusterKind::Voice)
+            .filter(|cluster| temporally_compatible(context, cluster, left))
+            .count();
+        if plausible_faces == 1 || plausible_voices == 1 {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::SingleCandidateContext,
+                score: 0.65,
+                reason: "only one plausible face or voice cluster is active in the binding window"
+                    .to_string(),
+            });
+        } else if plausible_faces > 1 && plausible_voices > 1 {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::SimultaneousConflict,
+                score: 0.85,
+                reason:
+                    "multiple face and voice clusters are active; speaker identity is ambiguous"
+                        .to_string(),
+            });
+        }
+
+        candidate_from_evidence(
+            left,
+            right,
+            BindingRelation::LikelySameEntity,
+            evidence,
+            "face/voice binding proposal",
+        )
+    }
+
+    fn rgb_geometry_candidate(
+        &self,
+        context: &BindingContext,
+        left: &DiscoveredCluster,
+        right: &DiscoveredCluster,
+    ) -> Option<BindingCandidate> {
+        let mut evidence = base_cross_modal_evidence(context, left, right);
+        let projection_error = projection_error_px(left, right);
+        if let Some(error) = projection_error {
+            if error <= self.projection_error_threshold_px {
+                evidence.push(BindingEvidence {
+                    kind: BindingEvidenceKind::ProjectionAgreement,
+                    score: (1.0 - error / self.projection_error_threshold_px).clamp(0.0, 1.0),
+                    reason: format!("RGB and geometry projections agree within {error:.2} px"),
+                });
+            } else {
+                evidence.push(BindingEvidence {
+                    kind: BindingEvidenceKind::Contradiction,
+                    score: (error / self.projection_error_threshold_px).clamp(0.0, 1.0),
+                    reason: format!("RGB/depth reprojection error {error:.2} px exceeds threshold"),
+                });
+            }
+        }
+        if let Some(distance) = pose_distance_m(left, right) {
+            if distance <= self.pose_distance_threshold_m {
+                evidence.push(BindingEvidence {
+                    kind: BindingEvidenceKind::PoseAgreement,
+                    score: (1.0 - distance / self.pose_distance_threshold_m).clamp(0.0, 1.0),
+                    reason: format!("RGB and geometry world poses agree within {distance:.2} m"),
+                });
+            }
+        }
+        add_recent_cooccurrence(context, left, right, &mut evidence);
+
+        if evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::ProjectionAgreement)
+            || evidence
+                .iter()
+                .any(|evidence| evidence.kind == BindingEvidenceKind::PoseAgreement)
+        {
+            Some(candidate_from_evidence(
+                left,
+                right,
+                BindingRelation::ProjectsTo,
+                evidence,
+                "RGB/geometry correspondence proposal",
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn object_place_candidate(
+        &self,
+        context: &BindingContext,
+        left: &DiscoveredCluster,
+        right: &DiscoveredCluster,
+    ) -> BindingCandidate {
+        let mut evidence = base_cross_modal_evidence(context, left, right);
+        if left.place_cell.is_some()
+            && right.place_cell.is_some()
+            && left.place_cell == right.place_cell
+        {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::SpatialOverlap,
+                score: 0.85,
+                reason: "object and place cluster share a place cell".to_string(),
+            });
+        } else if context
+            .current_place_cell
+            .is_some_and(|cell| left.place_cell == Some(cell) || right.place_cell == Some(cell))
+        {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::SpatialOverlap,
+                score: 0.65,
+                reason: "one cluster is compatible with the current place cell".to_string(),
+            });
+        }
+        if metadata_bool(left, "moves_independently") || metadata_bool(right, "moves_independently")
+        {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::Contradiction,
+                score: 0.7,
+                reason: "object cluster has evidence of independent motion".to_string(),
+            });
+        }
+        add_repetition_evidence(left, right, &mut evidence);
+        add_recent_cooccurrence(context, left, right, &mut evidence);
+
+        candidate_from_evidence(
+            left,
+            right,
+            BindingRelation::CooccursInEstimatedSpace,
+            evidence,
+            "object/place binding proposal",
+        )
+    }
+
+    fn action_outcome_candidate(
+        &self,
+        context: &BindingContext,
+        left: &DiscoveredCluster,
+        right: &DiscoveredCluster,
+    ) -> Option<BindingCandidate> {
+        let (action, outcome) = if left.kind == DiscoveredClusterKind::Action {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let lag_ms = outcome.first_seen_ms.saturating_sub(action.last_seen_ms);
+        if lag_ms < self.action_outcome_min_lag_ms || lag_ms > self.action_outcome_max_lag_ms {
+            return None;
+        }
+
+        let mut evidence = Vec::new();
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::TemporalOverlap,
+            score: lag_score(
+                lag_ms,
+                self.action_outcome_min_lag_ms,
+                self.action_outcome_max_lag_ms,
+            ),
+            reason: format!("outcome followed action after {lag_ms} ms"),
+        });
+        if context.active_action.is_some() {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::PoseAgreement,
+                score: 0.55,
+                reason: "binding context includes the active action that produced this window"
+                    .to_string(),
+            });
+        }
+        if let Some(body_state) = &context.body_state {
+            if body_state.charging
+                || body_state.flags.wheel_drop
+                || body_state.flags.bump_left
+                || body_state.flags.bump_right
+            {
+                evidence.push(BindingEvidence {
+                    kind: BindingEvidenceKind::RepeatedCooccurrence,
+                    score: 0.65,
+                    reason: "body state contains concrete outcome evidence".to_string(),
+                });
+            }
+        }
+        add_repetition_evidence(left, right, &mut evidence);
+
+        Some(candidate_from_evidence(
+            action,
+            outcome,
+            BindingRelation::ExplainsOutcome,
+            evidence,
+            "action/outcome binding proposal",
+        ))
+    }
+
+    fn label_cluster_candidate(
+        &self,
+        context: &BindingContext,
+        left: &DiscoveredCluster,
+        right: &DiscoveredCluster,
+    ) -> BindingCandidate {
+        let mut evidence = base_cross_modal_evidence(context, left, right);
+        let trusted =
+            metadata_bool(left, "trusted_source") || metadata_bool(right, "trusted_source");
+        let llm = metadata_string(left, "source").as_deref() == Some("llm")
+            || metadata_string(right, "source").as_deref() == Some("llm");
+        if trusted {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::HumanConfirmed,
+                score: 0.9,
+                reason: "label came from a trusted source".to_string(),
+            });
+        } else if llm {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::LlmSuggested,
+                score: 0.45,
+                reason: "LLM label suggests this correspondence but needs support".to_string(),
+            });
+        }
+        add_repetition_evidence(left, right, &mut evidence);
+        add_recent_cooccurrence(context, left, right, &mut evidence);
+
+        candidate_from_evidence(
+            left,
+            right,
+            BindingRelation::NamedBy,
+            evidence,
+            "label/cluster binding proposal",
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2053,6 +2509,315 @@ impl EntityMemory {
             top_entities,
         }
     }
+}
+
+fn base_cross_modal_evidence(
+    context: &BindingContext,
+    left: &DiscoveredCluster,
+    right: &DiscoveredCluster,
+) -> Vec<BindingEvidence> {
+    let mut evidence = Vec::new();
+    if temporally_compatible(context, left, right) {
+        let delta_ms = cluster_time_delta_ms(left, right);
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::TemporalOverlap,
+            score: (1.0 - delta_ms as f32 / context.time_window_ms.max(1) as f32).clamp(0.0, 1.0),
+            reason: format!("{} and {} occurred within {delta_ms} ms", left.id, right.id),
+        });
+    }
+    if source_frame_matches(context, left, right) {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::ProjectionAgreement,
+            score: 0.55,
+            reason: "clusters share a source frame context".to_string(),
+        });
+    }
+    if let Some(distance) = pose_distance_m(left, right) {
+        if distance <= 0.75 {
+            evidence.push(BindingEvidence {
+                kind: BindingEvidenceKind::SpatialOverlap,
+                score: (1.0 - distance / 0.75).clamp(0.0, 1.0),
+                reason: format!("cluster poses are within {distance:.2} m"),
+            });
+        }
+    }
+    evidence
+}
+
+fn candidate_from_evidence(
+    left: &DiscoveredCluster,
+    right: &DiscoveredCluster,
+    relation: BindingRelation,
+    evidence: Vec<BindingEvidence>,
+    fallback_reason: &str,
+) -> BindingCandidate {
+    let has_human_confirmation = evidence
+        .iter()
+        .any(|item| item.kind == BindingEvidenceKind::HumanConfirmed);
+    let has_hard_contradiction = evidence
+        .iter()
+        .any(|item| item.kind == BindingEvidenceKind::Contradiction);
+    let has_conflict = evidence.iter().any(|item| {
+        matches!(
+            item.kind,
+            BindingEvidenceKind::Contradiction | BindingEvidenceKind::SimultaneousConflict
+        )
+    });
+    let independent_positive_kinds = evidence
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.kind,
+                BindingEvidenceKind::Contradiction
+                    | BindingEvidenceKind::SimultaneousConflict
+                    | BindingEvidenceKind::VectorSimilarity
+                    | BindingEvidenceKind::LlmSuggested
+            )
+        })
+        .map(|item| binding_evidence_kind_rank(&item.kind))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mean_score = if evidence.is_empty() {
+        0.0
+    } else {
+        evidence
+            .iter()
+            .map(|item| item.score.clamp(0.0, 1.0))
+            .sum::<f32>()
+            / evidence.len() as f32
+    };
+    let mut confidence = if has_human_confirmation {
+        mean_score.max(0.9)
+    } else {
+        (mean_score * (independent_positive_kinds as f32 / 3.0).clamp(0.25, 1.0)).clamp(0.0, 1.0)
+    };
+    if has_conflict {
+        confidence *= 0.35;
+    }
+
+    let (decision, reason) = if has_hard_contradiction {
+        (
+            BindingDecision::Reject,
+            "candidate contains contradictory cross-modal evidence".to_string(),
+        )
+    } else if has_conflict {
+        (
+            BindingDecision::HoldAmbiguous,
+            "candidate is plausible but has competing cross-modal evidence".to_string(),
+        )
+    } else if has_human_confirmation {
+        (
+            BindingDecision::Accept,
+            "candidate has trusted human/source confirmation".to_string(),
+        )
+    } else if independent_positive_kinds >= 2 {
+        (
+            BindingDecision::Accept,
+            "candidate has at least two independent cross-modal evidence types".to_string(),
+        )
+    } else if evidence
+        .iter()
+        .any(|item| item.kind == BindingEvidenceKind::LlmSuggested)
+        && independent_positive_kinds == 0
+    {
+        (
+            BindingDecision::CollectMoreEvidence,
+            "LLM suggestion alone is not enough to bind clusters".to_string(),
+        )
+    } else if evidence.is_empty() {
+        (
+            BindingDecision::CollectMoreEvidence,
+            fallback_reason.to_string(),
+        )
+    } else {
+        (
+            BindingDecision::CollectMoreEvidence,
+            "candidate needs more independent evidence before admission".to_string(),
+        )
+    };
+
+    BindingCandidate {
+        left_cluster_id: left.id.clone(),
+        right_cluster_id: right.id.clone(),
+        relation,
+        evidence,
+        confidence: confidence.clamp(0.0, 1.0),
+        decision,
+        reason,
+    }
+}
+
+fn temporally_compatible(
+    context: &BindingContext,
+    left: &DiscoveredCluster,
+    right: &DiscoveredCluster,
+) -> bool {
+    cluster_time_delta_ms(left, right) <= context.time_window_ms
+}
+
+fn cluster_time_delta_ms(left: &DiscoveredCluster, right: &DiscoveredCluster) -> u64 {
+    if left.last_seen_ms < right.first_seen_ms {
+        right.first_seen_ms.saturating_sub(left.last_seen_ms)
+    } else if right.last_seen_ms < left.first_seen_ms {
+        left.first_seen_ms.saturating_sub(right.last_seen_ms)
+    } else {
+        0
+    }
+}
+
+fn source_frame_matches(
+    context: &BindingContext,
+    left: &DiscoveredCluster,
+    right: &DiscoveredCluster,
+) -> bool {
+    if left.source_frame_id.is_some()
+        && right.source_frame_id.is_some()
+        && left.source_frame_id == right.source_frame_id
+    {
+        return true;
+    }
+    context.source_frame_id.as_ref().is_some_and(|frame| {
+        left.source_frame_id.as_ref() == Some(frame)
+            || right.source_frame_id.as_ref() == Some(frame)
+    })
+}
+
+fn add_recent_cooccurrence(
+    context: &BindingContext,
+    left: &DiscoveredCluster,
+    right: &DiscoveredCluster,
+    evidence: &mut Vec<BindingEvidence>,
+) {
+    if context.recent_clusters.contains(&left.id) && context.recent_clusters.contains(&right.id) {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::RepeatedCooccurrence,
+            score: 0.7,
+            reason: "both clusters appeared in recent binding context".to_string(),
+        });
+    }
+    if !left.feature_ids.is_empty()
+        && !right.feature_ids.is_empty()
+        && left
+            .feature_ids
+            .iter()
+            .any(|id| context.recent_features.contains(id))
+        && right
+            .feature_ids
+            .iter()
+            .any(|id| context.recent_features.contains(id))
+    {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::RepeatedCooccurrence,
+            score: 0.7,
+            reason: "both clusters reference recently observed features".to_string(),
+        });
+    }
+}
+
+fn add_repetition_evidence(
+    left: &DiscoveredCluster,
+    right: &DiscoveredCluster,
+    evidence: &mut Vec<BindingEvidence>,
+) {
+    let repeats =
+        metadata_u64(left, "cooccurrence_count").max(metadata_u64(right, "cooccurrence_count"));
+    if repeats >= 2 {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::RepeatedCooccurrence,
+            score: (repeats as f32 / 5.0).clamp(0.0, 1.0),
+            reason: format!("clusters have repeated together in {repeats} observations"),
+        });
+    }
+}
+
+fn add_label_support(
+    left: &DiscoveredCluster,
+    right: &DiscoveredCluster,
+    evidence: &mut Vec<BindingEvidence>,
+) {
+    let left_label = metadata_string(left, "label");
+    let right_label = metadata_string(right, "label");
+    if left_label.is_some() && left_label == right_label {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::HumanConfirmed,
+            score: 0.85,
+            reason: "clusters share a supporting label".to_string(),
+        });
+    }
+}
+
+fn projection_error_px(left: &DiscoveredCluster, right: &DiscoveredCluster) -> Option<f32> {
+    let left_x = metadata_f32(left, "image_x");
+    let left_y = metadata_f32(left, "image_y");
+    let right_x =
+        metadata_f32(right, "projected_image_x").or_else(|| metadata_f32(right, "image_x"));
+    let right_y =
+        metadata_f32(right, "projected_image_y").or_else(|| metadata_f32(right, "image_y"));
+    left_x
+        .zip(left_y)
+        .zip(right_x.zip(right_y))
+        .map(|((lx, ly), (rx, ry))| ((lx - rx).powi(2) + (ly - ry).powi(2)).sqrt())
+        .or_else(|| {
+            let right_x = metadata_f32(right, "image_x");
+            let right_y = metadata_f32(right, "image_y");
+            let left_x =
+                metadata_f32(left, "projected_image_x").or_else(|| metadata_f32(left, "image_x"));
+            let left_y =
+                metadata_f32(left, "projected_image_y").or_else(|| metadata_f32(left, "image_y"));
+            left_x
+                .zip(left_y)
+                .zip(right_x.zip(right_y))
+                .map(|((lx, ly), (rx, ry))| ((lx - rx).powi(2) + (ly - ry).powi(2)).sqrt())
+        })
+}
+
+fn pose_distance_m(left: &DiscoveredCluster, right: &DiscoveredCluster) -> Option<f32> {
+    left.estimated_pose
+        .zip(right.estimated_pose)
+        .map(|(left, right)| {
+            ((left.x_m - right.x_m).powi(2) + (left.y_m - right.y_m).powi(2)).sqrt()
+        })
+}
+
+fn lag_score(lag_ms: u64, min_ms: u64, max_ms: u64) -> f32 {
+    if lag_ms < min_ms || lag_ms > max_ms {
+        return 0.0;
+    }
+    let midpoint = (min_ms + max_ms) as f32 / 2.0;
+    let half_span = (max_ms.saturating_sub(min_ms)).max(1) as f32 / 2.0;
+    (1.0 - ((lag_ms as f32 - midpoint).abs() / half_span)).clamp(0.1, 1.0)
+}
+
+fn metadata_f32(cluster: &DiscoveredCluster, key: &str) -> Option<f32> {
+    cluster
+        .metadata
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| value as f32)
+}
+
+fn metadata_u64(cluster: &DiscoveredCluster, key: &str) -> u64 {
+    cluster
+        .metadata
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn metadata_bool(cluster: &DiscoveredCluster, key: &str) -> bool {
+    cluster
+        .metadata
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn metadata_string(cluster: &DiscoveredCluster, key: &str) -> Option<String> {
+    cluster
+        .metadata
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 fn qualify_binding_candidate(
@@ -7167,6 +7932,242 @@ mod tests {
                 && evidence.reason.contains("entity:person:grace")
                 && evidence.reason.contains("entity:person:ada")
         }));
+    }
+
+    #[test]
+    fn cross_modal_engine_proposes_face_voice_candidate_without_mutation() {
+        let mut engine = DefaultCrossModalBindingEngine::default();
+        let context = BindingContext::new(1_000);
+        let clusters = vec![
+            DiscoveredCluster::new(
+                "face-a",
+                Modality::Vision,
+                DiscoveredClusterKind::Face,
+                1_000,
+                0.9,
+            ),
+            DiscoveredCluster::new(
+                "voice-a",
+                Modality::Audio,
+                DiscoveredClusterKind::Voice,
+                1_050,
+                0.85,
+            ),
+        ];
+
+        let candidates = engine.propose_bindings(&context, &clusters);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].relation, BindingRelation::LikelySameEntity);
+        assert!(candidates[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::TemporalOverlap));
+        assert!(candidates[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::SingleCandidateContext));
+        assert_eq!(
+            clusters.len(),
+            2,
+            "engine must not mutate clusters or entities"
+        );
+    }
+
+    #[test]
+    fn cross_modal_engine_holds_ambiguous_face_voice_context() {
+        let mut engine = DefaultCrossModalBindingEngine::default();
+        let context = BindingContext::new(1_000);
+        let clusters = vec![
+            DiscoveredCluster::new(
+                "face-a",
+                Modality::Vision,
+                DiscoveredClusterKind::Face,
+                1_000,
+                0.9,
+            ),
+            DiscoveredCluster::new(
+                "face-b",
+                Modality::Vision,
+                DiscoveredClusterKind::Face,
+                1_010,
+                0.9,
+            ),
+            DiscoveredCluster::new(
+                "voice-a",
+                Modality::Audio,
+                DiscoveredClusterKind::Voice,
+                1_020,
+                0.9,
+            ),
+            DiscoveredCluster::new(
+                "voice-b",
+                Modality::Audio,
+                DiscoveredClusterKind::Voice,
+                1_030,
+                0.9,
+            ),
+        ];
+
+        let candidates = engine.propose_bindings(&context, &clusters);
+
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|candidate| {
+            candidate.decision == BindingDecision::HoldAmbiguous
+                && candidate
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.kind == BindingEvidenceKind::SimultaneousConflict)
+        }));
+    }
+
+    #[test]
+    fn cross_modal_engine_proposes_rgb_geometry_projection() {
+        let mut engine = DefaultCrossModalBindingEngine::default();
+        let context = BindingContext {
+            source_frame_id: Some("frame-1".to_string()),
+            ..BindingContext::new(1_000)
+        };
+        let rgb = DiscoveredCluster::new(
+            "rgb-patch",
+            Modality::Vision,
+            DiscoveredClusterKind::RgbImage,
+            1_000,
+            0.8,
+        )
+        .with_source_frame_id("frame-1")
+        .with_metadata(json!({ "image_x": 100.0, "image_y": 50.0 }));
+        let depth = DiscoveredCluster::new(
+            "voxel",
+            Modality::Depth,
+            DiscoveredClusterKind::Geometry,
+            1_000,
+            0.8,
+        )
+        .with_source_frame_id("frame-1")
+        .with_metadata(json!({ "projected_image_x": 102.0, "projected_image_y": 53.0 }));
+
+        let candidates = engine.propose_bindings(&context, &[rgb, depth]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].relation, BindingRelation::ProjectsTo);
+        assert!(candidates[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::ProjectionAgreement));
+    }
+
+    #[test]
+    fn cross_modal_engine_proposes_object_place_binding() {
+        let mut engine = DefaultCrossModalBindingEngine::default();
+        let cell = PlaceCellKey { x: 2, y: 3 };
+        let context = BindingContext {
+            current_place_cell: Some(cell),
+            ..BindingContext::new(1_000)
+        };
+        let object = DiscoveredCluster::new(
+            "charger-object",
+            Modality::Vision,
+            DiscoveredClusterKind::Object,
+            1_000,
+            0.9,
+        )
+        .with_place_cell(cell)
+        .with_metadata(json!({ "cooccurrence_count": 3 }));
+        let place = DiscoveredCluster::new(
+            "dock-place",
+            Modality::Memory,
+            DiscoveredClusterKind::Place,
+            950,
+            0.8,
+        )
+        .with_place_cell(cell);
+
+        let candidates = engine.propose_bindings(&context, &[object, place]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].relation,
+            BindingRelation::CooccursInEstimatedSpace
+        );
+        assert!(candidates[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::SpatialOverlap));
+        assert!(candidates[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::RepeatedCooccurrence));
+    }
+
+    #[test]
+    fn cross_modal_engine_proposes_action_outcome_binding() {
+        let mut engine = DefaultCrossModalBindingEngine::default();
+        let context = BindingContext {
+            active_action: Some(ActionPrimitive::Go {
+                intensity: 0.5,
+                duration_ms: 500,
+            }),
+            body_state: Some(BodySense {
+                flags: BodyFlags {
+                    bump_left: true,
+                    ..BodyFlags::default()
+                },
+                ..BodySense::default()
+            }),
+            ..BindingContext::new(1_000)
+        };
+        let action = DiscoveredCluster::new(
+            "go-forward",
+            Modality::Odometry,
+            DiscoveredClusterKind::Action,
+            1_000,
+            0.8,
+        );
+        let outcome = DiscoveredCluster::new(
+            "bump-left",
+            Modality::Touch,
+            DiscoveredClusterKind::Outcome,
+            1_400,
+            0.9,
+        );
+
+        let candidates = engine.propose_bindings(&context, &[action, outcome]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].relation, BindingRelation::ExplainsOutcome);
+        assert!(candidates[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.reason.contains("outcome followed action")));
+    }
+
+    #[test]
+    fn cross_modal_engine_keeps_llm_label_alone_weak() {
+        let mut engine = DefaultCrossModalBindingEngine::default();
+        let context = BindingContext::new(1_000);
+        let label = DiscoveredCluster::new(
+            "llm-label-chair",
+            Modality::Language,
+            DiscoveredClusterKind::Label,
+            1_000,
+            0.7,
+        )
+        .with_metadata(json!({ "source": "llm", "label": "chair" }));
+        let object = DiscoveredCluster::new(
+            "object-blob",
+            Modality::Vision,
+            DiscoveredClusterKind::Object,
+            5_000,
+            0.7,
+        );
+
+        let candidates = engine.propose_bindings(&context, &[label, object]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].relation, BindingRelation::NamedBy);
+        assert_eq!(candidates[0].decision, BindingDecision::CollectMoreEvidence);
+        assert!(candidates[0].reason.contains("LLM suggestion alone"));
     }
 
     #[test]
