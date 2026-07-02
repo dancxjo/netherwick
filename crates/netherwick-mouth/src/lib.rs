@@ -56,8 +56,13 @@ pub fn mouth_from_env() -> Box<dyn Mouth + Send> {
 }
 
 pub struct QueuedPiperCpalMouth {
-    tx: Option<mpsc::Sender<String>>,
+    tx: Option<mpsc::Sender<MouthQueueItem>>,
     worker: Option<JoinHandle<()>>,
+}
+
+struct MouthQueueItem {
+    text: String,
+    outcome_tx: Option<mpsc::Sender<std::result::Result<SpeechOutcome, String>>>,
 }
 
 impl QueuedPiperCpalMouth {
@@ -66,7 +71,7 @@ impl QueuedPiperCpalMouth {
     }
 
     pub fn new(config: PiperConfig) -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = mpsc::channel::<MouthQueueItem>();
         let worker = std::thread::Builder::new()
             .name("netherwick-piper-mouth".to_string())
             .spawn(move || {
@@ -77,9 +82,26 @@ impl QueuedPiperCpalMouth {
                         return;
                     }
                 };
-                for text in rx {
-                    if let Err(error) = mouth.speak(&text) {
-                        tracing::warn!(error = %error, text = %text, "queued Piper mouth failed");
+                for item in rx {
+                    match mouth.speak(&item.text) {
+                        Ok(outcome) => {
+                            println!(
+                                "robot mouth spoke: device {}, duration {} ms",
+                                outcome.device.as_deref().unwrap_or("<unknown>"),
+                                outcome.duration_ms.unwrap_or_default()
+                            );
+                            if let Some(outcome_tx) = item.outcome_tx {
+                                let _ = outcome_tx.send(Ok(outcome));
+                            }
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            println!("robot mouth failed: {message}; text {:?}", item.text);
+                            tracing::warn!(error = %message, text = %item.text, "queued Piper mouth failed");
+                            if let Some(outcome_tx) = item.outcome_tx {
+                                let _ = outcome_tx.send(Err(message));
+                            }
+                        }
                     }
                 }
             })
@@ -95,10 +117,40 @@ impl QueuedPiperCpalMouth {
         if text.trim().is_empty() {
             return Ok(());
         }
+        self.send_item(MouthQueueItem {
+            text,
+            outcome_tx: None,
+        })
+    }
+
+    pub fn enqueue_and_wait(&self, text: impl Into<String>) -> Result<SpeechOutcome> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Ok(SpeechOutcome {
+                spoken: false,
+                backend: "queued-piper-cpal".to_string(),
+                ..SpeechOutcome::default()
+            });
+        }
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        self.send_item(MouthQueueItem {
+            text,
+            outcome_tx: Some(outcome_tx),
+        })?;
+        match outcome_rx
+            .recv()
+            .context("queued Piper mouth worker did not report outcome")?
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => anyhow::bail!(error),
+        }
+    }
+
+    fn send_item(&self, item: MouthQueueItem) -> Result<()> {
         self.tx
             .as_ref()
             .context("queued Piper mouth is already closed")?
-            .send(text)
+            .send(item)
             .context("queued Piper mouth worker is not running")
     }
 }
@@ -117,6 +169,7 @@ pub struct PiperConfig {
     pub model_path: PathBuf,
     pub config_path: PathBuf,
     pub variety: String,
+    pub output_device_name: Option<String>,
 }
 
 impl PiperConfig {
@@ -125,6 +178,7 @@ impl PiperConfig {
             model_path: model_path.into(),
             config_path: config_path.into(),
             variety: DEFAULT_TTS_VARIETY.to_string(),
+            output_device_name: None,
         }
     }
 
@@ -150,6 +204,10 @@ impl PiperConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_TTS_VARIETY.to_string());
+        config.output_device_name = std::env::var("NETHERWICK_TTS_OUTPUT_DEVICE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Ok(Some(config))
     }
 }
@@ -199,6 +257,7 @@ impl Mouth for PiperCpalMouth {
                 variety: self.config.variety.clone(),
             },
             text.len(),
+            self.config.output_device_name.as_deref(),
         )
     }
 }
@@ -207,11 +266,10 @@ fn play_tongues_streaming(
     speech: &mut PiperOnnxSpeech,
     request: SpeechRequest,
     text_len: usize,
+    output_device_name: Option<&str>,
 ) -> Result<SpeechOutcome> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("no default output device available"))?;
+    let device = select_output_device(&host, output_device_name)?;
     let device_name = device
         .name()
         .unwrap_or_else(|_| "<unknown output device>".to_string());
@@ -281,6 +339,33 @@ fn play_tongues_streaming(
         duration_ms: Some(duration.as_millis() as u64),
         device: Some(device_name),
     })
+}
+
+fn select_output_device(host: &cpal::Host, requested_name: Option<&str>) -> Result<cpal::Device> {
+    let Some(requested_name) = requested_name else {
+        return host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("no default output device available"));
+    };
+    let requested_name = requested_name.to_ascii_lowercase();
+    let devices = host
+        .output_devices()
+        .context("failed to enumerate output devices")?;
+    let mut available = Vec::new();
+    for device in devices {
+        let name = device
+            .name()
+            .unwrap_or_else(|_| "<unknown output device>".to_string());
+        if name.to_ascii_lowercase().contains(&requested_name) {
+            return Ok(device);
+        }
+        available.push(name);
+    }
+    anyhow::bail!(
+        "requested speech output device {:?} not found; available output devices: {}",
+        requested_name,
+        available.join(", ")
+    );
 }
 
 struct OutputConfig {

@@ -4536,7 +4536,6 @@ fn is_reliable_background_packet(packet: &SensePacket) -> bool {
 fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SensePacket) {
     let now_ms = Utc::now().timestamp_millis().max(0) as u64;
     let mut snapshot = live_state.latest().unwrap_or_default();
-    snapshot.body.last_update_ms = now_ms;
     snapshot
         .extensions
         .retain(|extension| extension.name != "live/startup_sensor_only");
@@ -4793,6 +4792,23 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
+    let mouth = match QueuedPiperCpalMouth::from_env() {
+        Ok(Some(mouth)) => Some(mouth),
+        Ok(None) => {
+            println!(
+                "robot mouth disabled: no Piper voice found; set NETHERWICK_TTS_PIPER_VOICE and NETHERWICK_TTS_PIPER_CONFIG"
+            );
+            None
+        }
+        Err(error) => {
+            println!("robot mouth disabled: could not load Piper voice: {error}");
+            None
+        }
+    };
+    if let Some(mouth) = &mouth {
+        speak_robot_mouth_text_before_status(mouth, "Hello. My name is Pete Netherwick.");
+    }
+
     let init_body = match body.read_body().await {
         Ok(body) => Some(body),
         Err(error) => {
@@ -4840,19 +4856,6 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         None => None,
     };
 
-    let mouth = match QueuedPiperCpalMouth::from_env() {
-        Ok(Some(mouth)) => Some(mouth),
-        Ok(None) => {
-            println!(
-                "robot mouth disabled: no Piper voice found; set NETHERWICK_TTS_PIPER_VOICE and NETHERWICK_TTS_PIPER_CONFIG"
-            );
-            None
-        }
-        Err(error) => {
-            println!("robot mouth disabled: could not load Piper voice: {error}");
-            None
-        }
-    };
     if let Some(mouth) = &mouth {
         enqueue_default_bringup_mouth(mouth, &initialization);
     }
@@ -4985,6 +4988,18 @@ fn enqueue_default_bringup_mouth(mouth: &QueuedPiperCpalMouth, initialization: &
             );
         }
         _ => enqueue_robot_mouth_text(mouth, "Battery status is unavailable."),
+    }
+}
+
+fn speak_robot_mouth_text_before_status(mouth: &QueuedPiperCpalMouth, text: &str) {
+    println!("robot mouth speaking before body status: {text:?}");
+    match mouth.enqueue_and_wait(text.to_string()) {
+        Ok(outcome) => println!(
+            "robot mouth completed before body status: device {}, duration {} ms",
+            outcome.device.as_deref().unwrap_or("<unknown>"),
+            outcome.duration_ms.unwrap_or_default()
+        ),
+        Err(error) => println!("robot mouth pre-status speech failed; continuing: {error}"),
     }
 }
 
@@ -11233,6 +11248,33 @@ mod tests {
         assert_eq!(mode, RobotMode::ReadOnly);
         assert!(is_mock_body);
         assert_eq!(body.read_body().await.unwrap().last_update_ms, 100);
+    }
+
+    #[test]
+    fn sensor_only_live_publish_does_not_refresh_body_timestamp() {
+        let live_state = LiveViewState::new().with_real_slow_hardware_control();
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.last_update_ms = 1_234;
+        live_state.update(snapshot);
+
+        publish_live_sensor_only_snapshot(
+            &live_state,
+            &SensePacket::EyeFrame(EyeFrame {
+                captured_at_ms: 9_999,
+                width: 1,
+                height: 1,
+                format: EyeFrameFormat::Rgb8,
+                bytes: vec![0, 0, 0],
+                source: Some("test".to_string()),
+            }),
+        );
+
+        let latest = live_state.latest().unwrap();
+        assert_eq!(latest.body.last_update_ms, 1_234);
+        assert_eq!(
+            latest.eye_frame.as_ref().map(|frame| frame.captured_at_ms),
+            Some(9_999)
+        );
     }
 
     #[test]

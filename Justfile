@@ -1,4 +1,5 @@
 set shell := ["bash", "-euxo", "pipefail", "-c"]
+set dotenv-load := true
 
 create1_port := env_var_or_default("CREATE1_PORT", "auto")
 gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "")
@@ -12,13 +13,14 @@ kinect_rgb_auto_gain_max := env_var_or_default("KINECT_RGB_AUTO_GAIN_MAX", "3.0"
 kinect_rgb_gain := env_var_or_default("KINECT_RGB_GAIN", "1.0")
 kinect_rgb_gamma := env_var_or_default("KINECT_RGB_GAMMA", "0.80")
 kinect_rgb_brightness := env_var_or_default("KINECT_RGB_BRIGHTNESS", "0.0")
+tts_output_device := env_var_or_default("NETHERWICK_TTS_OUTPUT_DEVICE", "USB Audio Device")
 
 # Default to the real robot path.
 default *args:
     just robot {{args}}
 
-# Install Linux dependencies, Rust toolchain, Docker, and Kinect prerequisites.
-setup: setup-system setup-docker setup-user setup-rust setup-kinect
+# Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, and the default TTS voice.
+setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-tts
     @echo "netherwick Linux setup complete"
     @echo "next: cargo check && just sim"
 
@@ -93,6 +95,29 @@ setup-kinect-from-source:
         -DBUILD_OPENNI2_DRIVER=OFF
     cmake --build .vendor/libfreenect/build -j
     sudo cmake --install .vendor/libfreenect/build
+
+# Download the default Piper voice used by the robot mouth.
+setup-tts:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VOICE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tongues/models/piper"
+    MODEL="$VOICE_DIR/en_US-ryan-medium.onnx"
+    CONFIG="$VOICE_DIR/en_US-ryan-medium.onnx.json"
+    mkdir -p "$VOICE_DIR"
+    if [ ! -s "$MODEL" ]; then
+        curl -fL --retry 3 --retry-delay 2 \
+            -o "$MODEL" \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx"
+    fi
+    if [ ! -s "$CONFIG" ]; then
+        curl -fL --retry 3 --retry-delay 2 \
+            -o "$CONFIG" \
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json"
+    fi
+    echo "Piper voice ready: $MODEL"
+
+# Fetch local model assets without running the full system setup.
+fetch: setup-tts
 
 # Format all Rust code in the workspace.
 fmt:
@@ -169,7 +194,7 @@ robot *args:
             --kinect-rgb-brightness "{{kinect_rgb_brightness}}"
         )
     fi
-    cargo run -p netherwick-tools -- robot \
+    NETHERWICK_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p netherwick-tools -- robot \
         --mode "${NETHERWICK_ROBOT_MODE:-slow}" \
         --create-port "{{create1_port}}" \
         --ledger "${NETHERWICK_ROBOT_LEDGER:-data/ledger/real/robot}" \

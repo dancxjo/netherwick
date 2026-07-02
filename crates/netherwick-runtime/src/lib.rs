@@ -4506,7 +4506,6 @@ where
             serde_json::Value::String("slow".to_string()),
         );
         self.insert_robot_initialization(&mut now);
-        enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
 
         now.reign = self.runtime.reign_sense(t_ms)?;
         if let Some(input) = now.reign.latest.clone() {
@@ -4535,6 +4534,8 @@ where
                 return Ok((snapshot, tick));
             }
         }
+
+        enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
 
         let tick = self
             .runtime
