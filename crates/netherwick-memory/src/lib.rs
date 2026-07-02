@@ -4,9 +4,9 @@ use netherwick_actions::{ActionPrimitive, TurnDir};
 use netherwick_body::{BodyFlags, BodySense, Velocity};
 use netherwick_core::{Feature, FeatureId, Goal, Pose2, Reward};
 use netherwick_experience::{
-    EmbodiedPipeline, EmbodiedVectorCoverage, Experience, ExperienceFuser, FuturePrediction,
-    Impression, InstantCoverage, MemoryLink, Modality, RecalledExperience, SensationPayloadKind,
-    VectorEmbedding,
+    EmbodiedContext, EmbodiedPipeline, EmbodiedVectorCoverage, Experience, ExperienceFuser,
+    FuturePrediction, Impression, InstantCoverage, MemoryLink, Modality, RecalledExperience,
+    SensationPayloadKind, VectorEmbedding,
 };
 use netherwick_ledger::{ExperienceFrame, ExperienceTransition};
 use netherwick_now::{
@@ -2558,6 +2558,926 @@ pub struct GraphIntelligenceDocument {
     pub human_reviews: Vec<HumanReviewRecord>,
     #[serde(default)]
     pub review_records: Vec<GraphReviewRecord>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CognitiveDiagnosticsReport {
+    pub summary: CognitiveDiagnosticsSummary,
+    pub features: FeatureDiagnostics,
+    pub clusters: ClusterDiagnostics,
+    pub bindings: BindingDiagnostics,
+    pub hypotheses: HypothesisDiagnostics,
+    pub constellations: ConstellationDiagnostics,
+    pub associations: AssociationDiagnostics,
+    pub predictions: PredictionDiagnostics,
+    pub active_learning: ActiveLearningDiagnostics,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CognitiveDiagnosticsSummary {
+    pub feature_count: usize,
+    pub cluster_count: usize,
+    pub binding_candidate_count: usize,
+    pub accepted_binding_count: usize,
+    pub rejected_binding_count: usize,
+    pub ambiguous_binding_count: usize,
+    pub hypothesis_count: usize,
+    pub competing_hypothesis_family_count: usize,
+    pub constellation_count: usize,
+    pub association_count: usize,
+    pub prediction_count: usize,
+    pub prediction_failure_count: usize,
+    pub open_question_count: usize,
+    pub contradiction_count: usize,
+    pub review_prompt_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FeatureDiagnostics {
+    pub items: Vec<FeatureInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FeatureInspectorItem {
+    pub feature_id: String,
+    pub modality: String,
+    pub feature_type: String,
+    pub timestamp_ms: u64,
+    pub confidence: f32,
+    pub provenance: String,
+    pub source_frame: Option<String>,
+    pub source_sensor: Option<String>,
+    pub vector_refs: Vec<VectorRefSummary>,
+    pub pose: Option<PoseSummary>,
+    pub metadata_summary: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorRefSummary {
+    pub collection: String,
+    pub point_id: String,
+    pub model: Option<String>,
+    pub source_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PoseSummary {
+    pub x_m: f32,
+    pub y_m: f32,
+    pub z_m: f32,
+    pub yaw_rad: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClusterDiagnostics {
+    pub items: Vec<ClusterInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClusterInspectorItem {
+    pub cluster_id: String,
+    pub modality: String,
+    pub lifecycle: String,
+    pub kind: String,
+    pub centroid_vector: Option<String>,
+    pub member_feature_ids: Vec<String>,
+    pub evidence_count: u32,
+    pub confidence: f32,
+    pub radius_or_spread: Option<f32>,
+    pub nearest_neighbors: Vec<String>,
+    pub split_merge_suggestions: Vec<String>,
+    pub source_frame: Option<String>,
+    pub pose: Option<PoseSummary>,
+    pub metadata_summary: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingDiagnostics {
+    pub items: Vec<BindingInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingInspectorItem {
+    pub binding_candidate_id: String,
+    pub accepted_binding_edge_id: Option<String>,
+    pub left_cluster_id: String,
+    pub right_cluster_id: String,
+    pub relation: String,
+    pub decision: String,
+    pub confidence: f32,
+    pub evidence: Vec<BindingEvidenceInspectorItem>,
+    pub rejection_reason: Option<String>,
+    pub ambiguity_reason: Option<String>,
+    pub contradictions: Vec<String>,
+    pub review_status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingEvidenceInspectorItem {
+    pub kind: String,
+    pub score: f32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HypothesisDiagnostics {
+    pub families: Vec<HypothesisFamilyInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HypothesisFamilyInspectorItem {
+    pub family_id: String,
+    pub competing_hypotheses: Vec<HypothesisInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HypothesisInspectorItem {
+    pub hypothesis_id: String,
+    pub kind: String,
+    pub target_id: Option<String>,
+    pub current_confidence: f32,
+    pub evidence: Vec<BindingEvidenceInspectorItem>,
+    pub contradictions: Vec<String>,
+    pub state: String,
+    pub why_not_promoted: Option<String>,
+    pub what_would_resolve_it: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConstellationDiagnostics {
+    pub items: Vec<ConstellationInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConstellationInspectorItem {
+    pub constellation_id: String,
+    pub state: String,
+    pub kind_hint: Option<String>,
+    pub member_clusters: Vec<String>,
+    pub member_bindings: Vec<String>,
+    pub supporting_features: Vec<String>,
+    pub supporting_places: Vec<String>,
+    pub supporting_entities: Vec<String>,
+    pub missing_expected_evidence: Vec<String>,
+    pub contradiction_notes: Vec<String>,
+    pub prediction_value: f32,
+    pub stability: f32,
+    pub suggested_tests: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssociationDiagnostics {
+    pub items: Vec<AssociationInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationInspectorItem {
+    pub association_id: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub relation_type: String,
+    pub confidence: f32,
+    pub prediction_gain: f32,
+    pub evidence_count: u32,
+    pub examples: Vec<AssociationExample>,
+    pub contradiction_count: u32,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PredictionDiagnostics {
+    pub items: Vec<PredictionInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PredictionInspectorItem {
+    pub current_prediction_id: String,
+    pub predicted_next_observation: String,
+    pub actual_next_observation: Option<String>,
+    pub prediction_error: Option<f32>,
+    pub surprise: f32,
+    pub likely_explanation: Option<String>,
+    pub related_associations: Vec<String>,
+    pub related_constellations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ActiveLearningDiagnostics {
+    pub open_questions: Vec<ActiveLearningInspectorItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActiveLearningInspectorItem {
+    pub question_id: String,
+    pub target_id: String,
+    pub target_kind: String,
+    pub question: String,
+    pub target_uncertainty: f32,
+    pub proposed_tests: Vec<InformationGatheringAction>,
+    pub expected_observation: Option<String>,
+    pub disconfirming_observation: Option<String>,
+    pub risk: f32,
+    pub expected_information_gain: f32,
+    pub human_question: Option<String>,
+    pub safety_blocker: Option<String>,
+    pub state: String,
+}
+
+impl CognitiveDiagnosticsReport {
+    pub fn from_graph_document(document: &GraphIntelligenceDocument) -> Self {
+        let mut planner = DefaultActiveLearningPlanner::default();
+        let active_learning_input = ActiveLearningInput {
+            context: ActiveLearningContext {
+                t_ms: document.t_ms,
+                ..ActiveLearningContext::default()
+            },
+            ambiguous_binding_candidates: document
+                .binding_candidates
+                .iter()
+                .filter(|candidate| is_ambiguous_binding(candidate))
+                .cloned()
+                .collect(),
+            tracking_hypotheses: document.tracking_hypotheses.clone(),
+            constellations: document.constellations.clone(),
+            association_edges: document.associations.clone(),
+            prediction_failures: prediction_failures_from_document(document),
+            llm_reviews: document
+                .llm_reviews
+                .iter()
+                .map(active_learning_hint_from_llm_review)
+                .collect(),
+            ..ActiveLearningInput::default()
+        };
+        let questions = planner.plan(&active_learning_input);
+        Self::from_parts(document, questions)
+    }
+
+    pub fn from_entity_memory_report(report: &EntityMemoryReport) -> Self {
+        let mut planner = DefaultActiveLearningPlanner::default();
+        let mut hypotheses = Vec::new();
+        hypotheses.extend(report.active_tracking_hypotheses.clone());
+        hypotheses.extend(report.review_tracking_hypotheses.clone());
+        hypotheses.extend(report.promoted_tracking_hypotheses.clone());
+        hypotheses.extend(report.expired_tracking_hypotheses.clone());
+        hypotheses.sort_by(|left, right| left.id.cmp(&right.id));
+        hypotheses.dedup_by(|left, right| left.id == right.id);
+
+        let mut candidates = Vec::new();
+        candidates.extend(report.accepted_binding_candidates.clone());
+        candidates.extend(report.ambiguous_binding_candidates.clone());
+        candidates.extend(report.rejected_binding_candidates.clone());
+        let input = ActiveLearningInput {
+            ambiguous_binding_candidates: report.ambiguous_binding_candidates.clone(),
+            tracking_hypotheses: hypotheses.clone(),
+            ..ActiveLearningInput::default()
+        };
+        let questions = planner.plan(&input);
+        let document = GraphIntelligenceDocument {
+            provenance: "entity_memory_report".to_string(),
+            binding_candidates: candidates,
+            tracking_hypotheses: hypotheses,
+            ..GraphIntelligenceDocument::default()
+        };
+        Self::from_parts(&document, questions)
+    }
+
+    pub fn with_embodied_context(mut self, context: &EmbodiedContext) -> Self {
+        let mut features = context
+            .sensations
+            .iter()
+            .map(feature_item_from_embodied_sensation)
+            .collect::<Vec<_>>();
+        self.features.items.append(&mut features);
+        self.predictions
+            .items
+            .extend(
+                context
+                    .predictions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, prediction)| PredictionInspectorItem {
+                        current_prediction_id: format!("embodied-prediction:{index}"),
+                        predicted_next_observation: prediction.text.clone(),
+                        actual_next_observation: None,
+                        prediction_error: None,
+                        surprise: 0.0,
+                        likely_explanation: None,
+                        related_associations: Vec::new(),
+                        related_constellations: Vec::new(),
+                    }),
+            );
+        self.refresh_summary();
+        self
+    }
+
+    fn from_parts(
+        document: &GraphIntelligenceDocument,
+        questions: Vec<ActiveLearningQuestion>,
+    ) -> Self {
+        let mut report = Self {
+            features: FeatureDiagnostics {
+                items: document.features.iter().map(feature_item).collect(),
+            },
+            clusters: ClusterDiagnostics {
+                items: document
+                    .clusters
+                    .iter()
+                    .map(|cluster| cluster_item(cluster, &document.clusters))
+                    .collect(),
+            },
+            bindings: BindingDiagnostics {
+                items: document
+                    .binding_candidates
+                    .iter()
+                    .map(|candidate| binding_item(candidate, &document.binding_edges))
+                    .collect(),
+            },
+            hypotheses: HypothesisDiagnostics {
+                families: hypothesis_families(&document.tracking_hypotheses),
+            },
+            constellations: ConstellationDiagnostics {
+                items: document
+                    .constellations
+                    .iter()
+                    .map(|constellation| constellation_item(constellation, &questions))
+                    .collect(),
+            },
+            associations: AssociationDiagnostics {
+                items: document.associations.iter().map(association_item).collect(),
+            },
+            predictions: PredictionDiagnostics {
+                items: prediction_items(document),
+            },
+            active_learning: ActiveLearningDiagnostics {
+                open_questions: questions.iter().map(active_learning_item).collect(),
+            },
+            summary: CognitiveDiagnosticsSummary::default(),
+        };
+        report.refresh_summary();
+        report
+    }
+
+    fn refresh_summary(&mut self) {
+        let accepted_binding_count = self
+            .bindings
+            .items
+            .iter()
+            .filter(|item| item.decision == "accept")
+            .count();
+        let rejected_binding_count = self
+            .bindings
+            .items
+            .iter()
+            .filter(|item| item.decision == "reject")
+            .count();
+        let ambiguous_binding_count = self
+            .bindings
+            .items
+            .iter()
+            .filter(|item| item.ambiguity_reason.is_some())
+            .count();
+        let contradiction_count = self
+            .bindings
+            .items
+            .iter()
+            .map(|item| item.contradictions.len())
+            .sum::<usize>()
+            + self
+                .hypotheses
+                .families
+                .iter()
+                .flat_map(|family| family.competing_hypotheses.iter())
+                .map(|hypothesis| hypothesis.contradictions.len())
+                .sum::<usize>()
+            + self
+                .constellations
+                .items
+                .iter()
+                .map(|item| item.contradiction_notes.len())
+                .sum::<usize>()
+            + self
+                .associations
+                .items
+                .iter()
+                .map(|item| item.contradiction_count as usize)
+                .sum::<usize>();
+        self.summary = CognitiveDiagnosticsSummary {
+            feature_count: self.features.items.len(),
+            cluster_count: self.clusters.items.len(),
+            binding_candidate_count: self.bindings.items.len(),
+            accepted_binding_count,
+            rejected_binding_count,
+            ambiguous_binding_count,
+            hypothesis_count: self
+                .hypotheses
+                .families
+                .iter()
+                .map(|family| family.competing_hypotheses.len())
+                .sum(),
+            competing_hypothesis_family_count: self
+                .hypotheses
+                .families
+                .iter()
+                .filter(|family| family.competing_hypotheses.len() > 1)
+                .count(),
+            constellation_count: self.constellations.items.len(),
+            association_count: self.associations.items.len(),
+            prediction_count: self.predictions.items.len(),
+            prediction_failure_count: self
+                .predictions
+                .items
+                .iter()
+                .filter(|item| item.prediction_error.is_some() || item.surprise > 0.0)
+                .count(),
+            open_question_count: self.active_learning.open_questions.len(),
+            contradiction_count,
+            review_prompt_count: self
+                .active_learning
+                .open_questions
+                .iter()
+                .filter(|item| item.human_question.is_some())
+                .count(),
+        };
+    }
+}
+
+fn feature_item(feature: &Feature) -> FeatureInspectorItem {
+    FeatureInspectorItem {
+        feature_id: feature.id.to_string(),
+        modality: feature.modality.as_str().to_string(),
+        feature_type: format!("{:?}", feature.feature_type),
+        timestamp_ms: feature.created_at_ms,
+        confidence: feature.confidence,
+        provenance: summarize_json(&feature.provenance),
+        source_frame: feature.source_frame.clone(),
+        source_sensor: feature.source_sensor.clone(),
+        vector_refs: feature
+            .vector_refs
+            .iter()
+            .map(|vector| VectorRefSummary {
+                collection: vector.collection.clone(),
+                point_id: vector.point_id.clone(),
+                model: vector.model.clone(),
+                source_id: vector.source_id.clone(),
+            })
+            .collect(),
+        pose: feature
+            .world_pose
+            .or(feature.local_pose)
+            .map(|pose| PoseSummary {
+                x_m: pose.x_m,
+                y_m: pose.y_m,
+                z_m: pose.z_m,
+                yaw_rad: pose.yaw_rad,
+            }),
+        metadata_summary: summarize_value(&feature.metadata),
+    }
+}
+
+fn feature_item_from_embodied_sensation(
+    sensation: &netherwick_experience::EmbodiedSensationRef,
+) -> FeatureInspectorItem {
+    FeatureInspectorItem {
+        feature_id: sensation.id.to_string(),
+        modality: sensation.modality.as_str().to_string(),
+        feature_type: sensation.payload_kind.as_str().to_string(),
+        timestamp_ms: 0,
+        confidence: 0.5,
+        provenance: sensation.source.clone(),
+        source_frame: None,
+        source_sensor: Some(sensation.source.clone()),
+        vector_refs: Vec::new(),
+        pose: None,
+        metadata_summary: json!({
+            "kind": sensation.kind,
+            "summary": sensation.summary,
+            "parent_id": sensation.parent_id.map(|id| id.to_string()),
+        }),
+    }
+}
+
+fn cluster_item(cluster: &DiscoveredCluster, all: &[DiscoveredCluster]) -> ClusterInspectorItem {
+    let nearest_neighbors = all
+        .iter()
+        .filter(|other| other.id != cluster.id && other.modality == cluster.modality)
+        .take(5)
+        .map(|other| other.id.clone())
+        .collect::<Vec<_>>();
+    let mut split_merge_suggestions = Vec::new();
+    if cluster.confidence < 0.45 {
+        split_merge_suggestions
+            .push("low confidence; collect more evidence before merging".to_string());
+    }
+    if metadata_bool(cluster, "moves_independently") {
+        split_merge_suggestions
+            .push("independent motion suggests this cluster may need splitting".to_string());
+    }
+    ClusterInspectorItem {
+        cluster_id: cluster.id.clone(),
+        modality: cluster.modality.as_str().to_string(),
+        lifecycle: if cluster.confidence >= 0.7 {
+            "strong".to_string()
+        } else if cluster.confidence >= 0.4 {
+            "tentative".to_string()
+        } else {
+            "weak".to_string()
+        },
+        kind: format!("{:?}", cluster.kind),
+        centroid_vector: cluster
+            .metadata
+            .get("centroid_vector_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        member_feature_ids: cluster
+            .feature_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect(),
+        evidence_count: cluster.feature_ids.len().max(1) as u32,
+        confidence: cluster.confidence,
+        radius_or_spread: cluster
+            .metadata
+            .get("radius")
+            .or_else(|| cluster.metadata.get("spread"))
+            .and_then(value_as_f32),
+        nearest_neighbors,
+        split_merge_suggestions,
+        source_frame: cluster.source_frame_id.clone(),
+        pose: cluster.estimated_pose.map(|pose| PoseSummary {
+            x_m: pose.x_m,
+            y_m: pose.y_m,
+            z_m: 0.0,
+            yaw_rad: pose.heading_rad,
+        }),
+        metadata_summary: summarize_value(&cluster.metadata),
+    }
+}
+
+fn binding_item(candidate: &BindingCandidate, edges: &[BindingEdge]) -> BindingInspectorItem {
+    let contradictions = candidate
+        .evidence
+        .iter()
+        .filter(|evidence| binding_evidence_is_contradictory(evidence))
+        .map(|evidence| evidence.reason.clone())
+        .collect::<Vec<_>>();
+    let accepted_binding_edge_id = (candidate.decision == BindingDecision::Accept).then(|| {
+        edges
+            .iter()
+            .find(|edge| {
+                edge.left_cluster_id == candidate.left_cluster_id
+                    && edge.right_cluster_id == candidate.right_cluster_id
+                    && edge.relation == candidate.relation
+            })
+            .map(binding_edge_id)
+            .unwrap_or_else(|| {
+                binding_edge_id_from_parts(
+                    &candidate.left_cluster_id,
+                    &candidate.right_cluster_id,
+                    &candidate.relation,
+                )
+            })
+    });
+    BindingInspectorItem {
+        binding_candidate_id: binding_candidate_id(candidate),
+        accepted_binding_edge_id,
+        left_cluster_id: candidate.left_cluster_id.clone(),
+        right_cluster_id: candidate.right_cluster_id.clone(),
+        relation: binding_relation_slug(&candidate.relation).to_string(),
+        decision: binding_decision_slug(&candidate.decision).to_string(),
+        confidence: candidate.confidence,
+        evidence: candidate
+            .evidence
+            .iter()
+            .map(binding_evidence_item)
+            .collect(),
+        rejection_reason: (candidate.decision == BindingDecision::Reject)
+            .then(|| candidate.reason.clone()),
+        ambiguity_reason: binding_is_unresolved(candidate).then(|| candidate.reason.clone()),
+        contradictions,
+        review_status: match candidate.decision {
+            BindingDecision::AskHuman => "needs_human_review",
+            BindingDecision::HoldAmbiguous | BindingDecision::CollectMoreEvidence => {
+                "needs_more_evidence"
+            }
+            BindingDecision::Reject => "rejected",
+            BindingDecision::Accept => "accepted",
+        }
+        .to_string(),
+    }
+}
+
+fn binding_is_unresolved(candidate: &BindingCandidate) -> bool {
+    !matches!(
+        candidate.decision,
+        BindingDecision::Accept | BindingDecision::Reject
+    ) && is_ambiguous_binding(candidate)
+}
+
+fn binding_evidence_item(evidence: &BindingEvidence) -> BindingEvidenceInspectorItem {
+    BindingEvidenceInspectorItem {
+        kind: binding_evidence_slug(&evidence.kind).to_string(),
+        score: evidence.score,
+        reason: evidence.reason.clone(),
+    }
+}
+
+fn hypothesis_families(hypotheses: &[TrackingHypothesis]) -> Vec<HypothesisFamilyInspectorItem> {
+    let mut by_family = BTreeMap::<String, Vec<HypothesisInspectorItem>>::new();
+    for hypothesis in hypotheses {
+        by_family
+            .entry(hypothesis.family_id.clone())
+            .or_default()
+            .push(hypothesis_item(hypothesis));
+    }
+    by_family
+        .into_iter()
+        .map(|(family_id, mut competing_hypotheses)| {
+            competing_hypotheses.sort_by(|left, right| {
+                right
+                    .current_confidence
+                    .partial_cmp(&left.current_confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            HypothesisFamilyInspectorItem {
+                family_id,
+                competing_hypotheses,
+            }
+        })
+        .collect()
+}
+
+fn hypothesis_item(hypothesis: &TrackingHypothesis) -> HypothesisInspectorItem {
+    HypothesisInspectorItem {
+        hypothesis_id: hypothesis.id.clone(),
+        kind: format!("{:?}", hypothesis.kind),
+        target_id: hypothesis.target_id.clone(),
+        current_confidence: hypothesis.confidence,
+        evidence: hypothesis
+            .evidence
+            .iter()
+            .map(binding_evidence_item)
+            .collect(),
+        contradictions: hypothesis.contradictions.clone(),
+        state: format!("{:?}", hypothesis.state),
+        why_not_promoted: why_hypothesis_not_promoted(hypothesis),
+        what_would_resolve_it: hypothesis_resolution_notes(hypothesis),
+    }
+}
+
+fn why_hypothesis_not_promoted(hypothesis: &TrackingHypothesis) -> Option<String> {
+    if hypothesis.state == HypothesisState::Promoted {
+        return None;
+    }
+    if !hypothesis.contradictions.is_empty() {
+        Some("contradictory evidence must be resolved first".to_string())
+    } else if hypothesis.confidence < HYPOTHESIS_PROMOTION_THRESHOLD {
+        Some(format!(
+            "confidence {:.2} is below promotion threshold {:.2}",
+            hypothesis.confidence, HYPOTHESIS_PROMOTION_THRESHOLD
+        ))
+    } else if matches!(hypothesis.state, HypothesisState::NeedsReview) {
+        Some("hypothesis is waiting for review".to_string())
+    } else {
+        Some("hypothesis has not accumulated enough stable evidence".to_string())
+    }
+}
+
+fn hypothesis_resolution_notes(hypothesis: &TrackingHypothesis) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !hypothesis.contradictions.is_empty() {
+        notes.push("resolve contradiction or reject the losing competitor".to_string());
+    }
+    if hypothesis.confidence < HYPOTHESIS_PROMOTION_THRESHOLD {
+        notes
+            .push("collect repeated supporting evidence in another observation window".to_string());
+    }
+    notes.push("human or LLM review can name the target or reject the match".to_string());
+    notes
+}
+
+fn constellation_item(
+    constellation: &Constellation,
+    questions: &[ActiveLearningQuestion],
+) -> ConstellationInspectorItem {
+    let contradiction_notes = constellation
+        .notes
+        .iter()
+        .filter(|note| note.to_lowercase().contains("contradict"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut missing_expected_evidence = Vec::new();
+    if constellation.member_binding_ids.is_empty() {
+        missing_expected_evidence.push("no accepted binding evidence yet".to_string());
+    }
+    if constellation.supporting_feature_ids.is_empty() {
+        missing_expected_evidence.push("no supporting feature ids attached".to_string());
+    }
+    ConstellationInspectorItem {
+        constellation_id: constellation.id.clone(),
+        state: constellation_state_slug(&constellation.state).to_string(),
+        kind_hint: constellation.kind_hint.clone(),
+        member_clusters: constellation.member_cluster_ids.clone(),
+        member_bindings: constellation.member_binding_ids.clone(),
+        supporting_features: constellation
+            .supporting_feature_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect(),
+        supporting_places: constellation
+            .supporting_place_cells
+            .iter()
+            .map(|cell| format!("place-cell:{},{}", cell.x, cell.y))
+            .collect(),
+        supporting_entities: constellation.supporting_entity_ids.clone(),
+        missing_expected_evidence,
+        contradiction_notes,
+        prediction_value: constellation.prediction_value,
+        stability: constellation.stability,
+        suggested_tests: questions
+            .iter()
+            .filter(|question| question.target_id == constellation.id)
+            .flat_map(|question| {
+                question
+                    .proposed_tests
+                    .iter()
+                    .map(|test| test.expected_observation.clone())
+            })
+            .collect(),
+    }
+}
+
+fn association_item(edge: &AssociationEdge) -> AssociationInspectorItem {
+    AssociationInspectorItem {
+        association_id: edge.id.clone(),
+        from_id: edge.from_id.clone(),
+        to_id: edge.to_id.clone(),
+        relation_type: format!("{:?}", edge.relation),
+        confidence: edge.confidence,
+        prediction_gain: edge.prediction_gain,
+        evidence_count: edge.evidence_count,
+        examples: edge.examples.clone(),
+        contradiction_count: edge.contradiction_count,
+        last_seen_ms: edge.last_seen_ms,
+    }
+}
+
+fn prediction_items(document: &GraphIntelligenceDocument) -> Vec<PredictionInspectorItem> {
+    let mut items = document
+        .predictions
+        .iter()
+        .map(|prediction| PredictionInspectorItem {
+            current_prediction_id: prediction.id.clone(),
+            predicted_next_observation: prediction.predicted.clone(),
+            actual_next_observation: document
+                .surprises
+                .iter()
+                .find(|surprise| surprise.target_id == prediction.id)
+                .map(|surprise| surprise.observed.clone()),
+            prediction_error: document
+                .surprises
+                .iter()
+                .find(|surprise| surprise.target_id == prediction.id)
+                .map(|surprise| surprise.surprise),
+            surprise: document
+                .surprises
+                .iter()
+                .filter(|surprise| surprise.target_id == prediction.id)
+                .map(|surprise| surprise.surprise)
+                .fold(0.0_f32, f32::max),
+            likely_explanation: Some(prediction.reason.clone()).filter(|reason| !reason.is_empty()),
+            related_associations: document
+                .associations
+                .iter()
+                .filter(|edge| {
+                    edge.from_id == prediction.target_id || edge.to_id == prediction.target_id
+                })
+                .map(|edge| edge.id.clone())
+                .collect(),
+            related_constellations: document
+                .constellations
+                .iter()
+                .filter(|constellation| {
+                    constellation
+                        .member_cluster_ids
+                        .iter()
+                        .any(|id| id == &prediction.target_id)
+                        || constellation
+                            .member_binding_ids
+                            .iter()
+                            .any(|id| id == &prediction.target_id)
+                })
+                .map(|constellation| constellation.id.clone())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    items.extend(document.surprises.iter().filter_map(|surprise| {
+        document
+            .predictions
+            .iter()
+            .any(|prediction| prediction.id == surprise.target_id)
+            .then_some(())
+            .is_none()
+            .then(|| PredictionInspectorItem {
+                current_prediction_id: surprise.target_id.clone(),
+                predicted_next_observation: "unknown".to_string(),
+                actual_next_observation: Some(surprise.observed.clone()),
+                prediction_error: Some(surprise.surprise),
+                surprise: surprise.surprise,
+                likely_explanation: Some(surprise.reason.clone()),
+                related_associations: Vec::new(),
+                related_constellations: Vec::new(),
+            })
+    }));
+    items
+}
+
+fn active_learning_item(question: &ActiveLearningQuestion) -> ActiveLearningInspectorItem {
+    let best = question.best_test();
+    ActiveLearningInspectorItem {
+        question_id: question.id.clone(),
+        target_id: question.target_id.clone(),
+        target_kind: format!("{:?}", question.target_kind),
+        question: question.question.clone(),
+        target_uncertainty: question.uncertainty,
+        proposed_tests: question.proposed_tests.clone(),
+        expected_observation: best.map(|test| test.expected_observation.clone()),
+        disconfirming_observation: best.map(|test| test.disconfirming_observation.clone()),
+        risk: question.risk,
+        expected_information_gain: question.expected_information_gain,
+        human_question: best.and_then(|test| test.human_question.clone()),
+        safety_blocker: question
+            .proposed_tests
+            .iter()
+            .find_map(|test| test.required_safety_state.clone()),
+        state: format!("{:?}", question.state),
+    }
+}
+
+fn prediction_failures_from_document(
+    document: &GraphIntelligenceDocument,
+) -> Vec<PredictionFailure> {
+    document
+        .surprises
+        .iter()
+        .map(|surprise| {
+            let prediction = document
+                .predictions
+                .iter()
+                .find(|prediction| prediction.id == surprise.target_id);
+            PredictionFailure {
+                id: format!("prediction-failure:{}", stable_slug(&surprise.id)),
+                target_id: surprise.target_id.clone(),
+                predicted: prediction
+                    .map(|prediction| prediction.predicted.clone())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                observed: surprise.observed.clone(),
+                confidence: surprise.confidence,
+                surprise: surprise.surprise,
+                action: None,
+                possible_causes: vec![surprise.reason.clone()],
+            }
+        })
+        .collect()
+}
+
+fn active_learning_hint_from_llm_review(review: &LlmReviewRecord) -> ActiveLearningReviewHint {
+    ActiveLearningReviewHint {
+        id: review.id.clone(),
+        target_id: review.target_id.clone(),
+        target_kind: review.target_kind.clone(),
+        suggested_tests: Vec::new(),
+        human_review_prompts: review.suggested_questions.clone(),
+        contradictions: review.contradictions.clone(),
+        confidence: review.confidence,
+    }
+}
+
+fn summarize_json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
+}
+
+fn summarize_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => json!({
+            "kind": "array",
+            "len": items.len(),
+            "sample": items.iter().take(5).map(summarize_value).collect::<Vec<_>>(),
+        }),
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map.iter().take(12) {
+                out.insert(key.clone(), summarize_value(value));
+            }
+            if map.len() > 12 {
+                out.insert("_truncated_keys".to_string(), json!(map.len() - 12));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::String(text) if text.len() > 160 => {
+            json!({ "kind": "text", "char_count": text.len(), "preview": &text[..160] })
+        }
+        other => other.clone(),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -10279,6 +11199,268 @@ fn neo4j_http_url_from_uri(uri: &str) -> Option<String> {
         return None;
     }
     Some(format!("http://{host_without_port}:7474"))
+}
+
+#[cfg(test)]
+mod cognitive_diagnostics_tests {
+    use super::*;
+    use netherwick_core::{FeatureModality, FeatureType, Provenance, VectorRef};
+
+    fn candidate(
+        left: &str,
+        right: &str,
+        decision: BindingDecision,
+        evidence: Vec<BindingEvidence>,
+    ) -> BindingCandidate {
+        BindingCandidate {
+            left_cluster_id: left.to_string(),
+            right_cluster_id: right.to_string(),
+            relation: BindingRelation::LikelySameEntity,
+            confidence: match decision {
+                BindingDecision::Accept => 0.88,
+                BindingDecision::Reject => 0.2,
+                _ => 0.48,
+            },
+            decision,
+            reason: "test decision reason".to_string(),
+            evidence,
+        }
+    }
+
+    fn evidence(kind: BindingEvidenceKind, reason: &str) -> BindingEvidence {
+        BindingEvidence {
+            kind,
+            score: 0.7,
+            reason: reason.to_string(),
+        }
+    }
+
+    fn diagnostic_document() -> GraphIntelligenceDocument {
+        let mut feature = Feature::new(
+            FeatureType::FaceObservation,
+            FeatureModality::Vision,
+            100,
+            0.82,
+            Provenance::direct().with_stage("test"),
+        )
+        .with_source_frame("frame-a")
+        .with_vector_ref(VectorRef::new("faces", "face-vector-a"))
+        .with_metadata(json!({
+            "raw_vector": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            "caption": "face candidate"
+        }));
+        let feature_id = feature.id;
+        feature.metadata["large_text"] = json!("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+
+        let accepted = candidate(
+            "face:a",
+            "voice:a",
+            BindingDecision::Accept,
+            vec![evidence(
+                BindingEvidenceKind::TemporalOverlap,
+                "same window",
+            )],
+        );
+        let rejected = candidate(
+            "face:a",
+            "voice:b",
+            BindingDecision::Reject,
+            vec![evidence(
+                BindingEvidenceKind::Contradiction,
+                "voice belongs to another face",
+            )],
+        );
+        let ambiguous = candidate(
+            "face:a",
+            "voice:c",
+            BindingDecision::HoldAmbiguous,
+            vec![evidence(
+                BindingEvidenceKind::SimultaneousConflict,
+                "two voices are active",
+            )],
+        );
+        GraphIntelligenceDocument {
+            id: "doc:test".to_string(),
+            t_ms: 120,
+            provenance: "test".to_string(),
+            features: vec![feature],
+            clusters: vec![
+                DiscoveredCluster::new(
+                    "face:a",
+                    Modality::Vision,
+                    DiscoveredClusterKind::Face,
+                    100,
+                    0.8,
+                )
+                .with_feature_ids(vec![feature_id]),
+                DiscoveredCluster::new(
+                    "voice:a",
+                    Modality::Audio,
+                    DiscoveredClusterKind::Voice,
+                    100,
+                    0.8,
+                ),
+            ],
+            binding_candidates: vec![accepted.clone(), rejected, ambiguous],
+            binding_edges: vec![BindingEdge {
+                left_cluster_id: accepted.left_cluster_id.clone(),
+                right_cluster_id: accepted.right_cluster_id.clone(),
+                relation: accepted.relation.clone(),
+                confidence: 0.9,
+                evidence_count: 2,
+                decay_per_tick: 0.01,
+                last_seen_ms: 120,
+            }],
+            tracking_hypotheses: vec![
+                TrackingHypothesis {
+                    id: "hypothesis:face:a:ada".to_string(),
+                    family_id: "face:a".to_string(),
+                    kind: TrackingHypothesisKind::FaceIdentity,
+                    target_id: Some("entity:ada".to_string()),
+                    observation_ids: vec!["obs:a".to_string()],
+                    binding_candidate_ids: vec!["candidate:a".to_string()],
+                    confidence: 0.51,
+                    evidence: vec![evidence(
+                        BindingEvidenceKind::VectorSimilarity,
+                        "close face vector",
+                    )],
+                    contradictions: Vec::new(),
+                    state: HypothesisState::Winning,
+                    first_seen_ms: 100,
+                    last_updated_ms: 120,
+                },
+                TrackingHypothesis {
+                    id: "hypothesis:face:a:grace".to_string(),
+                    family_id: "face:a".to_string(),
+                    kind: TrackingHypothesisKind::FaceIdentity,
+                    target_id: Some("entity:grace".to_string()),
+                    observation_ids: vec!["obs:a".to_string()],
+                    binding_candidate_ids: vec!["candidate:b".to_string()],
+                    confidence: 0.49,
+                    evidence: vec![evidence(
+                        BindingEvidenceKind::VectorSimilarity,
+                        "also close",
+                    )],
+                    contradictions: vec!["face vector close to two people".to_string()],
+                    state: HypothesisState::NeedsReview,
+                    first_seen_ms: 100,
+                    last_updated_ms: 120,
+                },
+            ],
+            constellations: vec![Constellation {
+                id: "constellation:person:a".to_string(),
+                kind_hint: Some("person".to_string()),
+                member_cluster_ids: vec!["face:a".to_string(), "voice:a".to_string()],
+                member_binding_ids: vec![binding_candidate_id(&accepted)],
+                supporting_feature_ids: Vec::new(),
+                supporting_entity_ids: vec!["entity:ada".to_string()],
+                supporting_place_cells: vec![PlaceCellKey { x: 1, y: 2 }],
+                confidence: 0.55,
+                stability: 0.35,
+                prediction_value: 0.4,
+                first_seen_ms: 100,
+                last_seen_ms: 120,
+                evidence_count: 1,
+                state: ConstellationState::Candidate,
+                notes: vec!["missing voice confirmation".to_string()],
+            }],
+            associations: vec![AssociationEdge {
+                id: "association:face-predicts-voice".to_string(),
+                from_id: "face:a".to_string(),
+                to_id: "voice:a".to_string(),
+                relation: AssociationRelation::Predicts,
+                confidence: 0.62,
+                evidence_count: 3,
+                prediction_gain: 0.2,
+                contradiction_count: 1,
+                first_seen_ms: 100,
+                last_seen_ms: 120,
+                examples: vec![AssociationExample {
+                    frame_id: Some("frame-a".to_string()),
+                    t_ms: 120,
+                    reason: "face preceded voice".to_string(),
+                    score: 0.7,
+                }],
+            }],
+            predictions: vec![PredictionRecord {
+                id: "prediction:voice".to_string(),
+                target_id: "voice:a".to_string(),
+                predicted: "voice continues".to_string(),
+                confidence: 0.6,
+                t_ms: 120,
+                state: "open".to_string(),
+                reason: "association predicts voice".to_string(),
+            }],
+            surprises: vec![SurpriseRecord {
+                id: "surprise:voice".to_string(),
+                target_id: "prediction:voice".to_string(),
+                observed: "voice stopped".to_string(),
+                surprise: 0.8,
+                confidence: 0.7,
+                t_ms: 130,
+                reason: "speaker stopped unexpectedly".to_string(),
+            }],
+            ..GraphIntelligenceDocument::default()
+        }
+    }
+
+    #[test]
+    fn cognitive_report_serializes_and_summarizes_sensitive_data() {
+        let report = CognitiveDiagnosticsReport::from_graph_document(&diagnostic_document());
+        let value = serde_json::to_value(&report).expect("serializable report");
+
+        assert_eq!(value["summary"]["feature_count"], 1);
+        assert_eq!(
+            value["features"]["items"][0]["metadata_summary"]["raw_vector"]["kind"],
+            "array"
+        );
+        assert!(
+            value["features"]["items"][0]["metadata_summary"]["raw_vector"]["vector"].is_null()
+        );
+    }
+
+    #[test]
+    fn binding_inspector_includes_accepted_rejected_and_ambiguous_candidates() {
+        let report = CognitiveDiagnosticsReport::from_graph_document(&diagnostic_document());
+
+        assert_eq!(report.summary.accepted_binding_count, 1);
+        assert_eq!(report.summary.rejected_binding_count, 1);
+        assert_eq!(report.summary.ambiguous_binding_count, 1);
+        assert!(report
+            .bindings
+            .items
+            .iter()
+            .any(|item| item.accepted_binding_edge_id.is_some()));
+        assert!(report
+            .bindings
+            .items
+            .iter()
+            .any(|item| item.rejection_reason.is_some()));
+        assert!(report
+            .bindings
+            .items
+            .iter()
+            .any(|item| item.ambiguity_reason.is_some()));
+    }
+
+    #[test]
+    fn hypothesis_constellation_active_learning_and_summary_are_inspectable() {
+        let report = CognitiveDiagnosticsReport::from_graph_document(&diagnostic_document());
+
+        assert_eq!(report.hypotheses.families.len(), 1);
+        assert_eq!(report.hypotheses.families[0].competing_hypotheses.len(), 2);
+        assert!(report.constellations.items[0]
+            .member_clusters
+            .contains(&"face:a".to_string()));
+        assert!(!report.constellations.items[0]
+            .missing_expected_evidence
+            .is_empty());
+        assert!(!report.active_learning.open_questions.is_empty());
+        assert_eq!(report.summary.cluster_count, 2);
+        assert_eq!(report.summary.constellation_count, 1);
+        assert_eq!(report.summary.association_count, 1);
+        assert_eq!(report.summary.prediction_failure_count, 1);
+    }
 }
 
 #[cfg(test)]

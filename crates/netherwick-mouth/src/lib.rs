@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+    mpsc, Arc, Mutex,
 };
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -50,6 +51,63 @@ pub fn mouth_from_env() -> Box<dyn Mouth + Send> {
         Err(error) => {
             tracing::warn!(error = %error, "failed to configure speech mouth; using noop mouth");
             Box::<NoopMouth>::default()
+        }
+    }
+}
+
+pub struct QueuedPiperCpalMouth {
+    tx: Option<mpsc::Sender<String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl QueuedPiperCpalMouth {
+    pub fn from_env() -> Result<Option<Self>> {
+        PiperConfig::from_env()?.map(Self::new).transpose()
+    }
+
+    pub fn new(config: PiperConfig) -> Result<Self> {
+        let (tx, rx) = mpsc::channel::<String>();
+        let worker = std::thread::Builder::new()
+            .name("netherwick-piper-mouth".to_string())
+            .spawn(move || {
+                let mut mouth = match PiperCpalMouth::new(config) {
+                    Ok(mouth) => mouth,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "queued Piper mouth failed to load voice");
+                        return;
+                    }
+                };
+                for text in rx {
+                    if let Err(error) = mouth.speak(&text) {
+                        tracing::warn!(error = %error, text = %text, "queued Piper mouth failed");
+                    }
+                }
+            })
+            .context("failed to spawn queued Piper mouth thread")?;
+        Ok(Self {
+            tx: Some(tx),
+            worker: Some(worker),
+        })
+    }
+
+    pub fn enqueue(&self, text: impl Into<String>) -> Result<()> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .as_ref()
+            .context("queued Piper mouth is already closed")?
+            .send(text)
+            .context("queued Piper mouth worker is not running")
+    }
+}
+
+impl Drop for QueuedPiperCpalMouth {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }

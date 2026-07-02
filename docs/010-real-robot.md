@@ -20,3 +20,18 @@ If distro packages are missing, build from source:
 ```bash
 just setup-kinect-from-source
 ```
+
+## Startup Events and Mouth
+
+The robot runner annotates the first real-robot `Now` with `robot.initialization` metadata: mode, body source, battery, requested/active sensors, ledger path, tick rate, dashboard, and capture destination. `EventExtractor` turns that first-tick annotation into a `RobotInitialized` event. The runtime then runs the replaceable `event_robot_initialized` behavior node, which can emit a bring-up `Song`, `Chirp`, and spoken status sequence.
+
+The robot process owns rendering. It creates a queued Piper/CPAL mouth from:
+
+```bash
+NETHERWICK_TTS_PIPER_VOICE=/path/to/en_US-ryan-medium.onnx
+NETHERWICK_TTS_PIPER_CONFIG=/path/to/en_US-ryan-medium.onnx.json
+```
+
+When configured, bring-up lines are enqueued immediately and played sequentially on a background thread using Tongues Piper streaming plus CPAL output. Later mouth actions emitted by event scripts are appended to the same queue. If the Piper voice or output device is unavailable, the robot should report the mouth as disabled and continue the robot run rather than blocking body/sensor startup.
+
+Mouth actions do not command motors. `Speak`, `Chirp`, and `Song` are rendered through the mouth gate; motion primitives remain separate and still pass the real-robot mode and safety gates.

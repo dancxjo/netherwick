@@ -32,7 +32,7 @@ use netherwick_memory::{
     PlaceRecognitionKind,
 };
 use netherwick_models::MODEL_REGISTRY;
-use netherwick_mouth::{Mouth, PiperCpalMouth};
+use netherwick_mouth::QueuedPiperCpalMouth;
 use netherwick_now::{EarSense, ExtensionSense, KinectSense, Now, RangeSense, SurpriseSense};
 use netherwick_runtime::{
     ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
@@ -4811,7 +4811,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let mut runner = RealRobotRunner::new(robot_mode, body, sensors, runtime)
         .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
         .with_live_image_enricher(live_image_enricher)
-        .with_robot_initialization(initialization);
+        .with_robot_initialization(initialization.clone());
     runner.tick_ms = args.tick_ms;
     for warning in frame_processor_warnings {
         println!("{warning}");
@@ -4840,7 +4840,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         None => None,
     };
 
-    let mut mouth = match PiperCpalMouth::from_env() {
+    let mouth = match QueuedPiperCpalMouth::from_env() {
         Ok(Some(mouth)) => Some(mouth),
         Ok(None) => {
             println!(
@@ -4853,6 +4853,9 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             None
         }
     };
+    if let Some(mouth) = &mouth {
+        enqueue_default_bringup_mouth(mouth, &initialization);
+    }
 
     let max_steps = args.steps.or_else(|| {
         args.duration_seconds
@@ -4879,7 +4882,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
-        play_event_script_mouth_actions(&mut mouth, &tick);
+        play_event_script_mouth_actions(&mouth, &tick);
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
             live_state.update_embodied_context(tick.frame.embodied_context());
@@ -4954,8 +4957,39 @@ fn robot_initialization_metadata(
     })
 }
 
-fn play_event_script_mouth_actions(mouth: &mut Option<PiperCpalMouth>, tick: &RuntimeTick) {
-    let Some(mouth) = mouth.as_mut() else {
+fn enqueue_default_bringup_mouth(mouth: &QueuedPiperCpalMouth, initialization: &serde_json::Value) {
+    enqueue_robot_mouth_text(mouth, song_text("bring_up"));
+    enqueue_robot_mouth_text(mouth, "dee doo?");
+    if let Some(mode) = initialization.get("mode").and_then(|value| value.as_str()) {
+        enqueue_robot_mouth_text(
+            mouth,
+            &format!("Netherwick robot initialization complete in {mode} mode."),
+        );
+    }
+    if let Some(body) = initialization.get("body").and_then(|value| value.as_str()) {
+        enqueue_robot_mouth_text(mouth, &format!("{body}."));
+    }
+    match (
+        initialization
+            .get("battery_percent")
+            .and_then(|value| value.as_u64()),
+        initialization
+            .get("charging")
+            .and_then(|value| value.as_bool()),
+    ) {
+        (Some(percent), Some(charging)) => {
+            let charging = if charging { "charging" } else { "not charging" };
+            enqueue_robot_mouth_text(
+                mouth,
+                &format!("Battery is {percent} percent and {charging}."),
+            );
+        }
+        _ => enqueue_robot_mouth_text(mouth, "Battery status is unavailable."),
+    }
+}
+
+fn play_event_script_mouth_actions(mouth: &Option<QueuedPiperCpalMouth>, tick: &RuntimeTick) {
+    let Some(mouth) = mouth.as_ref() else {
         return;
     };
     let Some(scripts) = tick.frame.now.extensions.get("event_scripts") else {
@@ -4971,24 +5005,21 @@ fn play_event_script_mouth_actions(mouth: &mut Option<PiperCpalMouth>, tick: &Ru
         for action in actions {
             let requested = action.get("requested").unwrap_or(action);
             if let Some(text) = requested.get("text").and_then(|value| value.as_str()) {
-                speak_robot_mouth_text(mouth, text);
+                enqueue_robot_mouth_text(mouth, text);
             } else if let Some(pattern) = requested.get("pattern").and_then(|value| value.as_str())
             {
-                speak_robot_mouth_text(mouth, chirp_pattern_text(pattern));
+                enqueue_robot_mouth_text(mouth, chirp_pattern_text(pattern));
             } else if let Some(name) = requested.get("name").and_then(|value| value.as_str()) {
-                speak_robot_mouth_text(mouth, song_text(name));
+                enqueue_robot_mouth_text(mouth, song_text(name));
             }
         }
     }
 }
 
-fn speak_robot_mouth_text(mouth: &mut PiperCpalMouth, text: &str) {
-    match mouth.speak(text) {
-        Ok(outcome) => println!(
-            "robot mouth: backend {}, spoken {}, text {:?}",
-            outcome.backend, outcome.spoken, text
-        ),
-        Err(error) => println!("robot mouth failed: {error}; text {text:?}"),
+fn enqueue_robot_mouth_text(mouth: &QueuedPiperCpalMouth, text: &str) {
+    match mouth.enqueue(text.to_string()) {
+        Ok(()) => println!("robot mouth queued: {text:?}"),
+        Err(error) => println!("robot mouth queue failed: {error}; text {text:?}"),
     }
 }
 
@@ -5004,6 +5035,7 @@ fn chirp_pattern_text(pattern: &str) -> &'static str {
 fn song_text(name: &str) -> &'static str {
     match name {
         "bring_up" => "doo doo dee, waking up, dee doo dee",
+        "mournful_bump" => "ohh, doo doo down, ooooh",
         _ => "doo dee doo",
     }
 }

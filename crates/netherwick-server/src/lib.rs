@@ -28,7 +28,8 @@ use netherwick_map::{
     PoseGraphOptimizationSummary, RemapSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
 };
 use netherwick_memory::{
-    EntityConstellationState, EntityLifecycleState, EntityMemory, EntityMemoryReport,
+    CognitiveDiagnosticsReport, EntityConstellationState, EntityLifecycleState, EntityMemory,
+    EntityMemoryReport,
 };
 use netherwick_now::{KinectSense, KinectSkeletonSense, ReignSense};
 use netherwick_runtime::{
@@ -72,6 +73,16 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/view/scene",
     "/view/map",
     "/view/behavior-nodes",
+    "/view/cognitive",
+    "/api/cognitive/features",
+    "/api/cognitive/clusters",
+    "/api/cognitive/bindings",
+    "/api/cognitive/hypotheses",
+    "/api/cognitive/constellations",
+    "/api/cognitive/associations",
+    "/api/cognitive/predictions",
+    "/api/cognitive/questions",
+    "/api/cognitive/summary",
     "/view/3d",
     "/view/capture-scene",
     "/view/training/latest",
@@ -520,6 +531,16 @@ impl LiveViewState {
             .lock()
             .expect("entity memory mutex poisoned")
             .report()
+    }
+
+    pub fn cognitive_diagnostics_report(&self) -> CognitiveDiagnosticsReport {
+        let report =
+            CognitiveDiagnosticsReport::from_entity_memory_report(&self.entity_memory_report());
+        if let Some(context) = self.latest_embodied_context() {
+            report.with_embodied_context(&context)
+        } else {
+            report
+        }
     }
 
     pub fn latest(&self) -> Option<WorldSnapshot> {
@@ -1449,6 +1470,22 @@ pub fn live_view_router(state: LiveViewState) -> Router {
             "/view/behavior-nodes/{id}/promote",
             post(post_promote_behavior_node),
         )
+        .route("/view/cognitive", get(cognitive_view_page))
+        .route("/api/cognitive/features", get(get_cognitive_features))
+        .route("/api/cognitive/clusters", get(get_cognitive_clusters))
+        .route("/api/cognitive/bindings", get(get_cognitive_bindings))
+        .route("/api/cognitive/hypotheses", get(get_cognitive_hypotheses))
+        .route(
+            "/api/cognitive/constellations",
+            get(get_cognitive_constellations),
+        )
+        .route(
+            "/api/cognitive/associations",
+            get(get_cognitive_associations),
+        )
+        .route("/api/cognitive/predictions", get(get_cognitive_predictions))
+        .route("/api/cognitive/questions", get(get_cognitive_questions))
+        .route("/api/cognitive/summary", get(get_cognitive_summary))
         .route("/view/3d", get(live_view_3d_page))
         .route("/view/capture-scene", get(get_capture_scene))
         .route("/stream/llm", get(get_llm_stream))
@@ -1915,6 +1952,60 @@ async fn get_live_map(
 
 async fn get_entity_memory(State(state): State<LiveViewState>) -> Json<EntityMemoryReport> {
     Json(state.entity_memory_report())
+}
+
+async fn get_cognitive_summary(
+    State(state): State<LiveViewState>,
+) -> Json<CognitiveDiagnosticsReport> {
+    Json(state.cognitive_diagnostics_report())
+}
+
+async fn get_cognitive_features(
+    State(state): State<LiveViewState>,
+) -> Json<netherwick_memory::FeatureDiagnostics> {
+    Json(state.cognitive_diagnostics_report().features)
+}
+
+async fn get_cognitive_clusters(
+    State(state): State<LiveViewState>,
+) -> Json<netherwick_memory::ClusterDiagnostics> {
+    Json(state.cognitive_diagnostics_report().clusters)
+}
+
+async fn get_cognitive_bindings(
+    State(state): State<LiveViewState>,
+) -> Json<netherwick_memory::BindingDiagnostics> {
+    Json(state.cognitive_diagnostics_report().bindings)
+}
+
+async fn get_cognitive_hypotheses(
+    State(state): State<LiveViewState>,
+) -> Json<netherwick_memory::HypothesisDiagnostics> {
+    Json(state.cognitive_diagnostics_report().hypotheses)
+}
+
+async fn get_cognitive_constellations(
+    State(state): State<LiveViewState>,
+) -> Json<netherwick_memory::ConstellationDiagnostics> {
+    Json(state.cognitive_diagnostics_report().constellations)
+}
+
+async fn get_cognitive_associations(
+    State(state): State<LiveViewState>,
+) -> Json<netherwick_memory::AssociationDiagnostics> {
+    Json(state.cognitive_diagnostics_report().associations)
+}
+
+async fn get_cognitive_predictions(
+    State(state): State<LiveViewState>,
+) -> Json<netherwick_memory::PredictionDiagnostics> {
+    Json(state.cognitive_diagnostics_report().predictions)
+}
+
+async fn get_cognitive_questions(
+    State(state): State<LiveViewState>,
+) -> Json<netherwick_memory::ActiveLearningDiagnostics> {
+    Json(state.cognitive_diagnostics_report().active_learning)
 }
 
 fn map_response_from_parts(
@@ -3822,6 +3913,10 @@ async fn live_view_page() -> Html<&'static str> {
     Html(LIVE_VIEW_PAGE)
 }
 
+async fn cognitive_view_page() -> Html<&'static str> {
+    Html(COGNITIVE_VIEW_PAGE)
+}
+
 async fn live_view_3d_page() -> Html<&'static str> {
     Html(LIVE_VIEW_3D_PAGE)
 }
@@ -5516,6 +5611,37 @@ addEventListener('keydown', e => {
   if(e.key === 'e') send({type:'Explore',duration_ms:3000},5000);
 });
 refresh(); setInterval(refresh, 1000);
+</script>"#;
+
+const COGNITIVE_VIEW_PAGE: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cognitive Inspector</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f7f8;--fg:#14171a;--muted:#66707a;--line:#d9dee3;--panel:#fff;--accent:#146c5f;--warn:#a55712}
+@media (prefers-color-scheme:dark){:root{--bg:#101316;--fg:#edf1f4;--muted:#9aa6b2;--line:#2d353d;--panel:#171c21;--accent:#5fc7b6;--warn:#f0a35d}}
+*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 18px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
+h1{margin:0;font-size:18px;font-weight:700;letter-spacing:0}main{max-width:1200px;margin:0 auto;padding:16px}
+nav{display:flex;gap:6px;flex-wrap:wrap}button{border:1px solid var(--line);background:transparent;color:var(--fg);padding:7px 10px;border-radius:6px;cursor:pointer;font:inherit}
+button.active{border-color:var(--accent);color:var(--accent)}.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px}
+.metric{border:1px solid var(--line);border-radius:6px;background:var(--panel);padding:10px;min-height:64px}.metric b{display:block;font-size:22px}.metric span{color:var(--muted);font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}article{border:1px solid var(--line);border-radius:6px;background:var(--panel);padding:12px;min-width:0}
+h2{margin:0 0 8px;font-size:15px}.meta{color:var(--muted);font-size:12px;margin-bottom:8px}.warn{color:var(--warn)}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font-size:12px;line-height:1.45}
+</style>
+<header><h1>Cognitive Inspector</h1><nav id="tabs"></nav></header>
+<main><section id="summary" class="summary"></section><section id="content" class="grid"></section></main>
+<script>
+const tabs=[['summary','Summary'],['bindings','Bindings'],['hypotheses','Hypotheses'],['constellations','Constellations'],['questions','Questions']];
+let active='summary';let report=null;
+function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function renderTabs(){tabsEl.innerHTML=tabs.map(([id,label])=>`<button class="${id===active?'active':''}" data-tab="${id}">${label}</button>`).join('');document.querySelectorAll('button[data-tab]').forEach(button=>button.addEventListener('click',()=>{active=button.dataset.tab;render();}));}
+function renderSummary(){const s=report.summary||{};const metrics=[['Features',s.feature_count],['Clusters',s.cluster_count],['Bindings',s.binding_candidate_count],['Rejected',s.rejected_binding_count],['Ambiguous',s.ambiguous_binding_count],['Hypotheses',s.hypothesis_count],['Constellations',s.constellation_count],['Questions',s.open_question_count]];summary.innerHTML=metrics.map(([label,value])=>`<div class="metric"><b>${esc(value??0)}</b><span>${esc(label)}</span></div>`).join('');}
+function card(title,meta,payload,warn=false){return `<article><h2 class="${warn?'warn':''}">${esc(title)}</h2><div class="meta">${esc(meta||'')}</div><pre>${esc(JSON.stringify(payload,null,2))}</pre></article>`;}
+function renderContent(){let html='';if(active==='summary'){html=card('Summary','/api/cognitive/summary',report.summary||{});}else if(active==='bindings'){html=(report.bindings?.items||[]).map(item=>card(item.binding_candidate_id,`${item.decision} ${item.relation}`,item,item.ambiguity_reason||item.rejection_reason)).join('');}else if(active==='hypotheses'){html=(report.hypotheses?.families||[]).map(family=>card(family.family_id,`${family.competing_hypotheses.length} competitors`,family,family.competing_hypotheses.length>1)).join('');}else if(active==='constellations'){html=(report.constellations?.items||[]).map(item=>card(item.constellation_id,`${item.state} ${item.kind_hint||''}`,item,item.missing_expected_evidence?.length)).join('');}else if(active==='questions'){html=(report.active_learning?.open_questions||[]).map(item=>card(item.question_id,`${item.state} uncertainty=${Number(item.target_uncertainty||0).toFixed(2)}`,item,item.human_question||item.safety_blocker)).join('');}content.innerHTML=html||card('No items','Waiting for cognitive evidence',{});}
+function render(){renderTabs();if(!report)return;renderSummary();renderContent();}
+fetch('/api/cognitive/summary').then(response=>response.json()).then(data=>{report=data;render();}).catch(error=>{report={summary:{},active_learning:{open_questions:[]}};render();content.innerHTML=card('Load failed','/api/cognitive/summary',{error:String(error)},true);});
+const tabsEl=document.getElementById('tabs');renderTabs();
 </script>"#;
 
 const LIVE_VIEW_PAGE: &str = r#"<!doctype html>
@@ -10649,6 +10775,22 @@ mod tests {
         let bytes = encode_eye_png_bytes(&frame).unwrap();
 
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[tokio::test]
+    async fn cognitive_summary_endpoint_returns_valid_json() {
+        let state = LiveViewState::new();
+        let Json(report) = get_cognitive_summary(State(state)).await;
+        let value = serde_json::to_value(&report).expect("cognitive report serializes");
+
+        assert!(value.get("summary").is_some());
+        assert!(value.get("bindings").is_some());
+        assert_eq!(value["summary"]["feature_count"], 0);
+        assert!(HTTP_ENDPOINTS.contains(&"/api/cognitive/summary"));
+        assert!(HTTP_ENDPOINTS.contains(&"/api/cognitive/bindings"));
+        let Html(page) = cognitive_view_page().await;
+        assert!(page.contains("Cognitive Inspector"));
+        assert!(page.contains("/api/cognitive/summary"));
     }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {

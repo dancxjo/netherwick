@@ -1141,7 +1141,7 @@ impl RuntimeModelStack {
                 self.behaviors.event_bump.hardcoded_id(),
                 self.behaviors.event_bump.model_id(),
                 self.behaviors.event_bump.fallback,
-                vec![impl_id("script.on_bump.v0", "Script hardcoded teacher")],
+                vec![impl_id("script.on_bump.ts.v0", "TypeScript script teacher")],
                 vec![impl_id("event.bump.shadow.v0", "Shadow model")],
                 last("event_bump"),
             ),
@@ -2110,19 +2110,30 @@ struct BumpScriptBehavior;
 
 impl FunctionBehavior<BumpEventInput, EventScriptOutput> for BumpScriptBehavior {
     fn id(&self) -> &'static str {
-        "script.on_bump.v0"
+        "script.on_bump.ts.v0"
     }
 
-    fn infer(&mut self, _input: &BumpEventInput) -> Result<EventScriptOutput> {
-        Ok(EventScriptOutput {
-            actions: vec![
-                EventScriptAction::Stop,
-                EventScriptAction::Rotate { deg: 180 },
-                EventScriptAction::Go,
-            ],
-        })
+    fn infer(&mut self, input: &BumpEventInput) -> Result<EventScriptOutput> {
+        execute_event_script_typescript(BUMP_SCRIPT, input)
     }
 }
+
+const BUMP_SCRIPT: &str = r#"
+const r = random();
+const lament =
+  r < 0.20 ? say("Uh-oh") :
+  r < 0.40 ? say("Oh no!") :
+  r < 0.60 ? say("Oopsie!") :
+  r < 0.80 ? say("Oh dear!") :
+             song("mournful_bump");
+
+[
+  lament,
+  stop(),
+  rotate(180),
+  go()
+]
+"#;
 
 struct FaceDetectedScriptBehavior;
 
@@ -3772,7 +3783,10 @@ where
                 proposed_actions.push(first);
             }
             safe_sequences.insert("bump".to_string(), serde_json::to_value(&sequence)?);
-            notes.push("EventScript:on(bump) emitted Stop -> Rotate(180) -> Go".to_string());
+            notes.push(
+                "EventScript:on(bump) emitted random lament -> Stop -> Rotate(180) -> Go"
+                    .to_string(),
+            );
             let mut record = run.record;
             record.selected_output = Some(EventScriptOutput {
                 actions: sequence
@@ -4195,6 +4209,7 @@ fn script_action_to_primitive(action: &EventScriptAction) -> Option<ActionPrimit
         EventScriptAction::Song { name } => Some(ActionPrimitive::Speak {
             text: match name.as_str() {
                 "bring_up" => "doo doo dee, systems waking up".to_string(),
+                "mournful_bump" => "ohh, doo doo down, ooooh".to_string(),
                 _ => format!("little {name} song"),
             },
         }),
@@ -4221,9 +4236,14 @@ where
 {
     let input_json =
         serde_json::to_string(input).context("failed to serialize event script input")?;
+    let random_value = rand::random::<f64>();
     let source = format!(
         r#"
 const input = {input_json};
+const __netherwickRandom = {random_value};
+function random() {{
+  return __netherwickRandom;
+}}
 function say(text) {{
   return {{ type: "say", text: String(text) }};
 }}
@@ -4232,6 +4252,15 @@ function chirp(pattern) {{
 }}
 function song(name) {{
   return {{ type: "song", name: String(name) }};
+}}
+function stop() {{
+  return {{ type: "stop" }};
+}}
+function rotate(deg) {{
+  return {{ type: "rotate", deg: Number(deg) }};
+}}
+function go() {{
+  return {{ type: "go" }};
 }}
 {script}
 "#
@@ -7147,7 +7176,9 @@ mod tests {
         SensationPayloadKind,
     };
     use netherwick_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader};
-    use netherwick_llm::{ConsciousCommand, LlmDecision, LlmTickResult};
+    use netherwick_llm::{
+        ConsciousCommand, LlmDecision, LlmReviewRequest, LlmScientificReview, LlmTickResult,
+    };
     use netherwick_map::MapConfig;
     use netherwick_memory::InMemoryExperienceStore;
     use netherwick_models::{
@@ -7495,8 +7526,9 @@ mod tests {
 
         let run = behavior.infer(&BumpEventInput::default(), 10).unwrap();
 
+        assert!(is_bump_lament_action(&run.chosen.actions[0]));
         assert_eq!(
-            run.chosen.actions,
+            &run.chosen.actions[1..],
             vec![
                 EventScriptAction::Stop,
                 EventScriptAction::Rotate { deg: 180 },
@@ -7515,8 +7547,9 @@ mod tests {
 
         let run = behavior.infer(&BumpEventInput::default(), 10).unwrap();
 
+        assert!(is_bump_lament_action(&run.chosen.actions[0]));
         assert_eq!(
-            run.chosen.actions,
+            &run.chosen.actions[1..],
             vec![
                 EventScriptAction::Stop,
                 EventScriptAction::Rotate { deg: 180 },
@@ -7525,6 +7558,16 @@ mod tests {
         );
         assert!(run.training_sample_emitted);
         assert_eq!(run.record.hardcoded_output, Some(run.chosen));
+    }
+
+    fn is_bump_lament_action(action: &EventScriptAction) -> bool {
+        match action {
+            EventScriptAction::Say { text } => {
+                matches!(text.as_str(), "Uh-oh" | "Oh no!" | "Oopsie!" | "Oh dear!")
+            }
+            EventScriptAction::Song { name } => name == "mournful_bump",
+            _ => false,
+        }
     }
 
     #[test]
@@ -9158,7 +9201,11 @@ mod tests {
             .cloned()
             .and_then(|value| serde_json::from_value::<SafeScriptSequence>(value).ok())
             .unwrap();
-        assert_eq!(sequence.actions.len(), 3);
+        assert_eq!(sequence.actions.len(), 4);
+        assert!(matches!(
+            sequence.actions.first().map(|action| &action.requested),
+            Some(EventScriptAction::Say { .. } | EventScriptAction::Song { .. })
+        ));
         assert!(sequence.actions.last().unwrap().vetoed);
 
         let _ = fs::remove_dir_all(root);
@@ -10348,6 +10395,13 @@ mod tests {
                 teaching: Vec::new(),
             })
         }
+
+        async fn scientific_review(
+            &mut self,
+            _request: &LlmReviewRequest,
+        ) -> Result<Option<LlmScientificReview>> {
+            Ok(None)
+        }
     }
 
     fn test_runtime<C>(
@@ -10859,6 +10913,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn robot_initialized_typescript_behavior_emits_bringup_mouth_sequence() {
+        let mut behavior = RobotInitializedScriptBehavior;
+        let input = RobotInitializedEventInput {
+            t_ms: 42,
+            mode: "read-only".to_string(),
+            body: "mock Create body connected".to_string(),
+            battery_percent: Some(100),
+            charging: Some(false),
+            active_sensors: 2,
+            requested_sensors: 3,
+            ledger: "data/ledger/test".to_string(),
+            tick_ms: 100,
+            dashboard: Some("127.0.0.1:3000".to_string()),
+            capture: None,
+        };
+
+        let output = behavior.infer(&input).unwrap();
+
+        assert!(matches!(
+            output.actions.first(),
+            Some(EventScriptAction::Song { name }) if name == "bring_up"
+        ));
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            EventScriptAction::Chirp {
+                pattern: ChirpPattern::Confirm
+            }
+        )));
+        assert!(output.actions.iter().any(|action| matches!(
+            action,
+            EventScriptAction::Say { text }
+                if text.contains("Netherwick robot initialization complete")
+        )));
     }
 
     fn test_reign_input(
