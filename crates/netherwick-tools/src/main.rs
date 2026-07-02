@@ -36,8 +36,8 @@ use netherwick_mouth::QueuedPiperCpalMouth;
 use netherwick_now::{EarSense, ExtensionSense, KinectSense, Now, RangeSense, SurpriseSense};
 use netherwick_runtime::{
     ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
-    InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, RobotMode, RuntimeLoop,
-    RuntimeModelStack, RuntimeTick, SimRunner,
+    InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, ReignQueue, RobotMode,
+    RuntimeLoop, RuntimeModelStack, RuntimeTick, SimRunner,
 };
 use netherwick_sensors::{
     AsrToolConfig, CameraSenseProvider, EyeFrame, EyeFrameFormat, FrameProcessor, GpsSenseProvider,
@@ -4603,6 +4603,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let (mut body, robot_mode, is_mock_body) =
         open_robot_body_or_fallback(create_port.as_deref(), args.create_baud, robot_mode).await?;
 
+    let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
     let live_state = args.dashboard.map(|_| {
         let live_state = if robot_mode == RobotMode::Slow {
             LiveViewState::new().with_real_slow_hardware_control()
@@ -4627,6 +4628,20 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         });
         live_state
     });
+
+    if let (Some(addr), Some(live_state)) = (args.dashboard, live_state.clone()) {
+        let server_state = live_state.clone();
+        let reign_state =
+            netherwick_server::ReignServerState::with_live_view(reign_queue.clone(), &live_state);
+        tokio::spawn(async move {
+            if let Err(error) =
+                netherwick_server::serve_live_view_with_reign(addr, server_state, reign_state).await
+            {
+                eprintln!("live robot view server stopped: {error}");
+            }
+        });
+        println!("robot {:?} dashboard: http://{addr}/view", robot_mode);
+    }
 
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
 
@@ -4789,13 +4804,14 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let ledger = JsonlLedger::new(&args.ledger);
     let memory = DurableExperienceStore::from_env();
     let recall = memory.clone();
-    let runtime = MinimalRuntime::with_default_events(
+    let runtime = MinimalRuntime::with_reign_queue(
         ledger.clone(),
         memory,
         recall,
         SimpleConductor::default(),
         SimpleSafety::default(),
         configured_llm_agent(&args.llm)?,
+        reign_queue,
     );
     let live_image_enricher = LiveImageEnricher::new(configured_llm_config(&args.llm)?)?;
     let mut frame_processor_warnings = Vec::new();
@@ -4815,22 +4831,6 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     runner.tick_ms = args.tick_ms;
     for warning in frame_processor_warnings {
         println!("{warning}");
-    }
-
-    if let (Some(addr), Some(live_state)) = (args.dashboard, live_state.clone()) {
-        let server_state = live_state.clone();
-        let reign_state = netherwick_server::ReignServerState::with_live_view(
-            runner.runtime.reign_queue.clone(),
-            &live_state,
-        );
-        tokio::spawn(async move {
-            if let Err(error) =
-                netherwick_server::serve_live_view_with_reign(addr, server_state, reign_state).await
-            {
-                eprintln!("live robot view server stopped: {error}");
-            }
-        });
-        println!("robot {:?} dashboard: http://{addr}/view", robot_mode);
     }
 
     let mut capture = match &args.capture {
