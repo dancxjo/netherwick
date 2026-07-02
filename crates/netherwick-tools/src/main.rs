@@ -8997,6 +8997,10 @@ fn binding_relation_label(relation: BindingRelation) -> &'static str {
         BindingRelation::MovesTogether => "moves_together",
         BindingRelation::PredictsSameFutureEvents => "predicts_same_future_events",
         BindingRelation::NamedBy => "named_by",
+        BindingRelation::ProjectsTo => "projects_to",
+        BindingRelation::LikelySameEntity => "likely_same_entity",
+        BindingRelation::Contradicts => "contradicts",
+        BindingRelation::RequiresReview => "requires_review",
     }
 }
 

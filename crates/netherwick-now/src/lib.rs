@@ -13,6 +13,7 @@ pub const IMAGE_VECTOR_COLLECTION: &str = "images";
 pub const IMAGE_DESCRIPTION_VECTOR_COLLECTION: &str = "image_descriptions";
 pub const SCENE_VECTOR_COLLECTION: &str = "scene_vectors";
 pub const FACE_VECTOR_COLLECTION: &str = "faces";
+pub const OBJECT_VECTOR_COLLECTION: &str = "objects";
 pub const VOICE_VECTOR_COLLECTION: &str = "voices";
 pub const GEOLOCATION_VECTOR_COLLECTION: &str = "geolocations";
 pub const TRANSCRIPT_VECTOR_COLLECTION: &str = "transcripts";
@@ -152,6 +153,10 @@ pub struct ObjectSense {
     pub schema_version: u32,
     #[serde(default)]
     pub observations: Vec<ObjectObservation>,
+    #[serde(default)]
+    pub embeddings: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub vectors: Vec<VectorArtifact>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -683,6 +688,8 @@ pub struct MemorySense {
     #[serde(default)]
     pub places_visited: u32,
     pub face_familiarity: f32,
+    #[serde(default)]
+    pub object_familiarity: f32,
     pub voice_familiarity: f32,
     pub similar_situation_count: u16,
     pub best_remembered_action: Option<ActionPrimitive>,

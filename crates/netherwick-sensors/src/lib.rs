@@ -6,9 +6,10 @@ use netherwick_actions::{ActionPrimitive, LlmActionProposal};
 use netherwick_body::BodySense;
 use netherwick_now::{
     AsrSense, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense,
-    ObjectSense, RangeSense, TranscriptCandidateEvent, TranscriptCandidateTracker,
-    TranscriptStabilityState, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
-    IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
+    ObjectClass, ObjectObservation, ObjectObservationSource, ObjectSense, RangeSense,
+    TranscriptCandidateEvent, TranscriptCandidateTracker, TranscriptStabilityState, VectorArtifact,
+    VoiceSense, FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION,
+    IMAGE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
     TRANSCRIPT_VECTOR_COLLECTION,
 };
 use netherwick_now::{Now, PredictionSense, SurpriseSense};
@@ -241,6 +242,7 @@ pub struct NowBuilder {
 pub struct FrameProcessor {
     last_processed_frame_key: Option<FrameKey>,
     face_detector: Option<Arc<dyn FaceDetector>>,
+    object_detector: Option<Arc<dyn ObjectDetector>>,
 }
 
 impl std::fmt::Debug for FrameProcessor {
@@ -248,6 +250,7 @@ impl std::fmt::Debug for FrameProcessor {
         f.debug_struct("FrameProcessor")
             .field("last_processed_frame_key", &self.last_processed_frame_key)
             .field("face_detector", &self.face_detector.is_some())
+            .field("object_detector", &self.object_detector.is_some())
             .finish()
     }
 }
@@ -265,6 +268,7 @@ struct FrameKey {
 pub struct ProcessedFrame {
     pub eye: EyeSense,
     pub face: FaceSense,
+    pub objects: ObjectSense,
     pub summary: String,
     pub source_frame_id: String,
 }
@@ -279,6 +283,7 @@ pub struct SensorUpdateTimes {
     pub gps: Option<TimeMs>,
     pub kinect: Option<TimeMs>,
     pub face: Option<TimeMs>,
+    pub objects: Option<TimeMs>,
     pub voice: Option<TimeMs>,
 }
 
@@ -344,6 +349,7 @@ impl NowBuilder {
                 }
                 SensePacket::Objects(objects) => {
                     self.last_snapshot.objects = objects;
+                    self.last_updates.objects = Some(t_ms);
                 }
                 SensePacket::Extension(extension) => {
                     self.last_snapshot.extensions.push(extension);
@@ -377,6 +383,11 @@ impl FrameProcessor {
         self
     }
 
+    pub fn with_object_detector(mut self, detector: Arc<dyn ObjectDetector>) -> Self {
+        self.object_detector = Some(detector);
+        self
+    }
+
     pub fn process_packets(&mut self, t_ms: TimeMs, packets: &mut Vec<SensePacket>) {
         let Some(frame) = packets.iter().rev().find_map(|packet| match packet {
             SensePacket::EyeFrame(frame) => Some(frame),
@@ -391,6 +402,12 @@ impl FrameProcessor {
         packets.push(SensePacket::Eye(processed.eye));
         if !processed.face.embeddings.is_empty() || !processed.face.vectors.is_empty() {
             packets.push(SensePacket::Face(processed.face));
+        }
+        if !processed.objects.observations.is_empty()
+            || !processed.objects.embeddings.is_empty()
+            || !processed.objects.vectors.is_empty()
+        {
+            packets.push(SensePacket::Objects(processed.objects));
         }
         packets.push(SensePacket::Extension(ExtensionSense {
             schema_version: 1,
@@ -411,6 +428,12 @@ impl FrameProcessor {
         if !processed.face.embeddings.is_empty() || !processed.face.vectors.is_empty() {
             snapshot.face = processed.face;
         }
+        if !processed.objects.observations.is_empty()
+            || !processed.objects.embeddings.is_empty()
+            || !processed.objects.vectors.is_empty()
+        {
+            snapshot.objects = processed.objects;
+        }
         snapshot.extensions.push(ExtensionSense {
             schema_version: 1,
             name: "vision.frame_summary".to_string(),
@@ -428,6 +451,7 @@ impl FrameProcessor {
             t_ms,
             frame,
             self.face_detector.as_deref(),
+            self.object_detector.as_deref(),
         ))
     }
 }
@@ -439,6 +463,24 @@ pub trait FaceDetector: Send + Sync {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FaceDetection {
     pub face_id: String,
+    pub source_frame_id: Option<String>,
+    pub embedding: Vec<f32>,
+    pub model: String,
+}
+
+pub trait ObjectDetector: Send + Sync {
+    fn detect_objects(&self, frame: &EyeFrame) -> Result<Vec<ObjectDetection>>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectDetection {
+    pub object_id: String,
+    pub label: String,
+    pub class: ObjectClass,
+    pub bearing_rad: f32,
+    pub distance_m: Option<f32>,
+    pub confidence: f32,
+    pub source: ObjectObservationSource,
     pub source_frame_id: Option<String>,
     pub embedding: Vec<f32>,
     pub model: String,
@@ -489,6 +531,7 @@ fn process_eye_frame(
     t_ms: TimeMs,
     frame: &EyeFrame,
     face_detector: Option<&dyn FaceDetector>,
+    object_detector: Option<&dyn ObjectDetector>,
 ) -> ProcessedFrame {
     let source_frame_id = format!(
         "eye-{}-{}x{}-{}",
@@ -546,9 +589,22 @@ fn process_eye_frame(
         ..FaceSense::default()
     });
 
+    let objects = match object_detector {
+        Some(detector) => detected_object_sense(t_ms, frame, &source_frame_id, detector),
+        None => Ok(ObjectSense {
+            schema_version: 1,
+            ..ObjectSense::default()
+        }),
+    }
+    .unwrap_or_else(|_| ObjectSense {
+        schema_version: 1,
+        ..ObjectSense::default()
+    });
+
     ProcessedFrame {
         eye,
         face,
+        objects,
         summary: format!(
             "{:?} frame {}x{}, {} bytes",
             frame.format,
@@ -592,6 +648,48 @@ fn detected_face_sense(
         );
     }
     Ok(face)
+}
+
+fn detected_object_sense(
+    t_ms: TimeMs,
+    frame: &EyeFrame,
+    source_frame_id: &str,
+    detector: &dyn ObjectDetector,
+) -> Result<ObjectSense> {
+    let detections = detector.detect_objects(frame)?;
+    let mut objects = ObjectSense {
+        schema_version: 1,
+        ..ObjectSense::default()
+    };
+    for detection in detections {
+        let source_frame_id = detection
+            .source_frame_id
+            .clone()
+            .unwrap_or_else(|| source_frame_id.to_string());
+        objects.observations.push(ObjectObservation {
+            label: detection.label,
+            class: detection.class,
+            bearing_rad: detection.bearing_rad,
+            distance_m: detection.distance_m,
+            confidence: detection.confidence,
+            source: detection.source,
+        });
+        if detection.embedding.is_empty() {
+            continue;
+        }
+        objects.embeddings.push(detection.embedding.clone());
+        objects.vectors.push(
+            VectorArtifact::new(
+                OBJECT_VECTOR_COLLECTION,
+                detection.object_id,
+                detection.embedding,
+            )
+            .with_model(detection.model)
+            .with_source_frame_id(source_frame_id)
+            .with_occurred_at_ms(t_ms),
+        );
+    }
+    Ok(objects)
 }
 
 fn face_detection_id(frame: &EyeFrame, index: usize, embedding: &[f32]) -> String {
@@ -2495,6 +2593,25 @@ mod tests {
         }
     }
 
+    struct StaticObjectDetector;
+
+    impl ObjectDetector for StaticObjectDetector {
+        fn detect_objects(&self, _frame: &EyeFrame) -> Result<Vec<ObjectDetection>> {
+            Ok(vec![ObjectDetection {
+                object_id: "object-static".to_string(),
+                label: "red cup".to_string(),
+                class: ObjectClass::Landmark,
+                bearing_rad: 0.25,
+                distance_m: Some(1.5),
+                confidence: 0.9,
+                source: ObjectObservationSource::Kinect,
+                source_frame_id: None,
+                embedding: vec![0.7, 0.2, 0.1],
+                model: "test.object.detector".to_string(),
+            }])
+        }
+    }
+
     #[test]
     fn frame_processor_vectorizes_detected_faces_into_face_collection() {
         let frame = EyeFrame {
@@ -2518,6 +2635,36 @@ mod tests {
         assert_eq!(artifact.point_id, "face-static");
         assert_eq!(artifact.vector, vec![0.1, 0.2, 0.3]);
         assert_eq!(artifact.model.as_deref(), Some("test.face.detector"));
+        assert_eq!(artifact.source_frame_id.as_deref(), Some("eye-42-1x1-3"));
+        assert_eq!(artifact.occurred_at_ms, Some(100));
+    }
+
+    #[test]
+    fn frame_processor_vectorizes_detected_objects_into_object_collection() {
+        let frame = EyeFrame {
+            captured_at_ms: 42,
+            width: 1,
+            height: 1,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![255, 128, 0],
+            source: Some("unit-camera".to_string()),
+        };
+        let mut processor =
+            FrameProcessor::new().with_object_detector(Arc::new(StaticObjectDetector));
+
+        let processed = processor
+            .process_frame(100, &frame)
+            .expect("processed frame");
+
+        assert_eq!(processed.objects.observations.len(), 1);
+        assert_eq!(processed.objects.observations[0].label, "red cup");
+        assert_eq!(processed.objects.embeddings, vec![vec![0.7, 0.2, 0.1]]);
+        assert_eq!(processed.objects.vectors.len(), 1);
+        let artifact = &processed.objects.vectors[0];
+        assert_eq!(artifact.collection, OBJECT_VECTOR_COLLECTION);
+        assert_eq!(artifact.point_id, "object-static");
+        assert_eq!(artifact.vector, vec![0.7, 0.2, 0.1]);
+        assert_eq!(artifact.model.as_deref(), Some("test.object.detector"));
         assert_eq!(artifact.source_frame_id.as_deref(), Some("eye-42-1x1-3"));
         assert_eq!(artifact.occurred_at_ms, Some(100));
     }

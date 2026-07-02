@@ -13,7 +13,8 @@ use netherwick_now::{
     AsrSense, EarSense, EyeFrame, EyeFrameFormat, GraphEdge, GraphEntity, KinectJointSense,
     KinectSense, KinectSkeletonSense, MemorySense, Now, ObjectClass, ObjectObservation,
     ObjectObservationSource, RangeSense, RecallHit, SurpriseSense, VectorArtifact,
-    FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
+    FACE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
+    VOICE_VECTOR_COLLECTION,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,10 @@ pub struct RecallQuery {
     pub face_vectors: Vec<Vec<f32>>,
     #[serde(default)]
     pub face_vector_artifacts: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub object_vectors: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub object_vector_artifacts: Vec<VectorArtifact>,
     pub voice_vectors: Vec<Vec<f32>>,
     #[serde(default)]
     pub voice_vector_artifacts: Vec<VectorArtifact>,
@@ -105,6 +110,8 @@ impl RecallQuery {
             place_recognition_input: None,
             face_vectors: now.face.embeddings.clone(),
             face_vector_artifacts: now.face.vectors.clone(),
+            object_vectors: now.objects.embeddings.clone(),
+            object_vector_artifacts: now.objects.vectors.clone(),
             voice_vectors: now.voice.embeddings.clone(),
             voice_vector_artifacts: now.voice.vectors.clone(),
             battery: now.body.battery_level,
@@ -183,6 +190,8 @@ pub struct SemanticCell {
     pub associated_scene_vectors: Vec<String>,
     #[serde(default)]
     pub associated_face_vectors: Vec<String>,
+    #[serde(default)]
+    pub associated_object_vectors: Vec<String>,
     #[serde(default)]
     pub associated_voice_vectors: Vec<String>,
     #[serde(default)]
@@ -329,6 +338,8 @@ pub struct PlaceCellSummary {
     #[serde(default)]
     pub associated_face_vectors: Vec<String>,
     #[serde(default)]
+    pub associated_object_vectors: Vec<String>,
+    #[serde(default)]
     pub associated_voice_vectors: Vec<String>,
     #[serde(default)]
     pub successful_actions: Vec<ActionOutcomeSummary>,
@@ -435,6 +446,7 @@ impl PlaceMemory {
         }
         merge_vector_ids(&mut cell.associated_scene_vectors, &now.eye.scene_vectors);
         merge_vector_ids(&mut cell.associated_face_vectors, &now.face.vectors);
+        merge_vector_ids(&mut cell.associated_object_vectors, &now.objects.vectors);
         merge_vector_ids(&mut cell.associated_voice_vectors, &now.voice.vectors);
         let scene_vectors = scene_vectors_with_frame_id(
             &now.eye.scene_vectors,
@@ -900,6 +912,9 @@ pub struct ModalitySupport {
     /// Vector point IDs from the face/image collection.
     #[serde(default)]
     pub face_vector_ids: Vec<String>,
+    /// Vector point IDs from the object identity/similarity collection.
+    #[serde(default)]
+    pub object_vector_ids: Vec<String>,
     /// Vector point IDs from the voice collection.
     #[serde(default)]
     pub voice_vector_ids: Vec<String>,
@@ -916,6 +931,7 @@ impl ModalitySupport {
     pub fn active_modalities(&self) -> usize {
         [
             !self.face_vector_ids.is_empty(),
+            !self.object_vector_ids.is_empty(),
             !self.voice_vector_ids.is_empty(),
             !self.scene_vector_ids.is_empty(),
             !self.text_labels.is_empty(),
@@ -935,6 +951,58 @@ pub enum BindingRelation {
     MovesTogether,
     PredictsSameFutureEvents,
     NamedBy,
+    ProjectsTo,
+    LikelySameEntity,
+    Contradicts,
+    RequiresReview,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum BindingDecision {
+    Accept,
+    Reject,
+    HoldAmbiguous,
+    AskHuman,
+    CollectMoreEvidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum BindingEvidenceKind {
+    TemporalOverlap,
+    SpatialOverlap,
+    VectorSimilarity,
+    ProjectionAgreement,
+    PoseAgreement,
+    RepeatedCooccurrence,
+    SingleCandidateContext,
+    HumanConfirmed,
+    LlmSuggested,
+    Contradiction,
+    SimultaneousConflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingEvidence {
+    pub kind: BindingEvidenceKind,
+    pub score: f32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingCandidate {
+    pub left_cluster_id: String,
+    pub right_cluster_id: String,
+    pub relation: BindingRelation,
+    pub evidence: Vec<BindingEvidence>,
+    pub confidence: f32,
+    pub decision: BindingDecision,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BindingEdgeResult {
+    pub edge: BindingEdge,
+    pub created: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1003,6 +1071,8 @@ pub struct EntityConstellation {
     pub modality_clusters: Vec<ModalityCluster>,
     #[serde(default)]
     pub binding_edges: Vec<BindingEdge>,
+    #[serde(default)]
+    pub binding_candidates: Vec<BindingCandidate>,
     pub state: EntityConstellationState,
     #[serde(default)]
     pub merged_entity_ids: Vec<String>,
@@ -1127,7 +1197,7 @@ impl EntityHypothesis {
     }
 
     /// Add face vector evidence.
-    pub fn add_face_vector(&mut self, point_id: impl Into<String>) {
+    pub fn add_face_vector(&mut self, point_id: impl Into<String>) -> String {
         let id = point_id.into();
         if !self.modality_support.face_vector_ids.contains(&id) {
             self.modality_support.face_vector_ids.push(id.clone());
@@ -1138,17 +1208,26 @@ impl EntityHypothesis {
             0.8,
             self.last_seen_ms,
         );
-        let face_cluster = self.upsert_cluster(Modality::Vision, format!("face:{id}"), point, 0.8);
-        self.bind_with_object_cluster(
-            face_cluster,
-            BindingRelation::CooccursInTime,
-            0.8,
+        self.upsert_cluster(Modality::Vision, format!("face:{id}"), point, 0.8)
+    }
+
+    /// Add object vector evidence.
+    pub fn add_object_vector(&mut self, point_id: impl Into<String>) -> String {
+        let id = point_id.into();
+        if !self.modality_support.object_vector_ids.contains(&id) {
+            self.modality_support.object_vector_ids.push(id.clone());
+        }
+        let point = self.push_observation_point(
+            Modality::Vision,
+            format!("object-vector:{id}"),
+            0.75,
             self.last_seen_ms,
         );
+        self.upsert_cluster(Modality::Vision, format!("object-vector:{id}"), point, 0.75)
     }
 
     /// Add voice vector evidence.
-    pub fn add_voice_vector(&mut self, point_id: impl Into<String>) {
+    pub fn add_voice_vector(&mut self, point_id: impl Into<String>) -> String {
         let id = point_id.into();
         if !self.modality_support.voice_vector_ids.contains(&id) {
             self.modality_support.voice_vector_ids.push(id.clone());
@@ -1159,17 +1238,11 @@ impl EntityHypothesis {
             0.8,
             self.last_seen_ms,
         );
-        let voice_cluster = self.upsert_cluster(Modality::Audio, format!("voice:{id}"), point, 0.8);
-        self.bind_with_object_cluster(
-            voice_cluster,
-            BindingRelation::CooccursInTime,
-            0.8,
-            self.last_seen_ms,
-        );
+        self.upsert_cluster(Modality::Audio, format!("voice:{id}"), point, 0.8)
     }
 
     /// Add scene/depth vector evidence.
-    pub fn add_scene_vector(&mut self, point_id: impl Into<String>) {
+    pub fn add_scene_vector(&mut self, point_id: impl Into<String>) -> String {
         let id = point_id.into();
         if !self.modality_support.scene_vector_ids.contains(&id) {
             self.modality_support.scene_vector_ids.push(id.clone());
@@ -1180,14 +1253,7 @@ impl EntityHypothesis {
             0.75,
             self.last_seen_ms,
         );
-        let scene_cluster =
-            self.upsert_cluster(Modality::Depth, format!("scene:{id}"), point, 0.75);
-        self.bind_with_object_cluster(
-            scene_cluster,
-            BindingRelation::CooccursInTime,
-            0.75,
-            self.last_seen_ms,
-        );
+        self.upsert_cluster(Modality::Depth, format!("scene:{id}"), point, 0.75)
     }
 
     pub fn add_text_label(&mut self, label: impl Into<String>, confidence: f32, t_ms: u64) {
@@ -1301,30 +1367,118 @@ impl EntityHypothesis {
         } else {
             (cluster_id, object_cluster_id)
         };
-        if let Some(edge) = self.constellation.binding_edges.iter_mut().find(|edge| {
+        self.upsert_binding_edge(
+            left_cluster_id,
+            right_cluster_id,
+            relation,
+            confidence,
+            t_ms,
+        );
+    }
+
+    fn primary_object_cluster_id(&self) -> Option<String> {
+        self.constellation
+            .modality_clusters
+            .iter()
+            .find(|cluster| cluster.id.starts_with("cluster:vision:object"))
+            .map(|cluster| cluster.id.clone())
+    }
+
+    pub fn upsert_binding_edge(
+        &mut self,
+        left_cluster_id: String,
+        right_cluster_id: String,
+        relation: BindingRelation,
+        confidence: f32,
+        t_ms: u64,
+    ) -> BindingEdgeResult {
+        let (left_cluster_id, right_cluster_id) = if left_cluster_id <= right_cluster_id {
+            (left_cluster_id, right_cluster_id)
+        } else {
+            (right_cluster_id, left_cluster_id)
+        };
+        if let Some(index) = self.constellation.binding_edges.iter().position(|edge| {
             edge.left_cluster_id == left_cluster_id
                 && edge.right_cluster_id == right_cluster_id
                 && edge.relation == relation
         }) {
-            edge.strengthen(confidence, t_ms);
-        } else {
-            let mut edge = BindingEdge {
-                left_cluster_id,
-                right_cluster_id,
-                relation,
-                confidence: 0.1,
-                evidence_count: 0,
-                decay_per_tick: 0.01,
-                last_seen_ms: t_ms,
+            self.constellation.binding_edges[index].strengthen(confidence, t_ms);
+            let edge = self.constellation.binding_edges[index].clone();
+            self.refresh_constellation_state();
+            return BindingEdgeResult {
+                edge,
+                created: false,
             };
-            edge.strengthen(confidence, t_ms);
-            self.constellation.binding_edges.push(edge);
         }
-        self.constellation.state = if self
+
+        let mut edge = BindingEdge {
+            left_cluster_id,
+            right_cluster_id,
+            relation,
+            confidence: 0.1,
+            evidence_count: 0,
+            decay_per_tick: 0.01,
+            last_seen_ms: t_ms,
+        };
+        edge.strengthen(confidence, t_ms);
+        self.constellation.binding_edges.push(edge.clone());
+        self.refresh_constellation_state();
+        BindingEdgeResult {
+            edge,
+            created: true,
+        }
+    }
+
+    fn record_binding_candidate(&mut self, candidate: BindingCandidate) {
+        self.constellation.binding_candidates.push(candidate);
+        const MAX_BINDING_CANDIDATES: usize = 64;
+        if self.constellation.binding_candidates.len() > MAX_BINDING_CANDIDATES {
+            let excess = self.constellation.binding_candidates.len() - MAX_BINDING_CANDIDATES;
+            self.constellation.binding_candidates.drain(0..excess);
+        }
+    }
+
+    fn refresh_constellation_state(&mut self) {
+        if matches!(
+            self.constellation.state,
+            EntityConstellationState::Merged
+                | EntityConstellationState::Split
+                | EntityConstellationState::Vanished
+        ) {
+            return;
+        }
+        let strong_edges = self
             .constellation
             .binding_edges
             .iter()
-            .any(BindingEdge::is_strong)
+            .filter(|edge| edge.is_strong())
+            .count();
+        let total_edge_evidence = self
+            .constellation
+            .binding_edges
+            .iter()
+            .map(|edge| edge.evidence_count)
+            .sum::<u32>();
+        let active_modalities = self.modality_support.active_modalities();
+        let has_major_contradiction =
+            self.constellation
+                .binding_candidates
+                .iter()
+                .any(|candidate| {
+                    candidate.decision == BindingDecision::Reject
+                        && candidate.evidence.iter().any(|evidence| {
+                            matches!(
+                                evidence.kind,
+                                BindingEvidenceKind::Contradiction
+                                    | BindingEvidenceKind::SimultaneousConflict
+                            )
+                        })
+                });
+        self.constellation.state = if !has_major_contradiction
+            && (strong_edges >= 2
+                || (self.constellation.binding_edges.len() >= 2
+                    && active_modalities >= 3
+                    && total_edge_evidence >= 3))
         {
             EntityConstellationState::Strong
         } else {
@@ -1336,16 +1490,7 @@ impl EntityHypothesis {
         for edge in &mut self.constellation.binding_edges {
             edge.weaken(decay_factor * edge.decay_per_tick.max(0.01));
         }
-        self.constellation.state = if self
-            .constellation
-            .binding_edges
-            .iter()
-            .any(BindingEdge::is_strong)
-        {
-            EntityConstellationState::Strong
-        } else {
-            EntityConstellationState::Weak
-        };
+        self.refresh_constellation_state();
     }
 }
 
@@ -1368,6 +1513,12 @@ pub struct EntityHypothesisSummary {
     pub observation_points: Vec<ObservationPoint>,
     pub modality_clusters: Vec<ModalityCluster>,
     pub binding_edges: Vec<BindingEdge>,
+    #[serde(default)]
+    pub accepted_binding_candidates: Vec<BindingCandidate>,
+    #[serde(default)]
+    pub ambiguous_binding_candidates: Vec<BindingCandidate>,
+    #[serde(default)]
+    pub rejected_binding_candidates: Vec<BindingCandidate>,
 }
 
 impl From<&EntityHypothesis> for EntityHypothesisSummary {
@@ -1389,6 +1540,34 @@ impl From<&EntityHypothesis> for EntityHypothesisSummary {
             observation_points: h.constellation.observation_points.clone(),
             modality_clusters: h.constellation.modality_clusters.clone(),
             binding_edges: h.constellation.binding_edges.clone(),
+            accepted_binding_candidates: h
+                .constellation
+                .binding_candidates
+                .iter()
+                .filter(|candidate| candidate.decision == BindingDecision::Accept)
+                .cloned()
+                .collect(),
+            ambiguous_binding_candidates: h
+                .constellation
+                .binding_candidates
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate.decision,
+                        BindingDecision::HoldAmbiguous
+                            | BindingDecision::AskHuman
+                            | BindingDecision::CollectMoreEvidence
+                    )
+                })
+                .cloned()
+                .collect(),
+            rejected_binding_candidates: h
+                .constellation
+                .binding_candidates
+                .iter()
+                .filter(|candidate| candidate.decision == BindingDecision::Reject)
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -1400,6 +1579,12 @@ pub struct EntityMemoryReport {
     pub active_entities: usize,
     pub occluded_entities: usize,
     pub vanished_entities: usize,
+    #[serde(default)]
+    pub accepted_binding_candidates: Vec<BindingCandidate>,
+    #[serde(default)]
+    pub ambiguous_binding_candidates: Vec<BindingCandidate>,
+    #[serde(default)]
+    pub rejected_binding_candidates: Vec<BindingCandidate>,
     /// Top entities ranked by confidence (active ones first).
     pub top_entities: Vec<EntityHypothesisSummary>,
 }
@@ -1413,7 +1598,16 @@ const ENTITY_VANISH_THRESHOLD: f32 = 0.05;
 pub struct EntityMemory {
     /// All known entity records keyed by entity id.
     pub entities: BTreeMap<String, EntityHypothesis>,
+    #[serde(default)]
+    pub binding_candidates: Vec<BindingCandidate>,
     last_tick: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VectorBindingKind {
+    Face,
+    Voice,
+    Scene,
 }
 
 impl EntityMemory {
@@ -1444,49 +1638,71 @@ impl EntityMemory {
             }
         }
 
-        // Attach face vectors to any person-class entities.
+        let current_entity_ids = now
+            .objects
+            .observations
+            .iter()
+            .map(|observation| {
+                format!(
+                    "entity:{}:{}",
+                    object_class_slug(&observation.class),
+                    stable_slug(&observation.label)
+                )
+            })
+            .collect::<BTreeSet<_>>();
+
+        // Face vectors propose person bindings; they do not fan out to every person.
         for artifact in &now.face.vectors {
-            let person_ids: Vec<String> = self
-                .entities
-                .keys()
-                .filter(|id| id.starts_with("entity:person:"))
-                .cloned()
-                .collect();
-            for id in person_ids {
+            self.admit_vector_artifact(
+                artifact,
+                VectorBindingKind::Face,
+                now.t_ms,
+                cell_key,
+                &current_entity_ids,
+            );
+        }
+
+        // Attach object vectors to active non-person entities, or to an explicit source entity.
+        for artifact in &now.objects.vectors {
+            let object_ids: Vec<String> = if let Some(source_id) = artifact.source_id.as_ref() {
+                vec![source_id.clone()]
+            } else {
+                self.entities
+                    .values()
+                    .filter(|entity| {
+                        entity.lifecycle == EntityLifecycleState::Active
+                            && !entity.id.starts_with("entity:person:")
+                    })
+                    .map(|entity| entity.id.clone())
+                    .collect()
+            };
+            for id in object_ids {
                 if let Some(entity) = self.entities.get_mut(&id) {
-                    entity.add_face_vector(&artifact.point_id);
+                    entity.add_object_vector(&artifact.point_id);
                 }
             }
         }
 
-        // Attach voice vectors to any person-class entities.
+        // Voice vectors propose speaker bindings; ambiguity is preserved for review.
         for artifact in &now.voice.vectors {
-            let person_ids: Vec<String> = self
-                .entities
-                .keys()
-                .filter(|id| id.starts_with("entity:person:"))
-                .cloned()
-                .collect();
-            for id in person_ids {
-                if let Some(entity) = self.entities.get_mut(&id) {
-                    entity.add_voice_vector(&artifact.point_id);
-                }
-            }
+            self.admit_vector_artifact(
+                artifact,
+                VectorBindingKind::Voice,
+                now.t_ms,
+                cell_key,
+                &current_entity_ids,
+            );
         }
 
-        // Attach scene vectors to all currently-active entities.
+        // Scene vectors bind only when there is explicit spatial/object context.
         for artifact in &now.eye.scene_vectors {
-            let active_ids: Vec<String> = self
-                .entities
-                .values()
-                .filter(|e| e.lifecycle == EntityLifecycleState::Active)
-                .map(|e| e.id.clone())
-                .collect();
-            for id in active_ids {
-                if let Some(entity) = self.entities.get_mut(&id) {
-                    entity.add_scene_vector(&artifact.point_id);
-                }
-            }
+            self.admit_vector_artifact(
+                artifact,
+                VectorBindingKind::Scene,
+                now.t_ms,
+                cell_key,
+                &current_entity_ids,
+            );
         }
 
         let text_labels = now
@@ -1513,6 +1729,135 @@ impl EntityMemory {
                     }
                 }
             }
+        }
+    }
+
+    fn admit_vector_artifact(
+        &mut self,
+        artifact: &VectorArtifact,
+        kind: VectorBindingKind,
+        t_ms: u64,
+        cell_key: Option<PlaceCellKey>,
+        current_entity_ids: &BTreeSet<String>,
+    ) {
+        let plausible_ids = self.plausible_entity_ids(artifact, kind, t_ms, cell_key);
+        if plausible_ids.is_empty() {
+            let reason = match kind {
+                VectorBindingKind::Face => "face vector observed but no plausible person entity",
+                VectorBindingKind::Voice => "voice observed but no plausible person entity",
+                VectorBindingKind::Scene => {
+                    "scene vector active but no spatially compatible object cluster"
+                }
+            };
+            self.record_binding_candidate(BindingCandidate {
+                left_cluster_id: "unresolved".to_string(),
+                right_cluster_id: vector_cluster_id(kind, &artifact.point_id),
+                relation: BindingRelation::RequiresReview,
+                evidence: vec![BindingEvidence {
+                    kind: BindingEvidenceKind::VectorSimilarity,
+                    score: 0.25,
+                    reason: "single vector artifact without compatible entity context".to_string(),
+                }],
+                confidence: 0.0,
+                decision: BindingDecision::CollectMoreEvidence,
+                reason: reason.to_string(),
+            });
+            return;
+        }
+
+        for entity_id in plausible_ids.clone() {
+            let Some(entity) = self.entities.get(&entity_id) else {
+                continue;
+            };
+            let Some(object_cluster_id) = entity.primary_object_cluster_id() else {
+                continue;
+            };
+            let right_cluster_id = vector_cluster_id(kind, &artifact.point_id);
+            let candidate = qualify_binding_candidate(
+                entity,
+                artifact,
+                kind,
+                object_cluster_id,
+                right_cluster_id,
+                t_ms,
+                cell_key,
+                plausible_ids.len(),
+                current_entity_ids.contains(&entity_id),
+            );
+            let accepted = candidate.decision == BindingDecision::Accept;
+            if let Some(entity) = self.entities.get_mut(&entity_id) {
+                entity.record_binding_candidate(candidate.clone());
+                if accepted {
+                    let actual_cluster_id = match kind {
+                        VectorBindingKind::Face => entity.add_face_vector(&artifact.point_id),
+                        VectorBindingKind::Voice => entity.add_voice_vector(&artifact.point_id),
+                        VectorBindingKind::Scene => entity.add_scene_vector(&artifact.point_id),
+                    };
+                    entity.upsert_binding_edge(
+                        candidate.left_cluster_id,
+                        actual_cluster_id,
+                        candidate.relation,
+                        candidate.confidence,
+                        t_ms,
+                    );
+                }
+            }
+        }
+    }
+
+    fn plausible_entity_ids(
+        &self,
+        artifact: &VectorArtifact,
+        kind: VectorBindingKind,
+        t_ms: u64,
+        cell_key: Option<PlaceCellKey>,
+    ) -> Vec<String> {
+        if let Some(source_id) = artifact.source_id.as_ref() {
+            if self.entities.contains_key(source_id) {
+                return vec![source_id.clone()];
+            }
+        }
+        self.entities
+            .values()
+            .filter(|entity| match kind {
+                VectorBindingKind::Face | VectorBindingKind::Voice => entity.kind == "person",
+                VectorBindingKind::Scene => entity.lifecycle == EntityLifecycleState::Active,
+            })
+            .filter(|entity| {
+                if entity.lifecycle != EntityLifecycleState::Active {
+                    return false;
+                }
+                let recent = t_ms.saturating_sub(entity.last_seen_ms) <= 1_000;
+                let same_cell = cell_key
+                    .map(|key| entity.location_cells.contains(&key))
+                    .unwrap_or(false);
+                let prior_support = match kind {
+                    VectorBindingKind::Face => !entity.modality_support.face_vector_ids.is_empty(),
+                    VectorBindingKind::Voice => {
+                        !entity.modality_support.voice_vector_ids.is_empty()
+                    }
+                    VectorBindingKind::Scene => {
+                        !entity.modality_support.scene_vector_ids.is_empty()
+                    }
+                };
+                let explicit_label = !entity.modality_support.text_labels.is_empty();
+                match kind {
+                    VectorBindingKind::Face | VectorBindingKind::Voice => {
+                        recent || same_cell || prior_support || explicit_label
+                    }
+                    VectorBindingKind::Scene => same_cell || prior_support,
+                }
+            })
+            .map(|entity| entity.id.clone())
+            .collect()
+    }
+
+    fn record_binding_candidate(&mut self, candidate: BindingCandidate) {
+        self.binding_candidates.push(candidate);
+        const MAX_BINDING_CANDIDATES: usize = 128;
+        if self.binding_candidates.len() > MAX_BINDING_CANDIDATES {
+            let excess = self.binding_candidates.len() - MAX_BINDING_CANDIDATES;
+            self.binding_candidates.drain(0..excess);
         }
     }
 
@@ -1664,13 +2009,251 @@ impl EntityMemory {
             .map(|e| EntityHypothesisSummary::from(*e))
             .collect();
 
+        let all_candidates = self
+            .binding_candidates
+            .iter()
+            .cloned()
+            .chain(
+                self.entities
+                    .values()
+                    .flat_map(|entity| entity.constellation.binding_candidates.iter().cloned()),
+            )
+            .collect::<Vec<_>>();
+        let accepted_binding_candidates = all_candidates
+            .iter()
+            .filter(|candidate| candidate.decision == BindingDecision::Accept)
+            .cloned()
+            .collect();
+        let ambiguous_binding_candidates = all_candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.decision,
+                    BindingDecision::HoldAmbiguous
+                        | BindingDecision::AskHuman
+                        | BindingDecision::CollectMoreEvidence
+                )
+            })
+            .cloned()
+            .collect();
+        let rejected_binding_candidates = all_candidates
+            .iter()
+            .filter(|candidate| candidate.decision == BindingDecision::Reject)
+            .cloned()
+            .collect();
+
         EntityMemoryReport {
             total_entities,
             active_entities,
             occluded_entities,
             vanished_entities,
+            accepted_binding_candidates,
+            ambiguous_binding_candidates,
+            rejected_binding_candidates,
             top_entities,
         }
+    }
+}
+
+fn qualify_binding_candidate(
+    entity: &EntityHypothesis,
+    artifact: &VectorArtifact,
+    kind: VectorBindingKind,
+    left_cluster_id: String,
+    right_cluster_id: String,
+    t_ms: u64,
+    cell_key: Option<PlaceCellKey>,
+    plausible_count: usize,
+    current_object_observed: bool,
+) -> BindingCandidate {
+    let mut evidence = Vec::new();
+    evidence.push(BindingEvidence {
+        kind: BindingEvidenceKind::VectorSimilarity,
+        score: 0.45,
+        reason: "vector artifact proposes a possible cross-modal correspondence".to_string(),
+    });
+
+    if artifact.source_id.as_deref() == Some(entity.id.as_str()) {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::HumanConfirmed,
+            score: 1.0,
+            reason: "vector source explicitly names this entity".to_string(),
+        });
+    }
+    if t_ms.saturating_sub(entity.last_seen_ms) <= 1_000 {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::TemporalOverlap,
+            score: 0.75,
+            reason: "entity was observed in the current temporal window".to_string(),
+        });
+    }
+    if cell_key
+        .map(|key| entity.location_cells.contains(&key))
+        .unwrap_or(false)
+    {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::SpatialOverlap,
+            score: 0.75,
+            reason: "entity has a compatible current map cell".to_string(),
+        });
+    }
+    if current_object_observed {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::ProjectionAgreement,
+            score: 0.7,
+            reason: "a current object observation anchors this entity".to_string(),
+        });
+    }
+    if plausible_count == 1 {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::SingleCandidateContext,
+            score: 0.65,
+            reason: "only one plausible entity matched this vector context".to_string(),
+        });
+    } else if plausible_count > 1 {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::SimultaneousConflict,
+            score: 0.8,
+            reason: match kind {
+                VectorBindingKind::Face => {
+                    "face vector close to multiple active person entities".to_string()
+                }
+                VectorBindingKind::Voice => {
+                    "voice observed while multiple person hypotheses are active".to_string()
+                }
+                VectorBindingKind::Scene => {
+                    "scene vector has multiple spatially plausible entities".to_string()
+                }
+            },
+        });
+    }
+    if entity.constellation.binding_edges.iter().any(|edge| {
+        edge.left_cluster_id == right_cluster_id || edge.right_cluster_id == right_cluster_id
+    }) {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::RepeatedCooccurrence,
+            score: 0.8,
+            reason: "prior binding history supports this correspondence".to_string(),
+        });
+    }
+
+    let has_human_confirmation = evidence
+        .iter()
+        .any(|item| item.kind == BindingEvidenceKind::HumanConfirmed);
+    let has_conflict = evidence.iter().any(|item| {
+        matches!(
+            item.kind,
+            BindingEvidenceKind::Contradiction | BindingEvidenceKind::SimultaneousConflict
+        )
+    });
+    let independent_positive_kinds = evidence
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.kind,
+                BindingEvidenceKind::Contradiction
+                    | BindingEvidenceKind::SimultaneousConflict
+                    | BindingEvidenceKind::VectorSimilarity
+            )
+        })
+        .map(|item| binding_evidence_kind_rank(&item.kind))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mean_score = if evidence.is_empty() {
+        0.0
+    } else {
+        evidence
+            .iter()
+            .map(|item| item.score.clamp(0.0, 1.0))
+            .sum::<f32>()
+            / evidence.len() as f32
+    };
+    let mut confidence = if has_human_confirmation {
+        mean_score.max(0.9)
+    } else {
+        (mean_score * (independent_positive_kinds as f32 / 3.0).clamp(0.25, 1.0)).clamp(0.0, 1.0)
+    };
+    if has_conflict {
+        confidence *= 0.35;
+    }
+
+    let (decision, reason) = if has_human_confirmation {
+        (
+            BindingDecision::Accept,
+            "human-confirmed or explicit source binding".to_string(),
+        )
+    } else if has_conflict {
+        (
+            BindingDecision::HoldAmbiguous,
+            match kind {
+                VectorBindingKind::Face => "face vector close to multiple active person entities",
+                VectorBindingKind::Voice => {
+                    "voice observed while multiple person hypotheses active"
+                }
+                VectorBindingKind::Scene => {
+                    "scene vector active but multiple spatially compatible entities exist"
+                }
+            }
+            .to_string(),
+        )
+    } else if independent_positive_kinds >= 2 {
+        (
+            BindingDecision::Accept,
+            "candidate has at least two independent supporting evidence types".to_string(),
+        )
+    } else if evidence.len() == 1 {
+        (
+            BindingDecision::CollectMoreEvidence,
+            "single vector similarity without supporting temporal/spatial evidence".to_string(),
+        )
+    } else {
+        (
+            BindingDecision::CollectMoreEvidence,
+            "projection agreement missing or evidence is not yet independent".to_string(),
+        )
+    };
+
+    BindingCandidate {
+        left_cluster_id,
+        right_cluster_id,
+        relation: match kind {
+            VectorBindingKind::Face | VectorBindingKind::Voice => BindingRelation::LikelySameEntity,
+            VectorBindingKind::Scene => BindingRelation::ProjectsTo,
+        },
+        evidence,
+        confidence: confidence.clamp(0.0, 1.0),
+        decision,
+        reason,
+    }
+}
+
+fn vector_cluster_id(kind: VectorBindingKind, point_id: &str) -> String {
+    let key = match kind {
+        VectorBindingKind::Face => format!("face:{point_id}"),
+        VectorBindingKind::Voice => format!("voice:{point_id}"),
+        VectorBindingKind::Scene => format!("scene:{point_id}"),
+    };
+    let modality = match kind {
+        VectorBindingKind::Face => Modality::Vision,
+        VectorBindingKind::Voice => Modality::Audio,
+        VectorBindingKind::Scene => Modality::Depth,
+    };
+    format!("cluster:{}:{}", modality.as_str(), stable_slug(&key))
+}
+
+fn binding_evidence_kind_rank(kind: &BindingEvidenceKind) -> u8 {
+    match kind {
+        BindingEvidenceKind::TemporalOverlap => 1,
+        BindingEvidenceKind::SpatialOverlap => 2,
+        BindingEvidenceKind::VectorSimilarity => 3,
+        BindingEvidenceKind::ProjectionAgreement => 4,
+        BindingEvidenceKind::PoseAgreement => 5,
+        BindingEvidenceKind::RepeatedCooccurrence => 6,
+        BindingEvidenceKind::SingleCandidateContext => 7,
+        BindingEvidenceKind::HumanConfirmed => 8,
+        BindingEvidenceKind::LlmSuggested => 9,
+        BindingEvidenceKind::Contradiction => 10,
+        BindingEvidenceKind::SimultaneousConflict => 11,
     }
 }
 
@@ -1687,6 +2270,8 @@ pub struct MemoryRecord {
     pub scene_vectors: Vec<VectorArtifact>,
     #[serde(default)]
     pub face_vectors: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub object_vectors: Vec<VectorArtifact>,
     #[serde(default)]
     pub voice_vectors: Vec<VectorArtifact>,
     #[serde(default)]
@@ -2273,6 +2858,7 @@ impl Recall for InMemoryExperienceStore {
         let mut place_danger = 0.0f32;
         let mut place_charge_value = 0.0f32;
         let mut face_familiarity = 0.0f32;
+        let mut object_familiarity = 0.0f32;
         let mut voice_familiarity = 0.0f32;
         let mut remembered_warning = None;
         let mut best_remembered_action = None;
@@ -2295,6 +2881,10 @@ impl Recall for InMemoryExperienceStore {
                 query_face_vectors(&query),
                 record.face_vectors.iter().collect(),
             );
+            let object_score = max_vector_similarity(
+                query_object_vectors(&query),
+                record.object_vectors.iter().collect(),
+            );
             let voice_score = max_vector_similarity(
                 query_voice_vectors(&query),
                 record.voice_vectors.iter().collect(),
@@ -2309,6 +2899,9 @@ impl Recall for InMemoryExperienceStore {
             }
             if has_face_query(&query) {
                 face_familiarity = face_familiarity.max(score).max(face_score);
+            }
+            if has_object_query(&query) {
+                object_familiarity = object_familiarity.max(score).max(object_score);
             }
             if has_voice_query(&query) {
                 voice_familiarity = voice_familiarity.max(score).max(voice_score);
@@ -2364,6 +2957,7 @@ impl Recall for InMemoryExperienceStore {
             recent_trap_confidence: 0.0,
             places_visited: place_features.places_visited,
             face_familiarity,
+            object_familiarity,
             voice_familiarity,
             similar_situation_count: hits.len().try_into().unwrap_or(u16::MAX),
             best_remembered_action,
@@ -2426,6 +3020,13 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         frame.id,
         frame.t_ms,
     );
+    let object_vectors = vector_artifacts_from_now(
+        OBJECT_VECTOR_COLLECTION,
+        &frame.now.objects.vectors,
+        &frame.now.objects.embeddings,
+        frame.id,
+        frame.t_ms,
+    );
     let voice_vectors = vector_artifacts_from_now(
         VOICE_VECTOR_COLLECTION,
         &frame.now.voice.vectors,
@@ -2433,8 +3034,13 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         frame.id,
         frame.t_ms,
     );
-    let linked_experiences =
-        experiences_with_memory_links(frame, &scene_vectors, &face_vectors, &voice_vectors);
+    let linked_experiences = experiences_with_memory_links(
+        frame,
+        &scene_vectors,
+        &face_vectors,
+        &object_vectors,
+        &voice_vectors,
+    );
     let (sensation_vectors, mut vector_payloads) = sensation_vectors_from_frame(frame);
     let experience_vectors = experience_vectors_from_frame(frame, &mut vector_payloads);
     let (graph_entities, graph_relationships) = graph_context_from_frame(
@@ -2442,6 +3048,7 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         &linked_experiences,
         &scene_vectors,
         &face_vectors,
+        &object_vectors,
         &voice_vectors,
     );
     Ok(MemoryRecord {
@@ -2452,6 +3059,7 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         graph_relationships,
         scene_vectors,
         face_vectors,
+        object_vectors,
         voice_vectors,
         sensation_vectors,
         experience_vectors,
@@ -2473,6 +3081,13 @@ pub fn attach_memory_links_to_frame(frame: &mut ExperienceFrame) {
         frame.id,
         frame.t_ms,
     );
+    let object_vectors = vector_artifacts_from_now(
+        OBJECT_VECTOR_COLLECTION,
+        &frame.now.objects.vectors,
+        &frame.now.objects.embeddings,
+        frame.id,
+        frame.t_ms,
+    );
     let voice_vectors = vector_artifacts_from_now(
         VOICE_VECTOR_COLLECTION,
         &frame.now.voice.vectors,
@@ -2480,7 +3095,13 @@ pub fn attach_memory_links_to_frame(frame: &mut ExperienceFrame) {
         frame.id,
         frame.t_ms,
     );
-    let links = memory_links_from_frame(frame, &scene_vectors, &face_vectors, &voice_vectors);
+    let links = memory_links_from_frame(
+        frame,
+        &scene_vectors,
+        &face_vectors,
+        &object_vectors,
+        &voice_vectors,
+    );
     for experience in &mut frame.experiences {
         merge_memory_links(&mut experience.memory_links, links.clone());
     }
@@ -2490,9 +3111,16 @@ fn experiences_with_memory_links(
     frame: &ExperienceFrame,
     scene_vectors: &[VectorArtifact],
     face_vectors: &[VectorArtifact],
+    object_vectors: &[VectorArtifact],
     voice_vectors: &[VectorArtifact],
 ) -> Vec<Experience> {
-    let links = memory_links_from_frame(frame, scene_vectors, face_vectors, voice_vectors);
+    let links = memory_links_from_frame(
+        frame,
+        scene_vectors,
+        face_vectors,
+        object_vectors,
+        voice_vectors,
+    );
     frame
         .experiences
         .iter()
@@ -3258,6 +3886,7 @@ fn summarize_cell(cell: &PlaceCell, score: f32) -> PlaceCellSummary {
         last_observed_objects: cell.last_observed_objects.clone(),
         associated_scene_vectors: cell.associated_scene_vectors.clone(),
         associated_face_vectors: cell.associated_face_vectors.clone(),
+        associated_object_vectors: cell.associated_object_vectors.clone(),
         associated_voice_vectors: cell.associated_voice_vectors.clone(),
         successful_actions: cell.successful_actions.clone(),
         failed_actions: cell.failed_actions.clone(),
@@ -3326,6 +3955,7 @@ fn graph_context_from_frame(
     experiences: &[Experience],
     scene_vectors: &[VectorArtifact],
     face_vectors: &[VectorArtifact],
+    object_vectors: &[VectorArtifact],
     voice_vectors: &[VectorArtifact],
 ) -> (Vec<GraphEntity>, Vec<GraphEdge>) {
     let frame_id = frame.id.to_string();
@@ -3534,6 +4164,36 @@ fn graph_context_from_frame(
             person_id,
             vector_node_id(artifact),
             "HAS_FACE_VECTOR",
+            None,
+        ));
+    }
+
+    for (index, artifact) in object_vectors.iter().enumerate() {
+        let object_id = artifact
+            .source_id
+            .clone()
+            .unwrap_or_else(|| format!("object:vector:{frame_id}:{index}"));
+        entities.push(GraphEntity {
+            id: object_id.clone(),
+            labels: vec![
+                "Object".to_string(),
+                "ObjectInstance".to_string(),
+                "Entity".to_string(),
+            ],
+            summary: "object seen by visual vector".to_string(),
+            score: 1.0,
+        });
+        entities.push(vector_entity(artifact, "object"));
+        relationships.push(graph_edge(
+            experience_id.clone(),
+            object_id.clone(),
+            "SAW_OBJECT",
+            None,
+        ));
+        relationships.push(graph_edge(
+            object_id,
+            vector_node_id(artifact),
+            "HAS_OBJECT_VECTOR",
             None,
         ));
     }
@@ -3949,6 +4609,7 @@ fn memory_links_from_frame(
     frame: &ExperienceFrame,
     _scene_vectors: &[VectorArtifact],
     face_vectors: &[VectorArtifact],
+    object_vectors: &[VectorArtifact],
     voice_vectors: &[VectorArtifact],
 ) -> Vec<MemoryLink> {
     let mut links = Vec::new();
@@ -4001,6 +4662,25 @@ fn memory_links_from_frame(
             payload: json!({
                 "target_kind": "person",
                 "text": "face observed",
+                "vector_id": vector_node_id(artifact),
+                "collection": artifact.collection,
+                "point_id": artifact.point_id,
+            }),
+        });
+    }
+
+    for (index, artifact) in object_vectors.iter().enumerate() {
+        let target_id = artifact
+            .source_id
+            .clone()
+            .unwrap_or_else(|| format!("object:vector:{}:{index}", frame.id));
+        links.push(MemoryLink {
+            target_id,
+            relation: "saw_object_vector".to_string(),
+            score: 1.0,
+            payload: json!({
+                "target_kind": "object",
+                "text": "object visual vector observed",
                 "vector_id": vector_node_id(artifact),
                 "collection": artifact.collection,
                 "point_id": artifact.point_id,
@@ -4282,6 +4962,7 @@ pub fn place_recognition_input_from_query_now(
             .scene_vectors
             .iter()
             .chain(now.face.vectors.iter())
+            .chain(now.objects.vectors.iter())
             .chain(now.voice.vectors.iter())
             .map(|artifact| format!("{}:{}", artifact.collection, artifact.point_id))
             .collect(),
@@ -4394,6 +5075,16 @@ fn query_face_vectors(query: &RecallQuery) -> Vec<&[f32]> {
     vectors
 }
 
+fn query_object_vectors(query: &RecallQuery) -> Vec<&[f32]> {
+    let mut vectors = query
+        .object_vector_artifacts
+        .iter()
+        .map(|artifact| artifact.vector.as_slice())
+        .collect::<Vec<_>>();
+    vectors.extend(query.object_vectors.iter().map(Vec::as_slice));
+    vectors
+}
+
 fn query_voice_vectors(query: &RecallQuery) -> Vec<&[f32]> {
     let mut vectors = query
         .voice_vector_artifacts
@@ -4411,6 +5102,7 @@ fn recall_vector_ids(record: &MemoryRecord) -> Vec<String> {
         .chain(record.sensation_vectors.iter())
         .chain(record.scene_vectors.iter())
         .chain(record.face_vectors.iter())
+        .chain(record.object_vectors.iter())
         .chain(record.voice_vectors.iter())
         .map(|artifact| format!("{}:{}", artifact.collection, artifact.point_id))
         .collect::<Vec<_>>();
@@ -4422,6 +5114,7 @@ fn recall_vector_ids(record: &MemoryRecord) -> Vec<String> {
 fn query_all_vectors(query: &RecallQuery) -> Vec<&[f32]> {
     let mut vectors = query_scene_vectors(query);
     vectors.extend(query_face_vectors(query));
+    vectors.extend(query_object_vectors(query));
     vectors.extend(query_voice_vectors(query));
     vectors
 }
@@ -4431,6 +5124,7 @@ fn record_all_vectors(record: &MemoryRecord) -> Vec<&VectorArtifact> {
         .scene_vectors
         .iter()
         .chain(record.face_vectors.iter())
+        .chain(record.object_vectors.iter())
         .chain(record.voice_vectors.iter())
         .chain(record.sensation_vectors.iter())
         .chain(record.experience_vectors.iter())
@@ -4452,6 +5146,10 @@ fn merge_json_object(base: &mut serde_json::Value, extra: &serde_json::Value) {
 
 fn has_face_query(query: &RecallQuery) -> bool {
     !query.face_vectors.is_empty() || !query.face_vector_artifacts.is_empty()
+}
+
+fn has_object_query(query: &RecallQuery) -> bool {
+    !query.object_vectors.is_empty() || !query.object_vector_artifacts.is_empty()
 }
 
 fn has_voice_query(query: &RecallQuery) -> bool {
@@ -4718,6 +5416,49 @@ mod tests {
             .impression
             .as_ref()
             .is_some_and(|impression| impression.text.starts_with("I remember")));
+    }
+
+    #[tokio::test]
+    async fn object_vectors_are_memorized_and_recalled_like_faces() {
+        let mut now = now_at(1_000, 0.0, 0.0);
+        now.objects.observations.push(ObjectObservation {
+            label: "red cup".to_string(),
+            class: ObjectClass::Landmark,
+            bearing_rad: 0.1,
+            distance_m: Some(1.2),
+            confidence: 0.9,
+            source: ObjectObservationSource::Kinect,
+        });
+        now.objects.vectors.push(
+            VectorArtifact::new(OBJECT_VECTOR_COLLECTION, "object-red-cup", vec![1.0, 0.0])
+                .with_model("test.object.embedding")
+                .with_source_id("entity:landmark:red-cup"),
+        );
+        let frame = empty_frame(now);
+        let store = InMemoryExperienceStore::new();
+        store.store(&frame).await.unwrap();
+
+        let record = store.snapshot().pop().expect("stored record");
+        assert_eq!(record.object_vectors.len(), 1);
+        assert!(record
+            .graph_relationships
+            .iter()
+            .any(|edge| edge.relationship == "HAS_OBJECT_VECTOR"));
+
+        let recall = store
+            .recall(RecallQuery {
+                object_vector_artifacts: vec![VectorArtifact::new(
+                    OBJECT_VECTOR_COLLECTION,
+                    "object-query",
+                    vec![1.0, 0.0],
+                )],
+                ..RecallQuery::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(recall.hits.len(), 1);
+        assert!(recall.sense.object_familiarity > 0.99);
     }
 
     #[test]
@@ -5338,6 +6079,7 @@ mod tests {
             )
             .with_model("test.face.detector")
             .with_source_frame_id("eye-frame")],
+            object_vectors: Vec::new(),
             voice_vectors: Vec::new(),
             sensation_vectors: Vec::new(),
             experience_vectors: Vec::new(),
@@ -5394,6 +6136,7 @@ mod tests {
             }],
             scene_vectors: Vec::new(),
             face_vectors: Vec::new(),
+            object_vectors: Vec::new(),
             voice_vectors: Vec::new(),
             sensation_vectors: Vec::new(),
             experience_vectors: Vec::new(),
@@ -6248,6 +6991,223 @@ mod tests {
                 .any(|edge| edge.relation == BindingRelation::NamedBy),
             "named_by edge should connect text cluster to the entity constellation"
         );
+    }
+
+    #[test]
+    fn face_vector_is_not_attached_to_every_active_person() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("ada", ObjectClass::Person, 0.8));
+        now.objects
+            .observations
+            .push(make_object_observation("grace", ObjectClass::Person, 0.8));
+        now.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-ambiguous",
+            vec![1.0, 0.0],
+        ));
+
+        memory.observe_now(&now, Some(PlaceCellKey { x: 0, y: 0 }));
+
+        assert!(memory
+            .entities
+            .values()
+            .all(|entity| entity.modality_support.face_vector_ids.is_empty()));
+        assert!(memory
+            .report()
+            .ambiguous_binding_candidates
+            .iter()
+            .any(|candidate| candidate.reason.contains("face vector close")));
+    }
+
+    #[test]
+    fn voice_vector_is_not_attached_to_every_active_person() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("ada", ObjectClass::Person, 0.8));
+        now.objects
+            .observations
+            .push(make_object_observation("grace", ObjectClass::Person, 0.8));
+        now.voice.vectors.push(VectorArtifact::new(
+            VOICE_VECTOR_COLLECTION,
+            "voice-ambiguous",
+            vec![0.0, 1.0],
+        ));
+
+        memory.observe_now(&now, Some(PlaceCellKey { x: 0, y: 0 }));
+
+        assert!(memory
+            .entities
+            .values()
+            .all(|entity| entity.modality_support.voice_vector_ids.is_empty()));
+        assert!(!memory.report().ambiguous_binding_candidates.is_empty());
+    }
+
+    #[test]
+    fn scene_vector_is_not_attached_to_every_active_entity() {
+        let mut memory = EntityMemory::new();
+        let mut first = now_at(100, 0.0, 0.0);
+        first
+            .objects
+            .observations
+            .push(make_object_observation("cup", ObjectClass::Unknown, 0.8));
+        memory.observe_now(&first, Some(PlaceCellKey { x: 0, y: 0 }));
+
+        let mut second = now_at(200, 2.0, 2.0);
+        second.objects.observations.push(make_object_observation(
+            "lamp",
+            ObjectClass::Unknown,
+            0.8,
+        ));
+        second.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-current",
+            vec![0.5, 0.5],
+        ));
+        memory.observe_now(&second, Some(PlaceCellKey { x: 4, y: 4 }));
+
+        let cup = memory.entities.get("entity:unknown:cup").unwrap();
+        let lamp = memory.entities.get("entity:unknown:lamp").unwrap();
+        assert!(cup.modality_support.scene_vector_ids.is_empty());
+        assert_eq!(
+            lamp.modality_support.scene_vector_ids,
+            vec!["scene-current".to_string()]
+        );
+    }
+
+    #[test]
+    fn candidate_with_only_one_weak_evidence_source_is_held() {
+        let observation = make_object_observation("ada", ObjectClass::Person, 0.8);
+        let entity = EntityHypothesis::from_observation(&observation, 100, None);
+        let candidate = qualify_binding_candidate(
+            &entity,
+            &VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-only", vec![1.0]),
+            VectorBindingKind::Face,
+            entity.primary_object_cluster_id().unwrap(),
+            vector_cluster_id(VectorBindingKind::Face, "face-only"),
+            5_000,
+            None,
+            0,
+            false,
+        );
+
+        assert_ne!(candidate.decision, BindingDecision::Accept);
+        assert!(candidate.reason.contains("single vector"));
+    }
+
+    #[test]
+    fn candidate_with_temporal_and_spatial_evidence_is_accepted() {
+        let observation = make_object_observation("ada", ObjectClass::Person, 0.8);
+        let cell = PlaceCellKey { x: 1, y: 2 };
+        let entity = EntityHypothesis::from_observation(&observation, 100, Some(cell));
+        let candidate = qualify_binding_candidate(
+            &entity,
+            &VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-ada", vec![1.0]),
+            VectorBindingKind::Face,
+            entity.primary_object_cluster_id().unwrap(),
+            vector_cluster_id(VectorBindingKind::Face, "face-ada"),
+            150,
+            Some(cell),
+            1,
+            false,
+        );
+
+        assert_eq!(candidate.decision, BindingDecision::Accept);
+    }
+
+    #[test]
+    fn accepted_candidates_strengthen_existing_binding_edges() {
+        let mut memory = EntityMemory::new();
+        let cell = PlaceCellKey { x: 0, y: 0 };
+        let mut now1 = now_at(100, 0.0, 0.0);
+        now1.objects
+            .observations
+            .push(make_object_observation("ada", ObjectClass::Person, 0.8));
+        now1.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-ada",
+            vec![1.0, 0.0],
+        ));
+        memory.observe_now(&now1, Some(cell));
+
+        let before = memory.entities["entity:person:ada"]
+            .constellation
+            .binding_edges[0]
+            .clone();
+
+        let mut now2 = now_at(200, 0.0, 0.0);
+        now2.objects
+            .observations
+            .push(make_object_observation("ada", ObjectClass::Person, 0.9));
+        now2.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-ada",
+            vec![1.0, 0.0],
+        ));
+        memory.observe_now(&now2, Some(cell));
+
+        let after = &memory.entities["entity:person:ada"]
+            .constellation
+            .binding_edges[0];
+        assert!(after.evidence_count > before.evidence_count);
+        assert!(after.confidence > before.confidence);
+    }
+
+    #[test]
+    fn strong_constellation_requires_multiple_supporting_bindings() {
+        let observation = make_object_observation("ada", ObjectClass::Person, 0.8);
+        let mut entity = EntityHypothesis::from_observation(&observation, 100, None);
+        let object_cluster = entity.primary_object_cluster_id().unwrap();
+        let face_cluster = entity.add_face_vector("face-ada");
+        for step in 0..5 {
+            entity.upsert_binding_edge(
+                object_cluster.clone(),
+                face_cluster.clone(),
+                BindingRelation::LikelySameEntity,
+                1.0,
+                100 + step,
+            );
+        }
+        assert_eq!(entity.constellation.state, EntityConstellationState::Weak);
+
+        let voice_cluster = entity.add_voice_vector("voice-ada");
+        for step in 0..5 {
+            entity.upsert_binding_edge(
+                object_cluster.clone(),
+                voice_cluster.clone(),
+                BindingRelation::LikelySameEntity,
+                1.0,
+                200 + step,
+            );
+        }
+        assert_eq!(entity.constellation.state, EntityConstellationState::Strong);
+    }
+
+    #[test]
+    fn binding_admission_does_not_merge_entities() {
+        let mut memory = EntityMemory::new();
+        let mut now = now_at(100, 0.0, 0.0);
+        now.objects
+            .observations
+            .push(make_object_observation("ada", ObjectClass::Person, 0.8));
+        now.objects
+            .observations
+            .push(make_object_observation("grace", ObjectClass::Person, 0.8));
+        now.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-ambiguous",
+            vec![1.0, 0.0],
+        ));
+
+        memory.observe_now(&now, Some(PlaceCellKey { x: 0, y: 0 }));
+
+        assert_eq!(memory.entities.len(), 2);
+        assert!(memory.entities.contains_key("entity:person:ada"));
+        assert!(memory.entities.contains_key("entity:person:grace"));
     }
 
     #[test]

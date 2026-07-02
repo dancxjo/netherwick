@@ -1203,6 +1203,7 @@ mod tests {
                 confidence: 0.9,
                 source: ObjectObservationSource::Sim,
             }],
+            ..ObjectSense::default()
         };
         now.face.embeddings = vec![vec![0.1, 0.2, 0.3]];
         now.memory.face_familiarity = 0.9;

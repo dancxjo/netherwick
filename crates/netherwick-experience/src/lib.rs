@@ -5118,6 +5118,7 @@ fn purpose_for_sensation(modality: &Modality, payload_kind: &SensationPayloadKin
 fn purpose_for_collection(collection: &str) -> String {
     match collection {
         "faces" => "face_identity",
+        "objects" => "object_identity",
         "voices" => "voice_identity",
         "scene_vectors" | "images" => "scene_similarity",
         "image_descriptions" | "memories" | "transcripts" => "transcript_semantic",
@@ -6797,6 +6798,38 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
         .with_summary("I have a face embedding from vision.");
         sensation.metadata.confidence = Some(0.6);
         sensation.metadata.labels.push("face".to_string());
+        sensations.push(sensation);
+    }
+
+    if !now.objects.embeddings.is_empty() || !now.objects.vectors.is_empty() {
+        let vector_artifacts = if now.objects.vectors.is_empty() {
+            legacy_vector_artifacts(
+                "objects",
+                "legacy-object",
+                &now.objects.embeddings,
+                now.t_ms,
+            )
+        } else {
+            now.objects.vectors.clone()
+        };
+        let mut sensation = Sensation::primary(
+            Modality::Vision,
+            SensationSource::new("object.features"),
+            now.t_ms,
+            now.t_ms,
+            SensationPayload {
+                kind: SensationPayloadKind::Crop,
+                value: json!({
+                    "object_observations": now.objects.observations.len(),
+                    "object_embeddings": now.objects.embeddings.len(),
+                    "object_vectors": now.objects.vectors.len(),
+                    "vector_artifacts": vector_artifacts,
+                }),
+            },
+        )
+        .with_summary("I have object visual vectors from vision.");
+        sensation.metadata.confidence = Some(0.6);
+        sensation.metadata.labels.push("object".to_string());
         sensations.push(sensation);
     }
 

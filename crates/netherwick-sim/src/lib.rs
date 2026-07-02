@@ -6,7 +6,7 @@ use netherwick_body::{
 use netherwick_now::{
     EarSense, ExtensionSense, FaceSense, GpsSense, ImuSense, KinectJointSense, KinectSense,
     KinectSkeletonSense, ObjectClass, ObjectObservation, ObjectObservationSource, ObjectSense,
-    RangeSense, VoiceSense,
+    RangeSense, VectorArtifact, VoiceSense, OBJECT_VECTOR_COLLECTION,
 };
 use netherwick_sensors::{
     EyeFrame, EyeFrameFormat, PcmAudioFrame, World, WorldSnapshot, WorldUpdate,
@@ -768,21 +768,73 @@ fn project_voice_sense(body: &BodySense, objects: &[SimObject]) -> VoiceSense {
 }
 
 fn project_object_sense(body: &BodySense, objects: &[SimObject]) -> ObjectSense {
-    let observations = visible_objects(body, objects)
-        .into_iter()
+    let visible = visible_objects(body, objects);
+    let observations = visible
+        .iter()
         .map(|(object, distance, bearing)| ObjectObservation {
             label: object.label.clone(),
             class: sim_object_class(&object.kind),
-            bearing_rad: bearing,
+            bearing_rad: *bearing,
             distance_m: Some((distance - object.radius_m - ROBOT_RADIUS_M).max(0.0)),
-            confidence: visible_object_confidence(distance, bearing),
+            confidence: visible_object_confidence(*distance, *bearing),
             source: ObjectObservationSource::Sim,
+        })
+        .collect();
+    let embeddings = visible
+        .iter()
+        .map(|(object, distance, bearing)| sim_embedding(&object.label, *distance, *bearing))
+        .collect::<Vec<_>>();
+    let vectors = visible
+        .into_iter()
+        .enumerate()
+        .map(|(index, (object, distance, bearing))| {
+            VectorArtifact::new(
+                OBJECT_VECTOR_COLLECTION,
+                format!("sim-object-{}-{index}", object.id),
+                sim_embedding(&object.label, distance, bearing),
+            )
+            .with_model("sim-object-embedding-v0")
+            .with_source_id(format!(
+                "entity:{}:{}",
+                object_class_slug(&sim_object_class(&object.kind)),
+                stable_slug(&object.label)
+            ))
         })
         .collect();
     ObjectSense {
         schema_version: 1,
         observations,
+        embeddings,
+        vectors,
     }
+}
+
+fn object_class_slug(class: &ObjectClass) -> &'static str {
+    match class {
+        ObjectClass::Obstacle => "obstacle",
+        ObjectClass::Charger => "charger",
+        ObjectClass::Person => "person",
+        ObjectClass::SoundSource => "sound_source",
+        ObjectClass::Landmark => "landmark",
+        ObjectClass::Unknown => "unknown",
+    }
+}
+
+fn stable_slug(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    slug.split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn sim_object_class(kind: &SimObjectKind) -> ObjectClass {
