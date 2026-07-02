@@ -19,8 +19,8 @@ tts_output_device := env_var_or_default("NETHERWICK_TTS_OUTPUT_DEVICE", "USB Aud
 default *args:
     just robot {{args}}
 
-# Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, and local model runtimes.
-setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-ort setup-tts setup-whisper
+# Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, and local models.
+setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-tts setup-whisper
     @echo "netherwick Linux setup complete"
     @echo "next: cargo check && just sim"
 
@@ -97,24 +97,6 @@ setup-kinect-from-source:
     cmake --build .vendor/libfreenect/build -j
     sudo cmake --install .vendor/libfreenect/build
 
-# Download ONNX Runtime for local Piper/ONNX speech synthesis.
-setup-ort:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    ORT_VERSION="${ORT_VERSION:-1.22.0}"
-    ORT_ARCHIVE="onnxruntime-linux-aarch64-${ORT_VERSION}.tgz"
-    ORT_URL="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_ARCHIVE}"
-    ORT_ROOT=".vendor/onnxruntime"
-    ORT_VERSION_DIR="$ORT_ROOT/onnxruntime-linux-aarch64-${ORT_VERSION}"
-    ORT_LIB="$ORT_VERSION_DIR/lib/libonnxruntime.so"
-    mkdir -p "$ORT_ROOT"
-    if [ ! -s "$ORT_LIB" ]; then
-        curl -fL --retry 3 --retry-delay 2 -o "$ORT_ROOT/$ORT_ARCHIVE" "$ORT_URL"
-        tar -xzf "$ORT_ROOT/$ORT_ARCHIVE" -C "$ORT_ROOT"
-    fi
-    test -s "$ORT_LIB"
-    echo "ONNX Runtime ready: $ORT_LIB"
-
 # Download the default Piper voice used by the robot mouth.
 setup-tts:
     #!/usr/bin/env bash
@@ -150,7 +132,7 @@ setup-whisper:
     echo "Whisper model ready: $MODEL"
 
 # Fetch local runtime/model assets without running the full system setup.
-fetch: setup-ort setup-tts setup-whisper
+fetch: setup-tts setup-whisper
 
 # Format all Rust code in the workspace.
 fmt:

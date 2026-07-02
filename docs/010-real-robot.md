@@ -28,19 +28,19 @@ The robot runner annotates the first real-robot `Now` with `robot.initialization
 The robot process owns rendering. It creates a queued Piper/CPAL mouth from:
 
 ```bash
-just setup-ort
 just setup-tts
 # or, as part of full system setup:
 just setup
 ```
 
-The default voice is downloaded to the Tongues Piper model directory and autoloaded at startup. To override it, set:
+The default voice is downloaded to the Tongues Piper model directory and autoloaded at startup. Piper ONNX execution uses the Tongues `piper-onnx` backend, which loads ONNX Runtime dynamically through `ort` like Listenbury and Mortar-Sea. Install ONNX Runtime on the host or in Python, or point `ORT_DYLIB_PATH` at an existing shared library.
+
+To override the voice, set:
 
 ```bash
 NETHERWICK_TTS_PIPER_VOICE=/path/to/en_US-ryan-medium.onnx
 NETHERWICK_TTS_PIPER_CONFIG=/path/to/en_US-ryan-medium.onnx.json
 NETHERWICK_TTS_OUTPUT_DEVICE="USB Audio Device"
-ORT_DYLIB_PATH=/path/to/libonnxruntime.so
 ```
 
 Command-backed ASR uses the robot microphone and local Whisper:
