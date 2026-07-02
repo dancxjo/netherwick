@@ -288,8 +288,7 @@ impl HardwareControlState {
             ttl_max_ms: HARDWARE_TTL_MAX_MS,
             max_forward_intensity: HARDWARE_MAX_FORWARD_INTENSITY,
             max_turn_intensity: HARDWARE_MAX_TURN_INTENSITY,
-            body_age_ms: snapshot
-                .map(|snapshot| now_ms.saturating_sub(snapshot.body.last_update_ms)),
+            body_age_ms: snapshot.and_then(|snapshot| hardware_body_age_ms(snapshot, now_ms)),
         }
     }
 }
@@ -300,12 +299,27 @@ const HARDWARE_MAX_FORWARD_INTENSITY: f32 = 0.15;
 const HARDWARE_MAX_TURN_INTENSITY: f32 = 0.25;
 const HARDWARE_BODY_STALE_MS: TimeMs = 1_000;
 const HARDWARE_CRITICAL_BATTERY: f32 = 0.10;
+const HARDWARE_WALL_CLOCK_FLOOR_MS: TimeMs = 1_600_000_000_000;
+
+fn hardware_body_age_ms(snapshot: &WorldSnapshot, now_ms: TimeMs) -> Option<TimeMs> {
+    let body_time = snapshot.body.last_update_ms;
+    if body_time < HARDWARE_WALL_CLOCK_FLOOR_MS || body_time > now_ms {
+        return None;
+    }
+    Some(now_ms.saturating_sub(body_time))
+}
 
 fn hardware_snapshot_block_reason(snapshot: &WorldSnapshot, now_ms: TimeMs) -> Option<String> {
-    let age_ms = now_ms.saturating_sub(snapshot.body.last_update_ms);
-    if age_ms > HARDWARE_BODY_STALE_MS {
+    if let Some(age_ms) = hardware_body_age_ms(snapshot, now_ms) {
+        if age_ms <= HARDWARE_BODY_STALE_MS {
+            return hardware_snapshot_body_block_reason(snapshot);
+        }
         return Some(format!("body snapshot stale: {age_ms} ms old"));
     }
+    hardware_snapshot_body_block_reason(snapshot)
+}
+
+fn hardware_snapshot_body_block_reason(snapshot: &WorldSnapshot) -> Option<String> {
     if snapshot.body.flags.wheel_drop {
         return Some("wheel drop active".to_string());
     }
@@ -9418,6 +9432,42 @@ mod tests {
                 && turn == -HARDWARE_MAX_TURN_INTENSITY
                 && duration_ms == HARDWARE_TTL_MAX_MS
         ));
+    }
+
+    #[tokio::test]
+    async fn hardware_drive_allows_sensor_only_snapshot_with_non_wall_clock_body_time() {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.last_update_ms = 0;
+        snapshot.body.battery_level = 1.0;
+        let state = hardware_reign_state_with_snapshot(snapshot);
+        let Json(status) = post_hardware_arm(
+            State(state.clone()),
+            Json(HardwareArmRequest { armed: true }),
+        )
+        .await
+        .unwrap();
+        assert!(status.armed);
+        assert_eq!(status.body_age_ms, None);
+        assert_eq!(status.reason, None);
+
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Drive {
+                forward: 0.10,
+                turn: 0.0,
+                duration_ms: 300,
+            },
+            priority: 1.0,
+            ttl_ms: Some(300),
+            note: None,
+            source: Some(ReignSource::WebRemote),
+        };
+
+        let Json(input) = post_reign_command(State(state), Json(request))
+            .await
+            .unwrap();
+
+        assert!(matches!(input.command, ReignCommand::Drive { .. }));
     }
 
     #[tokio::test]
