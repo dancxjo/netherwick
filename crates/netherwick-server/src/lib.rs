@@ -7559,6 +7559,19 @@ function robotLocalToWorld(pose, localX, localY){
   };
 }
 
+function occupancyGridCellCenter(cell, grid){
+  const res = Number(grid?.resolution_m) || .1;
+  return {
+    forward: (Number(cell.x) + .5) * res,
+    left: (Number(cell.y) + .5) * res
+  };
+}
+
+function occupancyGridCellToWorld(pose, cell, grid){
+  const center = occupancyGridCellCenter(cell, grid);
+  return robotLocalToWorld(pose, center.forward, center.left);
+}
+
 function updateTraceState(packet){
   const pose = packet.body;
   traceState.poses.push({x_m: pose.x_m, y_m: pose.y_m, heading_rad: pose.heading_rad});
@@ -7899,11 +7912,9 @@ function drawTraceMap(packet, liveMap=null){
   }
   const grid = packet.surface_perception?.obstacle_grid;
   if(layers.has('occupancy') && grid?.cells?.length){
-    const res = Number(grid.resolution_m) || .1;
+    const gridPose = packet.body || latest;
     for(const cell of grid.cells){
-      const localX = (Number(cell.x) + .5) * res;
-      const localY = (Number(cell.y) + .5) * res;
-      const p = robotLocalToWorld(latest, localX, localY);
+      const p = occupancyGridCellToWorld(gridPose, cell, grid);
       const occupied = cell.state === 'occupied' || cell.state?.Occupied != null;
       traceCtx.fillStyle = occupied ? 'rgba(255,102,126,.72)' : 'rgba(91,220,159,.26)';
       const size = occupied ? 4 : 2;
@@ -10506,6 +10517,11 @@ mod tests {
         ));
         assert!(page.contains("const traceLocal = (x, y) =>"));
         assert!(page.contains("forward: dx * headingCos + dy * headingSin"));
+        assert!(page.contains("function occupancyGridCellCenter"));
+        assert!(page.contains("forward: (Number(cell.x) + .5) * res"));
+        assert!(page.contains("left: (Number(cell.y) + .5) * res"));
+        assert!(page.contains("const gridPose = packet.body || latest;"));
+        assert!(page.contains("occupancyGridCellToWorld(gridPose, cell, grid)"));
         assert!(page.contains("traceCtx.rotate(-Math.PI / 2);"));
         assert!(page.contains("id=\"entity-graph\""));
         assert!(page.contains("drawEntityGraph"));

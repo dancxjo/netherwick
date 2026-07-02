@@ -2558,6 +2558,280 @@ pub struct GraphIntelligenceDocument {
     pub human_reviews: Vec<HumanReviewRecord>,
     #[serde(default)]
     pub review_records: Vec<GraphReviewRecord>,
+    #[serde(default)]
+    pub learning_events: Vec<LearningEventRecord>,
+    #[serde(default)]
+    pub training_examples: Vec<TrainingExample>,
+    #[serde(default)]
+    pub replay_items: Vec<ReplayItem>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningEvent {
+    FeatureObserved,
+    ClusterStrengthened,
+    ClusterSplit,
+    ClusterMerged,
+    BindingAccepted,
+    BindingRejected,
+    HypothesisPromoted,
+    HypothesisExpired,
+    ConstellationPromoted,
+    PredictionSucceeded,
+    PredictionFailed,
+    SurpriseSpike,
+    HumanCorrection,
+    LlmCritiqueAccepted,
+    AssociationStrengthened,
+    ActiveLearningTaskCreated,
+    #[default]
+    Other,
+}
+
+impl LearningEvent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FeatureObserved => "feature_observed",
+            Self::ClusterStrengthened => "cluster_strengthened",
+            Self::ClusterSplit => "cluster_split",
+            Self::ClusterMerged => "cluster_merged",
+            Self::BindingAccepted => "binding_accepted",
+            Self::BindingRejected => "binding_rejected",
+            Self::HypothesisPromoted => "hypothesis_promoted",
+            Self::HypothesisExpired => "hypothesis_expired",
+            Self::ConstellationPromoted => "constellation_promoted",
+            Self::PredictionSucceeded => "prediction_succeeded",
+            Self::PredictionFailed => "prediction_failed",
+            Self::SurpriseSpike => "surprise_spike",
+            Self::HumanCorrection => "human_correction",
+            Self::LlmCritiqueAccepted => "llm_critique_accepted",
+            Self::AssociationStrengthened => "association_strengthened",
+            Self::ActiveLearningTaskCreated => "active_learning_task_created",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LearningEventRecord {
+    pub id: String,
+    pub event: LearningEvent,
+    pub target_id: String,
+    pub t_ms: u64,
+    pub confidence: f32,
+    pub surprise: f32,
+    pub novelty: f32,
+    pub ambiguity: f32,
+    pub contradiction: f32,
+    pub trusted: bool,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingExampleKind {
+    PredictionPositive,
+    PredictionNegative,
+    BindingPositive,
+    BindingNegative,
+    ContrastiveNegative,
+    AssociationPositive,
+    AssociationNegative,
+    ConstellationPositive,
+    HumanTrustedPositive,
+    LlmCritique,
+    #[default]
+    Other,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TrainingExample {
+    pub id: String,
+    pub kind: TrainingExampleKind,
+    pub target_model: String,
+    pub source_event_id: String,
+    pub input_ref: String,
+    pub target_ref: String,
+    pub label: String,
+    pub weight: f32,
+    pub trusted: bool,
+    pub reason: String,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+pub trait SelfTrainingTarget {
+    fn generate_training_examples(
+        &self,
+        learning_event: &LearningEventRecord,
+    ) -> Vec<TrainingExample>;
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DefaultSelfTrainingTarget {
+    pub target_model: String,
+}
+
+impl Default for DefaultSelfTrainingTarget {
+    fn default() -> Self {
+        Self {
+            target_model: "cognitive_loop".to_string(),
+        }
+    }
+}
+
+impl SelfTrainingTarget for DefaultSelfTrainingTarget {
+    fn generate_training_examples(
+        &self,
+        learning_event: &LearningEventRecord,
+    ) -> Vec<TrainingExample> {
+        training_examples_for_event(learning_event, &self.target_model)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CurriculumScore {
+    pub priority: f32,
+    pub surprise: f32,
+    pub novelty: f32,
+    pub contradiction: f32,
+    pub ambiguity: f32,
+    pub human_confirmation: f32,
+    pub prediction_improvement: f32,
+    pub information_gain: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayItemState {
+    #[default]
+    Queued,
+    Training,
+    Archived,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplayItem {
+    pub id: String,
+    pub event_id: String,
+    pub source_frame_id: Option<String>,
+    pub t_ms: u64,
+    pub target_id: String,
+    pub curriculum: CurriculumScore,
+    pub decay_per_tick: f32,
+    pub state: ReplayItemState,
+    #[serde(default)]
+    pub training_example_ids: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayBuffer {
+    pub items: VecDeque<ReplayItem>,
+    pub max_items: usize,
+    pub archive_below_priority: f32,
+}
+
+impl Default for ReplayBuffer {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+            max_items: 512,
+            archive_below_priority: 0.03,
+        }
+    }
+}
+
+impl ReplayBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, item: ReplayItem) {
+        self.items.push_back(item);
+        self.prioritize();
+        while self.items.len() > self.max_items {
+            self.items.pop_back();
+        }
+    }
+
+    pub fn extend(&mut self, items: impl IntoIterator<Item = ReplayItem>) {
+        for item in items {
+            self.push(item);
+        }
+    }
+
+    pub fn prioritize(&mut self) {
+        let mut items = self.items.drain(..).collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            right
+                .curriculum
+                .priority
+                .partial_cmp(&left.curriculum.priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.t_ms.cmp(&left.t_ms))
+        });
+        self.items = items.into();
+    }
+
+    pub fn decay(&mut self, ticks: u64) {
+        let factor = (1.0 - ticks as f32 * 0.01).clamp(0.0, 1.0);
+        for item in &mut self.items {
+            let decay = (item.decay_per_tick * ticks as f32).clamp(0.0, 0.95);
+            item.curriculum.priority =
+                (item.curriculum.priority * (1.0 - decay) * factor).clamp(0.0, 1.0);
+            if item.curriculum.priority < self.archive_below_priority {
+                item.state = ReplayItemState::Archived;
+            }
+        }
+        self.prioritize();
+    }
+
+    pub fn queued(&self) -> Vec<ReplayItem> {
+        self.items
+            .iter()
+            .filter(|item| item.state == ReplayItemState::Queued)
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LearningCycleReport {
+    pub t_ms: u64,
+    pub frame_id: Option<String>,
+    #[serde(default)]
+    pub learning_events: Vec<LearningEventRecord>,
+    #[serde(default)]
+    pub replay_items: Vec<ReplayItem>,
+    #[serde(default)]
+    pub training_examples: Vec<TrainingExample>,
+    #[serde(default)]
+    pub critique_tasks: Vec<ActiveLearningQuestion>,
+    pub features_observed: usize,
+    pub clusters_updated: usize,
+    pub bindings_accepted: usize,
+    pub bindings_rejected: usize,
+    pub hypotheses_promoted: usize,
+    pub hypotheses_expired: usize,
+    pub constellations_promoted: usize,
+    pub prediction_successes: usize,
+    pub prediction_failures: usize,
+    pub surprise: f32,
+    pub active_learning_tasks: usize,
+    pub human_review_requests: usize,
+    pub what_observed: String,
+    pub what_changed: String,
+    pub what_surprised: String,
+    pub what_became_stronger: String,
+    pub what_became_weaker: String,
+    pub what_to_investigate: String,
+    pub what_to_remember: String,
+    pub what_to_forget: String,
+    pub what_to_train_on: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2571,6 +2845,7 @@ pub struct CognitiveDiagnosticsReport {
     pub associations: AssociationDiagnostics,
     pub predictions: PredictionDiagnostics,
     pub active_learning: ActiveLearningDiagnostics,
+    pub learning_cycle: LearningCycleReport,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2587,6 +2862,10 @@ pub struct CognitiveDiagnosticsSummary {
     pub association_count: usize,
     pub prediction_count: usize,
     pub prediction_failure_count: usize,
+    pub learning_event_count: usize,
+    pub replay_item_count: usize,
+    pub training_example_count: usize,
+    pub llm_critique_count: usize,
     pub open_question_count: usize,
     pub contradiction_count: usize,
     pub review_prompt_count: usize,
@@ -2874,6 +3153,7 @@ impl CognitiveDiagnosticsReport {
         document: &GraphIntelligenceDocument,
         questions: Vec<ActiveLearningQuestion>,
     ) -> Self {
+        let learning_cycle = LearningCycleReport::from_document(document, &questions);
         let mut report = Self {
             features: FeatureDiagnostics {
                 items: document.features.iter().map(feature_item).collect(),
@@ -2911,6 +3191,7 @@ impl CognitiveDiagnosticsReport {
             active_learning: ActiveLearningDiagnostics {
                 open_questions: questions.iter().map(active_learning_item).collect(),
             },
+            learning_cycle,
             summary: CognitiveDiagnosticsSummary::default(),
         };
         report.refresh_summary();
@@ -2989,6 +3270,20 @@ impl CognitiveDiagnosticsReport {
                 .iter()
                 .filter(|item| item.prediction_error.is_some() || item.surprise > 0.0)
                 .count(),
+            learning_event_count: self.learning_cycle.learning_events.len(),
+            replay_item_count: self.learning_cycle.replay_items.len(),
+            training_example_count: self.learning_cycle.training_examples.len(),
+            llm_critique_count: self
+                .learning_cycle
+                .critique_tasks
+                .iter()
+                .filter(|question| {
+                    question
+                        .proposed_tests
+                        .iter()
+                        .any(|test| test.kind == ActiveLearningActionKind::RequestLlmCritique)
+                })
+                .count(),
             open_question_count: self.active_learning.open_questions.len(),
             contradiction_count,
             review_prompt_count: self
@@ -2999,6 +3294,716 @@ impl CognitiveDiagnosticsReport {
                 .count(),
         };
     }
+}
+
+impl LearningCycleReport {
+    pub fn from_document(
+        document: &GraphIntelligenceDocument,
+        questions: &[ActiveLearningQuestion],
+    ) -> Self {
+        let mut events = document.learning_events.clone();
+        events.extend(derive_learning_events(document, questions));
+        dedupe_learning_events(&mut events);
+
+        let target = DefaultSelfTrainingTarget::default();
+        let mut training_examples = document.training_examples.clone();
+        for event in &events {
+            training_examples.extend(target.generate_training_examples(event));
+        }
+        dedupe_training_examples(&mut training_examples);
+
+        let mut replay_items = document.replay_items.clone();
+        replay_items.extend(
+            events
+                .iter()
+                .map(|event| replay_item_for_event(event, document, &training_examples)),
+        );
+        dedupe_replay_items(&mut replay_items);
+        replay_items.sort_by(|left, right| {
+            right
+                .curriculum
+                .priority
+                .partial_cmp(&left.curriculum.priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let prediction_failures = events
+            .iter()
+            .filter(|event| event.event == LearningEvent::PredictionFailed)
+            .count();
+        let prediction_successes = events
+            .iter()
+            .filter(|event| event.event == LearningEvent::PredictionSucceeded)
+            .count();
+        let surprise = events
+            .iter()
+            .map(|event| event.surprise)
+            .fold(0.0_f32, f32::max);
+        let critique_tasks = questions
+            .iter()
+            .filter(|question| {
+                question
+                    .proposed_tests
+                    .iter()
+                    .any(|test| test.kind == ActiveLearningActionKind::RequestLlmCritique)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let human_review_requests = questions
+            .iter()
+            .filter(|question| {
+                question
+                    .proposed_tests
+                    .iter()
+                    .any(|test| test.kind == ActiveLearningActionKind::AskHuman)
+            })
+            .count();
+
+        Self {
+            t_ms: document.t_ms,
+            frame_id: document.frame_id.clone(),
+            features_observed: document.features.len(),
+            clusters_updated: document.clusters.len(),
+            bindings_accepted: document
+                .binding_candidates
+                .iter()
+                .filter(|candidate| candidate.decision == BindingDecision::Accept)
+                .count(),
+            bindings_rejected: document
+                .binding_candidates
+                .iter()
+                .filter(|candidate| candidate.decision == BindingDecision::Reject)
+                .count(),
+            hypotheses_promoted: document
+                .tracking_hypotheses
+                .iter()
+                .filter(|hypothesis| hypothesis.state == HypothesisState::Promoted)
+                .count(),
+            hypotheses_expired: document
+                .tracking_hypotheses
+                .iter()
+                .filter(|hypothesis| hypothesis.state == HypothesisState::Expired)
+                .count(),
+            constellations_promoted: document
+                .constellations
+                .iter()
+                .filter(|constellation| constellation.state == ConstellationState::Stable)
+                .count(),
+            prediction_successes,
+            prediction_failures,
+            surprise,
+            active_learning_tasks: questions.len(),
+            human_review_requests,
+            what_observed: summarize_observations(document),
+            what_changed: summarize_changes(&events),
+            what_surprised: summarize_surprise(&events),
+            what_became_stronger: summarize_strengthened(&events),
+            what_became_weaker: summarize_weakened(&events),
+            what_to_investigate: summarize_investigations(questions),
+            what_to_remember: summarize_memory_targets(&replay_items),
+            what_to_forget: summarize_forgetting(&replay_items),
+            what_to_train_on: summarize_training_targets(&training_examples),
+            learning_events: events,
+            replay_items,
+            training_examples,
+            critique_tasks,
+        }
+    }
+}
+
+fn derive_learning_events(
+    document: &GraphIntelligenceDocument,
+    questions: &[ActiveLearningQuestion],
+) -> Vec<LearningEventRecord> {
+    let mut events = Vec::new();
+    for feature in &document.features {
+        events.push(LearningEventRecord {
+            id: format!(
+                "learning:{}:{}",
+                LearningEvent::FeatureObserved.as_str(),
+                feature.id
+            ),
+            event: LearningEvent::FeatureObserved,
+            target_id: feature.id.to_string(),
+            t_ms: feature.created_at_ms,
+            confidence: feature.confidence,
+            novelty: (1.0 - feature.confidence).clamp(0.0, 1.0),
+            reason: format!("{:?} feature entered the registry", feature.feature_type),
+            evidence_ids: vec![feature.id.to_string()],
+            ..LearningEventRecord::default()
+        });
+    }
+    for cluster in &document.clusters {
+        if cluster.confidence >= 0.65 {
+            events.push(LearningEventRecord {
+                id: format!("learning:cluster_strengthened:{}", stable_slug(&cluster.id)),
+                event: LearningEvent::ClusterStrengthened,
+                target_id: cluster.id.clone(),
+                t_ms: cluster.last_seen_ms,
+                confidence: cluster.confidence,
+                novelty: (1.0 / cluster.feature_ids.len().max(1) as f32).clamp(0.0, 1.0),
+                reason: "cluster gained enough evidence to be useful downstream".to_string(),
+                evidence_ids: cluster
+                    .feature_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect(),
+                ..LearningEventRecord::default()
+            });
+        }
+    }
+    for candidate in &document.binding_candidates {
+        let event = match candidate.decision {
+            BindingDecision::Accept => Some(LearningEvent::BindingAccepted),
+            BindingDecision::Reject => Some(LearningEvent::BindingRejected),
+            _ => None,
+        };
+        if let Some(event) = event {
+            events.push(LearningEventRecord {
+                id: format!(
+                    "learning:{}:{}",
+                    event.as_str(),
+                    binding_candidate_id(candidate)
+                ),
+                event,
+                target_id: binding_candidate_id(candidate),
+                t_ms: document.t_ms,
+                confidence: candidate.confidence,
+                ambiguity: binding_uncertainty(candidate),
+                contradiction: candidate
+                    .evidence
+                    .iter()
+                    .filter(|evidence| binding_evidence_is_contradictory(evidence))
+                    .map(|evidence| evidence.score)
+                    .fold(0.0_f32, f32::max),
+                trusted: candidate
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.kind == BindingEvidenceKind::HumanConfirmed),
+                reason: candidate.reason.clone(),
+                evidence_ids: vec![
+                    candidate.left_cluster_id.clone(),
+                    candidate.right_cluster_id.clone(),
+                ],
+                ..LearningEventRecord::default()
+            });
+        }
+    }
+    for hypothesis in &document.tracking_hypotheses {
+        let event = match hypothesis.state {
+            HypothesisState::Promoted => Some(LearningEvent::HypothesisPromoted),
+            HypothesisState::Expired => Some(LearningEvent::HypothesisExpired),
+            _ => None,
+        };
+        if let Some(event) = event {
+            events.push(LearningEventRecord {
+                id: format!(
+                    "learning:{}:{}",
+                    event.as_str(),
+                    stable_slug(&hypothesis.id)
+                ),
+                event,
+                target_id: hypothesis.id.clone(),
+                t_ms: hypothesis.last_updated_ms,
+                confidence: hypothesis.confidence,
+                ambiguity: hypothesis_uncertainty(hypothesis),
+                contradiction: (!hypothesis.contradictions.is_empty()) as u8 as f32,
+                trusted: hypothesis
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.kind == BindingEvidenceKind::HumanConfirmed),
+                reason: format!("{:?} hypothesis is {:?}", hypothesis.kind, hypothesis.state),
+                evidence_ids: hypothesis.binding_candidate_ids.clone(),
+                ..LearningEventRecord::default()
+            });
+        }
+        if hypothesis
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::HumanConfirmed)
+        {
+            events.push(LearningEventRecord {
+                id: format!("learning:human_correction:{}", stable_slug(&hypothesis.id)),
+                event: LearningEvent::HumanCorrection,
+                target_id: hypothesis.id.clone(),
+                t_ms: hypothesis.last_updated_ms,
+                confidence: 1.0,
+                trusted: true,
+                reason: "human confirmation resolved a tracking hypothesis".to_string(),
+                evidence_ids: hypothesis.binding_candidate_ids.clone(),
+                ..LearningEventRecord::default()
+            });
+        }
+    }
+    for constellation in &document.constellations {
+        if constellation.state == ConstellationState::Stable {
+            events.push(LearningEventRecord {
+                id: format!(
+                    "learning:constellation_promoted:{}",
+                    stable_slug(&constellation.id)
+                ),
+                event: LearningEvent::ConstellationPromoted,
+                target_id: constellation.id.clone(),
+                t_ms: constellation.last_seen_ms,
+                confidence: constellation.confidence,
+                novelty: (1.0 - constellation.stability).clamp(0.0, 1.0),
+                reason: "constellation became stable enough to train recognizers".to_string(),
+                evidence_ids: constellation.member_binding_ids.clone(),
+                ..LearningEventRecord::default()
+            });
+        }
+    }
+    for edge in &document.associations {
+        if edge.confidence >= 0.5 || edge.prediction_gain >= 0.1 {
+            events.push(LearningEventRecord {
+                id: format!(
+                    "learning:association_strengthened:{}",
+                    stable_slug(&edge.id)
+                ),
+                event: LearningEvent::AssociationStrengthened,
+                target_id: edge.id.clone(),
+                t_ms: edge.last_seen_ms,
+                confidence: edge.confidence,
+                contradiction: (edge.contradiction_count as f32
+                    / edge.evidence_count.max(1) as f32)
+                    .clamp(0.0, 1.0),
+                reason: format!("association {:?} gained predictive evidence", edge.relation),
+                evidence_ids: edge
+                    .examples
+                    .iter()
+                    .filter_map(|e| e.frame_id.clone())
+                    .collect(),
+                ..LearningEventRecord::default()
+            });
+        }
+    }
+    for prediction in &document.predictions {
+        if document
+            .surprises
+            .iter()
+            .all(|surprise| surprise.target_id != prediction.id)
+            && prediction.confidence >= 0.55
+        {
+            events.push(LearningEventRecord {
+                id: format!(
+                    "learning:prediction_succeeded:{}",
+                    stable_slug(&prediction.id)
+                ),
+                event: LearningEvent::PredictionSucceeded,
+                target_id: prediction.id.clone(),
+                t_ms: prediction.t_ms,
+                confidence: prediction.confidence,
+                reason: "prediction had no matching surprise in this cycle".to_string(),
+                evidence_ids: vec![prediction.target_id.clone()],
+                ..LearningEventRecord::default()
+            });
+        }
+    }
+    for failure in prediction_failures_from_document(document) {
+        events.push(LearningEventRecord {
+            id: format!("learning:prediction_failed:{}", stable_slug(&failure.id)),
+            event: LearningEvent::PredictionFailed,
+            target_id: failure.target_id.clone(),
+            t_ms: document.t_ms,
+            confidence: failure.confidence,
+            surprise: failure.surprise,
+            contradiction: failure.surprise,
+            reason: failure.possible_causes.join("; "),
+            evidence_ids: vec![failure.id.clone()],
+            ..LearningEventRecord::default()
+        });
+        if failure.surprise >= 0.7 {
+            events.push(LearningEventRecord {
+                id: format!("learning:surprise_spike:{}", stable_slug(&failure.id)),
+                event: LearningEvent::SurpriseSpike,
+                target_id: failure.target_id,
+                t_ms: document.t_ms,
+                confidence: failure.confidence,
+                surprise: failure.surprise,
+                reason: "prediction error exceeded surprise-spike threshold".to_string(),
+                evidence_ids: vec![failure.id],
+                ..LearningEventRecord::default()
+            });
+        }
+    }
+    for review in &document.llm_reviews {
+        if review.confidence >= 0.5 {
+            events.push(LearningEventRecord {
+                id: format!("learning:llm_critique_accepted:{}", stable_slug(&review.id)),
+                event: LearningEvent::LlmCritiqueAccepted,
+                target_id: review.target_id.clone(),
+                t_ms: review.t_ms,
+                confidence: review.confidence,
+                contradiction: (!review.contradictions.is_empty()) as u8 as f32,
+                reason: review.critique.clone(),
+                evidence_ids: review.suggested_questions.clone(),
+                ..LearningEventRecord::default()
+            });
+        }
+    }
+    for review in &document.human_reviews {
+        events.push(LearningEventRecord {
+            id: format!("learning:human_correction:{}", stable_slug(&review.id)),
+            event: LearningEvent::HumanCorrection,
+            target_id: review.target_id.clone(),
+            t_ms: review.t_ms,
+            confidence: review.confidence.max(0.9),
+            trusted: true,
+            reason: review.confirmation.clone(),
+            evidence_ids: Vec::new(),
+            ..LearningEventRecord::default()
+        });
+    }
+    for question in questions {
+        events.push(LearningEventRecord {
+            id: format!(
+                "learning:active_learning_task_created:{}",
+                stable_slug(&question.id)
+            ),
+            event: LearningEvent::ActiveLearningTaskCreated,
+            target_id: question.target_id.clone(),
+            t_ms: document.t_ms,
+            confidence: 1.0 - question.uncertainty,
+            ambiguity: question.uncertainty,
+            novelty: question.expected_information_gain,
+            reason: question.question.clone(),
+            evidence_ids: question
+                .proposed_tests
+                .iter()
+                .map(|test| test.expected_observation.clone())
+                .collect(),
+            ..LearningEventRecord::default()
+        });
+    }
+    events
+}
+
+fn training_examples_for_event(
+    event: &LearningEventRecord,
+    default_model: &str,
+) -> Vec<TrainingExample> {
+    let mut examples = Vec::new();
+    let (kind, model, label) = match event.event {
+        LearningEvent::PredictionSucceeded => (
+            TrainingExampleKind::PredictionPositive,
+            "prediction_model",
+            "prediction_succeeded",
+        ),
+        LearningEvent::PredictionFailed | LearningEvent::SurpriseSpike => (
+            TrainingExampleKind::PredictionNegative,
+            "prediction_model",
+            "prediction_failed",
+        ),
+        LearningEvent::BindingAccepted => (
+            TrainingExampleKind::BindingPositive,
+            "binding_model",
+            "binding_accepted",
+        ),
+        LearningEvent::BindingRejected => (
+            TrainingExampleKind::BindingNegative,
+            "binding_model",
+            "binding_rejected",
+        ),
+        LearningEvent::AssociationStrengthened => (
+            TrainingExampleKind::AssociationPositive,
+            "association_model",
+            "association_strengthened",
+        ),
+        LearningEvent::ConstellationPromoted => (
+            TrainingExampleKind::ConstellationPositive,
+            "constellation_recognizer",
+            "constellation_stable",
+        ),
+        LearningEvent::HumanCorrection => (
+            TrainingExampleKind::HumanTrustedPositive,
+            "trusted_correction_model",
+            "human_confirmed",
+        ),
+        LearningEvent::LlmCritiqueAccepted => (
+            TrainingExampleKind::LlmCritique,
+            "critique_filter",
+            "llm_critique_accepted",
+        ),
+        _ => (
+            TrainingExampleKind::Other,
+            default_model,
+            event.event.as_str(),
+        ),
+    };
+    if kind != TrainingExampleKind::Other || event.trusted {
+        examples.push(TrainingExample {
+            id: format!("training:{}:{}", model, stable_slug(&event.id)),
+            kind,
+            target_model: model.to_string(),
+            source_event_id: event.id.clone(),
+            input_ref: event.target_id.clone(),
+            target_ref: event.evidence_ids.first().cloned().unwrap_or_default(),
+            label: label.to_string(),
+            weight: training_weight(event),
+            trusted: event.trusted,
+            reason: event.reason.clone(),
+            metadata: json!({
+                "surprise": event.surprise,
+                "novelty": event.novelty,
+                "ambiguity": event.ambiguity,
+                "contradiction": event.contradiction
+            }),
+        });
+    }
+    if event.event == LearningEvent::BindingRejected {
+        examples.push(TrainingExample {
+            id: format!("training:contrastive:{}", stable_slug(&event.id)),
+            kind: TrainingExampleKind::ContrastiveNegative,
+            target_model: "contrastive_binding_model".to_string(),
+            source_event_id: event.id.clone(),
+            input_ref: event.target_id.clone(),
+            target_ref: event.evidence_ids.join("|"),
+            label: "not_same_binding".to_string(),
+            weight: training_weight(event).max(0.5),
+            trusted: event.trusted,
+            reason: event.reason.clone(),
+            metadata: serde_json::Value::Null,
+        });
+    }
+    examples
+}
+
+fn replay_item_for_event(
+    event: &LearningEventRecord,
+    document: &GraphIntelligenceDocument,
+    examples: &[TrainingExample],
+) -> ReplayItem {
+    let curriculum = curriculum_score(event);
+    ReplayItem {
+        id: format!("replay:{}", stable_slug(&event.id)),
+        event_id: event.id.clone(),
+        source_frame_id: document.frame_id.clone(),
+        t_ms: event.t_ms,
+        target_id: event.target_id.clone(),
+        curriculum,
+        decay_per_tick: if event.trusted { 0.0005 } else { 0.0025 },
+        state: ReplayItemState::Queued,
+        training_example_ids: examples
+            .iter()
+            .filter(|example| example.source_event_id == event.id)
+            .map(|example| example.id.clone())
+            .collect(),
+        reason: event.reason.clone(),
+    }
+}
+
+fn curriculum_score(event: &LearningEventRecord) -> CurriculumScore {
+    let human_confirmation = if event.trusted { 1.0 } else { 0.0 };
+    let prediction_improvement = match event.event {
+        LearningEvent::PredictionSucceeded | LearningEvent::PredictionFailed => event.confidence,
+        _ => 0.0,
+    };
+    let information_gain = event
+        .surprise
+        .max(event.novelty)
+        .max(event.ambiguity)
+        .max(event.contradiction)
+        .max(human_confirmation);
+    let priority = (event.surprise * 0.24
+        + event.novelty * 0.16
+        + event.contradiction * 0.18
+        + event.ambiguity * 0.14
+        + human_confirmation * 0.18
+        + prediction_improvement * 0.05
+        + information_gain * 0.05)
+        .max(match event.event {
+            LearningEvent::PredictionFailed
+            | LearningEvent::SurpriseSpike
+            | LearningEvent::HumanCorrection => 0.75,
+            LearningEvent::BindingRejected | LearningEvent::ConstellationPromoted => 0.55,
+            LearningEvent::BindingAccepted | LearningEvent::AssociationStrengthened => 0.35,
+            _ => 0.1,
+        })
+        .clamp(0.0, 1.0);
+    CurriculumScore {
+        priority,
+        surprise: event.surprise,
+        novelty: event.novelty,
+        contradiction: event.contradiction,
+        ambiguity: event.ambiguity,
+        human_confirmation,
+        prediction_improvement,
+        information_gain,
+    }
+}
+
+fn training_weight(event: &LearningEventRecord) -> f32 {
+    (0.35
+        + event.confidence * 0.25
+        + event.surprise * 0.15
+        + event.contradiction * 0.1
+        + event.ambiguity * 0.05
+        + if event.trusted { 0.35 } else { 0.0 })
+    .clamp(0.05, 1.0)
+}
+
+fn dedupe_learning_events(events: &mut Vec<LearningEventRecord>) {
+    let mut seen = BTreeSet::new();
+    events.retain(|event| seen.insert(event.id.clone()));
+}
+
+fn dedupe_training_examples(examples: &mut Vec<TrainingExample>) {
+    let mut seen = BTreeSet::new();
+    examples.retain(|example| seen.insert(example.id.clone()));
+}
+
+fn dedupe_replay_items(items: &mut Vec<ReplayItem>) {
+    let mut seen = BTreeSet::new();
+    items.retain(|item| seen.insert(item.id.clone()));
+}
+
+fn summarize_observations(document: &GraphIntelligenceDocument) -> String {
+    format!(
+        "{} features, {} clusters, {} predictions, {} surprise records",
+        document.features.len(),
+        document.clusters.len(),
+        document.predictions.len(),
+        document.surprises.len()
+    )
+}
+
+fn summarize_changes(events: &[LearningEventRecord]) -> String {
+    let mut counts = BTreeMap::<&'static str, usize>::new();
+    for event in events {
+        *counts.entry(event.event.as_str()).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return "no learning events yet".to_string();
+    }
+    counts
+        .into_iter()
+        .map(|(event, count)| format!("{count} {event}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn summarize_surprise(events: &[LearningEventRecord]) -> String {
+    events
+        .iter()
+        .filter(|event| event.surprise > 0.0)
+        .max_by(|left, right| {
+            left.surprise
+                .partial_cmp(&right.surprise)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|event| {
+            format!(
+                "{} at {:.2}: {}",
+                event.target_id, event.surprise, event.reason
+            )
+        })
+        .unwrap_or_else(|| "nothing exceeded the surprise threshold".to_string())
+}
+
+fn summarize_strengthened(events: &[LearningEventRecord]) -> String {
+    let targets = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event,
+                LearningEvent::ClusterStrengthened
+                    | LearningEvent::BindingAccepted
+                    | LearningEvent::HypothesisPromoted
+                    | LearningEvent::ConstellationPromoted
+                    | LearningEvent::AssociationStrengthened
+                    | LearningEvent::PredictionSucceeded
+            )
+        })
+        .map(|event| event.target_id.clone())
+        .take(5)
+        .collect::<Vec<_>>();
+    list_or_none(targets, "no subsystem strengthened this cycle")
+}
+
+fn summarize_weakened(events: &[LearningEventRecord]) -> String {
+    let targets = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event,
+                LearningEvent::BindingRejected
+                    | LearningEvent::HypothesisExpired
+                    | LearningEvent::PredictionFailed
+                    | LearningEvent::SurpriseSpike
+            )
+        })
+        .map(|event| event.target_id.clone())
+        .take(5)
+        .collect::<Vec<_>>();
+    list_or_none(targets, "nothing was weakened beyond graceful decay")
+}
+
+fn summarize_investigations(questions: &[ActiveLearningQuestion]) -> String {
+    list_or_none(
+        questions
+            .iter()
+            .map(|question| question.question.clone())
+            .take(5)
+            .collect(),
+        "no active investigation queued",
+    )
+}
+
+fn summarize_memory_targets(items: &[ReplayItem]) -> String {
+    list_or_none(
+        items
+            .iter()
+            .filter(|item| item.curriculum.priority >= 0.5)
+            .map(|item| item.target_id.clone())
+            .take(5)
+            .collect(),
+        "no high-priority replay item",
+    )
+}
+
+fn summarize_forgetting(items: &[ReplayItem]) -> String {
+    list_or_none(
+        items
+            .iter()
+            .filter(|item| item.state == ReplayItemState::Archived)
+            .map(|item| item.target_id.clone())
+            .take(5)
+            .collect(),
+        "old replay items should decay, not disappear immediately",
+    )
+}
+
+fn summarize_training_targets(examples: &[TrainingExample]) -> String {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for example in examples {
+        *counts.entry(example.target_model.clone()).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return "no training examples generated".to_string();
+    }
+    counts
+        .into_iter()
+        .map(|(model, count)| format!("{count} for {model}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn list_or_none(items: Vec<String>, fallback: &str) -> String {
+    if items.is_empty() {
+        fallback.to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn hypothesis_uncertainty(hypothesis: &TrackingHypothesis) -> f32 {
+    (1.0 - hypothesis.confidence)
+        .max(if hypothesis.contradictions.is_empty() {
+            0.0
+        } else {
+            0.65
+        })
+        .clamp(0.0, 1.0)
 }
 
 fn feature_item(feature: &Feature) -> FeatureInspectorItem {
@@ -11460,6 +12465,235 @@ mod cognitive_diagnostics_tests {
         assert_eq!(report.summary.constellation_count, 1);
         assert_eq!(report.summary.association_count, 1);
         assert_eq!(report.summary.prediction_failure_count, 1);
+    }
+
+    #[test]
+    fn learning_cycle_turns_person_greeting_into_replay_and_training() {
+        let feature = Feature::new(
+            FeatureType::FaceObservation,
+            FeatureModality::Vision,
+            1_000,
+            0.88,
+            Provenance::direct().with_stage("observe"),
+        );
+        let feature_id = feature.id;
+        let accepted = BindingCandidate {
+            left_cluster_id: "cluster:person-face:ada".to_string(),
+            right_cluster_id: "cluster:greeting:hello".to_string(),
+            relation: BindingRelation::NamedBy,
+            evidence: vec![
+                evidence(
+                    BindingEvidenceKind::TemporalOverlap,
+                    "face and greeting co-occurred",
+                ),
+                evidence(
+                    BindingEvidenceKind::RepeatedCooccurrence,
+                    "greeting repeated",
+                ),
+            ],
+            confidence: 0.91,
+            decision: BindingDecision::Accept,
+            reason: "person greeting binding accepted".to_string(),
+        };
+        let document = GraphIntelligenceDocument {
+            id: "doc:greeting".to_string(),
+            t_ms: 1_000,
+            frame_id: Some("frame:greeting".to_string()),
+            provenance: "integration_test".to_string(),
+            features: vec![feature],
+            clusters: vec![
+                DiscoveredCluster::new(
+                    "cluster:person-face:ada",
+                    Modality::Vision,
+                    DiscoveredClusterKind::Face,
+                    1_000,
+                    0.9,
+                )
+                .with_feature_ids(vec![feature_id]),
+                DiscoveredCluster::new(
+                    "cluster:greeting:hello",
+                    Modality::Language,
+                    DiscoveredClusterKind::Label,
+                    1_000,
+                    0.85,
+                ),
+            ],
+            binding_candidates: vec![accepted.clone()],
+            constellations: vec![Constellation {
+                id: "constellation:person:greeting".to_string(),
+                kind_hint: Some("person".to_string()),
+                member_cluster_ids: vec![
+                    "cluster:person-face:ada".to_string(),
+                    "cluster:greeting:hello".to_string(),
+                ],
+                member_binding_ids: vec![binding_candidate_id(&accepted)],
+                supporting_feature_ids: vec![feature_id],
+                supporting_entity_ids: vec!["entity:person:ada".to_string()],
+                supporting_place_cells: Vec::new(),
+                confidence: 0.82,
+                stability: 0.78,
+                prediction_value: 0.72,
+                first_seen_ms: 900,
+                last_seen_ms: 1_000,
+                evidence_count: 3,
+                state: ConstellationState::Stable,
+                notes: Vec::new(),
+            }],
+            associations: vec![AssociationEdge {
+                id: "association:person-predicts-greeting".to_string(),
+                from_id: "constellation:person:greeting".to_string(),
+                to_id: "outcome:greeting".to_string(),
+                relation: AssociationRelation::Predicts,
+                confidence: 0.74,
+                evidence_count: 4,
+                prediction_gain: 0.22,
+                contradiction_count: 0,
+                first_seen_ms: 900,
+                last_seen_ms: 1_000,
+                examples: vec![AssociationExample {
+                    frame_id: Some("frame:greeting".to_string()),
+                    t_ms: 1_000,
+                    reason: "person appearance predicted greeting".to_string(),
+                    score: 0.8,
+                }],
+            }],
+            predictions: vec![PredictionRecord {
+                id: "prediction:greeting".to_string(),
+                target_id: "outcome:greeting".to_string(),
+                predicted: "person says hello".to_string(),
+                confidence: 0.76,
+                t_ms: 1_000,
+                state: "succeeded".to_string(),
+                reason: "association predicted greeting".to_string(),
+            }],
+            ..GraphIntelligenceDocument::default()
+        };
+
+        let report = CognitiveDiagnosticsReport::from_graph_document(&document);
+        let event_kinds = report
+            .learning_cycle
+            .learning_events
+            .iter()
+            .map(|event| event.event.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert!(event_kinds.contains(&LearningEvent::FeatureObserved));
+        assert!(event_kinds.contains(&LearningEvent::ClusterStrengthened));
+        assert!(event_kinds.contains(&LearningEvent::BindingAccepted));
+        assert!(event_kinds.contains(&LearningEvent::ConstellationPromoted));
+        assert!(event_kinds.contains(&LearningEvent::AssociationStrengthened));
+        assert!(event_kinds.contains(&LearningEvent::PredictionSucceeded));
+        assert!(report
+            .learning_cycle
+            .training_examples
+            .iter()
+            .any(|example| example.target_model == "prediction_model"
+                && example.label == "prediction_succeeded"));
+        assert!(report
+            .learning_cycle
+            .replay_items
+            .iter()
+            .any(|item| item.target_id == "constellation:person:greeting"
+                && item.curriculum.priority >= 0.5));
+        assert_eq!(
+            report.summary.training_example_count,
+            report.learning_cycle.training_examples.len()
+        );
+    }
+
+    #[test]
+    fn learning_cycle_marks_human_confirmed_ambiguity_as_trusted_training() {
+        let hypothesis = TrackingHypothesis {
+            id: "hypothesis:face:unknown:ada".to_string(),
+            family_id: "family:ambiguous-face".to_string(),
+            kind: TrackingHypothesisKind::FaceIdentity,
+            target_id: Some("entity:person:ada".to_string()),
+            observation_ids: vec!["face-vector:ambiguous".to_string()],
+            binding_candidate_ids: vec!["binding:ambiguous-face-ada".to_string()],
+            confidence: 0.93,
+            evidence: vec![
+                evidence(
+                    BindingEvidenceKind::VectorSimilarity,
+                    "face vector is close",
+                ),
+                BindingEvidence {
+                    kind: BindingEvidenceKind::HumanConfirmed,
+                    score: 1.0,
+                    reason: "human confirmed this is Ada".to_string(),
+                },
+            ],
+            contradictions: Vec::new(),
+            state: HypothesisState::Promoted,
+            first_seen_ms: 2_000,
+            last_updated_ms: 2_400,
+        };
+        let document = GraphIntelligenceDocument {
+            id: "doc:human-confirmed".to_string(),
+            t_ms: 2_400,
+            provenance: "integration_test".to_string(),
+            binding_candidates: vec![BindingCandidate {
+                left_cluster_id: "cluster:face:unknown".to_string(),
+                right_cluster_id: "entity:person:ada".to_string(),
+                relation: BindingRelation::LikelySameEntity,
+                evidence: hypothesis.evidence.clone(),
+                confidence: 0.93,
+                decision: BindingDecision::Accept,
+                reason: "human confirmation promoted the binding".to_string(),
+            }],
+            tracking_hypotheses: vec![
+                hypothesis,
+                TrackingHypothesis {
+                    id: "hypothesis:face:unknown:other".to_string(),
+                    family_id: "family:ambiguous-face".to_string(),
+                    kind: TrackingHypothesisKind::FaceIdentity,
+                    target_id: Some("entity:person:other".to_string()),
+                    observation_ids: vec!["face-vector:ambiguous".to_string()],
+                    binding_candidate_ids: vec!["binding:ambiguous-face-other".to_string()],
+                    confidence: 0.21,
+                    evidence: vec![evidence(
+                        BindingEvidenceKind::SimultaneousConflict,
+                        "human confirmation rejected this competitor",
+                    )],
+                    contradictions: vec!["human confirmation selected Ada".to_string()],
+                    state: HypothesisState::Rejected,
+                    first_seen_ms: 2_000,
+                    last_updated_ms: 2_400,
+                },
+            ],
+            human_reviews: vec![HumanReviewRecord {
+                id: "human-review:ada".to_string(),
+                target_id: "hypothesis:face:unknown:ada".to_string(),
+                target_kind: ActiveLearningTargetKind::TrackingHypothesis,
+                confidence: 1.0,
+                t_ms: 2_400,
+                confirmation: "That face is Ada".to_string(),
+                reviewer: Some("test-human".to_string()),
+            }],
+            ..GraphIntelligenceDocument::default()
+        };
+
+        let report = CognitiveDiagnosticsReport::from_graph_document(&document);
+
+        assert!(report
+            .learning_cycle
+            .learning_events
+            .iter()
+            .any(|event| event.event == LearningEvent::HumanCorrection && event.trusted));
+        assert!(report
+            .learning_cycle
+            .training_examples
+            .iter()
+            .any(
+                |example| example.kind == TrainingExampleKind::HumanTrustedPositive
+                    && example.trusted
+                    && example.weight >= 0.9
+            ));
+        assert!(report.learning_cycle.replay_items.iter().any(|item| item
+            .curriculum
+            .human_confirmation
+            == 1.0
+            && item.curriculum.priority >= 0.75));
+        assert_eq!(report.learning_cycle.hypotheses_promoted, 1);
     }
 }
 
