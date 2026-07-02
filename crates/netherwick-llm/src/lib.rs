@@ -139,6 +139,121 @@ impl Default for CounterfactualAction {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTargetKind {
+    Feature,
+    Cluster,
+    BindingCandidate,
+    BindingEdge,
+    Hypothesis,
+    Constellation,
+    Prediction,
+    ActionOutcome,
+    TrainingExample,
+}
+
+impl Default for ReviewTargetKind {
+    fn default() -> Self {
+        Self::TrainingExample
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmScientificReview {
+    pub id: String,
+    pub t_ms: u64,
+    pub target_id: String,
+    pub target_kind: ReviewTargetKind,
+    pub critique: Option<String>,
+    pub counterfactuals: Vec<CounterfactualAction>,
+    pub suggested_tests: Vec<LlmSuggestedTest>,
+    pub suspicious_training_examples: Vec<LlmTrainingWarning>,
+    pub label_proposals: Vec<LlmLabelProposal>,
+    pub human_review_prompts: Vec<String>,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmSuggestedTest {
+    pub action: Option<ActionPrimitive>,
+    pub question: String,
+    pub expected_observation: String,
+    pub disconfirming_observation: String,
+    pub risk_note: Option<String>,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmTrainingWarning {
+    pub example_id: String,
+    pub reason: String,
+    pub severity: f32,
+    pub suspected_issue: String,
+    pub supporting_evidence: Vec<String>,
+    pub missing_evidence: Vec<String>,
+    pub suggested_fix: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmLabelProposal {
+    pub example_id: String,
+    pub proposed_label: String,
+    pub rationale: String,
+    pub confidence: f32,
+    pub requires_human_review: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmReviewRequest {
+    pub t_ms: u64,
+    pub target_id: String,
+    pub target_kind: ReviewTargetKind,
+    pub observed_evidence: Vec<String>,
+    pub candidate_explanation: Option<String>,
+    pub current_confidence: f32,
+    pub known_contradictions: Vec<String>,
+    pub missing_evidence: Vec<String>,
+    pub available_actions: Vec<ActionPrimitive>,
+    pub safety_state: Option<String>,
+    pub training_examples: Vec<LlmTrainingExampleEvidence>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LlmTrainingExampleEvidence {
+    pub example_id: String,
+    pub behavior: String,
+    pub input_summary: String,
+    pub expected_summary: String,
+    pub actual_summary: Option<String>,
+    pub reward: Option<f32>,
+    pub source: Option<String>,
+    pub contradictions: Vec<String>,
+    pub missing_evidence: Vec<String>,
+}
+
+impl LlmReviewRequest {
+    pub fn training_example(t_ms: u64, example: LlmTrainingExampleEvidence) -> Self {
+        Self {
+            t_ms,
+            target_id: example.example_id.clone(),
+            target_kind: ReviewTargetKind::TrainingExample,
+            observed_evidence: vec![
+                format!("behavior: {}", example.behavior),
+                format!("input: {}", example.input_summary),
+                format!("expected label: {}", example.expected_summary),
+            ],
+            candidate_explanation: Some("candidate training row for model learning".to_string()),
+            current_confidence: 0.5,
+            known_contradictions: example.contradictions.clone(),
+            missing_evidence: example.missing_evidence.clone(),
+            available_actions: Vec::new(),
+            safety_state: None,
+            training_examples: vec![example],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Combobulation {
     pub summary: String,
@@ -181,6 +296,11 @@ pub trait LlmAgent: Send {
         recall_summary: &str,
         awareness_summary: Option<&str>,
     ) -> Result<LlmTickResult>;
+
+    async fn scientific_review(
+        &mut self,
+        request: &LlmReviewRequest,
+    ) -> Result<Option<LlmScientificReview>>;
 }
 
 #[derive(Default)]
@@ -210,6 +330,13 @@ impl LlmAgent for NoopLlmAgent {
         _awareness_summary: Option<&str>,
     ) -> Result<LlmTickResult> {
         Ok(LlmTickResult::default())
+    }
+
+    async fn scientific_review(
+        &mut self,
+        _request: &LlmReviewRequest,
+    ) -> Result<Option<LlmScientificReview>> {
+        Ok(None)
     }
 }
 
@@ -689,6 +816,16 @@ impl LlmAgent for ConfiguredLlmAgent {
             }
         }
     }
+
+    async fn scientific_review(
+        &mut self,
+        request: &LlmReviewRequest,
+    ) -> Result<Option<LlmScientificReview>> {
+        match self {
+            Self::Disabled(agent) => agent.scientific_review(request).await,
+            Self::Ollama(agent) => agent.scientific_review(request).await,
+        }
+    }
 }
 
 pub struct OllamaLlmAgent {
@@ -1052,6 +1189,21 @@ impl LlmAgent for OllamaLlmAgent {
         self.last_tick_result = tick_result.clone();
         Ok(tick_result)
     }
+
+    async fn scientific_review(
+        &mut self,
+        request: &LlmReviewRequest,
+    ) -> Result<Option<LlmScientificReview>> {
+        let prompt = build_scientific_review_prompt(request);
+        let reply = self
+            .generate_json::<ScientificReviewReply>(
+                "scientific_review",
+                &self.config.agent_model,
+                prompt,
+            )
+            .await?;
+        Ok(Some(scientific_review_from_reply(request, reply)))
+    }
 }
 
 #[derive(Serialize)]
@@ -1164,6 +1316,74 @@ struct CounterfactualSpec {
     reason: String,
     #[serde(default)]
     weight: f32,
+}
+
+#[derive(Deserialize)]
+struct ScientificReviewReply {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    critique: Option<String>,
+    #[serde(default)]
+    counterfactuals: Vec<CounterfactualSpec>,
+    #[serde(default)]
+    suggested_tests: Vec<SuggestedTestSpec>,
+    #[serde(default)]
+    suspicious_training_examples: Vec<TrainingWarningSpec>,
+    #[serde(default)]
+    label_proposals: Vec<LabelProposalSpec>,
+    #[serde(default)]
+    human_review_prompts: Vec<String>,
+    #[serde(default)]
+    confidence: f32,
+}
+
+#[derive(Deserialize)]
+struct SuggestedTestSpec {
+    #[serde(default)]
+    action: Option<ActionSpec>,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    expected_observation: String,
+    #[serde(default)]
+    disconfirming_observation: String,
+    #[serde(default)]
+    risk_note: Option<String>,
+    #[serde(default)]
+    confidence: f32,
+}
+
+#[derive(Deserialize)]
+struct TrainingWarningSpec {
+    #[serde(default)]
+    example_id: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    severity: f32,
+    #[serde(default)]
+    suspected_issue: String,
+    #[serde(default)]
+    supporting_evidence: Vec<String>,
+    #[serde(default)]
+    missing_evidence: Vec<String>,
+    #[serde(default)]
+    suggested_fix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LabelProposalSpec {
+    #[serde(default)]
+    example_id: String,
+    #[serde(default)]
+    proposed_label: String,
+    #[serde(default)]
+    rationale: String,
+    #[serde(default)]
+    confidence: f32,
+    #[serde(default)]
+    requires_human_review: bool,
 }
 
 fn build_combobulator_prompt(
@@ -1281,6 +1501,93 @@ Summarized senses:\n{}\n",
         futures,
         senses
     )
+}
+
+pub fn build_scientific_review_prompt(request: &LlmReviewRequest) -> String {
+    let available_actions = request
+        .available_actions
+        .iter()
+        .filter_map(|action| serde_json::to_string(&action_spec_json(action)).ok())
+        .collect::<Vec<_>>();
+    let training_examples = request
+        .training_examples
+        .iter()
+        .map(|example| {
+            serde_json::json!({
+                "example_id": example.example_id,
+                "behavior": example.behavior,
+                "input_summary": example.input_summary,
+                "expected_summary": example.expected_summary,
+                "actual_summary": example.actual_summary,
+                "reward": example.reward,
+                "source": example.source,
+                "contradictions": example.contradictions,
+                "missing_evidence": example.missing_evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "You are Netherwick's scientific critic, not its source of truth.\n\
+Inspect the target below and produce skeptical, evidence-grounded review JSON only.\n\
+You may identify weak evidence, possible fused clusters, suspicious training rows, plausible labels, counterfactual actions, and tests that would reduce uncertainty.\n\
+You must not declare identity as certain, override safety, merge entities, accept bindings, invent sensor evidence, pretend movement happened, or mark a training row as true.\n\
+Motion actions are suggestions only; downstream safety and admission systems decide what can happen.\n\
+Be compact, explicit about uncertainty, and prefer \"plausible but unproven\" language when evidence is incomplete.\n\
+Return JSON only with this schema:\n\
+{{\n\
+  \"id\":\"optional review id\",\n\
+  \"critique\":\"optional critique grounded in evidence\",\n\
+  \"counterfactuals\":[{{\"instead_of\":null,\"proposed\":{{\"kind\":\"inspect\",\"target\":\"novelty\"}},\"reason\":\"...\",\"weight\":0.5}}],\n\
+  \"suggested_tests\":[{{\"action\":{{\"kind\":\"inspect\",\"target\":\"novelty\"}},\"question\":\"...\",\"expected_observation\":\"...\",\"disconfirming_observation\":\"...\",\"risk_note\":null,\"confidence\":0.5}}],\n\
+  \"suspicious_training_examples\":[{{\"example_id\":\"...\",\"reason\":\"...\",\"severity\":0.5,\"suspected_issue\":\"unsupported_label\",\"supporting_evidence\":[\"...\"],\"missing_evidence\":[\"...\"],\"suggested_fix\":\"human review\"}}],\n\
+  \"label_proposals\":[{{\"example_id\":\"...\",\"proposed_label\":\"...\",\"rationale\":\"...\",\"confidence\":0.5,\"requires_human_review\":true}}],\n\
+  \"human_review_prompts\":[\"...\"],\n\
+  \"confidence\":0.0\n\
+}}\n\n\
+REVIEW TARGET\n\
+- target_id: {}\n\
+- target_kind: {:?}\n\
+- review_time_ms: {}\n\
+- candidate_explanation: {}\n\
+- current_confidence: {:.2}\n\
+- safety_state: {}\n\n\
+OBSERVED EVIDENCE\n{}\n\n\
+KNOWN CONTRADICTIONS\n{}\n\n\
+MISSING EVIDENCE\n{}\n\n\
+AVAILABLE ACTIONS JSON\n{}\n\n\
+TRAINING EXAMPLES JSON\n{}\n",
+        prompt_json_string(&request.target_id),
+        request.target_kind,
+        request.t_ms,
+        prompt_json_string(request.candidate_explanation.as_deref().unwrap_or("none")),
+        request.current_confidence.clamp(0.0, 1.0),
+        prompt_json_string(request.safety_state.as_deref().unwrap_or("unknown")),
+        prompt_lines(&request.observed_evidence),
+        prompt_lines(&request.known_contradictions),
+        prompt_lines(&request.missing_evidence),
+        if available_actions.is_empty() {
+            "- none".to_string()
+        } else {
+            available_actions
+                .into_iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        serde_json::to_string_pretty(&training_examples)
+            .unwrap_or_else(|_| "[]".to_string())
+    )
+}
+
+fn prompt_lines(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return "- none".to_string();
+    }
+    lines
+        .iter()
+        .map(|line| format!("- {}", prompt_json_string(line)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_prompt_uuid_options() -> String {
@@ -1758,6 +2065,103 @@ pub fn parse_llm_decision_json(text: &str, commands_enabled: bool) -> Result<Llm
     })
 }
 
+pub fn parse_scientific_review_json(
+    request: &LlmReviewRequest,
+    text: &str,
+) -> Result<LlmScientificReview> {
+    let json = extract_json_object(text).unwrap_or_else(|| text.trim().to_string());
+    let reply: ScientificReviewReply =
+        serde_json::from_str(&json).context("failed to parse llm scientific review")?;
+    Ok(scientific_review_from_reply(request, reply))
+}
+
+fn scientific_review_from_reply(
+    request: &LlmReviewRequest,
+    reply: ScientificReviewReply,
+) -> LlmScientificReview {
+    let default_id = stable_uuid_for_text(&format!(
+        "llm-review:{}:{:?}:{}",
+        request.target_id, request.target_kind, request.t_ms
+    ))
+    .to_string();
+    LlmScientificReview {
+        id: reply
+            .id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_id),
+        t_ms: request.t_ms,
+        target_id: request.target_id.clone(),
+        target_kind: request.target_kind.clone(),
+        critique: reply
+            .critique
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        counterfactuals: reply
+            .counterfactuals
+            .into_iter()
+            .filter_map(parse_counterfactual_spec)
+            .collect(),
+        suggested_tests: reply
+            .suggested_tests
+            .into_iter()
+            .map(|test| LlmSuggestedTest {
+                action: test.action.and_then(parse_action_spec),
+                question: test.question,
+                expected_observation: test.expected_observation,
+                disconfirming_observation: test.disconfirming_observation,
+                risk_note: test
+                    .risk_note
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                confidence: test.confidence.clamp(0.0, 1.0),
+            })
+            .collect(),
+        suspicious_training_examples: reply
+            .suspicious_training_examples
+            .into_iter()
+            .map(|warning| LlmTrainingWarning {
+                example_id: if warning.example_id.trim().is_empty() {
+                    request.target_id.clone()
+                } else {
+                    warning.example_id
+                },
+                reason: warning.reason,
+                severity: warning.severity.clamp(0.0, 1.0),
+                suspected_issue: warning.suspected_issue,
+                supporting_evidence: warning.supporting_evidence,
+                missing_evidence: warning.missing_evidence,
+                suggested_fix: warning
+                    .suggested_fix
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            })
+            .collect(),
+        label_proposals: reply
+            .label_proposals
+            .into_iter()
+            .map(|proposal| LlmLabelProposal {
+                example_id: if proposal.example_id.trim().is_empty() {
+                    request.target_id.clone()
+                } else {
+                    proposal.example_id
+                },
+                proposed_label: proposal.proposed_label,
+                rationale: proposal.rationale,
+                confidence: proposal.confidence.clamp(0.0, 1.0),
+                requires_human_review: proposal.requires_human_review,
+            })
+            .collect(),
+        human_review_prompts: reply
+            .human_review_prompts
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        confidence: reply.confidence.clamp(0.0, 1.0),
+    }
+}
+
 fn parse_action_spec(spec: ActionSpec) -> Option<ActionPrimitive> {
     let kind = spec.kind.to_ascii_lowercase();
     match kind.as_str() {
@@ -2198,6 +2602,84 @@ mod tests {
         assert!(prompt.contains("Do not assume a human is currently present"));
         assert!(prompt.contains("CONTEXT FRAME"));
         assert!(prompt.contains("text=\"I hear: \\u003chello there\\u003e\""));
+    }
+
+    #[test]
+    fn scientific_review_prompt_frames_training_rows_as_uncertain_evidence() {
+        let request = LlmReviewRequest::training_example(
+            42,
+            LlmTrainingExampleEvidence {
+                example_id: "danger-row-7".to_string(),
+                behavior: "danger".to_string(),
+                input_summary: "front range says clear; no bump flags".to_string(),
+                expected_summary: "bump_risk=1.0".to_string(),
+                actual_summary: Some("model predicted low bump risk".to_string()),
+                reward: Some(-0.2),
+                source: Some("world_outcome".to_string()),
+                contradictions: vec!["no contact evidence supports bump label".to_string()],
+                missing_evidence: vec!["no post-action body flags".to_string()],
+            },
+        );
+
+        let prompt = build_scientific_review_prompt(&request);
+
+        assert!(prompt.contains("scientific critic, not its source of truth"));
+        assert!(prompt.contains("must not declare identity as certain"));
+        assert!(prompt.contains("mark a training row as true"));
+        assert!(prompt.contains("suspicious_training_examples"));
+        assert!(prompt.contains("label_proposals"));
+        assert!(prompt.contains("\"example_id\": \"danger-row-7\""));
+        assert!(prompt.contains("no contact evidence supports bump label"));
+        assert!(prompt.contains("AVAILABLE ACTIONS JSON\n- none"));
+    }
+
+    #[test]
+    fn parse_scientific_review_json_clamps_and_reuses_existing_action_types() {
+        let request = LlmReviewRequest::training_example(
+            99,
+            LlmTrainingExampleEvidence {
+                example_id: "charge-row-3".to_string(),
+                behavior: "charge".to_string(),
+                input_summary: "battery dropping, charger not visible".to_string(),
+                expected_summary: "charging_started=true".to_string(),
+                ..LlmTrainingExampleEvidence::default()
+            },
+        );
+        let review = parse_scientific_review_json(
+            &request,
+            r#"Here is JSON:
+{
+  "critique":"Label is plausible but unsupported by visible charger or battery delta.",
+  "counterfactuals":[{"instead_of":null,"proposed":{"kind":"inspect","target":"charger"},"reason":"Look for missing charger evidence.","weight":1.5}],
+  "suggested_tests":[{"action":{"kind":"inspect","target":"charger"},"question":"Is the charger visible?","expected_observation":"charger appears","disconfirming_observation":"no charger evidence","risk_note":"","confidence":-0.2}],
+  "suspicious_training_examples":[{"example_id":"","reason":"Expected charging label lacks support.","severity":2.0,"suspected_issue":"unsupported_label","supporting_evidence":["charger not visible"],"missing_evidence":["battery delta"],"suggested_fix":"send to human review"}],
+  "label_proposals":[{"example_id":"","proposed_label":"charging_started=unknown","rationale":"evidence is incomplete","confidence":0.7,"requires_human_review":true}],
+  "human_review_prompts":["Check whether charging actually started."],
+  "confidence":1.2
+}"#,
+        )
+        .expect("scientific review json should parse");
+
+        assert_eq!(review.t_ms, 99);
+        assert_eq!(review.target_id, "charge-row-3");
+        assert_eq!(review.target_kind, ReviewTargetKind::TrainingExample);
+        assert_eq!(review.confidence, 1.0);
+        assert_eq!(review.counterfactuals.len(), 1);
+        assert_eq!(review.counterfactuals[0].weight, 1.0);
+        assert_eq!(
+            review.suggested_tests[0].action,
+            Some(ActionPrimitive::Inspect {
+                target: InspectTarget::Charger
+            })
+        );
+        assert_eq!(review.suggested_tests[0].confidence, 0.0);
+        assert_eq!(
+            review.suspicious_training_examples[0].example_id,
+            "charge-row-3"
+        );
+        assert_eq!(review.suspicious_training_examples[0].severity, 1.0);
+        assert_eq!(review.label_proposals[0].confidence, 0.7);
+        assert!(review.label_proposals[0].requires_human_review);
     }
 
     #[test]
