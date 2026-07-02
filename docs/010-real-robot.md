@@ -33,7 +33,7 @@ just setup-tts
 just setup
 ```
 
-The default voice is downloaded to the Tongues Piper model directory and autoloaded at startup. Piper ONNX execution uses the Tongues `piper-onnx` backend with the Rust `ort` dependency; Cargo downloads and places the ONNX Runtime library next to the Netherwick binary during the build.
+The default voice is downloaded to the Tongues Piper model directory and autoloaded at startup. Piper ONNX execution uses the Tongues `piper-onnx` backend with the self-contained Rust `ort` package, prepared by `just setup-ort`.
 
 To override the voice, set:
 

@@ -73,7 +73,7 @@ setup-rust:
         curl https://sh.rustup.rs -sSf | sh -s -- -y; \
     fi
 
-# Fetch and build the self-contained Rust ONNX Runtime dependency used by Piper.
+# Fetch and build Piper's self-contained Rust ONNX package.
 setup-ort:
     cargo check -p netherwick-mouth
 
