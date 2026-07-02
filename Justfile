@@ -20,7 +20,7 @@ default *args:
     just robot {{args}}
 
 # Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, and local models.
-setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-tts setup-whisper
+setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-ort setup-tts setup-whisper
     @echo "netherwick Linux setup complete"
     @echo "next: cargo check && just sim"
 
@@ -42,7 +42,6 @@ setup-system:
         v4l-utils \
         libasound2-dev \
         libgomp1 \
-        libonnx-dev \
         libssl-dev \
         libudev-dev \
         libusb-1.0-0-dev \
@@ -73,6 +72,10 @@ setup-rust:
     if ! command -v cargo >/dev/null 2>&1; then \
         curl https://sh.rustup.rs -sSf | sh -s -- -y; \
     fi
+
+# Fetch and build the self-contained Rust ONNX Runtime dependency used by Piper.
+setup-ort:
+    cargo check -p netherwick-mouth
 
 # Install Kinect packages from apt when available.
 setup-kinect:
