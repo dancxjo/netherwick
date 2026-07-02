@@ -2079,6 +2079,20 @@ fn qualify_binding_candidate(
             score: 1.0,
             reason: "vector source explicitly names this entity".to_string(),
         });
+    } else if artifact
+        .source_id
+        .as_deref()
+        .is_some_and(|source_id| source_id.starts_with("entity:"))
+    {
+        evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::Contradiction,
+            score: 1.0,
+            reason: format!(
+                "vector source names {}, not {}",
+                artifact.source_id.as_deref().unwrap_or("unknown"),
+                entity.id
+            ),
+        });
     }
     if t_ms.saturating_sub(entity.last_seen_ms) <= 1_000 {
         evidence.push(BindingEvidence {
@@ -2146,6 +2160,9 @@ fn qualify_binding_candidate(
             BindingEvidenceKind::Contradiction | BindingEvidenceKind::SimultaneousConflict
         )
     });
+    let has_hard_contradiction = evidence
+        .iter()
+        .any(|item| item.kind == BindingEvidenceKind::Contradiction);
     let independent_positive_kinds = evidence
         .iter()
         .filter(|item| {
@@ -2177,7 +2194,12 @@ fn qualify_binding_candidate(
         confidence *= 0.35;
     }
 
-    let (decision, reason) = if has_human_confirmation {
+    let (decision, reason) = if has_hard_contradiction {
+        (
+            BindingDecision::Reject,
+            "candidate contradicts explicit entity source evidence".to_string(),
+        )
+    } else if has_human_confirmation {
         (
             BindingDecision::Accept,
             "human-confirmed or explicit source binding".to_string(),
@@ -7117,6 +7139,34 @@ mod tests {
         );
 
         assert_eq!(candidate.decision, BindingDecision::Accept);
+    }
+
+    #[test]
+    fn rejected_candidate_includes_useful_reason() {
+        let observation = make_object_observation("ada", ObjectClass::Person, 0.8);
+        let entity = EntityHypothesis::from_observation(&observation, 100, None);
+        let candidate = qualify_binding_candidate(
+            &entity,
+            &VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-grace", vec![1.0])
+                .with_source_id("entity:person:grace"),
+            VectorBindingKind::Face,
+            entity.primary_object_cluster_id().unwrap(),
+            vector_cluster_id(VectorBindingKind::Face, "face-grace"),
+            150,
+            None,
+            1,
+            false,
+        );
+
+        assert_eq!(candidate.decision, BindingDecision::Reject);
+        assert!(candidate
+            .reason
+            .contains("contradicts explicit entity source"));
+        assert!(candidate.evidence.iter().any(|evidence| {
+            evidence.kind == BindingEvidenceKind::Contradiction
+                && evidence.reason.contains("entity:person:grace")
+                && evidence.reason.contains("entity:person:ada")
+        }));
     }
 
     #[test]
