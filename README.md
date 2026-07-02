@@ -33,6 +33,7 @@ The next good artifact is a capture set: screenshots, video capture, and a short
 sensors
   -> synchronized RGB/depth/IMU/body events
   -> point cloud / voxel projection
+  -> Features
   -> 3D live view and WebXR inspection
   -> 2D map / occupancy surface
   -> cross-modal constellations
@@ -42,6 +43,8 @@ sensors
 ```
 
 The present engineering emphasis is not beauty. It is spatial trust. A crude voxel world that stays aligned is more useful than a polished render that cannot be believed.
+
+See [docs/013-feature-registry.md](docs/013-feature-registry.md) for the universal observation layer: everything Pete observes should become a Feature before new learning systems consume it.
 
 ## Constellations
 
