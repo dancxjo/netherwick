@@ -9,6 +9,7 @@ use netherwick_now::{
     ObjectSense, RangeSense, TranscriptCandidateEvent, TranscriptCandidateTracker,
     TranscriptStabilityState, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
     IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
+    TRANSCRIPT_VECTOR_COLLECTION,
 };
 use netherwick_now::{Now, PredictionSense, SurpriseSense};
 use serde::{Deserialize, Serialize};
@@ -834,11 +835,13 @@ impl AsrTool {
             self.transcript_tracker
                 .ingest_candidate(transcript.clone(), Some(confidence), true);
         let stability = transcript_stability_from_events(&candidate_events);
+        let transcript_vector = transcript_vector_artifact(&transcript, sequence, start_ms, end_ms);
         self.clear_chunk();
         Some(EarSense {
             schema_version: 1,
             features: Vec::new(),
             transcript: Some(transcript.clone()),
+            transcript_vectors: vec![transcript_vector],
             asr: AsrSense {
                 transcript: Some(transcript.clone()),
                 possible_transcript: None,
@@ -1271,8 +1274,7 @@ impl CpalMicrophone {
 
 #[cfg(any(feature = "linux-hardware", test))]
 fn is_muted_cpal_input_stream_error(message: &str) -> bool {
-    message.contains("snd_pcm_poll_descriptors")
-        && message.contains("Unknown errno (-32)")
+    message.contains("snd_pcm_poll_descriptors") && message.contains("Unknown errno (-32)")
 }
 
 #[cfg(feature = "linux-hardware")]
@@ -1629,6 +1631,72 @@ fn pcm_duration_ms(sample_count: usize, sample_rate_hz: u32, channels: u16) -> u
 fn command_transcript_confidence(transcript: &str) -> f32 {
     let words = transcript.split_whitespace().count() as f32;
     (0.55 + words.min(8.0) * 0.04).clamp(0.55, 0.92)
+}
+
+const ASR_TRANSCRIPT_VECTOR_DIM: usize = 32;
+const ASR_TRANSCRIPT_VECTOR_MODEL: &str = "netherwick.text.hashing.v1";
+
+fn transcript_vector_artifact(
+    transcript: &str,
+    sequence: u64,
+    start_ms: u64,
+    end_ms: u64,
+) -> VectorArtifact {
+    let source_id = format!("asr-utterance-{sequence}");
+    VectorArtifact::new(
+        TRANSCRIPT_VECTOR_COLLECTION,
+        format!("{source_id}-transcript"),
+        text_hash_vector(transcript, ASR_TRANSCRIPT_VECTOR_DIM),
+    )
+    .with_model(ASR_TRANSCRIPT_VECTOR_MODEL)
+    .with_source_id(source_id)
+    .with_occurred_at_ms(end_ms.max(start_ms))
+}
+
+fn text_hash_vector(text: &str, dim: usize) -> Vec<f32> {
+    let dim = dim.max(1);
+    let mut vector = vec![0.0_f32; dim];
+    let mut token_count = 0.0_f32;
+    for token in text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        token_count += 1.0;
+        let normalized = token.to_ascii_lowercase();
+        for ngram in token_ngrams(&normalized) {
+            let mut hash = 2166136261_u32;
+            for byte in ngram.bytes() {
+                hash = hash.wrapping_mul(16777619) ^ u32::from(byte);
+            }
+            let index = (hash as usize) % dim;
+            let sign = if hash & 1 == 0 { 1.0 } else { -1.0 };
+            vector[index] += sign;
+        }
+    }
+    vector[0] += (text.chars().count() as f32 / 512.0).clamp(0.0, 1.0);
+    if dim > 1 {
+        vector[1] += (token_count / 96.0).clamp(0.0, 1.0);
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > f32::EPSILON {
+        for value in &mut vector {
+            *value = (*value / norm).clamp(-1.0, 1.0);
+        }
+    }
+    vector
+}
+
+fn token_ngrams(token: &str) -> Vec<String> {
+    let chars = token.chars().collect::<Vec<_>>();
+    if chars.len() <= 3 {
+        return vec![token.to_string()];
+    }
+    let mut ngrams = Vec::new();
+    for window in chars.windows(3) {
+        ngrams.push(window.iter().collect());
+    }
+    ngrams.push(token.to_string());
+    ngrams
 }
 
 fn transcribe_with_command(
@@ -2699,6 +2767,15 @@ mod tests {
         assert_eq!(ear.asr.word_count, Some(1));
         assert_eq!(ear.asr.committed_transcript.as_deref(), Some("hello"));
         assert!(ear.asr.possible_transcript.is_none());
+        assert_eq!(ear.transcript_vectors.len(), 1);
+        let transcript_vector = &ear.transcript_vectors[0];
+        assert_eq!(transcript_vector.collection, TRANSCRIPT_VECTOR_COLLECTION);
+        assert_eq!(
+            transcript_vector.model.as_deref(),
+            Some(ASR_TRANSCRIPT_VECTOR_MODEL)
+        );
+        assert_eq!(transcript_vector.vector.len(), ASR_TRANSCRIPT_VECTOR_DIM);
+        assert_eq!(transcript_vector.occurred_at_ms, Some(1_250));
         assert_eq!(ear.asr.candidate_id, Some(1));
         assert_eq!(ear.asr.stable_text.as_deref(), Some("hello"));
         assert!(ear

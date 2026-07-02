@@ -2720,6 +2720,14 @@ pub fn deterministic_embodied_fixture_now(t_ms: u64, pose_offset_m: f32) -> Now 
         schema_version: 1,
         features: vec![vec![0.1, 0.2, 0.15, 0.05]],
         transcript: Some("fixture voice says remember the charger alcove".to_string()),
+        transcript_vectors: vec![netherwick_now::VectorArtifact::new(
+            "transcripts",
+            "fixture-asr-transcript",
+            vec![0.21, 0.34, 0.55, 0.89],
+        )
+        .with_model("netherwick.text.hashing.v1")
+        .with_source_id("fixture-asr")
+        .with_occurred_at_ms(t_ms)],
         asr: AsrSense {
             transcript: Some("fixture voice says remember the charger alcove".to_string()),
             is_final: true,

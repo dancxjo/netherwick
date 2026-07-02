@@ -15,6 +15,7 @@ pub const SCENE_VECTOR_COLLECTION: &str = "scene_vectors";
 pub const FACE_VECTOR_COLLECTION: &str = "faces";
 pub const VOICE_VECTOR_COLLECTION: &str = "voices";
 pub const GEOLOCATION_VECTOR_COLLECTION: &str = "geolocations";
+pub const TRANSCRIPT_VECTOR_COLLECTION: &str = "transcripts";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VectorArtifact {
@@ -158,6 +159,8 @@ pub struct EarSense {
     pub schema_version: u32,
     pub features: Vec<Vec<f32>>,
     pub transcript: Option<String>,
+    #[serde(default)]
+    pub transcript_vectors: Vec<VectorArtifact>,
     #[serde(default)]
     pub asr: AsrSense,
 }

@@ -39,9 +39,9 @@ use netherwick_runtime::{
     RuntimeModelStack, RuntimeTick, SimRunner,
 };
 use netherwick_sensors::{
-    AsrToolConfig, CameraSenseProvider, EyeFrame, EyeFrameFormat, FrameProcessor,
-    GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame, SensePacket,
-    SenseProducer, World, WorldSnapshot,
+    AsrToolConfig, CameraSenseProvider, EyeFrame, EyeFrameFormat, FrameProcessor, GpsSenseProvider,
+    ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World,
+    WorldSnapshot,
 };
 #[cfg(feature = "kinect-freenect")]
 use netherwick_sensors::{FreenectKinectProvider, KinectRgbAdjustment};
@@ -4457,9 +4457,7 @@ impl BackgroundSenseState {
     }
 
     fn next_packet(&mut self) -> Option<SensePacket> {
-        self.pending
-            .pop_front()
-            .or_else(|| self.latest.clone())
+        self.pending.pop_front().or_else(|| self.latest.clone())
     }
 }
 
@@ -4519,10 +4517,7 @@ impl BackgroundSenseProducer {
 #[async_trait::async_trait]
 impl SenseProducer for BackgroundSenseProducer {
     async fn poll(&mut self) -> Result<SensePacket> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("background sensor mutex poisoned");
+        let mut state = self.state.lock().expect("background sensor mutex poisoned");
         if let Some(packet) = state.next_packet() {
             Ok(packet)
         } else if let Some(error) = state.last_error.clone() {

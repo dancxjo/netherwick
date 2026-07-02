@@ -2730,6 +2730,56 @@ mod tests {
             ));
     }
 
+    #[tokio::test]
+    async fn embodied_now_preserves_precomputed_asr_transcript_vector() {
+        let mut now = Now::blank(300, BodySense::default());
+        now.ear.transcript = Some("open the pod bay doors".to_string());
+        now.ear.asr = AsrSense {
+            transcript: now.ear.transcript.clone(),
+            is_final: true,
+            confidence: 0.88,
+            start_ms: Some(240),
+            end_ms: Some(300),
+            duration_ms: Some(60),
+            word_count: Some(5),
+            ..AsrSense::default()
+        };
+        now.ear.transcript_vectors.push(
+            netherwick_now::VectorArtifact::new(
+                "transcripts",
+                "asr-utterance-7-transcript",
+                vec![0.25, 0.5, 0.75],
+            )
+            .with_model("netherwick.text.hashing.v1")
+            .with_source_id("asr-utterance-7")
+            .with_occurred_at_ms(300),
+        );
+
+        let embodied = embody_now(&now).await.unwrap();
+
+        let transcript = embodied
+            .sensations
+            .iter()
+            .find(|sensation| {
+                sensation.source == "ear.transcript_vectors"
+                    && sensation.payload_kind == SensationPayloadKind::TranscriptSpan
+            })
+            .expect("precomputed transcript vector sensation");
+        let vector = transcript
+            .vector
+            .as_ref()
+            .expect("preserved transcript vector");
+        assert_eq!(vector.vector, vec![0.25, 0.5, 0.75]);
+        assert_eq!(vector.model_id, "netherwick.text.hashing.v1");
+        assert_eq!(
+            vector.vectorizer_id,
+            "precomputed.transcripts.netherwick.text.hashing.v1"
+        );
+        assert_eq!(vector.purpose, "transcript_semantic");
+        assert_eq!(vector.collection, "transcripts");
+        assert!(!vector.is_fallback);
+    }
+
     #[test]
     fn embodied_context_from_current_experience_uses_traceable_sensation_lineage() {
         let primary = Sensation::primary(
@@ -6751,6 +6801,7 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
     }
 
     if !now.ear.features.is_empty()
+        || !now.ear.transcript_vectors.is_empty()
         || now
             .ear
             .transcript
@@ -6817,6 +6868,7 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
                 kind: SensationPayloadKind::AudioPcm,
                 value: json!({
                     "feature_sets": now.ear.features.len(),
+                    "transcript_vectors": now.ear.transcript_vectors.len(),
                     "transcript": legacy_transcript.or(transcript),
                     "asr": now.ear.asr,
                 }),
@@ -6829,6 +6881,42 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
         if transcript.is_some() {
             sensation.metadata.labels.push("asr available".to_string());
         }
+        sensations.push(sensation);
+    }
+
+    if !now.ear.transcript_vectors.is_empty() {
+        let transcript = now
+            .ear
+            .asr
+            .committed_transcript
+            .as_deref()
+            .or(now.ear.asr.transcript.as_deref())
+            .or(now.ear.transcript.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("speech transcript");
+        let observed_at_ms = now.ear.asr.end_ms.unwrap_or(now.t_ms);
+        let occurred_at_ms = now.ear.asr.start_ms.unwrap_or(observed_at_ms);
+        let mut sensation = Sensation::primary(
+            Modality::Audio,
+            SensationSource::new("ear.transcript_vectors"),
+            occurred_at_ms,
+            observed_at_ms,
+            SensationPayload {
+                kind: SensationPayloadKind::TranscriptSpan,
+                value: json!({
+                    "text": transcript,
+                    "transcript_vectors": now.ear.transcript_vectors.len(),
+                    "vector_artifacts": now.ear.transcript_vectors.clone(),
+                }),
+            },
+        )
+        .with_summary(format!("I have a transcript vector for \"{transcript}\"."));
+        sensation.metadata.confidence = Some(now.ear.asr.confidence.max(0.35).clamp(0.0, 1.0));
+        sensation
+            .metadata
+            .labels
+            .push("transcript vector".to_string());
         sensations.push(sensation);
     }
 
