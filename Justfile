@@ -42,6 +42,7 @@ setup-system:
         v4l-utils \
         libasound2-dev \
         libgomp1 \
+        libonnx-dev \
         libssl-dev \
         libudev-dev \
         libusb-1.0-0-dev \
