@@ -19,7 +19,7 @@ use netherwick_now::{
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -1768,7 +1768,11 @@ impl ConstellationQuery {
     pub fn from_observation(observation: &ConstellationObservation) -> Self {
         Self {
             t_ms: observation.t_ms,
-            cluster_ids: observation.clusters.iter().map(|cluster| cluster.id.clone()).collect(),
+            cluster_ids: observation
+                .clusters
+                .iter()
+                .map(|cluster| cluster.id.clone())
+                .collect(),
             binding_ids: observation
                 .accepted_bindings
                 .iter()
@@ -1972,10 +1976,14 @@ impl ConstellationEngine {
             .cloned()
             .collect::<Vec<_>>();
 
-        let cluster_score =
-            overlap_score(matched_cluster_ids.len(), constellation.member_cluster_ids.len());
-        let binding_score =
-            overlap_score(matched_binding_ids.len(), constellation.member_binding_ids.len());
+        let cluster_score = overlap_score(
+            matched_cluster_ids.len(),
+            constellation.member_cluster_ids.len(),
+        );
+        let binding_score = overlap_score(
+            matched_binding_ids.len(),
+            constellation.member_binding_ids.len(),
+        );
         let feature_score = overlap_score(
             intersection_count(&constellation.supporting_feature_ids, &query.feature_ids),
             constellation.supporting_feature_ids.len(),
@@ -2006,8 +2014,8 @@ impl ConstellationEngine {
             intersection_count(&constellation.member_binding_ids, &query.contradiction_ids),
             constellation.member_binding_ids.len(),
         ) * 0.45;
-        let score =
-            (evidence_score * (1.0 - stale_penalty) * (1.0 - contradiction_penalty)).clamp(0.0, 1.0);
+        let score = (evidence_score * (1.0 - stale_penalty) * (1.0 - contradiction_penalty))
+            .clamp(0.0, 1.0);
         let reason = if matched_binding_ids.is_empty() && !matched_cluster_ids.is_empty() {
             "partial cluster match without all known bindings".to_string()
         } else if !missing_cluster_ids.is_empty() {
@@ -2036,6 +2044,553 @@ impl ConstellationEngine {
         let id = format!("constellation:{}:{}", self.next_id, first);
         self.next_id = self.next_id.saturating_add(1);
         id
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssociationItemKind {
+    Feature,
+    Cluster,
+    Binding,
+    Constellation,
+    Action,
+    Outcome,
+    BodyState,
+    Prediction,
+    Surprise,
+    Memory,
+    LlmNote,
+    #[default]
+    Other,
+}
+
+impl AssociationItemKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Feature => "feature",
+            Self::Cluster => "cluster",
+            Self::Binding => "binding",
+            Self::Constellation => "constellation",
+            Self::Action => "action",
+            Self::Outcome => "outcome",
+            Self::BodyState => "body_state",
+            Self::Prediction => "prediction",
+            Self::Surprise => "surprise",
+            Self::Memory => "memory",
+            Self::LlmNote => "llm_note",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationItem {
+    pub id: String,
+    pub kind: AssociationItemKind,
+    pub confidence: f32,
+}
+
+impl AssociationItem {
+    pub fn new(id: impl Into<String>, kind: AssociationItemKind, confidence: f32) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            confidence: confidence.clamp(0.0, 1.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssociationRelation {
+    #[default]
+    CoOccursWith,
+    Predicts,
+    Follows,
+    Suppresses,
+    Contradicts,
+    Explains,
+    Enables,
+    Prevents,
+    PartOf,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationExample {
+    pub frame_id: Option<String>,
+    pub t_ms: u64,
+    pub reason: String,
+    pub score: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationEdge {
+    pub id: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub relation: AssociationRelation,
+    pub confidence: f32,
+    pub evidence_count: u32,
+    pub prediction_gain: f32,
+    pub contradiction_count: u32,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    #[serde(default)]
+    pub examples: Vec<AssociationExample>,
+}
+
+impl AssociationEdge {
+    fn new(
+        from_id: String,
+        to_id: String,
+        relation: AssociationRelation,
+        example: AssociationExample,
+    ) -> Self {
+        let id = association_edge_id(&from_id, &to_id, &relation);
+        Self {
+            id,
+            from_id,
+            to_id,
+            relation,
+            confidence: 0.0,
+            evidence_count: 0,
+            prediction_gain: 0.0,
+            contradiction_count: 0,
+            first_seen_ms: example.t_ms,
+            last_seen_ms: example.t_ms,
+            examples: Vec::new(),
+        }
+    }
+
+    fn strengthen(&mut self, example: AssociationExample, prediction_gain: f32) {
+        let score = example.score.clamp(0.0, 1.0);
+        self.evidence_count = self.evidence_count.saturating_add(1);
+        self.last_seen_ms = example.t_ms;
+        self.confidence =
+            (self.confidence * 0.78 + score * 0.22 + (self.evidence_count as f32).ln_1p() * 0.035)
+                .clamp(0.0, 1.0);
+        self.prediction_gain = (self.prediction_gain * 0.7 + prediction_gain * 0.3).clamp(0.0, 1.0);
+        self.examples.push(example);
+        const MAX_ASSOCIATION_EXAMPLES: usize = 12;
+        if self.examples.len() > MAX_ASSOCIATION_EXAMPLES {
+            let excess = self.examples.len() - MAX_ASSOCIATION_EXAMPLES;
+            self.examples.drain(0..excess);
+        }
+    }
+
+    fn weaken(&mut self, amount: f32) {
+        self.confidence = (self.confidence * (1.0 - amount.clamp(0.0, 1.0))).clamp(0.0, 1.0);
+        self.prediction_gain =
+            (self.prediction_gain * (1.0 - amount.clamp(0.0, 1.0) * 0.5)).clamp(0.0, 1.0);
+    }
+
+    fn add_contradiction(&mut self, example: AssociationExample) {
+        self.contradiction_count = self.contradiction_count.saturating_add(1);
+        self.last_seen_ms = example.t_ms;
+        self.confidence = (self.confidence * 0.72).clamp(0.0, 1.0);
+        self.examples.push(example);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AssociationNegativeEvidence {
+    pub present_id: String,
+    pub absent_id: String,
+    pub relation: AssociationRelation,
+    pub reason: String,
+    pub score: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssociationTimeWindow {
+    SameMoment,
+    Within500Ms,
+    Within2Sec,
+    Within10Sec,
+    NextFrame,
+    NextActionOutcome,
+}
+
+impl AssociationTimeWindow {
+    pub fn max_lag_ms(&self) -> u64 {
+        match self {
+            Self::SameMoment => 0,
+            Self::Within500Ms => 500,
+            Self::Within2Sec => 2_000,
+            Self::Within10Sec => 10_000,
+            Self::NextFrame => 2_000,
+            Self::NextActionOutcome => 10_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationObservation {
+    pub frame_id: Option<String>,
+    pub t_ms: u64,
+    #[serde(default)]
+    pub active_items: Vec<AssociationItem>,
+    #[serde(default)]
+    pub outcome_items: Vec<AssociationItem>,
+    #[serde(default)]
+    pub prediction_error_items: Vec<AssociationItem>,
+    #[serde(default)]
+    pub memory_recall_items: Vec<AssociationItem>,
+    #[serde(default)]
+    pub llm_notes: Vec<String>,
+    #[serde(default)]
+    pub negative_evidence: Vec<AssociationNegativeEvidence>,
+}
+
+impl Default for AssociationObservation {
+    fn default() -> Self {
+        Self {
+            frame_id: None,
+            t_ms: 0,
+            active_items: Vec::new(),
+            outcome_items: Vec::new(),
+            prediction_error_items: Vec::new(),
+            memory_recall_items: Vec::new(),
+            llm_notes: Vec::new(),
+            negative_evidence: Vec::new(),
+        }
+    }
+}
+
+impl AssociationObservation {
+    fn all_items(&self) -> Vec<AssociationItem> {
+        let mut items = self
+            .active_items
+            .iter()
+            .chain(self.outcome_items.iter())
+            .chain(self.prediction_error_items.iter())
+            .chain(self.memory_recall_items.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        items.extend(self.llm_notes.iter().map(|note| {
+            AssociationItem::new(
+                format!("llm-note:{}", stable_slug(note)),
+                AssociationItemKind::LlmNote,
+                0.45,
+            )
+        }));
+        dedupe_association_items(items)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationPrediction {
+    pub source_id: String,
+    pub predicted_id: String,
+    pub relation: AssociationRelation,
+    pub confidence: f32,
+    pub prediction_gain: f32,
+    pub evidence_count: u32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationLearningConfig {
+    pub same_moment_window_ms: u64,
+    pub short_sequence_window_ms: u64,
+    pub long_sequence_window_ms: u64,
+    pub max_recent_observations: usize,
+    pub decay_per_tick: f32,
+    pub min_prediction_gain: f32,
+}
+
+impl Default for AssociationLearningConfig {
+    fn default() -> Self {
+        Self {
+            same_moment_window_ms: 0,
+            short_sequence_window_ms: 2_000,
+            long_sequence_window_ms: 10_000,
+            max_recent_observations: 32,
+            decay_per_tick: 0.025,
+            min_prediction_gain: 0.02,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct AssociationItemStats {
+    present_count: u32,
+    last_seen_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationLearningEngine {
+    pub edges: BTreeMap<String, AssociationEdge>,
+    pub config: AssociationLearningConfig,
+    recent: VecDeque<AssociationObservation>,
+    item_stats: BTreeMap<String, AssociationItemStats>,
+    observation_count: u32,
+}
+
+impl Default for AssociationLearningEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AssociationLearningEngine {
+    pub fn new() -> Self {
+        Self {
+            edges: BTreeMap::new(),
+            config: AssociationLearningConfig::default(),
+            recent: VecDeque::new(),
+            item_stats: BTreeMap::new(),
+            observation_count: 0,
+        }
+    }
+
+    pub fn with_config(config: AssociationLearningConfig) -> Self {
+        Self {
+            edges: BTreeMap::new(),
+            config,
+            recent: VecDeque::new(),
+            item_stats: BTreeMap::new(),
+            observation_count: 0,
+        }
+    }
+
+    pub fn observe(&mut self, observation: AssociationObservation) -> Vec<AssociationEdge> {
+        self.observation_count = self.observation_count.saturating_add(1);
+        let current_items = observation.all_items();
+        for item in &current_items {
+            let stats = self.item_stats.entry(item.id.clone()).or_default();
+            stats.present_count = stats.present_count.saturating_add(1);
+            stats.last_seen_ms = observation.t_ms;
+        }
+
+        self.learn_cooccurrences(&observation, &current_items);
+        self.learn_sequences(&observation, &current_items);
+        self.learn_negative_evidence(&observation);
+
+        self.recent.push_back(observation);
+        while self.recent.len() > self.config.max_recent_observations {
+            self.recent.pop_front();
+        }
+        self.edges.values().cloned().collect()
+    }
+
+    pub fn decay(&mut self, ticks: u64) {
+        let amount = (self.config.decay_per_tick * ticks as f32).clamp(0.0, 0.95);
+        for edge in self.edges.values_mut() {
+            edge.weaken(amount);
+        }
+    }
+
+    pub fn predictions_for(
+        &self,
+        active_ids: &[String],
+        min_confidence: f32,
+        limit: usize,
+    ) -> Vec<AssociationPrediction> {
+        let active = active_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let mut predictions = self
+            .edges
+            .values()
+            .filter(|edge| active.contains(&edge.from_id))
+            .filter(|edge| {
+                matches!(
+                    edge.relation,
+                    AssociationRelation::Predicts
+                        | AssociationRelation::Follows
+                        | AssociationRelation::Enables
+                        | AssociationRelation::Explains
+                )
+            })
+            .filter(|edge| edge.confidence >= min_confidence)
+            .map(|edge| AssociationPrediction {
+                source_id: edge.from_id.clone(),
+                predicted_id: edge.to_id.clone(),
+                relation: edge.relation.clone(),
+                confidence: edge.confidence,
+                prediction_gain: edge.prediction_gain,
+                evidence_count: edge.evidence_count,
+                reason: format!(
+                    "{} {} {} with gain {:.2}",
+                    edge.from_id,
+                    association_relation_slug(&edge.relation),
+                    edge.to_id,
+                    edge.prediction_gain
+                ),
+            })
+            .collect::<Vec<_>>();
+        predictions.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .prediction_gain
+                        .partial_cmp(&left.prediction_gain)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        predictions.truncate(limit);
+        predictions
+    }
+
+    fn learn_cooccurrences(
+        &mut self,
+        observation: &AssociationObservation,
+        current_items: &[AssociationItem],
+    ) {
+        for left_index in 0..current_items.len() {
+            for right_index in (left_index + 1)..current_items.len() {
+                let left = &current_items[left_index];
+                let right = &current_items[right_index];
+                let (from, to) = canonical_association_pair(left, right);
+                self.upsert_association(
+                    from,
+                    to,
+                    AssociationRelation::CoOccursWith,
+                    AssociationExample {
+                        frame_id: observation.frame_id.clone(),
+                        t_ms: observation.t_ms,
+                        reason: "items appeared in the same observation window".to_string(),
+                        score: left.confidence.min(right.confidence),
+                    },
+                );
+            }
+        }
+    }
+
+    fn learn_sequences(
+        &mut self,
+        observation: &AssociationObservation,
+        current_items: &[AssociationItem],
+    ) {
+        let recent = self.recent.iter().cloned().collect::<Vec<_>>();
+        for prior in recent.iter().rev() {
+            let lag_ms = observation.t_ms.saturating_sub(prior.t_ms);
+            if lag_ms > self.config.long_sequence_window_ms {
+                break;
+            }
+            let prior_items = prior.all_items();
+            for from in &prior_items {
+                for to in current_items {
+                    if from.id == to.id {
+                        continue;
+                    }
+                    let relation = sequence_relation(to, lag_ms, &self.config);
+                    self.upsert_association(
+                        &from.id,
+                        &to.id,
+                        relation,
+                        AssociationExample {
+                            frame_id: observation.frame_id.clone(),
+                            t_ms: observation.t_ms,
+                            reason: format!("{} preceded {} by {lag_ms} ms", from.id, to.id),
+                            score: from.confidence.min(to.confidence)
+                                * lag_score_for_association(lag_ms),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn learn_negative_evidence(&mut self, observation: &AssociationObservation) {
+        for item in &observation.negative_evidence {
+            let relation = match item.relation {
+                AssociationRelation::Suppresses
+                | AssociationRelation::Contradicts
+                | AssociationRelation::Prevents => item.relation.clone(),
+                _ => AssociationRelation::Suppresses,
+            };
+            let edge = self.upsert_association(
+                &item.present_id,
+                &item.absent_id,
+                relation.clone(),
+                AssociationExample {
+                    frame_id: observation.frame_id.clone(),
+                    t_ms: observation.t_ms,
+                    reason: item.reason.clone(),
+                    score: item.score.clamp(0.0, 1.0),
+                },
+            );
+            if relation == AssociationRelation::Contradicts {
+                edge.add_contradiction(AssociationExample {
+                    frame_id: observation.frame_id.clone(),
+                    t_ms: observation.t_ms,
+                    reason: item.reason.clone(),
+                    score: item.score.clamp(0.0, 1.0),
+                });
+            }
+        }
+    }
+
+    fn upsert_association(
+        &mut self,
+        from_id: &str,
+        to_id: &str,
+        relation: AssociationRelation,
+        example: AssociationExample,
+    ) -> &mut AssociationEdge {
+        let id = association_edge_id(from_id, to_id, &relation);
+        let prediction_gain =
+            self.prediction_gain_estimate(from_id, to_id, example.score.clamp(0.0, 1.0));
+        let edge = self.edges.entry(id).or_insert_with(|| {
+            AssociationEdge::new(
+                from_id.to_string(),
+                to_id.to_string(),
+                relation,
+                example.clone(),
+            )
+        });
+        edge.strengthen(example, prediction_gain);
+        edge
+    }
+
+    fn prediction_gain_estimate(&self, from_id: &str, to_id: &str, fallback_score: f32) -> f32 {
+        let from_count = self
+            .item_stats
+            .get(from_id)
+            .map(|stats| stats.present_count)
+            .unwrap_or(1)
+            .max(1) as f32;
+        let to_count = self
+            .item_stats
+            .get(to_id)
+            .map(|stats| stats.present_count)
+            .unwrap_or(0) as f32;
+        let total = self.observation_count.max(1) as f32;
+        let edge_count = self
+            .edges
+            .get(&association_edge_id(
+                from_id,
+                to_id,
+                &AssociationRelation::Predicts,
+            ))
+            .or_else(|| {
+                self.edges.get(&association_edge_id(
+                    from_id,
+                    to_id,
+                    &AssociationRelation::Follows,
+                ))
+            })
+            .or_else(|| {
+                self.edges.get(&association_edge_id(
+                    from_id,
+                    to_id,
+                    &AssociationRelation::CoOccursWith,
+                ))
+            })
+            .map(|edge| edge.evidence_count as f32)
+            .unwrap_or(0.0)
+            + 1.0;
+        let p_b = (to_count / total).clamp(0.0, 1.0);
+        let p_b_given_a = (edge_count / from_count).clamp(0.0, 1.0);
+        let gain = (p_b_given_a - p_b).max(0.0);
+        gain.max(approximate_mutual_information(p_b, p_b_given_a))
+            .max(fallback_score * self.config.min_prediction_gain)
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -3995,7 +4550,12 @@ fn cluster_ids_from_observation(
                 candidate.right_cluster_id.clone(),
             ]
         })
-        .chain(observation.clusters.iter().map(|cluster| cluster.id.clone()))
+        .chain(
+            observation
+                .clusters
+                .iter()
+                .map(|cluster| cluster.id.clone()),
+        )
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -4028,9 +4588,9 @@ fn merge_constellation_observation(
     merge_unique(&mut constellation.notes, &observation.llm_notes);
     constellation.last_seen_ms = observation.t_ms;
     constellation.evidence_count = constellation.evidence_count.saturating_add(1);
-    constellation.prediction_value =
-        (constellation.prediction_value * 0.75 + observation.prediction_value * 0.25)
-            .clamp(0.0, 1.0);
+    constellation.prediction_value = (constellation.prediction_value * 0.75
+        + observation.prediction_value * 0.25)
+        .clamp(0.0, 1.0);
     if constellation.kind_hint.is_none() {
         constellation.kind_hint =
             infer_constellation_kind(&observation.clusters).map(|kind| kind.as_str().to_string());
@@ -4056,9 +4616,9 @@ fn refresh_constellation_scores(
             .sum::<f32>()
             / accepted_bindings.len() as f32
     };
-    let recurrence_score =
-        (constellation.evidence_count as f32 / config.min_evidence_for_stable.max(1) as f32)
-            .clamp(0.0, 1.0);
+    let recurrence_score = (constellation.evidence_count as f32
+        / config.min_evidence_for_stable.max(1) as f32)
+        .clamp(0.0, 1.0);
     let cluster_score = (constellation.member_cluster_ids.len() as f32
         / config.min_clusters_for_stable.max(1) as f32)
         .clamp(0.0, 1.0);
@@ -4185,6 +4745,92 @@ where
         }
     }
     target.sort();
+}
+
+fn association_edge_id(from_id: &str, to_id: &str, relation: &AssociationRelation) -> String {
+    format!(
+        "association:{}:{}:{}",
+        association_relation_slug(relation),
+        stable_slug(from_id),
+        stable_slug(to_id)
+    )
+}
+
+fn association_relation_slug(relation: &AssociationRelation) -> &'static str {
+    match relation {
+        AssociationRelation::CoOccursWith => "co-occurs-with",
+        AssociationRelation::Predicts => "predicts",
+        AssociationRelation::Follows => "follows",
+        AssociationRelation::Suppresses => "suppresses",
+        AssociationRelation::Contradicts => "contradicts",
+        AssociationRelation::Explains => "explains",
+        AssociationRelation::Enables => "enables",
+        AssociationRelation::Prevents => "prevents",
+        AssociationRelation::PartOf => "part-of",
+    }
+}
+
+fn dedupe_association_items(items: Vec<AssociationItem>) -> Vec<AssociationItem> {
+    let mut by_id = BTreeMap::<String, AssociationItem>::new();
+    for item in items {
+        by_id
+            .entry(item.id.clone())
+            .and_modify(|existing| {
+                existing.confidence = existing.confidence.max(item.confidence);
+            })
+            .or_insert(item);
+    }
+    by_id.into_values().collect()
+}
+
+fn canonical_association_pair<'a>(
+    left: &'a AssociationItem,
+    right: &'a AssociationItem,
+) -> (&'a str, &'a str) {
+    if left.id <= right.id {
+        (&left.id, &right.id)
+    } else {
+        (&right.id, &left.id)
+    }
+}
+
+fn sequence_relation(
+    to: &AssociationItem,
+    lag_ms: u64,
+    config: &AssociationLearningConfig,
+) -> AssociationRelation {
+    if matches!(
+        to.kind,
+        AssociationItemKind::Outcome
+            | AssociationItemKind::Prediction
+            | AssociationItemKind::Surprise
+            | AssociationItemKind::BodyState
+    ) && lag_ms <= config.long_sequence_window_ms
+    {
+        AssociationRelation::Predicts
+    } else if lag_ms <= config.short_sequence_window_ms {
+        AssociationRelation::Follows
+    } else {
+        AssociationRelation::Follows
+    }
+}
+
+fn lag_score_for_association(lag_ms: u64) -> f32 {
+    match lag_ms {
+        0..=500 => 1.0,
+        501..=2_000 => 0.8,
+        2_001..=10_000 => 0.55,
+        _ => 0.2,
+    }
+}
+
+fn approximate_mutual_information(p_b: f32, p_b_given_a: f32) -> f32 {
+    let p_b = p_b.clamp(0.001, 0.999);
+    let p_b_given_a = p_b_given_a.clamp(0.001, 0.999);
+    if p_b_given_a <= p_b {
+        return 0.0;
+    }
+    (p_b_given_a * (p_b_given_a / p_b).ln()).clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -7202,7 +7848,11 @@ mod tests {
         }
     }
 
-    fn test_cluster(id: &str, kind: DiscoveredClusterKind, modality: Modality) -> DiscoveredCluster {
+    fn test_cluster(
+        id: &str,
+        kind: DiscoveredClusterKind,
+        modality: Modality,
+    ) -> DiscoveredCluster {
         DiscoveredCluster::new(id, modality, kind, 1_000, 0.9)
     }
 
@@ -7234,8 +7884,16 @@ mod tests {
             t_ms,
             clusters: vec![
                 test_cluster("face:travis", DiscoveredClusterKind::Face, Modality::Vision),
-                test_cluster("voice:travis", DiscoveredClusterKind::Voice, Modality::Audio),
-                test_cluster("label:travis", DiscoveredClusterKind::Label, Modality::Language),
+                test_cluster(
+                    "voice:travis",
+                    DiscoveredClusterKind::Voice,
+                    Modality::Audio,
+                ),
+                test_cluster(
+                    "label:travis",
+                    DiscoveredClusterKind::Label,
+                    Modality::Language,
+                ),
             ],
             accepted_bindings: vec![
                 accepted_binding(
@@ -7331,8 +7989,12 @@ mod tests {
             .expect("partial match");
 
         assert!(matched.score >= engine.config.partial_match_threshold);
-        assert!(matched.matched_cluster_ids.contains(&"face:travis".to_string()));
-        assert!(matched.missing_cluster_ids.contains(&"label:travis".to_string()));
+        assert!(matched
+            .matched_cluster_ids
+            .contains(&"face:travis".to_string()));
+        assert!(matched
+            .missing_cluster_ids
+            .contains(&"label:travis".to_string()));
     }
 
     #[test]
@@ -7424,7 +8086,11 @@ mod tests {
             .observe(ConstellationObservation {
                 t_ms: 1_000,
                 clusters: vec![
-                    test_cluster("object:patch", DiscoveredClusterKind::Object, Modality::Vision),
+                    test_cluster(
+                        "object:patch",
+                        DiscoveredClusterKind::Object,
+                        Modality::Vision,
+                    ),
                     test_cluster(
                         "geometry:blob",
                         DiscoveredClusterKind::Geometry,
@@ -7440,6 +8106,133 @@ mod tests {
 
         assert_eq!(constellation.state, ConstellationState::SplitNeeded);
         assert!(constellation.confidence < 0.9);
+    }
+
+    fn association_item(id: &str, kind: AssociationItemKind, confidence: f32) -> AssociationItem {
+        AssociationItem::new(id, kind, confidence)
+    }
+
+    #[test]
+    fn repeated_cooccurrence_creates_association() {
+        let mut engine = AssociationLearningEngine::new();
+        for t_ms in [1_000, 1_100, 1_200] {
+            engine.observe(AssociationObservation {
+                t_ms,
+                active_items: vec![
+                    association_item("cluster:face:travis", AssociationItemKind::Cluster, 0.9),
+                    association_item("cluster:voice:travis", AssociationItemKind::Cluster, 0.85),
+                ],
+                ..AssociationObservation::default()
+            });
+        }
+
+        let id = association_edge_id(
+            "cluster:face:travis",
+            "cluster:voice:travis",
+            &AssociationRelation::CoOccursWith,
+        );
+        let edge = engine.edges.get(&id).expect("co-occurrence edge");
+        assert_eq!(edge.relation, AssociationRelation::CoOccursWith);
+        assert_eq!(edge.evidence_count, 3);
+        assert!(edge.confidence > 0.4);
+    }
+
+    #[test]
+    fn repeated_sequence_creates_predicts_or_follows() {
+        let mut engine = AssociationLearningEngine::new();
+        for base in [1_000, 3_000, 5_000] {
+            engine.observe(AssociationObservation {
+                t_ms: base,
+                active_items: vec![association_item(
+                    "action:forward",
+                    AssociationItemKind::Action,
+                    0.9,
+                )],
+                ..AssociationObservation::default()
+            });
+            engine.observe(AssociationObservation {
+                t_ms: base + 300,
+                outcome_items: vec![association_item(
+                    "outcome:no-movement",
+                    AssociationItemKind::Outcome,
+                    0.95,
+                )],
+                ..AssociationObservation::default()
+            });
+        }
+
+        let id = association_edge_id(
+            "action:forward",
+            "outcome:no-movement",
+            &AssociationRelation::Predicts,
+        );
+        let edge = engine.edges.get(&id).expect("prediction edge");
+        assert_eq!(edge.relation, AssociationRelation::Predicts);
+        assert!(edge.evidence_count >= 3);
+        assert!(edge.prediction_gain > 0.0);
+
+        let predictions = engine.predictions_for(&["action:forward".to_string()], 0.1, 3);
+        assert!(predictions
+            .iter()
+            .any(|prediction| prediction.predicted_id == "outcome:no-movement"));
+    }
+
+    #[test]
+    fn association_confidence_increases_with_evidence() {
+        let mut engine = AssociationLearningEngine::new();
+        engine.observe(AssociationObservation {
+            t_ms: 1_000,
+            active_items: vec![
+                association_item("place:charger", AssociationItemKind::Constellation, 0.8),
+                association_item("body:charging", AssociationItemKind::BodyState, 0.8),
+            ],
+            ..AssociationObservation::default()
+        });
+        let id = association_edge_id(
+            "body:charging",
+            "place:charger",
+            &AssociationRelation::CoOccursWith,
+        );
+        let first_confidence = engine.edges.get(&id).unwrap().confidence;
+
+        for t_ms in [1_500, 2_000, 2_500] {
+            engine.observe(AssociationObservation {
+                t_ms,
+                active_items: vec![
+                    association_item("place:charger", AssociationItemKind::Constellation, 0.9),
+                    association_item("body:charging", AssociationItemKind::BodyState, 0.9),
+                ],
+                ..AssociationObservation::default()
+            });
+        }
+        let later_confidence = engine.edges.get(&id).unwrap().confidence;
+
+        assert!(later_confidence > first_confidence);
+        assert_eq!(engine.edges.get(&id).unwrap().evidence_count, 4);
+    }
+
+    #[test]
+    fn association_decays_without_evidence() {
+        let mut engine = AssociationLearningEngine::new();
+        engine.observe(AssociationObservation {
+            t_ms: 1_000,
+            active_items: vec![
+                association_item("plane:wall", AssociationItemKind::Cluster, 0.9),
+                association_item("action:forward-unsafe", AssociationItemKind::Outcome, 0.9),
+            ],
+            ..AssociationObservation::default()
+        });
+        let id = association_edge_id(
+            "action:forward-unsafe",
+            "plane:wall",
+            &AssociationRelation::CoOccursWith,
+        );
+        let before = engine.edges.get(&id).unwrap().confidence;
+        engine.decay(10);
+        let after = engine.edges.get(&id).unwrap().confidence;
+
+        assert!(after < before);
+        assert!(after > 0.0);
     }
 
     #[tokio::test]
