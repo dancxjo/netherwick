@@ -1645,6 +1645,400 @@ pub struct EntityConstellation {
     pub split_entity_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstellationKind {
+    Person,
+    Place,
+    Object,
+    Episode,
+    Affordance,
+    RiskPattern,
+    ActionOutcome,
+    #[default]
+    Unknown,
+}
+
+impl ConstellationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Place => "place",
+            Self::Object => "object",
+            Self::Episode => "episode",
+            Self::Affordance => "affordance",
+            Self::RiskPattern => "risk_pattern",
+            Self::ActionOutcome => "action_outcome",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstellationState {
+    #[default]
+    Candidate,
+    Stable,
+    Ambiguous,
+    SplitNeeded,
+    MergeNeeded,
+    Retired,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Constellation {
+    pub id: String,
+    pub kind_hint: Option<String>,
+    #[serde(default)]
+    pub member_cluster_ids: Vec<String>,
+    #[serde(default)]
+    pub member_binding_ids: Vec<String>,
+    #[serde(default)]
+    pub supporting_feature_ids: Vec<FeatureId>,
+    #[serde(default)]
+    pub supporting_entity_ids: Vec<String>,
+    #[serde(default)]
+    pub supporting_place_cells: Vec<PlaceCellKey>,
+    pub confidence: f32,
+    pub stability: f32,
+    pub prediction_value: f32,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    pub evidence_count: u32,
+    pub state: ConstellationState,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConstellationObservation {
+    pub t_ms: u64,
+    #[serde(default)]
+    pub clusters: Vec<DiscoveredCluster>,
+    #[serde(default)]
+    pub accepted_bindings: Vec<BindingCandidate>,
+    #[serde(default)]
+    pub active_entity_ids: Vec<String>,
+    #[serde(default)]
+    pub place_cells: Vec<PlaceCellKey>,
+    #[serde(default)]
+    pub action_outcome_ids: Vec<String>,
+    #[serde(default)]
+    pub prediction_error_ids: Vec<String>,
+    pub prediction_value: f32,
+    #[serde(default)]
+    pub llm_notes: Vec<String>,
+}
+
+impl Default for ConstellationObservation {
+    fn default() -> Self {
+        Self {
+            t_ms: 0,
+            clusters: Vec::new(),
+            accepted_bindings: Vec::new(),
+            active_entity_ids: Vec::new(),
+            place_cells: Vec::new(),
+            action_outcome_ids: Vec::new(),
+            prediction_error_ids: Vec::new(),
+            prediction_value: 0.0,
+            llm_notes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConstellationQuery {
+    pub t_ms: u64,
+    #[serde(default)]
+    pub cluster_ids: Vec<String>,
+    #[serde(default)]
+    pub binding_ids: Vec<String>,
+    #[serde(default)]
+    pub feature_ids: Vec<FeatureId>,
+    #[serde(default)]
+    pub entity_ids: Vec<String>,
+    #[serde(default)]
+    pub place_cells: Vec<PlaceCellKey>,
+    #[serde(default)]
+    pub contradiction_ids: Vec<String>,
+}
+
+impl ConstellationQuery {
+    pub fn from_observation(observation: &ConstellationObservation) -> Self {
+        Self {
+            t_ms: observation.t_ms,
+            cluster_ids: observation.clusters.iter().map(|cluster| cluster.id.clone()).collect(),
+            binding_ids: observation
+                .accepted_bindings
+                .iter()
+                .filter(|candidate| candidate.decision == BindingDecision::Accept)
+                .map(binding_candidate_id)
+                .collect(),
+            feature_ids: observation
+                .clusters
+                .iter()
+                .flat_map(|cluster| cluster.feature_ids.iter().copied())
+                .collect(),
+            entity_ids: observation.active_entity_ids.clone(),
+            place_cells: observation.place_cells.clone(),
+            contradiction_ids: observation
+                .accepted_bindings
+                .iter()
+                .filter(|candidate| binding_has_conflict(candidate))
+                .map(binding_candidate_id)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConstellationMatch {
+    pub constellation_id: String,
+    pub score: f32,
+    pub matched_cluster_ids: Vec<String>,
+    pub matched_binding_ids: Vec<String>,
+    pub missing_cluster_ids: Vec<String>,
+    pub stale_penalty: f32,
+    pub contradiction_penalty: f32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConstellationEngineConfig {
+    pub promotion_confidence_threshold: f32,
+    pub min_evidence_for_stable: u32,
+    pub min_clusters_for_stable: usize,
+    pub min_bindings_for_stable: usize,
+    pub min_prediction_value_for_stable: f32,
+    pub partial_match_threshold: f32,
+    pub stale_after_ms: u64,
+}
+
+impl Default for ConstellationEngineConfig {
+    fn default() -> Self {
+        Self {
+            promotion_confidence_threshold: 0.68,
+            min_evidence_for_stable: 3,
+            min_clusters_for_stable: 2,
+            min_bindings_for_stable: 2,
+            min_prediction_value_for_stable: 0.1,
+            partial_match_threshold: 0.35,
+            stale_after_ms: 60_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConstellationEngine {
+    pub constellations: BTreeMap<String, Constellation>,
+    pub config: ConstellationEngineConfig,
+    next_id: u64,
+}
+
+impl Default for ConstellationEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConstellationEngine {
+    pub fn new() -> Self {
+        Self {
+            constellations: BTreeMap::new(),
+            config: ConstellationEngineConfig::default(),
+            next_id: 1,
+        }
+    }
+
+    pub fn with_config(config: ConstellationEngineConfig) -> Self {
+        Self {
+            constellations: BTreeMap::new(),
+            config,
+            next_id: 1,
+        }
+    }
+
+    pub fn observe(&mut self, observation: ConstellationObservation) -> Option<Constellation> {
+        let accepted_bindings = observation
+            .accepted_bindings
+            .iter()
+            .filter(|candidate| candidate.decision == BindingDecision::Accept)
+            .collect::<Vec<_>>();
+        let member_cluster_ids = cluster_ids_from_observation(&observation, &accepted_bindings);
+        let member_binding_ids = accepted_bindings
+            .iter()
+            .map(|candidate| binding_candidate_id(candidate))
+            .collect::<Vec<_>>();
+        if member_cluster_ids.len() < 2 || member_binding_ids.is_empty() {
+            return None;
+        }
+
+        let query = ConstellationQuery::from_observation(&observation);
+        let match_id = self
+            .best_match(&query)
+            .filter(|matched| matched.score >= self.config.partial_match_threshold)
+            .map(|matched| matched.constellation_id);
+
+        let id = if let Some(id) = match_id {
+            id
+        } else {
+            self.allocate_constellation_id(&member_cluster_ids)
+        };
+        if let Some(existing) = self.constellations.get_mut(&id) {
+            merge_constellation_observation(
+                existing,
+                &observation,
+                &member_cluster_ids,
+                &member_binding_ids,
+            );
+        } else {
+            let constellation = Constellation {
+                id: id.clone(),
+                kind_hint: infer_constellation_kind(&observation.clusters)
+                    .map(|kind| kind.as_str().to_string()),
+                member_cluster_ids,
+                member_binding_ids,
+                supporting_feature_ids: query.feature_ids,
+                supporting_entity_ids: observation.active_entity_ids.clone(),
+                supporting_place_cells: observation.place_cells.clone(),
+                confidence: 0.0,
+                stability: 0.0,
+                prediction_value: observation.prediction_value.clamp(0.0, 1.0),
+                first_seen_ms: observation.t_ms,
+                last_seen_ms: observation.t_ms,
+                evidence_count: 1,
+                state: ConstellationState::Candidate,
+                notes: observation.llm_notes.clone(),
+            };
+            self.constellations.insert(id.clone(), constellation);
+        }
+
+        let config = self.config.clone();
+        let constellation = self.constellations.get_mut(&id)?;
+        refresh_constellation_scores(constellation, &observation, &config);
+        Some(constellation.clone())
+    }
+
+    pub fn best_match(&self, query: &ConstellationQuery) -> Option<ConstellationMatch> {
+        self.matches(query, 1).into_iter().next()
+    }
+
+    pub fn matches(&self, query: &ConstellationQuery, limit: usize) -> Vec<ConstellationMatch> {
+        let mut matches = self
+            .constellations
+            .values()
+            .filter(|constellation| constellation.state != ConstellationState::Retired)
+            .filter_map(|constellation| self.score_match(constellation, query))
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matches.truncate(limit);
+        matches
+    }
+
+    fn score_match(
+        &self,
+        constellation: &Constellation,
+        query: &ConstellationQuery,
+    ) -> Option<ConstellationMatch> {
+        let constellation_clusters = constellation
+            .member_cluster_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let query_clusters = query.cluster_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let matched_cluster_ids = constellation_clusters
+            .intersection(&query_clusters)
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing_cluster_ids = constellation_clusters
+            .difference(&query_clusters)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let constellation_bindings = constellation
+            .member_binding_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let query_bindings = query.binding_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let matched_binding_ids = constellation_bindings
+            .intersection(&query_bindings)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let cluster_score =
+            overlap_score(matched_cluster_ids.len(), constellation.member_cluster_ids.len());
+        let binding_score =
+            overlap_score(matched_binding_ids.len(), constellation.member_binding_ids.len());
+        let feature_score = overlap_score(
+            intersection_count(&constellation.supporting_feature_ids, &query.feature_ids),
+            constellation.supporting_feature_ids.len(),
+        );
+        let entity_score = overlap_score(
+            intersection_count(&constellation.supporting_entity_ids, &query.entity_ids),
+            constellation.supporting_entity_ids.len(),
+        );
+        let place_score = overlap_score(
+            intersection_count(&constellation.supporting_place_cells, &query.place_cells),
+            constellation.supporting_place_cells.len(),
+        );
+
+        let evidence_score = cluster_score * 0.45
+            + binding_score * 0.3
+            + place_score * 0.1
+            + entity_score * 0.08
+            + feature_score * 0.07;
+        if evidence_score <= 0.0 {
+            return None;
+        }
+
+        let stale_penalty = stale_penalty(
+            query.t_ms.saturating_sub(constellation.last_seen_ms),
+            self.config.stale_after_ms,
+        );
+        let contradiction_penalty = overlap_score(
+            intersection_count(&constellation.member_binding_ids, &query.contradiction_ids),
+            constellation.member_binding_ids.len(),
+        ) * 0.45;
+        let score =
+            (evidence_score * (1.0 - stale_penalty) * (1.0 - contradiction_penalty)).clamp(0.0, 1.0);
+        let reason = if matched_binding_ids.is_empty() && !matched_cluster_ids.is_empty() {
+            "partial cluster match without all known bindings".to_string()
+        } else if !missing_cluster_ids.is_empty() {
+            "partial match with missing modalities".to_string()
+        } else {
+            "constellation evidence matches query".to_string()
+        };
+        Some(ConstellationMatch {
+            constellation_id: constellation.id.clone(),
+            score,
+            matched_cluster_ids,
+            matched_binding_ids,
+            missing_cluster_ids,
+            stale_penalty,
+            contradiction_penalty,
+            reason,
+        })
+    }
+
+    fn allocate_constellation_id(&mut self, cluster_ids: &[String]) -> String {
+        let first = cluster_ids
+            .first()
+            .map(|id| stable_slug(id))
+            .filter(|slug| !slug.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let id = format!("constellation:{}:{}", self.next_id, first);
+        self.next_id = self.next_id.saturating_add(1);
+        id
+    }
+}
+
 /// A provisional, persistent record of an observed entity.
 ///
 /// Entities begin as thin hypotheses from a single detection and grow stronger
@@ -3587,6 +3981,210 @@ fn score_hypothesis_evidence(evidence: &[BindingEvidence], repeated_observations
     }
     score -= contradiction_count * 0.18;
     score.clamp(0.0, 1.0)
+}
+
+fn cluster_ids_from_observation(
+    observation: &ConstellationObservation,
+    accepted_bindings: &[&BindingCandidate],
+) -> Vec<String> {
+    let mut ids = accepted_bindings
+        .iter()
+        .flat_map(|candidate| {
+            [
+                candidate.left_cluster_id.clone(),
+                candidate.right_cluster_id.clone(),
+            ]
+        })
+        .chain(observation.clusters.iter().map(|cluster| cluster.id.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn merge_constellation_observation(
+    constellation: &mut Constellation,
+    observation: &ConstellationObservation,
+    member_cluster_ids: &[String],
+    member_binding_ids: &[String],
+) {
+    merge_unique(&mut constellation.member_cluster_ids, member_cluster_ids);
+    merge_unique(&mut constellation.member_binding_ids, member_binding_ids);
+    let feature_ids = observation
+        .clusters
+        .iter()
+        .flat_map(|cluster| cluster.feature_ids.iter().copied())
+        .collect::<Vec<_>>();
+    merge_unique(&mut constellation.supporting_feature_ids, &feature_ids);
+    merge_unique(
+        &mut constellation.supporting_entity_ids,
+        &observation.active_entity_ids,
+    );
+    merge_unique(
+        &mut constellation.supporting_place_cells,
+        &observation.place_cells,
+    );
+    merge_unique(&mut constellation.notes, &observation.llm_notes);
+    constellation.last_seen_ms = observation.t_ms;
+    constellation.evidence_count = constellation.evidence_count.saturating_add(1);
+    constellation.prediction_value =
+        (constellation.prediction_value * 0.75 + observation.prediction_value * 0.25)
+            .clamp(0.0, 1.0);
+    if constellation.kind_hint.is_none() {
+        constellation.kind_hint =
+            infer_constellation_kind(&observation.clusters).map(|kind| kind.as_str().to_string());
+    }
+}
+
+fn refresh_constellation_scores(
+    constellation: &mut Constellation,
+    observation: &ConstellationObservation,
+    config: &ConstellationEngineConfig,
+) {
+    let accepted_bindings = observation
+        .accepted_bindings
+        .iter()
+        .filter(|candidate| candidate.decision == BindingDecision::Accept)
+        .collect::<Vec<_>>();
+    let positive_binding_score = if accepted_bindings.is_empty() {
+        0.0
+    } else {
+        accepted_bindings
+            .iter()
+            .map(|candidate| candidate.confidence.clamp(0.0, 1.0))
+            .sum::<f32>()
+            / accepted_bindings.len() as f32
+    };
+    let recurrence_score =
+        (constellation.evidence_count as f32 / config.min_evidence_for_stable.max(1) as f32)
+            .clamp(0.0, 1.0);
+    let cluster_score = (constellation.member_cluster_ids.len() as f32
+        / config.min_clusters_for_stable.max(1) as f32)
+        .clamp(0.0, 1.0);
+    let binding_score = (constellation.member_binding_ids.len() as f32
+        / config.min_bindings_for_stable.max(1) as f32)
+        .clamp(0.0, 1.0);
+    let contradiction_count = observation
+        .accepted_bindings
+        .iter()
+        .filter(|candidate| binding_has_conflict(candidate))
+        .count();
+    let contradiction_penalty = (contradiction_count as f32 * 0.25).min(0.65);
+
+    constellation.stability =
+        (recurrence_score * 0.5 + binding_score * 0.3 + cluster_score * 0.2).clamp(0.0, 1.0);
+    constellation.confidence = (positive_binding_score * 0.45
+        + constellation.stability * 0.35
+        + constellation.prediction_value * 0.2
+        - contradiction_penalty)
+        .clamp(0.0, 1.0);
+
+    if evidence_suggests_split(observation) {
+        constellation.state = ConstellationState::SplitNeeded;
+        return;
+    }
+    if contradiction_count > 0 {
+        constellation.state = ConstellationState::Ambiguous;
+        return;
+    }
+    let promotable = constellation.member_cluster_ids.len() >= config.min_clusters_for_stable
+        && constellation.member_binding_ids.len() >= config.min_bindings_for_stable
+        && constellation.evidence_count >= config.min_evidence_for_stable
+        && constellation.confidence >= config.promotion_confidence_threshold
+        && constellation.prediction_value >= config.min_prediction_value_for_stable;
+    constellation.state = if promotable {
+        ConstellationState::Stable
+    } else {
+        ConstellationState::Candidate
+    };
+}
+
+fn binding_has_conflict(candidate: &BindingCandidate) -> bool {
+    candidate.evidence.iter().any(|evidence| {
+        matches!(
+            evidence.kind,
+            BindingEvidenceKind::Contradiction | BindingEvidenceKind::SimultaneousConflict
+        )
+    })
+}
+
+fn evidence_suggests_split(observation: &ConstellationObservation) -> bool {
+    observation.accepted_bindings.iter().any(|candidate| {
+        candidate
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::SimultaneousConflict)
+    }) || observation.llm_notes.iter().any(|note| {
+        let note = note.to_ascii_lowercase();
+        note.contains("split")
+            || note.contains("fused")
+            || note.contains("fusion")
+            || note.contains("two patterns")
+    })
+}
+
+fn infer_constellation_kind(clusters: &[DiscoveredCluster]) -> Option<ConstellationKind> {
+    let kinds = clusters
+        .iter()
+        .map(|cluster| cluster.kind.clone())
+        .collect::<BTreeSet<_>>();
+    if kinds.contains(&DiscoveredClusterKind::Face) || kinds.contains(&DiscoveredClusterKind::Voice)
+    {
+        Some(ConstellationKind::Person)
+    } else if kinds.contains(&DiscoveredClusterKind::Action)
+        || kinds.contains(&DiscoveredClusterKind::Outcome)
+        || kinds.contains(&DiscoveredClusterKind::BodyState)
+    {
+        Some(ConstellationKind::ActionOutcome)
+    } else if kinds.contains(&DiscoveredClusterKind::Place) {
+        Some(ConstellationKind::Place)
+    } else if kinds.contains(&DiscoveredClusterKind::Object)
+        || kinds.contains(&DiscoveredClusterKind::Geometry)
+        || kinds.contains(&DiscoveredClusterKind::RgbImage)
+    {
+        Some(ConstellationKind::Object)
+    } else {
+        None
+    }
+}
+
+fn overlap_score(matched: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (matched as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn stale_penalty(age_ms: u64, stale_after_ms: u64) -> f32 {
+    if stale_after_ms == 0 || age_ms <= stale_after_ms {
+        0.0
+    } else {
+        ((age_ms - stale_after_ms) as f32 / (stale_after_ms * 4) as f32).clamp(0.0, 0.6)
+    }
+}
+
+fn intersection_count<T>(left: &[T], right: &[T]) -> usize
+where
+    T: Ord + Clone,
+{
+    let left = left.iter().cloned().collect::<BTreeSet<_>>();
+    let right = right.iter().cloned().collect::<BTreeSet<_>>();
+    left.intersection(&right).count()
+}
+
+fn merge_unique<T>(target: &mut Vec<T>, incoming: &[T])
+where
+    T: Ord + Clone,
+{
+    let mut seen = target.iter().cloned().collect::<BTreeSet<_>>();
+    for item in incoming {
+        if seen.insert(item.clone()) {
+            target.push(item.clone());
+        }
+    }
+    target.sort();
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -6602,6 +7200,246 @@ mod tests {
             counterfactuals: Vec::new(),
             notes: vec!["saw a familiar person".to_string()],
         }
+    }
+
+    fn test_cluster(id: &str, kind: DiscoveredClusterKind, modality: Modality) -> DiscoveredCluster {
+        DiscoveredCluster::new(id, modality, kind, 1_000, 0.9)
+    }
+
+    fn accepted_binding(left: &str, right: &str, relation: BindingRelation) -> BindingCandidate {
+        BindingCandidate {
+            left_cluster_id: left.to_string(),
+            right_cluster_id: right.to_string(),
+            relation,
+            evidence: vec![
+                BindingEvidence {
+                    kind: BindingEvidenceKind::TemporalOverlap,
+                    score: 0.9,
+                    reason: "test temporal support".to_string(),
+                },
+                BindingEvidence {
+                    kind: BindingEvidenceKind::RepeatedCooccurrence,
+                    score: 0.85,
+                    reason: "test repeated support".to_string(),
+                },
+            ],
+            confidence: 0.9,
+            decision: BindingDecision::Accept,
+            reason: "test accepted binding".to_string(),
+        }
+    }
+
+    fn person_constellation_observation(t_ms: u64) -> ConstellationObservation {
+        ConstellationObservation {
+            t_ms,
+            clusters: vec![
+                test_cluster("face:travis", DiscoveredClusterKind::Face, Modality::Vision),
+                test_cluster("voice:travis", DiscoveredClusterKind::Voice, Modality::Audio),
+                test_cluster("label:travis", DiscoveredClusterKind::Label, Modality::Language),
+            ],
+            accepted_bindings: vec![
+                accepted_binding(
+                    "face:travis",
+                    "voice:travis",
+                    BindingRelation::LikelySameEntity,
+                ),
+                accepted_binding("face:travis", "label:travis", BindingRelation::NamedBy),
+            ],
+            active_entity_ids: vec!["entity:person:travis".to_string()],
+            place_cells: vec![PlaceCellKey { x: 2, y: -1 }],
+            prediction_value: 0.65,
+            ..ConstellationObservation::default()
+        }
+    }
+
+    #[test]
+    fn repeated_accepted_bindings_form_candidate_constellation() {
+        let mut engine = ConstellationEngine::new();
+        let constellation = engine
+            .observe(ConstellationObservation {
+                t_ms: 1_000,
+                clusters: vec![
+                    test_cluster("face:a", DiscoveredClusterKind::Face, Modality::Vision),
+                    test_cluster("voice:a", DiscoveredClusterKind::Voice, Modality::Audio),
+                ],
+                accepted_bindings: vec![accepted_binding(
+                    "face:a",
+                    "voice:a",
+                    BindingRelation::LikelySameEntity,
+                )],
+                prediction_value: 0.4,
+                ..ConstellationObservation::default()
+            })
+            .expect("candidate");
+
+        assert_eq!(constellation.state, ConstellationState::Candidate);
+        assert_eq!(constellation.member_cluster_ids.len(), 2);
+        assert_eq!(constellation.member_binding_ids.len(), 1);
+    }
+
+    #[test]
+    fn candidate_becomes_stable_only_after_repeated_evidence() {
+        let mut engine = ConstellationEngine::new();
+        let first = engine
+            .observe(person_constellation_observation(1_000))
+            .expect("first candidate");
+        assert_eq!(first.state, ConstellationState::Candidate);
+
+        engine.observe(person_constellation_observation(2_000));
+        let stable = engine
+            .observe(person_constellation_observation(3_000))
+            .expect("stable constellation");
+
+        assert_eq!(stable.state, ConstellationState::Stable);
+        assert!(stable.confidence >= engine.config.promotion_confidence_threshold);
+        assert_eq!(stable.evidence_count, 3);
+    }
+
+    #[test]
+    fn constellation_is_not_promoted_from_one_strong_cluster_alone() {
+        let mut engine = ConstellationEngine::new();
+        for t_ms in [1_000, 2_000, 3_000, 4_000] {
+            let admitted = engine.observe(ConstellationObservation {
+                t_ms,
+                clusters: vec![test_cluster(
+                    "face:solo",
+                    DiscoveredClusterKind::Face,
+                    Modality::Vision,
+                )],
+                prediction_value: 1.0,
+                ..ConstellationObservation::default()
+            });
+            assert!(admitted.is_none());
+        }
+        assert!(engine.constellations.is_empty());
+    }
+
+    #[test]
+    fn partial_match_retrieves_known_constellation() {
+        let mut engine = ConstellationEngine::new();
+        for t_ms in [1_000, 2_000, 3_000] {
+            engine.observe(person_constellation_observation(t_ms));
+        }
+
+        let matched = engine
+            .best_match(&ConstellationQuery {
+                t_ms: 4_000,
+                cluster_ids: vec!["face:travis".to_string(), "voice:travis".to_string()],
+                place_cells: vec![PlaceCellKey { x: 2, y: -1 }],
+                ..ConstellationQuery::default()
+            })
+            .expect("partial match");
+
+        assert!(matched.score >= engine.config.partial_match_threshold);
+        assert!(matched.matched_cluster_ids.contains(&"face:travis".to_string()));
+        assert!(matched.missing_cluster_ids.contains(&"label:travis".to_string()));
+    }
+
+    #[test]
+    fn missing_modality_does_not_destroy_match() {
+        let mut engine = ConstellationEngine::new();
+        for t_ms in [1_000, 2_000, 3_000] {
+            engine.observe(person_constellation_observation(t_ms));
+        }
+
+        let full = engine
+            .best_match(&ConstellationQuery {
+                t_ms: 4_000,
+                cluster_ids: vec![
+                    "face:travis".to_string(),
+                    "voice:travis".to_string(),
+                    "label:travis".to_string(),
+                ],
+                place_cells: vec![PlaceCellKey { x: 2, y: -1 }],
+                ..ConstellationQuery::default()
+            })
+            .expect("full match");
+        let partial = engine
+            .best_match(&ConstellationQuery {
+                t_ms: 4_000,
+                cluster_ids: vec!["face:travis".to_string(), "voice:travis".to_string()],
+                place_cells: vec![PlaceCellKey { x: 2, y: -1 }],
+                ..ConstellationQuery::default()
+            })
+            .expect("partial match");
+
+        assert!(partial.score > 0.0);
+        assert!(partial.score < full.score);
+        assert!(partial.score >= engine.config.partial_match_threshold);
+    }
+
+    #[test]
+    fn contradiction_lowers_confidence() {
+        let mut engine = ConstellationEngine::new();
+        for t_ms in [1_000, 2_000, 3_000] {
+            engine.observe(person_constellation_observation(t_ms));
+        }
+        let known_binding_id = engine
+            .constellations
+            .values()
+            .next()
+            .unwrap()
+            .member_binding_ids
+            .first()
+            .cloned()
+            .unwrap();
+
+        let clean = engine
+            .best_match(&ConstellationQuery {
+                t_ms: 4_000,
+                cluster_ids: vec!["face:travis".to_string(), "voice:travis".to_string()],
+                binding_ids: vec![known_binding_id.clone()],
+                ..ConstellationQuery::default()
+            })
+            .expect("clean match");
+        let contradicted = engine
+            .best_match(&ConstellationQuery {
+                t_ms: 4_000,
+                cluster_ids: vec!["face:travis".to_string(), "voice:travis".to_string()],
+                binding_ids: vec![known_binding_id.clone()],
+                contradiction_ids: vec![known_binding_id],
+                ..ConstellationQuery::default()
+            })
+            .expect("contradicted match");
+
+        assert!(contradicted.score < clean.score);
+        assert!(contradicted.contradiction_penalty > 0.0);
+    }
+
+    #[test]
+    fn split_needed_state_appears_when_evidence_suggests_fusion() {
+        let mut engine = ConstellationEngine::new();
+        let mut binding = accepted_binding(
+            "object:patch",
+            "geometry:blob",
+            BindingRelation::CooccursInEstimatedSpace,
+        );
+        binding.evidence.push(BindingEvidence {
+            kind: BindingEvidenceKind::SimultaneousConflict,
+            score: 0.8,
+            reason: "two object tracks may have fused".to_string(),
+        });
+
+        let constellation = engine
+            .observe(ConstellationObservation {
+                t_ms: 1_000,
+                clusters: vec![
+                    test_cluster("object:patch", DiscoveredClusterKind::Object, Modality::Vision),
+                    test_cluster(
+                        "geometry:blob",
+                        DiscoveredClusterKind::Geometry,
+                        Modality::Depth,
+                    ),
+                ],
+                accepted_bindings: vec![binding],
+                prediction_value: 0.4,
+                llm_notes: vec!["this may be two fused patterns".to_string()],
+                ..ConstellationObservation::default()
+            })
+            .expect("split-needed constellation");
+
+        assert_eq!(constellation.state, ConstellationState::SplitNeeded);
+        assert!(constellation.confidence < 0.9);
     }
 
     #[tokio::test]
