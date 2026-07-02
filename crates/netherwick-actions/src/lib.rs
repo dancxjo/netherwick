@@ -116,6 +116,9 @@ pub enum ReignCommand {
     Speak {
         text: String,
     },
+    Chirp {
+        pattern: ChirpPattern,
+    },
     SetMode {
         mode: ReignMode,
     },
@@ -132,6 +135,7 @@ impl ReignCommand {
             Self::Dock | Self::Explore { .. } | Self::Approach { .. } => 5_000,
             Self::Inspect { .. } => 5_000,
             Self::Speak { .. } => 10_000,
+            Self::Chirp { .. } => 2_000,
             Self::SetMode { .. } => 2_000,
         }
     }
@@ -183,6 +187,9 @@ impl ReignCommand {
                 duration_ms: *duration_ms,
             }),
             Self::Speak { text } => Some(ActionPrimitive::Speak { text: text.clone() }),
+            Self::Chirp { pattern } => Some(ActionPrimitive::Chirp {
+                pattern: pattern.clone(),
+            }),
             Self::SetMode { .. } => None,
         }
     }

@@ -5229,7 +5229,7 @@ async fn post_reign_command(
     let source = request.source.unwrap_or(ReignSource::WebRemote);
     let mut command = sanitize_command(request.command)?;
     let mut ttl_ms = request.ttl_ms.unwrap_or_else(|| command.default_ttl_ms());
-    if state.hardware_control_status(now_ms).available {
+    if state.hardware_control_status(now_ms).available && hardware_gate_applies_to_command(&command) {
         command = sanitize_hardware_command(command)?;
         ttl_ms = ttl_ms.clamp(HARDWARE_TTL_MIN_MS, HARDWARE_TTL_MAX_MS);
         enforce_hardware_command_gate(&state, &source, &request.mode, &command, now_ms)?;
@@ -5457,8 +5457,20 @@ fn sanitize_command(command: ReignCommand) -> Result<ReignCommand, ReignApiError
                 text: text.chars().take(500).collect(),
             }
         }
+        ReignCommand::Chirp { pattern } => ReignCommand::Chirp { pattern },
         other => other,
     })
+}
+
+fn hardware_gate_applies_to_command(command: &ReignCommand) -> bool {
+    matches!(
+        command,
+        ReignCommand::Stop
+            | ReignCommand::Go { .. }
+            | ReignCommand::Reverse { .. }
+            | ReignCommand::Drive { .. }
+            | ReignCommand::Turn { .. }
+    )
 }
 
 fn sanitize_hardware_command(command: ReignCommand) -> Result<ReignCommand, ReignApiError> {
@@ -5592,6 +5604,9 @@ button.stop{background:#b00020;color:white}
 <button onclick="send({type:'Dock'},5000)">Dock</button>
 <button onclick="send({type:'Explore',duration_ms:3000},5000)">Explore</button>
 <input id="say" placeholder="Speak text"><button onclick="speak()">Speak</button>
+<button onclick="chirp('Confirm')">Chirp Confirm</button>
+<button onclick="chirp('Warning')">Chirp Warning</button>
+<button onclick="chirp('Curious')">Chirp Curious</button>
 <pre id="latest">loading...</pre>
 <script>
 async function send(command, ttl_ms){
@@ -5599,6 +5614,7 @@ async function send(command, ttl_ms){
   refresh();
 }
 function speak(){ const text = say.value.trim(); if(text) send({type:'Speak',text},10000); }
+function chirp(pattern){ send({type:'Chirp',pattern},2000); }
 async function refresh(){ latest.textContent = JSON.stringify(await (await fetch('/reign/state')).json(), null, 2); }
 addEventListener('keydown', e => {
   if(e.repeat) return;
@@ -6133,6 +6149,12 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .reign-buttons button{min-height:34px;border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer}
 .reign-buttons button:hover,.reign-buttons button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
 .reign-buttons .stop{background:#5b1720;border-color:#9a3443;color:#fff}
+.reign-voice{display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center}
+.reign-voice input{min-width:0;background:#111820;border:1px solid #33414d;color:#e7eef5;border-radius:4px;padding:7px 8px;font:inherit}
+.reign-voice button,.reign-chirps button{border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer;padding:7px 9px}
+.reign-chirps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.reign-chirps button{min-width:0}
+.reign-voice button:hover,.reign-voice button:focus-visible,.reign-chirps button:hover,.reign-chirps button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
 .reign-readout{font-size:11px;color:#b7c8d8}
 .reign-hint{color:#9fb0bf;font-size:11px;line-height:1.25}
 #llm{right:12px;top:96px;width:320px;height:300px;min-width:200px;min-height:150px;border-color:#3f4c58;background:rgba(9,12,16,.88)}
@@ -6295,6 +6317,15 @@ canvas{display:block}
       <div class="reign-readout" id="reign-readout">F 0.00 / T 0.00</div>
     </div>
   </div>
+  <div class="reign-voice">
+    <input id="reign-say" placeholder="Speak text" maxlength="500">
+    <button id="reign-speak" type="button">Speak</button>
+  </div>
+  <div class="reign-chirps" aria-label="chirp controls">
+    <button data-chirp="Confirm" type="button">Confirm</button>
+    <button data-chirp="Warning" type="button">Warning</button>
+    <button data-chirp="Curious" type="button">Curious</button>
+  </div>
   <div id="reign-state">web reign ready</div>
   <div class="reign-hint">Drag the stick or hold WASD / arrow keys. Space stops.</div>
   <div class="cockpit">
@@ -6440,6 +6471,9 @@ const reignJoystick = document.getElementById('reign-joystick');
 const reignStick = document.getElementById('reign-stick');
 const reignStop = document.getElementById('reign-stop');
 const reignReadout = document.getElementById('reign-readout');
+const reignSay = document.getElementById('reign-say');
+const reignSpeak = document.getElementById('reign-speak');
+const reignChirps = Array.from(document.querySelectorAll('[data-chirp]'));
 const hardwareArm = document.getElementById('hardware-arm');
 const hardwareState = document.getElementById('hardware-state');
 const traceCanvas = document.getElementById('trace-map');
@@ -8047,6 +8081,25 @@ reignJoystick.addEventListener('pointercancel', endWebJoystick);
 reignStop.addEventListener('click', () => {
   postWebReign({type:'Stop'}, 2000, 'stop', 1);
 });
+reignSpeak.addEventListener('click', () => {
+  const text = reignSay.value.trim();
+  if(!text){
+    reignState.textContent = 'speak text is empty';
+    return;
+  }
+  postWebReign({type:'Speak', text}, 10000, `speak "${text.slice(0, 28)}"`, .9);
+});
+reignSay.addEventListener('keydown', event => {
+  if(event.key !== 'Enter' || event.shiftKey) return;
+  reignSpeak.click();
+  event.preventDefault();
+});
+for(const button of reignChirps){
+  button.addEventListener('click', () => {
+    const pattern = button.dataset.chirp;
+    postWebReign({type:'Chirp', pattern}, 2000, `chirp ${pattern.toLowerCase()}`, .9);
+  });
+}
 hardwareArm.addEventListener('change', () => setHardwareArmed(hardwareArm.checked));
 window.addEventListener('pagehide', disarmHardwareOnExit);
 window.addEventListener('beforeunload', disarmHardwareOnExit);

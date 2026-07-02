@@ -7105,6 +7105,7 @@ fn summarize_reign_command_for_runtime(input: &netherwick_actions::ReignInput) -
             format!("Explore for {}ms", duration_ms)
         }
         netherwick_actions::ReignCommand::Speak { text } => format!("Speak {text}"),
+        netherwick_actions::ReignCommand::Chirp { pattern } => format!("Chirp {:?}", pattern),
         netherwick_actions::ReignCommand::SetMode { mode } => format!("Set mode {:?}", mode),
     }
 }
