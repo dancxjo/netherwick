@@ -126,12 +126,12 @@ setup-whisper:
     #!/usr/bin/env bash
     set -euo pipefail
     MODEL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/netherwick/models/whisper"
-    MODEL="$MODEL_DIR/ggml-large-v3-turbo.bin"
+    MODEL="$MODEL_DIR/ggml-tiny.en.bin"
     mkdir -p "$MODEL_DIR"
     if [ ! -s "$MODEL" ]; then
         curl -fL --retry 3 --retry-delay 2 \
             -o "$MODEL" \
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
     fi
     echo "Whisper model ready: $MODEL"
 

@@ -69,7 +69,7 @@ use serde_json::Value;
 
 const DEFAULT_LIVE_LLM_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MPU6050_IMU_DEVICE: &str = "/dev/i2c-1";
-const DEFAULT_WHISPER_MODEL_FILENAME: &str = "ggml-large-v3-turbo.bin";
+const DEFAULT_WHISPER_MODEL_FILENAME: &str = "ggml-tiny.en.bin";
 
 #[derive(Parser)]
 #[command(name = "netherwick")]

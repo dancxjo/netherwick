@@ -48,7 +48,7 @@ Command-backed ASR uses the robot microphone and local Whisper:
 ```bash
 just setup-whisper
 MIC_DEVICE=default
-NETHERWICK_WHISPER_MODEL=/path/to/ggml-large-v3-turbo.bin
+NETHERWICK_WHISPER_MODEL=/path/to/ggml-tiny.en.bin
 NETHERWICK_ASR_COMMAND=target/debug/netherwick whisper-transcribe
 ```
 
