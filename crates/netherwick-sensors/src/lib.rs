@@ -705,7 +705,7 @@ pub struct PcmAudioFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ListenburyAsrConfig {
+pub struct AsrToolConfig {
     pub command: Option<String>,
     pub min_voice_rms: f32,
     pub min_chunk_ms: u64,
@@ -713,7 +713,7 @@ pub struct ListenburyAsrConfig {
     pub silence_finalize_ms: u64,
 }
 
-impl Default for ListenburyAsrConfig {
+impl Default for AsrToolConfig {
     fn default() -> Self {
         Self {
             command: std::env::var("NETHERWICK_ASR_COMMAND")
@@ -740,8 +740,8 @@ impl Default for ListenburyAsrConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct ListenburyAsrAdapter {
-    config: ListenburyAsrConfig,
+pub struct AsrTool {
+    config: AsrToolConfig,
     chunk: Vec<i16>,
     chunk_start_ms: Option<u64>,
     chunk_end_ms: Option<u64>,
@@ -750,8 +750,8 @@ pub struct ListenburyAsrAdapter {
     transcript_tracker: TranscriptCandidateTracker,
 }
 
-impl ListenburyAsrAdapter {
-    pub fn new(config: ListenburyAsrConfig) -> Self {
+impl AsrTool {
+    pub fn new(config: AsrToolConfig) -> Self {
         Self {
             config,
             chunk: Vec::new(),
@@ -2147,7 +2147,7 @@ pub struct MicrophoneSenseProvider {
     #[cfg(feature = "linux-hardware")]
     microphone: CpalMicrophone,
     #[cfg_attr(not(feature = "linux-hardware"), allow(dead_code))]
-    asr: Option<ListenburyAsrAdapter>,
+    asr: Option<AsrTool>,
     pending: VecDeque<SensePacket>,
     #[cfg_attr(not(feature = "linux-hardware"), allow(dead_code))]
     last_pcm_ms: Option<u64>,
@@ -2155,19 +2155,19 @@ pub struct MicrophoneSenseProvider {
 
 impl MicrophoneSenseProvider {
     pub fn new(preferred_name: Option<&str>) -> Result<Self> {
-        Self::with_asr_config(preferred_name, ListenburyAsrConfig::default())
+        Self::with_asr_config(preferred_name, AsrToolConfig::default())
     }
 
     pub fn with_asr_config(
         preferred_name: Option<&str>,
-        asr_config: ListenburyAsrConfig,
+        asr_config: AsrToolConfig,
     ) -> Result<Self> {
         #[cfg(feature = "linux-hardware")]
         {
             let asr = asr_config
                 .command
                 .is_some()
-                .then(|| ListenburyAsrAdapter::new(asr_config));
+                .then(|| AsrTool::new(asr_config));
             Ok(Self {
                 microphone: CpalMicrophone::new(preferred_name, 16000, 1)?,
                 asr,
@@ -2673,8 +2673,8 @@ mod tests {
     }
 
     #[test]
-    fn listenbury_asr_adapter_emits_final_ear_sense_from_command_transcript() {
-        let mut adapter = ListenburyAsrAdapter::new(ListenburyAsrConfig {
+    fn asr_tool_emits_final_ear_sense_from_command_transcript() {
+        let mut adapter = AsrTool::new(AsrToolConfig {
             command: Some("printf hello".to_string()),
             min_voice_rms: 0.01,
             min_chunk_ms: 100,
@@ -2709,8 +2709,8 @@ mod tests {
     }
 
     #[test]
-    fn listenbury_asr_adapter_without_command_does_not_fabricate_words() {
-        let mut adapter = ListenburyAsrAdapter::new(ListenburyAsrConfig {
+    fn asr_tool_without_command_does_not_fabricate_words() {
+        let mut adapter = AsrTool::new(AsrToolConfig {
             command: None,
             min_voice_rms: 0.01,
             min_chunk_ms: 100,

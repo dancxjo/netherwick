@@ -2474,7 +2474,7 @@ mod tests {
                 "voice-vector-1",
                 vec![0.1, 0.3, 0.5, 0.7],
             )
-            .with_model("listenbury.voice.test.v0")
+            .with_model("netherwick.voice.test.v0")
             .with_source_id("voice-1")
             .with_occurred_at_ms(405),
         );
@@ -2485,13 +2485,13 @@ mod tests {
 
         let vector = registry.vectorize(&voice).await.unwrap().expect("vector");
 
-        assert_eq!(vector.model_id, "listenbury.voice.test.v0");
+        assert_eq!(vector.model_id, "netherwick.voice.test.v0");
         assert_eq!(vector.dim, 4);
         assert_eq!(vector.vector, vec![0.1, 0.3, 0.5, 0.7]);
         assert_eq!(vector.source_sensation_id, voice.id);
         assert_eq!(
             vector.vectorizer_id,
-            "precomputed.voices.listenbury.voice.test.v0"
+            "precomputed.voices.netherwick.voice.test.v0"
         );
         assert_eq!(vector.purpose, "voice_identity");
         assert_eq!(vector.collection, "voices");
@@ -2524,7 +2524,7 @@ mod tests {
             .iter()
             .filter_map(|sensation| sensation.vector.as_ref())
             .any(|vector| vector.vectorizer_id
-                == "precomputed.voices.listenbury/voice_vector/16d"
+                == "precomputed.voices.netherwick/voice_vector/16d"
                 && vector.collection == "voices"
                 && vector.purpose == "voice_identity"));
     }
@@ -6013,7 +6013,7 @@ fn audio_possible_speech(parent: &Sensation, window: &AudioWindow, transcript: &
             "unstable_text": window.unstable_text,
             "stable_word_prefix": window.stable_word_prefix,
             "stable_word_count": window.stable_word_count,
-            "method": "listenbury_transcript_candidate",
+            "method": "asr_tool_transcript_candidate",
         }),
         metadata,
         "descendant.audio_possible_speech",
@@ -6055,7 +6055,7 @@ fn audio_committed_speech(parent: &Sensation, window: &AudioWindow, transcript: 
             "stable_text": window.stable_text,
             "stable_word_prefix": window.stable_word_prefix,
             "stable_word_count": window.stable_word_count,
-            "method": "listenbury_transcript_commit",
+            "method": "asr_tool_transcript_commit",
         }),
         metadata,
         "descendant.audio_committed_speech",
@@ -6506,7 +6506,7 @@ pub async fn demo_embodied_experience(now_ms: TimeMs) -> Result<EmbodiedDemo> {
             "demo-voice-vector",
             vec![0.11, 0.05, 0.33, 0.78, 0.21],
         )
-        .with_model("listenbury/voice_vector/16d")
+        .with_model("netherwick/voice_vector/16d")
         .with_source_id("demo-voice")
         .with_occurred_at_ms(now_ms),
     );

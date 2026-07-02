@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -39,8 +39,8 @@ use netherwick_runtime::{
     RuntimeModelStack, RuntimeTick, SimRunner,
 };
 use netherwick_sensors::{
-    CameraSenseProvider, EyeFrame, EyeFrameFormat, FrameProcessor, GpsSenseProvider,
-    ImuSenseProvider, ListenburyAsrConfig, MicrophoneSenseProvider, PcmAudioFrame, SensePacket,
+    AsrToolConfig, CameraSenseProvider, EyeFrame, EyeFrameFormat, FrameProcessor,
+    GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame, SensePacket,
     SenseProducer, World, WorldSnapshot,
 };
 #[cfg(feature = "kinect-freenect")]
@@ -4437,7 +4437,30 @@ struct BackgroundSenseProducer {
 #[derive(Clone, Debug, Default)]
 struct BackgroundSenseState {
     latest: Option<SensePacket>,
+    pending: VecDeque<SensePacket>,
     last_error: Option<String>,
+}
+
+impl BackgroundSenseState {
+    fn record_packet(&mut self, name: &str, packet: SensePacket) {
+        if name == "kinect-depth" && matches!(packet, SensePacket::EyeFrame(_)) {
+            return;
+        }
+        if is_reliable_background_packet(&packet) {
+            self.pending.push_back(packet);
+            while self.pending.len() > 32 {
+                self.pending.pop_front();
+            }
+        } else {
+            self.latest = Some(packet);
+        }
+    }
+
+    fn next_packet(&mut self) -> Option<SensePacket> {
+        self.pending
+            .pop_front()
+            .or_else(|| self.latest.clone())
+    }
 }
 
 impl BackgroundSenseProducer {
@@ -4476,9 +4499,7 @@ impl BackgroundSenseProducer {
                         let mut state = worker_state
                             .lock()
                             .expect("background sensor mutex poisoned");
-                        if name != "kinect-depth" || !matches!(packet, SensePacket::EyeFrame(_)) {
-                            state.latest = Some(packet);
-                        }
+                        state.record_packet(name, packet);
                         state.last_error = None;
                     }
                     Err(error) => {
@@ -4498,19 +4519,22 @@ impl BackgroundSenseProducer {
 #[async_trait::async_trait]
 impl SenseProducer for BackgroundSenseProducer {
     async fn poll(&mut self) -> Result<SensePacket> {
-        let state = self
+        let mut state = self
             .state
             .lock()
-            .expect("background sensor mutex poisoned")
-            .clone();
-        if let Some(packet) = state.latest {
+            .expect("background sensor mutex poisoned");
+        if let Some(packet) = state.next_packet() {
             Ok(packet)
-        } else if let Some(error) = state.last_error {
+        } else if let Some(error) = state.last_error.clone() {
             anyhow::bail!("{} sensor unavailable: {error}", self.name)
         } else {
             anyhow::bail!("{} sensor has no frame yet", self.name)
         }
     }
+}
+
+fn is_reliable_background_packet(packet: &SensePacket) -> bool {
+    matches!(packet, SensePacket::Ear(_))
 }
 
 fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SensePacket) {
@@ -4683,7 +4707,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         } else {
             Some(device.as_str())
         };
-        let mut asr_config = ListenburyAsrConfig::default();
+        let mut asr_config = AsrToolConfig::default();
         if let Some(command) = args.asr_command.clone() {
             asr_config.command = Some(command);
         }
@@ -9980,6 +10004,34 @@ mod tests {
         }
 
         assert_eq!(config.timeout_ms, DEFAULT_LIVE_LLM_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn background_sensor_keeps_asr_packet_ahead_of_latest_pcm() {
+        let mut state = BackgroundSenseState::default();
+        let asr = SensePacket::Ear(EarSense {
+            transcript: Some("hello robot".to_string()),
+            ..EarSense::default()
+        });
+        let pcm = SensePacket::EarPcm(PcmAudioFrame {
+            captured_at_ms: 42,
+            sample_rate_hz: 16_000,
+            channels: 1,
+            samples: vec![0; 160],
+        });
+
+        state.record_packet("microphone", asr);
+        state.record_packet("microphone", pcm);
+
+        let first = state.next_packet().expect("queued ASR packet");
+        assert!(matches!(
+            first,
+            SensePacket::Ear(EarSense {
+                transcript: Some(text),
+                ..
+            }) if text == "hello robot"
+        ));
+        assert!(matches!(state.next_packet(), Some(SensePacket::EarPcm(_))));
     }
 
     #[test]

@@ -71,7 +71,7 @@ Log out and back in after changing group membership. A missing device or permiss
 
 The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, and `--gps`. Camera and microphone are optional by default, so absent devices do not block read-only body bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Netherwick finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. Passing `--require-camera`, `--require-mic`, `--require-imu`, or `--require-gps` makes the command fail if that provider is unavailable.
 
-`--asr-command` enables the listenbury-style ASR seam for microphone input. Netherwick chunks voiced PCM, writes each finalized chunk to a temporary WAV file, appends that path to the configured command, and reads the transcript from stdout. The same value can be supplied with `NETHERWICK_ASR_COMMAND`. ASR output is delivered as `EarSense.asr` and follows the normal sensation/vector path.
+`--asr-command` enables the command-backed ASR tool for microphone input. Netherwick chunks voiced PCM, writes each finalized chunk to a temporary WAV file, appends that path to the configured command, and reads the transcript from stdout. The same value can be supplied with `NETHERWICK_ASR_COMMAND`. ASR output is delivered as `EarSense.asr` and follows the normal sensation/vector path.
 
 Current minimum support is robust no-data handling plus mock/body capture. Rich camera, microphone, IMU, and GPS producers can be wired behind hardware features without changing the read-only runner.
 
