@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use netherwick_actions::{ActionPrimitive, ReignInput, ReignMode};
 use netherwick_body::BodySense;
+use netherwick_core::{
+    Feature, FeatureModality, FeatureRegistry, FeatureType, Pose3, Provenance, VectorRef,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub type ExtensionMap = BTreeMap<String, Value>;
@@ -904,6 +907,433 @@ impl Now {
             extensions: ExtensionMap::default(),
         }
     }
+
+    pub fn features(&self) -> Vec<Feature> {
+        let mut features = Vec::new();
+
+        for (index, observation) in self.objects.observations.iter().enumerate() {
+            let mut feature = Feature::new(
+                FeatureType::ObjectDetection,
+                FeatureModality::Vision,
+                self.t_ms,
+                observation.confidence,
+                Provenance::direct().with_stage("now.objects"),
+            )
+            .with_source_sensor(format!("{:?}", observation.source).to_lowercase())
+            .with_metadata(json!({
+                "label": observation.label,
+                "class": observation.class,
+                "bearing_rad": observation.bearing_rad,
+                "distance_m": observation.distance_m,
+                "index": index,
+            }));
+            if let Some(distance_m) = observation.distance_m {
+                feature = feature.with_local_pose(Pose3 {
+                    x_m: distance_m * observation.bearing_rad.cos(),
+                    y_m: distance_m * observation.bearing_rad.sin(),
+                    z_m: 0.0,
+                    yaw_rad: observation.bearing_rad,
+                    ..Pose3::default()
+                });
+            }
+            features.push(feature);
+        }
+
+        for artifact in &self.eye.image_vectors {
+            features.push(vector_feature(
+                artifact,
+                FeatureType::ImageDescriptor,
+                FeatureModality::Vision,
+                self.t_ms,
+                "eye",
+                "now.eye.image_vectors",
+            ));
+        }
+        for artifact in &self.eye.image_description_vectors {
+            features.push(vector_feature(
+                artifact,
+                FeatureType::ImageDescription,
+                FeatureModality::Language,
+                self.t_ms,
+                "captioner",
+                "now.eye.image_description_vectors",
+            ));
+        }
+        for artifact in &self.eye.scene_vectors {
+            features.push(vector_feature(
+                artifact,
+                FeatureType::ImageDescriptor,
+                FeatureModality::Geometry,
+                self.t_ms,
+                "eye",
+                "now.eye.scene_vectors",
+            ));
+        }
+        for artifact in &self.objects.vectors {
+            features.push(vector_feature(
+                artifact,
+                FeatureType::ImageDescriptor,
+                FeatureModality::Vision,
+                self.t_ms,
+                "objects",
+                "now.objects.vectors",
+            ));
+        }
+        for artifact in &self.face.vectors {
+            features.push(vector_feature(
+                artifact,
+                FeatureType::FaceObservation,
+                FeatureModality::Vision,
+                self.t_ms,
+                "face",
+                "now.face.vectors",
+            ));
+        }
+        for artifact in &self.voice.vectors {
+            features.push(vector_feature(
+                artifact,
+                FeatureType::VoiceEmbedding,
+                FeatureModality::Audio,
+                self.t_ms,
+                "voice",
+                "now.voice.vectors",
+            ));
+        }
+        for artifact in &self.ear.transcript_vectors {
+            features.push(vector_feature(
+                artifact,
+                FeatureType::Transcript,
+                FeatureModality::Language,
+                self.t_ms,
+                "asr",
+                "now.ear.transcript_vectors",
+            ));
+        }
+
+        if let Some(transcript) = self.ear.transcript.as_ref().filter(|text| !text.is_empty()) {
+            features.push(
+                Feature::new(
+                    FeatureType::Transcript,
+                    FeatureModality::Language,
+                    self.t_ms,
+                    self.ear.asr.confidence.max(0.5),
+                    Provenance::direct().with_stage("now.ear.transcript"),
+                )
+                .with_source_sensor("microphone")
+                .with_metadata(json!({ "text": transcript, "source": "ear.transcript" })),
+            );
+        }
+        if let Some(transcript) = self
+            .ear
+            .asr
+            .transcript
+            .as_ref()
+            .filter(|text| !text.is_empty())
+        {
+            features.push(
+                Feature::new(
+                    FeatureType::SpeechSegment,
+                    FeatureModality::Audio,
+                    self.ear.asr.end_ms.unwrap_or(self.t_ms),
+                    self.ear.asr.confidence,
+                    Provenance::direct().with_stage("now.ear.asr"),
+                )
+                .with_source_sensor("microphone")
+                .with_metadata(json!({
+                    "text": transcript,
+                    "is_final": self.ear.asr.is_final,
+                    "sequence_start": self.ear.asr.sequence_start,
+                    "sequence_end": self.ear.asr.sequence_end,
+                    "duration_ms": self.ear.asr.duration_ms,
+                    "speaker_confidence": self.ear.asr.speaker_confidence,
+                })),
+            );
+        }
+
+        features.extend(self.body_features());
+
+        if !self.imu.orientation.is_empty()
+            || !self.imu.acceleration.is_empty()
+            || !self.imu.angular_velocity.is_empty()
+        {
+            features.push(
+                Feature::new(
+                    FeatureType::ImuEvent,
+                    FeatureModality::Motion,
+                    nonzero_or(self.imu.captured_at_ms, self.t_ms),
+                    1.0,
+                    Provenance::direct().with_stage("now.imu"),
+                )
+                .with_source_sensor("imu")
+                .with_metadata(json!({
+                    "orientation": self.imu.orientation,
+                    "acceleration": self.imu.acceleration,
+                    "angular_velocity": self.imu.angular_velocity,
+                })),
+            );
+        }
+
+        if let Some(audio_angle_rad) = self.kinect.audio_angle_rad {
+            features.push(
+                Feature::new(
+                    FeatureType::DirectionEstimate,
+                    FeatureModality::Audio,
+                    nonzero_or(self.kinect.captured_at_ms, self.t_ms),
+                    self.kinect.audio_confidence,
+                    Provenance::direct().with_stage("now.kinect.audio"),
+                )
+                .with_source_sensor("kinect")
+                .with_metadata(json!({ "audio_angle_rad": audio_angle_rad })),
+            );
+        }
+
+        for entity in &self.memory.remembered_entities {
+            features.push(
+                Feature::new(
+                    FeatureType::RememberedEntity,
+                    FeatureModality::Memory,
+                    self.t_ms,
+                    entity.score,
+                    Provenance::direct().with_stage("now.memory.remembered_entities"),
+                )
+                .with_source_sensor("memory")
+                .with_metadata(json!({
+                    "id": entity.id,
+                    "labels": entity.labels,
+                    "summary": entity.summary,
+                })),
+            );
+        }
+        if self.memory.similar_situation_count > 0 || self.memory.best_remembered_action.is_some() {
+            features.push(
+                Feature::new(
+                    FeatureType::RecalledExperience,
+                    FeatureModality::Memory,
+                    self.t_ms,
+                    self.memory
+                        .place_familiarity
+                        .max(self.memory.map_confidence),
+                    Provenance::direct().with_stage("now.memory"),
+                )
+                .with_source_sensor("memory")
+                .with_metadata(json!({
+                    "similar_situation_count": self.memory.similar_situation_count,
+                    "best_remembered_action": self.memory.best_remembered_action,
+                    "remembered_warning": self.memory.remembered_warning,
+                    "graph_context_summary": self.memory.graph_context_summary,
+                })),
+            );
+        }
+
+        if !self.predictions.expected_events.is_empty()
+            || self.predictions.danger_model.is_some()
+            || self.predictions.charge_model.is_some()
+            || !self.predictions.action_values_model.is_empty()
+        {
+            features.push(
+                Feature::new(
+                    FeatureType::FuturePrediction,
+                    FeatureModality::Prediction,
+                    self.t_ms,
+                    (1.0 - self.predictions.uncertainty).clamp(0.0, 1.0),
+                    Provenance::direct().with_stage("now.predictions"),
+                )
+                .with_source_sensor("prediction")
+                .with_metadata(json!({
+                    "expected_events": self.predictions.expected_events,
+                    "uncertainty": self.predictions.uncertainty,
+                    "danger_model": self.predictions.danger_model,
+                    "charge_model": self.predictions.charge_model,
+                    "action_values_model": self.predictions.action_values_model,
+                })),
+            );
+        }
+
+        if self.surprise.total > 0.0 || self.surprise.prediction_error > 0.0 {
+            features.push(
+                Feature::new(
+                    FeatureType::Surprise,
+                    FeatureModality::Prediction,
+                    self.t_ms,
+                    self.surprise.total.clamp(0.0, 1.0),
+                    Provenance::direct().with_stage("now.surprise"),
+                )
+                .with_source_sensor("prediction")
+                .with_metadata(json!({
+                    "total": self.surprise.total,
+                    "prediction_error": self.surprise.prediction_error,
+                })),
+            );
+        }
+
+        if let Some(critique) = self.llm.critique.as_ref().filter(|text| !text.is_empty()) {
+            features.push(
+                Feature::new(
+                    FeatureType::LlmLabel,
+                    FeatureModality::Language,
+                    self.t_ms,
+                    self.llm.confidence,
+                    Provenance::direct().with_stage("now.llm.critique"),
+                )
+                .with_source_sensor("llm")
+                .with_metadata(json!({ "critique": critique })),
+            );
+        }
+
+        features
+    }
+
+    pub fn feature_registry(&self) -> FeatureRegistry {
+        let mut registry = FeatureRegistry::new();
+        registry.extend(self.features());
+        registry
+    }
+
+    fn body_features(&self) -> Vec<Feature> {
+        let mut features = Vec::new();
+        let body_time = nonzero_or(self.body.last_update_ms, self.t_ms);
+        let world_pose = Pose3 {
+            x_m: self.body.odometry.x_m,
+            y_m: self.body.odometry.y_m,
+            yaw_rad: self.body.odometry.heading_rad,
+            ..Pose3::default()
+        };
+
+        features.push(
+            Feature::new(
+                FeatureType::Battery,
+                FeatureModality::Body,
+                body_time,
+                1.0,
+                Provenance::direct().with_stage("now.body.battery"),
+            )
+            .with_source_sensor("body")
+            .with_metadata(json!({
+                "battery_level": self.body.battery_level,
+                "charging": self.body.charging,
+            })),
+        );
+        features.push(
+            Feature::new(
+                FeatureType::DockState,
+                FeatureModality::Body,
+                body_time,
+                1.0,
+                Provenance::direct().with_stage("now.body.charging"),
+            )
+            .with_source_sensor("body")
+            .with_metadata(json!({ "charging": self.body.charging })),
+        );
+        features.push(
+            Feature::new(
+                FeatureType::OdometryEvent,
+                FeatureModality::Motion,
+                body_time,
+                1.0,
+                Provenance::direct().with_stage("now.body.odometry"),
+            )
+            .with_source_sensor("body")
+            .with_world_pose(world_pose)
+            .with_metadata(json!({
+                "odometry": self.body.odometry,
+                "velocity": self.body.velocity,
+            })),
+        );
+
+        if self.body.flags.bump_left || self.body.flags.bump_right {
+            features.push(body_flag_feature(
+                FeatureType::Bumper,
+                body_time,
+                "now.body.flags.bump",
+                json!({
+                    "bump_left": self.body.flags.bump_left,
+                    "bump_right": self.body.flags.bump_right,
+                }),
+            ));
+        }
+        if self.body.flags.cliff_left
+            || self.body.flags.cliff_front_left
+            || self.body.flags.cliff_front_right
+            || self.body.flags.cliff_right
+        {
+            features.push(body_flag_feature(
+                FeatureType::Cliff,
+                body_time,
+                "now.body.flags.cliff",
+                json!({
+                    "flags": self.body.flags,
+                    "cliff_sensors": self.body.cliff_sensors,
+                }),
+            ));
+        }
+        if self.body.flags.wheel_drop {
+            features.push(body_flag_feature(
+                FeatureType::WheelDrop,
+                body_time,
+                "now.body.flags.wheel_drop",
+                json!({ "wheel_drop": true }),
+            ));
+        }
+
+        features
+    }
+}
+
+fn vector_feature(
+    artifact: &VectorArtifact,
+    feature_type: FeatureType,
+    modality: FeatureModality,
+    fallback_t_ms: u64,
+    source_sensor: &str,
+    stage: &str,
+) -> Feature {
+    Feature::new(
+        feature_type,
+        modality,
+        artifact.occurred_at_ms.unwrap_or(fallback_t_ms),
+        1.0,
+        Provenance::direct().with_stage(stage),
+    )
+    .with_source_sensor(source_sensor)
+    .with_optional_source_frame(artifact.source_frame_id.clone())
+    .with_vector_ref(
+        VectorRef::new(artifact.collection.clone(), artifact.point_id.clone())
+            .with_model(artifact.model.clone())
+            .with_source_id(artifact.source_id.clone()),
+    )
+    .with_metadata(json!({
+        "collection": artifact.collection,
+        "point_id": artifact.point_id,
+        "model": artifact.model,
+        "source_id": artifact.source_id,
+        "source_frame_id": artifact.source_frame_id,
+        "vector_dimensions": artifact.vector.len(),
+    }))
+}
+
+fn body_flag_feature(
+    feature_type: FeatureType,
+    t_ms: u64,
+    stage: &str,
+    metadata: Value,
+) -> Feature {
+    Feature::new(
+        feature_type,
+        FeatureModality::Body,
+        t_ms,
+        1.0,
+        Provenance::direct().with_stage(stage),
+    )
+    .with_source_sensor("body")
+    .with_metadata(metadata)
+}
+
+fn nonzero_or(value: u64, fallback: u64) -> u64 {
+    if value == 0 {
+        fallback
+    } else {
+        value
+    }
 }
 
 pub trait SenseVectorizer {
@@ -984,5 +1414,70 @@ mod tests {
         assert_eq!(state.stable_word_count, 1);
         assert_eq!(state.unstable_text, "");
         assert_eq!(state.confidence, Some(0.6));
+    }
+
+    #[test]
+    fn now_emits_queryable_features_across_modalities() {
+        let mut now = Now::blank(1_000, BodySense::default());
+        now.objects.observations.push(ObjectObservation {
+            label: "Ada".to_string(),
+            class: ObjectClass::Person,
+            bearing_rad: 0.25,
+            distance_m: Some(1.5),
+            confidence: 0.9,
+            source: ObjectObservationSource::Kinect,
+        });
+        now.face.vectors.push(
+            VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-ada", vec![1.0, 0.0])
+                .with_source_frame_id("frame-1")
+                .with_source_id("face-crop-1"),
+        );
+        now.voice.vectors.push(VectorArtifact::new(
+            VOICE_VECTOR_COLLECTION,
+            "voice-ada",
+            vec![0.0, 1.0],
+        ));
+        now.ear.transcript = Some("hello Pete".to_string());
+        now.ear.asr.transcript = Some("hello Pete".to_string());
+        now.ear.asr.confidence = 0.7;
+        now.ear.asr.is_final = true;
+        now.imu.captured_at_ms = 990;
+        now.imu.acceleration = vec![0.0, 0.0, 1.0];
+        now.memory.remembered_entities.push(GraphEntity {
+            id: "entity:person:ada".to_string(),
+            labels: vec!["Person".to_string()],
+            summary: "Ada was here before".to_string(),
+            score: 0.8,
+        });
+        now.predictions
+            .expected_events
+            .push("speech_heard".to_string());
+        now.predictions.uncertainty = 0.2;
+
+        let registry = now.feature_registry();
+
+        assert!(registry
+            .by_modality(FeatureModality::Vision)
+            .iter()
+            .any(|feature| feature.feature_type == FeatureType::ObjectDetection));
+        assert_eq!(registry.by_source_frame("frame-1").len(), 1);
+        assert_eq!(registry.by_vector_id("face-ada").len(), 1);
+        assert!(registry
+            .by_modality(FeatureModality::Audio)
+            .iter()
+            .any(|feature| feature.feature_type == FeatureType::VoiceEmbedding));
+        assert!(registry
+            .by_modality(FeatureModality::Language)
+            .iter()
+            .any(|feature| feature.feature_type == FeatureType::Transcript));
+        assert!(registry
+            .by_modality(FeatureModality::Memory)
+            .iter()
+            .any(|feature| feature.feature_type == FeatureType::RememberedEntity));
+        assert!(registry
+            .by_modality(FeatureModality::Prediction)
+            .iter()
+            .any(|feature| feature.feature_type == FeatureType::FuturePrediction));
+        assert!(!registry.by_time_window(990, 1_000).is_empty());
     }
 }
