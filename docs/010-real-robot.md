@@ -28,6 +28,7 @@ The robot runner annotates the first real-robot `Now` with `robot.initialization
 The robot process owns rendering. It creates a queued Piper/CPAL mouth from:
 
 ```bash
+just setup-ort
 just setup-tts
 # or, as part of full system setup:
 just setup
@@ -39,6 +40,16 @@ The default voice is downloaded to the Tongues Piper model directory and autoloa
 NETHERWICK_TTS_PIPER_VOICE=/path/to/en_US-ryan-medium.onnx
 NETHERWICK_TTS_PIPER_CONFIG=/path/to/en_US-ryan-medium.onnx.json
 NETHERWICK_TTS_OUTPUT_DEVICE="USB Audio Device"
+ORT_DYLIB_PATH=/path/to/libonnxruntime.so
+```
+
+Command-backed ASR uses the robot microphone and local Whisper:
+
+```bash
+just setup-whisper
+MIC_DEVICE=default
+NETHERWICK_WHISPER_MODEL=/path/to/ggml-base.en.bin
+NETHERWICK_ASR_COMMAND=target/debug/netherwick whisper-transcribe
 ```
 
 When configured, bring-up lines are enqueued immediately and played sequentially on a background thread using Tongues Piper streaming plus CPAL output. Later mouth actions emitted by event scripts are appended to the same queue. If the Piper voice or output device is unavailable, the robot should report the mouth as disabled and continue the robot run rather than blocking body/sensor startup.

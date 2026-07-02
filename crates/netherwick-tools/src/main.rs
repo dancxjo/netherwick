@@ -87,6 +87,7 @@ enum Command {
     MemoryInspect(MemoryInspectArgs),
     Mouth(MouthArgs),
     Robot(RobotArgs),
+    WhisperTranscribe(WhisperTranscribeArgs),
     HardwareEnv(HardwareEnvArgs),
     Replay,
     CaptureSim(CaptureSimArgs),
@@ -125,6 +126,7 @@ async fn main() -> Result<()> {
         Command::MemoryInspect(args) => memory_inspect(args).await,
         Command::Mouth(args) => run_mouth(args),
         Command::Robot(args) => run_robot(args).await,
+        Command::WhisperTranscribe(args) => run_whisper_transcribe(args),
         Command::HardwareEnv(args) => hardware_env(args).await,
         Command::CaptureSim(args) => capture_sim(args).await,
         Command::CaptureReal(args) => capture_real(args).await,
@@ -1169,6 +1171,13 @@ struct CompareScenarioReportsArgs {
 struct MouthArgs {
     #[arg(default_value = "Hello. My name is Pete Netherwick.")]
     text: String,
+}
+
+#[derive(Debug, Parser)]
+struct WhisperTranscribeArgs {
+    #[arg(long)]
+    model: Option<PathBuf>,
+    wav: PathBuf,
 }
 
 async fn run_sim(args: SimArgs) -> Result<()> {
@@ -4800,7 +4809,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    let mouth = match QueuedPiperCpalMouth::from_env() {
+    let mut mouth = match QueuedPiperCpalMouth::from_env() {
         Ok(Some(mouth)) => Some(mouth),
         Ok(None) => {
             println!(
@@ -4813,8 +4822,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             None
         }
     };
-    if let Some(mouth) = &mouth {
-        speak_robot_mouth_text_before_status(mouth, "Hello. My name is Pete Netherwick.");
+    if let Some(mouth_ref) = &mouth {
+        if !speak_robot_mouth_text_before_status(mouth_ref, "Hello. My name is Pete Netherwick.") {
+            mouth = None;
+        }
     }
 
     let init_body = match body.read_body().await {
@@ -4938,13 +4949,118 @@ fn run_mouth(args: MouthArgs) -> Result<()> {
             "robot mouth disabled: no Piper voice found; set NETHERWICK_TTS_PIPER_VOICE and NETHERWICK_TTS_PIPER_CONFIG"
         );
     };
-    let outcome = mouth.enqueue_and_wait(args.text)?;
+    let outcome = mouth.enqueue_and_wait_timeout(args.text, Some(Duration::from_secs(60)))?;
     println!(
         "robot mouth diagnostic complete: device {}, duration {} ms",
         outcome.device.as_deref().unwrap_or("<unknown>"),
         outcome.duration_ms.unwrap_or_default()
     );
     Ok(())
+}
+
+fn run_whisper_transcribe(args: WhisperTranscribeArgs) -> Result<()> {
+    use speaking::{AudioFrame, SpeechRecognizer, WhisperSpeechRecognizer};
+
+    let model = args
+        .model
+        .or_else(|| env_path("NETHERWICK_WHISPER_MODEL"))
+        .context("missing Whisper model; set NETHERWICK_WHISPER_MODEL or pass --model")?;
+    let samples = read_wav_as_16khz_mono_f32(&args.wav)
+        .with_context(|| format!("failed to read {}", args.wav.display()))?;
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let mut recognizer = WhisperSpeechRecognizer::new_quiet_without_input_padding(&model)
+        .with_context(|| format!("loading Whisper model {}", model.display()))?;
+    recognizer.push_frame(&AudioFrame {
+        sample_rate_hz: 16_000,
+        channels: 1,
+        samples,
+    })?;
+    let chunks = recognizer.poll_chunks()?;
+    let transcript = chunks
+        .into_iter()
+        .map(|chunk| chunk.text)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if !transcript.is_empty() {
+        println!("{transcript}");
+    }
+    Ok(())
+}
+
+fn read_wav_as_16khz_mono_f32(path: &Path) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let source_rate = spec.sample_rate.max(1);
+    let mut interleaved = Vec::new();
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Float, 32) => {
+            for sample in reader.samples::<f32>() {
+                interleaved.push(sample?);
+            }
+        }
+        (hound::SampleFormat::Int, 8) => {
+            for sample in reader.samples::<i8>() {
+                interleaved.push(sample? as f32 / i8::MAX as f32);
+            }
+        }
+        (hound::SampleFormat::Int, 16) => {
+            for sample in reader.samples::<i16>() {
+                interleaved.push(sample? as f32 / i16::MAX as f32);
+            }
+        }
+        (hound::SampleFormat::Int, 24 | 32) => {
+            let scale = ((1_i64 << (spec.bits_per_sample - 1)) - 1) as f32;
+            for sample in reader.samples::<i32>() {
+                interleaved.push(sample? as f32 / scale);
+            }
+        }
+        _ => anyhow::bail!(
+            "unsupported WAV format: {:?} {} bits",
+            spec.sample_format,
+            spec.bits_per_sample
+        ),
+    }
+    let mono = interleaved
+        .chunks(channels)
+        .map(|frame| frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32)
+        .collect::<Vec<_>>();
+    Ok(resample_mono_linear(&mono, source_rate, 16_000))
+}
+
+fn resample_mono_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
+        return Vec::new();
+    }
+    if source_rate == target_rate {
+        return samples.to_vec();
+    }
+    let output_len = (samples.len() as u64)
+        .saturating_mul(u64::from(target_rate))
+        .div_ceil(u64::from(source_rate)) as usize;
+    let ratio = source_rate as f64 / target_rate as f64;
+    let mut output = Vec::with_capacity(output_len);
+    for index in 0..output_len {
+        let pos = index as f64 * ratio;
+        let left = pos.floor() as usize;
+        let right = (left + 1).min(samples.len() - 1);
+        let fraction = (pos - left as f64) as f32;
+        let sample = samples[left] * (1.0 - fraction) + samples[right] * fraction;
+        output.push(sample.clamp(-1.0, 1.0));
+    }
+    output
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn robot_initialization_metadata(
@@ -5014,15 +5130,23 @@ fn enqueue_default_bringup_mouth(mouth: &QueuedPiperCpalMouth, initialization: &
     }
 }
 
-fn speak_robot_mouth_text_before_status(mouth: &QueuedPiperCpalMouth, text: &str) {
+fn speak_robot_mouth_text_before_status(mouth: &QueuedPiperCpalMouth, text: &str) -> bool {
     println!("robot mouth speaking before body status: {text:?}");
-    match mouth.enqueue_and_wait(text.to_string()) {
-        Ok(outcome) => println!(
-            "robot mouth completed before body status: device {}, duration {} ms",
-            outcome.device.as_deref().unwrap_or("<unknown>"),
-            outcome.duration_ms.unwrap_or_default()
-        ),
-        Err(error) => println!("robot mouth pre-status speech failed; continuing: {error}"),
+    match mouth.enqueue_and_wait_timeout(text.to_string(), Some(Duration::from_secs(20))) {
+        Ok(outcome) => {
+            println!(
+                "robot mouth completed before body status: device {}, duration {} ms",
+                outcome.device.as_deref().unwrap_or("<unknown>"),
+                outcome.duration_ms.unwrap_or_default()
+            );
+            true
+        }
+        Err(error) => {
+            println!(
+                "robot mouth pre-status speech failed; disabling mouth for this run and continuing: {error}"
+            );
+            false
+        }
     }
 }
 

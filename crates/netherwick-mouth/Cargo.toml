@@ -9,5 +9,6 @@ publish = false
 anyhow.workspace = true
 cpal.workspace = true
 serde.workspace = true
+speaking = { git = "https://github.com/dancxjo/tongues.git" }
 tongues-tts = { git = "https://github.com/dancxjo/tongues.git" }
 tracing.workspace = true

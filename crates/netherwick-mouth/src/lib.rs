@@ -10,7 +10,11 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use serde::{Deserialize, Serialize};
-use tongues_tts::{PiperOnnxSpeech, PiperVoice, SpeechRequest};
+use speaking::{
+    phonemicizer_for_variety, EvidenceProvenance, EvidenceSource, PhonemicizeOutput,
+    PhonemicizeRequest, UtteranceId, UtterancePlan, VarietyId,
+};
+use tongues_tts::{PiperAudioChunk, PiperOnnxBackend, PiperVoice, PiperVoiceConfig};
 
 const DEFAULT_TTS_VARIETY: &str = "en-US";
 
@@ -75,10 +79,15 @@ impl QueuedPiperCpalMouth {
         let worker = std::thread::Builder::new()
             .name("netherwick-piper-mouth".to_string())
             .spawn(move || {
+                println!(
+                    "robot mouth loading Piper voice: {}",
+                    config.model_path.display()
+                );
                 let mut mouth = match PiperCpalMouth::new(config) {
                     Ok(mouth) => mouth,
                     Err(error) => {
-                        let message = format!("queued Piper mouth failed to load voice: {error}");
+                        let message =
+                            format!("queued Piper mouth failed to load voice: {error:#}");
                         println!("robot mouth failed: {message}");
                         tracing::warn!(error = %error, "queued Piper mouth failed to load voice");
                         for item in rx {
@@ -89,6 +98,7 @@ impl QueuedPiperCpalMouth {
                         return;
                     }
                 };
+                println!("robot mouth Piper voice ready");
                 for item in rx {
                     match mouth.speak(&item.text) {
                         Ok(outcome) => {
@@ -131,6 +141,14 @@ impl QueuedPiperCpalMouth {
     }
 
     pub fn enqueue_and_wait(&self, text: impl Into<String>) -> Result<SpeechOutcome> {
+        self.enqueue_and_wait_timeout(text, None)
+    }
+
+    pub fn enqueue_and_wait_timeout(
+        &self,
+        text: impl Into<String>,
+        timeout: Option<Duration>,
+    ) -> Result<SpeechOutcome> {
         let text = text.into();
         if text.trim().is_empty() {
             return Ok(SpeechOutcome {
@@ -144,10 +162,15 @@ impl QueuedPiperCpalMouth {
             text,
             outcome_tx: Some(outcome_tx),
         })?;
-        match outcome_rx
-            .recv()
-            .context("queued Piper mouth worker did not report outcome")?
-        {
+        let result = match timeout {
+            Some(timeout) => outcome_rx
+                .recv_timeout(timeout)
+                .with_context(|| format!("queued Piper mouth did not finish within {timeout:?}"))?,
+            None => outcome_rx
+                .recv()
+                .context("queued Piper mouth worker did not report outcome")?,
+        };
+        match result {
             Ok(outcome) => Ok(outcome),
             Err(error) => anyhow::bail!(error),
         }
@@ -166,7 +189,11 @@ impl Drop for QueuedPiperCpalMouth {
     fn drop(&mut self) {
         drop(self.tx.take());
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                println!("robot mouth worker still running at shutdown; detaching");
+            }
         }
     }
 }
@@ -229,15 +256,15 @@ fn env_path(name: &str) -> Option<PathBuf> {
 
 pub struct PiperCpalMouth {
     config: PiperConfig,
-    speech: PiperOnnxSpeech,
+    speech: PiperOnnxBackend,
 }
 
 impl PiperCpalMouth {
     pub fn new(config: PiperConfig) -> Result<Self> {
-        let speech = PiperOnnxSpeech::load(PiperVoice::Path {
-            model: config.model_path.clone(),
-            config: config.config_path.clone(),
-        })?;
+        let voice_config = PiperVoiceConfig::from_json_file(&config.config_path)
+            .with_context(|| format!("failed to read {}", config.config_path.display()))?;
+        let speech = PiperOnnxBackend::load(&config.model_path, voice_config)
+            .context("failed to load Piper ONNX speech backend")?;
         Ok(Self { config, speech })
     }
 
@@ -257,12 +284,10 @@ impl Mouth for PiperCpalMouth {
             });
         }
 
+        let plan = utterance_plan_from_text(text, &self.config.variety)?;
         play_tongues_streaming(
             &mut self.speech,
-            SpeechRequest {
-                text: text.to_string(),
-                variety: self.config.variety.clone(),
-            },
+            &plan,
             text.len(),
             self.config.output_device_name.as_deref(),
         )
@@ -270,8 +295,8 @@ impl Mouth for PiperCpalMouth {
 }
 
 fn play_tongues_streaming(
-    speech: &mut PiperOnnxSpeech,
-    request: SpeechRequest,
+    speech: &mut PiperOnnxBackend,
+    plan: &UtterancePlan,
     text_len: usize,
     output_device_name: Option<&str>,
 ) -> Result<SpeechOutcome> {
@@ -280,6 +305,7 @@ fn play_tongues_streaming(
     let device_name = device
         .name()
         .unwrap_or_else(|_| "<unknown output device>".to_string());
+    println!("robot mouth using output device: {device_name}");
     let output_config = output_config(&device)?;
     let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
     let cursor = Arc::new(AtomicUsize::new(0));
@@ -295,22 +321,20 @@ fn play_tongues_streaming(
         .play()
         .with_context(|| format!("failed to start speech playback on {device_name}"))?;
 
-    let mut source_sample_rate_hz = None;
-    let mut source_channels = None;
+    let source_sample_rate_hz = speech.sample_rate_hz();
+    let source_channels = 1u16;
     let mut queued_samples = 0usize;
+    println!("robot mouth synthesizing speech");
     speech
-        .synthesize_streaming(request, &mut |audio| {
-            anyhow::ensure!(audio.channels > 0, "speech channel count must be positive");
+        .synthesize_plan_streaming(plan, &mut |audio: PiperAudioChunk| {
             anyhow::ensure!(
                 audio.sample_rate_hz > 0,
                 "speech sample rate must be positive"
             );
-            source_sample_rate_hz.get_or_insert(audio.sample_rate_hz);
-            source_channels.get_or_insert(audio.channels);
             let converted = convert_interleaved_f32(
                 &audio.pcm_mono_f32,
                 audio.sample_rate_hz,
-                audio.channels,
+                1,
                 output_config.sample_rate_hz,
                 output_config.channels,
             );
@@ -324,6 +348,7 @@ fn play_tongues_streaming(
         .context("Tongues Piper ONNX streaming synthesis failed")?;
 
     anyhow::ensure!(queued_samples > 0, "speech synthesis produced no audio");
+    println!("robot mouth draining {queued_samples} output samples");
     finished.store(true, Ordering::Release);
     while cursor.load(Ordering::Acquire) < queued_samples {
         std::thread::sleep(Duration::from_millis(10));
@@ -340,12 +365,48 @@ fn play_tongues_streaming(
         spoken: true,
         backend: "tongues-piper-onnx-cpal".to_string(),
         text_len,
-        sample_rate_hz: source_sample_rate_hz,
-        channels: source_channels,
+        sample_rate_hz: Some(source_sample_rate_hz),
+        channels: Some(source_channels),
         sample_count: queued_samples,
         duration_ms: Some(duration.as_millis() as u64),
         device: Some(device_name),
     })
+}
+
+fn utterance_plan_from_text(text: &str, variety: &str) -> Result<UtterancePlan> {
+    let variety = VarietyId(variety.to_string());
+    let phonemicizer = phonemicizer_for_variety(&variety)
+        .map_err(|error| anyhow::anyhow!("failed to load phonemicizer: {error}"))?;
+    let phonemicized = phonemicizer
+        .phonemicize(&PhonemicizeRequest {
+            text: text.to_string(),
+            variety,
+            style: None,
+        })
+        .context("failed to phonemicize text into a Piper speech plan")?;
+    Ok(utterance_plan_from_phonemicized(&phonemicized))
+}
+
+fn utterance_plan_from_phonemicized(output: &PhonemicizeOutput) -> UtterancePlan {
+    UtterancePlan {
+        id: UtteranceId("netherwick.mouth.utterance".into()),
+        variety: output.variety.clone(),
+        speaker: None,
+        intended_text: Some(output.text.clone()),
+        intended_morphemes: Vec::new(),
+        intended_phonemes: output.phonemes.clone(),
+        target_phones: output.phones.clone(),
+        target_syllables: output.syllables.clone(),
+        boundaries: output.boundaries.clone(),
+        target_prosody: output.prosody.clone(),
+        target_acoustics: Vec::new(),
+        style: None,
+        provenance: EvidenceProvenance {
+            source: EvidenceSource::TtsPlan,
+            method: "netherwick mouth phonemicized Piper plan".into(),
+            version: Some("0.1".into()),
+        },
+    }
 }
 
 fn select_output_device(host: &cpal::Host, requested_name: Option<&str>) -> Result<cpal::Device> {

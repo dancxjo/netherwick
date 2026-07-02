@@ -27,6 +27,8 @@ uuid.workspace = true
 reqwest.workspace = true
 image.workspace = true
 base64.workspace = true
+hound.workspace = true
+speaking = { git = "https://github.com/dancxjo/tongues.git", features = ["asr-whisper"] }
 netherwick-actions = { path = "../netherwick-actions" }
 netherwick-autonomic = { path = "../netherwick-autonomic" }
 netherwick-behaviors = { path = "../netherwick-behaviors" }
