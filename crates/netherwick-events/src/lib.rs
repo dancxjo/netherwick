@@ -27,6 +27,7 @@ pub enum DriveName {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     Tick,
+    RobotInitialized,
     BodyState,
     Bump,
     Cliff,
@@ -62,6 +63,18 @@ pub enum EventKind {
 pub enum EventPayload {
     #[default]
     None,
+    RobotInitialized {
+        mode: String,
+        body: String,
+        battery_percent: Option<u32>,
+        charging: Option<bool>,
+        active_sensors: usize,
+        requested_sensors: usize,
+        ledger: String,
+        tick_ms: u64,
+        dashboard: Option<String>,
+        capture: Option<String>,
+    },
     BatteryLow {
         battery_level: f32,
     },
@@ -305,6 +318,17 @@ impl EventExtractor {
     pub fn events_from_now(&mut self, now: &Now, recall: Option<&RecallBundle>) -> Vec<Event> {
         let mut events = Vec::new();
         let previous = self.last_now.as_ref();
+
+        if previous.is_none() {
+            if let Some(payload) = robot_initialized_payload(now) {
+                events.push(
+                    Event::new(now.t_ms, EventKind::RobotInitialized)
+                        .with_summary("Robot initialization completed.")
+                        .with_payload(payload)
+                        .with_provenance(Provenance::direct().with_stage("robot")),
+                );
+            }
+        }
 
         if now.reign.clear_sequence > self.last_reign_clear_sequence {
             events.push(
@@ -627,6 +651,54 @@ impl EventExtractor {
         }
         vec![safety_veto_event(now, desired, safety.reason.clone())]
     }
+}
+
+fn robot_initialized_payload(now: &Now) -> Option<EventPayload> {
+    let init = now.extensions.get("robot.initialization")?;
+    let active_sensors = init
+        .get("active_sensors")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let requested_sensors = init
+        .get("requested_sensors")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    Some(EventPayload::RobotInitialized {
+        mode: init
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        body: init
+            .get("body")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown body")
+            .to_string(),
+        battery_percent: init
+            .get("battery_percent")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok()),
+        charging: init.get("charging").and_then(|value| value.as_bool()),
+        active_sensors,
+        requested_sensors,
+        ledger: init
+            .get("ledger")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown ledger")
+            .to_string(),
+        tick_ms: init
+            .get("tick_ms")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        dashboard: init
+            .get("dashboard")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        capture: init
+            .get("capture")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
 }
 
 fn bump_side(now: &Now) -> &'static str {

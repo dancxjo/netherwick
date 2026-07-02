@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use netherwick_actions::{
-    action_to_motor_command, ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget,
-    LlmActionProposal, ReignInput, ReignMode, ReignOutcome, ReignSource, TurnDir,
+    action_to_motor_command, ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle,
+    InspectTarget, LlmActionProposal, ReignInput, ReignMode, ReignOutcome, ReignSource, TurnDir,
 };
 use netherwick_autonomic::{SafetyLayer, SafetyReason};
 use netherwick_behaviors::{
@@ -61,6 +61,7 @@ use netherwick_sensors::{
 };
 use netherwick_sim::{SimMotorComplex, VirtualWorld};
 use serde::{Deserialize, Serialize};
+use tsrun::{js_value_to_json, Interpreter, JsError, StepResult};
 use uuid::Uuid;
 
 pub struct MinimalRuntime<L, M, R, C, S, A>
@@ -666,6 +667,21 @@ pub struct BumpEventInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RobotInitializedEventInput {
+    pub t_ms: TimeMs,
+    pub mode: String,
+    pub body: String,
+    pub battery_percent: Option<u32>,
+    pub charging: Option<bool>,
+    pub active_sensors: usize,
+    pub requested_sensors: usize,
+    pub ledger: String,
+    pub tick_ms: u64,
+    pub dashboard: Option<String>,
+    pub capture: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FaceDetectedEventInput {
     pub t_ms: TimeMs,
     pub recognized: bool,
@@ -682,6 +698,8 @@ pub struct FacePerson {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventScriptAction {
     Say { text: String },
+    Chirp { pattern: ChirpPattern },
+    Song { name: String },
     Stop,
     Rotate { deg: i16 },
     Go,
@@ -965,6 +983,13 @@ impl RuntimeModelStack {
             stack.behaviors.event_bump =
                 bump_event_behavior(behavior.regime, behavior.model.clone(), behavior.fallback);
         }
+        if let Some(behavior) = config.behavior.get("event_robot_initialized") {
+            stack.behaviors.event_robot_initialized = robot_initialized_event_behavior(
+                behavior.regime,
+                behavior.model.clone(),
+                behavior.fallback,
+            );
+        }
         if let Some(behavior) = config.behavior.get("event_face_detected") {
             stack.behaviors.event_face_detected = face_detected_event_behavior(
                 behavior.regime,
@@ -1094,6 +1119,21 @@ impl RuntimeModelStack {
                 last("ear_next"),
             ),
             behavior_node_state(
+                "EventRobotInitialized",
+                "event_robot_initialized",
+                "on(robot-initialized)",
+                self.behaviors.event_robot_initialized.regime,
+                self.behaviors.event_robot_initialized.hardcoded_id(),
+                self.behaviors.event_robot_initialized.model_id(),
+                self.behaviors.event_robot_initialized.fallback,
+                vec![impl_id(
+                    "script.on_robot_initialized.ts.v0",
+                    "TypeScript script teacher",
+                )],
+                vec![impl_id("event.robot_initialized.shadow.v0", "Shadow model")],
+                last("event_robot_initialized"),
+            ),
+            behavior_node_state(
                 "EventBump",
                 "event_bump",
                 "on(bump)",
@@ -1165,6 +1205,7 @@ impl RuntimeModelStack {
             "action_value" => update_behavior!(action_value),
             "eye_next" => update_behavior!(eye_next),
             "ear_next" => update_behavior!(ear_next),
+            "event_robot_initialized" => update_behavior!(event_robot_initialized),
             "event_bump" => update_behavior!(event_bump),
             "event_face_detected" => update_behavior!(event_face_detected),
             _ => {}
@@ -1228,6 +1269,7 @@ fn normalize_behavior_node_id(node_id: &str) -> String {
         "ActionValue" => "action_value".to_string(),
         "EyeNext" => "eye_next".to_string(),
         "EarNext" => "ear_next".to_string(),
+        "EventRobotInitialized" => "event_robot_initialized".to_string(),
         "EventBump" => "event_bump".to_string(),
         "EventFaceDetected" => "event_face_detected".to_string(),
         other => other.to_ascii_lowercase().replace('-', "_"),
@@ -1257,6 +1299,7 @@ pub struct BehaviorRegistry {
     pub conductor: ReplaceableBehavior<ConductorInput, ActionPrimitive>,
     pub eye_next: ReplaceableBehavior<SituatedEyeNextInput, EyeNextOutput>,
     pub ear_next: ReplaceableBehavior<SituatedEarNextInput, EarNextOutput>,
+    pub event_robot_initialized: ReplaceableBehavior<RobotInitializedEventInput, EventScriptOutput>,
     pub event_bump: ReplaceableBehavior<BumpEventInput, EventScriptOutput>,
     pub event_face_detected: ReplaceableBehavior<FaceDetectedEventInput, EventScriptOutput>,
 }
@@ -1303,6 +1346,11 @@ impl Default for BehaviorRegistry {
             ear_next: ear_next_behavior(
                 BehaviorRegime::Hardcoded,
                 None,
+                FallbackPolicy::UseHardcoded,
+            ),
+            event_robot_initialized: robot_initialized_event_behavior(
+                BehaviorRegime::ShadowTrain,
+                Some("event.robot_initialized.shadow.v0".to_string()),
                 FallbackPolicy::UseHardcoded,
             ),
             event_bump: bump_event_behavior(
@@ -2103,6 +2151,43 @@ impl FunctionBehavior<FaceDetectedEventInput, EventScriptOutput> for FaceDetecte
     }
 }
 
+struct RobotInitializedScriptBehavior;
+
+impl FunctionBehavior<RobotInitializedEventInput, EventScriptOutput>
+    for RobotInitializedScriptBehavior
+{
+    fn id(&self) -> &'static str {
+        "script.on_robot_initialized.ts.v0"
+    }
+
+    fn infer(&mut self, input: &RobotInitializedEventInput) -> Result<EventScriptOutput> {
+        execute_event_script_typescript(ROBOT_INITIALIZED_SCRIPT, input)
+    }
+}
+
+const ROBOT_INITIALIZED_SCRIPT: &str = r#"
+[
+  song("bring_up"),
+  chirp("Curious"),
+  say(`Netherwick robot initialization complete in ${input.mode} mode.`),
+  say(`${input.body}.`),
+  input.battery_percent === null
+    ? say("Battery status is unavailable.")
+    : say(`Battery is ${input.battery_percent} percent and ${input.charging ? "charging" : "not charging"}.`),
+  input.requested_sensors === 0
+    ? say("No optional sensors requested.")
+    : say(`${input.active_sensors} of ${input.requested_sensors} optional sensors initialized.`),
+  say(`Ledger is ready at ${input.ledger}.`),
+  say(`Tick rate is ${input.tick_ms} milliseconds.`),
+  input.dashboard ? say(`Dashboard is listening at ${input.dashboard}.`) : say("Dashboard is not enabled."),
+  input.capture ? say(`Capture recording is armed at ${input.capture}.`) : say("Capture recording is not enabled."),
+  input.mode === "read-only"
+    ? say("Read only mode is active. Motors are suppressed.")
+    : say("Slow mode is active. Guarded motor commands are enabled."),
+  chirp("Confirm")
+]
+"#;
+
 struct EventScriptShadowModel {
     id: &'static str,
     last_observed: Option<EventScriptOutput>,
@@ -2128,6 +2213,26 @@ where
         self.samples_seen = self.samples_seen.saturating_add(1);
         Ok(())
     }
+}
+
+fn robot_initialized_event_behavior(
+    regime: BehaviorRegime,
+    model_id: Option<String>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<RobotInitializedEventInput, EventScriptOutput> {
+    ReplaceableBehavior::new(
+        "event_robot_initialized",
+        regime,
+        Box::new(RobotInitializedScriptBehavior),
+        model_id.map(|_| {
+            Box::new(EventScriptShadowModel {
+                id: "event.robot_initialized.shadow.v0",
+                last_observed: None,
+                samples_seen: 0,
+            }) as Box<_>
+        }),
+        fallback,
+    )
 }
 
 fn bump_event_behavior(
@@ -3626,6 +3731,31 @@ where
         let forced_action = None;
         let mut safe_sequences = serde_json::Map::new();
 
+        if let Some(input) = robot_initialized_event_input(now) {
+            let run = self
+                .models
+                .behaviors
+                .event_robot_initialized
+                .infer_with_teacher_source(&input, now.t_ms, TrainingSource::HardcodedTeacher)?;
+            let sequence = safety_trace_script_actions(&mut self.safety, now, &run.chosen);
+            for action in run
+                .chosen
+                .actions
+                .iter()
+                .filter_map(script_action_to_primitive)
+            {
+                proposed_actions.push(action);
+            }
+            safe_sequences.insert(
+                "robot-initialized".to_string(),
+                serde_json::to_value(&sequence)?,
+            );
+            notes.push(
+                "EventScript:on(robot-initialized) emitted bring-up mouth sequence".to_string(),
+            );
+            behavior_runs.push(run.record.erase());
+        }
+
         if now.body.flags.bump_left || now.body.flags.bump_right {
             let input = BumpEventInput {
                 t_ms: now.t_ms,
@@ -3957,6 +4087,53 @@ fn face_detected_event_input(now: &Now, recall: &RecallBundle) -> Option<FaceDet
     })
 }
 
+fn robot_initialized_event_input(now: &Now) -> Option<RobotInitializedEventInput> {
+    let init = now.extensions.get("robot.initialization")?;
+    Some(RobotInitializedEventInput {
+        t_ms: now.t_ms,
+        mode: init
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        body: init
+            .get("body")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown body")
+            .to_string(),
+        battery_percent: init
+            .get("battery_percent")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok()),
+        charging: init.get("charging").and_then(|value| value.as_bool()),
+        active_sensors: init
+            .get("active_sensors")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        requested_sensors: init
+            .get("requested_sensors")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        ledger: init
+            .get("ledger")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown ledger")
+            .to_string(),
+        tick_ms: init
+            .get("tick_ms")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        dashboard: init
+            .get("dashboard")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        capture: init
+            .get("capture")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
+}
+
 fn stable_person_id(value: &str) -> String {
     value
         .chars()
@@ -4001,12 +4178,26 @@ fn first_motor_script_action(output: &EventScriptOutput) -> Option<ActionPrimiti
         .actions
         .iter()
         .filter_map(script_action_to_primitive)
-        .find(|action| !matches!(action, ActionPrimitive::Speak { .. }))
+        .find(|action| {
+            !matches!(
+                action,
+                ActionPrimitive::Speak { .. } | ActionPrimitive::Chirp { .. }
+            )
+        })
 }
 
 fn script_action_to_primitive(action: &EventScriptAction) -> Option<ActionPrimitive> {
     match action {
         EventScriptAction::Say { text } => Some(ActionPrimitive::Speak { text: text.clone() }),
+        EventScriptAction::Chirp { pattern } => Some(ActionPrimitive::Chirp {
+            pattern: pattern.clone(),
+        }),
+        EventScriptAction::Song { name } => Some(ActionPrimitive::Speak {
+            text: match name.as_str() {
+                "bring_up" => "doo doo dee, systems waking up".to_string(),
+                _ => format!("little {name} song"),
+            },
+        }),
         EventScriptAction::Stop => Some(ActionPrimitive::Stop),
         EventScriptAction::Rotate { deg } => Some(ActionPrimitive::Turn {
             direction: if *deg >= 0 {
@@ -4022,6 +4213,68 @@ fn script_action_to_primitive(action: &EventScriptAction) -> Option<ActionPrimit
             duration_ms: 500,
         }),
     }
+}
+
+fn execute_event_script_typescript<I>(script: &str, input: &I) -> Result<EventScriptOutput>
+where
+    I: Serialize,
+{
+    let input_json =
+        serde_json::to_string(input).context("failed to serialize event script input")?;
+    let source = format!(
+        r#"
+const input = {input_json};
+function say(text) {{
+  return {{ type: "say", text: String(text) }};
+}}
+function chirp(pattern) {{
+  return {{ type: "chirp", pattern: String(pattern) }};
+}}
+function song(name) {{
+  return {{ type: "song", name: String(name) }};
+}}
+{script}
+"#
+    );
+    let mut interp = Interpreter::new();
+    interp
+        .prepare(
+            &source,
+            Some(tsrun::ModulePath::new("/netherwick-event-script.ts")),
+        )
+        .map_err(tsrun_error)?;
+    let value = loop {
+        match interp.step().map_err(tsrun_error)? {
+            StepResult::Continue => continue,
+            StepResult::Complete(value) => break value,
+            StepResult::NeedImports(imports) => {
+                let names = imports
+                    .iter()
+                    .map(|request| request.specifier.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!("unsupported TypeScript import(s): {names}");
+            }
+            StepResult::Suspended { .. } => {
+                anyhow::bail!(
+                    "TypeScript event script suspended; async host commands are not enabled"
+                )
+            }
+            StepResult::Done => return Ok(EventScriptOutput::default()),
+        }
+    };
+    let value = js_value_to_json(value.value()).map_err(tsrun_error)?;
+    if value.get("actions").is_some() {
+        serde_json::from_value(value).context("failed to parse TypeScript event script output")
+    } else {
+        let actions = serde_json::from_value(value)
+            .context("failed to parse TypeScript event script action list")?;
+        Ok(EventScriptOutput { actions })
+    }
+}
+
+fn tsrun_error(err: JsError) -> anyhow::Error {
+    anyhow::anyhow!("TypeScript event script failed: {err}")
 }
 
 pub struct RuntimeTick {
@@ -4093,6 +4346,7 @@ pub struct RealRobotRunner<R> {
     now_builder: NowBuilder,
     frame_processor: FrameProcessor,
     live_image_enricher: Option<LiveImageEnricher>,
+    robot_initialization: Option<serde_json::Value>,
 }
 
 impl<R> RealRobotRunner<R>
@@ -4115,6 +4369,7 @@ where
             now_builder: NowBuilder::new(),
             frame_processor: FrameProcessor::new(),
             live_image_enricher: None,
+            robot_initialization: None,
         }
     }
 
@@ -4125,6 +4380,11 @@ where
 
     pub fn with_live_image_enricher(mut self, enricher: Option<LiveImageEnricher>) -> Self {
         self.live_image_enricher = enricher;
+        self
+    }
+
+    pub fn with_robot_initialization(mut self, initialization: serde_json::Value) -> Self {
+        self.robot_initialization = Some(initialization);
         self
     }
 
@@ -4183,6 +4443,7 @@ where
                 "safety_reason": "ReadOnlyMode",
             }),
         );
+        self.insert_robot_initialization(&mut now);
         enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
 
         let tick = self
@@ -4215,6 +4476,7 @@ where
             "mode".to_string(),
             serde_json::Value::String("slow".to_string()),
         );
+        self.insert_robot_initialization(&mut now);
         enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
 
         now.reign = self.runtime.reign_sense(t_ms)?;
@@ -4312,6 +4574,15 @@ where
         snapshot.action_debug = Some(action_debug);
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
+    }
+
+    fn insert_robot_initialization(&mut self, now: &mut Now) {
+        if self.tick_count == 0 {
+            if let Some(initialization) = self.robot_initialization.take() {
+                now.extensions
+                    .insert("robot.initialization".to_string(), initialization);
+            }
+        }
     }
 }
 

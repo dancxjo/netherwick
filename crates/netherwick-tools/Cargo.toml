@@ -40,6 +40,7 @@ netherwick-llm = { path = "../netherwick-llm" }
 netherwick-map = { path = "../netherwick-map" }
 netherwick-memory = { path = "../netherwick-memory" }
 netherwick-models = { path = "../netherwick-models" }
+netherwick-mouth = { path = "../netherwick-mouth" }
 netherwick-now = { path = "../netherwick-now" }
 netherwick-runtime = { path = "../netherwick-runtime" }
 netherwick-server = { path = "../netherwick-server" }

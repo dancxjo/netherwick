@@ -32,6 +32,7 @@ use netherwick_memory::{
     PlaceRecognitionKind,
 };
 use netherwick_models::MODEL_REGISTRY;
+use netherwick_mouth::{Mouth, PiperCpalMouth};
 use netherwick_now::{EarSense, ExtensionSense, KinectSense, Now, RangeSense, SurpriseSense};
 use netherwick_runtime::{
     ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
@@ -4599,7 +4600,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         anyhow::bail!("--mode disabled does not start the real robot runner");
     }
 
-    let (body, robot_mode, is_mock_body) =
+    let (mut body, robot_mode, is_mock_body) =
         open_robot_body_or_fallback(create_port.as_deref(), args.create_baud, robot_mode).await?;
 
     let live_state = args.dashboard.map(|_| {
@@ -4777,6 +4778,14 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
+    let init_body = match body.read_body().await {
+        Ok(body) => Some(body),
+        Err(error) => {
+            println!("failed to read initial body status for speech checklist: {error}");
+            None
+        }
+    };
+
     let ledger = JsonlLedger::new(&args.ledger);
     let memory = DurableExperienceStore::from_env();
     let recall = memory.clone();
@@ -4790,9 +4799,19 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     );
     let live_image_enricher = LiveImageEnricher::new(configured_llm_config(&args.llm)?)?;
     let mut frame_processor_warnings = Vec::new();
+    let active_sensor_count = sensors.len();
+    let initialization = robot_initialization_metadata(
+        robot_mode,
+        &args,
+        is_mock_body,
+        create_port.as_deref(),
+        active_sensor_count,
+        init_body.as_ref(),
+    );
     let mut runner = RealRobotRunner::new(robot_mode, body, sensors, runtime)
         .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
-        .with_live_image_enricher(live_image_enricher);
+        .with_live_image_enricher(live_image_enricher)
+        .with_robot_initialization(initialization);
     runner.tick_ms = args.tick_ms;
     for warning in frame_processor_warnings {
         println!("{warning}");
@@ -4821,6 +4840,20 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         None => None,
     };
 
+    let mut mouth = match PiperCpalMouth::from_env() {
+        Ok(Some(mouth)) => Some(mouth),
+        Ok(None) => {
+            println!(
+                "robot mouth disabled: no Piper voice found; set NETHERWICK_TTS_PIPER_VOICE and NETHERWICK_TTS_PIPER_CONFIG"
+            );
+            None
+        }
+        Err(error) => {
+            println!("robot mouth disabled: could not load Piper voice: {error}");
+            None
+        }
+    };
+
     let max_steps = args.steps.or_else(|| {
         args.duration_seconds
             .map(|seconds| duration_to_steps(seconds, args.tick_ms))
@@ -4846,6 +4879,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
+        play_event_script_mouth_actions(&mut mouth, &tick);
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
             live_state.update_embodied_context(tick.frame.embodied_context());
@@ -4882,6 +4916,103 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         capture_summary
     );
     Ok(())
+}
+
+fn robot_initialization_metadata(
+    robot_mode: RobotMode,
+    args: &RobotArgs,
+    is_mock_body: bool,
+    create_port: Option<&str>,
+    active_sensor_count: usize,
+    init_body: Option<&BodySense>,
+) -> serde_json::Value {
+    let body_status = if is_mock_body {
+        "mock Create body connected".to_string()
+    } else if let Some(port) = create_port {
+        format!("Create body connected on {port}")
+    } else {
+        "Create body connected".to_string()
+    };
+    let mode = match robot_mode {
+        RobotMode::ReadOnly => "read-only",
+        RobotMode::Slow => "slow",
+        RobotMode::Disabled => "disabled",
+    };
+    serde_json::json!({
+        "mode": mode,
+        "body": body_status,
+        "battery_percent": init_body.map(|body| {
+            (body.battery_level.clamp(0.0, 1.0) * 100.0).round() as u32
+        }),
+        "charging": init_body.map(|body| body.charging),
+        "active_sensors": active_sensor_count,
+        "requested_sensors": requested_robot_sensor_count(args),
+        "ledger": args.ledger.clone(),
+        "tick_ms": args.tick_ms,
+        "dashboard": args.dashboard.map(|addr| addr.to_string()),
+        "capture": args.capture.clone(),
+    })
+}
+
+fn play_event_script_mouth_actions(mouth: &mut Option<PiperCpalMouth>, tick: &RuntimeTick) {
+    let Some(mouth) = mouth.as_mut() else {
+        return;
+    };
+    let Some(scripts) = tick.frame.now.extensions.get("event_scripts") else {
+        return;
+    };
+    let Some(object) = scripts.as_object() else {
+        return;
+    };
+    for sequence in object.values() {
+        let Some(actions) = sequence.get("actions").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for action in actions {
+            let requested = action.get("requested").unwrap_or(action);
+            if let Some(text) = requested.get("text").and_then(|value| value.as_str()) {
+                speak_robot_mouth_text(mouth, text);
+            } else if let Some(pattern) = requested.get("pattern").and_then(|value| value.as_str())
+            {
+                speak_robot_mouth_text(mouth, chirp_pattern_text(pattern));
+            } else if let Some(name) = requested.get("name").and_then(|value| value.as_str()) {
+                speak_robot_mouth_text(mouth, song_text(name));
+            }
+        }
+    }
+}
+
+fn speak_robot_mouth_text(mouth: &mut PiperCpalMouth, text: &str) {
+    match mouth.speak(text) {
+        Ok(outcome) => println!(
+            "robot mouth: backend {}, spoken {}, text {:?}",
+            outcome.backend, outcome.spoken, text
+        ),
+        Err(error) => println!("robot mouth failed: {error}; text {text:?}"),
+    }
+}
+
+fn chirp_pattern_text(pattern: &str) -> &'static str {
+    match pattern {
+        "Confirm" => "beep bee bee",
+        "Warning" => "bop bop bop",
+        "Curious" => "dee doo?",
+        _ => "beep",
+    }
+}
+
+fn song_text(name: &str) -> &'static str {
+    match name {
+        "bring_up" => "doo doo dee, waking up, dee doo dee",
+        _ => "doo dee doo",
+    }
+}
+
+fn requested_robot_sensor_count(args: &RobotArgs) -> usize {
+    usize::from(args.camera.is_some() || args.kinect_depth)
+        + usize::from(args.mic.is_some())
+        + usize::from(args.imu.is_some())
+        + usize::from(args.gps.is_some())
 }
 
 async fn open_robot_body_or_fallback(
