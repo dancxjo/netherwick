@@ -1,16 +1,24 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine;
 use chrono::{Local, SecondsFormat, TimeZone};
 use futures_util::StreamExt;
+use image::ImageEncoder;
 use netherwick_actions::{
     ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle, InspectTarget, TurnDir,
 };
 use netherwick_experience::{EmbodiedContext, ExperienceLatent, FuturePrediction, Impression};
-use netherwick_now::{LlmSense, Now, ReignSense};
+use netherwick_now::{
+    EyeFrame, EyeFrameFormat, LlmSense, Now, ReignSense, VectorArtifact,
+    IMAGE_DESCRIPTION_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -19,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-pub const IMAGE_CAPTION_PROMPT: &str = "The attached visual input is what I am seeing now. Describe only what you see from my viewpoint. Start from the fact that this is my own vision looking out, so first person should mean phrases like \"I see...\" or \"in front of me,\" not that visible people, faces, hands, eyes, or bodies are mine. Prefer concrete scene details over lighting or color summaries. Stay grounded in visible evidence and do not speculate beyond what can be seen. Do not interpret this as an image, screenshot, photo, frame, camera feed, metadata, data URL, or analysis; interpret it as the robot's own live view. When looking out, one does not see oneself: anyone visible is most likely someone I am looking at, not myself, unless I am clearly looking in a mirror or reflection. Describe visible people in third person, as someone in front of me.";
+pub const IMAGE_CAPTION_PROMPT: &str = "Describe only what you see from your viewpoint. Start from the fact that this is your own vision looking out, so the first person should mean phrases like \"I see...\" or \"in front of me,\" not that visible people, faces, hands, eyes, or bodies are yours. You may use more than one sentence when the visible scene needs fuller description, but stay grounded in visible evidence and do not speculate beyond what can be seen. Do not interpret this as an image; interpret it as the machine's own live view. When looking out, one does not see oneself: anyone you see is most likely someone you're looking at, not yourself, unless you're clearly looking in a mirror or reflection. Describe visible people in third person, as someone in front of you.";
 
 const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, not the sensor stream. Interpret images, audio, motion, location, body state, memory-derived entries, and other sensor-derived entries as the robot's own vision, hearing, body sense, position sense, and memory sense, not as media files or external sensor artifacts. Convert raw body data into feeling-centered first-person interpretations from inside the robot: say things like \"I feel steady,\" \"I feel the floor fall away ahead,\" or \"my body feels blocked,\" instead of naming raw flags, sensor booleans, channel levels, or detector states. Do not summarize the amount, density, cadence, or mix of input modalities as if that were the situation. Repeated frames, repeated detections, image embeddings, pending audio clips, and heartbeat-like status records are usually evidence to compress or ignore, not events to report. If people are visible, do not assume any visible person is me unless the vision is clearly a mirror or reflection. If the evidence does not reveal what is happening, say that I cannot tell what is happening yet. Do not infer emotional tone or words like chaotic, intense, overwhelming, anxious, or ominous from sensor volume alone.";
 
@@ -227,6 +235,9 @@ pub struct LlmConfig {
     pub endpoint: String,
     pub agent_model: String,
     pub combobulator_model: Option<String>,
+    pub vision_model: Option<String>,
+    pub embedding_model: Option<String>,
+    pub enrich_live_images: bool,
     pub temperature: f32,
     pub timeout_ms: u64,
 }
@@ -239,6 +250,12 @@ impl Default for LlmConfig {
         let agent_model = std::env::var("NETHERWICK_LLM_MODEL")
             .or_else(|_| std::env::var("OLLAMA_MODEL"))
             .unwrap_or_else(|_| "llama3.2".to_string());
+        let vision_model = std::env::var("NETHERWICK_VISION_MODEL")
+            .or_else(|_| std::env::var("OLLAMA_VISION_MODEL"))
+            .unwrap_or_else(|_| "gemma4".to_string());
+        let embedding_model = std::env::var("NETHERWICK_EMBEDDING_MODEL")
+            .or_else(|_| std::env::var("OLLAMA_EMBEDDING_MODEL"))
+            .unwrap_or_else(|_| "embeddinggemma".to_string());
         Self {
             provider: LlmProvider::Ollama,
             allow_commands: true,
@@ -246,6 +263,9 @@ impl Default for LlmConfig {
             endpoint,
             agent_model,
             combobulator_model: None,
+            vision_model: Some(vision_model),
+            embedding_model: Some(embedding_model),
+            enrich_live_images: true,
             temperature: 0.2,
             timeout_ms: DEFAULT_OLLAMA_TIMEOUT_MS,
         }
@@ -260,8 +280,256 @@ impl LlmConfig {
         if config.combobulator_model.is_none() {
             config.combobulator_model = Some(config.agent_model.clone());
         }
+        if config.vision_model.is_none() {
+            config.vision_model = Some("gemma4".to_string());
+        }
+        if config.embedding_model.is_none() {
+            config.embedding_model = Some("embeddinggemma".to_string());
+        }
         Ok(config)
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveImageEnricher {
+    config: LlmConfig,
+    client: Client,
+    last_frame_key: Option<LiveImageFrameKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveImageFrameKey {
+    captured_at_ms: u64,
+    width: u32,
+    height: u32,
+    format: String,
+    byte_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveImageEnrichment {
+    pub description: String,
+    pub image_description_vector: VectorArtifact,
+    pub scene_vector: VectorArtifact,
+}
+
+impl LiveImageEnricher {
+    pub fn new(config: LlmConfig) -> Result<Option<Self>> {
+        if config.provider != LlmProvider::Ollama || !config.enrich_live_images {
+            return Ok(None);
+        }
+        let client = Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .build()
+            .context("failed to build ollama image enricher http client")?;
+        Ok(Some(Self {
+            config,
+            client,
+            last_frame_key: None,
+        }))
+    }
+
+    pub async fn enrich_latest(&mut self, frame: &EyeFrame) -> Result<Option<LiveImageEnrichment>> {
+        let key = LiveImageFrameKey::from(frame);
+        if self.last_frame_key.as_ref() == Some(&key) {
+            return Ok(None);
+        }
+        self.last_frame_key = Some(key);
+
+        let image_base64 = encode_eye_frame_png_base64(frame)?;
+        let vision_model = self
+            .config
+            .vision_model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .context("live image enrichment requires vision_model")?;
+        let embedding_model = self
+            .config
+            .embedding_model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .context("live image enrichment requires embedding_model")?;
+        let description = self.describe_image(vision_model, image_base64).await?;
+        let embedding = self.embed_text(embedding_model, &description).await?;
+        let source_frame_id = live_image_source_frame_id(frame);
+        let point_id = stable_uuid_for_text(&format!(
+            "{}:{vision_model}:{embedding_model}:{description}",
+            source_frame_id
+        ))
+        .to_string();
+        let image_description_vector = VectorArtifact::new(
+            IMAGE_DESCRIPTION_VECTOR_COLLECTION,
+            point_id.clone(),
+            embedding.clone(),
+        )
+        .with_model(embedding_model.to_string())
+        .with_source_id(format!("image-description:{source_frame_id}"))
+        .with_source_frame_id(source_frame_id.clone())
+        .with_occurred_at_ms(frame.captured_at_ms);
+        let scene_vector = VectorArtifact::new(SCENE_VECTOR_COLLECTION, point_id, embedding)
+            .with_model(embedding_model.to_string())
+            .with_source_id(format!("image-description:{source_frame_id}"))
+            .with_source_frame_id(source_frame_id)
+            .with_occurred_at_ms(frame.captured_at_ms);
+        Ok(Some(LiveImageEnrichment {
+            description,
+            image_description_vector,
+            scene_vector,
+        }))
+    }
+
+    async fn describe_image(&self, model: &str, image_base64: String) -> Result<String> {
+        let request = OllamaChatRequest {
+            model,
+            stream: false,
+            messages: vec![OllamaChatMessage {
+                role: "user",
+                content: IMAGE_CAPTION_PROMPT,
+                images: vec![image_base64],
+            }],
+            options: OllamaGenerateOptions {
+                temperature: self.config.temperature,
+            },
+        };
+        let response: OllamaChatResponse = self
+            .client
+            .post(format!(
+                "{}/api/chat",
+                self.config.endpoint.trim_end_matches('/')
+            ))
+            .json(&request)
+            .send()
+            .await
+            .context("failed to reach ollama for image description")?
+            .error_for_status()
+            .context("ollama image description returned an error")?
+            .json()
+            .await
+            .context("failed to decode ollama image description")?;
+        let text = response.message.content.trim().to_string();
+        if text.is_empty() {
+            anyhow::bail!("ollama image description was empty");
+        }
+        Ok(text)
+    }
+
+    async fn embed_text(&self, model: &str, text: &str) -> Result<Vec<f32>> {
+        let request = OllamaEmbedRequest { model, input: text };
+        let response: OllamaEmbedResponse = self
+            .client
+            .post(format!(
+                "{}/api/embed",
+                self.config.endpoint.trim_end_matches('/')
+            ))
+            .json(&request)
+            .send()
+            .await
+            .context("failed to reach ollama for text embedding")?
+            .error_for_status()
+            .context("ollama text embedding returned an error")?
+            .json()
+            .await
+            .context("failed to decode ollama text embedding")?;
+        let embedding = response
+            .embeddings
+            .into_iter()
+            .next()
+            .context("ollama returned no embeddings")?;
+        if embedding.is_empty() {
+            anyhow::bail!("ollama returned an empty embedding");
+        }
+        Ok(embedding)
+    }
+}
+
+impl From<&EyeFrame> for LiveImageFrameKey {
+    fn from(frame: &EyeFrame) -> Self {
+        Self {
+            captured_at_ms: frame.captured_at_ms,
+            width: frame.width,
+            height: frame.height,
+            format: format!("{:?}", frame.format),
+            byte_len: frame.bytes.len(),
+        }
+    }
+}
+
+fn encode_eye_frame_png_base64(frame: &EyeFrame) -> Result<String> {
+    let (rgb, color_type) = match &frame.format {
+        EyeFrameFormat::Rgb8 => (frame.bytes.clone(), image::ColorType::Rgb8),
+        EyeFrameFormat::Bgr8 => {
+            let mut rgb = Vec::with_capacity(frame.bytes.len());
+            for pixel in frame.bytes.chunks_exact(3) {
+                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+            (rgb, image::ColorType::Rgb8)
+        }
+        EyeFrameFormat::Gray8 => (frame.bytes.clone(), image::ColorType::L8),
+        EyeFrameFormat::Mjpeg => {
+            let image = image::load_from_memory(&frame.bytes)
+                .context("failed to decode MJPEG eye frame")?
+                .to_rgb8();
+            (image.into_raw(), image::ColorType::Rgb8)
+        }
+        EyeFrameFormat::Yuyv422
+        | EyeFrameFormat::Uyvy422
+        | EyeFrameFormat::BayerGrbg8
+        | EyeFrameFormat::BayerRggb8
+        | EyeFrameFormat::BayerBggr8
+        | EyeFrameFormat::BayerGbrg8
+        | EyeFrameFormat::Unknown(_) => {
+            anyhow::bail!("unsupported live image frame format {:?}", frame.format)
+        }
+    };
+    let expected_len = match color_type {
+        image::ColorType::Rgb8 => frame.width as usize * frame.height as usize * 3,
+        image::ColorType::L8 => frame.width as usize * frame.height as usize,
+        _ => unreachable!("only rgb8 and gray8 are encoded"),
+    };
+    if frame.width == 0 || frame.height == 0 || rgb.len() != expected_len {
+        anyhow::bail!(
+            "invalid live image frame dimensions {}x{} for {} bytes",
+            frame.width,
+            frame.height,
+            rgb.len()
+        );
+    }
+
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(Cursor::new(&mut png))
+        .write_image(&rgb, frame.width, frame.height, color_type.into())
+        .context("failed to encode live image frame as PNG")?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
+}
+
+fn live_image_source_frame_id(frame: &EyeFrame) -> String {
+    if frame.captured_at_ms > 0 {
+        format!("eye-frame-{}", frame.captured_at_ms)
+    } else {
+        format!(
+            "eye-frame-{}",
+            stable_uuid_for_text(&format!(
+                "{}x{}:{:?}:{}",
+                frame.width,
+                frame.height,
+                frame.format,
+                frame.bytes.len()
+            ))
+        )
+    }
+}
+
+fn stable_uuid_for_text(text: &str) -> Uuid {
+    let mut first = DefaultHasher::new();
+    "netherwick-live-image-a".hash(&mut first);
+    text.hash(&mut first);
+    let mut second = DefaultHasher::new();
+    "netherwick-live-image-b".hash(&mut second);
+    text.hash(&mut second);
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_be_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_be_bytes());
+    Uuid::from_bytes(bytes)
 }
 
 pub fn summarized_senses(now: &Now) -> Vec<String> {
@@ -805,6 +1073,45 @@ struct OllamaGenerateResponse {
     response: String,
     #[serde(default)]
     thinking: String,
+}
+
+#[derive(Serialize)]
+struct OllamaChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<OllamaChatMessage<'a>>,
+    stream: bool,
+    options: OllamaGenerateOptions,
+}
+
+#[derive(Serialize)]
+struct OllamaChatMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatResponse {
+    message: OllamaChatResponseMessage,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatResponseMessage {
+    #[serde(default)]
+    content: String,
+}
+
+#[derive(Serialize)]
+struct OllamaEmbedRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Deserialize)]
+struct OllamaEmbedResponse {
+    #[serde(default)]
+    embeddings: Vec<Vec<f32>>,
 }
 
 #[derive(Deserialize)]
@@ -1992,13 +2299,16 @@ mod tests {
 
     #[test]
     fn image_caption_prompt_frames_live_vision_viewpoint() {
-        assert!(IMAGE_CAPTION_PROMPT.contains("what I am seeing now"));
-        assert!(IMAGE_CAPTION_PROMPT.contains("my own vision looking out"));
+        assert!(IMAGE_CAPTION_PROMPT.contains("Describe only what you see from your viewpoint"));
+        assert!(IMAGE_CAPTION_PROMPT.contains("your own vision looking out"));
         assert!(IMAGE_CAPTION_PROMPT.contains("not that visible people"));
+        assert!(IMAGE_CAPTION_PROMPT.contains("the machine's own live view"));
         assert!(IMAGE_CAPTION_PROMPT.contains("When looking out, one does not see oneself"));
         assert!(
-            IMAGE_CAPTION_PROMPT.contains("unless I am clearly looking in a mirror or reflection")
+            IMAGE_CAPTION_PROMPT.contains("most likely someone you're looking at, not yourself")
         );
+        assert!(IMAGE_CAPTION_PROMPT
+            .contains("unless you're clearly looking in a mirror or reflection"));
         assert!(IMAGE_CAPTION_PROMPT.contains("Describe visible people in third person"));
         assert!(!IMAGE_CAPTION_PROMPT.contains("data:image"));
     }

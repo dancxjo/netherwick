@@ -18,7 +18,7 @@ use netherwick_create1::{Create1Body, Create1OpenMode, MockCreate1Body};
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
-use netherwick_llm::{ConfiguredLlmAgent, LlmConfig, LlmProvider};
+use netherwick_llm::{ConfiguredLlmAgent, LiveImageEnricher, LlmConfig, LlmProvider};
 use netherwick_map::{
     observation_from_now, transform_point_to_world, LocalMap, LoopClosureCandidateInput,
     OrientationEstimate, Point3D, PointCloudConfig, PointCloudFrame, PoseGraphBuilder,
@@ -4788,9 +4788,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         SimpleSafety::default(),
         configured_llm_agent(&args.llm)?,
     );
+    let live_image_enricher = LiveImageEnricher::new(configured_llm_config(&args.llm)?)?;
     let mut frame_processor_warnings = Vec::new();
     let mut runner = RealRobotRunner::new(robot_mode, body, sensors, runtime)
-        .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await);
+        .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
+        .with_live_image_enricher(live_image_enricher);
     runner.tick_ms = args.tick_ms;
     for warning in frame_processor_warnings {
         println!("{warning}");

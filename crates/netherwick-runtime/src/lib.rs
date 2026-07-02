@@ -35,7 +35,7 @@ use netherwick_experience::{
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
 };
-use netherwick_llm::{Combobulation, LlmAgent, LlmTickResult};
+use netherwick_llm::{Combobulation, LiveImageEnricher, LlmAgent, LlmTickResult};
 use netherwick_map::{
     observation_from_now, LocalMap, LoopClosureCandidateInput, MAP_EXTENSION_NAME,
 };
@@ -4092,6 +4092,7 @@ pub struct RealRobotRunner<R> {
     pub tick_count: usize,
     now_builder: NowBuilder,
     frame_processor: FrameProcessor,
+    live_image_enricher: Option<LiveImageEnricher>,
 }
 
 impl<R> RealRobotRunner<R>
@@ -4113,11 +4114,17 @@ where
             tick_count: 0,
             now_builder: NowBuilder::new(),
             frame_processor: FrameProcessor::new(),
+            live_image_enricher: None,
         }
     }
 
     pub fn with_frame_processor(mut self, frame_processor: FrameProcessor) -> Self {
         self.frame_processor = frame_processor;
+        self
+    }
+
+    pub fn with_live_image_enricher(mut self, enricher: Option<LiveImageEnricher>) -> Self {
+        self.live_image_enricher = enricher;
         self
     }
 
@@ -4176,12 +4183,14 @@ where
                 "safety_reason": "ReadOnlyMode",
             }),
         );
+        enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
 
         let tick = self
             .runtime
             .tick(now, ExperienceLatent::default(), Vec::new())
             .await?;
         let mut snapshot = self.now_builder.snapshot();
+        snapshot.eye = tick.frame.now.eye.clone();
         annotate_snapshot_from_tick(&mut snapshot, &tick);
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
@@ -4206,6 +4215,7 @@ where
             "mode".to_string(),
             serde_json::Value::String("slow".to_string()),
         );
+        enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
 
         now.reign = self.runtime.reign_sense(t_ms)?;
         if let Some(input) = now.reign.latest.clone() {
@@ -4228,6 +4238,7 @@ where
                     &body_before,
                 )?;
                 let mut snapshot = self.now_builder.snapshot();
+                snapshot.eye = tick.frame.now.eye.clone();
                 annotate_snapshot_from_tick(&mut snapshot, &tick);
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
@@ -4254,6 +4265,7 @@ where
         self.body.apply_motor(final_motor).await?;
 
         let mut snapshot = self.now_builder.snapshot();
+        snapshot.eye = tick.frame.now.eye.clone();
         annotate_snapshot_from_tick(&mut snapshot, &tick);
         let mut action_debug = snapshot
             .action_debug
@@ -4300,6 +4312,43 @@ where
         snapshot.action_debug = Some(action_debug);
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
+    }
+}
+
+async fn enrich_now_latest_image(enricher: &mut Option<LiveImageEnricher>, now: &mut Now) {
+    let Some(enricher) = enricher.as_mut() else {
+        return;
+    };
+    let Some(frame) = now.eye_frame.as_ref() else {
+        return;
+    };
+    match enricher.enrich_latest(frame).await {
+        Ok(Some(enrichment)) => {
+            now.eye
+                .image_description_vectors
+                .push(enrichment.image_description_vector);
+            now.eye.scene_vectors.push(enrichment.scene_vector);
+            now.extensions.insert(
+                "vision.latest_image_description".to_string(),
+                serde_json::json!({
+                    "text": enrichment.description,
+                    "source_frame_id": now
+                        .eye
+                        .scene_vectors
+                        .last()
+                        .and_then(|vector| vector.source_frame_id.clone()),
+                    "scene_vector_count": now.eye.scene_vectors.len(),
+                    "image_description_vector_count": now.eye.image_description_vectors.len(),
+                }),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            now.extensions.insert(
+                "vision.image_enrichment_error".to_string(),
+                serde_json::json!(error.to_string()),
+            );
+        }
     }
 }
 
