@@ -1758,6 +1758,9 @@ fn summarize_reign_command(input: &netherwick_actions::ReignInput) -> String {
         netherwick_actions::ReignCommand::Speak { text } => {
             format!("Speak {text}")
         }
+        netherwick_actions::ReignCommand::Chirp { pattern } => {
+            format!("Chirp {:?}", pattern)
+        }
         netherwick_actions::ReignCommand::SetMode { mode } => {
             format!("Set mode {:?}", mode)
         }

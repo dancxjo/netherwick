@@ -381,4 +381,20 @@ mod tests {
         assert_eq!(motor.forward, 0.35);
         assert_eq!(motor.turn, -0.42);
     }
+
+    #[test]
+    fn reign_chirp_maps_to_chirp_action_without_motion() {
+        let action = ReignCommand::Chirp {
+            pattern: ChirpPattern::Confirm,
+        }
+        .to_action();
+
+        assert_eq!(
+            action,
+            Some(ActionPrimitive::Chirp {
+                pattern: ChirpPattern::Confirm
+            })
+        );
+        assert_eq!(action_to_motor_command(action.as_ref()), MotorCommand::stop());
+    }
 }

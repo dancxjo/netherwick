@@ -10519,6 +10519,9 @@ mod tests {
         assert!(page.contains("const nodes = {...graphLayout}"));
         assert!(page.contains("source='Gamepad'"));
         assert!(page.contains("type:'Drive'"));
+        assert!(page.contains("type:'Speak'"));
+        assert!(page.contains("type:'Chirp'"));
+        assert!(page.contains("data-chirp=\"Confirm\""));
         assert!(page.contains("WASD / arrow keys"));
         assert!(page.contains("keyboardReignCodes"));
         assert!(page.contains("KeyW"));
