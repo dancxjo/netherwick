@@ -1,11 +1,12 @@
 set shell := ["bash", "-euxo", "pipefail", "-c"]
 
-create1_port := env_var_or_default("CREATE1_PORT", "/dev/ttyUSB0")
-gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "/dev/ttyACM0")
+create1_port := env_var_or_default("CREATE1_PORT", "auto")
+gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "")
 camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
-mic_device := env_var_or_default("MIC_DEVICE", "default")
-imu_device := env_var_or_default("IMU_DEVICE", "/dev/i2c-1")
+mic_device := env_var_or_default("MIC_DEVICE", "")
+imu_device := env_var_or_default("IMU_DEVICE", "")
 robot_dashboard := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD", "0.0.0.0:3000")
+kinect_depth := env_var_or_default("NETHERWICK_KINECT_DEPTH", "0")
 kinect_rgb_target_luma := env_var_or_default("KINECT_RGB_TARGET_LUMA", "0.32")
 kinect_rgb_auto_gain_max := env_var_or_default("KINECT_RGB_AUTO_GAIN_MAX", "3.0")
 kinect_rgb_gain := env_var_or_default("KINECT_RGB_GAIN", "1.0")
@@ -139,20 +140,44 @@ sim:
 
 # Bring up the real robot in slow mode with default hardware auto-detection.
 robot *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CAMERA_ARGS=()
+    MIC_ARGS=()
+    IMU_ARGS=()
+    GPS_ARGS=()
+    KINECT_ARGS=()
+    if [ -n "{{camera_device}}" ]; then
+        CAMERA_ARGS+=(--camera "{{camera_device}}")
+    fi
+    if [ -n "{{mic_device}}" ]; then
+        MIC_ARGS+=(--mic "{{mic_device}}")
+    fi
+    if [ -n "{{imu_device}}" ]; then
+        IMU_ARGS+=(--imu "{{imu_device}}")
+    fi
+    if [ -n "{{gps_serial_port}}" ]; then
+        GPS_ARGS+=(--gps "{{gps_serial_port}}")
+    fi
+    if [ "{{kinect_depth}}" = "1" ] || [ "{{kinect_depth}}" = "true" ] || [ "{{kinect_depth}}" = "on" ]; then
+        KINECT_ARGS+=(
+            --kinect-depth
+            --kinect-rgb-target-luma "{{kinect_rgb_target_luma}}"
+            --kinect-rgb-auto-gain-max "{{kinect_rgb_auto_gain_max}}"
+            --kinect-rgb-gain "{{kinect_rgb_gain}}"
+            --kinect-rgb-gamma "{{kinect_rgb_gamma}}"
+            --kinect-rgb-brightness "{{kinect_rgb_brightness}}"
+        )
+    fi
     cargo run -p netherwick-tools -- robot \
         --mode "${NETHERWICK_ROBOT_MODE:-slow}" \
         --create-port "{{create1_port}}" \
         --ledger "${NETHERWICK_ROBOT_LEDGER:-data/ledger/real/robot}" \
-        --camera "{{camera_device}}" \
-        --kinect-depth \
-        --kinect-rgb-target-luma "{{kinect_rgb_target_luma}}" \
-        --kinect-rgb-auto-gain-max "{{kinect_rgb_auto_gain_max}}" \
-        --kinect-rgb-gain "{{kinect_rgb_gain}}" \
-        --kinect-rgb-gamma "{{kinect_rgb_gamma}}" \
-        --kinect-rgb-brightness "{{kinect_rgb_brightness}}" \
-        --mic "{{mic_device}}" \
-        --imu "{{imu_device}}" \
-        --gps "{{gps_serial_port}}" \
+        "${CAMERA_ARGS[@]}" \
+        "${KINECT_ARGS[@]}" \
+        "${MIC_ARGS[@]}" \
+        "${IMU_ARGS[@]}" \
+        "${GPS_ARGS[@]}" \
         --dashboard "{{robot_dashboard}}" \
         {{args}}
 

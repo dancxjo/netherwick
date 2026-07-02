@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "frame_count": 45,
+  "input": {
+    "source_type": "ledger",
+    "source_path": "data/ledger/robot-readonly/2026-06-24",
+    "provenance": {
+      "ledger-frame:3f48c0b1-c02c-458e-ba18-a1f12d60f6e0": 1,
+      "ledger-frame:ccd4ec3b-dd54-4c56-b862-1f67cb996830": 1,
+      "ledger-frame:60d871e7-adab-4b11-a294-9d4bf1fb5058": 1,
+      "ledger-frame:225258fd-4f29-48da-aaa6-5e6b3c4c25dd": 1,
+      "ledger-frame:56e4aaa0-c344-431a-9a7d-f1ff57a36542": 1,
+      "ledger-frame:7c53a5e2-1c48-4156-9110-2dd823406837": 1,
+      "ledger-frame:d0ad9404-b5c6-4195-bf07-d0eda92894de": 1,
+      "ledger-frame:86649ac1-b437-4336-a55e-df33c42c083c": 1,
+      "ledger-frame:08a8ed4a-08ef-48fb-bf2c-6c82201cc351": 1,
+      "ledger-frame:4f309a83-18e6-4a07-ac18-191d5754d6d0": 1,
+      "ledger-frame:0f2024db-34b9-42df-96a3-8b2b5a7fd218": 1,
+      "ledger-frame:72f2413f-0c80-41e4-8531-3597c7d2df98": 1,
+      "ledger-frame:320ad7e6-6000-48ab-9ec4-6cfc7c2e6613": 1,
+      "ledger-frame:3a599be3-052a-4bc7-8f70-f07a14aa1ccb": 1,
+      "ledger-frame:73f55e7b-d97b-40df-825d-b532c2b2dbf1": 1,
+      "ledger-frame:85c410ec-38e0-4793-a8ee-5519027d189a": 1,
+      "ledger-frame:89b25598-812a-4581-a8e5-2b0849ff66ac": 1,
+      "ledger-frame:e9248f6e-c91b-4aa1-a877-22124b8e48a3": 1,
+      "ledger-frame:ad0f80ec-1f4f-4782-8076-6c2fb8e7123e": 1,
+      "ledger-frame:6ea78851-b100-4359-aa32-ec5cb042080a": 1,
+      "ledger-frame:a1a0a18e-b879-400c-aaaf-6dcf16eb9798": 1,
+      "ledger-frame:b798955e-1b59-465a-8dd7-9a20c1355ae8": 1,
+      "ledger-frame:60153ff7-3234-478c-acc4-d2764ef1f7ce": 1,
+      "ledger-frame:0e3e64b2-cdfc-4034-8e7b-68340f713a30": 1,
+      "ledger-frame:c3c52174-e8d9-4e90-8076-bc2091675920": 1,
+      "ledger-frame:39bb5b58-89fc-4072-ac5a-345385dc4b39": 1,
+      "ledger-frame:1b8a7a87-2af4-4365-b256-ffa5db8d5bdc": 1,
+      "ledger-frame:ee3dfdbe-5c61-4737-ac74-c1e51133f1fa": 1,
+      "ledger-frame:89039f45-886e-42fc-a63b-d7f066dee135": 1,
+      "ledger-frame:a6eda09e-e195-4f3e-91d5-3db80a177846": 1,
+      "ledger-frame:9003b1fd-02b4-449b-98f0-d0bd300f2a27": 1,
+      "ledger-frame:18594f9b-09d3-4734-9a43-f19bab9287f5": 1,
+      "ledger-frame:17211652-c0e3-4358-a18c-b976f8039aca": 1,
+      "ledger-frame:d457b666-d5e3-42d9-af0f-e92e25dccb0a": 1,
+      "ledger-frame:bf184593-5b5e-4a02-9566-fc02823b5325": 1,
+      "ledger-frame:8794d2e3-afb4-44bf-b1a8-1898510b02a6": 1,
+      "ledger-frame:2602168f-86ed-4da0-a20e-a60cddf8252d": 1,
+      "ledger-frame:b0665b51-e55e-403f-bdf0-5b0316f7bfd5": 1,
+      "ledger-frame:6c108e7c-68ce-4290-b120-1a107c3cc8dc": 1,
+      "ledger-frame:a13a4276-5dc4-40fa-9f75-4bd34dfdcb06": 1,
+      "ledger-frame:3cadae5c-5aa5-4b29-b9b8-d36fa76f2fee": 1,
+      "ledger-frame:7425dc86-3240-4609-b02d-3a76416d782a": 1,
+      "ledger-frame:51e4a081-daf7-4a60-b2cd-e8e604d79223": 1,
+      "ledger-frame:cafb4e7c-63e6-411b-9510-c1dffd26082c": 1,
+      "ledger-frame:dae5c1e9-fbf8-40da-8ad0-2761ffedcda3": 1
+    }
+  },
+  "warnings": [
+    "audio/transcript channel missing across all frames",
+    "depth channel missing across all frames",
+    "object observations missing across all frames",
+    "point cloud received no usable observations",
+    "range sensor data missing across all frames",
+    "scene vectors missing across all frames"
+  ],
+  "entity_memory": {
+    "total_entities": 0,
+    "active_entities": 0,
+    "occluded_entities": 0,
+    "vanished_entities": 0,
+    "revived_entities": 0,
+    "modality_support_counts": {},
+    "constellation_edges_by_relation": {}
+  },
+  "map": {
+    "local_occupancy_cell_count": 0,
+    "pose_history_length": 45,
+    "point_cloud_voxel_count": 0,
+    "stable_voxel_count": 0,
+    "transient_voxel_count": 0
+  },
+  "pose_graph": {
+    "node_count": 5,
+    "odometry_edge_count": 4,
+    "loop_candidate_count": 690,
+    "loop_accepted_count": 585,
+    "loop_rejected_count": 105,
+    "confidence_distribution": {
+      "min": 0.6,
+      "max": 1.0,
+      "mean": 0.96077883,
+      "buckets": {
+        "0.95-1.00": 578,
+        "0.70-0.84": 29,
+        "0.50-0.69": 52,
+        "0.85-0.94": 31
+      }
+    }
+  },
+  "place_recognition": {
+    "candidates_emitted": 690,
+    "candidate_kinds": {
+      "same_place": 690
+    },
+    "confidence_distribution": {
+      "min": 0.6,
+      "max": 1.0,
+      "mean": 0.96077883,
+      "buckets": {
+        "0.50-0.74": 52,
+        "0.75-1.00": 638
+      }
+    },
+    "repeated_place_hints": [
+      "cell (0, 0) recognized 690 times"
+    ],
+    "warnings": [
+      "no stored place candidate met the confidence threshold"
+    ]
+  }
+}
