@@ -69,6 +69,7 @@ use serde_json::Value;
 
 const DEFAULT_LIVE_LLM_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MPU6050_IMU_DEVICE: &str = "/dev/i2c-1";
+const DEFAULT_WHISPER_MODEL_FILENAME: &str = "ggml-large-v3-turbo.bin";
 
 #[derive(Parser)]
 #[command(name = "netherwick")]
@@ -4962,7 +4963,8 @@ fn run_whisper_transcribe(args: WhisperTranscribeArgs) -> Result<()> {
     let model = args
         .model
         .or_else(|| env_path("NETHERWICK_WHISPER_MODEL"))
-        .context("missing Whisper model; set NETHERWICK_WHISPER_MODEL or pass --model")?;
+        .or_else(default_whisper_model_path)
+        .context("missing Whisper model path; run `just setup-whisper`, set NETHERWICK_WHISPER_MODEL, or pass --model")?;
     let samples = read_wav_as_16khz_mono_f32(&args.wav)
         .with_context(|| format!("failed to read {}", args.wav.display()))?;
     if samples.is_empty() {
@@ -5059,6 +5061,21 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn default_whisper_model_path() -> Option<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+        })?;
+    Some(
+        data_home
+            .join("netherwick")
+            .join("models")
+            .join("whisper")
+            .join(DEFAULT_WHISPER_MODEL_FILENAME),
+    )
 }
 
 fn robot_initialization_metadata(

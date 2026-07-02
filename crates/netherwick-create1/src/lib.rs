@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+#[cfg(feature = "serial")]
+use anyhow::Context;
+use anyhow::Result;
 use async_trait::async_trait;
 #[cfg(feature = "serial")]
 use netherwick_body::CliffSensors;
@@ -145,14 +147,11 @@ impl Create1Body {
 
     fn drive_direct(&mut self, cmd: MotorCommand) -> Result<()> {
         let limited = cmd.clamped(self.config.max_velocity_m_s, self.config.max_velocity_m_s);
-        let half_wheel_base = self.config.wheel_base_m / 2.0;
-        let left_m_s = limited.forward - (limited.turn * half_wheel_base);
-        let right_m_s = limited.forward + (limited.turn * half_wheel_base);
-        let left_mm_s = meters_per_second_to_mm_per_second(left_m_s);
-        let right_mm_s = meters_per_second_to_mm_per_second(right_m_s);
-        let mut packet = vec![145];
-        packet.extend_from_slice(&right_mm_s.to_be_bytes());
-        packet.extend_from_slice(&left_mm_s.to_be_bytes());
+        let velocity_mm_s = meters_per_second_to_mm_per_second(limited.forward);
+        let radius_mm = drive_radius_mm(limited, self.config.wheel_base_m);
+        let mut packet = vec![137];
+        packet.extend_from_slice(&velocity_mm_s.to_be_bytes());
+        packet.extend_from_slice(&radius_mm.to_be_bytes());
         self.write_bytes(&packet)
     }
 
@@ -287,7 +286,24 @@ fn wall_time_ms() -> u64 {
 
 fn meters_per_second_to_mm_per_second(value: f32) -> i16 {
     let scaled = (value * 1000.0).round();
-    scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    scaled.clamp(-500.0, 500.0) as i16
+}
+
+fn drive_radius_mm(cmd: MotorCommand, wheel_base_m: f32) -> i16 {
+    if cmd.turn.abs() < 1.0e-4 {
+        return i16::MIN;
+    }
+    if cmd.forward.abs() < 1.0e-4 {
+        return if cmd.turn > 0.0 { 1 } else { -1 };
+    }
+    let radius_m = (cmd.forward / cmd.turn).clamp(-2.0, 2.0);
+    let min_radius_m = (wheel_base_m * 0.5).max(0.001);
+    let radius_m = if radius_m.abs() < min_radius_m {
+        min_radius_m.copysign(radius_m)
+    } else {
+        radius_m
+    };
+    (radius_m * 1000.0).round().clamp(-2000.0, 2000.0) as i16
 }
 
 impl Create1Body {
@@ -329,4 +345,60 @@ fn read_sensor_packet(
     output.resize(start_len + packet_len, 0);
     port.read_exact(&mut output[start_len..])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create1_drive_radius_encodes_straight_and_turns() {
+        assert_eq!(
+            drive_radius_mm(
+                MotorCommand {
+                    forward: 0.15,
+                    turn: 0.0,
+                },
+                0.26,
+            ),
+            i16::MIN
+        );
+        assert_eq!(
+            drive_radius_mm(
+                MotorCommand {
+                    forward: 0.0,
+                    turn: 0.2,
+                },
+                0.26,
+            ),
+            1
+        );
+        assert_eq!(
+            drive_radius_mm(
+                MotorCommand {
+                    forward: 0.0,
+                    turn: -0.2,
+                },
+                0.26,
+            ),
+            -1
+        );
+        assert_eq!(
+            drive_radius_mm(
+                MotorCommand {
+                    forward: 0.15,
+                    turn: 0.3,
+                },
+                0.26,
+            ),
+            500
+        );
+    }
+
+    #[test]
+    fn create1_velocity_encoding_clamps_to_oi_drive_limits() {
+        assert_eq!(meters_per_second_to_mm_per_second(0.15), 150);
+        assert_eq!(meters_per_second_to_mm_per_second(2.0), 500);
+        assert_eq!(meters_per_second_to_mm_per_second(-2.0), -500);
+    }
 }

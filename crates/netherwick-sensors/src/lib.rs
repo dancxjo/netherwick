@@ -302,6 +302,7 @@ impl NowBuilder {
         self.last_updates.body = Some(body.last_update_ms);
         self.last_snapshot.body = body;
         self.last_snapshot.extensions.clear();
+        let mut saw_range_packet = false;
 
         for packet in packets {
             match packet {
@@ -326,6 +327,7 @@ impl NowBuilder {
                 SensePacket::Range(range) => {
                     self.last_snapshot.range = range;
                     self.last_updates.range = Some(t_ms);
+                    saw_range_packet = true;
                 }
                 SensePacket::Imu(imu) => {
                     self.last_snapshot.imu = imu;
@@ -336,6 +338,12 @@ impl NowBuilder {
                     self.last_updates.gps = Some(t_ms);
                 }
                 SensePacket::Kinect(kinect) => {
+                    if !saw_range_packet {
+                        if let Some(range) = range_from_kinect_depth(&kinect) {
+                            self.last_snapshot.range = range;
+                            self.last_updates.range = Some(t_ms);
+                        }
+                    }
                     self.last_snapshot.kinect = kinect;
                     self.last_updates.kinect = Some(t_ms);
                 }
@@ -371,6 +379,73 @@ impl NowBuilder {
     pub fn snapshot(&self) -> WorldSnapshot {
         self.last_snapshot.clone()
     }
+}
+
+fn range_from_kinect_depth(kinect: &KinectSense) -> Option<RangeSense> {
+    const FALLBACK_BEAM_COUNT: usize = 32;
+    let depth = &kinect.depth_m;
+    if depth.is_empty() {
+        return None;
+    }
+    let min_depth = if kinect.min_depth_m > 0.0 {
+        kinect.min_depth_m
+    } else {
+        0.2
+    };
+    let max_depth = if kinect.max_depth_m > min_depth {
+        kinect.max_depth_m
+    } else {
+        8.0
+    };
+    let valid_depth = |value: f32| value.is_finite() && value >= min_depth && value <= max_depth;
+
+    let beams = if kinect.depth_width > 0
+        && kinect.depth_height > 0
+        && (kinect.depth_width as usize).checked_mul(kinect.depth_height as usize)
+            == Some(depth.len())
+    {
+        let width = kinect.depth_width as usize;
+        let height = kinect.depth_height as usize;
+        let beam_count = FALLBACK_BEAM_COUNT.min(width.max(1));
+        let row_start = height / 3;
+        let row_end = (height * 2 / 3).max(row_start + 1).min(height);
+        (0..beam_count)
+            .map(|beam| {
+                let x_start = beam * width / beam_count;
+                let x_end = ((beam + 1) * width / beam_count)
+                    .max(x_start + 1)
+                    .min(width);
+                let mut nearest = max_depth;
+                for y in row_start..row_end {
+                    let row = y * width;
+                    for x in x_start..x_end {
+                        let value = depth[row + x];
+                        if valid_depth(value) {
+                            nearest = nearest.min(value);
+                        }
+                    }
+                }
+                nearest
+            })
+            .collect::<Vec<_>>()
+    } else {
+        depth
+            .iter()
+            .copied()
+            .filter(|value| valid_depth(*value))
+            .take(FALLBACK_BEAM_COUNT)
+            .collect::<Vec<_>>()
+    };
+
+    if beams.is_empty() {
+        return None;
+    }
+    let nearest_m = beams.iter().copied().reduce(f32::min);
+    Some(RangeSense {
+        schema_version: 1,
+        beams,
+        nearest_m,
+    })
 }
 
 impl FrameProcessor {
@@ -2755,6 +2830,63 @@ mod tests {
                 .and_then(|age| age.as_u64()),
             Some(150)
         );
+    }
+
+    #[test]
+    fn now_builder_derives_range_beams_from_kinect_depth_when_range_absent() {
+        let mut builder = NowBuilder::new();
+        let now = builder
+            .build(
+                100,
+                BodySense::default(),
+                vec![SensePacket::Kinect(KinectSense {
+                    depth_m: vec![1.0, 2.0, 0.0, 3.0],
+                    depth_width: 4,
+                    depth_height: 1,
+                    min_depth_m: 0.2,
+                    max_depth_m: 4.0,
+                    ..KinectSense::default()
+                })],
+            )
+            .unwrap();
+
+        assert_eq!(now.range.beams, vec![1.0, 2.0, 4.0, 3.0]);
+        assert_eq!(now.range.nearest_m, Some(1.0));
+        assert_eq!(
+            now.extensions
+                .get("sensor_status")
+                .and_then(|status| status.get("last_update_ms"))
+                .and_then(|updates| updates.get("range"))
+                .and_then(|value| value.as_u64()),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn now_builder_keeps_explicit_range_over_kinect_fallback() {
+        let mut builder = NowBuilder::new();
+        let now = builder
+            .build(
+                100,
+                BodySense::default(),
+                vec![
+                    SensePacket::Range(RangeSense {
+                        beams: vec![0.7],
+                        nearest_m: Some(0.7),
+                        ..RangeSense::default()
+                    }),
+                    SensePacket::Kinect(KinectSense {
+                        depth_m: vec![1.0, 2.0, 3.0, 4.0],
+                        depth_width: 4,
+                        depth_height: 1,
+                        ..KinectSense::default()
+                    }),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(now.range.beams, vec![0.7]);
+        assert_eq!(now.range.nearest_m, Some(0.7));
     }
 
     #[test]
