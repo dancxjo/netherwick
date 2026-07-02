@@ -78,7 +78,14 @@ impl QueuedPiperCpalMouth {
                 let mut mouth = match PiperCpalMouth::new(config) {
                     Ok(mouth) => mouth,
                     Err(error) => {
+                        let message = format!("queued Piper mouth failed to load voice: {error}");
+                        println!("robot mouth failed: {message}");
                         tracing::warn!(error = %error, "queued Piper mouth failed to load voice");
+                        for item in rx {
+                            if let Some(outcome_tx) = item.outcome_tx {
+                                let _ = outcome_tx.send(Err(message.clone()));
+                            }
+                        }
                         return;
                     }
                 };

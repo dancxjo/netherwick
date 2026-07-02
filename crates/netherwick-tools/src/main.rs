@@ -85,6 +85,7 @@ enum Command {
     DreamTrain(DreamTrainArgs),
     EvalScenario(EvalScenarioArgs),
     MemoryInspect(MemoryInspectArgs),
+    Mouth(MouthArgs),
     Robot(RobotArgs),
     HardwareEnv(HardwareEnvArgs),
     Replay,
@@ -122,6 +123,7 @@ async fn main() -> Result<()> {
         Command::DreamTrain(args) => run_dream_train(args).await,
         Command::EvalScenario(args) => run_eval_scenario(args).await,
         Command::MemoryInspect(args) => memory_inspect(args).await,
+        Command::Mouth(args) => run_mouth(args),
         Command::Robot(args) => run_robot(args).await,
         Command::HardwareEnv(args) => hardware_env(args).await,
         Command::CaptureSim(args) => capture_sim(args).await,
@@ -1161,6 +1163,12 @@ struct CompareScenarioReportsArgs {
     name: Option<String>,
     #[arg(long)]
     out: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct MouthArgs {
+    #[arg(default_value = "Hello. My name is Pete Netherwick.")]
+    text: String,
 }
 
 async fn run_sim(args: SimArgs) -> Result<()> {
@@ -4920,6 +4928,21 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         args.ledger,
         transitions.len(),
         capture_summary
+    );
+    Ok(())
+}
+
+fn run_mouth(args: MouthArgs) -> Result<()> {
+    let Some(mouth) = QueuedPiperCpalMouth::from_env()? else {
+        anyhow::bail!(
+            "robot mouth disabled: no Piper voice found; set NETHERWICK_TTS_PIPER_VOICE and NETHERWICK_TTS_PIPER_CONFIG"
+        );
+    };
+    let outcome = mouth.enqueue_and_wait(args.text)?;
+    println!(
+        "robot mouth diagnostic complete: device {}, duration {} ms",
+        outcome.device.as_deref().unwrap_or("<unknown>"),
+        outcome.duration_ms.unwrap_or_default()
     );
     Ok(())
 }

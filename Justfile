@@ -163,6 +163,10 @@ clippy:
 sim:
     cargo run -p netherwick-tools -- sim
 
+# Speak through the robot mouth without starting the robot body or sensors.
+say text="Hello. My name is Pete Netherwick.":
+    NETHERWICK_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p netherwick-tools -- mouth "{{text}}"
+
 # Bring up the real robot in slow mode with default hardware auto-detection.
 robot *args:
     #!/usr/bin/env bash
