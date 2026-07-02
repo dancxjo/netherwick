@@ -13,9 +13,9 @@ kinect_rgb_gain := env_var_or_default("KINECT_RGB_GAIN", "1.0")
 kinect_rgb_gamma := env_var_or_default("KINECT_RGB_GAMMA", "0.80")
 kinect_rgb_brightness := env_var_or_default("KINECT_RGB_BRIGHTNESS", "0.0")
 
-# Show the recipe catalog.
-default:
-    @just --list
+# Default to the real robot path.
+default *args:
+    just robot {{args}}
 
 # Install Linux dependencies, Rust toolchain, Docker, and Kinect prerequisites.
 setup: setup-system setup-docker setup-user setup-rust setup-kinect
