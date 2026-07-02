@@ -8,9 +8,11 @@ The project still keeps the larger PETE architecture in view. Pete gathers raw s
 
 Pete acts through high-level action primitives. A hard-coded autonomic layer keeps the body safe. The LLM may command, reflect, critique, and teach, but cannot bypass safety.
 
+The LLM loop is now active as a trainer, critic, and planner. It predicts counterfactual outcomes, critiques training data, and suggests motion intents. Movement itself is still not responding downstream, so the current debugging target is the command-to-base path: safety vetoes, robot mode, stale base connection, controller regression, or body-state refusal.
+
 Every hard-coded behavior is replaceable. It can run directly, shadow-train a model, compare with a model, promote a model, or fall back to safe hand-written logic.
 
-Pete Netherwick is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, and an LLM consciousness that commands and teaches while safety protects the body.
+Pete Netherwick is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.
 
 ## Current milestone
 
@@ -33,12 +35,31 @@ sensors
   -> point cloud / voxel projection
   -> 3D live view and WebXR inspection
   -> 2D map / occupancy surface
-  -> object and place hypotheses
+  -> cross-modal constellations
+  -> object, place, affordance, and action hypotheses
   -> Now / ExperienceLatent
   -> prediction, memory, action, and training loops
 ```
 
 The present engineering emphasis is not beauty. It is spatial trust. A crude voxel world that stays aligned is more useful than a polished render that cannot be believed.
+
+## Constellations
+
+A **constellation** is a repeatable pattern of experience, not merely a visual cluster. The first obvious constellations come from nearby colored voxels, planes, corners, and depth edges, but the abstraction should generalize across all modalities:
+
+- geometry: points, voxels, surfaces, occupancy, relative position,
+- color and image evidence,
+- motion and odometry,
+- robot body state,
+- audio and speech events,
+- text labels and image descriptions,
+- memory recalls,
+- prediction error and surprise,
+- LLM counterfactuals, critiques, and suggested actions.
+
+The search target is not yet "chair" or "kitchen." The search target is "I have seen this arrangement before." Once a constellation survives time, viewpoint changes, lighting changes, motion, and critique, it can be promoted into an object, place, affordance, or training specimen.
+
+See [docs/constellations.md](docs/constellations.md) for the generalized pattern-search model.
 
 ## Active debugging tracks
 
