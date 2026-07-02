@@ -1399,7 +1399,7 @@ impl DefaultCrossModalBindingEngine {
             });
         }
 
-        candidate_from_evidence(
+        proposal_candidate_from_evidence(
             left,
             right,
             BindingRelation::LikelySameEntity,
@@ -1442,14 +1442,17 @@ impl DefaultCrossModalBindingEngine {
         }
         add_recent_cooccurrence(context, left, right, &mut evidence);
 
-        if evidence
+        let has_projection_or_pose_agreement = evidence
             .iter()
             .any(|evidence| evidence.kind == BindingEvidenceKind::ProjectionAgreement)
             || evidence
                 .iter()
-                .any(|evidence| evidence.kind == BindingEvidenceKind::PoseAgreement)
-        {
-            Some(candidate_from_evidence(
+                .any(|evidence| evidence.kind == BindingEvidenceKind::PoseAgreement);
+        let has_projection_contradiction = evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::Contradiction);
+        if has_projection_or_pose_agreement || has_projection_contradiction {
+            Some(proposal_candidate_from_evidence(
                 left,
                 right,
                 BindingRelation::ProjectsTo,
@@ -1498,7 +1501,7 @@ impl DefaultCrossModalBindingEngine {
         add_repetition_evidence(left, right, &mut evidence);
         add_recent_cooccurrence(context, left, right, &mut evidence);
 
-        candidate_from_evidence(
+        proposal_candidate_from_evidence(
             left,
             right,
             BindingRelation::CooccursInEstimatedSpace,
@@ -1556,7 +1559,7 @@ impl DefaultCrossModalBindingEngine {
         }
         add_repetition_evidence(left, right, &mut evidence);
 
-        Some(candidate_from_evidence(
+        Some(proposal_candidate_from_evidence(
             action,
             outcome,
             BindingRelation::ExplainsOutcome,
@@ -1592,7 +1595,7 @@ impl DefaultCrossModalBindingEngine {
         add_repetition_evidence(left, right, &mut evidence);
         add_recent_cooccurrence(context, left, right, &mut evidence);
 
-        candidate_from_evidence(
+        proposal_candidate_from_evidence(
             left,
             right,
             BindingRelation::NamedBy,
@@ -7268,6 +7271,22 @@ fn candidate_from_evidence(
         decision,
         reason,
     }
+}
+
+fn proposal_candidate_from_evidence(
+    left: &DiscoveredCluster,
+    right: &DiscoveredCluster,
+    relation: BindingRelation,
+    evidence: Vec<BindingEvidence>,
+    fallback_reason: &str,
+) -> BindingCandidate {
+    let mut candidate = candidate_from_evidence(left, right, relation, evidence, fallback_reason);
+    if candidate.decision == BindingDecision::Accept {
+        candidate.decision = BindingDecision::CollectMoreEvidence;
+        candidate.reason =
+            "candidate is proposal-only; conservative binding admission must accept it".to_string();
+    }
+    candidate
 }
 
 fn temporally_compatible(
@@ -15587,6 +15606,8 @@ mod tests {
             .evidence
             .iter()
             .any(|evidence| evidence.kind == BindingEvidenceKind::SingleCandidateContext));
+        assert_ne!(candidates[0].decision, BindingDecision::Accept);
+        assert!(candidates[0].reason.contains("admission must accept"));
         assert_eq!(
             clusters.len(),
             2,
@@ -15675,6 +15696,43 @@ mod tests {
             .evidence
             .iter()
             .any(|evidence| evidence.kind == BindingEvidenceKind::ProjectionAgreement));
+    }
+
+    #[test]
+    fn cross_modal_engine_rejects_rgb_geometry_projection_disagreement() {
+        let mut engine = DefaultCrossModalBindingEngine::default();
+        let context = BindingContext {
+            source_frame_id: Some("frame-1".to_string()),
+            ..BindingContext::new(1_000)
+        };
+        let rgb = DiscoveredCluster::new(
+            "rgb-patch",
+            Modality::Vision,
+            DiscoveredClusterKind::RgbImage,
+            1_000,
+            0.8,
+        )
+        .with_source_frame_id("frame-1")
+        .with_metadata(json!({ "image_x": 100.0, "image_y": 50.0 }));
+        let depth = DiscoveredCluster::new(
+            "voxel",
+            Modality::Depth,
+            DiscoveredClusterKind::Geometry,
+            1_000,
+            0.8,
+        )
+        .with_source_frame_id("frame-1")
+        .with_metadata(json!({ "projected_image_x": 180.0, "projected_image_y": 110.0 }));
+
+        let candidates = engine.propose_bindings(&context, &[rgb, depth]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].relation, BindingRelation::ProjectsTo);
+        assert_eq!(candidates[0].decision, BindingDecision::Reject);
+        assert!(candidates[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == BindingEvidenceKind::Contradiction));
     }
 
     #[test]
@@ -15788,6 +15846,40 @@ mod tests {
         assert_eq!(candidates[0].relation, BindingRelation::NamedBy);
         assert_eq!(candidates[0].decision, BindingDecision::CollectMoreEvidence);
         assert!(candidates[0].reason.contains("LLM suggestion alone"));
+    }
+
+    #[test]
+    fn cross_modal_engine_never_accepts_without_admission() {
+        let mut engine = DefaultCrossModalBindingEngine::default();
+        let cell = PlaceCellKey { x: 2, y: 3 };
+        let context = BindingContext {
+            current_place_cell: Some(cell),
+            recent_clusters: vec!["charger-object".to_string(), "dock-place".to_string()],
+            ..BindingContext::new(1_000)
+        };
+        let object = DiscoveredCluster::new(
+            "charger-object",
+            Modality::Vision,
+            DiscoveredClusterKind::Object,
+            1_000,
+            0.95,
+        )
+        .with_place_cell(cell)
+        .with_metadata(json!({ "cooccurrence_count": 5 }));
+        let place = DiscoveredCluster::new(
+            "dock-place",
+            Modality::Memory,
+            DiscoveredClusterKind::Place,
+            1_000,
+            0.95,
+        )
+        .with_place_cell(cell);
+
+        let candidates = engine.propose_bindings(&context, &[object, place]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_ne!(candidates[0].decision, BindingDecision::Accept);
+        assert!(candidates[0].reason.contains("admission must accept"));
     }
 
     #[test]
