@@ -598,9 +598,9 @@ fn default_pose_graph_loop_min_geometric_overlap() -> f32 {
 impl Default for PointCloudConfig {
     fn default() -> Self {
         Self {
-            voxel_size_m: 0.025,
-            max_voxels: 120_000,
-            max_points_per_observation: 8_000,
+            voxel_size_m: 0.02,
+            max_voxels: 200_000,
+            max_points_per_observation: 12_000,
             min_depth_m: 0.35,
             max_depth_m: 8.0,
             confidence_increment: 0.18,

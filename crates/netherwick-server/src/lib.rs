@@ -55,6 +55,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/mode",
     "/reign",
     "/reign/command",
+    "/reign/command/ws",
     "/reign/prod",
     "/reign/state",
     "/reign/clear",
@@ -196,6 +197,13 @@ pub struct ReignCommandRequest {
     pub source: Option<ReignSource>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ReignCommandWsResponse {
+    pub accepted: bool,
+    pub input: Option<ReignInput>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct HardwareArmRequest {
     pub armed: bool,
@@ -295,6 +303,8 @@ impl HardwareControlState {
 
 const HARDWARE_TTL_MIN_MS: TimeMs = 250;
 const HARDWARE_TTL_MAX_MS: TimeMs = 500;
+const REIGN_TTL_MIN_MS: TimeMs = 100;
+const REIGN_TTL_MAX_MS: TimeMs = 300_000;
 const HARDWARE_MAX_FORWARD_INTENSITY: f32 = 0.15;
 const HARDWARE_MAX_TURN_INTENSITY: f32 = 0.25;
 const HARDWARE_BODY_STALE_MS: TimeMs = 1_000;
@@ -353,6 +363,7 @@ pub fn reign_router(state: ReignServerState) -> Router {
     Router::new()
         .route("/reign", get(reign_page))
         .route("/reign/command", post(post_reign_command))
+        .route("/reign/command/ws", get(get_reign_command_ws))
         .route("/reign/prod", post(post_reign_prod))
         .route("/reign/state", get(get_reign_state))
         .route("/reign/clear", post(post_reign_clear))
@@ -686,6 +697,11 @@ impl LiveViewState {
             calibration.depth_camera_pitch_rad(),
             calibration.camera_roll_rad,
             calibration.camera_yaw_rad,
+        );
+        extractor.set_compact_depth_calibration(
+            calibration.compact_depth_beam_count,
+            calibration.compact_depth_fov_rad,
+            calibration.depth_scale,
         );
         let mut perception = SceneSurfacePerception::from(extractor.process(
             &snapshot.kinect,
@@ -3842,7 +3858,7 @@ fn accumulated_scene_points(
     point_cloud: &VoxelPointCloud,
     now_ms: TimeMs,
 ) -> Vec<SceneAccumulatedPoint> {
-    const MAX_SCENE_POINTS: usize = 8_000;
+    const MAX_SCENE_POINTS: usize = 16_000;
     let points = point_cloud.points();
     let stride = points.len().div_ceil(MAX_SCENE_POINTS).max(1);
     points
@@ -5245,6 +5261,86 @@ async fn post_reign_command(
     State(state): State<ReignServerState>,
     Json(request): Json<ReignCommandRequest>,
 ) -> Result<Json<ReignInput>, ReignApiError> {
+    Ok(Json(enqueue_reign_command(&state, request)?))
+}
+
+async fn get_reign_command_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<ReignServerState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| stream_reign_commands(socket, state))
+}
+
+async fn stream_reign_commands(mut socket: WebSocket, state: ReignServerState) {
+    while let Some(message) = socket.recv().await {
+        let response = match message {
+            Ok(Message::Text(text)) => reign_ws_response(&state, text.as_str()),
+            Ok(Message::Binary(bytes)) => match std::str::from_utf8(&bytes) {
+                Ok(text) => reign_ws_response(&state, text),
+                Err(error) => ReignCommandWsResponse {
+                    accepted: false,
+                    input: None,
+                    error: Some(format!("invalid utf-8 websocket command: {error}")),
+                },
+            },
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+            Err(error) => {
+                let response = ReignCommandWsResponse {
+                    accepted: false,
+                    input: None,
+                    error: Some(format!("websocket command receive failed: {error}")),
+                };
+                let _ = send_reign_ws_response(&mut socket, &response).await;
+                break;
+            }
+        };
+        if send_reign_ws_response(&mut socket, &response)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn reign_ws_response(state: &ReignServerState, text: &str) -> ReignCommandWsResponse {
+    match serde_json::from_str::<ReignCommandRequest>(text) {
+        Ok(request) => match enqueue_reign_command(state, request) {
+            Ok(input) => ReignCommandWsResponse {
+                accepted: true,
+                input: Some(input),
+                error: None,
+            },
+            Err(error) => ReignCommandWsResponse {
+                accepted: false,
+                input: None,
+                error: Some(error.message),
+            },
+        },
+        Err(error) => ReignCommandWsResponse {
+            accepted: false,
+            input: None,
+            error: Some(format!("invalid reign command json: {error}")),
+        },
+    }
+}
+
+async fn send_reign_ws_response(
+    socket: &mut WebSocket,
+    response: &ReignCommandWsResponse,
+) -> Result<(), axum::Error> {
+    let text = serde_json::to_string(response).unwrap_or_else(|_| {
+        "{\"accepted\":false,\"input\":null,\"error\":\"reign response serialization failed\"}"
+            .to_string()
+    });
+    socket.send(Message::Text(text.into())).await
+}
+
+fn enqueue_reign_command(
+    state: &ReignServerState,
+    request: ReignCommandRequest,
+) -> Result<ReignInput, ReignApiError> {
     let now_ms = wall_now_ms();
     let source = request.source.unwrap_or(ReignSource::WebRemote);
     let mut command = sanitize_command(request.command)?;
@@ -5258,7 +5354,7 @@ async fn post_reign_command(
     let input = ReignInput {
         id: Uuid::new_v4(),
         issued_at_ms: now_ms,
-        expires_at_ms: now_ms.saturating_add(ttl_ms.clamp(100, 30_000)),
+        expires_at_ms: now_ms.saturating_add(ttl_ms.clamp(REIGN_TTL_MIN_MS, REIGN_TTL_MAX_MS)),
         source,
         mode: request.mode,
         command,
@@ -5270,7 +5366,7 @@ async fn post_reign_command(
         .lock()
         .map_err(|_| ReignApiError::internal("reign queue lock poisoned"))?
         .push(input.clone());
-    Ok(Json(input))
+    Ok(input)
 }
 
 async fn post_hardware_arm(
@@ -5617,35 +5713,59 @@ button.stop{background:#b00020;color:white}
 <select id="mode">
   <option>Direct</option><option>Assist</option><option>Suggest</option><option>ObserveOnly</option>
 </select>
-<button class="stop" onclick="send({type:'Stop'},2000)">STOP</button>
-<button onclick="send({type:'Go',intensity:.4,duration_ms:700},1200)">Forward</button>
-<button onclick="send({type:'Reverse',intensity:.4,duration_ms:700},1200)">Reverse</button>
-<button onclick="send({type:'Turn',direction:'Left',intensity:.5,duration_ms:500},1000)">Turn Left</button>
-<button onclick="send({type:'Turn',direction:'Right',intensity:.5,duration_ms:500},1000)">Turn Right</button>
-<button onclick="send({type:'Dock'},5000)">Dock</button>
-<button onclick="send({type:'Explore',duration_ms:3000},5000)">Explore</button>
+<button class="stop" onclick="send({type:'Stop'},60000)">STOP</button>
+<button onclick="send({type:'Go',intensity:.4,duration_ms:700},12000)">Forward</button>
+<button onclick="send({type:'Reverse',intensity:.4,duration_ms:700},12000)">Reverse</button>
+<button onclick="send({type:'Turn',direction:'Left',intensity:.5,duration_ms:500},12000)">Turn Left</button>
+<button onclick="send({type:'Turn',direction:'Right',intensity:.5,duration_ms:500},12000)">Turn Right</button>
+<button onclick="send({type:'Dock'},60000)">Dock</button>
+<button onclick="send({type:'Explore',duration_ms:3000},60000)">Explore</button>
 <input id="say" placeholder="Speak text"><button onclick="speak()">Speak</button>
 <button onclick="chirp('Confirm')">Chirp Confirm</button>
 <button onclick="chirp('Warning')">Chirp Warning</button>
 <button onclick="chirp('Curious')">Chirp Curious</button>
 <pre id="latest">loading...</pre>
 <script>
+let reignSocket = null;
+function reignSocketUrl(){
+  return `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/reign/command/ws`;
+}
+function getReignSocket(){
+  if(reignSocket && (reignSocket.readyState === WebSocket.OPEN || reignSocket.readyState === WebSocket.CONNECTING)) return reignSocket;
+  reignSocket = new WebSocket(reignSocketUrl());
+  reignSocket.addEventListener('message', event => {
+    try{
+      const response = JSON.parse(event.data);
+      if(response.accepted) refresh();
+      else latest.textContent = response.error || 'reign websocket command failed';
+    }catch(_error){}
+  });
+  reignSocket.addEventListener('close', () => { reignSocket = null; });
+  reignSocket.addEventListener('error', () => { reignSocket?.close(); });
+  return reignSocket;
+}
 async function send(command, ttl_ms){
-  await fetch('/reign/command',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:mode.value,priority:1,ttl_ms,command})});
+  const body = JSON.stringify({mode:mode.value,priority:1,ttl_ms,command});
+  const socket = getReignSocket();
+  if(socket.readyState === WebSocket.OPEN){
+    socket.send(body);
+    return;
+  }
+  await fetch('/reign/command',{method:'POST',headers:{'content-type':'application/json'},body});
   refresh();
 }
-function speak(){ const text = say.value.trim(); if(text) send({type:'Speak',text},10000); }
-function chirp(pattern){ send({type:'Chirp',pattern},2000); }
+function speak(){ const text = say.value.trim(); if(text) send({type:'Speak',text},120000); }
+function chirp(pattern){ send({type:'Chirp',pattern},60000); }
 async function refresh(){ latest.textContent = JSON.stringify(await (await fetch('/reign/state')).json(), null, 2); }
 addEventListener('keydown', e => {
   if(e.repeat) return;
-  if(e.code === 'Space') send({type:'Stop'},2000);
-  if(e.key === 'w') send({type:'Go',intensity:.4,duration_ms:700},1200);
-  if(e.key === 'a') send({type:'Turn',direction:'Left',intensity:.5,duration_ms:500},1000);
-  if(e.key === 'd') send({type:'Turn',direction:'Right',intensity:.5,duration_ms:500},1000);
-  if(e.key === 's') send({type:'Stop'},2000);
-  if(e.key === 'c') send({type:'Dock'},5000);
-  if(e.key === 'e') send({type:'Explore',duration_ms:3000},5000);
+  if(e.code === 'Space') send({type:'Stop'},60000);
+  if(e.key === 'w') send({type:'Go',intensity:.4,duration_ms:700},12000);
+  if(e.key === 'a') send({type:'Turn',direction:'Left',intensity:.5,duration_ms:500},12000);
+  if(e.key === 'd') send({type:'Turn',direction:'Right',intensity:.5,duration_ms:500},12000);
+  if(e.key === 's') send({type:'Stop'},60000);
+  if(e.key === 'c') send({type:'Dock'},60000);
+  if(e.key === 'e') send({type:'Explore',duration_ms:3000},60000);
 });
 refresh(); setInterval(refresh, 1000);
 </script>"#;
@@ -6147,12 +6267,16 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #hud dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 #hud dd.active-learning{color:#8df0b2;font-weight:700}
 #status{color:#ffd083}
-#reign{right:12px;top:12px;width:282px;min-width:250px;border-color:#36424d;background:rgba(11,16,22,.84);color:#dce8f2}
-#reign .panel-content{display:grid;gap:8px}
-#reign strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
+#reign,#reign-voice-panel,#reign-hardware,#reign-map,#reign-constellation{right:12px;width:282px;min-width:250px;border-color:#36424d;background:rgba(11,16,22,.84);color:#dce8f2}
+#reign{top:12px}
+#reign-voice-panel{top:230px}
+#reign-hardware{top:350px}
+#reign-map{top:466px}
+#reign-constellation{top:702px}
+#reign .panel-content,#reign-voice-panel .panel-content,#reign-hardware .panel-content,#reign-map .panel-content,#reign-constellation .panel-content{display:grid;gap:8px}
+#reign strong,#reign-voice-panel strong,#reign-hardware strong,#reign-map strong,#reign-constellation strong{display:block;font-size:12px;margin-bottom:6px;color:#91d7ff}
 #reign div{font-variant-numeric:tabular-nums}
 #reign-state{min-height:17px;color:#ffd083}
-.cockpit{border-top:1px solid #344350;padding-top:8px;display:grid;gap:7px}
 .cockpit-arm{display:flex;align-items:center;gap:7px;font-size:12px;color:#dce8f2}
 .cockpit-arm input{width:16px;height:16px}
 #hardware-state{font-size:11px;color:#ffbf7a;min-height:15px}
@@ -6253,7 +6377,7 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #xr{position:fixed;right:12px;bottom:12px;padding:9px 12px;border:1px solid #405060;background:#15202b;color:#fff;border-radius:6px}
 #xr[disabled]{opacity:.55}
 #fallback{position:fixed;left:12px;bottom:12px;color:#aab4bd;max-width:min(520px,calc(100vw - 24px))}
-@media(max-width:820px){.panel-window{max-width:calc(100vw - 24px)}#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}.llm-text{max-height:76px}#models{bottom:98px;max-height:46vh}#model-graph-window{display:none}#virtual-pipeline-section{left:12px;right:12px;top:128px;width:auto;max-height:28vh}#model-graph{height:220px}#learning{left:12px;right:12px;top:220px;width:auto;max-height:34vh}#calibration{display:none}}
+@media(max-width:820px){.panel-window{max-width:calc(100vw - 24px)}#llm{left:12px;right:12px;top:auto;bottom:56px;width:auto;max-height:42vh}#reign{top:auto;bottom:12px;right:12px;min-width:0}#reign-voice-panel,#reign-hardware,#reign-map,#reign-constellation{right:12px;width:280px;min-width:0;max-height:34vh}#reign-voice-panel{top:12px}#reign-hardware{top:128px}#reign-map{top:244px}#reign-constellation{display:none}.llm-text{max-height:76px}#models{bottom:98px;max-height:46vh}#model-graph-window{display:none}#virtual-pipeline-section{left:12px;right:12px;top:128px;width:auto;max-height:28vh}#model-graph{height:220px}#learning{left:12px;right:12px;top:220px;width:auto;max-height:34vh}#calibration{display:none}}
 canvas{display:block}
 </style>
 <canvas id="scene"></canvas>
@@ -6338,6 +6462,11 @@ canvas{display:block}
       <div class="reign-readout" id="reign-readout">F 0.00 / T 0.00</div>
     </div>
   </div>
+  <div id="reign-state">web reign ready</div>
+  <div class="reign-hint">Drag the stick or hold WASD / arrow keys. Space stops.</div>
+</aside>
+<aside id="reign-voice-panel" data-window-title="Voice">
+  <strong>Voice</strong>
   <div class="reign-voice">
     <input id="reign-say" placeholder="Speak text" maxlength="500">
     <button id="reign-speak" type="button">Speak</button>
@@ -6347,36 +6476,41 @@ canvas{display:block}
     <button data-chirp="Warning" type="button">Warning</button>
     <button data-chirp="Curious" type="button">Curious</button>
   </div>
-  <div id="reign-state">web reign ready</div>
-  <div class="reign-hint">Drag the stick or hold WASD / arrow keys. Space stops.</div>
-  <div class="cockpit">
-    <label class="cockpit-arm"><input id="hardware-arm" type="checkbox"> Real hardware armed</label>
-    <div id="hardware-state">hardware cockpit unavailable</div>
-    <div class="trace-label">Real hardware uses the same analog stick, with cautious speed limits.</div>
-    <canvas id="trace-map" width="220" height="180" aria-label="odometry/range trace map"></canvas>
-    <div class="map-toggles" aria-label="map overlays">
-      <label><input type="checkbox" data-map-layer="occupancy" checked>occupancy</label>
-      <label><input type="checkbox" data-map-layer="rays" checked>rays</label>
-      <label><input type="checkbox" data-map-layer="raw point cloud">raw cloud</label>
-      <label><input type="checkbox" data-map-layer="raw camera-frame points">camera frame</label>
-      <label><input type="checkbox" data-map-layer="robot-frame points">robot frame</label>
-      <label><input type="checkbox" data-map-layer="world-frame points">world frame</label>
-      <label><input type="checkbox" data-map-layer="accumulated occupancy" checked>accum</label>
-      <label><input type="checkbox" data-map-layer="flat image" checked>image</label>
-      <label><input type="checkbox" data-map-layer="hypotheses" checked>hypotheses</label>
-      <label><input type="checkbox" data-map-layer="floor plane" checked>floor</label>
-      <label><input type="checkbox" data-map-layer="axes gizmo" checked>axes</label>
-      <label><input type="checkbox" data-map-layer="stable wall candidates" checked>stable</label>
-      <label><input type="checkbox" data-map-layer="danger" checked>danger</label>
-      <label><input type="checkbox" data-map-layer="charger/charge" checked>charge</label>
-      <label><input type="checkbox" data-map-layer="social" checked>social</label>
-      <label><input type="checkbox" data-map-layer="novelty">novelty</label>
-      <label><input type="checkbox" data-map-layer="events" checked>events</label>
-    </div>
-    <div class="trace-label">Scan-matched occupancy map: range scans correct odometry before integration.</div>
-    <canvas id="entity-graph" width="220" height="170" aria-label="entity constellation graph"></canvas>
-    <div id="entity-graph-summary">sensations/experience/impressions waiting...</div>
+</aside>
+<aside id="reign-hardware" data-window-title="Hardware">
+  <strong>Hardware</strong>
+  <label class="cockpit-arm"><input id="hardware-arm" type="checkbox"> Real hardware armed</label>
+  <div id="hardware-state">hardware cockpit unavailable</div>
+  <div class="trace-label">Real hardware uses the same analog stick, with cautious speed limits.</div>
+</aside>
+<aside id="reign-map" data-window-title="2D map">
+  <strong>2D map</strong>
+  <canvas id="trace-map" width="220" height="180" aria-label="odometry/range trace map"></canvas>
+  <div class="map-toggles" aria-label="map overlays">
+    <label><input type="checkbox" data-map-layer="occupancy" checked>occupancy</label>
+    <label><input type="checkbox" data-map-layer="rays" checked>rays</label>
+    <label><input type="checkbox" data-map-layer="raw point cloud">raw cloud</label>
+    <label><input type="checkbox" data-map-layer="raw camera-frame points">camera frame</label>
+    <label><input type="checkbox" data-map-layer="robot-frame points">robot frame</label>
+    <label><input type="checkbox" data-map-layer="world-frame points">world frame</label>
+    <label><input type="checkbox" data-map-layer="accumulated occupancy" checked>accum</label>
+    <label><input type="checkbox" data-map-layer="flat image" checked>image</label>
+    <label><input type="checkbox" data-map-layer="hypotheses" checked>hypotheses</label>
+    <label><input type="checkbox" data-map-layer="floor plane" checked>floor</label>
+    <label><input type="checkbox" data-map-layer="axes gizmo" checked>axes</label>
+    <label><input type="checkbox" data-map-layer="stable wall candidates" checked>stable</label>
+    <label><input type="checkbox" data-map-layer="danger" checked>danger</label>
+    <label><input type="checkbox" data-map-layer="charger/charge" checked>charge</label>
+    <label><input type="checkbox" data-map-layer="social" checked>social</label>
+    <label><input type="checkbox" data-map-layer="novelty">novelty</label>
+    <label><input type="checkbox" data-map-layer="events" checked>events</label>
   </div>
+  <div class="trace-label">Scan-matched occupancy map: range scans correct odometry before integration.</div>
+</aside>
+<aside id="reign-constellation" data-window-title="Entities">
+  <strong>Entities</strong>
+  <canvas id="entity-graph" width="220" height="170" aria-label="entity constellation graph"></canvas>
+  <div id="entity-graph-summary">sensations/experience/impressions waiting...</div>
 </aside>
 <aside id="llm" data-window-title="LLM streams">
   <header>
@@ -6495,6 +6629,11 @@ const reignReadout = document.getElementById('reign-readout');
 const reignSay = document.getElementById('reign-say');
 const reignSpeak = document.getElementById('reign-speak');
 const reignChirps = Array.from(document.querySelectorAll('[data-chirp]'));
+let reignCommandSocket = null;
+const WEB_REIGN_DRIVE_TTL_MS = 12_000;
+const WEB_REIGN_STOP_TTL_MS = 60_000;
+const WEB_REIGN_SPEAK_TTL_MS = 120_000;
+const WEB_REIGN_CHIRP_TTL_MS = 60_000;
 const hardwareArm = document.getElementById('hardware-arm');
 const hardwareState = document.getElementById('hardware-state');
 const traceCanvas = document.getElementById('trace-map');
@@ -6924,7 +7063,7 @@ function renderAccumulatedVoxels(points, voxelSizeM){
   const positions = [];
   const colors = [];
   const indices = [];
-  const half = Math.max(0.015, Math.min(0.12, (Number(voxelSizeM) || 0.05) * 0.42));
+  const half = Math.max(0.008, Math.min(0.12, (Number(voxelSizeM) || 0.05) * 0.42));
   const corners = [
     [-half,-half,-half], [half,-half,-half], [half,half,-half], [-half,half,-half],
     [-half,-half,half], [half,-half,half], [half,half,half], [-half,half,half]
@@ -7512,6 +7651,37 @@ function stickAxes(gamepad){
   return {x: 0, y: 0};
 }
 
+function reignCommandSocketUrl(){
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${location.host}/reign/command/ws`;
+}
+
+function getReignCommandSocket(){
+  if(reignCommandSocket && (reignCommandSocket.readyState === WebSocket.OPEN || reignCommandSocket.readyState === WebSocket.CONNECTING)) return reignCommandSocket;
+  reignCommandSocket = new WebSocket(reignCommandSocketUrl());
+  reignCommandSocket.addEventListener('open', () => {
+    if(performance.now() - lastReignSentAt > 700) reignState.textContent = 'reign websocket ready';
+  });
+  reignCommandSocket.addEventListener('message', event => {
+    try{
+      const response = JSON.parse(event.data);
+      if(response && response.accepted === false){
+        reignState.textContent = response.error || 'reign websocket command rejected';
+      }
+    }catch(_error){}
+  });
+  reignCommandSocket.addEventListener('close', () => { reignCommandSocket = null; });
+  reignCommandSocket.addEventListener('error', () => { reignCommandSocket?.close(); });
+  return reignCommandSocket;
+}
+
+function sendReignCommandBody(body){
+  const socket = getReignCommandSocket();
+  if(socket.readyState !== WebSocket.OPEN) return false;
+  socket.send(body);
+  return true;
+}
+
 async function postReign(command, ttl_ms, label, priority=.95, source='Gamepad', note='WebXR controller reign'){
   const key = JSON.stringify(command);
   const now = performance.now();
@@ -7520,18 +7690,23 @@ async function postReign(command, ttl_ms, label, priority=.95, source='Gamepad',
   lastReignSentAt = now;
   lastReignText = label;
   reignState.textContent = `sending ${label}`;
+  const body = JSON.stringify({
+    mode:'Direct',
+    priority,
+    ttl_ms,
+    source,
+    note,
+    command
+  });
+  if(sendReignCommandBody(body)){
+    reignState.textContent = label;
+    return;
+  }
   try{
     const res = await fetch('/reign/command', {
       method:'POST',
       headers:{'content-type':'application/json'},
-      body:JSON.stringify({
-        mode:'Direct',
-        priority,
-        ttl_ms,
-        source,
-        note,
-        command
-      })
+      body
     });
     if(!res.ok) throw new Error(await res.text());
     reignState.textContent = label;
@@ -7568,7 +7743,7 @@ async function setHardwareArmed(armed){
     });
     if(!res.ok) throw new Error(await res.text());
     updateHardwareControl(await res.json());
-    if(!armed) postWebReign({type:'Stop'}, 900, 'hardware disarmed', 1);
+    if(!armed) postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'hardware disarmed', 1);
   }catch(error){
     hardwareState.textContent = 'arm request rejected';
     hardwareArm.checked = false;
@@ -7581,7 +7756,7 @@ function disarmHardwareOnExit(){
     const body = new Blob([JSON.stringify({armed:false})], {type:'application/json'});
     navigator.sendBeacon('/reign/hardware-arm', body);
   } else {
-    postWebReign({type:'Stop'}, 900, 'hardware stop', 1);
+    postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'hardware stop', 1);
   }
 }
 
@@ -8060,7 +8235,7 @@ function commandForWebJoystick(){
   const turn = Math.abs(x) < .12 ? 0 : -Math.sign(x) * clamp(Math.pow(Math.abs(x), 1.35), .08, 1);
   return {
     command:{type:'Drive', forward, turn, duration_ms:320},
-    ttl:680,
+    ttl:WEB_REIGN_DRIVE_TTL_MS,
     label:`drive F ${fmt(forward, 2)} T ${fmt(turn, 2)}`,
     priority:.96
   };
@@ -8094,13 +8269,13 @@ function endWebJoystick(event){
   if(event.pointerId !== webReignPointerId) return;
   webReignPointerId = null;
   resetWebJoystick();
-  postWebReign({type:'Stop'}, 900, 'stop', 1);
+  postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'stop', 1);
 }
 
 reignJoystick.addEventListener('pointerup', endWebJoystick);
 reignJoystick.addEventListener('pointercancel', endWebJoystick);
 reignStop.addEventListener('click', () => {
-  postWebReign({type:'Stop'}, 2000, 'stop', 1);
+  postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'stop', 1);
 });
 reignSpeak.addEventListener('click', () => {
   const text = reignSay.value.trim();
@@ -8108,7 +8283,7 @@ reignSpeak.addEventListener('click', () => {
     reignState.textContent = 'speak text is empty';
     return;
   }
-  postWebReign({type:'Speak', text}, 10000, `speak "${text.slice(0, 28)}"`, .9);
+  postWebReign({type:'Speak', text}, WEB_REIGN_SPEAK_TTL_MS, `speak "${text.slice(0, 28)}"`, .9);
 });
 reignSay.addEventListener('keydown', event => {
   if(event.key !== 'Enter' || event.shiftKey) return;
@@ -8118,7 +8293,7 @@ reignSay.addEventListener('keydown', event => {
 for(const button of reignChirps){
   button.addEventListener('click', () => {
     const pattern = button.dataset.chirp;
-    postWebReign({type:'Chirp', pattern}, 2000, `chirp ${pattern.toLowerCase()}`, .9);
+    postWebReign({type:'Chirp', pattern}, WEB_REIGN_CHIRP_TTL_MS, `chirp ${pattern.toLowerCase()}`, .9);
   });
 }
 hardwareArm.addEventListener('change', () => setHardwareArmed(hardwareArm.checked));
@@ -8148,7 +8323,7 @@ function updateKeyboardReignVector(){
   if(keyboardReignKeys.has('KeyD') || keyboardReignKeys.has('ArrowRight')) turn -= 1;
   if(forward === 0 && turn === 0){
     resetWebJoystick();
-    postWebReign({type:'Stop'}, 900, 'keyboard stop', 1);
+    postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'keyboard stop', 1);
     return;
   }
   setWebReignVector(-turn, -forward);
@@ -8158,7 +8333,7 @@ window.addEventListener('keydown', event => {
   if(event.code === 'Space' && !shouldIgnoreKeyboardReign(event)){
     keyboardReignKeys.clear();
     resetWebJoystick();
-    postWebReign({type:'Stop'}, 1200, 'keyboard stop', 1);
+    postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'keyboard stop', 1);
     event.preventDefault();
     return;
   }
@@ -8179,14 +8354,14 @@ window.addEventListener('blur', () => {
   if(!keyboardReignActive()) return;
   keyboardReignKeys.clear();
   resetWebJoystick();
-  postWebReign({type:'Stop'}, 900, 'keyboard blur stop', 1);
+  postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'keyboard blur stop', 1);
 });
 
 function commandForInputSource(inputSource){
   const gamepad = inputSource.gamepad;
   if(!gamepad) return null;
   if(buttonPressed(gamepad, 1) || buttonPressed(gamepad, 3)) {
-    return {command:{type:'Stop'}, ttl:900, label:'stop', priority:1};
+    return {command:{type:'Stop'}, ttl:WEB_REIGN_STOP_TTL_MS, label:'stop', priority:1};
   }
   const {x, y} = stickAxes(gamepad);
   if(Math.hypot(x, y) > .22) {
@@ -8194,7 +8369,7 @@ function commandForInputSource(inputSource){
     const turn = Math.abs(x) < .14 ? 0 : -Math.sign(x) * clamp(Math.pow(Math.abs(x), 1.35), .08, 1);
     return {
       command:{type:'Drive', forward, turn, duration_ms:320},
-      ttl:680,
+      ttl:WEB_REIGN_DRIVE_TTL_MS,
       label:`drive F ${fmt(forward, 2)} T ${fmt(turn, 2)}`,
       priority:.96
     };
@@ -8604,7 +8779,20 @@ async function setupXr(){
 
 let isInitialized = false;
 let maxZIndex = 100;
-const panelIds = ['hud', 'learning', 'reign', 'llm', 'virtual-pipeline-section', 'models', 'model-graph-window', 'calibration'];
+const panelIds = [
+  'hud',
+  'learning',
+  'reign',
+  'reign-voice-panel',
+  'reign-hardware',
+  'reign-map',
+  'reign-constellation',
+  'llm',
+  'virtual-pipeline-section',
+  'models',
+  'model-graph-window',
+  'calibration'
+];
 
 function preparePanelWindow(el) {
   if (el.classList.contains('panel-window')) return el.querySelector('.panel-titlebar');
@@ -10597,6 +10785,7 @@ mod tests {
         assert!(HTTP_ENDPOINTS.contains(&"/debug/embodied/graph"));
         assert!(HTTP_ENDPOINTS.contains(&"/models"));
         assert!(HTTP_ENDPOINTS.contains(&"/stream/llm"));
+        assert!(HTTP_ENDPOINTS.contains(&"/reign/command/ws"));
         let Html(live_page) = live_view_page().await;
         assert!(live_page.contains("Embodied lineage"));
         assert!(live_page.contains("/api/experience/lineage"));
@@ -10613,6 +10802,7 @@ mod tests {
         assert!(page.contains("navigator.xr"));
         assert!(page.contains("window.isSecureContext"));
         assert!(page.contains("/reign/command"));
+        assert!(page.contains("/reign/command/ws"));
         assert!(page.contains("/view/behavior-nodes"));
         assert!(page.contains("behaviorInspector"));
         assert!(page.contains("packet.behavior_nodes"));
@@ -10631,6 +10821,14 @@ mod tests {
         assert!(!page.contains("selectProjectedFloor"));
         assert!(!page.contains("quaternionFromFloorNormal"));
         assert!(page.contains("Real hardware armed"));
+        assert!(page.contains("id=\"reign-voice-panel\""));
+        assert!(page.contains("id=\"reign-hardware\""));
+        assert!(page.contains("id=\"reign-map\""));
+        assert!(page.contains("id=\"reign-constellation\""));
+        assert!(page.contains("'reign-voice-panel'"));
+        assert!(page.contains("'reign-hardware'"));
+        assert!(page.contains("'reign-map'"));
+        assert!(page.contains("'reign-constellation'"));
         assert!(page.contains("/reign/hardware-arm"));
         assert!(page.contains("window.addEventListener('pagehide'"));
         assert!(page.contains("navigator.sendBeacon"));
@@ -10676,6 +10874,7 @@ mod tests {
         assert!(page.contains("function occupancyGridCellCenter"));
         assert!(page.contains("forward: (Number(cell.x) + .5) * res"));
         assert!(page.contains("left: (Number(cell.y) + .5) * res"));
+        assert!(page.contains("const center = occupancyGridCellCenter(cell, grid);"));
         assert!(page.contains("const gridPose = packet.body || latest;"));
         assert!(page.contains("occupancyGridCellToWorld(gridPose, cell, grid)"));
         assert!(page.contains("traceCtx.rotate(-Math.PI / 2);"));

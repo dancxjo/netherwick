@@ -128,6 +128,9 @@ pub struct SurfaceExtractorConfig {
     pub occupancy_half_extent_m: f32,
     pub obstacle_min_height_m: f32,
     pub obstacle_max_height_m: f32,
+    pub compact_depth_beam_count: usize,
+    pub compact_depth_fov_rad: f32,
+    pub depth_scale: f32,
 }
 
 impl Default for SurfaceExtractorConfig {
@@ -140,7 +143,7 @@ impl Default for SurfaceExtractorConfig {
             depth_camera_pitch_down_rad: 0.0,
             depth_camera_roll_rad: 0.0,
             depth_camera_yaw_rad: 0.0,
-            voxel_size_m: 0.05,
+            voxel_size_m: 0.04,
             temporal_frames: 4,
             outlier_radius_m: 0.14,
             outlier_min_neighbors: 1,
@@ -167,6 +170,9 @@ impl Default for SurfaceExtractorConfig {
             occupancy_half_extent_m: 3.0,
             obstacle_min_height_m: 0.08,
             obstacle_max_height_m: 1.8,
+            compact_depth_beam_count: 0,
+            compact_depth_fov_rad: 0.0,
+            depth_scale: 1.0,
         }
     }
 }
@@ -416,6 +422,17 @@ impl SurfaceExtractor {
         self.config.depth_camera_pitch_down_rad = pitch_rad;
         self.config.depth_camera_roll_rad = roll_rad;
         self.config.depth_camera_yaw_rad = yaw_rad;
+    }
+
+    pub fn set_compact_depth_calibration(
+        &mut self,
+        beam_count: usize,
+        fov_rad: f32,
+        depth_scale: f32,
+    ) {
+        self.config.compact_depth_beam_count = beam_count;
+        self.config.compact_depth_fov_rad = fov_rad;
+        self.config.depth_scale = depth_scale;
     }
 
     pub fn process(
@@ -685,6 +702,11 @@ fn depth_to_world_points(
     robot_pose: Pose2,
     config: &SurfaceExtractorConfig,
 ) -> Vec<Point3> {
+    if config.compact_depth_beam_count > 0
+        && kinect.depth_m.len() == config.compact_depth_beam_count
+    {
+        return compact_depth_to_world_points(&kinect.depth_m, robot_pose, config);
+    }
     let Some(frame) = DepthProjection::from_kinect(kinect, config) else {
         return Vec::new();
     };
@@ -710,6 +732,49 @@ fn depth_to_world_points(
         });
     }
     points
+}
+
+fn compact_depth_to_world_points(
+    depth_m: &[f32],
+    robot_pose: Pose2,
+    config: &SurfaceExtractorConfig,
+) -> Vec<Point3> {
+    let beam_count = depth_m.len().max(1);
+    let fov_rad = config
+        .compact_depth_fov_rad
+        .clamp(0.01, std::f32::consts::TAU);
+    let start = if beam_count == 1 { 0.0 } else { -fov_rad * 0.5 };
+    let step = if beam_count == 1 {
+        0.0
+    } else {
+        fov_rad / (beam_count - 1) as f32
+    };
+    depth_m
+        .iter()
+        .enumerate()
+        .filter_map(|(index, depth)| {
+            if !depth.is_finite() || *depth <= 0.0 {
+                return None;
+            }
+            let distance =
+                (*depth * config.depth_scale).clamp(config.min_depth_m, config.max_depth_m);
+            let angle = start + step * index as f32;
+            let robot = rotate_robot_extrinsic(
+                Vec3::new(angle.cos() * distance, angle.sin() * distance, 0.0),
+                config.depth_camera_pitch_down_rad,
+                config.depth_camera_roll_rad,
+                config.depth_camera_yaw_rad,
+            );
+            let robot = Vec3::new(
+                robot.x + config.depth_camera_forward_offset_m,
+                robot.y,
+                robot.z + config.depth_camera_height_m,
+            );
+            Some(Point3 {
+                position: robot_to_world(robot, robot_pose),
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1730,6 +1795,33 @@ mod tests {
 
         assert!(center_ray.x > 1.0);
         assert!(center_ray.z < config.depth_camera_height_m);
+    }
+
+    #[test]
+    fn compact_depth_obstacle_grid_center_beam_points_forward() {
+        let mut extractor = SurfaceExtractor::new(SurfaceExtractorConfig {
+            compact_depth_beam_count: 3,
+            compact_depth_fov_rad: std::f32::consts::FRAC_PI_2,
+            depth_camera_height_m: 0.18,
+            min_depth_m: 0.1,
+            max_depth_m: 3.0,
+            outlier_min_neighbors: 0,
+            ..SurfaceExtractorConfig::default()
+        });
+        let kinect = KinectSense {
+            depth_m: vec![1.0, 1.0, 1.0],
+            ..KinectSense::default()
+        };
+
+        let output = extractor.process(&kinect, Pose2::default(), 1);
+        let center_cell = output
+            .obstacle_grid
+            .cells
+            .iter()
+            .find(|cell| cell.state == OccupancyState::Occupied && cell.y == 0)
+            .expect("center compact beam should create a forward occupied cell");
+
+        assert!(center_cell.x > 0);
     }
 
     #[test]
