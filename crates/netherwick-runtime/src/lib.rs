@@ -53,7 +53,8 @@ use netherwick_models::{
 };
 use netherwick_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
-    ExtensionSense, EyePrediction, MemorySense, Now, ReignSense, SafetySense, SurpriseSense,
+    ExtensionSense, EyePrediction, MemorySense, Now, ObjectClass, ReignSense, SafetySense,
+    SurpriseSense,
 };
 use netherwick_sensors::{
     anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
@@ -94,7 +95,102 @@ where
     pub nudge_policy: NudgePolicy,
     pub local_map: LocalMap,
     pub last_behavior_runs: Vec<ErasedBehaviorRunRecord>,
+    chirp_events: ChirpEventState,
     nudge: NudgeController,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ChirpEventState {
+    last_charging: Option<bool>,
+    last_awake: Option<bool>,
+    last_object_count: usize,
+    last_face_present: bool,
+    last_object_familiarity: f32,
+    last_place_familiarity: f32,
+    last_places_visited: u32,
+    last_similar_situation_count: u16,
+    last_surprise_high: bool,
+    last_chosen_docking: bool,
+}
+
+impl ChirpEventState {
+    fn emit_pre_selection_chirps(&mut self, now: &mut Now, notes: &mut Vec<String>) -> Result<()> {
+        let object_count = now.objects.observations.len() + now.objects.vectors.len();
+        if object_count > 0 && self.last_object_count == 0 {
+            append_event_script_chirp(now, notes, "saw-something", ChirpPattern::SawSomething)?;
+        }
+        if now.memory.object_familiarity >= 0.70 && self.last_object_familiarity < 0.70 {
+            append_event_script_chirp(
+                now,
+                notes,
+                "object-recognized",
+                ChirpPattern::ObjectRecognized,
+            )?;
+        }
+        if now.memory.place_familiarity >= 0.70 && self.last_place_familiarity < 0.70 {
+            append_event_script_chirp(
+                now,
+                notes,
+                "place-recognized",
+                ChirpPattern::PlaceRecognized,
+            )?;
+        }
+        let learned = (self.last_places_visited > 0
+            && now.memory.places_visited > self.last_places_visited)
+            || (self.last_similar_situation_count > 0
+                && now.memory.similar_situation_count > self.last_similar_situation_count);
+        if learned {
+            append_event_script_chirp(now, notes, "learned", ChirpPattern::Learned)?;
+        }
+        let surprise_high = now.surprise.total >= 0.70 || now.surprise.prediction_error >= 0.70;
+        if surprise_high && !self.last_surprise_high {
+            append_event_script_chirp(now, notes, "surprise", ChirpPattern::Surprise)?;
+        }
+        if matches!(self.last_charging, Some(false)) && now.body.charging {
+            append_event_script_chirp(
+                now,
+                notes,
+                "charging-started",
+                ChirpPattern::ChargingStarted,
+            )?;
+        }
+        let awake = now.drives.fatigue < 0.80;
+        if matches!(self.last_awake, Some(true)) && !awake {
+            append_event_script_chirp(now, notes, "sleep", ChirpPattern::Sleep)?;
+        } else if matches!(self.last_awake, Some(false)) && awake {
+            append_event_script_chirp(now, notes, "wake", ChirpPattern::Wake)?;
+        }
+
+        self.last_charging = Some(now.body.charging);
+        self.last_awake = Some(awake);
+        self.last_object_count = object_count;
+        self.last_face_present = face_present(now);
+        self.last_object_familiarity = now.memory.object_familiarity;
+        self.last_place_familiarity = now.memory.place_familiarity;
+        self.last_places_visited = now.memory.places_visited;
+        self.last_similar_situation_count = now.memory.similar_situation_count;
+        self.last_surprise_high = surprise_high;
+        Ok(())
+    }
+
+    fn emit_post_selection_chirps(
+        &mut self,
+        now: &mut Now,
+        notes: &mut Vec<String>,
+        chosen_action: &ActionPrimitive,
+    ) -> Result<()> {
+        let docking = matches!(chosen_action, ActionPrimitive::Dock);
+        if docking && !self.last_chosen_docking {
+            let pattern = if charger_visible(now) {
+                ChirpPattern::GoalAcquired
+            } else {
+                ChirpPattern::Docking
+            };
+            append_event_script_chirp(now, notes, "docking", pattern)?;
+        }
+        self.last_chosen_docking = docking;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2128,6 +2224,7 @@ const lament =
              song("mournful_bump");
 
 [
+  chirp("Warning"),
   lament,
   stop(),
   rotate(180),
@@ -2155,9 +2252,18 @@ impl FunctionBehavior<FaceDetectedEventInput, EventScriptOutput> for FaceDetecte
             format!("Stranger {}", input.person.id)
         };
         Ok(EventScriptOutput {
-            actions: vec![EventScriptAction::Say {
-                text: format!("Hello {label}"),
-            }],
+            actions: vec![
+                EventScriptAction::Chirp {
+                    pattern: if input.recognized {
+                        ChirpPattern::PersonRecognized
+                    } else {
+                        ChirpPattern::Hello
+                    },
+                },
+                EventScriptAction::Say {
+                    text: format!("Hello {label}"),
+                },
+            ],
         })
     }
 }
@@ -2179,7 +2285,8 @@ impl FunctionBehavior<RobotInitializedEventInput, EventScriptOutput>
 const ROBOT_INITIALIZED_SCRIPT: &str = r#"
 [
   song("bring_up"),
-  chirp("Curious"),
+  chirp("Wake"),
+  chirp("Hello"),
   say(`Netherwick robot initialization complete in ${input.mode} mode.`),
   say(`${input.body}.`),
   input.battery_percent === null
@@ -2696,6 +2803,7 @@ where
             nudge_policy: NudgePolicy::default(),
             local_map: LocalMap::default(),
             last_behavior_runs: Vec::new(),
+            chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
         }
     }
@@ -2731,6 +2839,7 @@ where
             nudge_policy: NudgePolicy::default(),
             local_map: LocalMap::default(),
             last_behavior_runs: Vec::new(),
+            chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
         }
     }
@@ -3060,6 +3169,8 @@ where
         let (event_script_forced_action, event_script_records) =
             self.run_event_scripts(&mut now, &recall, &mut notes, &mut proposed_actions)?;
         behavior_runs.extend(event_script_records);
+        self.chirp_events
+            .emit_pre_selection_chirps(&mut now, &mut notes)?;
         let runtime_instant = ExperienceInstant::from_parts(
             Some(&embodied_experience),
             &sensations,
@@ -3367,6 +3478,8 @@ where
             .clone()
             .or_else(|| event_script_forced_action.clone())
             .unwrap_or(conductor_selected_action);
+        self.chirp_events
+            .emit_post_selection_chirps(&mut now, &mut notes, &chosen_action)?;
         let mut map_memory_decision = map_memory_decision_debug(
             &now,
             &chosen_action,
@@ -3801,7 +3914,11 @@ where
             behavior_runs.push(record.erase());
         }
 
-        if let Some(input) = face_detected_event_input(now, recall) {
+        if let Some(input) = if self.chirp_events.last_face_present {
+            None
+        } else {
+            face_detected_event_input(now, recall)
+        } {
             let run = self
                 .models
                 .behaviors
@@ -4222,6 +4339,52 @@ fn script_action_to_primitive(action: &EventScriptAction) -> Option<ActionPrimit
     }
 }
 
+fn append_event_script_chirp(
+    now: &mut Now,
+    notes: &mut Vec<String>,
+    event_name: &str,
+    pattern: ChirpPattern,
+) -> Result<()> {
+    let sequence = SafeScriptSequence {
+        actions: vec![SafeScriptAction {
+            requested: EventScriptAction::Chirp {
+                pattern: pattern.clone(),
+            },
+            action: Some(ActionPrimitive::Chirp {
+                pattern: pattern.clone(),
+            }),
+            desired_motor: MotorCommand::stop(),
+            final_motor: MotorCommand::stop(),
+            vetoed: false,
+            safety_reason: None,
+        }],
+    };
+    let event_scripts = now
+        .extensions
+        .entry("event_scripts".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !event_scripts.is_object() {
+        *event_scripts = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(object) = event_scripts.as_object_mut() {
+        object.insert(event_name.to_string(), serde_json::to_value(sequence)?);
+    }
+    notes.push(format!(
+        "EventScript:on({event_name}) emitted chirp({pattern:?})"
+    ));
+    Ok(())
+}
+
+fn charger_visible(now: &Now) -> bool {
+    now.objects.observations.iter().any(|observation| {
+        observation.class == ObjectClass::Charger && observation.confidence >= 0.4
+    }) || sim_world_extension_score(now, 4) >= 0.5
+}
+
+fn face_present(now: &Now) -> bool {
+    !now.face.embeddings.is_empty() || !now.face.vectors.is_empty()
+}
+
 fn execute_event_script_typescript<I>(script: &str, input: &I) -> Result<EventScriptOutput>
 where
     I: Serialize,
@@ -4333,10 +4496,11 @@ where
     A: LlmAgent + Send,
 {
     fn reign_sense(&self, now_ms: TimeMs) -> Result<ReignSense> {
-        let reign_queue = self
+        let mut reign_queue = self
             .reign_queue
             .lock()
             .map_err(|_| anyhow::anyhow!("reign queue lock poisoned"))?;
+        reign_queue.drain_expired(now_ms);
         Ok(reign_queue.sense(now_ms))
     }
 
@@ -8338,6 +8502,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_robot_slow_direct_webremote_speak_bypasses_runtime_without_motor() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingBody {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        queue.lock().unwrap().push(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: wall_time_ms().saturating_add(500),
+            source: ReignSource::WebRemote,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Speak {
+                text: "hello from reign".to_string(),
+            },
+            priority: 1.0,
+            note: None,
+        });
+        let tick_attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = QueueOnlyRuntime {
+            queue,
+            tick_attempts: Arc::clone(&tick_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), runtime);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 0);
+        assert!(motors.lock().unwrap().is_empty());
+        assert!(matches!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Speak { ref text }) if text == "hello from reign"
+        ));
+        assert!(matches!(
+            tick.frame.reign_input.as_ref().map(|input| &input.command),
+            Some(ReignCommand::Speak { text }) if text == "hello from reign"
+        ));
+    }
+
+    #[tokio::test]
     async fn tick_adds_combobulated_experience() {
         let ledger = JsonlLedger::new("/tmp/netherwick-runtime-test");
         let memory = InMemoryExperienceStore::new();
@@ -9367,9 +9578,15 @@ mod tests {
             .cloned()
             .and_then(|value| serde_json::from_value::<SafeScriptSequence>(value).ok())
             .unwrap();
-        assert_eq!(sequence.actions.len(), 4);
+        assert_eq!(sequence.actions.len(), 5);
         assert!(matches!(
             sequence.actions.first().map(|action| &action.requested),
+            Some(EventScriptAction::Chirp {
+                pattern: ChirpPattern::Warning
+            })
+        ));
+        assert!(matches!(
+            sequence.actions.get(1).map(|action| &action.requested),
             Some(EventScriptAction::Say { .. } | EventScriptAction::Song { .. })
         ));
         assert!(sequence.actions.last().unwrap().vetoed);

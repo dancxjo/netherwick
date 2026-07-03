@@ -243,6 +243,7 @@ pub struct FrameProcessor {
     last_processed_frame_key: Option<FrameKey>,
     face_detector: Option<Arc<dyn FaceDetector>>,
     object_detector: Option<Arc<dyn ObjectDetector>>,
+    kinect_range_projection: Option<DepthRangeProjectionConfig>,
 }
 
 impl std::fmt::Debug for FrameProcessor {
@@ -251,7 +252,39 @@ impl std::fmt::Debug for FrameProcessor {
             .field("last_processed_frame_key", &self.last_processed_frame_key)
             .field("face_detector", &self.face_detector.is_some())
             .field("object_detector", &self.object_detector.is_some())
+            .field("kinect_range_projection", &self.kinect_range_projection)
             .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DepthRangeProjectionConfig {
+    pub compact_depth_beam_count: usize,
+    pub compact_depth_fov_rad: f32,
+    pub depth_scale: f32,
+    pub camera_forward_m: f32,
+    pub camera_height_m: f32,
+    pub camera_pitch_rad: f32,
+    pub camera_roll_rad: f32,
+    pub camera_yaw_rad: f32,
+    pub min_depth_m: f32,
+    pub max_depth_m: f32,
+}
+
+impl Default for DepthRangeProjectionConfig {
+    fn default() -> Self {
+        Self {
+            compact_depth_beam_count: 32,
+            compact_depth_fov_rad: std::f32::consts::PI * 0.75,
+            depth_scale: 1.0,
+            camera_forward_m: 0.0,
+            camera_height_m: 0.0,
+            camera_pitch_rad: 0.0,
+            camera_roll_rad: 0.0,
+            camera_yaw_rad: 0.0,
+            min_depth_m: 0.2,
+            max_depth_m: 8.0,
+        }
     }
 }
 
@@ -382,60 +415,46 @@ impl NowBuilder {
 }
 
 fn range_from_kinect_depth(kinect: &KinectSense) -> Option<RangeSense> {
+    range_from_kinect_depth_with_config(kinect, None)
+}
+
+fn range_from_kinect_depth_with_config(
+    kinect: &KinectSense,
+    config: Option<DepthRangeProjectionConfig>,
+) -> Option<RangeSense> {
     const FALLBACK_BEAM_COUNT: usize = 32;
     let depth = &kinect.depth_m;
     if depth.is_empty() {
         return None;
     }
-    let min_depth = if kinect.min_depth_m > 0.0 {
-        kinect.min_depth_m
-    } else {
-        0.2
-    };
+    let transform = config.unwrap_or_default();
+    let min_depth = positive_or(kinect.min_depth_m, transform.min_depth_m);
     let max_depth = if kinect.max_depth_m > min_depth {
         kinect.max_depth_m
     } else {
-        8.0
+        transform.max_depth_m.max(min_depth)
     };
     let valid_depth = |value: f32| value.is_finite() && value >= min_depth && value <= max_depth;
 
-    let beams = if kinect.depth_width > 0
-        && kinect.depth_height > 0
-        && (kinect.depth_width as usize).checked_mul(kinect.depth_height as usize)
-            == Some(depth.len())
-    {
-        let width = kinect.depth_width as usize;
-        let height = kinect.depth_height as usize;
-        let beam_count = FALLBACK_BEAM_COUNT.min(width.max(1));
-        let row_start = height / 3;
-        let row_end = (height * 2 / 3).max(row_start + 1).min(height);
-        (0..beam_count)
-            .map(|beam| {
-                let x_start = beam * width / beam_count;
-                let x_end = ((beam + 1) * width / beam_count)
-                    .max(x_start + 1)
-                    .min(width);
-                let mut nearest = max_depth;
-                for y in row_start..row_end {
-                    let row = y * width;
-                    for x in x_start..x_end {
-                        let value = depth[row + x];
-                        if valid_depth(value) {
-                            nearest = nearest.min(value);
-                        }
-                    }
-                }
-                nearest
-            })
-            .collect::<Vec<_>>()
-    } else {
-        depth
-            .iter()
-            .copied()
-            .filter(|value| valid_depth(*value))
-            .take(FALLBACK_BEAM_COUNT)
-            .collect::<Vec<_>>()
-    };
+    if let Some(projection) = RangeDepthProjection::from_kinect(kinect, min_depth, max_depth) {
+        let beam_count = config
+            .map(|config| config.compact_depth_beam_count)
+            .filter(|count| *count > 0)
+            .unwrap_or(FALLBACK_BEAM_COUNT)
+            .min(projection.width.max(1));
+        return range_from_depth_image(depth, projection, beam_count, transform);
+    }
+
+    if config.is_some() && depth.len() == transform.compact_depth_beam_count {
+        return range_from_compact_depth(depth, transform, min_depth, max_depth);
+    }
+
+    let beams = depth
+        .iter()
+        .copied()
+        .filter(|value| valid_depth(*value))
+        .take(FALLBACK_BEAM_COUNT)
+        .collect::<Vec<_>>();
 
     if beams.is_empty() {
         return None;
@@ -445,7 +464,222 @@ fn range_from_kinect_depth(kinect: &KinectSense) -> Option<RangeSense> {
         schema_version: 1,
         beams,
         nearest_m,
+        beam_angles_rad: Vec::new(),
+        frame: None,
+        source: Some("kinect_depth_legacy_range".to_string()),
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RangeDepthProjection {
+    width: usize,
+    height: usize,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    min_depth_m: f32,
+    max_depth_m: f32,
+}
+
+impl RangeDepthProjection {
+    fn from_kinect(kinect: &KinectSense, min_depth_m: f32, max_depth_m: f32) -> Option<Self> {
+        let width = usize::try_from(kinect.depth_width).ok()?;
+        let height = usize::try_from(kinect.depth_height).ok()?;
+        if width == 0 || height == 0 || width.checked_mul(height)? != kinect.depth_m.len() {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            fx: positive_or(kinect.depth_fx, 594.0),
+            fy: positive_or(kinect.depth_fy, 591.0),
+            cx: positive_or(kinect.depth_cx, (width as f32 - 1.0) * 0.5),
+            cy: positive_or(kinect.depth_cy, (height as f32 - 1.0) * 0.5),
+            min_depth_m,
+            max_depth_m,
+        })
+    }
+}
+
+fn range_from_depth_image(
+    depth: &[f32],
+    projection: RangeDepthProjection,
+    beam_count: usize,
+    transform: DepthRangeProjectionConfig,
+) -> Option<RangeSense> {
+    let beam_count = beam_count.max(1);
+    let row_start = projection.height / 3;
+    let row_end = (projection.height * 2 / 3)
+        .max(row_start + 1)
+        .min(projection.height);
+    let mut beams = vec![projection.max_depth_m; beam_count];
+    let mut angles = (0..beam_count)
+        .map(|beam| {
+            let u = ((beam as f32 + 0.5) * projection.width as f32 / beam_count as f32)
+                .clamp(0.0, projection.width.saturating_sub(1) as f32);
+            let v = (projection.height as f32 - 1.0) * 0.5;
+            let camera = depth_image_camera_point(u, v, 1.0, projection);
+            robot_angle_for_camera_point(camera, transform)
+        })
+        .collect::<Vec<_>>();
+    let mut saw_valid = false;
+
+    for y in row_start..row_end {
+        let row = y * projection.width;
+        for x in 0..projection.width {
+            let depth_m = depth[row + x] * transform.depth_scale;
+            if !depth_m.is_finite()
+                || depth_m < projection.min_depth_m
+                || depth_m > projection.max_depth_m
+            {
+                continue;
+            }
+            let beam = (x * beam_count / projection.width).min(beam_count - 1);
+            let camera = depth_image_camera_point(x as f32, y as f32, depth_m, projection);
+            let robot = depth_camera_point_to_robot(camera, transform);
+            let planar_distance = robot[0].hypot(robot[1]);
+            if planar_distance.is_finite() && planar_distance < beams[beam] {
+                beams[beam] = planar_distance;
+                angles[beam] = robot[1].atan2(robot[0]);
+                saw_valid = true;
+            }
+        }
+    }
+
+    if !saw_valid {
+        return None;
+    }
+    let nearest_m = beams.iter().copied().reduce(f32::min);
+    Some(RangeSense {
+        schema_version: 1,
+        beams,
+        nearest_m,
+        beam_angles_rad: angles,
+        frame: Some("robot_base".to_string()),
+        source: Some("kinect_depth_image".to_string()),
+    })
+}
+
+fn range_from_compact_depth(
+    depth: &[f32],
+    transform: DepthRangeProjectionConfig,
+    min_depth_m: f32,
+    max_depth_m: f32,
+) -> Option<RangeSense> {
+    let beam_count = depth.len().max(1);
+    let fov_rad = transform
+        .compact_depth_fov_rad
+        .clamp(0.01, std::f32::consts::TAU);
+    let start = if beam_count == 1 { 0.0 } else { -fov_rad * 0.5 };
+    let step = if beam_count == 1 {
+        0.0
+    } else {
+        fov_rad / (beam_count - 1) as f32
+    };
+    let mut beams = Vec::with_capacity(depth.len());
+    let mut angles = Vec::with_capacity(depth.len());
+
+    for (index, depth_m) in depth.iter().enumerate() {
+        let scaled = *depth_m * transform.depth_scale;
+        if !scaled.is_finite() || scaled < min_depth_m || scaled > max_depth_m {
+            continue;
+        }
+        let angle = start + step * index as f32;
+        let robot = depth_apply_robot_extrinsics(
+            [angle.cos() * scaled, angle.sin() * scaled, 0.0],
+            transform,
+        );
+        let planar_distance = robot[0].hypot(robot[1]);
+        if !planar_distance.is_finite() {
+            continue;
+        }
+        beams.push(planar_distance);
+        angles.push(robot[1].atan2(robot[0]));
+    }
+
+    if beams.is_empty() {
+        return None;
+    }
+    let nearest_m = beams.iter().copied().reduce(f32::min);
+    Some(RangeSense {
+        schema_version: 1,
+        beams,
+        nearest_m,
+        beam_angles_rad: angles,
+        frame: Some("robot_base".to_string()),
+        source: Some("kinect_compact_depth".to_string()),
+    })
+}
+
+fn depth_image_camera_point(
+    u: f32,
+    v: f32,
+    depth_m: f32,
+    projection: RangeDepthProjection,
+) -> [f32; 3] {
+    [
+        (u - projection.cx) * depth_m / projection.fx.max(f32::EPSILON),
+        (v - projection.cy) * depth_m / projection.fy.max(f32::EPSILON),
+        depth_m,
+    ]
+}
+
+fn robot_angle_for_camera_point(camera: [f32; 3], transform: DepthRangeProjectionConfig) -> f32 {
+    let robot = depth_camera_point_to_robot(camera, transform);
+    robot[1].atan2(robot[0])
+}
+
+fn depth_camera_point_to_robot(
+    camera: [f32; 3],
+    transform: DepthRangeProjectionConfig,
+) -> [f32; 3] {
+    depth_apply_robot_extrinsics([camera[2], -camera[0], -camera[1]], transform)
+}
+
+fn depth_apply_robot_extrinsics(base: [f32; 3], transform: DepthRangeProjectionConfig) -> [f32; 3] {
+    let rotated = depth_rotate_robot_extrinsic(
+        base,
+        transform.camera_pitch_rad,
+        transform.camera_roll_rad,
+        transform.camera_yaw_rad,
+    );
+    [
+        rotated[0] + transform.camera_forward_m,
+        rotated[1],
+        rotated[2] + transform.camera_height_m,
+    ]
+}
+
+fn depth_rotate_robot_extrinsic(
+    point: [f32; 3],
+    pitch_rad: f32,
+    roll_rad: f32,
+    yaw_rad: f32,
+) -> [f32; 3] {
+    let (pitch_sin, pitch_cos) = pitch_rad.sin_cos();
+    let mut x = point[0] * pitch_cos + point[2] * pitch_sin;
+    let y = point[1];
+    let mut z = -point[0] * pitch_sin + point[2] * pitch_cos;
+
+    let (roll_sin, roll_cos) = roll_rad.sin_cos();
+    let rolled_y = y * roll_cos - z * roll_sin;
+    z = y * roll_sin + z * roll_cos;
+
+    let (yaw_sin, yaw_cos) = yaw_rad.sin_cos();
+    let yawed_x = x * yaw_cos - rolled_y * yaw_sin;
+    let yawed_y = x * yaw_sin + rolled_y * yaw_cos;
+    x = yawed_x;
+
+    [x, yawed_y, z]
+}
+
+fn positive_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
 }
 
 impl FrameProcessor {
@@ -463,7 +697,14 @@ impl FrameProcessor {
         self
     }
 
+    pub fn with_kinect_range_projection(mut self, config: DepthRangeProjectionConfig) -> Self {
+        self.kinect_range_projection = Some(config);
+        self
+    }
+
     pub fn process_packets(&mut self, t_ms: TimeMs, packets: &mut Vec<SensePacket>) {
+        self.process_kinect_range_packets(packets);
+
         let Some(frame) = packets.iter().rev().find_map(|packet| match packet {
             SensePacket::EyeFrame(frame) => Some(frame),
             _ => None,
@@ -489,6 +730,28 @@ impl FrameProcessor {
             name: "vision.frame_summary".to_string(),
             values: summary_values,
         }));
+    }
+
+    fn process_kinect_range_packets(&self, packets: &mut Vec<SensePacket>) {
+        if packets
+            .iter()
+            .any(|packet| matches!(packet, SensePacket::Range(_)))
+        {
+            return;
+        }
+        let Some(config) = self.kinect_range_projection else {
+            return;
+        };
+        let Some(kinect) = packets.iter().rev().find_map(|packet| match packet {
+            SensePacket::Kinect(kinect) => Some(kinect),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(range) = range_from_kinect_depth_with_config(kinect, Some(config)) else {
+            return;
+        };
+        packets.insert(0, SensePacket::Range(range));
     }
 
     pub fn process_snapshot(&mut self, t_ms: TimeMs, snapshot: &mut WorldSnapshot) {
@@ -2850,8 +3113,17 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(now.range.beams, vec![1.0, 2.0, 4.0, 3.0]);
-        assert_eq!(now.range.nearest_m, Some(1.0));
+        assert_eq!(now.range.beams.len(), 4);
+        for (actual, expected) in now.range.beams.iter().zip([1.0, 2.0, 4.0, 3.0]) {
+            assert!((actual - expected).abs() < 0.0001);
+        }
+        assert!(now
+            .range
+            .nearest_m
+            .is_some_and(|nearest| (nearest - 1.0).abs() < 0.0001));
+        assert_eq!(now.range.beam_angles_rad.len(), 4);
+        assert_eq!(now.range.frame.as_deref(), Some("robot_base"));
+        assert_eq!(now.range.source.as_deref(), Some("kinect_depth_image"));
         assert_eq!(
             now.extensions
                 .get("sensor_status")
@@ -2860,6 +3132,37 @@ mod tests {
                 .and_then(|value| value.as_u64()),
             Some(100)
         );
+    }
+
+    #[test]
+    fn frame_processor_injects_calibrated_range_angles_from_kinect_depth() {
+        let mut processor =
+            FrameProcessor::new().with_kinect_range_projection(DepthRangeProjectionConfig {
+                compact_depth_beam_count: 3,
+                compact_depth_fov_rad: std::f32::consts::FRAC_PI_2,
+                camera_yaw_rad: -std::f32::consts::FRAC_PI_2,
+                min_depth_m: 0.1,
+                max_depth_m: 3.0,
+                ..DepthRangeProjectionConfig::default()
+            });
+        let mut packets = vec![SensePacket::Kinect(KinectSense {
+            depth_m: vec![1.0, 1.0, 1.0],
+            ..KinectSense::default()
+        })];
+
+        processor.process_packets(100, &mut packets);
+
+        let range = packets
+            .iter()
+            .find_map(|packet| match packet {
+                SensePacket::Range(range) => Some(range),
+                _ => None,
+            })
+            .expect("calibrated range packet");
+        assert_eq!(range.frame.as_deref(), Some("robot_base"));
+        assert_eq!(range.source.as_deref(), Some("kinect_compact_depth"));
+        assert_eq!(range.beam_angles_rad.len(), 3);
+        assert!((range.beam_angles_rad[1] + std::f32::consts::FRAC_PI_2).abs() < 0.001);
     }
 
     #[test]

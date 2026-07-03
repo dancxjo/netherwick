@@ -35,7 +35,23 @@ pub enum ExploreStyle {
 pub enum ChirpPattern {
     Confirm,
     Warning,
+    Hello,
+    Goodbye,
     Curious,
+    Idea,
+    GoalAcquired,
+    Searching,
+    SawSomething,
+    Surprise,
+    Learned,
+    PersonRecognized,
+    ObjectRecognized,
+    PlaceRecognized,
+    DidntUnderstand,
+    Docking,
+    ChargingStarted,
+    Sleep,
+    Wake,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

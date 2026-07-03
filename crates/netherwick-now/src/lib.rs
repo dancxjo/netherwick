@@ -521,6 +521,12 @@ pub struct RangeSense {
     pub schema_version: u32,
     pub beams: Vec<f32>,
     pub nearest_m: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beam_angles_rad: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

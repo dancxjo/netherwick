@@ -920,6 +920,10 @@ pub struct SceneSensorCalibration {
     pub camera_roll_rad: f32,
     #[serde(default)]
     pub camera_yaw_rad: f32,
+    #[serde(default)]
+    pub color_offset_x_px: i32,
+    #[serde(default)]
+    pub color_offset_y_px: i32,
 }
 
 impl SceneSensorCalibration {
@@ -936,6 +940,8 @@ impl SceneSensorCalibration {
             camera_pitch_rad: 0.0,
             camera_roll_rad: 0.0,
             camera_yaw_rad: 0.0,
+            color_offset_x_px: 3,
+            color_offset_y_px: 7,
         }
     }
 
@@ -961,6 +967,10 @@ impl SceneSensorCalibration {
         } else {
             self.depth_pitch_down_rad
         }
+    }
+
+    fn color_offset_px(self) -> (i32, i32) {
+        (self.color_offset_x_px, self.color_offset_y_px)
     }
 }
 
@@ -4305,6 +4315,7 @@ fn trap_kind_name(code: f32) -> Option<&'static str> {
 
 fn scene_range_from_snapshot(snapshot: &WorldSnapshot) -> SceneRange {
     let beam_count = snapshot.range.beams.len().max(1);
+    let explicit_angles = snapshot.range.beam_angles_rad.len() == snapshot.range.beams.len();
     let fov_rad = std::f32::consts::PI;
     SceneRange {
         nearest_m: snapshot.range.nearest_m,
@@ -4319,9 +4330,13 @@ fn scene_range_from_snapshot(snapshot: &WorldSnapshot) -> SceneRange {
                 } else {
                     index as f32 / (beam_count - 1) as f32
                 };
-                let angle_rad = -fov_rad * 0.5 + ratio * fov_rad;
+                let angle_rad = if explicit_angles {
+                    snapshot.range.beam_angles_rad[index]
+                } else {
+                    -fov_rad * 0.5 + ratio * fov_rad
+                };
                 SceneRangeBeam {
-                    angle_rad,
+                    angle_rad: finite_or_zero(angle_rad),
                     distance_m: finite_or_zero(*distance_m),
                     hit: snapshot
                         .range
@@ -4749,7 +4764,12 @@ fn depth_points(
             let z = (depth * calibration.map_or(1.0, |calibration| calibration.depth_scale))
                 .clamp(0.0, 8.0);
             let [r, g, b] = color
-                .and_then(|color| color.sample_depth_pixel(x, y, width, height))
+                .and_then(|color| {
+                    let (offset_x, offset_y) = calibration
+                        .map(SceneSensorCalibration::color_offset_px)
+                        .unwrap_or_default();
+                    color.sample_depth_pixel_with_offset(x, y, width, height, offset_x, offset_y)
+                })
                 .unwrap_or_else(|| depth_shade(z, 8.0));
             Some(ScenePoint {
                 x: nx * z,
@@ -4859,19 +4879,33 @@ impl DepthColorImage {
         Some(Self { width, height, rgb })
     }
 
-    fn sample_depth_pixel(
+    fn sample_depth_pixel_with_offset(
         &self,
         depth_x: usize,
         depth_y: usize,
         depth_width: usize,
         depth_height: usize,
+        offset_x_px: i32,
+        offset_y_px: i32,
     ) -> Option<[u8; 3]> {
         if depth_width == 0 || depth_height == 0 {
             return None;
         }
         let color_x = (depth_x.saturating_mul(self.width) / depth_width).min(self.width - 1);
         let color_y = (depth_y.saturating_mul(self.height) / depth_height).min(self.height - 1);
-        self.sample(color_x, color_y)
+        self.sample_offset(color_x, color_y, offset_x_px, offset_y_px)
+    }
+
+    fn sample_offset(
+        &self,
+        x: usize,
+        y: usize,
+        offset_x_px: i32,
+        offset_y_px: i32,
+    ) -> Option<[u8; 3]> {
+        let x = offset_index(x, offset_x_px, self.width)?;
+        let y = offset_index(y, offset_y_px, self.height)?;
+        self.sample(x, y)
     }
 
     fn sample(&self, x: usize, y: usize) -> Option<[u8; 3]> {
@@ -4882,6 +4916,14 @@ impl DepthColorImage {
             *self.rgb.get(offset + 2)?,
         ])
     }
+}
+
+fn offset_index(index: usize, offset: i32, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let shifted = index as i64 + offset as i64;
+    Some(shifted.clamp(0, len as i64 - 1) as usize)
 }
 
 fn depth_shade(depth_m: f32, max_depth_m: f32) -> [u8; 3] {
@@ -4899,6 +4941,9 @@ fn project_depth_image(
     let stride = (depth_m.len().div_ceil(MAX_POINTS)).max(1);
     let mut points = Vec::with_capacity(MAX_POINTS.min(depth_m.len()));
     let calibrated = calibration.map(|calibration| DepthExtrinsics::from(calibration));
+    let (color_offset_x_px, color_offset_y_px) = calibration
+        .map(SceneSensorCalibration::color_offset_px)
+        .unwrap_or_default();
     for (index, depth) in depth_m.iter().enumerate().step_by(stride) {
         if !depth.is_finite() || *depth <= 0.0 {
             continue;
@@ -4913,11 +4958,13 @@ fn project_depth_image(
         let y = (v - frame.cy) * z / frame.fy.max(f32::EPSILON);
         let [r, g, b] = color
             .and_then(|color| {
-                color.sample_depth_pixel(
+                color.sample_depth_pixel_with_offset(
                     index % frame.width,
                     index / frame.width,
                     frame.width,
                     frame.height,
+                    color_offset_x_px,
+                    color_offset_y_px,
                 )
             })
             .unwrap_or_else(|| depth_shade(z, frame.max_depth_m));
@@ -5708,6 +5755,9 @@ body{font:16px system-ui;margin:2rem;max-width:780px}
 button,input,select{font:inherit;margin:.25rem;padding:.5rem}
 button.stop{background:#b00020;color:white}
 #latest{white-space:pre-wrap;background:#f5f5f5;padding:1rem}
+.chirps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.35rem;margin:.75rem 0}
+.chirps button{text-align:left}
+.chirps small{display:block;color:#555;font-size:.75rem;line-height:1.2}
 </style>
 <h1>Reign Remote</h1>
 <select id="mode">
@@ -5721,9 +5771,30 @@ button.stop{background:#b00020;color:white}
 <button onclick="send({type:'Dock'},60000)">Dock</button>
 <button onclick="send({type:'Explore',duration_ms:3000},60000)">Explore</button>
 <input id="say" placeholder="Speak text"><button onclick="speak()">Speak</button>
-<button onclick="chirp('Confirm')">Chirp Confirm</button>
-<button onclick="chirp('Warning')">Chirp Warning</button>
-<button onclick="chirp('Curious')">Chirp Curious</button>
+<section>
+  <h2>Chirps</h2>
+  <div class="chirps" aria-label="chirp controls">
+    <button onclick="chirp('Confirm')" title="79,84,79; bright, decisive confirmation">Confirm<small>79,84,79; decisive</small></button>
+    <button onclick="chirp('Warning')" title="79,75; rejection, warning, or nope">Warning<small>79,75; nope</small></button>
+    <button onclick="chirp('Hello')" title="72,76,79; ascending greeting">Hello<small>72,76,79; greeting</small></button>
+    <button onclick="chirp('Goodbye')" title="79,76,72; descending farewell">Goodbye<small>79,76,72; farewell</small></button>
+    <button onclick="chirp('Curious')" title="72,76,74; unresolved question or interest">Curious<small>72,76,74; unresolved</small></button>
+    <button onclick="chirp('Idea')" title="76,81,84; rising idea or realization">Idea<small>76,81,84; climbing</small></button>
+    <button onclick="chirp('GoalAcquired')" title="72,79,84,91; little fanfare for finding a goal">Goal acquired<small>72,79,84,91; fanfare</small></button>
+    <button onclick="chirp('Searching')" title="72,74,76,74; gentle oscillation while looking">Searching<small>72,74,76,74; oscillation</small></button>
+    <button onclick="chirp('SawSomething')" title="84,91; quick widened-attention signal">Saw something<small>84,91; attention</small></button>
+    <button onclick="chirp('Surprise')" title="72,84; big leap for surprise">Surprise<small>72,84; leap</small></button>
+    <button onclick="chirp('Learned')" title="74,79,83; settled memory or learning">Learned<small>74,79,83; settled</small></button>
+    <button onclick="chirp('PersonRecognized')" title="76,79,84,79; warm arch for a recognized person">Person recognized<small>76,79,84,79; warm arch</small></button>
+    <button onclick="chirp('ObjectRecognized')" title="79,84,76; recognition motif for an object">Object recognized<small>79,84,76; motif</small></button>
+    <button onclick="chirp('PlaceRecognized')" title="79,84,72; recognition motif for a place">Place recognized<small>79,84,72; motif</small></button>
+    <button onclick="chirp('DidntUnderstand')" title="79,81,78; crooked ending for confusion">Did not understand<small>79,81,78; crooked</small></button>
+    <button onclick="chirp('Docking')" title="67,72,76,79; climbing toward home">Docking<small>67,72,76,79; homeward</small></button>
+    <button onclick="chirp('ChargingStarted')" title="60,67,72; solid foundation for charging contact">Charging started<small>60,67,72; foundation</small></button>
+    <button onclick="chirp('Sleep')" title="79,76,72,67; gentle descent into rest">Sleep<small>79,76,72,67; descent</small></button>
+    <button onclick="chirp('Wake')" title="67,72,79; upward stretch into activity">Wake<small>67,72,79; upward</small></button>
+  </div>
+</section>
 <pre id="latest">loading...</pre>
 <script>
 let reignSocket = null;
@@ -6290,6 +6361,11 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 #reign-joystick::before{left:12px;right:12px;top:50%;height:1px}
 #reign-joystick::after{top:12px;bottom:12px;left:50%;width:1px}
 #reign-stick{position:absolute;left:50%;top:50%;width:34px;height:34px;border-radius:50%;background:#dce8f2;border:1px solid #8ec9ef;box-shadow:0 0 18px rgba(111,191,242,.42);transform:translate(-50%,-50%)}
+.reign-turn{position:absolute;top:8px;z-index:2;width:32px;height:32px;border:1px solid #5f7d94;border-radius:50%;background:rgba(16,28,38,.88);color:#e7f5ff;font-size:21px;line-height:1;display:grid;place-items:center;cursor:pointer;touch-action:none}
+.reign-turn.left{left:8px}
+.reign-turn.right{right:8px}
+.reign-turn:hover,.reign-turn:focus-visible{border-color:#8ec9ef;color:#fff;outline:none;box-shadow:0 0 14px rgba(111,191,242,.34)}
+.reign-turn:active{background:#29465b}
 .reign-buttons{display:grid;grid-template-columns:1fr;gap:6px}
 .reign-buttons button{min-height:34px;border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer}
 .reign-buttons button:hover,.reign-buttons button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
@@ -6297,8 +6373,9 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .reign-voice{display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center}
 .reign-voice input{min-width:0;background:#111820;border:1px solid #33414d;color:#e7eef5;border-radius:4px;padding:7px 8px;font:inherit}
 .reign-voice button,.reign-chirps button{border:1px solid #3f607b;background:#1a2b38;color:#dce8f2;border-radius:5px;cursor:pointer;padding:7px 9px}
-.reign-chirps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
-.reign-chirps button{min-width:0}
+.reign-chirps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;max-height:184px;overflow:auto;scrollbar-width:thin}
+.reign-chirps button{min-width:0;text-align:left}
+.reign-chirps small{display:block;color:#9fb0bf;font-size:9px;line-height:1.15;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .reign-voice button:hover,.reign-voice button:focus-visible,.reign-chirps button:hover,.reign-chirps button:focus-visible{border-color:#8ec9ef;color:#fff;outline:none}
 .reign-readout{font-size:11px;color:#b7c8d8}
 .reign-hint{color:#9fb0bf;font-size:11px;line-height:1.25}
@@ -6455,6 +6532,8 @@ canvas{display:block}
   <strong>Reign controls</strong>
   <div class="reign-pad">
     <div id="reign-joystick" role="application" aria-label="Hold and drag to steer">
+      <button class="reign-turn left" data-reign-turn="Left" type="button" aria-label="Turn counterclockwise">&#8634;</button>
+      <button class="reign-turn right" data-reign-turn="Right" type="button" aria-label="Turn clockwise">&#8635;</button>
       <div id="reign-stick"></div>
     </div>
     <div class="reign-buttons">
@@ -6472,9 +6551,25 @@ canvas{display:block}
     <button id="reign-speak" type="button">Speak</button>
   </div>
   <div class="reign-chirps" aria-label="chirp controls">
-    <button data-chirp="Confirm" type="button">Confirm</button>
-    <button data-chirp="Warning" type="button">Warning</button>
-    <button data-chirp="Curious" type="button">Curious</button>
+    <button data-chirp="Confirm" type="button" title="79,84,79; bright, decisive confirmation" aria-label="Confirm chirp: notes 79,84,79; bright, decisive confirmation">Confirm<small>79,84,79; decisive</small></button>
+    <button data-chirp="Warning" type="button" title="79,75; rejection, warning, or nope" aria-label="Warning chirp: notes 79,75; rejection, warning, or nope">Warning<small>79,75; nope</small></button>
+    <button data-chirp="Hello" type="button" title="72,76,79; ascending greeting" aria-label="Hello chirp: notes 72,76,79; ascending greeting">Hello<small>72,76,79; greeting</small></button>
+    <button data-chirp="Goodbye" type="button" title="79,76,72; descending farewell" aria-label="Goodbye chirp: notes 79,76,72; descending farewell">Goodbye<small>79,76,72; farewell</small></button>
+    <button data-chirp="Curious" type="button" title="72,76,74; unresolved question or interest" aria-label="Curious chirp: notes 72,76,74; unresolved question or interest">Curious<small>72,76,74; unresolved</small></button>
+    <button data-chirp="Idea" type="button" title="76,81,84; rising idea or realization" aria-label="Idea chirp: notes 76,81,84; rising idea or realization">Idea<small>76,81,84; climbing</small></button>
+    <button data-chirp="GoalAcquired" type="button" title="72,79,84,91; little fanfare for finding a goal" aria-label="Goal acquired chirp: notes 72,79,84,91; little fanfare for finding a goal">Goal acquired<small>72,79,84,91; fanfare</small></button>
+    <button data-chirp="Searching" type="button" title="72,74,76,74; gentle oscillation while looking" aria-label="Searching chirp: notes 72,74,76,74; gentle oscillation while looking">Searching<small>72,74,76,74; oscillation</small></button>
+    <button data-chirp="SawSomething" type="button" title="84,91; quick widened-attention signal" aria-label="Saw something chirp: notes 84,91; quick widened-attention signal">Saw something<small>84,91; attention</small></button>
+    <button data-chirp="Surprise" type="button" title="72,84; big leap for surprise" aria-label="Surprise chirp: notes 72,84; big leap for surprise">Surprise<small>72,84; leap</small></button>
+    <button data-chirp="Learned" type="button" title="74,79,83; settled memory or learning" aria-label="Learned chirp: notes 74,79,83; settled memory or learning">Learned<small>74,79,83; settled</small></button>
+    <button data-chirp="PersonRecognized" type="button" title="76,79,84,79; warm arch for a recognized person" aria-label="Person recognized chirp: notes 76,79,84,79; warm arch for a recognized person">Person recognized<small>76,79,84,79; warm arch</small></button>
+    <button data-chirp="ObjectRecognized" type="button" title="79,84,76; recognition motif for an object" aria-label="Object recognized chirp: notes 79,84,76; recognition motif for an object">Object recognized<small>79,84,76; motif</small></button>
+    <button data-chirp="PlaceRecognized" type="button" title="79,84,72; recognition motif for a place" aria-label="Place recognized chirp: notes 79,84,72; recognition motif for a place">Place recognized<small>79,84,72; motif</small></button>
+    <button data-chirp="DidntUnderstand" type="button" title="79,81,78; crooked ending for confusion" aria-label="Did not understand chirp: notes 79,81,78; crooked ending for confusion">Did not understand<small>79,81,78; crooked</small></button>
+    <button data-chirp="Docking" type="button" title="67,72,76,79; climbing toward home" aria-label="Docking chirp: notes 67,72,76,79; climbing toward home">Docking<small>67,72,76,79; homeward</small></button>
+    <button data-chirp="ChargingStarted" type="button" title="60,67,72; solid foundation for charging contact" aria-label="Charging started chirp: notes 60,67,72; solid foundation for charging contact">Charging started<small>60,67,72; foundation</small></button>
+    <button data-chirp="Sleep" type="button" title="79,76,72,67; gentle descent into rest" aria-label="Sleep chirp: notes 79,76,72,67; gentle descent into rest">Sleep<small>79,76,72,67; descent</small></button>
+    <button data-chirp="Wake" type="button" title="67,72,79; upward stretch into activity" aria-label="Wake chirp: notes 67,72,79; upward stretch into activity">Wake<small>67,72,79; upward</small></button>
   </div>
 </aside>
 <aside id="reign-hardware" data-window-title="Hardware">
@@ -6601,6 +6696,16 @@ canvas{display:block}
       <input type="range" id="cal-camera-pitch" min="-45" max="45" step="1" value="0">
       <span id="val-camera-pitch" style="width:40px;text-align:right;font-family:monospace">0°</span>
     </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-color-x" style="width:90px">Color X</label>
+      <input type="range" id="cal-color-x" min="-32" max="32" step="1" value="3">
+      <span id="val-color-x" style="width:40px;text-align:right;font-family:monospace">3px</span>
+    </div>
+    <div style="display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center">
+      <label for="cal-color-y" style="width:90px">Color Y</label>
+      <input type="range" id="cal-color-y" min="-32" max="32" step="1" value="7">
+      <span id="val-color-y" style="width:40px;text-align:right;font-family:monospace">7px</span>
+    </div>
   </div>
   <div id="calibration-status" style="margin-top:6px;font-size:11px;color:#aab4bd;text-align:right">status: synced</div>
 </aside>
@@ -6626,11 +6731,13 @@ const reignJoystick = document.getElementById('reign-joystick');
 const reignStick = document.getElementById('reign-stick');
 const reignStop = document.getElementById('reign-stop');
 const reignReadout = document.getElementById('reign-readout');
+const reignTurnButtons = Array.from(document.querySelectorAll('[data-reign-turn]'));
 const reignSay = document.getElementById('reign-say');
 const reignSpeak = document.getElementById('reign-speak');
 const reignChirps = Array.from(document.querySelectorAll('[data-chirp]'));
 let reignCommandSocket = null;
 const WEB_REIGN_DRIVE_TTL_MS = 12_000;
+const WEB_REIGN_TURN_TTL_MS = 700;
 const WEB_REIGN_STOP_TTL_MS = 60_000;
 const WEB_REIGN_SPEAK_TTL_MS = 120_000;
 const WEB_REIGN_CHIRP_TTL_MS = 60_000;
@@ -6818,17 +6925,35 @@ const surfaceOverlays = new BABYLON.TransformNode("surfaceOverlays", scene);
 
 let pointCloud = null;
 let voxelCloud = null;
+let motionTrail = null;
+let connectionLines = null;
 let lastScene = null;
 let xrSession = null;
 let lastReignKey = '';
 let lastReignSentAt = 0;
 let lastReignText = 'idle';
+let lastReignAckAt = 0;
+let reignFallbackInFlight = false;
 let webReignPointerId = null;
 let webReignVector = {x: 0, y: 0};
+let webTurnPointerId = null;
+let webTurnInterval = null;
 const llmCards = new Map();
+const motionState = {poses: [], connections: []};
 
 function fmt(v, d=2){ return Number.isFinite(v) ? v.toFixed(d) : '-'; }
-function world(x, y, up=0){ return new BABYLON.Vector3(x, up, y); }
+function worldMathPointToBabylonWorld(p){
+  return new BABYLON.Vector3(-p.y, p.z, p.x);
+}
+function world(x, y, up=0){ return worldMathPointToBabylonWorld({x, y, z: up}); }
+function robotYawToBabylon(headingRad){
+  return Math.PI - (Number(headingRad) || 0);
+}
+function packetHeadingRad(packet){
+  const imuYawDeg = packet?.imu?.yaw_deg;
+  if(Number.isFinite(imuYawDeg)) return imuYawDeg * Math.PI / 180;
+  return Number(packet?.body?.heading_rad) || 0;
+}
 function clamp(value, min, max){ return Math.max(min, Math.min(max, value)); }
 function titleCase(value){
   return String(value || '-').replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
@@ -6892,15 +7017,6 @@ function materialFor(kind, color){
 
 function renderObjects(scenePacket){
   clearChildren(objects);
-  const arena = scenePacket.arena;
-  if(arena){
-    ground.scaling.set(arena.width_m / 10, 1, arena.height_m / 10);
-    ground.position.set(arena.width_m / 2, 0, arena.height_m / 2);
-    ground.rotationQuaternion = null;
-    gridMesh.position.set(arena.width_m / 2, 0, arena.height_m / 2);
-    gridMesh.rotationQuaternion = null;
-    viewerCamera.setTarget(new BABYLON.Vector3(arena.width_m / 2, 0, arena.height_m / 2));
-  }
   for(const item of scenePacket.objects || []){
     let mesh;
     const mat = materialFor(item.kind, item.color_rgb);
@@ -6940,18 +7056,23 @@ function syncVisualFloor(packet){
   const arena = packet.arena || {};
   const centerX = Number.isFinite(arena.width_m) ? arena.width_m / 2 : Number(packet.body?.x_m) || 0;
   const centerY = Number.isFinite(arena.height_m) ? arena.height_m / 2 : Number(packet.body?.y_m) || 0;
-  ground.position.set(centerX, 0, centerY);
-  gridMesh.position.set(centerX, 0, centerY);
+  const center = world(centerX, centerY, 0);
+  if(Number.isFinite(arena.width_m) && Number.isFinite(arena.height_m)){
+    ground.scaling.set(arena.height_m / 10, 1, arena.width_m / 10);
+  }
+  ground.position.copyFrom(center);
+  gridMesh.position.copyFrom(center);
   ground.rotationQuaternion = null;
   gridMesh.rotationQuaternion = null;
-  viewerCamera.setTarget(new BABYLON.Vector3(centerX, 0, centerY));
+  viewerCamera.setTarget(center);
 }
 
 function renderBeams(packet){
   clearChildren(beams);
   const b = packet.body;
+  const heading = packetHeadingRad(packet);
   for(const beam of packet.range?.beams || []){
-    const angle = b.heading_rad + beam.angle_rad;
+    const angle = heading + beam.angle_rad;
     const start = world(b.x_m, b.y_m, .12);
     const end = world(b.x_m + Math.cos(angle) * beam.distance_m, b.y_m + Math.sin(angle) * beam.distance_m, .12);
     
@@ -6985,10 +7106,6 @@ function robotRenderPointToBabylonLocal(p){
 
 function kinectCameraPointToBabylonLocal(p){
   return new BABYLON.Vector3(p.x, -p.y, -p.z);
-}
-
-function worldMathPointToBabylonWorld(p){
-  return new BABYLON.Vector3(-p.y, p.z, p.x);
 }
 
 function pointCloudPointToBabylonWorld(p, frameKind, robotMatrix){
@@ -7118,6 +7235,85 @@ function renderWorldBeliefPoints(packet){
     renderAccumulatedVoxels(accumulated, packet.kinect?.accumulated_summary?.voxel_size_m);
   }else{
     clearPointGeometry();
+  }
+}
+
+function disposeMotionMesh(mesh){
+  if(!mesh) return null;
+  if(mesh.material) mesh.material.dispose();
+  mesh.dispose();
+  return null;
+}
+
+function appendMotionPose(packet){
+  const pose = packet.body || {};
+  const t = Number(packet.t_ms) || 0;
+  const heading = packetHeadingRad(packet);
+  const last = motionState.poses[motionState.poses.length - 1];
+  const next = {
+    x_m: Number(pose.x_m) || 0,
+    y_m: Number(pose.y_m) || 0,
+    heading_rad: heading,
+    t_ms: t
+  };
+  const moved = !last || Math.hypot(next.x_m - last.x_m, next.y_m - last.y_m) > .01;
+  const turned = !last || Math.abs(next.heading_rad - last.heading_rad) > .025;
+  if(moved || turned || (last && t > last.t_ms + 1200)){
+    motionState.poses.push(next);
+    if(motionState.poses.length > 360) motionState.poses.shift();
+  }
+}
+
+function appendScanConnections(packet){
+  const pose = packet.body || {};
+  const heading = packetHeadingRad(packet);
+  const origin = world(Number(pose.x_m) || 0, Number(pose.y_m) || 0, .13);
+  const beamsIn = packet.range?.beams || [];
+  if(!beamsIn.length) return;
+  const maxConnections = 18;
+  const stride = Math.max(1, Math.ceil(beamsIn.length / maxConnections));
+  for(let index = 0; index < beamsIn.length; index += stride){
+    const beam = beamsIn[index];
+    if(!beam?.hit) continue;
+    const angle = heading + (Number(beam.angle_rad) || 0);
+    const distance = Math.max(0, Number(beam.distance_m) || 0);
+    const end = world(
+      (Number(pose.x_m) || 0) + Math.cos(angle) * distance,
+      (Number(pose.y_m) || 0) + Math.sin(angle) * distance,
+      .13
+    );
+    motionState.connections.push({origin: origin.clone(), end, t_ms: Number(packet.t_ms) || 0});
+  }
+  if(motionState.connections.length > 420){
+    motionState.connections.splice(0, motionState.connections.length - 420);
+  }
+}
+
+function renderRobotMotion(packet){
+  appendMotionPose(packet);
+  appendScanConnections(packet);
+  motionTrail = disposeMotionMesh(motionTrail);
+  connectionLines = disposeMotionMesh(connectionLines);
+
+  if(motionState.poses.length > 1){
+    const points = motionState.poses.map(pose => world(pose.x_m, pose.y_m, .035));
+    motionTrail = BABYLON.MeshBuilder.CreateLines("motionTrail", {points}, scene);
+    motionTrail.color = new BABYLON.Color3(0.55, 0.94, 0.70);
+    motionTrail.alpha = .82;
+  }
+
+  const now = Number(packet.t_ms) || 0;
+  const recent = motionState.connections.filter(line => !now || now - line.t_ms < 30_000);
+  motionState.connections = recent;
+  if(recent.length){
+    const lines = recent.map(line => [line.origin, line.end]);
+    const colors = recent.map(line => {
+      const age = now ? clamp(1 - (now - line.t_ms) / 30_000, .18, 1) : .55;
+      const c = new BABYLON.Color4(1.0, 0.80, 0.32, age * .5);
+      return [c, c];
+    });
+    connectionLines = BABYLON.MeshBuilder.CreateLineSystem("scanConnections", {lines, colors}, scene);
+    connectionLines.alpha = .7;
   }
 }
 
@@ -7541,10 +7737,11 @@ function updateScene(packet, liveMap=null){
   lastScene = packet;
   syncDisplayToggles();
   robot.position.copyFrom(world(packet.body.x_m, packet.body.y_m, 0));
-  robot.rotation.y = -packet.body.heading_rad - Math.PI / 2;
+  robot.rotation.y = robotYawToBabylon(packetHeadingRad(packet));
   renderObjects(packet);
   syncVisualFloor(packet);
   renderBeams(packet);
+  renderRobotMotion(packet);
   renderWorldBeliefPoints(packet);
   renderSurfacePerception(packet);
   renderEye(packet);
@@ -7614,7 +7811,7 @@ function updateScene(packet, liveMap=null){
   const imu = packet.imu || {};
   fields.imu_orientation.textContent = `raw [${(imu.raw_orientation || []).map(v => fmt(v, 3)).join(', ')}] ${imu.assumed_axis_order || '-'} ${imu.assumed_units || '-'} roll ${imu.roll_deg == null ? '-' : fmt(imu.roll_deg, 1)}° pitch ${imu.pitch_deg == null ? '-' : fmt(imu.pitch_deg, 1)}° yaw ${imu.yaw_deg == null ? '-' : fmt(imu.yaw_deg, 1)}° ${imu.roll_pitch_correction_active ? 'rp active' : 'rp off'} yaw ${imu.yaw_source || '-'}`;
   const cal = packet.sensor_calibration || {};
-  fields.calibration_readout.textContent = `h ${fmt(cal.camera_height_m ?? cal.point_y_m ?? 0)}m fwd ${fmt(cal.camera_forward_m ?? cal.depth_forward_offset_m ?? 0)}m pitch ${fmt((cal.camera_pitch_rad ?? cal.depth_pitch_down_rad ?? 0) * 180 / Math.PI, 1)}° roll ${fmt((cal.camera_roll_rad ?? 0) * 180 / Math.PI, 1)}° yaw ${fmt((cal.camera_yaw_rad ?? 0) * 180 / Math.PI, 1)}°`;
+  fields.calibration_readout.textContent = `h ${fmt(cal.camera_height_m ?? cal.point_y_m ?? 0)}m fwd ${fmt(cal.camera_forward_m ?? cal.depth_forward_offset_m ?? 0)}m pitch ${fmt((cal.camera_pitch_rad ?? cal.depth_pitch_down_rad ?? 0) * 180 / Math.PI, 1)}° roll ${fmt((cal.camera_roll_rad ?? 0) * 180 / Math.PI, 1)}° yaw ${fmt((cal.camera_yaw_rad ?? 0) * 180 / Math.PI, 1)}° color ${cal.color_offset_x_px ?? 0},${cal.color_offset_y_px ?? 0}px`;
   const geometryWarnings = [...(depth.warnings || []), ...(packet.warnings || []).filter(w => /intrinsics|coordinate|geometry|imu|floor|point cloud/i.test(w))];
   if(imu.contract_known === false) geometryWarnings.push('IMU orientation contract unknown/assumed');
   if((depth.coordinate_system || '').includes('unknown')) geometryWarnings.push('fallback depth projection active');
@@ -7665,6 +7862,7 @@ function getReignCommandSocket(){
   reignCommandSocket.addEventListener('message', event => {
     try{
       const response = JSON.parse(event.data);
+      lastReignAckAt = performance.now();
       if(response && response.accepted === false){
         reignState.textContent = response.error || 'reign websocket command rejected';
       }
@@ -7675,11 +7873,35 @@ function getReignCommandSocket(){
   return reignCommandSocket;
 }
 
-function sendReignCommandBody(body){
+function sendReignCommandBody(body, label){
   const socket = getReignCommandSocket();
   if(socket.readyState !== WebSocket.OPEN) return false;
+  const sentAt = performance.now();
   socket.send(body);
+  window.setTimeout(() => {
+    if(lastReignAckAt >= sentAt || reignFallbackInFlight) return;
+    if(reignCommandSocket === socket) socket.close();
+    fallbackPostReignBody(body, label);
+  }, 650);
   return true;
+}
+
+async function fallbackPostReignBody(body, label){
+  reignFallbackInFlight = true;
+  try{
+    const res = await fetch('/reign/command', {
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body
+    });
+    if(!res.ok) throw new Error(await res.text());
+    lastReignAckAt = performance.now();
+    reignState.textContent = label;
+  }catch(error){
+    reignState.textContent = 'reign send failed';
+  }finally{
+    reignFallbackInFlight = false;
+  }
 }
 
 async function postReign(command, ttl_ms, label, priority=.95, source='Gamepad', note='WebXR controller reign'){
@@ -7698,21 +7920,11 @@ async function postReign(command, ttl_ms, label, priority=.95, source='Gamepad',
     note,
     command
   });
-  if(sendReignCommandBody(body)){
+  if(sendReignCommandBody(body, label)){
     reignState.textContent = label;
     return;
   }
-  try{
-    const res = await fetch('/reign/command', {
-      method:'POST',
-      headers:{'content-type':'application/json'},
-      body
-    });
-    if(!res.ok) throw new Error(await res.text());
-    reignState.textContent = label;
-  }catch(error){
-    reignState.textContent = 'reign send failed';
-  }
+  await fallbackPostReignBody(body, label);
 }
 
 function postWebReign(command, ttl_ms, label, priority=.95){
@@ -8241,6 +8453,19 @@ function commandForWebJoystick(){
   };
 }
 
+function postTurnOnly(direction){
+  const text = direction === 'Left' ? 'turn CCW' : 'turn CW';
+  postWebReign({type:'Turn', direction, intensity:.85, duration_ms:320}, WEB_REIGN_TURN_TTL_MS, text, .98);
+}
+
+function stopTurnOnly(){
+  if(webTurnInterval != null){
+    window.clearInterval(webTurnInterval);
+    webTurnInterval = null;
+  }
+  webTurnPointerId = null;
+}
+
 function pollWebReigns(){
   if(webReignPointerId == null && !keyboardReignActive()) return false;
   const next = commandForWebJoystick();
@@ -8275,8 +8500,41 @@ function endWebJoystick(event){
 reignJoystick.addEventListener('pointerup', endWebJoystick);
 reignJoystick.addEventListener('pointercancel', endWebJoystick);
 reignStop.addEventListener('click', () => {
+  stopTurnOnly();
   postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'stop', 1);
 });
+
+for(const button of reignTurnButtons){
+  button.addEventListener('pointerdown', event => {
+    stopTurnOnly();
+    webTurnPointerId = event.pointerId;
+    button.setPointerCapture(event.pointerId);
+    const direction = button.dataset.reignTurn || 'Left';
+    postTurnOnly(direction);
+    webTurnInterval = window.setInterval(() => postTurnOnly(direction), 260);
+    event.stopPropagation();
+    event.preventDefault();
+  });
+  button.addEventListener('pointerup', event => {
+    if(event.pointerId !== webTurnPointerId) return;
+    stopTurnOnly();
+    postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'turn stop', 1);
+    event.stopPropagation();
+    event.preventDefault();
+  });
+  button.addEventListener('pointercancel', event => {
+    if(event.pointerId !== webTurnPointerId) return;
+    stopTurnOnly();
+    postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'turn stop', 1);
+    event.stopPropagation();
+    event.preventDefault();
+  });
+  button.addEventListener('click', event => {
+    event.stopPropagation();
+    event.preventDefault();
+  });
+}
+
 reignSpeak.addEventListener('click', () => {
   const text = reignSay.value.trim();
   if(!text){
@@ -8351,6 +8609,10 @@ window.addEventListener('keyup', event => {
 });
 
 window.addEventListener('blur', () => {
+  if(webTurnInterval != null){
+    stopTurnOnly();
+    postWebReign({type:'Stop'}, WEB_REIGN_STOP_TTL_MS, 'turn blur stop', 1);
+  }
   if(!keyboardReignActive()) return;
   keyboardReignKeys.clear();
   resetWebJoystick();
@@ -8432,12 +8694,14 @@ function sceneFromSnapshot(snapshot){
   const body = snapshot.body;
   const pose = body.odometry || {};
   const range = snapshot.range || {};
+  const beamAngles = Array.isArray(range.beam_angles_rad) ? range.beam_angles_rad : [];
   const beams = (range.beams || []).map((distance, index, allBeams) => {
     const finite = Number(distance);
     const beamCount = allBeams.length || 1;
     const ratio = beamCount <= 1 ? 0.5 : index / (beamCount - 1);
+    const explicitAngle = beamAngles.length === beamCount ? Number(beamAngles[index]) : NaN;
     return {
-      angle_rad: -Math.PI * .5 + ratio * Math.PI,
+      angle_rad: Number.isFinite(explicitAngle) ? explicitAngle : -Math.PI * .5 + ratio * Math.PI,
       distance_m: Number.isFinite(finite) ? finite : 0,
       hit: Number.isFinite(range.nearest_m) ? Math.abs(finite - range.nearest_m) < 0.05 : false
     };
@@ -9137,7 +9401,9 @@ const defaults = {
   cameraFov: 62,
   cameraY: 0.46,
   cameraZ: -0.18,
-  cameraPitch: 0
+  cameraPitch: 0,
+  colorX: 3,
+  colorY: 7
 };
 
 let cal = { ...defaults };
@@ -9156,6 +9422,8 @@ const cameraFovEl = document.getElementById('cal-camera-fov');
 const cameraYEl = document.getElementById('cal-camera-y');
 const cameraZEl = document.getElementById('cal-camera-z');
 const cameraPitchEl = document.getElementById('cal-camera-pitch');
+const colorXEl = document.getElementById('cal-color-x');
+const colorYEl = document.getElementById('cal-color-y');
 const resetBtn = document.getElementById('reset-calibration');
 const statusEl2 = document.getElementById('calibration-status');
 
@@ -9170,6 +9438,8 @@ const valCameraFov = document.getElementById('val-camera-fov');
 const valCameraY = document.getElementById('val-camera-y');
 const valCameraZ = document.getElementById('val-camera-z');
 const valCameraPitch = document.getElementById('val-camera-pitch');
+const valColorX = document.getElementById('val-color-x');
+const valColorY = document.getElementById('val-color-y');
 
 function loadCalibration() {
   let stored = localStorage.getItem(CALIBRATION_KEY);
@@ -9210,6 +9480,8 @@ function applyCalibrationToUI() {
   cameraYEl.value = cal.cameraY;
   cameraZEl.value = cal.cameraZ;
   cameraPitchEl.value = cal.cameraPitch;
+  colorXEl.value = cal.colorX;
+  colorYEl.value = cal.colorY;
 
   valDepthScale.textContent = cal.depthScale.toFixed(2);
   valPointY.textContent = cal.pointY.toFixed(2) + 'm';
@@ -9222,6 +9494,8 @@ function applyCalibrationToUI() {
   valCameraY.textContent = cal.cameraY.toFixed(2) + 'm';
   valCameraZ.textContent = cal.cameraZ.toFixed(2) + 'm';
   valCameraPitch.textContent = cal.cameraPitch + '°';
+  valColorX.textContent = cal.colorX + 'px';
+  valColorY.textContent = cal.colorY + 'px';
 }
 
 function applyVisionCalibration() {
@@ -9253,7 +9527,9 @@ function sendCalibrationToServer() {
           camera_height_m: cal.pointY,
           camera_pitch_rad: cal.depthPitch * Math.PI / 180,
           camera_roll_rad: cal.depthRoll * Math.PI / 180,
-          camera_yaw_rad: cal.depthYaw * Math.PI / 180
+          camera_yaw_rad: cal.depthYaw * Math.PI / 180,
+          color_offset_x_px: cal.colorX,
+          color_offset_y_px: cal.colorY
         })
       });
       if (res.ok) {
@@ -9279,6 +9555,8 @@ function onCalChange() {
   cal.cameraY = parseFloat(cameraYEl.value);
   cal.cameraZ = parseFloat(cameraZEl.value);
   cal.cameraPitch = parseInt(cameraPitchEl.value, 10);
+  cal.colorX = parseInt(colorXEl.value, 10);
+  cal.colorY = parseInt(colorYEl.value, 10);
 
   applyCalibrationToUI();
   applyVisionCalibration();
@@ -9286,7 +9564,7 @@ function onCalChange() {
   sendCalibrationToServer();
 }
 
-[depthScaleEl, pointYEl, depthZEl, depthPitchEl, depthRollEl, depthYawEl, depthFovEl, cameraFovEl, cameraYEl, cameraZEl, cameraPitchEl].forEach(el => {
+[depthScaleEl, pointYEl, depthZEl, depthPitchEl, depthRollEl, depthYawEl, depthFovEl, cameraFovEl, cameraYEl, cameraZEl, cameraPitchEl, colorXEl, colorYEl].forEach(el => {
   el.addEventListener('input', onCalChange);
 });
 
@@ -10709,6 +10987,32 @@ mod tests {
     }
 
     #[test]
+    fn depth_color_sampling_applies_calibrated_pixel_offsets() {
+        let width = 80;
+        let height = 80;
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                rgb.extend_from_slice(&[x as u8, y as u8, 0]);
+            }
+        }
+        let color = DepthColorImage { width, height, rgb };
+
+        assert_eq!(
+            color.sample_depth_pixel_with_offset(10, 10, width, height, 0, 0),
+            Some([10, 10, 0])
+        );
+        assert_eq!(
+            color.sample_depth_pixel_with_offset(10, 10, width, height, 3, 7),
+            Some([13, 17, 0])
+        );
+        assert_eq!(
+            color.sample_depth_pixel_with_offset(0, 0, width, height, -3, -7),
+            Some([0, 0, 0])
+        );
+    }
+
+    #[test]
     fn calibrated_kinect_depth_image_reports_below_floor_points() {
         let kinect = KinectSense {
             depth_m: vec![1.0],
@@ -10809,15 +11113,23 @@ mod tests {
         assert!(page.contains("const nodes = {...graphLayout}"));
         assert!(page.contains("source='Gamepad'"));
         assert!(page.contains("type:'Drive'"));
+        assert!(page.contains("data-reign-turn=\"Left\""));
+        assert!(page.contains("data-reign-turn=\"Right\""));
+        assert!(page.contains("function postTurnOnly"));
+        assert!(page.contains("type:'Turn', direction"));
         assert!(page.contains("type:'Speak'"));
         assert!(page.contains("type:'Chirp'"));
         assert!(page.contains("data-chirp=\"Confirm\""));
+        assert!(page.contains("data-chirp=\"GoalAcquired\""));
+        assert!(page.contains("data-chirp=\"PersonRecognized\""));
+        assert!(page.contains("notes 72,79,84,91"));
         assert!(page.contains("WASD / arrow keys"));
         assert!(page.contains("keyboardReignCodes"));
         assert!(page.contains("KeyW"));
         assert!(page.contains("ArrowUp"));
         assert!(page.contains("function syncVisualFloor"));
-        assert!(page.contains("viewerCamera.setTarget(new BABYLON.Vector3(centerX, 0, centerY));"));
+        assert!(page.contains("const center = world(centerX, centerY, 0);"));
+        assert!(page.contains("viewerCamera.setTarget(center);"));
         assert!(!page.contains("selectProjectedFloor"));
         assert!(!page.contains("quaternionFromFloorNormal"));
         assert!(page.contains("Real hardware armed"));
@@ -10830,6 +11142,11 @@ mod tests {
         assert!(page.contains("'reign-map'"));
         assert!(page.contains("'reign-constellation'"));
         assert!(page.contains("/reign/hardware-arm"));
+        let Html(reign_page) = reign_page().await;
+        assert!(reign_page.contains("chirp('Confirm')"));
+        assert!(reign_page.contains("chirp('GoalAcquired')"));
+        assert!(reign_page.contains("72,79,84,91; little fanfare"));
+        assert!(reign_page.contains("chirp('DidntUnderstand')"));
         assert!(page.contains("window.addEventListener('pagehide'"));
         assert!(page.contains("navigator.sendBeacon"));
         assert!(!page.contains("id=\"reign-dock\""));
@@ -10850,6 +11167,11 @@ mod tests {
         assert!(page.contains("function syncDisplayToggles"));
         assert!(page.contains("data-map-layer=\"stable wall candidates\""));
         assert!(page.contains("function renderWorldBeliefPoints"));
+        assert!(page.contains("function packetHeadingRad"));
+        assert!(page.contains("function robotYawToBabylon"));
+        assert!(page.contains("function renderRobotMotion"));
+        assert!(page.contains("motionState.connections"));
+        assert!(page.contains("scanConnections"));
         assert!(page.contains("function pointCloudFrameKind"));
         assert!(page.contains("function robotRenderPointToBabylonLocal"));
         assert!(page.contains("function kinectCameraPointToBabylonLocal"));

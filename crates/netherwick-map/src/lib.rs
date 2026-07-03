@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use netherwick_core::{Pose2, TimeMs};
-use netherwick_now::{EyeFrame, EyeFrameFormat, ImuSense, KinectSense, Now};
+use netherwick_now::{EyeFrame, EyeFrameFormat, ImuSense, KinectSense, Now, RangeSense};
 use netherwick_sensors::WorldSnapshot;
 use serde::{Deserialize, Serialize};
 
@@ -1888,8 +1888,7 @@ pub fn observation_from_snapshot(
             snapshot.body.velocity.forward_m_s,
             snapshot.body.velocity.turn_rad_s,
         ),
-        &snapshot.range.beams,
-        snapshot.range.nearest_m,
+        &snapshot.range,
         serde_json::json!({
             "body": {
                 "odometry": snapshot.body.odometry,
@@ -1918,8 +1917,7 @@ pub fn observation_from_now(now: &Now, config: MapConfig) -> MapObservation {
             now.body.velocity.forward_m_s,
             now.body.velocity.turn_rad_s,
         ),
-        &now.range.beams,
-        now.range.nearest_m,
+        &now.range,
         serde_json::json!({
             "body": {
                 "odometry": now.body.odometry,
@@ -1938,8 +1936,7 @@ pub fn observation_from_now(now: &Now, config: MapConfig) -> MapObservation {
 fn observation_from_parts(
     odometry: Pose2,
     pose_confidence: f32,
-    beams: &[f32],
-    nearest_m: Option<f32>,
+    range: &RangeSense,
     source_snapshot: serde_json::Value,
     t_ms: TimeMs,
     config: MapConfig,
@@ -1951,8 +1948,10 @@ fn observation_from_parts(
         source: "odometry".to_string(),
         t_ms,
     };
-    let beam_count = beams.len();
-    let range_beams = beams
+    let beam_count = range.beams.len();
+    let explicit_angles = range.beam_angles_rad.len() == beam_count;
+    let range_beams = range
+        .beams
         .iter()
         .enumerate()
         .filter_map(|(index, distance)| {
@@ -1965,8 +1964,16 @@ fn observation_from_parts(
             } else {
                 index as f32 / (beam_count - 1) as f32
             };
-            let angle_rad = -config.range_fov_rad * 0.5 + ratio * config.range_fov_rad;
-            let nearest_hit = nearest_m
+            let angle_rad = if explicit_angles {
+                range.beam_angles_rad[index]
+            } else {
+                -config.range_fov_rad * 0.5 + ratio * config.range_fov_rad
+            };
+            if !angle_rad.is_finite() {
+                return None;
+            }
+            let nearest_hit = range
+                .nearest_m
                 .filter(|nearest| nearest.is_finite())
                 .map(|nearest| (distance - nearest).abs() <= config.hit_epsilon_m)
                 .unwrap_or(false);
@@ -2834,8 +2841,18 @@ mod tests {
             schema_version: 1,
             nearest_m: beams.iter().copied().reduce(f32::min),
             beams,
+            ..RangeSense::default()
         };
         snapshot
+    }
+
+    fn range_sense(beams: &[f32]) -> RangeSense {
+        RangeSense {
+            schema_version: 1,
+            beams: beams.to_vec(),
+            nearest_m: beams.iter().copied().reduce(f32::min),
+            ..RangeSense::default()
+        }
     }
 
     fn kinect_snapshot_at(
@@ -2894,6 +2911,21 @@ mod tests {
         let cell = map.cells.get(&key).expect("endpoint cell should exist");
         assert!(cell.occupied_score > 0.5);
         assert!(cell.occupied_score > cell.free_score);
+    }
+
+    #[test]
+    fn occupancy_update_uses_explicit_robot_frame_beam_angles() {
+        let config = MapConfig {
+            resolution_m: 0.5,
+            ..MapConfig::default()
+        };
+        let mut snapshot = snapshot_at(0.0, 0.0, 0.0, vec![1.0]);
+        snapshot.range.beam_angles_rad = vec![std::f32::consts::FRAC_PI_2];
+        snapshot.range.frame = Some("robot_base".to_string());
+        let observation = observation_from_snapshot(&snapshot, 100, config);
+
+        assert_eq!(observation.range_beams.len(), 1);
+        assert!((observation.range_beams[0].angle_rad - std::f32::consts::FRAC_PI_2).abs() < 0.001);
     }
 
     #[test]
@@ -3005,8 +3037,7 @@ mod tests {
         let observation = observation_from_parts(
             pose(0.0, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"seed"}),
             150,
             map.config,
@@ -3029,8 +3060,7 @@ mod tests {
         let observation = observation_from_parts(
             pose(0.12, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"drifted"}),
             200,
             map.config,
@@ -3065,8 +3095,7 @@ mod tests {
         let first = observation_from_parts(
             pose(0.0, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"seed"}),
             100,
             config,
@@ -3074,8 +3103,7 @@ mod tests {
         let second = observation_from_parts(
             pose(1.0, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"next"}),
             200,
             config,
@@ -3099,8 +3127,7 @@ mod tests {
         let observation = observation_from_parts(
             pose(0.05, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"return"}),
             300,
             config,
@@ -3127,8 +3154,7 @@ mod tests {
         let observation = observation_from_parts(
             pose(0.05, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"return"}),
             300,
             config,
@@ -3164,8 +3190,7 @@ mod tests {
         let observation = observation_from_parts(
             pose(0.05, 0.0, 0.0),
             0.75,
-            &[3.0],
-            Some(3.0),
+            &range_sense(&[3.0]),
             serde_json::json!({"frame_id":"return"}),
             300,
             config,
@@ -3199,8 +3224,7 @@ mod tests {
         let observation = observation_from_parts(
             pose(0.05, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"return"}),
             300,
             config,
@@ -3865,8 +3889,7 @@ mod tests {
         map.integrate_observation(observation_from_parts(
             pose(0.0, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"seed"}),
             100,
             config,
@@ -3874,8 +3897,7 @@ mod tests {
         map.integrate_observation(observation_from_parts(
             pose(1.0, 0.0, 0.0),
             0.75,
-            &[1.0],
-            Some(1.0),
+            &range_sense(&[1.0]),
             serde_json::json!({"frame_id":"away"}),
             200,
             config,

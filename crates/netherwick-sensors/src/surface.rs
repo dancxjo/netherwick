@@ -409,6 +409,14 @@ impl SurfaceExtractor {
         }
     }
 
+    pub fn reset_tracking(&mut self) {
+        self.temporal_clouds.clear();
+        self.tracks.clear();
+        self.cluster_tracks.clear();
+        self.next_surface_id = 1;
+        self.next_cluster_id = 1;
+    }
+
     pub fn set_depth_camera_extrinsics(
         &mut self,
         height_m: f32,
@@ -417,6 +425,16 @@ impl SurfaceExtractor {
         roll_rad: f32,
         yaw_rad: f32,
     ) {
+        if surface_camera_extrinsics_changed(
+            &self.config,
+            height_m,
+            forward_offset_m,
+            pitch_rad,
+            roll_rad,
+            yaw_rad,
+        ) {
+            self.reset_tracking();
+        }
         self.config.depth_camera_height_m = height_m;
         self.config.depth_camera_forward_offset_m = forward_offset_m;
         self.config.depth_camera_pitch_down_rad = pitch_rad;
@@ -430,6 +448,10 @@ impl SurfaceExtractor {
         fov_rad: f32,
         depth_scale: f32,
     ) {
+        if surface_compact_depth_calibration_changed(&self.config, beam_count, fov_rad, depth_scale)
+        {
+            self.reset_tracking();
+        }
         self.config.compact_depth_beam_count = beam_count;
         self.config.compact_depth_fov_rad = fov_rad;
         self.config.depth_scale = depth_scale;
@@ -695,6 +717,34 @@ pub fn anticipate_surface_frame(
         projected_obstacle_grid,
         navigation,
     }
+}
+
+fn surface_camera_extrinsics_changed(
+    config: &SurfaceExtractorConfig,
+    height_m: f32,
+    forward_offset_m: f32,
+    pitch_rad: f32,
+    roll_rad: f32,
+    yaw_rad: f32,
+) -> bool {
+    const EPS: f32 = 1.0e-4;
+    (config.depth_camera_height_m - height_m).abs() > EPS
+        || (config.depth_camera_forward_offset_m - forward_offset_m).abs() > EPS
+        || (config.depth_camera_pitch_down_rad - pitch_rad).abs() > EPS
+        || (config.depth_camera_roll_rad - roll_rad).abs() > EPS
+        || (config.depth_camera_yaw_rad - yaw_rad).abs() > EPS
+}
+
+fn surface_compact_depth_calibration_changed(
+    config: &SurfaceExtractorConfig,
+    beam_count: usize,
+    fov_rad: f32,
+    depth_scale: f32,
+) -> bool {
+    const EPS: f32 = 1.0e-4;
+    config.compact_depth_beam_count != beam_count
+        || (config.compact_depth_fov_rad - fov_rad).abs() > EPS
+        || (config.depth_scale - depth_scale).abs() > EPS
 }
 
 fn depth_to_world_points(
@@ -1822,6 +1872,45 @@ mod tests {
             .expect("center compact beam should create a forward occupied cell");
 
         assert!(center_cell.x > 0);
+    }
+
+    #[test]
+    fn calibration_changes_clear_surface_tracking_state() {
+        let mut extractor = SurfaceExtractor::new(SurfaceExtractorConfig {
+            compact_depth_beam_count: 3,
+            compact_depth_fov_rad: std::f32::consts::FRAC_PI_2,
+            depth_scale: 1.0,
+            depth_camera_height_m: 0.18,
+            depth_camera_forward_offset_m: 0.02,
+            depth_camera_yaw_rad: 0.0,
+            ..SurfaceExtractorConfig::default()
+        });
+        extractor.temporal_clouds.push_back(vec![Point3 {
+            position: Vec3::new(1.0, 0.0, 0.0),
+        }]);
+        extractor.next_surface_id = 42;
+        extractor.next_cluster_id = 24;
+
+        extractor.set_depth_camera_extrinsics(0.18, 0.02, 0.0, 0.0, 0.0);
+        assert_eq!(extractor.temporal_clouds.len(), 1);
+        assert_eq!(extractor.next_surface_id, 42);
+        assert_eq!(extractor.next_cluster_id, 24);
+
+        extractor.set_depth_camera_extrinsics(0.18, 0.02, 0.0, 0.0, 0.25);
+        assert!(extractor.temporal_clouds.is_empty());
+        assert_eq!(extractor.next_surface_id, 1);
+        assert_eq!(extractor.next_cluster_id, 1);
+
+        extractor.temporal_clouds.push_back(vec![Point3 {
+            position: Vec3::new(1.0, 0.0, 0.0),
+        }]);
+        extractor.next_surface_id = 42;
+        extractor.next_cluster_id = 24;
+
+        extractor.set_compact_depth_calibration(5, std::f32::consts::FRAC_PI_2, 1.0);
+        assert!(extractor.temporal_clouds.is_empty());
+        assert_eq!(extractor.next_surface_id, 1);
+        assert_eq!(extractor.next_cluster_id, 1);
     }
 
     #[test]

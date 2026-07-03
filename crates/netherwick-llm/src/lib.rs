@@ -34,6 +34,26 @@ const SENSOR_GROUNDING_RULES: &str = "Describe the real-world scene or event, no
 const COMBOBULATOR_DISTILLATION_RULES: &str = "Distill what matters, not what the records said. Treat the entries as fragmentary, possibly contradictory, fleeting evidence about the actual situation, not as the topic to describe. Try to infer what is going on in the real world from those fragments. Sort meaning by time: occurred time first, observed time second. Consume the timeline in order; do not group by faculty or source. When related entries describe raw audio and the transcript derived from it, treat them as one real-world event. Some entries may be prior combobulation summaries looping back as impressions; use those only as provisional, possibly stale self-context, not as fresh external evidence. Do not say that you are observing a timeline, records, recordings, sensor streams, previous summaries, or a shift in conversation. Compress repeated low-level records into the real-world gist; do not enumerate ids, hashes, timestamps, edges, or detections unless they are the point.";
 
 const LIVE_EVENT_RULES: &str = "Live events may arrive while generation is happening. Treat them as observations from outside. Do not assume a human is currently present or addressing me; there may be nobody nearby. Clock and status events help track timing, pauses, and elapsed time, but do not narrate every tick, quiet moment, or idle thought.";
+const CHIRP_PATTERN_PROMPT: &str = "\
+- confirm: notes 79,84,79; bright, decisive confirmation\n\
+- warning: notes 79,75; rejection, warning, or nope\n\
+- hello: notes 72,76,79; ascending greeting\n\
+- goodbye: notes 79,76,72; descending farewell\n\
+- curious: notes 72,76,74; unresolved question or interest\n\
+- idea: notes 76,81,84; rising idea or realization\n\
+- goal_acquired: notes 72,79,84,91; little fanfare for finding a goal\n\
+- searching: notes 72,74,76,74; gentle oscillation while looking\n\
+- saw_something: notes 84,91; quick widened-attention signal\n\
+- surprise: notes 72,84; big leap for surprise\n\
+- learned: notes 74,79,83; settled memory or learning\n\
+- person_recognized: notes 76,79,84,79; warm arch for a recognized person\n\
+- object_recognized: notes 79,84,76; recognition motif for an object\n\
+- place_recognized: notes 79,84,72; recognition motif for a place\n\
+- didnt_understand: notes 79,81,78; crooked ending for confusion\n\
+- docking: notes 67,72,76,79; climbing toward home\n\
+- charging_started: notes 60,67,72; solid foundation for charging contact\n\
+- sleep: notes 79,76,72,67; gentle descent into rest\n\
+- wake: notes 67,72,79; upward stretch into activity";
 const STRICT_JSON_RESPONSE_RULES: &str = "\n\nFINAL OUTPUT REQUIREMENT (MANDATORY):\nReturn exactly one JSON object and nothing else.\nDo not include markdown fences, prose, explanations, preambles, or trailing text.\nOutput must start with '{' and end with '}'.\nIf unsure, still emit the best-effort valid JSON object matching the schema.";
 const COMBOBULATOR_CLUSTER_GAP_MS: u64 = 1_000;
 const COMBOBULATOR_MIN_INTERVAL_MS: u64 = 2_000;
@@ -1467,6 +1487,7 @@ Never output raw motor control such as wheel speeds, PWM values, serial bytes, o
 Treat Reign controls as present-tense command input. If a Reign command is active and safe, set action to the matching allowed action; if you choose something else, explain why in critique.\n\
 {LIVE_EVENT_RULES}\n\
 Allowed action kinds: stop, go, turn, inspect, approach, dock, explore, speak, chirp.\n\
+Allowed chirp patterns and meanings:\n{}\n\
 If commands are disabled, leave action null. Commands enabled: {}. Teaching enabled: {}.\n\
 Return JSON only with this schema:\n\
 {{\n\
@@ -1488,6 +1509,7 @@ Surprise: {:.2}\n\
 Latent confidence: {:.2}\n\
 Predicted futures:\n{}\n\
 Summarized senses:\n{}\n",
+        CHIRP_PATTERN_PROMPT,
         config.allow_commands,
         config.allow_teaching,
         uuid_options,
@@ -1853,12 +1875,32 @@ fn action_spec_json(action: &ActionPrimitive) -> serde_json::Value {
         }),
         ActionPrimitive::Chirp { pattern } => serde_json::json!({
             "kind": "chirp",
-            "pattern": match pattern {
-                ChirpPattern::Confirm => "confirm",
-                ChirpPattern::Warning => "warning",
-                ChirpPattern::Curious => "curious",
-            },
+            "pattern": chirp_pattern_name(pattern),
         }),
+    }
+}
+
+fn chirp_pattern_name(pattern: &ChirpPattern) -> &'static str {
+    match pattern {
+        ChirpPattern::Confirm => "confirm",
+        ChirpPattern::Warning => "warning",
+        ChirpPattern::Hello => "hello",
+        ChirpPattern::Goodbye => "goodbye",
+        ChirpPattern::Curious => "curious",
+        ChirpPattern::Idea => "idea",
+        ChirpPattern::GoalAcquired => "goal_acquired",
+        ChirpPattern::Searching => "searching",
+        ChirpPattern::SawSomething => "saw_something",
+        ChirpPattern::Surprise => "surprise",
+        ChirpPattern::Learned => "learned",
+        ChirpPattern::PersonRecognized => "person_recognized",
+        ChirpPattern::ObjectRecognized => "object_recognized",
+        ChirpPattern::PlaceRecognized => "place_recognized",
+        ChirpPattern::DidntUnderstand => "didnt_understand",
+        ChirpPattern::Docking => "docking",
+        ChirpPattern::ChargingStarted => "charging_started",
+        ChirpPattern::Sleep => "sleep",
+        ChirpPattern::Wake => "wake",
     }
 }
 
@@ -2219,19 +2261,39 @@ fn parse_action_spec(spec: ActionSpec) -> Option<ActionPrimitive> {
             text: spec.text.unwrap_or_default(),
         }),
         "chirp" => Some(ActionPrimitive::Chirp {
-            pattern: match spec
-                .pattern
-                .as_deref()
-                .unwrap_or("confirm")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "confirm" => ChirpPattern::Confirm,
-                "warning" => ChirpPattern::Warning,
-                "curious" => ChirpPattern::Curious,
-                _ => return None,
-            },
+            pattern: parse_chirp_pattern(spec.pattern.as_deref().unwrap_or("confirm"))?,
         }),
+        _ => None,
+    }
+}
+
+fn parse_chirp_pattern(pattern: &str) -> Option<ChirpPattern> {
+    match pattern
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "confirm" => Some(ChirpPattern::Confirm),
+        "warning" => Some(ChirpPattern::Warning),
+        "hello" => Some(ChirpPattern::Hello),
+        "goodbye" => Some(ChirpPattern::Goodbye),
+        "curious" => Some(ChirpPattern::Curious),
+        "idea" => Some(ChirpPattern::Idea),
+        "goalacquired" => Some(ChirpPattern::GoalAcquired),
+        "searching" => Some(ChirpPattern::Searching),
+        "sawsomething" => Some(ChirpPattern::SawSomething),
+        "surprise" => Some(ChirpPattern::Surprise),
+        "learned" => Some(ChirpPattern::Learned),
+        "personrecognized" => Some(ChirpPattern::PersonRecognized),
+        "objectrecognized" => Some(ChirpPattern::ObjectRecognized),
+        "placerecognized" => Some(ChirpPattern::PlaceRecognized),
+        "didntunderstand" => Some(ChirpPattern::DidntUnderstand),
+        "docking" => Some(ChirpPattern::Docking),
+        "chargingstarted" => Some(ChirpPattern::ChargingStarted),
+        "sleep" => Some(ChirpPattern::Sleep),
+        "wake" => Some(ChirpPattern::Wake),
         _ => None,
     }
 }
@@ -2384,6 +2446,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_speak_action() {
+        let action = parse_action_spec(ActionSpec {
+            kind: "speak".to_string(),
+            direction: None,
+            intensity: None,
+            duration_ms: None,
+            target: None,
+            text: Some("hello from the llm".to_string()),
+            style: None,
+            pattern: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            action,
+            ActionPrimitive::Speak {
+                text: "hello from the llm".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn parses_llm_json_explore_action_into_decision() {
         let decision = parse_llm_decision_json(r#"{"action":{"kind":"explore"}}"#, true).unwrap();
         assert_eq!(
@@ -2495,6 +2579,9 @@ mod tests {
         assert!(prompt.contains("Never output raw motor control such as wheel speeds"));
         assert!(prompt.contains("Treat Reign controls as present-tense command input"));
         assert!(prompt.contains("set action to the matching allowed action"));
+        assert!(prompt.contains("Allowed chirp patterns and meanings"));
+        assert!(prompt.contains("goal_acquired: notes 72,79,84,91"));
+        assert!(prompt.contains("person_recognized: notes 76,79,84,79"));
         assert!(!prompt.contains("Do not override active Direct reign"));
     }
 

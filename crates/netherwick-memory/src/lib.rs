@@ -10317,6 +10317,7 @@ pub fn deterministic_embodied_fixture_now(t_ms: u64, pose_offset_m: f32) -> Now 
         schema_version: 1,
         beams: vec![0.42, 0.55, 1.2, 0.9, 0.48],
         nearest_m: Some(0.42),
+        ..RangeSense::default()
     };
     now.kinect = KinectSense {
         schema_version: 1,

@@ -283,6 +283,7 @@ impl VirtualWorld {
                 RANGE_MAX_M,
             ),
             nearest_m: nearest_obstacle_distance(body, &state.objects, state.arena, RANGE_MAX_M),
+            ..RangeSense::default()
         };
         state.snapshot.imu = ImuSense {
             schema_version: 1,

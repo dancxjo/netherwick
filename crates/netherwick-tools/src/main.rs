@@ -40,9 +40,9 @@ use netherwick_runtime::{
     RuntimeLoop, RuntimeModelStack, RuntimeTick, SimRunner,
 };
 use netherwick_sensors::{
-    AsrToolConfig, CameraSenseProvider, EyeFrame, EyeFrameFormat, FrameProcessor, GpsSenseProvider,
-    ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World,
-    WorldSnapshot,
+    AsrToolConfig, CameraSenseProvider, DepthRangeProjectionConfig, EyeFrame, EyeFrameFormat,
+    FrameProcessor, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame,
+    SensePacket, SenseProducer, World, WorldSnapshot,
 };
 #[cfg(feature = "kinect-freenect")]
 use netherwick_sensors::{FreenectKinectProvider, KinectRgbAdjustment};
@@ -1480,6 +1480,8 @@ fn real_robot_depth_calibration_from_env() -> SceneSensorCalibration {
         DEFAULT_REAL_DEPTH_CAMERA_YAW_DEG,
     )
     .to_radians();
+    let color_offset_x_px = env_i32("NETHERWICK_DEPTH_COLOR_OFFSET_X_PX", 3);
+    let color_offset_y_px = env_i32("NETHERWICK_DEPTH_COLOR_OFFSET_Y_PX", 7);
     SceneSensorCalibration {
         compact_depth_beam_count: env_usize("NETHERWICK_COMPACT_DEPTH_BEAM_COUNT", 32),
         compact_depth_fov_rad: env_f32("NETHERWICK_DEPTH_FOV_DEG", 122.0).to_radians(),
@@ -1492,6 +1494,8 @@ fn real_robot_depth_calibration_from_env() -> SceneSensorCalibration {
         camera_pitch_rad: pitch_rad,
         camera_roll_rad: roll_rad,
         camera_yaw_rad: yaw_rad,
+        color_offset_x_px,
+        color_offset_y_px,
     }
 }
 
@@ -1506,6 +1510,13 @@ fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(default)
 }
 
@@ -5297,12 +5308,55 @@ async fn play_body_song(body: &mut (dyn RobotBody + Send), label: &str, song: Bo
 }
 
 fn chirp_pattern_song(pattern: &str) -> BodySong {
-    match pattern {
-        "Confirm" => BodySong::new([tone(76, 6), tone(79, 8)]),
-        "Warning" => BodySong::new([tone(67, 5), tone(55, 5), tone(55, 8)]),
-        "Curious" => BodySong::new([tone(72, 5), tone(76, 5), tone(74, 8)]),
-        _ => BodySong::new([tone(72, 6)]),
+    BodySong::new(
+        chirp_pattern_notes(pattern)
+            .iter()
+            .enumerate()
+            .map(|(index, note)| {
+                tone(
+                    *note,
+                    if index + 1 == chirp_pattern_notes(pattern).len() {
+                        8
+                    } else {
+                        6
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn chirp_pattern_notes(pattern: &str) -> &'static [u8] {
+    match normalized_chirp_pattern(pattern).as_str() {
+        "confirm" => &[79, 84, 79],
+        "warning" => &[79, 75],
+        "hello" => &[72, 76, 79],
+        "goodbye" => &[79, 76, 72],
+        "curious" => &[72, 76, 74],
+        "idea" => &[76, 81, 84],
+        "goalacquired" => &[72, 79, 84, 91],
+        "searching" => &[72, 74, 76, 74],
+        "sawsomething" => &[84, 91],
+        "surprise" => &[72, 84],
+        "learned" => &[74, 79, 83],
+        "personrecognized" => &[76, 79, 84, 79],
+        "objectrecognized" => &[79, 84, 76],
+        "placerecognized" => &[79, 84, 72],
+        "didntunderstand" => &[79, 81, 78],
+        "docking" => &[67, 72, 76, 79],
+        "chargingstarted" => &[60, 67, 72],
+        "sleep" => &[79, 76, 72, 67],
+        "wake" => &[67, 72, 79],
+        _ => &[72],
     }
+}
+
+fn normalized_chirp_pattern(pattern: &str) -> String {
+    pattern
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 fn robot_song(name: &str) -> BodySong {
@@ -5432,22 +5486,40 @@ fn durable_runtime(
 }
 
 async fn real_robot_frame_processor(warnings: &mut Vec<String>) -> FrameProcessor {
+    let processor = FrameProcessor::new()
+        .with_kinect_range_projection(real_robot_depth_range_projection_from_env());
     if std::env::var("NETHERWICK_FACE_DETECTION")
         .map(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
         .unwrap_or(false)
     {
         warnings.push("face detection disabled by NETHERWICK_FACE_DETECTION".to_string());
-        return FrameProcessor::new();
+        return processor;
     }
 
     match netherwick_sensors::FaceIdDetector::from_hf().await {
-        Ok(detector) => FrameProcessor::new().with_face_detector(std::sync::Arc::new(detector)),
+        Ok(detector) => processor.with_face_detector(std::sync::Arc::new(detector)),
         Err(error) => {
             warnings.push(format!(
                 "face detection unavailable; continuing without face vectors: {error}"
             ));
-            FrameProcessor::new()
+            processor
         }
+    }
+}
+
+fn real_robot_depth_range_projection_from_env() -> DepthRangeProjectionConfig {
+    let calibration = real_robot_depth_calibration_from_env();
+    DepthRangeProjectionConfig {
+        compact_depth_beam_count: calibration.compact_depth_beam_count,
+        compact_depth_fov_rad: calibration.compact_depth_fov_rad,
+        depth_scale: calibration.depth_scale,
+        camera_forward_m: calibration.camera_forward_m,
+        camera_height_m: calibration.camera_height_m,
+        camera_pitch_rad: calibration.camera_pitch_rad,
+        camera_roll_rad: calibration.camera_roll_rad,
+        camera_yaw_rad: calibration.camera_yaw_rad,
+        min_depth_m: 0.35,
+        max_depth_m: 8.0,
     }
 }
 
@@ -5776,6 +5848,7 @@ impl SenseProducer for MockRangeProducer {
             schema_version: 1,
             beams: vec![1.2, 1.0, 0.8],
             nearest_m: Some(0.8),
+            ..RangeSense::default()
         }))
     }
 }
@@ -10443,6 +10516,40 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn chirp_patterns_use_expected_note_sequences() {
+        for (pattern, expected) in [
+            ("Confirm", vec![79, 84, 79]),
+            ("Warning", vec![79, 75]),
+            ("Hello", vec![72, 76, 79]),
+            ("Goodbye", vec![79, 76, 72]),
+            ("Curious", vec![72, 76, 74]),
+            ("Idea", vec![76, 81, 84]),
+            ("GoalAcquired", vec![72, 79, 84, 91]),
+            ("goal-acquired", vec![72, 79, 84, 91]),
+            ("Searching", vec![72, 74, 76, 74]),
+            ("SawSomething", vec![84, 91]),
+            ("Surprise", vec![72, 84]),
+            ("Learned", vec![74, 79, 83]),
+            ("PersonRecognized", vec![76, 79, 84, 79]),
+            ("ObjectRecognized", vec![79, 84, 76]),
+            ("PlaceRecognized", vec![79, 84, 72]),
+            ("DidntUnderstand", vec![79, 81, 78]),
+            ("didn't-understand", vec![79, 81, 78]),
+            ("Docking", vec![67, 72, 76, 79]),
+            ("ChargingStarted", vec![60, 67, 72]),
+            ("Sleep", vec![79, 76, 72, 67]),
+            ("Wake", vec![67, 72, 79]),
+        ] {
+            let notes: Vec<u8> = chirp_pattern_song(pattern)
+                .tones
+                .into_iter()
+                .map(|tone| tone.note)
+                .collect();
+            assert_eq!(notes, expected, "pattern {pattern}");
+        }
     }
 
     #[test]
