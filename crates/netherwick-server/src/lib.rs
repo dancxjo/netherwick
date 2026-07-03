@@ -1539,6 +1539,7 @@ pub async fn serve_live_view_tls(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
 ) -> std::io::Result<()> {
+    install_rustls_crypto_provider();
     let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
     axum_server::bind_rustls(addr, config)
         .serve(live_view_router(state).into_make_service())
@@ -1553,12 +1554,17 @@ pub async fn serve_live_view_with_reign_tls(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
 ) -> std::io::Result<()> {
+    install_rustls_crypto_provider();
     let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
     let router = live_view_router(live_state).merge(reign_router(reign_state));
     axum_server::bind_rustls(addr, config)
         .serve(router.into_make_service())
         .await
         .map_err(std::io::Error::other)
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 async fn get_live_snapshot(
@@ -5545,9 +5551,9 @@ fn enforce_hardware_command_gate(
     if matches!(command, ReignCommand::Stop) {
         return Ok(());
     }
-    if source != &ReignSource::WebRemote {
+    if !matches!(source, ReignSource::WebRemote | ReignSource::Gamepad) {
         return Err(ReignApiError::forbidden(
-            "hardware cockpit only accepts WebRemote drive commands",
+            "hardware cockpit only accepts WebRemote or Gamepad drive commands",
         ));
     }
     if mode != &ReignMode::Direct {
@@ -9418,6 +9424,49 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            input.expires_at_ms - input.issued_at_ms,
+            HARDWARE_TTL_MAX_MS
+        );
+        assert!(matches!(
+            input.command,
+            ReignCommand::Drive {
+                forward,
+                turn,
+                duration_ms
+            } if forward == HARDWARE_MAX_FORWARD_INTENSITY
+                && turn == -HARDWARE_MAX_TURN_INTENSITY
+                && duration_ms == HARDWARE_TTL_MAX_MS
+        ));
+    }
+
+    #[tokio::test]
+    async fn hardware_armed_gamepad_drive_is_accepted_and_clamped() {
+        let state = hardware_reign_state_with_snapshot(recent_snapshot());
+        let _ = post_hardware_arm(
+            State(state.clone()),
+            Json(HardwareArmRequest { armed: true }),
+        )
+        .await
+        .unwrap();
+        let request = ReignCommandRequest {
+            mode: ReignMode::Direct,
+            command: ReignCommand::Drive {
+                forward: 0.9,
+                turn: -0.8,
+                duration_ms: 5_000,
+            },
+            priority: 1.0,
+            ttl_ms: Some(5_000),
+            note: None,
+            source: Some(ReignSource::Gamepad),
+        };
+
+        let Json(input) = post_reign_command(State(state), Json(request))
+            .await
+            .unwrap();
+
+        assert_eq!(input.source, ReignSource::Gamepad);
         assert_eq!(
             input.expires_at_ms - input.issued_at_ms,
             HARDWARE_TTL_MAX_MS

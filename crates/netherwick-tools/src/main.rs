@@ -491,6 +491,12 @@ struct RobotArgs {
     capture: Option<String>,
     #[arg(long)]
     dashboard: Option<SocketAddr>,
+    #[arg(long)]
+    dashboard_tls: bool,
+    #[arg(long, default_value = "certs/netherwick-dev.crt")]
+    dashboard_tls_cert: String,
+    #[arg(long, default_value = "certs/netherwick-dev.key")]
+    dashboard_tls_key: String,
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
     #[arg(long)]
@@ -4650,14 +4656,34 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         let server_state = live_state.clone();
         let reign_state =
             netherwick_server::ReignServerState::with_live_view(reign_queue.clone(), &live_state);
-        tokio::spawn(async move {
-            if let Err(error) =
-                netherwick_server::serve_live_view_with_reign(addr, server_state, reign_state).await
-            {
-                eprintln!("live robot view server stopped: {error}");
-            }
-        });
-        println!("robot {:?} dashboard: http://{addr}/view", robot_mode);
+        if args.dashboard_tls {
+            let cert_path = args.dashboard_tls_cert.clone();
+            let key_path = args.dashboard_tls_key.clone();
+            tokio::spawn(async move {
+                if let Err(error) = netherwick_server::serve_live_view_with_reign_tls(
+                    addr,
+                    server_state,
+                    reign_state,
+                    cert_path,
+                    key_path,
+                )
+                .await
+                {
+                    eprintln!("live robot HTTPS view server stopped: {error}");
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(error) =
+                    netherwick_server::serve_live_view_with_reign(addr, server_state, reign_state)
+                        .await
+                {
+                    eprintln!("live robot view server stopped: {error}");
+                }
+            });
+        }
+        let scheme = if args.dashboard_tls { "https" } else { "http" };
+        println!("robot {:?} dashboard: {scheme}://{addr}/view", robot_mode);
     }
 
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
@@ -4894,9 +4920,9 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         };
         let (snapshot, tick) = match tick_result {
             Ok(values) => values,
-            Err(error) if robot_mode == RobotMode::ReadOnly => {
-                if is_transient_readonly_timeout(&error) {
-                    eprintln!("read-only tick timed out; continuing");
+            Err(error) if matches!(robot_mode, RobotMode::ReadOnly | RobotMode::Slow) => {
+                if is_transient_robot_timeout(&error) {
+                    eprintln!("{robot_mode:?} tick timed out; continuing");
                     tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
                     continue;
                 }
@@ -6578,6 +6604,10 @@ async fn inspect_ledger(args: InspectLedgerArgs) -> Result<()> {
 }
 
 fn is_transient_readonly_timeout(error: &AnyhowError) -> bool {
+    is_transient_robot_timeout(error)
+}
+
+fn is_transient_robot_timeout(error: &AnyhowError) -> bool {
     let message = error.to_string().to_lowercase();
     if message.contains("timed out") || message.contains("operation timed out") {
         return true;

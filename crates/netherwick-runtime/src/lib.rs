@@ -4483,6 +4483,48 @@ where
             anyhow::bail!("slow manual tick requires RobotMode::Slow");
         }
 
+        let pre_body_t_ms = wall_time_ms();
+        if let Some(input) = self.runtime.reign_sense(pre_body_t_ms)?.latest {
+            if reign_input_outputs_real_slow_directly(&input) {
+                let body_before = netherwick_body::BodySense {
+                    last_update_ms: pre_body_t_ms,
+                    ..netherwick_body::BodySense::default()
+                };
+                let mut now =
+                    self.now_builder
+                        .build(pre_body_t_ms, body_before.clone(), Vec::new())?;
+                now.self_sense.mode = Some("slow".to_string());
+                now.extensions.insert(
+                    "source".to_string(),
+                    serde_json::Value::String("real_robot".to_string()),
+                );
+                now.extensions.insert(
+                    "mode".to_string(),
+                    serde_json::Value::String("slow".to_string()),
+                );
+                self.insert_robot_initialization(&mut now);
+                now.reign.latest = Some(input.clone());
+                now.reign.active = true;
+                now.reign.mode = Some(input.mode.clone());
+                now.reign.human_override_pressure = input.priority.clamp(0.0, 1.0);
+                now.reign.last_command_age_ms =
+                    Some(pre_body_t_ms.saturating_sub(input.issued_at_ms));
+                let tick = synthetic_slow_manual_tick(
+                    now,
+                    input,
+                    MotorCommand::stop(),
+                    MotorCommand::stop(),
+                    None,
+                    &body_before,
+                )?;
+                let mut snapshot = self.now_builder.snapshot();
+                snapshot.eye = tick.frame.now.eye.clone();
+                annotate_snapshot_from_tick(&mut snapshot, &tick);
+                self.tick_count = self.tick_count.saturating_add(1);
+                return Ok((snapshot, tick));
+            }
+        }
+
         let body_before = self.body.read_body().await?;
         let mut packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
@@ -4501,6 +4543,21 @@ where
 
         now.reign = self.runtime.reign_sense(t_ms)?;
         if let Some(input) = now.reign.latest.clone() {
+            if reign_input_outputs_real_slow_directly(&input) {
+                let tick = synthetic_slow_manual_tick(
+                    now,
+                    input,
+                    MotorCommand::stop(),
+                    MotorCommand::stop(),
+                    None,
+                    &body_before,
+                )?;
+                let mut snapshot = self.now_builder.snapshot();
+                snapshot.eye = tick.frame.now.eye.clone();
+                annotate_snapshot_from_tick(&mut snapshot, &tick);
+                self.tick_count = self.tick_count.saturating_add(1);
+                return Ok((snapshot, tick));
+            }
             if reign_input_drives_real_slow(&input) {
                 let desired_motor =
                     action_to_motor_command(input.command.to_action().as_ref()).clamped(0.15, 0.25);
@@ -4783,7 +4840,9 @@ fn synthetic_slow_manual_tick(
 }
 
 fn reign_input_drives_real_slow(input: &ReignInput) -> bool {
-    if input.source != ReignSource::WebRemote || input.mode != ReignMode::Direct {
+    if !matches!(input.source, ReignSource::WebRemote | ReignSource::Gamepad)
+        || input.mode != ReignMode::Direct
+    {
         return false;
     }
     matches!(
@@ -4793,6 +4852,17 @@ fn reign_input_drives_real_slow(input: &ReignInput) -> bool {
             | netherwick_actions::ReignCommand::Drive { .. }
             | netherwick_actions::ReignCommand::Turn { .. }
             | netherwick_actions::ReignCommand::Stop
+    )
+}
+
+fn reign_input_outputs_real_slow_directly(input: &ReignInput) -> bool {
+    if input.source != ReignSource::WebRemote || input.mode != ReignMode::Direct {
+        return false;
+    }
+    matches!(
+        input.command,
+        netherwick_actions::ReignCommand::Speak { .. }
+            | netherwick_actions::ReignCommand::Chirp { .. }
     )
 }
 
@@ -4819,7 +4889,7 @@ fn real_slow_motor_block_reason(
     manual_drive: bool,
 ) -> Option<String> {
     if !manual_drive {
-        return Some("real slow mode requires active WebRemote Direct command".to_string());
+        return Some("real slow mode requires active WebRemote/Gamepad Direct command".to_string());
     }
     if let Some(reason) = real_slow_body_block_reason(body) {
         return Some(reason);
@@ -7161,7 +7231,7 @@ fn describe_safety_reason(reason: Option<SafetyReason>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netherwick_actions::{ReignCommand, ReignMode, ReignSource};
+    use netherwick_actions::{ChirpPattern, ReignCommand, ReignMode, ReignSource};
     use netherwick_autonomic::SimpleSafety;
     use netherwick_body::{BodySense, MotorCommand, RobotBody};
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
@@ -8163,6 +8233,108 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_direct_gamepad_bypasses_slow_runtime_tick() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingBody {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        queue.lock().unwrap().push(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: wall_time_ms().saturating_add(500),
+            source: ReignSource::Gamepad,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Drive {
+                forward: 0.50,
+                turn: -0.50,
+                duration_ms: 300,
+            },
+            priority: 1.0,
+            note: None,
+        });
+        let tick_attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = QueueOnlyRuntime {
+            queue,
+            tick_attempts: Arc::clone(&tick_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), runtime);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            motors.lock().unwrap().as_slice(),
+            &[MotorCommand {
+                forward: 0.15,
+                turn: -0.25
+            }]
+        );
+        assert!(matches!(
+            tick.frame.reign_input.as_ref().map(|input| &input.source),
+            Some(ReignSource::Gamepad)
+        ));
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_direct_webremote_chirp_bypasses_runtime_without_motor() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingBody {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        queue.lock().unwrap().push(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: wall_time_ms().saturating_add(500),
+            source: ReignSource::WebRemote,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Chirp {
+                pattern: ChirpPattern::Confirm,
+            },
+            priority: 1.0,
+            note: None,
+        });
+        let tick_attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = QueueOnlyRuntime {
+            queue,
+            tick_attempts: Arc::clone(&tick_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), runtime);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 0);
+        assert!(motors.lock().unwrap().is_empty());
+        assert!(matches!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Chirp {
+                pattern: ChirpPattern::Confirm
+            })
+        ));
+        assert!(matches!(
+            tick.frame.reign_input.as_ref().map(|input| &input.command),
+            Some(ReignCommand::Chirp {
+                pattern: ChirpPattern::Confirm
+            })
+        ));
     }
 
     #[tokio::test]

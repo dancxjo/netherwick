@@ -7,6 +7,8 @@ camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 mic_device := env_var_or_default("MIC_DEVICE", "")
 imu_device := env_var_or_default("IMU_DEVICE", "")
 robot_dashboard := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD", "0.0.0.0:3000")
+robot_dashboard_tls_cert := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD_TLS_CERT", "certs/netherwick-dev.crt")
+robot_dashboard_tls_key := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD_TLS_KEY", "certs/netherwick-dev.key")
 kinect_depth := env_var_or_default("NETHERWICK_KINECT_DEPTH", "1")
 kinect_rgb_target_luma := env_var_or_default("KINECT_RGB_TARGET_LUMA", "0.32")
 kinect_rgb_auto_gain_max := env_var_or_default("KINECT_RGB_AUTO_GAIN_MAX", "3.0")
@@ -221,6 +223,21 @@ robot *args:
             --kinect-rgb-brightness "{{kinect_rgb_brightness}}"
         )
     fi
+    if [ ! -f "{{robot_dashboard_tls_cert}}" ] || [ ! -f "{{robot_dashboard_tls_key}}" ]; then
+        mkdir -p "$(dirname "{{robot_dashboard_tls_cert}}")" "$(dirname "{{robot_dashboard_tls_key}}")"
+        LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        if [ -z "$LAN_IP" ]; then
+            LAN_SAN=""
+        else
+            LAN_SAN=",IP:$LAN_IP"
+        fi
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "{{robot_dashboard_tls_key}}" \
+            -out "{{robot_dashboard_tls_cert}}" \
+            -days 365 \
+            -subj "/CN=netherwick.local" \
+            -addext "subjectAltName=DNS:localhost,DNS:netherwick.local,IP:127.0.0.1$LAN_SAN"
+    fi
     NETHERWICK_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p netherwick-tools -- robot \
         --mode "${NETHERWICK_ROBOT_MODE:-slow}" \
         --create-port "{{create1_port}}" \
@@ -231,6 +248,9 @@ robot *args:
         "${IMU_ARGS[@]}" \
         "${GPS_ARGS[@]}" \
         --dashboard "{{robot_dashboard}}" \
+        --dashboard-tls \
+        --dashboard-tls-cert "{{robot_dashboard_tls_cert}}" \
+        --dashboard-tls-key "{{robot_dashboard_tls_key}}" \
         {{args}}
 
 # Launch the virtual dream world with HTTPS live view.
