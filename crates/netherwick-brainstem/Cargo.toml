@@ -1,0 +1,26 @@
+[package]
+name = "netherwick-brainstem-rp2040"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+embedded-hal = "1.0"
+embedded-hal-nb = "1.0"
+fugit = "0.3"
+nb = "1"
+panic-halt = "1.0"
+rp2040-boot2 = "0.3"
+rp2040-hal = { version = "0.12", features = ["rt", "critical-section-impl"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = true
+panic = "abort"

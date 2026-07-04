@@ -27,6 +27,9 @@ members = [
     "crates/netherwick-tools",
     "xtask",
 ]
+exclude = [
+    "crates/netherwick-brainstem-rp2040",
+]
 resolver = "2"
 
 [workspace.package]
