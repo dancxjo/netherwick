@@ -1,3 +1,4 @@
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum SerialRead {
     Byte(u8),
     WouldBlock,

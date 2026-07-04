@@ -15,36 +15,22 @@ use hal::sio::Sio;
 use hal::uart::{DataBits, Enabled, StopBits, UartConfig, UartPeripheral};
 use hal::watchdog::Watchdog;
 
+use crate::body;
 use crate::hardware::{BrainstemHardware, SerialRead};
 
 #[link_section = ".boot2"]
 #[used]
 static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
-const XOSC_CRYSTAL_FREQ_HZ: u32 = 12_000_000;
-
-const CREATE_UART_BAUD: u32 = 57_600;
 const CREATE_UART_DATA_BITS: DataBits = DataBits::Eight;
 const CREATE_UART_STOP_BITS: StopBits = StopBits::One;
 
-#[allow(dead_code)]
-mod pinout {
-    pub const CREATE_TX_GPIO: u8 = 16;
-    pub const CREATE_TX_PHYSICAL_PIN: u8 = 21;
-    pub const CREATE_RX_GPIO: u8 = 17;
-    pub const CREATE_RX_PHYSICAL_PIN: u8 = 22;
-    pub const ONBOARD_LED_GPIO: u8 = 25;
-    pub const CREATE_POWER_TOGGLE_GPIO: u8 = 18;
-    pub const CREATE_BRC_GPIO: u8 = 19;
-    pub const EXTERNAL_LED_GPIO: u8 = 20;
-}
-
 // Unsafe hardware assumptions for this RP2040/Pico backend:
-// - GP16/Pico physical pin 21 is wired to Create RX.
-// - GP17/Pico physical pin 22 is wired from Create TX through external 5V-to-3.3V level shifting.
-// - GP18 drives the external Create Power Toggle interface with the correct polarity and isolation.
-// - GP19 drives Create BRC; BRC is released high by this firmware.
-// - GP20 is optional external LED output; leave unconnected if unused.
+// - body.toml maps GP16/Pico physical pin 21 to Create RX.
+// - body.toml maps GP17/Pico physical pin 22 from Create TX through external 5V-to-3.3V level shifting.
+// - body.toml maps GP18 to the external Create Power Toggle interface with the correct polarity and isolation.
+// - body.toml maps GP19 to Create BRC; BRC is released high by this firmware.
+// - body.toml maps GP20 as an optional external LED output; leave unconnected if unused.
 
 type CreateUart = UartPeripheral<
     Enabled,
@@ -71,7 +57,7 @@ impl Rp2040Brainstem {
         let mut pac = pac::Peripherals::take().unwrap();
         let mut watchdog = Watchdog::new(pac.WATCHDOG);
         let clocks = init_clocks_and_plls(
-            XOSC_CRYSTAL_FREQ_HZ,
+            body::XOSC_CRYSTAL_FREQ_HZ,
             pac.XOSC,
             pac.CLOCKS,
             pac.PLL_SYS,
@@ -98,7 +84,7 @@ impl Rp2040Brainstem {
         let uart = UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
             .enable(
                 UartConfig::new(
-                    CREATE_UART_BAUD.Hz(),
+                    body::CREATE_UART_BAUD.Hz(),
                     CREATE_UART_DATA_BITS,
                     None,
                     CREATE_UART_STOP_BITS,

@@ -1,0 +1,36 @@
+[body]
+name = "irobot-create-open-interface"
+kind = "create_oi"
+drive = "differential"
+
+[create_oi]
+baud = 57600
+data_bits = 8
+stop_bits = 1
+default_mode = "safe"
+sensor_probe_packet = 25
+
+[timing]
+power_toggle_pulse_ms = 500
+wake_wait_ms = 3000
+responsive_timeout_ms = 6000
+brc_low_pulse_ms = 500
+post_brc_settle_ms = 100
+post_mode_settle_ms = 100
+uart_byte_timeout_ms = 20
+idle_blink_ms = 1000
+error_blink_ms = 150
+error_pause_ms = 900
+
+[rp2040]
+xosc_crystal_freq_hz = 12000000
+
+[rp2040.pins]
+create_tx_gpio = 16
+create_tx_physical_pin = 21
+create_rx_gpio = 17
+create_rx_physical_pin = 22
+onboard_led_gpio = 25
+create_power_toggle_gpio = 18
+create_brc_gpio = 19
+external_led_gpio = 20

@@ -1,0 +1,137 @@
+use std::{env, fs, path::PathBuf};
+
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct BodyToml {
+    body: Body,
+    create_oi: CreateOi,
+    timing: Timing,
+    rp2040: Rp2040,
+}
+
+#[derive(Deserialize)]
+struct Body {
+    name: String,
+    kind: String,
+    drive: String,
+}
+
+#[derive(Deserialize)]
+struct CreateOi {
+    baud: u32,
+    data_bits: u8,
+    stop_bits: u8,
+    default_mode: String,
+    sensor_probe_packet: u8,
+}
+
+#[derive(Deserialize)]
+struct Timing {
+    power_toggle_pulse_ms: u32,
+    wake_wait_ms: u32,
+    responsive_timeout_ms: u32,
+    brc_low_pulse_ms: u32,
+    post_brc_settle_ms: u32,
+    post_mode_settle_ms: u32,
+    uart_byte_timeout_ms: u32,
+    idle_blink_ms: u32,
+    error_blink_ms: u32,
+    error_pause_ms: u32,
+}
+
+#[derive(Deserialize)]
+struct Rp2040 {
+    xosc_crystal_freq_hz: u32,
+    pins: Pins,
+}
+
+#[derive(Deserialize)]
+struct Pins {
+    create_tx_gpio: u8,
+    create_tx_physical_pin: u8,
+    create_rx_gpio: u8,
+    create_rx_physical_pin: u8,
+    onboard_led_gpio: u8,
+    create_power_toggle_gpio: u8,
+    create_brc_gpio: u8,
+    external_led_gpio: u8,
+}
+
+fn main() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let body_path = manifest_dir.join("body.toml");
+    println!("cargo:rerun-if-changed={}", body_path.display());
+
+    let body: BodyToml = toml::from_str(&fs::read_to_string(&body_path).unwrap()).unwrap();
+    assert_eq!(body.body.kind, "create_oi");
+    assert_eq!(body.body.drive, "differential");
+    assert_eq!(body.create_oi.data_bits, 8);
+    assert_eq!(body.create_oi.stop_bits, 1);
+
+    let default_mode = match body.create_oi.default_mode.as_str() {
+        "passive" => "CreateOiMode::Passive",
+        "safe" => "CreateOiMode::Safe",
+        "full" => "CreateOiMode::Full",
+        other => panic!("unsupported create_oi.default_mode: {other}"),
+    };
+
+    let generated = format!(
+        r#"pub const BODY_NAME: &str = {body_name:?};
+pub const BODY_KIND: BodyKind = BodyKind::CreateOpenInterface;
+pub const DRIVE_KIND: DriveKind = DriveKind::Differential;
+
+pub const CREATE_UART_BAUD: u32 = {baud};
+pub const CREATE_DEFAULT_MODE: CreateOiMode = {default_mode};
+pub const CREATE_SENSOR_PROBE_PACKET: u8 = {sensor_probe_packet};
+
+pub const POWER_TOGGLE_PULSE_MS: u32 = {power_toggle_pulse_ms};
+pub const CREATE_WAKE_WAIT_MS: u32 = {wake_wait_ms};
+pub const CREATE_RESPONSIVE_TIMEOUT_MS: u32 = {responsive_timeout_ms};
+pub const BRC_LOW_PULSE_MS: u32 = {brc_low_pulse_ms};
+pub const POST_BRC_SETTLE_MS: u32 = {post_brc_settle_ms};
+pub const POST_MODE_SETTLE_MS: u32 = {post_mode_settle_ms};
+pub const UART_BYTE_TIMEOUT_MS: u32 = {uart_byte_timeout_ms};
+pub const IDLE_BLINK_MS: u32 = {idle_blink_ms};
+pub const ERROR_BLINK_MS: u32 = {error_blink_ms};
+pub const ERROR_PAUSE_MS: u32 = {error_pause_ms};
+
+pub const XOSC_CRYSTAL_FREQ_HZ: u32 = {xosc_crystal_freq_hz};
+
+pub const CREATE_TX_GPIO: u8 = {create_tx_gpio};
+pub const CREATE_TX_PHYSICAL_PIN: u8 = {create_tx_physical_pin};
+pub const CREATE_RX_GPIO: u8 = {create_rx_gpio};
+pub const CREATE_RX_PHYSICAL_PIN: u8 = {create_rx_physical_pin};
+pub const ONBOARD_LED_GPIO: u8 = {onboard_led_gpio};
+pub const CREATE_POWER_TOGGLE_GPIO: u8 = {create_power_toggle_gpio};
+pub const CREATE_BRC_GPIO: u8 = {create_brc_gpio};
+pub const EXTERNAL_LED_GPIO: u8 = {external_led_gpio};
+"#,
+        body_name = body.body.name,
+        baud = body.create_oi.baud,
+        default_mode = default_mode,
+        sensor_probe_packet = body.create_oi.sensor_probe_packet,
+        power_toggle_pulse_ms = body.timing.power_toggle_pulse_ms,
+        wake_wait_ms = body.timing.wake_wait_ms,
+        responsive_timeout_ms = body.timing.responsive_timeout_ms,
+        brc_low_pulse_ms = body.timing.brc_low_pulse_ms,
+        post_brc_settle_ms = body.timing.post_brc_settle_ms,
+        post_mode_settle_ms = body.timing.post_mode_settle_ms,
+        uart_byte_timeout_ms = body.timing.uart_byte_timeout_ms,
+        idle_blink_ms = body.timing.idle_blink_ms,
+        error_blink_ms = body.timing.error_blink_ms,
+        error_pause_ms = body.timing.error_pause_ms,
+        xosc_crystal_freq_hz = body.rp2040.xosc_crystal_freq_hz,
+        create_tx_gpio = body.rp2040.pins.create_tx_gpio,
+        create_tx_physical_pin = body.rp2040.pins.create_tx_physical_pin,
+        create_rx_gpio = body.rp2040.pins.create_rx_gpio,
+        create_rx_physical_pin = body.rp2040.pins.create_rx_physical_pin,
+        onboard_led_gpio = body.rp2040.pins.onboard_led_gpio,
+        create_power_toggle_gpio = body.rp2040.pins.create_power_toggle_gpio,
+        create_brc_gpio = body.rp2040.pins.create_brc_gpio,
+        external_led_gpio = body.rp2040.pins.external_led_gpio,
+    );
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    fs::write(out_dir.join("body_config.rs"), generated).unwrap();
+}

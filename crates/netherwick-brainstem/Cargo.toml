@@ -11,10 +11,15 @@ cortex-m-rt = "0.7"
 embedded-hal = "1.0"
 embedded-hal-nb = "1.0"
 fugit = "0.3"
+heapless = "0.8"
 nb = "1"
 panic-halt = "1.0"
 rp2040-boot2 = "0.3"
 rp2040-hal = { version = "0.12", features = ["rt", "critical-section-impl"] }
+
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [profile.dev]
 panic = "abort"
