@@ -6,6 +6,7 @@ use serde::Deserialize;
 struct BodyToml {
     body: Body,
     create_oi: CreateOi,
+    gpio: Gpio,
     timing: Timing,
     rp2040: Rp2040,
 }
@@ -41,6 +42,18 @@ struct Timing {
 }
 
 #[derive(Deserialize)]
+struct Gpio {
+    create_brc: OptionalGpio,
+}
+
+#[derive(Deserialize)]
+struct OptionalGpio {
+    enabled: bool,
+    pin: String,
+    gpio: u8,
+}
+
+#[derive(Deserialize)]
 struct Rp2040 {
     xosc_crystal_freq_hz: u32,
     pins: Pins,
@@ -54,7 +67,6 @@ struct Pins {
     create_rx_physical_pin: u8,
     onboard_led_gpio: u8,
     create_power_toggle_gpio: u8,
-    create_brc_gpio: u8,
     external_led_gpio: u8,
 }
 
@@ -84,6 +96,7 @@ pub const DRIVE_KIND: DriveKind = DriveKind::Differential;
 pub const CREATE_UART_BAUD: u32 = {baud};
 pub const CREATE_DEFAULT_MODE: CreateOiMode = {default_mode};
 pub const CREATE_SENSOR_PROBE_PACKET: u8 = {sensor_probe_packet};
+pub const CREATE_BRC_ENABLED: bool = {create_brc_enabled};
 
 pub const POWER_TOGGLE_PULSE_MS: u32 = {power_toggle_pulse_ms};
 pub const CREATE_WAKE_WAIT_MS: u32 = {wake_wait_ms};
@@ -104,6 +117,7 @@ pub const CREATE_RX_GPIO: u8 = {create_rx_gpio};
 pub const CREATE_RX_PHYSICAL_PIN: u8 = {create_rx_physical_pin};
 pub const ONBOARD_LED_GPIO: u8 = {onboard_led_gpio};
 pub const CREATE_POWER_TOGGLE_GPIO: u8 = {create_power_toggle_gpio};
+pub const CREATE_BRC_PIN: &str = {create_brc_pin:?};
 pub const CREATE_BRC_GPIO: u8 = {create_brc_gpio};
 pub const EXTERNAL_LED_GPIO: u8 = {external_led_gpio};
 "#,
@@ -111,6 +125,7 @@ pub const EXTERNAL_LED_GPIO: u8 = {external_led_gpio};
         baud = body.create_oi.baud,
         default_mode = default_mode,
         sensor_probe_packet = body.create_oi.sensor_probe_packet,
+        create_brc_enabled = body.gpio.create_brc.enabled,
         power_toggle_pulse_ms = body.timing.power_toggle_pulse_ms,
         wake_wait_ms = body.timing.wake_wait_ms,
         responsive_timeout_ms = body.timing.responsive_timeout_ms,
@@ -128,7 +143,8 @@ pub const EXTERNAL_LED_GPIO: u8 = {external_led_gpio};
         create_rx_physical_pin = body.rp2040.pins.create_rx_physical_pin,
         onboard_led_gpio = body.rp2040.pins.onboard_led_gpio,
         create_power_toggle_gpio = body.rp2040.pins.create_power_toggle_gpio,
-        create_brc_gpio = body.rp2040.pins.create_brc_gpio,
+        create_brc_pin = body.gpio.create_brc.pin,
+        create_brc_gpio = body.gpio.create_brc.gpio,
         external_led_gpio = body.rp2040.pins.external_led_gpio,
     );
 

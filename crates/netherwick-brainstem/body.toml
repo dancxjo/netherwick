@@ -32,5 +32,9 @@ create_rx_gpio = 17
 create_rx_physical_pin = 22
 onboard_led_gpio = 25
 create_power_toggle_gpio = 18
-create_brc_gpio = 19
 external_led_gpio = 20
+
+[gpio.create_brc]
+enabled = false
+pin = "GP19"
+gpio = 19

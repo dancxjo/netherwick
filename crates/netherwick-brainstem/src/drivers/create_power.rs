@@ -51,6 +51,10 @@ impl CreatePower {
     ) where
         H: BrainstemHardware,
     {
+        if !body::CREATE_BRC_ENABLED {
+            return;
+        }
+
         let _ = events.push_back(BrainstemEvent::CreateBrcPulseRequested);
         hardware.set_brc(false);
         hardware.delay_ms(body::BRC_LOW_PULSE_MS);

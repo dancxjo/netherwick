@@ -19,6 +19,15 @@ drive = "differential"
 
 The file also declares Create OI UART settings, timing values, and the current RP2040/Pico pin map. To support another robot body, add a new body kind and driver implementation, then point the runtime at that driver without changing the high-level event loop.
 
+BRC is optional and disabled by default for 57600 baud bring-up:
+
+```toml
+[gpio.create_brc]
+enabled = false
+pin = "GP19"
+gpio = 19
+```
+
 ## Wiring
 
 | Signal | Pico GPIO | Pico physical pin | Direction |
@@ -26,7 +35,7 @@ The file also declares Create OI UART settings, timing values, and the current R
 | Create OI UART TX | GP16 | 21 | Pico TX to Create RX |
 | Create OI UART RX | GP17 | 22 | Create TX to Pico RX |
 | Create Power Toggle | GP18 | 24 | Pico output to external power-toggle interface |
-| Create BRC | GP19 | 25 | Pico output to Create BRC |
+| Create BRC | GP19 | 25 | Pico output to Create BRC, optional |
 | External status LED | GP20 | 26 | Pico output, optional |
 | Onboard LED | GP25 | onboard | Pico output |
 
@@ -35,6 +44,8 @@ UART is `57600 8N1`.
 Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external level shifting or a divider is present on the Create TX to Pico GP17 line.
 
 The Power Toggle and BRC outputs assume external wiring that is electrically safe for both the Pico and the Create. Review polarity and isolation before connecting a real robot.
+
+For initial 57600 baud Open Interface bring-up, wire Power Toggle, UART TX/RX, and GND first. Leave BRC disabled unless the robot body configuration explicitly enables it.
 
 ## Architecture
 
@@ -148,7 +159,7 @@ On boot the firmware:
 2. Enqueues the demo `BrainstemCommand` script.
 3. Pulses Create Power Toggle to wake the robot.
 4. Polls the Create OI sensor stream until UART bytes confirm the robot is alive.
-5. Pulses BRC low and releases it.
+5. Pulses BRC low and releases it if `gpio.create_brc.enabled = true`.
 6. Sends Open Interface `Start`.
 7. Enters `Safe` mode.
 8. Sends a tiny movement jig: short forward, short left turn, short right turn, stop.
