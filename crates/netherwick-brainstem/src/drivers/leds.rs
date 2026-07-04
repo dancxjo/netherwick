@@ -21,6 +21,7 @@ impl Leds {
         hardware.delay_ms(250);
     }
 
+    #[allow(dead_code)]
     pub fn idle_once<H>(&mut self, hardware: &mut H)
     where
         H: BrainstemHardware,
@@ -31,6 +32,7 @@ impl Leds {
         hardware.delay_ms(crate::body::IDLE_BLINK_MS);
     }
 
+    #[allow(dead_code)]
     pub fn error_once<H>(&mut self, hardware: &mut H)
     where
         H: BrainstemHardware,

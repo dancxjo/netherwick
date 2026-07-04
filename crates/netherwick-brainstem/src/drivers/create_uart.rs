@@ -1,6 +1,5 @@
 use heapless::{Deque, Vec};
 
-use crate::body;
 use crate::commands::CreateOiMode;
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::{BrainstemHardware, SerialRead};
@@ -44,35 +43,15 @@ impl CreateUart {
         }
     }
 
-    pub fn wait_for_response<H, const N: usize>(
+    pub fn request_sensor_packet<H>(
         &mut self,
         hardware: &mut H,
-        events: &mut Deque<BrainstemEvent, N>,
+        packet_id: u8,
     ) -> Result<(), BrainstemError>
     where
         H: BrainstemHardware,
     {
-        let deadline = hardware
-            .now_us()
-            .wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS * 1_000);
-        loop {
-            self.send_bytes(hardware, &[OI_SENSORS, body::CREATE_SENSOR_PROBE_PACKET])?;
-            let mut bytes = Vec::new();
-            if self.read_packet_bytes(hardware, &mut bytes, 2).is_ok() {
-                status::mark_uart_rx_ok(hardware.now_us() / 1_000);
-                let _ = events.push_back(BrainstemEvent::CreatePacketReceived {
-                    packet_id: body::CREATE_SENSOR_PROBE_PACKET,
-                    bytes,
-                });
-                return Ok(());
-            }
-            if hardware.now_us().wrapping_sub(deadline) < u32::MAX / 2 {
-                status::mark_uart_rx_error();
-                let _ = events.push_back(BrainstemEvent::Error(BrainstemError::CreateNoResponse));
-                return Err(BrainstemError::CreateNoResponse);
-            }
-            hardware.delay_ms(100);
-        }
+        self.send_bytes(hardware, &[OI_SENSORS, packet_id])
     }
 
     pub fn start_oi<H, const N: usize>(
@@ -85,7 +64,6 @@ impl CreateUart {
     {
         let _ = events.push_back(BrainstemEvent::CreateOiStartRequested);
         self.send_byte(hardware, OI_START)?;
-        hardware.delay_ms(body::POST_MODE_SETTLE_MS);
         Ok(())
     }
 
@@ -104,11 +82,10 @@ impl CreateUart {
             CreateOiMode::Safe => self.send_byte(hardware, OI_SAFE)?,
             CreateOiMode::Full => self.send_byte(hardware, OI_FULL)?,
         }
-        hardware.delay_ms(body::POST_MODE_SETTLE_MS);
         Ok(())
     }
 
-    pub fn drive_direct<H, const N: usize>(
+    pub fn drive_direct_start<H, const N: usize>(
         &mut self,
         hardware: &mut H,
         events: &mut Deque<BrainstemEvent, N>,
@@ -127,9 +104,7 @@ impl CreateUart {
 
         let velocity = ((left_mm_s as i32 + right_mm_s as i32) / 2) as i16;
         let radius = differential_radius_mm(left_mm_s, right_mm_s);
-        self.drive(hardware, velocity, radius)?;
-        hardware.delay_ms(duration_ms);
-        self.stop(hardware, events)
+        self.drive(hardware, velocity, radius)
     }
 
     pub fn stop<H, const N: usize>(
@@ -188,38 +163,6 @@ impl CreateUart {
             .map_err(|_| BrainstemError::UartFraming)
     }
 
-    fn read_packet_bytes<H>(
-        &mut self,
-        hardware: &mut H,
-        bytes: &mut Vec<u8, 32>,
-        len: usize,
-    ) -> Result<(), BrainstemError>
-    where
-        H: BrainstemHardware,
-    {
-        for _ in 0..len {
-            let start = hardware.now_us();
-            loop {
-                match hardware.read_byte() {
-                    SerialRead::Byte(byte) => {
-                        bytes
-                            .push(byte)
-                            .map_err(|_| BrainstemError::InvalidPacket)?;
-                        break;
-                    }
-                    SerialRead::WouldBlock => {
-                        if hardware.now_us().wrapping_sub(start)
-                            >= body::UART_BYTE_TIMEOUT_MS * 1_000
-                        {
-                            return Err(BrainstemError::Timeout);
-                        }
-                    }
-                    SerialRead::Error => return Err(BrainstemError::UartFraming),
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 fn differential_radius_mm(left_mm_s: i16, right_mm_s: i16) -> i16 {

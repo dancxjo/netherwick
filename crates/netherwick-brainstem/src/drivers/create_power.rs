@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use heapless::Deque;
 
 use crate::body;

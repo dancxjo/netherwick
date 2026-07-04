@@ -19,14 +19,15 @@ rp2040-hal = { version = "0.12", features = ["rt", "critical-section-impl"], opt
 
 cyw43 = { version = "0.7", optional = true }
 cyw43-pio = { version = "0.10", optional = true }
-embassy-executor = { version = "0.10", features = ["arch-cortex-m", "executor-thread"], optional = true }
-embassy-net = { version = "0.9", features = ["medium-ethernet", "proto-ipv4", "tcp"], optional = true }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"], optional = true }
+embassy-net = { version = "0.9", features = ["medium-ethernet", "multicast", "proto-ipv4", "tcp", "udp"], optional = true }
 embassy-rp = { version = "0.10", features = ["critical-section-impl", "rp2040", "time-driver"], optional = true }
 embassy-time = { version = "0.5", optional = true }
 embedded-io-async = { version = "0.7", optional = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 serde-json-core = { version = "0.6", optional = true }
 static_cell = { version = "2", optional = true }
+portable-atomic = { version = "1", features = ["critical-section"], optional = true }
 
 [features]
 default = ["rp2040"]
@@ -42,6 +43,7 @@ pico-w = [
     "dep:serde",
     "dep:serde-json-core",
     "dep:static_cell",
+    "dep:portable-atomic",
 ]
 
 [build-dependencies]

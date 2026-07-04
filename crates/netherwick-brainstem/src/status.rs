@@ -18,6 +18,24 @@ static DEMO_STATE: AtomicU8 = AtomicU8::new(DemoState::NotStarted as u8);
 static LAST_UART_PACKET_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct BrainstemStatus {
+    pub firmware_name: &'static str,
+    pub firmware_version: &'static str,
+    pub body_name: &'static str,
+    pub body_kind: &'static str,
+    pub uptime_ms: u32,
+    pub current_runtime_state: u8,
+    pub create_power_state: u8,
+    pub oi_mode: u8,
+    pub uart_rx_health: u8,
+    pub last_uart_packet_timestamp_ms: u32,
+    pub current_command: u8,
+    pub last_error: u8,
+    pub demo_state: u8,
+}
+
+#[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum RuntimeState {
     Booting = 1,
@@ -121,6 +139,25 @@ pub fn set_error(error: BrainstemError) {
     set_demo_state(DemoState::Error);
 }
 
+#[allow(dead_code)]
+pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
+    BrainstemStatus {
+        firmware_name: env!("CARGO_PKG_NAME"),
+        firmware_version: env!("CARGO_PKG_VERSION"),
+        body_name: body::BODY_NAME,
+        body_kind: body_kind(),
+        uptime_ms,
+        current_runtime_state: RUNTIME_STATE.load(Ordering::Relaxed),
+        create_power_state: CREATE_POWER_STATE.load(Ordering::Relaxed),
+        oi_mode: OI_MODE.load(Ordering::Relaxed),
+        uart_rx_health: UART_RX_HEALTH.load(Ordering::Relaxed),
+        last_uart_packet_timestamp_ms: LAST_UART_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
+        current_command: CURRENT_COMMAND.load(Ordering::Relaxed),
+        last_error: LAST_ERROR.load(Ordering::Relaxed),
+        demo_state: DEMO_STATE.load(Ordering::Relaxed),
+    }
+}
+
 #[cfg(feature = "pico-w")]
 #[derive(serde::Serialize)]
 struct StatusJson {
@@ -140,27 +177,27 @@ struct StatusJson {
 }
 
 #[cfg(feature = "pico-w")]
-pub fn render_json<'a>(uptime_ms: u32, buffer: &'a mut [u8]) -> Result<&'a str, ()> {
+pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Result<&'a str, ()> {
     let status = StatusJson {
-        firmware_name: env!("CARGO_PKG_NAME"),
-        firmware_version: env!("CARGO_PKG_VERSION"),
-        body_name: body::BODY_NAME,
-        body_kind: body_kind(),
-        uptime_ms,
-        current_runtime_state: runtime_state_text(RUNTIME_STATE.load(Ordering::Relaxed)),
-        create_power_state: tri_state_text(CREATE_POWER_STATE.load(Ordering::Relaxed)),
-        oi_mode: oi_mode_text(OI_MODE.load(Ordering::Relaxed)),
-        uart_rx_health: uart_health_text(UART_RX_HEALTH.load(Ordering::Relaxed)),
-        last_uart_packet_timestamp_ms: LAST_UART_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
-        current_command: command_text(CURRENT_COMMAND.load(Ordering::Relaxed)),
-        last_error: error_text(LAST_ERROR.load(Ordering::Relaxed)),
-        demo_state: demo_state_text(DEMO_STATE.load(Ordering::Relaxed)),
+        firmware_name: snapshot.firmware_name,
+        firmware_version: snapshot.firmware_version,
+        body_name: snapshot.body_name,
+        body_kind: snapshot.body_kind,
+        uptime_ms: snapshot.uptime_ms,
+        current_runtime_state: runtime_state_text(snapshot.current_runtime_state),
+        create_power_state: tri_state_text(snapshot.create_power_state),
+        oi_mode: oi_mode_text(snapshot.oi_mode),
+        uart_rx_health: uart_health_text(snapshot.uart_rx_health),
+        last_uart_packet_timestamp_ms: snapshot.last_uart_packet_timestamp_ms,
+        current_command: command_text(snapshot.current_command),
+        last_error: error_text(snapshot.last_error),
+        demo_state: demo_state_text(snapshot.demo_state),
     };
     let len = serde_json_core::to_slice(&status, buffer).map_err(|_| ())?;
     core::str::from_utf8(&buffer[..len]).map_err(|_| ())
 }
 
-#[cfg(feature = "pico-w")]
+#[allow(dead_code)]
 fn body_kind() -> &'static str {
     match body::BODY_KIND {
         body::BodyKind::CreateOpenInterface => "create_oi",

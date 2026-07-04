@@ -2,7 +2,7 @@
 
 Tiny deterministic firmware for bridging/control of the iRobot Create Open Interface. This crate intentionally contains no planning, behavior selection, LLM logic, mapping, or Netherwick runtime logic.
 
-The crate name and control layer are chip-neutral. The current hardware backend is `arch::rp2040`, targeting a Raspberry Pi Pico/RP2040 and producing a UF2 image.
+The crate name and control layer are chip-neutral. The default hardware backend is `arch::rp2040`, targeting a Raspberry Pi Pico/RP2040 and producing a UF2 image. A `pico-w` backend adds a Raspberry Pi Pico W Wi-Fi AP/status interface while keeping robot-affecting hardware in the safety/runtime lane.
 
 ## Configuration
 
@@ -66,6 +66,7 @@ board.toml
 
 src/
   arch/rp2040.rs
+  arch/pico_w.rs
   drivers/create_uart.rs
   drivers/create_power.rs
   drivers/leds.rs
@@ -77,6 +78,15 @@ src/
 ```
 
 Hardware details stay inside `arch/` and `drivers/`. The runtime moves small typed commands and events through fixed-capacity `heapless::Deque` queues.
+
+On Pico W, concurrency is split by ownership:
+
+- The safety/runtime lane owns Create UART writes, motor stop, Power Toggle, BRC, and robot LEDs.
+- The Wi-Fi/HTTP lane owns CYW43, AP setup, TCP, UDP, HTTP, and mDNS only.
+- Wi-Fi never receives robot GPIO/UART handles and cannot directly move motors or toggle Create power.
+- HTTP `/status.json` serializes a copied `BrainstemStatus` snapshot and does not hold shared state while writing TCP responses.
+- The runtime is tick-driven: each tick polls UART, enforces drive deadlines, advances at most one active action, and sends Stop on drive timeout or UART gating failure.
+- A hardware watchdog feed point is reserved in the safety/runtime tick; it must remain owned by that lane.
 
 ## Event Vocabulary
 
@@ -140,6 +150,20 @@ cd crates/netherwick-brainstem
 cargo build --release
 ```
 
+Build the Pico W AP/status firmware:
+
+```bash
+just brainstem-pico-w-build
+```
+
+The Pico W backend embeds CYW43 firmware blobs at compile time. They are not kept in version control; the Just target fetches them into `crates/netherwick-brainstem/firmware/cyw43/` before building. To fetch them without building:
+
+```bash
+just brainstem-fetch-cyw43
+```
+
+Set `CYW43_FIRMWARE_REF` to fetch from a specific Embassy branch, tag, or commit; it defaults to `main`.
+
 ## UF2
 
 Install the converter once:
@@ -160,7 +184,39 @@ The UF2 is written to:
 crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem.uf2
 ```
 
+Build the Pico W UF2:
+
+```bash
+just brainstem-pico-w-uf2
+```
+
+The Pico W UF2 is written to:
+
+```text
+crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem-pico-w.uf2
+```
+
 To flash, hold the Pico BOOTSEL button while plugging it into USB, then copy the UF2 file to the mounted `RPI-RP2` drive.
+
+## Pico W Operator Interface
+
+The Pico W backend starts an open AP:
+
+```text
+SSID: pete-brainstem
+Device IP: 192.168.4.1
+Hostname: pete.local via mDNS announcement
+```
+
+The interface is read-only for Brainstem 0:
+
+- `http://192.168.4.1/` serves a small index page with a link to status.
+- `http://192.168.4.1/status.json` serves firmware/body/runtime/Create/UART/demo status.
+- `http://pete.local/` and `http://pete.local/status.json` may work on clients that support mDNS on the AP network.
+
+The status JSON includes firmware name/version, body name/kind, uptime, runtime state, Create power state, OI mode, UART RX health, last UART packet timestamp, current command, last error, and demo state.
+
+Wi-Fi/AP/HTTP/mDNS failure does not prevent motor stop, UART timeout handling, power safety, or the error blink pattern. The Wi-Fi lane is not allowed to call robot drivers directly; future operator commands must enter through a bounded command queue consumed by the runtime lane.
 
 ## Demo Behavior
 
@@ -178,6 +234,8 @@ On boot the firmware:
 10. Leaves the controller in a safe idle blink loop.
 
 Motor movement is safety-gated: the built-in script only reaches drive commands after UART RX/responses confirm the Create is alive. Timeout, UART framing error, or invalid response skips the jig, sends Stop, and enters the repeating three-blink error pattern.
+
+All drive commands carry a duration. The tick-driven runtime treats that duration as a deadline and sends Stop when it expires, before power-cycle, before idle, and on errors.
 
 ## Porting
 

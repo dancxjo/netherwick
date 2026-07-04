@@ -12,6 +12,7 @@ pub trait BrainstemHardware {
     fn set_power_toggle(&mut self, high: bool);
     fn set_brc(&mut self, high: bool);
     fn set_indicators(&mut self, on: bool);
+    #[allow(dead_code)]
     fn set_primary_indicator(&mut self, on: bool);
 
     fn write_byte(&mut self, byte: u8) -> Result<(), ()>;

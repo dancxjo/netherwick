@@ -16,6 +16,7 @@ kinect_rgb_gain := env_var_or_default("KINECT_RGB_GAIN", "1.0")
 kinect_rgb_gamma := env_var_or_default("KINECT_RGB_GAMMA", "0.80")
 kinect_rgb_brightness := env_var_or_default("KINECT_RGB_BRIGHTNESS", "0.0")
 tts_output_device := env_var_or_default("NETHERWICK_TTS_OUTPUT_DEVICE", "")
+cyw43_firmware_ref := env_var_or_default("CYW43_FIRMWARE_REF", "main")
 
 # Default to the real robot path.
 default *args:
@@ -157,6 +158,31 @@ brainstem-uf2: brainstem-build
     elf2uf2-rs \
         crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem \
         crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem.uf2
+
+# Fetch CYW43 firmware blobs required by the Pico W backend.
+brainstem-fetch-cyw43:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="crates/netherwick-brainstem/firmware/cyw43"
+    base="https://raw.githubusercontent.com/embassy-rs/embassy/{{cyw43_firmware_ref}}/cyw43-firmware"
+    mkdir -p "$dir"
+    for file in \
+        43439A0.bin \
+        43439A0_clm.bin \
+        nvram_rp2040.bin \
+        LICENSE-permissive-binary-license-1.0.txt; do
+        curl -fL --retry 3 --retry-delay 2 -o "$dir/$file" "$base/$file"
+    done
+
+# Build the Brainstem Pico W firmware with AP/status support.
+brainstem-pico-w-build: brainstem-fetch-cyw43
+    cd crates/netherwick-brainstem && cargo build --release --no-default-features --features pico-w
+
+# Convert the Brainstem Pico W firmware ELF to UF2.
+brainstem-pico-w-uf2: brainstem-pico-w-build
+    elf2uf2-rs \
+        crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem \
+        crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem-pico-w.uf2
 
 # Render merged docker-compose configuration.
 compose-config:
