@@ -49,10 +49,11 @@ where
 
         loop {
             self.poll();
-            if self.consume_next_command().is_err() {
-                self.enter_error(BrainstemError::CreateNoResponse);
+            if let Err(error) = self.consume_next_command() {
+                self.enter_error(error);
             }
             if self.commands.is_empty() {
+                let _ = self.create_uart.stop(&mut self.hardware, &mut self.events);
                 self.idle();
             }
         }
@@ -75,6 +76,8 @@ where
                     .wait_for_response(&mut self.hardware, &mut self.events)
             }
             BrainstemCommand::SleepCreate => {
+                self.create_uart
+                    .stop(&mut self.hardware, &mut self.events)?;
                 self.power.sleep(&mut self.hardware, &mut self.events);
                 Ok(())
             }
@@ -112,8 +115,8 @@ where
             self.poll();
             if let Some(command) = self.commands.pop_front() {
                 let _ = self.commands.push_front(command);
-                if self.consume_next_command().is_err() {
-                    self.enter_error(BrainstemError::CreateNoResponse);
+                if let Err(error) = self.consume_next_command() {
+                    self.enter_error(error);
                 }
             }
             self.leds.idle_once(&mut self.hardware);

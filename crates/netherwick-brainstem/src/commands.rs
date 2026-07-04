@@ -8,6 +8,7 @@ pub enum CreateOiMode {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum BrainstemCommand {
     WakeCreate,
     SleepCreate,

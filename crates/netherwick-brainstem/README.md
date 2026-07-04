@@ -147,13 +147,15 @@ On boot the firmware:
 1. Blinks the onboard LED and optional GP20 LED.
 2. Enqueues the demo `BrainstemCommand` script.
 3. Pulses Create Power Toggle to wake the robot.
-4. Polls the Create OI sensor stream until UART bytes are received.
+4. Polls the Create OI sensor stream until UART bytes confirm the robot is alive.
 5. Pulses BRC low and releases it.
 6. Sends Open Interface `Start`.
-7. Enters `Safe` mode by default.
+7. Enters `Safe` mode.
 8. Sends a tiny movement jig: short forward, short left turn, short right turn, stop.
-9. Pulses Create Power Toggle again.
+9. Sends Stop, then pulses Create Power Toggle again.
 10. Leaves the controller in a safe idle blink loop.
+
+Motor movement is safety-gated: the built-in script only reaches drive commands after UART RX/responses confirm the Create is alive. Timeout, UART framing error, or invalid response skips the jig, sends Stop, and enters the repeating three-blink error pattern.
 
 ## Porting
 
@@ -163,4 +165,4 @@ To add a new controller, implement `BrainstemHardware` for that board, provide i
 
 To add a new robot body, add a body kind in `body.toml`/`build.rs`, implement a driver that consumes `BrainstemCommand` values or a body-specific command subset, and emit `BrainstemEvent` results from the driver. A later Orange Pi process can replace the built-in demo script by sending serialized `BrainstemCommand` values over UART, SPI, or USB into the same command queue.
 
-If the Create does not respond over UART, the firmware sends a stop command and enters a repeating three-blink error pattern.
+If a command fails, the firmware sends a stop command and enters a repeating three-blink error pattern.

@@ -34,6 +34,7 @@ pub enum BrainstemEvent {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum BrainstemError {
     CreateNoResponse,
     UartFraming,
