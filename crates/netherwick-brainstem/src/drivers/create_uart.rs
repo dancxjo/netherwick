@@ -4,6 +4,7 @@ use crate::body;
 use crate::commands::CreateOiMode;
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::{BrainstemHardware, SerialRead};
+use crate::status;
 
 const OI_START: u8 = 128;
 const OI_SAFE: u8 = 131;
@@ -29,6 +30,7 @@ impl CreateUart {
             SerialRead::Byte(byte) => {
                 let mut bytes = Vec::new();
                 let _ = bytes.push(byte);
+                status::mark_uart_rx_ok(hardware.now_us() / 1_000);
                 let _ = events.push_back(BrainstemEvent::CreatePacketReceived {
                     packet_id: 0,
                     bytes,
@@ -36,6 +38,7 @@ impl CreateUart {
             }
             SerialRead::WouldBlock => {}
             SerialRead::Error => {
+                status::mark_uart_rx_error();
                 let _ = events.push_back(BrainstemEvent::Error(BrainstemError::UartFraming));
             }
         }
@@ -56,6 +59,7 @@ impl CreateUart {
             self.send_bytes(hardware, &[OI_SENSORS, body::CREATE_SENSOR_PROBE_PACKET])?;
             let mut bytes = Vec::new();
             if self.read_packet_bytes(hardware, &mut bytes, 2).is_ok() {
+                status::mark_uart_rx_ok(hardware.now_us() / 1_000);
                 let _ = events.push_back(BrainstemEvent::CreatePacketReceived {
                     packet_id: body::CREATE_SENSOR_PROBE_PACKET,
                     bytes,
@@ -63,6 +67,7 @@ impl CreateUart {
                 return Ok(());
             }
             if hardware.now_us().wrapping_sub(deadline) < u32::MAX / 2 {
+                status::mark_uart_rx_error();
                 let _ = events.push_back(BrainstemEvent::Error(BrainstemError::CreateNoResponse));
                 return Err(BrainstemError::CreateNoResponse);
             }
