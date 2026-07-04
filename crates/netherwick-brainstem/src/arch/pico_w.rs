@@ -1,7 +1,7 @@
 use core::fmt::Write as _;
 
 use cyw43::aligned_bytes;
-use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
+use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -11,7 +11,7 @@ use embassy_net::{
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
 use embassy_rp::peripherals::{
-    DMA_CH0, PIO0, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29, UART0,
+    DMA_CH0, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29, PIO0, UART0,
 };
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::uart::{Blocking, Config as UartConfig, DataBits, Parity, StopBits, Uart};
@@ -37,6 +37,7 @@ const MDNS_PORT: u16 = 5353;
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
 const DHCP_LEASE_SECONDS: u32 = 3_600;
+const DHCP_OFFER_HOLD_SECONDS: u32 = 30;
 
 static mut CORE1_STACK: CoreStack<8192> = CoreStack::new();
 
@@ -120,9 +121,7 @@ impl BrainstemHardware for PicoWBrainstem {
 }
 
 pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
-    let hardware = PicoWBrainstem::new(
-        p.UART0, p.PIN_16, p.PIN_17, p.PIN_18, p.PIN_19, p.PIN_20,
-    );
+    let hardware = PicoWBrainstem::new(p.UART0, p.PIN_16, p.PIN_17, p.PIN_18, p.PIN_19, p.PIN_20);
 
     spawn_core1(
         p.CORE1,
@@ -130,9 +129,7 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
         move || Runtime::new(hardware).run_demo(),
     );
 
-    spawn_wifi_lane(
-        p.PIO0, p.DMA_CH0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29,
-    );
+    spawn_wifi_lane(p.PIO0, p.DMA_CH0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -147,9 +144,10 @@ fn spawn_wifi_lane(
     static EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
     let executor = EXECUTOR.init(embassy_executor::Executor::new());
     executor.run(|spawner| {
-        spawner.spawn(wifi_task(
-            spawner, pio0, dma0, wifi_power, wifi_dio, wifi_cs, wifi_clk,
-        ).expect("spawn wifi task"));
+        spawner.spawn(
+            wifi_task(spawner, pio0, dma0, wifi_power, wifi_dio, wifi_cs, wifi_clk)
+                .expect("spawn wifi task"),
+        );
     })
 }
 
@@ -333,6 +331,7 @@ async fn dhcp_task(stack: Stack<'static>) -> ! {
     let mut tx_buffer = [0; 1024];
     let mut request = [0; 576];
     let mut response = [0; 576];
+    let mut leases = DhcpLeaseState::new();
     let endpoint = IpEndpoint::new(
         IpAddress::Ipv4(Ipv4Address::new(255, 255, 255, 255)),
         DHCP_CLIENT_PORT,
@@ -357,7 +356,13 @@ async fn dhcp_task(stack: Stack<'static>) -> ! {
                 continue;
             };
 
-            let Some(reply) = build_dhcp_reply(&request[..len], &mut response) else {
+            let Some(dhcp_request) = DhcpRequest::parse(&request[..len]) else {
+                continue;
+            };
+            let Some(grant) = leases.grant(dhcp_request, Instant::now().as_millis() as u64) else {
+                continue;
+            };
+            let Some(reply) = build_dhcp_reply(grant, &request[..len], &mut response) else {
                 continue;
             };
             let _ = socket.send_to(reply, endpoint).await;
@@ -391,7 +396,10 @@ async fn write_plain_status(socket: &mut TcpSocket<'_>, code: u16, text: &str) {
 }
 
 fn request_path(request: &[u8]) -> Option<&str> {
-    let line_end = request.windows(2).position(|w| w == b"\r\n").unwrap_or(request.len());
+    let line_end = request
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(request.len());
     let line = core::str::from_utf8(&request[..line_end]).ok()?;
     let mut parts = line.split(' ');
     match (parts.next(), parts.next()) {
@@ -429,18 +437,11 @@ fn build_mdns_announcement(packet: &mut [u8; 96]) -> usize {
     i + answer.len()
 }
 
-fn build_dhcp_reply<'a>(request: &[u8], response: &'a mut [u8; 576]) -> Option<&'a [u8]> {
-    let message_type = dhcp_message_type(request)?;
-    let reply_type = match message_type {
-        1 => 2,
-        3 => 5,
-        _ => return None,
-    };
-
-    if request.len() < 240 || request[0] != 1 {
-        return None;
-    }
-
+fn build_dhcp_reply<'a>(
+    grant: DhcpGrant,
+    request: &[u8],
+    response: &'a mut [u8; 576],
+) -> Option<&'a [u8]> {
     response.fill(0);
     response[0] = 2;
     response[1] = request[1];
@@ -454,7 +455,7 @@ fn build_dhcp_reply<'a>(request: &[u8], response: &'a mut [u8; 576]) -> Option<&
     response[236..240].copy_from_slice(&[99, 130, 83, 99]);
 
     let mut i = 240;
-    i = write_dhcp_option(i, response, 53, &[reply_type])?;
+    i = write_dhcp_option(i, response, 53, &[grant.reply_message_type()])?;
     i = write_dhcp_option(i, response, 54, &AP_IP_OCTETS)?;
     i = write_dhcp_option(i, response, 51, &DHCP_LEASE_SECONDS.to_be_bytes())?;
     i = write_dhcp_option(i, response, 1, &[255, 255, 255, 0])?;
@@ -462,6 +463,116 @@ fn build_dhcp_reply<'a>(request: &[u8], response: &'a mut [u8; 576]) -> Option<&
     i = write_dhcp_option(i, response, 6, &AP_IP_OCTETS)?;
     response[i] = 255;
     Some(&response[..i + 1])
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct DhcpClient {
+    hardware_address: [u8; 6],
+}
+
+#[derive(Clone, Copy)]
+struct DhcpRequest {
+    message_type: u8,
+    client: DhcpClient,
+}
+
+impl DhcpRequest {
+    fn parse(packet: &[u8]) -> Option<Self> {
+        if packet.len() < 240 || packet[0] != 1 || packet[1] != 1 || packet[2] < 6 {
+            return None;
+        }
+
+        let mut hardware_address = [0; 6];
+        hardware_address.copy_from_slice(&packet[28..34]);
+
+        Some(Self {
+            message_type: dhcp_message_type(packet)?,
+            client: DhcpClient { hardware_address },
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DhcpLease {
+    client: DhcpClient,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DhcpGrant {
+    Offer,
+    Ack,
+}
+
+impl DhcpGrant {
+    fn reply_message_type(self) -> u8 {
+        match self {
+            Self::Offer => 2,
+            Self::Ack => 5,
+        }
+    }
+}
+
+struct DhcpLeaseState {
+    active: Option<DhcpLease>,
+}
+
+impl DhcpLeaseState {
+    const fn new() -> Self {
+        Self { active: None }
+    }
+
+    fn grant(&mut self, request: DhcpRequest, now_ms: u64) -> Option<DhcpGrant> {
+        self.clear_expired(now_ms);
+
+        match request.message_type {
+            1 => self
+                .reserve(request.client, now_ms, DHCP_OFFER_HOLD_SECONDS)
+                .then_some(DhcpGrant::Offer),
+            3 => self
+                .reserve(request.client, now_ms, DHCP_LEASE_SECONDS)
+                .then_some(DhcpGrant::Ack),
+            7 => {
+                self.release(request.client);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn reserve(&mut self, client: DhcpClient, now_ms: u64, seconds: u32) -> bool {
+        if let Some(active) = self.active {
+            if active.client != client {
+                return false;
+            }
+        }
+
+        self.active = Some(DhcpLease {
+            client,
+            expires_at_ms: now_ms.saturating_add(seconds as u64 * 1_000),
+        });
+        true
+    }
+
+    fn release(&mut self, client: DhcpClient) {
+        if self
+            .active
+            .map(|active| active.client == client)
+            .unwrap_or(false)
+        {
+            self.active = None;
+        }
+    }
+
+    fn clear_expired(&mut self, now_ms: u64) {
+        if self
+            .active
+            .map(|active| now_ms >= active.expires_at_ms)
+            .unwrap_or(false)
+        {
+            self.active = None;
+        }
+    }
 }
 
 fn dhcp_message_type(packet: &[u8]) -> Option<u8> {
