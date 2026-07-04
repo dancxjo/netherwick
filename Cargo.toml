@@ -28,7 +28,7 @@ members = [
     "xtask",
 ]
 exclude = [
-    "crates/netherwick-brainstem-rp2040",
+    "crates/netherwick-brainstem",
 ]
 resolver = "2"
 

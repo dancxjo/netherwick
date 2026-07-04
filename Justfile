@@ -148,15 +148,15 @@ fmt:
 check:
     cargo check --workspace
 
-# Build the RP2040 brainstem firmware ELF.
+# Build the brainstem firmware ELF for the configured chip backend.
 brainstem-build:
-    cd crates/netherwick-brainstem-rp2040 && cargo build --release
+    cd crates/netherwick-brainstem && cargo build --release
 
-# Convert the RP2040 brainstem firmware ELF to a Pico UF2.
+# Convert the brainstem firmware ELF to a Pico UF2 for the RP2040 backend.
 brainstem-uf2: brainstem-build
     elf2uf2-rs \
-        crates/netherwick-brainstem-rp2040/target/thumbv6m-none-eabi/release/netherwick-brainstem-rp2040 \
-        crates/netherwick-brainstem-rp2040/target/thumbv6m-none-eabi/release/netherwick-brainstem-rp2040.uf2
+        crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem \
+        crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem.uf2
 
 # Render merged docker-compose configuration.
 compose-config:

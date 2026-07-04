@@ -1,6 +1,8 @@
-# Netherwick Brainstem RP2040
+# Netherwick Brainstem
 
-Tiny deterministic RP2040 firmware for bridging/control of the iRobot Create Open Interface. This crate intentionally contains no planning, behavior selection, LLM logic, mapping, or Netherwick runtime logic.
+Tiny deterministic firmware for bridging/control of the iRobot Create Open Interface. This crate intentionally contains no planning, behavior selection, LLM logic, mapping, or Netherwick runtime logic.
+
+The crate name and control layer are chip-neutral. The current hardware backend is `arch::rp2040`, targeting a Raspberry Pi Pico/RP2040 and producing a UF2 image.
 
 ## Wiring
 
@@ -33,10 +35,10 @@ From the repo root:
 just brainstem-build
 ```
 
-The direct Cargo equivalent is:
+The direct Cargo equivalent for the current RP2040 backend is:
 
 ```bash
-cd crates/netherwick-brainstem-rp2040
+cd crates/netherwick-brainstem
 cargo build --release
 ```
 
@@ -57,7 +59,7 @@ just brainstem-uf2
 The UF2 is written to:
 
 ```text
-crates/netherwick-brainstem-rp2040/target/thumbv6m-none-eabi/release/netherwick-brainstem-rp2040.uf2
+crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem.uf2
 ```
 
 To flash, hold the Pico BOOTSEL button while plugging it into USB, then copy the UF2 file to the mounted `RPI-RP2` drive.
@@ -74,6 +76,12 @@ On boot the firmware:
 6. Enters `Safe` mode by default.
 7. Sends a tiny movement jig: short forward, short left turn, short right turn, stop.
 8. Pulses Create Power Toggle again.
-9. Leaves the RP2040 in a safe idle blink loop.
+9. Leaves the controller in a safe idle blink loop.
+
+## Porting
+
+Create behavior lives in `src/create.rs` and depends only on the `BrainstemHardware` trait in `src/hardware.rs`. Chip-specific code belongs under `src/arch/`.
+
+To add a new controller, implement `BrainstemHardware` for that board, provide its entry point and linker/build config, and keep Create pin polarity and voltage assumptions documented in the backend.
 
 If the Create does not respond over UART, the firmware sends a stop command and enters a repeating three-blink error pattern.
