@@ -1,0 +1,64 @@
+[board]
+name = "raspberry-pi-pico"
+arch = "rp2040"
+
+[rp2040]
+xosc_crystal_freq_hz = 12000000
+
+[pins.create_uart]
+tx = "GP16"
+tx_gpio = 16
+tx_physical_pin = 21
+rx = "GP17"
+rx_gpio = 17
+rx_physical_pin = 22
+
+[pins.power_toggle]
+pin = "GP18"
+gpio = 18
+physical_pin = 24
+
+[pins.create_brc]
+enabled = false
+pin = "GP19"
+gpio = 19
+physical_pin = 25
+
+[pins.leds]
+onboard = "GP25"
+onboard_gpio = 25
+status = "GP20"
+status_gpio = 20
+status_physical_pin = 26
+
+[pins.create_device_detect]
+enabled = false
+pin = "GP21"
+gpio = 21
+
+[pins.estop]
+enabled = false
+pin = "GP22"
+gpio = 22
+
+[i2c.primary]
+sda = "GP4"
+sda_gpio = 4
+scl = "GP5"
+scl_gpio = 5
+
+[spi.primary]
+mosi = "GP7"
+mosi_gpio = 7
+miso = "GP8"
+miso_gpio = 8
+sck = "GP6"
+sck_gpio = 6
+
+[pwm]
+aux0 = "GP10"
+aux0_gpio = 10
+
+[adc]
+battery = "GP26"
+battery_gpio = 26

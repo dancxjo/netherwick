@@ -4,9 +4,9 @@ Tiny deterministic firmware for bridging/control of the iRobot Create Open Inter
 
 The crate name and control layer are chip-neutral. The current hardware backend is `arch::rp2040`, targeting a Raspberry Pi Pico/RP2040 and producing a UF2 image.
 
-## Body Config
+## Configuration
 
-The target robot body is declared in `body.toml`. The firmware build reads that file and generates static constants; the embedded firmware does not parse TOML at runtime and does not allocate.
+The target robot body is declared in `body.toml`; the microcontroller board mapping is declared in `board.toml`. The firmware build reads both files and generates static constants; the embedded firmware does not parse TOML at runtime and does not allocate.
 
 Current body:
 
@@ -17,12 +17,22 @@ kind = "create_oi"
 drive = "differential"
 ```
 
-The file also declares Create OI UART settings, timing values, and the current RP2040/Pico pin map. To support another robot body, add a new body kind and driver implementation, then point the runtime at that driver without changing the high-level event loop.
+`body.toml` declares robot capabilities and timings: Create OI UART settings, differential drive, default OI mode, and demo timing. To support another robot body, add a new body kind and driver implementation, then point the runtime at that driver without changing the high-level event loop.
+
+Current board:
+
+```toml
+[board]
+name = "raspberry-pi-pico"
+arch = "rp2040"
+```
+
+`board.toml` owns physical pin assignments for the RP2040 backend and reserves logical roles for later capabilities such as I2C, SPI, PWM, ADC, device detect, and emergency stop. This keeps robot-body capabilities separate from the board used to host the brainstem.
 
 BRC is optional and disabled by default for 57600 baud bring-up:
 
 ```toml
-[gpio.create_brc]
+[pins.create_brc]
 enabled = false
 pin = "GP19"
 gpio = 19
@@ -45,12 +55,13 @@ Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external
 
 The Power Toggle and BRC outputs assume external wiring that is electrically safe for both the Pico and the Create. Review polarity and isolation before connecting a real robot.
 
-For initial 57600 baud Open Interface bring-up, wire Power Toggle, UART TX/RX, and GND first. Leave BRC disabled unless the robot body configuration explicitly enables it.
+For initial 57600 baud Open Interface bring-up, wire Power Toggle, UART TX/RX, and GND first. Leave BRC disabled unless the board configuration explicitly enables it.
 
 ## Architecture
 
 ```text
 body.toml
+board.toml
   -> build.rs generated body constants
 
 src/

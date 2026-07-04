@@ -21,20 +21,3 @@ uart_byte_timeout_ms = 20
 idle_blink_ms = 1000
 error_blink_ms = 150
 error_pause_ms = 900
-
-[rp2040]
-xosc_crystal_freq_hz = 12000000
-
-[rp2040.pins]
-create_tx_gpio = 16
-create_tx_physical_pin = 21
-create_rx_gpio = 17
-create_rx_physical_pin = 22
-onboard_led_gpio = 25
-create_power_toggle_gpio = 18
-external_led_gpio = 20
-
-[gpio.create_brc]
-enabled = false
-pin = "GP19"
-gpio = 19
