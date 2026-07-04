@@ -206,6 +206,7 @@ The Pico W backend starts an open AP:
 SSID: pete-brainstem
 Device IP: 192.168.4.1
 Hostname: pete.local via mDNS announcement
+DHCP: offers 192.168.4.2/24 with router/DNS set to 192.168.4.1
 ```
 
 The interface is read-only for Brainstem 0:
@@ -216,7 +217,7 @@ The interface is read-only for Brainstem 0:
 
 The status JSON includes firmware name/version, body name/kind, uptime, runtime state, Create power state, OI mode, UART RX health, last UART packet timestamp, current command, last error, and demo state.
 
-Wi-Fi/AP/HTTP/mDNS failure does not prevent motor stop, UART timeout handling, power safety, or the error blink pattern. The Wi-Fi lane is not allowed to call robot drivers directly; future operator commands must enter through a bounded command queue consumed by the runtime lane.
+Wi-Fi/AP/DHCP/HTTP/mDNS failure does not prevent motor stop, UART timeout handling, power safety, or the error blink pattern. The Wi-Fi lane is not allowed to call robot drivers directly; future operator commands must enter through a bounded command queue consumed by the runtime lane.
 
 ## Demo Behavior
 

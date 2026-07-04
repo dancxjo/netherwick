@@ -29,9 +29,14 @@ use crate::status;
 const AP_SSID: &str = "pete-brainstem";
 const MDNS_NAME: &[u8] = b"\x04pete\x05local\x00";
 const AP_CHANNEL: u8 = 6;
+const AP_IP_OCTETS: [u8; 4] = [192, 168, 4, 1];
+const DHCP_LEASE_IP_OCTETS: [u8; 4] = [192, 168, 4, 2];
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const HTTP_PORT: u16 = 80;
 const MDNS_PORT: u16 = 5353;
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_LEASE_SECONDS: u32 = 3_600;
 
 static mut CORE1_STACK: CoreStack<8192> = CoreStack::new();
 
@@ -165,6 +170,7 @@ async fn wifi_task(
         let _ = control.gpio_set(0, true).await;
         spawner.spawn(http_task(stack).expect("spawn http task"));
         spawner.spawn(mdns_task(stack).expect("spawn mdns task"));
+        spawner.spawn(dhcp_task(stack).expect("spawn dhcp task"));
     }
 
     loop {
@@ -215,8 +221,13 @@ async fn start_wifi_ap(
         gateway: None,
     });
 
-    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
-    let (stack, runner) = embassy_net::new(net_device, config, RESOURCES.init(StackResources::new()), 0x5eed);
+    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
+    let (stack, runner) = embassy_net::new(
+        net_device,
+        config,
+        RESOURCES.init(StackResources::new()),
+        0x5eed,
+    );
     let _ = stack.join_multicast_group(IpAddress::Ipv4(Ipv4Address::new(224, 0, 0, 251)));
     spawner.spawn(net_runner_task(runner).expect("spawn net runner"));
 
@@ -314,6 +325,46 @@ async fn mdns_task(stack: Stack<'static>) -> ! {
     }
 }
 
+#[embassy_executor::task]
+async fn dhcp_task(stack: Stack<'static>) -> ! {
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut rx_buffer = [0; 1024];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut tx_buffer = [0; 1024];
+    let mut request = [0; 576];
+    let mut response = [0; 576];
+    let endpoint = IpEndpoint::new(
+        IpAddress::Ipv4(Ipv4Address::new(255, 255, 255, 255)),
+        DHCP_CLIENT_PORT,
+    );
+
+    loop {
+        let mut socket = UdpSocket::new(
+            stack,
+            &mut rx_meta,
+            &mut rx_buffer,
+            &mut tx_meta,
+            &mut tx_buffer,
+        );
+
+        if socket.bind(DHCP_SERVER_PORT).is_err() {
+            Timer::after_secs(5).await;
+            continue;
+        }
+
+        loop {
+            let Ok((len, _meta)) = socket.recv_from(&mut request).await else {
+                continue;
+            };
+
+            let Some(reply) = build_dhcp_reply(&request[..len], &mut response) else {
+                continue;
+            };
+            let _ = socket.send_to(reply, endpoint).await;
+        }
+    }
+}
+
 async fn write_response(socket: &mut TcpSocket<'_>, content_type: &str, body: &[u8]) {
     let mut header = heapless::String::<192>::new();
     let _ = write!(
@@ -376,6 +427,88 @@ fn build_mdns_announcement(packet: &mut [u8; 96]) -> usize {
     ];
     packet[i..i + answer.len()].copy_from_slice(&answer);
     i + answer.len()
+}
+
+fn build_dhcp_reply<'a>(request: &[u8], response: &'a mut [u8; 576]) -> Option<&'a [u8]> {
+    let message_type = dhcp_message_type(request)?;
+    let reply_type = match message_type {
+        1 => 2,
+        3 => 5,
+        _ => return None,
+    };
+
+    if request.len() < 240 || request[0] != 1 {
+        return None;
+    }
+
+    response.fill(0);
+    response[0] = 2;
+    response[1] = request[1];
+    response[2] = request[2];
+    response[3] = request[3];
+    response[4..8].copy_from_slice(&request[4..8]);
+    response[10..12].copy_from_slice(&request[10..12]);
+    response[16..20].copy_from_slice(&DHCP_LEASE_IP_OCTETS);
+    response[20..24].copy_from_slice(&AP_IP_OCTETS);
+    response[28..44].copy_from_slice(&request[28..44]);
+    response[236..240].copy_from_slice(&[99, 130, 83, 99]);
+
+    let mut i = 240;
+    i = write_dhcp_option(i, response, 53, &[reply_type])?;
+    i = write_dhcp_option(i, response, 54, &AP_IP_OCTETS)?;
+    i = write_dhcp_option(i, response, 51, &DHCP_LEASE_SECONDS.to_be_bytes())?;
+    i = write_dhcp_option(i, response, 1, &[255, 255, 255, 0])?;
+    i = write_dhcp_option(i, response, 3, &AP_IP_OCTETS)?;
+    i = write_dhcp_option(i, response, 6, &AP_IP_OCTETS)?;
+    response[i] = 255;
+    Some(&response[..i + 1])
+}
+
+fn dhcp_message_type(packet: &[u8]) -> Option<u8> {
+    if packet.len() < 240 || packet[236..240] != [99, 130, 83, 99] {
+        return None;
+    }
+
+    let mut i = 240;
+    while i < packet.len() {
+        let option = packet[i];
+        i += 1;
+        match option {
+            0 => continue,
+            255 => return None,
+            _ => {
+                if i >= packet.len() {
+                    return None;
+                }
+                let len = packet[i] as usize;
+                i += 1;
+                if i + len > packet.len() {
+                    return None;
+                }
+                if option == 53 && len == 1 {
+                    return Some(packet[i]);
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
+fn write_dhcp_option(
+    offset: usize,
+    packet: &mut [u8; 576],
+    option: u8,
+    value: &[u8],
+) -> Option<usize> {
+    let end = offset.checked_add(2)?.checked_add(value.len())?;
+    if end >= packet.len() || value.len() > u8::MAX as usize {
+        return None;
+    }
+    packet[offset] = option;
+    packet[offset + 1] = value.len() as u8;
+    packet[offset + 2..end].copy_from_slice(value);
+    Some(end)
 }
 
 fn level(high: bool) -> Level {
