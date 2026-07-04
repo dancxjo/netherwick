@@ -155,7 +155,7 @@ To flash, hold the Pico BOOTSEL button while plugging it into USB, then copy the
 
 On boot the firmware:
 
-1. Blinks the onboard LED and optional GP20 LED.
+1. Blinks the onboard Pico LED as soon as RP2040 GPIO is initialized, then blinks the onboard LED and optional GP20 LED from the runtime.
 2. Enqueues the demo `BrainstemCommand` script.
 3. Pulses Create Power Toggle to wake the robot.
 4. Polls the Create OI sensor stream until UART bytes confirm the robot is alive.

@@ -68,7 +68,7 @@ impl Rp2040Brainstem {
         .ok()
         .unwrap();
 
-        let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+        let mut timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
         let sio = Sio::new(pac.SIO);
         let pins = hal::gpio::Pins::new(
             pac.IO_BANK0,
@@ -76,6 +76,9 @@ impl Rp2040Brainstem {
             sio.gpio_bank0,
             &mut pac.RESETS,
         );
+
+        let mut onboard_led = pins.gpio25.into_push_pull_output();
+        early_onboard_heartbeat(&mut timer, &mut onboard_led);
 
         let uart_pins = (
             pins.gpio16.into_function::<FunctionUart>(),
@@ -99,7 +102,7 @@ impl Rp2040Brainstem {
             power_toggle: pins.gpio18.into_push_pull_output(),
             brc: pins.gpio19.into_push_pull_output(),
             external_led: pins.gpio20.into_push_pull_output(),
-            onboard_led: pins.gpio25.into_push_pull_output(),
+            onboard_led,
         }
     }
 }
@@ -155,5 +158,17 @@ where
         let _ = pin.set_high();
     } else {
         let _ = pin.set_low();
+    }
+}
+
+fn early_onboard_heartbeat<P>(timer: &mut hal::Timer, onboard_led: &mut P)
+where
+    P: OutputPin<Error = Infallible>,
+{
+    for _ in 0..3 {
+        set_pin(onboard_led, true);
+        timer.delay_ms(80);
+        set_pin(onboard_led, false);
+        timer.delay_ms(80);
     }
 }
