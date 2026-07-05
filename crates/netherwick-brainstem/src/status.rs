@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use crate::body;
-use crate::commands::{BrainstemCommand, CreateOiMode};
+use crate::commands::{BrainstemCommand, CreateOiMode, LightPattern, RuntimeCommand};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::UartReadError;
 
@@ -37,8 +37,21 @@ static PENDING_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_A: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_B: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_DURATION_MS: AtomicU32 = AtomicU32::new(0);
+static PENDING_COMMAND_SEQ: AtomicU32 = AtomicU32::new(0);
+static PENDING_VELOCITY_KIND: AtomicU8 = AtomicU8::new(ControlCommandCode::None as u8);
+static PENDING_VELOCITY_ID: AtomicU32 = AtomicU32::new(0);
+static PENDING_VELOCITY_A: AtomicU32 = AtomicU32::new(0);
+static PENDING_VELOCITY_B: AtomicU32 = AtomicU32::new(0);
+static PENDING_VELOCITY_TTL_MS: AtomicU32 = AtomicU32::new(0);
+static PENDING_VELOCITY_SEQ: AtomicU32 = AtomicU32::new(0);
 static LAST_ACCEPTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static LAST_REJECTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
+static FOREBRAIN_UART_RX_BYTES: AtomicU32 = AtomicU32::new(0);
+static FOREBRAIN_UART_RX_LINES: AtomicU32 = AtomicU32::new(0);
+static FOREBRAIN_UART_LAST_SEQ: AtomicU32 = AtomicU32::new(0);
+static FOREBRAIN_UART_LAST_ERROR: AtomicU8 = AtomicU8::new(ForebrainUartErrorCode::None as u8);
+static FOREBRAIN_UART_LAST_RX_MS: AtomicU32 = AtomicU32::new(0);
+static FOREBRAIN_UART_LAST_COMMAND_MS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -76,6 +89,12 @@ pub struct BrainstemStatus {
     pub pending_command_id: u32,
     pub last_accepted_command_id: u32,
     pub last_rejected_command_id: u32,
+    pub forebrain_uart_rx_bytes: u32,
+    pub forebrain_uart_rx_lines: u32,
+    pub forebrain_uart_last_seq: u32,
+    pub forebrain_uart_last_error: u8,
+    pub forebrain_uart_link_alive_ms: u32,
+    pub forebrain_uart_last_command_age_ms: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -137,6 +156,18 @@ enum UartReadErrorCode {
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
+#[allow(dead_code)]
+pub enum ForebrainUartErrorCode {
+    None = 0,
+    LineTooLong = 1,
+    Utf8 = 2,
+    Parse = 3,
+    Busy = 4,
+    Uart = 5,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
 pub enum RuntimeActionCode {
     None = 0,
     PowerPulse = 1,
@@ -165,24 +196,21 @@ enum HttpsState {
     Unavailable = 0,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 enum ControlCommandCode {
     None = 0,
-    WakeCreate = 1,
-    SleepCreate = 2,
-    StartOi = 3,
-    PulseBrc = 4,
-    Stop = 5,
-    EStop = 6,
-    ClearEStop = 7,
-    SetModePassive = 8,
-    SetModeSafe = 9,
-    SetModeFull = 10,
-    DriveDirect = 11,
-    CmdVel = 12,
-    DriveArc = 13,
-    Ping = 14,
+    Ping = 1,
+    Arm = 2,
+    Disarm = 3,
+    EStop = 4,
+    ClearEStop = 5,
+    CmdVel = 6,
+    Stop = 7,
+    Status = 8,
+    SongPlay = 9,
+    Dock = 10,
+    SetLights = 11,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -193,37 +221,36 @@ pub fn set_demo_state(state: DemoState) {
     DEMO_STATE.store(state as u8, Ordering::Relaxed);
 }
 
-pub fn set_command(command: Option<BrainstemCommand>) {
+pub fn set_command(command: Option<RuntimeCommand>) {
     let code = match command {
         None => CommandCode::None,
-        Some(BrainstemCommand::WakeCreate) => CommandCode::WakeCreate,
-        Some(BrainstemCommand::SleepCreate) => CommandCode::SleepCreate,
-        Some(BrainstemCommand::SetMode(CreateOiMode::Passive)) => CommandCode::SetOiPassive,
-        Some(BrainstemCommand::SetMode(CreateOiMode::Safe)) => CommandCode::SetOiSafe,
-        Some(BrainstemCommand::SetMode(CreateOiMode::Full)) => CommandCode::SetOiFull,
-        Some(BrainstemCommand::Stop) => CommandCode::StopDrive,
-        Some(BrainstemCommand::EStop) => CommandCode::StopDrive,
-        Some(BrainstemCommand::ClearEStop) => CommandCode::None,
-        Some(BrainstemCommand::DriveDirect { .. }) => CommandCode::Drive,
-        Some(BrainstemCommand::CmdVel { .. }) => CommandCode::Drive,
-        Some(BrainstemCommand::DriveArc { .. }) => CommandCode::Drive,
-        Some(BrainstemCommand::Ping) => CommandCode::None,
-        Some(BrainstemCommand::PulseBrc) => CommandCode::PulseBrc,
-        Some(BrainstemCommand::StartOi) => CommandCode::StartOi,
-        Some(BrainstemCommand::SetOiMode(CreateOiMode::Passive)) => CommandCode::SetOiPassive,
-        Some(BrainstemCommand::SetOiMode(CreateOiMode::Safe)) => CommandCode::SetOiSafe,
-        Some(BrainstemCommand::SetOiMode(CreateOiMode::Full)) => CommandCode::SetOiFull,
-        Some(BrainstemCommand::Drive { .. }) => CommandCode::Drive,
-        Some(BrainstemCommand::StopDrive) => CommandCode::StopDrive,
+        Some(RuntimeCommand::WakeCreate) => CommandCode::WakeCreate,
+        Some(RuntimeCommand::SleepCreate) => CommandCode::SleepCreate,
+        Some(RuntimeCommand::SetMode(CreateOiMode::Passive)) => CommandCode::SetOiPassive,
+        Some(RuntimeCommand::SetMode(CreateOiMode::Safe)) => CommandCode::SetOiSafe,
+        Some(RuntimeCommand::SetMode(CreateOiMode::Full)) => CommandCode::SetOiFull,
+        Some(RuntimeCommand::Stop) => CommandCode::StopDrive,
+        Some(RuntimeCommand::EStop) => CommandCode::StopDrive,
+        Some(RuntimeCommand::ClearEStop) => CommandCode::None,
+        Some(RuntimeCommand::DriveDirect { .. }) => CommandCode::Drive,
+        Some(RuntimeCommand::CmdVel { .. }) => CommandCode::Drive,
+        Some(RuntimeCommand::DriveArc { .. }) => CommandCode::Drive,
+        Some(RuntimeCommand::PulseBrc) => CommandCode::PulseBrc,
+        Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
+        Some(RuntimeCommand::Drive { .. }) => CommandCode::Drive,
+        Some(RuntimeCommand::StopDrive) => CommandCode::StopDrive,
+        Some(RuntimeCommand::SongPlay { .. })
+        | Some(RuntimeCommand::Dock)
+        | Some(RuntimeCommand::SetLights { .. }) => CommandCode::None,
     };
     CURRENT_COMMAND.store(code as u8, Ordering::Relaxed);
 }
 
 #[cfg(feature = "pico-w")]
 pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> bool {
-    if PENDING_COMMAND_KIND.load(Ordering::Relaxed) != ControlCommandCode::None as u8 {
-        LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-        return false;
+    if matches!(command, BrainstemCommand::Status | BrainstemCommand::Ping) {
+        LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        return true;
     }
 
     let Some((kind, a, b, duration_ms)) = encode_control_command(command) else {
@@ -231,10 +258,35 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
         return false;
     };
 
+    if kind == ControlCommandCode::CmdVel {
+        let seq = command_seq(command);
+        if !seq_is_current_or_newer(seq, PENDING_VELOCITY_SEQ.load(Ordering::Relaxed)) {
+            LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+            return false;
+        }
+
+        PENDING_VELOCITY_ID.store(command_id, Ordering::Relaxed);
+        PENDING_VELOCITY_A.store(a, Ordering::Relaxed);
+        PENDING_VELOCITY_B.store(b, Ordering::Relaxed);
+        PENDING_VELOCITY_TTL_MS.store(duration_ms.unwrap_or(0), Ordering::Relaxed);
+        PENDING_VELOCITY_SEQ.store(seq, Ordering::Relaxed);
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::CmdVel as u8, Ordering::Relaxed);
+        LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        return true;
+    }
+
+    if matches!(kind, ControlCommandCode::Stop | ControlCommandCode::EStop) {
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    } else if PENDING_COMMAND_KIND.load(Ordering::Relaxed) != ControlCommandCode::None as u8 {
+        LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        return false;
+    }
+
     PENDING_COMMAND_ID.store(command_id, Ordering::Relaxed);
     PENDING_COMMAND_A.store(a, Ordering::Relaxed);
     PENDING_COMMAND_B.store(b, Ordering::Relaxed);
     PENDING_COMMAND_DURATION_MS.store(duration_ms.unwrap_or(0), Ordering::Relaxed);
+    PENDING_COMMAND_SEQ.store(command_seq(command), Ordering::Relaxed);
     PENDING_COMMAND_KIND.store(kind as u8, Ordering::Relaxed);
     LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
     true
@@ -242,19 +294,36 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
 
 pub fn take_control_command() -> Option<BrainstemCommand> {
     let kind = PENDING_COMMAND_KIND.load(Ordering::Relaxed);
-    if kind == ControlCommandCode::None as u8 {
+    if kind != ControlCommandCode::None as u8 {
+        let a = PENDING_COMMAND_A.load(Ordering::Relaxed);
+        let b = PENDING_COMMAND_B.load(Ordering::Relaxed);
+        let duration = match PENDING_COMMAND_DURATION_MS.load(Ordering::Relaxed) {
+            0 => None,
+            duration_ms => Some(duration_ms),
+        };
+        let seq = PENDING_COMMAND_SEQ.load(Ordering::Relaxed);
+        PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+
+        return decode_control_command(kind, a, b, duration, seq);
+    }
+
+    let kind = PENDING_VELOCITY_KIND.load(Ordering::Relaxed);
+    if kind != ControlCommandCode::CmdVel as u8 {
         return None;
     }
 
-    let a = PENDING_COMMAND_A.load(Ordering::Relaxed);
-    let b = PENDING_COMMAND_B.load(Ordering::Relaxed);
-    let duration = match PENDING_COMMAND_DURATION_MS.load(Ordering::Relaxed) {
-        0 => None,
-        duration_ms => Some(duration_ms),
-    };
-    PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    let a = PENDING_VELOCITY_A.load(Ordering::Relaxed);
+    let b = PENDING_VELOCITY_B.load(Ordering::Relaxed);
+    let ttl_ms = PENDING_VELOCITY_TTL_MS.load(Ordering::Relaxed);
+    let seq = PENDING_VELOCITY_SEQ.load(Ordering::Relaxed);
+    PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
 
-    decode_control_command(kind, a, b, duration)
+    Some(BrainstemCommand::CmdVel {
+        linear_mm_s: decode_i16(a),
+        angular_mrad_s: decode_i16(b),
+        ttl_ms,
+        seq,
+    })
 }
 
 #[cfg(feature = "pico-w")]
@@ -262,59 +331,34 @@ fn encode_control_command(
     command: BrainstemCommand,
 ) -> Option<(ControlCommandCode, u32, u32, Option<u32>)> {
     match command {
-        BrainstemCommand::WakeCreate => Some((ControlCommandCode::WakeCreate, 0, 0, None)),
-        BrainstemCommand::SleepCreate => Some((ControlCommandCode::SleepCreate, 0, 0, None)),
-        BrainstemCommand::StartOi => Some((ControlCommandCode::StartOi, 0, 0, None)),
-        BrainstemCommand::PulseBrc => Some((ControlCommandCode::PulseBrc, 0, 0, None)),
-        BrainstemCommand::Stop | BrainstemCommand::StopDrive => {
-            Some((ControlCommandCode::Stop, 0, 0, None))
-        }
+        BrainstemCommand::Ping => Some((ControlCommandCode::Ping, 0, 0, None)),
+        BrainstemCommand::Arm => Some((ControlCommandCode::Arm, 0, 0, None)),
+        BrainstemCommand::Disarm => Some((ControlCommandCode::Disarm, 0, 0, None)),
         BrainstemCommand::EStop => Some((ControlCommandCode::EStop, 0, 0, None)),
         BrainstemCommand::ClearEStop => Some((ControlCommandCode::ClearEStop, 0, 0, None)),
-        BrainstemCommand::SetMode(CreateOiMode::Passive)
-        | BrainstemCommand::SetOiMode(CreateOiMode::Passive) => {
-            Some((ControlCommandCode::SetModePassive, 0, 0, None))
-        }
-        BrainstemCommand::SetMode(CreateOiMode::Safe)
-        | BrainstemCommand::SetOiMode(CreateOiMode::Safe) => {
-            Some((ControlCommandCode::SetModeSafe, 0, 0, None))
-        }
-        BrainstemCommand::SetMode(CreateOiMode::Full)
-        | BrainstemCommand::SetOiMode(CreateOiMode::Full) => {
-            Some((ControlCommandCode::SetModeFull, 0, 0, None))
-        }
-        BrainstemCommand::DriveDirect {
-            left_mm_s,
-            right_mm_s,
-            duration_ms,
-        } => Some((
-            ControlCommandCode::DriveDirect,
-            encode_i16(left_mm_s),
-            encode_i16(right_mm_s),
-            duration_ms,
-        )),
+        BrainstemCommand::Stop => Some((ControlCommandCode::Stop, 0, 0, None)),
+        BrainstemCommand::Status => Some((ControlCommandCode::Status, 0, 0, None)),
         BrainstemCommand::CmdVel {
             linear_mm_s,
             angular_mrad_s,
-            duration_ms,
+            ttl_ms,
+            ..
         } => Some((
             ControlCommandCode::CmdVel,
             encode_i16(linear_mm_s),
             encode_i16(angular_mrad_s),
-            duration_ms,
+            Some(ttl_ms),
         )),
-        BrainstemCommand::DriveArc {
-            velocity_mm_s,
-            radius_mm,
-            duration_ms,
-        } => Some((
-            ControlCommandCode::DriveArc,
-            encode_i16(velocity_mm_s),
-            encode_i16(radius_mm),
-            duration_ms,
+        BrainstemCommand::SongPlay { id } => {
+            Some((ControlCommandCode::SongPlay, id as u32, 0, None))
+        }
+        BrainstemCommand::Dock => Some((ControlCommandCode::Dock, 0, 0, None)),
+        BrainstemCommand::SetLights { pattern } => Some((
+            ControlCommandCode::SetLights,
+            encode_light_pattern(pattern) as u32,
+            0,
+            None,
         )),
-        BrainstemCommand::Ping => Some((ControlCommandCode::Ping, 0, 0, None)),
-        _ => None,
     }
 }
 
@@ -323,42 +367,44 @@ fn decode_control_command(
     a: u32,
     b: u32,
     duration_ms: Option<u32>,
+    seq: u32,
 ) -> Option<BrainstemCommand> {
     match kind {
-        x if x == ControlCommandCode::WakeCreate as u8 => Some(BrainstemCommand::WakeCreate),
-        x if x == ControlCommandCode::SleepCreate as u8 => Some(BrainstemCommand::SleepCreate),
-        x if x == ControlCommandCode::StartOi as u8 => Some(BrainstemCommand::StartOi),
-        x if x == ControlCommandCode::PulseBrc as u8 => Some(BrainstemCommand::PulseBrc),
+        x if x == ControlCommandCode::Ping as u8 => Some(BrainstemCommand::Ping),
+        x if x == ControlCommandCode::Arm as u8 => Some(BrainstemCommand::Arm),
+        x if x == ControlCommandCode::Disarm as u8 => Some(BrainstemCommand::Disarm),
         x if x == ControlCommandCode::Stop as u8 => Some(BrainstemCommand::Stop),
         x if x == ControlCommandCode::EStop as u8 => Some(BrainstemCommand::EStop),
         x if x == ControlCommandCode::ClearEStop as u8 => Some(BrainstemCommand::ClearEStop),
-        x if x == ControlCommandCode::SetModePassive as u8 => {
-            Some(BrainstemCommand::SetMode(CreateOiMode::Passive))
-        }
-        x if x == ControlCommandCode::SetModeSafe as u8 => {
-            Some(BrainstemCommand::SetMode(CreateOiMode::Safe))
-        }
-        x if x == ControlCommandCode::SetModeFull as u8 => {
-            Some(BrainstemCommand::SetMode(CreateOiMode::Full))
-        }
-        x if x == ControlCommandCode::DriveDirect as u8 => Some(BrainstemCommand::DriveDirect {
-            left_mm_s: decode_i16(a),
-            right_mm_s: decode_i16(b),
-            duration_ms,
-        }),
+        x if x == ControlCommandCode::Status as u8 => Some(BrainstemCommand::Status),
         x if x == ControlCommandCode::CmdVel as u8 => Some(BrainstemCommand::CmdVel {
             linear_mm_s: decode_i16(a),
             angular_mrad_s: decode_i16(b),
-            duration_ms,
+            ttl_ms: duration_ms?,
+            seq,
         }),
-        x if x == ControlCommandCode::DriveArc as u8 => Some(BrainstemCommand::DriveArc {
-            velocity_mm_s: decode_i16(a),
-            radius_mm: decode_i16(b),
-            duration_ms,
+        x if x == ControlCommandCode::SongPlay as u8 => {
+            Some(BrainstemCommand::SongPlay { id: a as u8 })
+        }
+        x if x == ControlCommandCode::Dock as u8 => Some(BrainstemCommand::Dock),
+        x if x == ControlCommandCode::SetLights as u8 => Some(BrainstemCommand::SetLights {
+            pattern: decode_light_pattern(a as u8)?,
         }),
-        x if x == ControlCommandCode::Ping as u8 => Some(BrainstemCommand::Ping),
         _ => None,
     }
+}
+
+#[cfg(feature = "pico-w")]
+fn command_seq(command: BrainstemCommand) -> u32 {
+    match command {
+        BrainstemCommand::CmdVel { seq, .. } => seq,
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn seq_is_current_or_newer(seq: u32, latest_seq: u32) -> bool {
+    seq == latest_seq || seq.wrapping_sub(latest_seq) < u32::MAX / 2
 }
 
 #[cfg(feature = "pico-w")]
@@ -368,6 +414,30 @@ fn encode_i16(value: i16) -> u32 {
 
 fn decode_i16(value: u32) -> i16 {
     value as u16 as i16
+}
+
+#[cfg(feature = "pico-w")]
+fn encode_light_pattern(pattern: LightPattern) -> u8 {
+    match pattern {
+        LightPattern::Off => 0,
+        LightPattern::Status => 1,
+        LightPattern::Clean => 2,
+        LightPattern::Dock => 3,
+        LightPattern::Spot => 4,
+        LightPattern::Max => 5,
+    }
+}
+
+fn decode_light_pattern(value: u8) -> Option<LightPattern> {
+    match value {
+        0 => Some(LightPattern::Off),
+        1 => Some(LightPattern::Status),
+        2 => Some(LightPattern::Clean),
+        3 => Some(LightPattern::Dock),
+        4 => Some(LightPattern::Spot),
+        5 => Some(LightPattern::Max),
+        _ => None,
+    }
 }
 
 pub fn set_runtime_action(action: RuntimeActionCode) {
@@ -421,6 +491,25 @@ pub fn mark_uart_rx_error_detail(error: UartReadError) {
         UartReadError::Other => UartReadErrorCode::Other,
     };
     LAST_UART_READ_ERROR.store(code as u8, Ordering::Relaxed);
+}
+
+#[cfg(feature = "pico-w")]
+pub fn mark_forebrain_uart_rx_byte(uptime_ms: u32) {
+    increment(&FOREBRAIN_UART_RX_BYTES);
+    FOREBRAIN_UART_LAST_RX_MS.store(uptime_ms, Ordering::Relaxed);
+}
+
+#[cfg(feature = "pico-w")]
+pub fn mark_forebrain_uart_command(seq: u32, uptime_ms: u32) {
+    increment(&FOREBRAIN_UART_RX_LINES);
+    FOREBRAIN_UART_LAST_SEQ.store(seq, Ordering::Relaxed);
+    FOREBRAIN_UART_LAST_COMMAND_MS.store(uptime_ms, Ordering::Relaxed);
+    FOREBRAIN_UART_LAST_ERROR.store(ForebrainUartErrorCode::None as u8, Ordering::Relaxed);
+}
+
+#[cfg(feature = "pico-w")]
+pub fn mark_forebrain_uart_error(error: ForebrainUartErrorCode) {
+    FOREBRAIN_UART_LAST_ERROR.store(error as u8, Ordering::Relaxed);
 }
 
 pub fn set_wake_probe_progress(response_bytes: u32, expected_bytes: u32) {
@@ -542,6 +631,18 @@ fn increment_by(counter: &AtomicU32, amount: u32) {
 
 #[allow(dead_code)]
 pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
+    let pending_command = PENDING_COMMAND_KIND.load(Ordering::Relaxed);
+    let pending_command_id = if pending_command == ControlCommandCode::None as u8 {
+        PENDING_VELOCITY_ID.load(Ordering::Relaxed)
+    } else {
+        PENDING_COMMAND_ID.load(Ordering::Relaxed)
+    };
+    let pending_command = if pending_command == ControlCommandCode::None as u8 {
+        PENDING_VELOCITY_KIND.load(Ordering::Relaxed)
+    } else {
+        pending_command
+    };
+
     BrainstemStatus {
         firmware_name: env!("CARGO_PKG_NAME"),
         firmware_version: env!("CARGO_PKG_VERSION"),
@@ -572,10 +673,30 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         http_requests: HTTP_REQUESTS.load(Ordering::Relaxed),
         dhcp_grants: DHCP_GRANTS.load(Ordering::Relaxed),
         last_web_request_timestamp_ms: LAST_WEB_REQUEST_TIMESTAMP_MS.load(Ordering::Relaxed),
-        pending_command: PENDING_COMMAND_KIND.load(Ordering::Relaxed),
-        pending_command_id: PENDING_COMMAND_ID.load(Ordering::Relaxed),
+        pending_command,
+        pending_command_id,
         last_accepted_command_id: LAST_ACCEPTED_COMMAND_ID.load(Ordering::Relaxed),
         last_rejected_command_id: LAST_REJECTED_COMMAND_ID.load(Ordering::Relaxed),
+        forebrain_uart_rx_bytes: FOREBRAIN_UART_RX_BYTES.load(Ordering::Relaxed),
+        forebrain_uart_rx_lines: FOREBRAIN_UART_RX_LINES.load(Ordering::Relaxed),
+        forebrain_uart_last_seq: FOREBRAIN_UART_LAST_SEQ.load(Ordering::Relaxed),
+        forebrain_uart_last_error: FOREBRAIN_UART_LAST_ERROR.load(Ordering::Relaxed),
+        forebrain_uart_link_alive_ms: elapsed_since(
+            uptime_ms,
+            FOREBRAIN_UART_LAST_RX_MS.load(Ordering::Relaxed),
+        ),
+        forebrain_uart_last_command_age_ms: elapsed_since(
+            uptime_ms,
+            FOREBRAIN_UART_LAST_COMMAND_MS.load(Ordering::Relaxed),
+        ),
+    }
+}
+
+fn elapsed_since(now_ms: u32, timestamp_ms: u32) -> u32 {
+    if timestamp_ms == 0 {
+        0
+    } else {
+        now_ms.wrapping_sub(timestamp_ms)
     }
 }
 
@@ -616,6 +737,18 @@ struct StatusJson {
     pending_command_id: u32,
     last_accepted_command_id: u32,
     last_rejected_command_id: u32,
+    forebrain_uart: ForebrainUartStatusJson,
+}
+
+#[cfg(feature = "pico-w")]
+#[derive(serde::Serialize)]
+struct ForebrainUartStatusJson {
+    rx_bytes: u32,
+    rx_lines: u32,
+    last_seq: u32,
+    last_error: &'static str,
+    link_alive_ms: u32,
+    last_command_age_ms: u32,
 }
 
 #[cfg(feature = "pico-w")]
@@ -655,6 +788,14 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         pending_command_id: snapshot.pending_command_id,
         last_accepted_command_id: snapshot.last_accepted_command_id,
         last_rejected_command_id: snapshot.last_rejected_command_id,
+        forebrain_uart: ForebrainUartStatusJson {
+            rx_bytes: snapshot.forebrain_uart_rx_bytes,
+            rx_lines: snapshot.forebrain_uart_rx_lines,
+            last_seq: snapshot.forebrain_uart_last_seq,
+            last_error: forebrain_uart_error_text(snapshot.forebrain_uart_last_error),
+            link_alive_ms: snapshot.forebrain_uart_link_alive_ms,
+            last_command_age_ms: snapshot.forebrain_uart_last_command_age_ms,
+        },
     };
     let len = serde_json_core::to_slice(&status, buffer).map_err(|_| ())?;
     core::str::from_utf8(&buffer[..len]).map_err(|_| ())
@@ -760,6 +901,18 @@ fn uart_read_error_text(code: u8) -> &'static str {
 }
 
 #[cfg(feature = "pico-w")]
+fn forebrain_uart_error_text(code: u8) -> &'static str {
+    match code {
+        x if x == ForebrainUartErrorCode::LineTooLong as u8 => "line_too_long",
+        x if x == ForebrainUartErrorCode::Utf8 as u8 => "utf8",
+        x if x == ForebrainUartErrorCode::Parse as u8 => "parse",
+        x if x == ForebrainUartErrorCode::Busy as u8 => "busy",
+        x if x == ForebrainUartErrorCode::Uart as u8 => "uart",
+        _ => "none",
+    }
+}
+
+#[cfg(feature = "pico-w")]
 fn runtime_action_text(code: u8) -> &'static str {
     match code {
         x if x == RuntimeActionCode::PowerPulse as u8 => "power_pulse",
@@ -776,20 +929,17 @@ fn runtime_action_text(code: u8) -> &'static str {
 #[cfg(feature = "pico-w")]
 fn control_command_text(code: u8) -> &'static str {
     match code {
-        x if x == ControlCommandCode::WakeCreate as u8 => "wake_create",
-        x if x == ControlCommandCode::SleepCreate as u8 => "sleep_create",
-        x if x == ControlCommandCode::StartOi as u8 => "start_oi",
-        x if x == ControlCommandCode::PulseBrc as u8 => "pulse_brc",
-        x if x == ControlCommandCode::Stop as u8 => "stop",
+        x if x == ControlCommandCode::Ping as u8 => "ping",
+        x if x == ControlCommandCode::Arm as u8 => "arm",
+        x if x == ControlCommandCode::Disarm as u8 => "disarm",
         x if x == ControlCommandCode::EStop as u8 => "estop",
         x if x == ControlCommandCode::ClearEStop as u8 => "clear_estop",
-        x if x == ControlCommandCode::SetModePassive as u8 => "set_mode_passive",
-        x if x == ControlCommandCode::SetModeSafe as u8 => "set_mode_safe",
-        x if x == ControlCommandCode::SetModeFull as u8 => "set_mode_full",
-        x if x == ControlCommandCode::DriveDirect as u8 => "drive_direct",
         x if x == ControlCommandCode::CmdVel as u8 => "cmd_vel",
-        x if x == ControlCommandCode::DriveArc as u8 => "drive_arc",
-        x if x == ControlCommandCode::Ping as u8 => "ping",
+        x if x == ControlCommandCode::Stop as u8 => "stop",
+        x if x == ControlCommandCode::Status as u8 => "status",
+        x if x == ControlCommandCode::SongPlay as u8 => "song_play",
+        x if x == ControlCommandCode::Dock as u8 => "dock",
+        x if x == ControlCommandCode::SetLights as u8 => "set_lights",
         _ => "none",
     }
 }

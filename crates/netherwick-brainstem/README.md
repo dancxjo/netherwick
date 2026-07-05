@@ -108,19 +108,25 @@ BrainstemEvent::DriveStopped
 BrainstemEvent::Error(BrainstemError)
 ```
 
-Commands accepted by the runtime:
+Commands accepted from the forebrain:
 
 ```rust
-BrainstemCommand::WakeCreate
-BrainstemCommand::SleepCreate
-BrainstemCommand::PulseBrc
-BrainstemCommand::StartOi
-BrainstemCommand::SetOiMode(CreateOiMode)
-BrainstemCommand::Drive { left_mm_s, right_mm_s, duration_ms }
-BrainstemCommand::StopDrive
+BrainstemCommand::Ping
+BrainstemCommand::Arm
+BrainstemCommand::Disarm
+BrainstemCommand::EStop
+BrainstemCommand::ClearEStop
+BrainstemCommand::CmdVel { linear_mm_s, angular_mrad_s, ttl_ms, seq }
+BrainstemCommand::Stop
+BrainstemCommand::Status
+BrainstemCommand::SongPlay { id }
+BrainstemCommand::Dock
+BrainstemCommand::SetLights { pattern }
 ```
 
-Supporting enums:
+Create OI power, BRC, Open Interface start, Safe mode, watchdog stop, and recovery are owned by the brainstem runtime. They are intentionally not exposed as forebrain commands.
+
+Internal supporting enums:
 
 ```rust
 CreateOiMode::{Passive, Safe, Full}
@@ -243,10 +249,32 @@ Example command:
 ```bash
 curl -s http://192.168.4.1/command \
   -H 'Content-Type: application/json' \
-  -d '{"command_id":42,"kind":"cmd_vel","linear_mm_s":120,"angular_mrad_s":0,"duration_ms":250}'
+  -d '{"command_id":42,"kind":"cmd_vel","linear_mm_s":120,"angular_mrad_s":0,"ttl_ms":250,"seq":42}'
 ```
 
-Supported command `kind` values are `wake_create`, `sleep_create`, `stop`, `estop`, `clear_estop`, `set_mode`, `drive_direct`, `cmd_vel`, `drive_arc`, and `ping`. Motion commands must include `duration_ms`; the brainstem owns timing and stop deadlines, while higher-level intent stays outside this firmware.
+Supported command `kind` values are `ping`, `arm`, `disarm`, `estop`, `clear_estop`, `cmd_vel`, `stop`, `status`, `song_play`, `dock`, and `set_lights`. `cmd_vel` must include `ttl_ms` and `seq`; the brainstem owns timing, stop deadlines, Create startup, BRC, Open Interface start, Safe mode, watchdog stop, and recovery.
+
+## Forebrain UART
+
+On Pico W builds, UART0 GP0/GP1 remains dedicated to the iRobot Create OI link. UART1 GP4/GP5 is the forebrain control lane at 115200 8N1 with one ASCII command per line:
+
+```text
+PING seq
+ARM seq
+DISARM seq
+STOP seq
+ESTOP seq
+CLEAR_ESTOP seq
+CMD_VEL seq linear_mm_s angular_mrad_s ttl_ms
+STATUS seq
+SONG_PLAY seq id
+DOCK seq
+SET_LIGHTS seq off|status|clean|dock|spot|max
+```
+
+`ARM` expands internally to Create wake, BRC pulse, OI start, and Safe mode. `CMD_VEL` replaces the latest velocity mailbox instead of waiting behind ordinary commands, and the runtime stops the drive when its `ttl_ms` expires. `STOP` and `ESTOP` preempt immediately. Parse errors, line timeout, UART errors, runtime errors, and the estop latch all drive the runtime toward StopDrive.
+
+`/status.json` includes `forebrain_uart` with `rx_bytes`, `rx_lines`, `last_seq`, `last_error`, `link_alive_ms`, and `last_command_age_ms`.
 
 The Pico W onboard LED normally emits a one-blink heartbeat every 15 seconds. Event blink codes interrupt that heartbeat:
 

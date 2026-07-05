@@ -1,6 +1,6 @@
 use heapless::{Deque, Vec};
 
-use crate::commands::CreateOiMode;
+use crate::commands::{CreateOiMode, LightPattern};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::status;
@@ -10,6 +10,9 @@ const OI_SAFE: u8 = 131;
 const OI_FULL: u8 = 132;
 const OI_SENSORS: u8 = 142;
 const OI_DRIVE: u8 = 137;
+const OI_LEDS: u8 = 139;
+const OI_PLAY_SONG: u8 = 141;
+const OI_SEEK_DOCK: u8 = 143;
 const OI_DRIVE_DIRECT: u8 = 145;
 const UART_DRAIN_LIMIT: usize = 128;
 
@@ -177,6 +180,49 @@ impl CreateUart {
         status::signal_event(&event);
         let _ = events.push_back(event);
         Ok(())
+    }
+
+    pub fn play_song<H, const N: usize>(
+        &mut self,
+        hardware: &mut H,
+        _events: &mut Deque<BrainstemEvent, N>,
+        id: u8,
+    ) -> Result<(), BrainstemError>
+    where
+        H: BrainstemHardware,
+    {
+        self.send_bytes(hardware, &[OI_PLAY_SONG, id])
+    }
+
+    pub fn seek_dock<H, const N: usize>(
+        &mut self,
+        hardware: &mut H,
+        _events: &mut Deque<BrainstemEvent, N>,
+    ) -> Result<(), BrainstemError>
+    where
+        H: BrainstemHardware,
+    {
+        self.send_byte(hardware, OI_SEEK_DOCK)
+    }
+
+    pub fn set_lights<H, const N: usize>(
+        &mut self,
+        hardware: &mut H,
+        _events: &mut Deque<BrainstemEvent, N>,
+        pattern: LightPattern,
+    ) -> Result<(), BrainstemError>
+    where
+        H: BrainstemHardware,
+    {
+        let (bits, color, intensity) = match pattern {
+            LightPattern::Off => (0, 0, 0),
+            LightPattern::Status => (0b0010, 128, 160),
+            LightPattern::Clean => (0b0010, 0, 255),
+            LightPattern::Dock => (0b0100, 255, 255),
+            LightPattern::Spot => (0b1000, 255, 180),
+            LightPattern::Max => (0b1111, 255, 255),
+        };
+        self.send_bytes(hardware, &[OI_LEDS, bits, color, intensity])
     }
 
     fn drive<H>(

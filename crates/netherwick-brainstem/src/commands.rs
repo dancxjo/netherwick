@@ -1,18 +1,49 @@
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub enum CreateOiMode {
-    #[allow(dead_code)]
+#[allow(dead_code)]
+pub(crate) enum CreateOiMode {
     Passive,
     Safe,
-    #[allow(dead_code)]
     Full,
 }
-
-pub type BodyMode = CreateOiMode;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum BrainstemCommand {
-    SetMode(BodyMode),
+    Ping,
+    Arm,
+    Disarm,
+    EStop,
+    ClearEStop,
+    CmdVel {
+        linear_mm_s: i16,
+        angular_mrad_s: i16,
+        ttl_ms: u32,
+        seq: u32,
+    },
+    Stop,
+    Status,
+    SongPlay {
+        id: u8,
+    },
+    Dock,
+    SetLights {
+        pattern: LightPattern,
+    },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum LightPattern {
+    Off,
+    Status,
+    Clean,
+    Dock,
+    Spot,
+    Max,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum RuntimeCommand {
     WakeCreate,
     SleepCreate,
     Stop,
@@ -33,39 +64,53 @@ pub enum BrainstemCommand {
         radius_mm: i16,
         duration_ms: Option<u32>,
     },
-    Ping,
-
-    // Legacy/demo aliases kept local to the firmware command script.
     PulseBrc,
     StartOi,
-    SetOiMode(CreateOiMode),
+    SetMode(CreateOiMode),
     Drive {
         left_mm_s: i16,
         right_mm_s: i16,
         duration_ms: u32,
     },
     StopDrive,
+    SongPlay {
+        id: u8,
+    },
+    Dock,
+    SetLights {
+        pattern: LightPattern,
+    },
 }
 
-pub const DEMO_SCRIPT: &[BrainstemCommand] = &[
-    BrainstemCommand::WakeCreate,
-    BrainstemCommand::PulseBrc,
-    BrainstemCommand::StartOi,
-    BrainstemCommand::SetMode(BodyMode::Safe),
-    BrainstemCommand::DriveDirect {
+pub(crate) const ARM_SCRIPT: &[RuntimeCommand] = &[
+    RuntimeCommand::WakeCreate,
+    RuntimeCommand::PulseBrc,
+    RuntimeCommand::StartOi,
+    RuntimeCommand::SetMode(CreateOiMode::Safe),
+];
+
+pub(crate) const DISARM_SCRIPT: &[RuntimeCommand] =
+    &[RuntimeCommand::Stop, RuntimeCommand::SleepCreate];
+
+pub(crate) const DEMO_SCRIPT: &[RuntimeCommand] = &[
+    RuntimeCommand::WakeCreate,
+    RuntimeCommand::PulseBrc,
+    RuntimeCommand::StartOi,
+    RuntimeCommand::SetMode(CreateOiMode::Safe),
+    RuntimeCommand::DriveDirect {
         left_mm_s: 100,
         right_mm_s: 100,
         duration_ms: Some(500),
     },
-    BrainstemCommand::DriveDirect {
+    RuntimeCommand::DriveDirect {
         left_mm_s: -80,
         right_mm_s: 80,
         duration_ms: Some(400),
     },
-    BrainstemCommand::DriveDirect {
+    RuntimeCommand::DriveDirect {
         left_mm_s: 80,
         right_mm_s: -80,
         duration_ms: Some(400),
     },
-    BrainstemCommand::Stop,
+    RuntimeCommand::Stop,
 ];

@@ -1,7 +1,7 @@
 use heapless::Deque;
 
 use crate::body;
-use crate::commands::{BrainstemCommand, DEMO_SCRIPT};
+use crate::commands::{BrainstemCommand, RuntimeCommand, ARM_SCRIPT, DEMO_SCRIPT, DISARM_SCRIPT};
 use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::BrainstemHardware;
@@ -58,7 +58,7 @@ where
 {
     hardware: H,
     events: Deque<BrainstemEvent, EVENT_QUEUE_CAPACITY>,
-    commands: Deque<BrainstemCommand, COMMAND_QUEUE_CAPACITY>,
+    commands: Deque<RuntimeCommand, COMMAND_QUEUE_CAPACITY>,
     timers: Timers,
     create_uart: CreateUart,
     leds: Leds,
@@ -121,7 +121,7 @@ where
     }
 
     #[allow(dead_code)]
-    pub fn enqueue_command(&mut self, command: BrainstemCommand) -> Result<(), BrainstemCommand> {
+    pub fn enqueue_command(&mut self, command: RuntimeCommand) -> Result<(), RuntimeCommand> {
         self.commands.push_back(command)
     }
 
@@ -165,16 +165,68 @@ where
             BrainstemCommand::Stop | BrainstemCommand::EStop => {
                 self.commands.clear();
                 self.active = ActiveAction::None;
+                let command = match command {
+                    BrainstemCommand::Stop => RuntimeCommand::Stop,
+                    BrainstemCommand::EStop => RuntimeCommand::EStop,
+                    _ => unreachable!(),
+                };
                 let _ = self.commands.push_front(command);
                 self.mode = RuntimeMode::Running;
             }
-            _ => {
-                let _ = self.commands.push_back(command);
+            BrainstemCommand::Arm => {
+                for command in ARM_SCRIPT {
+                    let _ = self.commands.push_back(*command);
+                }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
                     status::set_runtime_state(RuntimeState::RunningDemo);
                 }
             }
+            BrainstemCommand::Disarm => {
+                self.commands.clear();
+                self.active = ActiveAction::None;
+                for command in DISARM_SCRIPT.iter().rev() {
+                    let _ = self.commands.push_front(*command);
+                }
+                self.mode = RuntimeMode::Running;
+            }
+            BrainstemCommand::CmdVel { .. } => {
+                if let Some(command) = runtime_command_from_forebrain(command) {
+                    self.enqueue_latest_velocity(command);
+                }
+                if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
+                    self.mode = RuntimeMode::Running;
+                    status::set_runtime_state(RuntimeState::RunningDemo);
+                }
+            }
+            _ => {
+                if let Some(command) = runtime_command_from_forebrain(command) {
+                    let _ = self.commands.push_back(command);
+                }
+                if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
+                    self.mode = RuntimeMode::Running;
+                    status::set_runtime_state(RuntimeState::RunningDemo);
+                }
+            }
+        }
+    }
+
+    fn enqueue_latest_velocity(&mut self, command: RuntimeCommand) {
+        let pending = self.commands.len();
+        for _ in 0..pending {
+            let Some(existing) = self.commands.pop_front() else {
+                break;
+            };
+            if !matches!(existing, RuntimeCommand::CmdVel { .. }) {
+                let _ = self.commands.push_back(existing);
+            }
+        }
+
+        if matches!(self.active, ActiveAction::Driving { .. }) {
+            self.active = ActiveAction::None;
+            let _ = self.commands.push_front(command);
+        } else {
+            let _ = self.commands.push_back(command);
         }
     }
 
@@ -187,20 +239,19 @@ where
 
         let now_ms = self.now_ms();
         match command {
-            BrainstemCommand::Stop | BrainstemCommand::StopDrive => {
+            RuntimeCommand::Stop | RuntimeCommand::StopDrive => {
                 self.stop_drive()?;
                 self.active = ActiveAction::None;
             }
-            BrainstemCommand::EStop => {
+            RuntimeCommand::EStop => {
                 self.stop_drive()?;
                 self.estop_latched = true;
                 self.active = ActiveAction::None;
             }
-            BrainstemCommand::ClearEStop => {
+            RuntimeCommand::ClearEStop => {
                 self.estop_latched = false;
             }
-            BrainstemCommand::Ping => {}
-            BrainstemCommand::WakeCreate => {
+            RuntimeCommand::WakeCreate => {
                 self.create_responsive = false;
                 status::set_create_power_unknown();
                 status::set_oi_mode_unknown();
@@ -213,7 +264,7 @@ where
                     power_on: true,
                 };
             }
-            BrainstemCommand::SleepCreate => {
+            RuntimeCommand::SleepCreate => {
                 self.create_responsive = false;
                 status::set_oi_mode_unknown();
                 status::set_demo_state(DemoState::PowerCycling);
@@ -226,7 +277,7 @@ where
                     power_on: false,
                 };
             }
-            BrainstemCommand::PulseBrc => {
+            RuntimeCommand::PulseBrc => {
                 if body::CREATE_BRC_ENABLED {
                     self.push_event(BrainstemEvent::CreateBrcPulseRequested);
                     self.hardware.set_brc(false);
@@ -235,7 +286,7 @@ where
                     };
                 }
             }
-            BrainstemCommand::StartOi => {
+            RuntimeCommand::StartOi => {
                 self.ensure_create_responsive()?;
                 self.create_uart
                     .start_oi(&mut self.hardware, &mut self.events)?;
@@ -244,7 +295,7 @@ where
                     until_ms: now_ms.wrapping_add(body::POST_MODE_SETTLE_MS),
                 };
             }
-            BrainstemCommand::SetMode(mode) | BrainstemCommand::SetOiMode(mode) => {
+            RuntimeCommand::SetMode(mode) => {
                 self.ensure_create_responsive()?;
                 self.create_uart
                     .set_mode(&mut self.hardware, &mut self.events, mode)?;
@@ -253,17 +304,17 @@ where
                     until_ms: now_ms.wrapping_add(body::POST_MODE_SETTLE_MS),
                 };
             }
-            BrainstemCommand::Drive {
+            RuntimeCommand::Drive {
                 left_mm_s,
                 right_mm_s,
                 duration_ms,
             } => self.start_drive_direct(left_mm_s, right_mm_s, Some(duration_ms), now_ms)?,
-            BrainstemCommand::DriveDirect {
+            RuntimeCommand::DriveDirect {
                 left_mm_s,
                 right_mm_s,
                 duration_ms,
             } => self.start_drive_direct(left_mm_s, right_mm_s, duration_ms, now_ms)?,
-            BrainstemCommand::CmdVel {
+            RuntimeCommand::CmdVel {
                 linear_mm_s,
                 angular_mrad_s,
                 duration_ms,
@@ -273,11 +324,25 @@ where
                 let right = clamp_i16(linear_mm_s as i32 + half_delta);
                 self.start_drive_direct(left, right, duration_ms, now_ms)?;
             }
-            BrainstemCommand::DriveArc {
+            RuntimeCommand::DriveArc {
                 velocity_mm_s,
                 radius_mm,
                 duration_ms,
             } => self.start_drive_arc(velocity_mm_s, radius_mm, duration_ms, now_ms)?,
+            RuntimeCommand::SongPlay { id } => {
+                self.ensure_create_responsive()?;
+                self.create_uart
+                    .play_song(&mut self.hardware, &mut self.events, id)?;
+            }
+            RuntimeCommand::Dock => {
+                self.ensure_create_responsive()?;
+                self.create_uart
+                    .seek_dock(&mut self.hardware, &mut self.events)?;
+            }
+            RuntimeCommand::SetLights { pattern } => {
+                self.create_uart
+                    .set_lights(&mut self.hardware, &mut self.events, pattern)?;
+            }
         }
 
         Ok(())
@@ -570,6 +635,31 @@ where
 
 fn time_reached(now_ms: u32, deadline_ms: u32) -> bool {
     now_ms.wrapping_sub(deadline_ms) < u32::MAX / 2
+}
+
+fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCommand> {
+    match command {
+        BrainstemCommand::Ping
+        | BrainstemCommand::Status
+        | BrainstemCommand::Arm
+        | BrainstemCommand::Disarm => None,
+        BrainstemCommand::Stop => Some(RuntimeCommand::Stop),
+        BrainstemCommand::EStop => Some(RuntimeCommand::EStop),
+        BrainstemCommand::ClearEStop => Some(RuntimeCommand::ClearEStop),
+        BrainstemCommand::CmdVel {
+            linear_mm_s,
+            angular_mrad_s,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::CmdVel {
+            linear_mm_s,
+            angular_mrad_s,
+            duration_ms: Some(ttl_ms),
+        }),
+        BrainstemCommand::SongPlay { id } => Some(RuntimeCommand::SongPlay { id }),
+        BrainstemCommand::Dock => Some(RuntimeCommand::Dock),
+        BrainstemCommand::SetLights { pattern } => Some(RuntimeCommand::SetLights { pattern }),
+    }
 }
 
 fn clamp_i16(value: i32) -> i16 {

@@ -11,7 +11,8 @@ use embassy_net::{
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
 use embassy_rp::peripherals::{
-    DMA_CH0, PIN_0, PIN_1, PIN_18, PIN_19, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29, PIO0, UART0,
+    DMA_CH0, PIN_0, PIN_1, PIN_18, PIN_19, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29, PIN_4, PIN_5,
+    PIO0, UART0, UART1,
 };
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::uart::{
@@ -24,7 +25,7 @@ use embedded_io_async::Write;
 use static_cell::StaticCell;
 
 use crate::body;
-use crate::commands::{BrainstemCommand, CreateOiMode};
+use crate::commands::{BrainstemCommand, LightPattern};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 use crate::status;
@@ -46,6 +47,10 @@ const DHCP_OFFER_HOLD_SECONDS: u32 = 30;
 const LED_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const LED_BLINK_ON_MS: u64 = 120;
 const LED_BLINK_OFF_MS: u64 = 120;
+const FOREBRAIN_UART_BAUD: u32 = 115_200;
+const FOREBRAIN_LINE_MAX: usize = 96;
+const FOREBRAIN_POLL_MS: u64 = 2;
+const FOREBRAIN_LINE_TIMEOUT_MS: u32 = 100;
 
 static mut CORE1_STACK: CoreStack<8192> = CoreStack::new();
 
@@ -147,7 +152,9 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
         move || Runtime::new(hardware).run_demo(),
     );
 
-    spawn_wifi_lane(p.PIO0, p.DMA_CH0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29);
+    spawn_wifi_lane(
+        p.PIO0, p.DMA_CH0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.UART1, p.PIN_4, p.PIN_5,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -158,6 +165,9 @@ fn spawn_wifi_lane(
     wifi_dio: Peri<'static, PIN_24>,
     wifi_cs: Peri<'static, PIN_25>,
     wifi_clk: Peri<'static, PIN_29>,
+    forebrain_uart: Peri<'static, UART1>,
+    forebrain_tx: Peri<'static, PIN_4>,
+    forebrain_rx: Peri<'static, PIN_5>,
 ) -> ! {
     static EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
     let executor = EXECUTOR.init(embassy_executor::Executor::new());
@@ -165,6 +175,10 @@ fn spawn_wifi_lane(
         spawner.spawn(
             wifi_task(spawner, pio0, dma0, wifi_power, wifi_dio, wifi_cs, wifi_clk)
                 .expect("spawn wifi task"),
+        );
+        spawner.spawn(
+            forebrain_uart_task(forebrain_uart, forebrain_tx, forebrain_rx)
+                .expect("spawn forebrain uart task"),
         );
     })
 }
@@ -268,6 +282,75 @@ async fn cyw43_runner_task(
 #[embassy_executor::task]
 async fn net_runner_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn forebrain_uart_task(
+    uart1: Peri<'static, UART1>,
+    tx: Peri<'static, PIN_4>,
+    rx: Peri<'static, PIN_5>,
+) -> ! {
+    let mut uart_config = UartConfig::default();
+    uart_config.baudrate = FOREBRAIN_UART_BAUD;
+    uart_config.data_bits = DataBits::DataBits8;
+    uart_config.stop_bits = StopBits::STOP1;
+    uart_config.parity = Parity::ParityNone;
+
+    let mut uart = Uart::new_blocking(uart1, tx, rx, uart_config);
+    let mut line = heapless::Vec::<u8, FOREBRAIN_LINE_MAX>::new();
+    let mut line_started_ms = 0;
+
+    loop {
+        let now_ms = Instant::now().as_millis() as u32;
+        match uart.read() {
+            Ok(byte) => {
+                status::mark_forebrain_uart_rx_byte(now_ms);
+                if line.is_empty() {
+                    line_started_ms = now_ms;
+                }
+
+                match byte {
+                    b'\r' => {}
+                    b'\n' => {
+                        handle_forebrain_uart_line(&mut uart, &line);
+                        line.clear();
+                        line_started_ms = 0;
+                    }
+                    byte => {
+                        if line.push(byte).is_err() {
+                            line.clear();
+                            line_started_ms = 0;
+                            status::mark_forebrain_uart_error(
+                                status::ForebrainUartErrorCode::LineTooLong,
+                            );
+                            submit_forebrain_stop();
+                            write_forebrain_uart_line(&mut uart, b"ERR 0 line_too_long\n");
+                        }
+                    }
+                }
+            }
+            Err(nb::Error::WouldBlock) => {
+                if !line.is_empty()
+                    && now_ms.wrapping_sub(line_started_ms) > FOREBRAIN_LINE_TIMEOUT_MS
+                {
+                    line.clear();
+                    line_started_ms = 0;
+                    status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Parse);
+                    submit_forebrain_stop();
+                    write_forebrain_uart_line(&mut uart, b"ERR 0 timeout\n");
+                }
+                Timer::after_millis(FOREBRAIN_POLL_MS).await;
+            }
+            Err(nb::Error::Other(_)) => {
+                line.clear();
+                line_started_ms = 0;
+                status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Uart);
+                submit_forebrain_stop();
+                write_forebrain_uart_line(&mut uart, b"ERR 0 uart\n");
+                Timer::after_millis(FOREBRAIN_POLL_MS).await;
+            }
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -660,8 +743,8 @@ button:active{transform:translateY(1px);background:#eef1ea}.danger{background:#7
 </section>
 <section class="panel">
 <div class="row"><button class="stop" id="stop">STOP</button><button class="danger" id="estop">E-STOP</button><button id="clear">Clear</button></div>
-<div class="row" style="margin-top:8px"><button id="wake">Wake</button><button id="sleep">Sleep</button><button id="cycle">Power cycle</button></div>
-<div class="row" style="margin-top:8px"><button data-mode="passive">Passive</button><button data-mode="safe">Safe</button><button data-mode="full">Full</button></div>
+<div class="row" style="margin-top:8px"><button id="arm">ARM</button><button id="disarm">DISARM</button><button id="dock">DOCK</button></div>
+<div class="row" style="margin-top:8px"><button data-lights="off">Lights Off</button><button data-lights="status">Status</button><button id="song">Song</button></div>
 <div class="row" style="margin-top:8px"><button id="back">Back</button><button id="left">Left</button><button id="right">Right</button></div>
 </section>
 <section class="panel wide">
@@ -680,9 +763,9 @@ button:active{transform:translateY(1px);background:#eef1ea}.danger{background:#7
 let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false;
 const base=document.getElementById('base'),nub=document.getElementById('nub'),net=document.getElementById('net');
 function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;net.textContent='control ws'};ws.onclose=()=>{wsOpen=false;setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false};ws.onmessage=e=>{try{let j=JSON.parse(e.data);net.textContent=j.accepted?'accepted':'busy'}catch(_){}}}catch(_){wsOpen=false}}
-function post(o){o.command_id=id++;let body=JSON.stringify(o);if(wsOpen&&ws&&ws.readyState===1){ws.send(body);return Promise.resolve({accepted:true})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{net.textContent=j.accepted?'accepted':'busy';return j}).catch(_=>{net.textContent='offline'})}
+function post(o){let cid=id++;o.command_id=cid;if(o.kind==='cmd_vel'&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o);if(wsOpen&&ws&&ws.readyState===1){ws.send(body);return Promise.resolve({accepted:true})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{net.textContent=j.accepted?'accepted':'busy';return j}).catch(_=>{net.textContent='offline'})}
 function stop(){clearInterval(timer);timer=0;active=false;nub.style.left='50%';nub.style.top='50%';post({kind:'stop'})}
-function sendJoy(){let lin=Math.round(-last.y*220),ang=Math.round(last.x*1800);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,duration_ms:250})}
+function sendJoy(){let lin=Math.round(-last.y*220),ang=Math.round(last.x*1800);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:250})}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
 base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
 base.onpointermove=e=>{if(active)move(e)}
@@ -690,13 +773,14 @@ base.onpointerup=base.onpointercancel=stop
 document.getElementById('stop').onclick=stop
 document.getElementById('estop').onclick=()=>post({kind:'estop'})
 document.getElementById('clear').onclick=()=>post({kind:'clear_estop'})
-document.getElementById('wake').onclick=()=>post({kind:'wake_create'})
-document.getElementById('sleep').onclick=()=>post({kind:'sleep_create'})
-document.getElementById('cycle').onclick=()=>post({kind:'sleep_create'}).then(()=>{setTimeout(()=>post({kind:'wake_create'}),1600);setTimeout(()=>post({kind:'start_oi'}),7200);setTimeout(()=>post({kind:'set_mode',mode:'safe'}),7600)})
-document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>post({kind:'set_mode',mode:b.dataset.mode}))
-document.getElementById('back').onclick=()=>post({kind:'cmd_vel',linear_mm_s:-100,angular_mrad_s:0,duration_ms:300})
-document.getElementById('left').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:-1500,duration_ms:250})
-document.getElementById('right').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:1500,duration_ms:250})
+document.getElementById('arm').onclick=()=>post({kind:'arm'})
+document.getElementById('disarm').onclick=()=>post({kind:'disarm'})
+document.getElementById('dock').onclick=()=>post({kind:'dock'})
+document.getElementById('song').onclick=()=>post({kind:'song_play',id:0})
+document.querySelectorAll('[data-lights]').forEach(b=>b.onclick=()=>post({kind:'set_lights',pattern:b.dataset.lights}))
+document.getElementById('back').onclick=()=>post({kind:'cmd_vel',linear_mm_s:-100,angular_mrad_s:0,ttl_ms:300})
+document.getElementById('left').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:-1500,ttl_ms:250})
+document.getElementById('right').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:1500,ttl_ms:250})
 function refresh(){fetch('/status.json').then(r=>r.json()).then(s=>{net.textContent=s.wifi_state||'online';runtime.textContent=s.current_runtime_state;create.textContent=s.create_power_state+' / '+s.oi_mode;uart.textContent=s.uart_rx_health+' '+s.last_uart_read_error;cmd.textContent=(s.current_command||'none')+' pending '+(s.pending_command||'none');err.textContent=(s.last_error||'none')+' '+(s.last_error_hint||'')}).catch(_=>net.textContent='offline')}
 setInterval(refresh,1500);refresh();
 connectWs();
@@ -717,7 +801,7 @@ fn handle_command_request<'a>(
 ) -> Result<&'a str, CommandParseError> {
     let body = request_body(request).ok_or(CommandParseError::BadRequest)?;
     let command_id = json_u32(body, "command_id").ok_or(CommandParseError::BadRequest)?;
-    let command = parse_command(body).ok_or(CommandParseError::BadRequest)?;
+    let command = parse_command(command_id, body).ok_or(CommandParseError::BadRequest)?;
     if !status::submit_control_command(command_id, command) {
         return Err(CommandParseError::Busy(command_id));
     }
@@ -727,11 +811,137 @@ fn handle_command_request<'a>(
 
 fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
     let command_id = json_u32(body, "command_id")?;
-    let command = parse_command(body)?;
+    let command = parse_command(command_id, body)?;
     if !status::submit_control_command(command_id, command) {
         return render_command_response(buffer, false, command_id, "busy");
     }
     render_command_response(buffer, true, command_id, "accepted")
+}
+
+fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
+    if line.is_empty() {
+        return;
+    }
+
+    let line = match core::str::from_utf8(line) {
+        Ok(line) => line,
+        Err(_) => {
+            status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Utf8);
+            submit_forebrain_stop();
+            write_forebrain_uart_line(uart, b"ERR 0 utf8\n");
+            return;
+        }
+    };
+
+    let (seq, command) = match parse_forebrain_uart_command(line) {
+        Ok(parsed) => parsed,
+        Err(seq) => {
+            status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Parse);
+            submit_forebrain_stop();
+            write_forebrain_uart_error(uart, seq, "parse");
+            return;
+        }
+    };
+
+    status::mark_forebrain_uart_command(seq, Instant::now().as_millis() as u32);
+    if !status::submit_control_command(seq, command) {
+        status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Busy);
+        if matches!(command, BrainstemCommand::CmdVel { .. }) {
+            submit_forebrain_stop();
+        }
+        write_forebrain_uart_error(uart, seq, "busy");
+        return;
+    }
+
+    if matches!(command, BrainstemCommand::Status) {
+        write_forebrain_uart_status(uart, seq);
+    } else {
+        write_forebrain_uart_ok(uart, seq);
+    }
+}
+
+fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u32> {
+    let mut parts = line.split_ascii_whitespace();
+    let Some(kind) = parts.next() else {
+        return Err(0);
+    };
+    let seq = parse_u32(parts.next()).ok_or(0u32)?;
+
+    let command = match kind {
+        "PING" => BrainstemCommand::Ping,
+        "ARM" => BrainstemCommand::Arm,
+        "DISARM" => BrainstemCommand::Disarm,
+        "STOP" => BrainstemCommand::Stop,
+        "ESTOP" => BrainstemCommand::EStop,
+        "CLEAR_ESTOP" => BrainstemCommand::ClearEStop,
+        "CMD_VEL" => BrainstemCommand::CmdVel {
+            seq,
+            linear_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "STATUS" => BrainstemCommand::Status,
+        "SONG_PLAY" => BrainstemCommand::SongPlay {
+            id: parse_u32(parts.next()).ok_or(seq)? as u8,
+        },
+        "DOCK" => BrainstemCommand::Dock,
+        "SET_LIGHTS" => BrainstemCommand::SetLights {
+            pattern: parse_light_pattern(parts.next().ok_or(seq)?).ok_or(seq)?,
+        },
+        _ => return Err(seq),
+    };
+
+    if parts.next().is_some() {
+        return Err(seq);
+    }
+
+    Ok((seq, command))
+}
+
+fn parse_u32(value: Option<&str>) -> Option<u32> {
+    value?.parse().ok()
+}
+
+fn parse_i16(value: Option<&str>) -> Option<i16> {
+    value?.parse().ok()
+}
+
+fn submit_forebrain_stop() {
+    let _ = status::submit_control_command(0, BrainstemCommand::Stop);
+}
+
+fn write_forebrain_uart_ok(uart: &mut Uart<'static, Blocking>, seq: u32) {
+    let mut response = heapless::String::<32>::new();
+    let _ = writeln!(response, "OK {seq}");
+    write_forebrain_uart_line(uart, response.as_bytes());
+}
+
+fn write_forebrain_uart_error(uart: &mut Uart<'static, Blocking>, seq: u32, error: &str) {
+    let mut response = heapless::String::<48>::new();
+    let _ = writeln!(response, "ERR {seq} {error}");
+    write_forebrain_uart_line(uart, response.as_bytes());
+}
+
+fn write_forebrain_uart_status(uart: &mut Uart<'static, Blocking>, seq: u32) {
+    let snapshot = status::snapshot(Instant::now().as_millis() as u32);
+    let mut response = heapless::String::<192>::new();
+    let _ = writeln!(
+        response,
+        "OK {seq} STATUS runtime={} command={} pending={} error={} rx_bytes={} rx_lines={}",
+        snapshot.current_runtime_state,
+        snapshot.current_command,
+        snapshot.pending_command,
+        snapshot.last_error,
+        snapshot.forebrain_uart_rx_bytes,
+        snapshot.forebrain_uart_rx_lines
+    );
+    write_forebrain_uart_line(uart, response.as_bytes());
+}
+
+fn write_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
+    if uart.blocking_write(line).is_err() || uart.blocking_flush().is_err() {
+        status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Uart);
+    }
 }
 
 fn request_body(request: &[u8]) -> Option<&str> {
@@ -742,37 +952,40 @@ fn request_body(request: &[u8]) -> Option<&str> {
     core::str::from_utf8(&request[body_start..]).ok()
 }
 
-fn parse_command(body: &str) -> Option<BrainstemCommand> {
+fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
     match json_str(body, "kind")? {
-        "wake_create" | "wake" => Some(BrainstemCommand::WakeCreate),
-        "sleep_create" | "sleep" => Some(BrainstemCommand::SleepCreate),
-        "start_oi" | "start" => Some(BrainstemCommand::StartOi),
-        "pulse_brc" | "brc" => Some(BrainstemCommand::PulseBrc),
+        "ping" => Some(BrainstemCommand::Ping),
+        "arm" => Some(BrainstemCommand::Arm),
+        "disarm" => Some(BrainstemCommand::Disarm),
         "stop" => Some(BrainstemCommand::Stop),
         "estop" => Some(BrainstemCommand::EStop),
         "clear_estop" => Some(BrainstemCommand::ClearEStop),
-        "set_mode" => match json_str(body, "mode")? {
-            "passive" => Some(BrainstemCommand::SetMode(CreateOiMode::Passive)),
-            "safe" => Some(BrainstemCommand::SetMode(CreateOiMode::Safe)),
-            "full" => Some(BrainstemCommand::SetMode(CreateOiMode::Full)),
-            _ => None,
-        },
-        "drive_direct" => Some(BrainstemCommand::DriveDirect {
-            left_mm_s: json_i16(body, "left_mm_s")?,
-            right_mm_s: json_i16(body, "right_mm_s")?,
-            duration_ms: Some(json_u32(body, "duration_ms")?),
-        }),
         "cmd_vel" => Some(BrainstemCommand::CmdVel {
             linear_mm_s: json_i16(body, "linear_mm_s")?,
             angular_mrad_s: json_i16(body, "angular_mrad_s")?,
-            duration_ms: Some(json_u32(body, "duration_ms")?),
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
-        "drive_arc" => Some(BrainstemCommand::DriveArc {
-            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
-            radius_mm: json_i16(body, "radius_mm")?,
-            duration_ms: Some(json_u32(body, "duration_ms")?),
+        "status" => Some(BrainstemCommand::Status),
+        "song_play" => Some(BrainstemCommand::SongPlay {
+            id: json_u32(body, "id")? as u8,
         }),
-        "ping" => Some(BrainstemCommand::Ping),
+        "dock" => Some(BrainstemCommand::Dock),
+        "set_lights" => Some(BrainstemCommand::SetLights {
+            pattern: parse_light_pattern(json_str(body, "pattern")?)?,
+        }),
+        _ => None,
+    }
+}
+
+fn parse_light_pattern(pattern: &str) -> Option<LightPattern> {
+    match pattern {
+        "off" => Some(LightPattern::Off),
+        "status" => Some(LightPattern::Status),
+        "clean" => Some(LightPattern::Clean),
+        "dock" => Some(LightPattern::Dock),
+        "spot" => Some(LightPattern::Spot),
+        "max" => Some(LightPattern::Max),
         _ => None,
     }
 }
