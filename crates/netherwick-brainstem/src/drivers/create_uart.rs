@@ -2,7 +2,7 @@ use heapless::{Deque, Vec};
 
 use crate::commands::CreateOiMode;
 use crate::events::{BrainstemError, BrainstemEvent};
-use crate::hardware::{BrainstemHardware, SerialRead};
+use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::status;
 
 const OI_START: u8 = 128;
@@ -10,6 +10,8 @@ const OI_SAFE: u8 = 131;
 const OI_FULL: u8 = 132;
 const OI_SENSORS: u8 = 142;
 const OI_DRIVE: u8 = 137;
+const OI_DRIVE_DIRECT: u8 = 145;
+const UART_DRAIN_LIMIT: usize = 128;
 
 pub struct CreateUart;
 
@@ -25,24 +27,41 @@ impl CreateUart {
     ) where
         H: BrainstemHardware,
     {
-        match hardware.read_byte() {
-            SerialRead::Byte(byte) => {
-                let mut bytes = Vec::new();
-                let _ = bytes.push(byte);
-                status::mark_uart_rx_ok(hardware.now_us() / 1_000);
-                let event = BrainstemEvent::CreatePacketReceived {
-                    packet_id: 0,
-                    bytes,
-                };
-                status::signal_event(&event);
-                let _ = events.push_back(event);
+        let mut bytes = Vec::new();
+        let mut drained = 0;
+
+        loop {
+            if drained >= UART_DRAIN_LIMIT {
+                push_packet(events, &mut bytes);
+                break;
             }
-            SerialRead::WouldBlock => {}
-            SerialRead::Error(error) => {
-                status::mark_uart_rx_error_detail(error);
-                let event = BrainstemEvent::Error(BrainstemError::UartFraming);
-                status::signal_event(&event);
-                let _ = events.push_back(event);
+
+            match hardware.read_byte() {
+                SerialRead::Byte(byte) => {
+                    drained += 1;
+                    status::mark_uart_rx_ok(hardware.now_us() / 1_000);
+                    if bytes.push(byte).is_err() {
+                        push_packet(events, &mut bytes);
+                        let _ = bytes.push(byte);
+                    }
+                }
+                SerialRead::WouldBlock => {
+                    push_packet(events, &mut bytes);
+                    break;
+                }
+                SerialRead::Error(UartReadError::Overrun) => {
+                    status::mark_uart_rx_error_detail(UartReadError::Overrun);
+                    push_packet(events, &mut bytes);
+                    break;
+                }
+                SerialRead::Error(error) => {
+                    status::mark_uart_rx_error_detail(error);
+                    push_packet(events, &mut bytes);
+                    let event = BrainstemEvent::Error(BrainstemError::UartFraming);
+                    status::signal_event(&event);
+                    let _ = events.push_back(event);
+                    break;
+                }
             }
         }
     }
@@ -93,7 +112,7 @@ impl CreateUart {
         Ok(())
     }
 
-    pub fn drive_direct_start<H, const N: usize>(
+    pub fn drive_direct<H, const N: usize>(
         &mut self,
         hardware: &mut H,
         events: &mut Deque<BrainstemEvent, N>,
@@ -112,9 +131,33 @@ impl CreateUart {
         status::signal_event(&event);
         let _ = events.push_back(event);
 
-        let velocity = ((left_mm_s as i32 + right_mm_s as i32) / 2) as i16;
-        let radius = differential_radius_mm(left_mm_s, right_mm_s);
-        self.drive(hardware, velocity, radius)
+        let right = right_mm_s.to_be_bytes();
+        let left = left_mm_s.to_be_bytes();
+        self.send_bytes(
+            hardware,
+            &[OI_DRIVE_DIRECT, right[0], right[1], left[0], left[1]],
+        )
+    }
+
+    pub fn drive_arc<H, const N: usize>(
+        &mut self,
+        hardware: &mut H,
+        events: &mut Deque<BrainstemEvent, N>,
+        velocity_mm_s: i16,
+        radius_mm: i16,
+    ) -> Result<(), BrainstemError>
+    where
+        H: BrainstemHardware,
+    {
+        let event = BrainstemEvent::DriveRequested {
+            left_mm_s: velocity_mm_s,
+            right_mm_s: radius_mm,
+            duration_ms: 0,
+        };
+        status::signal_event(&event);
+        let _ = events.push_back(event);
+
+        self.drive(hardware, velocity_mm_s, radius_mm)
     }
 
     pub fn stop<H, const N: usize>(
@@ -176,12 +219,15 @@ impl CreateUart {
     }
 }
 
-fn differential_radius_mm(left_mm_s: i16, right_mm_s: i16) -> i16 {
-    match (left_mm_s, right_mm_s) {
-        (left, right) if left == right => 0x8000u16 as i16,
-        (left, right) if left == -right && right > 0 => 1,
-        (left, right) if left == -right && right < 0 => -1,
-        (left, right) if left > right => -1,
-        _ => 1,
+fn push_packet<const N: usize>(events: &mut Deque<BrainstemEvent, N>, bytes: &mut Vec<u8, 32>) {
+    if bytes.is_empty() {
+        return;
     }
+
+    let event = BrainstemEvent::CreatePacketReceived {
+        packet_id: 0,
+        bytes: core::mem::take(bytes),
+    };
+    status::signal_event(&event);
+    let _ = events.push_back(event);
 }

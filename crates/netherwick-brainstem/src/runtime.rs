@@ -12,6 +12,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 16;
 const RUNTIME_TICK_MS: u32 = 10;
 const SENSOR_PROBE_PERIOD_MS: u32 = 100;
 const RESPONSIVE_BYTES_REQUIRED: u8 = 1;
+const CREATE_AXLE_TRACK_MM: i32 = 258;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -69,6 +70,7 @@ where
     idle_blink_next_ms: u32,
     idle_blink_on: bool,
     create_responsive: bool,
+    estop_latched: bool,
 }
 
 impl<H> Runtime<H>
@@ -97,6 +99,7 @@ where
             idle_blink_next_ms: 0,
             idle_blink_on: false,
             create_responsive: false,
+            estop_latched: false,
         }
     }
 
@@ -149,6 +152,29 @@ where
     fn poll(&mut self) {
         self.timers.poll(&mut self.hardware, &mut self.events);
         self.create_uart.poll(&mut self.hardware, &mut self.events);
+        self.poll_control_command();
+    }
+
+    fn poll_control_command(&mut self) {
+        let Some(command) = status::take_control_command() else {
+            return;
+        };
+
+        match command {
+            BrainstemCommand::Stop | BrainstemCommand::EStop => {
+                self.commands.clear();
+                self.active = ActiveAction::None;
+                let _ = self.commands.push_front(command);
+                self.mode = RuntimeMode::Running;
+            }
+            _ => {
+                let _ = self.commands.push_back(command);
+                if self.mode == RuntimeMode::Idle {
+                    self.mode = RuntimeMode::Running;
+                    status::set_runtime_state(RuntimeState::RunningDemo);
+                }
+            }
+        }
     }
 
     fn start_next_command(&mut self) -> Result<(), BrainstemError> {
@@ -160,6 +186,19 @@ where
 
         let now_ms = self.now_ms();
         match command {
+            BrainstemCommand::Stop | BrainstemCommand::StopDrive => {
+                self.stop_drive()?;
+                self.active = ActiveAction::None;
+            }
+            BrainstemCommand::EStop => {
+                self.stop_drive()?;
+                self.estop_latched = true;
+                self.active = ActiveAction::None;
+            }
+            BrainstemCommand::ClearEStop => {
+                self.estop_latched = false;
+            }
+            BrainstemCommand::Ping => {}
             BrainstemCommand::WakeCreate => {
                 status::set_demo_state(DemoState::WaitingForCreate);
                 self.push_event(BrainstemEvent::CreatePowerOnRequested);
@@ -198,7 +237,7 @@ where
                     until_ms: now_ms.wrapping_add(body::POST_MODE_SETTLE_MS),
                 };
             }
-            BrainstemCommand::SetOiMode(mode) => {
+            BrainstemCommand::SetMode(mode) | BrainstemCommand::SetOiMode(mode) => {
                 self.create_uart
                     .set_mode(&mut self.hardware, &mut self.events, mode)?;
                 status::set_oi_mode(mode);
@@ -210,27 +249,27 @@ where
                 left_mm_s,
                 right_mm_s,
                 duration_ms,
+            } => self.start_drive_direct(left_mm_s, right_mm_s, Some(duration_ms), now_ms)?,
+            BrainstemCommand::DriveDirect {
+                left_mm_s,
+                right_mm_s,
+                duration_ms,
+            } => self.start_drive_direct(left_mm_s, right_mm_s, duration_ms, now_ms)?,
+            BrainstemCommand::CmdVel {
+                linear_mm_s,
+                angular_mrad_s,
+                duration_ms,
             } => {
-                if !self.create_responsive {
-                    self.stop_drive()?;
-                    return Err(BrainstemError::CreateNoResponse);
-                }
-                status::set_demo_state(DemoState::Moving);
-                self.stop_sent = false;
-                self.create_uart.drive_direct_start(
-                    &mut self.hardware,
-                    &mut self.events,
-                    left_mm_s,
-                    right_mm_s,
-                    duration_ms,
-                )?;
-                self.active = ActiveAction::Driving {
-                    stop_at_ms: now_ms.wrapping_add(duration_ms),
-                };
+                let half_delta = angular_mrad_s as i32 * CREATE_AXLE_TRACK_MM / 2_000;
+                let left = clamp_i16(linear_mm_s as i32 - half_delta);
+                let right = clamp_i16(linear_mm_s as i32 + half_delta);
+                self.start_drive_direct(left, right, duration_ms, now_ms)?;
             }
-            BrainstemCommand::StopDrive => {
-                self.stop_drive()?;
-            }
+            BrainstemCommand::DriveArc {
+                velocity_mm_s,
+                radius_mm,
+                duration_ms,
+            } => self.start_drive_arc(velocity_mm_s, radius_mm, duration_ms, now_ms)?,
         }
 
         Ok(())
@@ -347,6 +386,69 @@ where
         Ok(())
     }
 
+    fn start_drive_direct(
+        &mut self,
+        left_mm_s: i16,
+        right_mm_s: i16,
+        duration_ms: Option<u32>,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let Some(duration_ms) = duration_ms else {
+            self.stop_drive()?;
+            return Err(BrainstemError::Timeout);
+        };
+        self.ensure_motion_allowed()?;
+
+        status::set_demo_state(DemoState::Moving);
+        self.stop_sent = false;
+        self.create_uart.drive_direct(
+            &mut self.hardware,
+            &mut self.events,
+            left_mm_s,
+            right_mm_s,
+            duration_ms,
+        )?;
+        self.active = ActiveAction::Driving {
+            stop_at_ms: now_ms.wrapping_add(duration_ms),
+        };
+        Ok(())
+    }
+
+    fn start_drive_arc(
+        &mut self,
+        velocity_mm_s: i16,
+        radius_mm: i16,
+        duration_ms: Option<u32>,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let Some(duration_ms) = duration_ms else {
+            self.stop_drive()?;
+            return Err(BrainstemError::Timeout);
+        };
+        self.ensure_motion_allowed()?;
+
+        status::set_demo_state(DemoState::Moving);
+        self.stop_sent = false;
+        self.create_uart.drive_arc(
+            &mut self.hardware,
+            &mut self.events,
+            velocity_mm_s,
+            radius_mm,
+        )?;
+        self.active = ActiveAction::Driving {
+            stop_at_ms: now_ms.wrapping_add(duration_ms),
+        };
+        Ok(())
+    }
+
+    fn ensure_motion_allowed(&mut self) -> Result<(), BrainstemError> {
+        if self.estop_latched || !self.create_responsive {
+            self.stop_drive()?;
+            return Err(BrainstemError::CreateNoResponse);
+        }
+        Ok(())
+    }
+
     fn enter_idle(&mut self) {
         let _ = self.stop_drive();
         self.mode = RuntimeMode::Idle;
@@ -428,4 +530,8 @@ where
 
 fn time_reached(now_ms: u32, deadline_ms: u32) -> bool {
     now_ms.wrapping_sub(deadline_ms) < u32::MAX / 2
+}
+
+fn clamp_i16(value: i32) -> i16 {
+    value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }

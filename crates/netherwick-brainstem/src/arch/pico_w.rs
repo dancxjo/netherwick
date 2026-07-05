@@ -24,6 +24,7 @@ use embedded_io_async::Write;
 use static_cell::StaticCell;
 
 use crate::body;
+use crate::commands::{BrainstemCommand, CreateOiMode};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 use crate::status;
@@ -290,18 +291,42 @@ async fn http_task(stack: Stack<'static>) -> ! {
 
         let uptime_ms = Instant::now().as_millis() as u32;
         status::mark_http_request(uptime_ms);
+        let method = request_method(&request[..n]);
         let path = request_path(&request[..n]);
-        let result = match path {
-            Some("/") | Some("/index.html") => {
+        let result = match (method, path) {
+            (Some("GET"), Some("/") | Some("/index.html")) => {
                 write_response(&mut socket, "text/plain; charset=utf-8", hello_body()).await
             }
-            Some("/status.json") => {
+            (Some("GET"), Some("/status.json")) => {
                 let snapshot = status::snapshot(uptime_ms);
                 match status::render_json(snapshot, &mut json) {
                     Ok(body) => {
                         write_response(&mut socket, "application/json", body.as_bytes()).await
                     }
                     Err(_) => write_plain_status(&mut socket, 500, "Internal Server Error").await,
+                }
+            }
+            (Some("POST"), Some("/command")) => {
+                match handle_command_request(&request[..n], &mut json) {
+                    Ok(body) => {
+                        write_response(&mut socket, "application/json", body.as_bytes()).await
+                    }
+                    Err(CommandParseError::Busy(command_id)) => {
+                        let body =
+                            render_command_response(json.as_mut(), false, command_id, "busy");
+                        match body {
+                            Some(body) => {
+                                write_response(&mut socket, "application/json", body.as_bytes())
+                                    .await
+                            }
+                            None => {
+                                write_plain_status(&mut socket, 500, "Internal Server Error").await
+                            }
+                        }
+                    }
+                    Err(CommandParseError::BadRequest) => {
+                        write_plain_status(&mut socket, 400, "Bad Request").await
+                    }
                 }
             }
             _ => write_plain_status(&mut socket, 404, "Not Found").await,
@@ -479,8 +504,128 @@ fn request_path(request: &[u8]) -> Option<&str> {
     }
 }
 
+fn request_method(request: &[u8]) -> Option<&str> {
+    let line_end = request
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(request.len());
+    let line = core::str::from_utf8(&request[..line_end]).ok()?;
+    line.split(' ').next()
+}
+
 fn hello_body() -> &'static [u8] {
     b"hello, I'm at least up\nstatus: /status.json\n"
+}
+
+enum CommandParseError {
+    BadRequest,
+    Busy(u32),
+}
+
+fn handle_command_request<'a>(
+    request: &[u8],
+    buffer: &'a mut [u8],
+) -> Result<&'a str, CommandParseError> {
+    let body = request_body(request).ok_or(CommandParseError::BadRequest)?;
+    let command_id = json_u32(body, "command_id").ok_or(CommandParseError::BadRequest)?;
+    let command = parse_command(body).ok_or(CommandParseError::BadRequest)?;
+    if !status::submit_control_command(command_id, command) {
+        return Err(CommandParseError::Busy(command_id));
+    }
+    render_command_response(buffer, true, command_id, "accepted")
+        .ok_or(CommandParseError::BadRequest)
+}
+
+fn request_body(request: &[u8]) -> Option<&str> {
+    let body_start = request
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")?
+        .checked_add(4)?;
+    core::str::from_utf8(&request[body_start..]).ok()
+}
+
+fn parse_command(body: &str) -> Option<BrainstemCommand> {
+    match json_str(body, "kind")? {
+        "wake_create" | "wake" => Some(BrainstemCommand::WakeCreate),
+        "sleep_create" | "sleep" => Some(BrainstemCommand::SleepCreate),
+        "stop" => Some(BrainstemCommand::Stop),
+        "estop" => Some(BrainstemCommand::EStop),
+        "clear_estop" => Some(BrainstemCommand::ClearEStop),
+        "set_mode" => match json_str(body, "mode")? {
+            "passive" => Some(BrainstemCommand::SetMode(CreateOiMode::Passive)),
+            "safe" => Some(BrainstemCommand::SetMode(CreateOiMode::Safe)),
+            "full" => Some(BrainstemCommand::SetMode(CreateOiMode::Full)),
+            _ => None,
+        },
+        "drive_direct" => Some(BrainstemCommand::DriveDirect {
+            left_mm_s: json_i16(body, "left_mm_s")?,
+            right_mm_s: json_i16(body, "right_mm_s")?,
+            duration_ms: Some(json_u32(body, "duration_ms")?),
+        }),
+        "cmd_vel" => Some(BrainstemCommand::CmdVel {
+            linear_mm_s: json_i16(body, "linear_mm_s")?,
+            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
+            duration_ms: Some(json_u32(body, "duration_ms")?),
+        }),
+        "drive_arc" => Some(BrainstemCommand::DriveArc {
+            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
+            radius_mm: json_i16(body, "radius_mm")?,
+            duration_ms: Some(json_u32(body, "duration_ms")?),
+        }),
+        "ping" => Some(BrainstemCommand::Ping),
+        _ => None,
+    }
+}
+
+fn render_command_response<'a>(
+    buffer: &'a mut [u8],
+    accepted: bool,
+    command_id: u32,
+    message: &str,
+) -> Option<&'a str> {
+    let mut response = heapless::String::<128>::new();
+    let _ = write!(
+        response,
+        "{{\"accepted\":{},\"command_id\":{},\"message\":\"{}\"}}\n",
+        if accepted { "true" } else { "false" },
+        command_id,
+        message
+    );
+    let bytes = response.as_bytes();
+    if bytes.len() > buffer.len() {
+        return None;
+    }
+    buffer[..bytes.len()].copy_from_slice(bytes);
+    core::str::from_utf8(&buffer[..bytes.len()]).ok()
+}
+
+fn json_str<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let key_start = body.find(key)?;
+    let after_key = &body[key_start + key.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+    let value = after_colon.strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some(&value[..end])
+}
+
+fn json_u32(body: &str, key: &str) -> Option<u32> {
+    json_i32(body, key).and_then(|value| u32::try_from(value).ok())
+}
+
+fn json_i16(body: &str, key: &str) -> Option<i16> {
+    json_i32(body, key).and_then(|value| i16::try_from(value).ok())
+}
+
+fn json_i32(body: &str, key: &str) -> Option<i32> {
+    let key_start = body.find(key)?;
+    let after_key = &body[key_start + key.len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    let end = value
+        .find(|c: char| !(c == '-' || c.is_ascii_digit()))
+        .unwrap_or(value.len());
+    value[..end].parse().ok()
 }
 
 fn build_mdns_announcement(packet: &mut [u8; 96]) -> usize {

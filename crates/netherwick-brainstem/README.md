@@ -213,6 +213,7 @@ The interface is read-only for Brainstem 0:
 
 - `http://192.168.4.1/` serves a plain liveness response: `hello, I'm at least up`.
 - `http://192.168.4.1/status.json` serves firmware/body/runtime/Create/UART/demo status.
+- `POST http://192.168.4.1/command` accepts one low-level command atom.
 - `http://pete.local/` and `http://pete.local/status.json` may work on clients that support mDNS on the AP network.
 
 The status JSON includes firmware name/version, body name/kind, uptime, runtime state, Create power state, OI mode, UART RX health, last UART packet timestamp, current command, last error, demo state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, and last web request timestamp.
@@ -236,6 +237,16 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 ```
 
 Firmware HTTPS is currently reported as `unavailable` in `/status.json`; the HTTP liveness and status paths are intentionally kept small and independent of Create/body responsiveness.
+
+Example command:
+
+```bash
+curl -s http://192.168.4.1/command \
+  -H 'Content-Type: application/json' \
+  -d '{"command_id":42,"kind":"cmd_vel","linear_mm_s":120,"angular_mrad_s":0,"duration_ms":250}'
+```
+
+Supported command `kind` values are `wake_create`, `sleep_create`, `stop`, `estop`, `clear_estop`, `set_mode`, `drive_direct`, `cmd_vel`, `drive_arc`, and `ping`. Motion commands must include `duration_ms`; the brainstem owns timing and stop deadlines, while higher-level intent stays outside this firmware.
 
 The Pico W onboard LED normally emits a one-blink heartbeat every 15 seconds. Event blink codes interrupt that heartbeat:
 

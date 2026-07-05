@@ -7,11 +7,35 @@ pub enum CreateOiMode {
     Full,
 }
 
+pub type BodyMode = CreateOiMode;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum BrainstemCommand {
+    SetMode(BodyMode),
     WakeCreate,
     SleepCreate,
+    Stop,
+    EStop,
+    ClearEStop,
+    DriveDirect {
+        left_mm_s: i16,
+        right_mm_s: i16,
+        duration_ms: Option<u32>,
+    },
+    CmdVel {
+        linear_mm_s: i16,
+        angular_mrad_s: i16,
+        duration_ms: Option<u32>,
+    },
+    DriveArc {
+        velocity_mm_s: i16,
+        radius_mm: i16,
+        duration_ms: Option<u32>,
+    },
+    Ping,
+
+    // Legacy/demo aliases kept local to the firmware command script.
     PulseBrc,
     StartOi,
     SetOiMode(CreateOiMode),
@@ -27,22 +51,21 @@ pub const DEMO_SCRIPT: &[BrainstemCommand] = &[
     BrainstemCommand::WakeCreate,
     BrainstemCommand::PulseBrc,
     BrainstemCommand::StartOi,
-    BrainstemCommand::SetOiMode(CreateOiMode::Safe),
-    BrainstemCommand::Drive {
+    BrainstemCommand::SetMode(BodyMode::Safe),
+    BrainstemCommand::DriveDirect {
         left_mm_s: 100,
         right_mm_s: 100,
-        duration_ms: 500,
+        duration_ms: Some(500),
     },
-    BrainstemCommand::Drive {
+    BrainstemCommand::DriveDirect {
         left_mm_s: -80,
         right_mm_s: 80,
-        duration_ms: 400,
+        duration_ms: Some(400),
     },
-    BrainstemCommand::Drive {
+    BrainstemCommand::DriveDirect {
         left_mm_s: 80,
         right_mm_s: -80,
-        duration_ms: 400,
+        duration_ms: Some(400),
     },
-    BrainstemCommand::StopDrive,
-    BrainstemCommand::SleepCreate,
+    BrainstemCommand::Stop,
 ];
