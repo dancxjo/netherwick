@@ -36,6 +36,8 @@ const AP_IP_OCTETS: [u8; 4] = [192, 168, 4, 1];
 const DHCP_LEASE_IP_OCTETS: [u8; 4] = [192, 168, 4, 2];
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const HTTP_PORT: u16 = 80;
+const WS_CONTROL_PORT: u16 = 81;
+const DNS_PORT: u16 = 53;
 const MDNS_PORT: u16 = 5353;
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
@@ -185,6 +187,8 @@ async fn wifi_task(
         status::mark_wifi_ap_started();
         let _ = control.gpio_set(0, false).await;
         spawner.spawn(http_task(stack).expect("spawn http task"));
+        spawner.spawn(websocket_task(stack).expect("spawn websocket task"));
+        spawner.spawn(dns_task(stack).expect("spawn dns task"));
         spawner.spawn(mdns_task(stack).expect("spawn mdns task"));
         spawner.spawn(dhcp_task(stack).expect("spawn dhcp task"));
         status::mark_wifi_services_started();
@@ -240,7 +244,7 @@ async fn start_wifi_ap(
         gateway: None,
     });
 
-    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         net_device,
         config,
@@ -352,6 +356,85 @@ async fn http_task(stack: Stack<'static>) -> ! {
     }
 }
 
+#[embassy_executor::task]
+async fn websocket_task(stack: Stack<'static>) -> ! {
+    let mut rx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 1024];
+    let mut request = [0; 512];
+    let mut payload = [0; 256];
+    let mut response = [0; 128];
+
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(Duration::from_secs(30)));
+
+        if socket.accept(WS_CONTROL_PORT).await.is_err() {
+            continue;
+        }
+
+        let n = match socket.read(&mut request).await {
+            Ok(n) => n,
+            Err(_) => {
+                socket.abort();
+                continue;
+            }
+        };
+
+        let path = request_path(&request[..n]);
+        let Some(key) = websocket_key(&request[..n]) else {
+            let _ = write_plain_status(&mut socket, 400, "Bad Request").await;
+            socket.close();
+            let _ = socket.flush().await;
+            continue;
+        };
+
+        if path != Some("/control") {
+            let _ = write_plain_status(&mut socket, 404, "Not Found").await;
+            socket.close();
+            let _ = socket.flush().await;
+            continue;
+        }
+
+        let Some(accept_key) = websocket_accept_key(key, &mut response) else {
+            socket.abort();
+            continue;
+        };
+
+        if write_websocket_upgrade(&mut socket, accept_key)
+            .await
+            .is_err()
+        {
+            socket.abort();
+            continue;
+        }
+
+        loop {
+            match read_websocket_text(&mut socket, &mut payload).await {
+                Ok(Some(body)) => {
+                    let reply = handle_websocket_command(body, &mut response)
+                        .unwrap_or("{\"accepted\":false,\"message\":\"bad_request\"}\n");
+                    if write_websocket_text(&mut socket, reply.as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        socket.abort();
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    socket.close();
+                    let _ = socket.flush().await;
+                    break;
+                }
+                Err(_) => {
+                    socket.abort();
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn onboard_led_loop(control: &mut cyw43::Control<'static>) -> ! {
     let mut next_heartbeat_ms = 0;
     loop {
@@ -377,6 +460,40 @@ async fn blink_onboard_led(control: &mut cyw43::Control<'static>, blinks: u8) {
         Timer::after_millis(LED_BLINK_ON_MS).await;
         let _ = control.gpio_set(0, false).await;
         Timer::after_millis(LED_BLINK_OFF_MS).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn dns_task(stack: Stack<'static>) -> ! {
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut rx_buffer = [0; 512];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut tx_buffer = [0; 512];
+    let mut request = [0; 512];
+    let mut response = [0; 512];
+
+    loop {
+        let mut socket = UdpSocket::new(
+            stack,
+            &mut rx_meta,
+            &mut rx_buffer,
+            &mut tx_meta,
+            &mut tx_buffer,
+        );
+        if socket.bind(DNS_PORT).is_err() {
+            Timer::after_secs(5).await;
+            continue;
+        }
+
+        loop {
+            let Ok((len, endpoint)) = socket.recv_from(&mut request).await else {
+                continue;
+            };
+            let Some(reply) = build_dns_reply(&request[..len], &mut response) else {
+                continue;
+            };
+            let _ = socket.send_to(reply, endpoint).await;
+        }
     }
 }
 
@@ -560,9 +677,10 @@ button:active{transform:translateY(1px);background:#eef1ea}.danger{background:#7
 <p class="small muted">Thumb stick renews short velocity commands. Release sends stop. Motion commands expire unless renewed.</p>
 </div>
 <script>
-let id=1,active=false,timer=0,last={x:0,y:0};
+let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false;
 const base=document.getElementById('base'),nub=document.getElementById('nub'),net=document.getElementById('net');
-function post(o){o.command_id=id++;return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).then(r=>r.json()).then(j=>{net.textContent=j.accepted?'accepted':'busy';return j}).catch(_=>{net.textContent='offline'})}
+function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;net.textContent='control ws'};ws.onclose=()=>{wsOpen=false;setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false};ws.onmessage=e=>{try{let j=JSON.parse(e.data);net.textContent=j.accepted?'accepted':'busy'}catch(_){}}}catch(_){wsOpen=false}}
+function post(o){o.command_id=id++;let body=JSON.stringify(o);if(wsOpen&&ws&&ws.readyState===1){ws.send(body);return Promise.resolve({accepted:true})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{net.textContent=j.accepted?'accepted':'busy';return j}).catch(_=>{net.textContent='offline'})}
 function stop(){clearInterval(timer);timer=0;active=false;nub.style.left='50%';nub.style.top='50%';post({kind:'stop'})}
 function sendJoy(){let lin=Math.round(-last.y*220),ang=Math.round(last.x*1800);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,duration_ms:250})}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
@@ -581,6 +699,7 @@ document.getElementById('left').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,a
 document.getElementById('right').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:1500,duration_ms:250})
 function refresh(){fetch('/status.json').then(r=>r.json()).then(s=>{net.textContent=s.wifi_state||'online';runtime.textContent=s.current_runtime_state;create.textContent=s.create_power_state+' / '+s.oi_mode;uart.textContent=s.uart_rx_health+' '+s.last_uart_read_error;cmd.textContent=(s.current_command||'none')+' pending '+(s.pending_command||'none');err.textContent=(s.last_error||'none')+' '+(s.last_error_hint||'')}).catch(_=>net.textContent='offline')}
 setInterval(refresh,1500);refresh();
+connectWs();
 </script>
 </body>
 </html>
@@ -604,6 +723,15 @@ fn handle_command_request<'a>(
     }
     render_command_response(buffer, true, command_id, "accepted")
         .ok_or(CommandParseError::BadRequest)
+}
+
+fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    let command_id = json_u32(body, "command_id")?;
+    let command = parse_command(body)?;
+    if !status::submit_control_command(command_id, command) {
+        return render_command_response(buffer, false, command_id, "busy");
+    }
+    render_command_response(buffer, true, command_id, "accepted")
 }
 
 fn request_body(request: &[u8]) -> Option<&str> {
@@ -671,6 +799,258 @@ fn render_command_response<'a>(
     core::str::from_utf8(&buffer[..bytes.len()]).ok()
 }
 
+fn websocket_key(request: &[u8]) -> Option<&str> {
+    let request = core::str::from_utf8(request).ok()?;
+    for line in request.split("\r\n") {
+        if let Some(value) = line.strip_prefix("Sec-WebSocket-Key:") {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+fn websocket_accept_key<'a>(key: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut sha1 = Sha1::new();
+    sha1.update(key.as_bytes());
+    sha1.update(GUID);
+    let digest = sha1.finalize();
+    let len = base64_encode(&digest, buffer)?;
+    core::str::from_utf8(&buffer[..len]).ok()
+}
+
+async fn write_websocket_upgrade(
+    socket: &mut TcpSocket<'_>,
+    accept_key: &str,
+) -> Result<(), embassy_net::tcp::Error> {
+    let mut header = heapless::String::<192>::new();
+    let _ = write!(
+        header,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+        accept_key
+    );
+    socket.write_all(header.as_bytes()).await?;
+    socket.flush().await
+}
+
+async fn read_websocket_text<'a>(
+    socket: &mut TcpSocket<'_>,
+    payload: &'a mut [u8],
+) -> Result<Option<&'a str>, embassy_net::tcp::Error> {
+    let mut header = [0; 2];
+    read_exact_tcp(socket, &mut header).await?;
+
+    let opcode = header[0] & 0x0f;
+    if opcode == 0x08 {
+        return Ok(None);
+    }
+    if opcode != 0x01 {
+        return Ok(Some(""));
+    }
+
+    let masked = header[1] & 0x80 != 0;
+    let len = (header[1] & 0x7f) as usize;
+    if !masked || len > payload.len() || len == 126 || len == 127 {
+        return Ok(Some(""));
+    }
+
+    let mut mask = [0; 4];
+    read_exact_tcp(socket, &mut mask).await?;
+    read_exact_tcp(socket, &mut payload[..len]).await?;
+    for i in 0..len {
+        payload[i] ^= mask[i & 3];
+    }
+
+    Ok(core::str::from_utf8(&payload[..len]).ok())
+}
+
+async fn write_websocket_text(
+    socket: &mut TcpSocket<'_>,
+    payload: &[u8],
+) -> Result<(), embassy_net::tcp::Error> {
+    if payload.len() > 125 {
+        return Ok(());
+    }
+    let header = [0x81, payload.len() as u8];
+    socket.write_all(&header).await?;
+    socket.write_all(payload).await?;
+    socket.flush().await
+}
+
+async fn read_exact_tcp(
+    socket: &mut TcpSocket<'_>,
+    mut buffer: &mut [u8],
+) -> Result<(), embassy_net::tcp::Error> {
+    while !buffer.is_empty() {
+        let n = socket.read(buffer).await?;
+        if n == 0 {
+            return Err(embassy_net::tcp::Error::ConnectionReset);
+        }
+        let tmp = buffer;
+        buffer = &mut tmp[n..];
+    }
+    Ok(())
+}
+
+fn base64_encode(input: &[u8], output: &mut [u8]) -> Option<usize> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let output_len = input.len().div_ceil(3) * 4;
+    if output_len > output.len() {
+        return None;
+    }
+
+    let mut i = 0;
+    let mut j = 0;
+    while i < input.len() {
+        let b0 = input[i];
+        let b1 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+        let b2 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+        output[j] = TABLE[(b0 >> 2) as usize];
+        output[j + 1] = TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
+        output[j + 2] = if i + 1 < input.len() {
+            TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize]
+        } else {
+            b'='
+        };
+        output[j + 3] = if i + 2 < input.len() {
+            TABLE[(b2 & 0x3f) as usize]
+        } else {
+            b'='
+        };
+        i += 3;
+        j += 4;
+    }
+    Some(output_len)
+}
+
+struct Sha1 {
+    state: [u32; 5],
+    len_bytes: u64,
+    buffer: [u8; 64],
+    buffer_len: usize,
+}
+
+impl Sha1 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6745_2301,
+                0xefcd_ab89,
+                0x98ba_dcfe,
+                0x1032_5476,
+                0xc3d2_e1f0,
+            ],
+            len_bytes: 0,
+            buffer: [0; 64],
+            buffer_len: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.len_bytes = self.len_bytes.saturating_add(input.len() as u64);
+
+        if self.buffer_len > 0 {
+            let copy_len = (64 - self.buffer_len).min(input.len());
+            self.buffer[self.buffer_len..self.buffer_len + copy_len]
+                .copy_from_slice(&input[..copy_len]);
+            self.buffer_len += copy_len;
+            input = &input[copy_len..];
+            if self.buffer_len == 64 {
+                let block = self.buffer;
+                self.process_block(&block);
+                self.buffer_len = 0;
+            }
+        }
+
+        while input.len() >= 64 {
+            let mut block = [0; 64];
+            block.copy_from_slice(&input[..64]);
+            self.process_block(&block);
+            input = &input[64..];
+        }
+
+        if !input.is_empty() {
+            self.buffer[..input.len()].copy_from_slice(input);
+            self.buffer_len = input.len();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 20] {
+        let bit_len = self.len_bytes.saturating_mul(8);
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+
+        if self.buffer_len > 56 {
+            for byte in &mut self.buffer[self.buffer_len..] {
+                *byte = 0;
+            }
+            let block = self.buffer;
+            self.process_block(&block);
+            self.buffer_len = 0;
+        }
+
+        for byte in &mut self.buffer[self.buffer_len..56] {
+            *byte = 0;
+        }
+        self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.buffer;
+        self.process_block(&block);
+
+        let mut out = [0; 20];
+        for (i, word) in self.state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    fn process_block(&mut self, block: &[u8; 64]) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let mut a = self.state[0];
+        let mut b = self.state[1];
+        let mut c = self.state[2];
+        let mut d = self.state[3];
+        let mut e = self.state[4];
+
+        for (i, word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+                _ => (b ^ c ^ d, 0xca62_c1d6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+    }
+}
+
 fn json_str<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     let key_start = body.find(key)?;
     let after_key = &body[key_start + key.len()..];
@@ -723,6 +1103,115 @@ fn build_mdns_announcement(packet: &mut [u8; 96]) -> usize {
     ];
     packet[i..i + answer.len()].copy_from_slice(&answer);
     i + answer.len()
+}
+
+fn build_dns_reply<'a>(query: &[u8], response: &'a mut [u8; 512]) -> Option<&'a [u8]> {
+    let question = parse_dns_question(query)?;
+    if !dns_name_matches_pete(&query[12..question.name_end])
+        || !matches!(question.qtype, 1 | 255)
+        || !matches!(question.qclass, 1 | 255)
+    {
+        return None;
+    }
+
+    response[..question.end].copy_from_slice(&query[..question.end]);
+    response[2] = 0x84 | (query[2] & 0x01); // response, authoritative, preserve RD
+    response[3] = 0x00; // no error
+    response[4] = 0x00;
+    response[5] = 0x01; // echo only the first question
+    response[6] = 0x00;
+    response[7] = 0x01; // one answer
+    response[8] = 0x00;
+    response[9] = 0x00;
+    response[10] = 0x00;
+    response[11] = 0x00;
+
+    let mut i = question.end;
+    let answer = [
+        0xc0,
+        0x0c, // compressed name pointer to the original question name
+        0x00,
+        0x01, // A
+        0x00,
+        0x01, // IN
+        0x00,
+        0x00,
+        0x00,
+        0x3c, // TTL 60s
+        0x00,
+        0x04, // IPv4 length
+        AP_IP_OCTETS[0],
+        AP_IP_OCTETS[1],
+        AP_IP_OCTETS[2],
+        AP_IP_OCTETS[3],
+    ];
+    if i + answer.len() > response.len() {
+        return None;
+    }
+    response[i..i + answer.len()].copy_from_slice(&answer);
+    i += answer.len();
+    Some(&response[..i])
+}
+
+struct DnsQuestion {
+    name_end: usize,
+    end: usize,
+    qtype: u16,
+    qclass: u16,
+}
+
+fn parse_dns_question(packet: &[u8]) -> Option<DnsQuestion> {
+    if packet.len() < 17 || packet[2] & 0x80 != 0 {
+        return None;
+    }
+    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
+    if question_count == 0 {
+        return None;
+    }
+
+    let mut i = 12;
+    loop {
+        let len = *packet.get(i)? as usize;
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        i += 1;
+        if len == 0 {
+            break;
+        }
+        i = i.checked_add(len)?;
+        if i > packet.len() {
+            return None;
+        }
+    }
+
+    let name_end = i;
+    let end = i.checked_add(4)?;
+    if end > packet.len() {
+        return None;
+    }
+    Some(DnsQuestion {
+        name_end,
+        end,
+        qtype: u16::from_be_bytes([packet[i], packet[i + 1]]),
+        qclass: u16::from_be_bytes([packet[i + 2], packet[i + 3]]),
+    })
+}
+
+fn dns_name_matches_pete(name: &[u8]) -> bool {
+    name.len() == MDNS_NAME.len()
+        && name
+            .iter()
+            .zip(MDNS_NAME.iter())
+            .all(|(left, right)| dns_byte_eq(*left, *right))
+}
+
+fn dns_byte_eq(left: u8, right: u8) -> bool {
+    if left.is_ascii_alphabetic() && right.is_ascii_alphabetic() {
+        left.to_ascii_lowercase() == right.to_ascii_lowercase()
+    } else {
+        left == right
+    }
 }
 
 fn build_dhcp_reply<'a>(
