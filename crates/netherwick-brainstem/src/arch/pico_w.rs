@@ -442,10 +442,10 @@ async fn http_task(stack: Stack<'static>) -> ! {
 #[embassy_executor::task]
 async fn websocket_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0; 1024];
-    let mut tx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 2048];
     let mut request = [0; 512];
     let mut payload = [0; 256];
-    let mut response = [0; 128];
+    let mut response = [0; 1536];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -494,14 +494,14 @@ async fn websocket_task(stack: Stack<'static>) -> ! {
         loop {
             match read_websocket_text(&mut socket, &mut payload).await {
                 Ok(Some(body)) => {
-                    let reply = handle_websocket_command(body, &mut response)
-                        .unwrap_or("{\"accepted\":false,\"message\":\"bad_request\"}\n");
-                    if write_websocket_text(&mut socket, reply.as_bytes())
-                        .await
-                        .is_err()
-                    {
-                        socket.abort();
-                        break;
+                    if let Some(reply) = handle_websocket_message(body, &mut response) {
+                        if write_websocket_text(&mut socket, reply.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            socket.abort();
+                            break;
+                        }
                     }
                 }
                 Ok(None) => {
@@ -718,71 +718,101 @@ fn index_html() -> &'static [u8] {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pete Brainstem</title>
 <style>
-:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#161616;background:#f6f7f4}
-*{box-sizing:border-box}body{margin:0}.wrap{max-width:780px;margin:auto;padding:14px}
-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
-h1{font-size:20px;margin:0}.pill{font-size:12px;border:1px solid #bbb;border-radius:999px;padding:4px 8px;background:white}
-.grid{display:grid;gap:10px}.panel{background:#fff;border:1px solid #d7d9d2;border-radius:8px;padding:12px}
-.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 auto}
-button{min-height:42px;border:1px solid #aeb3aa;border-radius:7px;background:#fff;font-weight:650;font-size:14px}
-button:active{transform:translateY(1px);background:#eef1ea}.danger{background:#7b1f24;color:#fff;border-color:#5c1418}.stop{background:#151515;color:#fff;border-color:#151515}
-.joy{height:260px;display:grid;place-items:center;touch-action:none;user-select:none}
-.base{width:min(72vw,240px);height:min(72vw,240px);border-radius:50%;background:#e6e9e1;border:2px solid #c4c9be;position:relative}
-.nub{width:82px;height:82px;border-radius:50%;background:#2f6f73;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);box-shadow:0 5px 14px #0003}
-.readout{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px}.readout div{background:#f3f4f0;border-radius:6px;padding:7px;min-height:34px}
-.wide{grid-column:1/-1}.muted{color:#60645f}.small{font-size:12px}
-@media(min-width:720px){.grid{grid-template-columns:1.2fr .8fr}.wide{grid-column:auto}.joy{height:330px}}
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#1b211d;background:#eef2ed}
+*{box-sizing:border-box}body{margin:0}.wrap{max-width:980px;margin:auto;padding:14px}
+header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
+h1{font-size:22px;line-height:1.1;margin:0}h2{font-size:13px;margin:0 0 10px;color:#57615a;text-transform:uppercase;font-weight:800}
+.sub{margin-top:4px;font-size:13px;color:#637067}.top{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}
+.pill{font-size:12px;border:1px solid #cbd3cd;border-radius:999px;padding:5px 9px;background:#fff;color:#36413a}
+.pill.ok{border-color:#8cc7a3;background:#eefbf3}.pill.warn{border-color:#e2bf62;background:#fff8df}.pill.bad{border-color:#d98282;background:#fff0f0}
+.grid{display:grid;gap:10px}.panel{background:#fff;border:1px solid #d8ded9;border-radius:8px;padding:12px;box-shadow:0 1px 2px #16201512}
+.hero{display:grid;gap:12px}.joy{min-height:285px;display:grid;place-items:center;touch-action:none;user-select:none;background:linear-gradient(180deg,#fbfcfb,#f3f7f3)}
+.base{width:min(72vw,270px);height:min(72vw,270px);border-radius:50%;background:#e4ebe5;border:2px solid #c5d0c7;position:relative;box-shadow:inset 0 0 0 28px #edf3ee}
+.base:before,.base:after{content:"";position:absolute;background:#cbd5ce}.base:before{width:2px;height:82%;left:50%;top:9%}.base:after{height:2px;width:82%;left:9%;top:50%}
+.nub{width:86px;height:86px;border-radius:50%;background:#2d696f;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);box-shadow:0 8px 18px #13251c33;border:4px solid #f7fbf8}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 auto}.stack{display:grid;gap:8px}.cluster{display:grid;gap:8px;margin-top:12px}
+button{min-height:44px;border:1px solid #b6c0b8;border-radius:7px;background:#fff;color:#1f2822;font-weight:750;font-size:14px;letter-spacing:0}
+button:active,.active{transform:translateY(1px);background:#eaf0ec}button:disabled{opacity:.55}.primary{background:#dcefe5;border-color:#9cc8ae}.stop{background:#202522;color:#fff;border-color:#202522}.danger{background:#8e242b;color:#fff;border-color:#75191f}
+.pad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.pad button{min-height:48px}.pad .center{grid-column:2}.pad .widebtn{grid-column:1/-1}
+.seg{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.seg button{min-height:38px;font-size:12px}
+label{font-size:12px;color:#5c675f;font-weight:700}.slider{display:grid;gap:6px}.slider input{width:100%;accent-color:#2d696f}
+.readout{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px}.tile{background:#f5f7f5;border:1px solid #e1e6e2;border-radius:7px;padding:8px;min-height:48px}
+.tile b{display:block;color:#4d5851;font-size:11px;text-transform:uppercase}.tile span{overflow-wrap:anywhere}.wide{grid-column:1/-1}.muted{color:#68736c}.log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45;max-height:96px;overflow:auto}
+@media(min-width:760px){.grid{grid-template-columns:1.1fr .9fr}.wide{grid-column:1/-1}.hero{grid-template-columns:1fr}.joy{min-height:360px}.controls{align-self:start}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<header><h1>Pete Brainstem</h1><span id="net" class="pill">connecting</span></header>
+<header><div><h1>Pete Brainstem</h1><div class="sub" id="headline">Waiting for status</div></div><div class="top"><span id="net" class="pill">connecting</span><span id="mode" class="pill">mode unknown</span></div></header>
 <div class="grid">
-<section class="panel joy">
-<div id="base" class="base"><div id="nub" class="nub"></div></div>
+<section class="panel hero">
+<div class="joy"><div id="base" class="base"><div id="nub" class="nub"></div></div></div>
+<div class="row"><button class="stop" id="stop">STOP</button><button class="danger" id="estop">E-STOP</button><button id="clear">Clear E-Stop</button></div>
 </section>
-<section class="panel">
-<div class="row"><button class="stop" id="stop">STOP</button><button class="danger" id="estop">E-STOP</button><button id="clear">Clear</button></div>
-<div class="row" style="margin-top:8px"><button id="arm">ARM</button><button id="disarm">DISARM</button><button id="dock">DOCK</button></div>
-<div class="row" style="margin-top:8px"><button data-lights="off">Lights Off</button><button data-lights="status">Status</button><button id="song">Song</button></div>
-<div class="row" style="margin-top:8px"><button id="back">Back</button><button id="left">Left</button><button id="right">Right</button></div>
+<section class="panel controls">
+<h2>Drive</h2>
+<div class="slider"><label for="speed">Speed <span id="speedv">120</span> mm/s</label><input id="speed" type="range" min="40" max="220" value="120"></div>
+<div class="slider"><label for="turn">Turn <span id="turnv">1200</span> mrad/s</label><input id="turn" type="range" min="400" max="1800" value="1200"></div>
+<div class="pad cluster">
+<button class="primary center" data-drive="fwd">FWD</button>
+<button data-drive="left">LEFT</button><button class="stop" id="padstop">STOP</button><button data-drive="right">RIGHT</button>
+<button data-drive="back" class="center">BACK</button>
+<button data-drive="spinl">SPIN L</button><button data-drive="slow">SLOW</button><button data-drive="spinr">SPIN R</button>
+</div>
+<div class="cluster"><h2>Mode</h2><div class="row"><button id="arm" class="primary">Arm</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
+<div class="cluster"><h2>Lights</h2><div class="seg"><button data-lights="off">Off</button><button data-lights="status">Status</button><button data-lights="clean">Clean</button><button data-lights="dock">Dock</button><button data-lights="spot">Spot</button><button data-lights="max">Max</button></div></div>
+<div class="cluster"><div class="row"><button id="song">Song</button><button id="refresh">Refresh</button></div></div>
 </section>
 <section class="panel wide">
+<h2>Telemetry</h2>
 <div class="readout">
-<div><b>Runtime</b><br><span id="runtime" class="muted">...</span></div>
-<div><b>Create</b><br><span id="create" class="muted">...</span></div>
-<div><b>UART</b><br><span id="uart" class="muted">...</span></div>
-<div><b>Command</b><br><span id="cmd" class="muted">...</span></div>
-<div class="wide"><b>Last error</b><br><span id="err" class="muted">...</span></div>
+<div class="tile"><b>Runtime</b><span id="runtime" class="muted">...</span></div>
+<div class="tile"><b>Uptime</b><span id="uptime" class="muted">...</span></div>
+<div class="tile"><b>Create</b><span id="create" class="muted">...</span></div>
+<div class="tile"><b>UART</b><span id="uart" class="muted">...</span></div>
+<div class="tile"><b>Command</b><span id="cmd" class="muted">...</span></div>
+<div class="tile"><b>Forebrain</b><span id="forebrain" class="muted">...</span></div>
+<div class="tile"><b>Web</b><span id="web" class="muted">...</span></div>
+<div class="tile"><b>Firmware</b><span id="firmware" class="muted">...</span></div>
+<div class="tile wide"><b>Last error</b><span id="err" class="muted">...</span></div>
+<div class="tile wide"><b>Activity</b><div id="log" class="log muted">No commands yet</div></div>
 </div>
 </section>
 </div>
-<p class="small muted">Thumb stick renews short velocity commands. Release sends stop. Motion commands expire unless renewed.</p>
 </div>
 <script>
-let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false;
-const base=document.getElementById('base'),nub=document.getElementById('nub'),net=document.getElementById('net');
-function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;net.textContent='control ws'};ws.onclose=()=>{wsOpen=false;setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false};ws.onmessage=e=>{try{let j=JSON.parse(e.data);net.textContent=j.accepted?'accepted':'busy'}catch(_){}}}catch(_){wsOpen=false}}
-function post(o){let cid=id++;o.command_id=cid;if(o.kind==='cmd_vel'&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o);if(wsOpen&&ws&&ws.readyState===1){ws.send(body);return Promise.resolve({accepted:true})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{net.textContent=j.accepted?'accepted':'busy';return j}).catch(_=>{net.textContent='offline'})}
-function stop(){clearInterval(timer);timer=0;active=false;nub.style.left='50%';nub.style.top='50%';post({kind:'stop'})}
-function sendJoy(){let lin=Math.round(-last.y*220),ang=Math.round(last.x*1800);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:250})}
+let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='';
+const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
+function title(s){return (s||'unknown').replaceAll('_',' ')}
+function pill(el,text,state){el.textContent=text;el.className='pill '+(state||'')}
+function addLog(text){let t=new Date().toLocaleTimeString();log.textContent=(t+'  '+text+'\n'+(log.textContent==='No commands yet'?'':log.textContent)).slice(0,900)}
+function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;pill(net,'control ws','ok');refresh()};ws.onclose=()=>{wsOpen=false;pill(net,'reconnecting','warn');setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false;pill(net,'ws error','warn')};ws.onmessage=e=>{try{let j=JSON.parse(e.data);if(j.type==='status'){showStatus(j);return}pill(net,j.accepted?'accepted':'busy',j.accepted?'ok':'warn');addLog((j.accepted?'accepted ':'busy ')+j.command_id)}catch(_){}}}catch(_){wsOpen=false}}
+function post(o,ack){let cid=id++;o.command_id=cid;if(ack===false)o.ack=false;if(o.kind==='cmd_vel'&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;if(wsOpen&&ws&&ws.readyState===1){ws.send(body);if(ack!==false)addLog('sent '+name);return Promise.resolve({accepted:true})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{pill(net,j.accepted?'accepted':'busy',j.accepted?'ok':'warn');addLog((j.accepted?'accepted ':'busy ')+name);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
+function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('.active').forEach(b=>b.classList.remove('active'));post({kind:'stop'})}
+function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
+function sendJoy(){let m=joyMax(),lin=Math.round(-last.y*m.lin),ang=Math.round(last.x*m.ang);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:250},false)}
+function sendDrive(){let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=-m.ang;if(driveKind==='right')ang=m.ang;if(driveKind==='spinl')ang=-m.ang,lin=0;if(driveKind==='spinr')ang=m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:260},false)}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
 base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
 base.onpointermove=e=>{if(active)move(e)}
 base.onpointerup=base.onpointercancel=stop
-document.getElementById('stop').onclick=stop
-document.getElementById('estop').onclick=()=>post({kind:'estop'})
-document.getElementById('clear').onclick=()=>post({kind:'clear_estop'})
-document.getElementById('arm').onclick=()=>post({kind:'arm'})
-document.getElementById('disarm').onclick=()=>post({kind:'disarm'})
-document.getElementById('dock').onclick=()=>post({kind:'dock'})
-document.getElementById('song').onclick=()=>post({kind:'song_play',id:0})
+$('stop').onclick=stop;$('padstop').onclick=stop
+$('estop').onclick=()=>post({kind:'estop'})
+$('clear').onclick=()=>post({kind:'clear_estop'})
+$('arm').onclick=()=>post({kind:'arm'})
+$('disarm').onclick=()=>post({kind:'disarm'})
+$('dock').onclick=()=>post({kind:'dock'})
+$('ping').onclick=()=>post({kind:'ping'})
+$('song').onclick=()=>post({kind:'song_play',id:0})
+$('refresh').onclick=refresh
 document.querySelectorAll('[data-lights]').forEach(b=>b.onclick=()=>post({kind:'set_lights',pattern:b.dataset.lights}))
-document.getElementById('back').onclick=()=>post({kind:'cmd_vel',linear_mm_s:-100,angular_mrad_s:0,ttl_ms:300})
-document.getElementById('left').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:-1500,ttl_ms:250})
-document.getElementById('right').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:1500,ttl_ms:250})
-function refresh(){fetch('/status.json').then(r=>r.json()).then(s=>{net.textContent=s.wifi_state||'online';runtime.textContent=s.current_runtime_state;create.textContent=s.create_power_state+' / '+s.oi_mode;uart.textContent=s.uart_rx_health+' '+s.last_uart_read_error;cmd.textContent=(s.current_command||'none')+' pending '+(s.pending_command||'none');err.textContent=(s.last_error||'none')+' '+(s.last_error_hint||'')}).catch(_=>net.textContent='offline')}
-setInterval(refresh,1500);refresh();
+document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveKind=b.dataset.drive;b.classList.add('active');sendDrive();timer=setInterval(sendDrive,190);b.setPointerCapture(e.pointerId)};b.onpointerup=b.onpointercancel=stop})
+$('speed').oninput=()=>$('speedv').textContent=$('speed').value
+$('turn').oninput=()=>$('turnv').textContent=$('turn').value
+function time(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60),h=Math.floor(m/60);return h+'h '+(m%60)+'m '+(s%60)+'s'}
+function showStatus(s){let err=s.last_error&&s.last_error!=='none';pill(net,wsOpen?'control ws':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),s.oi_mode==='safe'?'ok':'');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health);$('runtime').textContent=title(s.current_runtime_state)+' / demo '+title(s.demo_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=err?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=err?'':'muted'}
+function refresh(){if(wsOpen&&ws&&ws.readyState===1){ws.send(JSON.stringify({kind:'status',command_id:id++}));return}fetch('/status.json').then(r=>r.json()).then(showStatus).catch(_=>pill(net,'offline','bad'))}
+setInterval(refresh,2500);refresh();
 connectWs();
 </script>
 </body>
@@ -809,6 +839,27 @@ fn handle_command_request<'a>(
         .ok_or(CommandParseError::BadRequest)
 }
 
+fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    if json_str(body, "kind") == Some("status") {
+        let snapshot = status::snapshot(Instant::now().as_millis() as u32);
+        return render_status_websocket_response(snapshot, buffer);
+    }
+
+    if json_bool(body, "ack") == Some(false) {
+        let command_id = json_u32(body, "command_id")?;
+        let command = parse_command(command_id, body)?;
+        let accepted = status::submit_control_command(command_id, command);
+        if accepted {
+            None
+        } else {
+            render_command_response(buffer, false, command_id, "busy")
+        }
+    } else {
+        handle_websocket_command(body, buffer)
+            .or(Some("{\"accepted\":false,\"message\":\"bad_request\"}\n"))
+    }
+}
+
 fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
     let command_id = json_u32(body, "command_id")?;
     let command = parse_command(command_id, body)?;
@@ -816,6 +867,28 @@ fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
         return render_command_response(buffer, false, command_id, "busy");
     }
     render_command_response(buffer, true, command_id, "accepted")
+}
+
+fn render_status_websocket_response<'a>(
+    snapshot: status::BrainstemStatus,
+    buffer: &'a mut [u8],
+) -> Option<&'a str> {
+    let body_len = {
+        let body = status::render_json(snapshot, buffer).ok()?;
+        body.len()
+    };
+    let prefix = br#"{"type":"status","#;
+    let extra_len = prefix.len().checked_sub(1)?;
+    let new_len = body_len.checked_add(extra_len)?;
+    if new_len > buffer.len() {
+        return None;
+    }
+
+    for i in (1..body_len).rev() {
+        buffer[i + extra_len] = buffer[i];
+    }
+    buffer[..prefix.len()].copy_from_slice(prefix);
+    core::str::from_utf8(&buffer[..new_len]).ok()
 }
 
 fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
@@ -1081,11 +1154,16 @@ async fn write_websocket_text(
     socket: &mut TcpSocket<'_>,
     payload: &[u8],
 ) -> Result<(), embassy_net::tcp::Error> {
-    if payload.len() > 125 {
+    if payload.len() <= 125 {
+        let header = [0x81, payload.len() as u8];
+        socket.write_all(&header).await?;
+    } else if payload.len() <= u16::MAX as usize {
+        let len = payload.len() as u16;
+        let header = [0x81, 126, (len >> 8) as u8, len as u8];
+        socket.write_all(&header).await?;
+    } else {
         return Ok(());
     }
-    let header = [0x81, payload.len() as u8];
-    socket.write_all(&header).await?;
     socket.write_all(payload).await?;
     socket.flush().await
 }
@@ -1280,6 +1358,20 @@ fn json_u32(body: &str, key: &str) -> Option<u32> {
 
 fn json_i16(body: &str, key: &str) -> Option<i16> {
     json_i32(body, key).and_then(|value| i16::try_from(value).ok())
+}
+
+fn json_bool(body: &str, key: &str) -> Option<bool> {
+    let key_start = body.find(key)?;
+    let after_key = &body[key_start + key.len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn json_i32(body: &str, key: &str) -> Option<i32> {
