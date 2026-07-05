@@ -42,8 +42,8 @@ gpio = 19
 
 | Signal | Pico GPIO | Pico physical pin | Direction |
 | --- | ---: | ---: | --- |
-| Create OI UART TX | GP16 | 21 | Pico TX to Create RX |
-| Create OI UART RX | GP17 | 22 | Create TX to Pico RX |
+| Create OI UART TX | GP0 | 1 | Pico TX to Create RX |
+| Create OI UART RX | GP1 | 2 | Create TX to Pico RX |
 | Create Power Toggle | GP18 | 24 | Pico output to external power-toggle interface |
 | Create BRC | GP19 | 25 | Pico output to Create BRC, optional |
 | External status LED | GP20 | 26 | Pico output, optional |
@@ -51,7 +51,7 @@ gpio = 19
 
 UART is `57600 8N1`.
 
-Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external level shifting or a divider is present on the Create TX to Pico GP17 line.
+Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external level shifting or a divider is present on the Create TX to Pico GP1 line.
 
 The Power Toggle and BRC outputs assume external wiring that is electrically safe for both the Pico and the Create. Review polarity and isolation before connecting a real robot.
 
@@ -211,11 +211,44 @@ DHCP: offers 192.168.4.2/24 with router/DNS set to 192.168.4.1
 
 The interface is read-only for Brainstem 0:
 
-- `http://192.168.4.1/` serves a small index page with a link to status.
+- `http://192.168.4.1/` serves a plain liveness response: `hello, I'm at least up`.
 - `http://192.168.4.1/status.json` serves firmware/body/runtime/Create/UART/demo status.
 - `http://pete.local/` and `http://pete.local/status.json` may work on clients that support mDNS on the AP network.
 
-The status JSON includes firmware name/version, body name/kind, uptime, runtime state, Create power state, OI mode, UART RX health, last UART packet timestamp, current command, last error, and demo state.
+The status JSON includes firmware name/version, body name/kind, uptime, runtime state, Create power state, OI mode, UART RX health, last UART packet timestamp, current command, last error, demo state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, and last web request timestamp.
+
+The crate keeps local self-signed certificate material out of version control under:
+
+```text
+crates/netherwick-brainstem/certs/pete-brainstem.local.cert.pem
+crates/netherwick-brainstem/certs/pete-brainstem.local.key.pem
+```
+
+Regenerate it with:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout crates/netherwick-brainstem/certs/pete-brainstem.local.key.pem \
+  -out crates/netherwick-brainstem/certs/pete-brainstem.local.cert.pem \
+  -days 3650 \
+  -subj /CN=pete.local \
+  -addext subjectAltName=DNS:pete.local,IP:192.168.4.1
+```
+
+Firmware HTTPS is currently reported as `unavailable` in `/status.json`; the HTTP liveness and status paths are intentionally kept small and independent of Create/body responsiveness.
+
+The Pico W onboard LED normally emits a one-blink heartbeat every 15 seconds. Event blink codes interrupt that heartbeat:
+
+| Blinks | Meaning |
+| ---: | --- |
+| 1 | Boot or Wi-Fi starting |
+| 2 | Create power request or AP started |
+| 3 | Create power toggled or web services started |
+| 4 | BRC event or HTTP request |
+| 5 | OI request or DHCP grant |
+| 6 | Create UART packet received |
+| 7 | Drive requested/stopped |
+| 8 | Error |
 
 Wi-Fi/AP/DHCP/HTTP/mDNS failure does not prevent motor stop, UART timeout handling, power safety, or the error blink pattern. The Wi-Fi lane is not allowed to call robot drivers directly; future operator commands must enter through a bounded command queue consumed by the runtime lane.
 

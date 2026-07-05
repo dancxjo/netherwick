@@ -30,15 +30,19 @@ impl CreateUart {
                 let mut bytes = Vec::new();
                 let _ = bytes.push(byte);
                 status::mark_uart_rx_ok(hardware.now_us() / 1_000);
-                let _ = events.push_back(BrainstemEvent::CreatePacketReceived {
+                let event = BrainstemEvent::CreatePacketReceived {
                     packet_id: 0,
                     bytes,
-                });
+                };
+                status::signal_event(&event);
+                let _ = events.push_back(event);
             }
             SerialRead::WouldBlock => {}
-            SerialRead::Error => {
-                status::mark_uart_rx_error();
-                let _ = events.push_back(BrainstemEvent::Error(BrainstemError::UartFraming));
+            SerialRead::Error(error) => {
+                status::mark_uart_rx_error_detail(error);
+                let event = BrainstemEvent::Error(BrainstemError::UartFraming);
+                status::signal_event(&event);
+                let _ = events.push_back(event);
             }
         }
     }
@@ -62,7 +66,9 @@ impl CreateUart {
     where
         H: BrainstemHardware,
     {
-        let _ = events.push_back(BrainstemEvent::CreateOiStartRequested);
+        let event = BrainstemEvent::CreateOiStartRequested;
+        status::signal_event(&event);
+        let _ = events.push_back(event);
         self.send_byte(hardware, OI_START)?;
         Ok(())
     }
@@ -76,7 +82,9 @@ impl CreateUart {
     where
         H: BrainstemHardware,
     {
-        let _ = events.push_back(BrainstemEvent::CreateOiModeRequested(mode));
+        let event = BrainstemEvent::CreateOiModeRequested(mode);
+        status::signal_event(&event);
+        let _ = events.push_back(event);
         match mode {
             CreateOiMode::Passive => {}
             CreateOiMode::Safe => self.send_byte(hardware, OI_SAFE)?,
@@ -96,11 +104,13 @@ impl CreateUart {
     where
         H: BrainstemHardware,
     {
-        let _ = events.push_back(BrainstemEvent::DriveRequested {
+        let event = BrainstemEvent::DriveRequested {
             left_mm_s,
             right_mm_s,
             duration_ms,
-        });
+        };
+        status::signal_event(&event);
+        let _ = events.push_back(event);
 
         let velocity = ((left_mm_s as i32 + right_mm_s as i32) / 2) as i16;
         let radius = differential_radius_mm(left_mm_s, right_mm_s);
@@ -116,7 +126,9 @@ impl CreateUart {
         H: BrainstemHardware,
     {
         self.drive(hardware, 0, 0)?;
-        let _ = events.push_back(BrainstemEvent::DriveStopped);
+        let event = BrainstemEvent::DriveStopped;
+        status::signal_event(&event);
+        let _ = events.push_back(event);
         Ok(())
     }
 
@@ -162,7 +174,6 @@ impl CreateUart {
             .flush_uart()
             .map_err(|_| BrainstemError::UartFraming)
     }
-
 }
 
 fn differential_radius_mm(left_mm_s: i16, right_mm_s: i16) -> i16 {

@@ -8,15 +8,15 @@ use nb::block;
 use rp2040_hal as hal;
 
 use hal::clocks::{init_clocks_and_plls, Clock};
-use hal::gpio::bank0::{Gpio18, Gpio19, Gpio20, Gpio25};
+use hal::gpio::bank0::{Gpio0, Gpio1, Gpio18, Gpio19, Gpio20, Gpio25};
 use hal::gpio::{FunctionSioOutput, FunctionUart, Pin, PullDown};
 use hal::pac;
 use hal::sio::Sio;
-use hal::uart::{DataBits, Enabled, StopBits, UartConfig, UartPeripheral};
+use hal::uart::{DataBits, Enabled, ReadErrorType, StopBits, UartConfig, UartPeripheral};
 use hal::watchdog::Watchdog;
 
 use crate::body;
-use crate::hardware::{BrainstemHardware, SerialRead};
+use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 
 #[link_section = ".boot2"]
 #[used]
@@ -26,8 +26,8 @@ const CREATE_UART_DATA_BITS: DataBits = DataBits::Eight;
 const CREATE_UART_STOP_BITS: StopBits = StopBits::One;
 
 // Unsafe hardware assumptions for this RP2040/Pico backend:
-// - body.toml maps GP16/Pico physical pin 21 to Create RX.
-// - body.toml maps GP17/Pico physical pin 22 from Create TX through external 5V-to-3.3V level shifting.
+// - body.toml maps GP0/Pico physical pin 1 to Create RX.
+// - body.toml maps GP1/Pico physical pin 2 from Create TX through external 5V-to-3.3V level shifting.
 // - body.toml maps GP18 to the external Create Power Toggle interface with the correct polarity and isolation.
 // - body.toml maps GP19 to Create BRC; BRC is released high by this firmware.
 // - body.toml maps GP20 as an optional external LED output; leave unconnected if unused.
@@ -36,8 +36,8 @@ type CreateUart = UartPeripheral<
     Enabled,
     pac::UART0,
     (
-        Pin<hal::gpio::bank0::Gpio16, FunctionUart, PullDown>,
-        Pin<hal::gpio::bank0::Gpio17, FunctionUart, PullDown>,
+        Pin<Gpio0, FunctionUart, PullDown>,
+        Pin<Gpio1, FunctionUart, PullDown>,
     ),
 >;
 
@@ -81,8 +81,8 @@ impl Rp2040Brainstem {
         early_onboard_heartbeat(&mut timer, &mut onboard_led);
 
         let uart_pins = (
-            pins.gpio16.into_function::<FunctionUart>(),
-            pins.gpio17.into_function::<FunctionUart>(),
+            pins.gpio0.into_function::<FunctionUart>(),
+            pins.gpio1.into_function::<FunctionUart>(),
         );
         let uart = UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
             .enable(
@@ -145,8 +145,17 @@ impl BrainstemHardware for Rp2040Brainstem {
         match self.uart.read() {
             Ok(byte) => SerialRead::Byte(byte),
             Err(nb::Error::WouldBlock) => SerialRead::WouldBlock,
-            Err(nb::Error::Other(_)) => SerialRead::Error,
+            Err(nb::Error::Other(error)) => SerialRead::Error(map_read_error(error)),
         }
+    }
+}
+
+fn map_read_error(error: ReadErrorType) -> UartReadError {
+    match error {
+        ReadErrorType::Overrun => UartReadError::Overrun,
+        ReadErrorType::Break => UartReadError::Break,
+        ReadErrorType::Parity => UartReadError::Parity,
+        ReadErrorType::Framing => UartReadError::Framing,
     }
 }
 

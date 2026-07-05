@@ -2,7 +2,17 @@
 pub enum SerialRead {
     Byte(u8),
     WouldBlock,
-    Error,
+    Error(UartReadError),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum UartReadError {
+    Overrun,
+    Break,
+    Parity,
+    Framing,
+    Other,
 }
 
 pub trait BrainstemHardware {

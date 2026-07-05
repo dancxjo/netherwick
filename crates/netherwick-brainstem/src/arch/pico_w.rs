@@ -11,10 +11,12 @@ use embassy_net::{
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
 use embassy_rp::peripherals::{
-    DMA_CH0, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29, PIO0, UART0,
+    DMA_CH0, PIN_0, PIN_1, PIN_18, PIN_19, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29, PIO0, UART0,
 };
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_rp::uart::{Blocking, Config as UartConfig, DataBits, Parity, StopBits, Uart};
+use embassy_rp::uart::{
+    Blocking, Config as UartConfig, DataBits, Error as UartError, Parity, StopBits, Uart,
+};
 use embassy_rp::{bind_interrupts, dma, Peri};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_nb::serial::Read as _;
@@ -22,7 +24,7 @@ use embedded_io_async::Write;
 use static_cell::StaticCell;
 
 use crate::body;
-use crate::hardware::{BrainstemHardware, SerialRead};
+use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 use crate::status;
 
@@ -38,6 +40,9 @@ const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
 const DHCP_LEASE_SECONDS: u32 = 3_600;
 const DHCP_OFFER_HOLD_SECONDS: u32 = 30;
+const LED_HEARTBEAT_INTERVAL_SECS: u64 = 15;
+const LED_BLINK_ON_MS: u64 = 120;
+const LED_BLINK_OFF_MS: u64 = 120;
 
 static mut CORE1_STACK: CoreStack<8192> = CoreStack::new();
 
@@ -57,8 +62,8 @@ impl PicoWBrainstem {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         uart0: Peri<'static, UART0>,
-        tx: Peri<'static, PIN_16>,
-        rx: Peri<'static, PIN_17>,
+        tx: Peri<'static, PIN_0>,
+        rx: Peri<'static, PIN_1>,
         power_toggle: Peri<'static, PIN_18>,
         brc: Peri<'static, PIN_19>,
         status_led: Peri<'static, PIN_20>,
@@ -115,13 +120,23 @@ impl BrainstemHardware for PicoWBrainstem {
         match self.uart.read() {
             Ok(byte) => SerialRead::Byte(byte),
             Err(nb::Error::WouldBlock) => SerialRead::WouldBlock,
-            Err(nb::Error::Other(_)) => SerialRead::Error,
+            Err(nb::Error::Other(error)) => SerialRead::Error(map_uart_error(error)),
         }
     }
 }
 
+fn map_uart_error(error: UartError) -> UartReadError {
+    match error {
+        UartError::Overrun => UartReadError::Overrun,
+        UartError::Break => UartReadError::Break,
+        UartError::Parity => UartReadError::Parity,
+        UartError::Framing => UartReadError::Framing,
+        _ => UartReadError::Other,
+    }
+}
+
 pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
-    let hardware = PicoWBrainstem::new(p.UART0, p.PIN_16, p.PIN_17, p.PIN_18, p.PIN_19, p.PIN_20);
+    let hardware = PicoWBrainstem::new(p.UART0, p.PIN_0, p.PIN_1, p.PIN_18, p.PIN_19, p.PIN_20);
 
     spawn_core1(
         p.CORE1,
@@ -162,17 +177,22 @@ async fn wifi_task(
     wifi_cs: Peri<'static, PIN_25>,
     wifi_clk: Peri<'static, PIN_29>,
 ) {
+    status::mark_wifi_starting();
     if let Some((stack, mut control)) =
         start_wifi_ap(spawner, pio0, dma0, wifi_power, wifi_dio, wifi_cs, wifi_clk).await
     {
-        let _ = control.gpio_set(0, true).await;
+        status::mark_wifi_ap_started();
+        let _ = control.gpio_set(0, false).await;
         spawner.spawn(http_task(stack).expect("spawn http task"));
         spawner.spawn(mdns_task(stack).expect("spawn mdns task"));
         spawner.spawn(dhcp_task(stack).expect("spawn dhcp task"));
+        status::mark_wifi_services_started();
+        onboard_led_loop(&mut control).await;
     }
 
+    status::mark_wifi_error();
     loop {
-        Timer::after_secs(60).await;
+        Timer::after_secs(LED_HEARTBEAT_INTERVAL_SECS).await;
     }
 }
 
@@ -250,7 +270,7 @@ async fn http_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 2048];
     let mut request = [0; 512];
-    let mut json = [0; 768];
+    let mut json = [0; 1536];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -268,30 +288,70 @@ async fn http_task(stack: Stack<'static>) -> ! {
             }
         };
 
+        let uptime_ms = Instant::now().as_millis() as u32;
+        status::mark_http_request(uptime_ms);
         let path = request_path(&request[..n]);
-        match path {
+        let result = match path {
             Some("/") | Some("/index.html") => {
-                let body = index_html();
-                write_response(&mut socket, "text/html; charset=utf-8", body.as_bytes()).await;
+                write_response(&mut socket, "text/plain; charset=utf-8", hello_body()).await
             }
             Some("/status.json") => {
-                let uptime_ms = Instant::now().as_millis() as u32;
                 let snapshot = status::snapshot(uptime_ms);
                 match status::render_json(snapshot, &mut json) {
                     Ok(body) => {
-                        write_response(&mut socket, "application/json", body.as_bytes()).await;
+                        write_response(&mut socket, "application/json", body.as_bytes()).await
                     }
-                    Err(_) => {
-                        write_plain_status(&mut socket, 500, "Internal Server Error").await;
-                    }
+                    Err(_) => write_plain_status(&mut socket, 500, "Internal Server Error").await,
                 }
             }
-            _ => {
-                write_plain_status(&mut socket, 404, "Not Found").await;
+            _ => write_plain_status(&mut socket, 404, "Not Found").await,
+        };
+
+        match result {
+            Ok(()) => {
+                socket.close();
+                if socket.flush().await.is_ok() {
+                    status::mark_http_response_flushed();
+                } else {
+                    status::mark_http_response_error();
+                    socket.abort();
+                    let _ = socket.flush().await;
+                }
+            }
+            Err(_) => {
+                status::mark_http_response_error();
+                socket.abort();
+                let _ = socket.flush().await;
             }
         }
+    }
+}
 
-        socket.close();
+async fn onboard_led_loop(control: &mut cyw43::Control<'static>) -> ! {
+    let mut next_heartbeat_ms = 0;
+    loop {
+        let now_ms = Instant::now().as_millis() as u64;
+        if let Some(blinks) = status::take_led_blinks() {
+            blink_onboard_led(control, blinks).await;
+            Timer::after_millis(600).await;
+            continue;
+        }
+
+        if now_ms >= next_heartbeat_ms {
+            blink_onboard_led(control, 1).await;
+            next_heartbeat_ms = now_ms.saturating_add(LED_HEARTBEAT_INTERVAL_SECS * 1_000);
+        }
+
+        Timer::after_millis(100).await;
+    }
+}
+
+async fn blink_onboard_led(control: &mut cyw43::Control<'static>, blinks: u8) {
+    for _ in 0..blinks {
+        let _ = control.gpio_set(0, true).await;
+        Timer::after_millis(LED_BLINK_ON_MS).await;
+        let _ = control.gpio_set(0, false).await;
+        Timer::after_millis(LED_BLINK_OFF_MS).await;
     }
 }
 
@@ -365,12 +425,17 @@ async fn dhcp_task(stack: Stack<'static>) -> ! {
             let Some(reply) = build_dhcp_reply(grant, &request[..len], &mut response) else {
                 continue;
             };
+            status::mark_dhcp_grant();
             let _ = socket.send_to(reply, endpoint).await;
         }
     }
 }
 
-async fn write_response(socket: &mut TcpSocket<'_>, content_type: &str, body: &[u8]) {
+async fn write_response(
+    socket: &mut TcpSocket<'_>,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), embassy_net::tcp::Error> {
     let mut header = heapless::String::<192>::new();
     let _ = write!(
         header,
@@ -378,11 +443,16 @@ async fn write_response(socket: &mut TcpSocket<'_>, content_type: &str, body: &[
         content_type,
         body.len()
     );
-    let _ = socket.write_all(header.as_bytes()).await;
-    let _ = socket.write_all(body).await;
+    socket.write_all(header.as_bytes()).await?;
+    socket.write_all(body).await?;
+    socket.flush().await
 }
 
-async fn write_plain_status(socket: &mut TcpSocket<'_>, code: u16, text: &str) {
+async fn write_plain_status(
+    socket: &mut TcpSocket<'_>,
+    code: u16,
+    text: &str,
+) -> Result<(), embassy_net::tcp::Error> {
     let mut header = heapless::String::<160>::new();
     let _ = write!(
         header,
@@ -392,7 +462,8 @@ async fn write_plain_status(socket: &mut TcpSocket<'_>, code: u16, text: &str) {
         text.len(),
         text
     );
-    let _ = socket.write_all(header.as_bytes()).await;
+    socket.write_all(header.as_bytes()).await?;
+    socket.flush().await
 }
 
 fn request_path(request: &[u8]) -> Option<&str> {
@@ -408,8 +479,8 @@ fn request_path(request: &[u8]) -> Option<&str> {
     }
 }
 
-fn index_html() -> &'static str {
-    "<!doctype html><html><head><meta charset=\"utf-8\"><title>Pete Brainstem</title></head><body><h1>Pete Brainstem</h1><p>Hostname: pete.local</p><p><a href=\"/status.json\">status.json</a></p></body></html>"
+fn hello_body() -> &'static [u8] {
+    b"hello, I'm at least up\nstatus: /status.json\n"
 }
 
 fn build_mdns_announcement(packet: &mut [u8; 96]) -> usize {

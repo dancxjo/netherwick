@@ -5,7 +5,7 @@ use crate::commands::{BrainstemCommand, DEMO_SCRIPT};
 use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::BrainstemHardware;
-use crate::status::{self, DemoState, RuntimeState};
+use crate::status::{self, DemoState, RuntimeActionCode, RuntimeState};
 
 const EVENT_QUEUE_CAPACITY: usize = 16;
 const COMMAND_QUEUE_CAPACITY: usize = 16;
@@ -77,6 +77,7 @@ where
 {
     pub fn new(hardware: H) -> Self {
         let mut events = Deque::new();
+        status::signal_event(&BrainstemEvent::Boot);
         let _ = events.push_back(BrainstemEvent::Boot);
         status::set_runtime_state(RuntimeState::Booting);
         status::set_demo_state(DemoState::NotStarted);
@@ -121,6 +122,7 @@ where
     }
 
     pub fn tick(&mut self) {
+        status::set_runtime_action(self.active_action_code());
         self.poll();
         self.feed_watchdog_placeholder();
 
@@ -160,9 +162,7 @@ where
         match command {
             BrainstemCommand::WakeCreate => {
                 status::set_demo_state(DemoState::WaitingForCreate);
-                let _ = self
-                    .events
-                    .push_back(BrainstemEvent::CreatePowerOnRequested);
+                self.push_event(BrainstemEvent::CreatePowerOnRequested);
                 self.hardware.set_power_toggle(true);
                 self.active = ActiveAction::PowerPulse {
                     release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
@@ -173,9 +173,7 @@ where
             BrainstemCommand::SleepCreate => {
                 status::set_demo_state(DemoState::PowerCycling);
                 self.stop_drive()?;
-                let _ = self
-                    .events
-                    .push_back(BrainstemEvent::CreatePowerOffRequested);
+                self.push_event(BrainstemEvent::CreatePowerOffRequested);
                 self.hardware.set_power_toggle(true);
                 self.active = ActiveAction::PowerPulse {
                     release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
@@ -185,9 +183,7 @@ where
             }
             BrainstemCommand::PulseBrc => {
                 if body::CREATE_BRC_ENABLED {
-                    let _ = self
-                        .events
-                        .push_back(BrainstemEvent::CreateBrcPulseRequested);
+                    self.push_event(BrainstemEvent::CreateBrcPulseRequested);
                     self.hardware.set_brc(false);
                     self.active = ActiveAction::BrcLow {
                         release_at_ms: now_ms.wrapping_add(body::BRC_LOW_PULSE_MS),
@@ -195,7 +191,8 @@ where
                 }
             }
             BrainstemCommand::StartOi => {
-                self.create_uart.start_oi(&mut self.hardware, &mut self.events)?;
+                self.create_uart
+                    .start_oi(&mut self.hardware, &mut self.events)?;
                 status::set_demo_state(DemoState::OiStarted);
                 self.active = ActiveAction::Settle {
                     until_ms: now_ms.wrapping_add(body::POST_MODE_SETTLE_MS),
@@ -250,7 +247,7 @@ where
             } => {
                 if time_reached(now_ms, release_at_ms) {
                     self.hardware.set_power_toggle(false);
-                    let _ = self.events.push_back(BrainstemEvent::CreatePowerToggled);
+                    self.push_event(BrainstemEvent::CreatePowerToggled);
                     status::set_create_power_on(power_on);
                     self.active = match wake_wait_until_ms {
                         Some(until_ms) => ActiveAction::WakeSettle { until_ms },
@@ -262,7 +259,7 @@ where
             ActiveAction::BrcLow { release_at_ms } => {
                 if time_reached(now_ms, release_at_ms) {
                     self.hardware.set_brc(true);
-                    let _ = self.events.push_back(BrainstemEvent::CreateBrcPulsed);
+                    self.push_event(BrainstemEvent::CreateBrcPulsed);
                     self.active = ActiveAction::BrcSettle {
                         until_ms: now_ms.wrapping_add(body::POST_BRC_SETTLE_MS),
                     };
@@ -315,8 +312,10 @@ where
                 }
 
                 if time_reached(now_ms, next_probe_ms) {
-                    self.create_uart
-                        .request_sensor_packet(&mut self.hardware, body::CREATE_SENSOR_PROBE_PACKET)?;
+                    self.create_uart.request_sensor_packet(
+                        &mut self.hardware,
+                        body::CREATE_SENSOR_PROBE_PACKET,
+                    )?;
                     self.active = ActiveAction::WaitForCreate {
                         deadline_ms,
                         next_probe_ms: now_ms.wrapping_add(SENSOR_PROBE_PERIOD_MS),
@@ -342,7 +341,8 @@ where
     }
 
     fn stop_drive(&mut self) -> Result<(), BrainstemError> {
-        self.create_uart.stop(&mut self.hardware, &mut self.events)?;
+        self.create_uart
+            .stop(&mut self.hardware, &mut self.events)?;
         self.stop_sent = true;
         Ok(())
     }
@@ -369,7 +369,7 @@ where
 
     fn enter_error(&mut self, error: BrainstemError) {
         status::set_error(error);
-        let _ = self.events.push_back(BrainstemEvent::Error(error));
+        self.push_event(BrainstemEvent::Error(error));
         let _ = self.stop_drive();
         self.mode = RuntimeMode::Error;
         self.active = ActiveAction::None;
@@ -400,6 +400,24 @@ where
 
     fn now_ms(&mut self) -> u32 {
         self.hardware.now_us() / 1_000
+    }
+
+    fn active_action_code(&self) -> RuntimeActionCode {
+        match self.active {
+            ActiveAction::None => RuntimeActionCode::None,
+            ActiveAction::PowerPulse { .. } => RuntimeActionCode::PowerPulse,
+            ActiveAction::BrcLow { .. } => RuntimeActionCode::BrcLow,
+            ActiveAction::BrcSettle { .. } => RuntimeActionCode::BrcSettle,
+            ActiveAction::WakeSettle { .. } => RuntimeActionCode::WakeSettle,
+            ActiveAction::WaitForCreate { .. } => RuntimeActionCode::WaitForCreate,
+            ActiveAction::Settle { .. } => RuntimeActionCode::Settle,
+            ActiveAction::Driving { .. } => RuntimeActionCode::Driving,
+        }
+    }
+
+    fn push_event(&mut self, event: BrainstemEvent) {
+        status::signal_event(&event);
+        let _ = self.events.push_back(event);
     }
 
     fn feed_watchdog_placeholder(&mut self) {

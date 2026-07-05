@@ -6,12 +6,12 @@ arch = "rp2040"
 xosc_crystal_freq_hz = 12000000
 
 [pins.create_uart]
-tx = "GP16"
-tx_gpio = 16
-tx_physical_pin = 21
-rx = "GP17"
-rx_gpio = 17
-rx_physical_pin = 22
+tx = "GP0"
+tx_gpio = 0
+tx_physical_pin = 1
+rx = "GP1"
+rx_gpio = 1
+rx_physical_pin = 2
 
 [pins.power_toggle]
 pin = "GP18"
