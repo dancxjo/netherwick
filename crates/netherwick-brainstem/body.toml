@@ -12,7 +12,7 @@ sensor_probe_packet = 25
 
 [timing]
 power_toggle_pulse_ms = 500
-wake_wait_ms = 3000
+wake_wait_ms = 5000
 responsive_timeout_ms = 6000
 brc_low_pulse_ms = 500
 post_brc_settle_ms = 100
