@@ -15,9 +15,15 @@ static OI_MODE: AtomicU8 = AtomicU8::new(UNKNOWN);
 static UART_RX_HEALTH: AtomicU8 = AtomicU8::new(UNKNOWN);
 static CURRENT_COMMAND: AtomicU8 = AtomicU8::new(CommandCode::None as u8);
 static LAST_ERROR: AtomicU8 = AtomicU8::new(ErrorCode::None as u8);
+static LAST_ERROR_UART_READ_ERROR: AtomicU8 = AtomicU8::new(UartReadErrorCode::None as u8);
 static DEMO_STATE: AtomicU8 = AtomicU8::new(DemoState::NotStarted as u8);
 static LAST_UART_PACKET_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
 static LAST_UART_READ_ERROR: AtomicU8 = AtomicU8::new(UartReadErrorCode::None as u8);
+static UART_RX_BYTES: AtomicU32 = AtomicU32::new(0);
+static UART_RX_PACKETS: AtomicU32 = AtomicU32::new(0);
+static LAST_UART_PACKET_LEN: AtomicU32 = AtomicU32::new(0);
+static WAKE_PROBE_RESPONSE_BYTES: AtomicU32 = AtomicU32::new(0);
+static WAKE_PROBE_EXPECTED_BYTES: AtomicU32 = AtomicU32::new(0);
 static CURRENT_RUNTIME_ACTION: AtomicU8 = AtomicU8::new(RuntimeActionCode::None as u8);
 static LAST_ERROR_ACTION: AtomicU8 = AtomicU8::new(RuntimeActionCode::None as u8);
 static WIFI_STATE: AtomicU8 = AtomicU8::new(WifiState::Off as u8);
@@ -41,6 +47,8 @@ pub struct BrainstemStatus {
     pub firmware_version: &'static str,
     pub body_name: &'static str,
     pub body_kind: &'static str,
+    pub create_uart_baud: u32,
+    pub create_sensor_probe_packet: u8,
     pub uptime_ms: u32,
     pub current_runtime_state: u8,
     pub create_power_state: u8,
@@ -48,9 +56,15 @@ pub struct BrainstemStatus {
     pub uart_rx_health: u8,
     pub last_uart_packet_timestamp_ms: u32,
     pub last_uart_read_error: u8,
+    pub uart_rx_bytes: u32,
+    pub uart_rx_packets: u32,
+    pub last_uart_packet_len: u32,
+    pub wake_probe_response_bytes: u32,
+    pub wake_probe_expected_bytes: u32,
     pub current_command: u8,
     pub current_runtime_action: u8,
     pub last_error: u8,
+    pub last_error_uart_read_error: u8,
     pub last_error_action: u8,
     pub demo_state: u8,
     pub wifi_state: u8,
@@ -157,16 +171,18 @@ enum ControlCommandCode {
     None = 0,
     WakeCreate = 1,
     SleepCreate = 2,
-    Stop = 3,
-    EStop = 4,
-    ClearEStop = 5,
-    SetModePassive = 6,
-    SetModeSafe = 7,
-    SetModeFull = 8,
-    DriveDirect = 9,
-    CmdVel = 10,
-    DriveArc = 11,
-    Ping = 12,
+    StartOi = 3,
+    PulseBrc = 4,
+    Stop = 5,
+    EStop = 6,
+    ClearEStop = 7,
+    SetModePassive = 8,
+    SetModeSafe = 9,
+    SetModeFull = 10,
+    DriveDirect = 11,
+    CmdVel = 12,
+    DriveArc = 13,
+    Ping = 14,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -248,6 +264,8 @@ fn encode_control_command(
     match command {
         BrainstemCommand::WakeCreate => Some((ControlCommandCode::WakeCreate, 0, 0, None)),
         BrainstemCommand::SleepCreate => Some((ControlCommandCode::SleepCreate, 0, 0, None)),
+        BrainstemCommand::StartOi => Some((ControlCommandCode::StartOi, 0, 0, None)),
+        BrainstemCommand::PulseBrc => Some((ControlCommandCode::PulseBrc, 0, 0, None)),
         BrainstemCommand::Stop | BrainstemCommand::StopDrive => {
             Some((ControlCommandCode::Stop, 0, 0, None))
         }
@@ -309,6 +327,8 @@ fn decode_control_command(
     match kind {
         x if x == ControlCommandCode::WakeCreate as u8 => Some(BrainstemCommand::WakeCreate),
         x if x == ControlCommandCode::SleepCreate as u8 => Some(BrainstemCommand::SleepCreate),
+        x if x == ControlCommandCode::StartOi as u8 => Some(BrainstemCommand::StartOi),
+        x if x == ControlCommandCode::PulseBrc as u8 => Some(BrainstemCommand::PulseBrc),
         x if x == ControlCommandCode::Stop as u8 => Some(BrainstemCommand::Stop),
         x if x == ControlCommandCode::EStop as u8 => Some(BrainstemCommand::EStop),
         x if x == ControlCommandCode::ClearEStop as u8 => Some(BrainstemCommand::ClearEStop),
@@ -358,6 +378,10 @@ pub fn set_create_power_on(on: bool) {
     CREATE_POWER_STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
 }
 
+pub fn set_create_power_unknown() {
+    CREATE_POWER_STATE.store(UNKNOWN, Ordering::Relaxed);
+}
+
 pub fn set_oi_mode(mode: CreateOiMode) {
     let code = match mode {
         CreateOiMode::Passive => 1,
@@ -367,10 +391,20 @@ pub fn set_oi_mode(mode: CreateOiMode) {
     OI_MODE.store(code, Ordering::Relaxed);
 }
 
+pub fn set_oi_mode_unknown() {
+    OI_MODE.store(UNKNOWN, Ordering::Relaxed);
+}
+
 pub fn mark_uart_rx_ok(timestamp_ms: u32) {
     UART_RX_HEALTH.store(ON, Ordering::Relaxed);
     LAST_UART_READ_ERROR.store(UartReadErrorCode::None as u8, Ordering::Relaxed);
     LAST_UART_PACKET_TIMESTAMP_MS.store(timestamp_ms, Ordering::Relaxed);
+}
+
+pub fn mark_uart_packet(len: usize) {
+    increment(&UART_RX_PACKETS);
+    increment_by(&UART_RX_BYTES, len as u32);
+    LAST_UART_PACKET_LEN.store(len as u32, Ordering::Relaxed);
 }
 
 pub fn mark_uart_rx_error() {
@@ -389,6 +423,11 @@ pub fn mark_uart_rx_error_detail(error: UartReadError) {
     LAST_UART_READ_ERROR.store(code as u8, Ordering::Relaxed);
 }
 
+pub fn set_wake_probe_progress(response_bytes: u32, expected_bytes: u32) {
+    WAKE_PROBE_RESPONSE_BYTES.store(response_bytes, Ordering::Relaxed);
+    WAKE_PROBE_EXPECTED_BYTES.store(expected_bytes, Ordering::Relaxed);
+}
+
 pub fn set_error(error: BrainstemError) {
     let code = match error {
         BrainstemError::CreateNoResponse => ErrorCode::CreateNoResponse,
@@ -397,6 +436,10 @@ pub fn set_error(error: BrainstemError) {
         BrainstemError::InvalidPacket => ErrorCode::InvalidPacket,
     };
     LAST_ERROR.store(code as u8, Ordering::Relaxed);
+    LAST_ERROR_UART_READ_ERROR.store(
+        LAST_UART_READ_ERROR.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
     LAST_ERROR_ACTION.store(
         CURRENT_RUNTIME_ACTION.load(Ordering::Relaxed),
         Ordering::Relaxed,
@@ -486,10 +529,13 @@ fn request_led_blinks(blinks: u8) {
     }
 }
 
-#[cfg(feature = "pico-w")]
 fn increment(counter: &AtomicU32) {
+    increment_by(counter, 1);
+}
+
+fn increment_by(counter: &AtomicU32, amount: u32) {
     counter.store(
-        counter.load(Ordering::Relaxed).saturating_add(1),
+        counter.load(Ordering::Relaxed).saturating_add(amount),
         Ordering::Relaxed,
     );
 }
@@ -501,6 +547,8 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         firmware_version: env!("CARGO_PKG_VERSION"),
         body_name: body::BODY_NAME,
         body_kind: body_kind(),
+        create_uart_baud: body::CREATE_UART_BAUD,
+        create_sensor_probe_packet: body::CREATE_SENSOR_PROBE_PACKET,
         uptime_ms,
         current_runtime_state: RUNTIME_STATE.load(Ordering::Relaxed),
         create_power_state: CREATE_POWER_STATE.load(Ordering::Relaxed),
@@ -508,9 +556,15 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         uart_rx_health: UART_RX_HEALTH.load(Ordering::Relaxed),
         last_uart_packet_timestamp_ms: LAST_UART_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
         last_uart_read_error: LAST_UART_READ_ERROR.load(Ordering::Relaxed),
+        uart_rx_bytes: UART_RX_BYTES.load(Ordering::Relaxed),
+        uart_rx_packets: UART_RX_PACKETS.load(Ordering::Relaxed),
+        last_uart_packet_len: LAST_UART_PACKET_LEN.load(Ordering::Relaxed),
+        wake_probe_response_bytes: WAKE_PROBE_RESPONSE_BYTES.load(Ordering::Relaxed),
+        wake_probe_expected_bytes: WAKE_PROBE_EXPECTED_BYTES.load(Ordering::Relaxed),
         current_command: CURRENT_COMMAND.load(Ordering::Relaxed),
         current_runtime_action: CURRENT_RUNTIME_ACTION.load(Ordering::Relaxed),
         last_error: LAST_ERROR.load(Ordering::Relaxed),
+        last_error_uart_read_error: LAST_ERROR_UART_READ_ERROR.load(Ordering::Relaxed),
         last_error_action: LAST_ERROR_ACTION.load(Ordering::Relaxed),
         demo_state: DEMO_STATE.load(Ordering::Relaxed),
         wifi_state: WIFI_STATE.load(Ordering::Relaxed),
@@ -532,6 +586,8 @@ struct StatusJson {
     firmware_version: &'static str,
     body_name: &'static str,
     body_kind: &'static str,
+    create_uart_baud: u32,
+    create_sensor_probe_packet: u8,
     uptime_ms: u32,
     current_runtime_state: &'static str,
     create_power_state: &'static str,
@@ -539,9 +595,15 @@ struct StatusJson {
     uart_rx_health: &'static str,
     last_uart_packet_timestamp_ms: u32,
     last_uart_read_error: &'static str,
+    uart_rx_bytes: u32,
+    uart_rx_packets: u32,
+    last_uart_packet_len: u32,
+    wake_probe_response_bytes: u32,
+    wake_probe_expected_bytes: u32,
     current_command: &'static str,
     current_runtime_action: &'static str,
     last_error: &'static str,
+    last_error_uart_read_error: &'static str,
     last_error_action: &'static str,
     last_error_hint: &'static str,
     demo_state: &'static str,
@@ -563,6 +625,8 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         firmware_version: snapshot.firmware_version,
         body_name: snapshot.body_name,
         body_kind: snapshot.body_kind,
+        create_uart_baud: snapshot.create_uart_baud,
+        create_sensor_probe_packet: snapshot.create_sensor_probe_packet,
         uptime_ms: snapshot.uptime_ms,
         current_runtime_state: runtime_state_text(snapshot.current_runtime_state),
         create_power_state: tri_state_text(snapshot.create_power_state),
@@ -570,9 +634,15 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         uart_rx_health: uart_health_text(snapshot.uart_rx_health),
         last_uart_packet_timestamp_ms: snapshot.last_uart_packet_timestamp_ms,
         last_uart_read_error: uart_read_error_text(snapshot.last_uart_read_error),
+        uart_rx_bytes: snapshot.uart_rx_bytes,
+        uart_rx_packets: snapshot.uart_rx_packets,
+        last_uart_packet_len: snapshot.last_uart_packet_len,
+        wake_probe_response_bytes: snapshot.wake_probe_response_bytes,
+        wake_probe_expected_bytes: snapshot.wake_probe_expected_bytes,
         current_command: command_text(snapshot.current_command),
         current_runtime_action: runtime_action_text(snapshot.current_runtime_action),
         last_error: error_text(snapshot.last_error),
+        last_error_uart_read_error: uart_read_error_text(snapshot.last_error_uart_read_error),
         last_error_action: runtime_action_text(snapshot.last_error_action),
         last_error_hint: error_hint_text(snapshot),
         demo_state: demo_state_text(snapshot.demo_state),
@@ -708,6 +778,8 @@ fn control_command_text(code: u8) -> &'static str {
     match code {
         x if x == ControlCommandCode::WakeCreate as u8 => "wake_create",
         x if x == ControlCommandCode::SleepCreate as u8 => "sleep_create",
+        x if x == ControlCommandCode::StartOi as u8 => "start_oi",
+        x if x == ControlCommandCode::PulseBrc as u8 => "pulse_brc",
         x if x == ControlCommandCode::Stop as u8 => "stop",
         x if x == ControlCommandCode::EStop as u8 => "estop",
         x if x == ControlCommandCode::ClearEStop as u8 => "clear_estop",
@@ -724,7 +796,13 @@ fn control_command_text(code: u8) -> &'static str {
 
 #[cfg(feature = "pico-w")]
 fn error_hint_text(snapshot: BrainstemStatus) -> &'static str {
-    match (snapshot.last_error, snapshot.last_uart_read_error) {
+    let uart_error = if snapshot.last_error_uart_read_error == UartReadErrorCode::None as u8 {
+        snapshot.last_uart_read_error
+    } else {
+        snapshot.last_error_uart_read_error
+    };
+
+    match (snapshot.last_error, uart_error) {
         (error, uart)
             if error == ErrorCode::UartFraming as u8
                 && uart == UartReadErrorCode::Framing as u8 =>
@@ -748,6 +826,24 @@ fn error_hint_text(snapshot: BrainstemStatus) -> &'static str {
                 && uart == UartReadErrorCode::Overrun as u8 =>
         {
             "UART RX overran; bytes arrived faster than the runtime drained them."
+        }
+        (error, uart)
+            if error == ErrorCode::CreateNoResponse as u8
+                && uart == UartReadErrorCode::Break as u8 =>
+        {
+            "Create did not produce valid UART bytes and RX saw a break condition; the RP2040 RX line is being held low, shorted, inverted, or connected to the wrong signal."
+        }
+        (error, uart)
+            if error == ErrorCode::CreateNoResponse as u8
+                && uart == UartReadErrorCode::Framing as u8 =>
+        {
+            "Create did not produce a valid sensor response and RX saw invalid stop bits; check TX/RX crossing, common ground, level shifting, and baud 57600 8N1."
+        }
+        (error, uart)
+            if error == ErrorCode::CreateNoResponse as u8
+                && uart == UartReadErrorCode::Overrun as u8 =>
+        {
+            "Create did not produce a complete wake-probe response before timeout; RX also overran, so stale or noisy incoming bytes may be flooding the UART."
         }
         (error, _) if error == ErrorCode::CreateNoResponse as u8 => {
             "Create did not produce any valid UART byte before the wake timeout; check power, wake wiring, Create baud, TX/RX crossing, common ground, and level shifting."

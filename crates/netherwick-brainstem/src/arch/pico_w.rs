@@ -498,10 +498,8 @@ fn request_path(request: &[u8]) -> Option<&str> {
         .unwrap_or(request.len());
     let line = core::str::from_utf8(&request[..line_end]).ok()?;
     let mut parts = line.split(' ');
-    match (parts.next(), parts.next()) {
-        (Some("GET"), Some(path)) => Some(path),
-        _ => None,
-    }
+    let _method = parts.next()?;
+    parts.next()
 }
 
 fn request_method(request: &[u8]) -> Option<&str> {
@@ -576,7 +574,7 @@ document.getElementById('estop').onclick=()=>post({kind:'estop'})
 document.getElementById('clear').onclick=()=>post({kind:'clear_estop'})
 document.getElementById('wake').onclick=()=>post({kind:'wake_create'})
 document.getElementById('sleep').onclick=()=>post({kind:'sleep_create'})
-document.getElementById('cycle').onclick=()=>post({kind:'sleep_create'}).then(()=>setTimeout(()=>post({kind:'wake_create'}),1600))
+document.getElementById('cycle').onclick=()=>post({kind:'sleep_create'}).then(()=>{setTimeout(()=>post({kind:'wake_create'}),1600);setTimeout(()=>post({kind:'start_oi'}),5200);setTimeout(()=>post({kind:'set_mode',mode:'safe'}),5600)})
 document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>post({kind:'set_mode',mode:b.dataset.mode}))
 document.getElementById('back').onclick=()=>post({kind:'cmd_vel',linear_mm_s:-100,angular_mrad_s:0,duration_ms:300})
 document.getElementById('left').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:-1500,duration_ms:250})
@@ -620,6 +618,8 @@ fn parse_command(body: &str) -> Option<BrainstemCommand> {
     match json_str(body, "kind")? {
         "wake_create" | "wake" => Some(BrainstemCommand::WakeCreate),
         "sleep_create" | "sleep" => Some(BrainstemCommand::SleepCreate),
+        "start_oi" | "start" => Some(BrainstemCommand::StartOi),
+        "pulse_brc" | "brc" => Some(BrainstemCommand::PulseBrc),
         "stop" => Some(BrainstemCommand::Stop),
         "estop" => Some(BrainstemCommand::EStop),
         "clear_estop" => Some(BrainstemCommand::ClearEStop),

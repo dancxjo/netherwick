@@ -57,9 +57,6 @@ impl CreateUart {
                 SerialRead::Error(error) => {
                     status::mark_uart_rx_error_detail(error);
                     push_packet(events, &mut bytes);
-                    let event = BrainstemEvent::Error(BrainstemError::UartFraming);
-                    status::signal_event(&event);
-                    let _ = events.push_back(event);
                     break;
                 }
             }
@@ -75,6 +72,13 @@ impl CreateUart {
         H: BrainstemHardware,
     {
         self.send_bytes(hardware, &[OI_SENSORS, packet_id])
+    }
+
+    pub fn flush_rx<H>(&mut self, hardware: &mut H)
+    where
+        H: BrainstemHardware,
+    {
+        hardware.drain_uart_rx();
     }
 
     pub fn start_oi<H, const N: usize>(
@@ -228,6 +232,14 @@ fn push_packet<const N: usize>(events: &mut Deque<BrainstemEvent, N>, bytes: &mu
         packet_id: 0,
         bytes: core::mem::take(bytes),
     };
+    status::mark_uart_packet(event_len(&event));
     status::signal_event(&event);
     let _ = events.push_back(event);
+}
+
+fn event_len(event: &BrainstemEvent) -> usize {
+    match event {
+        BrainstemEvent::CreatePacketReceived { bytes, .. } => bytes.len(),
+        _ => 0,
+    }
 }

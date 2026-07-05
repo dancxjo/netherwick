@@ -11,7 +11,7 @@ const EVENT_QUEUE_CAPACITY: usize = 16;
 const COMMAND_QUEUE_CAPACITY: usize = 16;
 const RUNTIME_TICK_MS: u32 = 10;
 const SENSOR_PROBE_PERIOD_MS: u32 = 100;
-const RESPONSIVE_BYTES_REQUIRED: u8 = 1;
+const WAKE_PROBE_RESPONSE_BYTES_REQUIRED: u8 = 2;
 const CREATE_AXLE_TRACK_MM: i32 = 258;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -41,7 +41,8 @@ enum ActiveAction {
     WaitForCreate {
         deadline_ms: u32,
         next_probe_ms: u32,
-        bytes_seen: u8,
+        response_bytes: u8,
+        oi_started: bool,
     },
     Settle {
         until_ms: u32,
@@ -169,7 +170,7 @@ where
             }
             _ => {
                 let _ = self.commands.push_back(command);
-                if self.mode == RuntimeMode::Idle {
+                if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
                     status::set_runtime_state(RuntimeState::RunningDemo);
                 }
@@ -200,6 +201,9 @@ where
             }
             BrainstemCommand::Ping => {}
             BrainstemCommand::WakeCreate => {
+                self.create_responsive = false;
+                status::set_create_power_unknown();
+                status::set_oi_mode_unknown();
                 status::set_demo_state(DemoState::WaitingForCreate);
                 self.push_event(BrainstemEvent::CreatePowerOnRequested);
                 self.hardware.set_power_toggle(true);
@@ -210,6 +214,8 @@ where
                 };
             }
             BrainstemCommand::SleepCreate => {
+                self.create_responsive = false;
+                status::set_oi_mode_unknown();
                 status::set_demo_state(DemoState::PowerCycling);
                 self.stop_drive()?;
                 self.push_event(BrainstemEvent::CreatePowerOffRequested);
@@ -230,6 +236,7 @@ where
                 }
             }
             BrainstemCommand::StartOi => {
+                self.ensure_create_responsive()?;
                 self.create_uart
                     .start_oi(&mut self.hardware, &mut self.events)?;
                 status::set_demo_state(DemoState::OiStarted);
@@ -238,6 +245,7 @@ where
                 };
             }
             BrainstemCommand::SetMode(mode) | BrainstemCommand::SetOiMode(mode) => {
+                self.ensure_create_responsive()?;
                 self.create_uart
                     .set_mode(&mut self.hardware, &mut self.events, mode)?;
                 status::set_oi_mode(mode);
@@ -287,7 +295,9 @@ where
                 if time_reached(now_ms, release_at_ms) {
                     self.hardware.set_power_toggle(false);
                     self.push_event(BrainstemEvent::CreatePowerToggled);
-                    status::set_create_power_on(power_on);
+                    if wake_wait_until_ms.is_none() {
+                        status::set_create_power_on(power_on);
+                    }
                     self.active = match wake_wait_until_ms {
                         Some(until_ms) => ActiveAction::WakeSettle { until_ms },
                         None => ActiveAction::None,
@@ -316,7 +326,8 @@ where
                     self.active = ActiveAction::WaitForCreate {
                         deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
                         next_probe_ms: now_ms,
-                        bytes_seen: 0,
+                        response_bytes: 0,
+                        oi_started: false,
                     };
                 }
                 Ok(())
@@ -324,19 +335,24 @@ where
             ActiveAction::WaitForCreate {
                 deadline_ms,
                 next_probe_ms,
-                mut bytes_seen,
+                mut response_bytes,
+                mut oi_started,
             } => {
                 while let Some(event) = self.events.pop_front() {
                     match event {
-                        BrainstemEvent::CreatePacketReceived { .. } => {
-                            bytes_seen = bytes_seen.saturating_add(1);
+                        BrainstemEvent::CreatePacketReceived { bytes, .. } => {
+                            response_bytes = response_bytes.saturating_add(bytes.len() as u8);
                         }
                         BrainstemEvent::Error(error) => return Err(error),
                         _ => {}
                     }
                 }
+                status::set_wake_probe_progress(
+                    response_bytes as u32,
+                    WAKE_PROBE_RESPONSE_BYTES_REQUIRED as u32,
+                );
 
-                if bytes_seen >= RESPONSIVE_BYTES_REQUIRED {
+                if response_bytes >= WAKE_PROBE_RESPONSE_BYTES_REQUIRED {
                     self.create_responsive = true;
                     status::set_create_power_on(true);
                     self.active = ActiveAction::None;
@@ -346,11 +362,25 @@ where
                 if time_reached(now_ms, deadline_ms) {
                     self.stop_drive()?;
                     self.create_responsive = false;
+                    status::set_create_power_unknown();
+                    status::set_oi_mode_unknown();
                     status::mark_uart_rx_error();
                     return Err(BrainstemError::CreateNoResponse);
                 }
 
                 if time_reached(now_ms, next_probe_ms) {
+                    if !oi_started {
+                        self.create_uart.flush_rx(&mut self.hardware);
+                        self.create_uart
+                            .start_oi(&mut self.hardware, &mut self.events)?;
+                        oi_started = true;
+                    }
+                    self.create_uart.flush_rx(&mut self.hardware);
+                    response_bytes = 0;
+                    status::set_wake_probe_progress(
+                        response_bytes as u32,
+                        WAKE_PROBE_RESPONSE_BYTES_REQUIRED as u32,
+                    );
                     self.create_uart.request_sensor_packet(
                         &mut self.hardware,
                         body::CREATE_SENSOR_PROBE_PACKET,
@@ -358,13 +388,15 @@ where
                     self.active = ActiveAction::WaitForCreate {
                         deadline_ms,
                         next_probe_ms: now_ms.wrapping_add(SENSOR_PROBE_PERIOD_MS),
-                        bytes_seen,
+                        response_bytes,
+                        oi_started,
                     };
                 } else {
                     self.active = ActiveAction::WaitForCreate {
                         deadline_ms,
                         next_probe_ms,
-                        bytes_seen,
+                        response_bytes,
+                        oi_started,
                     };
                 }
                 Ok(())
@@ -441,11 +473,19 @@ where
         Ok(())
     }
 
+    fn ensure_create_responsive(&mut self) -> Result<(), BrainstemError> {
+        if !self.create_responsive {
+            return Err(BrainstemError::CreateNoResponse);
+        }
+        Ok(())
+    }
+
     fn ensure_motion_allowed(&mut self) -> Result<(), BrainstemError> {
-        if self.estop_latched || !self.create_responsive {
+        if self.estop_latched {
             self.stop_drive()?;
             return Err(BrainstemError::CreateNoResponse);
         }
+        self.ensure_create_responsive()?;
         Ok(())
     }
 

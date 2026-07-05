@@ -28,4 +28,13 @@ pub trait BrainstemHardware {
     fn write_byte(&mut self, byte: u8) -> Result<(), ()>;
     fn flush_uart(&mut self) -> Result<(), ()>;
     fn read_byte(&mut self) -> SerialRead;
+
+    fn drain_uart_rx(&mut self) {
+        for _ in 0..256 {
+            match self.read_byte() {
+                SerialRead::Byte(_) | SerialRead::Error(_) => {}
+                SerialRead::WouldBlock => break,
+            }
+        }
+    }
 }
