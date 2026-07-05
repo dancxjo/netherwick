@@ -295,7 +295,7 @@ async fn http_task(stack: Stack<'static>) -> ! {
         let path = request_path(&request[..n]);
         let result = match (method, path) {
             (Some("GET"), Some("/") | Some("/index.html")) => {
-                write_response(&mut socket, "text/plain; charset=utf-8", hello_body()).await
+                write_response(&mut socket, "text/html; charset=utf-8", index_html()).await
             }
             (Some("GET"), Some("/status.json")) => {
                 let snapshot = status::snapshot(uptime_ms);
@@ -513,8 +513,80 @@ fn request_method(request: &[u8]) -> Option<&str> {
     line.split(' ').next()
 }
 
-fn hello_body() -> &'static [u8] {
-    b"hello, I'm at least up\nstatus: /status.json\n"
+fn index_html() -> &'static [u8] {
+    br#"<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pete Brainstem</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#161616;background:#f6f7f4}
+*{box-sizing:border-box}body{margin:0}.wrap{max-width:780px;margin:auto;padding:14px}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+h1{font-size:20px;margin:0}.pill{font-size:12px;border:1px solid #bbb;border-radius:999px;padding:4px 8px;background:white}
+.grid{display:grid;gap:10px}.panel{background:#fff;border:1px solid #d7d9d2;border-radius:8px;padding:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 auto}
+button{min-height:42px;border:1px solid #aeb3aa;border-radius:7px;background:#fff;font-weight:650;font-size:14px}
+button:active{transform:translateY(1px);background:#eef1ea}.danger{background:#7b1f24;color:#fff;border-color:#5c1418}.stop{background:#151515;color:#fff;border-color:#151515}
+.joy{height:260px;display:grid;place-items:center;touch-action:none;user-select:none}
+.base{width:min(72vw,240px);height:min(72vw,240px);border-radius:50%;background:#e6e9e1;border:2px solid #c4c9be;position:relative}
+.nub{width:82px;height:82px;border-radius:50%;background:#2f6f73;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);box-shadow:0 5px 14px #0003}
+.readout{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px}.readout div{background:#f3f4f0;border-radius:6px;padding:7px;min-height:34px}
+.wide{grid-column:1/-1}.muted{color:#60645f}.small{font-size:12px}
+@media(min-width:720px){.grid{grid-template-columns:1.2fr .8fr}.wide{grid-column:auto}.joy{height:330px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header><h1>Pete Brainstem</h1><span id="net" class="pill">connecting</span></header>
+<div class="grid">
+<section class="panel joy">
+<div id="base" class="base"><div id="nub" class="nub"></div></div>
+</section>
+<section class="panel">
+<div class="row"><button class="stop" id="stop">STOP</button><button class="danger" id="estop">E-STOP</button><button id="clear">Clear</button></div>
+<div class="row" style="margin-top:8px"><button id="wake">Wake</button><button id="sleep">Sleep</button><button id="cycle">Power cycle</button></div>
+<div class="row" style="margin-top:8px"><button data-mode="passive">Passive</button><button data-mode="safe">Safe</button><button data-mode="full">Full</button></div>
+<div class="row" style="margin-top:8px"><button id="back">Back</button><button id="left">Left</button><button id="right">Right</button></div>
+</section>
+<section class="panel wide">
+<div class="readout">
+<div><b>Runtime</b><br><span id="runtime" class="muted">...</span></div>
+<div><b>Create</b><br><span id="create" class="muted">...</span></div>
+<div><b>UART</b><br><span id="uart" class="muted">...</span></div>
+<div><b>Command</b><br><span id="cmd" class="muted">...</span></div>
+<div class="wide"><b>Last error</b><br><span id="err" class="muted">...</span></div>
+</div>
+</section>
+</div>
+<p class="small muted">Thumb stick renews short velocity commands. Release sends stop. Motion commands expire unless renewed.</p>
+</div>
+<script>
+let id=1,active=false,timer=0,last={x:0,y:0};
+const base=document.getElementById('base'),nub=document.getElementById('nub'),net=document.getElementById('net');
+function post(o){o.command_id=id++;return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).then(r=>r.json()).then(j=>{net.textContent=j.accepted?'accepted':'busy';return j}).catch(_=>{net.textContent='offline'})}
+function stop(){clearInterval(timer);timer=0;active=false;nub.style.left='50%';nub.style.top='50%';post({kind:'stop'})}
+function sendJoy(){let lin=Math.round(-last.y*220),ang=Math.round(last.x*1800);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,duration_ms:250})}
+function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
+base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
+base.onpointermove=e=>{if(active)move(e)}
+base.onpointerup=base.onpointercancel=stop
+document.getElementById('stop').onclick=stop
+document.getElementById('estop').onclick=()=>post({kind:'estop'})
+document.getElementById('clear').onclick=()=>post({kind:'clear_estop'})
+document.getElementById('wake').onclick=()=>post({kind:'wake_create'})
+document.getElementById('sleep').onclick=()=>post({kind:'sleep_create'})
+document.getElementById('cycle').onclick=()=>post({kind:'sleep_create'}).then(()=>setTimeout(()=>post({kind:'wake_create'}),1600))
+document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>post({kind:'set_mode',mode:b.dataset.mode}))
+document.getElementById('back').onclick=()=>post({kind:'cmd_vel',linear_mm_s:-100,angular_mrad_s:0,duration_ms:300})
+document.getElementById('left').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:-1500,duration_ms:250})
+document.getElementById('right').onclick=()=>post({kind:'cmd_vel',linear_mm_s:0,angular_mrad_s:1500,duration_ms:250})
+function refresh(){fetch('/status.json').then(r=>r.json()).then(s=>{net.textContent=s.wifi_state||'online';runtime.textContent=s.current_runtime_state;create.textContent=s.create_power_state+' / '+s.oi_mode;uart.textContent=s.uart_rx_health+' '+s.last_uart_read_error;cmd.textContent=(s.current_command||'none')+' pending '+(s.pending_command||'none');err.textContent=(s.last_error||'none')+' '+(s.last_error_hint||'')}).catch(_=>net.textContent='offline')}
+setInterval(refresh,1500);refresh();
+</script>
+</body>
+</html>
+"#
 }
 
 enum CommandParseError {
