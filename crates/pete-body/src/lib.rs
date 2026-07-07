@@ -73,6 +73,85 @@ pub struct BodyHealth {
     pub health: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImuVector3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl ImuVector3 {
+    pub fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    pub fn magnitude(self) -> f32 {
+        (self
+            .x
+            .mul_add(self.x, self.y.mul_add(self.y, self.z * self.z)))
+        .sqrt()
+    }
+
+    pub fn dot(self, other: Self) -> f32 {
+        self.x
+            .mul_add(other.x, self.y.mul_add(other.y, self.z * other.z))
+    }
+
+    pub fn cross(self, other: Self) -> Self {
+        Self {
+            x: self.y * other.z - self.z * other.y,
+            y: self.z * other.x - self.x * other.z,
+            z: self.x * other.y - self.y * other.x,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ImuGravityCalibration {
+    /// Stationary accelerometer vector that should count as "level".
+    ///
+    /// Accelerometers measure specific force, so this points opposite physical
+    /// down while the robot is still. `down()` returns the physical down vector.
+    pub level_acceleration: ImuVector3,
+    pub level_magnitude: f32,
+}
+
+impl ImuGravityCalibration {
+    pub fn zero_from_stationary_acceleration(acceleration: ImuVector3) -> Option<Self> {
+        let level_magnitude = acceleration.magnitude();
+        if !level_magnitude.is_finite() || level_magnitude < 0.1 {
+            return None;
+        }
+        Some(Self {
+            level_acceleration: acceleration,
+            level_magnitude,
+        })
+    }
+
+    pub fn down(self) -> ImuVector3 {
+        ImuVector3::new(
+            -self.level_acceleration.x,
+            -self.level_acceleration.y,
+            -self.level_acceleration.z,
+        )
+    }
+
+    pub fn calibrated_tilt_rad(self, acceleration: ImuVector3) -> Option<f32> {
+        let current_magnitude = acceleration.magnitude();
+        if !current_magnitude.is_finite() || current_magnitude < 0.1 {
+            return None;
+        }
+        let cross = self.level_acceleration.cross(acceleration).magnitude();
+        let dot = self.level_acceleration.dot(acceleration);
+        Some(cross.atan2(dot).abs())
+    }
+
+    pub fn is_level_within(self, acceleration: ImuVector3, tolerance_rad: f32) -> bool {
+        self.calibrated_tilt_rad(acceleration)
+            .is_some_and(|tilt| tilt <= tolerance_rad)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BodySense {
     pub battery_level: f32,
@@ -101,5 +180,35 @@ impl Default for BodySense {
             },
             last_update_ms: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gravity_calibration_detects_down_for_arbitrary_mount() {
+        let calibration = ImuGravityCalibration::zero_from_stationary_acceleration(
+            ImuVector3::new(1.0, 0.0, 0.0),
+        )
+        .unwrap();
+
+        assert_eq!(calibration.down(), ImuVector3::new(-1.0, -0.0, -0.0));
+        assert!(calibration.is_level_within(ImuVector3::new(1.0, 0.0, 0.0), 0.001));
+    }
+
+    #[test]
+    fn gravity_calibration_reports_tilt_from_zeroed_direction() {
+        let calibration = ImuGravityCalibration::zero_from_stationary_acceleration(
+            ImuVector3::new(1.0, 0.0, 0.0),
+        )
+        .unwrap();
+
+        let tilt = calibration
+            .calibrated_tilt_rad(ImuVector3::new(0.0, 1.0, 0.0))
+            .unwrap();
+
+        assert!((tilt - core::f32::consts::FRAC_PI_2).abs() < 0.001);
     }
 }

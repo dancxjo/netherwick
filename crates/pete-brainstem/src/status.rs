@@ -8,7 +8,10 @@ use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
     RuntimeCommand, SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
-use crate::drivers::imu::{derive_sample, ImuHealth, ImuSample};
+use crate::drivers::imu::{
+    derive_sample, derive_sample_with_gravity_calibration, ImuGravityCalibration, ImuHealth,
+    ImuSample, ImuVector,
+};
 use crate::events::{BrainstemError, BrainstemEvent, CreateSensorPacket};
 use crate::hardware::UartReadError;
 
@@ -112,6 +115,11 @@ static IMU_IMPACT_SCORE_MM_S2: AtomicU32 = AtomicU32::new(0);
 static IMU_MOTION_CONSISTENCY: AtomicU8 = AtomicU8::new(MotionConsistencyCode::Unknown as u8);
 static IMU_CALIBRATION_STATE: AtomicU8 = AtomicU8::new(ImuCalibrationCode::Uncalibrated as u8);
 static IMU_TILT_ACTIVE: AtomicU8 = AtomicU8::new(0);
+static IMU_GRAVITY_CALIBRATED: AtomicU8 = AtomicU8::new(0);
+static IMU_GRAVITY_REF_X_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_GRAVITY_REF_Y_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_GRAVITY_REF_Z_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_GRAVITY_REF_MAGNITUDE_MM_S2: AtomicU32 = AtomicU32::new(0);
 static EVENT_NEXT_SEQ: AtomicU32 = AtomicU32::new(1);
 static EVENT_SEQ: [AtomicU32; EVENT_LOG_CAPACITY] =
     [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
@@ -1486,7 +1494,8 @@ pub fn mark_uart_packet(len: usize) {
 
 pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     let old_flags = CREATE_SENSOR_FLAGS.load(Ordering::Relaxed);
-    let new_flags = merge_create_sensor_flags(packet_id, old_flags, create_sensor_flags_bits(sensors));
+    let new_flags =
+        merge_create_sensor_flags(packet_id, old_flags, create_sensor_flags_bits(sensors));
     let old_ir_byte = CREATE_SENSOR_IR_BYTE.load(Ordering::Relaxed);
     let old_buttons = CREATE_SENSOR_BUTTONS.load(Ordering::Relaxed);
     let old_charging_state = CREATE_SENSOR_CHARGING_STATE.load(Ordering::Relaxed);
@@ -1544,7 +1553,8 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
             .store(sensors.cliff_front_right_signal as u32, Ordering::Relaxed);
     }
     if create_packet_has_cliff_right_signal(packet_id) {
-        CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(sensors.cliff_right_signal as u32, Ordering::Relaxed);
+        CREATE_SENSOR_CLIFF_RIGHT_SIGNAL
+            .store(sensors.cliff_right_signal as u32, Ordering::Relaxed);
     }
     // Create OI packets 0, 19, and 20 contain distance/angle deltas since
     // the last requested packet. Other packets are snapshots and must not be
@@ -1593,7 +1603,17 @@ pub fn mark_imu_sample(sample: ImuSample) {
     let previous_timestamp = IMU_LAST_SAMPLE_TIMESTAMP_MS.load(Ordering::Relaxed);
     let previous_yaw = decode_signed_i32(IMU_YAW_MRAD.load(Ordering::Relaxed));
     let previous_accel = IMU_ACCEL_MAGNITUDE_MM_S2.load(Ordering::Relaxed) as u16;
-    let derived = derive_sample(previous_yaw, previous_timestamp, previous_accel, sample);
+    let calibration = imu_gravity_calibration();
+    let derived = match calibration {
+        Some(calibration) => derive_sample_with_gravity_calibration(
+            previous_yaw,
+            previous_timestamp,
+            previous_accel,
+            sample,
+            calibration,
+        ),
+        None => derive_sample(previous_yaw, previous_timestamp, previous_accel, sample),
+    };
     let old_health = IMU_HEALTH.load(Ordering::Relaxed);
     let old_tilt = IMU_TILT_ACTIVE.load(Ordering::Relaxed) != 0;
     let new_tilt = derived.tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
@@ -1614,7 +1634,14 @@ pub fn mark_imu_sample(sample: ImuSample) {
     IMU_TILT_MAGNITUDE_MRAD.store(derived.tilt_magnitude_mrad as u32, Ordering::Relaxed);
     IMU_ROUGHNESS_MM_S2.store(derived.roughness_mm_s2 as u32, Ordering::Relaxed);
     IMU_IMPACT_SCORE_MM_S2.store(derived.impact_score_mm_s2 as u32, Ordering::Relaxed);
-    IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Ready as u8, Ordering::Relaxed);
+    IMU_CALIBRATION_STATE.store(
+        if calibration.is_some() {
+            ImuCalibrationCode::Ready as u8
+        } else {
+            ImuCalibrationCode::Uncalibrated as u8
+        },
+        Ordering::Relaxed,
+    );
     IMU_MOTION_CONSISTENCY.store(MotionConsistencyCode::Consistent as u8, Ordering::Relaxed);
     IMU_TILT_ACTIVE.store(new_tilt as u8, Ordering::Relaxed);
     increment(&IMU_SAMPLE_COUNT);
@@ -1645,6 +1672,82 @@ pub fn mark_imu_sample(sample: ImuSample) {
     }
 }
 
+pub fn zero_imu_orientation_from_gravity() -> bool {
+    let sample_count = IMU_SAMPLE_COUNT.load(Ordering::Relaxed);
+    if sample_count == 0 {
+        return false;
+    }
+    let sample = ImuSample {
+        timestamp_ms: IMU_LAST_SAMPLE_TIMESTAMP_MS.load(Ordering::Relaxed),
+        gyro_x_mrad_s: decode_signed_i16(IMU_GYRO_X_MRAD_S.load(Ordering::Relaxed)),
+        gyro_y_mrad_s: decode_signed_i16(IMU_GYRO_Y_MRAD_S.load(Ordering::Relaxed)),
+        gyro_z_mrad_s: decode_signed_i16(IMU_GYRO_Z_MRAD_S.load(Ordering::Relaxed)),
+        accel_x_mm_s2: decode_signed_i16(IMU_ACCEL_X_MM_S2.load(Ordering::Relaxed)),
+        accel_y_mm_s2: decode_signed_i16(IMU_ACCEL_Y_MM_S2.load(Ordering::Relaxed)),
+        accel_z_mm_s2: decode_signed_i16(IMU_ACCEL_Z_MM_S2.load(Ordering::Relaxed)),
+    };
+    let Some(calibration) = ImuGravityCalibration::from_stationary_sample(sample) else {
+        IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Uncalibrated as u8, Ordering::Relaxed);
+        return false;
+    };
+
+    IMU_GRAVITY_REF_X_MM_S2.store(
+        encode_signed_i16(calibration.reference.x_mm_s2),
+        Ordering::Relaxed,
+    );
+    IMU_GRAVITY_REF_Y_MM_S2.store(
+        encode_signed_i16(calibration.reference.y_mm_s2),
+        Ordering::Relaxed,
+    );
+    IMU_GRAVITY_REF_Z_MM_S2.store(
+        encode_signed_i16(calibration.reference.z_mm_s2),
+        Ordering::Relaxed,
+    );
+    IMU_GRAVITY_REF_MAGNITUDE_MM_S2.store(
+        calibration.reference_magnitude_mm_s2 as u32,
+        Ordering::Relaxed,
+    );
+    IMU_GRAVITY_CALIBRATED.store(1, Ordering::Relaxed);
+    IMU_YAW_MRAD.store(0, Ordering::Relaxed);
+    IMU_PITCH_MRAD.store(0, Ordering::Relaxed);
+    IMU_ROLL_MRAD.store(0, Ordering::Relaxed);
+    IMU_TILT_MAGNITUDE_MRAD.store(0, Ordering::Relaxed);
+    IMU_TILT_ACTIVE.store(0, Ordering::Relaxed);
+    IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Ready as u8, Ordering::Relaxed);
+    true
+}
+
+pub fn clear_imu_orientation_calibration() {
+    IMU_GRAVITY_CALIBRATED.store(0, Ordering::Relaxed);
+    IMU_GRAVITY_REF_X_MM_S2.store(0, Ordering::Relaxed);
+    IMU_GRAVITY_REF_Y_MM_S2.store(0, Ordering::Relaxed);
+    IMU_GRAVITY_REF_Z_MM_S2.store(0, Ordering::Relaxed);
+    IMU_GRAVITY_REF_MAGNITUDE_MM_S2.store(0, Ordering::Relaxed);
+    IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Uncalibrated as u8, Ordering::Relaxed);
+}
+
+pub fn imu_calibrated_down() -> Option<ImuVector> {
+    imu_gravity_calibration().map(ImuGravityCalibration::down)
+}
+
+fn imu_gravity_calibration() -> Option<ImuGravityCalibration> {
+    if IMU_GRAVITY_CALIBRATED.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let reference_magnitude_mm_s2 = IMU_GRAVITY_REF_MAGNITUDE_MM_S2.load(Ordering::Relaxed) as u16;
+    if reference_magnitude_mm_s2 == 0 {
+        return None;
+    }
+    Some(ImuGravityCalibration {
+        reference: ImuVector::new(
+            decode_signed_i16(IMU_GRAVITY_REF_X_MM_S2.load(Ordering::Relaxed)),
+            decode_signed_i16(IMU_GRAVITY_REF_Y_MM_S2.load(Ordering::Relaxed)),
+            decode_signed_i16(IMU_GRAVITY_REF_Z_MM_S2.load(Ordering::Relaxed)),
+        ),
+        reference_magnitude_mm_s2,
+    })
+}
+
 pub fn mark_imu_health(health: ImuHealth) {
     let code = match health {
         ImuHealth::Unknown => ImuHealthCode::Unknown,
@@ -1655,7 +1758,11 @@ pub fn mark_imu_health(health: ImuHealth) {
     let old = IMU_HEALTH.load(Ordering::Relaxed);
     IMU_HEALTH.store(code as u8, Ordering::Relaxed);
     IMU_PRESENT.store(
-        if matches!(health, ImuHealth::Absent) { OFF } else { ON },
+        if matches!(health, ImuHealth::Absent) {
+            OFF
+        } else {
+            ON
+        },
         Ordering::Relaxed,
     );
     if old != code as u8 {
@@ -3114,6 +3221,7 @@ mod tests {
     #[test]
     fn imu_sample_updates_status_and_events() {
         let _guard = status_test_guard();
+        clear_imu_orientation_calibration();
         reset_event_log_for_test();
         mark_imu_sample(ImuSample::stationary(100));
         mark_imu_sample(ImuSample {
@@ -3132,16 +3240,15 @@ mod tests {
         assert_eq!(snapshot.imu_accel_magnitude_mm_s2, 9_807);
 
         let records = collect::<8>(0);
-        assert!(
-            records
-                .iter()
-                .any(|record| record.kind == PublicEventKind::ImuFrameReceived as u8)
-        );
+        assert!(records
+            .iter()
+            .any(|record| record.kind == PublicEventKind::ImuFrameReceived as u8));
     }
 
     #[test]
     fn imu_thresholds_emit_tilt_and_impact_events() {
         let _guard = status_test_guard();
+        clear_imu_orientation_calibration();
         reset_event_log_for_test();
         mark_imu_sample(ImuSample::stationary(200));
         mark_imu_sample(ImuSample {
@@ -3160,15 +3267,43 @@ mod tests {
         });
 
         let records = collect::<12>(0);
-        assert!(
-            records
-                .iter()
-                .any(|record| record.kind == PublicEventKind::TiltChanged as u8 && record.a == 1)
+        assert!(records
+            .iter()
+            .any(|record| record.kind == PublicEventKind::TiltChanged as u8 && record.a == 1));
+        assert!(records
+            .iter()
+            .any(|record| record.kind == PublicEventKind::ImpactDetected as u8));
+    }
+
+    #[test]
+    fn imu_gravity_zero_calibrates_arbitrary_mount_direction() {
+        let _guard = status_test_guard();
+        clear_imu_orientation_calibration();
+        reset_event_log_for_test();
+
+        let mounted_sideways = ImuSample {
+            timestamp_ms: 300,
+            accel_x_mm_s2: 9_807,
+            accel_y_mm_s2: 0,
+            accel_z_mm_s2: 0,
+            ..ImuSample::stationary(300)
+        };
+        mark_imu_sample(mounted_sideways);
+        assert!(zero_imu_orientation_from_gravity());
+        assert_eq!(imu_calibrated_down(), Some(ImuVector::new(-9_807, 0, 0)));
+
+        mark_imu_sample(ImuSample {
+            timestamp_ms: 320,
+            ..mounted_sideways
+        });
+        let snapshot = snapshot(320);
+
+        assert_eq!(
+            snapshot.imu_calibration_state,
+            ImuCalibrationCode::Ready as u8
         );
-        assert!(
-            records
-                .iter()
-                .any(|record| record.kind == PublicEventKind::ImpactDetected as u8)
-        );
+        assert_eq!(snapshot.imu_pitch_mrad, 0);
+        assert_eq!(snapshot.imu_roll_mrad, 0);
+        assert_eq!(snapshot.imu_tilt_magnitude_mrad, 0);
     }
 }

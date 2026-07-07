@@ -1827,6 +1827,7 @@ mod tests {
     #[test]
     fn runtime_poll_imu_sample_updates_status() {
         let _guard = status::status_test_guard();
+        status::clear_imu_orientation_calibration();
         let mut runtime = Runtime::new(FakeHardware::with_imu_sample(
             1_000,
             ImuSample {
@@ -1847,6 +1848,7 @@ mod tests {
     #[test]
     fn safety_tick_stops_active_motion_on_imu_tilt() {
         let _guard = status::status_test_guard();
+        status::clear_imu_orientation_calibration();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.create_responsive = true;
         runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
