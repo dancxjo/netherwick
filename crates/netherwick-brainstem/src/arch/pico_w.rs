@@ -370,7 +370,7 @@ async fn http_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 2048];
     let mut request = [0; 512];
-    let mut json = [0; 2048];
+    let mut json = [0; 3072];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -454,7 +454,7 @@ async fn websocket_task(stack: Stack<'static>) -> ! {
     let mut tx_buffer = [0; 2048];
     let mut request = [0; 512];
     let mut payload = [0; 256];
-    let mut response = [0; 2048];
+    let mut response = [0; 3072];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -557,9 +557,9 @@ async fn udp_control_task(stack: Stack<'static>) -> ! {
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
     let mut rx_buffer = [0; 512];
     let mut tx_meta = [PacketMetadata::EMPTY; 2];
-    let mut tx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 2048];
     let mut request = [0; 128];
-    let mut response = heapless::String::<1024>::new();
+    let mut response = heapless::String::<2048>::new();
 
     loop {
         let mut socket = UdpSocket::new(
@@ -911,6 +911,9 @@ fn handle_command_request<'a>(
         let snapshot = status::snapshot(Instant::now().as_millis() as u32);
         return status::render_json(snapshot, buffer).map_err(|_| CommandParseError::BadRequest);
     }
+    if let BrainstemCommand::GetEvents { since_seq } = command {
+        return status::render_events_json(since_seq, buffer).ok_or(CommandParseError::BadRequest);
+    }
     if matches!(command, BrainstemCommand::GetCapabilities) {
         return render_capabilities_response(buffer, command_id)
             .ok_or(CommandParseError::BadRequest);
@@ -937,6 +940,10 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     if json_str(body, "kind") == Some("get_capabilities") {
         let command_id = json_u32(body, "command_id")?;
         return render_capabilities_response(buffer, command_id);
+    }
+    if json_str(body, "kind") == Some("get_events") {
+        let since_seq = json_u32(body, "since_seq").unwrap_or(0);
+        return status::render_events_json(since_seq, buffer);
     }
     if json_str(body, "kind") == Some("ping") {
         let command_id = json_u32(body, "command_id")?;
@@ -1027,6 +1034,10 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
     }
     if matches!(command, BrainstemCommand::GetCapabilities) {
         write_forebrain_uart_capabilities(uart, seq);
+        return;
+    }
+    if let BrainstemCommand::GetEvents { since_seq } = command {
+        write_forebrain_uart_events(uart, seq, since_seq);
         return;
     }
 
@@ -1243,6 +1254,9 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
         },
         "RESET_ODOMETRY" => BrainstemCommand::ResetOdometry { seq },
         "GET_CAPABILITIES" => BrainstemCommand::GetCapabilities,
+        "GET_EVENTS" => BrainstemCommand::GetEvents {
+            since_seq: parse_u32(parts.next()).unwrap_or(0),
+        },
         "STATUS" => BrainstemCommand::Status,
         "SONG_PLAY" => BrainstemCommand::SongPlay {
             id: parse_u32(parts.next()).ok_or(seq)? as u8,
@@ -1308,6 +1322,11 @@ fn handle_udp_control_line<const N: usize>(
             let _ = capabilities::write_compact(response, &capabilities::current(), seq);
             Some(false)
         }
+        BrainstemCommand::GetEvents { since_seq } => {
+            let _ = write!(response, "OK {seq} ");
+            let _ = status::write_compact_events(response, since_seq);
+            Some(false)
+        }
         BrainstemCommand::Bootsel => {
             let _ = writeln!(response, "OK {seq} bootsel");
             Some(true)
@@ -1364,9 +1383,19 @@ fn write_forebrain_uart_status(uart: &mut Uart<'static, Blocking>, seq: u32) {
 }
 
 fn write_forebrain_uart_capabilities(uart: &mut Uart<'static, Blocking>, seq: u32) {
-    let mut response = heapless::String::<1024>::new();
+    let mut response = heapless::String::<2048>::new();
     if capabilities::write_compact(&mut response, &capabilities::current(), seq).is_err() {
         write_forebrain_uart_error(uart, seq, "capabilities_too_large");
+        return;
+    }
+    write_forebrain_uart_line(uart, response.as_bytes());
+}
+
+fn write_forebrain_uart_events(uart: &mut Uart<'static, Blocking>, seq: u32, since_seq: u32) {
+    let mut response = heapless::String::<1024>::new();
+    let _ = write!(response, "OK {seq} ");
+    if status::write_compact_events(&mut response, since_seq).is_err() {
+        write_forebrain_uart_error(uart, seq, "events_too_large");
         return;
     }
     write_forebrain_uart_line(uart, response.as_bytes());
@@ -1598,6 +1627,9 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
         "get_capabilities" => Some(BrainstemCommand::GetCapabilities),
+        "get_events" => Some(BrainstemCommand::GetEvents {
+            since_seq: json_u32(body, "since_seq").unwrap_or(0),
+        }),
         "status" => Some(BrainstemCommand::Status),
         "song_play" => Some(BrainstemCommand::SongPlay {
             id: json_u32(body, "id")? as u8,

@@ -8,6 +8,7 @@ pub const VERBS: &[&str] = &[
     "ping",
     "status",
     "get_capabilities",
+    "get_events",
     "arm",
     "disarm",
     "stop",
@@ -62,6 +63,33 @@ pub const SENSORS: &[&str] = &[
 pub const OUTPUTS: &[&str] = &["lights", "song", "dock", "power_toggle", "brc"];
 pub const SAFETY: &[&str] = &["bump", "cliff", "wheel_drop", "estop", "heartbeat"];
 pub const FEEDBACK: &[&str] = &["ok", "error", "armed", "lost_target", "dock_seen", "danger"];
+pub const EVENTS: &[&str] = &[
+    "boot",
+    "command_accepted",
+    "command_rejected",
+    "command_started",
+    "command_completed",
+    "command_interrupted",
+    "command_timed_out",
+    "body_power_requested",
+    "body_power_changed",
+    "body_mode_requested",
+    "body_mode_changed",
+    "telemetry_received",
+    "sensor_frame_decoded",
+    "motion_requested",
+    "motion_stopped",
+    "safety_tripped",
+    "safety_cleared",
+    "bump_changed",
+    "cliff_changed",
+    "wheel_drop_latched",
+    "wheel_drop_cleared",
+    "heartbeat_expired",
+    "estop_latched",
+    "estop_cleared",
+    "error",
+];
 
 pub const SENSOR_PACKET_RANGE: &str = "0,7-31";
 pub const SONG_SLOTS: u8 = 16;
@@ -81,6 +109,7 @@ pub struct BrainstemCapabilities {
     pub outputs: &'static [&'static str],
     pub safety: &'static [&'static str],
     pub feedback: &'static [&'static str],
+    pub events: &'static [&'static str],
     pub sensor_packets: &'static str,
     pub max_song_tones: usize,
     pub song_slots: u8,
@@ -102,6 +131,7 @@ pub fn current() -> BrainstemCapabilities {
         outputs: OUTPUTS,
         safety: SAFETY,
         feedback: FEEDBACK,
+        events: EVENTS,
         sensor_packets: SENSOR_PACKET_RANGE,
         max_song_tones: MAX_SONG_TONES,
         song_slots: SONG_SLOTS,
@@ -117,7 +147,7 @@ pub fn render_json<'a>(
     command_id: u32,
     buffer: &'a mut [u8],
 ) -> Option<&'a str> {
-    let mut response = String::<2048>::new();
+    let mut response = String::<3072>::new();
     write!(
         response,
         "{{\"accepted\":true,\"command_id\":{},\"firmware\":\"{}\",\"version\":\"{}\",\"body\":\"{}\",\"body_kind\":\"{}\",\"drive\":\"{}\",",
@@ -130,11 +160,11 @@ pub fn render_json<'a>(
     )
     .ok()?;
     write_json_str_array(&mut response, "verbs", capabilities.verbs).ok()?;
-    write_json_str_array(&mut response, "commands", capabilities.verbs).ok()?;
     write_json_str_array(&mut response, "sensors", capabilities.sensors).ok()?;
     write_json_str_array(&mut response, "outputs", capabilities.outputs).ok()?;
     write_json_str_array(&mut response, "safety", capabilities.safety).ok()?;
     write_json_str_array(&mut response, "feedback", capabilities.feedback).ok()?;
+    write_json_str_array(&mut response, "events", capabilities.events).ok()?;
     write!(
         response,
         "\"limits\":{{\"max_linear_mm_s\":{},\"max_angular_mrad_s\":{},\"min_ttl_ms\":{},\"max_ttl_ms\":{}}},\"sensor_packets\":\"{}\",\"max_song_tones\":{},\"song_slots\":{}}}\n",
@@ -173,6 +203,8 @@ pub fn write_compact<const N: usize>(
     write_csv(response, capabilities.outputs)?;
     write!(response, " safety=")?;
     write_csv(response, capabilities.safety)?;
+    write!(response, " events=")?;
+    write_csv(response, capabilities.events)?;
     write!(
         response,
         " limits=max_linear_mm_s:{},max_angular_mrad_s:{},min_ttl_ms:{},max_ttl_ms:{} max_tones={} song_slots={} feedback_slots={} sensor_packets={}\n",

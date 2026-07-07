@@ -96,6 +96,9 @@ where
     idle_blink_on: bool,
     create_responsive: bool,
     estop_latched: bool,
+    last_bump: bool,
+    last_cliff: bool,
+    last_wheel_drop: bool,
 }
 
 impl<H> Runtime<H>
@@ -131,6 +134,9 @@ where
             idle_blink_on: false,
             create_responsive: false,
             estop_latched: false,
+            last_bump: false,
+            last_cliff: false,
+            last_wheel_drop: false,
         }
     }
 
@@ -290,10 +296,14 @@ where
             RuntimeCommand::EStop => {
                 self.stop_drive()?;
                 self.estop_latched = true;
+                status::mark_estop_latched();
+                status::mark_safety_tripped(status::SafetyEventKind::EStop);
                 self.active = ActiveAction::None;
             }
             RuntimeCommand::ClearEStop => {
                 self.estop_latched = false;
+                status::mark_estop_cleared();
+                status::mark_safety_cleared(status::SafetyEventKind::EStop);
             }
             RuntimeCommand::WakeCreate => {
                 self.create_responsive = false;
@@ -748,6 +758,7 @@ where
             ActiveAction::Driving { stop_at_ms } => {
                 if time_reached(now_ms, stop_at_ms) {
                     self.stop_drive()?;
+                    status::mark_current_command_timed_out();
                     self.active = ActiveAction::None;
                 }
                 Ok(())
@@ -1007,16 +1018,24 @@ where
         let cliff = flags & ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)) != 0;
 
         if !bump && !cliff && !wheel_drop {
+            self.update_safety_edges(bump, cliff, wheel_drop);
             if !self.safety_policy.wheel_drop_latch {
+                if self.safety_latched {
+                    status::mark_safety_cleared(status::SafetyEventKind::WheelDrop);
+                    status::mark_wheel_drop_cleared();
+                }
                 self.safety_latched = false;
             }
             return Ok(());
         }
+        self.update_safety_edges(bump, cliff, wheel_drop);
         if self.safety_latched {
             return Ok(());
         }
 
         if wheel_drop && self.safety_policy.wheel_drop_latch {
+            status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
+            status::mark_wheel_drop_latched();
             self.safety_latched = true;
             self.commands.clear();
             self.stop_drive()?;
@@ -1025,8 +1044,10 @@ where
         }
 
         let action = if cliff {
+            status::mark_safety_tripped(status::SafetyEventKind::Cliff);
             self.safety_policy.cliff
         } else if bump {
+            status::mark_safety_tripped(status::SafetyEventKind::Bump);
             self.safety_policy.bump
         } else {
             SafetyAction::Stop
@@ -1151,6 +1172,8 @@ where
             self.commands.clear();
             self.active = ActiveAction::None;
             self.heartbeat_stop_at_ms = None;
+            status::mark_heartbeat_expired();
+            status::mark_safety_tripped(status::SafetyEventKind::Heartbeat);
             self.stop_drive()?;
         }
         Ok(())
@@ -1227,6 +1250,23 @@ where
     fn push_event(&mut self, event: BrainstemEvent) {
         status::signal_event(&event);
         let _ = self.events.push_back(event);
+    }
+
+    fn update_safety_edges(&mut self, bump: bool, cliff: bool, wheel_drop: bool) {
+        if bump != self.last_bump {
+            status::mark_bump_changed(bump);
+            self.last_bump = bump;
+        }
+        if cliff != self.last_cliff {
+            status::mark_cliff_changed(cliff);
+            self.last_cliff = cliff;
+        }
+        if wheel_drop != self.last_wheel_drop {
+            if !wheel_drop {
+                status::mark_wheel_drop_cleared();
+            }
+            self.last_wheel_drop = wheel_drop;
+        }
     }
 
     fn feed_watchdog_placeholder(&mut self) {
@@ -1501,6 +1541,7 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         BrainstemCommand::Dock => Some(RuntimeCommand::Dock),
         BrainstemCommand::SetLights { pattern } => Some(RuntimeCommand::SetLights { pattern }),
         BrainstemCommand::GetCapabilities => None,
+        BrainstemCommand::GetEvents { .. } => None,
     }
 }
 

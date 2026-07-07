@@ -176,6 +176,9 @@ pub enum BrainstemCommand {
         seq: u32,
     },
     GetCapabilities,
+    GetEvents {
+        since_seq: u32,
+    },
     Stop,
     Status,
     Bootsel,

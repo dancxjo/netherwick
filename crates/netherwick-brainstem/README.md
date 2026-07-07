@@ -88,52 +88,125 @@ On Pico W, concurrency is split by ownership:
 - The runtime is tick-driven: each tick polls UART, enforces drive deadlines, advances at most one active action, and sends Stop on drive timeout or UART gating failure.
 - A hardware watchdog feed point is reserved in the safety/runtime tick; it must remain owned by that lane.
 
-## Event Vocabulary
+## Public Surface
 
-Events emitted by the brainstem:
+The public brainstem surface is body-neutral. The forebrain/motherbrain asks for motion, safety, feedback, telemetry, capabilities, and events; the active body driver maps those requests to Create OI opcodes, packet ids, BRC, songs, LEDs, dock seeking, UART behavior, and sensor decoding.
 
-```rust
-BrainstemEvent::Boot
-BrainstemEvent::TickMs(u32)
-BrainstemEvent::CreatePowerOnRequested
-BrainstemEvent::CreatePowerOffRequested
-BrainstemEvent::CreatePowerToggled
-BrainstemEvent::CreateBrcPulseRequested
-BrainstemEvent::CreateBrcPulsed
-BrainstemEvent::CreateOiStartRequested
-BrainstemEvent::CreateOiModeRequested(CreateOiMode)
-BrainstemEvent::CreatePacketReceived { packet_id, bytes }
-BrainstemEvent::DriveRequested { left_mm_s, right_mm_s, duration_ms }
-BrainstemEvent::DriveStopped
-BrainstemEvent::Error(BrainstemError)
+Current public verbs:
+
+```text
+ping
+status
+get_capabilities
+get_events
+arm
+disarm
+stop
+estop
+clear_estop
+clear_motion_queue
+cmd_vel
+drive_direct
+drive_arc
+drive_for
+turn_by
+arc_for
+creep_until
+scan_arc
+face_bearing
+track_bearing
+hold_heading
+turn_to_heading
+dock_align
+wall_follow
+wiggle_align
+bump_escape
+unstick
+cliff_guard
+request_sensors
+stream_sensors
+set_safety_policy
+song_define
+song_play
+define_chirp
+play_feedback
+power_state
+calibrate_turn
+reset_odometry
+dock
+set_lights
+set_mode
 ```
 
-Commands accepted from the forebrain:
+`get_capabilities` reports the current body contract using the clean names above: body kind, drive type, supported verbs, sensors, outputs, safety features, limits, feedback/song slots, and supported sensor packet range. HTTP/WebSocket return JSON; UDP and forebrain UART return a compact single-line representation.
 
-```rust
-BrainstemCommand::Ping
-BrainstemCommand::Arm
-BrainstemCommand::Disarm
-BrainstemCommand::EStop
-BrainstemCommand::ClearEStop
-BrainstemCommand::CmdVel { linear_mm_s, angular_mrad_s, ttl_ms, seq }
-BrainstemCommand::Stop
-BrainstemCommand::Status
-BrainstemCommand::SongPlay { id }
-BrainstemCommand::Dock
-BrainstemCommand::SetLights { pattern }
+Current outward event kinds:
+
+```text
+boot
+command_accepted
+command_rejected
+command_started
+command_completed
+command_interrupted
+command_timed_out
+body_power_requested
+body_power_changed
+body_mode_requested
+body_mode_changed
+telemetry_received
+sensor_frame_decoded
+motion_requested
+motion_stopped
+safety_tripped
+safety_cleared
+bump_changed
+cliff_changed
+wheel_drop_latched
+wheel_drop_cleared
+heartbeat_expired
+estop_latched
+estop_cleared
+error
 ```
 
-Create OI power, BRC, Open Interface start, Safe mode, watchdog stop, and recovery are owned by the brainstem runtime. They are intentionally not exposed as forebrain commands.
+`get_events` reads a fixed-size event log by sequence number. Events are compact records:
 
-Internal supporting enums:
-
-```rust
-CreateOiMode::{Passive, Safe, Full}
-BrainstemError::{CreateNoResponse, UartFraming, Timeout, InvalidPacket}
+```text
+seq kind a b c
 ```
 
-These types deliberately know about power, serial, motor commands, sensors, LEDs, and time. They do not know about SLAM, goals, mood, planning, language, or Netherwick behavior.
+The numeric fields are intentionally small and transport-neutral. For example, command lifecycle events use `a` for command id, motion events pack wheel speeds or duration, sensor-frame events carry the body packet/frame id plus flags and odometry delta, and error events carry a small error code.
+
+The current internal Rust enums still include Create-specific variants such as `CreateOiMode`, `CreatePacketReceived`, and `CreateSensorPacketDecoded`. Those are driver/runtime implementation details, not the clean public vocabulary. Public capability and event renderers translate them into body-neutral names.
+
+Smart controller verbs are one-shot step primitives. `face_bearing`, `track_bearing`, `hold_heading`, `wall_follow`, `dock_align`, and `creep_until` consume the supplied current error/range and emit a short motion pulse or stop. The forebrain must keep updating target error/range if it wants closed-loop behavior across time.
+
+Odometry is currently a lightweight accumulator over decoded body distance/angle deltas. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
+
+Create OI power, BRC, Open Interface start, Safe mode, watchdog stop, and recovery remain owned by the brainstem runtime and Create body driver. The hardware watchdog feed point is reserved in the safety/runtime tick and must remain owned by that lane, not Wi-Fi or the forebrain interface.
+
+## Current Boundaries
+
+Generic public surface:
+
+- Verbs use body-neutral names: motion, safety, feedback, telemetry, status, capabilities, and events.
+- Outward events use body-neutral names and are readable by sequence number.
+- Capabilities declare the active body kind, drive model, verbs, events, sensors, outputs, safety features, limits, feedback/song slots, and sensor packet range.
+
+Create-specific by design:
+
+- The Create OI driver owns opcodes, packet ids, BRC, Create UART behavior, OI modes, songs, LEDs, dock seeking, and Create sensor decoding.
+- `/status.json` still exposes some Create diagnostic fields because they are useful during bring-up.
+- `set_mode`, `power_state`, `song_define`, `song_play`, and `set_lights` are generic-ish surface names backed by Create-specific implementation details today.
+
+Known remaining TODOs:
+
+- Move controller constants into `body.toml`/capabilities: axle track, bearing slowdown, minimum track speed, bump escape timing, wall-follow gain, default motion limits, and safety defaults.
+- Promote body capabilities from generated constants into a stronger driver contract.
+- Expand odometry from accumulated distance/heading deltas into pose integration plus get/set/calibrate verbs.
+- Emit `command_completed` and `command_interrupted` consistently for every queued runtime command. Accepted, rejected, started, timed out, safety, stop, sensor, telemetry, and error events are already represented.
+- Implement the hardware watchdog feed in the runtime lane when the backend exposes it.
 
 ## Build
 
@@ -223,14 +296,18 @@ Hostname: pete.local via mDNS announcement
 DHCP: offers 192.168.4.2/24 with router/DNS set to 192.168.4.1
 ```
 
-The interface is read-only for Brainstem 0:
+The interface exposes the body-neutral brainstem surface:
 
-- `http://192.168.4.1/` serves a plain liveness response: `hello, I'm at least up`.
+- `http://192.168.4.1/` serves the operator interface.
 - `http://192.168.4.1/status.json` serves firmware/body/runtime/Create/UART/demo status.
 - `POST http://192.168.4.1/command` accepts one low-level command atom.
+- `POST http://192.168.4.1/command` with `{"kind":"get_capabilities"}` returns the body capability contract.
+- `POST http://192.168.4.1/command` with `{"kind":"get_events","since_seq":0}` returns the outward event log.
+- WebSocket control is available at `ws://192.168.4.1:81/control`.
+- UDP control is available on port `82` using the same ASCII line format as forebrain UART.
 - `http://pete.local/` and `http://pete.local/status.json` may work on clients that support mDNS on the AP network.
 
-The status JSON includes firmware name/version, body name/kind, uptime, runtime state, Create power state, OI mode, UART RX health, last UART packet timestamp, current command, last error, demo state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, and last web request timestamp.
+The status JSON includes firmware name/version, body name/kind, uptime, runtime state, body/Create diagnostic state, UART RX health, last UART packet timestamp, current command, command lifecycle ids, event sequence, last error, demo state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, forebrain UART status, sensor state, battery state, song state, and odometry accumulator state.
 
 The crate keeps local self-signed certificate material out of version control under:
 
@@ -260,7 +337,31 @@ curl -s http://192.168.4.1/command \
   -d '{"command_id":42,"kind":"cmd_vel","linear_mm_s":120,"angular_mrad_s":0,"ttl_ms":250,"seq":42}'
 ```
 
-Supported command `kind` values are `ping`, `arm`, `disarm`, `estop`, `clear_estop`, `cmd_vel`, `stop`, `status`, `song_play`, `dock`, and `set_lights`. `cmd_vel` must include `ttl_ms` and `seq`; the brainstem owns timing, stop deadlines, Create startup, BRC, Open Interface start, Safe mode, watchdog stop, and recovery.
+Capabilities:
+
+```bash
+curl -s http://192.168.4.1/command \
+  -H 'Content-Type: application/json' \
+  -d '{"command_id":43,"kind":"get_capabilities"}'
+```
+
+Events since boot:
+
+```bash
+curl -s http://192.168.4.1/command \
+  -H 'Content-Type: application/json' \
+  -d '{"command_id":44,"kind":"get_events","since_seq":0}'
+```
+
+UDP probes:
+
+```bash
+printf 'GET_CAPABILITIES 1\n' | nc -u -w1 192.168.4.1 82
+printf 'GET_EVENTS 2 0\n' | nc -u -w1 192.168.4.1 82
+printf 'CMD_VEL 3 80 0 250\n' | nc -u -w1 192.168.4.1 82
+```
+
+`cmd_vel`, `drive_direct`, and `drive_arc` must include `ttl_ms` and `seq`; the brainstem owns timing, stop deadlines, body startup, mode changes, watchdog stop, and recovery.
 
 ## Forebrain UART
 
@@ -268,21 +369,65 @@ On Pico W builds, UART0 GP0/GP1 remains dedicated to the iRobot Create OI link. 
 
 ```text
 PING seq
+STATUS seq
+GET_CAPABILITIES seq
+GET_EVENTS seq since_seq
 ARM seq
 DISARM seq
 STOP seq
 ESTOP seq
 CLEAR_ESTOP seq
 CMD_VEL seq linear_mm_s angular_mrad_s ttl_ms
-STATUS seq
+DRIVE_DIRECT seq left_mm_s right_mm_s ttl_ms
+DRIVE_ARC seq velocity_mm_s radius_mm ttl_ms
+FACE_BEARING seq bearing_mrad max_angular_mrad_s tolerance_mrad ttl_ms
+TRACK_BEARING seq bearing_mrad range_mm max_linear_mm_s max_angular_mrad_s stop_range_mm ttl_ms
+TURN_BY seq angle_mrad angular_mrad_s timeout_ms
+DRIVE_FOR seq distance_mm velocity_mm_s timeout_ms
+BUMP_ESCAPE seq left|right|either backoff_mm_s turn_angular_mrad_s
+HOLD_HEADING seq heading_error_mrad velocity_mm_s max_angular_mrad_s ttl_ms
+TURN_TO_HEADING seq heading_error_mrad angular_mrad_s tolerance_mrad timeout_ms
+ARC_FOR seq velocity_mm_s radius_mm duration_ms
+CREEP_UNTIL seq velocity_mm_s angular_mrad_s timeout_ms
+SCAN_ARC seq angle_mrad angular_mrad_s timeout_ms
+DOCK_ALIGN seq bearing_mrad range_mm max_linear_mm_s max_angular_mrad_s stop_range_mm ttl_ms
+WALL_FOLLOW seq distance_error_mm velocity_mm_s max_angular_mrad_s ttl_ms
+WIGGLE_ALIGN seq amplitude_mrad angular_mrad_s cycles
+UNSTICK seq left|right|either backoff_mm_s turn_angular_mrad_s
+CLIFF_GUARD seq true|false
+HEARTBEAT_STOP seq timeout_ms
+REQUEST_SENSORS seq packet_id
+STREAM_SENSORS seq true|false packet_id period_ms
+SET_SAFETY_POLICY seq none|stop|backoff|bump_escape none|stop|backoff|bump_escape wheel_drop_latch
+CLEAR_MOTION_QUEUE seq
+DEFINE_CHIRP seq ok|error|armed|lost_target|dock_seen|danger note duration_64ths...
+PLAY_FEEDBACK seq ok|error|armed|lost_target|dock_seen|danger
+POWER_STATE seq wake|sleep|pulse_brc|start_oi
+CALIBRATE_TURN seq angular_mrad_s duration_ms
+RESET_ODOMETRY seq
 SONG_PLAY seq id
+SONG_DEFINE seq id note duration_64ths...
 DOCK seq
 SET_LIGHTS seq off|status|clean|dock|spot|max
+SET_MODE seq passive|safe|full
+BOOTSEL seq
 ```
 
-`ARM` expands internally to Create wake, BRC pulse, OI start, and Safe mode. `CMD_VEL` replaces the latest velocity mailbox instead of waiting behind ordinary commands, and the runtime stops the drive when its `ttl_ms` expires. `STOP` and `ESTOP` preempt immediately. Parse errors, line timeout, UART errors, runtime errors, and the estop latch all drive the runtime toward StopDrive.
+`GET_CAPABILITIES` replies with one compact `CAPABILITIES` line. `GET_EVENTS` replies with one compact `EVENTS` line containing records newer than `since_seq`.
+
+`ARM` expands internally to body wake, optional BRC pulse for the Create body, interface start, and safe mode. `CMD_VEL` replaces the latest velocity mailbox instead of waiting behind ordinary commands, and the runtime stops the drive when its `ttl_ms` expires. `STOP` and `ESTOP` preempt immediately. Parse errors, line timeout, UART errors, runtime errors, and the estop latch all drive the runtime toward stop.
 
 `/status.json` includes `forebrain_uart` with `rx_bytes`, `rx_lines`, `last_seq`, `last_error`, `link_alive_ms`, and `last_command_age_ms`.
+
+Minimal UART smoke test:
+
+```text
+GET_CAPABILITIES 1
+GET_EVENTS 2 0
+CMD_VEL 3 80 0 250
+STOP 4
+GET_EVENTS 5 0
+```
 
 The Pico W onboard LED normally emits a one-blink heartbeat every 15 seconds. Event blink codes interrupt that heartbeat:
 

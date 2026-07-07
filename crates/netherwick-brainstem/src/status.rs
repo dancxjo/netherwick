@@ -1,4 +1,7 @@
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::{
+    fmt::Write as _,
+    sync::atomic::{AtomicU32, AtomicU8, Ordering},
+};
 
 use crate::body;
 use crate::commands::{
@@ -11,6 +14,7 @@ use crate::hardware::UartReadError;
 const UNKNOWN: u8 = 0;
 const OFF: u8 = 1;
 const ON: u8 = 2;
+const EVENT_LOG_CAPACITY: usize = 32;
 
 static RUNTIME_STATE: AtomicU8 = AtomicU8::new(RuntimeState::Booting as u8);
 static CREATE_POWER_STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
@@ -51,6 +55,11 @@ static PENDING_VELOCITY_TTL_MS: AtomicU32 = AtomicU32::new(0);
 static PENDING_VELOCITY_SEQ: AtomicU32 = AtomicU32::new(0);
 static LAST_ACCEPTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static LAST_REJECTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_STARTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_COMPLETED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_INTERRUPTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_TIMED_OUT_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_DISPATCHED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_RX_BYTES: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_RX_LINES: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_LAST_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -79,6 +88,16 @@ static CREATE_SONG_LAST_DEFINED_ID: AtomicU8 = AtomicU8::new(0);
 static CREATE_SONG_LAST_DEFINED_LEN: AtomicU8 = AtomicU8::new(0);
 static CREATE_SONG_LAST_PLAYED_ID: AtomicU8 = AtomicU8::new(0);
 static ODOMETRY_RESET_COUNT: AtomicU32 = AtomicU32::new(0);
+static ODOMETRY_DISTANCE_MM: AtomicU32 = AtomicU32::new(0);
+static ODOMETRY_HEADING_MRAD: AtomicU32 = AtomicU32::new(0);
+static EVENT_NEXT_SEQ: AtomicU32 = AtomicU32::new(1);
+static EVENT_SEQ: [AtomicU32; EVENT_LOG_CAPACITY] =
+    [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
+static EVENT_KIND: [AtomicU8; EVENT_LOG_CAPACITY] =
+    [const { AtomicU8::new(PublicEventKind::None as u8) }; EVENT_LOG_CAPACITY];
+static EVENT_A: [AtomicU32; EVENT_LOG_CAPACITY] = [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
+static EVENT_B: [AtomicU32; EVENT_LOG_CAPACITY] = [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
+static EVENT_C: [AtomicU32; EVENT_LOG_CAPACITY] = [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -116,6 +135,10 @@ pub struct BrainstemStatus {
     pub pending_command_id: u32,
     pub last_accepted_command_id: u32,
     pub last_rejected_command_id: u32,
+    pub last_started_command_id: u32,
+    pub last_completed_command_id: u32,
+    pub last_interrupted_command_id: u32,
+    pub last_timed_out_command_id: u32,
     pub forebrain_uart_rx_bytes: u32,
     pub forebrain_uart_rx_lines: u32,
     pub forebrain_uart_last_seq: u32,
@@ -142,6 +165,9 @@ pub struct BrainstemStatus {
     pub create_song_last_defined_len: u8,
     pub create_song_last_played_id: u8,
     pub odometry_reset_count: u32,
+    pub odometry_distance_mm: i32,
+    pub odometry_heading_mrad: i32,
+    pub event_next_seq: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -244,6 +270,56 @@ enum HttpsState {
     Unavailable = 0,
 }
 
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum PublicEventKind {
+    None = 0,
+    Boot = 1,
+    CommandAccepted = 2,
+    CommandRejected = 3,
+    CommandStarted = 4,
+    CommandCompleted = 5,
+    CommandInterrupted = 6,
+    CommandTimedOut = 7,
+    BodyPowerRequested = 8,
+    BodyPowerChanged = 9,
+    BodyModeRequested = 10,
+    BodyModeChanged = 11,
+    TelemetryReceived = 12,
+    SensorFrameDecoded = 13,
+    MotionRequested = 14,
+    MotionStopped = 15,
+    SafetyTripped = 16,
+    SafetyCleared = 17,
+    BumpChanged = 18,
+    CliffChanged = 19,
+    WheelDropLatched = 20,
+    WheelDropCleared = 21,
+    HeartbeatExpired = 22,
+    EStopLatched = 23,
+    EStopCleared = 24,
+    Error = 25,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum SafetyEventKind {
+    Bump = 1,
+    Cliff = 2,
+    WheelDrop = 3,
+    EStop = 4,
+    Heartbeat = 5,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct PublicEventRecord {
+    pub seq: u32,
+    pub kind: u8,
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 enum ControlCommandCode {
@@ -289,6 +365,7 @@ enum ControlCommandCode {
     CalibrateTurn = 39,
     ResetOdometry = 40,
     GetCapabilities = 41,
+    GetEvents = 42,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -347,21 +424,32 @@ pub fn set_command(command: Option<RuntimeCommand>) {
         | Some(RuntimeCommand::SetLights { .. }) => CommandCode::None,
     };
     CURRENT_COMMAND.store(code as u8, Ordering::Relaxed);
+    if code as u8 != CommandCode::None as u8 {
+        let command_id = LAST_DISPATCHED_COMMAND_ID.load(Ordering::Relaxed);
+        LAST_STARTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        record_public_event(PublicEventKind::CommandStarted, command_id, code as u32, 0);
+    }
 }
 
 #[cfg(feature = "pico-w")]
 pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> bool {
-    if matches!(command, BrainstemCommand::Status | BrainstemCommand::Ping) {
+    if matches!(
+        command,
+        BrainstemCommand::Status | BrainstemCommand::Ping | BrainstemCommand::GetEvents { .. }
+    ) {
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        record_public_event(PublicEventKind::CommandAccepted, command_id, 0, 0);
         return true;
     }
     if matches!(command, BrainstemCommand::GetCapabilities) {
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        record_public_event(PublicEventKind::CommandAccepted, command_id, 0, 0);
         return true;
     }
 
     let Some((kind, a, b, c, d, duration_ms)) = encode_control_command(command) else {
         LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        record_public_event(PublicEventKind::CommandRejected, command_id, 0, 0);
         return false;
     };
 
@@ -369,6 +457,7 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
         let seq = command_seq(command);
         if !seq_is_current_or_newer(seq, PENDING_VELOCITY_SEQ.load(Ordering::Relaxed)) {
             LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+            record_public_event(PublicEventKind::CommandRejected, command_id, seq, 0);
             return false;
         }
 
@@ -379,6 +468,7 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
         PENDING_VELOCITY_SEQ.store(seq, Ordering::Relaxed);
         PENDING_VELOCITY_KIND.store(ControlCommandCode::CmdVel as u8, Ordering::Relaxed);
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        record_public_event(PublicEventKind::CommandAccepted, command_id, seq, 0);
         return true;
     }
 
@@ -386,6 +476,7 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
         PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
     } else if PENDING_COMMAND_KIND.load(Ordering::Relaxed) != ControlCommandCode::None as u8 {
         LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        record_public_event(PublicEventKind::CommandRejected, command_id, 0, 0);
         return false;
     }
 
@@ -398,6 +489,12 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
     PENDING_COMMAND_SEQ.store(command_seq(command), Ordering::Relaxed);
     PENDING_COMMAND_KIND.store(kind as u8, Ordering::Relaxed);
     LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+    record_public_event(
+        PublicEventKind::CommandAccepted,
+        command_id,
+        command_seq(command),
+        kind as u32,
+    );
     true
 }
 
@@ -413,7 +510,9 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
             duration_ms => Some(duration_ms),
         };
         let seq = PENDING_COMMAND_SEQ.load(Ordering::Relaxed);
+        let command_id = PENDING_COMMAND_ID.load(Ordering::Relaxed);
         PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+        LAST_DISPATCHED_COMMAND_ID.store(command_id, Ordering::Relaxed);
 
         return decode_control_command(kind, a, b, c, d, duration, seq);
     }
@@ -427,7 +526,9 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
     let b = PENDING_VELOCITY_B.load(Ordering::Relaxed);
     let ttl_ms = PENDING_VELOCITY_TTL_MS.load(Ordering::Relaxed);
     let seq = PENDING_VELOCITY_SEQ.load(Ordering::Relaxed);
+    let command_id = PENDING_VELOCITY_ID.load(Ordering::Relaxed);
     PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    LAST_DISPATCHED_COMMAND_ID.store(command_id, Ordering::Relaxed);
 
     Some(BrainstemCommand::CmdVel {
         linear_mm_s: decode_i16(a),
@@ -816,6 +917,9 @@ fn encode_control_command(
         BrainstemCommand::GetCapabilities => {
             Some((ControlCommandCode::GetCapabilities, 0, 0, 0, 0, None))
         }
+        BrainstemCommand::GetEvents { since_seq } => {
+            Some((ControlCommandCode::GetEvents, since_seq, 0, 0, 0, None))
+        }
     }
 }
 
@@ -1043,6 +1147,9 @@ fn decode_control_command(
         }
         x if x == ControlCommandCode::GetCapabilities as u8 => {
             Some(BrainstemCommand::GetCapabilities)
+        }
+        x if x == ControlCommandCode::GetEvents as u8 => {
+            Some(BrainstemCommand::GetEvents { since_seq: a })
         }
         _ => None,
     }
@@ -1303,6 +1410,8 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL
         .store(sensors.cliff_front_right_signal as u32, Ordering::Relaxed);
     CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(sensors.cliff_right_signal as u32, Ordering::Relaxed);
+    add_signed(&ODOMETRY_DISTANCE_MM, sensors.distance_mm as i32);
+    add_signed(&ODOMETRY_HEADING_MRAD, sensors.angle_mrad as i32);
 }
 
 pub fn mark_song_defined(id: u8, tone_count: u8) {
@@ -1316,6 +1425,75 @@ pub fn mark_song_played(id: u8) {
 
 pub fn mark_odometry_reset() {
     increment(&ODOMETRY_RESET_COUNT);
+    ODOMETRY_DISTANCE_MM.store(0, Ordering::Relaxed);
+    ODOMETRY_HEADING_MRAD.store(0, Ordering::Relaxed);
+}
+
+#[allow(dead_code)]
+pub fn mark_command_completed(command_id: u32) {
+    LAST_COMPLETED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+    record_public_event(PublicEventKind::CommandCompleted, command_id, 0, 0);
+}
+
+#[allow(dead_code)]
+pub fn mark_current_command_completed() {
+    mark_command_completed(LAST_STARTED_COMMAND_ID.load(Ordering::Relaxed));
+}
+
+#[allow(dead_code)]
+pub fn mark_command_interrupted(command_id: u32) {
+    LAST_INTERRUPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+    record_public_event(PublicEventKind::CommandInterrupted, command_id, 0, 0);
+}
+
+#[allow(dead_code)]
+pub fn mark_current_command_interrupted() {
+    mark_command_interrupted(LAST_STARTED_COMMAND_ID.load(Ordering::Relaxed));
+}
+
+pub fn mark_command_timed_out(command_id: u32) {
+    LAST_TIMED_OUT_COMMAND_ID.store(command_id, Ordering::Relaxed);
+    record_public_event(PublicEventKind::CommandTimedOut, command_id, 0, 0);
+}
+
+pub fn mark_current_command_timed_out() {
+    mark_command_timed_out(LAST_STARTED_COMMAND_ID.load(Ordering::Relaxed));
+}
+
+pub fn mark_safety_tripped(kind: SafetyEventKind) {
+    record_public_event(PublicEventKind::SafetyTripped, kind as u32, 0, 0);
+}
+
+pub fn mark_safety_cleared(kind: SafetyEventKind) {
+    record_public_event(PublicEventKind::SafetyCleared, kind as u32, 0, 0);
+}
+
+pub fn mark_bump_changed(active: bool) {
+    record_public_event(PublicEventKind::BumpChanged, active as u32, 0, 0);
+}
+
+pub fn mark_cliff_changed(active: bool) {
+    record_public_event(PublicEventKind::CliffChanged, active as u32, 0, 0);
+}
+
+pub fn mark_wheel_drop_latched() {
+    record_public_event(PublicEventKind::WheelDropLatched, 1, 0, 0);
+}
+
+pub fn mark_wheel_drop_cleared() {
+    record_public_event(PublicEventKind::WheelDropCleared, 0, 0, 0);
+}
+
+pub fn mark_heartbeat_expired() {
+    record_public_event(PublicEventKind::HeartbeatExpired, 0, 0, 0);
+}
+
+pub fn mark_estop_latched() {
+    record_public_event(PublicEventKind::EStopLatched, 1, 0, 0);
+}
+
+pub fn mark_estop_cleared() {
+    record_public_event(PublicEventKind::EStopCleared, 0, 0, 0);
 }
 
 pub fn mark_uart_rx_error() {
@@ -1428,6 +1606,7 @@ pub fn mark_dhcp_grant() {
 }
 
 pub fn signal_event(event: &BrainstemEvent) {
+    record_public_event_from_brainstem_event(event);
     let blinks = match event {
         BrainstemEvent::Boot => 1,
         BrainstemEvent::CreatePowerOnRequested | BrainstemEvent::CreatePowerOffRequested => 2,
@@ -1441,6 +1620,95 @@ pub fn signal_event(event: &BrainstemEvent) {
         BrainstemEvent::TickMs(_) => return,
     };
     request_led_blinks(blinks);
+}
+
+pub fn event_next_seq() -> u32 {
+    EVENT_NEXT_SEQ.load(Ordering::Relaxed)
+}
+
+pub fn collect_events_since<const N: usize>(
+    since_seq: u32,
+    out: &mut heapless::Vec<PublicEventRecord, N>,
+) {
+    let next_seq = EVENT_NEXT_SEQ.load(Ordering::Relaxed);
+    let first_seq = next_seq.saturating_sub(EVENT_LOG_CAPACITY as u32);
+    let since_seq = since_seq.max(first_seq.saturating_sub(1));
+    for seq in since_seq.saturating_add(1)..next_seq {
+        let index = event_index(seq);
+        if EVENT_SEQ[index].load(Ordering::Relaxed) != seq {
+            continue;
+        }
+        let _ = out.push(PublicEventRecord {
+            seq,
+            kind: EVENT_KIND[index].load(Ordering::Relaxed),
+            a: EVENT_A[index].load(Ordering::Relaxed),
+            b: EVENT_B[index].load(Ordering::Relaxed),
+            c: EVENT_C[index].load(Ordering::Relaxed),
+        });
+    }
+}
+
+#[cfg(feature = "pico-w")]
+pub fn render_events_json<'a>(since_seq: u32, buffer: &'a mut [u8]) -> Option<&'a str> {
+    let mut response = heapless::String::<2048>::new();
+    let mut records = heapless::Vec::<PublicEventRecord, EVENT_LOG_CAPACITY>::new();
+    collect_events_since(since_seq, &mut records);
+    write!(
+        response,
+        "{{\"type\":\"events\",\"since_seq\":{},\"next_seq\":{},\"events\":[",
+        since_seq,
+        event_next_seq()
+    )
+    .ok()?;
+    for (index, record) in records.iter().enumerate() {
+        if index > 0 {
+            response.push(',').ok()?;
+        }
+        write!(
+            response,
+            "{{\"seq\":{},\"kind\":\"{}\",\"a\":{},\"b\":{},\"c\":{}}}",
+            record.seq,
+            public_event_kind_text(record.kind),
+            record.a,
+            record.b,
+            record.c
+        )
+        .ok()?;
+    }
+    response.push_str("]}\n").ok()?;
+    let bytes = response.as_bytes();
+    if bytes.len() > buffer.len() {
+        return None;
+    }
+    buffer[..bytes.len()].copy_from_slice(bytes);
+    core::str::from_utf8(&buffer[..bytes.len()]).ok()
+}
+
+pub fn write_compact_events<const N: usize>(
+    response: &mut heapless::String<N>,
+    since_seq: u32,
+) -> core::fmt::Result {
+    let mut records = heapless::Vec::<PublicEventRecord, EVENT_LOG_CAPACITY>::new();
+    collect_events_since(since_seq, &mut records);
+    write!(
+        response,
+        "EVENTS since={} next={} count={}",
+        since_seq,
+        event_next_seq(),
+        records.len()
+    )?;
+    for record in records {
+        write!(
+            response,
+            " | {}:{}:{},{},{}",
+            record.seq,
+            public_event_kind_text(record.kind),
+            record.a,
+            record.b,
+            record.c
+        )?;
+    }
+    response.push('\n').map_err(|_| core::fmt::Error)
 }
 
 #[cfg(feature = "pico-w")]
@@ -1471,6 +1739,84 @@ fn increment_by(counter: &AtomicU32, amount: u32) {
     );
 }
 
+fn add_signed(counter: &AtomicU32, amount: i32) {
+    let current = decode_signed_i32(counter.load(Ordering::Relaxed));
+    counter.store(
+        encode_signed_i32(current.saturating_add(amount)),
+        Ordering::Relaxed,
+    );
+}
+
+fn record_public_event(kind: PublicEventKind, a: u32, b: u32, c: u32) {
+    let seq = EVENT_NEXT_SEQ.load(Ordering::Relaxed);
+    EVENT_NEXT_SEQ.store(seq.wrapping_add(1).max(1), Ordering::Relaxed);
+    let index = event_index(seq);
+    EVENT_A[index].store(a, Ordering::Relaxed);
+    EVENT_B[index].store(b, Ordering::Relaxed);
+    EVENT_C[index].store(c, Ordering::Relaxed);
+    EVENT_KIND[index].store(kind as u8, Ordering::Relaxed);
+    EVENT_SEQ[index].store(seq, Ordering::Relaxed);
+}
+
+fn record_public_event_from_brainstem_event(event: &BrainstemEvent) {
+    match event {
+        BrainstemEvent::Boot => record_public_event(PublicEventKind::Boot, 0, 0, 0),
+        BrainstemEvent::CreatePowerOnRequested => {
+            record_public_event(PublicEventKind::BodyPowerRequested, 1, 0, 0)
+        }
+        BrainstemEvent::CreatePowerOffRequested => {
+            record_public_event(PublicEventKind::BodyPowerRequested, 0, 0, 0)
+        }
+        BrainstemEvent::CreatePowerToggled => {
+            record_public_event(PublicEventKind::BodyPowerChanged, 0, 0, 0)
+        }
+        BrainstemEvent::CreateOiStartRequested => {
+            record_public_event(PublicEventKind::BodyModeRequested, 0, 0, 0)
+        }
+        BrainstemEvent::CreateOiModeRequested(mode) => record_public_event(
+            PublicEventKind::BodyModeRequested,
+            encode_oi_mode_public(*mode),
+            0,
+            0,
+        ),
+        BrainstemEvent::CreatePacketReceived { packet_id, bytes } => record_public_event(
+            PublicEventKind::TelemetryReceived,
+            *packet_id as u32,
+            bytes.len() as u32,
+            0,
+        ),
+        BrainstemEvent::CreateSensorPacketDecoded { packet_id, sensors } => record_public_event(
+            PublicEventKind::SensorFrameDecoded,
+            *packet_id as u32,
+            create_sensor_flags_bits(*sensors),
+            pack_i16_pair(sensors.distance_mm, sensors.angle_mrad),
+        ),
+        BrainstemEvent::DriveRequested {
+            left_mm_s,
+            right_mm_s,
+            duration_ms,
+        } => record_public_event(
+            PublicEventKind::MotionRequested,
+            pack_i16_pair(*left_mm_s, *right_mm_s),
+            *duration_ms,
+            0,
+        ),
+        BrainstemEvent::DriveStopped => {
+            record_public_event(PublicEventKind::MotionStopped, 0, 0, 0)
+        }
+        BrainstemEvent::Error(error) => {
+            record_public_event(PublicEventKind::Error, encode_error_public(*error), 0, 0)
+        }
+        BrainstemEvent::CreateBrcPulseRequested
+        | BrainstemEvent::CreateBrcPulsed
+        | BrainstemEvent::TickMs(_) => {}
+    }
+}
+
+const fn event_index(seq: u32) -> usize {
+    seq as usize % EVENT_LOG_CAPACITY
+}
+
 fn create_sensor_flags_bits(sensors: CreateSensorPacket) -> u32 {
     let flags = sensors.flags;
     (flags.bump_left as u32)
@@ -1499,6 +1845,35 @@ fn encode_signed_i8(value: i8) -> u32 {
 
 fn decode_signed_i8(value: u32) -> i8 {
     value as u8 as i8
+}
+
+fn encode_signed_i32(value: i32) -> u32 {
+    value as u32
+}
+
+fn decode_signed_i32(value: u32) -> i32 {
+    value as i32
+}
+
+fn pack_i16_pair(left: i16, right: i16) -> u32 {
+    ((left as u16 as u32) << 16) | right as u16 as u32
+}
+
+fn encode_oi_mode_public(mode: CreateOiMode) -> u32 {
+    match mode {
+        CreateOiMode::Passive => 1,
+        CreateOiMode::Safe => 2,
+        CreateOiMode::Full => 3,
+    }
+}
+
+fn encode_error_public(error: BrainstemError) -> u32 {
+    match error {
+        BrainstemError::CreateNoResponse => ErrorCode::CreateNoResponse as u32,
+        BrainstemError::UartFraming => ErrorCode::UartFraming as u32,
+        BrainstemError::Timeout => ErrorCode::Timeout as u32,
+        BrainstemError::InvalidPacket => ErrorCode::InvalidPacket as u32,
+    }
 }
 
 #[allow(dead_code)]
@@ -1549,6 +1924,10 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         pending_command_id,
         last_accepted_command_id: LAST_ACCEPTED_COMMAND_ID.load(Ordering::Relaxed),
         last_rejected_command_id: LAST_REJECTED_COMMAND_ID.load(Ordering::Relaxed),
+        last_started_command_id: LAST_STARTED_COMMAND_ID.load(Ordering::Relaxed),
+        last_completed_command_id: LAST_COMPLETED_COMMAND_ID.load(Ordering::Relaxed),
+        last_interrupted_command_id: LAST_INTERRUPTED_COMMAND_ID.load(Ordering::Relaxed),
+        last_timed_out_command_id: LAST_TIMED_OUT_COMMAND_ID.load(Ordering::Relaxed),
         forebrain_uart_rx_bytes: FOREBRAIN_UART_RX_BYTES.load(Ordering::Relaxed),
         forebrain_uart_rx_lines: FOREBRAIN_UART_RX_LINES.load(Ordering::Relaxed),
         forebrain_uart_last_seq: FOREBRAIN_UART_LAST_SEQ.load(Ordering::Relaxed),
@@ -1593,6 +1972,9 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         create_song_last_defined_len: CREATE_SONG_LAST_DEFINED_LEN.load(Ordering::Relaxed),
         create_song_last_played_id: CREATE_SONG_LAST_PLAYED_ID.load(Ordering::Relaxed),
         odometry_reset_count: ODOMETRY_RESET_COUNT.load(Ordering::Relaxed),
+        odometry_distance_mm: decode_signed_i32(ODOMETRY_DISTANCE_MM.load(Ordering::Relaxed)),
+        odometry_heading_mrad: decode_signed_i32(ODOMETRY_HEADING_MRAD.load(Ordering::Relaxed)),
+        event_next_seq: EVENT_NEXT_SEQ.load(Ordering::Relaxed),
     }
 }
 
@@ -1641,6 +2023,11 @@ struct StatusJson {
     pending_command_id: u32,
     last_accepted_command_id: u32,
     last_rejected_command_id: u32,
+    last_started_command_id: u32,
+    last_completed_command_id: u32,
+    last_interrupted_command_id: u32,
+    last_timed_out_command_id: u32,
+    event_next_seq: u32,
     create_songs: CreateSongStatusJson,
     odometry: OdometryStatusJson,
     create_sensors: CreateSensorStatusJson,
@@ -1659,6 +2046,8 @@ struct CreateSongStatusJson {
 #[derive(serde::Serialize)]
 struct OdometryStatusJson {
     reset_count: u32,
+    distance_mm: i32,
+    heading_mrad: i32,
 }
 
 #[cfg(feature = "pico-w")]
@@ -1739,6 +2128,11 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         pending_command_id: snapshot.pending_command_id,
         last_accepted_command_id: snapshot.last_accepted_command_id,
         last_rejected_command_id: snapshot.last_rejected_command_id,
+        last_started_command_id: snapshot.last_started_command_id,
+        last_completed_command_id: snapshot.last_completed_command_id,
+        last_interrupted_command_id: snapshot.last_interrupted_command_id,
+        last_timed_out_command_id: snapshot.last_timed_out_command_id,
+        event_next_seq: snapshot.event_next_seq,
         create_songs: CreateSongStatusJson {
             last_defined_id: snapshot.create_song_last_defined_id,
             last_defined_len: snapshot.create_song_last_defined_len,
@@ -1746,6 +2140,8 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         },
         odometry: OdometryStatusJson {
             reset_count: snapshot.odometry_reset_count,
+            distance_mm: snapshot.odometry_distance_mm,
+            heading_mrad: snapshot.odometry_heading_mrad,
         },
         create_sensors: create_sensor_status_json(snapshot),
         forebrain_uart: ForebrainUartStatusJson {
@@ -1797,6 +2193,37 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
 fn body_kind() -> &'static str {
     match body::BODY_KIND {
         body::BodyKind::CreateOpenInterface => "create_oi",
+    }
+}
+
+pub fn public_event_kind_text(code: u8) -> &'static str {
+    match code {
+        x if x == PublicEventKind::Boot as u8 => "boot",
+        x if x == PublicEventKind::CommandAccepted as u8 => "command_accepted",
+        x if x == PublicEventKind::CommandRejected as u8 => "command_rejected",
+        x if x == PublicEventKind::CommandStarted as u8 => "command_started",
+        x if x == PublicEventKind::CommandCompleted as u8 => "command_completed",
+        x if x == PublicEventKind::CommandInterrupted as u8 => "command_interrupted",
+        x if x == PublicEventKind::CommandTimedOut as u8 => "command_timed_out",
+        x if x == PublicEventKind::BodyPowerRequested as u8 => "body_power_requested",
+        x if x == PublicEventKind::BodyPowerChanged as u8 => "body_power_changed",
+        x if x == PublicEventKind::BodyModeRequested as u8 => "body_mode_requested",
+        x if x == PublicEventKind::BodyModeChanged as u8 => "body_mode_changed",
+        x if x == PublicEventKind::TelemetryReceived as u8 => "telemetry_received",
+        x if x == PublicEventKind::SensorFrameDecoded as u8 => "sensor_frame_decoded",
+        x if x == PublicEventKind::MotionRequested as u8 => "motion_requested",
+        x if x == PublicEventKind::MotionStopped as u8 => "motion_stopped",
+        x if x == PublicEventKind::SafetyTripped as u8 => "safety_tripped",
+        x if x == PublicEventKind::SafetyCleared as u8 => "safety_cleared",
+        x if x == PublicEventKind::BumpChanged as u8 => "bump_changed",
+        x if x == PublicEventKind::CliffChanged as u8 => "cliff_changed",
+        x if x == PublicEventKind::WheelDropLatched as u8 => "wheel_drop_latched",
+        x if x == PublicEventKind::WheelDropCleared as u8 => "wheel_drop_cleared",
+        x if x == PublicEventKind::HeartbeatExpired as u8 => "heartbeat_expired",
+        x if x == PublicEventKind::EStopLatched as u8 => "estop_latched",
+        x if x == PublicEventKind::EStopCleared as u8 => "estop_cleared",
+        x if x == PublicEventKind::Error as u8 => "error",
+        _ => "none",
     }
 }
 
