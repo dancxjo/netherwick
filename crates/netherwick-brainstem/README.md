@@ -369,6 +369,61 @@ printf 'CMD_VEL 3 80 0 250\n' | nc -u -w1 192.168.4.1 82
 
 `cmd_vel`, `drive_direct`, and `drive_arc` must include `ttl_ms` and `seq`; the brainstem owns timing, stop deadlines, body startup, mode changes, watchdog stop, and recovery.
 
+## Host Client Contract
+
+The host-side crate `netherwick-brainstem-client` defines the smallest stable motherbrain/forebrain client surface. It is intentionally body-neutral: callers do not see Create OI modes, packet ids, BRC, LEDs, songs, dock opcodes, or UART details.
+
+Primary low-latency transport today is UDP on port `82`; forebrain UART uses the same compact command vocabulary and can implement the same trait later. HTTP remains useful for smoke testing and operator inspection.
+
+The Rust trait exposes:
+
+```rust
+get_status()
+get_capabilities()
+get_events_since(since_seq)
+arm()
+disarm()
+stop()
+estop()
+clear_estop()
+cmd_vel(linear_mm_s, angular_mrad_s, ttl_ms)
+heartbeat_stop(timeout_ms)
+stream_sensors(enabled, packet_id, period_ms)
+reset_odometry()
+```
+
+Generic outward events are represented by `BrainstemEventKind`, matching the public event names from `get_events`: `SafetyTripped`, `HeartbeatExpired`, `EStopLatched`, `MotionRequested`, `SensorFrameDecoded`, command lifecycle events, and the rest of the body-neutral vocabulary.
+
+`EventCursor` tracks `next_seq`. Each poll checks `dropped_before_seq`; if history was missed, it returns `MissedEvents` so the motherbrain can stop instead of driving with a hole in its transcript.
+
+Servo-loop example:
+
+```bash
+cargo run -p netherwick-brainstem-client --example servo_loop -- 192.168.4.1:82
+```
+
+The example does:
+
+```text
+arm
+stream_sensors true 0 250
+loop:
+  heartbeat_stop 900
+  cmd_vel 70 0 300
+  get_events_since cursor.next_seq
+  stop on safety_tripped, heartbeat_expired, estop_latched, or missed events
+stop
+```
+
+Manual UDP smoke test:
+
+```bash
+printf 'GET_EVENTS 1 0\n' | nc -u -w1 192.168.4.1 82
+printf 'CMD_VEL 2 60 0 250\n' | nc -u -w1 192.168.4.1 82
+printf 'GET_EVENTS 3 0\n' | nc -u -w1 192.168.4.1 82
+printf 'STOP 4\n' | nc -u -w1 192.168.4.1 82
+```
+
 ## Forebrain UART
 
 On Pico W builds, UART0 GP0/GP1 remains dedicated to the iRobot Create OI link. UART1 GP4/GP5 is the forebrain control lane at 115200 8N1 with one ASCII command per line:

@@ -1,0 +1,13 @@
+[package]
+name = "netherwick-brainstem-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+
+[[example]]
+name = "servo_loop"
+path = "examples/servo_loop.rs"

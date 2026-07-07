@@ -5119,6 +5119,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "netherwick-brainstem-client"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "netherwick-conductor"
 version = "0.1.0"
 dependencies = [
