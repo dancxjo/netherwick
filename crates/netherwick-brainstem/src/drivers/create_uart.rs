@@ -55,7 +55,7 @@ impl CreateUart {
                 SerialRead::Error(UartReadError::Overrun) => {
                     status::mark_uart_rx_error_detail(UartReadError::Overrun);
                     push_packet(events, &mut bytes);
-                    break;
+                    drained += 1;
                 }
                 SerialRead::Error(error) => {
                     status::mark_uart_rx_error_detail(error);

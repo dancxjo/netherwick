@@ -1,6 +1,6 @@
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum CreateOiMode {
+pub enum CreateOiMode {
     Passive,
     Safe,
     Full,
@@ -22,6 +22,8 @@ pub enum BrainstemCommand {
     },
     Stop,
     Status,
+    Bootsel,
+    SetMode(CreateOiMode),
     SongPlay {
         id: u8,
     },

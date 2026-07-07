@@ -44,6 +44,7 @@ struct Timing {
     responsive_timeout_ms: u32,
     brc_low_pulse_ms: u32,
     post_brc_settle_ms: u32,
+    post_start_settle_ms: u32,
     post_mode_settle_ms: u32,
     uart_byte_timeout_ms: u32,
     idle_blink_ms: u32,
@@ -151,6 +152,7 @@ pub const CREATE_WAKE_WAIT_MS: u32 = {wake_wait_ms};
 pub const CREATE_RESPONSIVE_TIMEOUT_MS: u32 = {responsive_timeout_ms};
 pub const BRC_LOW_PULSE_MS: u32 = {brc_low_pulse_ms};
 pub const POST_BRC_SETTLE_MS: u32 = {post_brc_settle_ms};
+pub const POST_START_SETTLE_MS: u32 = {post_start_settle_ms};
 pub const POST_MODE_SETTLE_MS: u32 = {post_mode_settle_ms};
 pub const UART_BYTE_TIMEOUT_MS: u32 = {uart_byte_timeout_ms};
 pub const IDLE_BLINK_MS: u32 = {idle_blink_ms};
@@ -189,6 +191,7 @@ pub const ESTOP_GPIO: u8 = {estop_gpio};
         responsive_timeout_ms = body.timing.responsive_timeout_ms,
         brc_low_pulse_ms = body.timing.brc_low_pulse_ms,
         post_brc_settle_ms = body.timing.post_brc_settle_ms,
+        post_start_settle_ms = body.timing.post_start_settle_ms,
         post_mode_settle_ms = body.timing.post_mode_settle_ms,
         uart_byte_timeout_ms = body.timing.uart_byte_timeout_ms,
         idle_blink_ms = body.timing.idle_blink_ms,

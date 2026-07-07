@@ -37,12 +37,14 @@ enum ActiveAction {
     },
     WakeSettle {
         until_ms: u32,
+        power_toggled: bool,
     },
     WaitForCreate {
         deadline_ms: u32,
         next_probe_ms: u32,
         response_bytes: u8,
         oi_started: bool,
+        power_toggled: bool,
     },
     Settle {
         until_ms: u32,
@@ -256,12 +258,12 @@ where
                 status::set_create_power_unknown();
                 status::set_oi_mode_unknown();
                 status::set_demo_state(DemoState::WaitingForCreate);
-                self.push_event(BrainstemEvent::CreatePowerOnRequested);
-                self.hardware.set_power_toggle(true);
-                self.active = ActiveAction::PowerPulse {
-                    release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
-                    wake_wait_until_ms: Some(now_ms.wrapping_add(body::CREATE_WAKE_WAIT_MS)),
-                    power_on: true,
+                self.active = ActiveAction::WaitForCreate {
+                    deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
+                    next_probe_ms: now_ms,
+                    response_bytes: 0,
+                    oi_started: false,
+                    power_toggled: false,
                 };
             }
             RuntimeCommand::SleepCreate => {
@@ -292,7 +294,7 @@ where
                     .start_oi(&mut self.hardware, &mut self.events)?;
                 status::set_demo_state(DemoState::OiStarted);
                 self.active = ActiveAction::Settle {
-                    until_ms: now_ms.wrapping_add(body::POST_MODE_SETTLE_MS),
+                    until_ms: now_ms.wrapping_add(body::POST_START_SETTLE_MS),
                 };
             }
             RuntimeCommand::SetMode(mode) => {
@@ -364,7 +366,10 @@ where
                         status::set_create_power_on(power_on);
                     }
                     self.active = match wake_wait_until_ms {
-                        Some(until_ms) => ActiveAction::WakeSettle { until_ms },
+                        Some(until_ms) => ActiveAction::WakeSettle {
+                            until_ms,
+                            power_toggled: true,
+                        },
                         None => ActiveAction::None,
                     };
                 }
@@ -386,13 +391,17 @@ where
                 }
                 Ok(())
             }
-            ActiveAction::WakeSettle { until_ms } => {
+            ActiveAction::WakeSettle {
+                until_ms,
+                power_toggled,
+            } => {
                 if time_reached(now_ms, until_ms) {
                     self.active = ActiveAction::WaitForCreate {
                         deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
                         next_probe_ms: now_ms,
                         response_bytes: 0,
                         oi_started: false,
+                        power_toggled,
                     };
                 }
                 Ok(())
@@ -401,7 +410,8 @@ where
                 deadline_ms,
                 next_probe_ms,
                 mut response_bytes,
-                mut oi_started,
+                oi_started,
+                power_toggled,
             } => {
                 while let Some(event) = self.events.pop_front() {
                     match event {
@@ -425,6 +435,18 @@ where
                 }
 
                 if time_reached(now_ms, deadline_ms) {
+                    if !power_toggled {
+                        self.push_event(BrainstemEvent::CreatePowerOnRequested);
+                        self.hardware.set_power_toggle(true);
+                        self.active = ActiveAction::PowerPulse {
+                            release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
+                            wake_wait_until_ms: Some(
+                                now_ms.wrapping_add(body::CREATE_WAKE_WAIT_MS),
+                            ),
+                            power_on: true,
+                        };
+                        return Ok(());
+                    }
                     self.stop_drive()?;
                     self.create_responsive = false;
                     status::set_create_power_unknown();
@@ -438,7 +460,14 @@ where
                         self.create_uart.flush_rx(&mut self.hardware);
                         self.create_uart
                             .start_oi(&mut self.hardware, &mut self.events)?;
-                        oi_started = true;
+                        self.active = ActiveAction::WaitForCreate {
+                            deadline_ms,
+                            next_probe_ms: now_ms.wrapping_add(body::POST_START_SETTLE_MS),
+                            response_bytes: 0,
+                            oi_started: true,
+                            power_toggled,
+                        };
+                        return Ok(());
                     }
                     self.create_uart.flush_rx(&mut self.hardware);
                     response_bytes = 0;
@@ -455,6 +484,7 @@ where
                         next_probe_ms: now_ms.wrapping_add(SENSOR_PROBE_PERIOD_MS),
                         response_bytes,
                         oi_started,
+                        power_toggled,
                     };
                 } else {
                     self.active = ActiveAction::WaitForCreate {
@@ -462,6 +492,7 @@ where
                         next_probe_ms,
                         response_bytes,
                         oi_started,
+                        power_toggled,
                     };
                 }
                 Ok(())
@@ -641,11 +672,13 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
     match command {
         BrainstemCommand::Ping
         | BrainstemCommand::Status
+        | BrainstemCommand::Bootsel
         | BrainstemCommand::Arm
         | BrainstemCommand::Disarm => None,
         BrainstemCommand::Stop => Some(RuntimeCommand::Stop),
         BrainstemCommand::EStop => Some(RuntimeCommand::EStop),
         BrainstemCommand::ClearEStop => Some(RuntimeCommand::ClearEStop),
+        BrainstemCommand::SetMode(mode) => Some(RuntimeCommand::SetMode(mode)),
         BrainstemCommand::CmdVel {
             linear_mm_s,
             angular_mrad_s,

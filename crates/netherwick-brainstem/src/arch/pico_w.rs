@@ -15,6 +15,7 @@ use embassy_rp::peripherals::{
     PIO0, UART0, UART1,
 };
 use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::rom_data::reset_to_usb_boot;
 use embassy_rp::uart::{
     Blocking, Config as UartConfig, DataBits, Error as UartError, Parity, StopBits, Uart,
 };
@@ -25,7 +26,7 @@ use embedded_io_async::Write;
 use static_cell::StaticCell;
 
 use crate::body;
-use crate::commands::{BrainstemCommand, LightPattern};
+use crate::commands::{BrainstemCommand, CreateOiMode, LightPattern};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 use crate::status;
@@ -38,6 +39,7 @@ const DHCP_LEASE_IP_OCTETS: [u8; 4] = [192, 168, 4, 2];
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const HTTP_PORT: u16 = 80;
 const WS_CONTROL_PORT: u16 = 81;
+const UDP_CONTROL_PORT: u16 = 82;
 const DNS_PORT: u16 = 53;
 const MDNS_PORT: u16 = 5353;
 const DHCP_SERVER_PORT: u16 = 67;
@@ -202,6 +204,7 @@ async fn wifi_task(
         let _ = control.gpio_set(0, false).await;
         spawner.spawn(http_task(stack).expect("spawn http task"));
         spawner.spawn(websocket_task(stack).expect("spawn websocket task"));
+        spawner.spawn(udp_control_task(stack).expect("spawn udp control task"));
         spawner.spawn(dns_task(stack).expect("spawn dns task"));
         spawner.spawn(mdns_task(stack).expect("spawn mdns task"));
         spawner.spawn(dhcp_task(stack).expect("spawn dhcp task"));
@@ -547,6 +550,47 @@ async fn blink_onboard_led(control: &mut cyw43::Control<'static>, blinks: u8) {
 }
 
 #[embassy_executor::task]
+async fn udp_control_task(stack: Stack<'static>) -> ! {
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut rx_buffer = [0; 512];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut tx_buffer = [0; 512];
+    let mut request = [0; 128];
+    let mut response = heapless::String::<512>::new();
+
+    loop {
+        let mut socket = UdpSocket::new(
+            stack,
+            &mut rx_meta,
+            &mut rx_buffer,
+            &mut tx_meta,
+            &mut tx_buffer,
+        );
+        if socket.bind(UDP_CONTROL_PORT).is_err() {
+            Timer::after_secs(5).await;
+            continue;
+        }
+
+        loop {
+            let Ok((len, endpoint)) = socket.recv_from(&mut request).await else {
+                continue;
+            };
+            let Ok(line) = core::str::from_utf8(&request[..len]) else {
+                continue;
+            };
+            let Some(boot_to_usb) = handle_udp_control_line(line.trim(), &mut response) else {
+                continue;
+            };
+            let _ = socket.send_to(response.as_bytes(), endpoint).await;
+            if boot_to_usb {
+                Timer::after_millis(100).await;
+                reset_to_usb_boot(0, 0);
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
 async fn dns_task(stack: Stack<'static>) -> ! {
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
     let mut rx_buffer = [0; 512];
@@ -759,9 +803,9 @@ label{font-size:12px;color:#5c675f;font-weight:700}.slider{display:grid;gap:6px}
 <button data-drive="back" class="center">BACK</button>
 <button data-drive="spinl">SPIN L</button><button data-drive="slow">SLOW</button><button data-drive="spinr">SPIN R</button>
 </div>
-<div class="cluster"><h2>Mode</h2><div class="row"><button id="arm" class="primary">Arm</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
+<div class="cluster"><h2>Mode</h2><div class="row"><button id="arm" class="primary">Arm</button><button id="safe">Safe</button><button id="full">Full</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
 <div class="cluster"><h2>Lights</h2><div class="seg"><button data-lights="off">Off</button><button data-lights="status">Status</button><button data-lights="clean">Clean</button><button data-lights="dock">Dock</button><button data-lights="spot">Spot</button><button data-lights="max">Max</button></div></div>
-<div class="cluster"><div class="row"><button id="song">Song</button><button id="refresh">Refresh</button></div></div>
+<div class="cluster"><div class="row"><button id="song">Song</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
 </section>
 <section class="panel wide">
 <h2>Telemetry</h2>
@@ -800,10 +844,13 @@ $('stop').onclick=stop;$('padstop').onclick=stop
 $('estop').onclick=()=>post({kind:'estop'})
 $('clear').onclick=()=>post({kind:'clear_estop'})
 $('arm').onclick=()=>post({kind:'arm'})
+$('safe').onclick=()=>post({kind:'set_mode',mode:'safe'})
+$('full').onclick=()=>post({kind:'set_mode',mode:'full'})
 $('disarm').onclick=()=>post({kind:'disarm'})
 $('dock').onclick=()=>post({kind:'dock'})
 $('ping').onclick=()=>post({kind:'ping'})
 $('song').onclick=()=>post({kind:'song_play',id:0})
+$('bootsel').onclick=()=>post({kind:'bootsel'})
 $('refresh').onclick=refresh
 document.querySelectorAll('[data-lights]').forEach(b=>b.onclick=()=>post({kind:'set_lights',pattern:b.dataset.lights}))
 document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveKind=b.dataset.drive;b.classList.add('active');sendDrive();timer=setInterval(sendDrive,190);b.setPointerCapture(e.pointerId)};b.onpointerup=b.onpointercancel=stop})
@@ -832,6 +879,9 @@ fn handle_command_request<'a>(
     let body = request_body(request).ok_or(CommandParseError::BadRequest)?;
     let command_id = json_u32(body, "command_id").ok_or(CommandParseError::BadRequest)?;
     let command = parse_command(command_id, body).ok_or(CommandParseError::BadRequest)?;
+    if matches!(command, BrainstemCommand::Bootsel) {
+        return render_bootsel_response(buffer, command_id).ok_or(CommandParseError::BadRequest);
+    }
     if !status::submit_control_command(command_id, command) {
         return Err(CommandParseError::Busy(command_id));
     }
@@ -848,6 +898,9 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     if json_bool(body, "ack") == Some(false) {
         let command_id = json_u32(body, "command_id")?;
         let command = parse_command(command_id, body)?;
+        if matches!(command, BrainstemCommand::Bootsel) {
+            return render_bootsel_response(buffer, command_id);
+        }
         let accepted = status::submit_control_command(command_id, command);
         if accepted {
             None
@@ -863,6 +916,9 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
 fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
     let command_id = json_u32(body, "command_id")?;
     let command = parse_command(command_id, body)?;
+    if matches!(command, BrainstemCommand::Bootsel) {
+        return render_bootsel_response(buffer, command_id);
+    }
     if !status::submit_control_command(command_id, command) {
         return render_command_response(buffer, false, command_id, "busy");
     }
@@ -917,6 +973,11 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
     };
 
     status::mark_forebrain_uart_command(seq, Instant::now().as_millis() as u32);
+    if matches!(command, BrainstemCommand::Bootsel) {
+        write_forebrain_uart_ok(uart, seq);
+        reset_to_usb_boot(0, 0);
+    }
+
     if !status::submit_control_command(seq, command) {
         status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Busy);
         if matches!(command, BrainstemCommand::CmdVel { .. }) {
@@ -942,8 +1003,12 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
 
     let command = match kind {
         "PING" => BrainstemCommand::Ping,
+        "BOOTSEL" => BrainstemCommand::Bootsel,
         "ARM" => BrainstemCommand::Arm,
         "DISARM" => BrainstemCommand::Disarm,
+        "SET_MODE" => {
+            BrainstemCommand::SetMode(parse_oi_mode(parts.next().ok_or(seq)?).ok_or(seq)?)
+        }
         "STOP" => BrainstemCommand::Stop,
         "ESTOP" => BrainstemCommand::EStop,
         "CLEAR_ESTOP" => BrainstemCommand::ClearEStop,
@@ -971,6 +1036,36 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
     Ok((seq, command))
 }
 
+fn handle_udp_control_line(line: &str, response: &mut heapless::String<512>) -> Option<bool> {
+    response.clear();
+    let (seq, command) = match parse_forebrain_uart_command(line) {
+        Ok(parsed) => parsed,
+        Err(seq) => {
+            let _ = writeln!(response, "ERR {seq} parse");
+            return Some(false);
+        }
+    };
+
+    match command {
+        BrainstemCommand::Status | BrainstemCommand::Ping => {
+            write_compact_status_line(response, seq);
+            Some(false)
+        }
+        BrainstemCommand::Bootsel => {
+            let _ = writeln!(response, "OK {seq} bootsel");
+            Some(true)
+        }
+        command => {
+            if status::submit_control_command(seq, command) {
+                let _ = writeln!(response, "OK {seq}");
+            } else {
+                let _ = writeln!(response, "ERR {seq} busy");
+            }
+            Some(false)
+        }
+    }
+}
+
 fn parse_u32(value: Option<&str>) -> Option<u32> {
     value?.parse().ok()
 }
@@ -996,19 +1091,41 @@ fn write_forebrain_uart_error(uart: &mut Uart<'static, Blocking>, seq: u32, erro
 }
 
 fn write_forebrain_uart_status(uart: &mut Uart<'static, Blocking>, seq: u32) {
+    let mut response = heapless::String::<384>::new();
+    write_compact_status_line(&mut response, seq);
+    write_forebrain_uart_line(uart, response.as_bytes());
+}
+
+fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>, seq: u32) {
     let snapshot = status::snapshot(Instant::now().as_millis() as u32);
-    let mut response = heapless::String::<192>::new();
     let _ = writeln!(
         response,
-        "OK {seq} STATUS runtime={} command={} pending={} error={} rx_bytes={} rx_lines={}",
+        "OK {seq} STATUS runtime={} demo={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_len={} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={}",
         snapshot.current_runtime_state,
+        snapshot.demo_state,
+        snapshot.current_runtime_action,
         snapshot.current_command,
         snapshot.pending_command,
         snapshot.last_error,
+        snapshot.last_error_uart_read_error,
+        snapshot.create_power_state,
+        snapshot.oi_mode,
+        snapshot.uart_rx_health,
+        snapshot.last_uart_read_error,
+        snapshot.uart_rx_bytes,
+        snapshot.uart_rx_packets,
+        snapshot.last_uart_packet_len,
+        snapshot.wake_probe_response_bytes,
+        snapshot.wake_probe_expected_bytes,
         snapshot.forebrain_uart_rx_bytes,
         snapshot.forebrain_uart_rx_lines
     );
-    write_forebrain_uart_line(uart, response.as_bytes());
+}
+
+fn render_bootsel_response(buffer: &mut [u8], command_id: u32) -> Option<&str> {
+    let body = render_command_response(buffer, true, command_id, "bootsel")?;
+    reset_to_usb_boot(0, 0);
+    Some(body)
 }
 
 fn write_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
@@ -1028,7 +1145,11 @@ fn request_body(request: &[u8]) -> Option<&str> {
 fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
     match json_str(body, "kind")? {
         "ping" => Some(BrainstemCommand::Ping),
+        "bootsel" => Some(BrainstemCommand::Bootsel),
         "arm" => Some(BrainstemCommand::Arm),
+        "set_mode" => Some(BrainstemCommand::SetMode(parse_oi_mode(json_str(
+            body, "mode",
+        )?)?)),
         "disarm" => Some(BrainstemCommand::Disarm),
         "stop" => Some(BrainstemCommand::Stop),
         "estop" => Some(BrainstemCommand::EStop),
@@ -1059,6 +1180,15 @@ fn parse_light_pattern(pattern: &str) -> Option<LightPattern> {
         "dock" => Some(LightPattern::Dock),
         "spot" => Some(LightPattern::Spot),
         "max" => Some(LightPattern::Max),
+        _ => None,
+    }
+}
+
+fn parse_oi_mode(mode: &str) -> Option<CreateOiMode> {
+    match mode {
+        "passive" | "PASSIVE" => Some(CreateOiMode::Passive),
+        "safe" | "SAFE" => Some(CreateOiMode::Safe),
+        "full" | "FULL" => Some(CreateOiMode::Full),
         _ => None,
     }
 }

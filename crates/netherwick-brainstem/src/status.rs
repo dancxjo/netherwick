@@ -211,6 +211,7 @@ enum ControlCommandCode {
     SongPlay = 9,
     Dock = 10,
     SetLights = 11,
+    SetMode = 12,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -338,6 +339,17 @@ fn encode_control_command(
         BrainstemCommand::ClearEStop => Some((ControlCommandCode::ClearEStop, 0, 0, None)),
         BrainstemCommand::Stop => Some((ControlCommandCode::Stop, 0, 0, None)),
         BrainstemCommand::Status => Some((ControlCommandCode::Status, 0, 0, None)),
+        BrainstemCommand::Bootsel => None,
+        BrainstemCommand::SetMode(mode) => Some((
+            ControlCommandCode::SetMode,
+            match mode {
+                CreateOiMode::Passive => 1,
+                CreateOiMode::Safe => 2,
+                CreateOiMode::Full => 3,
+            },
+            0,
+            None,
+        )),
         BrainstemCommand::CmdVel {
             linear_mm_s,
             angular_mrad_s,
@@ -377,6 +389,12 @@ fn decode_control_command(
         x if x == ControlCommandCode::EStop as u8 => Some(BrainstemCommand::EStop),
         x if x == ControlCommandCode::ClearEStop as u8 => Some(BrainstemCommand::ClearEStop),
         x if x == ControlCommandCode::Status as u8 => Some(BrainstemCommand::Status),
+        x if x == ControlCommandCode::SetMode as u8 => Some(BrainstemCommand::SetMode(match a {
+            1 => CreateOiMode::Passive,
+            2 => CreateOiMode::Safe,
+            3 => CreateOiMode::Full,
+            _ => return None,
+        })),
         x if x == ControlCommandCode::CmdVel as u8 => Some(BrainstemCommand::CmdVel {
             linear_mm_s: decode_i16(a),
             angular_mrad_s: decode_i16(b),
