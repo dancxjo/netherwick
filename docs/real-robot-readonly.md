@@ -1,17 +1,17 @@
 # Real Robot Read-Only Bring-Up
 
-Read-only robot mode lets Netherwick ingest real Create 1 body state and optional sensor data without allowing motion. It is intended for hardware bring-up, ledger collection, capture/replay data, dashboard inspection, and Reign teaching data before any autonomous driving mode exists.
+Read-only robot mode lets Netherwick ingest Cockpit status/events and optional sensor data without allowing motion. It is intended for hardware bring-up, ledger collection, capture/replay data, dashboard inspection, and Reign teaching data before any autonomous driving mode exists.
 
 Read-only mode must not drive motors.
 
 ## Commands
 
-Mock body, no hardware:
+Simulated Cockpit, no hardware:
 
 ```bash
 cargo run -p netherwick-tools -- robot \
   --mode read-only \
-  --create-port mock \
+  --cockpit sim \
   --ledger data/ledger/robot-readonly \
   --steps 10
 ```
@@ -22,12 +22,12 @@ Default Raspberry Pi hardware:
 just robot
 ```
 
-Create 1 body over serial:
+Brainstem Cockpit over UART:
 
 ```bash
 cargo run -p netherwick-tools -- robot \
   --mode read-only \
-  --create-port /dev/ttyUSB0 \
+  --cockpit uart --create-port /dev/ttyUSB0 \
   --ledger data/ledger/robot-readonly
 ```
 
@@ -36,7 +36,7 @@ Capture and dashboard:
 ```bash
 cargo run -p netherwick-tools -- robot \
   --mode read-only \
-  --create-port mock \
+  --cockpit sim \
   --capture data/captures/robot-readonly-001 \
   --dashboard 127.0.0.1:3000 \
   --steps 25
@@ -46,7 +46,7 @@ The dashboard exposes `/now` and `/view` for the latest live snapshot.
 
 ## Safety Guarantee
 
-The real robot runner reads body/sensor state, builds `Now`, runs the normal runtime tick, records the chosen action, and suppresses motor application. Ledger frames are annotated with:
+The real robot runner reads cockpit-derived status/sensor state, builds `Now`, runs the normal runtime tick, records the chosen action, and suppresses motion commands. Ledger frames are annotated with:
 
 ```text
 source = real_robot_read_only
@@ -59,21 +59,21 @@ The `Now` extension `read_only_motor_gate` records `motor_applied: false`, `fina
 
 ## Hardware Notes
 
-The Create 1 serial path uses the `netherwick-create1` serial feature from the tools binary. On Linux, the user running the command usually needs access to the serial device:
+Real hardware uses the brainstem Cockpit UART transport. Create-specific serial details live below the brainstem firmware. On Linux, the user running the command usually needs access to the serial device:
 
 ```bash
 sudo usermod -aG dialout "$USER"
 ```
 
-Log out and back in after changing group membership. A missing device or permission error fails clearly.
+Log out and back in after changing group membership. A missing cockpit UART device or permission error fails clearly.
 
 ## Optional Sensors
 
-The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, and `--gps`. Camera and microphone are optional by default, so absent devices do not block read-only body bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Netherwick finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. Passing `--require-camera`, `--require-mic`, `--require-imu`, or `--require-gps` makes the command fail if that provider is unavailable.
+The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, and `--gps`. Camera and microphone are optional by default, so absent devices do not block read-only cockpit bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Netherwick finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. Passing `--require-camera`, `--require-mic`, `--require-imu`, or `--require-gps` makes the command fail if that provider is unavailable.
 
 `--asr-command` enables the command-backed ASR tool for microphone input. Netherwick chunks voiced PCM, writes each finalized chunk to a temporary WAV file, appends that path to the configured command, and reads the transcript from stdout. The same value can be supplied with `NETHERWICK_ASR_COMMAND`. ASR output is delivered as `EarSense.asr` and follows the normal sensation/vector path.
 
-Current minimum support is robust no-data handling plus mock/body capture. Rich camera, microphone, IMU, and GPS producers can be wired behind hardware features without changing the read-only runner.
+Current minimum support is robust no-data handling plus simulated/brainstem cockpit capture. Rich camera, microphone, IMU, and GPS producers can be wired behind hardware features without changing the read-only runner.
 
 MPU-6050 IMUs are supported on Linux I2C buses when `netherwick-tools` is built with the existing `linux-hardware` sensor feature. On a Raspberry Pi, wire VCC to 3.3V physical pin 1, GND to pin 6, SDA to GPIO 2 physical pin 3, and SCL to GPIO 3 physical pin 5. Enable I2C, add the user to the `i2c` group, and reboot:
 

@@ -1,5 +1,3 @@
-use anyhow::Result;
-use async_trait::async_trait;
 use netherwick_core::{Pose2, TimeMs};
 use serde::{Deserialize, Serialize};
 
@@ -27,76 +25,6 @@ impl BodySong {
     pub fn new(tones: impl Into<Vec<BodyTone>>) -> Self {
         Self {
             tones: tones.into(),
-        }
-    }
-}
-
-#[async_trait]
-pub trait RobotBody {
-    async fn read_body(&mut self) -> Result<BodySense>;
-    async fn apply_motor(&mut self, cmd: MotorCommand) -> Result<()>;
-    async fn play_song(&mut self, _song: BodySong) -> Result<()> {
-        anyhow::bail!("robot body does not support songs")
-    }
-}
-
-#[async_trait]
-pub trait MotorComplex {
-    async fn send(&mut self, command: MotionCommand) -> Result<BodySense>;
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct MotorCommand {
-    pub forward: f32,
-    pub turn: f32,
-}
-
-impl MotorCommand {
-    pub fn stop() -> Self {
-        Self::default()
-    }
-
-    pub fn clamped(self, max_forward: f32, max_turn: f32) -> Self {
-        Self {
-            forward: self.forward.clamp(-max_forward, max_forward),
-            turn: self.turn.clamp(-max_turn, max_turn),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum MotionCommand {
-    Stop,
-    Forward { speed_m_s: f32 },
-    Turn { turn_rad_s: f32 },
-    Drive { forward_m_s: f32, turn_rad_s: f32 },
-}
-
-impl Default for MotionCommand {
-    fn default() -> Self {
-        Self::Stop
-    }
-}
-
-impl MotionCommand {
-    pub fn to_motor_command(&self) -> MotorCommand {
-        match self {
-            Self::Stop => MotorCommand::stop(),
-            Self::Forward { speed_m_s } => MotorCommand {
-                forward: *speed_m_s,
-                turn: 0.0,
-            },
-            Self::Turn { turn_rad_s } => MotorCommand {
-                forward: 0.0,
-                turn: *turn_rad_s,
-            },
-            Self::Drive {
-                forward_m_s,
-                turn_rad_s,
-            } => MotorCommand {
-                forward: *forward_m_s,
-                turn: *turn_rad_s,
-            },
         }
     }
 }

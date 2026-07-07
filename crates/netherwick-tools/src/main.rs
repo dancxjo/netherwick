@@ -12,9 +12,9 @@ use netherwick_actions::ActionPrimitive;
 use netherwick_actions::{ApproachTarget, ExploreStyle, TurnDir};
 use netherwick_autonomic::SimpleSafety;
 use netherwick_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
-use netherwick_body::{BodySense, BodySong, BodyTone, RobotBody};
+use netherwick_body::{BodySense, BodySong, BodyTone};
+use netherwick_cockpit::{Cockpit, SimCockpit as LocalSimCockpit, SongTone, UartCockpit};
 use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
-use netherwick_create1::{Create1Body, Create1OpenMode, MockCreate1Body};
 use netherwick_ledger::{
     ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
 };
@@ -455,6 +455,8 @@ impl From<DreamLevelArg> for DreamLevel {
 struct RobotArgs {
     #[arg(long, value_enum, default_value = "read-only")]
     mode: RobotModeArg,
+    #[arg(long, value_enum, default_value = "uart")]
+    cockpit: CockpitBackendArg,
     #[arg(long, default_value = "auto")]
     create_port: String,
     #[arg(long, default_value_t = 57_600)]
@@ -528,6 +530,12 @@ enum RobotModeArg {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CockpitBackendArg {
+    Sim,
+    Uart,
+}
+
 #[derive(Debug, Parser)]
 struct CaptureSimArgs {
     #[arg(long, default_value = "data/captures/sim-test")]
@@ -552,6 +560,8 @@ struct CaptureRealArgs {
     ledger: Option<String>,
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
+    #[arg(long, value_enum, default_value = "uart")]
+    cockpit: CockpitBackendArg,
     #[arg(long, default_value = "auto")]
     create_port: String,
     #[arg(long, default_value_t = 57_600)]
@@ -2755,7 +2765,7 @@ async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {
 async fn run_eval_episode<R>(
     runtime: R,
     world: netherwick_sim::VirtualWorld,
-    motors: netherwick_sim::SimMotorComplex,
+    motors: netherwick_sim::SimCockpit,
     args: &EvalScenarioArgs,
     mut metrics: EpisodeMetricBuilder,
 ) -> Result<(ScenarioEpisodeReport, Vec<String>)>
@@ -3670,7 +3680,7 @@ async fn replay_counterfactual(args: ReplayCounterfactualArgs) -> Result<()> {
     let policy = parse_counterfactual_policy(&args.policy, args.actions.as_deref())?;
 
     let (mut world, motors) =
-        netherwick_sim::VirtualWorld::new_with_motor(metadata.seed, metadata.arena);
+        netherwick_sim::VirtualWorld::new_with_cockpit(metadata.seed, metadata.arena);
     world.set_body(metadata.body.clone());
     world.set_objects(metadata.objects.clone());
 
@@ -3738,7 +3748,7 @@ where
 async fn run_counterfactual_sim<R>(
     runtime: R,
     world: netherwick_sim::VirtualWorld,
-    motors: netherwick_sim::SimMotorComplex,
+    motors: netherwick_sim::SimCockpit,
     metadata: &netherwick_sim::ScenarioMetadata,
     manifest: &netherwick_worldlab::CaptureManifest,
     args: &ReplayCounterfactualArgs,
@@ -4122,37 +4132,34 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         "kinect": env_report["kinect"].clone(),
     });
 
-    let create_port = selected_create_port(&args.create_port, &env_report);
+    let create_port = selected_cockpit_port(args.cockpit, &args.create_port, &env_report);
 
-    let body: Box<dyn RobotBody + Send> = if args.mock || create_port.as_deref() == Some("mock") {
-        device_availability["create"] = serde_json::json!({"present": true, "source": "mock"});
-        Box::new(MockCreate1Body::new())
-    } else if let Some(create_port) = &create_port {
-        match Create1Body::connect_with_mode(
-            create_port,
-            args.create_baud,
-            Create1OpenMode::Passive,
-        )
-        .await
-        {
-            Ok(body) => {
-                device_availability["create"] = serde_json::json!({
-                    "present": true,
-                    "port": create_port,
-                    "baud": args.create_baud
-                });
-                Box::new(body)
+    let cockpit: Box<dyn Cockpit + Send> =
+        if args.mock || create_port.as_deref() == Some("mock") {
+            device_availability["create"] =
+                serde_json::json!({"present": true, "source": "sim-cockpit"});
+            Box::new(LocalSimCockpit::new())
+        } else if let Some(create_port) = &create_port {
+            match UartCockpit::connect(create_port) {
+                Ok(cockpit) => {
+                    device_availability["create"] = serde_json::json!({
+                        "present": true,
+                        "port": create_port,
+                        "baud": args.create_baud,
+                        "backend": "uart-cockpit"
+                    });
+                    Box::new(cockpit)
+                }
+                Err(error) => {
+                    anyhow::bail!("failed to open cockpit UART device {create_port}: {error}");
+                }
             }
-            Err(error) => {
-                anyhow::bail!("failed to open Create serial device {create_port}: {error}");
-            }
-        }
     } else {
         warnings
-            .push("Create serial device not found; no body hardware stream available".to_string());
+            .push("cockpit UART device not found; using simulated cockpit status".to_string());
         device_availability["create"] =
-            serde_json::json!({"present": false, "reason": "no serial candidate"});
-        Box::new(MockCreate1Body::new())
+            serde_json::json!({"present": false, "reason": "no cockpit serial candidate"});
+        Box::new(LocalSimCockpit::new())
     };
 
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
@@ -4187,7 +4194,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         capture_real_with_runtime(
             args,
             runtime,
-            body,
+            cockpit,
             sensors,
             env_report,
             device_availability,
@@ -4200,7 +4207,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         capture_real_with_runtime(
             args,
             runtime,
-            body,
+            cockpit,
             sensors,
             env_report,
             device_availability,
@@ -4215,7 +4222,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
 async fn capture_real_with_runtime<R>(
     args: CaptureRealArgs,
     runtime: R,
-    body: Box<dyn RobotBody + Send>,
+    cockpit: Box<dyn Cockpit + Send>,
     sensors: Vec<Box<dyn SenseProducer + Send>>,
     env_report: Value,
     device_availability: Value,
@@ -4225,7 +4232,7 @@ async fn capture_real_with_runtime<R>(
 where
     R: RuntimeLoop + Send,
 {
-    let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, body, sensors, runtime)
+    let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, cockpit, sensors, runtime)
         .with_frame_processor(real_robot_frame_processor(&mut warnings).await);
     runner.tick_ms = args.tick_ms;
     let mut writer =
@@ -4624,7 +4631,7 @@ fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SenseP
 
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
-    let create_port = selected_create_port(&args.create_port, &env_report);
+    let create_port = selected_cockpit_port(args.cockpit, &args.create_port, &env_report);
     let robot_mode = match args.mode {
         RobotModeArg::ReadOnly => RobotMode::ReadOnly,
         RobotModeArg::Slow => RobotMode::Slow,
@@ -4634,8 +4641,8 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         anyhow::bail!("--mode disabled does not start the real robot runner");
     }
 
-    let (mut body, robot_mode, is_mock_body) =
-        open_robot_body_or_fallback(create_port.as_deref(), args.create_baud, robot_mode).await?;
+    let (cockpit, robot_mode, is_mock_body) =
+        open_robot_cockpit_or_fallback(create_port.as_deref(), robot_mode)?;
 
     let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
     let live_state = args.dashboard.map(|_| {
@@ -4866,13 +4873,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    let init_body = match body.read_body().await {
-        Ok(body) => Some(body),
-        Err(error) => {
-            println!("failed to read initial body status for speech checklist: {error}");
-            None
-        }
-    };
+    let init_body = None;
 
     let ledger = JsonlLedger::new(&args.ledger);
     let memory = DurableExperienceStore::from_env();
@@ -4897,7 +4898,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         active_sensor_count,
         init_body.as_ref(),
     );
-    let mut runner = RealRobotRunner::new(robot_mode, body, sensors, runtime)
+    let mut runner = RealRobotRunner::new(robot_mode, cockpit, sensors, runtime)
         .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
         .with_live_image_enricher(live_image_enricher)
         .with_robot_initialization(initialization.clone());
@@ -4913,7 +4914,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         None => None,
     };
 
-    enqueue_default_bringup_outputs(&mouth, runner.body.as_mut(), &initialization).await;
+    enqueue_default_bringup_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &initialization);
 
     let max_steps = args.steps.or_else(|| {
         args.duration_seconds
@@ -4941,8 +4942,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
-        play_event_script_outputs(&mouth, runner.body.as_mut(), &tick).await;
-        play_reign_audio_action(&mouth, runner.body.as_mut(), &tick, &mut played_reign_audio).await;
+        play_event_script_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &tick);
+        play_reign_audio_action(
+            &mouth,
+            runner.cockpit.client_mut().as_mut(),
+            &tick,
+            &mut played_reign_audio,
+        );
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
             live_state.update_embodied_context(tick.frame.embodied_context());
@@ -5153,13 +5159,13 @@ fn robot_initialization_metadata(
     })
 }
 
-async fn enqueue_default_bringup_outputs(
+fn enqueue_default_bringup_outputs(
     mouth: &Option<QueuedPiperCpalMouth>,
-    body: &mut (dyn RobotBody + Send),
+    cockpit: &mut dyn Cockpit,
     initialization: &serde_json::Value,
 ) {
-    play_robot_song(body, "bring_up").await;
-    play_robot_chirp(body, "Confirm").await;
+    play_robot_song(cockpit, "bring_up");
+    play_robot_chirp(cockpit, "Confirm");
     let Some(mouth) = mouth.as_ref() else {
         return;
     };
@@ -5211,9 +5217,9 @@ fn speak_robot_mouth_text_before_status(mouth: &QueuedPiperCpalMouth, text: &str
     }
 }
 
-async fn play_event_script_outputs(
+fn play_event_script_outputs(
     mouth: &Option<QueuedPiperCpalMouth>,
-    body: &mut (dyn RobotBody + Send),
+    cockpit: &mut dyn Cockpit,
     tick: &RuntimeTick,
 ) {
     let Some(scripts) = tick.frame.now.extensions.get("event_scripts") else {
@@ -5234,17 +5240,17 @@ async fn play_event_script_outputs(
                 }
             } else if let Some(pattern) = requested.get("pattern").and_then(|value| value.as_str())
             {
-                play_robot_chirp(body, pattern).await;
+                play_robot_chirp(cockpit, pattern);
             } else if let Some(name) = requested.get("name").and_then(|value| value.as_str()) {
-                play_robot_song(body, name).await;
+                play_robot_song(cockpit, name);
             }
         }
     }
 }
 
-async fn play_reign_audio_action(
+fn play_reign_audio_action(
     mouth: &Option<QueuedPiperCpalMouth>,
-    body: &mut (dyn RobotBody + Send),
+    cockpit: &mut dyn Cockpit,
     tick: &RuntimeTick,
     played: &mut HashSet<String>,
 ) {
@@ -5274,7 +5280,7 @@ async fn play_reign_audio_action(
             }
         }
         ActionPrimitive::Chirp { pattern } => {
-            play_robot_chirp(body, &format!("{pattern:?}")).await;
+            play_robot_chirp(cockpit, &format!("{pattern:?}"));
         }
         _ => {}
     }
@@ -5287,23 +5293,30 @@ fn enqueue_robot_mouth_text(mouth: &QueuedPiperCpalMouth, text: &str) {
     }
 }
 
-async fn play_robot_chirp(body: &mut (dyn RobotBody + Send), pattern: &str) {
+fn play_robot_chirp(cockpit: &mut dyn Cockpit, pattern: &str) {
     play_body_song(
-        body,
+        cockpit,
         &format!("chirp {pattern}"),
         chirp_pattern_song(pattern),
-    )
-    .await;
+    );
 }
 
-async fn play_robot_song(body: &mut (dyn RobotBody + Send), name: &str) {
-    play_body_song(body, name, robot_song(name)).await;
+fn play_robot_song(cockpit: &mut dyn Cockpit, name: &str) {
+    play_body_song(cockpit, name, robot_song(name));
 }
 
-async fn play_body_song(body: &mut (dyn RobotBody + Send), label: &str, song: BodySong) {
-    match body.play_song(song).await {
-        Ok(()) => println!("robot body song played: {label}"),
-        Err(error) => println!("robot body song skipped: {error}; song {label}"),
+fn play_body_song(cockpit: &mut dyn Cockpit, label: &str, song: BodySong) {
+    let tones = song
+        .tones
+        .iter()
+        .map(|tone| SongTone {
+            note: tone.note,
+            duration_64ths: tone.duration_64ths,
+        })
+        .collect::<Vec<_>>();
+    match cockpit.song_define(0, &tones).and_then(|()| cockpit.song_play(0)) {
+        Ok(()) => println!("robot cockpit song played: {label}"),
+        Err(error) => println!("robot cockpit song skipped: {error}; song {label}"),
     }
 }
 
@@ -5385,52 +5398,46 @@ fn requested_robot_sensor_count(args: &RobotArgs) -> usize {
         + usize::from(args.gps.is_some())
 }
 
-async fn open_robot_body_or_fallback(
+fn open_robot_cockpit_or_fallback(
     create_port: Option<&str>,
-    create_baud: u32,
     mut robot_mode: RobotMode,
-) -> Result<(Box<dyn RobotBody + Send>, RobotMode, bool)> {
+) -> Result<(Box<dyn Cockpit + Send>, RobotMode, bool)> {
     if create_port == Some("mock") {
         if robot_mode == RobotMode::Slow {
             println!(
-                "warning: create-port mock does not support motorized slow mode; running in read-only mode instead"
+                "warning: cockpit mock does not support real motorized slow mode; running in read-only mode instead"
             );
             robot_mode = RobotMode::ReadOnly;
         }
-        return Ok((Box::new(MockCreate1Body::new()), robot_mode, true));
+        return Ok((Box::new(LocalSimCockpit::new()), robot_mode, true));
     }
 
     let Some(create_port) = create_port else {
         if robot_mode == RobotMode::Slow {
             println!(
-                "warning: no Create serial device found; falling back to mock body in read-only mode"
+                "warning: no cockpit UART device found; falling back to simulated cockpit in read-only mode"
             );
             robot_mode = RobotMode::ReadOnly;
         } else {
-            println!("warning: no Create serial device found; falling back to mock body");
+            println!("warning: no cockpit UART device found; falling back to simulated cockpit");
         }
-        return Ok((Box::new(MockCreate1Body::new()), robot_mode, true));
+        return Ok((Box::new(LocalSimCockpit::new()), robot_mode, true));
     };
 
-    let open_mode = match robot_mode {
-        RobotMode::ReadOnly => Create1OpenMode::Passive,
-        RobotMode::Slow => Create1OpenMode::Safe,
-        RobotMode::Disabled => unreachable!("disabled mode bailed before body open"),
-    };
-    match Create1Body::connect_with_mode(create_port, create_baud, open_mode).await {
-        Ok(body) => Ok((Box::new(body), robot_mode, false)),
+    match UartCockpit::connect(create_port) {
+        Ok(cockpit) => Ok((Box::new(cockpit), robot_mode, false)),
         Err(error) => {
             if robot_mode == RobotMode::Slow {
                 println!(
-                    "warning: failed to open Create serial device {create_port}: {error}; falling back to mock body in read-only mode"
+                    "warning: failed to open cockpit UART device {create_port}: {error}; falling back to simulated cockpit in read-only mode"
                 );
                 robot_mode = RobotMode::ReadOnly;
             } else {
                 println!(
-                    "warning: failed to open Create serial device {create_port}: {error}; falling back to mock body"
+                    "warning: failed to open cockpit UART device {create_port}: {error}; falling back to simulated cockpit"
                 );
             }
-            Ok((Box::new(MockCreate1Body::new()), robot_mode, true))
+            Ok((Box::new(LocalSimCockpit::new()), robot_mode, true))
         }
     }
 }
@@ -5667,6 +5674,17 @@ fn selected_create_port(requested: &str, env_report: &Value) -> Option<String> {
         .collect::<Vec<_>>();
     candidates.sort_by_key(|device| create_serial_priority(device));
     candidates.into_iter().next()
+}
+
+fn selected_cockpit_port(
+    backend: CockpitBackendArg,
+    requested: &str,
+    env_report: &Value,
+) -> Option<String> {
+    match backend {
+        CockpitBackendArg::Sim => Some("mock".to_string()),
+        CockpitBackendArg::Uart => selected_create_port(requested, env_report),
+    }
 }
 
 fn create_serial_priority(device: &str) -> u8 {
@@ -11619,15 +11637,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn robot_body_fallback_uses_mock_readonly_when_create_missing() {
-        let (mut body, mode, is_mock_body) =
-            open_robot_body_or_fallback(None, 57_600, RobotMode::Slow)
-                .await
-                .unwrap();
+    async fn robot_cockpit_fallback_uses_sim_readonly_when_backend_missing() {
+        let (mut cockpit, mode, is_mock_body) =
+            open_robot_cockpit_or_fallback(None, RobotMode::Slow).unwrap();
 
         assert_eq!(mode, RobotMode::ReadOnly);
         assert!(is_mock_body);
-        assert_eq!(body.read_body().await.unwrap().last_update_ms, 100);
+        assert!(cockpit.get_status().unwrap().summary().armed.is_some());
     }
 
     #[test]
@@ -11931,6 +11947,7 @@ mod tests {
             out: temp_dir.to_string_lossy().to_string(),
             ledger: None,
             tick_ms: 1000,
+            cockpit: CockpitBackendArg::Sim,
             create_port: "mock".to_string(),
             create_baud: 57_600,
             camera: None,
@@ -11974,6 +11991,7 @@ mod tests {
             out: temp_dir.to_string_lossy().to_string(),
             ledger: None,
             tick_ms: 1000,
+            cockpit: CockpitBackendArg::Sim,
             create_port: "mock".to_string(),
             create_baud: 57_600,
             camera: None,

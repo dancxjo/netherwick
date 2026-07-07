@@ -10,7 +10,9 @@ anyhow.workspace = true
 async-trait.workspace = true
 rand.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 netherwick-body = { path = "../netherwick-body" }
+netherwick-cockpit = { path = "../netherwick-cockpit" }
 netherwick-now = { path = "../netherwick-now" }
 netherwick-sensors = { path = "../netherwick-sensors" }
 

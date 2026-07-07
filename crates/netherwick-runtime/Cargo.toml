@@ -20,6 +20,7 @@ netherwick-actions = { path = "../netherwick-actions" }
 netherwick-autonomic = { path = "../netherwick-autonomic" }
 netherwick-behaviors = { path = "../netherwick-behaviors" }
 netherwick-body = { path = "../netherwick-body" }
+netherwick-cockpit = { path = "../netherwick-cockpit" }
 netherwick-conductor = { path = "../netherwick-conductor" }
 netherwick-core = { path = "../netherwick-core" }
 netherwick-events = { path = "../netherwick-events" }

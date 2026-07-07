@@ -14,10 +14,10 @@ just run model-status
 just run sim --steps 200 --danger-checkpoint data/models/danger_v0 --danger-mode shadow-infer
 ```
 
-Run the read-only robot capture pulse:
+Run the read-only Cockpit capture pulse:
 
 ```sh
-just run robot --mode read-only --create-port mock --steps 20 --capture data/captures/mock-readonly
+just run robot --mode read-only --cockpit sim --steps 20 --capture data/captures/mock-readonly
 just run replay-capture --capture data/captures/mock-readonly
 ```
 

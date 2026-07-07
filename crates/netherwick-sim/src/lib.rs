@@ -1,7 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use netherwick_body::{
-    BodySense, CliffSensors, MotionCommand, MotorCommand, MotorComplex, RobotBody,
+use netherwick_body::{BodySense, CliffSensors};
+use netherwick_cockpit::{
+    mrad_s_to_radians_per_second, mm_s_to_meters_per_second, Cockpit, CockpitCapabilities,
+    CockpitRequest, CockpitResponse, CockpitStatus, EventBatch, MotionCommand,
 };
 use netherwick_now::{
     EarSense, ExtensionSense, FaceSense, GpsSense, ImuSense, KinectJointSense, KinectSense,
@@ -11,7 +13,6 @@ use netherwick_now::{
 use netherwick_sensors::{
     EyeFrame, EyeFrameFormat, PcmAudioFrame, World, WorldSnapshot, WorldUpdate,
 };
-use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -30,47 +31,6 @@ const VISIBLE_FOV_RAD: f32 = std::f32::consts::FRAC_PI_2;
 const VISIBLE_MAX_M: f32 = 4.0;
 const EYE_WIDTH: usize = 160;
 const EYE_HEIGHT: usize = 90;
-
-#[derive(Debug)]
-pub struct SimBody {
-    body: BodySense,
-    _rng: StdRng,
-}
-
-impl SimBody {
-    pub fn new(seed: u64) -> Self {
-        Self {
-            body: BodySense::default(),
-            _rng: StdRng::seed_from_u64(seed),
-        }
-    }
-}
-
-#[async_trait]
-impl RobotBody for SimBody {
-    async fn read_body(&mut self) -> Result<BodySense> {
-        Ok(self.body.clone())
-    }
-
-    async fn apply_motor(&mut self, cmd: MotorCommand) -> Result<()> {
-        self.body.velocity.forward_m_s = cmd.forward;
-        self.body.velocity.turn_rad_s = cmd.turn;
-        self.body.odometry.x_m += cmd.forward * 0.1;
-        self.body.odometry.heading_rad += cmd.turn * 0.1;
-        self.body.battery_level = (self.body.battery_level - cmd.forward.abs() * 0.01).max(0.0);
-        self.body.last_update_ms = self.body.last_update_ms.saturating_add(100);
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl MotorComplex for SimBody {
-    async fn send(&mut self, command: MotionCommand) -> Result<BodySense> {
-        let motor = command.to_motor_command();
-        self.apply_motor(motor).await?;
-        self.read_body().await
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ArenaConfig {
@@ -167,7 +127,7 @@ pub struct VirtualWorld {
 }
 
 #[derive(Clone, Debug)]
-pub struct SimMotorComplex {
+pub struct SimCockpit {
     state: Arc<Mutex<VirtualWorldState>>,
 }
 
@@ -177,7 +137,7 @@ impl VirtualWorld {
         world
     }
 
-    pub fn new_with_motor(seed: u64, arena: ArenaConfig) -> (Self, SimMotorComplex) {
+    pub fn new_with_cockpit(seed: u64, arena: ArenaConfig) -> (Self, SimCockpit) {
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.last_update_ms = seed;
         snapshot.body.odometry.x_m = arena.width_m * 0.5;
@@ -193,8 +153,12 @@ impl VirtualWorld {
             Self {
                 state: Arc::clone(&state),
             },
-            SimMotorComplex { state },
+            SimCockpit { state },
         )
+    }
+
+    pub fn new_with_motor(seed: u64, arena: ArenaConfig) -> (Self, SimCockpit) {
+        Self::new_with_cockpit(seed, arena)
     }
 
     pub fn add_object(&mut self, object: SimObject) {
@@ -360,9 +324,8 @@ impl World for VirtualWorld {
     }
 }
 
-#[async_trait]
-impl MotorComplex for SimMotorComplex {
-    async fn send(&mut self, command: MotionCommand) -> Result<BodySense> {
+impl SimCockpit {
+    pub fn apply_motion(&mut self, command: MotionCommand) -> Result<BodySense> {
         let motor = command.to_motor_command();
         let mut guard = self.state.lock().expect("virtual world mutex poisoned");
         guard.last_motion_sent = Some(command.clone());
@@ -408,25 +371,115 @@ impl MotorComplex for SimMotorComplex {
     }
 }
 
-#[async_trait]
-impl RobotBody for SimMotorComplex {
-    async fn read_body(&mut self) -> Result<BodySense> {
-        Ok(self
+impl Cockpit for SimCockpit {
+    fn execute(&mut self, request: CockpitRequest) -> netherwick_cockpit::Result<CockpitResponse> {
+        match request {
+            CockpitRequest::GetStatus => Ok(CockpitResponse::Status(self.get_status()?)),
+            CockpitRequest::GetCapabilities => {
+                Ok(CockpitResponse::Capabilities(self.get_capabilities()?))
+            }
+            CockpitRequest::GetEvents { since_seq } => {
+                Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
+            }
+            CockpitRequest::Stop => {
+                self.apply_motion(MotionCommand::Stop)
+                    .map_err(|error| netherwick_cockpit::CockpitError::BadResponse(error.to_string()))?;
+                Ok(CockpitResponse::Accepted)
+            }
+            CockpitRequest::CmdVel {
+                linear_mm_s,
+                angular_mrad_s,
+                ..
+            } => {
+                self.apply_motion(MotionCommand::Drive {
+                    forward_m_s: mm_s_to_meters_per_second(linear_mm_s),
+                    turn_rad_s: mrad_s_to_radians_per_second(angular_mrad_s),
+                })
+                .map_err(|error| netherwick_cockpit::CockpitError::BadResponse(error.to_string()))?;
+                Ok(CockpitResponse::Accepted)
+            }
+            CockpitRequest::HeartbeatStop { .. }
+            | CockpitRequest::Ping
+            | CockpitRequest::Arm
+            | CockpitRequest::Disarm => Ok(CockpitResponse::Accepted),
+            other => Ok(CockpitResponse::Rejected {
+                message: format!("unsupported simulator cockpit verb {}", other.verb()),
+            }),
+        }
+    }
+
+    fn get_status(&mut self) -> netherwick_cockpit::Result<CockpitStatus> {
+        let body = self
             .state
             .lock()
             .expect("virtual world mutex poisoned")
             .snapshot
             .body
-            .clone())
+            .clone();
+        Ok(CockpitStatus {
+            raw: serde_json::json!({
+                "current_runtime_state": "sim",
+                "oi_mode": "safe",
+                "current_command": if body.velocity.forward_m_s.abs() > f32::EPSILON || body.velocity.turn_rad_s.abs() > f32::EPSILON { "drive" } else { "stop" },
+                "create_sensors": {
+                    "bump_left": body.flags.bump_left,
+                    "bump_right": body.flags.bump_right,
+                    "wheel_drop": body.flags.wheel_drop,
+                    "wall": body.flags.wall,
+                    "virtual_wall": body.flags.virtual_wall,
+                    "cliff_left": body.flags.cliff_left,
+                    "cliff_front_left": body.flags.cliff_front_left,
+                    "cliff_front_right": body.flags.cliff_front_right,
+                    "cliff_right": body.flags.cliff_right,
+                    "charge_mah": (body.battery_level.clamp(0.0, 1.0) * 2600.0).round() as u32,
+                    "capacity_mah": 2600,
+                    "charging_state": if body.charging { 1 } else { 0 },
+                },
+                "odometry": {
+                    "distance_mm": ((body.odometry.x_m.hypot(body.odometry.y_m)) * 1000.0).round() as i32,
+                    "heading_mrad": (body.odometry.heading_rad * 1000.0).round() as i32,
+                    "reset_count": 0,
+                }
+            })
+            .to_string(),
+        })
     }
 
-    async fn apply_motor(&mut self, cmd: MotorCommand) -> Result<()> {
-        self.send(MotionCommand::Drive {
-            forward_m_s: cmd.forward,
-            turn_rad_s: cmd.turn,
+    fn get_capabilities(&mut self) -> netherwick_cockpit::Result<CockpitCapabilities> {
+        Ok(CockpitCapabilities {
+            body_kind: "sim".to_string(),
+            drive: "differential".to_string(),
+            verbs: ["ping", "status", "get_capabilities", "get_events", "arm", "disarm", "stop", "cmd_vel", "heartbeat_stop"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            sensors: ["bump", "cliff", "wheel_drop", "wall", "battery", "odometry"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            outputs: ["drive"].into_iter().map(str::to_string).collect(),
+            safety: ["heartbeat", "bump", "cliff", "wheel_drop"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            events: Vec::new(),
+            limits: netherwick_cockpit::CockpitLimits {
+                max_linear_mm_s: 500,
+                max_angular_mrad_s: 4_000,
+                min_ttl_ms: 10,
+                max_ttl_ms: 60_000,
+            },
         })
-        .await?;
-        Ok(())
+    }
+
+    fn get_events_since(&mut self, since_seq: u32) -> netherwick_cockpit::Result<EventBatch> {
+        Ok(EventBatch {
+            since_seq,
+            oldest_seq: 1,
+            next_seq: since_seq.saturating_add(1),
+            dropped_before_seq: 0,
+            events: Vec::new(),
+        })
     }
 }
 
@@ -1057,9 +1110,7 @@ mod tests {
         }
 
         let body = motor
-            .send(MotionCommand::Forward { speed_m_s: 1.0 })
-            .await
-            .unwrap();
+            .apply_motion(MotionCommand::Forward { speed_m_s: 1.0 }).unwrap();
 
         assert!(body.odometry.x_m >= 0.2 - f32::EPSILON);
         assert!(body.flags.bump_left && body.flags.bump_right);
@@ -1093,9 +1144,7 @@ mod tests {
         }
 
         let body = motor
-            .send(MotionCommand::Forward { speed_m_s: 2.0 })
-            .await
-            .unwrap();
+            .apply_motion(MotionCommand::Forward { speed_m_s: 2.0 }).unwrap();
 
         assert!(body.odometry.x_m < 0.8);
         assert!(body.flags.bump_left || body.flags.bump_right);
@@ -1113,7 +1162,7 @@ mod tests {
             guard.snapshot.body.battery_level = 0.4;
         }
 
-        let body = motor.send(MotionCommand::Stop).await.unwrap();
+        let body = motor.apply_motion(MotionCommand::Stop).unwrap();
 
         assert!(body.charging);
         assert!(body.battery_level > 0.4);

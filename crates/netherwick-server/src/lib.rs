@@ -19,7 +19,7 @@ use netherwick_actions::{
     ActionPrimitive, ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir,
 };
 use netherwick_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
-use netherwick_body::{MotionCommand, MotorCommand};
+use netherwick_cockpit::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
 use netherwick_experience::EmbodiedContext;
 use netherwick_map::{

@@ -1,4 +1,4 @@
-use netherwick_body::MotorCommand;
+use netherwick_cockpit::MotorCommand;
 use netherwick_now::Now;
 use serde::{Deserialize, Serialize};
 

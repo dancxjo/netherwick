@@ -1,7 +1,7 @@
 set shell := ["bash", "-euxo", "pipefail", "-c"]
 set dotenv-load := true
 
-create1_port := env_var_or_default("CREATE1_PORT", "auto")
+cockpit_port := env_var_or_default("NETHERWICK_COCKPIT_PORT", "auto")
 gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "")
 camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 mic_device := env_var_or_default("MIC_DEVICE", "")
@@ -343,7 +343,8 @@ robot *args:
     fi
     NETHERWICK_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p netherwick-tools -- robot \
         --mode "${NETHERWICK_ROBOT_MODE:-slow}" \
-        --create-port "{{create1_port}}" \
+        --cockpit "${NETHERWICK_COCKPIT_BACKEND:-uart}" \
+        --create-port "{{cockpit_port}}" \
         --ledger "${NETHERWICK_ROBOT_LEDGER:-data/ledger/real/robot}" \
         "${CAMERA_ARGS[@]}" \
         "${KINECT_ARGS[@]}" \
@@ -765,7 +766,7 @@ rehearse-models:
     just run evaluate behavior danger --ledger data/ledger/sim1
     just run model-status
     just run sim --steps 200 --danger-checkpoint data/models/danger_v0 --danger-mode shadow-infer
-    just run robot --mode read-only --create-port mock --steps 20 --capture data/captures/mock-readonly
+    just run robot --mode read-only --cockpit sim --steps 20 --capture data/captures/mock-readonly
     just run replay-capture --capture data/captures/mock-readonly
 
 # Run lightweight scenario evaluations for quick validation.
@@ -783,10 +784,10 @@ inspect-ledger:
 xtask command="check":
     cargo run -p xtask -- {{command}}
 
-# Show Create 1 wiring status and selected serial port.
-real-create1:
-    @echo "Create 1 port: {{create1_port}}"
-    @echo "The Create 1 control path is scaffolded at the crate level but the CLI robot mode is not wired yet."
+# Show cockpit wiring status and selected serial port.
+real-cockpit:
+    @echo "Cockpit backend: ${NETHERWICK_COCKPIT_BACKEND:-uart}"
+    @echo "Cockpit port: {{cockpit_port}}"
 
 # Print detected hardware-related environment status.
 hardware-env:

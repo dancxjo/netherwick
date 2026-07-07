@@ -46,7 +46,7 @@ sudo reboot
 
 ## Device Expectations
 
-Create serial should appear as one of:
+The brainstem Cockpit UART should appear as one of:
 
 ```text
 /dev/ttyUSB0
@@ -54,9 +54,9 @@ Create serial should appear as one of:
 /dev/serial/by-id/<adapter>
 ```
 
-The expected Create baud rate is `57600`.
+The expected Cockpit UART baud rate is `115200`.
 
-`robot` and `capture-real` default `--create-port auto`, which uses the first likely serial candidate from `hardware-env`. Pass `--create-port /dev/ttyUSB0` when you want to pin the adapter, `--create-port mock` for `robot` no-hardware smoke tests, or `--mock` for `capture-real` no-hardware smoke tests.
+`robot` and `capture-real` default to `--cockpit uart` and the first likely serial candidate from `hardware-env`. Pass `--cockpit uart --create-port /dev/ttyUSB0` when you want to pin the adapter, `--cockpit sim` for simulated Cockpit smoke tests, or `--mock` for `capture-real` no-hardware smoke tests.
 
 u-blox7 GPS receivers are read over USB serial at 9600 baud using NMEA. Netherwick auto-starts GPS on real runs by preferring `/dev/serial/by-id/*u-blox*`, `/dev/serial/by-id/*gps*`, or `/dev/serial/by-id/*gnss*`, then falling back to an unused `/dev/ttyACM*` device. Use `--gps /dev/serial/by-id/<u-blox-device>` to pin it, or `--gps none` to disable GPS capture.
 
@@ -142,10 +142,10 @@ The manifest includes machine info, command args, device availability, present/m
 
 ## What Failure Looks Like
 
-Missing camera, mic, Kinect, GPS, or IMU should produce warnings while still capturing any available body or sensor stream.
+Missing camera, mic, Kinect, GPS, or IMU should produce warnings while still capturing any available cockpit or sensor stream.
 
-Create serial open failures are clear errors unless `--mock` or `--create-port mock` is used.
+Cockpit UART open failures are clear errors unless `--mock` or `--cockpit sim` is used.
 
-If no useful body or sensor stream can be captured, `capture-real` exits with a clear error instead of writing a misleading success.
+If no useful cockpit or sensor stream can be captured, `capture-real` exits with a clear error instead of writing a misleading success.
 
 Any mode that would command motors is refused. Movement-capable bring-up must be a separate future task with explicit safety gates and tests.

@@ -1,4 +1,4 @@
-use netherwick_body::{MotionCommand, MotorCommand};
+use netherwick_cockpit::{MotionCommand, MotorCommand};
 use netherwick_core::TimeMs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

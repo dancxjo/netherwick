@@ -12,6 +12,90 @@ use tungstenite::{connect, Message, WebSocket};
 pub type Result<T> = std::result::Result<T, CockpitError>;
 const DEFAULT_SIM_EVENT_CAPACITY: usize = 32;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MotorCommand {
+    pub forward: f32,
+    pub turn: f32,
+}
+
+impl MotorCommand {
+    pub fn stop() -> Self {
+        Self::default()
+    }
+
+    pub fn clamped(self, max_forward: f32, max_turn: f32) -> Self {
+        Self {
+            forward: self.forward.clamp(-max_forward, max_forward),
+            turn: self.turn.clamp(-max_turn, max_turn),
+        }
+    }
+
+    pub fn to_cockpit_request(self, ttl_ms: u32) -> CockpitRequest {
+        if self.forward == 0.0 && self.turn == 0.0 {
+            CockpitRequest::Stop
+        } else {
+            CockpitRequest::CmdVel {
+                linear_mm_s: meters_per_second_to_mm_s(self.forward),
+                angular_mrad_s: radians_per_second_to_mrad_s(self.turn),
+                ttl_ms,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum MotionCommand {
+    Stop,
+    Forward { speed_m_s: f32 },
+    Turn { turn_rad_s: f32 },
+    Drive { forward_m_s: f32, turn_rad_s: f32 },
+}
+
+impl Default for MotionCommand {
+    fn default() -> Self {
+        Self::Stop
+    }
+}
+
+impl MotionCommand {
+    pub fn to_motor_command(&self) -> MotorCommand {
+        match self {
+            Self::Stop => MotorCommand::stop(),
+            Self::Forward { speed_m_s } => MotorCommand {
+                forward: *speed_m_s,
+                turn: 0.0,
+            },
+            Self::Turn { turn_rad_s } => MotorCommand {
+                forward: 0.0,
+                turn: *turn_rad_s,
+            },
+            Self::Drive {
+                forward_m_s,
+                turn_rad_s,
+            } => MotorCommand {
+                forward: *forward_m_s,
+                turn: *turn_rad_s,
+            },
+        }
+    }
+}
+
+pub fn meters_per_second_to_mm_s(value: f32) -> i16 {
+    (value * 1000.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+pub fn radians_per_second_to_mrad_s(value: f32) -> i16 {
+    (value * 1000.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+pub fn mm_s_to_meters_per_second(value: i16) -> f32 {
+    value as f32 / 1000.0
+}
+
+pub fn mrad_s_to_radians_per_second(value: i16) -> f32 {
+    value as f32 / 1000.0
+}
+
 #[derive(Debug, Error)]
 pub enum CockpitError {
     #[error("io error: {0}")]
@@ -379,6 +463,12 @@ pub trait Cockpit {
 
     fn set_lights(&mut self, pattern: LightPattern) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::SetLights { pattern })?)
+    }
+}
+
+impl<T: Cockpit + ?Sized> Cockpit for Box<T> {
+    fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+        (**self).execute(request)
     }
 }
 
@@ -914,9 +1004,7 @@ impl StatusSummary {
     fn from_json(raw: &str, value: &serde_json::Value) -> Self {
         let sensors = value.get("create_sensors");
         let safety_tripped = sensors.map(|sensors| {
-            json_bool_value(sensors, "bump_left").unwrap_or(false)
-                || json_bool_value(sensors, "bump_right").unwrap_or(false)
-                || json_bool_value(sensors, "wheel_drop").unwrap_or(false)
+            json_bool_value(sensors, "wheel_drop").unwrap_or(false)
                 || json_bool_value(sensors, "cliff_left").unwrap_or(false)
                 || json_bool_value(sensors, "cliff_front_left").unwrap_or(false)
                 || json_bool_value(sensors, "cliff_front_right").unwrap_or(false)

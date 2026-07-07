@@ -9,4 +9,4 @@ publish = false
 serde.workspace = true
 uuid.workspace = true
 netherwick-core = { path = "../netherwick-core" }
-netherwick-body = { path = "../netherwick-body" }
+netherwick-cockpit = { path = "../netherwick-cockpit" }

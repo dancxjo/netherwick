@@ -4,7 +4,6 @@ members = [
     "crates/netherwick-now",
     "crates/netherwick-ledger",
     "crates/netherwick-body",
-    "crates/netherwick-create1",
     "crates/netherwick-sim",
     "crates/netherwick-worldlab",
     "crates/netherwick-sensors",

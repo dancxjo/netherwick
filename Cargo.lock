@@ -5082,7 +5082,7 @@ dependencies = [
 name = "netherwick-actions"
 version = "0.1.0"
 dependencies = [
- "netherwick-body",
+ "netherwick-cockpit",
  "netherwick-core",
  "serde",
  "uuid",
@@ -5093,6 +5093,7 @@ name = "netherwick-autonomic"
 version = "0.1.0"
 dependencies = [
  "netherwick-body",
+ "netherwick-cockpit",
  "netherwick-now",
  "serde",
 ]
@@ -5112,8 +5113,6 @@ dependencies = [
 name = "netherwick-body"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
  "netherwick-core",
  "serde",
 ]
@@ -5149,17 +5148,6 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
-]
-
-[[package]]
-name = "netherwick-create1"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "netherwick-body",
- "serde",
- "serialport",
 ]
 
 [[package]]
@@ -5331,6 +5319,7 @@ dependencies = [
  "netherwick-autonomic",
  "netherwick-behaviors",
  "netherwick-body",
+ "netherwick-cockpit",
  "netherwick-conductor",
  "netherwick-core",
  "netherwick-events",
@@ -5387,6 +5376,7 @@ dependencies = [
  "netherwick-autonomic",
  "netherwick-behaviors",
  "netherwick-body",
+ "netherwick-cockpit",
  "netherwick-conductor",
  "netherwick-core",
  "netherwick-experience",
@@ -5414,10 +5404,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "netherwick-body",
+ "netherwick-cockpit",
  "netherwick-now",
  "netherwick-sensors",
  "rand 0.8.6",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -5437,9 +5429,9 @@ dependencies = [
  "netherwick-autonomic",
  "netherwick-behaviors",
  "netherwick-body",
+ "netherwick-cockpit",
  "netherwick-conductor",
  "netherwick-core",
- "netherwick-create1",
  "netherwick-experience",
  "netherwick-ledger",
  "netherwick-llm",
@@ -5472,6 +5464,7 @@ dependencies = [
  "netherwick-autonomic",
  "netherwick-behaviors",
  "netherwick-body",
+ "netherwick-cockpit",
  "netherwick-core",
  "netherwick-experience",
  "netherwick-ledger",

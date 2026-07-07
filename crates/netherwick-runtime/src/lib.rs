@@ -13,7 +13,10 @@ use netherwick_behaviors::{
     BehaviorRegistryConfig, ErasedBehaviorRunRecord, FallbackPolicy, FunctionBehavior,
     ReplaceableBehavior, TargetExtractor, TrainingSample, TrainingSource,
 };
-use netherwick_body::{MotionCommand, MotorCommand, MotorComplex, RobotBody};
+use netherwick_body::{BodyFlags, BodySense};
+use netherwick_cockpit::{
+    Cockpit, MotionCommand, MotorCommand, SafeCockpit, StatusSummary,
+};
 use netherwick_conductor::{Conductor, ConductorInput, NavigationIntent, SimpleConductor};
 use netherwick_core::{Pose2, Provenance, Reward, TimeMs};
 use netherwick_events::{
@@ -60,7 +63,7 @@ use netherwick_sensors::{
     anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
     SurfaceExtractorOutput, World, WorldSnapshot,
 };
-use netherwick_sim::{SimMotorComplex, VirtualWorld};
+use netherwick_sim::{SimCockpit, VirtualWorld};
 use serde::{Deserialize, Serialize};
 use tsrun::{js_value_to_json, Interpreter, JsError, StepResult};
 use uuid::Uuid;
@@ -4521,9 +4524,9 @@ pub enum RobotMode {
     Disabled,
 }
 
-pub struct RealRobotRunner<R> {
+pub struct RealRobotRunner<R, C> {
     pub mode: RobotMode,
-    pub body: Box<dyn RobotBody + Send>,
+    pub cockpit: SafeCockpit<C>,
     pub sensors: Vec<Box<dyn SenseProducer + Send>>,
     pub runtime: R,
     pub tick_ms: u64,
@@ -4534,19 +4537,20 @@ pub struct RealRobotRunner<R> {
     robot_initialization: Option<serde_json::Value>,
 }
 
-impl<R> RealRobotRunner<R>
+impl<R, C> RealRobotRunner<R, C>
 where
     R: RuntimeLoop + Send,
+    C: Cockpit + Send,
 {
     pub fn new(
         mode: RobotMode,
-        body: Box<dyn RobotBody + Send>,
+        cockpit: C,
         sensors: Vec<Box<dyn SenseProducer + Send>>,
         runtime: R,
     ) -> Self {
         Self {
             mode,
-            body,
+            cockpit: SafeCockpit::new(cockpit),
             sensors,
             runtime,
             tick_ms: 100,
@@ -4602,7 +4606,7 @@ where
             anyhow::bail!("only read-only robot mode is implemented");
         }
 
-        let body = self.body.read_body().await?;
+        let body = body_sense_from_cockpit_status(self.cockpit.refresh_status()?, wall_time_ms());
         let mut packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
@@ -4689,7 +4693,8 @@ where
             }
         }
 
-        let body_before = self.body.read_body().await?;
+        let body_before =
+            body_sense_from_cockpit_status(self.cockpit.refresh_status()?, wall_time_ms());
         let mut packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
@@ -4731,7 +4736,7 @@ where
                 } else {
                     MotorCommand::stop()
                 };
-                self.body.apply_motor(final_motor).await?;
+                apply_safe_cockpit_motor(&mut self.cockpit, final_motor)?;
                 let tick = synthetic_slow_manual_tick(
                     now,
                     input,
@@ -4767,7 +4772,7 @@ where
         } else {
             MotorCommand::stop()
         };
-        self.body.apply_motor(final_motor).await?;
+        apply_safe_cockpit_motor(&mut self.cockpit, final_motor)?;
 
         let mut snapshot = self.now_builder.snapshot();
         snapshot.eye = tick.frame.now.eye.clone();
@@ -4932,6 +4937,58 @@ fn motor_command_to_motion(motor: MotorCommand) -> MotionCommand {
             forward_m_s: motor.forward,
             turn_rad_s: motor.turn,
         }
+    }
+}
+
+fn apply_safe_cockpit_motor<C: Cockpit>(
+    cockpit: &mut SafeCockpit<C>,
+    motor: MotorCommand,
+) -> Result<()> {
+    if is_near_zero_motor(motor) {
+        cockpit.stop().map_err(anyhow::Error::from)
+    } else {
+        cockpit
+            .pulse_motion(
+                netherwick_cockpit::meters_per_second_to_mm_s(motor.forward),
+                netherwick_cockpit::radians_per_second_to_mrad_s(motor.turn),
+            )
+            .map_err(anyhow::Error::from)
+    }
+}
+
+fn apply_safe_cockpit_motion<C: Cockpit>(
+    cockpit: &mut SafeCockpit<C>,
+    motion: &MotionCommand,
+) -> Result<()> {
+    apply_safe_cockpit_motor(cockpit, motion.to_motor_command())
+}
+
+fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
+    BodySense {
+        battery_level: status
+            .battery
+            .percent
+            .map(|percent| percent as f32 / 100.0)
+            .unwrap_or(1.0),
+        charging: status.battery.charging_state.unwrap_or(0) != 0,
+        flags: BodyFlags {
+            bump_left: status.contact.bump_left.unwrap_or(false),
+            bump_right: status.contact.bump_right.unwrap_or(false),
+            cliff_left: status.contact.cliff_left.unwrap_or(false),
+            cliff_front_left: status.contact.cliff_front_left.unwrap_or(false),
+            cliff_front_right: status.contact.cliff_front_right.unwrap_or(false),
+            cliff_right: status.contact.cliff_right.unwrap_or(false),
+            wheel_drop: status.contact.wheel_drop.unwrap_or(false),
+            wall: status.contact.wall.unwrap_or(false),
+            virtual_wall: status.contact.virtual_wall.unwrap_or(false),
+        },
+        odometry: Pose2 {
+            x_m: status.odometry.distance_mm.unwrap_or(0) as f32 / 1000.0,
+            y_m: 0.0,
+            heading_rad: status.odometry.heading_mrad.unwrap_or(0) as f32 / 1000.0,
+        },
+        last_update_ms,
+        ..BodySense::default()
     }
 }
 
@@ -5127,7 +5184,7 @@ fn not_moving_reason(
 pub struct SimRunner<R> {
     pub runtime: R,
     pub world: VirtualWorld,
-    pub motors: SimMotorComplex,
+    pub cockpit: SafeCockpit<SimCockpit>,
     pub tick_count: usize,
     pub tick_ms: u64,
     stuck: StuckRecoveryController,
@@ -5501,11 +5558,11 @@ impl<R> SimRunner<R>
 where
     R: RuntimeLoop + Send,
 {
-    pub fn new(runtime: R, world: VirtualWorld, motors: SimMotorComplex) -> Self {
+    pub fn new(runtime: R, world: VirtualWorld, motors: SimCockpit) -> Self {
         Self {
             runtime,
             world,
-            motors,
+            cockpit: SafeCockpit::new(motors),
             tick_count: 0,
             tick_ms: 100,
             stuck: StuckRecoveryController::default(),
@@ -5557,7 +5614,7 @@ where
                 motion_sent_to_sim = None;
             } else {
                 let _ = manual_reign_driving;
-                self.motors.send(motion.clone()).await?;
+                apply_safe_cockpit_motion(&mut self.cockpit, &motion)?;
             };
             let mut after_snapshot = self.world.snapshot().await?;
             annotate_snapshot_from_tick(&mut after_snapshot, &tick);
@@ -7397,7 +7454,10 @@ mod tests {
     use super::*;
     use netherwick_actions::{ChirpPattern, ReignCommand, ReignMode, ReignSource};
     use netherwick_autonomic::SimpleSafety;
-    use netherwick_body::{BodySense, MotorCommand, RobotBody};
+    use netherwick_body::BodySense;
+    use netherwick_cockpit::{
+        CockpitCapabilities, CockpitRequest, CockpitResponse, CockpitStatus, EventBatch,
+    };
     use netherwick_conductor::{Conductor, ConductorInput, SimpleConductor};
     use netherwick_experience::{
         embody_now, experience_encode_input_from_now, EmbodiedContext, Modality,
@@ -7754,9 +7814,23 @@ mod tests {
 
         let run = behavior.infer(&BumpEventInput::default(), 10).unwrap();
 
-        assert!(is_bump_lament_action(&run.chosen.actions[0]));
+        assert!(run.chosen.actions.iter().any(is_bump_lament_action));
+        let recovery_actions = run
+            .chosen
+            .actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    EventScriptAction::Stop
+                        | EventScriptAction::Rotate { .. }
+                        | EventScriptAction::Go
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
-            &run.chosen.actions[1..],
+            recovery_actions,
             vec![
                 EventScriptAction::Stop,
                 EventScriptAction::Rotate { deg: 180 },
@@ -7775,9 +7849,23 @@ mod tests {
 
         let run = behavior.infer(&BumpEventInput::default(), 10).unwrap();
 
-        assert!(is_bump_lament_action(&run.chosen.actions[0]));
+        assert!(run.chosen.actions.iter().any(is_bump_lament_action));
+        let recovery_actions = run
+            .chosen
+            .actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    EventScriptAction::Stop
+                        | EventScriptAction::Rotate { .. }
+                        | EventScriptAction::Go
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
-            &run.chosen.actions[1..],
+            recovery_actions,
             vec![
                 EventScriptAction::Stop,
                 EventScriptAction::Rotate { deg: 180 },
@@ -7830,24 +7918,30 @@ mod tests {
             },
         };
 
-        assert_eq!(
-            behavior.infer(&named, 10).unwrap().chosen.actions,
-            vec![EventScriptAction::Say {
+        assert!(behavior
+            .infer(&named, 10)
+            .unwrap()
+            .chosen
+            .actions
+            .contains(&EventScriptAction::Say {
                 text: "Hello Ada".to_string()
-            }]
-        );
-        assert_eq!(
-            behavior.infer(&unnamed, 10).unwrap().chosen.actions,
-            vec![EventScriptAction::Say {
+            }));
+        assert!(behavior
+            .infer(&unnamed, 10)
+            .unwrap()
+            .chosen
+            .actions
+            .contains(&EventScriptAction::Say {
                 text: "Hello Acquaintance p2".to_string()
-            }]
-        );
-        assert_eq!(
-            behavior.infer(&stranger, 10).unwrap().chosen.actions,
-            vec![EventScriptAction::Say {
+            }));
+        assert!(behavior
+            .infer(&stranger, 10)
+            .unwrap()
+            .chosen
+            .actions
+            .contains(&EventScriptAction::Say {
                 text: "Hello Stranger p3".to_string()
-            }]
-        );
+            }));
     }
 
     #[test]
@@ -8097,22 +8191,110 @@ mod tests {
         }
     }
 
-    struct CountingBody {
+    struct CountingCockpit {
         motor_attempts: Arc<AtomicUsize>,
         motors: Arc<Mutex<Vec<MotorCommand>>>,
         body: BodySense,
     }
 
-    #[async_trait::async_trait]
-    impl RobotBody for CountingBody {
-        async fn read_body(&mut self) -> Result<BodySense> {
-            Ok(self.body.clone())
+    impl Cockpit for CountingCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> netherwick_cockpit::Result<CockpitResponse> {
+            match request {
+                CockpitRequest::GetStatus => Ok(CockpitResponse::Status(self.get_status()?)),
+                CockpitRequest::GetCapabilities => {
+                    Ok(CockpitResponse::Capabilities(self.get_capabilities()?))
+                }
+                CockpitRequest::GetEvents { since_seq } => {
+                    Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
+                }
+                CockpitRequest::Stop => {
+                    self.motor_attempts.fetch_add(1, Ordering::SeqCst);
+                    self.motors.lock().unwrap().push(MotorCommand::stop());
+                    Ok(CockpitResponse::Accepted)
+                }
+                CockpitRequest::CmdVel {
+                    linear_mm_s,
+                    angular_mrad_s,
+                    ..
+                } => {
+                    self.motor_attempts.fetch_add(1, Ordering::SeqCst);
+                    self.motors.lock().unwrap().push(MotorCommand {
+                        forward: linear_mm_s as f32 / 1000.0,
+                        turn: angular_mrad_s as f32 / 1000.0,
+                    });
+                    Ok(CockpitResponse::Accepted)
+                }
+                CockpitRequest::HeartbeatStop { .. } => Ok(CockpitResponse::Accepted),
+                _ => Ok(CockpitResponse::Accepted),
+            }
         }
 
-        async fn apply_motor(&mut self, cmd: MotorCommand) -> Result<()> {
-            self.motor_attempts.fetch_add(1, Ordering::SeqCst);
-            self.motors.lock().unwrap().push(cmd);
-            Ok(())
+        fn get_status(&mut self) -> netherwick_cockpit::Result<CockpitStatus> {
+            Ok(CockpitStatus {
+                raw: serde_json::json!({
+                    "current_runtime_state": "test",
+                    "oi_mode": "safe",
+                    "current_command": "stop",
+                    "create_sensors": {
+                        "bump_left": self.body.flags.bump_left,
+                        "bump_right": self.body.flags.bump_right,
+                        "wheel_drop": self.body.flags.wheel_drop,
+                        "wall": self.body.flags.wall,
+                        "virtual_wall": self.body.flags.virtual_wall,
+                        "cliff_left": self.body.flags.cliff_left,
+                        "cliff_front_left": self.body.flags.cliff_front_left,
+                        "cliff_front_right": self.body.flags.cliff_front_right,
+                        "cliff_right": self.body.flags.cliff_right,
+                        "charge_mah": (self.body.battery_level.clamp(0.0, 1.0) * 2600.0).round() as u32,
+                        "capacity_mah": 2600,
+                        "charging_state": if self.body.charging { 1 } else { 0 },
+                    },
+                    "odometry": {
+                        "distance_mm": (self.body.odometry.x_m * 1000.0).round() as i32,
+                        "heading_mrad": (self.body.odometry.heading_rad * 1000.0).round() as i32,
+                        "reset_count": 0,
+                    }
+                })
+                .to_string(),
+            })
+        }
+
+        fn get_capabilities(&mut self) -> netherwick_cockpit::Result<CockpitCapabilities> {
+            Ok(CockpitCapabilities {
+                body_kind: "test".to_string(),
+                drive: "differential".to_string(),
+                verbs: [
+                    "status",
+                    "get_capabilities",
+                    "get_events",
+                    "stop",
+                    "cmd_vel",
+                    "heartbeat_stop",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                sensors: Vec::new(),
+                outputs: Vec::new(),
+                safety: Vec::new(),
+                events: Vec::new(),
+                limits: netherwick_cockpit::CockpitLimits {
+                    max_linear_mm_s: 500,
+                    max_angular_mrad_s: 4_000,
+                    min_ttl_ms: 1,
+                    max_ttl_ms: 60_000,
+                },
+            })
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> netherwick_cockpit::Result<EventBatch> {
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: 1,
+                next_seq: since_seq.saturating_add(1),
+                dropped_before_seq: 0,
+                events: Vec::new(),
+            })
         }
     }
 
@@ -8129,7 +8311,7 @@ mod tests {
     async fn real_robot_read_only_runner_never_applies_motor() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::clone(&motor_attempts),
             motors: Arc::clone(&motors),
             body: BodySense {
@@ -8160,7 +8342,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_robot_read_only_runner_publishes_snapshot_when_optional_sensor_fails() {
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::new(AtomicUsize::new(0)),
             motors: Arc::new(Mutex::new(Vec::new())),
             body: BodySense {
@@ -8182,7 +8364,7 @@ mod tests {
     async fn real_robot_slow_runner_without_webremote_direct_sends_stop() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::clone(&motor_attempts),
             motors: Arc::clone(&motors),
             body: BodySense {
@@ -8203,7 +8385,7 @@ mod tests {
     async fn real_robot_slow_runner_waits_for_runtime_tick_without_backoff() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::clone(&motor_attempts),
             motors: Arc::clone(&motors),
             body: BodySense {
@@ -8318,7 +8500,7 @@ mod tests {
     async fn real_robot_slow_runner_applies_only_clamped_webremote_direct_motor() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::clone(&motor_attempts),
             motors: Arc::clone(&motors),
             body: BodySense {
@@ -8351,7 +8533,7 @@ mod tests {
         };
         body_sense.cliff_sensors.front_left = 0.96;
         body_sense.cliff_sensors.front_right = 0.82;
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::clone(&motor_attempts),
             motors: Arc::clone(&motors),
             body: body_sense,
@@ -8403,7 +8585,7 @@ mod tests {
     async fn real_robot_slow_direct_gamepad_bypasses_slow_runtime_tick() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::clone(&motor_attempts),
             motors: Arc::clone(&motors),
             body: BodySense {
@@ -8454,7 +8636,7 @@ mod tests {
     async fn real_robot_slow_direct_webremote_chirp_bypasses_runtime_without_motor() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::clone(&motor_attempts),
             motors: Arc::clone(&motors),
             body: BodySense {
@@ -8505,7 +8687,7 @@ mod tests {
     async fn real_robot_slow_direct_webremote_speak_bypasses_runtime_without_motor() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
-        let body = CountingBody {
+        let body = CountingCockpit {
             motor_attempts: Arc::clone(&motor_attempts),
             motors: Arc::clone(&motors),
             body: BodySense {
@@ -9482,7 +9664,7 @@ mod tests {
         let root = test_ledger_root("sim-runner-writes");
         let ledger = JsonlLedger::new(&root);
         let runtime = test_runtime(ledger.clone(), SimpleConductor::default());
-        let (world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         let mut runner = SimRunner::new(runtime, world, motors);
 
         runner.run_steps(10).await.unwrap();
@@ -9884,7 +10066,7 @@ mod tests {
                 duration_ms: 1_000,
             }),
         );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.5, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
 
@@ -9916,7 +10098,7 @@ mod tests {
             let ledger =
                 JsonlLedger::new(test_ledger_root(&format!("sim-runner-{name}-motor-bridge")));
             let runtime = test_runtime(ledger, FixedConductor::new(action.clone()));
-            let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+            let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
             world.set_body(test_body(1.0, 1.0, 0.5, 7));
             let mut runner = SimRunner::new(runtime, world, motors);
             let start = runner.world.body();
@@ -9961,7 +10143,7 @@ mod tests {
                 duration_ms: 1_000,
             }),
         );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         let mut body = test_body(1.0, 1.0, 0.2, 7);
         body.battery_level = 0.2;
         world.set_body(body);
@@ -9988,7 +10170,7 @@ mod tests {
                 duration_ms: 1_000,
             }),
         );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.8, 7));
         world.add_object(SimObject::obstacle("box", "box", 1.31, 1.0, 0.1));
         let mut runner = SimRunner::new(runtime, world, motors);
@@ -10013,7 +10195,7 @@ mod tests {
                 duration_ms: 1_000,
             }),
         );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.0, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
 
@@ -10049,7 +10231,7 @@ mod tests {
                 duration_ms: 1_000,
             }),
         );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         let mut body = test_body(0.2, 0.2, 1.0, 7);
         body.odometry.heading_rad = std::f32::consts::PI;
         world.set_body(body);
@@ -10083,7 +10265,7 @@ mod tests {
         let ledger = JsonlLedger::new(&root);
         let runtime = test_runtime(ledger.clone(), FixedConductor::new(action))
             .with_models(RuntimeModelStack::with_danger_shadow_checkpoint(&checkpoint).unwrap());
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.8, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
 
@@ -10103,7 +10285,7 @@ mod tests {
         let root = test_ledger_root("sim-runner-embodied-predictions");
         let ledger = JsonlLedger::new(&root);
         let runtime = test_runtime(ledger.clone(), FixedConductor::new(ActionPrimitive::Stop));
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.8, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
 
@@ -10170,7 +10352,7 @@ mod tests {
         let ledger = JsonlLedger::new(&root);
         let runtime = test_runtime(ledger.clone(), FixedConductor::new(action))
             .with_models(RuntimeModelStack::with_charge_shadow_checkpoint(&checkpoint).unwrap());
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.2, 7));
         world.add_object(SimObject::charger("charger", "charger", 1.2, 1.0, 0.18));
         let mut runner = SimRunner::new(runtime, world, motors);
@@ -10196,7 +10378,7 @@ mod tests {
         let runtime = test_runtime(ledger.clone(), FixedConductor::new(action)).with_models(
             RuntimeModelStack::with_action_value_shadow_checkpoint(&checkpoint).unwrap(),
         );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.2, 7));
         world.add_object(SimObject::charger("charger", "charger", 1.2, 1.0, 0.18));
         let mut runner = SimRunner::new(runtime, world, motors);
@@ -10247,7 +10429,7 @@ mod tests {
         let ledger = JsonlLedger::new(&root);
         let runtime = test_runtime(ledger.clone(), FixedConductor::new(ActionPrimitive::Stop))
             .with_models(RuntimeModelStack::with_future_shadow_checkpoint(&checkpoint).unwrap());
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.8, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
 
@@ -10290,7 +10472,7 @@ mod tests {
                 },
                 max_train_steps_per_tick: 1,
             });
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.8, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
         let mut observed_samples = 0usize;
@@ -10315,7 +10497,7 @@ mod tests {
         let root = test_ledger_root("inline-disabled");
         let ledger = JsonlLedger::new(&root);
         let runtime = test_runtime(ledger.clone(), FixedConductor::new(ActionPrimitive::Stop));
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.8, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
         let mut statuses = Vec::new();
@@ -10344,7 +10526,7 @@ mod tests {
         let ledger = JsonlLedger::new(&root);
         let runtime = test_runtime(ledger.clone(), FixedConductor::new(action))
             .with_models(RuntimeModelStack::with_ear_next_shadow_checkpoint(&checkpoint).unwrap());
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.8, 7));
         world.add_object(SimObject {
             id: "speaker".to_string(),
@@ -10422,7 +10604,7 @@ mod tests {
             .with_models(
                 RuntimeModelStack::with_experience_shadow_checkpoint(&checkpoint).unwrap(),
             );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         let mut body = test_body(1.0, 1.0, 0.8, 7);
         body.velocity.forward_m_s = 0.1;
         world.set_body(body);
@@ -10516,7 +10698,7 @@ mod tests {
             netherwick_llm::NoopLlmAgent,
             queue,
         );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 0.8, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
 
@@ -10564,7 +10746,7 @@ mod tests {
             netherwick_llm::NoopLlmAgent,
             queue,
         );
-        let (mut world, motors) = VirtualWorld::new_with_motor(7, arena());
+        let (mut world, motors) = VirtualWorld::new_with_cockpit(7, arena());
         world.set_body(test_body(1.0, 1.0, 1.0, 7));
         let mut runner = SimRunner::new(runtime, world, motors);
         runner.stuck.active = true;

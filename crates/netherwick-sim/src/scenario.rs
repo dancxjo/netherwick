@@ -2,7 +2,7 @@ use netherwick_body::BodySense;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
-use crate::{ArenaConfig, SimMotorComplex, SimObject, SimObjectKind, VirtualWorld};
+use crate::{ArenaConfig, SimCockpit, SimObject, SimObjectKind, VirtualWorld};
 
 pub const ROBOT_SPAWN_CLEARANCE_M: f32 = 0.45;
 
@@ -156,18 +156,18 @@ pub struct ScenarioMetadata {
 #[derive(Clone, Debug)]
 pub struct ScenarioWorld {
     pub world: VirtualWorld,
-    pub motors: SimMotorComplex,
+    pub motors: SimCockpit,
     pub metadata: ScenarioMetadata,
 }
 
-pub fn default_sim_world(seed: u64) -> (VirtualWorld, SimMotorComplex) {
+pub fn default_sim_world(seed: u64) -> (VirtualWorld, SimCockpit) {
     let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::Dream, seed));
     (scenario.world, scenario.motors)
 }
 
 pub fn build_scenario(config: ScenarioConfig) -> ScenarioWorld {
     let mut rng = StdRng::seed_from_u64(config.seed);
-    let (mut world, motors) = VirtualWorld::new_with_motor(config.seed, config.arena);
+    let (mut world, motors) = VirtualWorld::new_with_cockpit(config.seed, config.arena);
     let body = spawn_body(&config, &mut rng);
     world.set_body(body.clone());
 
