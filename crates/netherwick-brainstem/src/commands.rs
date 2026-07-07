@@ -1,3 +1,5 @@
+pub const MAX_SONG_TONES: usize = 16;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum CreateOiMode {
@@ -126,6 +128,12 @@ pub enum BrainstemCommand {
     Status,
     Bootsel,
     SetMode(CreateOiMode),
+    SongDefine {
+        id: u8,
+        tones: [SongTone; MAX_SONG_TONES],
+        tone_count: u8,
+        seq: u32,
+    },
     SongPlay {
         id: u8,
     },
@@ -150,6 +158,12 @@ pub enum EscapeDirection {
     Left,
     Right,
     Either,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Default)]
+pub struct SongTone {
+    pub note: u8,
+    pub duration_64ths: u8,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -270,6 +284,11 @@ pub(crate) enum RuntimeCommand {
         duration_ms: u32,
     },
     StopDrive,
+    SongDefine {
+        id: u8,
+        tones: [SongTone; MAX_SONG_TONES],
+        tone_count: u8,
+    },
     SongPlay {
         id: u8,
     },

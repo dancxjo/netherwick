@@ -204,6 +204,14 @@ crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainst
 
 To flash, hold the Pico BOOTSEL button while plugging it into USB, then copy the UF2 file to the mounted `RPI-RP2` drive.
 
+For an already-running Pico W on the `pete-brainstem` AP, the repo root also has a one-command Wi-Fi BOOTSEL flash path:
+
+```bash
+just flash
+```
+
+It builds `brainstem-pico-w-uf2`, posts the BOOTSEL command to `http://192.168.4.1/command`, waits for the `RPI-RP2` drive, then copies the UF2. Override `PICO_W_BOOTSEL_URL`, `PICO_W_MOUNT`, or `PICO_W_MOUNT_TIMEOUT_SECS` when needed.
+
 ## Pico W Operator Interface
 
 The Pico W backend starts an open AP:

@@ -475,6 +475,20 @@ where
                 self.create_uart
                     .play_song(&mut self.hardware, &mut self.events, id)?;
             }
+            RuntimeCommand::SongDefine {
+                id,
+                tones,
+                tone_count,
+            } => {
+                self.ensure_create_responsive()?;
+                self.create_uart.define_song(
+                    &mut self.hardware,
+                    &mut self.events,
+                    id,
+                    &tones,
+                    tone_count,
+                )?;
+            }
             RuntimeCommand::Dock => {
                 self.ensure_create_responsive()?;
                 self.create_uart
@@ -1212,6 +1226,16 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             Some(RuntimeCommand::HeartbeatStop { timeout_ms })
         }
         BrainstemCommand::SongPlay { id } => Some(RuntimeCommand::SongPlay { id }),
+        BrainstemCommand::SongDefine {
+            id,
+            tones,
+            tone_count,
+            ..
+        } => Some(RuntimeCommand::SongDefine {
+            id,
+            tones,
+            tone_count,
+        }),
         BrainstemCommand::Dock => Some(RuntimeCommand::Dock),
         BrainstemCommand::SetLights { pattern } => Some(RuntimeCommand::SetLights { pattern }),
     }

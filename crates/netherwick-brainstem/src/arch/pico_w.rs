@@ -27,7 +27,9 @@ use embedded_io_async::Write;
 use static_cell::StaticCell;
 
 use crate::body;
-use crate::commands::{BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern};
+use crate::commands::{
+    BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern, SongTone, MAX_SONG_TONES,
+};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 use crate::status;
@@ -858,7 +860,7 @@ $('full').onclick=()=>post({kind:'set_mode',mode:'full'})
 $('disarm').onclick=()=>post({kind:'disarm'})
 $('dock').onclick=()=>post({kind:'dock'})
 $('ping').onclick=()=>post({kind:'ping'})
-$('song').onclick=()=>post({kind:'song_play',id:0})
+$('song').onclick=()=>post({kind:'song_define',id:0,tones:'72:8,76:8,79:16'}).then(()=>post({kind:'song_play',id:0}))
 $('bootsel').onclick=()=>post({kind:'bootsel'})
 $('refresh').onclick=refresh
 document.querySelectorAll('[data-lights]').forEach(b=>b.onclick=()=>post({kind:'set_lights',pattern:b.dataset.lights}))
@@ -1145,6 +1147,31 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
         "SONG_PLAY" => BrainstemCommand::SongPlay {
             id: parse_u32(parts.next()).ok_or(seq)? as u8,
         },
+        "SONG_DEFINE" => {
+            let id = parse_u32(parts.next()).ok_or(seq)? as u8;
+            let mut tones = [SongTone::default(); MAX_SONG_TONES];
+            let mut tone_count = 0;
+            while tone_count < MAX_SONG_TONES {
+                let Some(note) = parts.next() else {
+                    break;
+                };
+                let duration = parts.next().ok_or(seq)?;
+                tones[tone_count] = SongTone {
+                    note: parse_u32(Some(note)).ok_or(seq)? as u8,
+                    duration_64ths: parse_u32(Some(duration)).ok_or(seq)? as u8,
+                };
+                tone_count += 1;
+            }
+            if tone_count == 0 {
+                return Err(seq);
+            }
+            BrainstemCommand::SongDefine {
+                id,
+                tones,
+                tone_count: tone_count as u8,
+                seq,
+            }
+        }
         "DOCK" => BrainstemCommand::Dock,
         "SET_LIGHTS" => BrainstemCommand::SetLights {
             pattern: parse_light_pattern(parts.next().ok_or(seq)?).ok_or(seq)?,
@@ -1397,6 +1424,15 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
         "song_play" => Some(BrainstemCommand::SongPlay {
             id: json_u32(body, "id")? as u8,
         }),
+        "song_define" => {
+            let (tones, tone_count) = parse_song_tones(json_str(body, "tones")?)?;
+            Some(BrainstemCommand::SongDefine {
+                id: json_u32(body, "id")? as u8,
+                tones,
+                tone_count,
+                seq: json_u32(body, "seq").unwrap_or(command_id),
+            })
+        }
         "dock" => Some(BrainstemCommand::Dock),
         "set_lights" => Some(BrainstemCommand::SetLights {
             pattern: parse_light_pattern(json_str(body, "pattern")?)?,
@@ -1423,6 +1459,33 @@ fn parse_escape_direction(direction: &str) -> Option<EscapeDirection> {
         "right" | "RIGHT" => Some(EscapeDirection::Right),
         "either" | "EITHER" => Some(EscapeDirection::Either),
         _ => None,
+    }
+}
+
+fn parse_song_tones(value: &str) -> Option<([SongTone; MAX_SONG_TONES], u8)> {
+    let mut tones = [SongTone::default(); MAX_SONG_TONES];
+    let mut tone_count = 0usize;
+    for pair in value.split(',') {
+        if tone_count >= MAX_SONG_TONES {
+            return None;
+        }
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let split = pair.find(':')?;
+        let note = pair[..split].trim().parse::<u8>().ok()?;
+        let duration_64ths = pair[split + 1..].trim().parse::<u8>().ok()?;
+        tones[tone_count] = SongTone {
+            note,
+            duration_64ths,
+        };
+        tone_count += 1;
+    }
+    if tone_count == 0 {
+        None
+    } else {
+        Some((tones, tone_count as u8))
     }
 }
 

@@ -1,6 +1,6 @@
 use heapless::{Deque, Vec};
 
-use crate::commands::{CreateOiMode, LightPattern};
+use crate::commands::{CreateOiMode, LightPattern, SongTone, MAX_SONG_TONES};
 use crate::events::{BrainstemError, BrainstemEvent, CreateSensorFlags, CreateSensorPacket};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::status;
@@ -11,6 +11,7 @@ const OI_FULL: u8 = 132;
 const OI_SENSORS: u8 = 142;
 const OI_DRIVE: u8 = 137;
 const OI_LEDS: u8 = 139;
+const OI_DEFINE_SONG: u8 = 140;
 const OI_PLAY_SONG: u8 = 141;
 const OI_SEEK_DOCK: u8 = 143;
 const OI_DRIVE_DIRECT: u8 = 145;
@@ -196,7 +197,42 @@ impl CreateUart {
     where
         H: BrainstemHardware,
     {
-        self.send_bytes(hardware, &[OI_PLAY_SONG, id])
+        let id = id.min(15);
+        self.send_bytes(hardware, &[OI_PLAY_SONG, id])?;
+        status::mark_song_played(id);
+        Ok(())
+    }
+
+    pub fn define_song<H, const N: usize>(
+        &mut self,
+        hardware: &mut H,
+        _events: &mut Deque<BrainstemEvent, N>,
+        id: u8,
+        tones: &[SongTone; MAX_SONG_TONES],
+        tone_count: u8,
+    ) -> Result<(), BrainstemError>
+    where
+        H: BrainstemHardware,
+    {
+        let id = id.min(15);
+        let tone_count = tone_count.min(MAX_SONG_TONES as u8);
+        if tone_count == 0 {
+            return Ok(());
+        }
+
+        let mut bytes = [0u8; 3 + MAX_SONG_TONES * 2];
+        bytes[0] = OI_DEFINE_SONG;
+        bytes[1] = id;
+        bytes[2] = tone_count;
+        for i in 0..tone_count as usize {
+            let tone = tones[i];
+            let offset = 3 + i * 2;
+            bytes[offset] = tone.note.clamp(31, 127);
+            bytes[offset + 1] = tone.duration_64ths.max(1);
+        }
+        self.send_bytes(hardware, &bytes[..3 + tone_count as usize * 2])?;
+        status::mark_song_defined(id, tone_count);
+        Ok(())
     }
 
     pub fn seek_dock<H, const N: usize>(

@@ -2,7 +2,8 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use crate::body;
 use crate::commands::{
-    BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern, RuntimeCommand,
+    BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern, RuntimeCommand, SongTone,
+    MAX_SONG_TONES,
 };
 use crate::events::{BrainstemError, BrainstemEvent, CreateSensorPacket};
 use crate::hardware::UartReadError;
@@ -72,6 +73,11 @@ static CREATE_SENSOR_CLIFF_LEFT_SIGNAL: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CLIFF_RIGHT_SIGNAL: AtomicU32 = AtomicU32::new(0);
+static PENDING_SONG_TONES: [AtomicU32; MAX_SONG_TONES] =
+    [const { AtomicU32::new(0) }; MAX_SONG_TONES];
+static CREATE_SONG_LAST_DEFINED_ID: AtomicU8 = AtomicU8::new(0);
+static CREATE_SONG_LAST_DEFINED_LEN: AtomicU8 = AtomicU8::new(0);
+static CREATE_SONG_LAST_PLAYED_ID: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -131,6 +137,9 @@ pub struct BrainstemStatus {
     pub create_sensor_cliff_front_left_signal: u16,
     pub create_sensor_cliff_front_right_signal: u16,
     pub create_sensor_cliff_right_signal: u16,
+    pub create_song_last_defined_id: u8,
+    pub create_song_last_defined_len: u8,
+    pub create_song_last_played_id: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -265,6 +274,7 @@ enum ControlCommandCode {
     WiggleAlign = 26,
     Unstick = 27,
     CliffGuard = 28,
+    SongDefine = 29,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -309,7 +319,8 @@ pub fn set_command(command: Option<RuntimeCommand>) {
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
         Some(RuntimeCommand::Drive { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::StopDrive) => CommandCode::StopDrive,
-        Some(RuntimeCommand::SongPlay { .. })
+        Some(RuntimeCommand::SongDefine { .. })
+        | Some(RuntimeCommand::SongPlay { .. })
         | Some(RuntimeCommand::Dock)
         | Some(RuntimeCommand::SetLights { .. }) => CommandCode::None,
     };
@@ -440,6 +451,23 @@ fn encode_control_command(
         )),
         BrainstemCommand::SongPlay { id } => {
             Some((ControlCommandCode::SongPlay, id as u32, 0, 0, 0, None))
+        }
+        BrainstemCommand::SongDefine {
+            id,
+            tones,
+            tone_count,
+            ..
+        } => {
+            let tone_count = tone_count.min(MAX_SONG_TONES as u8);
+            store_pending_song_tones(&tones, tone_count);
+            Some((
+                ControlCommandCode::SongDefine,
+                id as u32,
+                tone_count as u32,
+                0,
+                0,
+                None,
+            ))
         }
         BrainstemCommand::Dock => Some((ControlCommandCode::Dock, 0, 0, 0, 0, None)),
         BrainstemCommand::SetLights { pattern } => Some((
@@ -688,6 +716,15 @@ fn decode_control_command(
         x if x == ControlCommandCode::SongPlay as u8 => {
             Some(BrainstemCommand::SongPlay { id: a as u8 })
         }
+        x if x == ControlCommandCode::SongDefine as u8 => {
+            let tone_count = (b as u8).min(MAX_SONG_TONES as u8);
+            Some(BrainstemCommand::SongDefine {
+                id: a as u8,
+                tones: load_pending_song_tones(tone_count),
+                tone_count,
+                seq,
+            })
+        }
         x if x == ControlCommandCode::Dock as u8 => Some(BrainstemCommand::Dock),
         x if x == ControlCommandCode::SetLights as u8 => Some(BrainstemCommand::SetLights {
             pattern: decode_light_pattern(a as u8)?,
@@ -826,6 +863,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::WiggleAlign { seq, .. }
         | BrainstemCommand::Unstick { seq, .. }
         | BrainstemCommand::CliffGuard { seq, .. }
+        | BrainstemCommand::SongDefine { seq, .. }
         | BrainstemCommand::HeartbeatStop { seq, .. } => seq,
         _ => 0,
     }
@@ -869,6 +907,40 @@ fn decode_escape_direction(value: u8) -> Option<EscapeDirection> {
         2 => Some(EscapeDirection::Right),
         3 => Some(EscapeDirection::Either),
         _ => None,
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn store_pending_song_tones(tones: &[SongTone; MAX_SONG_TONES], tone_count: u8) {
+    let tone_count = tone_count.min(MAX_SONG_TONES as u8) as usize;
+    for i in 0..MAX_SONG_TONES {
+        let value = if i < tone_count {
+            pack_song_tone(tones[i])
+        } else {
+            0
+        };
+        PENDING_SONG_TONES[i].store(value, Ordering::Relaxed);
+    }
+}
+
+fn load_pending_song_tones(tone_count: u8) -> [SongTone; MAX_SONG_TONES] {
+    let mut tones = [SongTone::default(); MAX_SONG_TONES];
+    let tone_count = tone_count.min(MAX_SONG_TONES as u8) as usize;
+    for i in 0..tone_count {
+        tones[i] = unpack_song_tone(PENDING_SONG_TONES[i].load(Ordering::Relaxed));
+    }
+    tones
+}
+
+#[cfg(feature = "pico-w")]
+fn pack_song_tone(tone: SongTone) -> u32 {
+    ((tone.note as u32) << 8) | tone.duration_64ths as u32
+}
+
+fn unpack_song_tone(value: u32) -> SongTone {
+    SongTone {
+        note: (value >> 8) as u8,
+        duration_64ths: value as u8,
     }
 }
 
@@ -952,6 +1024,15 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL
         .store(sensors.cliff_front_right_signal as u32, Ordering::Relaxed);
     CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(sensors.cliff_right_signal as u32, Ordering::Relaxed);
+}
+
+pub fn mark_song_defined(id: u8, tone_count: u8) {
+    CREATE_SONG_LAST_DEFINED_ID.store(id, Ordering::Relaxed);
+    CREATE_SONG_LAST_DEFINED_LEN.store(tone_count.min(MAX_SONG_TONES as u8), Ordering::Relaxed);
+}
+
+pub fn mark_song_played(id: u8) {
+    CREATE_SONG_LAST_PLAYED_ID.store(id, Ordering::Relaxed);
 }
 
 pub fn mark_uart_rx_error() {
@@ -1225,6 +1306,9 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
             .load(Ordering::Relaxed) as u16,
         create_sensor_cliff_right_signal: CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.load(Ordering::Relaxed)
             as u16,
+        create_song_last_defined_id: CREATE_SONG_LAST_DEFINED_ID.load(Ordering::Relaxed),
+        create_song_last_defined_len: CREATE_SONG_LAST_DEFINED_LEN.load(Ordering::Relaxed),
+        create_song_last_played_id: CREATE_SONG_LAST_PLAYED_ID.load(Ordering::Relaxed),
     }
 }
 
@@ -1273,8 +1357,17 @@ struct StatusJson {
     pending_command_id: u32,
     last_accepted_command_id: u32,
     last_rejected_command_id: u32,
+    create_songs: CreateSongStatusJson,
     create_sensors: CreateSensorStatusJson,
     forebrain_uart: ForebrainUartStatusJson,
+}
+
+#[cfg(feature = "pico-w")]
+#[derive(serde::Serialize)]
+struct CreateSongStatusJson {
+    last_defined_id: u8,
+    last_defined_len: u8,
+    last_played_id: u8,
 }
 
 #[cfg(feature = "pico-w")]
@@ -1355,6 +1448,11 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         pending_command_id: snapshot.pending_command_id,
         last_accepted_command_id: snapshot.last_accepted_command_id,
         last_rejected_command_id: snapshot.last_rejected_command_id,
+        create_songs: CreateSongStatusJson {
+            last_defined_id: snapshot.create_song_last_defined_id,
+            last_defined_len: snapshot.create_song_last_defined_len,
+            last_played_id: snapshot.create_song_last_played_id,
+        },
         create_sensors: create_sensor_status_json(snapshot),
         forebrain_uart: ForebrainUartStatusJson {
             rx_bytes: snapshot.forebrain_uart_rx_bytes,
@@ -1557,6 +1655,7 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::WiggleAlign as u8 => "wiggle_align",
         x if x == ControlCommandCode::Unstick as u8 => "unstick",
         x if x == ControlCommandCode::CliffGuard as u8 => "cliff_guard",
+        x if x == ControlCommandCode::SongDefine as u8 => "song_define",
         _ => "none",
     }
 }

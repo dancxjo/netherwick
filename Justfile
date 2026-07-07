@@ -17,6 +17,9 @@ kinect_rgb_gamma := env_var_or_default("KINECT_RGB_GAMMA", "0.80")
 kinect_rgb_brightness := env_var_or_default("KINECT_RGB_BRIGHTNESS", "0.0")
 tts_output_device := env_var_or_default("NETHERWICK_TTS_OUTPUT_DEVICE", "")
 cyw43_firmware_ref := env_var_or_default("CYW43_FIRMWARE_REF", "main")
+pico_w_bootsel_url := env_var_or_default("PICO_W_BOOTSEL_URL", "http://192.168.4.1/command")
+pico_w_mount := env_var_or_default("PICO_W_MOUNT", "")
+pico_w_mount_timeout_secs := env_var_or_default("PICO_W_MOUNT_TIMEOUT_SECS", "30")
 
 # Default to the real robot path.
 default *args:
@@ -183,6 +186,70 @@ brainstem-pico-w-uf2: brainstem-pico-w-build
     elf2uf2-rs \
         crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem \
         crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem-pico-w.uf2
+
+# Build the Pico W firmware, put the board in BOOTSEL over Wi-Fi, then copy the UF2.
+flash: brainstem-pico-w-uf2
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uf2="crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem-pico-w.uf2"
+    bootsel_url="{{pico_w_bootsel_url}}"
+    mount_override="{{pico_w_mount}}"
+    timeout_secs="{{pico_w_mount_timeout_secs}}"
+
+    if [ ! -s "$uf2" ]; then
+        echo "UF2 not found: $uf2" >&2
+        exit 1
+    fi
+
+    echo "Requesting BOOTSEL via $bootsel_url"
+    curl -fsS --max-time 3 \
+        -H "Content-Type: application/json" \
+        -d '{"kind":"bootsel","command_id":1}' \
+        "$bootsel_url" >/dev/null || true
+
+    echo "Waiting for RPI-RP2 mount"
+    deadline=$((SECONDS + timeout_secs))
+    mount_path=""
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        candidates=()
+        if [ -n "$mount_override" ]; then
+            candidates+=("$mount_override")
+        fi
+        candidates+=(
+            "/media/$USER/RPI-RP2"
+            "/run/media/$USER/RPI-RP2"
+            "/media/RPI-RP2"
+            "/Volumes/RPI-RP2"
+        )
+
+        for candidate in "${candidates[@]}"; do
+            if [ -d "$candidate" ] && [ -w "$candidate" ]; then
+                mount_path="$candidate"
+                break 2
+            fi
+        done
+
+        if command -v lsblk >/dev/null 2>&1; then
+            while IFS= read -r candidate; do
+                if [ -n "$candidate" ] && [ -d "$candidate" ] && [ -w "$candidate" ]; then
+                    mount_path="$candidate"
+                    break 2
+                fi
+            done < <(lsblk -rpo LABEL,MOUNTPOINT | awk '$1 == "RPI-RP2" { print $2 }')
+        fi
+
+        sleep 1
+    done
+
+    if [ -z "$mount_path" ]; then
+        echo "Timed out waiting for RPI-RP2. Set PICO_W_MOUNT=/path/to/RPI-RP2 if it mounted somewhere unusual." >&2
+        exit 1
+    fi
+
+    echo "Copying $uf2 to $mount_path"
+    cp "$uf2" "$mount_path/"
+    sync
+    echo "Flash copy complete"
 
 # Render merged docker-compose configuration.
 compose-config:
