@@ -887,6 +887,9 @@ pub struct StatusSummary {
     pub safety_tripped: Option<bool>,
     pub active_motion: Option<bool>,
     pub event_next_seq: Option<u32>,
+    pub contact: ContactSummary,
+    pub battery: BatterySummary,
+    pub odometry: OdometrySummary,
 }
 
 impl StatusSummary {
@@ -902,6 +905,9 @@ impl StatusSummary {
             safety_tripped: bool_for(raw, "safety_tripped"),
             active_motion: bool_for(raw, "active_cmd_vel"),
             event_next_seq: number_for(raw, "event_next_seq"),
+            contact: ContactSummary::from_raw(raw),
+            battery: BatterySummary::from_raw(raw),
+            odometry: OdometrySummary::from_raw(raw),
         }
     }
 
@@ -927,7 +933,172 @@ impl StatusSummary {
             active_motion: json_str_value(value, "current_command")
                 .map(|command| command == "drive"),
             event_next_seq: json_u32_value(value, "event_next_seq"),
+            contact: ContactSummary::from_json(sensors),
+            battery: BatterySummary::from_json(sensors),
+            odometry: OdometrySummary::from_json(value.get("odometry")),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContactSummary {
+    pub bump_left: Option<bool>,
+    pub bump_right: Option<bool>,
+    pub wheel_drop: Option<bool>,
+    pub wall: Option<bool>,
+    pub virtual_wall: Option<bool>,
+    pub cliff_left: Option<bool>,
+    pub cliff_front_left: Option<bool>,
+    pub cliff_front_right: Option<bool>,
+    pub cliff_right: Option<bool>,
+}
+
+impl ContactSummary {
+    pub fn any_contact(&self) -> Option<bool> {
+        any_known_true([
+            self.bump_left,
+            self.bump_right,
+            self.wall,
+            self.virtual_wall,
+        ])
+    }
+
+    pub fn any_safety_stop(&self) -> Option<bool> {
+        any_known_true([
+            self.wheel_drop,
+            self.cliff_left,
+            self.cliff_front_left,
+            self.cliff_front_right,
+            self.cliff_right,
+        ])
+    }
+
+    fn from_raw(raw: &str) -> Self {
+        Self {
+            bump_left: bool_for(raw, "bump_left"),
+            bump_right: bool_for(raw, "bump_right"),
+            wheel_drop: bool_for(raw, "wheel_drop"),
+            wall: bool_for(raw, "wall"),
+            virtual_wall: bool_for(raw, "virtual_wall"),
+            cliff_left: bool_for(raw, "cliff_left"),
+            cliff_front_left: bool_for(raw, "cliff_front_left"),
+            cliff_front_right: bool_for(raw, "cliff_front_right"),
+            cliff_right: bool_for(raw, "cliff_right"),
+        }
+    }
+
+    fn from_json(sensors: Option<&serde_json::Value>) -> Self {
+        let Some(sensors) = sensors else {
+            return Self::default();
+        };
+        Self {
+            bump_left: json_bool_value(sensors, "bump_left"),
+            bump_right: json_bool_value(sensors, "bump_right"),
+            wheel_drop: json_bool_value(sensors, "wheel_drop"),
+            wall: json_bool_value(sensors, "wall"),
+            virtual_wall: json_bool_value(sensors, "virtual_wall"),
+            cliff_left: json_bool_value(sensors, "cliff_left"),
+            cliff_front_left: json_bool_value(sensors, "cliff_front_left"),
+            cliff_front_right: json_bool_value(sensors, "cliff_front_right"),
+            cliff_right: json_bool_value(sensors, "cliff_right"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BatterySummary {
+    pub voltage_mv: Option<u32>,
+    pub current_ma: Option<i32>,
+    pub charge_mah: Option<u32>,
+    pub capacity_mah: Option<u32>,
+    pub percent: Option<u8>,
+    pub charging_state: Option<u8>,
+    pub low: Option<bool>,
+}
+
+impl BatterySummary {
+    fn from_raw(raw: &str) -> Self {
+        let charge_mah = number_for(raw, "charge_mah");
+        let capacity_mah = number_for(raw, "capacity_mah");
+        let percent = battery_percent(charge_mah, capacity_mah);
+        Self {
+            voltage_mv: number_for(raw, "voltage_mv"),
+            current_ma: signed_number_for(raw, "current_ma"),
+            charge_mah,
+            capacity_mah,
+            percent,
+            charging_state: number_for(raw, "charging_state").map(|value| value as u8),
+            low: percent.map(|value| value <= 20),
+        }
+    }
+
+    fn from_json(sensors: Option<&serde_json::Value>) -> Self {
+        let Some(sensors) = sensors else {
+            return Self::default();
+        };
+        let charge_mah = json_u32_value(sensors, "charge_mah");
+        let capacity_mah = json_u32_value(sensors, "capacity_mah");
+        let percent = battery_percent(charge_mah, capacity_mah);
+        Self {
+            voltage_mv: json_u32_value(sensors, "voltage_mv"),
+            current_ma: json_i32_value(sensors, "current_ma"),
+            charge_mah,
+            capacity_mah,
+            percent,
+            charging_state: json_u32_value(sensors, "charging_state").map(|value| value as u8),
+            low: percent.map(|value| value <= 20),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OdometrySummary {
+    pub reset_count: Option<u32>,
+    pub distance_mm: Option<i32>,
+    pub heading_mrad: Option<i32>,
+}
+
+impl OdometrySummary {
+    fn from_raw(raw: &str) -> Self {
+        Self {
+            reset_count: number_for(raw, "odometry_resets"),
+            distance_mm: signed_number_for(raw, "odometry_distance_mm"),
+            heading_mrad: signed_number_for(raw, "odometry_heading_mrad"),
+        }
+    }
+
+    fn from_json(odometry: Option<&serde_json::Value>) -> Self {
+        let Some(odometry) = odometry else {
+            return Self::default();
+        };
+        Self {
+            reset_count: json_u32_value(odometry, "reset_count"),
+            distance_mm: json_i32_value(odometry, "distance_mm"),
+            heading_mrad: json_i32_value(odometry, "heading_mrad"),
+        }
+    }
+}
+
+fn any_known_true(values: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let mut saw_known = false;
+    for value in values {
+        match value {
+            Some(true) => return Some(true),
+            Some(false) => saw_known = true,
+            None => {}
+        }
+    }
+    saw_known.then_some(false)
+}
+
+fn battery_percent(charge_mah: Option<u32>, capacity_mah: Option<u32>) -> Option<u8> {
+    let (Some(charge_mah), Some(capacity_mah)) = (charge_mah, capacity_mah) else {
+        return None;
+    };
+    if capacity_mah == 0 {
+        None
+    } else {
+        Some(((charge_mah * 100) / capacity_mah).min(100) as u8)
     }
 }
 
@@ -1841,6 +2012,12 @@ pub enum CockpitEventKind {
     CliffChanged,
     WheelDropLatched,
     WheelDropCleared,
+    WallChanged,
+    VirtualWallChanged,
+    BatteryLow,
+    ChargingStateChanged,
+    ButtonsChanged,
+    IrChanged,
     HeartbeatExpired,
     EStopLatched,
     EStopCleared,
@@ -1872,6 +2049,12 @@ impl From<&str> for CockpitEventKind {
             "cliff_changed" => Self::CliffChanged,
             "wheel_drop_latched" => Self::WheelDropLatched,
             "wheel_drop_cleared" => Self::WheelDropCleared,
+            "wall_changed" => Self::WallChanged,
+            "virtual_wall_changed" => Self::VirtualWallChanged,
+            "battery_low" => Self::BatteryLow,
+            "charging_state_changed" => Self::ChargingStateChanged,
+            "buttons_changed" => Self::ButtonsChanged,
+            "ir_changed" => Self::IrChanged,
             "heartbeat_expired" => Self::HeartbeatExpired,
             "estop_latched" => Self::EStopLatched,
             "estop_cleared" => Self::EStopCleared,
@@ -1905,6 +2088,12 @@ impl CockpitEventKind {
             Self::CliffChanged => "cliff_changed",
             Self::WheelDropLatched => "wheel_drop_latched",
             Self::WheelDropCleared => "wheel_drop_cleared",
+            Self::WallChanged => "wall_changed",
+            Self::VirtualWallChanged => "virtual_wall_changed",
+            Self::BatteryLow => "battery_low",
+            Self::ChargingStateChanged => "charging_state_changed",
+            Self::ButtonsChanged => "buttons_changed",
+            Self::IrChanged => "ir_changed",
             Self::HeartbeatExpired => "heartbeat_expired",
             Self::EStopLatched => "estop_latched",
             Self::EStopCleared => "estop_cleared",
@@ -1931,6 +2120,19 @@ pub struct SimCockpit {
     armed: bool,
     estop_latched: bool,
     safety_tripped: bool,
+    bump_left: bool,
+    bump_right: bool,
+    cliff: bool,
+    wheel_drop: bool,
+    wall: bool,
+    virtual_wall: bool,
+    buttons: u8,
+    ir_byte: u8,
+    charging_state: u8,
+    battery_charge_mah: u32,
+    battery_capacity_mah: u32,
+    odometry_distance_mm: i32,
+    odometry_heading_mrad: i32,
     active_cmd_vel: Option<SimTimedAction>,
     heartbeat_stop_at_ms: Option<u32>,
     odometry_reset_count: u32,
@@ -1946,10 +2148,20 @@ impl SimCockpit {
                     .into_iter()
                     .map(ToOwned::to_owned)
                     .collect(),
-                sensors: ["bump", "cliff", "wheel_drop", "battery", "odometry"]
-                    .into_iter()
-                    .map(ToOwned::to_owned)
-                    .collect(),
+                sensors: [
+                    "bump",
+                    "cliff",
+                    "wheel_drop",
+                    "wall",
+                    "virtual_wall",
+                    "ir",
+                    "buttons",
+                    "battery",
+                    "odometry_delta",
+                ]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
                 outputs: ["drive", "lights", "song"]
                     .into_iter()
                     .map(ToOwned::to_owned)
@@ -1968,6 +2180,16 @@ impl SimCockpit {
                     "motion_stopped",
                     "safety_tripped",
                     "safety_cleared",
+                    "bump_changed",
+                    "cliff_changed",
+                    "wheel_drop_latched",
+                    "wheel_drop_cleared",
+                    "wall_changed",
+                    "virtual_wall_changed",
+                    "battery_low",
+                    "charging_state_changed",
+                    "buttons_changed",
+                    "ir_changed",
                     "heartbeat_expired",
                     "estop_latched",
                     "estop_cleared",
@@ -1990,6 +2212,19 @@ impl SimCockpit {
             armed: false,
             estop_latched: false,
             safety_tripped: false,
+            bump_left: false,
+            bump_right: false,
+            cliff: false,
+            wheel_drop: false,
+            wall: false,
+            virtual_wall: false,
+            buttons: 0,
+            ir_byte: 0,
+            charging_state: 0,
+            battery_charge_mah: 2600,
+            battery_capacity_mah: 2600,
+            odometry_distance_mm: 0,
+            odometry_heading_mrad: 0,
             active_cmd_vel: None,
             heartbeat_stop_at_ms: None,
             odometry_reset_count: 0,
@@ -2025,8 +2260,103 @@ impl SimCockpit {
         self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
     }
 
+    pub fn set_bump(&mut self, left: bool, right: bool) {
+        if self.bump_left == left && self.bump_right == right {
+            return;
+        }
+        self.bump_left = left;
+        self.bump_right = right;
+        self.push_event(CockpitEventKind::BumpChanged, (left || right) as u32, 0, 0);
+    }
+
+    pub fn set_cliff(&mut self, active: bool) {
+        if self.cliff == active {
+            return;
+        }
+        self.cliff = active;
+        self.push_event(CockpitEventKind::CliffChanged, active as u32, 0, 0);
+    }
+
+    pub fn set_wheel_drop(&mut self, active: bool) {
+        if self.wheel_drop == active {
+            return;
+        }
+        self.wheel_drop = active;
+        if active {
+            self.safety_tripped = true;
+            self.interrupt_active_motion();
+            self.push_event(CockpitEventKind::WheelDropLatched, 1, 0, 0);
+            self.push_event(CockpitEventKind::SafetyTripped, 3, 0, 0);
+            self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
+        } else {
+            self.safety_tripped = self.estop_latched || self.cliff;
+            self.push_event(CockpitEventKind::WheelDropCleared, 0, 0, 0);
+            self.push_event(CockpitEventKind::SafetyCleared, 3, 0, 0);
+        }
+    }
+
+    pub fn set_wall(&mut self, active: bool) {
+        if self.wall == active {
+            return;
+        }
+        self.wall = active;
+        self.push_event(CockpitEventKind::WallChanged, active as u32, 0, 0);
+    }
+
+    pub fn set_virtual_wall(&mut self, active: bool) {
+        if self.virtual_wall == active {
+            return;
+        }
+        self.virtual_wall = active;
+        self.push_event(CockpitEventKind::VirtualWallChanged, active as u32, 0, 0);
+    }
+
+    pub fn set_battery(&mut self, charge_mah: u32, capacity_mah: u32) {
+        self.battery_charge_mah = charge_mah;
+        self.battery_capacity_mah = capacity_mah;
+        if self.battery_percent().is_some_and(|percent| percent <= 20) {
+            self.push_event(
+                CockpitEventKind::BatteryLow,
+                self.battery_percent().unwrap_or(0) as u32,
+                0,
+                0,
+            );
+        }
+    }
+
+    pub fn set_charging_state(&mut self, state: u8) {
+        if self.charging_state == state {
+            return;
+        }
+        self.charging_state = state;
+        self.push_event(CockpitEventKind::ChargingStateChanged, state as u32, 0, 0);
+    }
+
+    pub fn set_buttons(&mut self, buttons: u8) {
+        if self.buttons == buttons {
+            return;
+        }
+        self.buttons = buttons;
+        self.push_event(CockpitEventKind::ButtonsChanged, buttons as u32, 0, 0);
+    }
+
+    pub fn set_ir_byte(&mut self, ir_byte: u8) {
+        if self.ir_byte == ir_byte {
+            return;
+        }
+        self.ir_byte = ir_byte;
+        self.push_event(CockpitEventKind::IrChanged, ir_byte as u32, 0, 0);
+    }
+
     pub fn odometry_reset_count(&self) -> u32 {
         self.odometry_reset_count
+    }
+
+    fn battery_percent(&self) -> Option<u8> {
+        battery_percent(
+            Some(self.battery_charge_mah),
+            Some(self.battery_capacity_mah),
+        )
     }
 
     fn accept_command(&mut self) -> u32 {
@@ -2165,13 +2495,31 @@ impl Cockpit for SimCockpit {
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
-                "OK 0 STATUS sim=true now_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} odometry_resets={}",
+                "OK 0 STATUS sim=true now_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={}",
                 self.now_ms,
                 self.armed,
                 self.estop_latched,
                 self.safety_tripped,
                 self.active_cmd_vel.is_some(),
-                self.odometry_reset_count
+                self.bump_left,
+                self.bump_right,
+                self.cliff,
+                self.cliff,
+                self.cliff,
+                self.cliff,
+                self.wheel_drop,
+                self.wall,
+                self.virtual_wall,
+                self.ir_byte,
+                self.buttons,
+                self.charging_state,
+                self.battery_charge_mah,
+                self.battery_capacity_mah,
+                if self.battery_capacity_mah == 0 { 0 } else { 14_400 },
+                0,
+                self.odometry_reset_count,
+                self.odometry_distance_mm,
+                self.odometry_heading_mrad
             ),
         })
     }
@@ -2284,6 +2632,8 @@ impl Cockpit for SimCockpit {
     fn reset_odometry(&mut self) -> Result<()> {
         let id = self.accept_command();
         self.odometry_reset_count = self.odometry_reset_count.saturating_add(1);
+        self.odometry_distance_mm = 0;
+        self.odometry_heading_mrad = 0;
         self.complete_command(id);
         Ok(())
     }
@@ -3039,6 +3389,10 @@ fn number_for(line: &str, key: &str) -> Option<u32> {
     value_for(line, key)?.parse().ok()
 }
 
+fn signed_number_for(line: &str, key: &str) -> Option<i32> {
+    value_for(line, key)?.parse().ok()
+}
+
 fn bool_for(line: &str, key: &str) -> Option<bool> {
     match value_for(line, key)? {
         "true" | "1" | "on" | "yes" => Some(true),
@@ -3059,6 +3413,13 @@ fn json_u32_value(value: &serde_json::Value, key: &str) -> Option<u32> {
     value
         .get(key)?
         .as_u64()
+        .and_then(|value| value.try_into().ok())
+}
+
+fn json_i32_value(value: &serde_json::Value, key: &str) -> Option<i32> {
+    value
+        .get(key)?
+        .as_i64()
         .and_then(|value| value.try_into().ok())
 }
 
@@ -3419,6 +3780,107 @@ mod tests {
         assert_eq!(sim.odometry_reset_count(), 1);
         let status = sim.get_status().unwrap();
         assert!(status.raw.contains("odometry_resets=1"));
+        assert_eq!(status.summary().odometry.reset_count, Some(1));
+        assert_eq!(status.summary().odometry.distance_mm, Some(0));
+    }
+
+    #[test]
+    fn simulator_builtin_sensor_edges_trip_and_clear() {
+        let mut sim = SimCockpit::new();
+        sim.set_bump(true, false);
+        sim.set_bump(false, false);
+        sim.set_cliff(true);
+        sim.set_cliff(false);
+        sim.set_wall(true);
+        sim.set_wall(false);
+        sim.set_virtual_wall(true);
+        sim.set_virtual_wall(false);
+
+        let batch = sim.get_events_since(0).unwrap();
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .filter(|event| event.kind == CockpitEventKind::BumpChanged)
+                .count(),
+            2
+        );
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .filter(|event| event.kind == CockpitEventKind::CliffChanged)
+                .count(),
+            2
+        );
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::WallChanged && event.a == 1));
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::VirtualWallChanged && event.a == 0));
+    }
+
+    #[test]
+    fn simulator_wheel_drop_latches_and_clears() {
+        let mut sim = SimCockpit::new();
+        sim.cmd_vel(70, 0, 1_000).unwrap();
+        sim.set_wheel_drop(true);
+        sim.set_wheel_drop(false);
+
+        let batch = sim.get_events_since(0).unwrap();
+        assert!(batch.has_stop_reason());
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::WheelDropLatched));
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::WheelDropCleared));
+    }
+
+    #[test]
+    fn simulator_low_battery_and_charging_state_change() {
+        let mut sim = SimCockpit::new();
+        sim.set_battery(400, 2600);
+        sim.set_charging_state(2);
+
+        let status = sim.get_status().unwrap().summary();
+        assert_eq!(status.battery.percent, Some(15));
+        assert_eq!(status.battery.low, Some(true));
+        assert_eq!(status.battery.charging_state, Some(2));
+
+        let batch = sim.get_events_since(0).unwrap();
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::BatteryLow && event.a == 15));
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::ChargingStateChanged && event.a == 2));
+    }
+
+    #[test]
+    fn simulator_buttons_and_ir_changes_are_events() {
+        let mut sim = SimCockpit::new();
+        sim.set_buttons(0b0000_0011);
+        sim.set_ir_byte(248);
+
+        let status = sim.get_status().unwrap().summary();
+        assert_eq!(status.contact.any_contact(), Some(false));
+        let batch = sim.get_events_since(0).unwrap();
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::ButtonsChanged && event.a == 3));
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::IrChanged && event.a == 248));
     }
 
     #[test]

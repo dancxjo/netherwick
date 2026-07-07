@@ -82,6 +82,7 @@ static CREATE_SENSOR_CLIFF_LEFT_SIGNAL: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CLIFF_RIGHT_SIGNAL: AtomicU32 = AtomicU32::new(0);
+static BATTERY_LOW_LATCHED: AtomicU8 = AtomicU8::new(0);
 static PENDING_SONG_TONES: [AtomicU32; MAX_SONG_TONES] =
     [const { AtomicU32::new(0) }; MAX_SONG_TONES];
 static CREATE_SONG_LAST_DEFINED_ID: AtomicU8 = AtomicU8::new(0);
@@ -295,10 +296,16 @@ pub enum PublicEventKind {
     CliffChanged = 19,
     WheelDropLatched = 20,
     WheelDropCleared = 21,
-    HeartbeatExpired = 22,
-    EStopLatched = 23,
-    EStopCleared = 24,
-    Error = 25,
+    WallChanged = 22,
+    VirtualWallChanged = 23,
+    BatteryLow = 24,
+    ChargingStateChanged = 25,
+    ButtonsChanged = 26,
+    IrChanged = 27,
+    HeartbeatExpired = 28,
+    EStopLatched = 29,
+    EStopCleared = 30,
+    Error = 31,
 }
 
 #[derive(Clone, Copy)]
@@ -1402,24 +1409,67 @@ pub fn mark_uart_packet(len: usize) {
 }
 
 pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
+    let old_flags = CREATE_SENSOR_FLAGS.load(Ordering::Relaxed);
+    let new_flags = merge_create_sensor_flags(packet_id, old_flags, create_sensor_flags_bits(sensors));
+    let old_ir_byte = CREATE_SENSOR_IR_BYTE.load(Ordering::Relaxed);
+    let old_buttons = CREATE_SENSOR_BUTTONS.load(Ordering::Relaxed);
+    let old_charging_state = CREATE_SENSOR_CHARGING_STATE.load(Ordering::Relaxed);
+    let old_charge = CREATE_SENSOR_CHARGE_MAH.load(Ordering::Relaxed) as u16;
+    let old_capacity = CREATE_SENSOR_CAPACITY_MAH.load(Ordering::Relaxed) as u16;
+    let new_charge = if create_packet_has_charge(packet_id) {
+        sensors.charge_mah
+    } else {
+        old_charge
+    };
+    let new_capacity = if create_packet_has_capacity(packet_id) {
+        sensors.capacity_mah
+    } else {
+        old_capacity
+    };
+
     CREATE_SENSOR_LAST_PACKET_ID.store(packet_id, Ordering::Relaxed);
-    CREATE_SENSOR_FLAGS.store(create_sensor_flags_bits(sensors), Ordering::Relaxed);
+    CREATE_SENSOR_FLAGS.store(new_flags, Ordering::Relaxed);
     CREATE_SENSOR_DISTANCE_MM.store(encode_signed_i16(sensors.distance_mm), Ordering::Relaxed);
     CREATE_SENSOR_ANGLE_MRAD.store(encode_signed_i16(sensors.angle_mrad), Ordering::Relaxed);
-    CREATE_SENSOR_IR_BYTE.store(sensors.ir_byte, Ordering::Relaxed);
-    CREATE_SENSOR_BUTTONS.store(sensors.buttons, Ordering::Relaxed);
-    CREATE_SENSOR_CHARGING_STATE.store(sensors.charging_state, Ordering::Relaxed);
-    CREATE_SENSOR_VOLTAGE_MV.store(sensors.voltage_mv as u32, Ordering::Relaxed);
-    CREATE_SENSOR_CURRENT_MA.store(encode_signed_i16(sensors.current_ma), Ordering::Relaxed);
-    CREATE_SENSOR_TEMPERATURE_C.store(encode_signed_i8(sensors.temperature_c), Ordering::Relaxed);
-    CREATE_SENSOR_CHARGE_MAH.store(sensors.charge_mah as u32, Ordering::Relaxed);
-    CREATE_SENSOR_CAPACITY_MAH.store(sensors.capacity_mah as u32, Ordering::Relaxed);
-    CREATE_SENSOR_CLIFF_LEFT_SIGNAL.store(sensors.cliff_left_signal as u32, Ordering::Relaxed);
-    CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL
-        .store(sensors.cliff_front_left_signal as u32, Ordering::Relaxed);
-    CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL
-        .store(sensors.cliff_front_right_signal as u32, Ordering::Relaxed);
-    CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(sensors.cliff_right_signal as u32, Ordering::Relaxed);
+    if create_packet_has_ir(packet_id) {
+        CREATE_SENSOR_IR_BYTE.store(sensors.ir_byte, Ordering::Relaxed);
+    }
+    if create_packet_has_buttons(packet_id) {
+        CREATE_SENSOR_BUTTONS.store(sensors.buttons, Ordering::Relaxed);
+    }
+    if create_packet_has_charging_state(packet_id) {
+        CREATE_SENSOR_CHARGING_STATE.store(sensors.charging_state, Ordering::Relaxed);
+    }
+    if create_packet_has_voltage(packet_id) {
+        CREATE_SENSOR_VOLTAGE_MV.store(sensors.voltage_mv as u32, Ordering::Relaxed);
+    }
+    if create_packet_has_current(packet_id) {
+        CREATE_SENSOR_CURRENT_MA.store(encode_signed_i16(sensors.current_ma), Ordering::Relaxed);
+    }
+    if create_packet_has_temperature(packet_id) {
+        CREATE_SENSOR_TEMPERATURE_C
+            .store(encode_signed_i8(sensors.temperature_c), Ordering::Relaxed);
+    }
+    if create_packet_has_charge(packet_id) {
+        CREATE_SENSOR_CHARGE_MAH.store(sensors.charge_mah as u32, Ordering::Relaxed);
+    }
+    if create_packet_has_capacity(packet_id) {
+        CREATE_SENSOR_CAPACITY_MAH.store(sensors.capacity_mah as u32, Ordering::Relaxed);
+    }
+    if create_packet_has_cliff_left_signal(packet_id) {
+        CREATE_SENSOR_CLIFF_LEFT_SIGNAL.store(sensors.cliff_left_signal as u32, Ordering::Relaxed);
+    }
+    if create_packet_has_cliff_front_left_signal(packet_id) {
+        CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL
+            .store(sensors.cliff_front_left_signal as u32, Ordering::Relaxed);
+    }
+    if create_packet_has_cliff_front_right_signal(packet_id) {
+        CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL
+            .store(sensors.cliff_front_right_signal as u32, Ordering::Relaxed);
+    }
+    if create_packet_has_cliff_right_signal(packet_id) {
+        CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(sensors.cliff_right_signal as u32, Ordering::Relaxed);
+    }
     // Create OI packets 0, 19, and 20 contain distance/angle deltas since
     // the last requested packet. Other packets are snapshots and must not be
     // integrated into odometry.
@@ -1429,6 +1479,22 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     if create_packet_has_angle_delta(packet_id) {
         add_signed(&ODOMETRY_HEADING_MRAD, sensors.angle_mrad as i32);
     }
+
+    record_sensor_edge_events(
+        packet_id,
+        old_flags,
+        new_flags,
+        old_ir_byte,
+        sensors.ir_byte,
+        old_buttons,
+        sensors.buttons,
+        old_charging_state,
+        sensors.charging_state,
+        old_charge,
+        old_capacity,
+        new_charge,
+        new_capacity,
+    );
 }
 
 pub fn mark_song_defined(id: u8, tone_count: u8) {
@@ -1475,6 +1541,30 @@ pub fn mark_bump_changed(active: bool) {
 
 pub fn mark_cliff_changed(active: bool) {
     record_public_event(PublicEventKind::CliffChanged, active as u32, 0, 0);
+}
+
+pub fn mark_wall_changed(active: bool) {
+    record_public_event(PublicEventKind::WallChanged, active as u32, 0, 0);
+}
+
+pub fn mark_virtual_wall_changed(active: bool) {
+    record_public_event(PublicEventKind::VirtualWallChanged, active as u32, 0, 0);
+}
+
+pub fn mark_battery_low(percent: u8) {
+    record_public_event(PublicEventKind::BatteryLow, percent as u32, 0, 0);
+}
+
+pub fn mark_charging_state_changed(state: u8) {
+    record_public_event(PublicEventKind::ChargingStateChanged, state as u32, 0, 0);
+}
+
+pub fn mark_buttons_changed(buttons: u8) {
+    record_public_event(PublicEventKind::ButtonsChanged, buttons as u32, 0, 0);
+}
+
+pub fn mark_ir_changed(ir_byte: u8) {
+    record_public_event(PublicEventKind::IrChanged, ir_byte as u32, 0, 0);
 }
 
 pub fn mark_wheel_drop_latched() {
@@ -1862,12 +1952,135 @@ fn create_sensor_flags_bits(sensors: CreateSensorPacket) -> u32 {
         | ((flags.overcurrent as u32) << 9)
 }
 
+fn merge_create_sensor_flags(packet_id: u8, old_flags: u32, packet_flags: u32) -> u32 {
+    let mask = match packet_id {
+        0 => 0b11_1111_1111,
+        7 => (1 << 0) | (1 << 1) | (1 << 2),
+        8 => 1 << 3,
+        9 => 1 << 4,
+        10 => 1 << 5,
+        11 => 1 << 6,
+        12 => 1 << 7,
+        13 => 1 << 8,
+        14 => 1 << 9,
+        _ => 0,
+    };
+    (old_flags & !mask) | (packet_flags & mask)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_sensor_edge_events(
+    packet_id: u8,
+    old_flags: u32,
+    new_flags: u32,
+    old_ir_byte: u8,
+    new_ir_byte: u8,
+    old_buttons: u8,
+    new_buttons: u8,
+    old_charging_state: u8,
+    new_charging_state: u8,
+    old_charge: u16,
+    old_capacity: u16,
+    new_charge: u16,
+    new_capacity: u16,
+) {
+    if changed(old_flags, new_flags, 1 << 3) {
+        mark_wall_changed(new_flags & (1 << 3) != 0);
+    }
+    if changed(old_flags, new_flags, 1 << 8) {
+        mark_virtual_wall_changed(new_flags & (1 << 8) != 0);
+    }
+    if create_packet_has_charging_state(packet_id) && old_charging_state != new_charging_state {
+        mark_charging_state_changed(new_charging_state);
+    }
+    if create_packet_has_buttons(packet_id) && old_buttons != new_buttons {
+        mark_buttons_changed(new_buttons);
+    }
+    if create_packet_has_ir(packet_id) && old_ir_byte != new_ir_byte {
+        mark_ir_changed(new_ir_byte);
+    }
+
+    let old_percent = battery_percent(old_charge, old_capacity);
+    let new_percent = battery_percent(new_charge, new_capacity);
+    if let Some(percent) = new_percent {
+        let old_low = old_percent.is_some_and(|value| value <= 20);
+        let new_low = percent <= 20;
+        let latched = BATTERY_LOW_LATCHED.load(Ordering::Relaxed) != 0;
+        if new_low && (!old_low || !latched) {
+            mark_battery_low(percent);
+            BATTERY_LOW_LATCHED.store(1, Ordering::Relaxed);
+        } else if !new_low {
+            BATTERY_LOW_LATCHED.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+fn changed(old_flags: u32, new_flags: u32, mask: u32) -> bool {
+    old_flags & mask != new_flags & mask
+}
+
+fn battery_percent(charge_mah: u16, capacity_mah: u16) -> Option<u8> {
+    if capacity_mah == 0 {
+        None
+    } else {
+        Some(((charge_mah as u32 * 100) / capacity_mah as u32).min(100) as u8)
+    }
+}
+
 fn create_packet_has_distance_delta(packet_id: u8) -> bool {
     matches!(packet_id, 0 | 19)
 }
 
 fn create_packet_has_angle_delta(packet_id: u8) -> bool {
     matches!(packet_id, 0 | 20)
+}
+
+fn create_packet_has_ir(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 17)
+}
+
+fn create_packet_has_buttons(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 18)
+}
+
+fn create_packet_has_charging_state(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 21)
+}
+
+fn create_packet_has_voltage(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 22)
+}
+
+fn create_packet_has_current(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 23)
+}
+
+fn create_packet_has_temperature(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 24)
+}
+
+fn create_packet_has_charge(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 25)
+}
+
+fn create_packet_has_capacity(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 26)
+}
+
+fn create_packet_has_cliff_left_signal(packet_id: u8) -> bool {
+    matches!(packet_id, 28)
+}
+
+fn create_packet_has_cliff_front_left_signal(packet_id: u8) -> bool {
+    matches!(packet_id, 29)
+}
+
+fn create_packet_has_cliff_front_right_signal(packet_id: u8) -> bool {
+    matches!(packet_id, 30)
+}
+
+fn create_packet_has_cliff_right_signal(packet_id: u8) -> bool {
+    matches!(packet_id, 31)
 }
 
 fn encode_signed_i16(value: i16) -> u32 {
@@ -2258,6 +2471,12 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
         x if x == PublicEventKind::CliffChanged as u8 => "cliff_changed",
         x if x == PublicEventKind::WheelDropLatched as u8 => "wheel_drop_latched",
         x if x == PublicEventKind::WheelDropCleared as u8 => "wheel_drop_cleared",
+        x if x == PublicEventKind::WallChanged as u8 => "wall_changed",
+        x if x == PublicEventKind::VirtualWallChanged as u8 => "virtual_wall_changed",
+        x if x == PublicEventKind::BatteryLow as u8 => "battery_low",
+        x if x == PublicEventKind::ChargingStateChanged as u8 => "charging_state_changed",
+        x if x == PublicEventKind::ButtonsChanged as u8 => "buttons_changed",
+        x if x == PublicEventKind::IrChanged as u8 => "ir_changed",
         x if x == PublicEventKind::HeartbeatExpired as u8 => "heartbeat_expired",
         x if x == PublicEventKind::EStopLatched as u8 => "estop_latched",
         x if x == PublicEventKind::EStopCleared as u8 => "estop_cleared",
