@@ -18,6 +18,7 @@ pub enum UartReadError {
 pub trait BrainstemHardware {
     fn delay_ms(&mut self, ms: u32);
     fn now_us(&mut self) -> u32;
+    fn feed_watchdog(&mut self);
 
     fn set_power_toggle(&mut self, high: bool);
     fn set_brc(&mut self, high: bool);

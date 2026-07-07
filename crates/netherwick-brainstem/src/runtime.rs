@@ -180,7 +180,7 @@ where
     pub fn tick(&mut self) {
         status::set_runtime_action(self.active_action_code());
         self.poll();
-        self.feed_watchdog_placeholder();
+        self.hardware.feed_watchdog();
         if let Err(error) = self.poll_sensor_stream() {
             self.enter_error(error);
             return;
@@ -1375,11 +1375,6 @@ where
             }
             self.last_wheel_drop = wheel_drop;
         }
-    }
-
-    fn feed_watchdog_placeholder(&mut self) {
-        // Hardware watchdog feeding belongs here once a backend exposes it.
-        // It must remain owned by this safety/runtime lane, not Wi-Fi.
     }
 }
 

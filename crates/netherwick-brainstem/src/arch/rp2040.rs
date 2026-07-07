@@ -116,6 +116,10 @@ impl BrainstemHardware for Rp2040Brainstem {
         self.timer.get_counter_low()
     }
 
+    fn feed_watchdog(&mut self) {
+        // The bare RP2040 demo backend does not enable the watchdog yet.
+    }
+
     fn set_power_toggle(&mut self, high: bool) {
         set_pin(&mut self.power_toggle, high);
     }

@@ -1836,6 +1836,18 @@ const fn event_index(seq: u32) -> usize {
     seq as usize % EVENT_LOG_CAPACITY
 }
 
+#[cfg(test)]
+fn reset_event_log_for_test() {
+    EVENT_NEXT_SEQ.store(1, Ordering::Relaxed);
+    for index in 0..EVENT_LOG_CAPACITY {
+        EVENT_SEQ[index].store(0, Ordering::Relaxed);
+        EVENT_KIND[index].store(PublicEventKind::None as u8, Ordering::Relaxed);
+        EVENT_A[index].store(0, Ordering::Relaxed);
+        EVENT_B[index].store(0, Ordering::Relaxed);
+        EVENT_C[index].store(0, Ordering::Relaxed);
+    }
+}
+
 fn create_sensor_flags_bits(sensors: CreateSensorPacket) -> u32 {
     let flags = sensors.flags;
     (flags.bump_left as u32)
@@ -2494,5 +2506,94 @@ fn https_state_text(code: u8) -> &'static str {
     match code {
         x if x == HttpsState::Unavailable as u8 => "unavailable",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect<const N: usize>(since_seq: u32) -> heapless::Vec<PublicEventRecord, N> {
+        let mut records = heapless::Vec::<PublicEventRecord, N>::new();
+        collect_events_since(since_seq, &mut records);
+        records
+    }
+
+    #[test]
+    fn event_log_reports_oldest_next_and_dropped_before() {
+        reset_event_log_for_test();
+        mark_command_completed(10);
+        mark_command_completed(11);
+
+        assert_eq!(event_oldest_seq(), 1);
+        assert_eq!(event_next_seq(), 3);
+        assert_eq!(event_dropped_before_seq(0), 0);
+        let records = collect::<4>(0);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].seq, 1);
+        assert_eq!(records[1].seq, 2);
+    }
+
+    #[test]
+    fn event_log_ring_overwrite_reports_dropped_before_seq() {
+        reset_event_log_for_test();
+        for command_id in 0..(EVENT_LOG_CAPACITY as u32 + 4) {
+            mark_command_completed(command_id);
+        }
+
+        assert_eq!(event_next_seq(), EVENT_LOG_CAPACITY as u32 + 5);
+        assert_eq!(event_oldest_seq(), 5);
+        assert_eq!(event_dropped_before_seq(0), 5);
+        let records = collect::<EVENT_LOG_CAPACITY>(0);
+        assert_eq!(records.len(), EVENT_LOG_CAPACITY);
+        assert_eq!(records[0].seq, 5);
+        assert_eq!(records.last().unwrap().seq, EVENT_LOG_CAPACITY as u32 + 4);
+    }
+
+    #[test]
+    fn generic_event_name_rendering_has_stable_fallback() {
+        assert_eq!(
+            public_event_kind_text(PublicEventKind::MotionRequested as u8),
+            "motion_requested"
+        );
+        assert_eq!(public_event_kind_text(250), "none");
+    }
+
+    #[test]
+    fn command_lifecycle_event_ordering() {
+        reset_event_log_for_test();
+        mark_command_started(42, ControlCommandCode::CmdVel as u8);
+        mark_command_completed(42);
+
+        let records = collect::<4>(0);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind, PublicEventKind::CommandStarted as u8);
+        assert_eq!(records[0].a, 42);
+        assert_eq!(records[0].b, ControlCommandCode::CmdVel as u8 as u32);
+        assert_eq!(records[1].kind, PublicEventKind::CommandCompleted as u8);
+        assert_eq!(records[1].a, 42);
+    }
+
+    #[test]
+    fn safety_event_ordering() {
+        reset_event_log_for_test();
+        mark_estop_latched();
+        mark_safety_tripped(SafetyEventKind::EStop);
+        mark_estop_cleared();
+        mark_safety_cleared(SafetyEventKind::EStop);
+
+        let records = collect::<8>(0);
+        let kinds: heapless::Vec<u8, 8> = records.iter().map(|record| record.kind).collect();
+        assert_eq!(
+            kinds.as_slice(),
+            &[
+                PublicEventKind::EStopLatched as u8,
+                PublicEventKind::SafetyTripped as u8,
+                PublicEventKind::EStopCleared as u8,
+                PublicEventKind::SafetyCleared as u8,
+            ]
+        );
+        assert_eq!(records[1].a, SafetyEventKind::EStop as u32);
+        assert_eq!(records[3].a, SafetyEventKind::EStop as u32);
     }
 }

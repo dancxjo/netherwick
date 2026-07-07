@@ -7,6 +7,7 @@ use serialport::SerialPort;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, BrainstemClientError>;
+const DEFAULT_SIM_EVENT_CAPACITY: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum BrainstemClientError {
@@ -159,6 +160,364 @@ impl From<&str> for BrainstemEventKind {
     }
 }
 
+impl BrainstemEventKind {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Boot => "boot",
+            Self::CommandAccepted => "command_accepted",
+            Self::CommandRejected => "command_rejected",
+            Self::CommandStarted => "command_started",
+            Self::CommandCompleted => "command_completed",
+            Self::CommandInterrupted => "command_interrupted",
+            Self::CommandTimedOut => "command_timed_out",
+            Self::BodyPowerRequested => "body_power_requested",
+            Self::BodyPowerChanged => "body_power_changed",
+            Self::BodyModeRequested => "body_mode_requested",
+            Self::BodyModeChanged => "body_mode_changed",
+            Self::TelemetryReceived => "telemetry_received",
+            Self::SensorFrameDecoded => "sensor_frame_decoded",
+            Self::MotionRequested => "motion_requested",
+            Self::MotionStopped => "motion_stopped",
+            Self::SafetyTripped => "safety_tripped",
+            Self::SafetyCleared => "safety_cleared",
+            Self::BumpChanged => "bump_changed",
+            Self::CliffChanged => "cliff_changed",
+            Self::WheelDropLatched => "wheel_drop_latched",
+            Self::WheelDropCleared => "wheel_drop_cleared",
+            Self::HeartbeatExpired => "heartbeat_expired",
+            Self::EStopLatched => "estop_latched",
+            Self::EStopCleared => "estop_cleared",
+            Self::Error => "error",
+            Self::Unknown(kind) => kind.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SimTimedAction {
+    command_id: u32,
+    complete_at_ms: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimBrainstemClient {
+    capabilities: BrainstemCapabilities,
+    events: Vec<BrainstemEvent>,
+    next_event_seq: u32,
+    event_capacity: usize,
+    now_ms: u32,
+    next_command_id: u32,
+    armed: bool,
+    estop_latched: bool,
+    safety_tripped: bool,
+    active_cmd_vel: Option<SimTimedAction>,
+    heartbeat_stop_at_ms: Option<u32>,
+    odometry_reset_count: u32,
+}
+
+impl SimBrainstemClient {
+    pub fn new() -> Self {
+        let mut sim = Self {
+            capabilities: BrainstemCapabilities {
+                body_kind: "sim_create_oi".to_owned(),
+                drive: "differential".to_owned(),
+                verbs: [
+                    "ping",
+                    "arm",
+                    "stop",
+                    "disarm",
+                    "estop",
+                    "clear_estop",
+                    "cmd_vel",
+                    "heartbeat_stop",
+                    "stream_sensors",
+                    "reset_odometry",
+                    "get_capabilities",
+                    "get_events",
+                ]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+                sensors: ["bump", "cliff", "wheel_drop", "battery", "odometry"]
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                outputs: ["drive", "lights", "song"]
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                safety: ["estop", "heartbeat", "bump", "cliff", "wheel_drop"]
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                events: [
+                    "boot",
+                    "command_accepted",
+                    "command_started",
+                    "command_completed",
+                    "command_interrupted",
+                    "motion_requested",
+                    "motion_stopped",
+                    "safety_tripped",
+                    "safety_cleared",
+                    "heartbeat_expired",
+                    "estop_latched",
+                    "estop_cleared",
+                ]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            },
+            events: Vec::new(),
+            next_event_seq: 1,
+            event_capacity: DEFAULT_SIM_EVENT_CAPACITY,
+            now_ms: 0,
+            next_command_id: 1,
+            armed: false,
+            estop_latched: false,
+            safety_tripped: false,
+            active_cmd_vel: None,
+            heartbeat_stop_at_ms: None,
+            odometry_reset_count: 0,
+        };
+        sim.push_event(BrainstemEventKind::Boot, 0, 0, 0);
+        sim
+    }
+
+    pub fn with_event_capacity(mut self, event_capacity: usize) -> Self {
+        self.event_capacity = event_capacity.max(1);
+        self.enforce_event_capacity();
+        self
+    }
+
+    pub fn advance_ms(&mut self, ms: u32) {
+        self.now_ms = self.now_ms.wrapping_add(ms);
+        self.complete_due_cmd_vel();
+        self.expire_heartbeat_if_due();
+    }
+
+    pub fn trip_safety(&mut self) {
+        if self.safety_tripped {
+            return;
+        }
+        self.safety_tripped = true;
+        self.interrupt_active_motion();
+        self.push_event(BrainstemEventKind::SafetyTripped, 1, 0, 0);
+        self.push_event(BrainstemEventKind::MotionStopped, 0, 0, 0);
+    }
+
+    pub fn odometry_reset_count(&self) -> u32 {
+        self.odometry_reset_count
+    }
+
+    fn accept_command(&mut self) -> u32 {
+        let id = self.next_command_id;
+        self.next_command_id = self.next_command_id.wrapping_add(1).max(1);
+        self.push_event(BrainstemEventKind::CommandAccepted, id, 0, 0);
+        self.push_event(BrainstemEventKind::CommandStarted, id, 0, 0);
+        id
+    }
+
+    fn complete_command(&mut self, id: u32) {
+        self.push_event(BrainstemEventKind::CommandCompleted, id, 0, 0);
+    }
+
+    fn push_event(&mut self, kind: BrainstemEventKind, a: u32, b: u32, c: u32) {
+        let seq = self.next_event_seq;
+        self.next_event_seq = self.next_event_seq.wrapping_add(1).max(1);
+        self.events.push(BrainstemEvent { seq, kind, a, b, c });
+        self.enforce_event_capacity();
+    }
+
+    fn enforce_event_capacity(&mut self) {
+        let overflow = self.events.len().saturating_sub(self.event_capacity);
+        if overflow > 0 {
+            self.events.drain(0..overflow);
+        }
+    }
+
+    fn interrupt_active_motion(&mut self) {
+        if let Some(active) = self.active_cmd_vel.take() {
+            self.push_event(
+                BrainstemEventKind::CommandInterrupted,
+                active.command_id,
+                0,
+                0,
+            );
+        }
+    }
+
+    fn complete_due_cmd_vel(&mut self) {
+        let Some(active) = self.active_cmd_vel.clone() else {
+            return;
+        };
+        if !time_reached(self.now_ms, active.complete_at_ms) {
+            return;
+        }
+        self.active_cmd_vel = None;
+        self.push_event(BrainstemEventKind::MotionStopped, 0, 0, 0);
+        self.complete_command(active.command_id);
+    }
+
+    fn expire_heartbeat_if_due(&mut self) {
+        let Some(deadline_ms) = self.heartbeat_stop_at_ms else {
+            return;
+        };
+        if !time_reached(self.now_ms, deadline_ms) {
+            return;
+        }
+        self.heartbeat_stop_at_ms = None;
+        self.interrupt_active_motion();
+        self.safety_tripped = true;
+        self.push_event(BrainstemEventKind::HeartbeatExpired, 0, 0, 0);
+        self.push_event(BrainstemEventKind::SafetyTripped, 5, 0, 0);
+        self.push_event(BrainstemEventKind::MotionStopped, 0, 0, 0);
+    }
+
+    fn oldest_seq(&self) -> u32 {
+        self.events
+            .first()
+            .map(|event| event.seq)
+            .unwrap_or(self.next_event_seq)
+    }
+}
+
+impl Default for SimBrainstemClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrainstemClient for SimBrainstemClient {
+    fn get_status(&mut self) -> Result<BrainstemStatus> {
+        self.complete_due_cmd_vel();
+        self.expire_heartbeat_if_due();
+        Ok(BrainstemStatus {
+            raw: format!(
+                "OK 0 STATUS sim=true now_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} odometry_resets={}",
+                self.now_ms,
+                self.armed,
+                self.estop_latched,
+                self.safety_tripped,
+                self.active_cmd_vel.is_some(),
+                self.odometry_reset_count
+            ),
+        })
+    }
+
+    fn get_capabilities(&mut self) -> Result<BrainstemCapabilities> {
+        Ok(self.capabilities.clone())
+    }
+
+    fn get_events_since(&mut self, since_seq: u32) -> Result<EventBatch> {
+        self.complete_due_cmd_vel();
+        self.expire_heartbeat_if_due();
+        let oldest_seq = self.oldest_seq();
+        let dropped_before_seq = if since_seq.saturating_add(1) < oldest_seq {
+            oldest_seq
+        } else {
+            0
+        };
+        Ok(EventBatch {
+            since_seq,
+            oldest_seq,
+            next_seq: self.next_event_seq,
+            dropped_before_seq,
+            events: self
+                .events
+                .iter()
+                .filter(|event| event.seq > since_seq)
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn arm(&mut self) -> Result<()> {
+        let id = self.accept_command();
+        self.armed = true;
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn disarm(&mut self) -> Result<()> {
+        let id = self.accept_command();
+        self.interrupt_active_motion();
+        self.armed = false;
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        let id = self.accept_command();
+        self.interrupt_active_motion();
+        self.push_event(BrainstemEventKind::MotionStopped, 0, 0, 0);
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn estop(&mut self) -> Result<()> {
+        let id = self.accept_command();
+        self.interrupt_active_motion();
+        self.estop_latched = true;
+        self.safety_tripped = true;
+        self.push_event(BrainstemEventKind::EStopLatched, 1, 0, 0);
+        self.push_event(BrainstemEventKind::SafetyTripped, 4, 0, 0);
+        self.push_event(BrainstemEventKind::MotionStopped, 0, 0, 0);
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn clear_estop(&mut self) -> Result<()> {
+        let id = self.accept_command();
+        self.estop_latched = false;
+        self.safety_tripped = false;
+        self.push_event(BrainstemEventKind::EStopCleared, 0, 0, 0);
+        self.push_event(BrainstemEventKind::SafetyCleared, 4, 0, 0);
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn cmd_vel(&mut self, linear_mm_s: i16, angular_mrad_s: i16, ttl_ms: u32) -> Result<()> {
+        let id = self.accept_command();
+        if self.estop_latched || self.safety_tripped {
+            self.push_event(BrainstemEventKind::CommandRejected, id, 0, 0);
+            return Ok(());
+        }
+        self.interrupt_active_motion();
+        self.push_event(
+            BrainstemEventKind::MotionRequested,
+            pack_i16_pair(linear_mm_s, angular_mrad_s),
+            ttl_ms,
+            0,
+        );
+        self.active_cmd_vel = Some(SimTimedAction {
+            command_id: id,
+            complete_at_ms: self.now_ms.wrapping_add(ttl_ms.max(1)),
+        });
+        Ok(())
+    }
+
+    fn heartbeat_stop(&mut self, timeout_ms: u32) -> Result<()> {
+        let id = self.accept_command();
+        self.heartbeat_stop_at_ms = Some(self.now_ms.wrapping_add(timeout_ms.max(1)));
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn stream_sensors(&mut self, _enabled: bool, _packet_id: u8, _period_ms: u32) -> Result<()> {
+        let id = self.accept_command();
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn reset_odometry(&mut self) -> Result<()> {
+        let id = self.accept_command();
+        self.odometry_reset_count = self.odometry_reset_count.saturating_add(1);
+        self.complete_command(id);
+        Ok(())
+    }
+}
+
 pub struct EventCursor {
     next_seq: u32,
 }
@@ -175,7 +534,7 @@ impl EventCursor {
     pub fn poll<C: BrainstemClient>(&mut self, client: &mut C) -> Result<EventBatch> {
         let batch = client.get_events_since(self.next_seq)?;
         batch.ensure_no_missed_events()?;
-        self.next_seq = batch.next_seq;
+        self.next_seq = batch.next_seq.saturating_sub(1);
         Ok(batch)
     }
 }
@@ -550,22 +909,48 @@ fn parse_events(seq: u32, since_seq: u32, response: &str) -> Result<EventBatch> 
         dropped_before_seq,
         events: Vec::new(),
     };
+    let mut parsed_count = 0usize;
     for chunk in rest.split('|').skip(1) {
         let chunk = chunk.trim();
         let Some((seq_text, tail)) = chunk.split_once(':') else {
-            continue;
+            return Err(BrainstemClientError::BadResponse(response.to_owned()));
         };
         let Some((kind_text, fields)) = tail.split_once(':') else {
-            continue;
+            return Err(BrainstemClientError::BadResponse(response.to_owned()));
         };
         let mut nums = fields.split(',');
+        let event_seq = seq_text
+            .parse()
+            .map_err(|_| BrainstemClientError::BadResponse(response.to_owned()))?;
+        let a = nums
+            .next()
+            .ok_or_else(|| BrainstemClientError::BadResponse(response.to_owned()))?
+            .parse()
+            .map_err(|_| BrainstemClientError::BadResponse(response.to_owned()))?;
+        let b = nums
+            .next()
+            .ok_or_else(|| BrainstemClientError::BadResponse(response.to_owned()))?
+            .parse()
+            .map_err(|_| BrainstemClientError::BadResponse(response.to_owned()))?;
+        let c = nums
+            .next()
+            .ok_or_else(|| BrainstemClientError::BadResponse(response.to_owned()))?
+            .parse()
+            .map_err(|_| BrainstemClientError::BadResponse(response.to_owned()))?;
+        if nums.next().is_some() {
+            return Err(BrainstemClientError::BadResponse(response.to_owned()));
+        }
         batch.events.push(BrainstemEvent {
-            seq: seq_text.parse().unwrap_or(0),
+            seq: event_seq,
             kind: BrainstemEventKind::from(kind_text),
-            a: nums.next().and_then(|n| n.parse().ok()).unwrap_or(0),
-            b: nums.next().and_then(|n| n.parse().ok()).unwrap_or(0),
-            c: nums.next().and_then(|n| n.parse().ok()).unwrap_or(0),
+            a,
+            b,
+            c,
         });
+        parsed_count += 1;
+    }
+    if number_for(header, "count").is_some_and(|count| count as usize != parsed_count) {
+        return Err(BrainstemClientError::BadResponse(response.to_owned()));
     }
     Ok(batch)
 }
@@ -590,9 +975,172 @@ fn number_for(line: &str, key: &str) -> Option<u32> {
     value_for(line, key)?.parse().ok()
 }
 
+fn pack_i16_pair(left: i16, right: i16) -> u32 {
+    ((left as u16 as u32) << 16) | right as u16 as u32
+}
+
+fn time_reached(now_ms: u32, deadline_ms: u32) -> bool {
+    now_ms.wrapping_sub(deadline_ms) < u32::MAX / 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulator_capabilities_round_trip() {
+        let mut sim = SimBrainstemClient::new();
+        let caps = sim.get_capabilities().unwrap();
+        assert_eq!(caps.body_kind, "sim_create_oi");
+        assert_eq!(caps.drive, "differential");
+        assert!(caps.verbs.contains(&"cmd_vel".to_owned()));
+        assert!(caps.events.contains(&"safety_tripped".to_owned()));
+    }
+
+    #[test]
+    fn simulator_event_cursor_happy_path() {
+        let mut sim = SimBrainstemClient::new();
+        let mut cursor = EventCursor::new();
+        let boot = cursor.poll(&mut sim).unwrap();
+        assert_eq!(boot.events[0].kind, BrainstemEventKind::Boot);
+        sim.arm().unwrap();
+        let batch = cursor.poll(&mut sim).unwrap();
+        assert_eq!(cursor.next_seq(), batch.next_seq - 1);
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::CommandCompleted));
+    }
+
+    #[test]
+    fn simulator_detects_missed_events_through_dropped_before_seq() {
+        let mut sim = SimBrainstemClient::new().with_event_capacity(3);
+        for _ in 0..4 {
+            sim.arm().unwrap();
+        }
+        let batch = sim.get_events_since(0).unwrap();
+        assert!(batch.dropped_before_seq > 0);
+        assert!(matches!(
+            batch.ensure_no_missed_events(),
+            Err(BrainstemClientError::MissedEvents { .. })
+        ));
+    }
+
+    #[test]
+    fn simulator_arm_stop_disarm_lifecycle() {
+        let mut sim = SimBrainstemClient::new();
+        sim.arm().unwrap();
+        sim.cmd_vel(50, 0, 100).unwrap();
+        sim.stop().unwrap();
+        sim.disarm().unwrap();
+        let batch = sim.get_events_since(0).unwrap();
+        let kinds: Vec<_> = batch.events.iter().map(|event| &event.kind).collect();
+        assert!(kinds.contains(&&BrainstemEventKind::CommandInterrupted));
+        assert!(kinds.contains(&&BrainstemEventKind::MotionStopped));
+        assert!(kinds.contains(&&BrainstemEventKind::CommandCompleted));
+    }
+
+    #[test]
+    fn simulator_cmd_vel_completes_after_ttl() {
+        let mut sim = SimBrainstemClient::new();
+        sim.cmd_vel(70, 10, 300).unwrap();
+        sim.advance_ms(299);
+        assert!(!sim
+            .get_events_since(0)
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::MotionStopped));
+        sim.advance_ms(1);
+        let batch = sim.get_events_since(0).unwrap();
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::MotionStopped));
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::CommandCompleted));
+    }
+
+    #[test]
+    fn simulator_estop_and_clear_estop() {
+        let mut sim = SimBrainstemClient::new();
+        sim.estop().unwrap();
+        sim.clear_estop().unwrap();
+        let batch = sim.get_events_since(0).unwrap();
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::EStopLatched));
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::EStopCleared));
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::SafetyCleared));
+    }
+
+    #[test]
+    fn simulator_heartbeat_expiry_is_stop_reason() {
+        let mut sim = SimBrainstemClient::new();
+        sim.cmd_vel(70, 0, 1_000).unwrap();
+        sim.heartbeat_stop(100).unwrap();
+        sim.advance_ms(100);
+        let batch = sim.get_events_since(0).unwrap();
+        assert!(batch.has_stop_reason());
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::HeartbeatExpired));
+    }
+
+    #[test]
+    fn simulator_safety_tripped_stops_motion_and_rejects_motion() {
+        let mut sim = SimBrainstemClient::new();
+        sim.cmd_vel(70, 0, 1_000).unwrap();
+        sim.trip_safety();
+        sim.cmd_vel(10, 0, 100).unwrap();
+        let batch = sim.get_events_since(0).unwrap();
+        assert!(batch.has_stop_reason());
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::CommandRejected));
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == BrainstemEventKind::MotionStopped));
+    }
+
+    #[test]
+    fn simulator_reset_odometry() {
+        let mut sim = SimBrainstemClient::new();
+        sim.reset_odometry().unwrap();
+        assert_eq!(sim.odometry_reset_count(), 1);
+        let status = sim.get_status().unwrap();
+        assert!(status.raw.contains("odometry_resets=1"));
+    }
+
+    #[test]
+    fn parses_ok_and_err_responses() {
+        assert!(expect_ok(2, "OK 2").is_ok());
+        assert!(matches!(
+            expect_ok(2, "ERR 2 parse"),
+            Err(BrainstemClientError::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn parses_status_response_as_raw_status() {
+        expect_ok(9, "OK 9 STATUS runtime=idle demo=idle").unwrap();
+        let status = BrainstemStatus {
+            raw: "OK 9 STATUS runtime=idle demo=idle".to_owned(),
+        };
+        assert!(status.raw.contains("runtime=idle"));
+    }
 
     #[test]
     fn parses_compact_events() {
@@ -607,6 +1155,52 @@ mod tests {
         assert_eq!(batch.events.len(), 2);
         assert_eq!(batch.events[1].kind, BrainstemEventKind::SafetyTripped);
         assert!(batch.has_stop_reason());
+    }
+
+    #[test]
+    fn parses_unknown_event_kinds() {
+        let batch = parse_events(
+            7,
+            12,
+            "OK 7 EVENTS since=12 oldest=13 next=14 dropped_before=0 count=1 | 13:new_future_event:1,2,3",
+        )
+        .unwrap();
+        assert_eq!(
+            batch.events[0].kind,
+            BrainstemEventKind::Unknown("new_future_event".to_owned())
+        );
+        assert_eq!(batch.events[0].kind.as_str(), "new_future_event");
+    }
+
+    #[test]
+    fn rejects_malformed_or_truncated_event_lines() {
+        for line in [
+            "OK 7 EVENTS since=12 oldest=13 next=14 dropped_before=0 count=1 | malformed",
+            "OK 7 EVENTS since=12 oldest=13 next=14 dropped_before=0 count=1 | 13:motion_requested:1,2",
+            "OK 7 EVENTS since=12 oldest=13 next=14 dropped_before=0 count=2 | 13:motion_requested:1,2,3",
+        ] {
+            assert!(matches!(
+                parse_events(7, 12, line),
+                Err(BrainstemClientError::BadResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_large_event_lists_near_response_buffer_limits() {
+        let mut line =
+            String::from("OK 7 EVENTS since=0 oldest=1 next=29 dropped_before=0 count=28");
+        for seq in 1..29 {
+            line.push_str(&format!(
+                " | {seq}:motion_requested:{seq},{},{}",
+                seq + 1,
+                seq + 2
+            ));
+        }
+        assert!(line.len() < DEFAULT_UART_MAX_RESPONSE_LEN);
+        let batch = parse_events(7, 0, &line).unwrap();
+        assert_eq!(batch.events.len(), 28);
+        assert_eq!(batch.events.last().unwrap().seq, 28);
     }
 
     #[test]

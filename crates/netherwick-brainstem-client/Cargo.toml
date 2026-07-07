@@ -16,3 +16,7 @@ path = "examples/servo_loop.rs"
 [[example]]
 name = "uart_servo_loop"
 path = "examples/uart_servo_loop.rs"
+
+[[example]]
+name = "sim_servo_loop"
+path = "examples/sim_servo_loop.rs"

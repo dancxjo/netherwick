@@ -186,11 +186,11 @@ Motion events pack wheel speeds or duration, sensor-frame events carry the body 
 
 The current internal Rust enums still include Create-specific variants such as `CreateOiMode`, `CreatePacketReceived`, and `CreateSensorPacketDecoded`. Those are driver/runtime implementation details, not the clean public vocabulary. Public capability and event renderers translate them into body-neutral names.
 
-Smart controller verbs are one-shot step primitives. `face_bearing`, `track_bearing`, `hold_heading`, `wall_follow`, `dock_align`, and `creep_until` consume the supplied current error/range and emit a short motion pulse or stop. The forebrain must keep updating target error/range if it wants closed-loop behavior across time.
+Smart controller verbs are one-shot/TTL step primitives. `face_bearing`, `track_bearing`, `hold_heading`, `turn_to_heading`, `dock_align`, `wall_follow`, and `creep_until` consume the supplied current error/range and emit a short motion pulse or stop. The host must repeatedly send fresh target error/range samples if it wants closed-loop behavior across time.
 
 Odometry is currently a lightweight accumulator over decoded Create distance/angle deltas. Only packet `0`, `19`, and `20` update odometry: packet `0` carries both distance and angle deltas, packet `19` carries distance, and packet `20` carries angle. Other decoded sensor packets update status and events but do not integrate into odometry. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
 
-Create OI power, BRC, Open Interface start, Safe mode, watchdog stop, and recovery remain owned by the brainstem runtime and Create body driver. The hardware watchdog feed point is reserved in the safety/runtime tick and must remain owned by that lane, not Wi-Fi or the forebrain interface.
+Create OI power, BRC, Open Interface start, Safe mode, watchdog stop, and recovery remain owned by the brainstem runtime and Create body driver. Hardware watchdog support is plumbed through the `BrainstemHardware::feed_watchdog` hook and called from the runtime safety lane. The current RP2040/Pico W backends still no-op that hook until the hardware watchdog is deliberately enabled.
 
 ## Current Boundaries
 
@@ -212,7 +212,19 @@ Known remaining TODOs:
 - Promote body descriptors from generated constants into a stronger typed driver contract.
 - Expand odometry from accumulated distance/heading deltas into pose integration plus get/set/calibrate verbs.
 - Add a child-step field for compound verbs that expand into multiple runtime steps under one external command id.
-- Implement the hardware watchdog feed in the runtime lane when the backend exposes it.
+- Enable a real hardware watchdog feed in the RP2040/Pico W backend once reset timing and bring-up policy are settled.
+
+## Bring-Up Ladder
+
+Start without robot hardware and climb only when the previous rung is boring:
+
+1. Simulator tests: `cargo test -p netherwick-brainstem-client`.
+2. Local simulator smoke loop: `cargo run -p netherwick-brainstem-client --example sim_servo_loop`.
+3. UDP smoke test against a powered brainstem: `GET_CAPABILITIES`, `GET_EVENTS`, then a low-TTL `CMD_VEL`.
+4. UART smoke test over the forebrain link with the same compact protocol.
+5. Robot attached, wheels off floor: arm, heartbeat, short low-speed motion, stop, event cursor check.
+6. Robot attached, low-speed motion on the floor with clear space and an operator stop path.
+7. Motherbrain/forebrain integration later, after the brainstem contract and safety events remain stable under the local tests.
 
 ## Build
 

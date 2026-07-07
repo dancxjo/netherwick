@@ -109,6 +109,11 @@ impl BrainstemHardware for PicoWBrainstem {
         Instant::now().as_micros() as u32
     }
 
+    fn feed_watchdog(&mut self) {
+        // Watchdog plumbing is owned by the runtime safety lane; this Pico W
+        // backend currently leaves the hardware watchdog disabled.
+    }
+
     fn set_power_toggle(&mut self, high: bool) {
         self.power_toggle.set_level(level(high));
     }

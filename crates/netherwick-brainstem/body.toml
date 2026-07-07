@@ -43,6 +43,8 @@ verbs = [
   "drive_for",
   "turn_by",
   "arc_for",
+  # Step-controller verbs are one-shot/TTL primitives. The host must resend
+  # fresh target error/range samples to get closed-loop behavior over time.
   "creep_until",
   "scan_arc",
   "face_bearing",
