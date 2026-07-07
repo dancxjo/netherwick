@@ -1,7 +1,9 @@
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use crate::body;
-use crate::commands::{BrainstemCommand, CreateOiMode, LightPattern, RuntimeCommand};
+use crate::commands::{
+    BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern, RuntimeCommand,
+};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::UartReadError;
 
@@ -36,6 +38,8 @@ static PENDING_COMMAND_KIND: AtomicU8 = AtomicU8::new(ControlCommandCode::None a
 static PENDING_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_A: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_B: AtomicU32 = AtomicU32::new(0);
+static PENDING_COMMAND_C: AtomicU32 = AtomicU32::new(0);
+static PENDING_COMMAND_D: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_DURATION_MS: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_SEQ: AtomicU32 = AtomicU32::new(0);
 static PENDING_VELOCITY_KIND: AtomicU8 = AtomicU8::new(ControlCommandCode::None as u8);
@@ -131,6 +135,7 @@ enum CommandCode {
     SetOiFull = 7,
     Drive = 8,
     StopDrive = 9,
+    Behavior = 10,
 }
 
 #[derive(Clone, Copy)]
@@ -212,6 +217,12 @@ enum ControlCommandCode {
     Dock = 10,
     SetLights = 11,
     SetMode = 12,
+    FaceBearing = 13,
+    TrackBearing = 14,
+    TurnBy = 15,
+    DriveFor = 16,
+    BumpEscape = 17,
+    HeartbeatStop = 18,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -236,6 +247,12 @@ pub fn set_command(command: Option<RuntimeCommand>) {
         Some(RuntimeCommand::DriveDirect { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::CmdVel { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::DriveArc { .. }) => CommandCode::Drive,
+        Some(RuntimeCommand::FaceBearing { .. })
+        | Some(RuntimeCommand::TrackBearing { .. })
+        | Some(RuntimeCommand::TurnBy { .. })
+        | Some(RuntimeCommand::DriveFor { .. })
+        | Some(RuntimeCommand::BumpEscape { .. })
+        | Some(RuntimeCommand::HeartbeatStop { .. }) => CommandCode::Behavior,
         Some(RuntimeCommand::PulseBrc) => CommandCode::PulseBrc,
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
         Some(RuntimeCommand::Drive { .. }) => CommandCode::Drive,
@@ -254,7 +271,7 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
         return true;
     }
 
-    let Some((kind, a, b, duration_ms)) = encode_control_command(command) else {
+    let Some((kind, a, b, c, d, duration_ms)) = encode_control_command(command) else {
         LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         return false;
     };
@@ -286,6 +303,8 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
     PENDING_COMMAND_ID.store(command_id, Ordering::Relaxed);
     PENDING_COMMAND_A.store(a, Ordering::Relaxed);
     PENDING_COMMAND_B.store(b, Ordering::Relaxed);
+    PENDING_COMMAND_C.store(c, Ordering::Relaxed);
+    PENDING_COMMAND_D.store(d, Ordering::Relaxed);
     PENDING_COMMAND_DURATION_MS.store(duration_ms.unwrap_or(0), Ordering::Relaxed);
     PENDING_COMMAND_SEQ.store(command_seq(command), Ordering::Relaxed);
     PENDING_COMMAND_KIND.store(kind as u8, Ordering::Relaxed);
@@ -298,6 +317,8 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
     if kind != ControlCommandCode::None as u8 {
         let a = PENDING_COMMAND_A.load(Ordering::Relaxed);
         let b = PENDING_COMMAND_B.load(Ordering::Relaxed);
+        let c = PENDING_COMMAND_C.load(Ordering::Relaxed);
+        let d = PENDING_COMMAND_D.load(Ordering::Relaxed);
         let duration = match PENDING_COMMAND_DURATION_MS.load(Ordering::Relaxed) {
             0 => None,
             duration_ms => Some(duration_ms),
@@ -305,7 +326,7 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
         let seq = PENDING_COMMAND_SEQ.load(Ordering::Relaxed);
         PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
 
-        return decode_control_command(kind, a, b, duration, seq);
+        return decode_control_command(kind, a, b, c, d, duration, seq);
     }
 
     let kind = PENDING_VELOCITY_KIND.load(Ordering::Relaxed);
@@ -330,15 +351,15 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
 #[cfg(feature = "pico-w")]
 fn encode_control_command(
     command: BrainstemCommand,
-) -> Option<(ControlCommandCode, u32, u32, Option<u32>)> {
+) -> Option<(ControlCommandCode, u32, u32, u32, u32, Option<u32>)> {
     match command {
-        BrainstemCommand::Ping => Some((ControlCommandCode::Ping, 0, 0, None)),
-        BrainstemCommand::Arm => Some((ControlCommandCode::Arm, 0, 0, None)),
-        BrainstemCommand::Disarm => Some((ControlCommandCode::Disarm, 0, 0, None)),
-        BrainstemCommand::EStop => Some((ControlCommandCode::EStop, 0, 0, None)),
-        BrainstemCommand::ClearEStop => Some((ControlCommandCode::ClearEStop, 0, 0, None)),
-        BrainstemCommand::Stop => Some((ControlCommandCode::Stop, 0, 0, None)),
-        BrainstemCommand::Status => Some((ControlCommandCode::Status, 0, 0, None)),
+        BrainstemCommand::Ping => Some((ControlCommandCode::Ping, 0, 0, 0, 0, None)),
+        BrainstemCommand::Arm => Some((ControlCommandCode::Arm, 0, 0, 0, 0, None)),
+        BrainstemCommand::Disarm => Some((ControlCommandCode::Disarm, 0, 0, 0, 0, None)),
+        BrainstemCommand::EStop => Some((ControlCommandCode::EStop, 0, 0, 0, 0, None)),
+        BrainstemCommand::ClearEStop => Some((ControlCommandCode::ClearEStop, 0, 0, 0, 0, None)),
+        BrainstemCommand::Stop => Some((ControlCommandCode::Stop, 0, 0, 0, 0, None)),
+        BrainstemCommand::Status => Some((ControlCommandCode::Status, 0, 0, 0, 0, None)),
         BrainstemCommand::Bootsel => None,
         BrainstemCommand::SetMode(mode) => Some((
             ControlCommandCode::SetMode,
@@ -347,6 +368,8 @@ fn encode_control_command(
                 CreateOiMode::Safe => 2,
                 CreateOiMode::Full => 3,
             },
+            0,
+            0,
             0,
             None,
         )),
@@ -359,17 +382,98 @@ fn encode_control_command(
             ControlCommandCode::CmdVel,
             encode_i16(linear_mm_s),
             encode_i16(angular_mrad_s),
+            0,
+            0,
             Some(ttl_ms),
         )),
         BrainstemCommand::SongPlay { id } => {
-            Some((ControlCommandCode::SongPlay, id as u32, 0, None))
+            Some((ControlCommandCode::SongPlay, id as u32, 0, 0, 0, None))
         }
-        BrainstemCommand::Dock => Some((ControlCommandCode::Dock, 0, 0, None)),
+        BrainstemCommand::Dock => Some((ControlCommandCode::Dock, 0, 0, 0, 0, None)),
         BrainstemCommand::SetLights { pattern } => Some((
             ControlCommandCode::SetLights,
             encode_light_pattern(pattern) as u32,
             0,
+            0,
+            0,
             None,
+        )),
+        BrainstemCommand::FaceBearing {
+            bearing_mrad,
+            max_angular_mrad_s,
+            tolerance_mrad,
+            ttl_ms,
+            ..
+        } => Some((
+            ControlCommandCode::FaceBearing,
+            encode_i16(bearing_mrad),
+            encode_i16(max_angular_mrad_s),
+            encode_i16(tolerance_mrad),
+            0,
+            Some(ttl_ms),
+        )),
+        BrainstemCommand::TrackBearing {
+            bearing_mrad,
+            range_mm,
+            max_linear_mm_s,
+            max_angular_mrad_s,
+            stop_range_mm,
+            ttl_ms,
+            ..
+        } => Some((
+            ControlCommandCode::TrackBearing,
+            encode_i16(bearing_mrad),
+            range_mm as u32,
+            encode_i16(max_linear_mm_s),
+            pack_i16_u16(max_angular_mrad_s, stop_range_mm),
+            Some(ttl_ms),
+        )),
+        BrainstemCommand::TurnBy {
+            angle_mrad,
+            angular_mrad_s,
+            timeout_ms,
+            ..
+        } => Some((
+            ControlCommandCode::TurnBy,
+            encode_i16(angle_mrad),
+            encode_i16(angular_mrad_s),
+            0,
+            0,
+            Some(timeout_ms),
+        )),
+        BrainstemCommand::DriveFor {
+            distance_mm,
+            velocity_mm_s,
+            timeout_ms,
+            ..
+        } => Some((
+            ControlCommandCode::DriveFor,
+            encode_i16(distance_mm),
+            encode_i16(velocity_mm_s),
+            0,
+            0,
+            Some(timeout_ms),
+        )),
+        BrainstemCommand::BumpEscape {
+            direction,
+            backoff_mm_s,
+            turn_angular_mrad_s,
+            ..
+        } => Some((
+            ControlCommandCode::BumpEscape,
+            encode_escape_direction(direction) as u32,
+            encode_i16(backoff_mm_s),
+            encode_i16(turn_angular_mrad_s),
+            0,
+            None,
+        )),
+        BrainstemCommand::HeartbeatStop { timeout_ms, .. } => Some((
+            ControlCommandCode::HeartbeatStop,
+            0,
+            0,
+            0,
+            0,
+            Some(timeout_ms),
         )),
     }
 }
@@ -378,6 +482,8 @@ fn decode_control_command(
     kind: u8,
     a: u32,
     b: u32,
+    c: u32,
+    d: u32,
     duration_ms: Option<u32>,
     seq: u32,
 ) -> Option<BrainstemCommand> {
@@ -408,6 +514,49 @@ fn decode_control_command(
         x if x == ControlCommandCode::SetLights as u8 => Some(BrainstemCommand::SetLights {
             pattern: decode_light_pattern(a as u8)?,
         }),
+        x if x == ControlCommandCode::FaceBearing as u8 => Some(BrainstemCommand::FaceBearing {
+            bearing_mrad: decode_i16(a),
+            max_angular_mrad_s: decode_i16(b),
+            tolerance_mrad: decode_i16(c),
+            ttl_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::TrackBearing as u8 => {
+            let (max_angular_mrad_s, stop_range_mm) = unpack_i16_u16(d);
+            Some(BrainstemCommand::TrackBearing {
+                bearing_mrad: decode_i16(a),
+                range_mm: b as u16,
+                max_linear_mm_s: decode_i16(c),
+                max_angular_mrad_s,
+                stop_range_mm,
+                ttl_ms: duration_ms?,
+                seq,
+            })
+        }
+        x if x == ControlCommandCode::TurnBy as u8 => Some(BrainstemCommand::TurnBy {
+            angle_mrad: decode_i16(a),
+            angular_mrad_s: decode_i16(b),
+            timeout_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::DriveFor as u8 => Some(BrainstemCommand::DriveFor {
+            distance_mm: decode_i16(a),
+            velocity_mm_s: decode_i16(b),
+            timeout_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::BumpEscape as u8 => Some(BrainstemCommand::BumpEscape {
+            direction: decode_escape_direction(a as u8)?,
+            backoff_mm_s: decode_i16(b),
+            turn_angular_mrad_s: decode_i16(c),
+            seq,
+        }),
+        x if x == ControlCommandCode::HeartbeatStop as u8 => {
+            Some(BrainstemCommand::HeartbeatStop {
+                timeout_ms: duration_ms?,
+                seq,
+            })
+        }
         _ => None,
     }
 }
@@ -415,7 +564,13 @@ fn decode_control_command(
 #[cfg(feature = "pico-w")]
 fn command_seq(command: BrainstemCommand) -> u32 {
     match command {
-        BrainstemCommand::CmdVel { seq, .. } => seq,
+        BrainstemCommand::CmdVel { seq, .. }
+        | BrainstemCommand::FaceBearing { seq, .. }
+        | BrainstemCommand::TrackBearing { seq, .. }
+        | BrainstemCommand::TurnBy { seq, .. }
+        | BrainstemCommand::DriveFor { seq, .. }
+        | BrainstemCommand::BumpEscape { seq, .. }
+        | BrainstemCommand::HeartbeatStop { seq, .. } => seq,
         _ => 0,
     }
 }
@@ -432,6 +587,33 @@ fn encode_i16(value: i16) -> u32 {
 
 fn decode_i16(value: u32) -> i16 {
     value as u16 as i16
+}
+
+#[cfg(feature = "pico-w")]
+fn pack_i16_u16(left: i16, right: u16) -> u32 {
+    ((left as u16 as u32) << 16) | right as u32
+}
+
+fn unpack_i16_u16(value: u32) -> (i16, u16) {
+    ((value >> 16) as u16 as i16, value as u16)
+}
+
+#[cfg(feature = "pico-w")]
+fn encode_escape_direction(direction: EscapeDirection) -> u8 {
+    match direction {
+        EscapeDirection::Left => 1,
+        EscapeDirection::Right => 2,
+        EscapeDirection::Either => 3,
+    }
+}
+
+fn decode_escape_direction(value: u8) -> Option<EscapeDirection> {
+    match value {
+        1 => Some(EscapeDirection::Left),
+        2 => Some(EscapeDirection::Right),
+        3 => Some(EscapeDirection::Either),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "pico-w")]
@@ -958,6 +1140,13 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::SongPlay as u8 => "song_play",
         x if x == ControlCommandCode::Dock as u8 => "dock",
         x if x == ControlCommandCode::SetLights as u8 => "set_lights",
+        x if x == ControlCommandCode::SetMode as u8 => "set_mode",
+        x if x == ControlCommandCode::FaceBearing as u8 => "face_bearing",
+        x if x == ControlCommandCode::TrackBearing as u8 => "track_bearing",
+        x if x == ControlCommandCode::TurnBy as u8 => "turn_by",
+        x if x == ControlCommandCode::DriveFor as u8 => "drive_for",
+        x if x == ControlCommandCode::BumpEscape as u8 => "bump_escape",
+        x if x == ControlCommandCode::HeartbeatStop as u8 => "heartbeat_stop",
         _ => "none",
     }
 }

@@ -1,7 +1,9 @@
 use heapless::Deque;
 
 use crate::body;
-use crate::commands::{BrainstemCommand, RuntimeCommand, ARM_SCRIPT, DEMO_SCRIPT, DISARM_SCRIPT};
+use crate::commands::{
+    BrainstemCommand, EscapeDirection, RuntimeCommand, ARM_SCRIPT, DEMO_SCRIPT, DISARM_SCRIPT,
+};
 use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::BrainstemHardware;
@@ -13,6 +15,10 @@ const RUNTIME_TICK_MS: u32 = 10;
 const SENSOR_PROBE_PERIOD_MS: u32 = 100;
 const WAKE_PROBE_RESPONSE_BYTES_REQUIRED: u8 = 2;
 const CREATE_AXLE_TRACK_MM: i32 = 258;
+const BEARING_SLOWDOWN_MRAD: i32 = 1_000;
+const MIN_TRACK_SPEED_MM_S: i32 = 35;
+const BUMP_ESCAPE_BACKOFF_MS: u32 = 450;
+const BUMP_ESCAPE_TURN_MS: u32 = 650;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -67,6 +73,7 @@ where
     mode: RuntimeMode,
     active: ActiveAction,
     stop_sent: bool,
+    heartbeat_stop_at_ms: Option<u32>,
     error_blink_next_ms: u32,
     error_blink_on: bool,
     error_blink_count: u8,
@@ -96,6 +103,7 @@ where
             mode: RuntimeMode::Running,
             active: ActiveAction::None,
             stop_sent: false,
+            heartbeat_stop_at_ms: None,
             error_blink_next_ms: 0,
             error_blink_on: false,
             error_blink_count: 0,
@@ -131,6 +139,10 @@ where
         status::set_runtime_action(self.active_action_code());
         self.poll();
         self.feed_watchdog_placeholder();
+        if let Err(error) = self.enforce_heartbeat_stop() {
+            self.enter_error(error);
+            return;
+        }
 
         match self.mode {
             RuntimeMode::Running => {
@@ -167,6 +179,7 @@ where
             BrainstemCommand::Stop | BrainstemCommand::EStop => {
                 self.commands.clear();
                 self.active = ActiveAction::None;
+                self.heartbeat_stop_at_ms = None;
                 let command = match command {
                     BrainstemCommand::Stop => RuntimeCommand::Stop,
                     BrainstemCommand::EStop => RuntimeCommand::EStop,
@@ -187,6 +200,7 @@ where
             BrainstemCommand::Disarm => {
                 self.commands.clear();
                 self.active = ActiveAction::None;
+                self.heartbeat_stop_at_ms = None;
                 for command in DISARM_SCRIPT.iter().rev() {
                     let _ = self.commands.push_front(*command);
                 }
@@ -321,10 +335,53 @@ where
                 angular_mrad_s,
                 duration_ms,
             } => {
-                let half_delta = angular_mrad_s as i32 * CREATE_AXLE_TRACK_MM / 2_000;
-                let left = clamp_i16(linear_mm_s as i32 - half_delta);
-                let right = clamp_i16(linear_mm_s as i32 + half_delta);
-                self.start_drive_direct(left, right, duration_ms, now_ms)?;
+                self.start_cmd_vel(linear_mm_s, angular_mrad_s, duration_ms, now_ms)?;
+            }
+            RuntimeCommand::FaceBearing {
+                bearing_mrad,
+                max_angular_mrad_s,
+                tolerance_mrad,
+                duration_ms,
+            } => self.start_face_bearing(
+                bearing_mrad,
+                max_angular_mrad_s,
+                tolerance_mrad,
+                duration_ms,
+                now_ms,
+            )?,
+            RuntimeCommand::TrackBearing {
+                bearing_mrad,
+                range_mm,
+                max_linear_mm_s,
+                max_angular_mrad_s,
+                stop_range_mm,
+                duration_ms,
+            } => self.start_track_bearing(
+                bearing_mrad,
+                range_mm,
+                max_linear_mm_s,
+                max_angular_mrad_s,
+                stop_range_mm,
+                duration_ms,
+                now_ms,
+            )?,
+            RuntimeCommand::TurnBy {
+                angle_mrad,
+                angular_mrad_s,
+                timeout_ms,
+            } => self.start_turn_by(angle_mrad, angular_mrad_s, timeout_ms, now_ms)?,
+            RuntimeCommand::DriveFor {
+                distance_mm,
+                velocity_mm_s,
+                timeout_ms,
+            } => self.start_drive_for(distance_mm, velocity_mm_s, timeout_ms, now_ms)?,
+            RuntimeCommand::BumpEscape {
+                direction,
+                backoff_mm_s,
+                turn_angular_mrad_s,
+            } => self.queue_bump_escape(direction, backoff_mm_s, turn_angular_mrad_s)?,
+            RuntimeCommand::HeartbeatStop { timeout_ms } => {
+                self.heartbeat_stop_at_ms = Some(now_ms.wrapping_add(timeout_ms));
             }
             RuntimeCommand::DriveArc {
                 velocity_mm_s,
@@ -514,6 +571,166 @@ where
         Ok(())
     }
 
+    fn start_cmd_vel(
+        &mut self,
+        linear_mm_s: i16,
+        angular_mrad_s: i16,
+        duration_ms: Option<u32>,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let half_delta = angular_mrad_s as i32 * CREATE_AXLE_TRACK_MM / 2_000;
+        let left = clamp_i16(linear_mm_s as i32 - half_delta);
+        let right = clamp_i16(linear_mm_s as i32 + half_delta);
+        self.start_drive_direct(left, right, duration_ms, now_ms)
+    }
+
+    fn start_face_bearing(
+        &mut self,
+        bearing_mrad: i16,
+        max_angular_mrad_s: i16,
+        tolerance_mrad: i16,
+        ttl_ms: u32,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let error = bearing_mrad as i32;
+        let tolerance = abs_i32(tolerance_mrad as i32);
+        if abs_i32(error) <= tolerance {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
+
+        let max_angular = abs_i32(max_angular_mrad_s as i32);
+        if max_angular == 0 || ttl_ms == 0 {
+            self.stop_drive()?;
+            return Err(BrainstemError::Timeout);
+        }
+
+        let angular = clamp_i16(error.clamp(-max_angular, max_angular));
+        let turn_ms = ((abs_i32(error) - tolerance) as u32)
+            .saturating_mul(1_000)
+            .checked_div(abs_i32(angular as i32) as u32)
+            .unwrap_or(ttl_ms)
+            .max(1)
+            .min(ttl_ms);
+        self.start_cmd_vel(0, angular, Some(turn_ms), now_ms)
+    }
+
+    fn start_track_bearing(
+        &mut self,
+        bearing_mrad: i16,
+        range_mm: u16,
+        max_linear_mm_s: i16,
+        max_angular_mrad_s: i16,
+        stop_range_mm: u16,
+        ttl_ms: u32,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        if ttl_ms == 0 || (stop_range_mm > 0 && range_mm <= stop_range_mm) {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
+
+        let error = bearing_mrad as i32;
+        let max_angular = abs_i32(max_angular_mrad_s as i32);
+        let angular = clamp_i16(error.clamp(-max_angular, max_angular));
+        let slowdown = abs_i32(error).min(BEARING_SLOWDOWN_MRAD);
+        let scale = BEARING_SLOWDOWN_MRAD - slowdown;
+        let max_linear = abs_i32(max_linear_mm_s as i32);
+        let mut linear = max_linear * scale / BEARING_SLOWDOWN_MRAD;
+        if linear > 0 {
+            linear = linear.max(MIN_TRACK_SPEED_MM_S).min(max_linear);
+        }
+        if max_linear_mm_s < 0 {
+            linear = -linear;
+        }
+
+        self.start_cmd_vel(clamp_i16(linear), angular, Some(ttl_ms), now_ms)
+    }
+
+    fn start_turn_by(
+        &mut self,
+        angle_mrad: i16,
+        angular_mrad_s: i16,
+        timeout_ms: u32,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let angle = angle_mrad as i32;
+        let angular_abs = abs_i32(angular_mrad_s as i32);
+        if angle == 0 || angular_abs == 0 || timeout_ms == 0 {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
+
+        let angular = if angle > 0 { angular_abs } else { -angular_abs };
+        let duration_ms = (abs_i32(angle) as u32)
+            .saturating_mul(1_000)
+            .checked_div(angular_abs as u32)
+            .unwrap_or(timeout_ms)
+            .max(1)
+            .min(timeout_ms);
+        self.start_cmd_vel(0, clamp_i16(angular), Some(duration_ms), now_ms)
+    }
+
+    fn start_drive_for(
+        &mut self,
+        distance_mm: i16,
+        velocity_mm_s: i16,
+        timeout_ms: u32,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let distance = distance_mm as i32;
+        let velocity_abs = abs_i32(velocity_mm_s as i32);
+        if distance == 0 || velocity_abs == 0 || timeout_ms == 0 {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
+
+        let velocity = if distance > 0 {
+            velocity_abs
+        } else {
+            -velocity_abs
+        };
+        let duration_ms = (abs_i32(distance) as u32)
+            .saturating_mul(1_000)
+            .checked_div(velocity_abs as u32)
+            .unwrap_or(timeout_ms)
+            .max(1)
+            .min(timeout_ms);
+        self.start_cmd_vel(clamp_i16(velocity), 0, Some(duration_ms), now_ms)
+    }
+
+    fn queue_bump_escape(
+        &mut self,
+        direction: EscapeDirection,
+        backoff_mm_s: i16,
+        turn_angular_mrad_s: i16,
+    ) -> Result<(), BrainstemError> {
+        self.ensure_motion_allowed()?;
+        let backoff = -abs_i32(backoff_mm_s as i32);
+        let turn_abs = abs_i32(turn_angular_mrad_s as i32);
+        let turn = match direction {
+            EscapeDirection::Left => turn_abs,
+            EscapeDirection::Right => -turn_abs,
+            EscapeDirection::Either => turn_abs,
+        };
+        let _ = self.commands.push_front(RuntimeCommand::CmdVel {
+            linear_mm_s: 0,
+            angular_mrad_s: clamp_i16(turn),
+            duration_ms: Some(BUMP_ESCAPE_TURN_MS),
+        });
+        let _ = self.commands.push_front(RuntimeCommand::CmdVel {
+            linear_mm_s: clamp_i16(backoff),
+            angular_mrad_s: 0,
+            duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
+        });
+        self.active = ActiveAction::None;
+        Ok(())
+    }
+
     fn start_drive_direct(
         &mut self,
         left_mm_s: i16,
@@ -582,6 +799,19 @@ where
             return Err(BrainstemError::CreateNoResponse);
         }
         self.ensure_create_responsive()?;
+        Ok(())
+    }
+
+    fn enforce_heartbeat_stop(&mut self) -> Result<(), BrainstemError> {
+        let Some(deadline_ms) = self.heartbeat_stop_at_ms else {
+            return Ok(());
+        };
+        if time_reached(self.now_ms(), deadline_ms) {
+            self.commands.clear();
+            self.active = ActiveAction::None;
+            self.heartbeat_stop_at_ms = None;
+            self.stop_drive()?;
+        }
         Ok(())
     }
 
@@ -689,6 +919,67 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             angular_mrad_s,
             duration_ms: Some(ttl_ms),
         }),
+        BrainstemCommand::FaceBearing {
+            bearing_mrad,
+            max_angular_mrad_s,
+            tolerance_mrad,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::FaceBearing {
+            bearing_mrad,
+            max_angular_mrad_s,
+            tolerance_mrad,
+            duration_ms: ttl_ms,
+        }),
+        BrainstemCommand::TrackBearing {
+            bearing_mrad,
+            range_mm,
+            max_linear_mm_s,
+            max_angular_mrad_s,
+            stop_range_mm,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::TrackBearing {
+            bearing_mrad,
+            range_mm,
+            max_linear_mm_s,
+            max_angular_mrad_s,
+            stop_range_mm,
+            duration_ms: ttl_ms,
+        }),
+        BrainstemCommand::TurnBy {
+            angle_mrad,
+            angular_mrad_s,
+            timeout_ms,
+            ..
+        } => Some(RuntimeCommand::TurnBy {
+            angle_mrad,
+            angular_mrad_s,
+            timeout_ms,
+        }),
+        BrainstemCommand::DriveFor {
+            distance_mm,
+            velocity_mm_s,
+            timeout_ms,
+            ..
+        } => Some(RuntimeCommand::DriveFor {
+            distance_mm,
+            velocity_mm_s,
+            timeout_ms,
+        }),
+        BrainstemCommand::BumpEscape {
+            direction,
+            backoff_mm_s,
+            turn_angular_mrad_s,
+            ..
+        } => Some(RuntimeCommand::BumpEscape {
+            direction,
+            backoff_mm_s,
+            turn_angular_mrad_s,
+        }),
+        BrainstemCommand::HeartbeatStop { timeout_ms, .. } => {
+            Some(RuntimeCommand::HeartbeatStop { timeout_ms })
+        }
         BrainstemCommand::SongPlay { id } => Some(RuntimeCommand::SongPlay { id }),
         BrainstemCommand::Dock => Some(RuntimeCommand::Dock),
         BrainstemCommand::SetLights { pattern } => Some(RuntimeCommand::SetLights { pattern }),
@@ -697,4 +988,8 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
 
 fn clamp_i16(value: i32) -> i16 {
     value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+fn abs_i32(value: i32) -> i32 {
+    value.saturating_abs()
 }

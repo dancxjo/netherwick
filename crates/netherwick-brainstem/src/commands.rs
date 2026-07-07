@@ -20,6 +20,44 @@ pub enum BrainstemCommand {
         ttl_ms: u32,
         seq: u32,
     },
+    FaceBearing {
+        bearing_mrad: i16,
+        max_angular_mrad_s: i16,
+        tolerance_mrad: i16,
+        ttl_ms: u32,
+        seq: u32,
+    },
+    TrackBearing {
+        bearing_mrad: i16,
+        range_mm: u16,
+        max_linear_mm_s: i16,
+        max_angular_mrad_s: i16,
+        stop_range_mm: u16,
+        ttl_ms: u32,
+        seq: u32,
+    },
+    TurnBy {
+        angle_mrad: i16,
+        angular_mrad_s: i16,
+        timeout_ms: u32,
+        seq: u32,
+    },
+    DriveFor {
+        distance_mm: i16,
+        velocity_mm_s: i16,
+        timeout_ms: u32,
+        seq: u32,
+    },
+    BumpEscape {
+        direction: EscapeDirection,
+        backoff_mm_s: i16,
+        turn_angular_mrad_s: i16,
+        seq: u32,
+    },
+    HeartbeatStop {
+        timeout_ms: u32,
+        seq: u32,
+    },
     Stop,
     Status,
     Bootsel,
@@ -44,6 +82,13 @@ pub enum LightPattern {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+pub enum EscapeDirection {
+    Left,
+    Right,
+    Either,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum RuntimeCommand {
     WakeCreate,
@@ -60,6 +105,38 @@ pub(crate) enum RuntimeCommand {
         linear_mm_s: i16,
         angular_mrad_s: i16,
         duration_ms: Option<u32>,
+    },
+    FaceBearing {
+        bearing_mrad: i16,
+        max_angular_mrad_s: i16,
+        tolerance_mrad: i16,
+        duration_ms: u32,
+    },
+    TrackBearing {
+        bearing_mrad: i16,
+        range_mm: u16,
+        max_linear_mm_s: i16,
+        max_angular_mrad_s: i16,
+        stop_range_mm: u16,
+        duration_ms: u32,
+    },
+    TurnBy {
+        angle_mrad: i16,
+        angular_mrad_s: i16,
+        timeout_ms: u32,
+    },
+    DriveFor {
+        distance_mm: i16,
+        velocity_mm_s: i16,
+        timeout_ms: u32,
+    },
+    BumpEscape {
+        direction: EscapeDirection,
+        backoff_mm_s: i16,
+        turn_angular_mrad_s: i16,
+    },
+    HeartbeatStop {
+        timeout_ms: u32,
     },
     DriveArc {
         velocity_mm_s: i16,

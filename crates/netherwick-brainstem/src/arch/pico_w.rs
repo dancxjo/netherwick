@@ -27,7 +27,7 @@ use embedded_io_async::Write;
 use static_cell::StaticCell;
 
 use crate::body;
-use crate::commands::{BrainstemCommand, CreateOiMode, LightPattern};
+use crate::commands::{BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 use crate::status;
@@ -843,8 +843,8 @@ function post(o,ack){let cid=id++;o.command_id=cid;if(ack===false)o.ack=false;if
 function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('.active').forEach(b=>b.classList.remove('active'));post({kind:'stop'})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
 function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
-function sendJoy(){paceDrive(()=>{let m=joyMax(),lin=Math.round(-last.y*m.lin),ang=Math.round(last.x*m.ang);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
-function sendDrive(){paceDrive(()=>{let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=-m.ang;if(driveKind==='right')ang=m.ang;if(driveKind==='spinl')ang=-m.ang,lin=0;if(driveKind==='spinr')ang=m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
+function sendJoy(){paceDrive(()=>{let m=joyMax(),lin=Math.round(-last.y*m.lin),ang=Math.round(-last.x*m.ang);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
+function sendDrive(){paceDrive(()=>{let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=m.ang;if(driveKind==='right')ang=-m.ang;if(driveKind==='spinl')ang=m.ang,lin=0;if(driveKind==='spinr')ang=-m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
 base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
 base.onpointermove=e=>{if(active)move(e)}
@@ -1039,6 +1039,44 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
             ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
         },
+        "FACE_BEARING" => BrainstemCommand::FaceBearing {
+            seq,
+            bearing_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            tolerance_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "TRACK_BEARING" => BrainstemCommand::TrackBearing {
+            seq,
+            bearing_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            range_mm: parse_u32(parts.next()).ok_or(seq)? as u16,
+            max_linear_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            stop_range_mm: parse_u32(parts.next()).ok_or(seq)? as u16,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "TURN_BY" => BrainstemCommand::TurnBy {
+            seq,
+            angle_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "DRIVE_FOR" => BrainstemCommand::DriveFor {
+            seq,
+            distance_mm: parse_i16(parts.next()).ok_or(seq)?,
+            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "BUMP_ESCAPE" => BrainstemCommand::BumpEscape {
+            seq,
+            direction: parse_escape_direction(parts.next().ok_or(seq)?).ok_or(seq)?,
+            backoff_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            turn_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+        },
+        "HEARTBEAT_STOP" => BrainstemCommand::HeartbeatStop {
+            seq,
+            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
         "STATUS" => BrainstemCommand::Status,
         "SONG_PLAY" => BrainstemCommand::SongPlay {
             id: parse_u32(parts.next()).ok_or(seq)? as u8,
@@ -1181,6 +1219,44 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
+        "face_bearing" => Some(BrainstemCommand::FaceBearing {
+            bearing_mrad: json_i16(body, "bearing_mrad")?,
+            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s")?,
+            tolerance_mrad: json_i16(body, "tolerance_mrad").unwrap_or(35),
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "track_bearing" => Some(BrainstemCommand::TrackBearing {
+            bearing_mrad: json_i16(body, "bearing_mrad")?,
+            range_mm: json_u32(body, "range_mm")? as u16,
+            max_linear_mm_s: json_i16(body, "max_linear_mm_s")?,
+            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s")?,
+            stop_range_mm: json_u32(body, "stop_range_mm").unwrap_or(0) as u16,
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "turn_by" => Some(BrainstemCommand::TurnBy {
+            angle_mrad: json_i16(body, "angle_mrad")?,
+            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
+            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "drive_for" => Some(BrainstemCommand::DriveFor {
+            distance_mm: json_i16(body, "distance_mm")?,
+            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
+            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "bump_escape" => Some(BrainstemCommand::BumpEscape {
+            direction: parse_escape_direction(json_str(body, "direction").unwrap_or("either"))?,
+            backoff_mm_s: json_i16(body, "backoff_mm_s").unwrap_or(80),
+            turn_angular_mrad_s: json_i16(body, "turn_angular_mrad_s").unwrap_or(900),
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "heartbeat_stop" => Some(BrainstemCommand::HeartbeatStop {
+            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "ttl_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
         "status" => Some(BrainstemCommand::Status),
         "song_play" => Some(BrainstemCommand::SongPlay {
             id: json_u32(body, "id")? as u8,
@@ -1201,6 +1277,15 @@ fn parse_light_pattern(pattern: &str) -> Option<LightPattern> {
         "dock" => Some(LightPattern::Dock),
         "spot" => Some(LightPattern::Spot),
         "max" => Some(LightPattern::Max),
+        _ => None,
+    }
+}
+
+fn parse_escape_direction(direction: &str) -> Option<EscapeDirection> {
+    match direction {
+        "left" | "LEFT" => Some(EscapeDirection::Left),
+        "right" | "RIGHT" => Some(EscapeDirection::Right),
+        "either" | "EITHER" => Some(EscapeDirection::Either),
         _ => None,
     }
 }
