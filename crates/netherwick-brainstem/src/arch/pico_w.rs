@@ -3,6 +3,7 @@ use core::fmt::Write as _;
 use cyw43::aligned_bytes;
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{
@@ -38,6 +39,7 @@ const AP_IP_OCTETS: [u8; 4] = [192, 168, 4, 1];
 const DHCP_LEASE_IP_OCTETS: [u8; 4] = [192, 168, 4, 2];
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const HTTP_PORT: u16 = 80;
+const HTTP_TASKS: usize = 3;
 const WS_CONTROL_PORT: u16 = 81;
 const UDP_CONTROL_PORT: u16 = 82;
 const DNS_PORT: u16 = 53;
@@ -46,6 +48,7 @@ const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
 const DHCP_LEASE_SECONDS: u32 = 3_600;
 const DHCP_OFFER_HOLD_SECONDS: u32 = 30;
+const HTTP_FLUSH_TIMEOUT_MS: u64 = 250;
 const LED_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const LED_BLINK_ON_MS: u64 = 120;
 const LED_BLINK_OFF_MS: u64 = 120;
@@ -202,7 +205,9 @@ async fn wifi_task(
     {
         status::mark_wifi_ap_started();
         let _ = control.gpio_set(0, false).await;
-        spawner.spawn(http_task(stack).expect("spawn http task"));
+        for _ in 0..HTTP_TASKS {
+            spawner.spawn(http_task(stack).expect("spawn http task"));
+        }
         spawner.spawn(websocket_task(stack).expect("spawn websocket task"));
         spawner.spawn(udp_control_task(stack).expect("spawn udp control task"));
         spawner.spawn(dns_task(stack).expect("spawn dns task"));
@@ -252,7 +257,7 @@ async fn start_wifi_ap(
 
     control.init(clm).await;
     control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
     let config = NetConfig::ipv4_static(embassy_net::StaticConfigV4 {
@@ -261,7 +266,7 @@ async fn start_wifi_ap(
         gateway: None,
     });
 
-    static RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<10>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         net_device,
         config,
@@ -356,7 +361,7 @@ async fn forebrain_uart_task(
     }
 }
 
-#[embassy_executor::task]
+#[embassy_executor::task(pool_size = 3)]
 async fn http_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 2048];
@@ -423,20 +428,17 @@ async fn http_task(stack: Stack<'static>) -> ! {
         };
 
         match result {
-            Ok(()) => {
+            Ok(true) => {
+                status::mark_http_response_flushed();
                 socket.close();
-                if socket.flush().await.is_ok() {
-                    status::mark_http_response_flushed();
-                } else {
-                    status::mark_http_response_error();
-                    socket.abort();
-                    let _ = socket.flush().await;
-                }
+            }
+            Ok(false) => {
+                status::mark_http_response_error();
+                socket.abort();
             }
             Err(_) => {
                 status::mark_http_response_error();
                 socket.abort();
-                let _ = socket.flush().await;
             }
         }
     }
@@ -469,15 +471,13 @@ async fn websocket_task(stack: Stack<'static>) -> ! {
         let path = request_path(&request[..n]);
         let Some(key) = websocket_key(&request[..n]) else {
             let _ = write_plain_status(&mut socket, 400, "Bad Request").await;
-            socket.close();
-            let _ = socket.flush().await;
+            socket.abort();
             continue;
         };
 
         if path != Some("/control") {
             let _ = write_plain_status(&mut socket, 404, "Not Found").await;
-            socket.close();
-            let _ = socket.flush().await;
+            socket.abort();
             continue;
         }
 
@@ -508,8 +508,7 @@ async fn websocket_task(stack: Stack<'static>) -> ! {
                     }
                 }
                 Ok(None) => {
-                    socket.close();
-                    let _ = socket.flush().await;
+                    socket.abort();
                     break;
                 }
                 Err(_) => {
@@ -704,7 +703,7 @@ async fn write_response(
     socket: &mut TcpSocket<'_>,
     content_type: &str,
     body: &[u8],
-) -> Result<(), embassy_net::tcp::Error> {
+) -> Result<bool, embassy_net::tcp::Error> {
     let mut header = heapless::String::<192>::new();
     let _ = write!(
         header,
@@ -714,14 +713,14 @@ async fn write_response(
     );
     socket.write_all(header.as_bytes()).await?;
     socket.write_all(body).await?;
-    socket.flush().await
+    flush_tcp_with_timeout(socket).await
 }
 
 async fn write_plain_status(
     socket: &mut TcpSocket<'_>,
     code: u16,
     text: &str,
-) -> Result<(), embassy_net::tcp::Error> {
+) -> Result<bool, embassy_net::tcp::Error> {
     let mut header = heapless::String::<160>::new();
     let _ = write!(
         header,
@@ -732,7 +731,16 @@ async fn write_plain_status(
         text
     );
     socket.write_all(header.as_bytes()).await?;
-    socket.flush().await
+    flush_tcp_with_timeout(socket).await
+}
+
+async fn flush_tcp_with_timeout(
+    socket: &mut TcpSocket<'_>,
+) -> Result<bool, embassy_net::tcp::Error> {
+    match select(socket.flush(), Timer::after_millis(HTTP_FLUSH_TIMEOUT_MS)).await {
+        Either::First(result) => result.map(|()| true),
+        Either::Second(()) => Ok(false),
+    }
 }
 
 fn request_path(request: &[u8]) -> Option<&str> {
@@ -825,17 +833,18 @@ label{font-size:12px;color:#5c675f;font-weight:700}.slider{display:grid;gap:6px}
 </div>
 </div>
 <script>
-let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='';
+let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='',statusBusy=false,lastDriveAt=0;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
 function title(s){return (s||'unknown').replaceAll('_',' ')}
 function pill(el,text,state){el.textContent=text;el.className='pill '+(state||'')}
 function addLog(text){let t=new Date().toLocaleTimeString();log.textContent=(t+'  '+text+'\n'+(log.textContent==='No commands yet'?'':log.textContent)).slice(0,900)}
 function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;pill(net,'control ws','ok');refresh()};ws.onclose=()=>{wsOpen=false;pill(net,'reconnecting','warn');setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false;pill(net,'ws error','warn')};ws.onmessage=e=>{try{let j=JSON.parse(e.data);if(j.type==='status'){showStatus(j);return}pill(net,j.accepted?'accepted':'busy',j.accepted?'ok':'warn');addLog((j.accepted?'accepted ':'busy ')+j.command_id)}catch(_){}}}catch(_){wsOpen=false}}
-function post(o,ack){let cid=id++;o.command_id=cid;if(ack===false)o.ack=false;if(o.kind==='cmd_vel'&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;if(wsOpen&&ws&&ws.readyState===1){ws.send(body);if(ack!==false)addLog('sent '+name);return Promise.resolve({accepted:true})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{pill(net,j.accepted?'accepted':'busy',j.accepted?'ok':'warn');addLog((j.accepted?'accepted ':'busy ')+name);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
+function post(o,ack){let cid=id++;o.command_id=cid;if(ack===false)o.ack=false;if(o.kind==='cmd_vel'&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;if(wsOpen&&ws&&ws.readyState===1){if(ws.bufferedAmount<384){ws.send(body);if(ack!==false)addLog('sent '+name);return Promise.resolve({accepted:true})}pill(net,'throttled','warn');return Promise.resolve({accepted:false})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{pill(net,j.accepted?'accepted':'busy',j.accepted?'ok':'warn');addLog((j.accepted?'accepted ':'busy ')+name);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
 function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('.active').forEach(b=>b.classList.remove('active'));post({kind:'stop'})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
-function sendJoy(){let m=joyMax(),lin=Math.round(-last.y*m.lin),ang=Math.round(last.x*m.ang);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:250},false)}
-function sendDrive(){let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=-m.ang;if(driveKind==='right')ang=m.ang;if(driveKind==='spinl')ang=-m.ang,lin=0;if(driveKind==='spinr')ang=m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:260},false)}
+function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
+function sendJoy(){paceDrive(()=>{let m=joyMax(),lin=Math.round(-last.y*m.lin),ang=Math.round(last.x*m.ang);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
+function sendDrive(){paceDrive(()=>{let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=-m.ang;if(driveKind==='right')ang=m.ang;if(driveKind==='spinl')ang=-m.ang,lin=0;if(driveKind==='spinr')ang=m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
 base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
 base.onpointermove=e=>{if(active)move(e)}
@@ -857,9 +866,9 @@ document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveK
 $('speed').oninput=()=>$('speedv').textContent=$('speed').value
 $('turn').oninput=()=>$('turnv').textContent=$('turn').value
 function time(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60),h=Math.floor(m/60);return h+'h '+(m%60)+'m '+(s%60)+'s'}
-function showStatus(s){let err=s.last_error&&s.last_error!=='none';pill(net,wsOpen?'control ws':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),s.oi_mode==='safe'?'ok':'');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health);$('runtime').textContent=title(s.current_runtime_state)+' / demo '+title(s.demo_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=err?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=err?'':'muted'}
-function refresh(){if(wsOpen&&ws&&ws.readyState===1){ws.send(JSON.stringify({kind:'status',command_id:id++}));return}fetch('/status.json').then(r=>r.json()).then(showStatus).catch(_=>pill(net,'offline','bad'))}
-setInterval(refresh,2500);refresh();
+function showStatus(s){let err=s.last_error&&s.last_error!=='none';pill(net,wsOpen?'control ws':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health);$('runtime').textContent=title(s.current_runtime_state)+' / demo '+title(s.demo_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=err?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=err?'':'muted'}
+function refresh(){if(statusBusy)return;statusBusy=true;if(wsOpen&&ws&&ws.readyState===1&&ws.bufferedAmount<384){ws.send(JSON.stringify({kind:'status',command_id:id++}));statusBusy=false;return}fetch('/status.json').then(r=>r.json()).then(showStatus).catch(_=>pill(net,'offline','bad')).finally(()=>statusBusy=false)}
+setInterval(refresh,3500);refresh();
 connectWs();
 </script>
 </body>
@@ -879,6 +888,14 @@ fn handle_command_request<'a>(
     let body = request_body(request).ok_or(CommandParseError::BadRequest)?;
     let command_id = json_u32(body, "command_id").ok_or(CommandParseError::BadRequest)?;
     let command = parse_command(command_id, body).ok_or(CommandParseError::BadRequest)?;
+    if matches!(command, BrainstemCommand::Status) {
+        let snapshot = status::snapshot(Instant::now().as_millis() as u32);
+        return status::render_json(snapshot, buffer).map_err(|_| CommandParseError::BadRequest);
+    }
+    if matches!(command, BrainstemCommand::Ping) {
+        return render_command_response(buffer, true, command_id, "pong")
+            .ok_or(CommandParseError::BadRequest);
+    }
     if matches!(command, BrainstemCommand::Bootsel) {
         return render_bootsel_response(buffer, command_id).ok_or(CommandParseError::BadRequest);
     }
@@ -893,6 +910,10 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     if json_str(body, "kind") == Some("status") {
         let snapshot = status::snapshot(Instant::now().as_millis() as u32);
         return render_status_websocket_response(snapshot, buffer);
+    }
+    if json_str(body, "kind") == Some("ping") {
+        let command_id = json_u32(body, "command_id")?;
+        return render_command_response(buffer, true, command_id, "pong");
     }
 
     if json_bool(body, "ack") == Some(false) {
@@ -1246,7 +1267,7 @@ async fn write_websocket_upgrade(
         accept_key
     );
     socket.write_all(header.as_bytes()).await?;
-    socket.flush().await
+    flush_tcp_with_timeout(socket).await.map(|_| ())
 }
 
 async fn read_websocket_text<'a>(
@@ -1295,7 +1316,7 @@ async fn write_websocket_text(
         return Ok(());
     }
     socket.write_all(payload).await?;
-    socket.flush().await
+    flush_tcp_with_timeout(socket).await.map(|_| ())
 }
 
 async fn read_exact_tcp(
