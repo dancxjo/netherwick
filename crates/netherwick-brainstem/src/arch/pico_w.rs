@@ -1450,7 +1450,7 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
     let snapshot = status::snapshot(Instant::now().as_millis() as u32);
     let _ = writeln!(
         response,
-        "OK {seq} STATUS runtime={} demo={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_len={} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={}",
+        "OK {seq} STATUS runtime={} demo={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_len={} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_yaw_rate_mrad_s={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={}",
         snapshot.current_runtime_state,
         snapshot.demo_state,
         snapshot.current_runtime_action,
@@ -1468,7 +1468,19 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.wake_probe_response_bytes,
         snapshot.wake_probe_expected_bytes,
         snapshot.forebrain_uart_rx_bytes,
-        snapshot.forebrain_uart_rx_lines
+        snapshot.forebrain_uart_rx_lines,
+        snapshot.imu_present,
+        snapshot.imu_health,
+        snapshot.imu_sample_age_ms,
+        snapshot.imu_poll_period_ms,
+        snapshot.imu_yaw_mrad,
+        snapshot.imu_yaw_rate_mrad_s,
+        snapshot.imu_accel_magnitude_mm_s2,
+        snapshot.imu_tilt_magnitude_mrad,
+        snapshot.imu_roughness_mm_s2,
+        snapshot.imu_impact_score_mm_s2,
+        snapshot.imu_motion_consistency,
+        snapshot.imu_calibration_state
     );
 }
 

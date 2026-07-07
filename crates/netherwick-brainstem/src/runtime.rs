@@ -1086,8 +1086,12 @@ where
         let bump = flags & ((1 << 0) | (1 << 1)) != 0;
         let wheel_drop = flags & (1 << 2) != 0;
         let cliff = flags & ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)) != 0;
+        let imu_ok = body::IMU_ENABLED && snapshot.imu_health == status::ImuHealthCode::Ok as u8;
+        let tilt = imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
+        let impact =
+            imu_ok && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
 
-        if !bump && !cliff && !wheel_drop {
+        if !bump && !cliff && !wheel_drop && !tilt && !impact {
             self.update_safety_edges(bump, cliff, wheel_drop);
             if !self.safety_policy.wheel_drop_latch {
                 if self.safety_latched {
@@ -1114,7 +1118,13 @@ where
             return Ok(());
         }
 
-        let action = if cliff {
+        let action = if tilt {
+            status::mark_safety_tripped(status::SafetyEventKind::Tilt);
+            SafetyAction::Stop
+        } else if impact {
+            status::mark_safety_tripped(status::SafetyEventKind::Impact);
+            SafetyAction::Stop
+        } else if cliff {
             status::mark_safety_tripped(status::SafetyEventKind::Cliff);
             self.safety_policy.cliff
         } else if bump {
@@ -1715,4 +1725,84 @@ fn default_feedback_tones(kind: FeedbackKind) -> ([SongTone; MAX_SONG_TONES], u8
         };
     }
     (tones, notes.len() as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drivers::imu::ImuSample;
+    use crate::hardware::SerialRead;
+
+    struct FakeHardware {
+        now_us: u32,
+        writes: heapless::Vec<u8, 32>,
+    }
+
+    impl FakeHardware {
+        fn new(now_ms: u32) -> Self {
+            Self {
+                now_us: now_ms * 1_000,
+                writes: heapless::Vec::new(),
+            }
+        }
+    }
+
+    impl BrainstemHardware for FakeHardware {
+        fn delay_ms(&mut self, ms: u32) {
+            self.now_us = self.now_us.wrapping_add(ms * 1_000);
+        }
+
+        fn now_us(&mut self) -> u32 {
+            self.now_us
+        }
+
+        fn feed_watchdog(&mut self) {}
+
+        fn set_power_toggle(&mut self, _high: bool) {}
+
+        fn set_brc(&mut self, _high: bool) {}
+
+        fn set_indicators(&mut self, _on: bool) {}
+
+        fn set_primary_indicator(&mut self, _on: bool) {}
+
+        fn write_byte(&mut self, byte: u8) -> Result<(), ()> {
+            let _ = self.writes.push(byte);
+            Ok(())
+        }
+
+        fn flush_uart(&mut self) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn read_byte(&mut self) -> SerialRead {
+            SerialRead::WouldBlock
+        }
+    }
+
+    #[test]
+    fn safety_tick_stops_active_motion_on_imu_tilt() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(77);
+        status::mark_imu_sample(ImuSample {
+            timestamp_ms: 1_000,
+            accel_x_mm_s2: 9_807,
+            accel_y_mm_s2: 0,
+            accel_z_mm_s2: 1_000,
+            ..ImuSample::stationary(1_000)
+        });
+
+        runtime.tick();
+
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert!(runtime.safety_latched);
+        assert!(runtime
+            .events
+            .iter()
+            .any(|event| matches!(event, BrainstemEvent::DriveStopped)));
+        assert!(!runtime.hardware.writes.is_empty());
+    }
 }

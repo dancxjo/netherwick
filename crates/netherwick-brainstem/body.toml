@@ -82,9 +82,10 @@ sensors = [
   "buttons",
   "battery",
   "odometry_delta",
+  "imu",
 ]
 outputs = ["lights", "song", "dock", "power_toggle", "brc"]
-safety = ["bump", "cliff", "wheel_drop", "estop", "heartbeat"]
+safety = ["bump", "cliff", "wheel_drop", "estop", "heartbeat", "tilt", "impact"]
 feedback = ["ok", "error", "armed", "lost_target", "dock_seen", "danger"]
 events = [
   "boot",
@@ -117,6 +118,11 @@ events = [
   "heartbeat_expired",
   "estop_latched",
   "estop_cleared",
+  "imu_frame_received",
+  "imu_fault",
+  "tilt_changed",
+  "motion_inconsistency_detected",
+  "impact_detected",
   "error",
 ]
 song_slots = 16

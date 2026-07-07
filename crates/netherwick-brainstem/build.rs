@@ -18,6 +18,8 @@ struct BoardToml {
     board: Board,
     rp2040: Rp2040,
     pins: Pins,
+    i2c: I2c,
+    imu: Imu,
 }
 
 #[allow(dead_code)]
@@ -104,6 +106,33 @@ struct Pins {
 
 #[allow(dead_code)]
 #[derive(Deserialize)]
+struct I2c {
+    primary: I2cPins,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct I2cPins {
+    sda: String,
+    sda_gpio: u8,
+    sda_physical_pin: u8,
+    scl: String,
+    scl_gpio: u8,
+    scl_physical_pin: u8,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct Imu {
+    enabled: bool,
+    i2c_bus: String,
+    poll_period_ms: u32,
+    tilt_stop_mrad: i16,
+    impact_stop_mm_s2: u16,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
 struct CreateUartPins {
     tx: String,
     tx_gpio: u8,
@@ -154,6 +183,7 @@ fn main() {
     assert_eq!(body.create_oi.data_bits, 8);
     assert_eq!(body.create_oi.stop_bits, 1);
     assert_eq!(board.board.arch, "rp2040");
+    assert_eq!(board.imu.i2c_bus, "primary");
 
     let default_mode = match body.create_oi.default_mode.as_str() {
         "passive" => "CreateOiMode::Passive",
@@ -220,6 +250,17 @@ pub const CREATE_DEVICE_DETECT_GPIO: u8 = {create_device_detect_gpio};
 pub const ESTOP_ENABLED: bool = {estop_enabled};
 pub const ESTOP_PIN: &str = {estop_pin:?};
 pub const ESTOP_GPIO: u8 = {estop_gpio};
+
+pub const I2C_PRIMARY_SDA_PIN: &str = {i2c_sda_pin:?};
+pub const I2C_PRIMARY_SDA_GPIO: u8 = {i2c_sda_gpio};
+pub const I2C_PRIMARY_SDA_PHYSICAL_PIN: u8 = {i2c_sda_physical_pin};
+pub const I2C_PRIMARY_SCL_PIN: &str = {i2c_scl_pin:?};
+pub const I2C_PRIMARY_SCL_GPIO: u8 = {i2c_scl_gpio};
+pub const I2C_PRIMARY_SCL_PHYSICAL_PIN: u8 = {i2c_scl_physical_pin};
+pub const IMU_ENABLED: bool = {imu_enabled};
+pub const IMU_POLL_PERIOD_MS: u32 = {imu_poll_period_ms};
+pub const IMU_TILT_STOP_MRAD: i16 = {imu_tilt_stop_mrad};
+pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
 "#,
         body_name = body.body.name,
         board_name = board.board.name,
@@ -271,6 +312,16 @@ pub const ESTOP_GPIO: u8 = {estop_gpio};
         estop_enabled = board.pins.estop.enabled,
         estop_pin = board.pins.estop.pin,
         estop_gpio = board.pins.estop.gpio,
+        i2c_sda_pin = board.i2c.primary.sda,
+        i2c_sda_gpio = board.i2c.primary.sda_gpio,
+        i2c_sda_physical_pin = board.i2c.primary.sda_physical_pin,
+        i2c_scl_pin = board.i2c.primary.scl,
+        i2c_scl_gpio = board.i2c.primary.scl_gpio,
+        i2c_scl_physical_pin = board.i2c.primary.scl_physical_pin,
+        imu_enabled = board.imu.enabled,
+        imu_poll_period_ms = board.imu.poll_period_ms,
+        imu_tilt_stop_mrad = board.imu.tilt_stop_mrad,
+        imu_impact_stop_mm_s2 = board.imu.impact_stop_mm_s2,
     );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

@@ -42,10 +42,19 @@ pin = "GP22"
 gpio = 22
 
 [i2c.primary]
-sda = "GP4"
-sda_gpio = 4
-scl = "GP5"
-scl_gpio = 5
+sda = "GP2"
+sda_gpio = 2
+sda_physical_pin = 4
+scl = "GP3"
+scl_gpio = 3
+scl_physical_pin = 5
+
+[imu]
+enabled = true
+i2c_bus = "primary"
+poll_period_ms = 20
+tilt_stop_mrad = 650
+impact_stop_mm_s2 = 18000
 
 [spi.primary]
 mosi = "GP7"

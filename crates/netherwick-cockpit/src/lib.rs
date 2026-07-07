@@ -81,11 +81,15 @@ impl MotionCommand {
 }
 
 pub fn meters_per_second_to_mm_s(value: f32) -> i16 {
-    (value * 1000.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    (value * 1000.0)
+        .round()
+        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 pub fn radians_per_second_to_mrad_s(value: f32) -> i16 {
-    (value * 1000.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    (value * 1000.0)
+        .round()
+        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 pub fn mm_s_to_meters_per_second(value: i16) -> f32 {
@@ -980,6 +984,7 @@ pub struct StatusSummary {
     pub contact: ContactSummary,
     pub battery: BatterySummary,
     pub odometry: OdometrySummary,
+    pub imu: ImuSummary,
 }
 
 impl StatusSummary {
@@ -998,6 +1003,7 @@ impl StatusSummary {
             contact: ContactSummary::from_raw(raw),
             battery: BatterySummary::from_raw(raw),
             odometry: OdometrySummary::from_raw(raw),
+            imu: ImuSummary::from_raw(raw),
         }
     }
 
@@ -1024,6 +1030,7 @@ impl StatusSummary {
             contact: ContactSummary::from_json(sensors),
             battery: BatterySummary::from_json(sensors),
             odometry: OdometrySummary::from_json(value.get("odometry")),
+            imu: ImuSummary::from_json(value.get("imu")),
         }
     }
 }
@@ -1163,6 +1170,61 @@ impl OdometrySummary {
             reset_count: json_u32_value(odometry, "reset_count"),
             distance_mm: json_i32_value(odometry, "distance_mm"),
             heading_mrad: json_i32_value(odometry, "heading_mrad"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImuSummary {
+    pub present: Option<String>,
+    pub health: Option<String>,
+    pub sample_age_ms: Option<u32>,
+    pub poll_period_ms: Option<u32>,
+    pub yaw_mrad: Option<i32>,
+    pub yaw_rate_mrad_s: Option<i32>,
+    pub accel_magnitude_mm_s2: Option<u32>,
+    pub tilt_magnitude_mrad: Option<u32>,
+    pub roughness_mm_s2: Option<u32>,
+    pub impact_score_mm_s2: Option<u32>,
+    pub motion_consistency: Option<String>,
+    pub calibration: Option<String>,
+}
+
+impl ImuSummary {
+    fn from_raw(raw: &str) -> Self {
+        Self {
+            present: value_for(raw, "imu_present").map(ToOwned::to_owned),
+            health: value_for(raw, "imu_health").map(ToOwned::to_owned),
+            sample_age_ms: number_for(raw, "imu_age_ms"),
+            poll_period_ms: number_for(raw, "imu_poll_ms"),
+            yaw_mrad: signed_number_for(raw, "imu_yaw_mrad"),
+            yaw_rate_mrad_s: signed_number_for(raw, "imu_yaw_rate_mrad_s"),
+            accel_magnitude_mm_s2: number_for(raw, "imu_accel_mag_mm_s2"),
+            tilt_magnitude_mrad: number_for(raw, "imu_tilt_mrad"),
+            roughness_mm_s2: number_for(raw, "imu_roughness_mm_s2"),
+            impact_score_mm_s2: number_for(raw, "imu_impact_mm_s2"),
+            motion_consistency: value_for(raw, "imu_motion_consistency").map(ToOwned::to_owned),
+            calibration: value_for(raw, "imu_calibration").map(ToOwned::to_owned),
+        }
+    }
+
+    fn from_json(imu: Option<&serde_json::Value>) -> Self {
+        let Some(imu) = imu else {
+            return Self::default();
+        };
+        Self {
+            present: json_str_value(imu, "present").map(ToOwned::to_owned),
+            health: json_str_value(imu, "health").map(ToOwned::to_owned),
+            sample_age_ms: json_u32_value(imu, "sample_age_ms"),
+            poll_period_ms: json_u32_value(imu, "poll_period_ms"),
+            yaw_mrad: json_i32_value(imu, "yaw_mrad"),
+            yaw_rate_mrad_s: json_i32_value(imu, "yaw_rate_mrad_s"),
+            accel_magnitude_mm_s2: json_u32_value(imu, "accel_magnitude_mm_s2"),
+            tilt_magnitude_mrad: json_u32_value(imu, "tilt_magnitude_mrad"),
+            roughness_mm_s2: json_u32_value(imu, "roughness_mm_s2"),
+            impact_score_mm_s2: json_u32_value(imu, "impact_score_mm_s2"),
+            motion_consistency: json_str_value(imu, "motion_consistency").map(ToOwned::to_owned),
+            calibration: json_str_value(imu, "calibration").map(ToOwned::to_owned),
         }
     }
 }
@@ -2109,6 +2171,11 @@ pub enum CockpitEventKind {
     HeartbeatExpired,
     EStopLatched,
     EStopCleared,
+    ImuFrameReceived,
+    ImuFault,
+    TiltChanged,
+    MotionInconsistencyDetected,
+    ImpactDetected,
     Error,
     Unknown(String),
 }
@@ -2146,6 +2213,11 @@ impl From<&str> for CockpitEventKind {
             "heartbeat_expired" => Self::HeartbeatExpired,
             "estop_latched" => Self::EStopLatched,
             "estop_cleared" => Self::EStopCleared,
+            "imu_frame_received" => Self::ImuFrameReceived,
+            "imu_fault" => Self::ImuFault,
+            "tilt_changed" => Self::TiltChanged,
+            "motion_inconsistency_detected" => Self::MotionInconsistencyDetected,
+            "impact_detected" => Self::ImpactDetected,
             "error" => Self::Error,
             other => Self::Unknown(other.to_owned()),
         }
@@ -2185,6 +2257,11 @@ impl CockpitEventKind {
             Self::HeartbeatExpired => "heartbeat_expired",
             Self::EStopLatched => "estop_latched",
             Self::EStopCleared => "estop_cleared",
+            Self::ImuFrameReceived => "imu_frame_received",
+            Self::ImuFault => "imu_fault",
+            Self::TiltChanged => "tilt_changed",
+            Self::MotionInconsistencyDetected => "motion_inconsistency_detected",
+            Self::ImpactDetected => "impact_detected",
             Self::Error => "error",
             Self::Unknown(kind) => kind.as_str(),
         }
@@ -2246,6 +2323,7 @@ impl SimCockpit {
                     "buttons",
                     "battery",
                     "odometry_delta",
+                    "imu",
                 ]
                 .into_iter()
                 .map(ToOwned::to_owned)
@@ -2254,10 +2332,18 @@ impl SimCockpit {
                     .into_iter()
                     .map(ToOwned::to_owned)
                     .collect(),
-                safety: ["estop", "heartbeat", "bump", "cliff", "wheel_drop"]
-                    .into_iter()
-                    .map(ToOwned::to_owned)
-                    .collect(),
+                safety: [
+                    "estop",
+                    "heartbeat",
+                    "bump",
+                    "cliff",
+                    "wheel_drop",
+                    "tilt",
+                    "impact",
+                ]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
                 events: [
                     "boot",
                     "command_accepted",
@@ -2281,6 +2367,11 @@ impl SimCockpit {
                     "heartbeat_expired",
                     "estop_latched",
                     "estop_cleared",
+                    "imu_frame_received",
+                    "imu_fault",
+                    "tilt_changed",
+                    "motion_inconsistency_detected",
+                    "impact_detected",
                 ]
                 .into_iter()
                 .map(ToOwned::to_owned)
@@ -2583,7 +2674,7 @@ impl Cockpit for SimCockpit {
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
-                "OK 0 STATUS sim=true now_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={}",
+                "OK 0 STATUS sim=true now_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_yaw_rate_mrad_s=0 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration=3",
                 self.now_ms,
                 self.armed,
                 self.estop_latched,

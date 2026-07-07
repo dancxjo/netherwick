@@ -8,6 +8,7 @@ use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
     RuntimeCommand, SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
+use crate::drivers::imu::{derive_sample, ImuHealth, ImuSample};
 use crate::events::{BrainstemError, BrainstemEvent, CreateSensorPacket};
 use crate::hardware::UartReadError;
 
@@ -91,6 +92,26 @@ static CREATE_SONG_LAST_PLAYED_ID: AtomicU8 = AtomicU8::new(0);
 static ODOMETRY_RESET_COUNT: AtomicU32 = AtomicU32::new(0);
 static ODOMETRY_DISTANCE_MM: AtomicU32 = AtomicU32::new(0);
 static ODOMETRY_HEADING_MRAD: AtomicU32 = AtomicU32::new(0);
+static IMU_PRESENT: AtomicU8 = AtomicU8::new(UNKNOWN);
+static IMU_HEALTH: AtomicU8 = AtomicU8::new(ImuHealthCode::Unknown as u8);
+static IMU_LAST_SAMPLE_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
+static IMU_SAMPLE_COUNT: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_X_MRAD_S: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_Y_MRAD_S: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_Z_MRAD_S: AtomicU32 = AtomicU32::new(0);
+static IMU_ACCEL_X_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_ACCEL_Y_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_ACCEL_Z_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_YAW_MRAD: AtomicU32 = AtomicU32::new(0);
+static IMU_PITCH_MRAD: AtomicU32 = AtomicU32::new(0);
+static IMU_ROLL_MRAD: AtomicU32 = AtomicU32::new(0);
+static IMU_ACCEL_MAGNITUDE_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_TILT_MAGNITUDE_MRAD: AtomicU32 = AtomicU32::new(0);
+static IMU_ROUGHNESS_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_IMPACT_SCORE_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_MOTION_CONSISTENCY: AtomicU8 = AtomicU8::new(MotionConsistencyCode::Unknown as u8);
+static IMU_CALIBRATION_STATE: AtomicU8 = AtomicU8::new(ImuCalibrationCode::Uncalibrated as u8);
+static IMU_TILT_ACTIVE: AtomicU8 = AtomicU8::new(0);
 static EVENT_NEXT_SEQ: AtomicU32 = AtomicU32::new(1);
 static EVENT_SEQ: [AtomicU32; EVENT_LOG_CAPACITY] =
     [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
@@ -168,6 +189,28 @@ pub struct BrainstemStatus {
     pub odometry_reset_count: u32,
     pub odometry_distance_mm: i32,
     pub odometry_heading_mrad: i32,
+    pub imu_present: u8,
+    pub imu_health: u8,
+    pub imu_sample_count: u32,
+    pub imu_last_sample_timestamp_ms: u32,
+    pub imu_sample_age_ms: u32,
+    pub imu_poll_period_ms: u32,
+    pub imu_yaw_mrad: i32,
+    pub imu_pitch_mrad: i16,
+    pub imu_roll_mrad: i16,
+    pub imu_yaw_rate_mrad_s: i16,
+    pub imu_gyro_x_mrad_s: i16,
+    pub imu_gyro_y_mrad_s: i16,
+    pub imu_gyro_z_mrad_s: i16,
+    pub imu_accel_x_mm_s2: i16,
+    pub imu_accel_y_mm_s2: i16,
+    pub imu_accel_z_mm_s2: i16,
+    pub imu_accel_magnitude_mm_s2: u16,
+    pub imu_tilt_magnitude_mrad: u16,
+    pub imu_roughness_mm_s2: u16,
+    pub imu_impact_score_mm_s2: u16,
+    pub imu_motion_consistency: u8,
+    pub imu_calibration_state: u8,
     pub event_next_seq: u32,
 }
 
@@ -305,7 +348,12 @@ pub enum PublicEventKind {
     HeartbeatExpired = 28,
     EStopLatched = 29,
     EStopCleared = 30,
-    Error = 31,
+    ImuFrameReceived = 31,
+    ImuFault = 32,
+    TiltChanged = 33,
+    MotionInconsistencyDetected = 34,
+    ImpactDetected = 35,
+    Error = 36,
 }
 
 #[derive(Clone, Copy)]
@@ -316,6 +364,34 @@ pub enum SafetyEventKind {
     WheelDrop = 3,
     EStop = 4,
     Heartbeat = 5,
+    Tilt = 6,
+    Impact = 7,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum ImuHealthCode {
+    Unknown = 0,
+    Ok = 1,
+    Fault = 2,
+    Absent = 3,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum MotionConsistencyCode {
+    Unknown = 0,
+    Consistent = 1,
+    Inconsistent = 2,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum ImuCalibrationCode {
+    Uncalibrated = 0,
+    Calibrating = 1,
+    Biased = 2,
+    Ready = 3,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1510,6 +1586,91 @@ pub fn mark_odometry_reset() {
     increment(&ODOMETRY_RESET_COUNT);
     ODOMETRY_DISTANCE_MM.store(0, Ordering::Relaxed);
     ODOMETRY_HEADING_MRAD.store(0, Ordering::Relaxed);
+    IMU_YAW_MRAD.store(0, Ordering::Relaxed);
+}
+
+pub fn mark_imu_sample(sample: ImuSample) {
+    let previous_timestamp = IMU_LAST_SAMPLE_TIMESTAMP_MS.load(Ordering::Relaxed);
+    let previous_yaw = decode_signed_i32(IMU_YAW_MRAD.load(Ordering::Relaxed));
+    let previous_accel = IMU_ACCEL_MAGNITUDE_MM_S2.load(Ordering::Relaxed) as u16;
+    let derived = derive_sample(previous_yaw, previous_timestamp, previous_accel, sample);
+    let old_health = IMU_HEALTH.load(Ordering::Relaxed);
+    let old_tilt = IMU_TILT_ACTIVE.load(Ordering::Relaxed) != 0;
+    let new_tilt = derived.tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
+
+    IMU_PRESENT.store(ON, Ordering::Relaxed);
+    IMU_HEALTH.store(ImuHealthCode::Ok as u8, Ordering::Relaxed);
+    IMU_LAST_SAMPLE_TIMESTAMP_MS.store(sample.timestamp_ms, Ordering::Relaxed);
+    IMU_GYRO_X_MRAD_S.store(encode_signed_i16(sample.gyro_x_mrad_s), Ordering::Relaxed);
+    IMU_GYRO_Y_MRAD_S.store(encode_signed_i16(sample.gyro_y_mrad_s), Ordering::Relaxed);
+    IMU_GYRO_Z_MRAD_S.store(encode_signed_i16(sample.gyro_z_mrad_s), Ordering::Relaxed);
+    IMU_ACCEL_X_MM_S2.store(encode_signed_i16(sample.accel_x_mm_s2), Ordering::Relaxed);
+    IMU_ACCEL_Y_MM_S2.store(encode_signed_i16(sample.accel_y_mm_s2), Ordering::Relaxed);
+    IMU_ACCEL_Z_MM_S2.store(encode_signed_i16(sample.accel_z_mm_s2), Ordering::Relaxed);
+    IMU_YAW_MRAD.store(encode_signed_i32(derived.yaw_mrad), Ordering::Relaxed);
+    IMU_PITCH_MRAD.store(encode_signed_i16(derived.pitch_mrad), Ordering::Relaxed);
+    IMU_ROLL_MRAD.store(encode_signed_i16(derived.roll_mrad), Ordering::Relaxed);
+    IMU_ACCEL_MAGNITUDE_MM_S2.store(derived.accel_magnitude_mm_s2 as u32, Ordering::Relaxed);
+    IMU_TILT_MAGNITUDE_MRAD.store(derived.tilt_magnitude_mrad as u32, Ordering::Relaxed);
+    IMU_ROUGHNESS_MM_S2.store(derived.roughness_mm_s2 as u32, Ordering::Relaxed);
+    IMU_IMPACT_SCORE_MM_S2.store(derived.impact_score_mm_s2 as u32, Ordering::Relaxed);
+    IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Ready as u8, Ordering::Relaxed);
+    IMU_MOTION_CONSISTENCY.store(MotionConsistencyCode::Consistent as u8, Ordering::Relaxed);
+    IMU_TILT_ACTIVE.store(new_tilt as u8, Ordering::Relaxed);
+    increment(&IMU_SAMPLE_COUNT);
+    record_public_event(
+        PublicEventKind::ImuFrameReceived,
+        sample.timestamp_ms,
+        derived.yaw_rate_mrad_s as u16 as u32,
+        derived.accel_magnitude_mm_s2 as u32,
+    );
+    if old_health != ImuHealthCode::Ok as u8 {
+        record_public_event(PublicEventKind::ImuFault, ImuHealthCode::Ok as u32, 0, 0);
+    }
+    if old_tilt != new_tilt {
+        record_public_event(
+            PublicEventKind::TiltChanged,
+            new_tilt as u32,
+            derived.tilt_magnitude_mrad as u32,
+            0,
+        );
+    }
+    if derived.impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2 {
+        record_public_event(
+            PublicEventKind::ImpactDetected,
+            derived.impact_score_mm_s2 as u32,
+            derived.accel_magnitude_mm_s2 as u32,
+            0,
+        );
+    }
+}
+
+pub fn mark_imu_health(health: ImuHealth) {
+    let code = match health {
+        ImuHealth::Unknown => ImuHealthCode::Unknown,
+        ImuHealth::Ok => ImuHealthCode::Ok,
+        ImuHealth::Fault => ImuHealthCode::Fault,
+        ImuHealth::Absent => ImuHealthCode::Absent,
+    };
+    let old = IMU_HEALTH.load(Ordering::Relaxed);
+    IMU_HEALTH.store(code as u8, Ordering::Relaxed);
+    IMU_PRESENT.store(
+        if matches!(health, ImuHealth::Absent) { OFF } else { ON },
+        Ordering::Relaxed,
+    );
+    if old != code as u8 {
+        record_public_event(PublicEventKind::ImuFault, code as u32, 0, 0);
+    }
+}
+
+pub fn mark_motion_inconsistency(expected: i16, observed: i16) {
+    IMU_MOTION_CONSISTENCY.store(MotionConsistencyCode::Inconsistent as u8, Ordering::Relaxed);
+    record_public_event(
+        PublicEventKind::MotionInconsistencyDetected,
+        expected as u16 as u32,
+        observed as u16 as u32,
+        0,
+    );
 }
 
 pub fn mark_command_completed(command_id: u32) {
@@ -1938,6 +2099,14 @@ fn reset_event_log_for_test() {
     }
 }
 
+#[cfg(test)]
+static STATUS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn status_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    STATUS_TEST_LOCK.lock().unwrap()
+}
+
 fn create_sensor_flags_bits(sensors: CreateSensorPacket) -> u32 {
     let flags = sensors.flags;
     (flags.bump_left as u32)
@@ -2226,6 +2395,31 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         odometry_reset_count: ODOMETRY_RESET_COUNT.load(Ordering::Relaxed),
         odometry_distance_mm: decode_signed_i32(ODOMETRY_DISTANCE_MM.load(Ordering::Relaxed)),
         odometry_heading_mrad: decode_signed_i32(ODOMETRY_HEADING_MRAD.load(Ordering::Relaxed)),
+        imu_present: IMU_PRESENT.load(Ordering::Relaxed),
+        imu_health: IMU_HEALTH.load(Ordering::Relaxed),
+        imu_sample_count: IMU_SAMPLE_COUNT.load(Ordering::Relaxed),
+        imu_last_sample_timestamp_ms: IMU_LAST_SAMPLE_TIMESTAMP_MS.load(Ordering::Relaxed),
+        imu_sample_age_ms: elapsed_since(
+            uptime_ms,
+            IMU_LAST_SAMPLE_TIMESTAMP_MS.load(Ordering::Relaxed),
+        ),
+        imu_poll_period_ms: body::IMU_POLL_PERIOD_MS,
+        imu_yaw_mrad: decode_signed_i32(IMU_YAW_MRAD.load(Ordering::Relaxed)),
+        imu_pitch_mrad: decode_signed_i16(IMU_PITCH_MRAD.load(Ordering::Relaxed)),
+        imu_roll_mrad: decode_signed_i16(IMU_ROLL_MRAD.load(Ordering::Relaxed)),
+        imu_yaw_rate_mrad_s: decode_signed_i16(IMU_GYRO_Z_MRAD_S.load(Ordering::Relaxed)),
+        imu_gyro_x_mrad_s: decode_signed_i16(IMU_GYRO_X_MRAD_S.load(Ordering::Relaxed)),
+        imu_gyro_y_mrad_s: decode_signed_i16(IMU_GYRO_Y_MRAD_S.load(Ordering::Relaxed)),
+        imu_gyro_z_mrad_s: decode_signed_i16(IMU_GYRO_Z_MRAD_S.load(Ordering::Relaxed)),
+        imu_accel_x_mm_s2: decode_signed_i16(IMU_ACCEL_X_MM_S2.load(Ordering::Relaxed)),
+        imu_accel_y_mm_s2: decode_signed_i16(IMU_ACCEL_Y_MM_S2.load(Ordering::Relaxed)),
+        imu_accel_z_mm_s2: decode_signed_i16(IMU_ACCEL_Z_MM_S2.load(Ordering::Relaxed)),
+        imu_accel_magnitude_mm_s2: IMU_ACCEL_MAGNITUDE_MM_S2.load(Ordering::Relaxed) as u16,
+        imu_tilt_magnitude_mrad: IMU_TILT_MAGNITUDE_MRAD.load(Ordering::Relaxed) as u16,
+        imu_roughness_mm_s2: IMU_ROUGHNESS_MM_S2.load(Ordering::Relaxed) as u16,
+        imu_impact_score_mm_s2: IMU_IMPACT_SCORE_MM_S2.load(Ordering::Relaxed) as u16,
+        imu_motion_consistency: IMU_MOTION_CONSISTENCY.load(Ordering::Relaxed),
+        imu_calibration_state: IMU_CALIBRATION_STATE.load(Ordering::Relaxed),
         event_next_seq: EVENT_NEXT_SEQ.load(Ordering::Relaxed),
     }
 }
@@ -2282,6 +2476,7 @@ struct StatusJson {
     event_next_seq: u32,
     create_songs: CreateSongStatusJson,
     odometry: OdometryStatusJson,
+    imu: ImuStatusJson,
     create_sensors: CreateSensorStatusJson,
     forebrain_uart: ForebrainUartStatusJson,
 }
@@ -2300,6 +2495,37 @@ struct OdometryStatusJson {
     reset_count: u32,
     distance_mm: i32,
     heading_mrad: i32,
+}
+
+#[cfg(feature = "pico-w")]
+#[derive(serde::Serialize)]
+struct ImuStatusJson {
+    present: &'static str,
+    health: &'static str,
+    sample_count: u32,
+    last_sample_timestamp_ms: u32,
+    sample_age_ms: u32,
+    poll_period_ms: u32,
+    yaw_mrad: i32,
+    pitch_mrad: i16,
+    roll_mrad: i16,
+    yaw_rate_mrad_s: i16,
+    angular_velocity_mrad_s: Axis3I16Json,
+    linear_acceleration_mm_s2: Axis3I16Json,
+    accel_magnitude_mm_s2: u16,
+    tilt_magnitude_mrad: u16,
+    roughness_mm_s2: u16,
+    impact_score_mm_s2: u16,
+    motion_consistency: &'static str,
+    calibration: &'static str,
+}
+
+#[cfg(feature = "pico-w")]
+#[derive(serde::Serialize)]
+struct Axis3I16Json {
+    x: i16,
+    y: i16,
+    z: i16,
 }
 
 #[cfg(feature = "pico-w")]
@@ -2395,6 +2621,34 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
             distance_mm: snapshot.odometry_distance_mm,
             heading_mrad: snapshot.odometry_heading_mrad,
         },
+        imu: ImuStatusJson {
+            present: tri_state_text(snapshot.imu_present),
+            health: imu_health_text(snapshot.imu_health),
+            sample_count: snapshot.imu_sample_count,
+            last_sample_timestamp_ms: snapshot.imu_last_sample_timestamp_ms,
+            sample_age_ms: snapshot.imu_sample_age_ms,
+            poll_period_ms: snapshot.imu_poll_period_ms,
+            yaw_mrad: snapshot.imu_yaw_mrad,
+            pitch_mrad: snapshot.imu_pitch_mrad,
+            roll_mrad: snapshot.imu_roll_mrad,
+            yaw_rate_mrad_s: snapshot.imu_yaw_rate_mrad_s,
+            angular_velocity_mrad_s: Axis3I16Json {
+                x: snapshot.imu_gyro_x_mrad_s,
+                y: snapshot.imu_gyro_y_mrad_s,
+                z: snapshot.imu_gyro_z_mrad_s,
+            },
+            linear_acceleration_mm_s2: Axis3I16Json {
+                x: snapshot.imu_accel_x_mm_s2,
+                y: snapshot.imu_accel_y_mm_s2,
+                z: snapshot.imu_accel_z_mm_s2,
+            },
+            accel_magnitude_mm_s2: snapshot.imu_accel_magnitude_mm_s2,
+            tilt_magnitude_mrad: snapshot.imu_tilt_magnitude_mrad,
+            roughness_mm_s2: snapshot.imu_roughness_mm_s2,
+            impact_score_mm_s2: snapshot.imu_impact_score_mm_s2,
+            motion_consistency: motion_consistency_text(snapshot.imu_motion_consistency),
+            calibration: imu_calibration_text(snapshot.imu_calibration_state),
+        },
         create_sensors: create_sensor_status_json(snapshot),
         forebrain_uart: ForebrainUartStatusJson {
             rx_bytes: snapshot.forebrain_uart_rx_bytes,
@@ -2480,6 +2734,13 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
         x if x == PublicEventKind::HeartbeatExpired as u8 => "heartbeat_expired",
         x if x == PublicEventKind::EStopLatched as u8 => "estop_latched",
         x if x == PublicEventKind::EStopCleared as u8 => "estop_cleared",
+        x if x == PublicEventKind::ImuFrameReceived as u8 => "imu_frame_received",
+        x if x == PublicEventKind::ImuFault as u8 => "imu_fault",
+        x if x == PublicEventKind::TiltChanged as u8 => "tilt_changed",
+        x if x == PublicEventKind::MotionInconsistencyDetected as u8 => {
+            "motion_inconsistency_detected"
+        }
+        x if x == PublicEventKind::ImpactDetected as u8 => "impact_detected",
         x if x == PublicEventKind::Error as u8 => "error",
         _ => "none",
     }
@@ -2586,6 +2847,35 @@ fn forebrain_uart_error_text(code: u8) -> &'static str {
         x if x == ForebrainUartErrorCode::Busy as u8 => "busy",
         x if x == ForebrainUartErrorCode::Uart as u8 => "uart",
         _ => "none",
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn imu_health_text(code: u8) -> &'static str {
+    match code {
+        x if x == ImuHealthCode::Ok as u8 => "ok",
+        x if x == ImuHealthCode::Fault as u8 => "fault",
+        x if x == ImuHealthCode::Absent as u8 => "absent",
+        _ => "unknown",
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn motion_consistency_text(code: u8) -> &'static str {
+    match code {
+        x if x == MotionConsistencyCode::Consistent as u8 => "consistent",
+        x if x == MotionConsistencyCode::Inconsistent as u8 => "inconsistent",
+        _ => "unknown",
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn imu_calibration_text(code: u8) -> &'static str {
+    match code {
+        x if x == ImuCalibrationCode::Calibrating as u8 => "calibrating",
+        x if x == ImuCalibrationCode::Biased as u8 => "biased",
+        x if x == ImuCalibrationCode::Ready as u8 => "ready",
+        _ => "uncalibrated",
     }
 }
 
@@ -2740,6 +3030,7 @@ mod tests {
 
     #[test]
     fn event_log_reports_oldest_next_and_dropped_before() {
+        let _guard = status_test_guard();
         reset_event_log_for_test();
         mark_command_completed(10);
         mark_command_completed(11);
@@ -2755,6 +3046,7 @@ mod tests {
 
     #[test]
     fn event_log_ring_overwrite_reports_dropped_before_seq() {
+        let _guard = status_test_guard();
         reset_event_log_for_test();
         for command_id in 0..(EVENT_LOG_CAPACITY as u32 + 4) {
             mark_command_completed(command_id);
@@ -2771,6 +3063,7 @@ mod tests {
 
     #[test]
     fn generic_event_name_rendering_has_stable_fallback() {
+        let _guard = status_test_guard();
         assert_eq!(
             public_event_kind_text(PublicEventKind::MotionRequested as u8),
             "motion_requested"
@@ -2780,6 +3073,7 @@ mod tests {
 
     #[test]
     fn command_lifecycle_event_ordering() {
+        let _guard = status_test_guard();
         reset_event_log_for_test();
         mark_command_started(42, ControlCommandCode::CmdVel as u8);
         mark_command_completed(42);
@@ -2795,6 +3089,7 @@ mod tests {
 
     #[test]
     fn safety_event_ordering() {
+        let _guard = status_test_guard();
         reset_event_log_for_test();
         mark_estop_latched();
         mark_safety_tripped(SafetyEventKind::EStop);
@@ -2814,5 +3109,66 @@ mod tests {
         );
         assert_eq!(records[1].a, SafetyEventKind::EStop as u32);
         assert_eq!(records[3].a, SafetyEventKind::EStop as u32);
+    }
+
+    #[test]
+    fn imu_sample_updates_status_and_events() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        mark_imu_sample(ImuSample::stationary(100));
+        mark_imu_sample(ImuSample {
+            timestamp_ms: 120,
+            gyro_z_mrad_s: 1_000,
+            ..ImuSample::stationary(120)
+        });
+
+        let snapshot = snapshot(140);
+        assert_eq!(snapshot.imu_present, ON);
+        assert_eq!(snapshot.imu_health, ImuHealthCode::Ok as u8);
+        assert_eq!(snapshot.imu_sample_age_ms, 20);
+        assert_eq!(snapshot.imu_poll_period_ms, body::IMU_POLL_PERIOD_MS);
+        assert_eq!(snapshot.imu_yaw_rate_mrad_s, 1_000);
+        assert_eq!(snapshot.imu_yaw_mrad, 20);
+        assert_eq!(snapshot.imu_accel_magnitude_mm_s2, 9_807);
+
+        let records = collect::<8>(0);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == PublicEventKind::ImuFrameReceived as u8)
+        );
+    }
+
+    #[test]
+    fn imu_thresholds_emit_tilt_and_impact_events() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        mark_imu_sample(ImuSample::stationary(200));
+        mark_imu_sample(ImuSample {
+            timestamp_ms: 220,
+            accel_x_mm_s2: 9_807,
+            accel_y_mm_s2: 0,
+            accel_z_mm_s2: 1_000,
+            ..ImuSample::stationary(220)
+        });
+        mark_imu_sample(ImuSample {
+            timestamp_ms: 240,
+            accel_x_mm_s2: 0,
+            accel_y_mm_s2: 0,
+            accel_z_mm_s2: 30_000,
+            ..ImuSample::stationary(240)
+        });
+
+        let records = collect::<12>(0);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == PublicEventKind::TiltChanged as u8 && record.a == 1)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == PublicEventKind::ImpactDetected as u8)
+        );
     }
 }
