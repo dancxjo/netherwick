@@ -149,11 +149,18 @@ with BuildPart() as part:
             with Locations((x, y, BASE_THICKNESS)):
                 Cylinder(radius=1.05, height=2.2, mode=Mode.ADD)
 
-    # Friendly edges, because hands are also sensors.
-    fillet(part.edges().filter_by(Axis.Z), radius=1.0)
-    chamfer(part.edges().filter_by(Axis.Z).sort_by(Axis.X)[-4:], length=0.4)
+    # Friendly outside corners, because hands are also sensors. Keep this away from
+    # tiny vertical edges created by connector and relief cutouts.
+    outer_vertical_edges = [
+        edge
+        for edge in part.edges().filter_by(Axis.Z)
+        if abs(abs(edge.center().X) - outer_len / 2) < 0.01
+        and abs(abs(edge.center().Y) - outer_w / 2) < 0.01
+    ]
+    fillet(outer_vertical_edges, radius=1.0)
 
-show_object(part.part, name="create1_cargo_bay_adapter")
+if "show_object" in globals():
+    show_object(part.part, name="create1_cargo_bay_adapter")
 export_stl(part.part, "create1_cargo_bay_adapter.stl")
 export_step(part.part, "create1_cargo_bay_adapter.step")
 
