@@ -8,6 +8,8 @@ struct BodyToml {
     body: Body,
     create_oi: CreateOi,
     timing: Timing,
+    capabilities: Capabilities,
+    limits: Limits,
 }
 
 #[allow(dead_code)]
@@ -34,6 +36,30 @@ struct CreateOi {
     stop_bits: u8,
     default_mode: String,
     sensor_probe_packet: u8,
+    supported_sensor_packets: String,
+    supported_modes: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct Capabilities {
+    verbs: Vec<String>,
+    sensors: Vec<String>,
+    outputs: Vec<String>,
+    safety: Vec<String>,
+    feedback: Vec<String>,
+    events: Vec<String>,
+    song_slots: u8,
+    max_song_tones: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct Limits {
+    max_linear_mm_s: i16,
+    max_angular_mrad_s: i16,
+    min_ttl_ms: u32,
+    max_ttl_ms: u32,
 }
 
 #[allow(dead_code)]
@@ -145,7 +171,22 @@ pub const DRIVE_KIND: DriveKind = DriveKind::Differential;
 pub const CREATE_UART_BAUD: u32 = {baud};
 pub const CREATE_DEFAULT_MODE: CreateOiMode = {default_mode};
 pub const CREATE_SENSOR_PROBE_PACKET: u8 = {sensor_probe_packet};
+pub const CREATE_SUPPORTED_SENSOR_PACKETS: &str = {supported_sensor_packets:?};
+pub const CREATE_SUPPORTED_MODES: &[&str] = {supported_modes};
 pub const CREATE_BRC_ENABLED: bool = {create_brc_enabled};
+
+pub const CAPABILITY_VERBS: &[&str] = {capability_verbs};
+pub const CAPABILITY_SENSORS: &[&str] = {capability_sensors};
+pub const CAPABILITY_OUTPUTS: &[&str] = {capability_outputs};
+pub const CAPABILITY_SAFETY: &[&str] = {capability_safety};
+pub const CAPABILITY_FEEDBACK: &[&str] = {capability_feedback};
+pub const CAPABILITY_EVENTS: &[&str] = {capability_events};
+pub const CAPABILITY_SONG_SLOTS: u8 = {song_slots};
+pub const CAPABILITY_MAX_SONG_TONES: usize = {max_song_tones};
+pub const CAPABILITY_MAX_LINEAR_MM_S: i16 = {max_linear_mm_s};
+pub const CAPABILITY_MAX_ANGULAR_MRAD_S: i16 = {max_angular_mrad_s};
+pub const CAPABILITY_MIN_TTL_MS: u32 = {min_ttl_ms};
+pub const CAPABILITY_MAX_TTL_MS: u32 = {max_ttl_ms};
 
 pub const POWER_TOGGLE_PULSE_MS: u32 = {power_toggle_pulse_ms};
 pub const CREATE_WAKE_WAIT_MS: u32 = {wake_wait_ms};
@@ -185,7 +226,21 @@ pub const ESTOP_GPIO: u8 = {estop_gpio};
         baud = body.create_oi.baud,
         default_mode = default_mode,
         sensor_probe_packet = body.create_oi.sensor_probe_packet,
+        supported_sensor_packets = body.create_oi.supported_sensor_packets,
+        supported_modes = string_slice_literal(&body.create_oi.supported_modes),
         create_brc_enabled = board.pins.create_brc.enabled,
+        capability_verbs = string_slice_literal(&body.capabilities.verbs),
+        capability_sensors = string_slice_literal(&body.capabilities.sensors),
+        capability_outputs = string_slice_literal(&body.capabilities.outputs),
+        capability_safety = string_slice_literal(&body.capabilities.safety),
+        capability_feedback = string_slice_literal(&body.capabilities.feedback),
+        capability_events = string_slice_literal(&body.capabilities.events),
+        song_slots = body.capabilities.song_slots,
+        max_song_tones = body.capabilities.max_song_tones,
+        max_linear_mm_s = body.limits.max_linear_mm_s,
+        max_angular_mrad_s = body.limits.max_angular_mrad_s,
+        min_ttl_ms = body.limits.min_ttl_ms,
+        max_ttl_ms = body.limits.max_ttl_ms,
         power_toggle_pulse_ms = body.timing.power_toggle_pulse_ms,
         wake_wait_ms = body.timing.wake_wait_ms,
         responsive_timeout_ms = body.timing.responsive_timeout_ms,
@@ -220,4 +275,16 @@ pub const ESTOP_GPIO: u8 = {estop_gpio};
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     fs::write(out_dir.join("body_config.rs"), generated).unwrap();
+}
+
+fn string_slice_literal(values: &[String]) -> String {
+    let mut literal = String::from("&[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            literal.push_str(", ");
+        }
+        literal.push_str(&format!("{value:?}"));
+    }
+    literal.push(']');
+    literal
 }

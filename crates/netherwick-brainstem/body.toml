@@ -9,6 +9,8 @@ data_bits = 8
 stop_bits = 1
 default_mode = "safe"
 sensor_probe_packet = 25
+supported_sensor_packets = "0,7-31"
+supported_modes = ["passive", "safe", "full"]
 
 [timing]
 power_toggle_pulse_ms = 500
@@ -22,3 +24,97 @@ uart_byte_timeout_ms = 20
 idle_blink_ms = 1000
 error_blink_ms = 150
 error_pause_ms = 900
+
+[capabilities]
+verbs = [
+  "ping",
+  "status",
+  "get_capabilities",
+  "get_events",
+  "arm",
+  "disarm",
+  "stop",
+  "estop",
+  "clear_estop",
+  "clear_motion_queue",
+  "cmd_vel",
+  "drive_direct",
+  "drive_arc",
+  "drive_for",
+  "turn_by",
+  "arc_for",
+  "creep_until",
+  "scan_arc",
+  "face_bearing",
+  "track_bearing",
+  "hold_heading",
+  "turn_to_heading",
+  "dock_align",
+  "wall_follow",
+  "wiggle_align",
+  "bump_escape",
+  "unstick",
+  "cliff_guard",
+  "request_sensors",
+  "stream_sensors",
+  "set_safety_policy",
+  "song_define",
+  "song_play",
+  "define_chirp",
+  "play_feedback",
+  "power_state",
+  "calibrate_turn",
+  "reset_odometry",
+  "dock",
+  "set_lights",
+  "set_mode",
+]
+sensors = [
+  "bump",
+  "cliff",
+  "wheel_drop",
+  "wall",
+  "virtual_wall",
+  "ir",
+  "buttons",
+  "battery",
+  "odometry_delta",
+]
+outputs = ["lights", "song", "dock", "power_toggle", "brc"]
+safety = ["bump", "cliff", "wheel_drop", "estop", "heartbeat"]
+feedback = ["ok", "error", "armed", "lost_target", "dock_seen", "danger"]
+events = [
+  "boot",
+  "command_accepted",
+  "command_rejected",
+  "command_started",
+  "command_completed",
+  "command_interrupted",
+  "command_timed_out",
+  "body_power_requested",
+  "body_power_changed",
+  "body_mode_requested",
+  "body_mode_changed",
+  "telemetry_received",
+  "sensor_frame_decoded",
+  "motion_requested",
+  "motion_stopped",
+  "safety_tripped",
+  "safety_cleared",
+  "bump_changed",
+  "cliff_changed",
+  "wheel_drop_latched",
+  "wheel_drop_cleared",
+  "heartbeat_expired",
+  "estop_latched",
+  "estop_cleared",
+  "error",
+]
+song_slots = 16
+max_song_tones = 16
+
+[limits]
+max_linear_mm_s = 500
+max_angular_mrad_s = 4000
+min_ttl_ms = 10
+max_ttl_ms = 60000

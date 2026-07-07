@@ -2,101 +2,7 @@ use core::fmt::{self, Write as _};
 
 use heapless::String;
 
-use crate::{body, commands::MAX_SONG_TONES};
-
-pub const VERBS: &[&str] = &[
-    "ping",
-    "status",
-    "get_capabilities",
-    "get_events",
-    "arm",
-    "disarm",
-    "stop",
-    "estop",
-    "clear_estop",
-    "clear_motion_queue",
-    "cmd_vel",
-    "drive_direct",
-    "drive_arc",
-    "drive_for",
-    "turn_by",
-    "arc_for",
-    "creep_until",
-    "scan_arc",
-    "face_bearing",
-    "track_bearing",
-    "hold_heading",
-    "turn_to_heading",
-    "dock_align",
-    "wall_follow",
-    "wiggle_align",
-    "bump_escape",
-    "unstick",
-    "cliff_guard",
-    "request_sensors",
-    "stream_sensors",
-    "set_safety_policy",
-    "song_define",
-    "song_play",
-    "define_chirp",
-    "play_feedback",
-    "power_state",
-    "calibrate_turn",
-    "reset_odometry",
-    "dock",
-    "set_lights",
-    "set_mode",
-];
-
-pub const SENSORS: &[&str] = &[
-    "bump",
-    "cliff",
-    "wheel_drop",
-    "wall",
-    "virtual_wall",
-    "ir",
-    "buttons",
-    "battery",
-    "odometry_delta",
-];
-
-pub const OUTPUTS: &[&str] = &["lights", "song", "dock", "power_toggle", "brc"];
-pub const SAFETY: &[&str] = &["bump", "cliff", "wheel_drop", "estop", "heartbeat"];
-pub const FEEDBACK: &[&str] = &["ok", "error", "armed", "lost_target", "dock_seen", "danger"];
-pub const EVENTS: &[&str] = &[
-    "boot",
-    "command_accepted",
-    "command_rejected",
-    "command_started",
-    "command_completed",
-    "command_interrupted",
-    "command_timed_out",
-    "body_power_requested",
-    "body_power_changed",
-    "body_mode_requested",
-    "body_mode_changed",
-    "telemetry_received",
-    "sensor_frame_decoded",
-    "motion_requested",
-    "motion_stopped",
-    "safety_tripped",
-    "safety_cleared",
-    "bump_changed",
-    "cliff_changed",
-    "wheel_drop_latched",
-    "wheel_drop_cleared",
-    "heartbeat_expired",
-    "estop_latched",
-    "estop_cleared",
-    "error",
-];
-
-pub const SENSOR_PACKET_RANGE: &str = "0,7-31";
-pub const SONG_SLOTS: u8 = 16;
-pub const MIN_TTL_MS: u32 = 10;
-pub const MAX_TTL_MS: u32 = 60_000;
-pub const MAX_LINEAR_MM_S: i16 = 500;
-pub const MAX_ANGULAR_MRAD_S: i16 = 4_000;
+use crate::body;
 
 pub struct BrainstemCapabilities {
     pub firmware_name: &'static str,
@@ -117,29 +23,23 @@ pub struct BrainstemCapabilities {
     pub max_angular_mrad_s: i16,
     pub min_ttl_ms: u32,
     pub max_ttl_ms: u32,
+    #[allow(dead_code)]
+    pub driver: BodyDriverCapabilities,
+}
+
+#[allow(dead_code)]
+pub struct BodyDriverCapabilities {
+    pub modes: &'static [&'static str],
+    pub sensor_packets: &'static str,
+    pub has_brc: bool,
+    pub has_power_toggle: bool,
+    pub has_lights: bool,
+    pub has_songs: bool,
+    pub has_dock: bool,
 }
 
 pub fn current() -> BrainstemCapabilities {
-    BrainstemCapabilities {
-        firmware_name: env!("CARGO_PKG_NAME"),
-        firmware_version: env!("CARGO_PKG_VERSION"),
-        body_name: body::BODY_NAME,
-        body_kind: body_kind_text(body::BODY_KIND),
-        drive: drive_kind_text(body::DRIVE_KIND),
-        verbs: VERBS,
-        sensors: SENSORS,
-        outputs: OUTPUTS,
-        safety: SAFETY,
-        feedback: FEEDBACK,
-        events: EVENTS,
-        sensor_packets: SENSOR_PACKET_RANGE,
-        max_song_tones: MAX_SONG_TONES,
-        song_slots: SONG_SLOTS,
-        max_linear_mm_s: MAX_LINEAR_MM_S,
-        max_angular_mrad_s: MAX_ANGULAR_MRAD_S,
-        min_ttl_ms: MIN_TTL_MS,
-        max_ttl_ms: MAX_TTL_MS,
-    }
+    body::current_capabilities()
 }
 
 pub fn render_json<'a>(
@@ -242,16 +142,4 @@ fn write_csv<const N: usize>(response: &mut String<N>, values: &[&str]) -> fmt::
         response.push_str(value).map_err(|_| fmt::Error)?;
     }
     Ok(())
-}
-
-fn body_kind_text(kind: body::BodyKind) -> &'static str {
-    match kind {
-        body::BodyKind::CreateOpenInterface => "create_oi",
-    }
-}
-
-fn drive_kind_text(kind: body::DriveKind) -> &'static str {
-    match kind {
-        body::DriveKind::Differential => "differential",
-    }
 }
