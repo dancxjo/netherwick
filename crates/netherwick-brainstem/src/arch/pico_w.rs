@@ -772,61 +772,70 @@ fn index_html() -> &'static [u8] {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pete Brainstem</title>
 <style>
-:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#1b211d;background:#eef2ed}
-*{box-sizing:border-box}body{margin:0}.wrap{max-width:980px;margin:auto;padding:14px}
-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
-h1{font-size:22px;line-height:1.1;margin:0}h2{font-size:13px;margin:0 0 10px;color:#57615a;text-transform:uppercase;font-weight:800}
-.sub{margin-top:4px;font-size:13px;color:#637067}.top{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}
-.pill{font-size:12px;border:1px solid #cbd3cd;border-radius:999px;padding:5px 9px;background:#fff;color:#36413a}
-.pill.ok{border-color:#8cc7a3;background:#eefbf3}.pill.warn{border-color:#e2bf62;background:#fff8df}.pill.bad{border-color:#d98282;background:#fff0f0}
-.grid{display:grid;gap:10px}.panel{background:#fff;border:1px solid #d8ded9;border-radius:8px;padding:12px;box-shadow:0 1px 2px #16201512}
-.hero{display:grid;gap:12px}.joy{min-height:285px;display:grid;place-items:center;touch-action:none;user-select:none;background:linear-gradient(180deg,#fbfcfb,#f3f7f3)}
-.base{width:min(72vw,270px);height:min(72vw,270px);border-radius:50%;background:#e4ebe5;border:2px solid #c5d0c7;position:relative;box-shadow:inset 0 0 0 28px #edf3ee}
-.base:before,.base:after{content:"";position:absolute;background:#cbd5ce}.base:before{width:2px;height:82%;left:50%;top:9%}.base:after{height:2px;width:82%;left:9%;top:50%}
-.nub{width:86px;height:86px;border-radius:50%;background:#2d696f;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);box-shadow:0 8px 18px #13251c33;border:4px solid #f7fbf8}
-.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 auto}.stack{display:grid;gap:8px}.cluster{display:grid;gap:8px;margin-top:12px}
-button{min-height:44px;border:1px solid #b6c0b8;border-radius:7px;background:#fff;color:#1f2822;font-weight:750;font-size:14px;letter-spacing:0}
-button:active,.active{transform:translateY(1px);background:#eaf0ec}button:disabled{opacity:.55}.primary{background:#dcefe5;border-color:#9cc8ae}.stop{background:#202522;color:#fff;border-color:#202522}.danger{background:#8e242b;color:#fff;border-color:#75191f}
-.pad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.pad button{min-height:48px}.pad .center{grid-column:2}.pad .widebtn{grid-column:1/-1}
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#202522;background:#f2f4f1;accent-color:#1f6f78}
+*{box-sizing:border-box}body{margin:0}.wrap{max-width:1180px;margin:auto;padding:14px}
+header{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:12px}
+h1{font-size:22px;line-height:1.1;margin:0}h2{font-size:12px;margin:0 0 9px;color:#59625d;text-transform:uppercase;font-weight:800}
+.sub{font-size:13px;color:#626c66;margin-top:4px}.top{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}
+.pill{font-size:12px;border:1px solid #c8cfca;border-radius:999px;padding:5px 9px;background:#fff;color:#303934;white-space:nowrap}
+.pill.ok{border-color:#63ad7d;background:#edf9f1}.pill.warn{border-color:#d4aa40;background:#fff7dc}.pill.bad{border-color:#d67171;background:#fff0f0}
+.layout{display:grid;gap:10px}.panel{background:#fff;border:1px solid #d7ddd9;border-radius:8px;padding:12px;box-shadow:0 1px 2px #1a241e12}
+.motion{display:grid;gap:12px}.joy{min-height:300px;display:grid;place-items:center;touch-action:none;user-select:none;background:#f7f9f7;border:1px solid #e1e7e3;border-radius:8px}
+.base{width:min(72vw,286px);height:min(72vw,286px);border-radius:50%;background:#e5ebe7;border:2px solid #c3ccc6;position:relative;box-shadow:inset 0 0 0 28px #f0f4f1}
+.base:before,.base:after{content:"";position:absolute;background:#c8d1cb}.base:before{width:2px;height:82%;left:50%;top:9%}.base:after{height:2px;width:82%;left:9%;top:50%}
+.nub{width:84px;height:84px;border-radius:50%;background:#1f6f78;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);box-shadow:0 8px 18px #13251c33;border:4px solid #fbfdfb}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 auto}.stack{display:grid;gap:8px}.cluster{display:grid;gap:8px;margin-top:12px}.split{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{min-height:42px;border:1px solid #b9c2bd;border-radius:7px;background:#fff;color:#202722;font-weight:750;font-size:14px;letter-spacing:0}
+button:active,.active{transform:translateY(1px);background:#eef2ef}button:disabled{opacity:.55}.primary{background:#dceee6;border-color:#8eb99f}.stop{background:#202522;color:#fff;border-color:#202522}.danger{background:#9d2830;color:#fff;border-color:#842029}.warnbtn{background:#fff3d6;border-color:#d8b24a}.blue{background:#e7f0fb;border-color:#9bbbe0}
+.pad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.pad button{min-height:48px}.pad .center{grid-column:2}
 .seg{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.seg button{min-height:38px;font-size:12px}
-label{font-size:12px;color:#5c675f;font-weight:700}.slider{display:grid;gap:6px}.slider input{width:100%;accent-color:#2d696f}
-.readout{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px}.tile{background:#f5f7f5;border:1px solid #e1e6e2;border-radius:7px;padding:8px;min-height:48px}
-.tile b{display:block;color:#4d5851;font-size:11px;text-transform:uppercase}.tile span{overflow-wrap:anywhere}.wide{grid-column:1/-1}.muted{color:#68736c}.log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45;max-height:96px;overflow:auto}
-@media(min-width:760px){.grid{grid-template-columns:1.1fr .9fr}.wide{grid-column:1/-1}.hero{grid-template-columns:1fr}.joy{min-height:360px}.controls{align-self:start}}
+label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;gap:6px}.slider input{width:100%}input{width:100%;min-height:40px;border:1px solid #cbd3ce;border-radius:7px;padding:8px;font:inherit;background:#fff}
+.readout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;font-size:13px}.tile{background:#f6f8f6;border:1px solid #e1e6e2;border-radius:7px;padding:8px;min-height:50px}
+.tile b{display:block;color:#4e5852;font-size:11px;text-transform:uppercase;margin-bottom:3px}.tile span,.tile div{overflow-wrap:anywhere}.wide{grid-column:1/-1}.muted{color:#68736c}.badtext{color:#a1262f}.oktext{color:#287142}
+.log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45;max-height:110px;overflow:auto;white-space:pre-wrap}
+@media(min-width:800px){.layout{grid-template-columns:minmax(320px,.9fr) minmax(380px,1.1fr)}.telemetry{grid-column:1/-1}.joy{min-height:382px}.controlgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.cluster{margin-top:0}}
+@media(max-width:520px){.wrap{padding:10px}header{display:grid}.readout,.split{grid-template-columns:1fr}.seg{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<header><div><h1>Pete Brainstem</h1><div class="sub" id="headline">Waiting for status</div></div><div class="top"><span id="net" class="pill">connecting</span><span id="mode" class="pill">mode unknown</span></div></header>
-<div class="grid">
-<section class="panel hero">
+<header><div><h1>Pete Brainstem</h1><div class="sub" id="headline">Waiting for status</div></div><div class="top"><span id="net" class="pill">connecting</span><span id="mode" class="pill">mode unknown</span><span id="safety" class="pill">safety unknown</span></div></header>
+<div class="layout">
+<section class="panel motion">
+<h2>Motion</h2>
 <div class="joy"><div id="base" class="base"><div id="nub" class="nub"></div></div></div>
-<div class="row"><button class="stop" id="stop">STOP</button><button class="danger" id="estop">E-STOP</button><button id="clear">Clear E-Stop</button></div>
-</section>
-<section class="panel controls">
-<h2>Drive</h2>
-<div class="slider"><label for="speed">Speed <span id="speedv">120</span> mm/s</label><input id="speed" type="range" min="40" max="220" value="120"></div>
-<div class="slider"><label for="turn">Turn <span id="turnv">1200</span> mrad/s</label><input id="turn" type="range" min="400" max="1800" value="1200"></div>
-<div class="pad cluster">
+<div class="split"><div class="slider"><label for="speed">Speed <span id="speedv">120</span> mm/s</label><input id="speed" type="range" min="40" max="260" value="120"></div><div class="slider"><label for="turn">Turn <span id="turnv">1200</span> mrad/s</label><input id="turn" type="range" min="300" max="2000" value="1200"></div></div>
+<div class="pad">
 <button class="primary center" data-drive="fwd">FWD</button>
 <button data-drive="left">LEFT</button><button class="stop" id="padstop">STOP</button><button data-drive="right">RIGHT</button>
 <button data-drive="back" class="center">BACK</button>
 <button data-drive="spinl">SPIN L</button><button data-drive="slow">SLOW</button><button data-drive="spinr">SPIN R</button>
 </div>
-<div class="cluster"><h2>Mode</h2><div class="row"><button id="arm" class="primary">Arm</button><button id="safe">Safe</button><button id="full">Full</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
-<div class="cluster"><h2>Lights</h2><div class="seg"><button data-lights="off">Off</button><button data-lights="status">Status</button><button data-lights="clean">Clean</button><button data-lights="dock">Dock</button><button data-lights="spot">Spot</button><button data-lights="max">Max</button></div></div>
-<div class="cluster"><div class="row"><button id="song">Song</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
+<div class="row"><button class="stop" id="stop">STOP</button><button class="danger" id="estop">E-STOP</button><button id="clear">Clear E-Stop</button></div>
 </section>
-<section class="panel wide">
+<section class="panel controls">
+<div class="controlgrid">
+<div class="cluster"><h2>Mode</h2><div class="seg"><button id="arm" class="primary">Arm</button><button id="safe">Safe</button><button id="full">Full</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
+<div class="cluster"><h2>Lights</h2><div class="seg"><button data-lights="off">Off</button><button data-lights="status">Status</button><button data-lights="clean">Clean</button><button data-lights="dock">Dock</button><button data-lights="spot">Spot</button><button data-lights="max">Max</button></div></div>
+<div class="cluster"><h2>Primitives</h2><div class="seg"><button data-action="drive_for">Drive 300</button><button data-action="turn_left">Turn L</button><button data-action="turn_right">Turn R</button><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div></div>
+<div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
+<div class="cluster wide"><h2>Music</h2><div class="split"><div class="field"><label for="songid">Slot</label><input id="songid" inputmode="numeric" value="0"></div><div class="field"><label for="tones">Tones</label><input id="tones" value="72:8,76:8,79:16"></div></div><div class="row"><button id="songdef" class="primary">Define</button><button id="songplay">Play</button><button id="song">Chirp</button></div></div>
+</div>
+</section>
+<section class="panel telemetry">
 <h2>Telemetry</h2>
 <div class="readout">
 <div class="tile"><b>Runtime</b><span id="runtime" class="muted">...</span></div>
 <div class="tile"><b>Uptime</b><span id="uptime" class="muted">...</span></div>
 <div class="tile"><b>Create</b><span id="create" class="muted">...</span></div>
+<div class="tile"><b>Safety</b><span id="safetyread" class="muted">...</span></div>
 <div class="tile"><b>UART</b><span id="uart" class="muted">...</span></div>
 <div class="tile"><b>Command</b><span id="cmd" class="muted">...</span></div>
 <div class="tile"><b>Forebrain</b><span id="forebrain" class="muted">...</span></div>
 <div class="tile"><b>Web</b><span id="web" class="muted">...</span></div>
+<div class="tile"><b>Sensors</b><span id="sensors" class="muted">...</span></div>
+<div class="tile"><b>Battery</b><span id="battery" class="muted">...</span></div>
+<div class="tile"><b>Music</b><span id="music" class="muted">...</span></div>
 <div class="tile"><b>Firmware</b><span id="firmware" class="muted">...</span></div>
 <div class="tile wide"><b>Last error</b><span id="err" class="muted">...</span></div>
 <div class="tile wide"><b>Activity</b><div id="log" class="log muted">No commands yet</div></div>
@@ -847,6 +856,9 @@ function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
 function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
 function sendJoy(){paceDrive(()=>{let m=joyMax(),lin=Math.round(-last.y*m.lin),ang=Math.round(-last.x*m.ang);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
 function sendDrive(){paceDrive(()=>{let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=m.ang;if(driveKind==='right')ang=-m.ang;if(driveKind==='spinl')ang=m.ang,lin=0;if(driveKind==='spinr')ang=-m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
+function songSlot(){let n=parseInt($('songid').value,10);return Number.isFinite(n)?Math.max(0,Math.min(15,n)):0}
+function defineSong(){return post({kind:'song_define',id:songSlot(),tones:$('tones').value})}
+function behavior(k){let m=joyMax();if(k==='drive_for')post({kind:'drive_for',distance_mm:300,velocity_mm_s:m.lin,timeout_ms:3500});if(k==='turn_left')post({kind:'turn_by',angle_mrad:1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='turn_right')post({kind:'turn_by',angle_mrad:-1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='creep')post({kind:'creep_until',velocity_mm_s:45,timeout_ms:1200});if(k==='scan')post({kind:'scan_arc',angle_mrad:3140,angular_mrad_s:700,timeout_ms:6000});if(k==='wiggle')post({kind:'wiggle_align',amplitude_mrad:240,angular_mrad_s:700,cycles:4});if(k==='bump_escape')post({kind:'bump_escape',direction:'either'});if(k==='unstick')post({kind:'unstick',direction:'either'});if(k==='cliff_trip')post({kind:'cliff_guard',clear:false});if(k==='heartbeat')post({kind:'heartbeat_stop',timeout_ms:1200})}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
 base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
 base.onpointermove=e=>{if(active)move(e)}
@@ -860,15 +872,18 @@ $('full').onclick=()=>post({kind:'set_mode',mode:'full'})
 $('disarm').onclick=()=>post({kind:'disarm'})
 $('dock').onclick=()=>post({kind:'dock'})
 $('ping').onclick=()=>post({kind:'ping'})
-$('song').onclick=()=>post({kind:'song_define',id:0,tones:'72:8,76:8,79:16'}).then(()=>post({kind:'song_play',id:0}))
+$('songdef').onclick=defineSong
+$('songplay').onclick=()=>post({kind:'song_play',id:songSlot()})
+$('song').onclick=()=>defineSong().then(()=>post({kind:'song_play',id:songSlot()}))
 $('bootsel').onclick=()=>post({kind:'bootsel'})
 $('refresh').onclick=refresh
 document.querySelectorAll('[data-lights]').forEach(b=>b.onclick=()=>post({kind:'set_lights',pattern:b.dataset.lights}))
+document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>behavior(b.dataset.action))
 document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveKind=b.dataset.drive;b.classList.add('active');sendDrive();timer=setInterval(sendDrive,190);b.setPointerCapture(e.pointerId)};b.onpointerup=b.onpointercancel=stop})
 $('speed').oninput=()=>$('speedv').textContent=$('speed').value
 $('turn').oninput=()=>$('turnv').textContent=$('turn').value
 function time(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60),h=Math.floor(m/60);return h+'h '+(m%60)+'m '+(s%60)+'s'}
-function showStatus(s){let err=s.last_error&&s.last_error!=='none';pill(net,wsOpen?'control ws':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health);$('runtime').textContent=title(s.current_runtime_state)+' / demo '+title(s.demo_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=err?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=err?'':'muted'}
+function showStatus(s){let cs=s.create_sensors||{},music=s.create_songs||{},err=s.last_error&&s.last_error!=='none',danger=cs.bump_left||cs.bump_right||cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right;pill(net,wsOpen?'control ws':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),danger?'contact':'clear',danger?'bad':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health);$('runtime').textContent=title(s.current_runtime_state)+' / demo '+title(s.demo_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=(cs.bump_left?'bump L ':'')+(cs.bump_right?'bump R ':'')+(cs.wheel_drop?'wheel drop ':'')+(cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right?'cliff ':'')||'clear';$('safetyread').className=danger?'badtext':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / dist '+(cs.distance_mm||0)+' mm / angle '+(cs.angle_mrad||0)+' mrad';$('battery').textContent=(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh';$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=err?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=err?'badtext':'muted'}
 function refresh(){if(statusBusy)return;statusBusy=true;if(wsOpen&&ws&&ws.readyState===1&&ws.bufferedAmount<384){ws.send(JSON.stringify({kind:'status',command_id:id++}));statusBusy=false;return}fetch('/status.json').then(r=>r.json()).then(showStatus).catch(_=>pill(net,'offline','bad')).finally(()=>statusBusy=false)}
 setInterval(refresh,3500);refresh();
 connectWs();
