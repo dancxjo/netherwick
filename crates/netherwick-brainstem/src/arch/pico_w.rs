@@ -27,6 +27,7 @@ use embedded_io_async::Write;
 use static_cell::StaticCell;
 
 use crate::body;
+use crate::capabilities;
 use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
     SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
@@ -369,7 +370,7 @@ async fn http_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 2048];
     let mut request = [0; 512];
-    let mut json = [0; 1536];
+    let mut json = [0; 2048];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -453,7 +454,7 @@ async fn websocket_task(stack: Stack<'static>) -> ! {
     let mut tx_buffer = [0; 2048];
     let mut request = [0; 512];
     let mut payload = [0; 256];
-    let mut response = [0; 1536];
+    let mut response = [0; 2048];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -556,9 +557,9 @@ async fn udp_control_task(stack: Stack<'static>) -> ! {
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
     let mut rx_buffer = [0; 512];
     let mut tx_meta = [PacketMetadata::EMPTY; 2];
-    let mut tx_buffer = [0; 512];
+    let mut tx_buffer = [0; 1024];
     let mut request = [0; 128];
-    let mut response = heapless::String::<512>::new();
+    let mut response = heapless::String::<1024>::new();
 
     loop {
         let mut socket = UdpSocket::new(
@@ -1024,6 +1025,10 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
         write_forebrain_uart_ok(uart, seq);
         reset_to_usb_boot(0, 0);
     }
+    if matches!(command, BrainstemCommand::GetCapabilities) {
+        write_forebrain_uart_capabilities(uart, seq);
+        return;
+    }
 
     if !status::submit_control_command(seq, command) {
         status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Busy);
@@ -1281,7 +1286,10 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
     Ok((seq, command))
 }
 
-fn handle_udp_control_line(line: &str, response: &mut heapless::String<512>) -> Option<bool> {
+fn handle_udp_control_line<const N: usize>(
+    line: &str,
+    response: &mut heapless::String<N>,
+) -> Option<bool> {
     response.clear();
     let (seq, command) = match parse_forebrain_uart_command(line) {
         Ok(parsed) => parsed,
@@ -1297,11 +1305,7 @@ fn handle_udp_control_line(line: &str, response: &mut heapless::String<512>) -> 
             Some(false)
         }
         BrainstemCommand::GetCapabilities => {
-            let _ = writeln!(
-                response,
-                "OK {seq} CAPABILITIES max_tones={} song_slots=16 feedback_slots=6 sensor_packets=0,7-31",
-                MAX_SONG_TONES
-            );
+            let _ = capabilities::write_compact(response, &capabilities::current(), seq);
             Some(false)
         }
         BrainstemCommand::Bootsel => {
@@ -1356,6 +1360,15 @@ fn write_forebrain_uart_error(uart: &mut Uart<'static, Blocking>, seq: u32, erro
 fn write_forebrain_uart_status(uart: &mut Uart<'static, Blocking>, seq: u32) {
     let mut response = heapless::String::<384>::new();
     write_compact_status_line(&mut response, seq);
+    write_forebrain_uart_line(uart, response.as_bytes());
+}
+
+fn write_forebrain_uart_capabilities(uart: &mut Uart<'static, Blocking>, seq: u32) {
+    let mut response = heapless::String::<1024>::new();
+    if capabilities::write_compact(&mut response, &capabilities::current(), seq).is_err() {
+        write_forebrain_uart_error(uart, seq, "capabilities_too_large");
+        return;
+    }
     write_forebrain_uart_line(uart, response.as_bytes());
 }
 
@@ -1718,22 +1731,7 @@ fn render_command_response<'a>(
 }
 
 fn render_capabilities_response(buffer: &mut [u8], command_id: u32) -> Option<&str> {
-    let mut response = heapless::String::<1536>::new();
-    let _ = write!(
-        response,
-        "{{\"accepted\":true,\"command_id\":{},\"firmware\":\"{}\",\"version\":\"{}\",\"body\":\"{}\",\"max_song_tones\":{},\"song_slots\":16,\"feedback\":[\"ok\",\"error\",\"armed\",\"lost_target\",\"dock_seen\",\"danger\"],\"sensor_packets\":\"0,7-31\",\"commands\":[\"ping\",\"status\",\"get_capabilities\",\"arm\",\"disarm\",\"stop\",\"estop\",\"clear_estop\",\"clear_motion_queue\",\"cmd_vel\",\"drive_direct\",\"drive_arc\",\"drive_for\",\"turn_by\",\"arc_for\",\"creep_until\",\"scan_arc\",\"face_bearing\",\"track_bearing\",\"hold_heading\",\"turn_to_heading\",\"dock_align\",\"wall_follow\",\"wiggle_align\",\"bump_escape\",\"unstick\",\"cliff_guard\",\"request_sensors\",\"stream_sensors\",\"set_safety_policy\",\"song_define\",\"song_play\",\"define_chirp\",\"play_feedback\",\"power_state\",\"calibrate_turn\",\"reset_odometry\",\"dock\",\"set_lights\",\"set_mode\"]}}\n",
-        command_id,
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        body::BODY_NAME,
-        MAX_SONG_TONES
-    );
-    let bytes = response.as_bytes();
-    if bytes.len() > buffer.len() {
-        return None;
-    }
-    buffer[..bytes.len()].copy_from_slice(bytes);
-    core::str::from_utf8(&buffer[..bytes.len()]).ok()
+    capabilities::render_json(&capabilities::current(), command_id, buffer)
 }
 
 fn websocket_key(request: &[u8]) -> Option<&str> {

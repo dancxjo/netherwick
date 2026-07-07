@@ -3,6 +3,7 @@
 
 mod arch;
 mod body;
+mod capabilities;
 mod commands;
 mod drivers;
 mod events;
