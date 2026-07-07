@@ -4,7 +4,7 @@ use crate::body;
 use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern, RuntimeCommand,
 };
-use crate::events::{BrainstemError, BrainstemEvent};
+use crate::events::{BrainstemError, BrainstemEvent, CreateSensorPacket};
 use crate::hardware::UartReadError;
 
 const UNKNOWN: u8 = 0;
@@ -56,6 +56,22 @@ static FOREBRAIN_UART_LAST_SEQ: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_LAST_ERROR: AtomicU8 = AtomicU8::new(ForebrainUartErrorCode::None as u8);
 static FOREBRAIN_UART_LAST_RX_MS: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_LAST_COMMAND_MS: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_LAST_PACKET_ID: AtomicU8 = AtomicU8::new(0);
+static CREATE_SENSOR_FLAGS: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_DISTANCE_MM: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_ANGLE_MRAD: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_IR_BYTE: AtomicU8 = AtomicU8::new(0);
+static CREATE_SENSOR_BUTTONS: AtomicU8 = AtomicU8::new(0);
+static CREATE_SENSOR_CHARGING_STATE: AtomicU8 = AtomicU8::new(0);
+static CREATE_SENSOR_VOLTAGE_MV: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_CURRENT_MA: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_TEMPERATURE_C: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_CHARGE_MAH: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_CAPACITY_MAH: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_CLIFF_LEFT_SIGNAL: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_CLIFF_RIGHT_SIGNAL: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -99,6 +115,22 @@ pub struct BrainstemStatus {
     pub forebrain_uart_last_error: u8,
     pub forebrain_uart_link_alive_ms: u32,
     pub forebrain_uart_last_command_age_ms: u32,
+    pub create_sensor_last_packet_id: u8,
+    pub create_sensor_flags: u32,
+    pub create_sensor_distance_mm: i16,
+    pub create_sensor_angle_mrad: i16,
+    pub create_sensor_ir_byte: u8,
+    pub create_sensor_buttons: u8,
+    pub create_sensor_charging_state: u8,
+    pub create_sensor_voltage_mv: u16,
+    pub create_sensor_current_ma: i16,
+    pub create_sensor_temperature_c: i8,
+    pub create_sensor_charge_mah: u16,
+    pub create_sensor_capacity_mah: u16,
+    pub create_sensor_cliff_left_signal: u16,
+    pub create_sensor_cliff_front_left_signal: u16,
+    pub create_sensor_cliff_front_right_signal: u16,
+    pub create_sensor_cliff_right_signal: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -223,6 +255,16 @@ enum ControlCommandCode {
     DriveFor = 16,
     BumpEscape = 17,
     HeartbeatStop = 18,
+    HoldHeading = 19,
+    TurnToHeading = 20,
+    ArcFor = 21,
+    CreepUntil = 22,
+    ScanArc = 23,
+    DockAlign = 24,
+    WallFollow = 25,
+    WiggleAlign = 26,
+    Unstick = 27,
+    CliffGuard = 28,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -252,6 +294,16 @@ pub fn set_command(command: Option<RuntimeCommand>) {
         | Some(RuntimeCommand::TurnBy { .. })
         | Some(RuntimeCommand::DriveFor { .. })
         | Some(RuntimeCommand::BumpEscape { .. })
+        | Some(RuntimeCommand::HoldHeading { .. })
+        | Some(RuntimeCommand::TurnToHeading { .. })
+        | Some(RuntimeCommand::ArcFor { .. })
+        | Some(RuntimeCommand::CreepUntil { .. })
+        | Some(RuntimeCommand::ScanArc { .. })
+        | Some(RuntimeCommand::DockAlign { .. })
+        | Some(RuntimeCommand::WallFollow { .. })
+        | Some(RuntimeCommand::WiggleAlign { .. })
+        | Some(RuntimeCommand::Unstick { .. })
+        | Some(RuntimeCommand::CliffGuard { .. })
         | Some(RuntimeCommand::HeartbeatStop { .. }) => CommandCode::Behavior,
         Some(RuntimeCommand::PulseBrc) => CommandCode::PulseBrc,
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
@@ -475,6 +527,132 @@ fn encode_control_command(
             0,
             Some(timeout_ms),
         )),
+        BrainstemCommand::HoldHeading {
+            heading_error_mrad,
+            velocity_mm_s,
+            max_angular_mrad_s,
+            ttl_ms,
+            ..
+        } => Some((
+            ControlCommandCode::HoldHeading,
+            encode_i16(heading_error_mrad),
+            encode_i16(velocity_mm_s),
+            encode_i16(max_angular_mrad_s),
+            0,
+            Some(ttl_ms),
+        )),
+        BrainstemCommand::TurnToHeading {
+            heading_error_mrad,
+            angular_mrad_s,
+            tolerance_mrad,
+            timeout_ms,
+            ..
+        } => Some((
+            ControlCommandCode::TurnToHeading,
+            encode_i16(heading_error_mrad),
+            encode_i16(angular_mrad_s),
+            encode_i16(tolerance_mrad),
+            0,
+            Some(timeout_ms),
+        )),
+        BrainstemCommand::ArcFor {
+            velocity_mm_s,
+            radius_mm,
+            duration_ms,
+            ..
+        } => Some((
+            ControlCommandCode::ArcFor,
+            encode_i16(velocity_mm_s),
+            encode_i16(radius_mm),
+            0,
+            0,
+            Some(duration_ms),
+        )),
+        BrainstemCommand::CreepUntil {
+            velocity_mm_s,
+            angular_mrad_s,
+            timeout_ms,
+            ..
+        } => Some((
+            ControlCommandCode::CreepUntil,
+            encode_i16(velocity_mm_s),
+            encode_i16(angular_mrad_s),
+            0,
+            0,
+            Some(timeout_ms),
+        )),
+        BrainstemCommand::ScanArc {
+            angle_mrad,
+            angular_mrad_s,
+            timeout_ms,
+            ..
+        } => Some((
+            ControlCommandCode::ScanArc,
+            encode_i16(angle_mrad),
+            encode_i16(angular_mrad_s),
+            0,
+            0,
+            Some(timeout_ms),
+        )),
+        BrainstemCommand::DockAlign {
+            bearing_mrad,
+            range_mm,
+            max_linear_mm_s,
+            max_angular_mrad_s,
+            stop_range_mm,
+            ttl_ms,
+            ..
+        } => Some((
+            ControlCommandCode::DockAlign,
+            encode_i16(bearing_mrad),
+            range_mm as u32,
+            encode_i16(max_linear_mm_s),
+            pack_i16_u16(max_angular_mrad_s, stop_range_mm),
+            Some(ttl_ms),
+        )),
+        BrainstemCommand::WallFollow {
+            distance_error_mm,
+            velocity_mm_s,
+            max_angular_mrad_s,
+            ttl_ms,
+            ..
+        } => Some((
+            ControlCommandCode::WallFollow,
+            encode_i16(distance_error_mm),
+            encode_i16(velocity_mm_s),
+            encode_i16(max_angular_mrad_s),
+            0,
+            Some(ttl_ms),
+        )),
+        BrainstemCommand::WiggleAlign {
+            amplitude_mrad,
+            angular_mrad_s,
+            cycles,
+            ..
+        } => Some((
+            ControlCommandCode::WiggleAlign,
+            encode_i16(amplitude_mrad),
+            encode_i16(angular_mrad_s),
+            cycles as u32,
+            0,
+            None,
+        )),
+        BrainstemCommand::Unstick {
+            direction,
+            backoff_mm_s,
+            turn_angular_mrad_s,
+            ..
+        } => Some((
+            ControlCommandCode::Unstick,
+            encode_escape_direction(direction) as u32,
+            encode_i16(backoff_mm_s),
+            encode_i16(turn_angular_mrad_s),
+            0,
+            None,
+        )),
+        BrainstemCommand::CliffGuard { clear, .. } => {
+            Some((ControlCommandCode::CliffGuard, clear as u32, 0, 0, 0, None))
+        }
     }
 }
 
@@ -557,6 +735,74 @@ fn decode_control_command(
                 seq,
             })
         }
+        x if x == ControlCommandCode::HoldHeading as u8 => Some(BrainstemCommand::HoldHeading {
+            heading_error_mrad: decode_i16(a),
+            velocity_mm_s: decode_i16(b),
+            max_angular_mrad_s: decode_i16(c),
+            ttl_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::TurnToHeading as u8 => {
+            Some(BrainstemCommand::TurnToHeading {
+                heading_error_mrad: decode_i16(a),
+                angular_mrad_s: decode_i16(b),
+                tolerance_mrad: decode_i16(c),
+                timeout_ms: duration_ms?,
+                seq,
+            })
+        }
+        x if x == ControlCommandCode::ArcFor as u8 => Some(BrainstemCommand::ArcFor {
+            velocity_mm_s: decode_i16(a),
+            radius_mm: decode_i16(b),
+            duration_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::CreepUntil as u8 => Some(BrainstemCommand::CreepUntil {
+            velocity_mm_s: decode_i16(a),
+            angular_mrad_s: decode_i16(b),
+            timeout_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::ScanArc as u8 => Some(BrainstemCommand::ScanArc {
+            angle_mrad: decode_i16(a),
+            angular_mrad_s: decode_i16(b),
+            timeout_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::DockAlign as u8 => {
+            let (max_angular_mrad_s, stop_range_mm) = unpack_i16_u16(d);
+            Some(BrainstemCommand::DockAlign {
+                bearing_mrad: decode_i16(a),
+                range_mm: b as u16,
+                max_linear_mm_s: decode_i16(c),
+                max_angular_mrad_s,
+                stop_range_mm,
+                ttl_ms: duration_ms?,
+                seq,
+            })
+        }
+        x if x == ControlCommandCode::WallFollow as u8 => Some(BrainstemCommand::WallFollow {
+            distance_error_mm: decode_i16(a),
+            velocity_mm_s: decode_i16(b),
+            max_angular_mrad_s: decode_i16(c),
+            ttl_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::WiggleAlign as u8 => Some(BrainstemCommand::WiggleAlign {
+            amplitude_mrad: decode_i16(a),
+            angular_mrad_s: decode_i16(b),
+            cycles: c as u8,
+            seq,
+        }),
+        x if x == ControlCommandCode::Unstick as u8 => Some(BrainstemCommand::Unstick {
+            direction: decode_escape_direction(a as u8)?,
+            backoff_mm_s: decode_i16(b),
+            turn_angular_mrad_s: decode_i16(c),
+            seq,
+        }),
+        x if x == ControlCommandCode::CliffGuard as u8 => {
+            Some(BrainstemCommand::CliffGuard { clear: a != 0, seq })
+        }
         _ => None,
     }
 }
@@ -570,6 +816,16 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::TurnBy { seq, .. }
         | BrainstemCommand::DriveFor { seq, .. }
         | BrainstemCommand::BumpEscape { seq, .. }
+        | BrainstemCommand::HoldHeading { seq, .. }
+        | BrainstemCommand::TurnToHeading { seq, .. }
+        | BrainstemCommand::ArcFor { seq, .. }
+        | BrainstemCommand::CreepUntil { seq, .. }
+        | BrainstemCommand::ScanArc { seq, .. }
+        | BrainstemCommand::DockAlign { seq, .. }
+        | BrainstemCommand::WallFollow { seq, .. }
+        | BrainstemCommand::WiggleAlign { seq, .. }
+        | BrainstemCommand::Unstick { seq, .. }
+        | BrainstemCommand::CliffGuard { seq, .. }
         | BrainstemCommand::HeartbeatStop { seq, .. } => seq,
         _ => 0,
     }
@@ -675,6 +931,27 @@ pub fn mark_uart_packet(len: usize) {
     increment(&UART_RX_PACKETS);
     increment_by(&UART_RX_BYTES, len as u32);
     LAST_UART_PACKET_LEN.store(len as u32, Ordering::Relaxed);
+}
+
+pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
+    CREATE_SENSOR_LAST_PACKET_ID.store(packet_id, Ordering::Relaxed);
+    CREATE_SENSOR_FLAGS.store(create_sensor_flags_bits(sensors), Ordering::Relaxed);
+    CREATE_SENSOR_DISTANCE_MM.store(encode_signed_i16(sensors.distance_mm), Ordering::Relaxed);
+    CREATE_SENSOR_ANGLE_MRAD.store(encode_signed_i16(sensors.angle_mrad), Ordering::Relaxed);
+    CREATE_SENSOR_IR_BYTE.store(sensors.ir_byte, Ordering::Relaxed);
+    CREATE_SENSOR_BUTTONS.store(sensors.buttons, Ordering::Relaxed);
+    CREATE_SENSOR_CHARGING_STATE.store(sensors.charging_state, Ordering::Relaxed);
+    CREATE_SENSOR_VOLTAGE_MV.store(sensors.voltage_mv as u32, Ordering::Relaxed);
+    CREATE_SENSOR_CURRENT_MA.store(encode_signed_i16(sensors.current_ma), Ordering::Relaxed);
+    CREATE_SENSOR_TEMPERATURE_C.store(encode_signed_i8(sensors.temperature_c), Ordering::Relaxed);
+    CREATE_SENSOR_CHARGE_MAH.store(sensors.charge_mah as u32, Ordering::Relaxed);
+    CREATE_SENSOR_CAPACITY_MAH.store(sensors.capacity_mah as u32, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_LEFT_SIGNAL.store(sensors.cliff_left_signal as u32, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL
+        .store(sensors.cliff_front_left_signal as u32, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL
+        .store(sensors.cliff_front_right_signal as u32, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(sensors.cliff_right_signal as u32, Ordering::Relaxed);
 }
 
 pub fn mark_uart_rx_error() {
@@ -793,7 +1070,8 @@ pub fn signal_event(event: &BrainstemEvent) {
         BrainstemEvent::CreatePowerToggled => 3,
         BrainstemEvent::CreateBrcPulseRequested | BrainstemEvent::CreateBrcPulsed => 4,
         BrainstemEvent::CreateOiStartRequested | BrainstemEvent::CreateOiModeRequested(_) => 5,
-        BrainstemEvent::CreatePacketReceived { .. } => 6,
+        BrainstemEvent::CreatePacketReceived { .. }
+        | BrainstemEvent::CreateSensorPacketDecoded { .. } => 6,
         BrainstemEvent::DriveRequested { .. } | BrainstemEvent::DriveStopped => 7,
         BrainstemEvent::Error(_) => 8,
         BrainstemEvent::TickMs(_) => return,
@@ -827,6 +1105,36 @@ fn increment_by(counter: &AtomicU32, amount: u32) {
         counter.load(Ordering::Relaxed).saturating_add(amount),
         Ordering::Relaxed,
     );
+}
+
+fn create_sensor_flags_bits(sensors: CreateSensorPacket) -> u32 {
+    let flags = sensors.flags;
+    (flags.bump_left as u32)
+        | ((flags.bump_right as u32) << 1)
+        | ((flags.wheel_drop as u32) << 2)
+        | ((flags.wall as u32) << 3)
+        | ((flags.cliff_left as u32) << 4)
+        | ((flags.cliff_front_left as u32) << 5)
+        | ((flags.cliff_front_right as u32) << 6)
+        | ((flags.cliff_right as u32) << 7)
+        | ((flags.virtual_wall as u32) << 8)
+        | ((flags.overcurrent as u32) << 9)
+}
+
+fn encode_signed_i16(value: i16) -> u32 {
+    value as u16 as u32
+}
+
+fn decode_signed_i16(value: u32) -> i16 {
+    value as u16 as i16
+}
+
+fn encode_signed_i8(value: i8) -> u32 {
+    value as u8 as u32
+}
+
+fn decode_signed_i8(value: u32) -> i8 {
+    value as u8 as i8
 }
 
 #[allow(dead_code)]
@@ -889,6 +1197,34 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
             uptime_ms,
             FOREBRAIN_UART_LAST_COMMAND_MS.load(Ordering::Relaxed),
         ),
+        create_sensor_last_packet_id: CREATE_SENSOR_LAST_PACKET_ID.load(Ordering::Relaxed),
+        create_sensor_flags: CREATE_SENSOR_FLAGS.load(Ordering::Relaxed),
+        create_sensor_distance_mm: decode_signed_i16(
+            CREATE_SENSOR_DISTANCE_MM.load(Ordering::Relaxed),
+        ),
+        create_sensor_angle_mrad: decode_signed_i16(
+            CREATE_SENSOR_ANGLE_MRAD.load(Ordering::Relaxed),
+        ),
+        create_sensor_ir_byte: CREATE_SENSOR_IR_BYTE.load(Ordering::Relaxed),
+        create_sensor_buttons: CREATE_SENSOR_BUTTONS.load(Ordering::Relaxed),
+        create_sensor_charging_state: CREATE_SENSOR_CHARGING_STATE.load(Ordering::Relaxed),
+        create_sensor_voltage_mv: CREATE_SENSOR_VOLTAGE_MV.load(Ordering::Relaxed) as u16,
+        create_sensor_current_ma: decode_signed_i16(
+            CREATE_SENSOR_CURRENT_MA.load(Ordering::Relaxed),
+        ),
+        create_sensor_temperature_c: decode_signed_i8(
+            CREATE_SENSOR_TEMPERATURE_C.load(Ordering::Relaxed),
+        ),
+        create_sensor_charge_mah: CREATE_SENSOR_CHARGE_MAH.load(Ordering::Relaxed) as u16,
+        create_sensor_capacity_mah: CREATE_SENSOR_CAPACITY_MAH.load(Ordering::Relaxed) as u16,
+        create_sensor_cliff_left_signal: CREATE_SENSOR_CLIFF_LEFT_SIGNAL.load(Ordering::Relaxed)
+            as u16,
+        create_sensor_cliff_front_left_signal: CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL
+            .load(Ordering::Relaxed) as u16,
+        create_sensor_cliff_front_right_signal: CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL
+            .load(Ordering::Relaxed) as u16,
+        create_sensor_cliff_right_signal: CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.load(Ordering::Relaxed)
+            as u16,
     }
 }
 
@@ -937,7 +1273,38 @@ struct StatusJson {
     pending_command_id: u32,
     last_accepted_command_id: u32,
     last_rejected_command_id: u32,
+    create_sensors: CreateSensorStatusJson,
     forebrain_uart: ForebrainUartStatusJson,
+}
+
+#[cfg(feature = "pico-w")]
+#[derive(serde::Serialize)]
+struct CreateSensorStatusJson {
+    last_packet_id: u8,
+    bump_left: bool,
+    bump_right: bool,
+    wheel_drop: bool,
+    wall: bool,
+    cliff_left: bool,
+    cliff_front_left: bool,
+    cliff_front_right: bool,
+    cliff_right: bool,
+    virtual_wall: bool,
+    overcurrent: bool,
+    distance_mm: i16,
+    angle_mrad: i16,
+    ir_byte: u8,
+    buttons: u8,
+    charging_state: u8,
+    voltage_mv: u16,
+    current_ma: i16,
+    temperature_c: i8,
+    charge_mah: u16,
+    capacity_mah: u16,
+    cliff_left_signal: u16,
+    cliff_front_left_signal: u16,
+    cliff_front_right_signal: u16,
+    cliff_right_signal: u16,
 }
 
 #[cfg(feature = "pico-w")]
@@ -988,6 +1355,7 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         pending_command_id: snapshot.pending_command_id,
         last_accepted_command_id: snapshot.last_accepted_command_id,
         last_rejected_command_id: snapshot.last_rejected_command_id,
+        create_sensors: create_sensor_status_json(snapshot),
         forebrain_uart: ForebrainUartStatusJson {
             rx_bytes: snapshot.forebrain_uart_rx_bytes,
             rx_lines: snapshot.forebrain_uart_rx_lines,
@@ -999,6 +1367,38 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
     };
     let len = serde_json_core::to_slice(&status, buffer).map_err(|_| ())?;
     core::str::from_utf8(&buffer[..len]).map_err(|_| ())
+}
+
+#[cfg(feature = "pico-w")]
+fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJson {
+    let flags = snapshot.create_sensor_flags;
+    CreateSensorStatusJson {
+        last_packet_id: snapshot.create_sensor_last_packet_id,
+        bump_left: flags & (1 << 0) != 0,
+        bump_right: flags & (1 << 1) != 0,
+        wheel_drop: flags & (1 << 2) != 0,
+        wall: flags & (1 << 3) != 0,
+        cliff_left: flags & (1 << 4) != 0,
+        cliff_front_left: flags & (1 << 5) != 0,
+        cliff_front_right: flags & (1 << 6) != 0,
+        cliff_right: flags & (1 << 7) != 0,
+        virtual_wall: flags & (1 << 8) != 0,
+        overcurrent: flags & (1 << 9) != 0,
+        distance_mm: snapshot.create_sensor_distance_mm,
+        angle_mrad: snapshot.create_sensor_angle_mrad,
+        ir_byte: snapshot.create_sensor_ir_byte,
+        buttons: snapshot.create_sensor_buttons,
+        charging_state: snapshot.create_sensor_charging_state,
+        voltage_mv: snapshot.create_sensor_voltage_mv,
+        current_ma: snapshot.create_sensor_current_ma,
+        temperature_c: snapshot.create_sensor_temperature_c,
+        charge_mah: snapshot.create_sensor_charge_mah,
+        capacity_mah: snapshot.create_sensor_capacity_mah,
+        cliff_left_signal: snapshot.create_sensor_cliff_left_signal,
+        cliff_front_left_signal: snapshot.create_sensor_cliff_front_left_signal,
+        cliff_front_right_signal: snapshot.create_sensor_cliff_front_right_signal,
+        cliff_right_signal: snapshot.create_sensor_cliff_right_signal,
+    }
 }
 
 #[allow(dead_code)]
@@ -1147,6 +1547,16 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::DriveFor as u8 => "drive_for",
         x if x == ControlCommandCode::BumpEscape as u8 => "bump_escape",
         x if x == ControlCommandCode::HeartbeatStop as u8 => "heartbeat_stop",
+        x if x == ControlCommandCode::HoldHeading as u8 => "hold_heading",
+        x if x == ControlCommandCode::TurnToHeading as u8 => "turn_to_heading",
+        x if x == ControlCommandCode::ArcFor as u8 => "arc_for",
+        x if x == ControlCommandCode::CreepUntil as u8 => "creep_until",
+        x if x == ControlCommandCode::ScanArc as u8 => "scan_arc",
+        x if x == ControlCommandCode::DockAlign as u8 => "dock_align",
+        x if x == ControlCommandCode::WallFollow as u8 => "wall_follow",
+        x if x == ControlCommandCode::WiggleAlign as u8 => "wiggle_align",
+        x if x == ControlCommandCode::Unstick as u8 => "unstick",
+        x if x == ControlCommandCode::CliffGuard as u8 => "cliff_guard",
         _ => "none",
     }
 }

@@ -1073,6 +1073,70 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             backoff_mm_s: parse_i16(parts.next()).ok_or(seq)?,
             turn_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
         },
+        "HOLD_HEADING" => BrainstemCommand::HoldHeading {
+            seq,
+            heading_error_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "TURN_TO_HEADING" => BrainstemCommand::TurnToHeading {
+            seq,
+            heading_error_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            tolerance_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "ARC_FOR" => BrainstemCommand::ArcFor {
+            seq,
+            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            radius_mm: parse_i16(parts.next()).ok_or(seq)?,
+            duration_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "CREEP_UNTIL" => BrainstemCommand::CreepUntil {
+            seq,
+            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "SCAN_ARC" => BrainstemCommand::ScanArc {
+            seq,
+            angle_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "DOCK_ALIGN" => BrainstemCommand::DockAlign {
+            seq,
+            bearing_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            range_mm: parse_u32(parts.next()).ok_or(seq)? as u16,
+            max_linear_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            stop_range_mm: parse_u32(parts.next()).ok_or(seq)? as u16,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "WALL_FOLLOW" => BrainstemCommand::WallFollow {
+            seq,
+            distance_error_mm: parse_i16(parts.next()).ok_or(seq)?,
+            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "WIGGLE_ALIGN" => BrainstemCommand::WiggleAlign {
+            seq,
+            amplitude_mrad: parse_i16(parts.next()).ok_or(seq)?,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            cycles: parse_u32(parts.next()).ok_or(seq)? as u8,
+        },
+        "UNSTICK" => BrainstemCommand::Unstick {
+            seq,
+            direction: parse_escape_direction(parts.next().ok_or(seq)?).ok_or(seq)?,
+            backoff_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            turn_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+        },
+        "CLIFF_GUARD" => BrainstemCommand::CliffGuard {
+            seq,
+            clear: parse_bool(parts.next()).ok_or(seq)?,
+        },
         "HEARTBEAT_STOP" => BrainstemCommand::HeartbeatStop {
             seq,
             timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
@@ -1131,6 +1195,14 @@ fn parse_u32(value: Option<&str>) -> Option<u32> {
 
 fn parse_i16(value: Option<&str>) -> Option<i16> {
     value?.parse().ok()
+}
+
+fn parse_bool(value: Option<&str>) -> Option<bool> {
+    match value? {
+        "1" | "true" | "TRUE" | "clear" | "CLEAR" => Some(true),
+        "0" | "false" | "FALSE" | "trip" | "TRIP" => Some(false),
+        _ => None,
+    }
 }
 
 fn submit_forebrain_stop() {
@@ -1251,6 +1323,70 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             direction: parse_escape_direction(json_str(body, "direction").unwrap_or("either"))?,
             backoff_mm_s: json_i16(body, "backoff_mm_s").unwrap_or(80),
             turn_angular_mrad_s: json_i16(body, "turn_angular_mrad_s").unwrap_or(900),
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "hold_heading" => Some(BrainstemCommand::HoldHeading {
+            heading_error_mrad: json_i16(body, "heading_error_mrad")?,
+            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
+            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s")?,
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "turn_to_heading" => Some(BrainstemCommand::TurnToHeading {
+            heading_error_mrad: json_i16(body, "heading_error_mrad")?,
+            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
+            tolerance_mrad: json_i16(body, "tolerance_mrad").unwrap_or(35),
+            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "arc_for" => Some(BrainstemCommand::ArcFor {
+            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
+            radius_mm: json_i16(body, "radius_mm")?,
+            duration_ms: json_u32(body, "duration_ms").or_else(|| json_u32(body, "ttl_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "creep_until" => Some(BrainstemCommand::CreepUntil {
+            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
+            angular_mrad_s: json_i16(body, "angular_mrad_s").unwrap_or(0),
+            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "scan_arc" => Some(BrainstemCommand::ScanArc {
+            angle_mrad: json_i16(body, "angle_mrad")?,
+            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
+            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "dock_align" => Some(BrainstemCommand::DockAlign {
+            bearing_mrad: json_i16(body, "bearing_mrad")?,
+            range_mm: json_u32(body, "range_mm")? as u16,
+            max_linear_mm_s: json_i16(body, "max_linear_mm_s").unwrap_or(110),
+            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s").unwrap_or(650),
+            stop_range_mm: json_u32(body, "stop_range_mm").unwrap_or(250) as u16,
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "wall_follow" => Some(BrainstemCommand::WallFollow {
+            distance_error_mm: json_i16(body, "distance_error_mm")?,
+            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
+            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s")?,
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "wiggle_align" => Some(BrainstemCommand::WiggleAlign {
+            amplitude_mrad: json_i16(body, "amplitude_mrad")?,
+            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
+            cycles: json_u32(body, "cycles").unwrap_or(2) as u8,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "unstick" => Some(BrainstemCommand::Unstick {
+            direction: parse_escape_direction(json_str(body, "direction").unwrap_or("either"))?,
+            backoff_mm_s: json_i16(body, "backoff_mm_s").unwrap_or(100),
+            turn_angular_mrad_s: json_i16(body, "turn_angular_mrad_s").unwrap_or(1_000),
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "cliff_guard" => Some(BrainstemCommand::CliffGuard {
+            clear: json_bool(body, "clear").unwrap_or(false),
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
         "heartbeat_stop" => Some(BrainstemCommand::HeartbeatStop {

@@ -380,6 +380,88 @@ where
                 backoff_mm_s,
                 turn_angular_mrad_s,
             } => self.queue_bump_escape(direction, backoff_mm_s, turn_angular_mrad_s)?,
+            RuntimeCommand::HoldHeading {
+                heading_error_mrad,
+                velocity_mm_s,
+                max_angular_mrad_s,
+                duration_ms,
+            } => self.start_hold_heading(
+                heading_error_mrad,
+                velocity_mm_s,
+                max_angular_mrad_s,
+                duration_ms,
+                now_ms,
+            )?,
+            RuntimeCommand::TurnToHeading {
+                heading_error_mrad,
+                angular_mrad_s,
+                tolerance_mrad,
+                timeout_ms,
+            } => self.start_face_bearing(
+                heading_error_mrad,
+                angular_mrad_s,
+                tolerance_mrad,
+                timeout_ms,
+                now_ms,
+            )?,
+            RuntimeCommand::ArcFor {
+                velocity_mm_s,
+                radius_mm,
+                duration_ms,
+            } => self.start_drive_arc(velocity_mm_s, radius_mm, Some(duration_ms), now_ms)?,
+            RuntimeCommand::CreepUntil {
+                velocity_mm_s,
+                angular_mrad_s,
+                timeout_ms,
+            } => self.start_cmd_vel(velocity_mm_s, angular_mrad_s, Some(timeout_ms), now_ms)?,
+            RuntimeCommand::ScanArc {
+                angle_mrad,
+                angular_mrad_s,
+                timeout_ms,
+            } => self.start_turn_by(angle_mrad, angular_mrad_s, timeout_ms, now_ms)?,
+            RuntimeCommand::DockAlign {
+                bearing_mrad,
+                range_mm,
+                max_linear_mm_s,
+                max_angular_mrad_s,
+                stop_range_mm,
+                duration_ms,
+            } => self.start_track_bearing(
+                bearing_mrad,
+                range_mm,
+                max_linear_mm_s,
+                max_angular_mrad_s,
+                stop_range_mm,
+                duration_ms,
+                now_ms,
+            )?,
+            RuntimeCommand::WallFollow {
+                distance_error_mm,
+                velocity_mm_s,
+                max_angular_mrad_s,
+                duration_ms,
+            } => self.start_wall_follow(
+                distance_error_mm,
+                velocity_mm_s,
+                max_angular_mrad_s,
+                duration_ms,
+                now_ms,
+            )?,
+            RuntimeCommand::WiggleAlign {
+                amplitude_mrad,
+                angular_mrad_s,
+                cycles,
+            } => self.queue_wiggle_align(amplitude_mrad, angular_mrad_s, cycles)?,
+            RuntimeCommand::Unstick {
+                direction,
+                backoff_mm_s,
+                turn_angular_mrad_s,
+            } => self.queue_bump_escape(direction, backoff_mm_s, turn_angular_mrad_s)?,
+            RuntimeCommand::CliffGuard { clear } => {
+                if !clear {
+                    self.stop_drive()?;
+                }
+            }
             RuntimeCommand::HeartbeatStop { timeout_ms } => {
                 self.heartbeat_stop_at_ms = Some(now_ms.wrapping_add(timeout_ms));
             }
@@ -731,6 +813,52 @@ where
         Ok(())
     }
 
+    fn start_hold_heading(
+        &mut self,
+        heading_error_mrad: i16,
+        velocity_mm_s: i16,
+        max_angular_mrad_s: i16,
+        ttl_ms: u32,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let max_angular = abs_i32(max_angular_mrad_s as i32);
+        let angular = (heading_error_mrad as i32).clamp(-max_angular, max_angular);
+        self.start_cmd_vel(velocity_mm_s, clamp_i16(angular), Some(ttl_ms), now_ms)
+    }
+
+    fn start_wall_follow(
+        &mut self,
+        distance_error_mm: i16,
+        velocity_mm_s: i16,
+        max_angular_mrad_s: i16,
+        ttl_ms: u32,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let max_angular = abs_i32(max_angular_mrad_s as i32);
+        let angular = (distance_error_mm as i32 * 8).clamp(-max_angular, max_angular);
+        self.start_cmd_vel(velocity_mm_s, clamp_i16(angular), Some(ttl_ms), now_ms)
+    }
+
+    fn queue_wiggle_align(
+        &mut self,
+        amplitude_mrad: i16,
+        angular_mrad_s: i16,
+        cycles: u8,
+    ) -> Result<(), BrainstemError> {
+        self.ensure_motion_allowed()?;
+        let cycles = cycles.min(6);
+        for cycle in (0..cycles).rev() {
+            let sign = if cycle % 2 == 0 { 1 } else { -1 };
+            let _ = self.commands.push_front(RuntimeCommand::TurnBy {
+                angle_mrad: clamp_i16(amplitude_mrad as i32 * sign),
+                angular_mrad_s,
+                timeout_ms: 800,
+            });
+        }
+        self.active = ActiveAction::None;
+        Ok(())
+    }
+
     fn start_drive_direct(
         &mut self,
         left_mm_s: i16,
@@ -977,6 +1105,109 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             backoff_mm_s,
             turn_angular_mrad_s,
         }),
+        BrainstemCommand::HoldHeading {
+            heading_error_mrad,
+            velocity_mm_s,
+            max_angular_mrad_s,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::HoldHeading {
+            heading_error_mrad,
+            velocity_mm_s,
+            max_angular_mrad_s,
+            duration_ms: ttl_ms,
+        }),
+        BrainstemCommand::TurnToHeading {
+            heading_error_mrad,
+            angular_mrad_s,
+            tolerance_mrad,
+            timeout_ms,
+            ..
+        } => Some(RuntimeCommand::TurnToHeading {
+            heading_error_mrad,
+            angular_mrad_s,
+            tolerance_mrad,
+            timeout_ms,
+        }),
+        BrainstemCommand::ArcFor {
+            velocity_mm_s,
+            radius_mm,
+            duration_ms,
+            ..
+        } => Some(RuntimeCommand::ArcFor {
+            velocity_mm_s,
+            radius_mm,
+            duration_ms,
+        }),
+        BrainstemCommand::CreepUntil {
+            velocity_mm_s,
+            angular_mrad_s,
+            timeout_ms,
+            ..
+        } => Some(RuntimeCommand::CreepUntil {
+            velocity_mm_s,
+            angular_mrad_s,
+            timeout_ms,
+        }),
+        BrainstemCommand::ScanArc {
+            angle_mrad,
+            angular_mrad_s,
+            timeout_ms,
+            ..
+        } => Some(RuntimeCommand::ScanArc {
+            angle_mrad,
+            angular_mrad_s,
+            timeout_ms,
+        }),
+        BrainstemCommand::DockAlign {
+            bearing_mrad,
+            range_mm,
+            max_linear_mm_s,
+            max_angular_mrad_s,
+            stop_range_mm,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::DockAlign {
+            bearing_mrad,
+            range_mm,
+            max_linear_mm_s,
+            max_angular_mrad_s,
+            stop_range_mm,
+            duration_ms: ttl_ms,
+        }),
+        BrainstemCommand::WallFollow {
+            distance_error_mm,
+            velocity_mm_s,
+            max_angular_mrad_s,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::WallFollow {
+            distance_error_mm,
+            velocity_mm_s,
+            max_angular_mrad_s,
+            duration_ms: ttl_ms,
+        }),
+        BrainstemCommand::WiggleAlign {
+            amplitude_mrad,
+            angular_mrad_s,
+            cycles,
+            ..
+        } => Some(RuntimeCommand::WiggleAlign {
+            amplitude_mrad,
+            angular_mrad_s,
+            cycles,
+        }),
+        BrainstemCommand::Unstick {
+            direction,
+            backoff_mm_s,
+            turn_angular_mrad_s,
+            ..
+        } => Some(RuntimeCommand::Unstick {
+            direction,
+            backoff_mm_s,
+            turn_angular_mrad_s,
+        }),
+        BrainstemCommand::CliffGuard { clear, .. } => Some(RuntimeCommand::CliffGuard { clear }),
         BrainstemCommand::HeartbeatStop { timeout_ms, .. } => {
             Some(RuntimeCommand::HeartbeatStop { timeout_ms })
         }
