@@ -23,3 +23,5 @@ certs/
 
 target/
 firmware/
+
+.venv
