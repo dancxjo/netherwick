@@ -176,13 +176,17 @@ error
 seq kind a b c
 ```
 
-The numeric fields are intentionally small and transport-neutral. For example, command lifecycle events use `a` for command id, motion events pack wheel speeds or duration, sensor-frame events carry the body packet/frame id plus flags and odometry delta, and error events carry a small error code.
+The JSON response includes `oldest_seq`, `next_seq`, and `dropped_before_seq`. The compact UART/UDP response includes the same values as `oldest`, `next`, and `dropped_before`. If `dropped_before_seq`/`dropped_before` is non-zero, the caller asked for history older than the ring still contains.
+
+The numeric fields are intentionally small and transport-neutral. Command lifecycle events use `a` for command id. `command_started` is emitted when the runtime actually pops a queued runtime command and begins executing it. `command_completed` is emitted when that runtime step finishes normally, including normal TTL expiry for motion. `command_interrupted` is emitted when Stop/E-stop/new velocity/safety/reflex logic clears the active command. `command_timed_out` is reserved for actual failure/deadline paths such as Create wake response timeout, not ordinary motion TTL completion.
+
+Motion events pack wheel speeds or duration, sensor-frame events carry the body packet/frame id plus flags and odometry delta, and error events carry a small error code. Compound verbs such as `bump_escape` and `wiggle_align` currently expand into runtime substeps that share the external command id; a future event schema should add a child-step field.
 
 The current internal Rust enums still include Create-specific variants such as `CreateOiMode`, `CreatePacketReceived`, and `CreateSensorPacketDecoded`. Those are driver/runtime implementation details, not the clean public vocabulary. Public capability and event renderers translate them into body-neutral names.
 
 Smart controller verbs are one-shot step primitives. `face_bearing`, `track_bearing`, `hold_heading`, `wall_follow`, `dock_align`, and `creep_until` consume the supplied current error/range and emit a short motion pulse or stop. The forebrain must keep updating target error/range if it wants closed-loop behavior across time.
 
-Odometry is currently a lightweight accumulator over decoded body distance/angle deltas. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
+Odometry is currently a lightweight accumulator over decoded Create distance/angle deltas. Only packet `0`, `19`, and `20` update odometry: packet `0` carries both distance and angle deltas, packet `19` carries distance, and packet `20` carries angle. Other decoded sensor packets update status and events but do not integrate into odometry. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
 
 Create OI power, BRC, Open Interface start, Safe mode, watchdog stop, and recovery remain owned by the brainstem runtime and Create body driver. The hardware watchdog feed point is reserved in the safety/runtime tick and must remain owned by that lane, not Wi-Fi or the forebrain interface.
 
@@ -205,7 +209,7 @@ Known remaining TODOs:
 - Move controller constants into `body.toml`/capabilities: axle track, bearing slowdown, minimum track speed, bump escape timing, wall-follow gain, default motion limits, and safety defaults.
 - Promote body capabilities from generated constants into a stronger driver contract.
 - Expand odometry from accumulated distance/heading deltas into pose integration plus get/set/calibrate verbs.
-- Emit `command_completed` and `command_interrupted` consistently for every queued runtime command. Accepted, rejected, started, timed out, safety, stop, sensor, telemetry, and error events are already represented.
+- Add a child-step field for compound verbs that expand into multiple runtime steps under one external command id.
 - Implement the hardware watchdog feed in the runtime lane when the backend exposes it.
 
 ## Build

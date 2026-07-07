@@ -70,18 +70,25 @@ struct SensorStream {
     next_request_ms: u32,
 }
 
+#[derive(Clone, Copy)]
+struct QueuedCommand {
+    command_id: u32,
+    command: RuntimeCommand,
+}
+
 pub struct Runtime<H>
 where
     H: BrainstemHardware,
 {
     hardware: H,
     events: Deque<BrainstemEvent, EVENT_QUEUE_CAPACITY>,
-    commands: Deque<RuntimeCommand, COMMAND_QUEUE_CAPACITY>,
+    commands: Deque<QueuedCommand, COMMAND_QUEUE_CAPACITY>,
     timers: Timers,
     create_uart: CreateUart,
     leds: Leds,
     mode: RuntimeMode,
     active: ActiveAction,
+    active_command_id: Option<u32>,
     stop_sent: bool,
     heartbeat_stop_at_ms: Option<u32>,
     sensor_stream: Option<SensorStream>,
@@ -120,6 +127,7 @@ where
             leds: Leds::new(),
             mode: RuntimeMode::Running,
             active: ActiveAction::None,
+            active_command_id: None,
             stop_sent: false,
             heartbeat_stop_at_ms: None,
             sensor_stream: None,
@@ -152,13 +160,21 @@ where
         status::set_runtime_state(RuntimeState::RunningDemo);
         self.leds.boot_indicator(&mut self.hardware);
         for command in DEMO_SCRIPT {
-            let _ = self.commands.push_back(*command);
+            let _ = self.commands.push_back(QueuedCommand {
+                command_id: 0,
+                command: *command,
+            });
         }
     }
 
     #[allow(dead_code)]
     pub fn enqueue_command(&mut self, command: RuntimeCommand) -> Result<(), RuntimeCommand> {
-        self.commands.push_back(command)
+        self.commands
+            .push_back(QueuedCommand {
+                command_id: 0,
+                command,
+            })
+            .map_err(|queued| queued.command)
     }
 
     pub fn tick(&mut self) {
@@ -208,9 +224,11 @@ where
         let Some(command) = status::take_control_command() else {
             return;
         };
+        let command_id = status::last_dispatched_command_id();
 
         match command {
             BrainstemCommand::Stop | BrainstemCommand::EStop => {
+                self.interrupt_active_command();
                 self.commands.clear();
                 self.active = ActiveAction::None;
                 self.heartbeat_stop_at_ms = None;
@@ -219,12 +237,18 @@ where
                     BrainstemCommand::EStop => RuntimeCommand::EStop,
                     _ => unreachable!(),
                 };
-                let _ = self.commands.push_front(command);
+                let _ = self.commands.push_front(QueuedCommand {
+                    command_id,
+                    command,
+                });
                 self.mode = RuntimeMode::Running;
             }
             BrainstemCommand::Arm => {
                 for command in ARM_SCRIPT {
-                    let _ = self.commands.push_back(*command);
+                    let _ = self.commands.push_back(QueuedCommand {
+                        command_id,
+                        command: *command,
+                    });
                 }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
@@ -232,17 +256,21 @@ where
                 }
             }
             BrainstemCommand::Disarm => {
+                self.interrupt_active_command();
                 self.commands.clear();
                 self.active = ActiveAction::None;
                 self.heartbeat_stop_at_ms = None;
                 for command in DISARM_SCRIPT.iter().rev() {
-                    let _ = self.commands.push_front(*command);
+                    let _ = self.commands.push_front(QueuedCommand {
+                        command_id,
+                        command: *command,
+                    });
                 }
                 self.mode = RuntimeMode::Running;
             }
             BrainstemCommand::CmdVel { .. } => {
                 if let Some(command) = runtime_command_from_forebrain(command) {
-                    self.enqueue_latest_velocity(command);
+                    self.enqueue_latest_velocity(command_id, command);
                 }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
@@ -251,7 +279,10 @@ where
             }
             _ => {
                 if let Some(command) = runtime_command_from_forebrain(command) {
-                    let _ = self.commands.push_back(command);
+                    let _ = self.commands.push_back(QueuedCommand {
+                        command_id,
+                        command,
+                    });
                 }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
@@ -261,31 +292,41 @@ where
         }
     }
 
-    fn enqueue_latest_velocity(&mut self, command: RuntimeCommand) {
+    fn enqueue_latest_velocity(&mut self, command_id: u32, command: RuntimeCommand) {
         let pending = self.commands.len();
         for _ in 0..pending {
             let Some(existing) = self.commands.pop_front() else {
                 break;
             };
-            if !matches!(existing, RuntimeCommand::CmdVel { .. }) {
+            if !matches!(existing.command, RuntimeCommand::CmdVel { .. }) {
                 let _ = self.commands.push_back(existing);
             }
         }
 
         if matches!(self.active, ActiveAction::Driving { .. }) {
+            self.interrupt_active_command();
             self.active = ActiveAction::None;
-            let _ = self.commands.push_front(command);
+            let _ = self.commands.push_front(QueuedCommand {
+                command_id,
+                command,
+            });
         } else {
-            let _ = self.commands.push_back(command);
+            let _ = self.commands.push_back(QueuedCommand {
+                command_id,
+                command,
+            });
         }
     }
 
     fn start_next_command(&mut self) -> Result<(), BrainstemError> {
-        let Some(command) = self.commands.pop_front() else {
+        let Some(queued) = self.commands.pop_front() else {
             status::set_command(None);
             return Ok(());
         };
-        status::set_command(Some(command));
+        let command = queued.command;
+        let command_code = status::set_command(Some(command));
+        self.active_command_id = Some(queued.command_id);
+        status::mark_command_started(queued.command_id, command_code);
 
         let now_ms = self.now_ms();
         match command {
@@ -417,7 +458,12 @@ where
                 direction,
                 backoff_mm_s,
                 turn_angular_mrad_s,
-            } => self.queue_bump_escape(direction, backoff_mm_s, turn_angular_mrad_s)?,
+            } => self.queue_bump_escape(
+                self.active_command_id.unwrap_or(0),
+                direction,
+                backoff_mm_s,
+                turn_angular_mrad_s,
+            )?,
             RuntimeCommand::HoldHeading {
                 heading_error_mrad,
                 velocity_mm_s,
@@ -494,7 +540,12 @@ where
                 direction,
                 backoff_mm_s,
                 turn_angular_mrad_s,
-            } => self.queue_bump_escape(direction, backoff_mm_s, turn_angular_mrad_s)?,
+            } => self.queue_bump_escape(
+                self.active_command_id.unwrap_or(0),
+                direction,
+                backoff_mm_s,
+                turn_angular_mrad_s,
+            )?,
             RuntimeCommand::CliffGuard { clear } => {
                 if !clear {
                     self.stop_drive()?;
@@ -605,6 +656,9 @@ where
             }
         }
 
+        if self.active == ActiveAction::None {
+            self.complete_active_command();
+        }
         Ok(())
     }
 
@@ -630,6 +684,9 @@ where
                         },
                         None => ActiveAction::None,
                     };
+                    if self.active == ActiveAction::None {
+                        self.complete_active_command();
+                    }
                 }
                 Ok(())
             }
@@ -646,6 +703,7 @@ where
             ActiveAction::BrcSettle { until_ms } | ActiveAction::Settle { until_ms } => {
                 if time_reached(now_ms, until_ms) {
                     self.active = ActiveAction::None;
+                    self.complete_active_command();
                 }
                 Ok(())
             }
@@ -689,6 +747,7 @@ where
                     self.create_responsive = true;
                     status::set_create_power_on(true);
                     self.active = ActiveAction::None;
+                    self.complete_active_command();
                     return Ok(());
                 }
 
@@ -758,8 +817,8 @@ where
             ActiveAction::Driving { stop_at_ms } => {
                 if time_reached(now_ms, stop_at_ms) {
                     self.stop_drive()?;
-                    status::mark_current_command_timed_out();
                     self.active = ActiveAction::None;
+                    self.complete_active_command();
                 }
                 Ok(())
             }
@@ -907,6 +966,7 @@ where
 
     fn queue_bump_escape(
         &mut self,
+        command_id: u32,
         direction: EscapeDirection,
         backoff_mm_s: i16,
         turn_angular_mrad_s: i16,
@@ -919,15 +979,21 @@ where
             EscapeDirection::Right => -turn_abs,
             EscapeDirection::Either => turn_abs,
         };
-        let _ = self.commands.push_front(RuntimeCommand::CmdVel {
-            linear_mm_s: 0,
-            angular_mrad_s: clamp_i16(turn),
-            duration_ms: Some(BUMP_ESCAPE_TURN_MS),
+        let _ = self.commands.push_front(QueuedCommand {
+            command_id,
+            command: RuntimeCommand::CmdVel {
+                linear_mm_s: 0,
+                angular_mrad_s: clamp_i16(turn),
+                duration_ms: Some(BUMP_ESCAPE_TURN_MS),
+            },
         });
-        let _ = self.commands.push_front(RuntimeCommand::CmdVel {
-            linear_mm_s: clamp_i16(backoff),
-            angular_mrad_s: 0,
-            duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
+        let _ = self.commands.push_front(QueuedCommand {
+            command_id,
+            command: RuntimeCommand::CmdVel {
+                linear_mm_s: clamp_i16(backoff),
+                angular_mrad_s: 0,
+                duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
+            },
         });
         self.active = ActiveAction::None;
         Ok(())
@@ -969,10 +1035,13 @@ where
         let cycles = cycles.min(6);
         for cycle in (0..cycles).rev() {
             let sign = if cycle % 2 == 0 { 1 } else { -1 };
-            let _ = self.commands.push_front(RuntimeCommand::TurnBy {
-                angle_mrad: clamp_i16(amplitude_mrad as i32 * sign),
-                angular_mrad_s,
-                timeout_ms: 800,
+            let _ = self.commands.push_front(QueuedCommand {
+                command_id: self.active_command_id.unwrap_or(0),
+                command: RuntimeCommand::TurnBy {
+                    angle_mrad: clamp_i16(amplitude_mrad as i32 * sign),
+                    angular_mrad_s,
+                    timeout_ms: 800,
+                },
             });
         }
         self.active = ActiveAction::None;
@@ -985,11 +1054,12 @@ where
             let Some(command) = self.commands.pop_front() else {
                 break;
             };
-            if !is_motion_command(command) {
+            if !is_motion_command(command.command) {
                 let _ = self.commands.push_back(command);
             }
         }
         if matches!(self.active, ActiveAction::Driving { .. }) {
+            self.interrupt_active_command();
             self.stop_drive()?;
             self.active = ActiveAction::None;
         }
@@ -1037,6 +1107,7 @@ where
             status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
             status::mark_wheel_drop_latched();
             self.safety_latched = true;
+            self.interrupt_active_command();
             self.commands.clear();
             self.stop_drive()?;
             self.active = ActiveAction::None;
@@ -1060,6 +1131,7 @@ where
             SafetyAction::None => Ok(()),
             SafetyAction::Stop => {
                 self.safety_latched = true;
+                self.interrupt_active_command();
                 self.commands.clear();
                 self.stop_drive()?;
                 self.active = ActiveAction::None;
@@ -1067,20 +1139,27 @@ where
             }
             SafetyAction::Backoff => {
                 self.safety_latched = true;
+                let command_id = self.active_command_id.unwrap_or(0);
+                self.interrupt_active_command();
                 self.commands.clear();
                 self.active = ActiveAction::None;
-                let _ = self.commands.push_front(RuntimeCommand::CmdVel {
-                    linear_mm_s: -80,
-                    angular_mrad_s: 0,
-                    duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
+                let _ = self.commands.push_front(QueuedCommand {
+                    command_id,
+                    command: RuntimeCommand::CmdVel {
+                        linear_mm_s: -80,
+                        angular_mrad_s: 0,
+                        duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
+                    },
                 });
                 Ok(())
             }
             SafetyAction::BumpEscape => {
                 self.safety_latched = true;
+                let command_id = self.active_command_id.unwrap_or(0);
+                self.interrupt_active_command();
                 self.commands.clear();
                 self.active = ActiveAction::None;
-                self.queue_bump_escape(EscapeDirection::Either, 80, 900)
+                self.queue_bump_escape(command_id, EscapeDirection::Either, 80, 900)
             }
         }
     }
@@ -1169,6 +1248,7 @@ where
             return Ok(());
         };
         if time_reached(self.now_ms(), deadline_ms) {
+            self.interrupt_active_command();
             self.commands.clear();
             self.active = ActiveAction::None;
             self.heartbeat_stop_at_ms = None;
@@ -1181,6 +1261,7 @@ where
 
     fn enter_idle(&mut self) {
         let _ = self.stop_drive();
+        self.complete_active_command();
         self.mode = RuntimeMode::Idle;
         self.active = ActiveAction::None;
         status::set_runtime_state(RuntimeState::Idle);
@@ -1202,6 +1283,7 @@ where
     fn enter_error(&mut self, error: BrainstemError) {
         status::set_error(error);
         self.push_event(BrainstemEvent::Error(error));
+        self.fail_active_command(error);
         let _ = self.stop_drive();
         self.mode = RuntimeMode::Error;
         self.active = ActiveAction::None;
@@ -1250,6 +1332,32 @@ where
     fn push_event(&mut self, event: BrainstemEvent) {
         status::signal_event(&event);
         let _ = self.events.push_back(event);
+    }
+
+    fn complete_active_command(&mut self) {
+        if let Some(command_id) = self.active_command_id.take() {
+            status::mark_command_completed(command_id);
+        }
+    }
+
+    fn interrupt_active_command(&mut self) {
+        if let Some(command_id) = self.active_command_id.take() {
+            status::mark_command_interrupted(command_id);
+        }
+    }
+
+    fn fail_active_command(&mut self, error: BrainstemError) {
+        let Some(command_id) = self.active_command_id.take() else {
+            return;
+        };
+        match error {
+            BrainstemError::CreateNoResponse | BrainstemError::Timeout => {
+                status::mark_command_timed_out(command_id);
+            }
+            BrainstemError::UartFraming | BrainstemError::InvalidPacket => {
+                status::mark_command_interrupted(command_id);
+            }
+        }
     }
 
     fn update_safety_edges(&mut self, bump: bool, cliff: bool, wheel_drop: bool) {

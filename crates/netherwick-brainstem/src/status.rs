@@ -376,7 +376,7 @@ pub fn set_demo_state(state: DemoState) {
     DEMO_STATE.store(state as u8, Ordering::Relaxed);
 }
 
-pub fn set_command(command: Option<RuntimeCommand>) {
+pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
     let code = match command {
         None => CommandCode::None,
         Some(RuntimeCommand::WakeCreate) => CommandCode::WakeCreate,
@@ -424,11 +424,21 @@ pub fn set_command(command: Option<RuntimeCommand>) {
         | Some(RuntimeCommand::SetLights { .. }) => CommandCode::None,
     };
     CURRENT_COMMAND.store(code as u8, Ordering::Relaxed);
-    if code as u8 != CommandCode::None as u8 {
-        let command_id = LAST_DISPATCHED_COMMAND_ID.load(Ordering::Relaxed);
-        LAST_STARTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-        record_public_event(PublicEventKind::CommandStarted, command_id, code as u32, 0);
-    }
+    code as u8
+}
+
+pub fn last_dispatched_command_id() -> u32 {
+    LAST_DISPATCHED_COMMAND_ID.load(Ordering::Relaxed)
+}
+
+pub fn mark_command_started(command_id: u32, command_code: u8) {
+    LAST_STARTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+    record_public_event(
+        PublicEventKind::CommandStarted,
+        command_id,
+        command_code as u32,
+        0,
+    );
 }
 
 #[cfg(feature = "pico-w")]
@@ -1410,8 +1420,15 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL
         .store(sensors.cliff_front_right_signal as u32, Ordering::Relaxed);
     CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(sensors.cliff_right_signal as u32, Ordering::Relaxed);
-    add_signed(&ODOMETRY_DISTANCE_MM, sensors.distance_mm as i32);
-    add_signed(&ODOMETRY_HEADING_MRAD, sensors.angle_mrad as i32);
+    // Create OI packets 0, 19, and 20 contain distance/angle deltas since
+    // the last requested packet. Other packets are snapshots and must not be
+    // integrated into odometry.
+    if create_packet_has_distance_delta(packet_id) {
+        add_signed(&ODOMETRY_DISTANCE_MM, sensors.distance_mm as i32);
+    }
+    if create_packet_has_angle_delta(packet_id) {
+        add_signed(&ODOMETRY_HEADING_MRAD, sensors.angle_mrad as i32);
+    }
 }
 
 pub fn mark_song_defined(id: u8, tone_count: u8) {
@@ -1429,35 +1446,19 @@ pub fn mark_odometry_reset() {
     ODOMETRY_HEADING_MRAD.store(0, Ordering::Relaxed);
 }
 
-#[allow(dead_code)]
 pub fn mark_command_completed(command_id: u32) {
     LAST_COMPLETED_COMMAND_ID.store(command_id, Ordering::Relaxed);
     record_public_event(PublicEventKind::CommandCompleted, command_id, 0, 0);
 }
 
-#[allow(dead_code)]
-pub fn mark_current_command_completed() {
-    mark_command_completed(LAST_STARTED_COMMAND_ID.load(Ordering::Relaxed));
-}
-
-#[allow(dead_code)]
 pub fn mark_command_interrupted(command_id: u32) {
     LAST_INTERRUPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
     record_public_event(PublicEventKind::CommandInterrupted, command_id, 0, 0);
 }
 
-#[allow(dead_code)]
-pub fn mark_current_command_interrupted() {
-    mark_command_interrupted(LAST_STARTED_COMMAND_ID.load(Ordering::Relaxed));
-}
-
 pub fn mark_command_timed_out(command_id: u32) {
     LAST_TIMED_OUT_COMMAND_ID.store(command_id, Ordering::Relaxed);
     record_public_event(PublicEventKind::CommandTimedOut, command_id, 0, 0);
-}
-
-pub fn mark_current_command_timed_out() {
-    mark_command_timed_out(LAST_STARTED_COMMAND_ID.load(Ordering::Relaxed));
 }
 
 pub fn mark_safety_tripped(kind: SafetyEventKind) {
@@ -1626,13 +1627,27 @@ pub fn event_next_seq() -> u32 {
     EVENT_NEXT_SEQ.load(Ordering::Relaxed)
 }
 
+pub fn event_oldest_seq() -> u32 {
+    event_next_seq()
+        .saturating_sub(EVENT_LOG_CAPACITY as u32)
+        .max(1)
+}
+
+pub fn event_dropped_before_seq(since_seq: u32) -> u32 {
+    let oldest_seq = event_oldest_seq();
+    if since_seq.saturating_add(1) < oldest_seq {
+        oldest_seq
+    } else {
+        0
+    }
+}
+
 pub fn collect_events_since<const N: usize>(
     since_seq: u32,
     out: &mut heapless::Vec<PublicEventRecord, N>,
 ) {
     let next_seq = EVENT_NEXT_SEQ.load(Ordering::Relaxed);
-    let first_seq = next_seq.saturating_sub(EVENT_LOG_CAPACITY as u32);
-    let since_seq = since_seq.max(first_seq.saturating_sub(1));
+    let since_seq = since_seq.max(event_oldest_seq().saturating_sub(1));
     for seq in since_seq.saturating_add(1)..next_seq {
         let index = event_index(seq);
         if EVENT_SEQ[index].load(Ordering::Relaxed) != seq {
@@ -1655,9 +1670,11 @@ pub fn render_events_json<'a>(since_seq: u32, buffer: &'a mut [u8]) -> Option<&'
     collect_events_since(since_seq, &mut records);
     write!(
         response,
-        "{{\"type\":\"events\",\"since_seq\":{},\"next_seq\":{},\"events\":[",
+        "{{\"type\":\"events\",\"since_seq\":{},\"oldest_seq\":{},\"next_seq\":{},\"dropped_before_seq\":{},\"events\":[",
         since_seq,
-        event_next_seq()
+        event_oldest_seq(),
+        event_next_seq(),
+        event_dropped_before_seq(since_seq)
     )
     .ok()?;
     for (index, record) in records.iter().enumerate() {
@@ -1692,9 +1709,11 @@ pub fn write_compact_events<const N: usize>(
     collect_events_since(since_seq, &mut records);
     write!(
         response,
-        "EVENTS since={} next={} count={}",
+        "EVENTS since={} oldest={} next={} dropped_before={} count={}",
         since_seq,
+        event_oldest_seq(),
         event_next_seq(),
+        event_dropped_before_seq(since_seq),
         records.len()
     )?;
     for record in records {
@@ -1829,6 +1848,14 @@ fn create_sensor_flags_bits(sensors: CreateSensorPacket) -> u32 {
         | ((flags.cliff_right as u32) << 7)
         | ((flags.virtual_wall as u32) << 8)
         | ((flags.overcurrent as u32) << 9)
+}
+
+fn create_packet_has_distance_delta(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 19)
+}
+
+fn create_packet_has_angle_delta(packet_id: u8) -> bool {
+    matches!(packet_id, 0 | 20)
 }
 
 fn encode_signed_i16(value: i16) -> u32 {
