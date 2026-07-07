@@ -773,6 +773,30 @@ fn request_method(request: &[u8]) -> Option<&str> {
 }
 
 fn index_html() -> &'static [u8] {
+    // Embedded browser cockpit mapping to the host-side netherwick-cockpit contract:
+    //
+    // UI action                    JSON kind             CockpitRequest                 Capability
+    // joystick / drive pad          cmd_vel               CmdVel                         cmd_vel
+    // active motion heartbeat       heartbeat_stop        HeartbeatStop                  heartbeat_stop
+    // STOP                          stop                  Stop                           stop
+    // E-STOP                        estop                 EStop                          estop
+    // Clear E-Stop                  clear_estop           ClearEStop                     clear_estop
+    // Arm / Disarm                  arm / disarm          Arm / Disarm                   arm / disarm
+    // Safe / Full                   set_mode              SetMode                        set_mode
+    // Dock                          dock                  Dock                           dock
+    // Ping                          ping                  Ping                           ping
+    // Lights                        set_lights            SetLights                      set_lights
+    // Drive 300                     drive_for             DriveFor                       drive_for
+    // Turn L/R                      turn_by               TurnBy                         turn_by
+    // Creep                         creep_until           CreepUntil                     creep_until
+    // Scan                          scan_arc              ScanArc                        scan_arc
+    // Wiggle                        wiggle_align          WiggleAlign                    wiggle_align
+    // Bump Escape                   bump_escape           BumpEscape                     bump_escape
+    // Unstick                       unstick               Unstick                        unstick
+    // Cliff Stop                    cliff_guard           CliffGuard                     cliff_guard
+    // Music Define / Play           song_define/play      SongDefine / SongPlay          song_define/song_play
+    // Refresh                       status/get_events     GetStatus / GetEvents          status/get_events
+    // BOOTSEL                       bootsel               Bootsel                        service/debug only
     br#"<!doctype html>
 <html>
 <head>
@@ -825,7 +849,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <div class="cluster"><h2>Mode</h2><div class="seg"><button id="arm" class="primary">Arm</button><button id="safe">Safe</button><button id="full">Full</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
 <div class="cluster"><h2>Lights</h2><div class="seg"><button data-lights="off">Off</button><button data-lights="status">Status</button><button data-lights="clean">Clean</button><button data-lights="dock">Dock</button><button data-lights="spot">Spot</button><button data-lights="max">Max</button></div></div>
 <div class="cluster"><h2>Primitives</h2><div class="seg"><button data-action="drive_for">Drive 300</button><button data-action="turn_left">Turn L</button><button data-action="turn_right">Turn R</button><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div></div>
-<div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
+<div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="stream">Stream Sensors</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
 <div class="cluster wide"><h2>Music</h2><div class="split"><div class="field"><label for="songid">Slot</label><input id="songid" inputmode="numeric" value="0"></div><div class="field"><label for="tones">Tones</label><input id="tones" value="72:8,76:8,79:16"></div></div><div class="row"><button id="songdef" class="primary">Define</button><button id="songplay">Play</button><button id="song">Chirp</button></div></div>
 </div>
 </section>
@@ -844,6 +868,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <div class="tile"><b>Battery</b><span id="battery" class="muted">...</span></div>
 <div class="tile"><b>Music</b><span id="music" class="muted">...</span></div>
 <div class="tile"><b>Firmware</b><span id="firmware" class="muted">...</span></div>
+<div class="tile wide"><b>Events</b><span id="events" class="muted">...</span></div>
 <div class="tile wide"><b>Last error</b><span id="err" class="muted">...</span></div>
 <div class="tile wide"><b>Activity</b><div id="log" class="log muted">No commands yet</div></div>
 </div>
@@ -851,48 +876,60 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 </div>
 </div>
 <script>
-let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='',statusBusy=false,lastDriveAt=0;
+let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='',statusBusy=false,lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,eventBusy=false,caps=null;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
+const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','calibrate_turn','reset_odometry','song_define']);
+const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',heartbeat:'heartbeat_stop'};
 function title(s){return (s||'unknown').replaceAll('_',' ')}
 function pill(el,text,state){el.textContent=text;el.className='pill '+(state||'')}
 function addLog(text){let t=new Date().toLocaleTimeString();log.textContent=(t+'  '+text+'\n'+(log.textContent==='No commands yet'?'':log.textContent)).slice(0,900)}
-function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;pill(net,'control ws','ok');refresh()};ws.onclose=()=>{wsOpen=false;pill(net,'reconnecting','warn');setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false;pill(net,'ws error','warn')};ws.onmessage=e=>{try{let j=JSON.parse(e.data);if(j.type==='status'){showStatus(j);return}pill(net,j.accepted?'accepted':'busy',j.accepted?'ok':'warn');addLog((j.accepted?'accepted ':'busy ')+j.command_id)}catch(_){}}}catch(_){wsOpen=false}}
-function post(o,ack){let cid=id++;o.command_id=cid;if(ack===false)o.ack=false;if(o.kind==='cmd_vel'&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;if(wsOpen&&ws&&ws.readyState===1){if(ws.bufferedAmount<384){ws.send(body);if(ack!==false)addLog('sent '+name);return Promise.resolve({accepted:true})}pill(net,'throttled','warn');return Promise.resolve({accepted:false})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{pill(net,j.accepted?'accepted':'busy',j.accepted?'ok':'warn');addLog((j.accepted?'accepted ':'busy ')+name);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
-function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('.active').forEach(b=>b.classList.remove('active'));post({kind:'stop'})}
+function hasVerb(v){return !!(caps&&caps.verbs&&caps.verbs.indexOf(v)>=0)}
+function setDisabled(ids,verb){ids.forEach(x=>{let e=$(x);if(e)e.disabled=!hasVerb(verb)})}
+function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;pill(net,'control ws','ok');requestCaps();refresh();pollEvents()};ws.onclose=()=>{wsOpen=false;pill(net,'reconnecting','warn');setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false;pill(net,'ws error','warn')};ws.onmessage=e=>{try{handleReply(JSON.parse(e.data))}catch(_){}}}catch(_){wsOpen=false}}
+function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='events'){handleEvents(j);return}if(j.verbs){caps=j;applyCaps();pill(net,'capabilities','ok');return}let ok=j.accepted!==false;pill(net,ok?'accepted':'rejected',ok?'ok':'warn');if(!ok)addLog('rejected '+(j.message||j.command_id||''));else if(j.message)addLog(j.message+' '+(j.command_id||''))}
+function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(ack===false)o.ack=false;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;if(wsOpen&&ws&&ws.readyState===1){if(ws.bufferedAmount<384){ws.send(body);if(ack!==false)addLog('sent '+name);return Promise.resolve({accepted:true})}pill(net,'throttled','warn');return Promise.resolve({accepted:false,message:'throttled'})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
+function requestCaps(){sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps()}})}
+function applyCaps(){setDisabled(['arm'],'arm');setDisabled(['disarm'],'disarm');setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});document.querySelectorAll('[data-lights]').forEach(b=>b.disabled=!hasVerb('set_lights'));['dock','safe','full','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='safe'||x==='full'?'set_mode':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
+function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('.active').forEach(b=>b.classList.remove('active'));sendCockpit({kind:'stop'})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
 function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
-function sendJoy(){paceDrive(()=>{let m=joyMax(),lin=Math.round(-last.y*m.lin),ang=Math.round(-last.x*m.ang);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
-function sendDrive(){paceDrive(()=>{let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=m.ang;if(driveKind==='right')ang=-m.ang;if(driveKind==='spinl')ang=m.ang,lin=0;if(driveKind==='spinr')ang=-m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);post({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)})}
+function refreshHeartbeat(){if(!hasVerb('heartbeat_stop'))return;let now=Date.now();if(now-lastHeartbeatAt>550){lastHeartbeatAt=now;sendCockpit({kind:'heartbeat_stop',timeout_ms:900},false)}}
+function pulseCmdVel(lin,ang){if(!hasVerb('cmd_vel')){addLog('unsupported cmd_vel');stop();return}refreshHeartbeat();sendCockpit({kind:'cmd_vel',linear_mm_s:lin,angular_mrad_s:ang,ttl_ms:320},false)}
+function sendJoy(){paceDrive(()=>{let m=joyMax(),lin=Math.round(-last.y*m.lin),ang=Math.round(-last.x*m.ang);pulseCmdVel(lin,ang)})}
+function sendDrive(){paceDrive(()=>{let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=m.ang;if(driveKind==='right')ang=-m.ang;if(driveKind==='spinl')ang=m.ang,lin=0;if(driveKind==='spinr')ang=-m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);pulseCmdVel(lin,ang)})}
 function songSlot(){let n=parseInt($('songid').value,10);return Number.isFinite(n)?Math.max(0,Math.min(15,n)):0}
-function defineSong(){return post({kind:'song_define',id:songSlot(),tones:$('tones').value})}
-function behavior(k){let m=joyMax();if(k==='drive_for')post({kind:'drive_for',distance_mm:300,velocity_mm_s:m.lin,timeout_ms:3500});if(k==='turn_left')post({kind:'turn_by',angle_mrad:1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='turn_right')post({kind:'turn_by',angle_mrad:-1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='creep')post({kind:'creep_until',velocity_mm_s:45,timeout_ms:1200});if(k==='scan')post({kind:'scan_arc',angle_mrad:3140,angular_mrad_s:700,timeout_ms:6000});if(k==='wiggle')post({kind:'wiggle_align',amplitude_mrad:240,angular_mrad_s:700,cycles:4});if(k==='bump_escape')post({kind:'bump_escape',direction:'either'});if(k==='unstick')post({kind:'unstick',direction:'either'});if(k==='cliff_trip')post({kind:'cliff_guard',clear:false});if(k==='heartbeat')post({kind:'heartbeat_stop',timeout_ms:1200})}
+function defineSong(){return sendCockpit({kind:'song_define',id:songSlot(),tones:$('tones').value})}
+function behavior(k){let v=actionVerb[k];if(v&&!hasVerb(v)){addLog('unsupported '+v);return}let m=joyMax();if(k==='drive_for')sendCockpit({kind:'drive_for',distance_mm:300,velocity_mm_s:m.lin,timeout_ms:3500});if(k==='turn_left')sendCockpit({kind:'turn_by',angle_mrad:1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='turn_right')sendCockpit({kind:'turn_by',angle_mrad:-1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='creep')sendCockpit({kind:'creep_until',velocity_mm_s:45,timeout_ms:1200});if(k==='scan')sendCockpit({kind:'scan_arc',angle_mrad:3140,angular_mrad_s:700,timeout_ms:6000});if(k==='wiggle')sendCockpit({kind:'wiggle_align',amplitude_mrad:240,angular_mrad_s:700,cycles:4});if(k==='bump_escape')sendCockpit({kind:'bump_escape',direction:'either'});if(k==='unstick')sendCockpit({kind:'unstick',direction:'either'});if(k==='cliff_trip')sendCockpit({kind:'cliff_guard',clear:false});if(k==='heartbeat')sendCockpit({kind:'heartbeat_stop',timeout_ms:1200})}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
 base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
 base.onpointermove=e=>{if(active)move(e)}
 base.onpointerup=base.onpointercancel=stop
 $('stop').onclick=stop;$('padstop').onclick=stop
-$('estop').onclick=()=>post({kind:'estop'})
-$('clear').onclick=()=>post({kind:'clear_estop'})
-$('arm').onclick=()=>post({kind:'arm'})
-$('safe').onclick=()=>post({kind:'set_mode',mode:'safe'})
-$('full').onclick=()=>post({kind:'set_mode',mode:'full'})
-$('disarm').onclick=()=>post({kind:'disarm'})
-$('dock').onclick=()=>post({kind:'dock'})
-$('ping').onclick=()=>post({kind:'ping'})
+$('estop').onclick=()=>sendCockpit({kind:'estop'})
+$('clear').onclick=()=>sendCockpit({kind:'clear_estop'})
+$('arm').onclick=()=>sendCockpit({kind:'arm'})
+$('safe').onclick=()=>sendCockpit({kind:'set_mode',mode:'safe'})
+$('full').onclick=()=>sendCockpit({kind:'set_mode',mode:'full'})
+$('disarm').onclick=()=>sendCockpit({kind:'disarm'})
+$('dock').onclick=()=>sendCockpit({kind:'dock'})
+$('ping').onclick=()=>sendCockpit({kind:'ping'})
 $('songdef').onclick=defineSong
-$('songplay').onclick=()=>post({kind:'song_play',id:songSlot()})
-$('song').onclick=()=>defineSong().then(()=>post({kind:'song_play',id:songSlot()}))
-$('bootsel').onclick=()=>post({kind:'bootsel'})
+$('songplay').onclick=()=>sendCockpit({kind:'song_play',id:songSlot()})
+$('song').onclick=()=>defineSong().then(()=>sendCockpit({kind:'song_play',id:songSlot()}))
+$('stream').onclick=()=>sendCockpit({kind:'stream_sensors',enabled:true,packet_id:0,period_ms:250})
+$('bootsel').onclick=()=>sendCockpit({kind:'bootsel'})
 $('refresh').onclick=refresh
-document.querySelectorAll('[data-lights]').forEach(b=>b.onclick=()=>post({kind:'set_lights',pattern:b.dataset.lights}))
+document.querySelectorAll('[data-lights]').forEach(b=>b.onclick=()=>sendCockpit({kind:'set_lights',pattern:b.dataset.lights}))
 document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>behavior(b.dataset.action))
 document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveKind=b.dataset.drive;b.classList.add('active');sendDrive();timer=setInterval(sendDrive,190);b.setPointerCapture(e.pointerId)};b.onpointerup=b.onpointercancel=stop})
 $('speed').oninput=()=>$('speedv').textContent=$('speed').value
 $('turn').oninput=()=>$('turnv').textContent=$('turn').value
 function time(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60),h=Math.floor(m/60);return h+'h '+(m%60)+'m '+(s%60)+'s'}
 function showStatus(s){let cs=s.create_sensors||{},music=s.create_songs||{},err=s.last_error&&s.last_error!=='none',danger=cs.bump_left||cs.bump_right||cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right;pill(net,wsOpen?'control ws':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),danger?'contact':'clear',danger?'bad':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health);$('runtime').textContent=title(s.current_runtime_state)+' / demo '+title(s.demo_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=(cs.bump_left?'bump L ':'')+(cs.bump_right?'bump R ':'')+(cs.wheel_drop?'wheel drop ':'')+(cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right?'cliff ':'')||'clear';$('safetyread').className=danger?'badtext':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / dist '+(cs.distance_mm||0)+' mm / angle '+(cs.angle_mrad||0)+' mrad';$('battery').textContent=(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh';$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=err?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=err?'badtext':'muted'}
+function handleEvents(batch){eventBusy=false;if(batch.dropped_before_seq){$('events').textContent='missed before '+batch.dropped_before_seq;pill($('safety'),'event history missed','bad');addLog('missed event history before '+batch.dropped_before_seq);stop()}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}eventCursor=Math.max(0,(batch.next_seq||1)-1);(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k);stop()}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0))}else if(k==='motion_stopped'){addLog('motion stopped')}})}
+function pollEvents(){if(eventBusy)return;eventBusy=true;sendCockpit({kind:'get_events',since_seq:eventCursor},false).then(j=>{if(j&&j.type==='events')handleEvents(j);else eventBusy=false}).catch(_=>{eventBusy=false})}
 function refresh(){if(statusBusy)return;statusBusy=true;if(wsOpen&&ws&&ws.readyState===1&&ws.bufferedAmount<384){ws.send(JSON.stringify({kind:'status',command_id:id++}));statusBusy=false;return}fetch('/status.json').then(r=>r.json()).then(showStatus).catch(_=>pill(net,'offline','bad')).finally(()=>statusBusy=false)}
-setInterval(refresh,3500);refresh();
+applyCaps();setInterval(refresh,3500);setInterval(pollEvents,600);refresh();requestCaps();
 connectWs();
 </script>
 </body>

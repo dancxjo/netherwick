@@ -1,9 +1,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use netherwick_cockpit::{
-    Cockpit, EventCursor, UartCockpit, UartCockpitConfig,
-};
+use netherwick_cockpit::{Cockpit, EventCursor, UartCockpit, UartCockpitConfig};
 
 fn main() -> netherwick_cockpit::Result<()> {
     let path = std::env::args()

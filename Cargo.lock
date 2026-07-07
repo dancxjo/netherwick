@@ -5126,6 +5126,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "thiserror 1.0.69",
+ "toml 0.8.23",
  "tungstenite",
 ]
 

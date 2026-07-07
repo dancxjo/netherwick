@@ -12,6 +12,9 @@ serialport = "4"
 thiserror.workspace = true
 tungstenite = "0.29"
 
+[dev-dependencies]
+toml.workspace = true
+
 [[example]]
 name = "servo_loop"
 path = "examples/servo_loop.rs"
@@ -23,3 +26,7 @@ path = "examples/uart_servo_loop.rs"
 [[example]]
 name = "sim_servo_loop"
 path = "examples/sim_servo_loop.rs"
+
+[[example]]
+name = "contract_check"
+path = "examples/contract_check.rs"

@@ -57,6 +57,7 @@ verbs = [
   "bump_escape",
   "unstick",
   "cliff_guard",
+  "heartbeat_stop",
   "request_sensors",
   "stream_sensors",
   "set_safety_policy",

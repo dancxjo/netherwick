@@ -387,6 +387,30 @@ The host-side crate `netherwick-cockpit` defines the cockpit protocol: the stabl
 
 `SimCockpit`, `UdpCockpit`, `UartCockpit`, `HttpCockpit`, and `WebSocketCockpit` all implement the same `Cockpit` trait. UDP on port `82` and direct forebrain UART use the compact line protocol; HTTP and WebSocket use firmware JSON. They are peer transports under the same request/response/event model.
 
+Capabilities are the live cockpit contract, not decoration. Pilots should call `get_capabilities`, build a `CockpitContract`, and validate requests before issuing body verbs. Unsupported verbs fail closed: agents should reject them, and UIs should hide or disable their controls instead of silently no-oping. The contract also carries body limits for motion speed, angular speed, and TTL/timeout ranges; safe pilots clamp or reject motion outside those limits before it reaches the brainstem.
+
+`CockpitContract` checks:
+
+```text
+supports(verb)
+requires_capability(request)
+validate_request(request)
+motion and TTL/timeout limits
+event vocabulary against CockpitEventKind
+local model drift against advertised verbs/events
+```
+
+Contract smoke examples:
+
+```bash
+cargo run -p netherwick-cockpit --example contract_check
+cargo run -p netherwick-cockpit --example contract_check -- udp 192.168.4.1:82
+cargo run -p netherwick-cockpit --example contract_check -- http 192.168.4.1:80
+cargo run -p netherwick-cockpit --example contract_check -- ws ws://192.168.4.1:81/control
+```
+
+The embedded Pico W browser cockpit is a static implementation of this same logical contract. It fetches capabilities at startup, disables unsupported motion/safety/lights/music/dock/primitives/sensor-streaming controls, polls `get_events`, and stops or warns on missed event history and safety events. LLMs and motherbrain code should use `netherwick-cockpit` directly, usually over simulator or UART first; transport choice is a deployment detail, not a different pilot API.
+
 The Rust trait exposes the complete firmware public verb set through both named helper methods and the `CockpitRequest` enum:
 
 ```rust

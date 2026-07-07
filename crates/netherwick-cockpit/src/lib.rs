@@ -32,6 +32,25 @@ pub enum CockpitError {
     Json(#[from] serde_json::Error),
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CockpitLimits {
+    pub max_linear_mm_s: i16,
+    pub max_angular_mrad_s: i16,
+    pub min_ttl_ms: u32,
+    pub max_ttl_ms: u32,
+}
+
+impl Default for CockpitLimits {
+    fn default() -> Self {
+        Self {
+            max_linear_mm_s: i16::MAX,
+            max_angular_mrad_s: i16::MAX,
+            min_ttl_ms: 1,
+            max_ttl_ms: u32::MAX,
+        }
+    }
+}
+
 pub trait Cockpit {
     fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse>;
 
@@ -520,11 +539,279 @@ pub struct CockpitCapabilities {
     pub outputs: Vec<String>,
     pub safety: Vec<String>,
     pub events: Vec<String>,
+    #[serde(default)]
+    pub limits: CockpitLimits,
 }
 
 impl CockpitCapabilities {
     pub fn supports(&self, verb: &str) -> bool {
         self.verbs.iter().any(|candidate| candidate == verb)
+    }
+
+    pub fn contract(&self) -> CockpitContract {
+        CockpitContract::new(self.clone())
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CockpitContract {
+    capabilities: CockpitCapabilities,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ContractReport {
+    pub missing_verbs: Vec<String>,
+    pub extra_verbs: Vec<String>,
+    pub optional_absent_verbs: Vec<String>,
+    pub unknown_events: Vec<String>,
+}
+
+impl ContractReport {
+    pub fn is_clean(&self) -> bool {
+        self.missing_verbs.is_empty()
+            && self.extra_verbs.is_empty()
+            && self.unknown_events.is_empty()
+    }
+}
+
+impl CockpitContract {
+    pub fn new(capabilities: CockpitCapabilities) -> Self {
+        Self { capabilities }
+    }
+
+    pub fn capabilities(&self) -> &CockpitCapabilities {
+        &self.capabilities
+    }
+
+    pub fn supports(&self, verb: &str) -> bool {
+        self.capabilities.supports(verb)
+    }
+
+    pub fn requires_capability(&self, request: &CockpitRequest) -> Option<&'static str> {
+        request.required_capability()
+    }
+
+    pub fn validate_request(&self, request: &CockpitRequest) -> Result<()> {
+        if let Some(verb) = self.requires_capability(request) {
+            if !self.supports(verb) {
+                return Err(CockpitError::Policy(format!(
+                    "unsupported cockpit verb {verb}"
+                )));
+            }
+        }
+        self.validate_motion_limits(request)?;
+        self.validate_ttl_limits(request)?;
+        Ok(())
+    }
+
+    pub fn validate_motion_limits(&self, request: &CockpitRequest) -> Result<()> {
+        let limits = &self.capabilities.limits;
+        let max_linear = limits.max_linear_mm_s.abs();
+        let max_angular = limits.max_angular_mrad_s.abs();
+        let check_linear = |value: i16, name: &str| {
+            if value.abs() > max_linear {
+                Err(CockpitError::Policy(format!(
+                    "{name} {value} mm/s exceeds max_linear_mm_s {max_linear}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        let check_angular = |value: i16, name: &str| {
+            if value.abs() > max_angular {
+                Err(CockpitError::Policy(format!(
+                    "{name} {value} mrad/s exceeds max_angular_mrad_s {max_angular}"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        match request {
+            CockpitRequest::CmdVel {
+                linear_mm_s,
+                angular_mrad_s,
+                ..
+            } => {
+                check_linear(*linear_mm_s, "linear_mm_s")?;
+                check_angular(*angular_mrad_s, "angular_mrad_s")
+            }
+            CockpitRequest::DriveDirect {
+                left_mm_s,
+                right_mm_s,
+                ..
+            } => {
+                check_linear(*left_mm_s, "left_mm_s")?;
+                check_linear(*right_mm_s, "right_mm_s")
+            }
+            CockpitRequest::DriveArc { velocity_mm_s, .. }
+            | CockpitRequest::ArcFor { velocity_mm_s, .. }
+            | CockpitRequest::CreepUntil { velocity_mm_s, .. } => {
+                check_linear(*velocity_mm_s, "velocity_mm_s")
+            }
+            CockpitRequest::HoldHeading {
+                velocity_mm_s,
+                max_angular_mrad_s,
+                ..
+            }
+            | CockpitRequest::WallFollow {
+                velocity_mm_s,
+                max_angular_mrad_s,
+                ..
+            } => {
+                check_linear(*velocity_mm_s, "velocity_mm_s")?;
+                check_angular(*max_angular_mrad_s, "max_angular_mrad_s")
+            }
+            CockpitRequest::DriveFor { velocity_mm_s, .. } => {
+                check_linear(*velocity_mm_s, "velocity_mm_s")
+            }
+            CockpitRequest::TrackBearing {
+                max_linear_mm_s,
+                max_angular_mrad_s,
+                ..
+            }
+            | CockpitRequest::DockAlign {
+                max_linear_mm_s,
+                max_angular_mrad_s,
+                ..
+            } => {
+                check_linear(*max_linear_mm_s, "max_linear_mm_s")?;
+                check_angular(*max_angular_mrad_s, "max_angular_mrad_s")
+            }
+            CockpitRequest::FaceBearing {
+                max_angular_mrad_s, ..
+            } => check_angular(*max_angular_mrad_s, "max_angular_mrad_s"),
+            CockpitRequest::TurnBy { angular_mrad_s, .. }
+            | CockpitRequest::TurnToHeading { angular_mrad_s, .. }
+            | CockpitRequest::ScanArc { angular_mrad_s, .. }
+            | CockpitRequest::WiggleAlign { angular_mrad_s, .. }
+            | CockpitRequest::CalibrateTurn { angular_mrad_s, .. } => {
+                check_angular(*angular_mrad_s, "angular_mrad_s")
+            }
+            CockpitRequest::BumpEscape {
+                backoff_mm_s,
+                turn_angular_mrad_s,
+                ..
+            }
+            | CockpitRequest::Unstick {
+                backoff_mm_s,
+                turn_angular_mrad_s,
+                ..
+            } => {
+                check_linear(*backoff_mm_s, "backoff_mm_s")?;
+                check_angular(*turn_angular_mrad_s, "turn_angular_mrad_s")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn validate_ttl_limits(&self, request: &CockpitRequest) -> Result<()> {
+        let Some(ttl_ms) = request.ttl_or_timeout_ms() else {
+            return Ok(());
+        };
+        let limits = &self.capabilities.limits;
+        if ttl_ms < limits.min_ttl_ms || ttl_ms > limits.max_ttl_ms {
+            return Err(CockpitError::Policy(format!(
+                "ttl/timeout {ttl_ms} ms outside {}..={} ms",
+                limits.min_ttl_ms, limits.max_ttl_ms
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn clamp_motion_request(&self, request: &CockpitRequest) -> CockpitRequest {
+        let linear = self.capabilities.limits.max_linear_mm_s.abs();
+        let angular = self.capabilities.limits.max_angular_mrad_s.abs();
+        let ttl_min = self.capabilities.limits.min_ttl_ms;
+        let ttl_max = self.capabilities.limits.max_ttl_ms;
+        let clamp_linear = |value: i16| value.clamp(-linear, linear);
+        let clamp_angular = |value: i16| value.clamp(-angular, angular);
+        let clamp_ttl = |value: u32| value.clamp(ttl_min, ttl_max);
+        match request {
+            CockpitRequest::CmdVel {
+                linear_mm_s,
+                angular_mrad_s,
+                ttl_ms,
+            } => CockpitRequest::CmdVel {
+                linear_mm_s: clamp_linear(*linear_mm_s),
+                angular_mrad_s: clamp_angular(*angular_mrad_s),
+                ttl_ms: clamp_ttl(*ttl_ms),
+            },
+            CockpitRequest::HeartbeatStop { timeout_ms } => CockpitRequest::HeartbeatStop {
+                timeout_ms: clamp_ttl(*timeout_ms),
+            },
+            other => other.clone(),
+        }
+    }
+
+    pub fn validate_event_vocabulary(&self) -> Result<()> {
+        let unknown: Vec<_> = self
+            .capabilities
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    CockpitEventKind::from(event.as_str()),
+                    CockpitEventKind::Unknown(_)
+                )
+            })
+            .cloned()
+            .collect();
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(CockpitError::Policy(format!(
+                "unknown cockpit events: {}",
+                unknown.join(",")
+            )))
+        }
+    }
+
+    pub fn validate_local_model(&self) -> ContractReport {
+        let modeled_verbs: Vec<_> = CockpitRequest::capability_verbs()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        let optional_verbs = optional_cockpit_verbs();
+        let missing_verbs = self
+            .capabilities
+            .verbs
+            .iter()
+            .filter(|verb| !modeled_verbs.iter().any(|modeled| modeled == *verb))
+            .cloned()
+            .collect();
+        let extra_verbs = modeled_verbs
+            .iter()
+            .filter(|verb| {
+                !self.capabilities.supports(verb)
+                    && !optional_verbs
+                        .iter()
+                        .any(|optional| optional == &verb.as_str())
+            })
+            .cloned()
+            .collect();
+        let optional_absent_verbs = optional_verbs
+            .iter()
+            .filter(|verb| !self.capabilities.supports(verb))
+            .map(|verb| (*verb).to_owned())
+            .collect();
+        let unknown_events = self
+            .capabilities
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    CockpitEventKind::from(event.as_str()),
+                    CockpitEventKind::Unknown(_)
+                )
+            })
+            .cloned()
+            .collect();
+        ContractReport {
+            missing_verbs,
+            extra_verbs,
+            optional_absent_verbs,
+            unknown_events,
+        }
     }
 }
 
@@ -637,7 +924,8 @@ impl StatusSummary {
             armed: json_str_value(value, "oi_mode").map(|mode| mode == "safe" || mode == "full"),
             estop_latched: None,
             safety_tripped,
-            active_motion: json_str_value(value, "current_command").map(|command| command == "drive"),
+            active_motion: json_str_value(value, "current_command")
+                .map(|command| command == "drive"),
             event_next_seq: json_u32_value(value, "event_next_seq"),
         }
     }
@@ -650,7 +938,9 @@ pub enum CockpitRequest {
     Bootsel,
     GetStatus,
     GetCapabilities,
-    GetEvents { since_seq: u32 },
+    GetEvents {
+        since_seq: u32,
+    },
     Arm,
     Disarm,
     Stop,
@@ -751,53 +1041,153 @@ pub enum CockpitRequest {
         backoff_mm_s: i16,
         turn_angular_mrad_s: i16,
     },
-    CliffGuard { clear: bool },
-    HeartbeatStop { timeout_ms: u32 },
-    RequestSensors { packet_id: u8 },
+    CliffGuard {
+        clear: bool,
+    },
+    HeartbeatStop {
+        timeout_ms: u32,
+    },
+    RequestSensors {
+        packet_id: u8,
+    },
     StreamSensors {
         enabled: bool,
         packet_id: u8,
         period_ms: u32,
     },
-    SetSafetyPolicy { policy: SafetyPolicy },
+    SetSafetyPolicy {
+        policy: SafetyPolicy,
+    },
     ClearMotionQueue,
     DefineChirp {
         feedback: FeedbackKind,
         tones: Vec<SongTone>,
     },
-    PlayFeedback { feedback: FeedbackKind },
-    PowerState { request: PowerStateRequest },
+    PlayFeedback {
+        feedback: FeedbackKind,
+    },
+    PowerState {
+        request: PowerStateRequest,
+    },
     CalibrateTurn {
         angular_mrad_s: i16,
         duration_ms: u32,
     },
     ResetOdometry,
-    SetMode { mode: CreateOiMode },
-    SongDefine { id: u8, tones: Vec<SongTone> },
-    SongPlay { id: u8 },
+    SetMode {
+        mode: CreateOiMode,
+    },
+    SongDefine {
+        id: u8,
+        tones: Vec<SongTone>,
+    },
+    SongPlay {
+        id: u8,
+    },
     Dock,
-    SetLights { pattern: LightPattern },
+    SetLights {
+        pattern: LightPattern,
+    },
 }
 
 impl CockpitRequest {
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Bootsel => "bootsel",
+            Self::GetStatus => "status",
+            Self::GetCapabilities => "get_capabilities",
+            Self::GetEvents { .. } => "get_events",
+            Self::Arm => "arm",
+            Self::Disarm => "disarm",
+            Self::Stop => "stop",
+            Self::EStop => "estop",
+            Self::ClearEStop => "clear_estop",
+            Self::CmdVel { .. } => "cmd_vel",
+            Self::DriveDirect { .. } => "drive_direct",
+            Self::DriveArc { .. } => "drive_arc",
+            Self::FaceBearing { .. } => "face_bearing",
+            Self::TrackBearing { .. } => "track_bearing",
+            Self::TurnBy { .. } => "turn_by",
+            Self::DriveFor { .. } => "drive_for",
+            Self::BumpEscape { .. } => "bump_escape",
+            Self::HoldHeading { .. } => "hold_heading",
+            Self::TurnToHeading { .. } => "turn_to_heading",
+            Self::ArcFor { .. } => "arc_for",
+            Self::CreepUntil { .. } => "creep_until",
+            Self::ScanArc { .. } => "scan_arc",
+            Self::DockAlign { .. } => "dock_align",
+            Self::WallFollow { .. } => "wall_follow",
+            Self::WiggleAlign { .. } => "wiggle_align",
+            Self::Unstick { .. } => "unstick",
+            Self::CliffGuard { .. } => "cliff_guard",
+            Self::HeartbeatStop { .. } => "heartbeat_stop",
+            Self::RequestSensors { .. } => "request_sensors",
+            Self::StreamSensors { .. } => "stream_sensors",
+            Self::SetSafetyPolicy { .. } => "set_safety_policy",
+            Self::ClearMotionQueue => "clear_motion_queue",
+            Self::DefineChirp { .. } => "define_chirp",
+            Self::PlayFeedback { .. } => "play_feedback",
+            Self::PowerState { .. } => "power_state",
+            Self::CalibrateTurn { .. } => "calibrate_turn",
+            Self::ResetOdometry => "reset_odometry",
+            Self::SetMode { .. } => "set_mode",
+            Self::SongDefine { .. } => "song_define",
+            Self::SongPlay { .. } => "song_play",
+            Self::Dock => "dock",
+            Self::SetLights { .. } => "set_lights",
+        }
+    }
+
+    pub fn required_capability(&self) -> Option<&'static str> {
+        match self {
+            Self::Bootsel => None,
+            other => Some(other.verb()),
+        }
+    }
+
+    pub fn capability_verbs() -> Vec<&'static str> {
+        sample_cockpit_capability_verbs()
+    }
+
+    fn ttl_or_timeout_ms(&self) -> Option<u32> {
+        match self {
+            Self::CmdVel { ttl_ms, .. }
+            | Self::DriveDirect { ttl_ms, .. }
+            | Self::DriveArc { ttl_ms, .. }
+            | Self::FaceBearing { ttl_ms, .. }
+            | Self::TrackBearing { ttl_ms, .. }
+            | Self::HoldHeading { ttl_ms, .. }
+            | Self::DockAlign { ttl_ms, .. }
+            | Self::WallFollow { ttl_ms, .. } => Some(*ttl_ms),
+            Self::TurnBy { timeout_ms, .. }
+            | Self::DriveFor { timeout_ms, .. }
+            | Self::CreepUntil { timeout_ms, .. }
+            | Self::ScanArc { timeout_ms, .. }
+            | Self::TurnToHeading { timeout_ms, .. } => Some(*timeout_ms),
+            Self::ArcFor { duration_ms, .. } | Self::CalibrateTurn { duration_ms, .. } => {
+                Some(*duration_ms)
+            }
+            Self::HeartbeatStop { timeout_ms } => Some(*timeout_ms),
+            Self::StreamSensors { period_ms, .. } => Some(*period_ms),
+            _ => None,
+        }
+    }
+
     pub fn apply<C: Cockpit>(&self, client: &mut C) -> Result<CockpitResponse> {
         match self {
             Self::Ping => client.ping().map(|()| CockpitResponse::Accepted),
             Self::Bootsel => client.bootsel().map(|()| CockpitResponse::Accepted),
             Self::GetStatus => Ok(CockpitResponse::Status(client.get_status()?)),
-            Self::GetCapabilities => {
-                Ok(CockpitResponse::Capabilities(client.get_capabilities()?))
-            }
-            Self::GetEvents { since_seq } => {
-                Ok(CockpitResponse::Events(client.get_events_since(*since_seq)?))
-            }
+            Self::GetCapabilities => Ok(CockpitResponse::Capabilities(client.get_capabilities()?)),
+            Self::GetEvents { since_seq } => Ok(CockpitResponse::Events(
+                client.get_events_since(*since_seq)?,
+            )),
             Self::Arm => client.arm().map(|()| CockpitResponse::Accepted),
             Self::Disarm => client.disarm().map(|()| CockpitResponse::Accepted),
             Self::Stop => client.stop().map(|()| CockpitResponse::Accepted),
             Self::EStop => client.estop().map(|()| CockpitResponse::Accepted),
-            Self::ClearEStop => client
-                .clear_estop()
-                .map(|()| CockpitResponse::Accepted),
+            Self::ClearEStop => client.clear_estop().map(|()| CockpitResponse::Accepted),
             Self::CmdVel {
                 linear_mm_s,
                 angular_mrad_s,
@@ -871,7 +1261,12 @@ impl CockpitRequest {
                 max_angular_mrad_s,
                 ttl_ms,
             } => client
-                .hold_heading(*heading_error_mrad, *velocity_mm_s, *max_angular_mrad_s, *ttl_ms)
+                .hold_heading(
+                    *heading_error_mrad,
+                    *velocity_mm_s,
+                    *max_angular_mrad_s,
+                    *ttl_ms,
+                )
                 .map(|()| CockpitResponse::Accepted),
             Self::TurnToHeading {
                 heading_error_mrad,
@@ -930,7 +1325,12 @@ impl CockpitRequest {
                 max_angular_mrad_s,
                 ttl_ms,
             } => client
-                .wall_follow(*distance_error_mm, *velocity_mm_s, *max_angular_mrad_s, *ttl_ms)
+                .wall_follow(
+                    *distance_error_mm,
+                    *velocity_mm_s,
+                    *max_angular_mrad_s,
+                    *ttl_ms,
+                )
                 .map(|()| CockpitResponse::Accepted),
             Self::WiggleAlign {
                 amplitude_mrad,
@@ -962,9 +1362,7 @@ impl CockpitRequest {
             } => client
                 .stream_sensors(*enabled, *packet_id, *period_ms)
                 .map(|()| CockpitResponse::Accepted),
-            Self::ResetOdometry => client
-                .reset_odometry()
-                .map(|()| CockpitResponse::Accepted),
+            Self::ResetOdometry => client.reset_odometry().map(|()| CockpitResponse::Accepted),
             Self::SetSafetyPolicy { policy } => client
                 .set_safety_policy(*policy)
                 .map(|()| CockpitResponse::Accepted),
@@ -986,15 +1384,11 @@ impl CockpitRequest {
             } => client
                 .calibrate_turn(*angular_mrad_s, *duration_ms)
                 .map(|()| CockpitResponse::Accepted),
-            Self::SetMode { mode } => client
-                .set_mode(*mode)
-                .map(|()| CockpitResponse::Accepted),
+            Self::SetMode { mode } => client.set_mode(*mode).map(|()| CockpitResponse::Accepted),
             Self::SongDefine { id, tones } => client
                 .song_define(*id, tones)
                 .map(|()| CockpitResponse::Accepted),
-            Self::SongPlay { id } => client
-                .song_play(*id)
-                .map(|()| CockpitResponse::Accepted),
+            Self::SongPlay { id } => client.song_play(*id).map(|()| CockpitResponse::Accepted),
             Self::Dock => client.dock().map(|()| CockpitResponse::Accepted),
             Self::SetLights { pattern } => client
                 .set_lights(*pattern)
@@ -1207,6 +1601,57 @@ impl CockpitRequest {
     }
 }
 
+fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
+    vec![
+        "ping",
+        "status",
+        "get_capabilities",
+        "get_events",
+        "arm",
+        "disarm",
+        "stop",
+        "estop",
+        "clear_estop",
+        "clear_motion_queue",
+        "cmd_vel",
+        "drive_direct",
+        "drive_arc",
+        "drive_for",
+        "turn_by",
+        "arc_for",
+        "creep_until",
+        "scan_arc",
+        "face_bearing",
+        "track_bearing",
+        "hold_heading",
+        "turn_to_heading",
+        "dock_align",
+        "wall_follow",
+        "wiggle_align",
+        "bump_escape",
+        "unstick",
+        "cliff_guard",
+        "heartbeat_stop",
+        "request_sensors",
+        "stream_sensors",
+        "set_safety_policy",
+        "song_define",
+        "song_play",
+        "define_chirp",
+        "play_feedback",
+        "power_state",
+        "calibrate_turn",
+        "reset_odometry",
+        "dock",
+        "set_lights",
+        "set_mode",
+    ]
+}
+
+fn optional_cockpit_verbs() -> Vec<&'static str> {
+    Vec::new()
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CockpitResponse {
@@ -1260,6 +1705,7 @@ pub struct SafeCockpit<C> {
     client: C,
     cursor: EventCursor,
     policy: AgentPolicy,
+    contract: Option<CockpitContract>,
 }
 
 impl<C: Cockpit> SafeCockpit<C> {
@@ -1272,6 +1718,7 @@ impl<C: Cockpit> SafeCockpit<C> {
             client,
             cursor: EventCursor::new(),
             policy,
+            contract: None,
         }
     }
 
@@ -1281,6 +1728,21 @@ impl<C: Cockpit> SafeCockpit<C> {
 
     pub fn refresh_status(&mut self) -> Result<StatusSummary> {
         Ok(self.client.get_status()?.summary())
+    }
+
+    pub fn refresh_contract(&mut self) -> Result<&CockpitContract> {
+        let capabilities = self.client.get_capabilities()?;
+        let contract = CockpitContract::new(capabilities);
+        contract.validate_event_vocabulary()?;
+        self.contract = Some(contract);
+        Ok(self.contract.as_ref().expect("contract was just set"))
+    }
+
+    fn ensure_contract(&mut self) -> Result<&CockpitContract> {
+        if self.contract.is_none() {
+            self.refresh_contract()?;
+        }
+        Ok(self.contract.as_ref().expect("contract is present"))
     }
 
     pub fn poll_safety_events(&mut self) -> Result<Vec<SafeStopReason>> {
@@ -1299,9 +1761,45 @@ impl<C: Cockpit> SafeCockpit<C> {
                 "refusing motion while safety is latched".to_owned(),
             ));
         }
-        self.client.heartbeat_stop(self.policy.heartbeat_timeout_ms)?;
-        self.client
-            .cmd_vel(linear_mm_s, angular_mrad_s, self.policy.motion_ttl_ms)?;
+        let heartbeat_timeout_ms = self.policy.heartbeat_timeout_ms;
+        let motion_ttl_ms = self.policy.motion_ttl_ms;
+        let contract = self.ensure_contract()?;
+        if !contract.supports("cmd_vel") {
+            return Err(CockpitError::Policy(
+                "refusing motion because cmd_vel is unsupported".to_owned(),
+            ));
+        }
+        if heartbeat_timeout_ms > 0 && !contract.supports("heartbeat_stop") {
+            return Err(CockpitError::Policy(
+                "heartbeat policy requires heartbeat_stop capability".to_owned(),
+            ));
+        }
+        let request = CockpitRequest::CmdVel {
+            linear_mm_s,
+            angular_mrad_s,
+            ttl_ms: motion_ttl_ms,
+        };
+        let request = contract.clamp_motion_request(&request);
+        contract.validate_request(&request)?;
+        if heartbeat_timeout_ms > 0 {
+            let heartbeat = CockpitRequest::HeartbeatStop {
+                timeout_ms: heartbeat_timeout_ms,
+            };
+            let heartbeat = contract.clamp_motion_request(&heartbeat);
+            contract.validate_request(&heartbeat)?;
+            if let CockpitRequest::HeartbeatStop { timeout_ms } = heartbeat {
+                self.client.heartbeat_stop(timeout_ms)?;
+            }
+        }
+        let CockpitRequest::CmdVel {
+            linear_mm_s,
+            angular_mrad_s,
+            ttl_ms,
+        } = request
+        else {
+            unreachable!("request was constructed as cmd_vel")
+        };
+        self.client.cmd_vel(linear_mm_s, angular_mrad_s, ttl_ms)?;
         let stops = self.poll_safety_events()?;
         if !stops.is_empty() {
             let _ = self.client.stop();
@@ -1444,23 +1942,10 @@ impl SimCockpit {
             capabilities: CockpitCapabilities {
                 body_kind: "sim_create_oi".to_owned(),
                 drive: "differential".to_owned(),
-                verbs: [
-                    "ping",
-                    "arm",
-                    "stop",
-                    "disarm",
-                    "estop",
-                    "clear_estop",
-                    "cmd_vel",
-                    "heartbeat_stop",
-                    "stream_sensors",
-                    "reset_odometry",
-                    "get_capabilities",
-                    "get_events",
-                ]
-                .into_iter()
-                .map(ToOwned::to_owned)
-                .collect(),
+                verbs: CockpitRequest::capability_verbs()
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect(),
                 sensors: ["bump", "cliff", "wheel_drop", "battery", "odometry"]
                     .into_iter()
                     .map(ToOwned::to_owned)
@@ -1490,6 +1975,12 @@ impl SimCockpit {
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
+                limits: CockpitLimits {
+                    max_linear_mm_s: 500,
+                    max_angular_mrad_s: 4_000,
+                    min_ttl_ms: 10,
+                    max_ttl_ms: 60_000,
+                },
             },
             events: Vec::new(),
             next_event_seq: 1,
@@ -1510,6 +2001,11 @@ impl SimCockpit {
     pub fn with_event_capacity(mut self, event_capacity: usize) -> Self {
         self.event_capacity = event_capacity.max(1);
         self.enforce_event_capacity();
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: CockpitCapabilities) -> Self {
+        self.capabilities = capabilities;
         self
     }
 
@@ -2288,6 +2784,7 @@ fn parse_capabilities(seq: u32, response: &str) -> Result<CockpitCapabilities> {
         outputs: csv_for(rest, "outputs"),
         safety: csv_for(rest, "safety"),
         events: csv_for(rest, "events"),
+        limits: parse_compact_limits(rest),
     })
 }
 
@@ -2363,12 +2860,12 @@ fn parse_compact_cockpit_response(
                 raw: response.to_owned(),
             }))
         }
-        CockpitRequest::GetCapabilities => {
-            Ok(CockpitResponse::Capabilities(parse_capabilities(seq, response)?))
-        }
-        CockpitRequest::GetEvents { since_seq } => {
-            Ok(CockpitResponse::Events(parse_events(seq, *since_seq, response)?))
-        }
+        CockpitRequest::GetCapabilities => Ok(CockpitResponse::Capabilities(parse_capabilities(
+            seq, response,
+        )?)),
+        CockpitRequest::GetEvents { since_seq } => Ok(CockpitResponse::Events(parse_events(
+            seq, *since_seq, response,
+        )?)),
         _ => {
             expect_ok(seq, response)?;
             Ok(CockpitResponse::Accepted)
@@ -2397,9 +2894,9 @@ fn parse_json_cockpit_response(
         CockpitRequest::GetCapabilities => Ok(CockpitResponse::Capabilities(
             parse_json_capabilities(&value)?,
         )),
-        CockpitRequest::GetEvents { since_seq } => {
-            Ok(CockpitResponse::Events(parse_json_events(*since_seq, &value)?))
-        }
+        CockpitRequest::GetEvents { since_seq } => Ok(CockpitResponse::Events(parse_json_events(
+            *since_seq, &value,
+        )?)),
         _ => {
             if value.get("accepted").and_then(serde_json::Value::as_bool) == Some(true) {
                 Ok(CockpitResponse::Accepted)
@@ -2412,14 +2909,67 @@ fn parse_json_cockpit_response(
 
 fn parse_json_capabilities(value: &serde_json::Value) -> Result<CockpitCapabilities> {
     Ok(CockpitCapabilities {
-        body_kind: json_str_value(value, "body_kind").unwrap_or_default().to_owned(),
-        drive: json_str_value(value, "drive").unwrap_or_default().to_owned(),
+        body_kind: json_str_value(value, "body_kind")
+            .unwrap_or_default()
+            .to_owned(),
+        drive: json_str_value(value, "drive")
+            .unwrap_or_default()
+            .to_owned(),
         verbs: json_string_array(value, "verbs"),
         sensors: json_string_array(value, "sensors"),
         outputs: json_string_array(value, "outputs"),
         safety: json_string_array(value, "safety"),
         events: json_string_array(value, "events"),
+        limits: parse_json_limits(value),
     })
+}
+
+fn parse_compact_limits(line: &str) -> CockpitLimits {
+    let Some(raw) = value_for(line, "limits") else {
+        return CockpitLimits::default();
+    };
+    let mut limits = CockpitLimits::default();
+    for item in raw.split(',') {
+        let Some((key, value)) = item.split_once(':') else {
+            continue;
+        };
+        match key {
+            "max_linear_mm_s" => {
+                if let Ok(value) = value.parse() {
+                    limits.max_linear_mm_s = value;
+                }
+            }
+            "max_angular_mrad_s" => {
+                if let Ok(value) = value.parse() {
+                    limits.max_angular_mrad_s = value;
+                }
+            }
+            "min_ttl_ms" => {
+                if let Ok(value) = value.parse() {
+                    limits.min_ttl_ms = value;
+                }
+            }
+            "max_ttl_ms" => {
+                if let Ok(value) = value.parse() {
+                    limits.max_ttl_ms = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    limits
+}
+
+fn parse_json_limits(value: &serde_json::Value) -> CockpitLimits {
+    let Some(limits) = value.get("limits") else {
+        return CockpitLimits::default();
+    };
+    CockpitLimits {
+        max_linear_mm_s: json_i16_value(limits, "max_linear_mm_s").unwrap_or(i16::MAX),
+        max_angular_mrad_s: json_i16_value(limits, "max_angular_mrad_s").unwrap_or(i16::MAX),
+        min_ttl_ms: json_u32_value(limits, "min_ttl_ms").unwrap_or(1),
+        max_ttl_ms: json_u32_value(limits, "max_ttl_ms").unwrap_or(u32::MAX),
+    }
 }
 
 fn parse_json_events(since_seq: u32, value: &serde_json::Value) -> Result<EventBatch> {
@@ -2506,7 +3056,17 @@ fn json_bool_value(value: &serde_json::Value, key: &str) -> Option<bool> {
 }
 
 fn json_u32_value(value: &serde_json::Value, key: &str) -> Option<u32> {
-    value.get(key)?.as_u64().and_then(|value| value.try_into().ok())
+    value
+        .get(key)?
+        .as_u64()
+        .and_then(|value| value.try_into().ok())
+}
+
+fn json_i16_value(value: &serde_json::Value, key: &str) -> Option<i16> {
+    value
+        .get(key)?
+        .as_i64()
+        .and_then(|value| value.try_into().ok())
 }
 
 fn compact_tones(tones: &[SongTone]) -> String {
@@ -2537,7 +3097,10 @@ fn rewrite_for_firmware_json(
             object.remove("policy");
             object.insert("bump_action".to_owned(), policy.bump.as_str().into());
             object.insert("cliff_action".to_owned(), policy.cliff.as_str().into());
-            object.insert("wheel_drop_latch".to_owned(), policy.wheel_drop_latch.into());
+            object.insert(
+                "wheel_drop_latch".to_owned(),
+                policy.wheel_drop_latch.into(),
+            );
         }
         _ => {}
     }
@@ -2564,61 +3127,41 @@ mod tests {
         assert_eq!(caps.drive, "differential");
         assert!(caps.verbs.contains(&"cmd_vel".to_owned()));
         assert!(caps.events.contains(&"safety_tripped".to_owned()));
+        assert_eq!(caps.limits.max_linear_mm_s, 500);
     }
 
     #[test]
-    fn cockpit_request_covers_public_firmware_verbs() {
+    fn cockpit_request_covers_public_firmware_verbs_from_body_toml() {
         let cockpit_verbs: BTreeSet<_> = sample_cockpit_requests()
             .into_iter()
             .map(|(verb, _, _)| verb)
             .filter(|verb| *verb != "bootsel")
             .collect();
-        let firmware_verbs: BTreeSet<_> = [
-            "ping",
-            "status",
-            "get_capabilities",
-            "get_events",
-            "arm",
-            "disarm",
-            "stop",
-            "estop",
-            "clear_estop",
-            "clear_motion_queue",
-            "cmd_vel",
-            "drive_direct",
-            "drive_arc",
-            "drive_for",
-            "turn_by",
-            "arc_for",
-            "creep_until",
-            "scan_arc",
-            "face_bearing",
-            "track_bearing",
-            "hold_heading",
-            "turn_to_heading",
-            "dock_align",
-            "wall_follow",
-            "wiggle_align",
-            "bump_escape",
-            "unstick",
-            "cliff_guard",
-            "request_sensors",
-            "stream_sensors",
-            "set_safety_policy",
-            "song_define",
-            "song_play",
-            "define_chirp",
-            "play_feedback",
-            "power_state",
-            "calibrate_turn",
-            "reset_odometry",
-            "dock",
-            "set_lights",
-            "set_mode",
-        ]
-        .into_iter()
-        .collect();
+        let firmware_verbs: BTreeSet<_> = body_toml_array("verbs").into_iter().collect();
         assert_eq!(cockpit_verbs, firmware_verbs);
+    }
+
+    #[test]
+    fn cockpit_event_kind_covers_public_firmware_events_from_body_toml() {
+        for event in body_toml_array("events") {
+            assert!(
+                !matches!(CockpitEventKind::from(event), CockpitEventKind::Unknown(_)),
+                "body.toml event {event} is not modeled by CockpitEventKind"
+            );
+        }
+    }
+
+    #[test]
+    fn body_toml_capabilities_validate_local_cockpit_model() {
+        let contract = CockpitContract::new(body_toml_capabilities());
+        let report = contract.validate_local_model();
+        assert!(
+            report.is_clean(),
+            "missing={:?} extra={:?} unknown_events={:?}",
+            report.missing_verbs,
+            report.extra_verbs,
+            report.unknown_events
+        );
     }
 
     #[test]
@@ -2632,7 +3175,10 @@ mod tests {
                 Some(expected_json_kind),
                 "{verb} serialized as {json}"
             );
-            assert_eq!(value.get("command_id").and_then(serde_json::Value::as_u64), Some(7));
+            assert_eq!(
+                value.get("command_id").and_then(serde_json::Value::as_u64),
+                Some(7)
+            );
         }
     }
 
@@ -2669,8 +3215,83 @@ mod tests {
                 duration_64ths: 8,
             }],
         };
-        let value: serde_json::Value = serde_json::from_str(&song.to_firmware_json(2).unwrap()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&song.to_firmware_json(2).unwrap()).unwrap();
         assert_eq!(value["tones"], "72:8");
+    }
+
+    #[test]
+    fn parses_json_accepted_and_rejected_command_responses() {
+        let accepted = parse_json_cockpit_response(
+            4,
+            &CockpitRequest::Arm,
+            r#"{"accepted":true,"command_id":4,"message":"accepted"}"#,
+        )
+        .unwrap();
+        assert_eq!(accepted, CockpitResponse::Accepted);
+
+        let rejected = parse_json_cockpit_response(
+            5,
+            &CockpitRequest::Arm,
+            r#"{"accepted":false,"command_id":5,"message":"busy"}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            rejected,
+            CockpitError::Rejected {
+                command_id: 5,
+                reason
+            } if reason == "busy"
+        ));
+    }
+
+    #[test]
+    fn parses_json_status_capabilities_and_events() {
+        let status = parse_json_cockpit_response(
+            1,
+            &CockpitRequest::GetStatus,
+            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","event_next_seq":8}"#,
+        )
+        .unwrap();
+        let CockpitResponse::Status(status) = status else {
+            panic!("expected status response");
+        };
+        let summary = status.summary();
+        assert_eq!(summary.runtime_state.as_deref(), Some("idle"));
+        assert_eq!(summary.armed, Some(true));
+        assert_eq!(summary.event_next_seq, Some(8));
+
+        let caps = parse_json_cockpit_response(
+            2,
+            &CockpitRequest::GetCapabilities,
+            r#"{"accepted":true,"command_id":2,"body_kind":"create_oi","drive":"differential","verbs":["arm","cmd_vel"],"sensors":["bump"],"outputs":["drive"],"safety":["estop"],"events":["boot","safety_tripped"]}"#,
+        )
+        .unwrap();
+        let CockpitResponse::Capabilities(caps) = caps else {
+            panic!("expected capabilities response");
+        };
+        assert_eq!(caps.body_kind, "create_oi");
+        assert_eq!(caps.verbs, ["arm", "cmd_vel"]);
+        assert_eq!(caps.limits.max_linear_mm_s, i16::MAX);
+
+        let events = parse_json_cockpit_response(
+            3,
+            &CockpitRequest::GetEvents { since_seq: 6 },
+            r#"{"type":"events","since_seq":6,"oldest_seq":4,"next_seq":9,"dropped_before_seq":0,"events":[{"seq":7,"kind":"safety_tripped","a":1,"b":0,"c":0},{"seq":8,"kind":"motion_stopped","a":0,"b":0,"c":0}]}"#,
+        )
+        .unwrap();
+        let CockpitResponse::Events(events) = events else {
+            panic!("expected events response");
+        };
+        assert_eq!(events.since_seq, 6);
+        assert_eq!(events.next_seq, 9);
+        assert!(events.has_stop_reason());
+    }
+
+    #[test]
+    fn malformed_json_response_maps_to_json_error() {
+        let err = parse_json_cockpit_response(1, &CockpitRequest::Arm, "{not-json").unwrap_err();
+        assert!(matches!(err, CockpitError::Json(_)));
     }
 
     #[test]
@@ -2905,6 +3526,107 @@ mod tests {
         assert_eq!(caps.drive, "differential");
         assert_eq!(caps.verbs, ["arm", "stop", "cmd_vel"]);
         assert_eq!(caps.events, ["boot", "safety_tripped"]);
+        assert_eq!(caps.limits.max_linear_mm_s, 500);
+    }
+
+    #[test]
+    fn parses_json_capability_limits() {
+        let caps = parse_json_capabilities(&serde_json::json!({
+            "body_kind":"create_oi",
+            "drive":"differential",
+            "verbs":["cmd_vel"],
+            "events":["boot"],
+            "limits":{
+                "max_linear_mm_s":120,
+                "max_angular_mrad_s":800,
+                "min_ttl_ms":20,
+                "max_ttl_ms":900
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            caps.limits,
+            CockpitLimits {
+                max_linear_mm_s: 120,
+                max_angular_mrad_s: 800,
+                min_ttl_ms: 20,
+                max_ttl_ms: 900,
+            }
+        );
+    }
+
+    #[test]
+    fn contract_rejects_unsupported_lights_music_and_step_verbs() {
+        let contract =
+            CockpitContract::new(sim_caps_without(&["set_lights", "song_play", "dock_align"]));
+        assert!(matches!(
+            contract.validate_request(&CockpitRequest::SetLights {
+                pattern: LightPattern::Status
+            }),
+            Err(CockpitError::Policy(message)) if message.contains("set_lights")
+        ));
+        assert!(matches!(
+            contract.validate_request(&CockpitRequest::SongPlay { id: 0 }),
+            Err(CockpitError::Policy(message)) if message.contains("song_play")
+        ));
+        assert!(matches!(
+            contract.validate_request(&CockpitRequest::DockAlign {
+                bearing_mrad: 0,
+                range_mm: 400,
+                max_linear_mm_s: 80,
+                max_angular_mrad_s: 500,
+                stop_range_mm: 200,
+                ttl_ms: 300,
+            }),
+            Err(CockpitError::Policy(message)) if message.contains("dock_align")
+        ));
+    }
+
+    #[test]
+    fn safe_cockpit_clamps_motion_to_body_limits() {
+        let mut caps = sim_caps_with_all_verbs();
+        caps.limits.max_linear_mm_s = 40;
+        caps.limits.max_angular_mrad_s = 100;
+        caps.limits.min_ttl_ms = 50;
+        caps.limits.max_ttl_ms = 200;
+        let sim = SimCockpit::new().with_capabilities(caps);
+        let mut safe = SafeCockpit::with_policy(
+            sim,
+            AgentPolicy {
+                motion_ttl_ms: 500,
+                heartbeat_timeout_ms: 500,
+            },
+        );
+        safe.pulse_motion(120, 300).unwrap();
+        let batch = safe.client_mut().get_events_since(0).unwrap();
+        let motion = batch
+            .events
+            .iter()
+            .find(|event| event.kind == CockpitEventKind::MotionRequested)
+            .unwrap();
+        assert_eq!(motion.a, pack_i16_pair(40, 100));
+        assert_eq!(motion.b, 200);
+    }
+
+    #[test]
+    fn safe_cockpit_requires_heartbeat_only_when_policy_uses_it() {
+        let caps = sim_caps_without(&["heartbeat_stop"]);
+        let sim = SimCockpit::new().with_capabilities(caps.clone());
+        let mut safe = SafeCockpit::new(sim);
+        assert!(matches!(
+            safe.pulse_motion(20, 0),
+            Err(CockpitError::Policy(message)) if message.contains("heartbeat_stop")
+        ));
+
+        let sim = SimCockpit::new().with_capabilities(caps);
+        let mut safe = SafeCockpit::with_policy(
+            sim,
+            AgentPolicy {
+                motion_ttl_ms: 100,
+                heartbeat_timeout_ms: 0,
+            },
+        );
+        safe.pulse_motion(20, 0).unwrap();
     }
 
     #[test]
@@ -2945,7 +3667,11 @@ mod tests {
             ("stop", "stop", "STOP"),
             ("estop", "estop", "ESTOP"),
             ("clear_estop", "clear_estop", "CLEAR_ESTOP"),
-            ("clear_motion_queue", "clear_motion_queue", "CLEAR_MOTION_QUEUE"),
+            (
+                "clear_motion_queue",
+                "clear_motion_queue",
+                "CLEAR_MOTION_QUEUE",
+            ),
             ("cmd_vel", "cmd_vel", "CMD_VEL"),
             ("drive_direct", "drive_direct", "DRIVE_DIRECT"),
             ("drive_arc", "drive_arc", "DRIVE_ARC"),
@@ -2964,9 +3690,14 @@ mod tests {
             ("bump_escape", "bump_escape", "BUMP_ESCAPE"),
             ("unstick", "unstick", "UNSTICK"),
             ("cliff_guard", "cliff_guard", "CLIFF_GUARD"),
+            ("heartbeat_stop", "heartbeat_stop", "HEARTBEAT_STOP"),
             ("request_sensors", "request_sensors", "REQUEST_SENSORS"),
             ("stream_sensors", "stream_sensors", "STREAM_SENSORS"),
-            ("set_safety_policy", "set_safety_policy", "SET_SAFETY_POLICY"),
+            (
+                "set_safety_policy",
+                "set_safety_policy",
+                "SET_SAFETY_POLICY",
+            ),
             ("song_define", "song_define", "SONG_DEFINE"),
             ("song_play", "song_play", "SONG_PLAY"),
             ("define_chirp", "define_chirp", "DEFINE_CHIRP"),
@@ -2978,6 +3709,94 @@ mod tests {
             ("set_lights", "set_lights", "SET_LIGHTS"),
             ("set_mode", "set_mode", "SET_MODE"),
         ]
+    }
+
+    fn body_toml() -> toml::Value {
+        include_str!("../../netherwick-brainstem/body.toml")
+            .parse()
+            .unwrap()
+    }
+
+    fn body_toml_array(key: &str) -> Vec<&'static str> {
+        let body = body_toml();
+        let values = body["capabilities"][key].as_array().unwrap();
+        values
+            .iter()
+            .map(|value| {
+                let value = value.as_str().unwrap().to_owned();
+                Box::leak(value.into_boxed_str()) as &'static str
+            })
+            .collect()
+    }
+
+    fn body_toml_capabilities() -> CockpitCapabilities {
+        let body = body_toml();
+        let limits = &body["limits"];
+        CockpitCapabilities {
+            body_kind: body["body"]["kind"].as_str().unwrap().to_owned(),
+            drive: body["body"]["drive"].as_str().unwrap().to_owned(),
+            verbs: body_toml_array("verbs")
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            sensors: body_toml_array("sensors")
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            outputs: body_toml_array("outputs")
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            safety: body_toml_array("safety")
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            events: body_toml_array("events")
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            limits: CockpitLimits {
+                max_linear_mm_s: limits["max_linear_mm_s"]
+                    .as_integer()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                max_angular_mrad_s: limits["max_angular_mrad_s"]
+                    .as_integer()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                min_ttl_ms: limits["min_ttl_ms"]
+                    .as_integer()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                max_ttl_ms: limits["max_ttl_ms"]
+                    .as_integer()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            },
+        }
+    }
+
+    fn sim_caps_with_all_verbs() -> CockpitCapabilities {
+        let mut caps = SimCockpit::new().get_capabilities().unwrap();
+        caps.verbs = CockpitRequest::capability_verbs()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        caps.events = body_toml_array("events")
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        caps
+    }
+
+    fn sim_caps_without(without: &[&str]) -> CockpitCapabilities {
+        let mut caps = sim_caps_with_all_verbs();
+        caps.verbs.retain(|verb| !without.contains(&verb.as_str()));
+        caps
     }
 
     fn sample_request_for(verb: &str) -> CockpitRequest {
@@ -3089,6 +3908,7 @@ mod tests {
                 turn_angular_mrad_s: 900,
             },
             "cliff_guard" => CockpitRequest::CliffGuard { clear: false },
+            "heartbeat_stop" => CockpitRequest::HeartbeatStop { timeout_ms: 900 },
             "request_sensors" => CockpitRequest::RequestSensors { packet_id: 0 },
             "stream_sensors" => CockpitRequest::StreamSensors {
                 enabled: true,
