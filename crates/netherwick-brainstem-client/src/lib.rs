@@ -1,6 +1,9 @@
+use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serialport::SerialPort;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, BrainstemClientError>;
@@ -9,6 +12,8 @@ pub type Result<T> = std::result::Result<T, BrainstemClientError>;
 pub enum BrainstemClientError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("serial error: {0}")]
+    Serial(#[from] serialport::Error),
     #[error("bad brainstem response: {0}")]
     BadResponse(String),
     #[error("event history missed before sequence {dropped_before_seq}")]
@@ -213,11 +218,7 @@ impl UdpBrainstemClient {
         self.socket.send_to(line.as_bytes(), self.brainstem)?;
         let mut buf = [0u8; 2048];
         let (len, _) = self.socket.recv_from(&mut buf)?;
-        let response = std::str::from_utf8(&buf[..len])
-            .map_err(|_| BrainstemClientError::BadResponse("response was not utf-8".into()))?
-            .trim()
-            .to_owned();
-        Ok(response)
+        response_from_bytes(&buf[..len])
     }
 
     fn seq(&mut self) -> u32 {
@@ -306,12 +307,216 @@ impl BrainstemClient for UdpBrainstemClient {
     }
 }
 
-fn expect_ok(seq: u32, response: &str) -> Result<()> {
-    let expected = format!("OK {seq}");
-    if response.starts_with(&expected) {
+pub const DEFAULT_UART_BAUD_RATE: u32 = 115_200;
+pub const DEFAULT_UART_TIMEOUT: Duration = Duration::from_millis(750);
+pub const DEFAULT_UART_MAX_RESPONSE_LEN: usize = 2048;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct UartBrainstemClientConfig {
+    pub path: PathBuf,
+    pub baud_rate: u32,
+    pub timeout: Duration,
+    pub max_response_len: usize,
+}
+
+impl UartBrainstemClientConfig {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            baud_rate: DEFAULT_UART_BAUD_RATE,
+            timeout: DEFAULT_UART_TIMEOUT,
+            max_response_len: DEFAULT_UART_MAX_RESPONSE_LEN,
+        }
+    }
+
+    pub fn with_baud_rate(mut self, baud_rate: u32) -> Self {
+        self.baud_rate = baud_rate;
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_response_len(mut self, max_response_len: usize) -> Self {
+        self.max_response_len = max_response_len;
+        self
+    }
+}
+
+pub struct UartBrainstemClient {
+    port: Box<dyn SerialPort>,
+    next_seq: u32,
+    timeout: Duration,
+    max_response_len: usize,
+}
+
+impl UartBrainstemClient {
+    pub fn connect(path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with_config(UartBrainstemClientConfig::new(path.as_ref()))
+    }
+
+    pub fn connect_with_config(config: UartBrainstemClientConfig) -> Result<Self> {
+        let port = serialport::new(config.path.to_string_lossy(), config.baud_rate)
+            .timeout(config.timeout)
+            .open()?;
+        Ok(Self {
+            port,
+            next_seq: 1,
+            timeout: config.timeout,
+            max_response_len: config.max_response_len,
+        })
+    }
+
+    pub fn from_port(port: Box<dyn SerialPort>) -> Self {
+        Self {
+            port,
+            next_seq: 1,
+            timeout: DEFAULT_UART_TIMEOUT,
+            max_response_len: DEFAULT_UART_MAX_RESPONSE_LEN,
+        }
+    }
+
+    pub fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.timeout = timeout;
+        self.port.set_timeout(timeout)?;
         Ok(())
-    } else {
-        Err(BrainstemClientError::BadResponse(response.to_owned()))
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    fn request(&mut self, line: String) -> Result<String> {
+        self.port.write_all(line.as_bytes())?;
+        self.port.flush()?;
+        read_line_response(&mut self.port, self.max_response_len)
+    }
+
+    fn seq(&mut self) -> u32 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        seq
+    }
+
+    fn command(&mut self, kind: &str) -> Result<()> {
+        let seq = self.seq();
+        expect_ok(seq, &self.request(format!("{kind} {seq}\n"))?)
+    }
+}
+
+impl BrainstemClient for UartBrainstemClient {
+    fn get_status(&mut self) -> Result<BrainstemStatus> {
+        let seq = self.seq();
+        let response = self.request(format!("STATUS {seq}\n"))?;
+        expect_ok(seq, &response)?;
+        Ok(BrainstemStatus { raw: response })
+    }
+
+    fn get_capabilities(&mut self) -> Result<BrainstemCapabilities> {
+        let seq = self.seq();
+        let response = self.request(format!("GET_CAPABILITIES {seq}\n"))?;
+        parse_capabilities(seq, &response)
+    }
+
+    fn get_events_since(&mut self, since_seq: u32) -> Result<EventBatch> {
+        let seq = self.seq();
+        let response = self.request(format!("GET_EVENTS {seq} {since_seq}\n"))?;
+        parse_events(seq, since_seq, &response)
+    }
+
+    fn arm(&mut self) -> Result<()> {
+        self.command("ARM")
+    }
+
+    fn disarm(&mut self) -> Result<()> {
+        self.command("DISARM")
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.command("STOP")
+    }
+
+    fn estop(&mut self) -> Result<()> {
+        self.command("ESTOP")
+    }
+
+    fn clear_estop(&mut self) -> Result<()> {
+        self.command("CLEAR_ESTOP")
+    }
+
+    fn cmd_vel(&mut self, linear_mm_s: i16, angular_mrad_s: i16, ttl_ms: u32) -> Result<()> {
+        let seq = self.seq();
+        expect_ok(
+            seq,
+            &self.request(format!(
+                "CMD_VEL {seq} {linear_mm_s} {angular_mrad_s} {ttl_ms}\n"
+            ))?,
+        )
+    }
+
+    fn heartbeat_stop(&mut self, timeout_ms: u32) -> Result<()> {
+        let seq = self.seq();
+        expect_ok(
+            seq,
+            &self.request(format!("HEARTBEAT_STOP {seq} {timeout_ms}\n"))?,
+        )
+    }
+
+    fn stream_sensors(&mut self, enabled: bool, packet_id: u8, period_ms: u32) -> Result<()> {
+        let seq = self.seq();
+        let enabled = if enabled { "true" } else { "false" };
+        expect_ok(
+            seq,
+            &self.request(format!(
+                "STREAM_SENSORS {seq} {enabled} {packet_id} {period_ms}\n"
+            ))?,
+        )
+    }
+
+    fn reset_odometry(&mut self) -> Result<()> {
+        self.command("RESET_ODOMETRY")
+    }
+}
+
+fn read_line_response(port: &mut Box<dyn SerialPort>, max_len: usize) -> Result<String> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match port.read(&mut byte) {
+            Ok(0) => continue,
+            Ok(_) if byte[0] == b'\n' => return response_from_bytes(&buf),
+            Ok(_) if byte[0] == b'\r' => continue,
+            Ok(_) => {
+                if buf.len() >= max_len {
+                    return Err(BrainstemClientError::BadResponse(
+                        "response line exceeded maximum length".into(),
+                    ));
+                }
+                buf.push(byte[0]);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn response_from_bytes(bytes: &[u8]) -> Result<String> {
+    let response = std::str::from_utf8(bytes)
+        .map_err(|_| BrainstemClientError::BadResponse("response was not utf-8".into()))?
+        .trim()
+        .to_owned();
+    Ok(response)
+}
+
+fn expect_ok(seq: u32, response: &str) -> Result<()> {
+    let mut parts = response.split_ascii_whitespace();
+    match (
+        parts.next(),
+        parts.next().and_then(|value| value.parse::<u32>().ok()),
+    ) {
+        (Some("OK"), Some(response_seq)) if response_seq == seq => Ok(()),
+        _ => Err(BrainstemClientError::BadResponse(response.to_owned())),
     }
 }
 
@@ -430,5 +635,31 @@ mod tests {
         assert_eq!(caps.drive, "differential");
         assert_eq!(caps.verbs, ["arm", "stop", "cmd_vel"]);
         assert_eq!(caps.events, ["boot", "safety_tripped"]);
+    }
+
+    #[test]
+    fn uart_config_defaults_to_forebrain_baud() {
+        let config = UartBrainstemClientConfig::new("/dev/ttyTEST0");
+        assert_eq!(config.baud_rate, DEFAULT_UART_BAUD_RATE);
+        assert_eq!(config.timeout, DEFAULT_UART_TIMEOUT);
+        assert_eq!(config.max_response_len, DEFAULT_UART_MAX_RESPONSE_LEN);
+    }
+
+    #[test]
+    fn malformed_response_maps_to_bad_response() {
+        let err = expect_ok(2, "ERR 2 parse").unwrap_err();
+        assert!(matches!(err, BrainstemClientError::BadResponse(_)));
+    }
+
+    #[test]
+    fn mismatched_sequence_maps_to_bad_response() {
+        let err = expect_ok(1, "OK 12").unwrap_err();
+        assert!(matches!(err, BrainstemClientError::BadResponse(_)));
+    }
+
+    #[test]
+    fn non_utf8_response_maps_to_bad_response() {
+        let err = response_from_bytes(&[0xff]).unwrap_err();
+        assert!(matches!(err, BrainstemClientError::BadResponse(_)));
     }
 }

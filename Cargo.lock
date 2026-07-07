@@ -5122,6 +5122,7 @@ dependencies = [
 name = "netherwick-brainstem-client"
 version = "0.1.0"
 dependencies = [
+ "serialport",
  "thiserror 1.0.69",
 ]
 

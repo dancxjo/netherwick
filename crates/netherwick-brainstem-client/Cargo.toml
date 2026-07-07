@@ -6,8 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+serialport = "4"
 thiserror.workspace = true
 
 [[example]]
 name = "servo_loop"
 path = "examples/servo_loop.rs"
+
+[[example]]
+name = "uart_servo_loop"
+path = "examples/uart_servo_loop.rs"

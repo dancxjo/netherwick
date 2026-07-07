@@ -371,9 +371,9 @@ printf 'CMD_VEL 3 80 0 250\n' | nc -u -w1 192.168.4.1 82
 
 ## Host Client Contract
 
-The host-side crate `netherwick-brainstem-client` defines the smallest stable motherbrain/forebrain client surface. It is intentionally body-neutral: callers do not see Create OI modes, packet ids, BRC, LEDs, songs, dock opcodes, or UART details.
+The host-side crate `netherwick-brainstem-client` defines the smallest stable motherbrain/forebrain client surface. It is intentionally body-neutral: callers do not see Create OI modes, packet ids, BRC, LEDs, songs, dock opcodes, or Create UART details.
 
-Primary low-latency transport today is UDP on port `82`; forebrain UART uses the same compact command vocabulary and can implement the same trait later. HTTP remains useful for smoke testing and operator inspection.
+Primary low-latency transports are UDP on port `82` and direct forebrain UART. Both use the same compact line protocol and implement the same `BrainstemClient` trait. HTTP remains useful for smoke testing and operator inspection.
 
 The Rust trait exposes:
 
@@ -402,6 +402,14 @@ Servo-loop example:
 cargo run -p netherwick-brainstem-client --example servo_loop -- 192.168.4.1:82
 ```
 
+Direct UART servo-loop example:
+
+```bash
+cargo run -p netherwick-brainstem-client --example uart_servo_loop -- /dev/ttyACM0 115200
+```
+
+The UART example also accepts `NETHERWICK_BRAINSTEM_UART` and `NETHERWICK_BRAINSTEM_BAUD`; baud defaults to `115200`.
+
 The example does:
 
 ```text
@@ -427,6 +435,14 @@ printf 'STOP 4\n' | nc -u -w1 192.168.4.1 82
 ## Forebrain UART
 
 On Pico W builds, UART0 GP0/GP1 remains dedicated to the iRobot Create OI link. UART1 GP4/GP5 is the forebrain control lane at 115200 8N1 with one ASCII command per line:
+
+| Signal | Pico GPIO | Direction |
+| --- | ---: | --- |
+| Forebrain UART TX | GP4 | Pico TX to host RX |
+| Forebrain UART RX | GP5 | Host TX to Pico RX |
+| Ground | GND | Common reference |
+
+Use 3.3V UART levels and cross TX/RX. Do not connect RS-232 voltage levels directly to the Pico. The host path is usually a USB UART such as `/dev/ttyUSB0`, `/dev/ttyACM0`, or a stable `/dev/serial/by-id/...` symlink.
 
 ```text
 PING seq
@@ -482,12 +498,19 @@ BOOTSEL seq
 
 Minimal UART smoke test:
 
-```text
-GET_CAPABILITIES 1
-GET_EVENTS 2 0
-CMD_VEL 3 80 0 250
-STOP 4
-GET_EVENTS 5 0
+```bash
+stty -F /dev/ttyUSB0 115200 cs8 -cstopb -parenb -ixon -ixoff raw
+printf 'GET_CAPABILITIES 1\n' > /dev/ttyUSB0
+timeout 1 cat /dev/ttyUSB0
+printf 'GET_EVENTS 2 0\n' > /dev/ttyUSB0
+timeout 1 cat /dev/ttyUSB0
+```
+
+Expected replies are single lines beginning with `OK 1 CAPABILITIES` and `OK 2 EVENTS`. For a movement smoke test, only run this with the robot lifted or safely staged:
+
+```bash
+printf 'ARM 3\nHEARTBEAT_STOP 4 900\nCMD_VEL 5 80 0 250\nSTOP 6\nGET_EVENTS 7 0\n' > /dev/ttyUSB0
+timeout 1 cat /dev/ttyUSB0
 ```
 
 The Pico W onboard LED normally emits a one-blink heartbeat every 15 seconds. Event blink codes interrupt that heartbeat:
