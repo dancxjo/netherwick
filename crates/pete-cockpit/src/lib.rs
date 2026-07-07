@@ -446,6 +446,14 @@ pub trait Cockpit {
         expect_accepted(self.execute(CockpitRequest::ResetOdometry)?)
     }
 
+    fn zero_imu_orientation(&mut self) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::ZeroImuOrientation)?)
+    }
+
+    fn clear_imu_orientation(&mut self) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::ClearImuOrientation)?)
+    }
+
     fn set_mode(&mut self, mode: CreateOiMode) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::SetMode { mode })?)
     }
@@ -1395,6 +1403,8 @@ pub enum CockpitRequest {
         duration_ms: u32,
     },
     ResetOdometry,
+    ZeroImuOrientation,
+    ClearImuOrientation,
     SetMode {
         mode: CreateOiMode,
     },
@@ -1452,6 +1462,8 @@ impl CockpitRequest {
             Self::PowerState { .. } => "power_state",
             Self::CalibrateTurn { .. } => "calibrate_turn",
             Self::ResetOdometry => "reset_odometry",
+            Self::ZeroImuOrientation => "zero_imu_orientation",
+            Self::ClearImuOrientation => "clear_imu_orientation",
             Self::SetMode { .. } => "set_mode",
             Self::SongDefine { .. } => "song_define",
             Self::SongPlay { .. } => "song_play",
@@ -1684,6 +1696,12 @@ impl CockpitRequest {
                 .stream_sensors(*enabled, *packet_id, *period_ms)
                 .map(|()| CockpitResponse::Accepted),
             Self::ResetOdometry => client.reset_odometry().map(|()| CockpitResponse::Accepted),
+            Self::ZeroImuOrientation => client
+                .zero_imu_orientation()
+                .map(|()| CockpitResponse::Accepted),
+            Self::ClearImuOrientation => client
+                .clear_imu_orientation()
+                .map(|()| CockpitResponse::Accepted),
             Self::SetSafetyPolicy { policy } => client
                 .set_safety_policy(*policy)
                 .map(|()| CockpitResponse::Accepted),
@@ -1908,6 +1926,8 @@ impl CockpitRequest {
                 duration_ms,
             } => format!("CALIBRATE_TURN {seq} {angular_mrad_s} {duration_ms}\n"),
             Self::ResetOdometry => format!("RESET_ODOMETRY {seq}\n"),
+            Self::ZeroImuOrientation => format!("ZERO_IMU_ORIENTATION {seq}\n"),
+            Self::ClearImuOrientation => format!("CLEAR_IMU_ORIENTATION {seq}\n"),
             Self::SetMode { mode } => format!("SET_MODE {seq} {}\n", mode.as_str()),
             Self::SongDefine { id, tones } => {
                 format!("SONG_DEFINE {seq} {id}{}\n", compact_tones(tones))
@@ -1963,6 +1983,8 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "power_state",
         "calibrate_turn",
         "reset_odometry",
+        "zero_imu_orientation",
+        "clear_imu_orientation",
         "dock",
         "set_lights",
         "set_mode",
@@ -2301,6 +2323,7 @@ pub struct SimCockpit {
     active_cmd_vel: Option<SimTimedAction>,
     heartbeat_stop_at_ms: Option<u32>,
     odometry_reset_count: u32,
+    imu_calibration: u8,
 }
 
 impl SimCockpit {
@@ -2407,6 +2430,7 @@ impl SimCockpit {
             active_cmd_vel: None,
             heartbeat_stop_at_ms: None,
             odometry_reset_count: 0,
+            imu_calibration: 3,
         };
         sim.push_event(CockpitEventKind::Boot, 0, 0, 0);
         sim
@@ -2661,6 +2685,12 @@ impl Cockpit for SimCockpit {
             CockpitRequest::ResetOdometry => {
                 self.reset_odometry().map(|()| CockpitResponse::Accepted)
             }
+            CockpitRequest::ZeroImuOrientation => self
+                .zero_imu_orientation()
+                .map(|()| CockpitResponse::Accepted),
+            CockpitRequest::ClearImuOrientation => self
+                .clear_imu_orientation()
+                .map(|()| CockpitResponse::Accepted),
             _ => {
                 let id = self.accept_command();
                 self.complete_command(id);
@@ -2674,7 +2704,7 @@ impl Cockpit for SimCockpit {
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
-                "OK 0 STATUS sim=true now_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_yaw_rate_mrad_s=0 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration=3",
+                "OK 0 STATUS sim=true now_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_yaw_rate_mrad_s=0 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={}",
                 self.now_ms,
                 self.armed,
                 self.estop_latched,
@@ -2698,7 +2728,8 @@ impl Cockpit for SimCockpit {
                 0,
                 self.odometry_reset_count,
                 self.odometry_distance_mm,
-                self.odometry_heading_mrad
+                self.odometry_heading_mrad,
+                self.imu_calibration
             ),
         })
     }
@@ -2813,6 +2844,20 @@ impl Cockpit for SimCockpit {
         self.odometry_reset_count = self.odometry_reset_count.saturating_add(1);
         self.odometry_distance_mm = 0;
         self.odometry_heading_mrad = 0;
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn zero_imu_orientation(&mut self) -> Result<()> {
+        let id = self.accept_command();
+        self.imu_calibration = 3;
+        self.complete_command(id);
+        Ok(())
+    }
+
+    fn clear_imu_orientation(&mut self) -> Result<()> {
+        let id = self.accept_command();
+        self.imu_calibration = 0;
         self.complete_command(id);
         Ok(())
     }
@@ -3079,6 +3124,14 @@ impl Cockpit for UdpCockpit {
     fn reset_odometry(&mut self) -> Result<()> {
         self.command("RESET_ODOMETRY")
     }
+
+    fn zero_imu_orientation(&mut self) -> Result<()> {
+        self.command("ZERO_IMU_ORIENTATION")
+    }
+
+    fn clear_imu_orientation(&mut self) -> Result<()> {
+        self.command("CLEAR_IMU_ORIENTATION")
+    }
 }
 
 pub const DEFAULT_UART_BAUD_RATE: u32 = 115_200;
@@ -3257,6 +3310,14 @@ impl Cockpit for UartCockpit {
 
     fn reset_odometry(&mut self) -> Result<()> {
         self.command("RESET_ODOMETRY")
+    }
+
+    fn zero_imu_orientation(&mut self) -> Result<()> {
+        self.command("ZERO_IMU_ORIENTATION")
+    }
+
+    fn clear_imu_orientation(&mut self) -> Result<()> {
+        self.command("CLEAR_IMU_ORIENTATION")
     }
 }
 
@@ -4346,6 +4407,16 @@ mod tests {
             ("power_state", "power_state", "POWER_STATE"),
             ("calibrate_turn", "calibrate_turn", "CALIBRATE_TURN"),
             ("reset_odometry", "reset_odometry", "RESET_ODOMETRY"),
+            (
+                "zero_imu_orientation",
+                "zero_imu_orientation",
+                "ZERO_IMU_ORIENTATION",
+            ),
+            (
+                "clear_imu_orientation",
+                "clear_imu_orientation",
+                "CLEAR_IMU_ORIENTATION",
+            ),
             ("dock", "dock", "DOCK"),
             ("set_lights", "set_lights", "SET_LIGHTS"),
             ("set_mode", "set_mode", "SET_MODE"),
@@ -4583,6 +4654,8 @@ mod tests {
                 duration_ms: 1_000,
             },
             "reset_odometry" => CockpitRequest::ResetOdometry,
+            "zero_imu_orientation" => CockpitRequest::ZeroImuOrientation,
+            "clear_imu_orientation" => CockpitRequest::ClearImuOrientation,
             "dock" => CockpitRequest::Dock,
             "set_lights" => CockpitRequest::SetLights {
                 pattern: LightPattern::Status,

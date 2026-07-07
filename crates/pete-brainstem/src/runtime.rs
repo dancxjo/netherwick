@@ -629,6 +629,12 @@ where
             RuntimeCommand::ResetOdometry => {
                 status::mark_odometry_reset();
             }
+            RuntimeCommand::ZeroImuOrientation => {
+                let _ = status::zero_imu_orientation_from_gravity();
+            }
+            RuntimeCommand::ClearImuOrientation => {
+                status::clear_imu_orientation_calibration();
+            }
             RuntimeCommand::SongPlay { id } => {
                 self.ensure_create_responsive()?;
                 self.create_uart
@@ -1661,6 +1667,8 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             duration_ms,
         }),
         BrainstemCommand::ResetOdometry { .. } => Some(RuntimeCommand::ResetOdometry),
+        BrainstemCommand::ZeroImuOrientation { .. } => Some(RuntimeCommand::ZeroImuOrientation),
+        BrainstemCommand::ClearImuOrientation { .. } => Some(RuntimeCommand::ClearImuOrientation),
         BrainstemCommand::SongPlay { id } => Some(RuntimeCommand::SongPlay { id }),
         BrainstemCommand::SongDefine {
             id,

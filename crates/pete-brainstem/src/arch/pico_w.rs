@@ -910,7 +910,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <div class="cluster"><h2>Mode</h2><div class="seg"><button id="arm" class="primary">Arm</button><button id="safe">Safe</button><button id="full">Full</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
 <div class="cluster"><h2>Lights</h2><div class="seg"><button data-lights="off">Off</button><button data-lights="status">Status</button><button data-lights="clean">Clean</button><button data-lights="dock">Dock</button><button data-lights="spot">Spot</button><button data-lights="max">Max</button></div></div>
 <div class="cluster"><h2>Primitives</h2><div class="seg"><button data-action="drive_for">Drive 300</button><button data-action="turn_left">Turn L</button><button data-action="turn_right">Turn R</button><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div></div>
-<div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="stream">Stream Sensors</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
+<div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="imuzero">Zero IMU</button><button id="imuclear">Clear IMU</button><button id="stream">Stream Sensors</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
 <div class="cluster wide"><h2>Music</h2><div class="split"><div class="field"><label for="songid">Slot</label><input id="songid" inputmode="numeric" value="0"></div><div class="field"><label for="tones">Tones</label><input id="tones" value="72:8,76:8,79:16"></div></div><div class="row"><button id="songdef" class="primary">Define</button><button id="songplay">Play</button><button id="song">Chirp</button></div></div>
 </div>
 </section>
@@ -950,7 +950,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <script>
 let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='',statusBusy=false,lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,eventBusy=false,caps=null;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
-const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','calibrate_turn','reset_odometry','song_define']);
+const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','calibrate_turn','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
 const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',heartbeat:'heartbeat_stop'};
 function title(s){return (s||'unknown').replaceAll('_',' ')}
 function pill(el,text,state){el.textContent=text;el.className='pill '+(state||'')}
@@ -961,7 +961,7 @@ function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control
 function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='events'){handleEvents(j);return}if(j.verbs){caps=j;applyCaps();pill(net,'capabilities','ok');return}let ok=j.accepted!==false;pill(net,ok?'accepted':'rejected',ok?'ok':'warn');if(!ok)addLog('rejected '+(j.message||j.command_id||''));else if(j.message)addLog(j.message+' '+(j.command_id||''))}
 function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(ack===false)o.ack=false;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;if(wsOpen&&ws&&ws.readyState===1){if(ws.bufferedAmount<384){ws.send(body);if(ack!==false)addLog('sent '+name);return Promise.resolve({accepted:true})}pill(net,'throttled','warn');return Promise.resolve({accepted:false,message:'throttled'})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
 function requestCaps(){sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps()}})}
-function applyCaps(){setDisabled(['arm'],'arm');setDisabled(['disarm'],'disarm');setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});document.querySelectorAll('[data-lights]').forEach(b=>b.disabled=!hasVerb('set_lights'));['dock','safe','full','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='safe'||x==='full'?'set_mode':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
+function applyCaps(){setDisabled(['arm'],'arm');setDisabled(['disarm'],'disarm');setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');setDisabled(['imuzero'],'zero_imu_orientation');setDisabled(['imuclear'],'clear_imu_orientation');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});document.querySelectorAll('[data-lights]').forEach(b=>b.disabled=!hasVerb('set_lights'));['dock','safe','full','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='safe'||x==='full'?'set_mode':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
 function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('.active').forEach(b=>b.classList.remove('active'));sendCockpit({kind:'stop'})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
 function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
@@ -985,6 +985,8 @@ $('full').onclick=()=>sendCockpit({kind:'set_mode',mode:'full'})
 $('disarm').onclick=()=>sendCockpit({kind:'disarm'})
 $('dock').onclick=()=>sendCockpit({kind:'dock'})
 $('ping').onclick=()=>sendCockpit({kind:'ping'})
+$('imuzero').onclick=()=>sendCockpit({kind:'zero_imu_orientation'})
+$('imuclear').onclick=()=>sendCockpit({kind:'clear_imu_orientation'})
 $('songdef').onclick=defineSong
 $('songplay').onclick=()=>sendCockpit({kind:'song_play',id:songSlot()})
 $('song').onclick=()=>defineSong().then(()=>sendCockpit({kind:'song_play',id:songSlot()}))
@@ -1373,6 +1375,8 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             duration_ms: parse_u32(parts.next()).ok_or(seq)?,
         },
         "RESET_ODOMETRY" => BrainstemCommand::ResetOdometry { seq },
+        "ZERO_IMU_ORIENTATION" => BrainstemCommand::ZeroImuOrientation { seq },
+        "CLEAR_IMU_ORIENTATION" => BrainstemCommand::ClearImuOrientation { seq },
         "GET_CAPABILITIES" => BrainstemCommand::GetCapabilities,
         "GET_EVENTS" => BrainstemCommand::GetEvents {
             since_seq: parse_u32(parts.next()).unwrap_or(0),
@@ -1756,6 +1760,12 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
         "reset_odometry" => Some(BrainstemCommand::ResetOdometry {
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "zero_imu_orientation" => Some(BrainstemCommand::ZeroImuOrientation {
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "clear_imu_orientation" => Some(BrainstemCommand::ClearImuOrientation {
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
         "get_capabilities" => Some(BrainstemCommand::GetCapabilities),

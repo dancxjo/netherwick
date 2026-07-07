@@ -457,6 +457,8 @@ enum ControlCommandCode {
     ResetOdometry = 40,
     GetCapabilities = 41,
     GetEvents = 42,
+    ZeroImuOrientation = 43,
+    ClearImuOrientation = 44,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -509,6 +511,8 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::PlayFeedback { .. })
         | Some(RuntimeCommand::CalibrateTurn { .. })
         | Some(RuntimeCommand::ResetOdometry)
+        | Some(RuntimeCommand::ZeroImuOrientation)
+        | Some(RuntimeCommand::ClearImuOrientation)
         | Some(RuntimeCommand::SongDefine { .. })
         | Some(RuntimeCommand::SongPlay { .. })
         | Some(RuntimeCommand::Dock)
@@ -1015,6 +1019,12 @@ fn encode_control_command(
         BrainstemCommand::ResetOdometry { .. } => {
             Some((ControlCommandCode::ResetOdometry, 0, 0, 0, 0, None))
         }
+        BrainstemCommand::ZeroImuOrientation { .. } => {
+            Some((ControlCommandCode::ZeroImuOrientation, 0, 0, 0, 0, None))
+        }
+        BrainstemCommand::ClearImuOrientation { .. } => {
+            Some((ControlCommandCode::ClearImuOrientation, 0, 0, 0, 0, None))
+        }
         BrainstemCommand::GetCapabilities => {
             Some((ControlCommandCode::GetCapabilities, 0, 0, 0, 0, None))
         }
@@ -1246,6 +1256,12 @@ fn decode_control_command(
         x if x == ControlCommandCode::ResetOdometry as u8 => {
             Some(BrainstemCommand::ResetOdometry { seq })
         }
+        x if x == ControlCommandCode::ZeroImuOrientation as u8 => {
+            Some(BrainstemCommand::ZeroImuOrientation { seq })
+        }
+        x if x == ControlCommandCode::ClearImuOrientation as u8 => {
+            Some(BrainstemCommand::ClearImuOrientation { seq })
+        }
         x if x == ControlCommandCode::GetCapabilities as u8 => {
             Some(BrainstemCommand::GetCapabilities)
         }
@@ -1287,6 +1303,8 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::PowerState { seq, .. }
         | BrainstemCommand::CalibrateTurn { seq, .. }
         | BrainstemCommand::ResetOdometry { seq, .. }
+        | BrainstemCommand::ZeroImuOrientation { seq, .. }
+        | BrainstemCommand::ClearImuOrientation { seq, .. }
         | BrainstemCommand::HeartbeatStop { seq, .. } => seq,
         _ => 0,
     }
@@ -3043,6 +3061,8 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::PowerState as u8 => "power_state",
         x if x == ControlCommandCode::CalibrateTurn as u8 => "calibrate_turn",
         x if x == ControlCommandCode::ResetOdometry as u8 => "reset_odometry",
+        x if x == ControlCommandCode::ZeroImuOrientation as u8 => "zero_imu_orientation",
+        x if x == ControlCommandCode::ClearImuOrientation as u8 => "clear_imu_orientation",
         x if x == ControlCommandCode::GetCapabilities as u8 => "get_capabilities",
         _ => "none",
     }

@@ -175,6 +175,12 @@ pub enum BrainstemCommand {
     ResetOdometry {
         seq: u32,
     },
+    ZeroImuOrientation {
+        seq: u32,
+    },
+    ClearImuOrientation {
+        seq: u32,
+    },
     GetCapabilities,
     GetEvents {
         since_seq: u32,
@@ -398,6 +404,8 @@ pub(crate) enum RuntimeCommand {
         duration_ms: u32,
     },
     ResetOdometry,
+    ZeroImuOrientation,
+    ClearImuOrientation,
     PulseBrc,
     StartOi,
     SetMode(CreateOiMode),

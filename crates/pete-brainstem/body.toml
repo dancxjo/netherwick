@@ -68,6 +68,8 @@ verbs = [
   "power_state",
   "calibrate_turn",
   "reset_odometry",
+  "zero_imu_orientation",
+  "clear_imu_orientation",
   "dock",
   "set_lights",
   "set_mode",
