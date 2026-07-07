@@ -2,8 +2,8 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use crate::body;
 use crate::commands::{
-    BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern, RuntimeCommand, SongTone,
-    MAX_SONG_TONES,
+    BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
+    RuntimeCommand, SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
 use crate::events::{BrainstemError, BrainstemEvent, CreateSensorPacket};
 use crate::hardware::UartReadError;
@@ -78,6 +78,7 @@ static PENDING_SONG_TONES: [AtomicU32; MAX_SONG_TONES] =
 static CREATE_SONG_LAST_DEFINED_ID: AtomicU8 = AtomicU8::new(0);
 static CREATE_SONG_LAST_DEFINED_LEN: AtomicU8 = AtomicU8::new(0);
 static CREATE_SONG_LAST_PLAYED_ID: AtomicU8 = AtomicU8::new(0);
+static ODOMETRY_RESET_COUNT: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -140,6 +141,7 @@ pub struct BrainstemStatus {
     pub create_song_last_defined_id: u8,
     pub create_song_last_defined_len: u8,
     pub create_song_last_played_id: u8,
+    pub odometry_reset_count: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -275,6 +277,18 @@ enum ControlCommandCode {
     Unstick = 27,
     CliffGuard = 28,
     SongDefine = 29,
+    DriveDirect = 30,
+    DriveArc = 31,
+    RequestSensors = 32,
+    StreamSensors = 33,
+    SetSafetyPolicy = 34,
+    ClearMotionQueue = 35,
+    DefineChirp = 36,
+    PlayFeedback = 37,
+    PowerState = 38,
+    CalibrateTurn = 39,
+    ResetOdometry = 40,
+    GetCapabilities = 41,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -319,7 +333,15 @@ pub fn set_command(command: Option<RuntimeCommand>) {
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
         Some(RuntimeCommand::Drive { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::StopDrive) => CommandCode::StopDrive,
-        Some(RuntimeCommand::SongDefine { .. })
+        Some(RuntimeCommand::RequestSensors { .. })
+        | Some(RuntimeCommand::StreamSensors { .. })
+        | Some(RuntimeCommand::SetSafetyPolicy { .. })
+        | Some(RuntimeCommand::ClearMotionQueue)
+        | Some(RuntimeCommand::DefineChirp { .. })
+        | Some(RuntimeCommand::PlayFeedback { .. })
+        | Some(RuntimeCommand::CalibrateTurn { .. })
+        | Some(RuntimeCommand::ResetOdometry)
+        | Some(RuntimeCommand::SongDefine { .. })
         | Some(RuntimeCommand::SongPlay { .. })
         | Some(RuntimeCommand::Dock)
         | Some(RuntimeCommand::SetLights { .. }) => CommandCode::None,
@@ -330,6 +352,10 @@ pub fn set_command(command: Option<RuntimeCommand>) {
 #[cfg(feature = "pico-w")]
 pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> bool {
     if matches!(command, BrainstemCommand::Status | BrainstemCommand::Ping) {
+        LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        return true;
+    }
+    if matches!(command, BrainstemCommand::GetCapabilities) {
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         return true;
     }
@@ -445,6 +471,32 @@ fn encode_control_command(
             ControlCommandCode::CmdVel,
             encode_i16(linear_mm_s),
             encode_i16(angular_mrad_s),
+            0,
+            0,
+            Some(ttl_ms),
+        )),
+        BrainstemCommand::DriveDirect {
+            left_mm_s,
+            right_mm_s,
+            ttl_ms,
+            ..
+        } => Some((
+            ControlCommandCode::DriveDirect,
+            encode_i16(left_mm_s),
+            encode_i16(right_mm_s),
+            0,
+            0,
+            Some(ttl_ms),
+        )),
+        BrainstemCommand::DriveArc {
+            velocity_mm_s,
+            radius_mm,
+            ttl_ms,
+            ..
+        } => Some((
+            ControlCommandCode::DriveArc,
+            encode_i16(velocity_mm_s),
+            encode_i16(radius_mm),
             0,
             0,
             Some(ttl_ms),
@@ -681,6 +733,89 @@ fn encode_control_command(
         BrainstemCommand::CliffGuard { clear, .. } => {
             Some((ControlCommandCode::CliffGuard, clear as u32, 0, 0, 0, None))
         }
+        BrainstemCommand::RequestSensors { packet_id, .. } => Some((
+            ControlCommandCode::RequestSensors,
+            packet_id as u32,
+            0,
+            0,
+            0,
+            None,
+        )),
+        BrainstemCommand::StreamSensors {
+            enabled,
+            packet_id,
+            period_ms,
+            ..
+        } => Some((
+            ControlCommandCode::StreamSensors,
+            enabled as u32,
+            packet_id as u32,
+            0,
+            0,
+            Some(period_ms),
+        )),
+        BrainstemCommand::SetSafetyPolicy { policy, .. } => Some((
+            ControlCommandCode::SetSafetyPolicy,
+            encode_safety_action(policy.bump) as u32,
+            encode_safety_action(policy.cliff) as u32,
+            policy.wheel_drop_latch as u32,
+            0,
+            None,
+        )),
+        BrainstemCommand::ClearMotionQueue { .. } => {
+            Some((ControlCommandCode::ClearMotionQueue, 0, 0, 0, 0, None))
+        }
+        BrainstemCommand::DefineChirp {
+            kind,
+            tones,
+            tone_count,
+            ..
+        } => {
+            let tone_count = tone_count.min(MAX_SONG_TONES as u8);
+            store_pending_song_tones(&tones, tone_count);
+            Some((
+                ControlCommandCode::DefineChirp,
+                encode_feedback_kind(kind) as u32,
+                tone_count as u32,
+                0,
+                0,
+                None,
+            ))
+        }
+        BrainstemCommand::PlayFeedback { kind, .. } => Some((
+            ControlCommandCode::PlayFeedback,
+            encode_feedback_kind(kind) as u32,
+            0,
+            0,
+            0,
+            None,
+        )),
+        BrainstemCommand::PowerState { request, .. } => Some((
+            ControlCommandCode::PowerState,
+            encode_power_request(request) as u32,
+            0,
+            0,
+            0,
+            None,
+        )),
+        BrainstemCommand::CalibrateTurn {
+            angular_mrad_s,
+            duration_ms,
+            ..
+        } => Some((
+            ControlCommandCode::CalibrateTurn,
+            encode_i16(angular_mrad_s),
+            0,
+            0,
+            0,
+            Some(duration_ms),
+        )),
+        BrainstemCommand::ResetOdometry { .. } => {
+            Some((ControlCommandCode::ResetOdometry, 0, 0, 0, 0, None))
+        }
+        BrainstemCommand::GetCapabilities => {
+            Some((ControlCommandCode::GetCapabilities, 0, 0, 0, 0, None))
+        }
     }
 }
 
@@ -710,6 +845,18 @@ fn decode_control_command(
         x if x == ControlCommandCode::CmdVel as u8 => Some(BrainstemCommand::CmdVel {
             linear_mm_s: decode_i16(a),
             angular_mrad_s: decode_i16(b),
+            ttl_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::DriveDirect as u8 => Some(BrainstemCommand::DriveDirect {
+            left_mm_s: decode_i16(a),
+            right_mm_s: decode_i16(b),
+            ttl_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::DriveArc as u8 => Some(BrainstemCommand::DriveArc {
+            velocity_mm_s: decode_i16(a),
+            radius_mm: decode_i16(b),
             ttl_ms: duration_ms?,
             seq,
         }),
@@ -840,6 +987,63 @@ fn decode_control_command(
         x if x == ControlCommandCode::CliffGuard as u8 => {
             Some(BrainstemCommand::CliffGuard { clear: a != 0, seq })
         }
+        x if x == ControlCommandCode::RequestSensors as u8 => {
+            Some(BrainstemCommand::RequestSensors {
+                packet_id: a as u8,
+                seq,
+            })
+        }
+        x if x == ControlCommandCode::StreamSensors as u8 => {
+            Some(BrainstemCommand::StreamSensors {
+                enabled: a != 0,
+                packet_id: b as u8,
+                period_ms: duration_ms?,
+                seq,
+            })
+        }
+        x if x == ControlCommandCode::SetSafetyPolicy as u8 => {
+            Some(BrainstemCommand::SetSafetyPolicy {
+                policy: SafetyPolicy {
+                    bump: decode_safety_action(a as u8)?,
+                    cliff: decode_safety_action(b as u8)?,
+                    wheel_drop_latch: c != 0,
+                },
+                seq,
+            })
+        }
+        x if x == ControlCommandCode::ClearMotionQueue as u8 => {
+            Some(BrainstemCommand::ClearMotionQueue { seq })
+        }
+        x if x == ControlCommandCode::DefineChirp as u8 => {
+            let tone_count = (b as u8).min(MAX_SONG_TONES as u8);
+            Some(BrainstemCommand::DefineChirp {
+                kind: decode_feedback_kind(a as u8)?,
+                tones: load_pending_song_tones(tone_count),
+                tone_count,
+                seq,
+            })
+        }
+        x if x == ControlCommandCode::PlayFeedback as u8 => Some(BrainstemCommand::PlayFeedback {
+            kind: decode_feedback_kind(a as u8)?,
+            seq,
+        }),
+        x if x == ControlCommandCode::PowerState as u8 => Some(BrainstemCommand::PowerState {
+            request: decode_power_request(a as u8)?,
+            seq,
+        }),
+        x if x == ControlCommandCode::CalibrateTurn as u8 => {
+            Some(BrainstemCommand::CalibrateTurn {
+                angular_mrad_s: decode_i16(a),
+                duration_ms: duration_ms?,
+                seq,
+            })
+        }
+        x if x == ControlCommandCode::ResetOdometry as u8 => {
+            Some(BrainstemCommand::ResetOdometry { seq })
+        }
+        x if x == ControlCommandCode::GetCapabilities as u8 => {
+            Some(BrainstemCommand::GetCapabilities)
+        }
         _ => None,
     }
 }
@@ -848,6 +1052,8 @@ fn decode_control_command(
 fn command_seq(command: BrainstemCommand) -> u32 {
     match command {
         BrainstemCommand::CmdVel { seq, .. }
+        | BrainstemCommand::DriveDirect { seq, .. }
+        | BrainstemCommand::DriveArc { seq, .. }
         | BrainstemCommand::FaceBearing { seq, .. }
         | BrainstemCommand::TrackBearing { seq, .. }
         | BrainstemCommand::TurnBy { seq, .. }
@@ -864,6 +1070,15 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::Unstick { seq, .. }
         | BrainstemCommand::CliffGuard { seq, .. }
         | BrainstemCommand::SongDefine { seq, .. }
+        | BrainstemCommand::RequestSensors { seq, .. }
+        | BrainstemCommand::StreamSensors { seq, .. }
+        | BrainstemCommand::SetSafetyPolicy { seq, .. }
+        | BrainstemCommand::ClearMotionQueue { seq, .. }
+        | BrainstemCommand::DefineChirp { seq, .. }
+        | BrainstemCommand::PlayFeedback { seq, .. }
+        | BrainstemCommand::PowerState { seq, .. }
+        | BrainstemCommand::CalibrateTurn { seq, .. }
+        | BrainstemCommand::ResetOdometry { seq, .. }
         | BrainstemCommand::HeartbeatStop { seq, .. } => seq,
         _ => 0,
     }
@@ -906,6 +1121,70 @@ fn decode_escape_direction(value: u8) -> Option<EscapeDirection> {
         1 => Some(EscapeDirection::Left),
         2 => Some(EscapeDirection::Right),
         3 => Some(EscapeDirection::Either),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn encode_safety_action(action: SafetyAction) -> u8 {
+    match action {
+        SafetyAction::None => 0,
+        SafetyAction::Stop => 1,
+        SafetyAction::Backoff => 2,
+        SafetyAction::BumpEscape => 3,
+    }
+}
+
+fn decode_safety_action(value: u8) -> Option<SafetyAction> {
+    match value {
+        0 => Some(SafetyAction::None),
+        1 => Some(SafetyAction::Stop),
+        2 => Some(SafetyAction::Backoff),
+        3 => Some(SafetyAction::BumpEscape),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn encode_feedback_kind(kind: FeedbackKind) -> u8 {
+    match kind {
+        FeedbackKind::Ok => 0,
+        FeedbackKind::Error => 1,
+        FeedbackKind::Armed => 2,
+        FeedbackKind::LostTarget => 3,
+        FeedbackKind::DockSeen => 4,
+        FeedbackKind::Danger => 5,
+    }
+}
+
+fn decode_feedback_kind(value: u8) -> Option<FeedbackKind> {
+    match value {
+        0 => Some(FeedbackKind::Ok),
+        1 => Some(FeedbackKind::Error),
+        2 => Some(FeedbackKind::Armed),
+        3 => Some(FeedbackKind::LostTarget),
+        4 => Some(FeedbackKind::DockSeen),
+        5 => Some(FeedbackKind::Danger),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn encode_power_request(request: PowerStateRequest) -> u8 {
+    match request {
+        PowerStateRequest::Wake => 1,
+        PowerStateRequest::Sleep => 2,
+        PowerStateRequest::PulseBrc => 3,
+        PowerStateRequest::StartOi => 4,
+    }
+}
+
+fn decode_power_request(value: u8) -> Option<PowerStateRequest> {
+    match value {
+        1 => Some(PowerStateRequest::Wake),
+        2 => Some(PowerStateRequest::Sleep),
+        3 => Some(PowerStateRequest::PulseBrc),
+        4 => Some(PowerStateRequest::StartOi),
         _ => None,
     }
 }
@@ -1033,6 +1312,10 @@ pub fn mark_song_defined(id: u8, tone_count: u8) {
 
 pub fn mark_song_played(id: u8) {
     CREATE_SONG_LAST_PLAYED_ID.store(id, Ordering::Relaxed);
+}
+
+pub fn mark_odometry_reset() {
+    increment(&ODOMETRY_RESET_COUNT);
 }
 
 pub fn mark_uart_rx_error() {
@@ -1309,6 +1592,7 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         create_song_last_defined_id: CREATE_SONG_LAST_DEFINED_ID.load(Ordering::Relaxed),
         create_song_last_defined_len: CREATE_SONG_LAST_DEFINED_LEN.load(Ordering::Relaxed),
         create_song_last_played_id: CREATE_SONG_LAST_PLAYED_ID.load(Ordering::Relaxed),
+        odometry_reset_count: ODOMETRY_RESET_COUNT.load(Ordering::Relaxed),
     }
 }
 
@@ -1358,6 +1642,7 @@ struct StatusJson {
     last_accepted_command_id: u32,
     last_rejected_command_id: u32,
     create_songs: CreateSongStatusJson,
+    odometry: OdometryStatusJson,
     create_sensors: CreateSensorStatusJson,
     forebrain_uart: ForebrainUartStatusJson,
 }
@@ -1368,6 +1653,12 @@ struct CreateSongStatusJson {
     last_defined_id: u8,
     last_defined_len: u8,
     last_played_id: u8,
+}
+
+#[cfg(feature = "pico-w")]
+#[derive(serde::Serialize)]
+struct OdometryStatusJson {
+    reset_count: u32,
 }
 
 #[cfg(feature = "pico-w")]
@@ -1452,6 +1743,9 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
             last_defined_id: snapshot.create_song_last_defined_id,
             last_defined_len: snapshot.create_song_last_defined_len,
             last_played_id: snapshot.create_song_last_played_id,
+        },
+        odometry: OdometryStatusJson {
+            reset_count: snapshot.odometry_reset_count,
         },
         create_sensors: create_sensor_status_json(snapshot),
         forebrain_uart: ForebrainUartStatusJson {
@@ -1656,6 +1950,18 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::Unstick as u8 => "unstick",
         x if x == ControlCommandCode::CliffGuard as u8 => "cliff_guard",
         x if x == ControlCommandCode::SongDefine as u8 => "song_define",
+        x if x == ControlCommandCode::DriveDirect as u8 => "drive_direct",
+        x if x == ControlCommandCode::DriveArc as u8 => "drive_arc",
+        x if x == ControlCommandCode::RequestSensors as u8 => "request_sensors",
+        x if x == ControlCommandCode::StreamSensors as u8 => "stream_sensors",
+        x if x == ControlCommandCode::SetSafetyPolicy as u8 => "set_safety_policy",
+        x if x == ControlCommandCode::ClearMotionQueue as u8 => "clear_motion_queue",
+        x if x == ControlCommandCode::DefineChirp as u8 => "define_chirp",
+        x if x == ControlCommandCode::PlayFeedback as u8 => "play_feedback",
+        x if x == ControlCommandCode::PowerState as u8 => "power_state",
+        x if x == ControlCommandCode::CalibrateTurn as u8 => "calibrate_turn",
+        x if x == ControlCommandCode::ResetOdometry as u8 => "reset_odometry",
+        x if x == ControlCommandCode::GetCapabilities as u8 => "get_capabilities",
         _ => "none",
     }
 }

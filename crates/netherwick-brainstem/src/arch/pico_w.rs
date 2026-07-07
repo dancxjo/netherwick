@@ -28,7 +28,8 @@ use static_cell::StaticCell;
 
 use crate::body;
 use crate::commands::{
-    BrainstemCommand, CreateOiMode, EscapeDirection, LightPattern, SongTone, MAX_SONG_TONES,
+    BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
+    SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
@@ -909,6 +910,10 @@ fn handle_command_request<'a>(
         let snapshot = status::snapshot(Instant::now().as_millis() as u32);
         return status::render_json(snapshot, buffer).map_err(|_| CommandParseError::BadRequest);
     }
+    if matches!(command, BrainstemCommand::GetCapabilities) {
+        return render_capabilities_response(buffer, command_id)
+            .ok_or(CommandParseError::BadRequest);
+    }
     if matches!(command, BrainstemCommand::Ping) {
         return render_command_response(buffer, true, command_id, "pong")
             .ok_or(CommandParseError::BadRequest);
@@ -927,6 +932,10 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     if json_str(body, "kind") == Some("status") {
         let snapshot = status::snapshot(Instant::now().as_millis() as u32);
         return render_status_websocket_response(snapshot, buffer);
+    }
+    if json_str(body, "kind") == Some("get_capabilities") {
+        let command_id = json_u32(body, "command_id")?;
+        return render_capabilities_response(buffer, command_id);
     }
     if json_str(body, "kind") == Some("ping") {
         let command_id = json_u32(body, "command_id")?;
@@ -1056,6 +1065,18 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
             ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
         },
+        "DRIVE_DIRECT" => BrainstemCommand::DriveDirect {
+            seq,
+            left_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            right_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "DRIVE_ARC" => BrainstemCommand::DriveArc {
+            seq,
+            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            radius_mm: parse_i16(parts.next()).ok_or(seq)?,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
         "FACE_BEARING" => BrainstemCommand::FaceBearing {
             seq,
             bearing_mrad: parse_i16(parts.next()).ok_or(seq)?,
@@ -1158,6 +1179,65 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             seq,
             timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
         },
+        "REQUEST_SENSORS" => BrainstemCommand::RequestSensors {
+            seq,
+            packet_id: parse_u32(parts.next()).ok_or(seq)? as u8,
+        },
+        "STREAM_SENSORS" => BrainstemCommand::StreamSensors {
+            seq,
+            enabled: parse_bool(parts.next()).ok_or(seq)?,
+            packet_id: parse_u32(parts.next()).ok_or(seq)? as u8,
+            period_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "SET_SAFETY_POLICY" => BrainstemCommand::SetSafetyPolicy {
+            seq,
+            policy: SafetyPolicy {
+                bump: parse_safety_action(parts.next().ok_or(seq)?).ok_or(seq)?,
+                cliff: parse_safety_action(parts.next().ok_or(seq)?).ok_or(seq)?,
+                wheel_drop_latch: parse_bool(parts.next()).ok_or(seq)?,
+            },
+        },
+        "CLEAR_MOTION_QUEUE" => BrainstemCommand::ClearMotionQueue { seq },
+        "DEFINE_CHIRP" => {
+            let kind = parse_feedback_kind(parts.next().ok_or(seq)?).ok_or(seq)?;
+            let mut tones = [SongTone::default(); MAX_SONG_TONES];
+            let mut tone_count = 0;
+            while tone_count < MAX_SONG_TONES {
+                let Some(note) = parts.next() else {
+                    break;
+                };
+                let duration = parts.next().ok_or(seq)?;
+                tones[tone_count] = SongTone {
+                    note: parse_u32(Some(note)).ok_or(seq)? as u8,
+                    duration_64ths: parse_u32(Some(duration)).ok_or(seq)? as u8,
+                };
+                tone_count += 1;
+            }
+            if tone_count == 0 {
+                return Err(seq);
+            }
+            BrainstemCommand::DefineChirp {
+                kind,
+                tones,
+                tone_count: tone_count as u8,
+                seq,
+            }
+        }
+        "PLAY_FEEDBACK" => BrainstemCommand::PlayFeedback {
+            seq,
+            kind: parse_feedback_kind(parts.next().ok_or(seq)?).ok_or(seq)?,
+        },
+        "POWER_STATE" => BrainstemCommand::PowerState {
+            seq,
+            request: parse_power_request(parts.next().ok_or(seq)?).ok_or(seq)?,
+        },
+        "CALIBRATE_TURN" => BrainstemCommand::CalibrateTurn {
+            seq,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            duration_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
+        "RESET_ODOMETRY" => BrainstemCommand::ResetOdometry { seq },
+        "GET_CAPABILITIES" => BrainstemCommand::GetCapabilities,
         "STATUS" => BrainstemCommand::Status,
         "SONG_PLAY" => BrainstemCommand::SongPlay {
             id: parse_u32(parts.next()).ok_or(seq)? as u8,
@@ -1216,6 +1296,14 @@ fn handle_udp_control_line(line: &str, response: &mut heapless::String<512>) -> 
             write_compact_status_line(response, seq);
             Some(false)
         }
+        BrainstemCommand::GetCapabilities => {
+            let _ = writeln!(
+                response,
+                "OK {seq} CAPABILITIES max_tones={} song_slots=16 feedback_slots=6 sensor_packets=0,7-31",
+                MAX_SONG_TONES
+            );
+            Some(false)
+        }
         BrainstemCommand::Bootsel => {
             let _ = writeln!(response, "OK {seq} bootsel");
             Some(true)
@@ -1241,8 +1329,10 @@ fn parse_i16(value: Option<&str>) -> Option<i16> {
 
 fn parse_bool(value: Option<&str>) -> Option<bool> {
     match value? {
-        "1" | "true" | "TRUE" | "clear" | "CLEAR" => Some(true),
-        "0" | "false" | "FALSE" | "trip" | "TRIP" => Some(false),
+        "1" | "true" | "TRUE" | "clear" | "CLEAR" | "on" | "ON" | "enable" | "ENABLE" => Some(true),
+        "0" | "false" | "FALSE" | "trip" | "TRIP" | "off" | "OFF" | "disable" | "DISABLE" => {
+            Some(false)
+        }
         _ => None,
     }
 }
@@ -1330,6 +1420,18 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
         "cmd_vel" => Some(BrainstemCommand::CmdVel {
             linear_mm_s: json_i16(body, "linear_mm_s")?,
             angular_mrad_s: json_i16(body, "angular_mrad_s")?,
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "drive_direct" => Some(BrainstemCommand::DriveDirect {
+            left_mm_s: json_i16(body, "left_mm_s")?,
+            right_mm_s: json_i16(body, "right_mm_s")?,
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "drive_arc" => Some(BrainstemCommand::DriveArc {
+            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
+            radius_mm: json_i16(body, "radius_mm")?,
             ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
@@ -1435,6 +1537,54 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "ttl_ms"))?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
+        "request_sensors" => Some(BrainstemCommand::RequestSensors {
+            packet_id: json_u32(body, "packet_id")? as u8,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "stream_sensors" => Some(BrainstemCommand::StreamSensors {
+            enabled: json_bool(body, "enabled").unwrap_or(true),
+            packet_id: json_u32(body, "packet_id")
+                .unwrap_or(body::CREATE_SENSOR_PROBE_PACKET as u32) as u8,
+            period_ms: json_u32(body, "period_ms").unwrap_or(250),
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "set_safety_policy" => Some(BrainstemCommand::SetSafetyPolicy {
+            policy: SafetyPolicy {
+                bump: parse_safety_action(json_str(body, "bump_action").unwrap_or("stop"))?,
+                cliff: parse_safety_action(json_str(body, "cliff_action").unwrap_or("stop"))?,
+                wheel_drop_latch: json_bool(body, "wheel_drop_latch").unwrap_or(true),
+            },
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "clear_motion_queue" => Some(BrainstemCommand::ClearMotionQueue {
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "define_chirp" => {
+            let (tones, tone_count) = parse_song_tones(json_str(body, "tones")?)?;
+            Some(BrainstemCommand::DefineChirp {
+                kind: parse_feedback_kind(json_str(body, "feedback")?)?,
+                tones,
+                tone_count,
+                seq: json_u32(body, "seq").unwrap_or(command_id),
+            })
+        }
+        "play_feedback" => Some(BrainstemCommand::PlayFeedback {
+            kind: parse_feedback_kind(json_str(body, "feedback")?)?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "power_state" => Some(BrainstemCommand::PowerState {
+            request: parse_power_request(json_str(body, "request")?)?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "calibrate_turn" => Some(BrainstemCommand::CalibrateTurn {
+            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
+            duration_ms: json_u32(body, "duration_ms")?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "reset_odometry" => Some(BrainstemCommand::ResetOdometry {
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "get_capabilities" => Some(BrainstemCommand::GetCapabilities),
         "status" => Some(BrainstemCommand::Status),
         "song_play" => Some(BrainstemCommand::SongPlay {
             id: json_u32(body, "id")? as u8,
@@ -1473,6 +1623,38 @@ fn parse_escape_direction(direction: &str) -> Option<EscapeDirection> {
         "left" | "LEFT" => Some(EscapeDirection::Left),
         "right" | "RIGHT" => Some(EscapeDirection::Right),
         "either" | "EITHER" => Some(EscapeDirection::Either),
+        _ => None,
+    }
+}
+
+fn parse_safety_action(action: &str) -> Option<SafetyAction> {
+    match action {
+        "none" | "NONE" => Some(SafetyAction::None),
+        "stop" | "STOP" => Some(SafetyAction::Stop),
+        "backoff" | "BACKOFF" => Some(SafetyAction::Backoff),
+        "bump_escape" | "BUMP_ESCAPE" | "escape" | "ESCAPE" => Some(SafetyAction::BumpEscape),
+        _ => None,
+    }
+}
+
+fn parse_feedback_kind(kind: &str) -> Option<FeedbackKind> {
+    match kind {
+        "ok" | "OK" => Some(FeedbackKind::Ok),
+        "error" | "ERROR" => Some(FeedbackKind::Error),
+        "armed" | "ARMED" => Some(FeedbackKind::Armed),
+        "lost_target" | "LOST_TARGET" => Some(FeedbackKind::LostTarget),
+        "dock_seen" | "DOCK_SEEN" => Some(FeedbackKind::DockSeen),
+        "danger" | "DANGER" => Some(FeedbackKind::Danger),
+        _ => None,
+    }
+}
+
+fn parse_power_request(request: &str) -> Option<PowerStateRequest> {
+    match request {
+        "wake" | "WAKE" => Some(PowerStateRequest::Wake),
+        "sleep" | "SLEEP" => Some(PowerStateRequest::Sleep),
+        "pulse_brc" | "PULSE_BRC" => Some(PowerStateRequest::PulseBrc),
+        "start_oi" | "START_OI" => Some(PowerStateRequest::StartOi),
         _ => None,
     }
 }
@@ -1526,6 +1708,25 @@ fn render_command_response<'a>(
         if accepted { "true" } else { "false" },
         command_id,
         message
+    );
+    let bytes = response.as_bytes();
+    if bytes.len() > buffer.len() {
+        return None;
+    }
+    buffer[..bytes.len()].copy_from_slice(bytes);
+    core::str::from_utf8(&buffer[..bytes.len()]).ok()
+}
+
+fn render_capabilities_response(buffer: &mut [u8], command_id: u32) -> Option<&str> {
+    let mut response = heapless::String::<1536>::new();
+    let _ = write!(
+        response,
+        "{{\"accepted\":true,\"command_id\":{},\"firmware\":\"{}\",\"version\":\"{}\",\"body\":\"{}\",\"max_song_tones\":{},\"song_slots\":16,\"feedback\":[\"ok\",\"error\",\"armed\",\"lost_target\",\"dock_seen\",\"danger\"],\"sensor_packets\":\"0,7-31\",\"commands\":[\"ping\",\"status\",\"get_capabilities\",\"arm\",\"disarm\",\"stop\",\"estop\",\"clear_estop\",\"clear_motion_queue\",\"cmd_vel\",\"drive_direct\",\"drive_arc\",\"drive_for\",\"turn_by\",\"arc_for\",\"creep_until\",\"scan_arc\",\"face_bearing\",\"track_bearing\",\"hold_heading\",\"turn_to_heading\",\"dock_align\",\"wall_follow\",\"wiggle_align\",\"bump_escape\",\"unstick\",\"cliff_guard\",\"request_sensors\",\"stream_sensors\",\"set_safety_policy\",\"song_define\",\"song_play\",\"define_chirp\",\"play_feedback\",\"power_state\",\"calibrate_turn\",\"reset_odometry\",\"dock\",\"set_lights\",\"set_mode\"]}}\n",
+        command_id,
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        body::BODY_NAME,
+        MAX_SONG_TONES
     );
     let bytes = response.as_bytes();
     if bytes.len() > buffer.len() {

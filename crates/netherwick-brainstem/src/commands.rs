@@ -22,6 +22,18 @@ pub enum BrainstemCommand {
         ttl_ms: u32,
         seq: u32,
     },
+    DriveDirect {
+        left_mm_s: i16,
+        right_mm_s: i16,
+        ttl_ms: u32,
+        seq: u32,
+    },
+    DriveArc {
+        velocity_mm_s: i16,
+        radius_mm: i16,
+        ttl_ms: u32,
+        seq: u32,
+    },
     FaceBearing {
         bearing_mrad: i16,
         max_angular_mrad_s: i16,
@@ -124,6 +136,46 @@ pub enum BrainstemCommand {
         timeout_ms: u32,
         seq: u32,
     },
+    RequestSensors {
+        packet_id: u8,
+        seq: u32,
+    },
+    StreamSensors {
+        enabled: bool,
+        packet_id: u8,
+        period_ms: u32,
+        seq: u32,
+    },
+    SetSafetyPolicy {
+        policy: SafetyPolicy,
+        seq: u32,
+    },
+    ClearMotionQueue {
+        seq: u32,
+    },
+    DefineChirp {
+        kind: FeedbackKind,
+        tones: [SongTone; MAX_SONG_TONES],
+        tone_count: u8,
+        seq: u32,
+    },
+    PlayFeedback {
+        kind: FeedbackKind,
+        seq: u32,
+    },
+    PowerState {
+        request: PowerStateRequest,
+        seq: u32,
+    },
+    CalibrateTurn {
+        angular_mrad_s: i16,
+        duration_ms: u32,
+        seq: u32,
+    },
+    ResetOdometry {
+        seq: u32,
+    },
+    GetCapabilities,
     Stop,
     Status,
     Bootsel,
@@ -158,6 +210,49 @@ pub enum EscapeDirection {
     Left,
     Right,
     Either,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum SafetyAction {
+    None,
+    Stop,
+    Backoff,
+    BumpEscape,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct SafetyPolicy {
+    pub bump: SafetyAction,
+    pub cliff: SafetyAction,
+    pub wheel_drop_latch: bool,
+}
+
+impl Default for SafetyPolicy {
+    fn default() -> Self {
+        Self {
+            bump: SafetyAction::Stop,
+            cliff: SafetyAction::Stop,
+            wheel_drop_latch: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum FeedbackKind {
+    Ok,
+    Error,
+    Armed,
+    LostTarget,
+    DockSeen,
+    Danger,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum PowerStateRequest {
+    Wake,
+    Sleep,
+    PulseBrc,
+    StartOi,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Default)]
@@ -275,6 +370,31 @@ pub(crate) enum RuntimeCommand {
         radius_mm: i16,
         duration_ms: Option<u32>,
     },
+    RequestSensors {
+        packet_id: u8,
+    },
+    StreamSensors {
+        enabled: bool,
+        packet_id: u8,
+        period_ms: u32,
+    },
+    SetSafetyPolicy {
+        policy: SafetyPolicy,
+    },
+    ClearMotionQueue,
+    DefineChirp {
+        kind: FeedbackKind,
+        tones: [SongTone; MAX_SONG_TONES],
+        tone_count: u8,
+    },
+    PlayFeedback {
+        kind: FeedbackKind,
+    },
+    CalibrateTurn {
+        angular_mrad_s: i16,
+        duration_ms: u32,
+    },
+    ResetOdometry,
     PulseBrc,
     StartOi,
     SetMode(CreateOiMode),

@@ -2,7 +2,8 @@ use heapless::Deque;
 
 use crate::body;
 use crate::commands::{
-    BrainstemCommand, EscapeDirection, RuntimeCommand, ARM_SCRIPT, DEMO_SCRIPT, DISARM_SCRIPT,
+    BrainstemCommand, EscapeDirection, FeedbackKind, PowerStateRequest, RuntimeCommand,
+    SafetyAction, SafetyPolicy, SongTone, ARM_SCRIPT, DEMO_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
 };
 use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
 use crate::events::{BrainstemError, BrainstemEvent};
@@ -19,6 +20,8 @@ const BEARING_SLOWDOWN_MRAD: i32 = 1_000;
 const MIN_TRACK_SPEED_MM_S: i32 = 35;
 const BUMP_ESCAPE_BACKOFF_MS: u32 = 450;
 const BUMP_ESCAPE_TURN_MS: u32 = 650;
+const FEEDBACK_SLOT_BASE: u8 = 10;
+const FEEDBACK_KIND_COUNT: usize = 6;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -60,6 +63,13 @@ enum ActiveAction {
     },
 }
 
+#[derive(Clone, Copy)]
+struct SensorStream {
+    packet_id: u8,
+    period_ms: u32,
+    next_request_ms: u32,
+}
+
 pub struct Runtime<H>
 where
     H: BrainstemHardware,
@@ -74,6 +84,11 @@ where
     active: ActiveAction,
     stop_sent: bool,
     heartbeat_stop_at_ms: Option<u32>,
+    sensor_stream: Option<SensorStream>,
+    safety_policy: SafetyPolicy,
+    safety_latched: bool,
+    chirps: [[SongTone; MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
+    chirp_counts: [u8; FEEDBACK_KIND_COUNT],
     error_blink_next_ms: u32,
     error_blink_on: bool,
     error_blink_count: u8,
@@ -104,6 +119,11 @@ where
             active: ActiveAction::None,
             stop_sent: false,
             heartbeat_stop_at_ms: None,
+            sensor_stream: None,
+            safety_policy: SafetyPolicy::default(),
+            safety_latched: false,
+            chirps: [[SongTone::default(); MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
+            chirp_counts: [0; FEEDBACK_KIND_COUNT],
             error_blink_next_ms: 0,
             error_blink_on: false,
             error_blink_count: 0,
@@ -139,6 +159,14 @@ where
         status::set_runtime_action(self.active_action_code());
         self.poll();
         self.feed_watchdog_placeholder();
+        if let Err(error) = self.poll_sensor_stream() {
+            self.enter_error(error);
+            return;
+        }
+        if let Err(error) = self.enforce_safety_policy() {
+            self.enter_error(error);
+            return;
+        }
         if let Err(error) = self.enforce_heartbeat_stop() {
             self.enter_error(error);
             return;
@@ -470,6 +498,73 @@ where
                 radius_mm,
                 duration_ms,
             } => self.start_drive_arc(velocity_mm_s, radius_mm, duration_ms, now_ms)?,
+            RuntimeCommand::RequestSensors { packet_id } => {
+                self.ensure_create_responsive()?;
+                self.create_uart
+                    .request_sensor_packet(&mut self.hardware, packet_id)?;
+            }
+            RuntimeCommand::StreamSensors {
+                enabled,
+                packet_id,
+                period_ms,
+            } => {
+                if enabled {
+                    self.sensor_stream = Some(SensorStream {
+                        packet_id,
+                        period_ms: period_ms.max(RUNTIME_TICK_MS),
+                        next_request_ms: now_ms,
+                    });
+                } else {
+                    self.sensor_stream = None;
+                }
+            }
+            RuntimeCommand::SetSafetyPolicy { policy } => {
+                self.safety_policy = policy;
+                self.safety_latched = false;
+            }
+            RuntimeCommand::ClearMotionQueue => {
+                self.clear_motion_queue()?;
+            }
+            RuntimeCommand::DefineChirp {
+                kind,
+                tones,
+                tone_count,
+            } => {
+                let index = feedback_index(kind);
+                self.chirps[index] = tones;
+                self.chirp_counts[index] = tone_count.min(MAX_SONG_TONES as u8);
+                self.ensure_create_responsive()?;
+                self.create_uart.define_song(
+                    &mut self.hardware,
+                    &mut self.events,
+                    feedback_slot(kind),
+                    &self.chirps[index],
+                    self.chirp_counts[index],
+                )?;
+            }
+            RuntimeCommand::PlayFeedback { kind } => {
+                self.ensure_create_responsive()?;
+                let (tones, tone_count) = self.feedback_tones(kind);
+                self.create_uart.define_song(
+                    &mut self.hardware,
+                    &mut self.events,
+                    feedback_slot(kind),
+                    &tones,
+                    tone_count,
+                )?;
+                self.create_uart.play_song(
+                    &mut self.hardware,
+                    &mut self.events,
+                    feedback_slot(kind),
+                )?;
+            }
+            RuntimeCommand::CalibrateTurn {
+                angular_mrad_s,
+                duration_ms,
+            } => self.start_cmd_vel(0, angular_mrad_s, Some(duration_ms), now_ms)?,
+            RuntimeCommand::ResetOdometry => {
+                status::mark_odometry_reset();
+            }
             RuntimeCommand::SongPlay { id } => {
                 self.ensure_create_responsive()?;
                 self.create_uart
@@ -873,6 +968,110 @@ where
         Ok(())
     }
 
+    fn clear_motion_queue(&mut self) -> Result<(), BrainstemError> {
+        let pending = self.commands.len();
+        for _ in 0..pending {
+            let Some(command) = self.commands.pop_front() else {
+                break;
+            };
+            if !is_motion_command(command) {
+                let _ = self.commands.push_back(command);
+            }
+        }
+        if matches!(self.active, ActiveAction::Driving { .. }) {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+        }
+        Ok(())
+    }
+
+    fn poll_sensor_stream(&mut self) -> Result<(), BrainstemError> {
+        let Some(mut stream) = self.sensor_stream else {
+            return Ok(());
+        };
+        let now_ms = self.now_ms();
+        if self.create_responsive && time_reached(now_ms, stream.next_request_ms) {
+            self.create_uart
+                .request_sensor_packet(&mut self.hardware, stream.packet_id)?;
+            stream.next_request_ms = now_ms.wrapping_add(stream.period_ms);
+        }
+        self.sensor_stream = Some(stream);
+        Ok(())
+    }
+
+    fn enforce_safety_policy(&mut self) -> Result<(), BrainstemError> {
+        let snapshot = status::snapshot(self.now_ms());
+        let flags = snapshot.create_sensor_flags;
+        let bump = flags & ((1 << 0) | (1 << 1)) != 0;
+        let wheel_drop = flags & (1 << 2) != 0;
+        let cliff = flags & ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)) != 0;
+
+        if !bump && !cliff && !wheel_drop {
+            if !self.safety_policy.wheel_drop_latch {
+                self.safety_latched = false;
+            }
+            return Ok(());
+        }
+        if self.safety_latched {
+            return Ok(());
+        }
+
+        if wheel_drop && self.safety_policy.wheel_drop_latch {
+            self.safety_latched = true;
+            self.commands.clear();
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
+
+        let action = if cliff {
+            self.safety_policy.cliff
+        } else if bump {
+            self.safety_policy.bump
+        } else {
+            SafetyAction::Stop
+        };
+        self.apply_safety_action(action)
+    }
+
+    fn apply_safety_action(&mut self, action: SafetyAction) -> Result<(), BrainstemError> {
+        match action {
+            SafetyAction::None => Ok(()),
+            SafetyAction::Stop => {
+                self.safety_latched = true;
+                self.commands.clear();
+                self.stop_drive()?;
+                self.active = ActiveAction::None;
+                Ok(())
+            }
+            SafetyAction::Backoff => {
+                self.safety_latched = true;
+                self.commands.clear();
+                self.active = ActiveAction::None;
+                let _ = self.commands.push_front(RuntimeCommand::CmdVel {
+                    linear_mm_s: -80,
+                    angular_mrad_s: 0,
+                    duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
+                });
+                Ok(())
+            }
+            SafetyAction::BumpEscape => {
+                self.safety_latched = true;
+                self.commands.clear();
+                self.active = ActiveAction::None;
+                self.queue_bump_escape(EscapeDirection::Either, 80, 900)
+            }
+        }
+    }
+
+    fn feedback_tones(&self, kind: FeedbackKind) -> ([SongTone; MAX_SONG_TONES], u8) {
+        let index = feedback_index(kind);
+        if self.chirp_counts[index] > 0 {
+            return (self.chirps[index], self.chirp_counts[index]);
+        }
+        default_feedback_tones(kind)
+    }
+
     fn start_drive_direct(
         &mut self,
         left_mm_s: i16,
@@ -1061,6 +1260,26 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             angular_mrad_s,
             duration_ms: Some(ttl_ms),
         }),
+        BrainstemCommand::DriveDirect {
+            left_mm_s,
+            right_mm_s,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::DriveDirect {
+            left_mm_s,
+            right_mm_s,
+            duration_ms: Some(ttl_ms),
+        }),
+        BrainstemCommand::DriveArc {
+            velocity_mm_s,
+            radius_mm,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::DriveArc {
+            velocity_mm_s,
+            radius_mm,
+            duration_ms: Some(ttl_ms),
+        }),
         BrainstemCommand::FaceBearing {
             bearing_mrad,
             max_angular_mrad_s,
@@ -1225,6 +1444,49 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         BrainstemCommand::HeartbeatStop { timeout_ms, .. } => {
             Some(RuntimeCommand::HeartbeatStop { timeout_ms })
         }
+        BrainstemCommand::RequestSensors { packet_id, .. } => {
+            Some(RuntimeCommand::RequestSensors { packet_id })
+        }
+        BrainstemCommand::StreamSensors {
+            enabled,
+            packet_id,
+            period_ms,
+            ..
+        } => Some(RuntimeCommand::StreamSensors {
+            enabled,
+            packet_id,
+            period_ms,
+        }),
+        BrainstemCommand::SetSafetyPolicy { policy, .. } => {
+            Some(RuntimeCommand::SetSafetyPolicy { policy })
+        }
+        BrainstemCommand::ClearMotionQueue { .. } => Some(RuntimeCommand::ClearMotionQueue),
+        BrainstemCommand::DefineChirp {
+            kind,
+            tones,
+            tone_count,
+            ..
+        } => Some(RuntimeCommand::DefineChirp {
+            kind,
+            tones,
+            tone_count,
+        }),
+        BrainstemCommand::PlayFeedback { kind, .. } => Some(RuntimeCommand::PlayFeedback { kind }),
+        BrainstemCommand::PowerState { request, .. } => match request {
+            PowerStateRequest::Wake => Some(RuntimeCommand::WakeCreate),
+            PowerStateRequest::Sleep => Some(RuntimeCommand::SleepCreate),
+            PowerStateRequest::PulseBrc => Some(RuntimeCommand::PulseBrc),
+            PowerStateRequest::StartOi => Some(RuntimeCommand::StartOi),
+        },
+        BrainstemCommand::CalibrateTurn {
+            angular_mrad_s,
+            duration_ms,
+            ..
+        } => Some(RuntimeCommand::CalibrateTurn {
+            angular_mrad_s,
+            duration_ms,
+        }),
+        BrainstemCommand::ResetOdometry { .. } => Some(RuntimeCommand::ResetOdometry),
         BrainstemCommand::SongPlay { id } => Some(RuntimeCommand::SongPlay { id }),
         BrainstemCommand::SongDefine {
             id,
@@ -1238,6 +1500,7 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         }),
         BrainstemCommand::Dock => Some(RuntimeCommand::Dock),
         BrainstemCommand::SetLights { pattern } => Some(RuntimeCommand::SetLights { pattern }),
+        BrainstemCommand::GetCapabilities => None,
     }
 }
 
@@ -1247,4 +1510,65 @@ fn clamp_i16(value: i32) -> i16 {
 
 fn abs_i32(value: i32) -> i32 {
     value.saturating_abs()
+}
+
+fn is_motion_command(command: RuntimeCommand) -> bool {
+    matches!(
+        command,
+        RuntimeCommand::DriveDirect { .. }
+            | RuntimeCommand::CmdVel { .. }
+            | RuntimeCommand::DriveArc { .. }
+            | RuntimeCommand::Drive { .. }
+            | RuntimeCommand::StopDrive
+            | RuntimeCommand::FaceBearing { .. }
+            | RuntimeCommand::TrackBearing { .. }
+            | RuntimeCommand::TurnBy { .. }
+            | RuntimeCommand::DriveFor { .. }
+            | RuntimeCommand::BumpEscape { .. }
+            | RuntimeCommand::HoldHeading { .. }
+            | RuntimeCommand::TurnToHeading { .. }
+            | RuntimeCommand::ArcFor { .. }
+            | RuntimeCommand::CreepUntil { .. }
+            | RuntimeCommand::ScanArc { .. }
+            | RuntimeCommand::DockAlign { .. }
+            | RuntimeCommand::WallFollow { .. }
+            | RuntimeCommand::WiggleAlign { .. }
+            | RuntimeCommand::Unstick { .. }
+            | RuntimeCommand::CliffGuard { .. }
+            | RuntimeCommand::CalibrateTurn { .. }
+    )
+}
+
+fn feedback_index(kind: FeedbackKind) -> usize {
+    match kind {
+        FeedbackKind::Ok => 0,
+        FeedbackKind::Error => 1,
+        FeedbackKind::Armed => 2,
+        FeedbackKind::LostTarget => 3,
+        FeedbackKind::DockSeen => 4,
+        FeedbackKind::Danger => 5,
+    }
+}
+
+fn feedback_slot(kind: FeedbackKind) -> u8 {
+    FEEDBACK_SLOT_BASE + feedback_index(kind) as u8
+}
+
+fn default_feedback_tones(kind: FeedbackKind) -> ([SongTone; MAX_SONG_TONES], u8) {
+    let mut tones = [SongTone::default(); MAX_SONG_TONES];
+    let notes: &[(u8, u8)] = match kind {
+        FeedbackKind::Ok => &[(76, 6), (84, 10)],
+        FeedbackKind::Error => &[(45, 12), (40, 16)],
+        FeedbackKind::Armed => &[(60, 6), (67, 6), (72, 10)],
+        FeedbackKind::LostTarget => &[(55, 8), (52, 8), (48, 12)],
+        FeedbackKind::DockSeen => &[(67, 8), (71, 8), (74, 12)],
+        FeedbackKind::Danger => &[(40, 6), (40, 6), (40, 12)],
+    };
+    for (i, (note, duration_64ths)) in notes.iter().enumerate() {
+        tones[i] = SongTone {
+            note: *note,
+            duration_64ths: *duration_64ths,
+        };
+    }
+    (tones, notes.len() as u8)
 }
