@@ -1,3 +1,5 @@
+use crate::drivers::imu::{ImuHealth, ImuSample};
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum SerialRead {
     Byte(u8),
@@ -29,6 +31,10 @@ pub trait BrainstemHardware {
     fn write_byte(&mut self, byte: u8) -> Result<(), ()>;
     fn flush_uart(&mut self) -> Result<(), ()>;
     fn read_byte(&mut self) -> SerialRead;
+
+    fn poll_imu_sample(&mut self, _now_ms: u32) -> Result<Option<ImuSample>, ImuHealth> {
+        Ok(None)
+    }
 
     fn drain_uart_rx(&mut self) {
         for _ in 0..256 {

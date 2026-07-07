@@ -8,14 +8,16 @@ use nb::block;
 use rp2040_hal as hal;
 
 use hal::clocks::{init_clocks_and_plls, Clock};
-use hal::gpio::bank0::{Gpio0, Gpio1, Gpio18, Gpio19, Gpio20, Gpio25};
-use hal::gpio::{FunctionSioOutput, FunctionUart, Pin, PullDown};
+use hal::gpio::bank0::{Gpio0, Gpio1, Gpio18, Gpio19, Gpio2, Gpio20, Gpio25, Gpio3};
+use hal::gpio::{FunctionI2c, FunctionSioOutput, FunctionUart, Pin, PullDown, PullUp};
+use hal::i2c::I2C;
 use hal::pac;
 use hal::sio::Sio;
 use hal::uart::{DataBits, Enabled, ReadErrorType, StopBits, UartConfig, UartPeripheral};
 use hal::watchdog::Watchdog;
 
 use crate::body;
+use crate::drivers::imu::{ImuDriver, ImuHealth, ImuSample, Mpu6050};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 
 #[link_section = ".boot2"]
@@ -42,10 +44,18 @@ type CreateUart = UartPeripheral<
 >;
 
 type Output<P> = Pin<P, FunctionSioOutput, PullDown>;
+type ImuBus = I2C<
+    pac::I2C1,
+    (
+        Pin<Gpio2, FunctionI2c, PullUp>,
+        Pin<Gpio3, FunctionI2c, PullUp>,
+    ),
+>;
 
 pub struct Rp2040Brainstem {
     timer: hal::Timer,
     uart: CreateUart,
+    imu: Option<Mpu6050<ImuBus>>,
     power_toggle: Output<Gpio18>,
     brc: Output<Gpio19>,
     external_led: Output<Gpio20>,
@@ -95,10 +105,24 @@ impl Rp2040Brainstem {
                 clocks.peripheral_clock.freq(),
             )
             .unwrap();
+        let imu = if body::IMU_ENABLED {
+            let i2c = I2C::i2c1(
+                pac.I2C1,
+                pins.gpio2.reconfigure(),
+                pins.gpio3.reconfigure(),
+                400.kHz(),
+                &mut pac.RESETS,
+                clocks.system_clock.freq(),
+            );
+            Some(Mpu6050::new(i2c))
+        } else {
+            None
+        };
 
         Self {
             timer,
             uart,
+            imu,
             power_toggle: pins.gpio18.into_push_pull_output(),
             brc: pins.gpio19.into_push_pull_output(),
             external_led: pins.gpio20.into_push_pull_output(),
@@ -151,6 +175,13 @@ impl BrainstemHardware for Rp2040Brainstem {
             Err(nb::Error::WouldBlock) => SerialRead::WouldBlock,
             Err(nb::Error::Other(error)) => SerialRead::Error(map_read_error(error)),
         }
+    }
+
+    fn poll_imu_sample(&mut self, now_ms: u32) -> Result<Option<ImuSample>, ImuHealth> {
+        let Some(imu) = self.imu.as_mut() else {
+            return Err(ImuHealth::Absent);
+        };
+        imu.poll(now_ms)
     }
 }
 

@@ -92,6 +92,7 @@ where
     stop_sent: bool,
     heartbeat_stop_at_ms: Option<u32>,
     sensor_stream: Option<SensorStream>,
+    next_imu_poll_ms: u32,
     safety_policy: SafetyPolicy,
     safety_latched: bool,
     chirps: [[SongTone; MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
@@ -131,6 +132,7 @@ where
             stop_sent: false,
             heartbeat_stop_at_ms: None,
             sensor_stream: None,
+            next_imu_poll_ms: 0,
             safety_policy: SafetyPolicy::default(),
             safety_latched: false,
             chirps: [[SongTone::default(); MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
@@ -181,6 +183,7 @@ where
         status::set_runtime_action(self.active_action_code());
         self.poll();
         self.hardware.feed_watchdog();
+        self.poll_imu();
         if let Err(error) = self.poll_sensor_stream() {
             self.enter_error(error);
             return;
@@ -1080,6 +1083,25 @@ where
         Ok(())
     }
 
+    fn poll_imu(&mut self) {
+        if !body::IMU_ENABLED {
+            status::mark_imu_health(crate::drivers::imu::ImuHealth::Absent);
+            return;
+        }
+
+        let now_ms = self.now_ms();
+        if !time_reached(now_ms, self.next_imu_poll_ms) {
+            return;
+        }
+        self.next_imu_poll_ms = now_ms.wrapping_add(body::IMU_POLL_PERIOD_MS.max(1));
+
+        match self.hardware.poll_imu_sample(now_ms) {
+            Ok(Some(sample)) => status::mark_imu_sample(sample),
+            Ok(None) => {}
+            Err(health) => status::mark_imu_health(health),
+        }
+    }
+
     fn enforce_safety_policy(&mut self) -> Result<(), BrainstemError> {
         let snapshot = status::snapshot(self.now_ms());
         let flags = snapshot.create_sensor_flags;
@@ -1088,8 +1110,7 @@ where
         let cliff = flags & ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)) != 0;
         let imu_ok = body::IMU_ENABLED && snapshot.imu_health == status::ImuHealthCode::Ok as u8;
         let tilt = imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
-        let impact =
-            imu_ok && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
+        let impact = imu_ok && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
 
         if !bump && !cliff && !wheel_drop && !tilt && !impact {
             self.update_safety_edges(bump, cliff, wheel_drop);
@@ -1736,6 +1757,8 @@ mod tests {
     struct FakeHardware {
         now_us: u32,
         writes: heapless::Vec<u8, 32>,
+        imu_sample: Option<ImuSample>,
+        imu_health: Option<crate::drivers::imu::ImuHealth>,
     }
 
     impl FakeHardware {
@@ -1743,6 +1766,17 @@ mod tests {
             Self {
                 now_us: now_ms * 1_000,
                 writes: heapless::Vec::new(),
+                imu_sample: None,
+                imu_health: None,
+            }
+        }
+
+        fn with_imu_sample(now_ms: u32, imu_sample: ImuSample) -> Self {
+            Self {
+                now_us: now_ms * 1_000,
+                writes: heapless::Vec::new(),
+                imu_sample: Some(imu_sample),
+                imu_health: None,
             }
         }
     }
@@ -1778,6 +1812,36 @@ mod tests {
         fn read_byte(&mut self) -> SerialRead {
             SerialRead::WouldBlock
         }
+
+        fn poll_imu_sample(
+            &mut self,
+            _now_ms: u32,
+        ) -> Result<Option<ImuSample>, crate::drivers::imu::ImuHealth> {
+            if let Some(health) = self.imu_health {
+                return Err(health);
+            }
+            Ok(self.imu_sample.take())
+        }
+    }
+
+    #[test]
+    fn runtime_poll_imu_sample_updates_status() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::with_imu_sample(
+            1_000,
+            ImuSample {
+                timestamp_ms: 1_000,
+                gyro_z_mrad_s: 500,
+                ..ImuSample::stationary(1_000)
+            },
+        ));
+
+        runtime.tick();
+
+        let snapshot = status::snapshot(1_000);
+        assert_eq!(snapshot.imu_health, status::ImuHealthCode::Ok as u8);
+        assert_eq!(snapshot.imu_sample_count, 1);
+        assert_eq!(snapshot.imu_yaw_rate_mrad_s, 500);
     }
 
     #[test]

@@ -11,10 +11,11 @@ use embassy_net::{
     StackResources,
 };
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::i2c::{Blocking as I2cBlocking, Config as I2cConfig, I2c};
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
 use embassy_rp::peripherals::{
-    DMA_CH0, PIN_0, PIN_1, PIN_18, PIN_19, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29, PIN_4, PIN_5,
-    PIO0, UART0, UART1,
+    DMA_CH0, I2C1, PIN_0, PIN_1, PIN_18, PIN_19, PIN_2, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29,
+    PIN_3, PIN_4, PIN_5, PIO0, UART0, UART1,
 };
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::rom_data::reset_to_usb_boot;
@@ -33,6 +34,7 @@ use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
     SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
+use crate::drivers::imu::{ImuDriver, ImuHealth, ImuSample, Mpu6050};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 use crate::status;
@@ -73,6 +75,7 @@ bind_interrupts!(struct Irqs {
 
 pub struct PicoWBrainstem {
     uart: Uart<'static, Blocking>,
+    imu: Option<Mpu6050<I2c<'static, I2C1, I2cBlocking>>>,
     power_toggle: Output<'static>,
     brc: Output<'static>,
     status_led: Output<'static>,
@@ -84,6 +87,9 @@ impl PicoWBrainstem {
         uart0: Peri<'static, UART0>,
         tx: Peri<'static, PIN_0>,
         rx: Peri<'static, PIN_1>,
+        i2c1: Peri<'static, I2C1>,
+        i2c_sda: Peri<'static, PIN_2>,
+        i2c_scl: Peri<'static, PIN_3>,
         power_toggle: Peri<'static, PIN_18>,
         brc: Peri<'static, PIN_19>,
         status_led: Peri<'static, PIN_20>,
@@ -93,9 +99,19 @@ impl PicoWBrainstem {
         uart_config.data_bits = DataBits::DataBits8;
         uart_config.stop_bits = StopBits::STOP1;
         uart_config.parity = Parity::ParityNone;
+        let imu = if body::IMU_ENABLED {
+            let mut i2c_config = I2cConfig::default();
+            i2c_config.frequency = 400_000;
+            Some(Mpu6050::new(I2c::new_blocking(
+                i2c1, i2c_scl, i2c_sda, i2c_config,
+            )))
+        } else {
+            None
+        };
 
         Self {
             uart: Uart::new_blocking(uart0, tx, rx, uart_config),
+            imu,
             power_toggle: Output::new(power_toggle, Level::Low),
             brc: Output::new(brc, Level::High),
             status_led: Output::new(status_led, Level::Low),
@@ -148,6 +164,13 @@ impl BrainstemHardware for PicoWBrainstem {
             Err(nb::Error::Other(error)) => SerialRead::Error(map_uart_error(error)),
         }
     }
+
+    fn poll_imu_sample(&mut self, now_ms: u32) -> Result<Option<ImuSample>, ImuHealth> {
+        let Some(imu) = self.imu.as_mut() else {
+            return Err(ImuHealth::Absent);
+        };
+        imu.poll(now_ms)
+    }
 }
 
 fn map_uart_error(error: UartError) -> UartReadError {
@@ -161,7 +184,9 @@ fn map_uart_error(error: UartError) -> UartReadError {
 }
 
 pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
-    let hardware = PicoWBrainstem::new(p.UART0, p.PIN_0, p.PIN_1, p.PIN_18, p.PIN_19, p.PIN_20);
+    let hardware = PicoWBrainstem::new(
+        p.UART0, p.PIN_0, p.PIN_1, p.I2C1, p.PIN_2, p.PIN_3, p.PIN_18, p.PIN_19, p.PIN_20,
+    );
 
     spawn_core1(
         p.CORE1,

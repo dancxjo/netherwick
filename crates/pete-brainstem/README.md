@@ -48,8 +48,12 @@ gpio = 19
 | Create BRC | GP19 | 25 | Pico output to Create BRC, optional |
 | External status LED | GP20 | 26 | Pico output, optional |
 | Onboard LED | GP25 | onboard | Pico output |
+| IMU I2C SDA | GP2 | 4 | Pico I2C1 SDA to MPU-6050 SDA |
+| IMU I2C SCL | GP3 | 5 | Pico I2C1 SCL to MPU-6050 SCL |
 
 UART is `57600 8N1`.
+
+The IMU path is short-horizon inertial telemetry plus local tilt/impact reflex safety. It is not SLAM, global pose, or autonomous recovery; higher-level mapping must treat IMU status as one sensor input with explicit freshness and health.
 
 Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external level shifting or a divider is present on the Create TX to Pico GP1 line.
 
