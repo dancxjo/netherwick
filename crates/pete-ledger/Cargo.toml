@@ -1,0 +1,24 @@
+[package]
+name = "pete-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+pete-actions = { path = "../pete-actions" }
+pete-behaviors = { path = "../pete-behaviors" }
+pete-core = { path = "../pete-core" }
+pete-experience = { path = "../pete-experience" }
+pete-llm = { path = "../pete-llm" }
+pete-now = { path = "../pete-now" }
+
+[dev-dependencies]
+pete-body = { path = "../pete-body" }

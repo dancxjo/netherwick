@@ -2,7 +2,7 @@
 
 Worldlab passive replay feeds recorded `WorldSnapshot` frames back through the runtime exactly as captured. It answers “what happened?” Counterfactual replay reconstructs a small simulator world from capture metadata, applies controlled edits, runs forward with a selected policy, and writes a fresh ledger and/or JSON report. It answers first-step “what if?” questions.
 
-For a hardware-free embodied pipeline gate, use `cargo run --bin netherwick -- embodied-eval --fixture deterministic --json` instead. That command does not reconstruct or edit a world; it proves the sensor-to-sensation-to-vector-to-experience-to-prediction-to-memory-recall path is intact using a tiny deterministic fixture. In issue terms, it builds on #34's embodied prediction input path and #35's vector metadata/vectorizer work, then adds the #36 persistence and recall coverage check.
+For a hardware-free embodied pipeline gate, use `cargo run --bin pete -- embodied-eval --fixture deterministic --json` instead. That command does not reconstruct or edit a world; it proves the sensor-to-sensation-to-vector-to-experience-to-prediction-to-memory-recall path is intact using a tiny deterministic fixture. In issue terms, it builds on #34's embodied prediction input path and #35's vector metadata/vectorizer work, then adds the #36 persistence and recall coverage check.
 
 ## Required Capture Metadata
 
@@ -52,7 +52,7 @@ These are probe policies, not learned planning. They exist to create alternative
 ## Examples
 
 ```bash
-cargo run --bin netherwick -- sim-curriculum \
+cargo run --bin pete -- sim-curriculum \
   --scenario charger-seeking \
   --episodes 1 \
   --steps 100 \
@@ -60,7 +60,7 @@ cargo run --bin netherwick -- sim-curriculum \
   --out data/ledger/curriculum/cf-charge-source \
   --capture-root data/captures/counterfactual/source
 
-cargo run --bin netherwick -- replay-counterfactual \
+cargo run --bin pete -- replay-counterfactual \
   --capture data/captures/counterfactual/source/episode-000 \
   --edit move-charger:x=1.0,y=1.0 \
   --policy seek-charge \

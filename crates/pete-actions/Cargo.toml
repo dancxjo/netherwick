@@ -1,0 +1,12 @@
+[package]
+name = "pete-actions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true
+pete-core = { path = "../pete-core" }
+pete-cockpit = { path = "../pete-cockpit" }

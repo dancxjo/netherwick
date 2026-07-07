@@ -1,0 +1,23 @@
+[package]
+name = "pete-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+pete-actions = { path = "../pete-actions" }
+pete-body = { path = "../pete-body" }
+pete-core = { path = "../pete-core" }
+pete-experience = { path = "../pete-experience" }
+pete-ledger = { path = "../pete-ledger" }
+pete-now = { path = "../pete-now" }
+
+[dev-dependencies]

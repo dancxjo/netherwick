@@ -1,0 +1,41 @@
+[package]
+name = "pete-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum.workspace = true
+base64.workspace = true
+image.workspace = true
+pete-actions = { path = "../pete-actions" }
+pete-behaviors = { path = "../pete-behaviors" }
+pete-body = { path = "../pete-body" }
+pete-cockpit = { path = "../pete-cockpit" }
+pete-core = { path = "../pete-core" }
+pete-experience = { path = "../pete-experience" }
+pete-llm = { path = "../pete-llm" }
+pete-map = { path = "../pete-map" }
+pete-memory = { path = "../pete-memory" }
+pete-now = { path = "../pete-now" }
+pete-runtime = { path = "../pete-runtime" }
+pete-sensors = { path = "../pete-sensors" }
+pete-worldlab = { path = "../pete-worldlab" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower-http.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+pete-autonomic = { path = "../pete-autonomic" }
+pete-body = { path = "../pete-body" }
+pete-conductor = { path = "../pete-conductor" }
+pete-ledger = { path = "../pete-ledger" }
+pete-memory = { path = "../pete-memory" }
+tokio.workspace = true

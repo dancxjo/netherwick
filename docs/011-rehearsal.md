@@ -1,6 +1,6 @@
 # End-to-end rehearsal
 
-The local development entrypoint is `just run`, which forwards arguments to the `netherwick-tools` binary.
+The local development entrypoint is `just run`, which forwards arguments to the `pete-tools` binary.
 
 Run the full model rehearsal:
 

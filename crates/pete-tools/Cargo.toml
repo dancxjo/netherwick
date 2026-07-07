@@ -1,0 +1,57 @@
+[package]
+name = "pete-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["kinect-freenect"]
+kinect-freenect = ["pete-sensors/kinect-freenect"]
+
+[[bin]]
+name = "pete"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+rand.workspace = true
+serde.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+image.workspace = true
+base64.workspace = true
+hound.workspace = true
+speaking = { path = "../../../tongues/crates/speaking", features = ["asr-whisper"] }
+pete-actions = { path = "../pete-actions" }
+pete-autonomic = { path = "../pete-autonomic" }
+pete-behaviors = { path = "../pete-behaviors" }
+pete-body = { path = "../pete-body" }
+pete-cockpit = { path = "../pete-cockpit" }
+pete-conductor = { path = "../pete-conductor" }
+pete-core = { path = "../pete-core" }
+pete-experience = { path = "../pete-experience" }
+pete-ledger = { path = "../pete-ledger" }
+pete-llm = { path = "../pete-llm" }
+pete-map = { path = "../pete-map" }
+pete-memory = { path = "../pete-memory" }
+pete-models = { path = "../pete-models" }
+pete-mouth = { path = "../pete-mouth" }
+pete-now = { path = "../pete-now" }
+pete-runtime = { path = "../pete-runtime" }
+pete-server = { path = "../pete-server" }
+pete-sim = { path = "../pete-sim" }
+pete-training = { path = "../pete-training" }
+pete-worldlab = { path = "../pete-worldlab" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pete-sensors = { path = "../pete-sensors", features = ["linux-hardware"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+pete-sensors = { path = "../pete-sensors" }

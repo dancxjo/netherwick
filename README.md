@@ -1,8 +1,8 @@
-# netherwick
+# pete
 
-`netherwick` is a Rust workspace for Pete Netherwick, an embodied self-training robot architecture.
+`pete` is a Rust workspace for Pete, an embodied self-training robot architecture.
 
-Pete now has a working real-world perception path: Kinect RGB and depth data can be fused into aligned, Minecrafty but properly colored 3D voxels that correspond to real objects in real space. The current milestone is important because Netherwick is no longer only passing sensor packets around. It is beginning to hold a visible world model that a human can inspect, debug, and eventually enter through the WebXR viewer.
+Pete now has a working real-world perception path: Kinect RGB and depth data can be fused into aligned, Minecrafty but properly colored 3D voxels that correspond to real objects in real space. The current milestone is important because Pete is no longer only passing sensor packets around. It is beginning to hold a visible world model that a human can inspect, debug, and eventually enter through the WebXR viewer.
 
 The project still keeps the larger PETE architecture in view. Pete gathers raw sensors, memory recalls, internal drives, model predictions, surprise, and LLM guidance into `Now`. `Now` is compressed into an `ExperienceLatent`, used to imagine futures, choose actions, and train from consequences.
 
@@ -12,7 +12,7 @@ The LLM loop is now active as a trainer, critic, and planner. It predicts counte
 
 Every hard-coded behavior is replaceable. It can run directly, shadow-train a model, compare with a model, promote a model, or fall back to safe hand-written logic.
 
-Pete Netherwick is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.
+Pete is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.
 
 ## Current milestone
 
@@ -131,10 +131,10 @@ Scenario reports can be generated with `just run eval-scenario --scenario empty-
 Pete's Raspberry Pi 5 hardware path starts capture-first: inspect devices, run bounded read-only body/sensor ticks, record Worldlab captures, and inspect the result. Autonomous motor movement is not enabled by default.
 
 ```bash
-cargo run --bin netherwick -- hardware-env
-cargo run --bin netherwick -- robot --mode read-only --duration-seconds 30 --ledger data/ledger/real/read-only-smoke
-cargo run --bin netherwick -- capture-real --duration-seconds 60 --out data/captures/real/rpi5-smoke
-cargo run --bin netherwick -- inspect-capture data/captures/real/rpi5-smoke
+cargo run --bin pete -- hardware-env
+cargo run --bin pete -- robot --mode read-only --duration-seconds 30 --ledger data/ledger/real/read-only-smoke
+cargo run --bin pete -- capture-real --duration-seconds 60 --out data/captures/real/rpi5-smoke
+cargo run --bin pete -- inspect-capture data/captures/real/rpi5-smoke
 ```
 
 See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions, device expectations, success criteria, and failure behavior.

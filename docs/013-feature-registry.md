@@ -15,7 +15,7 @@ Pete should not remember "Kinect depth sample #41892." Pete should remember "I o
 
 ## Why
 
-Netherwick already contains many feature-like concepts, but they are shaped by their source subsystem:
+Pete already contains many feature-like concepts, but they are shaped by their source subsystem:
 
 - voxels and point cloud points,
 - object observations and image regions,

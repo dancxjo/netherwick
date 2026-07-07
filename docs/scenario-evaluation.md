@@ -1,6 +1,6 @@
 # Scenario Evaluation
 
-Scenario evaluation is Netherwick's simulated exam loop. It runs deterministic scenarios, observes the runtime tick by tick, and writes a stable JSON report that says whether Pete completed the task better than a baseline policy or checkpoint configuration.
+Scenario evaluation is Pete's simulated exam loop. It runs deterministic scenarios, observes the runtime tick by tick, and writes a stable JSON report that says whether Pete completed the task better than a baseline policy or checkpoint configuration.
 
 This is different from `sim-curriculum`: curriculum runs generate training ledgers and optional Worldlab captures. Scenario evaluation can also write ledgers and captures, but its main output is a report card with task metrics, model loading status, and a recommendation.
 
@@ -64,7 +64,7 @@ Ledger frames include the learned experience path. Inspect `z` for the learned `
 Use `embodied-eval` when you want a fast, deterministic check of the embodied data path without Create hardware, Kinect hardware, camera, microphone, model checkpoints, or a sim episode:
 
 ```bash
-cargo run --bin netherwick -- embodied-eval \
+cargo run --bin pete -- embodied-eval \
   --fixture deterministic \
   --json
 ```

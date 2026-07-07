@@ -56,7 +56,7 @@ Point-cloud v0 assets are ASCII PLY files generated from depth. The conversion u
 ## Commands
 
 ```bash
-cargo run --bin netherwick -- capture-real \
+cargo run --bin pete -- capture-real \
   --duration-seconds 3 \
   --mock \
   --out data/captures/real/mock-assets-smoke \
@@ -64,12 +64,12 @@ cargo run --bin netherwick -- capture-real \
   --export-depth \
   --export-audio
 
-cargo run --bin netherwick -- capture-assets \
+cargo run --bin pete -- capture-assets \
   --capture data/captures/real/mock-assets-smoke \
   --pointcloud \
   --stride 4
 
-cargo run --bin netherwick -- inspect-capture \
+cargo run --bin pete -- inspect-capture \
   data/captures/real/mock-assets-smoke
 ```
 

@@ -1,0 +1,22 @@
+[package]
+name = "pete-experience"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+uuid.workspace = true
+pete-actions = { path = "../pete-actions" }
+pete-body = { path = "../pete-body" }
+pete-core = { path = "../pete-core" }
+pete-now = { path = "../pete-now" }
+
+[dev-dependencies]
+tokio.workspace = true

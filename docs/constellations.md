@@ -9,7 +9,7 @@ constellation = a recurrent arrangement of signals that persists across time,
 viewpoint, context, or action strongly enough to be recognized again
 ```
 
-For the current Netherwick milestone, the easiest constellations to see are visual-spatial: nearby colored voxels, surfaces, depth discontinuities, planes, corners, and blobs. That is only the first species of the idea. The abstraction should generalize across all modalities.
+For the current Pete milestone, the easiest constellations to see are visual-spatial: nearby colored voxels, surfaces, depth discontinuities, planes, corners, and blobs. That is only the first species of the idea. The abstraction should generalize across all modalities.
 
 ## Modalities that may contribute
 

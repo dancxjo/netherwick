@@ -5079,446 +5079,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "netherwick-actions"
-version = "0.1.0"
-dependencies = [
- "netherwick-cockpit",
- "netherwick-core",
- "serde",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-autonomic"
-version = "0.1.0"
-dependencies = [
- "netherwick-body",
- "netherwick-cockpit",
- "netherwick-now",
- "serde",
-]
-
-[[package]]
-name = "netherwick-behaviors"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "netherwick-core",
- "serde",
- "serde_json",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "netherwick-body"
-version = "0.1.0"
-dependencies = [
- "netherwick-core",
- "serde",
-]
-
-[[package]]
-name = "netherwick-cockpit"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "serialport",
- "thiserror 1.0.69",
- "toml 0.8.23",
- "tungstenite",
-]
-
-[[package]]
-name = "netherwick-conductor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "netherwick-actions",
- "netherwick-body",
- "netherwick-experience",
- "netherwick-now",
- "serde",
-]
-
-[[package]]
-name = "netherwick-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-events"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "netherwick-actions",
- "netherwick-autonomic",
- "netherwick-body",
- "netherwick-core",
- "netherwick-experience",
- "netherwick-llm",
- "netherwick-memory",
- "netherwick-now",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-experience"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "netherwick-actions",
- "netherwick-body",
- "netherwick-core",
- "netherwick-now",
- "serde",
- "serde_json",
- "tokio",
- "toml 0.8.23",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-ledger"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "netherwick-actions",
- "netherwick-behaviors",
- "netherwick-body",
- "netherwick-core",
- "netherwick-experience",
- "netherwick-llm",
- "netherwick-now",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-llm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "futures-util",
- "image",
- "netherwick-actions",
- "netherwick-body",
- "netherwick-experience",
- "netherwick-now",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "tokio",
- "toml 0.8.23",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-map"
-version = "0.1.0"
-dependencies = [
- "netherwick-core",
- "netherwick-now",
- "netherwick-sensors",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "netherwick-memory"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "netherwick-actions",
- "netherwick-body",
- "netherwick-core",
- "netherwick-experience",
- "netherwick-ledger",
- "netherwick-now",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-models"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "burn",
- "netherwick-actions",
- "netherwick-behaviors",
- "netherwick-body",
- "netherwick-core",
- "netherwick-experience",
- "netherwick-now",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "netherwick-mouth"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "serde",
- "speaking",
- "tongues-tts",
- "tracing",
-]
-
-[[package]]
-name = "netherwick-now"
-version = "0.1.0"
-dependencies = [
- "netherwick-actions",
- "netherwick-body",
- "netherwick-core",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-perception"
-version = "0.1.0"
-dependencies = [
- "netherwick-core",
- "netherwick-now",
- "netherwick-sensors",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "netherwick-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "netherwick-actions",
- "netherwick-autonomic",
- "netherwick-behaviors",
- "netherwick-body",
- "netherwick-cockpit",
- "netherwick-conductor",
- "netherwick-core",
- "netherwick-events",
- "netherwick-experience",
- "netherwick-ledger",
- "netherwick-llm",
- "netherwick-map",
- "netherwick-memory",
- "netherwick-models",
- "netherwick-now",
- "netherwick-sensors",
- "netherwick-sim",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tsrun",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-sensors"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "cpal",
- "face_id",
- "image",
- "libc",
- "netherwick-actions",
- "netherwick-body",
- "netherwick-core",
- "netherwick-now",
- "serde",
- "serde_json",
- "serialport",
- "tokio",
- "v4l",
-]
-
-[[package]]
-name = "netherwick-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "axum-server",
- "base64 0.22.1",
- "image",
- "netherwick-actions",
- "netherwick-autonomic",
- "netherwick-behaviors",
- "netherwick-body",
- "netherwick-cockpit",
- "netherwick-conductor",
- "netherwick-core",
- "netherwick-experience",
- "netherwick-ledger",
- "netherwick-llm",
- "netherwick-map",
- "netherwick-memory",
- "netherwick-now",
- "netherwick-runtime",
- "netherwick-sensors",
- "netherwick-worldlab",
- "rustls 0.23.41",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tower-http",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-sim"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "netherwick-body",
- "netherwick-cockpit",
- "netherwick-now",
- "netherwick-sensors",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "netherwick-tools"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "clap",
- "dotenvy",
- "hound",
- "image",
- "netherwick-actions",
- "netherwick-autonomic",
- "netherwick-behaviors",
- "netherwick-body",
- "netherwick-cockpit",
- "netherwick-conductor",
- "netherwick-core",
- "netherwick-experience",
- "netherwick-ledger",
- "netherwick-llm",
- "netherwick-map",
- "netherwick-memory",
- "netherwick-models",
- "netherwick-mouth",
- "netherwick-now",
- "netherwick-runtime",
- "netherwick-sensors",
- "netherwick-server",
- "netherwick-sim",
- "netherwick-training",
- "netherwick-worldlab",
- "rand 0.8.6",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "speaking",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-training"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "netherwick-actions",
- "netherwick-autonomic",
- "netherwick-behaviors",
- "netherwick-body",
- "netherwick-cockpit",
- "netherwick-core",
- "netherwick-experience",
- "netherwick-ledger",
- "netherwick-models",
- "netherwick-now",
- "netherwick-sensors",
- "netherwick-sim",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tokio",
- "toml 0.8.23",
- "uuid",
-]
-
-[[package]]
-name = "netherwick-ui"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "netherwick-worldlab"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "hound",
- "image",
- "netherwick-autonomic",
- "netherwick-body",
- "netherwick-conductor",
- "netherwick-core",
- "netherwick-experience",
- "netherwick-ledger",
- "netherwick-llm",
- "netherwick-memory",
- "netherwick-now",
- "netherwick-perception",
- "netherwick-runtime",
- "netherwick-sensors",
- "netherwick-sim",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6147,6 +5707,446 @@ checksum = "89815c69d36021a140146f26659a81d6c2afa33d216d736dd4be5381a7362220"
 dependencies = [
  "pest",
  "sha2",
+]
+
+[[package]]
+name = "pete-actions"
+version = "0.1.0"
+dependencies = [
+ "pete-cockpit",
+ "pete-core",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "pete-autonomic"
+version = "0.1.0"
+dependencies = [
+ "pete-body",
+ "pete-cockpit",
+ "pete-now",
+ "serde",
+]
+
+[[package]]
+name = "pete-behaviors"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pete-core",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "pete-body"
+version = "0.1.0"
+dependencies = [
+ "pete-core",
+ "serde",
+]
+
+[[package]]
+name = "pete-cockpit"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serialport",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
+ "tungstenite",
+]
+
+[[package]]
+name = "pete-conductor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pete-actions",
+ "pete-body",
+ "pete-experience",
+ "pete-now",
+ "serde",
+]
+
+[[package]]
+name = "pete-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "pete-events"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pete-actions",
+ "pete-autonomic",
+ "pete-body",
+ "pete-core",
+ "pete-experience",
+ "pete-llm",
+ "pete-memory",
+ "pete-now",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "pete-experience"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "pete-actions",
+ "pete-body",
+ "pete-core",
+ "pete-now",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "uuid",
+]
+
+[[package]]
+name = "pete-ledger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "pete-actions",
+ "pete-behaviors",
+ "pete-body",
+ "pete-core",
+ "pete-experience",
+ "pete-llm",
+ "pete-now",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pete-llm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "futures-util",
+ "image",
+ "pete-actions",
+ "pete-body",
+ "pete-experience",
+ "pete-now",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "uuid",
+]
+
+[[package]]
+name = "pete-map"
+version = "0.1.0"
+dependencies = [
+ "pete-core",
+ "pete-now",
+ "pete-sensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pete-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "pete-actions",
+ "pete-body",
+ "pete-core",
+ "pete-experience",
+ "pete-ledger",
+ "pete-now",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pete-models"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "burn",
+ "pete-actions",
+ "pete-behaviors",
+ "pete-body",
+ "pete-core",
+ "pete-experience",
+ "pete-now",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pete-mouth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "serde",
+ "speaking",
+ "tongues-tts",
+ "tracing",
+]
+
+[[package]]
+name = "pete-now"
+version = "0.1.0"
+dependencies = [
+ "pete-actions",
+ "pete-body",
+ "pete-core",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "pete-perception"
+version = "0.1.0"
+dependencies = [
+ "pete-core",
+ "pete-now",
+ "pete-sensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pete-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "pete-actions",
+ "pete-autonomic",
+ "pete-behaviors",
+ "pete-body",
+ "pete-cockpit",
+ "pete-conductor",
+ "pete-core",
+ "pete-events",
+ "pete-experience",
+ "pete-ledger",
+ "pete-llm",
+ "pete-map",
+ "pete-memory",
+ "pete-models",
+ "pete-now",
+ "pete-sensors",
+ "pete-sim",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tsrun",
+ "uuid",
+]
+
+[[package]]
+name = "pete-sensors"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cpal",
+ "face_id",
+ "image",
+ "libc",
+ "pete-actions",
+ "pete-body",
+ "pete-core",
+ "pete-now",
+ "serde",
+ "serde_json",
+ "serialport",
+ "tokio",
+ "v4l",
+]
+
+[[package]]
+name = "pete-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "image",
+ "pete-actions",
+ "pete-autonomic",
+ "pete-behaviors",
+ "pete-body",
+ "pete-cockpit",
+ "pete-conductor",
+ "pete-core",
+ "pete-experience",
+ "pete-ledger",
+ "pete-llm",
+ "pete-map",
+ "pete-memory",
+ "pete-now",
+ "pete-runtime",
+ "pete-sensors",
+ "pete-worldlab",
+ "rustls 0.23.41",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tower-http",
+ "uuid",
+]
+
+[[package]]
+name = "pete-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "pete-body",
+ "pete-cockpit",
+ "pete-now",
+ "pete-sensors",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pete-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "hound",
+ "image",
+ "pete-actions",
+ "pete-autonomic",
+ "pete-behaviors",
+ "pete-body",
+ "pete-cockpit",
+ "pete-conductor",
+ "pete-core",
+ "pete-experience",
+ "pete-ledger",
+ "pete-llm",
+ "pete-map",
+ "pete-memory",
+ "pete-models",
+ "pete-mouth",
+ "pete-now",
+ "pete-runtime",
+ "pete-sensors",
+ "pete-server",
+ "pete-sim",
+ "pete-training",
+ "pete-worldlab",
+ "rand 0.8.6",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "speaking",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pete-training"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pete-actions",
+ "pete-autonomic",
+ "pete-behaviors",
+ "pete-body",
+ "pete-cockpit",
+ "pete-core",
+ "pete-experience",
+ "pete-ledger",
+ "pete-models",
+ "pete-now",
+ "pete-sensors",
+ "pete-sim",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "uuid",
+]
+
+[[package]]
+name = "pete-ui"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "pete-worldlab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "hound",
+ "image",
+ "pete-autonomic",
+ "pete-body",
+ "pete-conductor",
+ "pete-core",
+ "pete-experience",
+ "pete-ledger",
+ "pete-llm",
+ "pete-memory",
+ "pete-now",
+ "pete-perception",
+ "pete-runtime",
+ "pete-sensors",
+ "pete-sim",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

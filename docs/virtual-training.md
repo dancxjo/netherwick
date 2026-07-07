@@ -1,4 +1,4 @@
-# Netherwick Virtual Training and Evaluation Pipeline
+# Pete Virtual Training and Evaluation Pipeline
 
 This document describes the automated post-run virtual training and evaluation pipeline designed to close the experience collection and behavioral learning loop.
 
@@ -52,7 +52,7 @@ The `just train virtual` command orchestrates five consecutive stages:
 
 5. **Dashboard Updates:**
    Consolidates the run metrics and model statuses into `data/reports/virtual/latest.json`.
-   The `netherwick-server` serves this report via `GET /view/training/latest`.
+   The `pete-server` serves this report via `GET /view/training/latest`.
 
 ---
 
@@ -63,19 +63,19 @@ To run the full pipeline:
 ```bash
 just train virtual
 ```
-*Note: Set `NETHERWICK_LEDGER` to point to a custom ledger, and `NETHERWICK_EPOCHS` to configure training epochs (default is 5).*
+*Note: Set `PETE_LEDGER` to point to a custom ledger, and `PETE_EPOCHS` to configure training epochs (default is 5).*
 
 ### Generate Run Report Only
 To generate a standalone run report from telemetry:
 ```bash
-cargo run -p netherwick-tools -- virtual-report --ledger data/ledger/virtual-live --out data/reports/virtual-run.json
+cargo run -p pete-tools -- virtual-report --ledger data/ledger/virtual-live --out data/reports/virtual-run.json
 ```
 
 ---
 
 ## 3. Safety and Promotion Gates
 
-Promotion is strictly governed by rules defined in `netherwick-training`:
+Promotion is strictly governed by rules defined in `pete-training`:
 - **Collision Rate:** Candidate collision rate must be less than or equal to the baseline.
 - **Success Rate:** Candidate success rate must be greater than or equal to the baseline.
 - **Safety Gating:** Auto-promotion to active `Inference` mode is disabled for safety-critical behavior components (such as `danger`) unless explicitly overridden. This ensures models under test run safely in `Shadow` mode before taking active control.

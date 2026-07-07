@@ -1,0 +1,20 @@
+[package]
+name = "pete-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+pete-body = { path = "../pete-body" }
+pete-cockpit = { path = "../pete-cockpit" }
+pete-now = { path = "../pete-now" }
+pete-sensors = { path = "../pete-sensors" }
+
+[dev-dependencies]
+tokio.workspace = true

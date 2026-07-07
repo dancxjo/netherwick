@@ -1,20 +1,20 @@
-# Repo audit and steal plan for netherwick
+# Repo audit and steal plan for pete
 
 ## Executive summary
 
-`netherwick` should steal ideas asymmetrically, not evenly.
+`pete` should steal ideas asymmetrically, not evenly.
 
 `daringsby` has the richest real memory/graph/vector machinery and the best evidence for "memory returned as sensation", but much of it is overgrown and mixed with Pete-specific tooling. Steal the storage patterns and a few graph/query seams, not the whole psyche loop.
 
 `listenbury` has the strongest live audio runtime organs: CPAL capture, frame/ring buffering, VAD seams, self-hearing suppression, playback tracing, and transcript/timing formats. Steal those for robot ears and mouth runtime, but do not inherit its monolithic CLI orchestration as your runtime architecture.
 
-`mortar-sea` has the cleanest cognitive vocabulary. Its `Sensation -> Impression -> Experience -> Memory -> Sensation` doctrine is the right conceptual spine for `netherwick`, and its explicit provenance and timestamp semantics are better than `daringsby`'s older impression/stimulus model.
+`mortar-sea` has the cleanest cognitive vocabulary. Its `Sensation -> Impression -> Experience -> Memory -> Sensation` doctrine is the right conceptual spine for `pete`, and its explicit provenance and timestamp semantics are better than `daringsby`'s older impression/stimulus model.
 
 `tongues` is useful mainly as a workspace/training/checkpoint pattern source. Its Burn setup is practical and minimal in `common-phone`; its artifact manifest and checkpoint conventions are worth copying. It is not yet a good source for embodied model-runtime boundaries.
 
 The main recommendation is:
 
-- keep `netherwick`'s embodied/control architecture,
+- keep `pete`'s embodied/control architecture,
 - adopt `mortar-sea` terminology for cognition,
 - port a narrowed memory subsystem from `daringsby`,
 - port live audio/runtime seams from `listenbury`,
@@ -66,9 +66,9 @@ The main recommendation is:
 - `psyche/src/voice.rs`
   Good for sentence streaming to mouth, but too conversation-centric and not safe enough for embodied output control.
 - `psyche/src/sensation.rs`
-  Rich, but too heterogeneous and `Any`-driven. `netherwick` should keep typed sensor records and avoid `Box<dyn Any>` as the canonical runtime substrate.
+  Rich, but too heterogeneous and `Any`-driven. `pete` should keep typed sensor records and avoid `Box<dyn Any>` as the canonical runtime substrate.
 - `pete/src/bin/will.rs::recall`
-  The retrieval itself is useful, but returning plain formatted strings to the LLM is only half the design. `netherwick` should feed retrieval into both LLM brief and numeric/model inputs.
+  The retrieval itself is useful, but returning plain formatted strings to the LLM is only half the design. `pete` should feed retrieval into both LLM brief and numeric/model inputs.
 - `psyche/src/wits/memory_wit.rs`
   Avoid the naive "concat summaries every N ticks" memory model. It is too lossy and too untyped.
 
@@ -167,7 +167,7 @@ Which code path most closely resembles “memory returned as sensation”:
 - `pete/src/bin/remember.rs` writing remembered output through `Neo4jClient::attach_remembrance`
 - `psyche/src/wits/combobulator.rs` looping `CombobulationSummary` back through `Topic::Sensation`
 
-Recommendation for how netherwick should model Sensation/Impression/Experience:
+Recommendation for how pete should model Sensation/Impression/Experience:
 
 - Use `mortar-sea`'s explicit typed split as the main ontology.
 - `Sensation`: typed sensor or memory input, timestamped, provenance-bearing, machine-readable payload.
@@ -175,7 +175,7 @@ Recommendation for how netherwick should model Sensation/Impression/Experience:
 - `Experience`: integrated meaning across time, suitable for memory indexing and training labels.
 - Do not store freeform impression summaries as the primary durable semantic memory unit; store experiences, with links back to impressions and source sensations.
 
-Recommendation for how netherwick should implement recall-as-sense:
+Recommendation for how pete should implement recall-as-sense:
 
 - Use a real `MemoryRecall` sensation family, not just injected prompt text.
 - Retrieval should return:
@@ -220,12 +220,12 @@ Recommendation for how netherwick should implement recall-as-sense:
 - `src/cli/commands/mic_transcribe.rs`
   Contains reusable capture code, but wrapped in command behavior and web-transcription concerns.
 - The whole live loop orchestration
-  Should be extracted into `EarRuntime`, `SpeechPlanner`, `MouthRuntime`, `TraceRuntime`, and `InputRouter` services inside `netherwick`, not left in one command file.
+  Should be extracted into `EarRuntime`, `SpeechPlanner`, `MouthRuntime`, `TraceRuntime`, and `InputRouter` services inside `pete`, not left in one command file.
 
 ### Avoid
 
 - Application/demo specific browser transcript player packaging as a direct dependency of robot runtime.
-- Heavy reuse of all the language-pack, vocoder, or alternate TTS backend machinery for initial `netherwick`; that scope is too broad.
+- Heavy reuse of all the language-pack, vocoder, or alternate TTS backend machinery for initial `pete`; that scope is too broad.
 - The current live command file layout as architectural truth.
 
 ### Specific files/types/functions
@@ -267,7 +267,7 @@ Recommendation for how netherwick should implement recall-as-sense:
 Audio pipeline reuse plan:
 
 - Steal `AudioFrame`, ring buffering, timed frames, VAD backends, self-hearing suppression, and trace payload formats.
-- Extract CPAL capture into a standalone `netherwick-ear-capture` service from the capture code currently embedded in `mic_transcribe.rs` and `live_half_duplex.rs`.
+- Extract CPAL capture into a standalone `pete-ear-capture` service from the capture code currently embedded in `mic_transcribe.rs` and `live_half_duplex.rs`.
 - Use `SoundscapePipelineAdapter` ideas to attribute mic frames, speaker playback, and ASR output to sources in the robot body.
 
 Voice command / speech output reuse plan:
@@ -295,7 +295,7 @@ Things too brittle or too application-specific to reuse:
 - the current browser transcript player packaging as a runtime dependency
 - all alternative TTS/vocoder backends for MVP
 
-What netherwick should steal for EarSense:
+What pete should steal for EarSense:
 
 - VAD backend seam
 - CPAL capture patterns
@@ -303,7 +303,7 @@ What netherwick should steal for EarSense:
 - self-hearing suppression
 - timed transcript/word stream model
 
-What netherwick should steal for Speak/Chirp/Speech actions:
+What pete should steal for Speak/Chirp/Speech actions:
 
 - `TextToSpeech`
 - chunk planner concepts from `mouth/planner.rs`
@@ -356,7 +356,7 @@ How Listenbury’s voice loop should be adapted to a robot body:
 ### Rewrite
 
 - `psyche/src/memory.rs::Memory::recall`
-  The reference trait recalls all experiences; `netherwick` needs queryable and typed recall.
+  The reference trait recalls all experiences; `pete` needs queryable and typed recall.
 - `psyche/src/pipeline.rs`
   Useful as a reference, but too synchronous and in-memory for the embodied runtime.
 - `face/src/realtime_experience.rs`
@@ -364,7 +364,7 @@ How Listenbury’s voice loop should be adapted to a robot body:
 
 ### Avoid
 
-- Preserving `faculties` and `wits` as crate names or user-facing runtime components in `netherwick`.
+- Preserving `faculties` and `wits` as crate names or user-facing runtime components in `pete`.
 - Treating `<say>` as the primary robot action language beyond speech itself.
 
 ### Specific files/types/functions
@@ -412,7 +412,7 @@ Terminology to discard:
 - `faculties`
 - `wits`
 
-Architectural pieces that should replace or modify the netherwick spec:
+Architectural pieces that should replace or modify the pete spec:
 
 - Replace any vague "experience latent" input semantics with an explicit ladder:
   sensations feed local encoders,
@@ -426,7 +426,7 @@ Is Mortar-Sea’s cognitive vocabulary cleaner than Daringsby’s:
 
 - Yes, clearly.
 
-Are “faculties” and “wits” worth preserving in netherwick:
+Are “faculties” and “wits” worth preserving in pete:
 
 - As historical inspiration, yes.
 - As primary public/runtime terminology, no.
@@ -454,11 +454,11 @@ Is there a better abstraction for sensory streams or impressions:
 - `crates/tongues-cli/src/main.rs`
   Good family-first CLI structure pattern.
 - `xtask/src/main.rs`
-  Good place for scaffolding and bench/demo helpers, though keep `xtask` smaller in `netherwick`.
+  Good place for scaffolding and bench/demo helpers, though keep `xtask` smaller in `pete`.
 
 ### Rewrite
 
-- The overall model-family sprawl. `netherwick` should not copy the number of crates or command namespaces.
+- The overall model-family sprawl. `pete` should not copy the number of crates or command namespaces.
 - Any task-specific seq2seq assumptions in `tongues-g2p2g`.
 
 ### Avoid
@@ -503,15 +503,15 @@ Training/checkpointing recommendation:
   `model-epoch-N.bin`,
   `model.bin`.
 - Prefer `model-latest.bin` during training, epoch checkpoints at validation boundaries, and `model.bin` as best-known checkpoint.
-- Keep recorder and manifest helpers in one shared `netherwick-model-artifacts` crate.
+- Keep recorder and manifest helpers in one shared `pete-model-artifacts` crate.
 
 CLI/xtask recommendation:
 
 - Use a family-first CLI:
-  `netherwick train ...`,
-  `netherwick replay ...`,
-  `netherwick sim ...`,
-  `netherwick inspect ...`,
+  `pete train ...`,
+  `pete replay ...`,
+  `pete sim ...`,
+  `pete inspect ...`,
   or model-family subcommands only where necessary.
 - Use `xtask` for scaffold, fixture generation, replay conversion, and benchmark helpers.
 
@@ -521,7 +521,7 @@ Data format recommendation for ledger/replay:
 - Use compact binary blobs only for large sensor tensors or audio/video payloads.
 - Copy `tongues-common-phone`'s atomic JSONL writing discipline and `listenbury`'s trace/replay payload style.
 
-How should netherwick structure Burn models:
+How should pete structure Burn models:
 
 - One crate for shared tensor/artifact helpers.
 - One crate per small neural organ family:
@@ -530,7 +530,7 @@ How should netherwick structure Burn models:
   memory-sense retriever,
   behavior replacement models.
 
-How should netherwick checkpoint models:
+How should pete checkpoint models:
 
 - `model-latest.bin`
 - `model-epoch-N.bin`
@@ -540,7 +540,7 @@ How should netherwick checkpoint models:
 
 Is there a good training CLI pattern to reuse:
 
-- Yes. `tongues-cli`'s family-first structure is the right shape, but `netherwick` should keep fewer families and fewer commands.
+- Yes. `tongues-cli`'s family-first structure is the right shape, but `pete` should keep fewer families and fewer commands.
 
 Is there a good data/frames pattern for the ExperienceLedger:
 
@@ -557,33 +557,33 @@ What dependencies and feature flags should be copied:
 - Copy later:
   optional CUDA features only when justified
 
-## Recommended netherwick crate layout
+## Recommended pete crate layout
 
-- `crates/netherwick-core`
+- `crates/pete-core`
   Core ids, timestamps, provenance, typed events, shared errors.
-- `crates/netherwick-sense`
+- `crates/pete-sense`
   `Sensation`, sensor frame types, memory-sense types, normalization.
-- `crates/netherwick-cognition`
+- `crates/pete-cognition`
   `Impression`, `Experience`, context frame, recall policies, conductor inputs.
-- `crates/netherwick-memory`
+- `crates/pete-memory`
   ledger indexing, graph/vector storage, recall services, recollection sensations.
-- `crates/netherwick-audio`
+- `crates/pete-audio`
   `AudioFrame`, capture, VAD, suppression, timed-word streams.
-- `crates/netherwick-mouth`
+- `crates/pete-mouth`
   speech planner, mouth gate, TTS boundary, playback events.
-- `crates/netherwick-body`
+- `crates/pete-body`
   body interfaces, action primitives, embodiment state, simulator/real adapters.
-- `crates/netherwick-autonomic`
+- `crates/pete-autonomic`
   safety vetoes, reflexes, watchdogs, action arbitration.
-- `crates/netherwick-model-artifacts`
+- `crates/pete-model-artifacts`
   Burn recorder, manifests, checkpoint metadata.
-- `crates/netherwick-models`
+- `crates/pete-models`
   latent encoder/decoder, future predictor, memory-sense retriever, replacement models.
-- `crates/netherwick-runtime`
+- `crates/pete-runtime`
   simulator-first orchestration loop.
-- `crates/netherwick-server`
+- `crates/pete-server`
   dashboard/WebSocket/API.
-- `crates/netherwick-tools`
+- `crates/pete-tools`
   replay/inspect/train helpers.
 - `xtask`
   scaffolds, fixture generation, benchmark helpers.
@@ -641,7 +641,7 @@ What dependencies and feature flags should be copied:
 - Discard:
   `Combobulator` as a production name
 
-`Combobulator` is a charming prototype word, but `netherwick` should use plainer names like `AwarenessSynthesizer` or `SituationIntegrator`.
+`Combobulator` is a charming prototype word, but `pete` should use plainer names like `AwarenessSynthesizer` or `SituationIntegrator`.
 
 ## Recommended memory/recall design
 
@@ -723,7 +723,7 @@ What dependencies and feature flags should be copied:
 
 ## Cleanup tasks before implementation
 
-- Collapse current `netherwick` ontology docs around `mortar-sea`'s `Sensation`/`Impression`/`Experience` split.
+- Collapse current `pete` ontology docs around `mortar-sea`'s `Sensation`/`Impression`/`Experience` split.
 - Rename any planned `Combobulator`-like component to a plainer integrator name.
 - Define `MemorySense` now, before building recall.
 - Decide one timestamp/provenance contract and apply it everywhere.

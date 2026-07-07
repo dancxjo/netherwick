@@ -1,0 +1,20 @@
+[package]
+name = "pete-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+pete-actions = { path = "../pete-actions" }
+pete-autonomic = { path = "../pete-autonomic" }
+pete-body = { path = "../pete-body" }
+pete-core = { path = "../pete-core" }
+pete-experience = { path = "../pete-experience" }
+pete-llm = { path = "../pete-llm" }
+pete-memory = { path = "../pete-memory" }
+pete-now = { path = "../pete-now" }

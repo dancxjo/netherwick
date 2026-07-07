@@ -1,0 +1,13 @@
+[package]
+name = "pete-map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+pete-core = { path = "../pete-core" }
+pete-now = { path = "../pete-now" }
+pete-sensors = { path = "../pete-sensors", default-features = false }

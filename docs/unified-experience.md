@@ -14,7 +14,7 @@ Teacher vectors are scaffolding, not Pete's learned state. The trainer assembles
 Run it from existing replay ledgers:
 
 ```bash
-cargo run --bin netherwick -- train unified-experience \
+cargo run --bin pete -- train unified-experience \
   --ledger data/ledger/sim1 \
   --checkpoint data/models/unified_experience/latest \
   --report data/reports/unified-experience/latest.json \

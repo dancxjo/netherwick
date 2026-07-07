@@ -1,6 +1,6 @@
 # Depth Geometry Debugging
 
-Netherwick uses these depth geometry conventions:
+Pete uses these depth geometry conventions:
 
 - Kinect camera frame: `+x` right, `+y` down, `+z` forward.
 - Robot/base math frame: `+x` forward, `+y` left, `+z` up. The floor is `z = 0`.
@@ -23,7 +23,7 @@ viewer regression.
 Generate a report from a real capture before tuning the UI:
 
 ```bash
-cargo run -p netherwick-tools -- geometry-debug \
+cargo run -p pete-tools -- geometry-debug \
   --capture data/captures/real/rpi5-smoke \
   --out data/reports/geometry/rpi5-smoke.json
 ```
@@ -31,7 +31,7 @@ cargo run -p netherwick-tools -- geometry-debug \
 Or report directly from a running live robot dashboard:
 
 ```bash
-cargo run -p netherwick-tools -- geometry-debug \
+cargo run -p pete-tools -- geometry-debug \
   --live-now-url http://127.0.0.1:3000/now \
   --out data/reports/geometry/live-now.json
 ```
@@ -72,7 +72,7 @@ The live `LocalMap` can now consume place/entity loop-closure candidates through
 
 Real robot depth calibration defaults assume the Kinect/depth cloud needs a clockwise
 90 degree yaw correction before entering the robot math frame. Override with
-`NETHERWICK_DEPTH_CAMERA_YAW_DEG` if the physical camera mount differs.
+`PETE_DEPTH_CAMERA_YAW_DEG` if the physical camera mount differs.
 
 ## Live View Checks
 

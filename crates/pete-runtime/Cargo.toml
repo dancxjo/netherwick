@@ -1,0 +1,35 @@
+[package]
+name = "pete-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tsrun = "0.1.23"
+uuid.workspace = true
+pete-actions = { path = "../pete-actions" }
+pete-autonomic = { path = "../pete-autonomic" }
+pete-behaviors = { path = "../pete-behaviors" }
+pete-body = { path = "../pete-body" }
+pete-cockpit = { path = "../pete-cockpit" }
+pete-conductor = { path = "../pete-conductor" }
+pete-core = { path = "../pete-core" }
+pete-events = { path = "../pete-events" }
+pete-experience = { path = "../pete-experience" }
+pete-ledger = { path = "../pete-ledger" }
+pete-llm = { path = "../pete-llm" }
+pete-map = { path = "../pete-map" }
+pete-memory = { path = "../pete-memory" }
+pete-models = { path = "../pete-models" }
+pete-now = { path = "../pete-now" }
+pete-sensors = { path = "../pete-sensors" }
+pete-sim = { path = "../pete-sim" }

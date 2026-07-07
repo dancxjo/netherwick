@@ -1,0 +1,12280 @@
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+use std::time::Duration;
+
+use anyhow::{Context, Error as AnyhowError, Result};
+use chrono::Utc;
+use clap::{Parser, Subcommand, ValueEnum};
+use pete_actions::ActionPrimitive;
+use pete_actions::{ApproachTarget, ExploreStyle, TurnDir};
+use pete_autonomic::SimpleSafety;
+use pete_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
+use pete_body::{BodySense, BodySong, BodyTone};
+use pete_cockpit::{Cockpit, SimCockpit as LocalSimCockpit, SongTone, UartCockpit};
+use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
+use pete_ledger::{
+    ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
+};
+use pete_llm::{ConfiguredLlmAgent, LiveImageEnricher, LlmConfig, LlmProvider};
+use pete_map::{
+    observation_from_now, transform_point_to_world, LocalMap, LoopClosureCandidateInput,
+    OrientationEstimate, Point3D, PointCloudConfig, PointCloudFrame, PoseGraphBuilder,
+    PoseGraphConfig, PoseGraphReport, VoxelPointCloud,
+};
+use pete_memory::{
+    deterministic_embodied_eval_report_with_omissions, place_memory_report_from_frames,
+    place_recognition_input_from_frame, place_recognition_vectors_from_input, BindingRelation,
+    DurableExperienceStore, EmbodiedEvalOmission, EntityConstellationState, EntityMemory,
+    InMemoryExperienceStore, PlaceMemory, PlaceMemoryReport, PlaceRecognitionCandidate,
+    PlaceRecognitionKind,
+};
+use pete_models::MODEL_REGISTRY;
+use pete_mouth::QueuedPiperCpalMouth;
+use pete_now::{EarSense, ExtensionSense, KinectSense, Now, RangeSense, SurpriseSense};
+use pete_runtime::{
+    ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
+    InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, ReignQueue, RobotMode,
+    RuntimeLoop, RuntimeModelStack, RuntimeTick, SimRunner,
+};
+use pete_sensors::{
+    AsrToolConfig, CameraSenseProvider, DepthRangeProjectionConfig, EyeFrame, EyeFrameFormat,
+    FrameProcessor, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame,
+    SensePacket, SenseProducer, World, WorldSnapshot,
+};
+#[cfg(feature = "kinect-freenect")]
+use pete_sensors::{FreenectKinectProvider, KinectRgbAdjustment};
+use pete_server::{
+    LiveSceneMetadata, LiveViewState, SceneArena, SceneObject, SceneSensorCalibration, SceneSession,
+};
+use pete_sim::{build_scenario, ScenarioConfig, ScenarioKind, SimObjectKind};
+use pete_training::dream_policy::{
+    load_best_genome, train_dream_policy, DreamLevel, DreamTrainingConfig,
+};
+use pete_training::{
+    evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
+    train_latent_round_trip, train_unified_experience, EvaluateBehaviorRequest,
+    TrainBehaviorRequest, TrainLatentRoundTripRequest, TrainUnifiedExperienceRequest,
+    TrainableBehavior,
+};
+use pete_worldlab::{
+    export_pointcloud_for_frame, export_snapshot_assets, rewrite_frames, update_manifest,
+    CaptureReader, CaptureReplayRunner, CaptureSource, CaptureStreams, CaptureWriter,
+};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+const DEFAULT_LIVE_LLM_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_MPU6050_IMU_DEVICE: &str = "/dev/i2c-1";
+const DEFAULT_WHISPER_MODEL_FILENAME: &str = "ggml-tiny.en.bin";
+
+#[derive(Parser)]
+#[command(name = "pete")]
+#[command(about = "Pete CLI entrypoint")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Sim(SimArgs),
+    SimCurriculum(SimCurriculumArgs),
+    DreamTrain(DreamTrainArgs),
+    EvalScenario(EvalScenarioArgs),
+    MemoryInspect(MemoryInspectArgs),
+    Mouth(MouthArgs),
+    Robot(RobotArgs),
+    WhisperTranscribe(WhisperTranscribeArgs),
+    HardwareEnv(HardwareEnvArgs),
+    Replay,
+    CaptureSim(CaptureSimArgs),
+    CaptureReal(CaptureRealArgs),
+    CaptureAssets(CaptureAssetsArgs),
+    InspectCapture(InspectCaptureArgs),
+    ReplayCapture(ReplayCaptureArgs),
+    ReplayCounterfactual(ReplayCounterfactualArgs),
+    Train(TrainCommand),
+    Evaluate(EvaluateCommand),
+    Promote(PromoteCommand),
+    InspectLedger(InspectLedgerArgs),
+    PoseGraphReport(PoseGraphReportArgs),
+    GeometryDebug(GeometryDebugArgs),
+    RepresentationReport(RepresentationReportArgs),
+    ModelRegister(ModelRegisterArgs),
+    ModelStatus,
+    ModelPromote(ModelPromoteArgs),
+    CompareScenarioReports(CompareScenarioReportsArgs),
+    Dashboard,
+    VirtualReport(VirtualReportArgs),
+    RetinaMockSend(RetinaMockSendArgs),
+    EmbodiedDemo(EmbodiedDemoArgs),
+    EmbodiedEval(EmbodiedEvalArgs),
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Sim(args) => run_sim(args).await,
+        Command::SimCurriculum(args) => run_sim_curriculum(args).await,
+        Command::DreamTrain(args) => run_dream_train(args).await,
+        Command::EvalScenario(args) => run_eval_scenario(args).await,
+        Command::MemoryInspect(args) => memory_inspect(args).await,
+        Command::Mouth(args) => run_mouth(args),
+        Command::Robot(args) => run_robot(args).await,
+        Command::WhisperTranscribe(args) => run_whisper_transcribe(args),
+        Command::HardwareEnv(args) => hardware_env(args).await,
+        Command::CaptureSim(args) => capture_sim(args).await,
+        Command::CaptureReal(args) => capture_real(args).await,
+        Command::CaptureAssets(args) => capture_assets(args).await,
+        Command::InspectCapture(args) => inspect_capture(args).await,
+        Command::ReplayCapture(args) => replay_capture(args).await,
+        Command::ReplayCounterfactual(args) => replay_counterfactual(args).await,
+        Command::InspectLedger(args) => inspect_ledger(args).await,
+        Command::PoseGraphReport(args) => run_pose_graph_report(args).await,
+        Command::GeometryDebug(args) => run_geometry_debug(args).await,
+        Command::RepresentationReport(args) => run_representation_report(args).await,
+        Command::Train(command) => run_train(command).await,
+        Command::Evaluate(command) => run_evaluate(command).await,
+        Command::Promote(command) => run_promote(command),
+        Command::ModelRegister(args) => model_register(args),
+        Command::ModelStatus => model_status(),
+        Command::ModelPromote(args) => model_promote(args),
+        Command::CompareScenarioReports(args) => compare_scenario_reports_command(args),
+        Command::VirtualReport(args) => run_virtual_report(args).await,
+        Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
+        Command::EmbodiedDemo(args) => run_embodied_demo(args).await,
+        Command::EmbodiedEval(args) => run_embodied_eval(args).await,
+        other => {
+            println!("selected command: {:?}", other);
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+struct SimArgs {
+    #[arg(long, default_value_t = 50)]
+    steps: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, value_enum, default_value = "mixed-room")]
+    scenario: ScenarioArg,
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long)]
+    danger_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    danger_mode: DangerMode,
+    #[arg(long)]
+    charge_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    charge_mode: ChargeMode,
+    #[arg(long)]
+    action_value_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    action_value_mode: ActionValueMode,
+    #[arg(long)]
+    future_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "hardcoded")]
+    future_mode: FutureMode,
+    #[arg(long)]
+    eye_next_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    eye_next_mode: EyeNextMode,
+    #[arg(long)]
+    ear_next_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    ear_next_mode: EarNextMode,
+    #[arg(long)]
+    experience_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    experience_mode: ExperienceMode,
+    #[arg(long, value_enum, default_value = "baseline")]
+    action_selector: CliActionSelectorMode,
+    #[arg(long, env = "PETE_DREAM_POLICY_CHECKPOINT")]
+    dream_policy_checkpoint: Option<String>,
+    #[arg(long, env = "PETE_INLINE_LEARNING")]
+    inline_learning: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "world-outcome",
+        env = "PETE_INLINE_LEARNING_MODE"
+    )]
+    inline_learning_mode: InlineLearningModeArg,
+    #[arg(
+        long,
+        default_value_t = 1,
+        env = "PETE_INLINE_TRAIN_STEPS_PER_TICK"
+    )]
+    inline_train_steps_per_tick: usize,
+    #[arg(long, env = "PETE_INLINE_BEHAVIORS")]
+    inline_behaviors: Option<String>,
+    #[arg(long)]
+    live: bool,
+    #[arg(long, default_value = "127.0.0.1:8787")]
+    live_addr: SocketAddr,
+    #[arg(long)]
+    live_tls: bool,
+    #[arg(long, default_value = "certs/pete-dev.crt")]
+    live_tls_cert: String,
+    #[arg(long, default_value = "certs/pete-dev.key")]
+    live_tls_key: String,
+    #[arg(long, default_value_t = 100)]
+    tick_delay_ms: u64,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct SimCurriculumArgs {
+    #[arg(long, value_enum)]
+    scenario: ScenarioArg,
+    #[arg(long, default_value_t = 20)]
+    episodes: usize,
+    #[arg(long, default_value_t = 300)]
+    steps: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value = "data/ledger/curriculum")]
+    out: String,
+    #[arg(long)]
+    capture_root: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[arg(long, default_value_t = 0.1)]
+    validation_ratio: f32,
+    #[arg(long, default_value_t = 0.1)]
+    test_ratio: f32,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct DreamTrainArgs {
+    #[arg(long, value_enum, default_value = "motion")]
+    start_level: DreamLevelArg,
+    #[arg(long, default_value_t = 30)]
+    generations: usize,
+    #[arg(long, default_value_t = 32)]
+    population: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value_t = 12)]
+    hidden_dim: usize,
+    #[arg(long, default_value = "data/models/dream-policy/neat")]
+    checkpoint_dir: String,
+    #[arg(long, default_value = "datasets/dream-policy/v0/episodes")]
+    dataset_dir: String,
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true")]
+    export_dataset: bool,
+    #[arg(long, default_value_t = false)]
+    detailed_logs: bool,
+    #[arg(long, default_value_t = false)]
+    clear: bool,
+}
+
+#[derive(Debug, Parser)]
+struct EvalScenarioArgs {
+    #[arg(long, value_enum)]
+    scenario: ScenarioArg,
+    #[arg(long, default_value_t = 20)]
+    episodes: usize,
+    #[arg(long, default_value_t = 300)]
+    steps: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[arg(long)]
+    out: Option<String>,
+    #[arg(long)]
+    ledger: Option<String>,
+    #[arg(long)]
+    capture_root: Option<String>,
+    #[arg(long)]
+    memory_report: bool,
+    #[arg(long)]
+    danger_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    danger_mode: DangerMode,
+    #[arg(long)]
+    charge_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    charge_mode: ChargeMode,
+    #[arg(long)]
+    action_value_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    action_value_mode: ActionValueMode,
+    #[arg(long)]
+    future_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "hardcoded")]
+    future_mode: FutureMode,
+    #[arg(long)]
+    eye_next_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    eye_next_mode: EyeNextMode,
+    #[arg(long)]
+    ear_next_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    ear_next_mode: EarNextMode,
+    #[arg(long)]
+    experience_checkpoint: Option<String>,
+    #[arg(long, value_enum, default_value = "off")]
+    experience_mode: ExperienceMode,
+    #[arg(long, value_enum, default_value = "baseline")]
+    action_selector: CliActionSelectorMode,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct MemoryInspectArgs {
+    #[arg(long)]
+    ledger: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliActionSelectorMode {
+    Baseline,
+    Random,
+    ModelAssisted,
+    Scripted,
+}
+
+impl From<CliActionSelectorMode> for ActionSelectorMode {
+    fn from(value: CliActionSelectorMode) -> Self {
+        match value {
+            CliActionSelectorMode::Baseline => ActionSelectorMode::Baseline,
+            CliActionSelectorMode::Random => ActionSelectorMode::Random,
+            CliActionSelectorMode::ModelAssisted => ActionSelectorMode::ModelAssisted,
+            CliActionSelectorMode::Scripted => ActionSelectorMode::Scripted,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum InlineLearningModeArg {
+    Off,
+    ShadowOnly,
+    WorldOutcome,
+}
+
+impl From<InlineLearningModeArg> for InlineLearningMode {
+    fn from(value: InlineLearningModeArg) -> Self {
+        match value {
+            InlineLearningModeArg::Off => InlineLearningMode::Off,
+            InlineLearningModeArg::ShadowOnly => InlineLearningMode::ShadowOnly,
+            InlineLearningModeArg::WorldOutcome => InlineLearningMode::WorldOutcome,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Parser)]
+struct LlmArgs {
+    #[arg(long)]
+    llm_config: Option<String>,
+    #[arg(long, value_enum)]
+    llm_provider: Option<CliLlmProvider>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliLlmProvider {
+    Disabled,
+    Ollama,
+}
+
+impl From<CliLlmProvider> for LlmProvider {
+    fn from(value: CliLlmProvider) -> Self {
+        match value {
+            CliLlmProvider::Disabled => LlmProvider::Disabled,
+            CliLlmProvider::Ollama => LlmProvider::Ollama,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ScenarioArg {
+    EmptyRoom,
+    ObstacleAvoidance,
+    CornerTrap,
+    ColumnTrap,
+    ChargerSeeking,
+    PersonSpeakerRoom,
+    MixedRoom,
+    Dream,
+}
+
+impl From<ScenarioArg> for ScenarioKind {
+    fn from(value: ScenarioArg) -> Self {
+        match value {
+            ScenarioArg::EmptyRoom => ScenarioKind::EmptyRoom,
+            ScenarioArg::ObstacleAvoidance => ScenarioKind::ObstacleAvoidance,
+            ScenarioArg::CornerTrap => ScenarioKind::CornerTrap,
+            ScenarioArg::ColumnTrap => ScenarioKind::ColumnTrap,
+            ScenarioArg::ChargerSeeking => ScenarioKind::ChargerSeeking,
+            ScenarioArg::PersonSpeakerRoom => ScenarioKind::PersonAndSpeaker,
+            ScenarioArg::MixedRoom => ScenarioKind::MixedRoom,
+            ScenarioArg::Dream => ScenarioKind::Dream,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DreamLevelArg {
+    Motion,
+    ObstacleAvoidance,
+    EscapeTrap,
+    ChargerSeeking,
+    SocialInspection,
+    PlaceMemory,
+    WeirdDream,
+}
+
+impl From<DreamLevelArg> for DreamLevel {
+    fn from(value: DreamLevelArg) -> Self {
+        match value {
+            DreamLevelArg::Motion => DreamLevel::Motion,
+            DreamLevelArg::ObstacleAvoidance => DreamLevel::ObstacleAvoidance,
+            DreamLevelArg::EscapeTrap => DreamLevel::EscapeTrap,
+            DreamLevelArg::ChargerSeeking => DreamLevel::ChargerSeeking,
+            DreamLevelArg::SocialInspection => DreamLevel::SocialInspection,
+            DreamLevelArg::PlaceMemory => DreamLevel::PlaceMemory,
+            DreamLevelArg::WeirdDream => DreamLevel::WeirdDream,
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+struct RobotArgs {
+    #[arg(long, value_enum, default_value = "read-only")]
+    mode: RobotModeArg,
+    #[arg(long, value_enum, default_value = "uart")]
+    cockpit: CockpitBackendArg,
+    #[arg(long, default_value = "auto")]
+    create_port: String,
+    #[arg(long, default_value_t = 57_600)]
+    create_baud: u32,
+    #[arg(long, default_value = "data/ledger/robot-readonly")]
+    ledger: String,
+    #[arg(long)]
+    camera: Option<String>,
+    #[arg(long)]
+    kinect_depth: bool,
+    #[arg(long, default_value_t = 0)]
+    kinect_index: i32,
+    #[arg(long, default_value_t = 0.32)]
+    kinect_rgb_target_luma: f32,
+    #[arg(long, default_value_t = 3.0)]
+    kinect_rgb_auto_gain_max: f32,
+    #[arg(long, default_value_t = 1.0)]
+    kinect_rgb_gain: f32,
+    #[arg(long, default_value_t = 0.80)]
+    kinect_rgb_gamma: f32,
+    #[arg(long, default_value_t = 0.0)]
+    kinect_rgb_brightness: f32,
+    #[arg(long)]
+    kinect_rgb_raw: bool,
+    #[arg(long)]
+    mic: Option<String>,
+    #[arg(long)]
+    asr_command: Option<String>,
+    #[arg(long)]
+    imu: Option<String>,
+    #[arg(long)]
+    gps: Option<String>,
+    #[arg(long)]
+    capture: Option<String>,
+    #[arg(long)]
+    dashboard: Option<SocketAddr>,
+    #[arg(long)]
+    dashboard_tls: bool,
+    #[arg(long, default_value = "certs/pete-dev.crt")]
+    dashboard_tls_cert: String,
+    #[arg(long, default_value = "certs/pete-dev.key")]
+    dashboard_tls_key: String,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[arg(long)]
+    steps: Option<usize>,
+    #[arg(long)]
+    duration_seconds: Option<u64>,
+    #[arg(long)]
+    require_camera: bool,
+    #[arg(long)]
+    require_mic: bool,
+    #[arg(long)]
+    require_imu: bool,
+    #[arg(long)]
+    require_gps: bool,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct HardwareEnvArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RobotModeArg {
+    ReadOnly,
+    Slow,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CockpitBackendArg {
+    Sim,
+    Uart,
+}
+
+#[derive(Debug, Parser)]
+struct CaptureSimArgs {
+    #[arg(long, default_value = "data/captures/sim-test")]
+    out: String,
+    #[arg(long, default_value_t = 100)]
+    steps: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct CaptureRealArgs {
+    #[arg(long, default_value_t = 60)]
+    duration_seconds: u64,
+    #[arg(long, default_value = "data/captures/real/rpi5-smoke")]
+    out: String,
+    #[arg(long)]
+    ledger: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
+    #[arg(long, value_enum, default_value = "uart")]
+    cockpit: CockpitBackendArg,
+    #[arg(long, default_value = "auto")]
+    create_port: String,
+    #[arg(long, default_value_t = 57_600)]
+    create_baud: u32,
+    #[arg(long)]
+    camera: Option<String>,
+    #[arg(long)]
+    kinect_depth: bool,
+    #[arg(long, default_value_t = 0)]
+    kinect_index: i32,
+    #[arg(long, default_value_t = 0.32)]
+    kinect_rgb_target_luma: f32,
+    #[arg(long, default_value_t = 3.0)]
+    kinect_rgb_auto_gain_max: f32,
+    #[arg(long, default_value_t = 1.0)]
+    kinect_rgb_gain: f32,
+    #[arg(long, default_value_t = 0.80)]
+    kinect_rgb_gamma: f32,
+    #[arg(long, default_value_t = 0.0)]
+    kinect_rgb_brightness: f32,
+    #[arg(long)]
+    kinect_rgb_raw: bool,
+    #[arg(long)]
+    mic: Option<String>,
+    #[arg(long)]
+    imu: Option<String>,
+    #[arg(long)]
+    gps: Option<String>,
+    #[arg(long)]
+    mock: bool,
+    #[arg(long)]
+    export_rgb: bool,
+    #[arg(long)]
+    export_depth: bool,
+    #[arg(long)]
+    export_audio: bool,
+    #[arg(long)]
+    export_pointcloud: bool,
+    #[arg(long, default_value_t = 4)]
+    pointcloud_stride: usize,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct CaptureAssetsArgs {
+    #[arg(long)]
+    capture: String,
+    #[arg(long)]
+    pointcloud: bool,
+    #[arg(long)]
+    world_pointcloud: bool,
+    #[arg(long, default_value_t = 4)]
+    stride: usize,
+    #[arg(long, default_value_t = 8.0)]
+    max_depth_m: f32,
+}
+
+#[derive(Debug, Parser)]
+struct InspectCaptureArgs {
+    path: String,
+}
+
+#[derive(Debug, Parser)]
+struct ReplayCaptureArgs {
+    #[arg(long)]
+    capture: String,
+    #[arg(long, default_value = "data/ledger/replay-test")]
+    ledger: String,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct ReplayCounterfactualArgs {
+    #[arg(long)]
+    capture: String,
+    #[arg(long)]
+    edit: Vec<String>,
+    #[arg(long, default_value = "baseline")]
+    policy: String,
+    #[arg(long)]
+    actions: Option<String>,
+    #[arg(long)]
+    steps: Option<usize>,
+    #[arg(long)]
+    out_ledger: Option<String>,
+    #[arg(long)]
+    out_report: Option<String>,
+    #[command(flatten)]
+    llm: LlmArgs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DangerMode {
+    Off,
+    ShadowInfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ChargeMode {
+    Off,
+    ShadowInfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ActionValueMode {
+    Off,
+    ShadowInfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FutureMode {
+    Hardcoded,
+    ShadowInfer,
+    ModelInfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum EyeNextMode {
+    Off,
+    ShadowInfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum EarNextMode {
+    Off,
+    ShadowInfer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ExperienceMode {
+    Off,
+    ShadowInfer,
+    ModelInfer,
+}
+
+#[derive(Debug, Parser)]
+struct TrainCommand {
+    #[command(subcommand)]
+    model: TrainModel,
+}
+
+#[derive(Debug, Subcommand)]
+enum TrainModel {
+    Behavior(TrainBehaviorArgs),
+    Danger(TrainDangerArgs),
+    Charge(TrainChargeArgs),
+    ActionValue(TrainActionValueArgs),
+    Future(TrainFutureArgs),
+    EyeNext(TrainEyeNextArgs),
+    EarNext(TrainEarNextArgs),
+    Experience(TrainExperienceArgs),
+    LatentRoundTrip(TrainLatentRoundTripArgs),
+    UnifiedExperience(TrainUnifiedExperienceArgs),
+    Virtual(TrainVirtualArgs),
+}
+
+#[derive(Debug, Parser)]
+struct TrainBehaviorArgs {
+    behavior: String,
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long)]
+    checkpoint: Option<String>,
+    #[arg(long, default_value_t = 0.2)]
+    validation_split: f32,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+}
+
+#[derive(Debug, Parser)]
+struct TrainDangerArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/danger_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainChargeArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/charge_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainActionValueArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/action_value_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainFutureArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/future_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainEyeNextArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/eye_next_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainEarNextArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/ear_next_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainExperienceArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/experience_v0")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Parser)]
+struct TrainLatentRoundTripArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/latent_round_trip_v0")]
+    checkpoint: String,
+    #[arg(long, default_value = "data/reports/latent-round-trip.json")]
+    report: String,
+    #[arg(long, default_value_t = 16)]
+    z_dim: usize,
+    #[arg(long, default_value_t = 0.2)]
+    validation_split: f32,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    #[arg(long)]
+    codebook_size: Option<usize>,
+}
+
+#[derive(Debug, Parser)]
+struct TrainUnifiedExperienceArgs {
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long, default_value_t = 5)]
+    epochs: usize,
+    #[arg(long, default_value = "data/models/unified_experience/latest")]
+    checkpoint: String,
+    #[arg(long, default_value = "data/reports/unified-experience/latest.json")]
+    report: String,
+    #[arg(long, default_value_t = 16)]
+    z_dim: usize,
+    #[arg(long, default_value_t = 16)]
+    teacher_dim: usize,
+    #[arg(long, default_value_t = 0.2)]
+    validation_split: f32,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+}
+
+#[derive(Debug, Parser)]
+struct InspectLedgerArgs {
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "PETE_LEDGER"
+    )]
+    ledger: String,
+}
+
+#[derive(Debug, Parser)]
+struct VirtualReportArgs {
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "PETE_LEDGER"
+    )]
+    ledger: String,
+    #[arg(long, default_value = "data/reports/virtual/latest.json")]
+    out: String,
+}
+
+#[derive(Debug, Parser)]
+struct PoseGraphReportArgs {
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "PETE_LEDGER"
+    )]
+    ledger: String,
+    #[arg(long)]
+    capture: Option<String>,
+    #[arg(long, default_value = "data/reports/pose-graph/latest.json")]
+    out: String,
+    #[arg(long, default_value_t = 0.25)]
+    min_node_distance_m: f32,
+    #[arg(long, default_value_t = 15.0)]
+    min_node_degrees: f32,
+    #[arg(long, default_value_t = 10)]
+    max_ticks_between_nodes: u64,
+    #[arg(long, default_value_t = 0.85)]
+    min_loop_confidence: f32,
+}
+
+#[derive(Debug, Parser)]
+struct GeometryDebugArgs {
+    #[arg(long)]
+    capture: Option<String>,
+    #[arg(long)]
+    live_now_url: Option<String>,
+    #[arg(long, default_value = "data/reports/geometry/latest.json")]
+    out: String,
+    #[arg(long, default_value_t = 16)]
+    samples: usize,
+    #[arg(long, default_value_t = 0.02)]
+    max_below_floor_ratio: f32,
+    #[arg(long, default_value_t = 200)]
+    max_body_timestamp_age_ms: u64,
+    #[arg(long, default_value_t = 45.0)]
+    min_stationary_rotation_deg: f32,
+    #[arg(long, default_value_t = 0.20)]
+    max_stationary_translation_m: f32,
+    #[arg(long, default_value_t = 0.05)]
+    min_stationary_stable_voxel_ratio: f32,
+    #[arg(long, default_value_t = 1.50)]
+    max_stationary_stable_z_span_m: f32,
+}
+
+#[derive(Debug, Parser)]
+struct RepresentationReportArgs {
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "PETE_LEDGER"
+    )]
+    ledger: String,
+    #[arg(long)]
+    capture: Option<String>,
+    #[arg(long, default_value = "data/reports/representation/latest.json")]
+    out: String,
+}
+
+#[derive(Debug, Parser)]
+struct EmbodiedDemoArgs {
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    ledger: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct EmbodiedEvalArgs {
+    #[arg(long, value_enum, default_value = "deterministic")]
+    fixture: EmbodiedEvalFixtureArg,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, value_enum)]
+    omit: Vec<EmbodiedEvalOmissionArg>,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum EmbodiedEvalFixtureArg {
+    Deterministic,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum EmbodiedEvalOmissionArg {
+    PrimarySensations,
+    Descendants,
+    Vectors,
+    Impressions,
+    FusedExperience,
+    SummaryImpression,
+    Predictions,
+    MemoryPersistence,
+    MemoryLinks,
+    Recall,
+}
+
+impl From<EmbodiedEvalOmissionArg> for EmbodiedEvalOmission {
+    fn from(value: EmbodiedEvalOmissionArg) -> Self {
+        match value {
+            EmbodiedEvalOmissionArg::PrimarySensations => Self::PrimarySensations,
+            EmbodiedEvalOmissionArg::Descendants => Self::Descendants,
+            EmbodiedEvalOmissionArg::Vectors => Self::Vectors,
+            EmbodiedEvalOmissionArg::Impressions => Self::Impressions,
+            EmbodiedEvalOmissionArg::FusedExperience => Self::FusedExperience,
+            EmbodiedEvalOmissionArg::SummaryImpression => Self::SummaryImpression,
+            EmbodiedEvalOmissionArg::Predictions => Self::Predictions,
+            EmbodiedEvalOmissionArg::MemoryPersistence => Self::MemoryPersistence,
+            EmbodiedEvalOmissionArg::MemoryLinks => Self::MemoryLinks,
+            EmbodiedEvalOmissionArg::Recall => Self::Recall,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationHealthReport {
+    schema_version: u32,
+    frame_count: usize,
+    input: RepresentationInputSummary,
+    warnings: Vec<String>,
+    entity_memory: RepresentationEntityMemorySummary,
+    map: RepresentationMapSummary,
+    pose_graph: RepresentationPoseGraphSummary,
+    place_recognition: RepresentationPlaceRecognitionSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationInputSummary {
+    source_type: String,
+    source_path: String,
+    provenance: HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationEntityMemorySummary {
+    total_entities: usize,
+    active_entities: usize,
+    occluded_entities: usize,
+    vanished_entities: usize,
+    revived_entities: usize,
+    modality_support_counts: HashMap<String, usize>,
+    constellation_edges_by_relation: HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationMapSummary {
+    local_occupancy_cell_count: usize,
+    pose_history_length: usize,
+    point_cloud_voxel_count: usize,
+    stable_voxel_count: usize,
+    transient_voxel_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationPoseGraphSummary {
+    node_count: usize,
+    odometry_edge_count: usize,
+    loop_candidate_count: usize,
+    loop_accepted_count: usize,
+    loop_rejected_count: usize,
+    confidence_distribution: RepresentationConfidenceDistribution,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationPlaceRecognitionSummary {
+    candidates_emitted: usize,
+    candidate_kinds: HashMap<String, usize>,
+    confidence_distribution: RepresentationConfidenceDistribution,
+    repeated_place_hints: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct RepresentationConfidenceDistribution {
+    min: Option<f32>,
+    max: Option<f32>,
+    mean: Option<f32>,
+    buckets: HashMap<String, usize>,
+}
+
+#[derive(Debug, Parser)]
+struct TrainVirtualArgs {
+    #[arg(
+        long,
+        default_value = "data/ledger/virtual-live",
+        env = "PETE_LEDGER"
+    )]
+    ledger: String,
+    #[arg(
+        long,
+        default_value = "data/models/virtual/latest",
+        env = "PETE_MODEL_OUT"
+    )]
+    out_dir: String,
+    #[arg(long, default_value = "data/reports/virtual/latest.json")]
+    report_out: String,
+    #[arg(long, default_value_t = 5, env = "PETE_EPOCHS")]
+    epochs: usize,
+    #[arg(long)]
+    allow_safety_critical_inference: bool,
+}
+
+#[derive(Debug, Parser)]
+struct EvaluateCommand {
+    #[command(subcommand)]
+    model: EvaluateModel,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvaluateModel {
+    Behavior(EvaluateBehaviorArgs),
+}
+
+#[derive(Debug, Parser)]
+struct EvaluateBehaviorArgs {
+    behavior: String,
+    #[arg(long, default_value = "data/ledger")]
+    ledger: String,
+    #[arg(long)]
+    checkpoint: Option<String>,
+    #[arg(long)]
+    max_samples: Option<usize>,
+    #[arg(long)]
+    out: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct PromoteCommand {
+    #[command(subcommand)]
+    model: PromoteModel,
+}
+
+#[derive(Debug, Subcommand)]
+enum PromoteModel {
+    Behavior(PromoteBehaviorArgs),
+}
+
+#[derive(Debug, Parser)]
+struct PromoteBehaviorArgs {
+    behavior: String,
+    #[arg(long)]
+    checkpoint: Option<String>,
+    #[arg(long, default_value = "configs/models.toml")]
+    config: String,
+    #[arg(long, value_enum)]
+    mode: PromoteMode,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PromoteMode {
+    ShadowInfer,
+    ModelInfer,
+    ShadowTrain,
+}
+
+#[derive(Debug, Parser)]
+struct ModelRegisterArgs {
+    #[arg(long)]
+    behavior: String,
+    #[arg(long)]
+    checkpoint: String,
+    #[arg(long)]
+    training_ledger: Option<String>,
+    #[arg(long)]
+    training_command: Option<String>,
+    #[arg(long)]
+    behavior_report: Option<String>,
+    #[arg(long)]
+    scenario_report: Option<String>,
+    #[arg(long)]
+    comparison_report: Option<String>,
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    notes: Vec<String>,
+    #[arg(long)]
+    parent: Option<String>,
+    #[arg(long, default_value = "data/models/registry.json")]
+    registry: String,
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ModelPromoteArgs {
+    #[arg(long)]
+    behavior: String,
+    #[arg(long)]
+    name: String,
+    #[arg(long, value_enum)]
+    target: ModelStatus,
+    #[arg(long)]
+    baseline_report: Option<String>,
+    #[arg(long)]
+    candidate_report: Option<String>,
+    #[arg(long)]
+    comparison_report: Option<String>,
+    #[arg(long, default_value = "data/models/registry.json")]
+    registry: String,
+    #[arg(long)]
+    allow_safety_critical_inference: bool,
+    #[arg(long)]
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct CompareScenarioReportsArgs {
+    #[arg(long)]
+    baseline: String,
+    #[arg(long)]
+    candidate: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    out: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct MouthArgs {
+    #[arg(default_value = "Hello. My name is Pete.")]
+    text: String,
+}
+
+#[derive(Debug, Parser)]
+struct WhisperTranscribeArgs {
+    #[arg(long)]
+    model: Option<PathBuf>,
+    wav: PathBuf,
+}
+
+async fn run_sim(args: SimArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let flags = RuntimeModelFlags::from(&args);
+    let (models, model_loading) = load_runtime_models_from_flags(&flags)?;
+    let action_selector_mode = ActionSelectorMode::from(args.action_selector);
+    let inline_learning = inline_learning_config_from_sim_args(&args)?;
+    let models_loaded = loaded_model_names(&model_loading);
+    let conductor = SimpleConductor::default();
+    let mut live_action_selector_label = action_selector_mode.as_str().to_string();
+    if let Some(checkpoint) = args.dream_policy_checkpoint.as_deref() {
+        println!(
+            "Dream NEAT controller ignored for live control: {checkpoint}. Reign mechanics drive directly; models remain shadow observers."
+        );
+        live_action_selector_label = format!("reign-passthrough+{}", action_selector_mode.as_str());
+    }
+    let memory = DurableExperienceStore::from_env();
+    let recall = memory.clone();
+    let llm = configured_llm_agent_for_sim(&args.llm, args.live)?;
+    let mut runtime = MinimalRuntime::with_default_events(
+        ledger,
+        memory,
+        recall,
+        conductor,
+        SimpleSafety::default(),
+        llm,
+    )
+    .with_action_selector_mode(action_selector_mode)
+    .with_inline_learning(inline_learning.clone())
+    .with_nudge_policy(NudgePolicy::virtual_default());
+    if let Some(models) = models {
+        runtime = runtime.with_models(models);
+    }
+
+    let scenario_kind: ScenarioKind = args.scenario.into();
+    let scenario = build_scenario(ScenarioConfig::new(scenario_kind, args.seed));
+    let live_metadata = live_scene_metadata_from_scenario(&scenario.metadata);
+    let world = scenario.world;
+    let motors = scenario.motors;
+    let mut runner = SimRunner::new(runtime, world, motors);
+    if args.live {
+        let live_state = LiveViewState::new().with_virtual_retina(true);
+        let initial_snapshot = runner.world.snapshot().await?;
+        live_state.update(initial_snapshot);
+        live_state.update_inline_learning(inline_learning.clone());
+        live_state.update_scene_metadata(live_metadata);
+        live_state.update_session(SceneSession {
+            mode: "virtual-live".to_string(),
+            scenario: Some(scenario_kind.slug().to_string()),
+            seed: Some(args.seed),
+            source: "sim".to_string(),
+            tick_ms: Some(args.tick_delay_ms),
+        });
+        live_state.update_training_status(pete_server::LiveTrainingStatus {
+            training_mode: inline_learning.training_mode_label().to_string(),
+            ledger_path: Some(args.ledger.clone()),
+            frames_written: 0,
+            transitions_written: 0,
+            models_loaded: models_loaded.clone(),
+            model_modes: model_modes_from_flags(&flags),
+            action_selector_mode: live_action_selector_label.clone(),
+            weights_updating: inline_learning.is_enabled(),
+        });
+        live_state.update_behavior_nodes(runner.runtime.behavior_node_states());
+        let server_state = live_state.clone();
+        let reign_state = pete_server::ReignServerState::with_live_view(
+            runner.runtime.reign_queue.clone(),
+            &live_state,
+        );
+        let live_addr = args.live_addr;
+        if args.live_tls {
+            let cert_path = args.live_tls_cert.clone();
+            let key_path = args.live_tls_key.clone();
+            tokio::spawn(async move {
+                if let Err(error) = pete_server::serve_live_view_with_reign_tls(
+                    live_addr,
+                    server_state,
+                    reign_state,
+                    cert_path,
+                    key_path,
+                )
+                .await
+                {
+                    eprintln!("live robot HTTPS view server stopped: {error}");
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(error) = pete_server::serve_live_view_with_reign(
+                    live_addr,
+                    server_state,
+                    reign_state,
+                )
+                .await
+                {
+                    eprintln!("live robot view server stopped: {error}");
+                }
+            });
+        }
+        let scheme = if args.live_tls { "https" } else { "http" };
+        println!();
+        println!("Pete Dream World is running.");
+        if inline_learning.is_enabled() {
+            println!(
+                "Dream World is collecting experience and running {} inline learning.",
+                inline_learning.mode.as_str()
+            );
+        } else {
+            println!("Dream World is collecting experience.");
+            println!("Models are not updated online in this run.");
+            println!("Train later with `cargo run --bin pete -- train behavior ...`");
+        }
+        println!();
+        println!("Desktop:");
+        println!("  {scheme}://127.0.0.1:{}/view/3d", args.live_addr.port());
+        println!();
+        println!("Bound address:");
+        println!("  {scheme}://{}/view/3d", args.live_addr);
+        println!();
+        println!("Scene JSON:");
+        println!("  {scheme}://{}/view/scene", args.live_addr);
+        if args.live_tls {
+            println!();
+            println!("If your headset warns about the certificate, trust the local dev certificate or install the generated CA/cert.");
+            println!("This serves robot/dream-world sensor data on the LAN. Use only on trusted networks.");
+        }
+        for _ in 0..args.steps {
+            let current_inline_learning = live_state.inline_learning();
+            runner.runtime.inline_learning = current_inline_learning.clone();
+            for node in live_state.behavior_nodes() {
+                runner.runtime.apply_behavior_node_update(
+                    &node.behavior_id,
+                    &pete_behaviors::BehaviorNodeUpdate {
+                        selected_regime: Some(node.selected_regime),
+                        selected_hardcoded: Some(node.selected_hardcoded.clone()),
+                        selected_model: node.selected_model.clone(),
+                        checkpoint_path: node.checkpoint_path.clone(),
+                        fallback_policy: Some(node.fallback_policy),
+                        training_enabled: Some(node.training_enabled),
+                    },
+                );
+            }
+            let eye_frame = live_state.take_pending_retina_frame();
+            if let Some(mut frame) = eye_frame {
+                frame.source = Some("babylon-robot-eye".to_string());
+                runner.world.set_retina_frame(Some(frame));
+                live_state.record_ledger_write();
+            } else {
+                runner.world.set_retina_frame(None);
+            }
+            let mut live_snapshot = None;
+            runner
+                .run_steps_observing_ticks(1, |snapshot, tick| {
+                    live_snapshot = Some(snapshot.clone());
+                    live_state.update_embodied_context(tick.frame.embodied_context());
+                })
+                .await?;
+            live_state.update_behavior_nodes(runner.runtime.behavior_node_states());
+            live_state.update(live_snapshot.unwrap_or(runner.world.snapshot().await?));
+            live_state.update_prod_state(runner.runtime.nudge_status());
+            live_state.update_training_status(pete_server::LiveTrainingStatus {
+                training_mode: current_inline_learning.training_mode_label().to_string(),
+                ledger_path: Some(args.ledger.clone()),
+                frames_written: runner.tick_count,
+                transitions_written: runner.tick_count.saturating_sub(1),
+                models_loaded: models_loaded.clone(),
+                model_modes: model_modes_from_flags(&flags),
+                action_selector_mode: live_action_selector_label.clone(),
+                weights_updating: current_inline_learning.is_enabled(),
+            });
+            tokio::time::sleep(Duration::from_millis(args.tick_delay_ms)).await;
+        }
+    } else {
+        runner.run_steps(args.steps).await?;
+    }
+    println!(
+        "sim complete: {} ticks, seed {}, ledger {}, action_selector {:?}, danger_mode {:?}, charge_mode {:?}, action_value_mode {:?}, eye_next_mode {:?}, ear_next_mode {:?}, experience_mode {:?}",
+        runner.tick_count,
+        args.seed,
+        args.ledger,
+        args.action_selector,
+        args.danger_mode,
+        args.charge_mode,
+        args.action_value_mode,
+        args.eye_next_mode,
+        args.ear_next_mode,
+        args.experience_mode
+    );
+    Ok(())
+}
+
+fn loaded_model_names(report: &RuntimeModelLoadReport) -> Vec<String> {
+    let mut names = report
+        .loaded_checkpoints
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn inline_learning_config_from_sim_args(args: &SimArgs) -> Result<InlineLearningConfig> {
+    let mut mode = InlineLearningMode::from(args.inline_learning_mode);
+    if args.inline_learning && mode == InlineLearningMode::Off {
+        mode = InlineLearningMode::WorldOutcome;
+    }
+    Ok(InlineLearningConfig {
+        mode,
+        behaviors: inline_learning_behaviors(args.inline_behaviors.as_deref())?,
+        max_train_steps_per_tick: args.inline_train_steps_per_tick,
+    })
+}
+
+fn inline_learning_behaviors(list: Option<&str>) -> Result<InlineLearningBehaviors> {
+    let Some(list) = list else {
+        return Ok(InlineLearningBehaviors::default());
+    };
+    if list.trim().is_empty() || list.trim().eq_ignore_ascii_case("all") {
+        return Ok(InlineLearningBehaviors::default());
+    }
+    let mut behaviors = InlineLearningBehaviors {
+        danger: false,
+        charge: false,
+        future: false,
+        action_value: false,
+        eye_next: false,
+        ear_next: false,
+        experience: false,
+    };
+    for raw in list.split(',') {
+        match raw.trim().replace('-', "_").as_str() {
+            "" => {}
+            "danger" => behaviors.danger = true,
+            "charge" => behaviors.charge = true,
+            "future" => behaviors.future = true,
+            "action_value" => behaviors.action_value = true,
+            "eye_next" => behaviors.eye_next = true,
+            "ear_next" => behaviors.ear_next = true,
+            "experience" => behaviors.experience = true,
+            other => anyhow::bail!(
+                "unknown inline behavior '{other}', expected one of danger,charge,future,action_value,eye_next,ear_next,experience"
+            ),
+        }
+    }
+    Ok(behaviors)
+}
+
+fn live_scene_metadata_from_scenario(
+    metadata: &pete_sim::ScenarioMetadata,
+) -> LiveSceneMetadata {
+    LiveSceneMetadata {
+        arena: Some(SceneArena {
+            width_m: metadata.arena.width_m,
+            height_m: metadata.arena.height_m,
+        }),
+        objects: metadata
+            .objects
+            .iter()
+            .map(|object| SceneObject {
+                id: object.id.clone(),
+                kind: match &object.kind {
+                    SimObjectKind::Obstacle => "obstacle",
+                    SimObjectKind::Charger => "charger",
+                    SimObjectKind::Person { .. } => "person",
+                    SimObjectKind::SoundSource { .. } => "speaker",
+                    SimObjectKind::Landmark { .. } => "landmark",
+                }
+                .to_string(),
+                x_m: object.x_m,
+                y_m: object.y_m,
+                radius_m: object.radius_m,
+                label: Some(object.label.clone()),
+                color_rgb: Some(object.color_rgb),
+            })
+            .collect(),
+        sensor_calibration: Some(SceneSensorCalibration {
+            compact_depth_fov_rad: std::f32::consts::PI * 0.68,
+            ..SceneSensorCalibration::sim_default()
+        }),
+    }
+}
+
+const DEFAULT_REAL_DEPTH_CAMERA_YAW_DEG: f32 = -90.0;
+
+fn real_robot_depth_calibration_from_env() -> SceneSensorCalibration {
+    let height_m = env_f32("PETE_DEPTH_CAMERA_HEIGHT_M", 0.46);
+    let forward_m = env_f32("PETE_DEPTH_CAMERA_FORWARD_M", 0.0);
+    let pitch_rad = env_f32("PETE_DEPTH_CAMERA_PITCH_DEG", 0.0).to_radians();
+    let roll_rad = env_f32("PETE_DEPTH_CAMERA_ROLL_DEG", 0.0).to_radians();
+    let yaw_rad = env_f32(
+        "PETE_DEPTH_CAMERA_YAW_DEG",
+        DEFAULT_REAL_DEPTH_CAMERA_YAW_DEG,
+    )
+    .to_radians();
+    let color_offset_x_px = env_i32("PETE_DEPTH_COLOR_OFFSET_X_PX", 3);
+    let color_offset_y_px = env_i32("PETE_DEPTH_COLOR_OFFSET_Y_PX", 7);
+    SceneSensorCalibration {
+        compact_depth_beam_count: env_usize("PETE_COMPACT_DEPTH_BEAM_COUNT", 32),
+        compact_depth_fov_rad: env_f32("PETE_DEPTH_FOV_DEG", 122.0).to_radians(),
+        depth_scale: env_f32("PETE_DEPTH_SCALE", 1.0),
+        point_y_m: height_m,
+        depth_forward_offset_m: forward_m,
+        depth_pitch_down_rad: pitch_rad,
+        camera_forward_m: forward_m,
+        camera_height_m: height_m,
+        camera_pitch_rad: pitch_rad,
+        camera_roll_rad: roll_rad,
+        camera_yaw_rad: yaw_rad,
+        color_offset_x_px,
+        color_offset_y_px,
+    }
+}
+
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+async fn run_sim_curriculum(args: SimCurriculumArgs) -> Result<()> {
+    if args.validation_ratio < 0.0 || args.test_ratio < 0.0 {
+        anyhow::bail!("validation and test ratios must be non-negative");
+    }
+    if args.validation_ratio + args.test_ratio >= 1.0 {
+        anyhow::bail!("validation_ratio + test_ratio must be less than 1.0");
+    }
+
+    let kind = ScenarioKind::from(args.scenario);
+    let ledger = JsonlLedger::new(&args.out);
+    let mut total_ticks = 0usize;
+    let mut capture_count = 0usize;
+    let mut manifest_episodes = Vec::with_capacity(args.episodes);
+
+    for episode_index in 0..args.episodes {
+        let episode_seed = args.seed.saturating_add(episode_index as u64);
+        let scenario = build_scenario(ScenarioConfig::new(kind, episode_seed));
+        let object_count = scenario.metadata.objects.len();
+        let object_summary = scenario_object_summary(&scenario.metadata.objects);
+        let runtime = default_runtime(ledger.clone(), &args.llm)?;
+        let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
+        runner.tick_ms = args.tick_ms;
+        let mut capture_path_for_manifest = None;
+
+        if let Some(root) = &args.capture_root {
+            let mut snapshots = Vec::with_capacity(args.steps);
+            runner
+                .run_steps_observing(args.steps, |snapshot| snapshots.push(snapshot.clone()))
+                .await?;
+            let capture_path = Path::new(root).join(format!("episode-{episode_index:03}"));
+            capture_path_for_manifest = Some(capture_path.to_string_lossy().to_string());
+            let mut writer =
+                CaptureWriter::create(&capture_path, CaptureSource::Sim, Some(args.tick_ms))
+                    .await?;
+            writer.manifest_mut().scenario = Some(scenario.metadata.clone());
+            for snapshot in snapshots {
+                writer
+                    .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+                    .await?;
+            }
+            writer.finish().await?;
+            capture_count = capture_count.saturating_add(1);
+        } else {
+            runner.run_steps(args.steps).await?;
+        }
+        total_ticks = total_ticks.saturating_add(runner.tick_count);
+        manifest_episodes.push(serde_json::json!({
+            "index": episode_index,
+            "split": curriculum_split(
+                episode_index,
+                args.episodes,
+                args.validation_ratio,
+                args.test_ratio,
+            ),
+            "scenario": kind.slug(),
+            "seed": episode_seed,
+            "steps": args.steps,
+            "ticks": runner.tick_count,
+            "arena": scenario.metadata.arena,
+            "spawn": {
+                "x_m": scenario.metadata.body.odometry.x_m,
+                "y_m": scenario.metadata.body.odometry.y_m,
+                "heading_rad": scenario.metadata.body.odometry.heading_rad,
+                "battery_level": scenario.metadata.body.battery_level,
+            },
+            "object_count": object_count,
+            "objects": object_summary,
+            "capture": capture_path_for_manifest,
+        }));
+        println!(
+            "episode {} complete: scenario {}, seed {}, ticks {}, objects {}",
+            episode_index,
+            kind.slug(),
+            episode_seed,
+            runner.tick_count,
+            object_count
+        );
+    }
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "scenario": kind.slug(),
+        "base_seed": args.seed,
+        "episodes": args.episodes,
+        "steps_per_episode": args.steps,
+        "tick_ms": args.tick_ms,
+        "ledger": args.out,
+        "capture_root": args.capture_root,
+        "splits": {
+            "train": manifest_episodes.iter().filter(|episode| episode["split"] == "train").count(),
+            "validation": manifest_episodes.iter().filter(|episode| episode["split"] == "validation").count(),
+            "test": manifest_episodes.iter().filter(|episode| episode["split"] == "test").count(),
+            "validation_ratio": args.validation_ratio,
+            "test_ratio": args.test_ratio,
+        },
+        "episodes_detail": manifest_episodes,
+    });
+    fs::create_dir_all(&args.out)?;
+    let manifest_path = Path::new(&args.out).join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+
+    let transitions = ledger.transitions().await?;
+    println!(
+        "sim curriculum complete: scenario {}, episodes {}, ticks {}, ledger {}, transitions {}, captures {}, manifest {}",
+        kind.slug(),
+        args.episodes,
+        total_ticks,
+        args.out,
+        transitions.len(),
+        capture_count,
+        manifest_path.display()
+    );
+    Ok(())
+}
+
+fn curriculum_split(
+    episode_index: usize,
+    episode_count: usize,
+    validation_ratio: f32,
+    test_ratio: f32,
+) -> &'static str {
+    let validation_count = ((episode_count as f32) * validation_ratio).round() as usize;
+    let test_count = ((episode_count as f32) * test_ratio).round() as usize;
+    let train_count = episode_count.saturating_sub(validation_count + test_count);
+    if episode_index < train_count {
+        "train"
+    } else if episode_index < train_count + validation_count {
+        "validation"
+    } else {
+        "test"
+    }
+}
+
+fn scenario_object_summary(objects: &[pete_sim::SimObject]) -> serde_json::Value {
+    let mut chargers = 0usize;
+    let mut obstacles = 0usize;
+    let mut people = 0usize;
+    let mut speakers = 0usize;
+    let mut landmarks = 0usize;
+
+    for object in objects {
+        match &object.kind {
+            pete_sim::SimObjectKind::Charger => chargers += 1,
+            pete_sim::SimObjectKind::Obstacle => obstacles += 1,
+            pete_sim::SimObjectKind::Person { .. } => people += 1,
+            pete_sim::SimObjectKind::SoundSource { .. } => speakers += 1,
+            pete_sim::SimObjectKind::Landmark { .. } => landmarks += 1,
+        }
+    }
+
+    serde_json::json!({
+        "chargers": chargers,
+        "obstacles": obstacles,
+        "people": people,
+        "speakers": speakers,
+        "landmarks": landmarks,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ScenarioEvaluationReport {
+    schema_version: u32,
+    scenario: String,
+    base_seed: u64,
+    episodes: usize,
+    steps_per_episode: usize,
+    tick_ms: u64,
+    action_selector_mode: String,
+    model_modes: HashMap<String, String>,
+    model_loading: RuntimeModelLoadReport,
+    ledger: Option<String>,
+    capture_root: Option<String>,
+    summary: ScenarioEvaluationSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<ScenarioMemorySummary>,
+    episodes_detail: Vec<ScenarioEpisodeReport>,
+    recommendation: String,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioEvaluationSummary {
+    success_rate: f32,
+    collision_rate: f32,
+    mean_collisions_per_episode: f32,
+    mean_battery_delta: f32,
+    mean_final_battery: f32,
+    mean_distance_to_charger_final_m: Option<f32>,
+    #[serde(default)]
+    ticks_with_charger_visible: usize,
+    #[serde(default)]
+    ticks_with_charger_near: usize,
+    #[serde(default)]
+    ticks_approaching_charger: usize,
+    #[serde(default)]
+    ticks_docking_from_too_far: usize,
+    mean_nearest_obstacle_m: Option<f32>,
+    mean_distance_traveled_m: f32,
+    #[serde(default)]
+    action_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    wall_cliff_veto_count: usize,
+    #[serde(default)]
+    escape_progress_score: f32,
+    mean_ticks_survived: f32,
+    #[serde(default)]
+    stuck_count: usize,
+    #[serde(default)]
+    trap_kind_counts: HashMap<String, usize>,
+    #[serde(default)]
+    recovery_attempts: usize,
+    #[serde(default)]
+    stuck_duration: Option<f32>,
+    #[serde(default)]
+    mean_stuck_duration: Option<f32>,
+    #[serde(default)]
+    recovery_success_rate: Option<f32>,
+    #[serde(default)]
+    mean_recovery_ticks: Option<f32>,
+    #[serde(default)]
+    repeated_trap_count: usize,
+    #[serde(default)]
+    dead_battery_tick: Option<usize>,
+    #[serde(default)]
+    distance_after_recovery_m: Option<f32>,
+    mean_safety_interventions: f32,
+    behavior_run_records: usize,
+    #[serde(default)]
+    model_fallbacks: usize,
+    #[serde(default)]
+    action_selector_fallbacks: usize,
+    #[serde(default)]
+    action_selector_guard_yields: usize,
+    #[serde(default)]
+    map_memory_decisions: usize,
+    #[serde(default)]
+    danger_memory_decisions: usize,
+    #[serde(default)]
+    charge_memory_decisions: usize,
+    #[serde(default)]
+    novelty_memory_decisions: usize,
+    #[serde(default)]
+    frontier_memory_decisions: usize,
+    #[serde(default)]
+    trap_memory_decisions: usize,
+    #[serde(default)]
+    memory_navigation_intents: HashMap<String, usize>,
+    #[serde(default)]
+    memory_navigation_reasons: HashMap<String, usize>,
+    #[serde(default)]
+    map_memory_signals: HashMap<String, usize>,
+    #[serde(default)]
+    map_memory_safety_overrides: usize,
+    #[serde(default)]
+    low_confidence_navigation_fallbacks: usize,
+    model_assisted_decisions: usize,
+    action_selector_safety_overrides: usize,
+    mean_chosen_score: Option<f32>,
+    mean_candidate_score: Option<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ScenarioEpisodeReport {
+    index: usize,
+    seed: u64,
+    success: bool,
+    ticks: usize,
+    collisions: usize,
+    wall_hits: usize,
+    bumper_hits: usize,
+    cliff_hits: usize,
+    charging_ticks: usize,
+    first_charge_tick: Option<usize>,
+    started_battery: f32,
+    final_battery: f32,
+    battery_delta: f32,
+    min_nearest_obstacle_m: Option<f32>,
+    mean_nearest_obstacle_m: Option<f32>,
+    final_distance_to_charger_m: Option<f32>,
+    #[serde(default)]
+    final_heading_rad: Option<f32>,
+    #[serde(default)]
+    final_bearing_to_charger_rad: Option<f32>,
+    final_distance_to_person_m: Option<f32>,
+    final_distance_to_speaker_m: Option<f32>,
+    distance_traveled_m: f32,
+    #[serde(default)]
+    ticks_with_charger_visible: usize,
+    #[serde(default)]
+    ticks_with_charger_near: usize,
+    #[serde(default)]
+    ticks_approaching_charger: usize,
+    #[serde(default)]
+    ticks_docking_from_too_far: usize,
+    #[serde(default)]
+    action_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    wall_cliff_veto_count: usize,
+    #[serde(default)]
+    escape_progress_score: f32,
+    #[serde(default)]
+    stuck_ticks: usize,
+    #[serde(default)]
+    stuck_count: usize,
+    #[serde(default)]
+    trap_kind_counts: HashMap<String, usize>,
+    #[serde(default)]
+    recovery_attempts: usize,
+    #[serde(default)]
+    stuck_duration: Option<f32>,
+    #[serde(default)]
+    mean_stuck_duration: Option<f32>,
+    #[serde(default)]
+    recovery_success_rate: Option<f32>,
+    #[serde(default)]
+    mean_recovery_ticks: Option<f32>,
+    #[serde(default)]
+    repeated_trap_count: usize,
+    #[serde(default)]
+    dead_battery_tick: Option<usize>,
+    #[serde(default)]
+    distance_after_recovery_m: Option<f32>,
+    unique_actions: Vec<String>,
+    safety_interventions: usize,
+    behavior_run_records: usize,
+    model_fallbacks: usize,
+    model_assisted_decisions: usize,
+    action_selector_safety_overrides: usize,
+    action_selector_fallbacks: usize,
+    #[serde(default)]
+    action_selector_guard_yields: usize,
+    #[serde(default)]
+    map_memory_decisions: usize,
+    #[serde(default)]
+    danger_memory_decisions: usize,
+    #[serde(default)]
+    charge_memory_decisions: usize,
+    #[serde(default)]
+    novelty_memory_decisions: usize,
+    #[serde(default)]
+    frontier_memory_decisions: usize,
+    #[serde(default)]
+    trap_memory_decisions: usize,
+    #[serde(default)]
+    memory_navigation_intents: HashMap<String, usize>,
+    #[serde(default)]
+    memory_navigation_reasons: HashMap<String, usize>,
+    #[serde(default)]
+    map_memory_signals: HashMap<String, usize>,
+    #[serde(default)]
+    map_memory_safety_overrides: usize,
+    #[serde(default)]
+    map_memory_decision_samples: Vec<ScenarioMapMemoryDecisionReport>,
+    #[serde(default)]
+    low_confidence_navigation_fallbacks: usize,
+    mean_chosen_score: Option<f32>,
+    mean_candidate_score: Option<f32>,
+    ticks_with_eye_frames: usize,
+    ticks_with_ear_features: usize,
+    ticks_with_voice_embeddings: usize,
+    ticks_with_face_embeddings: usize,
+    ticks_with_kinect_skeletons: usize,
+    ticks_with_future_predictions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<ScenarioEpisodeMemoryReport>,
+    capture: Option<String>,
+    ledger: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioMemorySummary {
+    places_visited: usize,
+    mean_places_visited_per_episode: f32,
+    charge_memory_hit_rate: Option<f32>,
+    danger_memory_hit_rate: Option<f32>,
+    social_memory_hit_rate: Option<f32>,
+    novelty_decay_sane: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioMapMemoryDecisionReport {
+    signal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signal_value: Option<f32>,
+    signal_confidence: f32,
+    chosen_action: Option<ActionPrimitive>,
+    reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason_string: Option<String>,
+    safety_overrode: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioEpisodeMemoryReport {
+    places_visited: usize,
+    charge_memory_ticks: usize,
+    charge_opportunity_ticks: usize,
+    charge_memory_hit_rate: Option<f32>,
+    danger_memory_ticks: usize,
+    danger_opportunity_ticks: usize,
+    danger_memory_hit_rate: Option<f32>,
+    social_memory_ticks: usize,
+    social_opportunity_ticks: usize,
+    social_memory_hit_rate: Option<f32>,
+    first_novelty: Option<f32>,
+    final_novelty: Option<f32>,
+    novelty_decayed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct EpisodeMetricBuilder {
+    kind: ScenarioKind,
+    metadata: pete_sim::ScenarioMetadata,
+    index: usize,
+    seed: u64,
+    ledger: Option<String>,
+    capture: Option<String>,
+    ticks: usize,
+    collisions: usize,
+    wall_hits: usize,
+    bumper_hits: usize,
+    cliff_hits: usize,
+    charging_ticks: usize,
+    first_charge_tick: Option<usize>,
+    started_battery: Option<f32>,
+    final_battery: f32,
+    min_nearest_obstacle_m: Option<f32>,
+    nearest_obstacle_sum: f32,
+    nearest_obstacle_count: usize,
+    start_position: Option<(f32, f32)>,
+    last_position: Option<(f32, f32)>,
+    last_heading_rad: Option<f32>,
+    distance_traveled_m: f32,
+    ticks_with_charger_visible: usize,
+    ticks_with_charger_near: usize,
+    ticks_approaching_charger: usize,
+    ticks_docking_from_too_far: usize,
+    stuck_ticks: usize,
+    stuck_count: usize,
+    trap_kind_counts: HashMap<String, usize>,
+    recovery_attempts: usize,
+    stuck_duration_sum_ms: f32,
+    stuck_duration_count: usize,
+    active_stuck_duration_ms: Option<f32>,
+    recovery_successes: usize,
+    recovery_ticks_sum: usize,
+    recovery_tick_count: usize,
+    repeated_trap_count: usize,
+    distance_at_last_recovery_m: Option<f32>,
+    dead_battery_tick: Option<usize>,
+    unique_actions: BTreeSet<String>,
+    action_histogram: HashMap<String, usize>,
+    wall_cliff_veto_count: usize,
+    safety_interventions: usize,
+    behavior_run_records: usize,
+    model_fallbacks: usize,
+    model_assisted_decisions: usize,
+    action_selector_safety_overrides: usize,
+    action_selector_fallbacks: usize,
+    action_selector_guard_yields: usize,
+    map_memory_decisions: usize,
+    danger_memory_decisions: usize,
+    charge_memory_decisions: usize,
+    novelty_memory_decisions: usize,
+    frontier_memory_decisions: usize,
+    trap_memory_decisions: usize,
+    memory_navigation_intents: HashMap<String, usize>,
+    memory_navigation_reasons: HashMap<String, usize>,
+    map_memory_signals: HashMap<String, usize>,
+    map_memory_safety_overrides: usize,
+    map_memory_decision_samples: Vec<ScenarioMapMemoryDecisionReport>,
+    low_confidence_navigation_fallbacks: usize,
+    chosen_score_sum: f32,
+    chosen_score_count: usize,
+    candidate_score_sum: f32,
+    candidate_score_count: usize,
+    ticks_with_eye_frames: usize,
+    ticks_with_ear_features: usize,
+    ticks_with_voice_embeddings: usize,
+    ticks_with_face_embeddings: usize,
+    ticks_with_kinect_skeletons: usize,
+    ticks_with_future_predictions: usize,
+    memory: ScenarioEpisodeMemoryBuilder,
+}
+
+impl EpisodeMetricBuilder {
+    fn new(
+        kind: ScenarioKind,
+        metadata: pete_sim::ScenarioMetadata,
+        index: usize,
+        seed: u64,
+        ledger: Option<String>,
+        capture: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            metadata,
+            index,
+            seed,
+            ledger,
+            capture,
+            ticks: 0,
+            collisions: 0,
+            wall_hits: 0,
+            bumper_hits: 0,
+            cliff_hits: 0,
+            charging_ticks: 0,
+            first_charge_tick: None,
+            started_battery: None,
+            final_battery: 0.0,
+            min_nearest_obstacle_m: None,
+            nearest_obstacle_sum: 0.0,
+            nearest_obstacle_count: 0,
+            start_position: None,
+            last_position: None,
+            last_heading_rad: None,
+            distance_traveled_m: 0.0,
+            ticks_with_charger_visible: 0,
+            ticks_with_charger_near: 0,
+            ticks_approaching_charger: 0,
+            ticks_docking_from_too_far: 0,
+            stuck_ticks: 0,
+            stuck_count: 0,
+            trap_kind_counts: HashMap::new(),
+            recovery_attempts: 0,
+            stuck_duration_sum_ms: 0.0,
+            stuck_duration_count: 0,
+            active_stuck_duration_ms: None,
+            recovery_successes: 0,
+            recovery_ticks_sum: 0,
+            recovery_tick_count: 0,
+            repeated_trap_count: 0,
+            distance_at_last_recovery_m: None,
+            dead_battery_tick: None,
+            unique_actions: BTreeSet::new(),
+            action_histogram: HashMap::new(),
+            wall_cliff_veto_count: 0,
+            safety_interventions: 0,
+            behavior_run_records: 0,
+            model_fallbacks: 0,
+            model_assisted_decisions: 0,
+            action_selector_safety_overrides: 0,
+            action_selector_fallbacks: 0,
+            action_selector_guard_yields: 0,
+            map_memory_decisions: 0,
+            danger_memory_decisions: 0,
+            charge_memory_decisions: 0,
+            novelty_memory_decisions: 0,
+            frontier_memory_decisions: 0,
+            trap_memory_decisions: 0,
+            memory_navigation_intents: HashMap::new(),
+            memory_navigation_reasons: HashMap::new(),
+            map_memory_signals: HashMap::new(),
+            map_memory_safety_overrides: 0,
+            map_memory_decision_samples: Vec::new(),
+            low_confidence_navigation_fallbacks: 0,
+            chosen_score_sum: 0.0,
+            chosen_score_count: 0,
+            candidate_score_sum: 0.0,
+            candidate_score_count: 0,
+            ticks_with_eye_frames: 0,
+            ticks_with_ear_features: 0,
+            ticks_with_voice_embeddings: 0,
+            ticks_with_face_embeddings: 0,
+            ticks_with_kinect_skeletons: 0,
+            ticks_with_future_predictions: 0,
+            memory: ScenarioEpisodeMemoryBuilder::default(),
+        }
+    }
+
+    fn observe(&mut self, snapshot: &WorldSnapshot, tick: &RuntimeTick) {
+        self.ticks = self.ticks.saturating_add(1);
+        let body = &snapshot.body;
+        self.started_battery.get_or_insert(body.battery_level);
+        self.final_battery = body.battery_level;
+        if self.dead_battery_tick.is_none() && body.battery_level <= f32::EPSILON && !body.charging
+        {
+            self.dead_battery_tick = Some(self.ticks.saturating_sub(1));
+        }
+        let position = (body.odometry.x_m, body.odometry.y_m);
+        if self.start_position.is_none() {
+            self.start_position = Some(position);
+        }
+        self.last_heading_rad = Some(body.odometry.heading_rad);
+        if let Some(last) = self.last_position.replace(position) {
+            let step_distance = distance_between(last, position);
+            self.distance_traveled_m += step_distance;
+        }
+        let charger_near_score = sim_world_score(snapshot, 3);
+        let charger_visible_score = sim_world_score(snapshot, 4);
+        if charger_visible_score >= 0.20 {
+            self.ticks_with_charger_visible = self.ticks_with_charger_visible.saturating_add(1);
+        }
+        if charger_near_score >= 0.25 || body.charging {
+            self.ticks_with_charger_near = self.ticks_with_charger_near.saturating_add(1);
+        }
+
+        let bumper = body.flags.bump_left || body.flags.bump_right;
+        let cliff = body.flags.cliff_left
+            || body.flags.cliff_front_left
+            || body.flags.cliff_front_right
+            || body.flags.cliff_right;
+        let collision = bumper || body.flags.wall || cliff;
+        if collision {
+            self.collisions = self.collisions.saturating_add(1);
+        }
+        if body.flags.wall {
+            self.wall_hits = self.wall_hits.saturating_add(1);
+        }
+        if bumper {
+            self.bumper_hits = self.bumper_hits.saturating_add(1);
+        }
+        if cliff {
+            self.cliff_hits = self.cliff_hits.saturating_add(1);
+        }
+        if body.charging {
+            if self.first_charge_tick.is_none() {
+                self.first_charge_tick = Some(self.ticks.saturating_sub(1));
+            }
+            self.charging_ticks = self.charging_ticks.saturating_add(1);
+        }
+        if let Some(nearest) = snapshot.range.nearest_m {
+            self.min_nearest_obstacle_m = Some(
+                self.min_nearest_obstacle_m
+                    .map(|value| value.min(nearest))
+                    .unwrap_or(nearest),
+            );
+            self.nearest_obstacle_sum += nearest;
+            self.nearest_obstacle_count = self.nearest_obstacle_count.saturating_add(1);
+        }
+        if let Some(action) = &tick.chosen_action {
+            self.unique_actions.insert(format!("{action:?}"));
+            *self
+                .action_histogram
+                .entry(action_histogram_label(action).to_string())
+                .or_default() += 1;
+            if matches!(
+                action,
+                ActionPrimitive::Approach {
+                    target: ApproachTarget::Charger
+                }
+            ) {
+                self.ticks_approaching_charger = self.ticks_approaching_charger.saturating_add(1);
+            }
+            if matches!(action, ActionPrimitive::Dock)
+                && !body.charging
+                && charger_near_score < 0.80
+            {
+                self.ticks_docking_from_too_far = self.ticks_docking_from_too_far.saturating_add(1);
+            }
+        }
+        self.observe_stuck(snapshot);
+        if tick
+            .frame
+            .now
+            .extensions
+            .get("safety.vetoed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            self.safety_interventions = self.safety_interventions.saturating_add(1);
+            if wall_or_cliff_veto(tick) {
+                self.wall_cliff_veto_count = self.wall_cliff_veto_count.saturating_add(1);
+            }
+        }
+        self.observe_behavior_runs(&tick.frame.behavior_runs);
+        self.observe_action_selector(tick);
+        self.observe_map_memory_decision(tick);
+        if snapshot.eye_frame.is_some() || !snapshot.eye.frames.is_empty() {
+            self.ticks_with_eye_frames = self.ticks_with_eye_frames.saturating_add(1);
+        }
+        if !snapshot.ear.features.is_empty() || snapshot.ear_pcm.is_some() {
+            self.ticks_with_ear_features = self.ticks_with_ear_features.saturating_add(1);
+        }
+        if !snapshot.voice.embeddings.is_empty() {
+            self.ticks_with_voice_embeddings = self.ticks_with_voice_embeddings.saturating_add(1);
+        }
+        if !snapshot.face.embeddings.is_empty() {
+            self.ticks_with_face_embeddings = self.ticks_with_face_embeddings.saturating_add(1);
+        }
+        if !snapshot.kinect.skeletons.is_empty() {
+            self.ticks_with_kinect_skeletons = self.ticks_with_kinect_skeletons.saturating_add(1);
+        }
+        if !tick.frame.predicted_futures.is_empty() {
+            self.ticks_with_future_predictions =
+                self.ticks_with_future_predictions.saturating_add(1);
+        }
+        self.memory.observe(snapshot, tick);
+    }
+
+    fn observe_stuck(&mut self, snapshot: &WorldSnapshot) {
+        let Some(extension) = snapshot
+            .extensions
+            .iter()
+            .find(|extension| extension.name == "sim.stuck")
+        else {
+            return;
+        };
+        let values = &extension.values;
+        let active = values.first().copied().unwrap_or(0.0) > 0.0;
+        let duration_ms = values.get(3).copied().unwrap_or(0.0).max(0.0);
+        let event_started = values.get(6).copied().unwrap_or(0.0) > 0.0;
+        let recovered = values.get(7).copied().unwrap_or(0.0) > 0.0;
+        let trap_kind = trap_kind_label(values.get(10).copied().unwrap_or(0.0));
+        let attempts = values.get(11).copied().unwrap_or(0.0).max(0.0) as usize;
+        let repeated = values.get(12).copied().unwrap_or(0.0).max(0.0) as usize;
+        if event_started {
+            self.stuck_count = self.stuck_count.saturating_add(1);
+            self.recovery_attempts = self.recovery_attempts.saturating_add(1);
+            self.active_stuck_duration_ms = Some(duration_ms);
+            if let Some(kind) = trap_kind {
+                *self.trap_kind_counts.entry(kind.to_string()).or_default() += 1;
+            }
+        }
+        if active {
+            self.stuck_ticks = self.stuck_ticks.saturating_add(1);
+            self.active_stuck_duration_ms = Some(duration_ms);
+        }
+        self.recovery_attempts = self.recovery_attempts.max(attempts);
+        self.repeated_trap_count = self.repeated_trap_count.max(repeated);
+        if recovered {
+            self.recovery_successes = self.recovery_successes.saturating_add(1);
+            let duration = if duration_ms > 0.0 {
+                Some(duration_ms)
+            } else {
+                self.active_stuck_duration_ms
+            };
+            self.active_stuck_duration_ms = None;
+            if let Some(duration) = duration {
+                self.stuck_duration_sum_ms += duration;
+                self.stuck_duration_count = self.stuck_duration_count.saturating_add(1);
+                self.recovery_ticks_sum = self
+                    .recovery_ticks_sum
+                    .saturating_add((duration / 100.0).round().max(0.0) as usize);
+                self.recovery_tick_count = self.recovery_tick_count.saturating_add(1);
+            }
+            self.distance_at_last_recovery_m = Some(self.distance_traveled_m);
+        }
+    }
+
+    fn observe_behavior_runs(&mut self, records: &[ErasedBehaviorRunRecord]) {
+        self.behavior_run_records = self.behavior_run_records.saturating_add(records.len());
+        self.model_fallbacks = self.model_fallbacks.saturating_add(
+            records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.regime,
+                        BehaviorRegime::ModelInfer | BehaviorRegime::ModelTrainAndInfer
+                    ) && (record.error.is_some()
+                        || (record.model_json.is_none() && record.hardcoded_json.is_some()))
+                })
+                .count(),
+        );
+    }
+
+    fn observe_action_selector(&mut self, tick: &RuntimeTick) {
+        let Some(value) = tick.frame.now.extensions.get("action_selector") else {
+            return;
+        };
+        let Ok(decision) = serde_json::from_value::<ActionSelectionDecision>(value.clone()) else {
+            return;
+        };
+        if decision.mode == ActionSelectorMode::ModelAssisted {
+            self.model_assisted_decisions = self.model_assisted_decisions.saturating_add(1);
+        }
+        if decision.safety_overrode {
+            self.action_selector_safety_overrides =
+                self.action_selector_safety_overrides.saturating_add(1);
+        }
+        if decision
+            .candidates
+            .iter()
+            .any(|candidate| candidate.fallback_used)
+        {
+            self.action_selector_fallbacks = self.action_selector_fallbacks.saturating_add(1);
+        }
+        if decision
+            .fallback_warnings
+            .iter()
+            .any(|warning| warning.contains("baseline trap recovery"))
+        {
+            self.action_selector_guard_yields = self.action_selector_guard_yields.saturating_add(1);
+        }
+        if let Some(score) = decision.selected_score {
+            self.chosen_score_sum += score;
+            self.chosen_score_count = self.chosen_score_count.saturating_add(1);
+        }
+        for candidate in decision.candidates {
+            self.candidate_score_sum += candidate.score;
+            self.candidate_score_count = self.candidate_score_count.saturating_add(1);
+        }
+    }
+
+    fn observe_map_memory_decision(&mut self, tick: &RuntimeTick) {
+        let Some(decision) = tick
+            .frame
+            .now
+            .extensions
+            .get("action.motion_bridge")
+            .and_then(|value| value.get("map_memory_decision"))
+        else {
+            return;
+        };
+        if !decision
+            .get("influenced")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.map_memory_decisions = self.map_memory_decisions.saturating_add(1);
+        let reason = decision
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if let Some(intent) = decision
+            .get("navigation_intent")
+            .and_then(|value| value.as_str())
+        {
+            *self
+                .memory_navigation_intents
+                .entry(intent.to_string())
+                .or_default() += 1;
+        }
+        if !reason.is_empty() {
+            *self
+                .memory_navigation_reasons
+                .entry(reason.to_string())
+                .or_default() += 1;
+        }
+        if let Some(signal) = decision.get("signal").and_then(|value| value.as_str()) {
+            *self
+                .map_memory_signals
+                .entry(signal.to_string())
+                .or_default() += 1;
+        }
+        if decision
+            .get("safety_overrode")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            self.map_memory_safety_overrides = self.map_memory_safety_overrides.saturating_add(1);
+        }
+        if self.map_memory_decision_samples.len() < 16 {
+            if let Some(sample) = scenario_map_memory_decision_report(decision) {
+                self.map_memory_decision_samples.push(sample);
+            }
+        }
+        if decision
+            .get("confidence")
+            .and_then(|value| value.as_f64())
+            .map(|confidence| confidence < 0.35)
+            .unwrap_or(false)
+        {
+            self.low_confidence_navigation_fallbacks =
+                self.low_confidence_navigation_fallbacks.saturating_add(1);
+        }
+        if reason.starts_with("danger_") {
+            self.danger_memory_decisions = self.danger_memory_decisions.saturating_add(1);
+        } else if reason.starts_with("charge_") {
+            self.charge_memory_decisions = self.charge_memory_decisions.saturating_add(1);
+        } else if reason.starts_with("safe_novelty_") {
+            self.novelty_memory_decisions = self.novelty_memory_decisions.saturating_add(1);
+        } else if reason.starts_with("frontier_") {
+            self.frontier_memory_decisions = self.frontier_memory_decisions.saturating_add(1);
+        } else if reason.starts_with("recent_trap_") {
+            self.trap_memory_decisions = self.trap_memory_decisions.saturating_add(1);
+        }
+    }
+
+    fn finish(self) -> ScenarioEpisodeReport {
+        let final_position = self.last_position.unwrap_or_else(|| {
+            (
+                self.metadata.body.odometry.x_m,
+                self.metadata.body.odometry.y_m,
+            )
+        });
+        let started_battery = self
+            .started_battery
+            .unwrap_or(self.metadata.body.battery_level);
+        let final_distance_to_charger_m =
+            nearest_object_distance(final_position, &self.metadata.objects, |kind| {
+                matches!(kind, pete_sim::SimObjectKind::Charger)
+            });
+        let final_bearing_to_charger_rad = nearest_object_bearing(
+            final_position,
+            self.last_heading_rad.unwrap_or(0.0),
+            &self.metadata.objects,
+            |kind| matches!(kind, pete_sim::SimObjectKind::Charger),
+        );
+        let final_distance_to_person_m =
+            nearest_object_distance(final_position, &self.metadata.objects, |kind| {
+                matches!(kind, pete_sim::SimObjectKind::Person { .. })
+            });
+        let final_distance_to_speaker_m =
+            nearest_object_distance(final_position, &self.metadata.objects, |kind| {
+                matches!(kind, pete_sim::SimObjectKind::SoundSource { .. })
+            });
+        let mean_nearest_obstacle_m = if self.nearest_obstacle_count == 0 {
+            None
+        } else {
+            Some(self.nearest_obstacle_sum / self.nearest_obstacle_count as f32)
+        };
+        let mut stuck_duration_sum_ms = self.stuck_duration_sum_ms;
+        let mut stuck_duration_count = self.stuck_duration_count;
+        if let Some(duration) = self.active_stuck_duration_ms {
+            stuck_duration_sum_ms += duration;
+            stuck_duration_count = stuck_duration_count.saturating_add(1);
+        }
+        let stuck_duration = (stuck_duration_count > 0)
+            .then_some(stuck_duration_sum_ms / stuck_duration_count as f32);
+        let mut report = ScenarioEpisodeReport {
+            index: self.index,
+            seed: self.seed,
+            success: false,
+            ticks: self.ticks,
+            collisions: self.collisions,
+            wall_hits: self.wall_hits,
+            bumper_hits: self.bumper_hits,
+            cliff_hits: self.cliff_hits,
+            charging_ticks: self.charging_ticks,
+            first_charge_tick: self.first_charge_tick,
+            started_battery,
+            final_battery: self.final_battery,
+            battery_delta: self.final_battery - started_battery,
+            min_nearest_obstacle_m: self.min_nearest_obstacle_m,
+            mean_nearest_obstacle_m,
+            final_distance_to_charger_m,
+            final_heading_rad: self.last_heading_rad,
+            final_bearing_to_charger_rad,
+            final_distance_to_person_m,
+            final_distance_to_speaker_m,
+            distance_traveled_m: self.distance_traveled_m,
+            ticks_with_charger_visible: self.ticks_with_charger_visible,
+            ticks_with_charger_near: self.ticks_with_charger_near,
+            ticks_approaching_charger: self.ticks_approaching_charger,
+            ticks_docking_from_too_far: self.ticks_docking_from_too_far,
+            action_histogram: self.action_histogram,
+            wall_cliff_veto_count: self.wall_cliff_veto_count,
+            escape_progress_score: escape_progress_score(
+                self.kind,
+                self.distance_traveled_m,
+                self.distance_at_last_recovery_m,
+                self.collisions,
+                self.stuck_ticks,
+                self.ticks,
+            ),
+            stuck_ticks: self.stuck_ticks,
+            stuck_count: self.stuck_count,
+            trap_kind_counts: self.trap_kind_counts,
+            recovery_attempts: self.recovery_attempts,
+            stuck_duration,
+            mean_stuck_duration: stuck_duration,
+            recovery_success_rate: (self.stuck_count > 0)
+                .then_some(self.recovery_successes as f32 / self.stuck_count as f32),
+            mean_recovery_ticks: (self.recovery_tick_count > 0)
+                .then_some(self.recovery_ticks_sum as f32 / self.recovery_tick_count as f32),
+            repeated_trap_count: self.repeated_trap_count,
+            dead_battery_tick: self.dead_battery_tick,
+            distance_after_recovery_m: self
+                .distance_at_last_recovery_m
+                .map(|distance| (self.distance_traveled_m - distance).max(0.0)),
+            unique_actions: self.unique_actions.into_iter().collect(),
+            safety_interventions: self.safety_interventions,
+            behavior_run_records: self.behavior_run_records,
+            model_fallbacks: self.model_fallbacks,
+            model_assisted_decisions: self.model_assisted_decisions,
+            action_selector_safety_overrides: self.action_selector_safety_overrides,
+            action_selector_fallbacks: self.action_selector_fallbacks,
+            action_selector_guard_yields: self.action_selector_guard_yields,
+            map_memory_decisions: self.map_memory_decisions,
+            danger_memory_decisions: self.danger_memory_decisions,
+            charge_memory_decisions: self.charge_memory_decisions,
+            novelty_memory_decisions: self.novelty_memory_decisions,
+            frontier_memory_decisions: self.frontier_memory_decisions,
+            trap_memory_decisions: self.trap_memory_decisions,
+            memory_navigation_intents: self.memory_navigation_intents,
+            memory_navigation_reasons: self.memory_navigation_reasons,
+            map_memory_signals: self.map_memory_signals,
+            map_memory_safety_overrides: self.map_memory_safety_overrides,
+            map_memory_decision_samples: self.map_memory_decision_samples,
+            low_confidence_navigation_fallbacks: self.low_confidence_navigation_fallbacks,
+            mean_chosen_score: (self.chosen_score_count > 0)
+                .then_some(self.chosen_score_sum / self.chosen_score_count as f32),
+            mean_candidate_score: (self.candidate_score_count > 0)
+                .then_some(self.candidate_score_sum / self.candidate_score_count as f32),
+            ticks_with_eye_frames: self.ticks_with_eye_frames,
+            ticks_with_ear_features: self.ticks_with_ear_features,
+            ticks_with_voice_embeddings: self.ticks_with_voice_embeddings,
+            ticks_with_face_embeddings: self.ticks_with_face_embeddings,
+            ticks_with_kinect_skeletons: self.ticks_with_kinect_skeletons,
+            ticks_with_future_predictions: self.ticks_with_future_predictions,
+            memory: Some(self.memory.finish()),
+            capture: self.capture,
+            ledger: self.ledger,
+        };
+        report.success = episode_success(self.kind, &report);
+        report
+    }
+}
+
+fn scenario_map_memory_decision_report(
+    decision: &serde_json::Value,
+) -> Option<ScenarioMapMemoryDecisionReport> {
+    let signal = decision.get("signal")?.as_str()?.to_string();
+    let reason = decision.get("reason")?.as_str()?.to_string();
+    let chosen_action = decision
+        .get("chosen_action")
+        .or_else(|| decision.get("selected_action"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    Some(ScenarioMapMemoryDecisionReport {
+        signal,
+        signal_value: decision
+            .get("signal_value")
+            .and_then(|value| value.as_f64())
+            .map(|value| value as f32),
+        signal_confidence: decision
+            .get("signal_confidence")
+            .or_else(|| decision.get("confidence"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0) as f32,
+        chosen_action,
+        reason,
+        reason_string: decision
+            .get("reason_string")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        safety_overrode: decision
+            .get("safety_overrode")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScenarioEpisodeMemoryBuilder {
+    max_places_visited: usize,
+    charge_memory_ticks: usize,
+    charge_opportunity_ticks: usize,
+    danger_memory_ticks: usize,
+    danger_opportunity_ticks: usize,
+    social_memory_ticks: usize,
+    social_opportunity_ticks: usize,
+    first_novelty: Option<f32>,
+    final_novelty: Option<f32>,
+}
+
+impl ScenarioEpisodeMemoryBuilder {
+    fn observe(&mut self, snapshot: &WorldSnapshot, tick: &RuntimeTick) {
+        let memory = &tick.frame.now.memory;
+        self.max_places_visited = self.max_places_visited.max(memory.places_visited as usize);
+        self.first_novelty.get_or_insert(memory.place_novelty);
+        self.final_novelty = Some(memory.place_novelty);
+
+        let charger_near = snapshot.body.charging
+            || sim_world_score(snapshot, 3).max(sim_world_score(snapshot, 4)) >= 0.3;
+        if charger_near {
+            self.charge_opportunity_ticks = self.charge_opportunity_ticks.saturating_add(1);
+            if memory.place_charge_value >= 0.3 {
+                self.charge_memory_ticks = self.charge_memory_ticks.saturating_add(1);
+            }
+        }
+
+        let danger_near = snapshot.body.flags.bump_left
+            || snapshot.body.flags.bump_right
+            || snapshot.body.flags.wall
+            || snapshot.body.flags.cliff_left
+            || snapshot.body.flags.cliff_front_left
+            || snapshot.body.flags.cliff_front_right
+            || snapshot.body.flags.cliff_right
+            || snapshot
+                .range
+                .nearest_m
+                .map(|nearest| nearest <= 0.35)
+                .unwrap_or(false);
+        if danger_near {
+            self.danger_opportunity_ticks = self.danger_opportunity_ticks.saturating_add(1);
+            if memory.place_danger >= 0.3 {
+                self.danger_memory_ticks = self.danger_memory_ticks.saturating_add(1);
+            }
+        }
+
+        let social_seen = !snapshot.face.embeddings.is_empty()
+            || !snapshot.voice.embeddings.is_empty()
+            || !snapshot.kinect.skeletons.is_empty();
+        if social_seen {
+            self.social_opportunity_ticks = self.social_opportunity_ticks.saturating_add(1);
+            if memory.place_social_value >= 0.3 {
+                self.social_memory_ticks = self.social_memory_ticks.saturating_add(1);
+            }
+        }
+    }
+
+    fn finish(self) -> ScenarioEpisodeMemoryReport {
+        ScenarioEpisodeMemoryReport {
+            places_visited: self.max_places_visited,
+            charge_memory_ticks: self.charge_memory_ticks,
+            charge_opportunity_ticks: self.charge_opportunity_ticks,
+            charge_memory_hit_rate: hit_rate(
+                self.charge_memory_ticks,
+                self.charge_opportunity_ticks,
+            ),
+            danger_memory_ticks: self.danger_memory_ticks,
+            danger_opportunity_ticks: self.danger_opportunity_ticks,
+            danger_memory_hit_rate: hit_rate(
+                self.danger_memory_ticks,
+                self.danger_opportunity_ticks,
+            ),
+            social_memory_ticks: self.social_memory_ticks,
+            social_opportunity_ticks: self.social_opportunity_ticks,
+            social_memory_hit_rate: hit_rate(
+                self.social_memory_ticks,
+                self.social_opportunity_ticks,
+            ),
+            first_novelty: self.first_novelty,
+            final_novelty: self.final_novelty,
+            novelty_decayed: self
+                .first_novelty
+                .zip(self.final_novelty)
+                .map(|(first, final_value)| final_value <= first)
+                .unwrap_or(false),
+        }
+    }
+}
+
+async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {
+    let kind = ScenarioKind::from(args.scenario);
+    let flags = RuntimeModelFlags::from(&args);
+    let mut model_loading = load_runtime_models_from_flags(&flags)?.1;
+    if args.future_mode == FutureMode::ModelInfer {
+        model_loading.blocked_model_infer.push(
+            "future model-infer is limited to prediction behavior; motor safety remains hardcoded"
+                .to_string(),
+        );
+    }
+    if args.experience_mode == ExperienceMode::ModelInfer {
+        model_loading.blocked_model_infer.push(
+            "experience model-infer changes latent encoding only; motor safety remains hardcoded"
+                .to_string(),
+        );
+    }
+
+    let mut episodes_detail = Vec::with_capacity(args.episodes);
+    for episode_index in 0..args.episodes {
+        let episode_seed = args.seed.saturating_add(episode_index as u64);
+        let scenario = build_scenario(ScenarioConfig::new(kind, episode_seed));
+        let capture = args.capture_root.as_ref().map(|root| {
+            Path::new(root)
+                .join(format!("episode-{episode_index:03}"))
+                .to_string_lossy()
+                .to_string()
+        });
+        let builder = EpisodeMetricBuilder::new(
+            kind,
+            scenario.metadata.clone(),
+            episode_index,
+            episode_seed,
+            args.ledger.clone(),
+            capture.clone(),
+        );
+        let (episode, warnings) = if let Some(ledger_path) = &args.ledger {
+            let mut runtime = default_runtime(JsonlLedger::new(ledger_path), &args.llm)?;
+            runtime = runtime.with_action_selector_mode(args.action_selector.into());
+            if let Some(models) = load_runtime_models_from_flags(&flags)?.0 {
+                runtime = runtime.with_models(models);
+            }
+            run_eval_episode(runtime, scenario.world, scenario.motors, &args, builder).await?
+        } else {
+            let mut runtime = default_noop_runtime(&args.llm)?;
+            runtime = runtime.with_action_selector_mode(args.action_selector.into());
+            if let Some(models) = load_runtime_models_from_flags(&flags)?.0 {
+                runtime = runtime.with_models(models);
+            }
+            run_eval_episode(runtime, scenario.world, scenario.motors, &args, builder).await?
+        };
+        model_loading.warnings.extend(warnings);
+        println!(
+            "eval episode {} complete: scenario {}, seed {}, ticks {}, success {}, collisions {}",
+            episode.index,
+            kind.slug(),
+            episode.seed,
+            episode.ticks,
+            episode.success,
+            episode.collisions
+        );
+        episodes_detail.push(episode);
+    }
+
+    let summary = summarize_episodes(&episodes_detail);
+    let memory = args
+        .memory_report
+        .then(|| summarize_episode_memory(&episodes_detail));
+    let recommendation = scenario_recommendation(args.episodes, &summary);
+    let report = ScenarioEvaluationReport {
+        schema_version: 1,
+        scenario: kind.slug().to_string(),
+        base_seed: args.seed,
+        episodes: args.episodes,
+        steps_per_episode: args.steps,
+        tick_ms: args.tick_ms,
+        action_selector_mode: ActionSelectorMode::from(args.action_selector)
+            .as_str()
+            .to_string(),
+        model_modes: model_modes_from_flags(&flags),
+        model_loading: model_loading.clone(),
+        ledger: args.ledger.clone(),
+        capture_root: args.capture_root.clone(),
+        summary,
+        memory,
+        episodes_detail,
+        recommendation,
+        warnings: model_loading.warnings.clone(),
+    };
+
+    let bytes = serde_json::to_vec_pretty(&report)?;
+    if let Some(out) = &args.out {
+        if let Some(parent) = Path::new(out).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(out, &bytes)?;
+        println!("scenario evaluation report written: {out}");
+    } else {
+        println!("{}", String::from_utf8_lossy(&bytes));
+    }
+    Ok(())
+}
+
+async fn run_eval_episode<R>(
+    runtime: R,
+    world: pete_sim::VirtualWorld,
+    motors: pete_sim::SimCockpit,
+    args: &EvalScenarioArgs,
+    mut metrics: EpisodeMetricBuilder,
+) -> Result<(ScenarioEpisodeReport, Vec<String>)>
+where
+    R: RuntimeLoop + Send,
+{
+    let mut warnings = Vec::new();
+    let mut runner = SimRunner::new(runtime, world, motors);
+    runner.tick_ms = args.tick_ms;
+    let mut snapshots = Vec::new();
+    runner
+        .run_steps_observing_ticks(args.steps, |snapshot, tick| {
+            if metrics.capture.is_some() {
+                snapshots.push(snapshot.clone());
+            }
+            metrics.observe(snapshot, tick);
+        })
+        .await?;
+
+    if let Some(capture_path) = &metrics.capture {
+        let mut writer =
+            CaptureWriter::create(capture_path, CaptureSource::Sim, Some(args.tick_ms)).await?;
+        writer.manifest_mut().scenario = Some(metrics.metadata.clone());
+        for snapshot in snapshots {
+            writer
+                .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+                .await?;
+        }
+        writer.finish().await?;
+    }
+
+    if runner.tick_count < args.steps {
+        warnings.push(format!(
+            "episode {} stopped after {} ticks before requested {} steps",
+            metrics.index, runner.tick_count, args.steps
+        ));
+    }
+    Ok((metrics.finish(), warnings))
+}
+
+fn configured_llm_config(args: &LlmArgs) -> Result<LlmConfig> {
+    let mut config = match &args.llm_config {
+        Some(path) => LlmConfig::load(path)?,
+        None => LlmConfig::default(),
+    };
+    if let Some(provider) = args.llm_provider {
+        config.provider = provider.into();
+    }
+    Ok(config)
+}
+
+fn configured_llm_agent(args: &LlmArgs) -> Result<ConfiguredLlmAgent> {
+    let config = configured_llm_config(args)?;
+    ConfiguredLlmAgent::from_config(config)
+}
+
+fn configured_llm_config_for_sim(args: &LlmArgs, live: bool) -> Result<LlmConfig> {
+    let mut config = configured_llm_config(args)?;
+    if live && args.llm_config.is_none() {
+        let live_timeout_ms = std::env::var("PETE_LIVE_LLM_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LIVE_LLM_TIMEOUT_MS);
+        config.timeout_ms = config.timeout_ms.min(live_timeout_ms.max(1));
+    }
+    Ok(config)
+}
+
+fn configured_llm_agent_for_sim(args: &LlmArgs, live: bool) -> Result<ConfiguredLlmAgent> {
+    let config = configured_llm_config_for_sim(args, live)?;
+    ConfiguredLlmAgent::from_config(config)
+}
+
+fn default_noop_runtime(
+    llm_args: &LlmArgs,
+) -> Result<
+    MinimalRuntime<
+        NoopLedger,
+        InMemoryExperienceStore,
+        InMemoryExperienceStore,
+        SimpleConductor,
+        SimpleSafety,
+        ConfiguredLlmAgent,
+    >,
+> {
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    Ok(MinimalRuntime::with_default_events(
+        NoopLedger,
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        configured_llm_agent(llm_args)?,
+    ))
+}
+
+fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool {
+    match kind {
+        ScenarioKind::EmptyRoom => episode.ticks > 0 && episode.collisions == 0,
+        ScenarioKind::ObstacleAvoidance => {
+            episode.ticks > 0
+                && episode.collisions <= (episode.ticks / 50).max(1)
+                && episode.stuck_ticks < episode.ticks / 2
+                && episode.distance_traveled_m > 0.05
+        }
+        ScenarioKind::CornerTrap => {
+            episode.stuck_count > 0
+                && episode.recovery_success_rate.unwrap_or(0.0) > 0.0
+                && episode.distance_traveled_m > 0.10
+                && episode.collisions <= (episode.ticks / 20).max(1)
+        }
+        ScenarioKind::ColumnTrap => {
+            episode.stuck_count > 0
+                && episode.recovery_success_rate.unwrap_or(0.0) > 0.0
+                && episode.distance_traveled_m > 0.25
+                && episode.collisions <= (episode.ticks / 20).max(1)
+        }
+        ScenarioKind::ChargerSeeking => episode.charging_ticks > 0 || episode.battery_delta > 0.03,
+        ScenarioKind::PersonAndSpeaker => {
+            episode.ticks > 0
+                && episode.collisions == 0
+                && (episode.ticks_with_face_embeddings > 0
+                    || episode.ticks_with_voice_embeddings > 0
+                    || episode.ticks_with_kinect_skeletons > 0
+                    || episode.ticks_with_ear_features > 0)
+        }
+        ScenarioKind::MixedRoom => {
+            episode.ticks > 0
+                && episode.collisions <= (episode.ticks / 40).max(1)
+                && (episode.charging_ticks > 0
+                    || episode.ticks_with_face_embeddings > 0
+                    || episode.ticks_with_voice_embeddings > 0)
+        }
+        ScenarioKind::Dream => {
+            episode.ticks > 0
+                && episode.collisions <= (episode.ticks / 30).max(1)
+                && (episode.charging_ticks > 0
+                    || episode.ticks_with_face_embeddings > 0
+                    || episode.ticks_with_voice_embeddings > 0
+                    || episode.ticks_with_ear_features > 0)
+        }
+    }
+}
+
+fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationSummary {
+    if episodes.is_empty() {
+        return ScenarioEvaluationSummary::default();
+    }
+    let count = episodes.len() as f32;
+    let total_ticks: usize = episodes.iter().map(|episode| episode.ticks).sum();
+    let total_collisions: usize = episodes.iter().map(|episode| episode.collisions).sum();
+    let mut trap_kind_counts = HashMap::new();
+    for episode in episodes {
+        for (kind, count) in &episode.trap_kind_counts {
+            *trap_kind_counts.entry(kind.clone()).or_default() += count;
+        }
+    }
+    ScenarioEvaluationSummary {
+        success_rate: episodes.iter().filter(|episode| episode.success).count() as f32 / count,
+        collision_rate: if total_ticks == 0 {
+            0.0
+        } else {
+            total_collisions as f32 / total_ticks as f32
+        },
+        mean_collisions_per_episode: total_collisions as f32 / count,
+        mean_battery_delta: mean(episodes.iter().map(|episode| episode.battery_delta)),
+        mean_final_battery: mean(episodes.iter().map(|episode| episode.final_battery)),
+        mean_distance_to_charger_final_m: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.final_distance_to_charger_m),
+        ),
+        ticks_with_charger_visible: episodes
+            .iter()
+            .map(|episode| episode.ticks_with_charger_visible)
+            .sum(),
+        ticks_with_charger_near: episodes
+            .iter()
+            .map(|episode| episode.ticks_with_charger_near)
+            .sum(),
+        ticks_approaching_charger: episodes
+            .iter()
+            .map(|episode| episode.ticks_approaching_charger)
+            .sum(),
+        ticks_docking_from_too_far: episodes
+            .iter()
+            .map(|episode| episode.ticks_docking_from_too_far)
+            .sum(),
+        mean_nearest_obstacle_m: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_nearest_obstacle_m),
+        ),
+        mean_distance_traveled_m: mean(episodes.iter().map(|episode| episode.distance_traveled_m)),
+        action_histogram: summarize_action_histogram(episodes),
+        wall_cliff_veto_count: episodes
+            .iter()
+            .map(|episode| episode.wall_cliff_veto_count)
+            .sum(),
+        escape_progress_score: mean(episodes.iter().map(|episode| episode.escape_progress_score)),
+        mean_ticks_survived: mean(episodes.iter().map(|episode| episode.ticks as f32)),
+        stuck_count: episodes.iter().map(|episode| episode.stuck_count).sum(),
+        trap_kind_counts,
+        recovery_attempts: episodes
+            .iter()
+            .map(|episode| episode.recovery_attempts)
+            .sum(),
+        stuck_duration: mean_optional(episodes.iter().filter_map(|episode| episode.stuck_duration)),
+        mean_stuck_duration: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_stuck_duration),
+        ),
+        recovery_success_rate: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.recovery_success_rate),
+        ),
+        mean_recovery_ticks: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_recovery_ticks),
+        ),
+        repeated_trap_count: episodes
+            .iter()
+            .map(|episode| episode.repeated_trap_count)
+            .sum(),
+        dead_battery_tick: episodes
+            .iter()
+            .filter_map(|episode| episode.dead_battery_tick)
+            .min(),
+        distance_after_recovery_m: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.distance_after_recovery_m),
+        ),
+        mean_safety_interventions: mean(
+            episodes
+                .iter()
+                .map(|episode| episode.safety_interventions as f32),
+        ),
+        behavior_run_records: episodes
+            .iter()
+            .map(|episode| episode.behavior_run_records)
+            .sum(),
+        model_fallbacks: episodes.iter().map(|episode| episode.model_fallbacks).sum(),
+        action_selector_fallbacks: episodes
+            .iter()
+            .map(|episode| episode.action_selector_fallbacks)
+            .sum(),
+        action_selector_guard_yields: episodes
+            .iter()
+            .map(|episode| episode.action_selector_guard_yields)
+            .sum(),
+        map_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.map_memory_decisions)
+            .sum(),
+        danger_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.danger_memory_decisions)
+            .sum(),
+        charge_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.charge_memory_decisions)
+            .sum(),
+        novelty_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.novelty_memory_decisions)
+            .sum(),
+        frontier_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.frontier_memory_decisions)
+            .sum(),
+        trap_memory_decisions: episodes
+            .iter()
+            .map(|episode| episode.trap_memory_decisions)
+            .sum(),
+        memory_navigation_intents: summarize_memory_navigation_intents(episodes),
+        memory_navigation_reasons: summarize_memory_navigation_reasons(episodes),
+        map_memory_signals: summarize_map_memory_signals(episodes),
+        map_memory_safety_overrides: episodes
+            .iter()
+            .map(|episode| episode.map_memory_safety_overrides)
+            .sum(),
+        low_confidence_navigation_fallbacks: episodes
+            .iter()
+            .map(|episode| episode.low_confidence_navigation_fallbacks)
+            .sum(),
+        model_assisted_decisions: episodes
+            .iter()
+            .map(|episode| episode.model_assisted_decisions)
+            .sum(),
+        action_selector_safety_overrides: episodes
+            .iter()
+            .map(|episode| episode.action_selector_safety_overrides)
+            .sum(),
+        mean_chosen_score: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_chosen_score),
+        ),
+        mean_candidate_score: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_candidate_score),
+        ),
+    }
+}
+
+fn summarize_action_histogram(episodes: &[ScenarioEpisodeReport]) -> HashMap<String, usize> {
+    let mut histogram = HashMap::new();
+    for episode in episodes {
+        for (action, count) in &episode.action_histogram {
+            *histogram.entry(action.clone()).or_default() += count;
+        }
+    }
+    histogram
+}
+
+fn summarize_memory_navigation_intents(
+    episodes: &[ScenarioEpisodeReport],
+) -> HashMap<String, usize> {
+    let mut histogram = HashMap::new();
+    for episode in episodes {
+        for (intent, count) in &episode.memory_navigation_intents {
+            *histogram.entry(intent.clone()).or_default() += count;
+        }
+    }
+    histogram
+}
+
+fn summarize_memory_navigation_reasons(
+    episodes: &[ScenarioEpisodeReport],
+) -> HashMap<String, usize> {
+    let mut histogram = HashMap::new();
+    for episode in episodes {
+        for (reason, count) in &episode.memory_navigation_reasons {
+            *histogram.entry(reason.clone()).or_default() += count;
+        }
+    }
+    histogram
+}
+
+fn summarize_map_memory_signals(episodes: &[ScenarioEpisodeReport]) -> HashMap<String, usize> {
+    let mut histogram = HashMap::new();
+    for episode in episodes {
+        for (signal, count) in &episode.map_memory_signals {
+            *histogram.entry(signal.clone()).or_default() += count;
+        }
+    }
+    histogram
+}
+
+fn action_histogram_label(action: &ActionPrimitive) -> &'static str {
+    match action {
+        ActionPrimitive::Stop => "Stop",
+        ActionPrimitive::Go { intensity, .. } if *intensity < 0.0 => "Reverse",
+        ActionPrimitive::Go { .. } => "Go",
+        ActionPrimitive::Drive { .. } => "Drive",
+        ActionPrimitive::Turn {
+            direction: TurnDir::Left,
+            ..
+        } => "TurnLeft",
+        ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            ..
+        } => "TurnRight",
+        ActionPrimitive::Inspect { .. } => "Inspect",
+        ActionPrimitive::Approach { .. } => "Approach",
+        ActionPrimitive::Dock => "Dock",
+        ActionPrimitive::Explore { .. } => "Explore",
+        ActionPrimitive::Speak { .. } => "Speak",
+        ActionPrimitive::Chirp { .. } => "Chirp",
+    }
+}
+
+fn wall_or_cliff_veto(tick: &RuntimeTick) -> bool {
+    tick.frame
+        .now
+        .extensions
+        .get("motor_gate")
+        .and_then(|value| value.get("safety_reason"))
+        .and_then(|value| value.as_str())
+        .map(|reason| reason == "cliff")
+        .unwrap_or(false)
+        || tick.frame.now.body.flags.wall
+        || tick.frame.now.body.flags.cliff_left
+        || tick.frame.now.body.flags.cliff_front_left
+        || tick.frame.now.body.flags.cliff_front_right
+        || tick.frame.now.body.flags.cliff_right
+}
+
+fn escape_progress_score(
+    kind: ScenarioKind,
+    distance_traveled_m: f32,
+    distance_at_last_recovery_m: Option<f32>,
+    collisions: usize,
+    stuck_ticks: usize,
+    ticks: usize,
+) -> f32 {
+    let progress = match kind {
+        ScenarioKind::ColumnTrap | ScenarioKind::CornerTrap => distance_at_last_recovery_m
+            .map(|distance| (distance_traveled_m - distance).max(0.0))
+            .filter(|distance| *distance >= 0.08)
+            .unwrap_or(distance_traveled_m),
+        _ => distance_traveled_m,
+    };
+    let collision_penalty = collisions as f32 * 0.05;
+    let stuck_penalty = if ticks == 0 {
+        0.0
+    } else {
+        stuck_ticks as f32 / ticks as f32 * 0.25
+    };
+    (progress - collision_penalty - stuck_penalty).max(0.0)
+}
+
+fn trap_kind_label(code: f32) -> Option<&'static str> {
+    match code.round() as i32 {
+        1 => Some("wall"),
+        2 => Some("corner"),
+        3 => Some("column"),
+        _ => None,
+    }
+}
+
+fn summarize_episode_memory(episodes: &[ScenarioEpisodeReport]) -> ScenarioMemorySummary {
+    let memory_reports = episodes
+        .iter()
+        .filter_map(|episode| episode.memory.as_ref())
+        .collect::<Vec<_>>();
+    if memory_reports.is_empty() {
+        return ScenarioMemorySummary {
+            novelty_decay_sane: false,
+            warnings: vec!["no episode memory reports".to_string()],
+            ..ScenarioMemorySummary::default()
+        };
+    }
+    let places_visited = memory_reports
+        .iter()
+        .map(|memory| memory.places_visited)
+        .max()
+        .unwrap_or(0);
+    let mut warnings = Vec::new();
+    if places_visited == 0 {
+        warnings.push("memory observed zero places".to_string());
+    }
+    let novelty_decay_sane = memory_reports.iter().any(|memory| memory.novelty_decayed);
+    if !novelty_decay_sane {
+        warnings.push("novelty did not decay in any episode".to_string());
+    }
+    ScenarioMemorySummary {
+        places_visited,
+        mean_places_visited_per_episode: mean(
+            memory_reports
+                .iter()
+                .map(|memory| memory.places_visited as f32),
+        ),
+        charge_memory_hit_rate: aggregate_hit_rate(
+            memory_reports
+                .iter()
+                .map(|memory| (memory.charge_memory_ticks, memory.charge_opportunity_ticks)),
+        ),
+        danger_memory_hit_rate: aggregate_hit_rate(
+            memory_reports
+                .iter()
+                .map(|memory| (memory.danger_memory_ticks, memory.danger_opportunity_ticks)),
+        ),
+        social_memory_hit_rate: aggregate_hit_rate(
+            memory_reports
+                .iter()
+                .map(|memory| (memory.social_memory_ticks, memory.social_opportunity_ticks)),
+        ),
+        novelty_decay_sane,
+        warnings,
+    }
+}
+
+async fn run_dream_train(args: DreamTrainArgs) -> Result<()> {
+    let checkpoint_dir = PathBuf::from(&args.checkpoint_dir);
+    if args.clear && checkpoint_dir.exists() {
+        fs::remove_dir_all(&checkpoint_dir).with_context(|| {
+            format!(
+                "failed to clear checkpoint dir {}",
+                checkpoint_dir.display()
+            )
+        })?;
+        println!(
+            "cleared dream checkpoint dir for fresh evolve run: {}",
+            checkpoint_dir.display()
+        );
+    }
+
+    let evolve_best = checkpoint_dir.join("evolve-best.json");
+    let incumbent = if !args.clear && evolve_best.exists() {
+        Some(load_best_genome(&evolve_best).with_context(|| {
+            format!(
+                "failed to load incumbent evolve checkpoint {}",
+                evolve_best.display()
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let config = DreamTrainingConfig {
+        population_size: args.population,
+        generations: args.generations,
+        base_seed: args.seed,
+        start_level: args.start_level.into(),
+        hidden_dim: args.hidden_dim,
+        checkpoint_dir: checkpoint_dir.clone(),
+        dataset_dir: PathBuf::from(args.dataset_dir),
+        export_dataset: args.export_dataset,
+        detailed_logs: args.detailed_logs,
+    };
+    let report = train_dream_policy(config).await?;
+
+    let candidate = load_best_genome(&report.best_checkpoint).with_context(|| {
+        format!(
+            "failed to load candidate checkpoint {}",
+            report.best_checkpoint.display()
+        )
+    })?;
+    let promote = incumbent.as_ref().map_or(true, |current| {
+        if candidate.level.id() != current.level.id() {
+            candidate.level.id() > current.level.id()
+        } else {
+            candidate.best_score > current.best_score
+        }
+    });
+
+    if promote {
+        fs::copy(&report.best_checkpoint, &evolve_best).with_context(|| {
+            format!(
+                "failed to publish evolve checkpoint alias from {} to {}",
+                report.best_checkpoint.display(),
+                evolve_best.display()
+            )
+        })?;
+        println!(
+            "published evolve checkpoint alias: {}",
+            evolve_best.display()
+        );
+    } else if let Some(current) = &incumbent {
+        println!(
+            "kept incumbent evolve checkpoint: {} (incumbent level={} score={:.3}, candidate level={} score={:.3})",
+            evolve_best.display(),
+            current.level.name(),
+            current.best_score,
+            candidate.level.name(),
+            candidate.best_score,
+        );
+    }
+
+    fn comma_count(value: u64) -> String {
+        let digits = value.to_string();
+        let mut out = String::with_capacity(digits.len() + (digits.len().saturating_sub(1) / 3));
+        let mut since_comma = 0usize;
+        for ch in digits.chars().rev() {
+            if since_comma == 3 {
+                out.push(',');
+                since_comma = 0;
+            }
+            out.push(ch);
+            since_comma += 1;
+        }
+        out.chars().rev().collect()
+    }
+
+    let unlocked = report
+        .unlocked_levels
+        .iter()
+        .map(|level| level.name())
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    println!(
+        "dream policy training complete: level {}, generation {}, best score {:.3}, genome {}, checkpoint {}, dataset {}, unlocked {}",
+        report.status.current_level.name(),
+        comma_count(report.status.generation as u64),
+        report.status.best_score,
+        comma_count(report.status.selected_genome_id),
+        report.best_checkpoint.display(),
+        report.dataset_dir.display(),
+        unlocked,
+    );
+    if let Some(reason) = report.status.blocked_reason {
+        println!("last safety block: {reason}");
+    }
+    Ok(())
+}
+
+fn scenario_recommendation(episodes: usize, summary: &ScenarioEvaluationSummary) -> String {
+    if episodes < 3 {
+        "insufficient_data".to_string()
+    } else if summary.collision_rate > 0.10 || summary.mean_collisions_per_episode > 5.0 {
+        "reject_or_continue_training".to_string()
+    } else if summary.success_rate >= 0.80 && summary.collision_rate <= 0.02 {
+        "candidate_for_more_eval".to_string()
+    } else {
+        "continue_training".to_string()
+    }
+}
+
+fn nearest_object_distance<F>(
+    position: (f32, f32),
+    objects: &[pete_sim::SimObject],
+    matches_kind: F,
+) -> Option<f32>
+where
+    F: Fn(&pete_sim::SimObjectKind) -> bool,
+{
+    objects
+        .iter()
+        .filter(|object| matches_kind(&object.kind))
+        .map(|object| {
+            (distance_between(position, (object.x_m, object.y_m)) - object.radius_m).max(0.0)
+        })
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn nearest_object_bearing<F>(
+    position: (f32, f32),
+    heading_rad: f32,
+    objects: &[pete_sim::SimObject],
+    matches_kind: F,
+) -> Option<f32>
+where
+    F: Fn(&pete_sim::SimObjectKind) -> bool,
+{
+    objects
+        .iter()
+        .filter(|object| matches_kind(&object.kind))
+        .min_by(|left, right| {
+            let left_distance = distance_between(position, (left.x_m, left.y_m));
+            let right_distance = distance_between(position, (right.x_m, right.y_m));
+            left_distance
+                .partial_cmp(&right_distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|object| {
+            let dx = object.x_m - position.0;
+            let dy = object.y_m - position.1;
+            (dy.atan2(dx) - heading_rad + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI
+        })
+}
+
+fn distance_between(left: (f32, f32), right: (f32, f32)) -> f32 {
+    let dx = left.0 - right.0;
+    let dy = left.1 - right.1;
+    ((dx * dx) + (dy * dy)).sqrt()
+}
+
+fn hit_rate(hits: usize, opportunities: usize) -> Option<f32> {
+    (opportunities > 0).then_some(hits.min(opportunities) as f32 / opportunities as f32)
+}
+
+fn aggregate_hit_rate(pairs: impl Iterator<Item = (usize, usize)>) -> Option<f32> {
+    let (hits, opportunities) = pairs.fold((0usize, 0usize), |acc, pair| {
+        (acc.0.saturating_add(pair.0), acc.1.saturating_add(pair.1))
+    });
+    hit_rate(hits, opportunities)
+}
+
+fn sim_world_score(snapshot: &WorldSnapshot, index: usize) -> f32 {
+    snapshot
+        .extensions
+        .iter()
+        .find(|extension| extension.name == "sim.world")
+        .and_then(|extension| extension.values.get(index).copied())
+        .unwrap_or(0.0)
+}
+
+fn mean(values: impl Iterator<Item = f32>) -> f32 {
+    let mut count = 0usize;
+    let mut sum = 0.0;
+    for value in values {
+        count = count.saturating_add(1);
+        sum += value;
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f32
+    }
+}
+
+fn mean_optional(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut count = 0usize;
+    let mut sum = 0.0;
+    for value in values {
+        count = count.saturating_add(1);
+        sum += value;
+    }
+    (count > 0).then_some(sum / count as f32)
+}
+
+async fn capture_sim(args: CaptureSimArgs) -> Result<()> {
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    let runtime = MinimalRuntime::with_default_events(
+        NoopLedger,
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        configured_llm_agent(&args.llm)?,
+    );
+    let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::MixedRoom, args.seed));
+    let world = scenario.world;
+    let motors = scenario.motors;
+    let mut runner = SimRunner::new(runtime, world, motors);
+    let mut snapshots = Vec::new();
+    runner
+        .run_steps_observing(args.steps, |snapshot| snapshots.push(snapshot.clone()))
+        .await?;
+
+    let mut writer =
+        CaptureWriter::create(&args.out, CaptureSource::Sim, Some(args.tick_ms)).await?;
+    writer.manifest_mut().scenario = Some(scenario.metadata);
+    for snapshot in snapshots {
+        let t_ms = snapshot.body.last_update_ms;
+        writer.append_snapshot(t_ms, snapshot, Vec::new()).await?;
+    }
+    let manifest = writer.finish().await?;
+
+    println!(
+        "capture complete: {} frames, seed {}, out {}, tick_ms {:?}",
+        manifest.frame_count, args.seed, args.out, manifest.tick_ms
+    );
+    Ok(())
+}
+
+async fn replay_capture(args: ReplayCaptureArgs) -> Result<()> {
+    let reader = CaptureReader::open(&args.capture).await?;
+    let ledger = JsonlLedger::new(&args.ledger);
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    let runtime = MinimalRuntime::with_default_events(
+        ledger.clone(),
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        configured_llm_agent(&args.llm)?,
+    );
+    let mut runner = CaptureReplayRunner::new(runtime, reader);
+    let summary = runner.replay().await?;
+    let transitions = ledger.transitions().await?;
+
+    println!(
+        "replay complete: {} frames replayed, {} runtime ticks, ledger {}, {} transitions written",
+        summary.frames_replayed,
+        summary.runtime_ticks,
+        args.ledger,
+        transitions.len()
+    );
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CounterfactualEdit {
+    MoveObject {
+        kind: CounterfactualObjectKind,
+        id: Option<String>,
+        x_m: f32,
+        y_m: f32,
+    },
+    RemoveObstacle {
+        id: Option<String>,
+    },
+    AddObstacle {
+        x_m: f32,
+        y_m: f32,
+        radius_m: f32,
+    },
+    SetBattery {
+        value: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CounterfactualObjectKind {
+    Charger,
+    Person,
+    Speaker,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CounterfactualPolicy {
+    Baseline,
+    Stop,
+    TurnLeftOnDanger,
+    TurnRightOnDanger,
+    SeekCharge,
+    RandomWalk { seed: u64 },
+    Scripted(Vec<ActionPrimitive>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct CounterfactualReport {
+    schema_version: u32,
+    source_capture: String,
+    reconstructable: bool,
+    edits: Vec<String>,
+    policy: String,
+    steps: usize,
+    summary: CounterfactualSummary,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct CounterfactualSummary {
+    collisions: usize,
+    charging_ticks: usize,
+    battery_delta: f32,
+    distance_traveled: f32,
+    final_distance_to_charger_m: Option<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct CounterfactualConductor {
+    policy: CounterfactualPolicy,
+    baseline: SimpleConductor,
+    rng: StdRng,
+    scripted_index: usize,
+}
+
+impl CounterfactualConductor {
+    fn new(policy: CounterfactualPolicy) -> Self {
+        let seed = match policy {
+            CounterfactualPolicy::RandomWalk { seed } => seed,
+            _ => 0,
+        };
+        Self {
+            policy,
+            baseline: SimpleConductor::default(),
+            rng: StdRng::seed_from_u64(seed),
+            scripted_index: 0,
+        }
+    }
+}
+
+impl Conductor for CounterfactualConductor {
+    fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
+        match &self.policy {
+            CounterfactualPolicy::Baseline => self.baseline.choose(input),
+            CounterfactualPolicy::Stop => Ok(ActionPrimitive::Stop),
+            CounterfactualPolicy::TurnLeftOnDanger => {
+                if danger_present(&input) {
+                    Ok(turn_action(TurnDir::Left))
+                } else {
+                    self.baseline.choose(input)
+                }
+            }
+            CounterfactualPolicy::TurnRightOnDanger => {
+                if danger_present(&input) {
+                    Ok(turn_action(TurnDir::Right))
+                } else {
+                    self.baseline.choose(input)
+                }
+            }
+            CounterfactualPolicy::SeekCharge => Ok(ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            }),
+            CounterfactualPolicy::RandomWalk { .. } => {
+                if self.rng.gen_bool(0.25) || danger_present(&input) {
+                    let direction = if self.rng.gen_bool(0.5) {
+                        TurnDir::Left
+                    } else {
+                        TurnDir::Right
+                    };
+                    Ok(turn_action(direction))
+                } else {
+                    Ok(ActionPrimitive::Go {
+                        intensity: 0.25,
+                        duration_ms: 1_000,
+                    })
+                }
+            }
+            CounterfactualPolicy::Scripted(actions) => {
+                let action = actions
+                    .get(self.scripted_index)
+                    .cloned()
+                    .unwrap_or(ActionPrimitive::Stop);
+                self.scripted_index = self.scripted_index.saturating_add(1);
+                Ok(action)
+            }
+        }
+    }
+}
+
+async fn replay_counterfactual(args: ReplayCounterfactualArgs) -> Result<()> {
+    let reader = CaptureReader::open(&args.capture).await?;
+    let manifest = reader.manifest().clone();
+    let Some(mut metadata) = manifest.scenario.clone() else {
+        anyhow::bail!(
+            "passive captures without reconstructable sim metadata cannot yet be counterfactually replayed"
+        );
+    };
+    let frames = reader.read_frames().await?;
+    let steps = args.steps.unwrap_or(frames.len()).max(1);
+    let edits = args
+        .edit
+        .iter()
+        .map(|edit| parse_counterfactual_edit(edit))
+        .collect::<Result<Vec<_>>>()?;
+    let mut warnings = Vec::new();
+    apply_counterfactual_edits(&mut metadata, &edits, &mut warnings)?;
+    let policy = parse_counterfactual_policy(&args.policy, args.actions.as_deref())?;
+
+    let (mut world, motors) =
+        pete_sim::VirtualWorld::new_with_cockpit(metadata.seed, metadata.arena);
+    world.set_body(metadata.body.clone());
+    world.set_objects(metadata.objects.clone());
+
+    if let Some(ledger_path) = &args.out_ledger {
+        let runtime =
+            counterfactual_runtime(JsonlLedger::new(ledger_path), policy.clone(), &args.llm)?;
+        let report = run_counterfactual_sim(
+            runtime, world, motors, &metadata, &manifest, &args, steps, policy, warnings,
+        )
+        .await?;
+        write_or_print_counterfactual_report(&args, &report)?;
+        let transitions = JsonlLedger::new(ledger_path).transitions().await?;
+        println!(
+            "counterfactual replay complete: {} steps, ledger {}, transitions {}, report {}",
+            steps,
+            ledger_path,
+            transitions.len(),
+            args.out_report.as_deref().unwrap_or("stdout")
+        );
+    } else {
+        let runtime = counterfactual_runtime(NoopLedger, policy.clone(), &args.llm)?;
+        let report = run_counterfactual_sim(
+            runtime, world, motors, &metadata, &manifest, &args, steps, policy, warnings,
+        )
+        .await?;
+        write_or_print_counterfactual_report(&args, &report)?;
+        println!(
+            "counterfactual replay complete: {} steps, report {}",
+            steps,
+            args.out_report.as_deref().unwrap_or("stdout")
+        );
+    }
+    Ok(())
+}
+
+fn counterfactual_runtime<L>(
+    ledger: L,
+    policy: CounterfactualPolicy,
+    llm: &LlmArgs,
+) -> Result<
+    MinimalRuntime<
+        L,
+        InMemoryExperienceStore,
+        InMemoryExperienceStore,
+        CounterfactualConductor,
+        SimpleSafety,
+        ConfiguredLlmAgent,
+    >,
+>
+where
+    L: LedgerWriter + Sync + Send,
+{
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    Ok(MinimalRuntime::with_default_events(
+        ledger,
+        memory,
+        recall,
+        CounterfactualConductor::new(policy),
+        SimpleSafety::default(),
+        configured_llm_agent(llm)?,
+    ))
+}
+
+async fn run_counterfactual_sim<R>(
+    runtime: R,
+    world: pete_sim::VirtualWorld,
+    motors: pete_sim::SimCockpit,
+    metadata: &pete_sim::ScenarioMetadata,
+    manifest: &pete_worldlab::CaptureManifest,
+    args: &ReplayCounterfactualArgs,
+    steps: usize,
+    policy: CounterfactualPolicy,
+    warnings: Vec<String>,
+) -> Result<CounterfactualReport>
+where
+    R: RuntimeLoop + Send,
+{
+    let mut metrics = EpisodeMetricBuilder::new(
+        metadata.kind,
+        metadata.clone(),
+        0,
+        metadata.seed,
+        args.out_ledger.clone(),
+        Some(args.capture.clone()),
+    );
+    let mut runner = SimRunner::new(runtime, world, motors);
+    runner.tick_ms = manifest.tick_ms.unwrap_or(100);
+    runner
+        .run_steps_observing_ticks(steps, |snapshot, tick| metrics.observe(snapshot, tick))
+        .await?;
+    let episode = metrics.finish();
+    Ok(CounterfactualReport {
+        schema_version: 1,
+        source_capture: args.capture.clone(),
+        reconstructable: true,
+        edits: args.edit.clone(),
+        policy: counterfactual_policy_label(&policy),
+        steps: episode.ticks,
+        summary: CounterfactualSummary {
+            collisions: episode.collisions,
+            charging_ticks: episode.charging_ticks,
+            battery_delta: episode.battery_delta,
+            distance_traveled: episode.distance_traveled_m,
+            final_distance_to_charger_m: episode.final_distance_to_charger_m,
+        },
+        warnings,
+    })
+}
+
+fn write_or_print_counterfactual_report(
+    args: &ReplayCounterfactualArgs,
+    report: &CounterfactualReport,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(report)?;
+    if let Some(out) = &args.out_report {
+        if let Some(parent) = Path::new(out).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(out, bytes)?;
+    } else {
+        println!("{}", String::from_utf8_lossy(&bytes));
+    }
+    Ok(())
+}
+
+fn parse_counterfactual_policy(
+    policy: &str,
+    actions: Option<&str>,
+) -> Result<CounterfactualPolicy> {
+    if let Some(actions) = actions {
+        return Ok(CounterfactualPolicy::Scripted(parse_scripted_actions(
+            actions,
+        )?));
+    }
+    if policy == "baseline" {
+        Ok(CounterfactualPolicy::Baseline)
+    } else if policy == "stop" {
+        Ok(CounterfactualPolicy::Stop)
+    } else if policy == "turn-left-on-danger" {
+        Ok(CounterfactualPolicy::TurnLeftOnDanger)
+    } else if policy == "turn-right-on-danger" {
+        Ok(CounterfactualPolicy::TurnRightOnDanger)
+    } else if policy == "seek-charge" {
+        Ok(CounterfactualPolicy::SeekCharge)
+    } else if policy == "random-walk" {
+        Ok(CounterfactualPolicy::RandomWalk { seed: 0 })
+    } else if let Some(rest) = policy.strip_prefix("random-walk:seed=") {
+        Ok(CounterfactualPolicy::RandomWalk {
+            seed: rest.parse().context("invalid random-walk seed")?,
+        })
+    } else {
+        anyhow::bail!("unknown counterfactual policy '{policy}'")
+    }
+}
+
+fn counterfactual_policy_label(policy: &CounterfactualPolicy) -> String {
+    match policy {
+        CounterfactualPolicy::Baseline => "baseline".to_string(),
+        CounterfactualPolicy::Stop => "stop".to_string(),
+        CounterfactualPolicy::TurnLeftOnDanger => "turn-left-on-danger".to_string(),
+        CounterfactualPolicy::TurnRightOnDanger => "turn-right-on-danger".to_string(),
+        CounterfactualPolicy::SeekCharge => "seek-charge".to_string(),
+        CounterfactualPolicy::RandomWalk { seed } => format!("random-walk:seed={seed}"),
+        CounterfactualPolicy::Scripted(_) => "scripted".to_string(),
+    }
+}
+
+fn parse_scripted_actions(actions: &str) -> Result<Vec<ActionPrimitive>> {
+    actions
+        .split(',')
+        .map(|token| match token.trim() {
+            "forward" | "go" => Ok(ActionPrimitive::Go {
+                intensity: 0.25,
+                duration_ms: 1_000,
+            }),
+            "left" => Ok(turn_action(TurnDir::Left)),
+            "right" => Ok(turn_action(TurnDir::Right)),
+            "stop" => Ok(ActionPrimitive::Stop),
+            "dock" => Ok(ActionPrimitive::Dock),
+            "wander" | "random-walk" => Ok(ActionPrimitive::Explore {
+                style: ExploreStyle::RandomWalk,
+                duration_ms: 1_000,
+            }),
+            other => anyhow::bail!("unknown scripted action '{other}'"),
+        })
+        .collect()
+}
+
+fn turn_action(direction: TurnDir) -> ActionPrimitive {
+    ActionPrimitive::Turn {
+        direction,
+        intensity: 0.6,
+        duration_ms: 1_000,
+    }
+}
+
+fn danger_present(input: &ConductorInput) -> bool {
+    input.body.flags.bump_left
+        || input.body.flags.bump_right
+        || input.body.flags.wall
+        || input.body.flags.cliff_left
+        || input.body.flags.cliff_front_left
+        || input.body.flags.cliff_front_right
+        || input.body.flags.cliff_right
+        || input.drives.danger_avoidance >= 0.5
+}
+
+fn parse_counterfactual_edit(input: &str) -> Result<CounterfactualEdit> {
+    let (name, rest) = input
+        .split_once(':')
+        .map(|(name, rest)| (name.trim(), rest.trim()))
+        .unwrap_or((input.trim(), ""));
+    let fields = parse_edit_fields(rest)?;
+    match name {
+        "move-charger" => parse_move_edit(CounterfactualObjectKind::Charger, fields),
+        "move-person" => parse_move_edit(CounterfactualObjectKind::Person, fields),
+        "move-speaker" => parse_move_edit(CounterfactualObjectKind::Speaker, fields),
+        "remove-obstacle" => Ok(CounterfactualEdit::RemoveObstacle {
+            id: fields.get("id").cloned(),
+        }),
+        "add-obstacle" => Ok(CounterfactualEdit::AddObstacle {
+            x_m: required_f32(&fields, "x")?,
+            y_m: required_f32(&fields, "y")?,
+            radius_m: required_f32(&fields, "radius")?,
+        }),
+        "set-battery" => Ok(CounterfactualEdit::SetBattery {
+            value: required_f32(&fields, "value")?.clamp(0.0, 1.0),
+        }),
+        _ => anyhow::bail!("unknown counterfactual edit '{name}'"),
+    }
+}
+
+fn parse_move_edit(
+    kind: CounterfactualObjectKind,
+    fields: HashMap<String, String>,
+) -> Result<CounterfactualEdit> {
+    Ok(CounterfactualEdit::MoveObject {
+        kind,
+        id: fields.get("id").cloned(),
+        x_m: required_f32(&fields, "x")?,
+        y_m: required_f32(&fields, "y")?,
+    })
+}
+
+fn parse_edit_fields(input: &str) -> Result<HashMap<String, String>> {
+    let mut fields = HashMap::new();
+    if input.trim().is_empty() {
+        return Ok(fields);
+    }
+    for part in input.split(',') {
+        let (key, value) = part
+            .split_once('=')
+            .with_context(|| format!("invalid edit field '{part}', expected key=value"))?;
+        fields.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    Ok(fields)
+}
+
+fn required_f32(fields: &HashMap<String, String>, key: &str) -> Result<f32> {
+    fields
+        .get(key)
+        .with_context(|| format!("missing required edit field '{key}'"))?
+        .parse()
+        .with_context(|| format!("invalid float for edit field '{key}'"))
+}
+
+fn apply_counterfactual_edits(
+    metadata: &mut pete_sim::ScenarioMetadata,
+    edits: &[CounterfactualEdit],
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    for edit in edits {
+        match edit {
+            CounterfactualEdit::MoveObject { kind, id, x_m, y_m } => {
+                let object = find_counterfactual_object_mut(&mut metadata.objects, *kind, id)?;
+                object.x_m = *x_m;
+                object.y_m = *y_m;
+                if id.is_none() {
+                    warnings.push(format!(
+                        "{} edit used first matching object because no id was provided",
+                        object_kind_label(*kind)
+                    ));
+                }
+            }
+            CounterfactualEdit::RemoveObstacle { id } => {
+                let index = metadata
+                    .objects
+                    .iter()
+                    .position(|object| {
+                        matches!(object.kind, pete_sim::SimObjectKind::Obstacle)
+                            && id.as_ref().map(|id| id == &object.id).unwrap_or(true)
+                    })
+                    .with_context(|| {
+                        if let Some(id) = id {
+                            format!("obstacle '{id}' not found")
+                        } else {
+                            "no obstacle found to remove".to_string()
+                        }
+                    })?;
+                metadata.objects.remove(index);
+                if id.is_none() {
+                    warnings.push(
+                        "remove-obstacle edit used first obstacle because no id was provided"
+                            .to_string(),
+                    );
+                }
+            }
+            CounterfactualEdit::AddObstacle { x_m, y_m, radius_m } => {
+                let index = metadata
+                    .objects
+                    .iter()
+                    .filter(|object| matches!(object.kind, pete_sim::SimObjectKind::Obstacle))
+                    .count();
+                metadata.objects.push(pete_sim::SimObject::obstacle(
+                    format!("counterfactual-obstacle-{index}"),
+                    format!("counterfactual obstacle {index}"),
+                    *x_m,
+                    *y_m,
+                    *radius_m,
+                ));
+            }
+            CounterfactualEdit::SetBattery { value } => {
+                metadata.body.battery_level = *value;
+                metadata.body.charging = false;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_counterfactual_object_mut<'a>(
+    objects: &'a mut [pete_sim::SimObject],
+    kind: CounterfactualObjectKind,
+    id: &Option<String>,
+) -> Result<&'a mut pete_sim::SimObject> {
+    objects
+        .iter_mut()
+        .find(|object| {
+            object_matches_counterfactual_kind(&object.kind, kind)
+                && id.as_ref().map(|id| id == &object.id).unwrap_or(true)
+        })
+        .with_context(|| {
+            if let Some(id) = id {
+                format!("{} '{id}' not found", object_kind_label(kind))
+            } else {
+                format!("no {} found", object_kind_label(kind))
+            }
+        })
+}
+
+fn object_matches_counterfactual_kind(
+    kind: &pete_sim::SimObjectKind,
+    edit_kind: CounterfactualObjectKind,
+) -> bool {
+    match edit_kind {
+        CounterfactualObjectKind::Charger => matches!(kind, pete_sim::SimObjectKind::Charger),
+        CounterfactualObjectKind::Person => {
+            matches!(kind, pete_sim::SimObjectKind::Person { .. })
+        }
+        CounterfactualObjectKind::Speaker => {
+            matches!(kind, pete_sim::SimObjectKind::SoundSource { .. })
+        }
+    }
+}
+
+fn object_kind_label(kind: CounterfactualObjectKind) -> &'static str {
+    match kind {
+        CounterfactualObjectKind::Charger => "charger",
+        CounterfactualObjectKind::Person => "person",
+        CounterfactualObjectKind::Speaker => "speaker",
+    }
+}
+
+async fn hardware_env(args: HardwareEnvArgs) -> Result<()> {
+    let report = collect_hardware_env_report().await;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("hardware environment");
+    println!("  os: {}", report["os"].as_str().unwrap_or("unknown"));
+    println!(
+        "  architecture: {}",
+        report["architecture"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "  cpu: {}",
+        report["cpu_model"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "  memory: {} kB",
+        report["memory_total_kb"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  raspberry-pi-like: {}",
+        report["raspberry_pi_like"].as_bool().unwrap_or(false)
+    );
+    print_json_list("  create serial candidates", &report["serial_devices"]);
+    print_json_list("  gps serial candidates", &report["gps_serial_candidates"]);
+    println!(
+        "  default gps: {}",
+        report["default_gps"]["device"]
+            .as_str()
+            .unwrap_or("not detected")
+    );
+    print_json_list("  i2c devices", &report["i2c_devices"]);
+    println!(
+        "  default imu: {}",
+        report["default_imu"]["device"]
+            .as_str()
+            .unwrap_or("unknown")
+    );
+    print_json_list("  cameras", &report["camera_devices"]);
+    print_json_list("  audio inputs", &report["audio_input_devices"]);
+    println!(
+        "  libfreenect/freenect: {}",
+        report["kinect"]["freenect_available"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    println!("  data dirs writable:");
+    if let Some(object) = report["data_dirs_writable"].as_object() {
+        for (path, writable) in object {
+            println!("    {path}: {}", writable.as_bool().unwrap_or(false));
+        }
+    }
+    print_json_list("  warnings", &report["warnings"]);
+    Ok(())
+}
+
+async fn capture_real(args: CaptureRealArgs) -> Result<()> {
+    if args.duration_seconds == 0 {
+        anyhow::bail!("--duration-seconds must be greater than zero");
+    }
+
+    let env_report = collect_hardware_env_report().await;
+    let mut warnings = Vec::new();
+    let mut device_availability = serde_json::json!({
+        "mock": args.mock,
+        "create": null,
+        "camera": null,
+        "microphone": null,
+        "imu": null,
+        "gps": null,
+        "kinect": env_report["kinect"].clone(),
+    });
+
+    let create_port = selected_cockpit_port(args.cockpit, &args.create_port, &env_report);
+
+    let cockpit: Box<dyn Cockpit + Send> =
+        if args.mock || create_port.as_deref() == Some("mock") {
+            device_availability["create"] =
+                serde_json::json!({"present": true, "source": "sim-cockpit"});
+            Box::new(LocalSimCockpit::new())
+        } else if let Some(create_port) = &create_port {
+            match UartCockpit::connect(create_port) {
+                Ok(cockpit) => {
+                    device_availability["create"] = serde_json::json!({
+                        "present": true,
+                        "port": create_port,
+                        "baud": args.create_baud,
+                        "backend": "uart-cockpit"
+                    });
+                    Box::new(cockpit)
+                }
+                Err(error) => {
+                    anyhow::bail!("failed to open cockpit UART device {create_port}: {error}");
+                }
+            }
+    } else {
+        warnings
+            .push("cockpit UART device not found; using simulated cockpit status".to_string());
+        device_availability["create"] =
+            serde_json::json!({"present": false, "reason": "no cockpit serial candidate"});
+        Box::new(LocalSimCockpit::new())
+    };
+
+    let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
+    if args.mock {
+        sensors.push(Box::new(MockEyeProducer::default()));
+        sensors.push(Box::new(MockEarProducer::default()));
+        sensors.push(Box::new(MockRangeProducer::default()));
+        sensors.push(Box::new(MockKinectProducer::default()));
+        device_availability["camera"] = serde_json::json!({"present": true, "source": "mock"});
+        device_availability["microphone"] = serde_json::json!({"present": true, "source": "mock"});
+        device_availability["kinect"] = serde_json::json!({"present": true, "source": "mock"});
+    } else {
+        add_optional_real_sensors(
+            &args,
+            &env_report,
+            create_port.as_deref(),
+            &mut sensors,
+            &mut device_availability,
+            &mut warnings,
+        );
+    }
+    let no_real_create = device_availability["create"]["present"].as_bool() != Some(true);
+    if !args.mock && no_real_create && sensors.is_empty() {
+        anyhow::bail!(
+            "no usable devices found: no Create serial device and no requested sensor initialized"
+        );
+    }
+
+    let requested_frames = duration_to_steps(args.duration_seconds, args.tick_ms);
+    if let Some(ledger_path) = &args.ledger {
+        let runtime = durable_runtime(JsonlLedger::new(ledger_path), &args.llm)?;
+        capture_real_with_runtime(
+            args,
+            runtime,
+            cockpit,
+            sensors,
+            env_report,
+            device_availability,
+            warnings,
+            requested_frames,
+        )
+        .await
+    } else {
+        let runtime = default_noop_runtime(&args.llm)?;
+        capture_real_with_runtime(
+            args,
+            runtime,
+            cockpit,
+            sensors,
+            env_report,
+            device_availability,
+            warnings,
+            requested_frames,
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn capture_real_with_runtime<R>(
+    args: CaptureRealArgs,
+    runtime: R,
+    cockpit: Box<dyn Cockpit + Send>,
+    sensors: Vec<Box<dyn SenseProducer + Send>>,
+    env_report: Value,
+    device_availability: Value,
+    mut warnings: Vec<String>,
+    requested_frames: usize,
+) -> Result<()>
+where
+    R: RuntimeLoop + Send,
+{
+    let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, cockpit, sensors, runtime)
+        .with_frame_processor(real_robot_frame_processor(&mut warnings).await);
+    runner.tick_ms = args.tick_ms;
+    let mut writer =
+        CaptureWriter::create(&args.out, CaptureSource::RealRobot, Some(args.tick_ms)).await?;
+    {
+        let manifest = writer.manifest_mut();
+        manifest.machine = Some(machine_info_from_env(&env_report));
+        manifest.command_args = std::env::args().collect();
+        manifest.device_availability = device_availability;
+        manifest
+            .notes
+            .push("capture-real is capture-only; motors are not commanded".to_string());
+        if args.export_rgb || args.export_depth || args.export_audio {
+            manifest.notes.push(
+                "asset export enabled; frame asset paths are relative to capture root".to_string(),
+            );
+        }
+    }
+    if args.export_pointcloud
+        && !warnings
+            .iter()
+            .any(|warning| warning.contains("uncalibrated point cloud"))
+    {
+        warnings
+            .push("uncalibrated point cloud: using approximate placeholder intrinsics".to_string());
+    }
+
+    let mut stream_counts = StreamCounts::default();
+    let mut events_written = 0usize;
+    let mut frame_index = 0u64;
+    for _ in 0..requested_frames {
+        let tick_result = runner.tick_read_only().await;
+        let (snapshot, tick) = match tick_result {
+            Ok(values) => values,
+            Err(error) if is_transient_readonly_timeout(&error) => {
+                eprintln!("read-only capture tick timed out; continuing");
+                tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        stream_counts.observe(&snapshot);
+        if tick
+            .frame
+            .notes
+            .iter()
+            .any(|note| note.contains("ReadOnlyActionSuppressed"))
+        {
+            events_written = events_written.saturating_add(1);
+        }
+        let export = export_snapshot_assets(
+            writer.root(),
+            frame_index,
+            &snapshot,
+            args.export_rgb,
+            args.export_depth,
+            args.export_audio,
+        )?;
+        writer
+            .append_snapshot_with_assets(
+                snapshot.body.last_update_ms,
+                snapshot,
+                Vec::new(),
+                export.assets,
+                (!export
+                    .metadata
+                    .as_object()
+                    .map(|m| m.is_empty())
+                    .unwrap_or(true))
+                .then_some(export.metadata),
+            )
+            .await?;
+        frame_index = frame_index.saturating_add(1);
+        tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+    }
+
+    let streams = stream_counts.streams();
+    warnings.extend(stream_counts.warnings());
+    if stream_counts.useful_stream_count() == 0 {
+        anyhow::bail!("no usable body or sensor streams were captured");
+    }
+    {
+        let manifest = writer.manifest_mut();
+        manifest.streams = streams;
+        manifest.warnings = warnings.clone();
+        if let Some(ledger) = &args.ledger {
+            manifest.notes.push(format!("ledger: {ledger}"));
+        }
+    }
+    let manifest = writer.finish().await?;
+    println!(
+        "capture-real complete: {} frames, out {}, streams {:?}, warnings {}, motor_applied false",
+        manifest.frame_count,
+        args.out,
+        manifest.streams.present,
+        manifest.warnings.len()
+    );
+    if events_written > 0 {
+        println!("  read-only motor suppressions observed: {events_written}");
+    }
+    if args.export_pointcloud {
+        capture_assets(CaptureAssetsArgs {
+            capture: args.out.clone(),
+            pointcloud: true,
+            world_pointcloud: false,
+            stride: args.pointcloud_stride,
+            max_depth_m: 8.0,
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+async fn capture_assets(args: CaptureAssetsArgs) -> Result<()> {
+    if !args.pointcloud && !args.world_pointcloud {
+        anyhow::bail!("no asset conversion requested; pass --pointcloud and/or --world-pointcloud");
+    }
+    let root = PathBuf::from(&args.capture);
+    let reader = CaptureReader::open(&root).await?;
+    let mut manifest = reader.manifest().clone();
+    let mut frames = reader.read_frames().await?;
+    let mut exported = 0usize;
+    if args.pointcloud {
+        for frame in &mut frames {
+            if export_pointcloud_for_frame(&root, frame, args.max_depth_m, args.stride)?.is_some() {
+                exported = exported.saturating_add(1);
+            }
+        }
+        rewrite_frames(&root, &frames).await?;
+    }
+    let world_vertices = if args.world_pointcloud {
+        Some(export_world_pointcloud_for_capture(&root, &frames)?)
+    } else {
+        None
+    };
+    if exported > 0
+        && !manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("uncalibrated point cloud"))
+    {
+        manifest
+            .warnings
+            .push("uncalibrated point cloud: using approximate placeholder intrinsics".to_string());
+    }
+    let world_vertices_count = world_vertices.unwrap_or(0);
+    if world_vertices_count > 0 {
+        manifest.asset_layout["world_pointcloud"] =
+            serde_json::json!("assets/pointcloud/world-accumulated.ply");
+        manifest.notes.push(format!(
+            "world pointcloud: assets/pointcloud/world-accumulated.ply ({world_vertices_count} voxels)"
+        ));
+    }
+    update_manifest(&root, &manifest).await?;
+    println!(
+        "capture-assets complete: pointcloud {} frames, world {}, capture {}, stride {}",
+        exported, world_vertices_count, args.capture, args.stride
+    );
+    Ok(())
+}
+
+fn export_world_pointcloud_for_capture(
+    root: &Path,
+    frames: &[pete_worldlab::CaptureFrameRecord],
+) -> Result<usize> {
+    let mut cloud = VoxelPointCloud::default();
+    for frame in frames {
+        cloud.observe_snapshot(&frame.snapshot, frame.t_ms);
+    }
+    let points = cloud.points();
+    let rel = Path::new("assets")
+        .join("pointcloud")
+        .join("world-accumulated.ply");
+    write_world_pointcloud_ply(&root.join(rel), &points)?;
+    Ok(points.len())
+}
+
+fn write_world_pointcloud_ply(path: &Path, points: &[pete_map::VoxelPoint]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = String::new();
+    out.push_str("ply\nformat ascii 1.0\n");
+    out.push_str(&format!("element vertex {}\n", points.len()));
+    out.push_str("property float x\nproperty float y\nproperty float z\n");
+    out.push_str("property uchar red\nproperty uchar green\nproperty uchar blue\n");
+    out.push_str("property float confidence\nproperty uchar stable\nproperty uchar transient\n");
+    out.push_str("end_header\n");
+    for point in points {
+        let [r, g, b] = point.color_rgb.unwrap_or([190, 194, 246]);
+        out.push_str(&format!(
+            "{:.6} {:.6} {:.6} {} {} {} {:.6} {} {}\n",
+            point.position.x_m,
+            point.position.y_m,
+            point.position.z_m,
+            r,
+            g,
+            b,
+            point.confidence,
+            u8::from(point.stable),
+            u8::from(point.transient)
+        ));
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+async fn inspect_capture(args: InspectCaptureArgs) -> Result<()> {
+    let report = inspect_capture_report(&args.path).await?;
+    println!("capture: {}", report.path.display());
+    println!("  frames: {}", report.frame_count);
+    println!("  duration_ms: {}", report.duration_ms.unwrap_or(0));
+    println!(
+        "  streams present: {}",
+        join_or_none(&report.streams_present)
+    );
+    println!(
+        "  streams missing: {}",
+        join_or_none(&report.streams_missing)
+    );
+    println!(
+        "  first/last timestamps: {:?} / {:?}",
+        report.first_timestamp_ms, report.last_timestamp_ms
+    );
+    println!("  events: {}", report.event_count);
+    println!("  assets:");
+    for (kind, count) in &report.asset_counts {
+        println!("    {kind}: {count}");
+    }
+    for detail in &report.asset_details {
+        println!("    {detail}");
+    }
+    println!("  warnings: {}", report.warnings.len());
+    for warning in &report.warnings {
+        println!("    - {warning}");
+    }
+    Ok(())
+}
+
+struct BackgroundSenseProducer {
+    name: &'static str,
+    state: std::sync::Arc<std::sync::Mutex<BackgroundSenseState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BackgroundSenseState {
+    latest: Option<SensePacket>,
+    pending: VecDeque<SensePacket>,
+    last_error: Option<String>,
+}
+
+impl BackgroundSenseState {
+    fn record_packet(&mut self, name: &str, packet: SensePacket) {
+        if name == "kinect-depth" && matches!(packet, SensePacket::EyeFrame(_)) {
+            return;
+        }
+        if is_reliable_background_packet(&packet) {
+            self.pending.push_back(packet);
+            while self.pending.len() > 32 {
+                self.pending.pop_front();
+            }
+        } else {
+            self.latest = Some(packet);
+        }
+    }
+
+    fn next_packet(&mut self) -> Option<SensePacket> {
+        self.pending.pop_front().or_else(|| self.latest.clone())
+    }
+}
+
+impl BackgroundSenseProducer {
+    fn spawn_with_callback<T, F>(
+        name: &'static str,
+        mut producer: T,
+        poll_interval: Duration,
+        on_packet: F,
+    ) -> Self
+    where
+        T: SenseProducer + Send + 'static,
+        F: Fn(&SensePacket) + Send + 'static,
+    {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(BackgroundSenseState::default()));
+        let worker_state = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let mut state = worker_state
+                        .lock()
+                        .expect("background sensor mutex poisoned");
+                    state.last_error = Some(format!(
+                        "failed to start background sensor runtime: {error}"
+                    ));
+                    return;
+                }
+            };
+            loop {
+                match runtime.block_on(producer.poll()) {
+                    Ok(packet) => {
+                        on_packet(&packet);
+                        let mut state = worker_state
+                            .lock()
+                            .expect("background sensor mutex poisoned");
+                        state.record_packet(name, packet);
+                        state.last_error = None;
+                    }
+                    Err(error) => {
+                        let mut state = worker_state
+                            .lock()
+                            .expect("background sensor mutex poisoned");
+                        state.last_error = Some(error.to_string());
+                    }
+                }
+                std::thread::sleep(poll_interval);
+            }
+        });
+        Self { name, state }
+    }
+}
+
+#[async_trait::async_trait]
+impl SenseProducer for BackgroundSenseProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        let mut state = self.state.lock().expect("background sensor mutex poisoned");
+        if let Some(packet) = state.next_packet() {
+            Ok(packet)
+        } else if let Some(error) = state.last_error.clone() {
+            anyhow::bail!("{} sensor unavailable: {error}", self.name)
+        } else {
+            anyhow::bail!("{} sensor has no frame yet", self.name)
+        }
+    }
+}
+
+fn is_reliable_background_packet(packet: &SensePacket) -> bool {
+    matches!(packet, SensePacket::Ear(_))
+}
+
+fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SensePacket) {
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let mut snapshot = live_state.latest().unwrap_or_default();
+    snapshot
+        .extensions
+        .retain(|extension| extension.name != "live/startup_sensor_only");
+    snapshot.extensions.push(ExtensionSense {
+        schema_version: 1,
+        name: "live/startup_sensor_only".to_string(),
+        values: vec![now_ms as f32],
+    });
+
+    match packet {
+        SensePacket::Kinect(kinect) => {
+            snapshot.kinect = kinect.clone();
+        }
+        SensePacket::EyeFrame(frame) => {
+            snapshot.eye_frame = Some(frame.clone());
+        }
+        SensePacket::Range(range) => {
+            snapshot.range = range.clone();
+        }
+        SensePacket::Imu(imu) => {
+            snapshot.imu = imu.clone();
+        }
+        SensePacket::Gps(gps) => {
+            snapshot.gps = Some(gps.clone());
+        }
+        SensePacket::Ear(ear) => {
+            snapshot.ear = ear.clone();
+        }
+        SensePacket::EarPcm(frame) => {
+            snapshot.ear_pcm = Some(frame.clone());
+        }
+        SensePacket::Eye(eye) => {
+            snapshot.eye = eye.clone();
+        }
+        SensePacket::Face(face) => {
+            snapshot.face = face.clone();
+        }
+        SensePacket::Voice(voice) => {
+            snapshot.voice = voice.clone();
+        }
+        SensePacket::Objects(objects) => {
+            snapshot.objects = objects.clone();
+        }
+        SensePacket::Extension(extension) => {
+            snapshot.extensions.push(extension.clone());
+        }
+    }
+
+    live_state.update(snapshot);
+}
+
+async fn run_robot(args: RobotArgs) -> Result<()> {
+    let env_report = collect_hardware_env_report().await;
+    let create_port = selected_cockpit_port(args.cockpit, &args.create_port, &env_report);
+    let robot_mode = match args.mode {
+        RobotModeArg::ReadOnly => RobotMode::ReadOnly,
+        RobotModeArg::Slow => RobotMode::Slow,
+        RobotModeArg::Disabled => RobotMode::Disabled,
+    };
+    if robot_mode == RobotMode::Disabled {
+        anyhow::bail!("--mode disabled does not start the real robot runner");
+    }
+
+    let (cockpit, robot_mode, is_mock_body) =
+        open_robot_cockpit_or_fallback(create_port.as_deref(), robot_mode)?;
+
+    let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
+    let live_state = args.dashboard.map(|_| {
+        let live_state = if robot_mode == RobotMode::Slow {
+            LiveViewState::new().with_real_slow_hardware_control()
+        } else {
+            LiveViewState::new()
+        };
+        live_state.update_session(SceneSession {
+            mode: match robot_mode {
+                RobotMode::ReadOnly => "read-only".to_string(),
+                RobotMode::Slow => "slow".to_string(),
+                RobotMode::Disabled => "disabled".to_string(),
+            },
+            scenario: None,
+            seed: None,
+            source: "real_robot".to_string(),
+            tick_ms: Some(args.tick_ms),
+        });
+        live_state.update_scene_metadata(LiveSceneMetadata {
+            arena: None,
+            objects: Vec::new(),
+            sensor_calibration: Some(real_robot_depth_calibration_from_env()),
+        });
+        live_state
+    });
+
+    if let (Some(addr), Some(live_state)) = (args.dashboard, live_state.clone()) {
+        let server_state = live_state.clone();
+        let reign_state =
+            pete_server::ReignServerState::with_live_view(reign_queue.clone(), &live_state);
+        if args.dashboard_tls {
+            let cert_path = args.dashboard_tls_cert.clone();
+            let key_path = args.dashboard_tls_key.clone();
+            tokio::spawn(async move {
+                if let Err(error) = pete_server::serve_live_view_with_reign_tls(
+                    addr,
+                    server_state,
+                    reign_state,
+                    cert_path,
+                    key_path,
+                )
+                .await
+                {
+                    eprintln!("live robot HTTPS view server stopped: {error}");
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(error) =
+                    pete_server::serve_live_view_with_reign(addr, server_state, reign_state)
+                        .await
+                {
+                    eprintln!("live robot view server stopped: {error}");
+                }
+            });
+        }
+        let scheme = if args.dashboard_tls { "https" } else { "http" };
+        println!("robot {:?} dashboard: {scheme}://{addr}/view", robot_mode);
+    }
+
+    let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
+
+    if args.kinect_depth {
+        if let Some(device) = &args.camera {
+            println!(
+                "Kinect depth enabled; using libfreenect for Kinect RGB/depth and not opening {device} through V4L"
+            );
+        }
+    } else if let Some(device) = &args.camera {
+        match CameraSenseProvider::new(device) {
+            Ok(provider) => {
+                let live_state_for_camera = live_state.clone();
+                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                    "camera",
+                    provider,
+                    Duration::from_millis(33),
+                    move |packet| {
+                        if let (Some(live_state), SensePacket::EyeFrame(frame)) =
+                            (&live_state_for_camera, packet)
+                        {
+                            live_state.record_live_eye_frame(frame.clone());
+                            publish_live_sensor_only_snapshot(live_state, packet);
+                        }
+                    },
+                )));
+            }
+            Err(err) => {
+                if args.require_camera {
+                    anyhow::bail!("failed to initialize camera: {err}");
+                } else {
+                    println!("failed to initialize camera: {err}; continuing without it");
+                }
+            }
+        }
+    }
+
+    if args.kinect_depth {
+        #[cfg(feature = "kinect-freenect")]
+        match FreenectKinectProvider::with_index(args.kinect_index)
+            .map(|provider| provider.with_rgb_adjustment(kinect_rgb_adjustment_for_robot(&args)))
+        {
+            Ok(provider) => {
+                let live_state_for_kinect = live_state.clone();
+                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                    "kinect-depth",
+                    provider,
+                    Duration::from_millis(33),
+                    move |packet| {
+                        if let Some(live_state) = &live_state_for_kinect {
+                            if let SensePacket::EyeFrame(frame) = packet {
+                                live_state.record_live_eye_frame(frame.clone());
+                            }
+                            if matches!(packet, SensePacket::EyeFrame(_) | SensePacket::Kinect(_)) {
+                                publish_live_sensor_only_snapshot(live_state, packet);
+                            }
+                        }
+                    },
+                )));
+            }
+            Err(err) => {
+                println!("failed to initialize Kinect depth: {err}; continuing without it");
+            }
+        }
+        #[cfg(not(feature = "kinect-freenect"))]
+        println!(
+            "failed to initialize Kinect depth: rebuild with --features kinect-freenect; continuing without it"
+        );
+    }
+
+    if let Some(device) = &args.mic {
+        let pref_name = if device == "default" {
+            None
+        } else {
+            Some(device.as_str())
+        };
+        let mut asr_config = AsrToolConfig::default();
+        if let Some(command) = args.asr_command.clone() {
+            asr_config.command = Some(command);
+        }
+        match MicrophoneSenseProvider::with_asr_config(pref_name, asr_config) {
+            Ok(provider) => {
+                let live_state_for_mic = live_state.clone();
+                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                    "microphone",
+                    provider,
+                    Duration::from_millis(25),
+                    move |packet| {
+                        if let Some(live_state) = &live_state_for_mic {
+                            if matches!(packet, SensePacket::EarPcm(_) | SensePacket::Ear(_)) {
+                                publish_live_sensor_only_snapshot(live_state, packet);
+                            }
+                        }
+                    },
+                )));
+            }
+            Err(err) => {
+                if args.require_mic {
+                    anyhow::bail!("failed to initialize mic: {err}");
+                } else {
+                    println!("failed to initialize mic: {err}; continuing without it");
+                }
+            }
+        }
+    }
+
+    if let Some(device) = selected_gps_device(
+        args.gps.as_deref(),
+        is_mock_body,
+        &env_report,
+        create_port.as_deref(),
+    ) {
+        match GpsSenseProvider::new(&device, 9600) {
+            Ok(provider) => sensors.push(Box::new(provider)),
+            Err(err) => {
+                if args.require_gps {
+                    anyhow::bail!("failed to initialize gps: {err}");
+                } else {
+                    println!("failed to initialize gps: {err}; continuing without it");
+                }
+            }
+        }
+    }
+
+    if let Some(device) = selected_imu_device(args.imu.as_deref(), is_mock_body) {
+        match ImuSenseProvider::new(device) {
+            Ok(provider) => {
+                let live_state_for_imu = live_state.clone();
+                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                    "imu",
+                    provider,
+                    Duration::from_millis(25),
+                    move |packet| {
+                        if let Some(live_state) = &live_state_for_imu {
+                            if matches!(packet, SensePacket::Imu(_)) {
+                                publish_live_sensor_only_snapshot(live_state, packet);
+                            }
+                        }
+                    },
+                )));
+            }
+            Err(err) => {
+                if args.require_imu {
+                    anyhow::bail!("failed to initialize imu: {err}");
+                } else {
+                    println!("failed to initialize imu: {err}; continuing without it");
+                }
+            }
+        }
+    }
+
+    let mut mouth = match QueuedPiperCpalMouth::from_env() {
+        Ok(Some(mouth)) => Some(mouth),
+        Ok(None) => {
+            println!(
+                "robot mouth disabled: no Piper voice found; set PETE_TTS_PIPER_VOICE and PETE_TTS_PIPER_CONFIG"
+            );
+            None
+        }
+        Err(error) => {
+            println!("robot mouth disabled: could not load Piper voice: {error}");
+            None
+        }
+    };
+    if let Some(mouth_ref) = &mouth {
+        if !speak_robot_mouth_text_before_status(mouth_ref, "Hello. My name is Pete.") {
+            mouth = None;
+        }
+    }
+
+    let init_body = None;
+
+    let ledger = JsonlLedger::new(&args.ledger);
+    let memory = DurableExperienceStore::from_env();
+    let recall = memory.clone();
+    let runtime = MinimalRuntime::with_reign_queue(
+        ledger.clone(),
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        configured_llm_agent(&args.llm)?,
+        reign_queue,
+    );
+    let live_image_enricher = LiveImageEnricher::new(configured_llm_config(&args.llm)?)?;
+    let mut frame_processor_warnings = Vec::new();
+    let active_sensor_count = sensors.len();
+    let initialization = robot_initialization_metadata(
+        robot_mode,
+        &args,
+        is_mock_body,
+        create_port.as_deref(),
+        active_sensor_count,
+        init_body.as_ref(),
+    );
+    let mut runner = RealRobotRunner::new(robot_mode, cockpit, sensors, runtime)
+        .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
+        .with_live_image_enricher(live_image_enricher)
+        .with_robot_initialization(initialization.clone());
+    runner.tick_ms = args.tick_ms;
+    for warning in frame_processor_warnings {
+        println!("{warning}");
+    }
+
+    let mut capture = match &args.capture {
+        Some(path) => {
+            Some(CaptureWriter::create(path, CaptureSource::RealRobot, Some(args.tick_ms)).await?)
+        }
+        None => None,
+    };
+
+    enqueue_default_bringup_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &initialization);
+
+    let max_steps = args.steps.or_else(|| {
+        args.duration_seconds
+            .map(|seconds| duration_to_steps(seconds, args.tick_ms))
+    });
+    let mut played_reign_audio = HashSet::new();
+    while max_steps
+        .map(|limit| runner.tick_count < limit)
+        .unwrap_or(true)
+    {
+        let tick_result = match robot_mode {
+            RobotMode::ReadOnly => runner.tick_read_only().await,
+            RobotMode::Slow => runner.tick_slow_manual().await,
+            RobotMode::Disabled => unreachable!("disabled mode bailed before runner start"),
+        };
+        let (snapshot, tick) = match tick_result {
+            Ok(values) => values,
+            Err(error) if matches!(robot_mode, RobotMode::ReadOnly | RobotMode::Slow) => {
+                if is_transient_robot_timeout(&error) {
+                    eprintln!("{robot_mode:?} tick timed out; continuing");
+                    tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        play_event_script_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &tick);
+        play_reign_audio_action(
+            &mouth,
+            runner.cockpit.client_mut().as_mut(),
+            &tick,
+            &mut played_reign_audio,
+        );
+        if let Some(live_state) = &live_state {
+            live_state.update(snapshot.clone());
+            live_state.update_embodied_context(tick.frame.embodied_context());
+        }
+        if let Some(writer) = capture.as_mut() {
+            writer
+                .append_snapshot(snapshot.body.last_update_ms, snapshot.clone(), Vec::new())
+                .await?;
+        }
+        println!(
+            "robot {:?} tick {}: battery {:.2}, chosen {:?}",
+            robot_mode, runner.tick_count, tick.frame.now.body.battery_level, tick.chosen_action
+        );
+        tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+    }
+
+    let capture_summary = if let Some(writer) = capture {
+        let manifest = writer.finish().await?;
+        format!(
+            ", capture {}, {} frames",
+            args.capture.as_deref().unwrap_or_default(),
+            manifest.frame_count
+        )
+    } else {
+        String::new()
+    };
+    let transitions = ledger.transitions().await?;
+    println!(
+        "robot {:?} complete: {} ticks, ledger {}, {} transitions{}",
+        robot_mode,
+        runner.tick_count,
+        args.ledger,
+        transitions.len(),
+        capture_summary
+    );
+    Ok(())
+}
+
+fn run_mouth(args: MouthArgs) -> Result<()> {
+    let Some(mouth) = QueuedPiperCpalMouth::from_env()? else {
+        anyhow::bail!(
+            "robot mouth disabled: no Piper voice found; set PETE_TTS_PIPER_VOICE and PETE_TTS_PIPER_CONFIG"
+        );
+    };
+    let outcome = mouth.enqueue_and_wait_timeout(args.text, Some(Duration::from_secs(60)))?;
+    println!(
+        "robot mouth diagnostic complete: device {}, duration {} ms",
+        outcome.device.as_deref().unwrap_or("<unknown>"),
+        outcome.duration_ms.unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn run_whisper_transcribe(args: WhisperTranscribeArgs) -> Result<()> {
+    use speaking::{AudioFrame, SpeechRecognizer, WhisperSpeechRecognizer};
+
+    let model = args
+        .model
+        .or_else(|| env_path("PETE_WHISPER_MODEL"))
+        .or_else(default_whisper_model_path)
+        .context("missing Whisper model path; run `just setup-whisper`, set PETE_WHISPER_MODEL, or pass --model")?;
+    let samples = read_wav_as_16khz_mono_f32(&args.wav)
+        .with_context(|| format!("failed to read {}", args.wav.display()))?;
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let mut recognizer = WhisperSpeechRecognizer::new_quiet_without_input_padding(&model)
+        .with_context(|| format!("loading Whisper model {}", model.display()))?;
+    recognizer.push_frame(&AudioFrame {
+        sample_rate_hz: 16_000,
+        channels: 1,
+        samples,
+    })?;
+    let chunks = recognizer.poll_chunks()?;
+    let transcript = chunks
+        .into_iter()
+        .map(|chunk| chunk.text)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if !transcript.is_empty() {
+        println!("{transcript}");
+    }
+    Ok(())
+}
+
+fn read_wav_as_16khz_mono_f32(path: &Path) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let source_rate = spec.sample_rate.max(1);
+    let mut interleaved = Vec::new();
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Float, 32) => {
+            for sample in reader.samples::<f32>() {
+                interleaved.push(sample?);
+            }
+        }
+        (hound::SampleFormat::Int, 8) => {
+            for sample in reader.samples::<i8>() {
+                interleaved.push(sample? as f32 / i8::MAX as f32);
+            }
+        }
+        (hound::SampleFormat::Int, 16) => {
+            for sample in reader.samples::<i16>() {
+                interleaved.push(sample? as f32 / i16::MAX as f32);
+            }
+        }
+        (hound::SampleFormat::Int, 24 | 32) => {
+            let scale = ((1_i64 << (spec.bits_per_sample - 1)) - 1) as f32;
+            for sample in reader.samples::<i32>() {
+                interleaved.push(sample? as f32 / scale);
+            }
+        }
+        _ => anyhow::bail!(
+            "unsupported WAV format: {:?} {} bits",
+            spec.sample_format,
+            spec.bits_per_sample
+        ),
+    }
+    let mono = interleaved
+        .chunks(channels)
+        .map(|frame| frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32)
+        .collect::<Vec<_>>();
+    Ok(resample_mono_linear(&mono, source_rate, 16_000))
+}
+
+fn resample_mono_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
+        return Vec::new();
+    }
+    if source_rate == target_rate {
+        return samples.to_vec();
+    }
+    let output_len = (samples.len() as u64)
+        .saturating_mul(u64::from(target_rate))
+        .div_ceil(u64::from(source_rate)) as usize;
+    let ratio = source_rate as f64 / target_rate as f64;
+    let mut output = Vec::with_capacity(output_len);
+    for index in 0..output_len {
+        let pos = index as f64 * ratio;
+        let left = pos.floor() as usize;
+        let right = (left + 1).min(samples.len() - 1);
+        let fraction = (pos - left as f64) as f32;
+        let sample = samples[left] * (1.0 - fraction) + samples[right] * fraction;
+        output.push(sample.clamp(-1.0, 1.0));
+    }
+    output
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn default_whisper_model_path() -> Option<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+        })?;
+    Some(
+        data_home
+            .join("pete")
+            .join("models")
+            .join("whisper")
+            .join(DEFAULT_WHISPER_MODEL_FILENAME),
+    )
+}
+
+fn robot_initialization_metadata(
+    robot_mode: RobotMode,
+    args: &RobotArgs,
+    is_mock_body: bool,
+    create_port: Option<&str>,
+    active_sensor_count: usize,
+    init_body: Option<&BodySense>,
+) -> serde_json::Value {
+    let body_status = if is_mock_body {
+        "mock Create body connected".to_string()
+    } else if let Some(port) = create_port {
+        format!("Create body connected on {port}")
+    } else {
+        "Create body connected".to_string()
+    };
+    let mode = match robot_mode {
+        RobotMode::ReadOnly => "read-only",
+        RobotMode::Slow => "slow",
+        RobotMode::Disabled => "disabled",
+    };
+    serde_json::json!({
+        "mode": mode,
+        "body": body_status,
+        "battery_percent": init_body.map(|body| {
+            (body.battery_level.clamp(0.0, 1.0) * 100.0).round() as u32
+        }),
+        "charging": init_body.map(|body| body.charging),
+        "active_sensors": active_sensor_count,
+        "requested_sensors": requested_robot_sensor_count(args),
+        "ledger": args.ledger.clone(),
+        "tick_ms": args.tick_ms,
+        "dashboard": args.dashboard.map(|addr| addr.to_string()),
+        "capture": args.capture.clone(),
+    })
+}
+
+fn enqueue_default_bringup_outputs(
+    mouth: &Option<QueuedPiperCpalMouth>,
+    cockpit: &mut dyn Cockpit,
+    initialization: &serde_json::Value,
+) {
+    play_robot_song(cockpit, "bring_up");
+    play_robot_chirp(cockpit, "Confirm");
+    let Some(mouth) = mouth.as_ref() else {
+        return;
+    };
+    if let Some(mode) = initialization.get("mode").and_then(|value| value.as_str()) {
+        enqueue_robot_mouth_text(
+            mouth,
+            &format!("Pete robot initialization complete in {mode} mode."),
+        );
+    }
+    if let Some(body) = initialization.get("body").and_then(|value| value.as_str()) {
+        enqueue_robot_mouth_text(mouth, &format!("{body}."));
+    }
+    match (
+        initialization
+            .get("battery_percent")
+            .and_then(|value| value.as_u64()),
+        initialization
+            .get("charging")
+            .and_then(|value| value.as_bool()),
+    ) {
+        (Some(percent), Some(charging)) => {
+            let charging = if charging { "charging" } else { "not charging" };
+            enqueue_robot_mouth_text(
+                mouth,
+                &format!("Battery is {percent} percent and {charging}."),
+            );
+        }
+        _ => enqueue_robot_mouth_text(mouth, "Battery status is unavailable."),
+    }
+}
+
+fn speak_robot_mouth_text_before_status(mouth: &QueuedPiperCpalMouth, text: &str) -> bool {
+    println!("robot mouth speaking before body status: {text:?}");
+    match mouth.enqueue_and_wait_timeout(text.to_string(), Some(Duration::from_secs(20))) {
+        Ok(outcome) => {
+            println!(
+                "robot mouth completed before body status: device {}, duration {} ms",
+                outcome.device.as_deref().unwrap_or("<unknown>"),
+                outcome.duration_ms.unwrap_or_default()
+            );
+            true
+        }
+        Err(error) => {
+            println!(
+                "robot mouth pre-status speech failed; disabling mouth for this run and continuing: {error}"
+            );
+            false
+        }
+    }
+}
+
+fn play_event_script_outputs(
+    mouth: &Option<QueuedPiperCpalMouth>,
+    cockpit: &mut dyn Cockpit,
+    tick: &RuntimeTick,
+) {
+    let Some(scripts) = tick.frame.now.extensions.get("event_scripts") else {
+        return;
+    };
+    let Some(object) = scripts.as_object() else {
+        return;
+    };
+    for sequence in object.values() {
+        let Some(actions) = sequence.get("actions").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for action in actions {
+            let requested = action.get("requested").unwrap_or(action);
+            if let Some(text) = requested.get("text").and_then(|value| value.as_str()) {
+                if let Some(mouth) = mouth.as_ref() {
+                    enqueue_robot_mouth_text(mouth, text);
+                }
+            } else if let Some(pattern) = requested.get("pattern").and_then(|value| value.as_str())
+            {
+                play_robot_chirp(cockpit, pattern);
+            } else if let Some(name) = requested.get("name").and_then(|value| value.as_str()) {
+                play_robot_song(cockpit, name);
+            }
+        }
+    }
+}
+
+fn play_reign_audio_action(
+    mouth: &Option<QueuedPiperCpalMouth>,
+    cockpit: &mut dyn Cockpit,
+    tick: &RuntimeTick,
+    played: &mut HashSet<String>,
+) {
+    let Some(action) = tick.chosen_action.as_ref() else {
+        return;
+    };
+    let action_key = match action {
+        ActionPrimitive::Speak { text } => format!("speak:{text}"),
+        ActionPrimitive::Chirp { pattern } => format!("chirp:{pattern:?}"),
+        _ => return,
+    };
+    let key = tick
+        .frame
+        .reign_input
+        .as_ref()
+        .map(|input| format!("reign:{}:{action_key}", input.id))
+        .unwrap_or_else(|| format!("frame:{}:{action_key}", tick.frame.id));
+    if !played.insert(key) {
+        return;
+    }
+    match action {
+        ActionPrimitive::Speak { text } => {
+            if let Some(mouth) = mouth.as_ref() {
+                enqueue_robot_mouth_text(mouth, text);
+            } else {
+                println!("robot mouth unavailable; skipped Reign speech {text:?}");
+            }
+        }
+        ActionPrimitive::Chirp { pattern } => {
+            play_robot_chirp(cockpit, &format!("{pattern:?}"));
+        }
+        _ => {}
+    }
+}
+
+fn enqueue_robot_mouth_text(mouth: &QueuedPiperCpalMouth, text: &str) {
+    match mouth.enqueue(text.to_string()) {
+        Ok(()) => println!("robot mouth queued: {text:?}"),
+        Err(error) => println!("robot mouth queue failed: {error}; text {text:?}"),
+    }
+}
+
+fn play_robot_chirp(cockpit: &mut dyn Cockpit, pattern: &str) {
+    play_body_song(
+        cockpit,
+        &format!("chirp {pattern}"),
+        chirp_pattern_song(pattern),
+    );
+}
+
+fn play_robot_song(cockpit: &mut dyn Cockpit, name: &str) {
+    play_body_song(cockpit, name, robot_song(name));
+}
+
+fn play_body_song(cockpit: &mut dyn Cockpit, label: &str, song: BodySong) {
+    let tones = song
+        .tones
+        .iter()
+        .map(|tone| SongTone {
+            note: tone.note,
+            duration_64ths: tone.duration_64ths,
+        })
+        .collect::<Vec<_>>();
+    match cockpit.song_define(0, &tones).and_then(|()| cockpit.song_play(0)) {
+        Ok(()) => println!("robot cockpit song played: {label}"),
+        Err(error) => println!("robot cockpit song skipped: {error}; song {label}"),
+    }
+}
+
+fn chirp_pattern_song(pattern: &str) -> BodySong {
+    BodySong::new(
+        chirp_pattern_notes(pattern)
+            .iter()
+            .enumerate()
+            .map(|(index, note)| {
+                tone(
+                    *note,
+                    if index + 1 == chirp_pattern_notes(pattern).len() {
+                        8
+                    } else {
+                        6
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn chirp_pattern_notes(pattern: &str) -> &'static [u8] {
+    match normalized_chirp_pattern(pattern).as_str() {
+        "confirm" => &[79, 84, 79],
+        "warning" => &[79, 75],
+        "hello" => &[72, 76, 79],
+        "goodbye" => &[79, 76, 72],
+        "curious" => &[72, 76, 74],
+        "idea" => &[76, 81, 84],
+        "goalacquired" => &[72, 79, 84, 91],
+        "searching" => &[72, 74, 76, 74],
+        "sawsomething" => &[84, 91],
+        "surprise" => &[72, 84],
+        "learned" => &[74, 79, 83],
+        "personrecognized" => &[76, 79, 84, 79],
+        "objectrecognized" => &[79, 84, 76],
+        "placerecognized" => &[79, 84, 72],
+        "didntunderstand" => &[79, 81, 78],
+        "docking" => &[67, 72, 76, 79],
+        "chargingstarted" => &[60, 67, 72],
+        "sleep" => &[79, 76, 72, 67],
+        "wake" => &[67, 72, 79],
+        _ => &[72],
+    }
+}
+
+fn normalized_chirp_pattern(pattern: &str) -> String {
+    pattern
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn robot_song(name: &str) -> BodySong {
+    match name {
+        "bring_up" => BodySong::new([
+            tone(60, 8),
+            tone(64, 8),
+            tone(67, 8),
+            tone(72, 12),
+            tone(67, 6),
+            tone(72, 14),
+        ]),
+        "mournful_bump" => BodySong::new([tone(64, 12), tone(63, 12), tone(60, 16), tone(55, 20)]),
+        _ => BodySong::new([tone(60, 8), tone(67, 8), tone(72, 12)]),
+    }
+}
+
+fn tone(note: u8, duration_64ths: u8) -> BodyTone {
+    BodyTone::new(note, duration_64ths)
+}
+
+fn requested_robot_sensor_count(args: &RobotArgs) -> usize {
+    usize::from(args.camera.is_some() || args.kinect_depth)
+        + usize::from(args.mic.is_some())
+        + usize::from(args.imu.is_some())
+        + usize::from(args.gps.is_some())
+}
+
+fn open_robot_cockpit_or_fallback(
+    create_port: Option<&str>,
+    mut robot_mode: RobotMode,
+) -> Result<(Box<dyn Cockpit + Send>, RobotMode, bool)> {
+    if create_port == Some("mock") {
+        if robot_mode == RobotMode::Slow {
+            println!(
+                "warning: cockpit mock does not support real motorized slow mode; running in read-only mode instead"
+            );
+            robot_mode = RobotMode::ReadOnly;
+        }
+        return Ok((Box::new(LocalSimCockpit::new()), robot_mode, true));
+    }
+
+    let Some(create_port) = create_port else {
+        if robot_mode == RobotMode::Slow {
+            println!(
+                "warning: no cockpit UART device found; falling back to simulated cockpit in read-only mode"
+            );
+            robot_mode = RobotMode::ReadOnly;
+        } else {
+            println!("warning: no cockpit UART device found; falling back to simulated cockpit");
+        }
+        return Ok((Box::new(LocalSimCockpit::new()), robot_mode, true));
+    };
+
+    match UartCockpit::connect(create_port) {
+        Ok(cockpit) => Ok((Box::new(cockpit), robot_mode, false)),
+        Err(error) => {
+            if robot_mode == RobotMode::Slow {
+                println!(
+                    "warning: failed to open cockpit UART device {create_port}: {error}; falling back to simulated cockpit in read-only mode"
+                );
+                robot_mode = RobotMode::ReadOnly;
+            } else {
+                println!(
+                    "warning: failed to open cockpit UART device {create_port}: {error}; falling back to simulated cockpit"
+                );
+            }
+            Ok((Box::new(LocalSimCockpit::new()), robot_mode, true))
+        }
+    }
+}
+
+fn default_runtime(
+    ledger: JsonlLedger,
+    llm_args: &LlmArgs,
+) -> Result<
+    MinimalRuntime<
+        JsonlLedger,
+        InMemoryExperienceStore,
+        InMemoryExperienceStore,
+        SimpleConductor,
+        SimpleSafety,
+        ConfiguredLlmAgent,
+    >,
+> {
+    let memory = InMemoryExperienceStore::new();
+    let recall = memory.clone();
+    Ok(MinimalRuntime::with_default_events(
+        ledger,
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        configured_llm_agent(llm_args)?,
+    ))
+}
+
+fn durable_runtime(
+    ledger: JsonlLedger,
+    llm_args: &LlmArgs,
+) -> Result<
+    MinimalRuntime<
+        JsonlLedger,
+        DurableExperienceStore,
+        DurableExperienceStore,
+        SimpleConductor,
+        SimpleSafety,
+        ConfiguredLlmAgent,
+    >,
+> {
+    let memory = DurableExperienceStore::from_env();
+    let recall = memory.clone();
+    Ok(MinimalRuntime::with_default_events(
+        ledger,
+        memory,
+        recall,
+        SimpleConductor::default(),
+        SimpleSafety::default(),
+        configured_llm_agent(llm_args)?,
+    ))
+}
+
+async fn real_robot_frame_processor(warnings: &mut Vec<String>) -> FrameProcessor {
+    let processor = FrameProcessor::new()
+        .with_kinect_range_projection(real_robot_depth_range_projection_from_env());
+    if std::env::var("PETE_FACE_DETECTION")
+        .map(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(false)
+    {
+        warnings.push("face detection disabled by PETE_FACE_DETECTION".to_string());
+        return processor;
+    }
+
+    match pete_sensors::FaceIdDetector::from_hf().await {
+        Ok(detector) => processor.with_face_detector(std::sync::Arc::new(detector)),
+        Err(error) => {
+            warnings.push(format!(
+                "face detection unavailable; continuing without face vectors: {error}"
+            ));
+            processor
+        }
+    }
+}
+
+fn real_robot_depth_range_projection_from_env() -> DepthRangeProjectionConfig {
+    let calibration = real_robot_depth_calibration_from_env();
+    DepthRangeProjectionConfig {
+        compact_depth_beam_count: calibration.compact_depth_beam_count,
+        compact_depth_fov_rad: calibration.compact_depth_fov_rad,
+        depth_scale: calibration.depth_scale,
+        camera_forward_m: calibration.camera_forward_m,
+        camera_height_m: calibration.camera_height_m,
+        camera_pitch_rad: calibration.camera_pitch_rad,
+        camera_roll_rad: calibration.camera_roll_rad,
+        camera_yaw_rad: calibration.camera_yaw_rad,
+        min_depth_m: 0.35,
+        max_depth_m: 8.0,
+    }
+}
+
+fn duration_to_steps(duration_seconds: u64, tick_ms: u64) -> usize {
+    let tick_ms = tick_ms.max(1);
+    let total_ms = duration_seconds.saturating_mul(1000);
+    total_ms.div_ceil(tick_ms).max(1) as usize
+}
+
+fn add_optional_real_sensors(
+    args: &CaptureRealArgs,
+    env_report: &Value,
+    create_port: Option<&str>,
+    sensors: &mut Vec<Box<dyn SenseProducer + Send>>,
+    availability: &mut Value,
+    warnings: &mut Vec<String>,
+) {
+    if args.kinect_depth {
+        if let Some(device) = &args.camera {
+            warnings.push(format!(
+                "Kinect depth requested; using libfreenect for Kinect RGB/depth instead of opening {device} through V4L"
+            ));
+        }
+    } else if let Some(device) = &args.camera {
+        match CameraSenseProvider::new(device) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["camera"] = serde_json::json!({"present": true, "device": device});
+            }
+            Err(error) => {
+                availability["camera"] = serde_json::json!({"present": false, "device": device, "error": error.to_string()});
+                warnings.push(format!("camera unavailable: {error}"));
+            }
+        }
+    } else {
+        availability["camera"] = serde_json::json!({"present": false, "reason": "not requested"});
+        warnings.push("camera not requested; RGB stream missing".to_string());
+    }
+
+    if args.kinect_depth {
+        #[cfg(feature = "kinect-freenect")]
+        match FreenectKinectProvider::with_index(args.kinect_index)
+            .map(|provider| provider.with_rgb_adjustment(kinect_rgb_adjustment_for_capture(&args)))
+        {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["kinect"] = serde_json::json!({
+                    "present": true,
+                    "source": "libfreenect",
+                    "index": args.kinect_index,
+                    "rgb_adjustment": kinect_rgb_adjustment_json(kinect_rgb_adjustment_for_capture(args))
+                });
+                availability["camera"] = serde_json::json!({
+                    "present": true,
+                    "source": "libfreenect",
+                    "index": args.kinect_index,
+                    "rgb_adjustment": kinect_rgb_adjustment_json(kinect_rgb_adjustment_for_capture(args))
+                });
+            }
+            Err(error) => {
+                availability["kinect"] = serde_json::json!({
+                    "present": false,
+                    "source": "libfreenect",
+                    "index": args.kinect_index,
+                    "error": error.to_string()
+                });
+                warnings.push(format!("Kinect depth unavailable: {error}"));
+            }
+        }
+        #[cfg(not(feature = "kinect-freenect"))]
+        {
+            availability["kinect"] = serde_json::json!({
+                "present": false,
+                "reason": "pete-tools was built without kinect-freenect"
+            });
+            warnings.push(
+                "Kinect depth requested but binary was built without kinect-freenect".to_string(),
+            );
+        }
+    }
+
+    if let Some(device) = &args.mic {
+        let pref_name = (device != "default").then_some(device.as_str());
+        match MicrophoneSenseProvider::new(pref_name) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["microphone"] = serde_json::json!({"present": true, "device": device});
+            }
+            Err(error) => {
+                availability["microphone"] = serde_json::json!({"present": false, "device": device, "error": error.to_string()});
+                warnings.push(format!("microphone unavailable: {error}"));
+            }
+        }
+    } else {
+        availability["microphone"] =
+            serde_json::json!({"present": false, "reason": "not requested"});
+        warnings.push("microphone not requested; audio stream missing".to_string());
+    }
+
+    if let Some(device) = selected_gps_device(args.gps.as_deref(), false, env_report, create_port) {
+        match GpsSenseProvider::new(&device, 9600) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["gps"] = serde_json::json!({"present": true, "device": device});
+            }
+            Err(error) => {
+                availability["gps"] = serde_json::json!({"present": false, "device": device, "error": error.to_string()});
+                warnings.push(format!("gps unavailable: {error}"));
+            }
+        }
+    } else {
+        availability["gps"] =
+            serde_json::json!({"present": false, "reason": "disabled or not detected"});
+    }
+
+    if let Some(device) = selected_imu_device(args.imu.as_deref(), false) {
+        match ImuSenseProvider::new(device) {
+            Ok(provider) => {
+                sensors.push(Box::new(provider));
+                availability["imu"] = serde_json::json!({"present": true, "device": device});
+            }
+            Err(error) => {
+                availability["imu"] = serde_json::json!({"present": false, "device": device, "error": error.to_string()});
+                warnings.push(format!("imu unavailable: {error}"));
+            }
+        }
+    } else {
+        availability["imu"] = serde_json::json!({"present": false, "reason": "disabled"});
+    }
+
+    if availability["kinect"]["present"].as_bool() != Some(true)
+        && availability["kinect"]["freenect_available"].as_bool() != Some(true)
+    {
+        warnings.push("Kinect/libfreenect not detected; depth stream missing".to_string());
+    }
+}
+
+fn selected_create_port(requested: &str, env_report: &Value) -> Option<String> {
+    if requested != "auto" {
+        return Some(requested.to_string());
+    }
+    let mut candidates = serial_device_strings(env_report)
+        .into_iter()
+        .filter(|device| !looks_like_gps_serial_device(device))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|device| create_serial_priority(device));
+    candidates.into_iter().next()
+}
+
+fn selected_cockpit_port(
+    backend: CockpitBackendArg,
+    requested: &str,
+    env_report: &Value,
+) -> Option<String> {
+    match backend {
+        CockpitBackendArg::Sim => Some("mock".to_string()),
+        CockpitBackendArg::Uart => selected_create_port(requested, env_report),
+    }
+}
+
+fn create_serial_priority(device: &str) -> u8 {
+    if device.contains("/dev/ttyUSB") {
+        0
+    } else if device.contains("/dev/serial/by-id") {
+        1
+    } else if device.contains("/dev/ttyACM") {
+        2
+    } else {
+        3
+    }
+}
+
+fn selected_gps_device(
+    requested: Option<&str>,
+    suppress_default: bool,
+    env_report: &Value,
+    create_port: Option<&str>,
+) -> Option<String> {
+    match requested.map(str::trim) {
+        Some(value) if gps_disabled_value(value) => return None,
+        Some(value) if !value.is_empty() => return Some(value.to_string()),
+        _ if suppress_default => return None,
+        _ => {}
+    }
+
+    let available = serial_device_strings(env_report)
+        .into_iter()
+        .filter(|device| {
+            create_port
+                .map(|port| port != device.as_str())
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    available
+        .iter()
+        .find(|device| looks_like_gps_serial_device(device))
+        .cloned()
+        .or_else(|| {
+            available
+                .iter()
+                .find(|device| device.contains("/dev/ttyACM"))
+                .cloned()
+        })
+}
+
+fn serial_device_strings(env_report: &Value) -> Vec<String> {
+    env_report["serial_devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn looks_like_gps_serial_device(device: &str) -> bool {
+    let lower = device.to_lowercase();
+    lower.contains("u-blox")
+        || lower.contains("ublox")
+        || lower.contains("gps")
+        || lower.contains("gnss")
+}
+
+fn gps_disabled_value(value: &str) -> bool {
+    value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("disabled")
+}
+
+fn selected_imu_device(requested: Option<&str>, suppress_default: bool) -> Option<&str> {
+    match requested.map(str::trim) {
+        Some(value) if imu_disabled_value(value) => None,
+        Some(value) if !value.is_empty() => Some(value),
+        _ if suppress_default => None,
+        _ => Some(DEFAULT_MPU6050_IMU_DEVICE),
+    }
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn kinect_rgb_adjustment_for_robot(args: &RobotArgs) -> KinectRgbAdjustment {
+    KinectRgbAdjustment {
+        enabled: !args.kinect_rgb_raw,
+        gain: args.kinect_rgb_gain,
+        gamma: args.kinect_rgb_gamma,
+        target_luma: args.kinect_rgb_target_luma,
+        auto_gain_max: args.kinect_rgb_auto_gain_max,
+        brightness: args.kinect_rgb_brightness,
+    }
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn kinect_rgb_adjustment_for_capture(args: &CaptureRealArgs) -> KinectRgbAdjustment {
+    KinectRgbAdjustment {
+        enabled: !args.kinect_rgb_raw,
+        gain: args.kinect_rgb_gain,
+        gamma: args.kinect_rgb_gamma,
+        target_luma: args.kinect_rgb_target_luma,
+        auto_gain_max: args.kinect_rgb_auto_gain_max,
+        brightness: args.kinect_rgb_brightness,
+    }
+}
+
+#[cfg(feature = "kinect-freenect")]
+fn kinect_rgb_adjustment_json(adjustment: KinectRgbAdjustment) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": adjustment.enabled,
+        "gain": adjustment.gain,
+        "gamma": adjustment.gamma,
+        "target_luma": adjustment.target_luma,
+        "auto_gain_max": adjustment.auto_gain_max,
+        "brightness": adjustment.brightness,
+    })
+}
+
+fn imu_disabled_value(value: &str) -> bool {
+    value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("disabled")
+}
+
+#[derive(Default)]
+struct MockEyeProducer {
+    tick: u64,
+}
+
+#[async_trait::async_trait]
+impl SenseProducer for MockEyeProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        self.tick = self.tick.saturating_add(1);
+        let base = (self.tick % 16) as f32 / 16.0;
+        let b = (base * 255.0).round() as u8;
+        Ok(SensePacket::EyeFrame(EyeFrame {
+            captured_at_ms: Utc::now().timestamp_millis().max(0) as u64,
+            width: 2,
+            height: 2,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![b, 64, 128, 128, b, 64, 64, 128, b, 255, 255, 255],
+            source: None,
+        }))
+    }
+}
+
+#[derive(Default)]
+struct MockEarProducer {
+    tick: u64,
+}
+
+#[async_trait::async_trait]
+impl SenseProducer for MockEarProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        self.tick = self.tick.saturating_add(1);
+        Ok(if self.tick % 2 == 0 {
+            SensePacket::Ear(EarSense {
+                schema_version: 1,
+                features: vec![vec![0.1, 0.2, 0.1]],
+                transcript: None,
+                ..EarSense::default()
+            })
+        } else {
+            SensePacket::EarPcm(PcmAudioFrame {
+                captured_at_ms: Utc::now().timestamp_millis().max(0) as u64,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                samples: vec![0, 128, -128, 64],
+            })
+        })
+    }
+}
+
+#[derive(Default)]
+struct MockRangeProducer;
+
+#[async_trait::async_trait]
+impl SenseProducer for MockRangeProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        Ok(SensePacket::Range(RangeSense {
+            schema_version: 1,
+            beams: vec![1.2, 1.0, 0.8],
+            nearest_m: Some(0.8),
+            ..RangeSense::default()
+        }))
+    }
+}
+
+#[derive(Default)]
+struct MockKinectProducer;
+
+#[async_trait::async_trait]
+impl SenseProducer for MockKinectProducer {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        Ok(SensePacket::Kinect(KinectSense {
+            schema_version: 1,
+            captured_at_ms: Utc::now().timestamp_millis().max(0) as u64,
+            color_features: vec![vec![0.2, 0.4, 0.6]],
+            depth_m: vec![0.8, 1.0, 1.2],
+            audio_angle_rad: Some(0.0),
+            audio_confidence: 0.75,
+            ..KinectSense::default()
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct NoopLedger;
+
+#[async_trait::async_trait]
+impl LedgerWriter for NoopLedger {
+    async fn append(&self, _frame: &ExperienceFrame) -> Result<()> {
+        Ok(())
+    }
+
+    async fn append_transition(&self, _transition: &ExperienceTransition) -> Result<()> {
+        Ok(())
+    }
+}
+
+async fn collect_hardware_env_report() -> Value {
+    let serial_devices = list_matching_paths(&["/dev/ttyUSB", "/dev/ttyACM", "/dev/serial/by-id/"]);
+    let gps_serial_candidates = serial_devices
+        .iter()
+        .filter(|device| looks_like_gps_serial_device(device))
+        .cloned()
+        .collect::<Vec<_>>();
+    let default_gps_device = gps_serial_candidates.first().cloned().or_else(|| {
+        serial_devices
+            .iter()
+            .find(|device| device.contains("/dev/ttyACM"))
+            .cloned()
+    });
+    let i2c_devices = list_matching_paths(&["/dev/i2c-"]);
+    let camera_devices = list_matching_paths(&["/dev/video"]);
+    let audio_input_devices = audio_input_devices();
+    let warnings = hardware_env_warnings(
+        &serial_devices,
+        &i2c_devices,
+        &camera_devices,
+        &audio_input_devices,
+    );
+    serde_json::json!({
+        "os": std::env::consts::OS,
+        "architecture": std::env::consts::ARCH,
+        "cpu_model": cpu_model(),
+        "memory_total_kb": memory_total_kb(),
+        "serial_devices": serial_devices,
+        "gps_serial_candidates": gps_serial_candidates,
+        "default_gps": {
+            "kind": "u-blox7",
+            "device": default_gps_device,
+            "baud": 9600,
+            "protocol": "nmea"
+        },
+        "i2c_devices": i2c_devices,
+        "default_imu": {
+            "kind": "mpu6050",
+            "device": DEFAULT_MPU6050_IMU_DEVICE,
+            "address": "0x68",
+            "raspberry_pi_header_pins": {
+                "sda": 3,
+                "scl": 5,
+                "power_3v3": 1,
+                "ground": 6
+            },
+            "gpio_bcm": {
+                "sda": 2,
+                "scl": 3
+            },
+            "present": Path::new(DEFAULT_MPU6050_IMU_DEVICE).exists()
+        },
+        "camera_devices": camera_devices,
+        "audio_input_devices": audio_input_devices,
+        "kinect": {
+            "freenect_available": command_exists("freenect-glview") || command_exists("freenect-camtest") || pkg_config_exists("libfreenect"),
+            "freenect_glview": command_exists("freenect-glview"),
+            "freenect_camtest": command_exists("freenect-camtest"),
+            "pkg_config_libfreenect": pkg_config_exists("libfreenect"),
+        },
+        "permissions": {
+            "groups": current_groups(),
+            "serial_group_hint": "dialout",
+            "i2c_group_hint": "i2c",
+            "video_group_hint": "video",
+            "audio_group_hint": "audio",
+        },
+        "data_dirs_writable": {
+            "data": directory_writable(Path::new("data")),
+            "data/captures/real": directory_writable(Path::new("data/captures/real")),
+            "data/ledger/real": directory_writable(Path::new("data/ledger/real")),
+        },
+        "raspberry_pi_like": raspberry_pi_like(),
+        "warnings": warnings,
+    })
+}
+
+fn hardware_env_warnings(
+    serial_devices: &[String],
+    i2c_devices: &[String],
+    camera_devices: &[String],
+    audio_input_devices: &[String],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let groups = current_groups();
+    if serial_devices.is_empty() {
+        warnings.push("no likely Create serial devices found under /dev/ttyUSB*, /dev/ttyACM*, or /dev/serial/by-id".to_string());
+    }
+    if i2c_devices.is_empty() {
+        warnings.push(
+            "no /dev/i2c-* buses found; enable Raspberry Pi I2C before using the MPU-6050"
+                .to_string(),
+        );
+    } else if !i2c_devices
+        .iter()
+        .any(|device| device == DEFAULT_MPU6050_IMU_DEVICE)
+    {
+        warnings.push(format!(
+            "default MPU-6050 bus {DEFAULT_MPU6050_IMU_DEVICE} not found; pass --imu /dev/i2c-N if your Pi exposes a different bus"
+        ));
+    }
+    if camera_devices.is_empty() {
+        warnings.push("no /dev/video* camera devices found".to_string());
+    }
+    if audio_input_devices.is_empty() {
+        warnings.push("no audio input devices detected by arecord or /proc/asound".to_string());
+    }
+    for group in ["dialout", "i2c", "video", "audio"] {
+        if !groups.iter().any(|item| item == group) {
+            warnings.push(format!(
+                "current user is not in `{group}` group; hardware permissions may fail"
+            ));
+        }
+    }
+    warnings
+}
+
+fn machine_info_from_env(report: &Value) -> Value {
+    serde_json::json!({
+        "os": report["os"].clone(),
+        "architecture": report["architecture"].clone(),
+        "cpu_model": report["cpu_model"].clone(),
+        "memory_total_kb": report["memory_total_kb"].clone(),
+        "raspberry_pi_like": report["raspberry_pi_like"].clone(),
+    })
+}
+
+fn cpu_model() -> Option<String> {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
+    cpuinfo.lines().find_map(|line| {
+        line.strip_prefix("Model")
+            .or_else(|| line.strip_prefix("model name"))
+            .and_then(|line| {
+                line.split_once(':')
+                    .map(|(_, value)| value.trim().to_string())
+            })
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn memory_total_kb() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo.lines().find_map(|line| {
+        line.strip_prefix("MemTotal:")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+fn raspberry_pi_like() -> bool {
+    let model = fs::read_to_string("/proc/device-tree/model")
+        .or_else(|_| fs::read_to_string("/sys/firmware/devicetree/base/model"))
+        .unwrap_or_default()
+        .to_lowercase();
+    model.contains("raspberry pi")
+}
+
+fn list_matching_paths(prefixes: &[&str]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for prefix in prefixes {
+        let path = Path::new(prefix);
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    paths.push(entry.path().to_string_lossy().to_string());
+                }
+            }
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let Some(name_prefix) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.starts_with(name_prefix))
+                    .unwrap_or(false)
+                {
+                    paths.push(entry.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn audio_input_devices() -> Vec<String> {
+    if let Ok(output) = ProcessCommand::new("arecord").arg("-l").output() {
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| line.trim_start().starts_with("card "))
+                .map(|line| line.trim().to_string())
+                .collect();
+        }
+    }
+    let proc_asound = Path::new("/proc/asound/cards");
+    fs::read_to_string(proc_asound)
+        .ok()
+        .map(|text| {
+            text.lines()
+                .filter(|line| line.contains('[') && line.contains(']'))
+                .map(|line| line.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn command_exists(command: &str) -> bool {
+    ProcessCommand::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {command} >/dev/null 2>&1"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn pkg_config_exists(package: &str) -> bool {
+    ProcessCommand::new("pkg-config")
+        .arg("--exists")
+        .arg(package)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn current_groups() -> Vec<String> {
+    ProcessCommand::new("id")
+        .arg("-nG")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn directory_writable(path: &Path) -> bool {
+    if fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    let probe = path.join(".pete-write-test");
+    match fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn print_json_list(label: &str, value: &Value) {
+    println!("{label}:");
+    let Some(items) = value.as_array() else {
+        println!("    none");
+        return;
+    };
+    if items.is_empty() {
+        println!("    none");
+        return;
+    }
+    for item in items {
+        if let Some(text) = item.as_str() {
+            println!("    - {text}");
+        } else {
+            println!("    - {item}");
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StreamCounts {
+    body: usize,
+    rgb: usize,
+    depth: usize,
+    audio: usize,
+    range: usize,
+    imu: usize,
+    gps: usize,
+    kinect: usize,
+}
+
+impl StreamCounts {
+    fn observe(&mut self, snapshot: &WorldSnapshot) {
+        self.body = self.body.saturating_add(1);
+        if snapshot.eye_frame.is_some() || !snapshot.eye.frames.is_empty() {
+            self.rgb = self.rgb.saturating_add(1);
+        }
+        if snapshot.ear_pcm.is_some() || !snapshot.ear.features.is_empty() {
+            self.audio = self.audio.saturating_add(1);
+        }
+        if !snapshot.kinect.depth_m.is_empty() {
+            self.depth = self.depth.saturating_add(1);
+        }
+        if !snapshot.range.beams.is_empty() || snapshot.range.nearest_m.is_some() {
+            self.range = self.range.saturating_add(1);
+        }
+        if !snapshot.imu.orientation.is_empty()
+            || !snapshot.imu.acceleration.is_empty()
+            || !snapshot.imu.angular_velocity.is_empty()
+        {
+            self.imu = self.imu.saturating_add(1);
+        }
+        if snapshot.gps.is_some() {
+            self.gps = self.gps.saturating_add(1);
+        }
+        if !snapshot.kinect.color_features.is_empty()
+            || !snapshot.kinect.depth_m.is_empty()
+            || !snapshot.kinect.skeletons.is_empty()
+        {
+            self.kinect = self.kinect.saturating_add(1);
+        }
+    }
+
+    fn streams(&self) -> CaptureStreams {
+        let all = [
+            ("body", self.body),
+            ("rgb", self.rgb),
+            ("depth", self.depth),
+            ("audio", self.audio),
+            ("range", self.range),
+            ("imu", self.imu),
+            ("gps", self.gps),
+            ("kinect", self.kinect),
+        ];
+        CaptureStreams {
+            present: all
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+            missing: all
+                .iter()
+                .filter(|(_, count)| *count == 0)
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+        }
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        self.streams()
+            .missing
+            .into_iter()
+            .filter(|name| name != "gps" && name != "imu")
+            .map(|name| format!("{name} stream missing"))
+            .collect()
+    }
+
+    fn useful_stream_count(&self) -> usize {
+        [
+            self.body,
+            self.rgb,
+            self.depth,
+            self.audio,
+            self.range,
+            self.imu,
+            self.gps,
+            self.kinect,
+        ]
+        .into_iter()
+        .filter(|count| *count > 0)
+        .count()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CaptureInspectionReport {
+    path: PathBuf,
+    frame_count: usize,
+    duration_ms: Option<u64>,
+    streams_present: Vec<String>,
+    streams_missing: Vec<String>,
+    first_timestamp_ms: Option<u64>,
+    last_timestamp_ms: Option<u64>,
+    event_count: usize,
+    asset_counts: Vec<(String, usize)>,
+    asset_details: Vec<String>,
+    warnings: Vec<String>,
+}
+
+async fn inspect_capture_report(path: impl AsRef<Path>) -> Result<CaptureInspectionReport> {
+    let path = path.as_ref().to_path_buf();
+    let reader = CaptureReader::open(&path).await?;
+    let frames = reader.read_frames().await?;
+    let mut stream_counts = StreamCounts::default();
+    let mut event_count = 0usize;
+    for frame in &frames {
+        stream_counts.observe(&frame.snapshot);
+        event_count = event_count.saturating_add(frame.events.len());
+    }
+    event_count = event_count.saturating_add(count_jsonl_lines(&path.join("events.jsonl"))?);
+    let first_timestamp_ms = frames.first().map(|frame| frame.t_ms);
+    let last_timestamp_ms = frames.last().map(|frame| frame.t_ms);
+    let duration_ms = first_timestamp_ms
+        .zip(last_timestamp_ms)
+        .map(|(first, last)| last.saturating_sub(first));
+    let streams = if reader.manifest().streams.present.is_empty()
+        && reader.manifest().streams.missing.is_empty()
+    {
+        stream_counts.streams()
+    } else {
+        reader.manifest().streams.clone()
+    };
+    Ok(CaptureInspectionReport {
+        path: path.clone(),
+        frame_count: frames.len(),
+        duration_ms,
+        streams_present: streams.present,
+        streams_missing: streams.missing,
+        first_timestamp_ms,
+        last_timestamp_ms,
+        event_count,
+        asset_counts: asset_counts(&path),
+        asset_details: asset_details(&frames),
+        warnings: reader.manifest().warnings.clone(),
+    })
+}
+
+fn asset_details(frames: &[pete_worldlab::CaptureFrameRecord]) -> Vec<String> {
+    let mut details = Vec::new();
+    let mut seen = BTreeSet::new();
+    for frame in frames {
+        let Some(metadata) = frame.stream_metadata.as_ref().and_then(Value::as_object) else {
+            continue;
+        };
+        for kind in ["rgb", "depth", "audio", "pointcloud"] {
+            if seen.contains(kind) {
+                continue;
+            }
+            let Some(value) = metadata.get(kind).and_then(Value::as_object) else {
+                continue;
+            };
+            let detail = match kind {
+                "rgb" | "depth" => format!(
+                    "{kind} metadata: {}x{}, {}",
+                    value.get("width").and_then(Value::as_u64).unwrap_or(0),
+                    value.get("height").and_then(Value::as_u64).unwrap_or(0),
+                    value
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                "audio" => format!(
+                    "audio metadata: {} Hz, {} channel(s), {}",
+                    value
+                        .get("sample_rate_hz")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    value.get("channels").and_then(Value::as_u64).unwrap_or(0),
+                    value
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                "pointcloud" => format!(
+                    "pointcloud metadata: {} vertices, {}, calibration {}",
+                    value.get("vertices").and_then(Value::as_u64).unwrap_or(0),
+                    value
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    value
+                        .get("calibration")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                _ => continue,
+            };
+            seen.insert(kind);
+            details.push(detail);
+        }
+    }
+    details
+}
+
+fn asset_counts(root: &Path) -> Vec<(String, usize)> {
+    ["rgb", "depth", "audio", "pointcloud"]
+        .into_iter()
+        .map(|kind| {
+            let path = root.join("assets").join(kind);
+            (kind.to_string(), count_files(&path))
+        })
+        .collect()
+}
+
+fn count_files(path: &Path) -> usize {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn count_jsonl_lines(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count())
+}
+
+fn join_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeModelFlags<'a> {
+    danger_checkpoint: Option<&'a str>,
+    danger_mode: DangerMode,
+    charge_checkpoint: Option<&'a str>,
+    charge_mode: ChargeMode,
+    action_value_checkpoint: Option<&'a str>,
+    action_value_mode: ActionValueMode,
+    future_checkpoint: Option<&'a str>,
+    future_mode: FutureMode,
+    eye_next_checkpoint: Option<&'a str>,
+    eye_next_mode: EyeNextMode,
+    ear_next_checkpoint: Option<&'a str>,
+    ear_next_mode: EarNextMode,
+    experience_checkpoint: Option<&'a str>,
+    experience_mode: ExperienceMode,
+}
+
+impl<'a> From<&'a SimArgs> for RuntimeModelFlags<'a> {
+    fn from(args: &'a SimArgs) -> Self {
+        Self {
+            danger_checkpoint: args.danger_checkpoint.as_deref(),
+            danger_mode: args.danger_mode,
+            charge_checkpoint: args.charge_checkpoint.as_deref(),
+            charge_mode: args.charge_mode,
+            action_value_checkpoint: args.action_value_checkpoint.as_deref(),
+            action_value_mode: args.action_value_mode,
+            future_checkpoint: args.future_checkpoint.as_deref(),
+            future_mode: args.future_mode,
+            eye_next_checkpoint: args.eye_next_checkpoint.as_deref(),
+            eye_next_mode: args.eye_next_mode,
+            ear_next_checkpoint: args.ear_next_checkpoint.as_deref(),
+            ear_next_mode: args.ear_next_mode,
+            experience_checkpoint: args.experience_checkpoint.as_deref(),
+            experience_mode: args.experience_mode,
+        }
+    }
+}
+
+impl<'a> From<&'a EvalScenarioArgs> for RuntimeModelFlags<'a> {
+    fn from(args: &'a EvalScenarioArgs) -> Self {
+        Self {
+            danger_checkpoint: args.danger_checkpoint.as_deref(),
+            danger_mode: args.danger_mode,
+            charge_checkpoint: args.charge_checkpoint.as_deref(),
+            charge_mode: args.charge_mode,
+            action_value_checkpoint: args.action_value_checkpoint.as_deref(),
+            action_value_mode: args.action_value_mode,
+            future_checkpoint: args.future_checkpoint.as_deref(),
+            future_mode: args.future_mode,
+            eye_next_checkpoint: args.eye_next_checkpoint.as_deref(),
+            eye_next_mode: args.eye_next_mode,
+            ear_next_checkpoint: args.ear_next_checkpoint.as_deref(),
+            ear_next_mode: args.ear_next_mode,
+            experience_checkpoint: args.experience_checkpoint.as_deref(),
+            experience_mode: args.experience_mode,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct RuntimeModelLoadReport {
+    requested_checkpoints: HashMap<String, Option<String>>,
+    loaded_checkpoints: HashMap<String, String>,
+    active_modes: HashMap<String, String>,
+    blocked_model_infer: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn load_runtime_models_from_flags(
+    flags: &RuntimeModelFlags<'_>,
+) -> Result<(Option<RuntimeModelStack>, RuntimeModelLoadReport)> {
+    let mut report = RuntimeModelLoadReport::default();
+    report.active_modes = model_modes_from_flags(flags);
+    report.requested_checkpoints.insert(
+        "danger".to_string(),
+        flags.danger_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "charge".to_string(),
+        flags.charge_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "action_value".to_string(),
+        flags.action_value_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "future".to_string(),
+        flags.future_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "eye_next".to_string(),
+        flags.eye_next_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "ear_next".to_string(),
+        flags.ear_next_checkpoint.map(ToOwned::to_owned),
+    );
+    report.requested_checkpoints.insert(
+        "experience".to_string(),
+        flags.experience_checkpoint.map(ToOwned::to_owned),
+    );
+
+    if flags.danger_mode != DangerMode::ShadowInfer
+        && flags.charge_mode != ChargeMode::ShadowInfer
+        && flags.action_value_mode != ActionValueMode::ShadowInfer
+        && flags.future_mode == FutureMode::Hardcoded
+        && flags.eye_next_mode != EyeNextMode::ShadowInfer
+        && flags.ear_next_mode != EarNextMode::ShadowInfer
+        && flags.experience_mode == ExperienceMode::Off
+    {
+        return Ok((None, report));
+    }
+    let mut checkpoint_path = |behavior: &str, checkpoint: Option<&str>, enabled: bool| {
+        if !enabled {
+            return None;
+        }
+        match checkpoint {
+            Some(checkpoint) if Path::new(checkpoint).exists() => {
+                let path = PathBuf::from(checkpoint);
+                println!("loaded {behavior} checkpoint: {}", path.display());
+                report
+                    .loaded_checkpoints
+                    .insert(behavior.to_string(), checkpoint.to_string());
+                Some(path)
+            }
+            Some(checkpoint) => {
+                let warning =
+                    format!("{behavior} inference disabled: checkpoint not found at {checkpoint}");
+                println!("{warning}");
+                report.warnings.push(warning);
+                None
+            }
+            None => {
+                let warning =
+                    format!("{behavior} inference disabled: no --{behavior}-checkpoint provided");
+                println!("{warning}");
+                report.warnings.push(warning);
+                None
+            }
+        }
+    };
+    let danger_path = checkpoint_path(
+        "danger",
+        flags.danger_checkpoint,
+        flags.danger_mode == DangerMode::ShadowInfer,
+    );
+    let charge_path = checkpoint_path(
+        "charge",
+        flags.charge_checkpoint,
+        flags.charge_mode == ChargeMode::ShadowInfer,
+    );
+    let action_value_path = checkpoint_path(
+        "action_value",
+        flags.action_value_checkpoint,
+        flags.action_value_mode == ActionValueMode::ShadowInfer,
+    );
+    let future_path = checkpoint_path(
+        "future",
+        flags.future_checkpoint,
+        flags.future_mode != FutureMode::Hardcoded,
+    );
+    let eye_next_path = checkpoint_path(
+        "eye_next",
+        flags.eye_next_checkpoint,
+        flags.eye_next_mode == EyeNextMode::ShadowInfer,
+    );
+    let ear_next_path = checkpoint_path(
+        "ear_next",
+        flags.ear_next_checkpoint,
+        flags.ear_next_mode == EarNextMode::ShadowInfer,
+    );
+    let experience_path = checkpoint_path(
+        "experience",
+        flags.experience_checkpoint,
+        flags.experience_mode != ExperienceMode::Off,
+    );
+    if danger_path.is_none()
+        && charge_path.is_none()
+        && action_value_path.is_none()
+        && future_path.is_none()
+        && eye_next_path.is_none()
+        && ear_next_path.is_none()
+        && experience_path.is_none()
+    {
+        return Ok((None, report));
+    }
+
+    let mut models = RuntimeModelStack::with_shadow_checkpoints(
+        danger_path.as_deref(),
+        charge_path.as_deref(),
+        action_value_path.as_deref(),
+        future_path.as_deref(),
+        eye_next_path.as_deref(),
+        ear_next_path.as_deref(),
+        experience_path.as_deref(),
+    )?;
+    if future_path.is_some() && flags.future_mode == FutureMode::ModelInfer {
+        models.behaviors.future.regime = BehaviorRegime::ModelInfer;
+    }
+    if experience_path.is_some() && flags.experience_mode == ExperienceMode::ModelInfer {
+        models.behaviors.experience.regime = BehaviorRegime::ModelInfer;
+    }
+    Ok((Some(models), report))
+}
+
+fn model_modes_from_flags(flags: &RuntimeModelFlags<'_>) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "danger".to_string(),
+            mode_name(flags.danger_mode).to_string(),
+        ),
+        (
+            "charge".to_string(),
+            mode_name(flags.charge_mode).to_string(),
+        ),
+        (
+            "action_value".to_string(),
+            mode_name(flags.action_value_mode).to_string(),
+        ),
+        (
+            "future".to_string(),
+            mode_name(flags.future_mode).to_string(),
+        ),
+        (
+            "eye_next".to_string(),
+            mode_name(flags.eye_next_mode).to_string(),
+        ),
+        (
+            "ear_next".to_string(),
+            mode_name(flags.ear_next_mode).to_string(),
+        ),
+        (
+            "experience".to_string(),
+            mode_name(flags.experience_mode).to_string(),
+        ),
+    ])
+}
+
+fn mode_name<T: std::fmt::Debug>(mode: T) -> &'static str {
+    match format!("{mode:?}").as_str() {
+        "Off" => "off",
+        "Hardcoded" => "hardcoded",
+        "ShadowInfer" => "shadow-infer",
+        "ModelInfer" => "model-infer",
+        _ => "unknown",
+    }
+}
+
+async fn inspect_ledger(args: InspectLedgerArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let frames = ledger.recent(10).await?;
+    if frames.is_empty() {
+        println!("ledger is empty");
+        return Ok(());
+    }
+
+    for frame in frames {
+        print_frame(&frame);
+    }
+    Ok(())
+}
+
+fn is_transient_readonly_timeout(error: &AnyhowError) -> bool {
+    is_transient_robot_timeout(error)
+}
+
+fn is_transient_robot_timeout(error: &AnyhowError) -> bool {
+    let message = error.to_string().to_lowercase();
+    if message.contains("timed out") || message.contains("operation timed out") {
+        return true;
+    }
+
+    if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+        return io_error.kind() == std::io::ErrorKind::TimedOut;
+    }
+
+    let mut current = error.source();
+    while let Some(err) = current {
+        if err.to_string().to_lowercase().contains("timed out")
+            || err
+                .to_string()
+                .to_lowercase()
+                .contains("operation timed out")
+        {
+            return true;
+        }
+        if let Some(io_error) = err.downcast_ref::<std::io::Error>() {
+            if io_error.kind() == std::io::ErrorKind::TimedOut {
+                return true;
+            }
+        }
+        current = err.source();
+    }
+    false
+}
+
+async fn memory_inspect(args: MemoryInspectArgs) -> Result<()> {
+    let ledger = JsonlLedger::new(&args.ledger);
+    let frames = ledger.range(0, u64::MAX).await?;
+    let report = place_memory_report_from_frames(&frames);
+    print_memory_report(&args.ledger, frames.len(), &report);
+    Ok(())
+}
+
+fn print_memory_report(source: &str, frame_count: usize, report: &PlaceMemoryReport) {
+    println!("memory report: {source}");
+    println!("  frames: {frame_count}");
+    println!("  places_visited: {}", report.places_visited);
+    println!("  coverage_m2: {:.2}", report.coverage_m2);
+    println!("  novelty_mean: {:.3}", report.novelty_mean);
+    print_place_cells("top danger cells", &report.top_danger_cells);
+    print_place_cells("top charge cells", &report.top_charge_cells);
+    print_place_cells("top social cells", &report.top_social_cells);
+    if report.warnings.is_empty() {
+        println!("  warnings: none");
+    } else {
+        println!("  warnings:");
+        for warning in &report.warnings {
+            println!("    - {warning}");
+        }
+    }
+}
+
+fn print_place_cells(label: &str, cells: &[pete_memory::PlaceCellSummary]) {
+    println!("  {label}:");
+    if cells.is_empty() {
+        println!("    none");
+        return;
+    }
+    for cell in cells {
+        println!(
+            "    - cell=({}, {}) center=({:.2}, {:.2}) score={:.3} visits={} confidence={:.3}",
+            cell.x,
+            cell.y,
+            cell.center_x_m,
+            cell.center_y_m,
+            cell.score,
+            cell.visit_count,
+            cell.confidence
+        );
+    }
+}
+
+async fn run_train(command: TrainCommand) -> Result<()> {
+    match command.model {
+        TrainModel::Behavior(args) => train_behavior_command(args).await,
+        TrainModel::Danger(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "danger".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::Charge(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "charge".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::ActionValue(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "action-value".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::Future(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "future".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::EyeNext(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "eye-next".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::EarNext(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "ear-next".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::Experience(args) => {
+            train_behavior_command(TrainBehaviorArgs {
+                behavior: "experience".to_string(),
+                ledger: args.ledger,
+                epochs: args.epochs,
+                checkpoint: Some(args.checkpoint),
+                validation_split: 0.2,
+                seed: 7,
+            })
+            .await
+        }
+        TrainModel::LatentRoundTrip(args) => run_train_latent_round_trip(args).await,
+        TrainModel::UnifiedExperience(args) => run_train_unified_experience(args).await,
+        TrainModel::Virtual(args) => run_train_virtual(args).await,
+    }
+}
+
+async fn train_behavior_command(args: TrainBehaviorArgs) -> Result<()> {
+    let behavior: TrainableBehavior = args.behavior.parse()?;
+    let checkpoint = args
+        .checkpoint
+        .unwrap_or_else(|| default_checkpoint(&behavior).to_string());
+    let summary = train_behavior(TrainBehaviorRequest {
+        behavior: behavior.clone(),
+        ledger_path: args.ledger.into(),
+        checkpoint_path: checkpoint.clone().into(),
+        epochs: args.epochs,
+        validation_split: args.validation_split,
+        seed: args.seed,
+    })
+    .await?;
+    println!(
+        "{} training complete: {} transitions, {} train samples, {} eval samples, {} epochs, {} samples seen, metrics {}",
+        behavior,
+        summary.transition_count,
+        summary.train_sample_count,
+        summary.eval_sample_count,
+        summary.epochs,
+        summary.samples_seen,
+        summary.metrics_path.display()
+    );
+    println!(
+        "saved {} checkpoint: {}",
+        behavior,
+        summary.checkpoint_path.display()
+    );
+    if let Some(last_loss) = summary.last_loss {
+        println!("last_loss: {:.6}", last_loss);
+    }
+    println!("best_loss: {:?}", summary.best_loss);
+    print_evaluation_report(&summary.evaluation)?;
+    Ok(())
+}
+
+async fn run_train_latent_round_trip(args: TrainLatentRoundTripArgs) -> Result<()> {
+    let report = train_latent_round_trip(TrainLatentRoundTripRequest {
+        ledger_path: args.ledger.into(),
+        checkpoint_path: args.checkpoint.clone().into(),
+        report_path: args.report.clone().into(),
+        epochs: args.epochs,
+        validation_split: args.validation_split,
+        seed: args.seed,
+        z_dim: args.z_dim,
+        codebook_size: args.codebook_size,
+    })
+    .await?;
+    println!(
+        "latent round-trip training complete: {} transitions, {} epochs, report {}",
+        report.transition_count, report.epochs, args.report
+    );
+    println!(
+        "reconstruction_loss_mean: {:.6}",
+        report.reconstruction.trained_decoder_loss_mean
+    );
+    for predictor in &report.predictors {
+        println!(
+            "{} predictor: model_loss={:.6} stasis_loss={:.6} improvement={:?} predictive={}",
+            predictor.encoder,
+            predictor.model_loss_mean,
+            predictor.stasis_loss_mean,
+            predictor.improvement_ratio,
+            predictor.predictive
+        );
+    }
+    if let Some(codebook) = &report.codebook {
+        println!(
+            "codebook: {} codes, {} used, {} dead",
+            codebook.code_count, codebook.used_codes, codebook.dead_codes
+        );
+    }
+    println!("verdict: {}", report.verdict);
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+async fn run_train_unified_experience(args: TrainUnifiedExperienceArgs) -> Result<()> {
+    let report = train_unified_experience(TrainUnifiedExperienceRequest {
+        ledger_path: args.ledger.into(),
+        checkpoint_path: args.checkpoint.clone().into(),
+        report_path: args.report.clone().into(),
+        epochs: args.epochs,
+        validation_split: args.validation_split,
+        seed: args.seed,
+        z_dim: args.z_dim,
+        teacher_dim: args.teacher_dim,
+    })
+    .await?;
+    println!(
+        "unified Experience training complete: {} examples, {} transitions, {} epochs, checkpoint {}, report {}",
+        report.example_count,
+        report.transition_count,
+        report.epochs,
+        args.checkpoint,
+        args.report
+    );
+    println!(
+        "reconstruction_loss={:.6} zero_loss={:.6} reconstructive={}",
+        report.reconstruction.total_loss_mean,
+        report.reconstruction.zero_loss_mean,
+        report.reconstruction.reconstructive
+    );
+    println!(
+        "trained_loss={:?} copy_current_loss={:?} random_loss={:?} mechanical_loss={:?}",
+        report.baselines.trained_loss_mean,
+        report.baselines.copy_current_loss_mean,
+        report.baselines.random_projection_loss_mean,
+        report.baselines.mechanical_instant_loss_mean
+    );
+    println!("verdict: {}", report.verdict);
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+async fn run_evaluate(command: EvaluateCommand) -> Result<()> {
+    match command.model {
+        EvaluateModel::Behavior(args) => {
+            let behavior: TrainableBehavior = args.behavior.parse()?;
+            let checkpoint = args
+                .checkpoint
+                .unwrap_or_else(|| default_checkpoint(&behavior).to_string());
+            let report = evaluate_behavior(EvaluateBehaviorRequest {
+                behavior,
+                ledger_path: args.ledger.into(),
+                checkpoint_path: checkpoint.clone().into(),
+                max_samples: args.max_samples,
+            })
+            .await?;
+            let checkpoint_evaluation_path = Path::new(&checkpoint).join("evaluation.json");
+            let json = serde_json::to_string_pretty(&report)?;
+            std::fs::write(&checkpoint_evaluation_path, &json)?;
+            println!(
+                "Saved checkpoint evaluation report to {}",
+                checkpoint_evaluation_path.display()
+            );
+            if let Some(out_path) = &args.out {
+                std::fs::write(out_path, &json)?;
+                println!("Saved evaluation report to {}", out_path);
+            }
+            print_evaluation_report(&report)
+        }
+    }
+}
+
+fn run_promote(command: PromoteCommand) -> Result<()> {
+    match command.model {
+        PromoteModel::Behavior(args) => {
+            let behavior: TrainableBehavior = args.behavior.parse()?;
+            let checkpoint = args
+                .checkpoint
+                .unwrap_or_else(|| default_checkpoint(&behavior).to_string());
+            let regime = match args.mode {
+                PromoteMode::ShadowInfer => BehaviorRegime::ShadowInfer,
+                PromoteMode::ModelInfer => BehaviorRegime::ModelInfer,
+                PromoteMode::ShadowTrain => BehaviorRegime::ShadowTrain,
+            };
+            promote_behavior_config(
+                behavior.clone(),
+                checkpoint.clone().into(),
+                Path::new(&args.config),
+                regime,
+            )?;
+            println!(
+                "promoted {} in {}: regime {:?}, checkpoint {}",
+                behavior, args.config, regime, checkpoint
+            );
+            Ok(())
+        }
+    }
+}
+
+fn default_checkpoint(behavior: &TrainableBehavior) -> &'static str {
+    match behavior {
+        TrainableBehavior::Danger => "data/models/danger_v0",
+        TrainableBehavior::Charge => "data/models/charge_v0",
+        TrainableBehavior::ActionValue => "data/models/action_value_v0",
+        TrainableBehavior::EyeNext => "data/models/eye_next_v0",
+        TrainableBehavior::EarNext => "data/models/ear_next_v0",
+        TrainableBehavior::Experience => "data/models/experience_v0",
+        TrainableBehavior::Future => "data/models/future_v0",
+    }
+}
+
+fn print_evaluation_report(report: &pete_training::BehaviorEvaluationReport) -> Result<()> {
+    println!("evaluation behavior: {}", report.behavior);
+    println!("checkpoint: {}", report.checkpoint_path.display());
+    println!("sample_count: {}", report.sample_count);
+    println!("model_loss_mean: {:.6}", report.model_loss_mean);
+    println!("hardcoded_loss_mean: {:?}", report.hardcoded_loss_mean);
+    println!("selected_loss_mean: {:?}", report.selected_loss_mean);
+    println!(
+        "model_better_than_hardcoded: {:?}",
+        report.model_better_than_hardcoded
+    );
+    println!("improvement_ratio: {:?}", report.improvement_ratio);
+    println!("recommendation: {:?}", report.recommendation);
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+const DEFAULT_REGISTRY_PATH: &str = "data/models/registry.json";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ModelRegistry {
+    schema_version: u32,
+    entries: Vec<ModelRegistryEntry>,
+}
+
+impl Default for ModelRegistry {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ModelRegistryEntry {
+    schema_version: u32,
+    name: String,
+    behavior: TrainableBehavior,
+    checkpoint: String,
+    created_at: Option<String>,
+    training: ModelTrainingRecord,
+    reports: ModelReportRecord,
+    scenario_names: Vec<String>,
+    metrics: ModelMetricsSummary,
+    allowed_modes: Vec<String>,
+    status: ModelStatus,
+    warnings: Vec<String>,
+    notes: Vec<String>,
+    parent_model: Option<String>,
+    git_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ModelTrainingRecord {
+    ledger: Option<String>,
+    command: Option<String>,
+    epochs: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ModelReportRecord {
+    behavior: Option<String>,
+    scenario: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ModelMetricsSummary {
+    behavior_loss: Option<f32>,
+    scenario_success_rate: Option<f32>,
+    collision_rate: Option<f32>,
+    battery_delta: Option<f32>,
+    fallback_count: Option<usize>,
+    episodes: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum ModelStatus {
+    Registered,
+    Shadow,
+    Inference,
+    Retired,
+    Rejected,
+}
+
+impl ModelStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::Shadow => "shadow",
+            Self::Inference => "inference",
+            Self::Retired => "retired",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ScenarioComparisonReport {
+    schema_version: u32,
+    baseline_report_path: String,
+    candidate_report_path: String,
+    baseline_scenario: String,
+    candidate_scenario: String,
+    baseline_episodes: usize,
+    candidate_episodes: usize,
+    compared_metrics: ScenarioComparisonMetrics,
+    deltas: HashMap<String, f32>,
+    recommendation: ScenarioComparisonRecommendation,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ScenarioComparisonMetrics {
+    success_rate: MetricComparison,
+    collision_rate: MetricComparison,
+    mean_collisions_per_episode: MetricComparison,
+    mean_safety_interventions: MetricComparison,
+    model_fallbacks: MetricComparison,
+    action_selector_fallbacks: MetricComparison,
+    action_selector_guard_yields: MetricComparison,
+    mean_battery_delta: MetricComparison,
+    stuck_count: MetricComparison,
+    recovery_attempts: MetricComparison,
+    repeated_trap_count: MetricComparison,
+    recovery_success_rate: MetricComparison,
+    mean_recovery_ticks: MetricComparison,
+    mean_stuck_duration: MetricComparison,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct MetricComparison {
+    baseline: Option<f32>,
+    candidate: Option<f32>,
+    delta: Option<f32>,
+    regression: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScenarioComparisonRecommendation {
+    PassCandidate,
+    NeedsMoreEval,
+    RegressionDetected,
+    InsufficientData,
+}
+
+impl ScenarioComparisonRecommendation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PassCandidate => "pass_candidate",
+            Self::NeedsMoreEval => "needs_more_eval",
+            Self::RegressionDetected => "regression_detected",
+            Self::InsufficientData => "insufficient_data",
+        }
+    }
+}
+
+fn model_register(args: ModelRegisterArgs) -> Result<()> {
+    let behavior: TrainableBehavior = args.behavior.parse()?;
+    let mut registry = load_model_registry(Path::new(&args.registry))?;
+    if registry
+        .entries
+        .iter()
+        .any(|entry| entry.name == args.name && entry.behavior == behavior)
+        && !args.overwrite
+    {
+        anyhow::bail!(
+            "model {} for {} already exists; pass --overwrite to replace it",
+            args.name,
+            behavior
+        );
+    }
+
+    let behavior_report = args
+        .behavior_report
+        .as_deref()
+        .map(load_behavior_report)
+        .transpose()?;
+    let scenario_report = args
+        .scenario_report
+        .as_deref()
+        .map(load_scenario_report)
+        .transpose()?;
+    let mut warnings = Vec::new();
+    if !Path::new(&args.checkpoint).exists() {
+        warnings.push(format!("checkpoint missing: {}", args.checkpoint));
+    }
+    if let Some(path) = &args.behavior_report {
+        if !Path::new(path).exists() {
+            warnings.push(format!("behavior report missing: {path}"));
+        }
+    } else if behavior == TrainableBehavior::Danger {
+        warnings.push("danger registration lacks a behavior evaluation report".to_string());
+    }
+    if let Some(path) = &args.scenario_report {
+        if !Path::new(path).exists() {
+            warnings.push(format!("scenario report missing: {path}"));
+        }
+    }
+
+    let metrics = ModelMetricsSummary {
+        behavior_loss: behavior_report
+            .as_ref()
+            .map(|report| report.model_loss_mean),
+        scenario_success_rate: scenario_report
+            .as_ref()
+            .map(|report| report.summary.success_rate),
+        collision_rate: scenario_report
+            .as_ref()
+            .map(|report| report.summary.collision_rate),
+        battery_delta: scenario_report
+            .as_ref()
+            .map(|report| report.summary.mean_battery_delta),
+        fallback_count: scenario_report
+            .as_ref()
+            .map(|report| report.summary.model_fallbacks),
+        episodes: scenario_report.as_ref().map(|report| report.episodes),
+    };
+    let entry = ModelRegistryEntry {
+        schema_version: 1,
+        name: args.name.clone(),
+        behavior: behavior.clone(),
+        checkpoint: args.checkpoint,
+        created_at: Some(Utc::now().to_rfc3339()),
+        training: ModelTrainingRecord {
+            ledger: args.training_ledger,
+            command: args.training_command.or_else(|| Some(command_summary())),
+            epochs: None,
+        },
+        reports: ModelReportRecord {
+            behavior: args.behavior_report,
+            scenario: args.scenario_report,
+            comparison: args.comparison_report,
+        },
+        scenario_names: scenario_report
+            .as_ref()
+            .map(|report| vec![report.scenario.clone()])
+            .unwrap_or_default(),
+        metrics,
+        allowed_modes: allowed_modes_for_status(&behavior, ModelStatus::Registered),
+        status: ModelStatus::Registered,
+        warnings,
+        notes: args.notes,
+        parent_model: args.parent,
+        git_commit: current_git_commit(),
+    };
+
+    registry
+        .entries
+        .retain(|entry| !(entry.name == args.name && entry.behavior == behavior));
+    registry.entries.push(entry);
+    write_model_registry(Path::new(&args.registry), &registry)?;
+    println!(
+        "registered {} model {} in {}",
+        behavior, args.name, args.registry
+    );
+    Ok(())
+}
+
+fn model_promote(args: ModelPromoteArgs) -> Result<()> {
+    let behavior: TrainableBehavior = args.behavior.parse()?;
+    let path = Path::new(&args.registry);
+    let mut registry = load_model_registry(path)?;
+    let Some(index) = registry
+        .entries
+        .iter()
+        .position(|entry| entry.name == args.name && entry.behavior == behavior)
+    else {
+        anyhow::bail!("model {} for {} is not registered", args.name, behavior);
+    };
+
+    let candidate_path = args
+        .candidate_report
+        .clone()
+        .or_else(|| registry.entries[index].reports.scenario.clone());
+    let baseline_report = args
+        .baseline_report
+        .as_deref()
+        .map(load_scenario_report)
+        .transpose()?;
+    let candidate_report = candidate_path
+        .as_deref()
+        .map(load_scenario_report)
+        .transpose()?;
+    let comparison_report = args
+        .comparison_report
+        .as_deref()
+        .or_else(|| registry.entries[index].reports.comparison.as_deref())
+        .map(load_scenario_comparison_report)
+        .transpose()?;
+    let comparison = match (&comparison_report, &baseline_report, &candidate_report) {
+        (Some(comparison), _, _) => Some(comparison.clone()),
+        (None, Some(baseline), Some(candidate)) => Some(compare_scenario_reports(
+            args.baseline_report.as_deref().unwrap_or("baseline"),
+            candidate_path.as_deref().unwrap_or("candidate"),
+            baseline,
+            candidate,
+        )),
+        _ => None,
+    };
+    let decision = promotion_gate(
+        &registry.entries[index],
+        args.target,
+        baseline_report.as_ref(),
+        candidate_report.as_ref(),
+        comparison.as_ref(),
+        args.allow_safety_critical_inference,
+    );
+
+    if !decision.allowed {
+        for warning in decision.warnings {
+            println!("warning: {warning}");
+        }
+        anyhow::bail!(
+            "promotion refused: {} {} -> {}",
+            behavior,
+            args.name,
+            args.target.as_str()
+        );
+    }
+
+    {
+        let entry = &mut registry.entries[index];
+        entry.status = args.target;
+        entry.allowed_modes = allowed_modes_for_status(&behavior, args.target);
+        entry.warnings = merge_warnings(&entry.warnings, &decision.warnings);
+        entry.notes.extend(args.notes);
+        if let Some(path) = args.candidate_report {
+            entry.reports.scenario = Some(path);
+        }
+        if let Some(path) = args.comparison_report {
+            entry.reports.comparison = Some(path);
+        }
+        if let Some(report) = candidate_report {
+            entry.scenario_names = vec![report.scenario.clone()];
+            entry.metrics.scenario_success_rate = Some(report.summary.success_rate);
+            entry.metrics.collision_rate = Some(report.summary.collision_rate);
+            entry.metrics.battery_delta = Some(report.summary.mean_battery_delta);
+            entry.metrics.fallback_count = Some(report.summary.model_fallbacks);
+            entry.metrics.episodes = Some(report.episodes);
+        }
+    }
+    write_model_registry(path, &registry)?;
+    println!(
+        "promoted {} model {} to {}",
+        behavior,
+        args.name,
+        args.target.as_str()
+    );
+    if let Some(comparison) = comparison {
+        print_scenario_comparison(&comparison);
+    }
+    Ok(())
+}
+
+fn compare_scenario_reports_command(args: CompareScenarioReportsArgs) -> Result<()> {
+    let baseline = load_scenario_report(&args.baseline)?;
+    let candidate = load_scenario_report(&args.candidate)?;
+    let comparison =
+        compare_scenario_reports(&args.baseline, &args.candidate, &baseline, &candidate);
+    let out = args.out.unwrap_or_else(|| {
+        default_comparison_report_path(args.name.as_deref(), &baseline, &candidate)
+    });
+    write_scenario_comparison_report(Path::new(&out), &comparison)?;
+    print_scenario_comparison(&comparison);
+    println!("comparison report written: {out}");
+    Ok(())
+}
+
+fn load_model_registry(path: &Path) -> Result<ModelRegistry> {
+    if !path.exists() {
+        return Ok(ModelRegistry::default());
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_model_registry(path: &Path, registry: &ModelRegistry) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, serde_json::to_vec_pretty(registry)?)?;
+    fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+fn load_behavior_report(path: &str) -> Result<pete_training::BehaviorEvaluationReport> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn load_scenario_report(path: &str) -> Result<ScenarioEvaluationReport> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn load_scenario_comparison_report(path: &str) -> Result<ScenarioComparisonReport> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_scenario_comparison_report(path: &Path, report: &ScenarioComparisonReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(path, serde_json::to_vec_pretty(report)?)?;
+    Ok(())
+}
+
+fn compare_scenario_reports(
+    baseline_path: &str,
+    candidate_path: &str,
+    baseline: &ScenarioEvaluationReport,
+    candidate: &ScenarioEvaluationReport,
+) -> ScenarioComparisonReport {
+    let metrics = ScenarioComparisonMetrics {
+        success_rate: metric_cmp(
+            Some(baseline.summary.success_rate),
+            Some(candidate.summary.success_rate),
+            RegressionDirection::LowerIsWorse,
+            0.01,
+        ),
+        collision_rate: metric_cmp(
+            Some(baseline.summary.collision_rate),
+            Some(candidate.summary.collision_rate),
+            RegressionDirection::HigherIsWorse,
+            0.005,
+        ),
+        mean_collisions_per_episode: metric_cmp(
+            Some(baseline.summary.mean_collisions_per_episode),
+            Some(candidate.summary.mean_collisions_per_episode),
+            RegressionDirection::HigherIsWorse,
+            0.05,
+        ),
+        mean_safety_interventions: metric_cmp(
+            Some(baseline.summary.mean_safety_interventions),
+            Some(candidate.summary.mean_safety_interventions),
+            RegressionDirection::HigherIsWorse,
+            0.05,
+        ),
+        model_fallbacks: metric_cmp(
+            Some(baseline.summary.model_fallbacks as f32),
+            Some(candidate.summary.model_fallbacks as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        action_selector_fallbacks: metric_cmp(
+            Some(baseline.summary.action_selector_fallbacks as f32),
+            Some(candidate.summary.action_selector_fallbacks as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        action_selector_guard_yields: metric_cmp(
+            Some(baseline.summary.action_selector_guard_yields as f32),
+            Some(candidate.summary.action_selector_guard_yields as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        mean_battery_delta: metric_cmp(
+            Some(baseline.summary.mean_battery_delta),
+            Some(candidate.summary.mean_battery_delta),
+            RegressionDirection::LowerIsWorse,
+            0.02,
+        ),
+        stuck_count: metric_cmp(
+            Some(baseline.summary.stuck_count as f32),
+            Some(candidate.summary.stuck_count as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        recovery_attempts: metric_cmp(
+            Some(baseline.summary.recovery_attempts as f32),
+            Some(candidate.summary.recovery_attempts as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        repeated_trap_count: metric_cmp(
+            Some(baseline.summary.repeated_trap_count as f32),
+            Some(candidate.summary.repeated_trap_count as f32),
+            RegressionDirection::HigherIsWorse,
+            0.0,
+        ),
+        recovery_success_rate: metric_cmp(
+            baseline.summary.recovery_success_rate,
+            candidate.summary.recovery_success_rate,
+            RegressionDirection::LowerIsWorse,
+            0.05,
+        ),
+        mean_recovery_ticks: metric_cmp(
+            baseline.summary.mean_recovery_ticks,
+            candidate.summary.mean_recovery_ticks,
+            RegressionDirection::HigherIsWorse,
+            1.0,
+        ),
+        mean_stuck_duration: metric_cmp(
+            baseline.summary.mean_stuck_duration,
+            candidate.summary.mean_stuck_duration,
+            RegressionDirection::HigherIsWorse,
+            50.0,
+        ),
+    };
+    let mut warnings = comparison_warnings(baseline, candidate, &metrics);
+    let recommendation = comparison_recommendation(baseline, candidate, &metrics, &warnings);
+    if matches!(
+        recommendation,
+        ScenarioComparisonRecommendation::NeedsMoreEval
+    ) && baseline.episodes < 10
+    {
+        warnings.push(format!(
+            "candidate has only {} episodes; run at least 10 for promotion confidence",
+            candidate.episodes
+        ));
+    }
+    let deltas = comparison_deltas(&metrics);
+    ScenarioComparisonReport {
+        schema_version: 1,
+        baseline_report_path: baseline_path.to_string(),
+        candidate_report_path: candidate_path.to_string(),
+        baseline_scenario: baseline.scenario.clone(),
+        candidate_scenario: candidate.scenario.clone(),
+        baseline_episodes: baseline.episodes,
+        candidate_episodes: candidate.episodes,
+        compared_metrics: metrics,
+        deltas,
+        recommendation,
+        warnings,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegressionDirection {
+    HigherIsWorse,
+    LowerIsWorse,
+}
+
+fn metric_cmp(
+    baseline: Option<f32>,
+    candidate: Option<f32>,
+    direction: RegressionDirection,
+    tolerance: f32,
+) -> MetricComparison {
+    let delta = baseline
+        .zip(candidate)
+        .map(|(baseline, candidate)| candidate - baseline);
+    let regression = delta
+        .map(|delta| match direction {
+            RegressionDirection::HigherIsWorse => delta > tolerance,
+            RegressionDirection::LowerIsWorse => delta < -tolerance,
+        })
+        .unwrap_or(false);
+    MetricComparison {
+        baseline,
+        candidate,
+        delta,
+        regression,
+    }
+}
+
+fn comparison_warnings(
+    baseline: &ScenarioEvaluationReport,
+    candidate: &ScenarioEvaluationReport,
+    metrics: &ScenarioComparisonMetrics,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if baseline.scenario != candidate.scenario {
+        warnings.push(format!(
+            "scenario mismatch: baseline={} candidate={}",
+            baseline.scenario, candidate.scenario
+        ));
+    }
+    if baseline.episodes != candidate.episodes {
+        warnings.push(format!(
+            "episode count mismatch: baseline={} candidate={}",
+            baseline.episodes, candidate.episodes
+        ));
+    }
+    for (name, metric) in [
+        ("success_rate", &metrics.success_rate),
+        ("collision_rate", &metrics.collision_rate),
+        (
+            "mean_collisions_per_episode",
+            &metrics.mean_collisions_per_episode,
+        ),
+        (
+            "mean_safety_interventions",
+            &metrics.mean_safety_interventions,
+        ),
+        ("model_fallbacks", &metrics.model_fallbacks),
+        (
+            "action_selector_fallbacks",
+            &metrics.action_selector_fallbacks,
+        ),
+        (
+            "action_selector_guard_yields",
+            &metrics.action_selector_guard_yields,
+        ),
+        ("mean_battery_delta", &metrics.mean_battery_delta),
+        ("stuck_count", &metrics.stuck_count),
+        ("recovery_attempts", &metrics.recovery_attempts),
+        ("repeated_trap_count", &metrics.repeated_trap_count),
+        ("recovery_success_rate", &metrics.recovery_success_rate),
+        ("mean_recovery_ticks", &metrics.mean_recovery_ticks),
+        ("mean_stuck_duration", &metrics.mean_stuck_duration),
+    ] {
+        if metric.regression {
+            warnings.push(format!(
+                "{name} regressed by {:.4}",
+                metric.delta.unwrap_or_default()
+            ));
+        }
+    }
+    warnings
+}
+
+fn comparison_recommendation(
+    baseline: &ScenarioEvaluationReport,
+    candidate: &ScenarioEvaluationReport,
+    metrics: &ScenarioComparisonMetrics,
+    warnings: &[String],
+) -> ScenarioComparisonRecommendation {
+    if baseline.episodes < 3 || candidate.episodes < 3 {
+        return ScenarioComparisonRecommendation::InsufficientData;
+    }
+    if warnings.iter().any(|warning| warning.contains("regressed")) {
+        return ScenarioComparisonRecommendation::RegressionDetected;
+    }
+    if baseline.scenario != candidate.scenario {
+        return ScenarioComparisonRecommendation::NeedsMoreEval;
+    }
+    if candidate.episodes < 10 {
+        return ScenarioComparisonRecommendation::NeedsMoreEval;
+    }
+    if metrics.success_rate.delta.unwrap_or_default() >= -0.01
+        && metrics.collision_rate.delta.unwrap_or_default() <= 0.005
+        && metrics.mean_battery_delta.delta.unwrap_or_default() >= -0.02
+    {
+        ScenarioComparisonRecommendation::PassCandidate
+    } else {
+        ScenarioComparisonRecommendation::NeedsMoreEval
+    }
+}
+
+fn comparison_deltas(metrics: &ScenarioComparisonMetrics) -> HashMap<String, f32> {
+    let mut deltas = HashMap::new();
+    for (name, metric) in [
+        ("success_rate", &metrics.success_rate),
+        ("collision_rate", &metrics.collision_rate),
+        (
+            "mean_collisions_per_episode",
+            &metrics.mean_collisions_per_episode,
+        ),
+        (
+            "mean_safety_interventions",
+            &metrics.mean_safety_interventions,
+        ),
+        ("model_fallbacks", &metrics.model_fallbacks),
+        (
+            "action_selector_fallbacks",
+            &metrics.action_selector_fallbacks,
+        ),
+        (
+            "action_selector_guard_yields",
+            &metrics.action_selector_guard_yields,
+        ),
+        ("mean_battery_delta", &metrics.mean_battery_delta),
+        ("stuck_count", &metrics.stuck_count),
+        ("recovery_attempts", &metrics.recovery_attempts),
+        ("repeated_trap_count", &metrics.repeated_trap_count),
+        ("recovery_success_rate", &metrics.recovery_success_rate),
+        ("mean_recovery_ticks", &metrics.mean_recovery_ticks),
+        ("mean_stuck_duration", &metrics.mean_stuck_duration),
+    ] {
+        if let Some(delta) = metric.delta {
+            deltas.insert(name.to_string(), delta);
+        }
+    }
+    deltas
+}
+
+fn default_comparison_report_path(
+    name: Option<&str>,
+    baseline: &ScenarioEvaluationReport,
+    candidate: &ScenarioEvaluationReport,
+) -> String {
+    let name = name
+        .map(safe_report_name)
+        .unwrap_or_else(|| format!("{}-{}-candidate", baseline.scenario, candidate.scenario));
+    format!("data/reports/comparisons/{name}.json")
+}
+
+fn safe_report_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn print_scenario_comparison(comparison: &ScenarioComparisonReport) {
+    println!("recommendation: {}", comparison.recommendation.as_str());
+    for (name, delta) in &comparison.deltas {
+        println!("{name}_delta: {delta:.6}");
+    }
+    for warning in &comparison.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PromotionGateDecision {
+    allowed: bool,
+    warnings: Vec<String>,
+}
+
+fn promotion_gate(
+    entry: &ModelRegistryEntry,
+    target: ModelStatus,
+    baseline: Option<&ScenarioEvaluationReport>,
+    candidate: Option<&ScenarioEvaluationReport>,
+    comparison: Option<&ScenarioComparisonReport>,
+    allow_safety_critical_inference: bool,
+) -> PromotionGateDecision {
+    let mut warnings = Vec::new();
+    if !Path::new(&entry.checkpoint).exists() {
+        warnings.push(format!("checkpoint missing: {}", entry.checkpoint));
+    }
+    if matches!(
+        target,
+        ModelStatus::Retired | ModelStatus::Rejected | ModelStatus::Registered
+    ) {
+        return PromotionGateDecision {
+            allowed: true,
+            warnings,
+        };
+    }
+    if target == ModelStatus::Shadow {
+        if entry.reports.scenario.is_none() {
+            warnings.push("shadow requires a scenario evaluation report".to_string());
+        }
+        return PromotionGateDecision {
+            allowed: warnings.is_empty(),
+            warnings,
+        };
+    }
+    if target != ModelStatus::Inference {
+        return PromotionGateDecision {
+            allowed: false,
+            warnings: vec!["unknown promotion target".to_string()],
+        };
+    }
+    if is_safety_critical_behavior(&entry.behavior) && !allow_safety_critical_inference {
+        warnings.push(
+            "safety-critical inference requires --allow-safety-critical-inference".to_string(),
+        );
+    }
+    let Some(candidate) = candidate else {
+        warnings.push("inference promotion requires a candidate scenario report".to_string());
+        return PromotionGateDecision {
+            allowed: false,
+            warnings,
+        };
+    };
+    if candidate.episodes < 10 {
+        warnings.push(format!(
+            "not enough scenario episodes for inference: {} < 10",
+            candidate.episodes
+        ));
+    }
+    if candidate.summary.model_fallbacks > 0 {
+        warnings.push(format!(
+            "model fallback count is not zero: {}",
+            candidate.summary.model_fallbacks
+        ));
+    }
+    if candidate.summary.collision_rate > 0.05 {
+        warnings.push(format!(
+            "candidate collision rate too high: {:.4}",
+            candidate.summary.collision_rate
+        ));
+    }
+    if let Some(comparison) = comparison {
+        if comparison.recommendation == ScenarioComparisonRecommendation::RegressionDetected {
+            warnings.push("candidate scenario report regressed against baseline".to_string());
+        }
+    } else if baseline.is_none() && is_safety_critical_behavior(&entry.behavior) {
+        warnings
+            .push("safety-critical inference requires baseline comparison evidence".to_string());
+    }
+    match entry.behavior {
+        TrainableBehavior::Danger => {
+            if let Some(comparison) = comparison {
+                if comparison
+                    .compared_metrics
+                    .collision_rate
+                    .delta
+                    .unwrap_or_default()
+                    > 0.002
+                {
+                    warnings.push(format!(
+                        "danger collision rate worse than baseline by {:.4}",
+                        comparison
+                            .compared_metrics
+                            .collision_rate
+                            .delta
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        TrainableBehavior::Charge => {
+            if candidate.summary.success_rate < 0.70 {
+                warnings.push(format!(
+                    "charger success rate below threshold: {:.3}",
+                    candidate.summary.success_rate
+                ));
+            }
+            if candidate.summary.mean_battery_delta < -0.05 {
+                warnings.push(format!(
+                    "charger battery delta unacceptable: {:.3}",
+                    candidate.summary.mean_battery_delta
+                ));
+            }
+        }
+        TrainableBehavior::ActionValue => {
+            if candidate.scenario != "mixed-room" {
+                warnings
+                    .push("action-value inference requires mixed-room scenario eval".to_string());
+            }
+        }
+        TrainableBehavior::Future => {
+            warnings.push(
+                "future inference is not a direct motor-control promotion; keep hardcoded fallback available"
+                    .to_string(),
+            );
+        }
+        TrainableBehavior::EyeNext | TrainableBehavior::EarNext | TrainableBehavior::Experience => {
+            if entry.behavior == TrainableBehavior::Experience {
+                warnings.push(
+                    "experience inference changes latent encoding; only use where it cannot directly command motors"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    PromotionGateDecision {
+        allowed: warnings.is_empty(),
+        warnings,
+    }
+}
+
+fn allowed_modes_for_status(behavior: &TrainableBehavior, status: ModelStatus) -> Vec<String> {
+    let mut modes = vec!["off".to_string(), "hardcoded".to_string()];
+    if matches!(status, ModelStatus::Shadow | ModelStatus::Inference) {
+        modes.push("shadow-infer".to_string());
+    }
+    if status == ModelStatus::Inference
+        && matches!(
+            behavior,
+            TrainableBehavior::Future
+                | TrainableBehavior::EyeNext
+                | TrainableBehavior::EarNext
+                | TrainableBehavior::Experience
+        )
+    {
+        modes.push("model-infer".to_string());
+    }
+    modes
+}
+
+fn merge_warnings(left: &[String], right: &[String]) -> Vec<String> {
+    let mut warnings = left.to_vec();
+    for warning in right {
+        if !warnings.contains(warning) {
+            warnings.push(warning.clone());
+        }
+    }
+    warnings
+}
+
+fn command_summary() -> String {
+    std::env::args().collect::<Vec<_>>().join(" ")
+}
+
+fn current_git_commit() -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn model_status() -> Result<()> {
+    print_registry_status(Path::new(DEFAULT_REGISTRY_PATH))?;
+    println!();
+    println!("registered models:");
+    for model in MODEL_REGISTRY {
+        println!("  - {model}");
+    }
+
+    let config_path = Path::new("configs/models.toml");
+    println!();
+    println!("models config: {}", config_path.display());
+    let config = match load_models_config(config_path) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            println!("  unavailable: {error}");
+            None
+        }
+    };
+
+    println!();
+    println!("behavior instrument panel:");
+    for behavior in trainable_behaviors() {
+        print_behavior_status(behavior, config.as_ref())?;
+    }
+
+    println!();
+    println!("checkpoint directories:");
+    print_model_directories(Path::new("data/models"))?;
+    Ok(())
+}
+
+fn print_registry_status(path: &Path) -> Result<()> {
+    let registry = load_model_registry(path)?;
+    println!("model registry: {}", path.display());
+    if registry.entries.is_empty() {
+        println!("  no registry entries");
+        return Ok(());
+    }
+    println!(
+        "{:<14} {:<24} {:<10} {:<32} {:<32} recommendation/warnings",
+        "behavior", "name", "status", "checkpoint", "scenario report"
+    );
+    for entry in registry.entries {
+        let report = entry.reports.scenario.as_deref().unwrap_or("-");
+        let recommendation = registry_recommendation(&entry);
+        println!(
+            "{:<14} {:<24} {:<10} {:<32} {:<32} {}",
+            entry.behavior,
+            entry.name,
+            entry.status.as_str(),
+            entry.checkpoint,
+            report,
+            recommendation
+        );
+    }
+    Ok(())
+}
+
+fn registry_recommendation(entry: &ModelRegistryEntry) -> String {
+    if !entry.warnings.is_empty() {
+        return entry.warnings.join("; ");
+    }
+    match entry.status {
+        ModelStatus::Registered => "run scenario eval, then promote to shadow".to_string(),
+        ModelStatus::Shadow => {
+            if is_safety_critical_behavior(&entry.behavior) {
+                "collect baseline comparison before inference".to_string()
+            } else {
+                "eligible for cautious inference review".to_string()
+            }
+        }
+        ModelStatus::Inference => "allowed for configured inference surfaces".to_string(),
+        ModelStatus::Retired => "retired".to_string(),
+        ModelStatus::Rejected => "rejected".to_string(),
+    }
+}
+
+fn trainable_behaviors() -> &'static [TrainableBehavior] {
+    &[
+        TrainableBehavior::Danger,
+        TrainableBehavior::Charge,
+        TrainableBehavior::ActionValue,
+        TrainableBehavior::Future,
+        TrainableBehavior::EyeNext,
+        TrainableBehavior::EarNext,
+        TrainableBehavior::Experience,
+    ]
+}
+
+fn print_behavior_status(
+    behavior: &TrainableBehavior,
+    config: Option<&pete_behaviors::BehaviorRegistryConfig>,
+) -> Result<()> {
+    let key = behavior.config_key();
+    let configured = config.and_then(|config| config.behavior.get(key));
+    let checkpoint = configured
+        .and_then(|entry| entry.checkpoint.as_deref())
+        .unwrap_or_else(|| default_checkpoint(behavior));
+    let checkpoint_path = Path::new(checkpoint);
+    let checkpoint_present = checkpoint_path.is_dir();
+    let metadata = read_json_optional(&checkpoint_path.join("metadata.json"))?;
+    let evaluation = read_json_optional(&checkpoint_path.join("evaluation.json"))?;
+    let latest_metric = read_latest_metric(&checkpoint_path.join("metrics.jsonl"))?;
+
+    println!("  - {}", behavior);
+    println!(
+        "      checkpoint: {} ({})",
+        checkpoint_path.display(),
+        if checkpoint_present {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "      samples_seen: {}",
+        json_field(&metadata, "samples_seen").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      best_loss: {}",
+        json_field(&metadata, "best_loss").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      latest_eval_loss: {}",
+        json_field(&evaluation, "model_loss_mean").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      hardcoded_loss: {}",
+        json_field(&evaluation, "hardcoded_loss_mean").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      improvement_ratio: {}",
+        json_field(&evaluation, "improvement_ratio").unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "      current regime: {}",
+        configured
+            .map(|entry| format!("{:?}", entry.regime))
+            .unwrap_or_else(|| "unconfigured".to_string())
+    );
+    println!(
+        "      recommended regime: {}",
+        recommended_regime(behavior, evaluation.as_ref())
+    );
+    println!(
+        "      safety-critical? {}",
+        if is_safety_critical_behavior(behavior) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "      last metrics timestamp: {}",
+        latest_metric
+            .as_ref()
+            .and_then(|metric| json_field(&Some(metric.clone()), "t_ms"))
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+
+    if let Some(entry) = configured {
+        println!("      hardcoded: {}", entry.hardcoded);
+        println!("      model: {}", entry.model.as_deref().unwrap_or("none"));
+        println!("      fallback: {:?}", entry.fallback);
+    } else {
+        println!("      hardcoded: {}", behavior.default_hardcoded_id());
+        println!("      model: {}", behavior.default_model_id());
+        println!("      fallback: UseHardcoded");
+    }
+    if let Some(warnings) = evaluation
+        .as_ref()
+        .and_then(|json| json.get("warnings"))
+        .and_then(Value::as_array)
+    {
+        for warning in warnings.iter().filter_map(Value::as_str) {
+            println!("      warning: {warning}");
+        }
+    }
+    Ok(())
+}
+
+fn read_json_optional(path: &Path) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+fn read_latest_metric(path: &Path) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)?;
+    let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(line)?))
+}
+
+fn json_field(json: &Option<Value>, field: &str) -> Option<String> {
+    json.as_ref().and_then(|json| {
+        json.get(field).map(|value| match value {
+            Value::String(text) => text.clone(),
+            Value::Null => "null".to_string(),
+            other => other.to_string(),
+        })
+    })
+}
+
+fn recommended_regime(behavior: &TrainableBehavior, evaluation: Option<&Value>) -> String {
+    let recommendation = evaluation
+        .and_then(|json| json.get("recommendation"))
+        .and_then(Value::as_str);
+    match recommendation {
+        Some("promote_to_model_infer") if is_safety_critical_behavior(behavior) => {
+            "shadow_infer (model_infer blocked for safety-critical behavior)".to_string()
+        }
+        Some("promote_to_model_infer") => "model_infer".to_string(),
+        Some("shadow_infer") => "shadow_infer".to_string(),
+        Some("shadow_train") => "shadow_train".to_string(),
+        Some("keep_hardcoded") => "hardcoded".to_string(),
+        Some("reject_checkpoint") => "hardcoded (reject checkpoint)".to_string(),
+        Some(other) => format!("unknown ({other})"),
+        None => "unknown".to_string(),
+    }
+}
+
+fn is_safety_critical_behavior(behavior: &TrainableBehavior) -> bool {
+    matches!(
+        behavior,
+        TrainableBehavior::Danger
+            | TrainableBehavior::ActionValue
+            | TrainableBehavior::Experience
+            | TrainableBehavior::Future
+    )
+}
+
+fn print_model_directories(path: &Path) -> Result<()> {
+    if !path.exists() {
+        println!("  missing {}", path.display());
+        return Ok(());
+    }
+    let mut directories = fs::read_dir(path)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.path())
+        })
+        .collect::<Vec<_>>();
+    directories.sort();
+    if directories.is_empty() {
+        println!("  none below {}", path.display());
+        return Ok(());
+    }
+    for directory in directories {
+        let metadata = directory.join("metadata.json").exists();
+        let evaluation = directory.join("evaluation.json").exists();
+        let metrics = directory.join("metrics.jsonl").exists();
+        println!(
+            "  - {} (metadata={}, evaluation={}, metrics={})",
+            directory.display(),
+            metadata,
+            evaluation,
+            metrics
+        );
+    }
+    Ok(())
+}
+
+fn print_frame(frame: &ExperienceFrame) {
+    println!("frame {} @ {}ms", frame.id, frame.t_ms);
+    println!("  summary: {}", frame.summary_text());
+    println!("  action: {:?}", frame.chosen_action);
+    println!("  recalls: {}", frame.memory_recall.len());
+    println!("  recollections: {}", frame.recollections.len());
+    let embodied = frame.embodied_context();
+    println!(
+        "  embodied_summary: {}",
+        if embodied.summary.trim().is_empty() {
+            "none"
+        } else {
+            embodied.summary.trim()
+        }
+    );
+    println!(
+        "  embodied_experience_id: {}",
+        embodied
+            .experience_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!("  sensation_count: {}", embodied.sensations.len());
+    println!("  impression_count: {}", embodied.impressions.len());
+    println!(
+        "  derived_sensation_count: {}",
+        embodied.derived_sensation_count()
+    );
+    println!("  lineage_edge_count: {}", embodied.lineage.len());
+    if embodied.lineage.is_empty() {
+        println!("  lineage_graph: none");
+    } else {
+        println!("  lineage_graph:");
+        for edge in embodied.lineage.iter().take(8) {
+            println!("    - {} -> {}", edge.parent_id, edge.child_id);
+        }
+    }
+    println!(
+        "  embodied_prediction_count: {}",
+        embodied.predictions.len()
+    );
+    println!(
+        "  embodied_memory_link_count: {}",
+        embodied.memory_links.len()
+    );
+    if let Some(experience) = frame.experiences.last() {
+        println!("  experience: {}", experience.text);
+    }
+    if let Some(transcript) = &frame.now.ear.transcript {
+        println!("  heard: {}", transcript);
+    }
+    if let Some(eye_frame) = &frame.now.eye_frame {
+        println!(
+            "  eye_frame: {}x{} ({:?}) source={:?}",
+            eye_frame.width,
+            eye_frame.height,
+            eye_frame.format,
+            eye_frame.source.as_deref().unwrap_or("none")
+        );
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VirtualRunReport {
+    pub total_frames: usize,
+    pub total_transitions: usize,
+    pub total_eye_frames: usize,
+    pub total_ear_frames: usize,
+    pub total_stuck_trap_events: usize,
+    pub battery_delta: f32,
+    pub duration_seconds: f64,
+    pub eye_sources: HashMap<String, usize>,
+    pub retina_coverage: f32,
+    pub collisions: usize,
+    pub collision_rate: f32,
+    pub charger_contacts: usize,
+    pub charging_ticks: usize,
+    pub battery_recovery_success: bool,
+    pub stuck_recovery_attempts: usize,
+    pub stuck_recovery_successes: usize,
+    pub trap_kinds: HashMap<String, usize>,
+    pub ledger_gaps: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VirtualTrainingReport {
+    pub timestamp: String,
+    pub run_report: VirtualRunReport,
+    pub models: HashMap<String, ModelTrainingStatus>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ModelTrainingStatus {
+    pub name: String,
+    pub trained: bool,
+    pub previous_status: String,
+    pub new_status: String,
+    pub recommended_action: String,
+    pub warnings: Vec<String>,
+    pub loss: Option<f32>,
+    pub baseline_collision_rate: Option<f32>,
+    pub candidate_collision_rate: Option<f32>,
+    pub baseline_success_rate: Option<f32>,
+    pub candidate_success_rate: Option<f32>,
+}
+
+async fn run_virtual_report(args: VirtualReportArgs) -> Result<()> {
+    let report = generate_virtual_report(&args.ledger).await?;
+    let parent = Path::new(&args.out).parent();
+    if let Some(p) = parent {
+        if !p.as_os_str().is_empty() {
+            fs::create_dir_all(p)?;
+        }
+    }
+    let content = serde_json::to_string_pretty(&report)?;
+    fs::write(&args.out, content)?;
+    println!("virtual run report written to {}", args.out);
+    Ok(())
+}
+
+async fn run_pose_graph_report(args: PoseGraphReportArgs) -> Result<()> {
+    let report = generate_pose_graph_report(&args).await?;
+    let parent = Path::new(&args.out).parent();
+    if let Some(p) = parent {
+        if !p.as_os_str().is_empty() {
+            fs::create_dir_all(p)?;
+        }
+    }
+    fs::write(&args.out, serde_json::to_string_pretty(&report)?)?;
+    println!(
+        "pose graph report written to {} (nodes={}, odometry_edges={}, loop_candidates={}, rejected={})",
+        args.out,
+        report.nodes,
+        report.odometry_edges,
+        report.loop_candidate_edges,
+        report.rejected_loop_candidates
+    );
+    Ok(())
+}
+
+async fn run_geometry_debug(args: GeometryDebugArgs) -> Result<()> {
+    let report = generate_geometry_debug_report(&args).await?;
+    if let Some(parent) = Path::new(&args.out).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "geometry debug report written to {} (frame={}, below_floor_ratio={:.3}, ready_for_real_slam={})",
+        args.out,
+        report.frame_index,
+        report.floor_statistics.below_floor_ratio,
+        report.sensor_truth.ready_for_real_slam
+    );
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryDebugReport {
+    schema_version: u32,
+    input_source: String,
+    frame_index: u64,
+    t_ms: u64,
+    sensor_truth: SensorTruthReport,
+    depth_projection: GeometryDepthProjection,
+    calibration_extrinsics: GeometryExtrinsics,
+    imu_orientation: GeometryImuInterpretation,
+    timestamp_diagnostics: GeometryTimestampDiagnostics,
+    stationary_rotation_diagnostics: StationaryRotationDiagnostics,
+    coordinate_frame_conventions: Vec<String>,
+    sample_transformed_points: Vec<GeometryPointSample>,
+    floor_statistics: GeometryFloorStatistics,
+    warnings: Vec<String>,
+    hard_failures: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryDepthProjection {
+    width: usize,
+    height: usize,
+    vector_len: usize,
+    projection_source: String,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    min_depth_m: Option<f32>,
+    median_depth_m: Option<f32>,
+    max_depth_m: Option<f32>,
+    skipped_depth_count: usize,
+    clipped_depth_count: usize,
+    sample_stride: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SensorTruthReport {
+    ready_for_real_slam: bool,
+    gates: Vec<SensorTruthGate>,
+}
+
+#[derive(Debug, Serialize)]
+struct SensorTruthGate {
+    name: String,
+    status: SensorTruthStatus,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SensorTruthStatus {
+    Pass,
+    Fail,
+    NotApplicable,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryExtrinsics {
+    camera_height_m: f32,
+    camera_forward_m: f32,
+    camera_pitch_rad: f32,
+    camera_roll_rad: f32,
+    camera_yaw_rad: f32,
+    rotation_order: String,
+    base_mapping: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryImuInterpretation {
+    raw_orientation: Vec<f32>,
+    assumed_units: String,
+    assumed_axis_order: String,
+    roll_deg: Option<f32>,
+    pitch_deg: Option<f32>,
+    yaw_deg: Option<f32>,
+    roll_pitch_correction_active: bool,
+    yaw_source: String,
+    contract_known: bool,
+    contract_source: String,
+    note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryTimestampDiagnostics {
+    frame_count: usize,
+    depth_frame_count: usize,
+    first_frame_t_ms: Option<u64>,
+    last_frame_t_ms: Option<u64>,
+    frame_timestamps_monotonic: bool,
+    median_frame_dt_ms: Option<u64>,
+    max_frame_dt_ms: Option<u64>,
+    body_last_update_age_ms: Option<u64>,
+    eye_frame_age_ms: Option<u64>,
+    ear_pcm_age_ms: Option<u64>,
+    kinect_capture_timestamp_present: bool,
+    kinect_capture_age_ms: Option<u64>,
+    imu_capture_timestamp_present: bool,
+    imu_capture_age_ms: Option<u64>,
+    note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StationaryRotationDiagnostics {
+    evaluated: bool,
+    reason: String,
+    frame_count: usize,
+    heading_delta_deg: f32,
+    translation_delta_m: f32,
+    raw_points_seen: u64,
+    voxel_count: usize,
+    stable_voxel_count: usize,
+    stable_voxel_ratio: f32,
+    stable_z_span_m: Option<f32>,
+    stable_z_median_m: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryPointSample {
+    pixel_index: usize,
+    u: usize,
+    v: usize,
+    depth_m: f32,
+    camera_frame: Point3D,
+    robot_base_frame: Point3D,
+    world_frame: Point3D,
+    render_scene_frame: Point3D,
+}
+
+#[derive(Debug, Serialize)]
+struct GeometryFloorStatistics {
+    sampled_points: usize,
+    below_floor_count: usize,
+    below_floor_ratio: f32,
+    robot_base_below_floor_count: usize,
+    robot_base_below_floor_ratio: f32,
+    min_robot_base_z_m: Option<f32>,
+    median_robot_base_z_m: Option<f32>,
+    max_robot_base_z_m: Option<f32>,
+    min_math_frame_z_m: Option<f32>,
+    median_math_frame_z_m: Option<f32>,
+    max_math_frame_z_m: Option<f32>,
+    min_render_vertical_axis_m: Option<f32>,
+    median_render_vertical_axis_m: Option<f32>,
+    max_render_vertical_axis_m: Option<f32>,
+}
+
+async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<GeometryDebugReport> {
+    let input = geometry_debug_input(args).await?;
+    let frames = input.frames;
+    let record = frames
+        .iter()
+        .find(|frame| !frame.snapshot.kinect.depth_m.is_empty())
+        .context("capture contains no frame with Kinect/depth data")?;
+    let snapshot = &record.snapshot;
+    let kinect = &snapshot.kinect;
+    let mut warnings = Vec::new();
+    let mut hard_failures = Vec::new();
+    let projection = geometry_projection(kinect, &mut warnings);
+    let config = PointCloudConfig::default();
+    let orientation = pete_map::orientation_from_snapshot(snapshot);
+    let imu_interpretation = geometry_imu_interpretation(&snapshot.imu.orientation, orientation);
+    let pose = snapshot.body.odometry;
+    let timestamp_diagnostics = geometry_timestamp_diagnostics(&frames, record);
+    let stationary_rotation_diagnostics = stationary_rotation_diagnostics(&frames, args);
+    let sample_stride = kinect.depth_m.len().div_ceil(args.samples.max(1)).max(1);
+    let min_depth = positive_depth_or(kinect.min_depth_m, config.min_depth_m);
+    let max_depth = positive_depth_or(kinect.max_depth_m, config.max_depth_m);
+    let mut full_skipped = 0usize;
+    let mut full_clipped = 0usize;
+    let mut full_valid_depths = Vec::new();
+    for depth in &kinect.depth_m {
+        if !depth.is_finite() || *depth <= 0.0 {
+            full_skipped = full_skipped.saturating_add(1);
+        } else if *depth < min_depth || *depth > max_depth {
+            full_clipped = full_clipped.saturating_add(1);
+        } else {
+            full_valid_depths.push(*depth);
+        }
+    }
+    full_valid_depths.sort_by(|a, b| a.total_cmp(b));
+    let mut samples = Vec::new();
+    let mut robot_heights = Vec::new();
+    let mut world_heights = Vec::new();
+    let mut render_heights = Vec::new();
+    for (index, depth) in kinect.depth_m.iter().enumerate() {
+        if !depth.is_finite() || *depth <= 0.0 {
+            continue;
+        }
+        if *depth < min_depth || *depth > max_depth {
+            continue;
+        }
+        let u = index % projection.width;
+        let v = index / projection.width;
+        let camera = Point3D {
+            x_m: (u as f32 - projection.cx) * *depth / projection.fx.max(f32::EPSILON),
+            y_m: (v as f32 - projection.cy) * *depth / projection.fy.max(f32::EPSILON),
+            z_m: *depth,
+        };
+        let robot = geometry_camera_to_robot(camera, config);
+        let world = transform_point_to_world(camera, projection.frame, pose, orientation, config);
+        let render = Point3D {
+            x_m: robot.y_m,
+            y_m: robot.z_m,
+            z_m: robot.x_m,
+        };
+        robot_heights.push(robot.z_m);
+        world_heights.push(world.z_m);
+        render_heights.push(render.y_m);
+        if samples.len() < args.samples && index % sample_stride == 0 {
+            samples.push(GeometryPointSample {
+                pixel_index: index,
+                u,
+                v,
+                depth_m: *depth,
+                camera_frame: camera,
+                robot_base_frame: robot,
+                world_frame: world,
+                render_scene_frame: render,
+            });
+        }
+    }
+    let robot_base_below_floor_count = robot_heights.iter().filter(|z| **z < 0.0).count();
+    let robot_base_below_floor_ratio = if robot_heights.is_empty() {
+        0.0
+    } else {
+        robot_base_below_floor_count as f32 / robot_heights.len() as f32
+    };
+    let below_floor_count = world_heights.iter().filter(|z| **z < 0.0).count();
+    let below_floor_ratio = if world_heights.is_empty() {
+        0.0
+    } else {
+        below_floor_count as f32 / world_heights.len() as f32
+    };
+    if projection.source_is_fallback {
+        warnings.push(
+            "fallback intrinsics/projection are active; real Kinect geometry is not trustworthy"
+                .to_string(),
+        );
+    }
+    if !kinect
+        .depth_coordinate_system
+        .as_deref()
+        .is_some_and(|s| s == "kinect_camera")
+    {
+        warnings.push(format!(
+            "depth coordinate system metadata is {:?}; assuming Kinect camera frame",
+            kinect.depth_coordinate_system
+        ));
+    }
+    if !imu_interpretation.contract_known {
+        warnings.push(format!(
+            "IMU orientation contract is not sufficient for roll/pitch correction: {}",
+            imu_interpretation.note
+        ));
+    }
+    let sensor_truth = sensor_truth_report(
+        projection.source_is_fallback,
+        &timestamp_diagnostics,
+        &imu_interpretation,
+        below_floor_ratio,
+        &stationary_rotation_diagnostics,
+        args,
+    );
+    for gate in &sensor_truth.gates {
+        if gate.status == SensorTruthStatus::Fail {
+            hard_failures.push(format!("{}: {}", gate.name, gate.detail));
+        }
+    }
+    Ok(GeometryDebugReport {
+        schema_version: 1,
+        input_source: input.source,
+        frame_index: record.index,
+        t_ms: record.t_ms,
+        sensor_truth,
+        depth_projection: GeometryDepthProjection {
+            width: projection.width,
+            height: projection.height,
+            vector_len: kinect.depth_m.len(),
+            projection_source: projection.source,
+            fx: projection.fx,
+            fy: projection.fy,
+            cx: projection.cx,
+            cy: projection.cy,
+            min_depth_m: full_valid_depths.first().copied(),
+            median_depth_m: median_sorted(&full_valid_depths),
+            max_depth_m: full_valid_depths.last().copied(),
+            skipped_depth_count: full_skipped,
+            clipped_depth_count: full_clipped,
+            sample_stride,
+        },
+        calibration_extrinsics: GeometryExtrinsics {
+            camera_height_m: config.camera_height_m,
+            camera_forward_m: config.camera_forward_m,
+            camera_pitch_rad: config.camera_pitch_rad,
+            camera_roll_rad: config.camera_roll_rad,
+            camera_yaw_rad: config.camera_yaw_rad,
+            rotation_order: "camera -> base [z,-x,-y], then pitch, roll, yaw, then translate".to_string(),
+            base_mapping: "Kinect camera +x right, +y down, +z forward -> robot +x forward, +y left, +z up".to_string(),
+        },
+        imu_orientation: imu_interpretation,
+        timestamp_diagnostics,
+        stationary_rotation_diagnostics,
+        coordinate_frame_conventions: vec![
+            "Kinect camera frame: +x right, +y down, +z forward".to_string(),
+            "Robot/base math frame: +x forward, +y left, +z up; floor is z=0".to_string(),
+            "World/odometry math frame: +x odom forward/east, +y odom left/north, +z up".to_string(),
+            "Scene render frame: Babylon +x world x/left-local, +y up, +z world y; robot forward is local -z".to_string(),
+            "ScenePoint for calibrated live depth is scene_robot_render: x=robot_y, y=robot_z, z=robot_x".to_string(),
+        ],
+        sample_transformed_points: samples,
+        floor_statistics: GeometryFloorStatistics {
+            sampled_points: world_heights.len(),
+            below_floor_count,
+            below_floor_ratio,
+            robot_base_below_floor_count,
+            robot_base_below_floor_ratio,
+            min_robot_base_z_m: min_sorted(robot_heights.clone()),
+            median_robot_base_z_m: median_values(robot_heights.clone()),
+            max_robot_base_z_m: max_sorted(robot_heights.clone()),
+            min_math_frame_z_m: min_sorted(world_heights.clone()),
+            median_math_frame_z_m: median_values(world_heights.clone()),
+            max_math_frame_z_m: max_sorted(world_heights.clone()),
+            min_render_vertical_axis_m: min_sorted(render_heights.clone()),
+            median_render_vertical_axis_m: median_values(render_heights.clone()),
+            max_render_vertical_axis_m: max_sorted(render_heights),
+        },
+        warnings,
+        hard_failures,
+    })
+}
+
+struct GeometryDebugInput {
+    source: String,
+    frames: Vec<pete_worldlab::CaptureFrameRecord>,
+}
+
+async fn geometry_debug_input(args: &GeometryDebugArgs) -> Result<GeometryDebugInput> {
+    match (&args.capture, &args.live_now_url) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("pass only one of --capture or --live-now-url");
+        }
+        (Some(capture), None) => {
+            let reader = CaptureReader::open(capture).await?;
+            Ok(GeometryDebugInput {
+                source: format!("capture:{capture}"),
+                frames: reader.read_frames().await?,
+            })
+        }
+        (None, Some(url)) => {
+            let now = reqwest::Client::new()
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("fetching live Now snapshot from {url}"))?
+                .error_for_status()
+                .with_context(|| format!("live Now endpoint returned an error for {url}"))?
+                .json::<Now>()
+                .await
+                .with_context(|| format!("decoding live Now JSON from {url}"))?;
+            let t_ms = now.t_ms;
+            Ok(GeometryDebugInput {
+                source: format!("live-now:{url}"),
+                frames: vec![pete_worldlab::CaptureFrameRecord {
+                    index: 0,
+                    t_ms,
+                    snapshot: world_snapshot_from_now(now),
+                    events: Vec::new(),
+                    assets: pete_worldlab::CaptureFrameAssets::default(),
+                    stream_metadata: Some(serde_json::json!({
+                        "source": "live_now_url",
+                        "url": url
+                    })),
+                }],
+            })
+        }
+        (None, None) => {
+            anyhow::bail!("pass --capture <dir> or --live-now-url <url>");
+        }
+    }
+}
+
+fn world_snapshot_from_now(now: Now) -> WorldSnapshot {
+    WorldSnapshot {
+        body: now.body,
+        eye_frame: now.eye_frame,
+        eye: now.eye,
+        ear: now.ear,
+        range: now.range,
+        imu: now.imu,
+        gps: now.gps,
+        kinect: now.kinect,
+        objects: now.objects,
+        face: now.face,
+        voice: now.voice,
+        extensions: Vec::new(),
+        ..WorldSnapshot::default()
+    }
+}
+
+struct GeometryProjection {
+    width: usize,
+    height: usize,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    frame: PointCloudFrame,
+    source: String,
+    source_is_fallback: bool,
+}
+
+fn geometry_projection(kinect: &KinectSense, warnings: &mut Vec<String>) -> GeometryProjection {
+    let width = usize::try_from(kinect.depth_width).unwrap_or(0);
+    let height = usize::try_from(kinect.depth_height).unwrap_or(0);
+    if width > 0 && height > 0 && width.saturating_mul(height) == kinect.depth_m.len() {
+        return GeometryProjection {
+            width,
+            height,
+            fx: positive_depth_or(kinect.depth_fx, 594.0),
+            fy: positive_depth_or(kinect.depth_fy, 591.0),
+            cx: positive_depth_or(kinect.depth_cx, (width as f32 - 1.0) * 0.5),
+            cy: positive_depth_or(kinect.depth_cy, (height as f32 - 1.0) * 0.5),
+            frame: PointCloudFrame::KinectCamera,
+            source: if kinect.depth_fx > 0.0 && kinect.depth_fy > 0.0 {
+                "real_intrinsics".to_string()
+            } else {
+                "metadata_dimensions_with_fallback_intrinsics".to_string()
+            },
+            source_is_fallback: !(kinect.depth_fx > 0.0 && kinect.depth_fy > 0.0),
+        };
+    }
+    warnings.push(
+        "depth width/height do not match vector length; using legacy square fallback projection"
+            .to_string(),
+    );
+    let width = (kinect.depth_m.len() as f32).sqrt().ceil().max(1.0) as usize;
+    GeometryProjection {
+        width,
+        height: kinect.depth_m.len().div_ceil(width).max(1),
+        fx: width as f32,
+        fy: width as f32,
+        cx: (width as f32 - 1.0) * 0.5,
+        cy: (kinect.depth_m.len().div_ceil(width).max(1) as f32 - 1.0) * 0.5,
+        frame: PointCloudFrame::DepthImageUnknown,
+        source: "fallback_legacy_square_projection".to_string(),
+        source_is_fallback: true,
+    }
+}
+
+fn sensor_truth_report(
+    depth_projection_is_fallback: bool,
+    timestamps: &GeometryTimestampDiagnostics,
+    imu: &GeometryImuInterpretation,
+    below_floor_ratio: f32,
+    stationary: &StationaryRotationDiagnostics,
+    args: &GeometryDebugArgs,
+) -> SensorTruthReport {
+    let mut gates = Vec::new();
+    gates.push(SensorTruthGate {
+        name: "depth_intrinsics_non_fallback".to_string(),
+        status: if depth_projection_is_fallback {
+            SensorTruthStatus::Fail
+        } else {
+            SensorTruthStatus::Pass
+        },
+        detail: if depth_projection_is_fallback {
+            "depth projection is using fallback intrinsics/projection".to_string()
+        } else {
+            "depth frame carries usable width/height and fx/fy intrinsics".to_string()
+        },
+    });
+    gates.push(SensorTruthGate {
+        name: "below_floor_ratio".to_string(),
+        status: if below_floor_ratio <= args.max_below_floor_ratio {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "below_floor_ratio={below_floor_ratio:.4}, threshold={:.4}",
+            args.max_below_floor_ratio
+        ),
+    });
+    gates.push(SensorTruthGate {
+        name: "frame_timestamps_monotonic".to_string(),
+        status: if timestamps.frame_timestamps_monotonic {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "frames={}, median_dt_ms={:?}, max_dt_ms={:?}",
+            timestamps.frame_count, timestamps.median_frame_dt_ms, timestamps.max_frame_dt_ms
+        ),
+    });
+    let body_age_ok = timestamps
+        .body_last_update_age_ms
+        .is_some_and(|age| age <= args.max_body_timestamp_age_ms);
+    gates.push(SensorTruthGate {
+        name: "body_timestamp_fresh".to_string(),
+        status: if body_age_ok {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "body_last_update_age_ms={:?}, threshold={}",
+            timestamps.body_last_update_age_ms, args.max_body_timestamp_age_ms
+        ),
+    });
+    gates.push(SensorTruthGate {
+        name: "kinect_timestamp_carried".to_string(),
+        status: if timestamps.kinect_capture_timestamp_present {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "kinect_captured_at_ms_present={}, age_ms={:?}",
+            timestamps.kinect_capture_timestamp_present, timestamps.kinect_capture_age_ms
+        ),
+    });
+    gates.push(SensorTruthGate {
+        name: "imu_timestamp_carried".to_string(),
+        status: if timestamps.imu_capture_timestamp_present {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "imu_captured_at_ms_present={}, age_ms={:?}",
+            timestamps.imu_capture_timestamp_present, timestamps.imu_capture_age_ms
+        ),
+    });
+    let imu_ready = imu.contract_known && imu.roll_pitch_correction_active;
+    gates.push(SensorTruthGate {
+        name: "imu_roll_pitch_contract".to_string(),
+        status: if imu_ready {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "{}; roll_pitch_active={}",
+            imu.contract_source, imu.roll_pitch_correction_active
+        ),
+    });
+    let stationary_status = if !stationary.evaluated {
+        SensorTruthStatus::NotApplicable
+    } else if stationary.stable_voxel_ratio >= args.min_stationary_stable_voxel_ratio
+        && stationary
+            .stable_z_span_m
+            .is_some_and(|span| span <= args.max_stationary_stable_z_span_m)
+    {
+        SensorTruthStatus::Pass
+    } else {
+        SensorTruthStatus::Fail
+    };
+    gates.push(SensorTruthGate {
+        name: "stationary_rotation_cloud_stability".to_string(),
+        status: stationary_status,
+        detail: format!(
+            "{}; heading_delta_deg={:.1}, translation_delta_m={:.3}, stable_ratio={:.3}, stable_z_span_m={:?}",
+            stationary.reason,
+            stationary.heading_delta_deg,
+            stationary.translation_delta_m,
+            stationary.stable_voxel_ratio,
+            stationary.stable_z_span_m
+        ),
+    });
+    let ready_for_real_slam = gates
+        .iter()
+        .all(|gate| gate.status == SensorTruthStatus::Pass);
+    SensorTruthReport {
+        ready_for_real_slam,
+        gates,
+    }
+}
+
+fn geometry_timestamp_diagnostics(
+    frames: &[pete_worldlab::CaptureFrameRecord],
+    selected: &pete_worldlab::CaptureFrameRecord,
+) -> GeometryTimestampDiagnostics {
+    let mut deltas = frames
+        .windows(2)
+        .map(|pair| pair[1].t_ms.saturating_sub(pair[0].t_ms))
+        .collect::<Vec<_>>();
+    deltas.sort_unstable();
+    let frame_timestamps_monotonic = frames.windows(2).all(|pair| pair[1].t_ms >= pair[0].t_ms);
+    let median_frame_dt_ms = if deltas.is_empty() {
+        None
+    } else {
+        Some(deltas[deltas.len() / 2])
+    };
+    let max_frame_dt_ms = deltas.last().copied();
+    let snapshot = &selected.snapshot;
+    GeometryTimestampDiagnostics {
+        frame_count: frames.len(),
+        depth_frame_count: frames
+            .iter()
+            .filter(|frame| !frame.snapshot.kinect.depth_m.is_empty())
+            .count(),
+        first_frame_t_ms: frames.first().map(|frame| frame.t_ms),
+        last_frame_t_ms: frames.last().map(|frame| frame.t_ms),
+        frame_timestamps_monotonic,
+        median_frame_dt_ms,
+        max_frame_dt_ms,
+        body_last_update_age_ms: Some(selected.t_ms.saturating_sub(snapshot.body.last_update_ms)),
+        eye_frame_age_ms: snapshot
+            .eye_frame
+            .as_ref()
+            .map(|frame| selected.t_ms.saturating_sub(frame.captured_at_ms)),
+        ear_pcm_age_ms: snapshot
+            .ear_pcm
+            .as_ref()
+            .map(|frame| selected.t_ms.saturating_sub(frame.captured_at_ms)),
+        kinect_capture_timestamp_present: snapshot.kinect.captured_at_ms > 0,
+        kinect_capture_age_ms: (snapshot.kinect.captured_at_ms > 0)
+            .then(|| selected.t_ms.saturating_sub(snapshot.kinect.captured_at_ms)),
+        imu_capture_timestamp_present: snapshot.imu.captured_at_ms > 0,
+        imu_capture_age_ms: (snapshot.imu.captured_at_ms > 0)
+            .then(|| selected.t_ms.saturating_sub(snapshot.imu.captured_at_ms)),
+        note: "KinectSense and ImuSense carry individual capture timestamps when produced by current sensor providers; old captures may deserialize as 0 and fail these gates".to_string(),
+    }
+}
+
+fn stationary_rotation_diagnostics(
+    frames: &[pete_worldlab::CaptureFrameRecord],
+    args: &GeometryDebugArgs,
+) -> StationaryRotationDiagnostics {
+    let depth_frames = frames
+        .iter()
+        .filter(|frame| !frame.snapshot.kinect.depth_m.is_empty())
+        .collect::<Vec<_>>();
+    if depth_frames.len() < 2 {
+        return StationaryRotationDiagnostics {
+            evaluated: false,
+            reason: "capture has fewer than two depth frames".to_string(),
+            frame_count: depth_frames.len(),
+            heading_delta_deg: 0.0,
+            translation_delta_m: 0.0,
+            raw_points_seen: 0,
+            voxel_count: 0,
+            stable_voxel_count: 0,
+            stable_voxel_ratio: 0.0,
+            stable_z_span_m: None,
+            stable_z_median_m: None,
+        };
+    }
+    let first = depth_frames.first().unwrap();
+    let last = depth_frames.last().unwrap();
+    let first_pose = first.snapshot.body.odometry;
+    let last_pose = last.snapshot.body.odometry;
+    let heading_delta_deg =
+        angle_delta_abs(last_pose.heading_rad, first_pose.heading_rad).to_degrees();
+    let translation_delta_m = ((last_pose.x_m - first_pose.x_m).powi(2)
+        + (last_pose.y_m - first_pose.y_m).powi(2))
+    .sqrt();
+    let stationary_candidate = heading_delta_deg >= args.min_stationary_rotation_deg
+        && translation_delta_m <= args.max_stationary_translation_m;
+    let mut cloud = VoxelPointCloud::default();
+    for frame in &depth_frames {
+        cloud.observe_snapshot(&frame.snapshot, frame.t_ms);
+    }
+    let summary = cloud.summary();
+    let stable_z_values = cloud
+        .points()
+        .into_iter()
+        .filter(|point| point.stable)
+        .map(|point| point.position.z_m)
+        .filter(|z| z.is_finite())
+        .collect::<Vec<_>>();
+    let stable_z_span_m = min_max_values(&stable_z_values).map(|(min, max)| max - min);
+    let stable_z_median_m = median_values(stable_z_values.clone());
+    let stable_voxel_ratio = if summary.voxels == 0 {
+        0.0
+    } else {
+        summary.stable_voxels as f32 / summary.voxels as f32
+    };
+    StationaryRotationDiagnostics {
+        evaluated: stationary_candidate,
+        reason: if stationary_candidate {
+            "capture looks like a stationary rotation test".to_string()
+        } else {
+            format!(
+                "capture is not a stationary rotation test; requires heading_delta>={:.1}deg and translation<={:.2}m",
+                args.min_stationary_rotation_deg, args.max_stationary_translation_m
+            )
+        },
+        frame_count: depth_frames.len(),
+        heading_delta_deg,
+        translation_delta_m,
+        raw_points_seen: summary.raw_points_seen,
+        voxel_count: summary.voxels,
+        stable_voxel_count: summary.stable_voxels,
+        stable_voxel_ratio,
+        stable_z_span_m,
+        stable_z_median_m,
+    }
+}
+
+fn geometry_camera_to_robot(point: Point3D, config: PointCloudConfig) -> Point3D {
+    let base = Point3D {
+        x_m: point.z_m,
+        y_m: -point.x_m,
+        z_m: -point.y_m,
+    };
+    let rotated = geometry_rotate_robot_extrinsic(
+        base,
+        config.camera_pitch_rad,
+        config.camera_roll_rad,
+        config.camera_yaw_rad,
+    );
+    Point3D {
+        x_m: rotated.x_m + config.camera_forward_m,
+        y_m: rotated.y_m,
+        z_m: rotated.z_m + config.camera_height_m,
+    }
+}
+
+fn geometry_rotate_robot_extrinsic(
+    point: Point3D,
+    pitch_rad: f32,
+    roll_rad: f32,
+    yaw_rad: f32,
+) -> Point3D {
+    let (pitch_sin, pitch_cos) = pitch_rad.sin_cos();
+    let x = point.x_m * pitch_cos + point.z_m * pitch_sin;
+    let y = point.y_m;
+    let mut z = -point.x_m * pitch_sin + point.z_m * pitch_cos;
+    let (roll_sin, roll_cos) = roll_rad.sin_cos();
+    let rolled_y = y * roll_cos - z * roll_sin;
+    z = y * roll_sin + z * roll_cos;
+    let (yaw_sin, yaw_cos) = yaw_rad.sin_cos();
+    Point3D {
+        x_m: x * yaw_cos - rolled_y * yaw_sin,
+        y_m: x * yaw_sin + rolled_y * yaw_cos,
+        z_m: z,
+    }
+}
+
+fn geometry_imu_interpretation(
+    raw: &[f32],
+    orientation: OrientationEstimate,
+) -> GeometryImuInterpretation {
+    let (contract_known, contract_source, note) = match raw.len() {
+        2 => (
+            true,
+            "recognized MPU-6050 hardware shape: [roll, pitch] radians from gravity".to_string(),
+            "hardware MPU-6050 has roll/pitch but no absolute yaw; yaw should come from odometry"
+                .to_string(),
+        ),
+        3.. => (
+            true,
+            "recognized full orientation shape: [roll, pitch, yaw] radians".to_string(),
+            "full orientation vector supplies roll/pitch/yaw in Pete order".to_string(),
+        ),
+        1 => (
+            false,
+            "legacy heading-only shape: [yaw]".to_string(),
+            "legacy one-value orientation has no roll/pitch correction".to_string(),
+        ),
+        _ => (
+            false,
+            "no orientation vector".to_string(),
+            "no IMU orientation was present in this frame".to_string(),
+        ),
+    };
+    GeometryImuInterpretation {
+        raw_orientation: raw.to_vec(),
+        assumed_units: "radians".to_string(),
+        assumed_axis_order: match raw.len() {
+            0 => "none".to_string(),
+            1 => "[yaw] legacy heading-only".to_string(),
+            2 => "[roll, pitch]".to_string(),
+            _ => "[roll, pitch, yaw]".to_string(),
+        },
+        roll_deg: orientation.roll_rad.map(f32::to_degrees),
+        pitch_deg: orientation.pitch_rad.map(f32::to_degrees),
+        yaw_deg: orientation.yaw_rad.map(f32::to_degrees),
+        roll_pitch_correction_active: orientation.roll_pitch_from_imu,
+        yaw_source: format!("{:?}", orientation.yaw_source),
+        contract_known,
+        contract_source,
+        note,
+    }
+}
+
+fn positive_depth_or(value: f32, fallback: f32) -> f32 {
+    if value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn median_values(mut values: Vec<f32>) -> Option<f32> {
+    values.sort_by(|a, b| a.total_cmp(b));
+    median_sorted(&values)
+}
+
+fn median_sorted(values: &[f32]) -> Option<f32> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values[values.len() / 2])
+    }
+}
+
+fn min_sorted(mut values: Vec<f32>) -> Option<f32> {
+    values.sort_by(|a, b| a.total_cmp(b));
+    values.first().copied()
+}
+
+fn max_sorted(mut values: Vec<f32>) -> Option<f32> {
+    values.sort_by(|a, b| a.total_cmp(b));
+    values.last().copied()
+}
+
+fn min_max_values(values: &[f32]) -> Option<(f32, f32)> {
+    let mut iter = values.iter().copied().filter(|value| value.is_finite());
+    let first = iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for value in iter {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    Some((min, max))
+}
+
+fn angle_delta_abs(left: f32, right: f32) -> f32 {
+    let mut delta = left - right;
+    while delta > std::f32::consts::PI {
+        delta -= std::f32::consts::TAU;
+    }
+    while delta < -std::f32::consts::PI {
+        delta += std::f32::consts::TAU;
+    }
+    delta.abs()
+}
+
+async fn run_representation_report(args: RepresentationReportArgs) -> Result<()> {
+    let report = generate_representation_report(&args).await?;
+    if let Some(parent) = Path::new(&args.out).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&args.out, serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "representation report written to {} (frames={}, entities={}, voxels={})",
+        args.out,
+        report.frame_count,
+        report.entity_memory.total_entities,
+        report.map.point_cloud_voxel_count
+    );
+    Ok(())
+}
+
+async fn generate_representation_report(
+    args: &RepresentationReportArgs,
+) -> Result<RepresentationHealthReport> {
+    let mut warnings = BTreeSet::new();
+    let mut provenance: HashMap<String, usize> = HashMap::new();
+    let mut place_memory = PlaceMemory::new();
+    let mut entity_memory = EntityMemory::new();
+    let mut local_map = LocalMap::default();
+    let mut point_cloud = VoxelPointCloud::default();
+    let mut pose_graph = PoseGraphBuilder::new(PoseGraphConfig::default());
+    let mut place_candidates = Vec::new();
+    let mut place_recognition_warnings = BTreeSet::new();
+    let mut frame_count = 0usize;
+
+    let mut saw_range = false;
+    let mut saw_scene_vectors = false;
+    let mut saw_objects = false;
+    let mut saw_depth = false;
+    let mut saw_audio = false;
+
+    let input = if let Some(capture) = args.capture.as_deref() {
+        let reader = CaptureReader::open(capture).await?;
+        let mut records = reader.read_frames().await?;
+        records.sort_by_key(|record| record.t_ms);
+        for record in records {
+            frame_count += 1;
+            *provenance
+                .entry("capture_snapshot".to_string())
+                .or_default() += 1;
+            let frame_id = format!("capture-frame-{}", record.index);
+            let mut now = record.snapshot.to_now(record.t_ms);
+            set_now_frame_id(&mut now, &frame_id);
+            saw_range |= !now.range.beams.is_empty() || now.range.nearest_m.is_some();
+            saw_scene_vectors |= !now.eye.scene_vectors.is_empty();
+            saw_objects |= !now.objects.observations.is_empty();
+            saw_depth |= !record.snapshot.kinect.depth_m.is_empty();
+            saw_audio |= !now.ear.features.is_empty() || now.ear.transcript.is_some();
+
+            let current_key =
+                Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+            let live_loop_candidates = live_loop_candidates_from_now(
+                &place_memory,
+                &now,
+                current_key,
+                Some(frame_id.clone()),
+            );
+            place_memory.observe_now(&now);
+            entity_memory.observe_now(&now, current_key);
+            let map_observation = observation_from_now(&now, local_map.config);
+            local_map
+                .integrate_observation_with_loop_candidates(map_observation, &live_loop_candidates);
+            point_cloud.observe_snapshot(&record.snapshot, record.t_ms);
+            observe_pose_graph_now(&mut pose_graph, &mut place_memory, &now, Some(frame_id));
+
+            let output =
+                place_memory.recognize_places_report(current_key, &now.eye.scene_vectors, 0.0, 20);
+            if let Some(reason) = output.not_enough_evidence {
+                place_recognition_warnings.insert(reason);
+            }
+            place_candidates.extend(output.candidates);
+        }
+        RepresentationInputSummary {
+            source_type: "capture".to_string(),
+            source_path: capture.to_string(),
+            provenance,
+        }
+    } else {
+        let ledger = JsonlLedger::new(&args.ledger);
+        let mut frames = ledger.range(0, u64::MAX).await?;
+        frames.sort_by_key(|frame| frame.t_ms);
+        for frame in &frames {
+            frame_count += 1;
+            let place_input = place_recognition_input_from_frame(frame);
+            *provenance
+                .entry(place_input.provenance.clone())
+                .or_default() += 1;
+
+            let now = &frame.now;
+            saw_range |= !now.range.beams.is_empty() || now.range.nearest_m.is_some();
+            saw_scene_vectors |= !now.eye.scene_vectors.is_empty();
+            saw_objects |= !now.objects.observations.is_empty();
+            saw_depth |= !now.kinect.depth_m.is_empty();
+            saw_audio |= !now.ear.features.is_empty() || now.ear.transcript.is_some();
+
+            let current_key =
+                Some(place_memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+            let live_loop_candidates =
+                live_loop_candidates_from_frame(&place_memory, frame, current_key);
+            place_memory.observe_frame(frame);
+            entity_memory.observe_now(now, current_key);
+            let map_now = now_with_frame_id(now, &frame.id.to_string());
+            let map_observation = observation_from_now(&map_now, local_map.config);
+            local_map
+                .integrate_observation_with_loop_candidates(map_observation, &live_loop_candidates);
+            point_cloud.decay_stale(now.t_ms);
+            observe_pose_graph_frame(&mut pose_graph, &mut place_memory, frame);
+
+            let mut query_vectors = now.eye.scene_vectors.clone();
+            query_vectors.extend(place_recognition_vectors_from_input(&place_input));
+            let output = place_memory.recognize_places_report(current_key, &query_vectors, 0.0, 20);
+            if let Some(reason) = output.not_enough_evidence {
+                place_recognition_warnings.insert(reason);
+            }
+            place_candidates.extend(output.candidates);
+        }
+        RepresentationInputSummary {
+            source_type: "ledger".to_string(),
+            source_path: args.ledger.clone(),
+            provenance,
+        }
+    };
+
+    if frame_count == 0 {
+        warnings.insert("no frames found in input".to_string());
+    }
+    if !saw_range {
+        warnings.insert("range sensor data missing across all frames".to_string());
+    }
+    if !saw_scene_vectors {
+        warnings.insert("scene vectors missing across all frames".to_string());
+    }
+    if !saw_objects {
+        warnings.insert("object observations missing across all frames".to_string());
+    }
+    if !saw_depth {
+        warnings.insert("depth channel missing across all frames".to_string());
+    }
+    if !saw_audio {
+        warnings.insert("audio/transcript channel missing across all frames".to_string());
+    }
+
+    let entity_report = entity_memory.report();
+    let revived_entities = entity_memory
+        .entities
+        .values()
+        .filter(|entity| entity.constellation.state == EntityConstellationState::Revived)
+        .count();
+    let mut modality_support_counts = HashMap::new();
+    let mut constellation_edges_by_relation = HashMap::new();
+    for entity in entity_memory.entities.values() {
+        if !entity.modality_support.face_vector_ids.is_empty() {
+            *modality_support_counts
+                .entry("face".to_string())
+                .or_default() += 1;
+        }
+        if !entity.modality_support.voice_vector_ids.is_empty() {
+            *modality_support_counts
+                .entry("voice".to_string())
+                .or_default() += 1;
+        }
+        if !entity.modality_support.scene_vector_ids.is_empty() {
+            *modality_support_counts
+                .entry("scene".to_string())
+                .or_default() += 1;
+        }
+        if !entity.modality_support.text_labels.is_empty() {
+            *modality_support_counts
+                .entry("text".to_string())
+                .or_default() += 1;
+        }
+        for edge in &entity.constellation.binding_edges {
+            *constellation_edges_by_relation
+                .entry(binding_relation_label(edge.relation.clone()).to_string())
+                .or_default() += 1;
+        }
+    }
+
+    let map_summary = local_map.summary();
+    let point_cloud_summary = point_cloud.summary();
+    if point_cloud_summary.observations == 0 {
+        warnings.insert("point cloud received no usable observations".to_string());
+    }
+
+    let pose_graph_report = pose_graph.finish_report();
+    let confidence_values = place_candidates
+        .iter()
+        .map(|candidate| candidate.confidence)
+        .collect::<Vec<_>>();
+    let mut candidate_kinds = HashMap::new();
+    let mut same_place_cells: HashMap<(i32, i32), usize> = HashMap::new();
+    for candidate in &place_candidates {
+        let kind = match &candidate.kind {
+            PlaceRecognitionKind::SamePlace => "same_place",
+            PlaceRecognitionKind::SimilarPlace => "similar_place",
+            PlaceRecognitionKind::EntityConstellation => "entity_constellation",
+        };
+        *candidate_kinds.entry(kind.to_string()).or_default() += 1;
+        if matches!(&candidate.kind, PlaceRecognitionKind::SamePlace) {
+            *same_place_cells
+                .entry((candidate.cell.x, candidate.cell.y))
+                .or_default() += 1;
+        }
+    }
+    let repeated_place_hints = same_place_cells
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|((x, y), count)| format!("cell ({x}, {y}) recognized {count} times"))
+        .take(5)
+        .collect::<Vec<_>>();
+    if place_candidates.is_empty() {
+        place_recognition_warnings.insert("no place-recognition candidates emitted".to_string());
+    }
+
+    Ok(RepresentationHealthReport {
+        schema_version: 1,
+        frame_count,
+        input,
+        warnings: warnings.into_iter().collect(),
+        entity_memory: RepresentationEntityMemorySummary {
+            total_entities: entity_report.total_entities,
+            active_entities: entity_report.active_entities,
+            occluded_entities: entity_report.occluded_entities,
+            vanished_entities: entity_report.vanished_entities,
+            revived_entities,
+            modality_support_counts,
+            constellation_edges_by_relation,
+        },
+        map: RepresentationMapSummary {
+            local_occupancy_cell_count: map_summary.occupied_cells,
+            pose_history_length: local_map.pose_history.len(),
+            point_cloud_voxel_count: point_cloud_summary.voxels,
+            stable_voxel_count: point_cloud_summary.stable_voxels,
+            transient_voxel_count: point_cloud_summary.transient_voxels,
+        },
+        pose_graph: RepresentationPoseGraphSummary {
+            node_count: pose_graph_report.nodes,
+            odometry_edge_count: pose_graph_report.odometry_edges,
+            loop_candidate_count: pose_graph_report.loop_candidate_edges,
+            loop_accepted_count: pose_graph_report.active_loop_candidate_edges,
+            loop_rejected_count: pose_graph_report.rejected_loop_candidates,
+            confidence_distribution: RepresentationConfidenceDistribution {
+                min: pose_graph_report.confidence_distribution.min,
+                max: pose_graph_report.confidence_distribution.max,
+                mean: pose_graph_report.confidence_distribution.mean,
+                buckets: pose_graph_report
+                    .confidence_distribution
+                    .buckets
+                    .into_iter()
+                    .collect(),
+            },
+        },
+        place_recognition: RepresentationPlaceRecognitionSummary {
+            candidates_emitted: place_candidates.len(),
+            candidate_kinds,
+            confidence_distribution: summarize_confidence_distribution(&confidence_values),
+            repeated_place_hints,
+            warnings: place_recognition_warnings.into_iter().collect(),
+        },
+    })
+}
+
+fn summarize_confidence_distribution(values: &[f32]) -> RepresentationConfidenceDistribution {
+    let mut buckets = HashMap::new();
+    for value in values {
+        let bucket = if *value < 0.25 {
+            "0.00-0.24"
+        } else if *value < 0.5 {
+            "0.25-0.49"
+        } else if *value < 0.75 {
+            "0.50-0.74"
+        } else {
+            "0.75-1.00"
+        };
+        *buckets.entry(bucket.to_string()).or_default() += 1;
+    }
+    let min = values
+        .iter()
+        .copied()
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let max = values
+        .iter()
+        .copied()
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = (!values.is_empty()).then_some(values.iter().sum::<f32>() / values.len() as f32);
+    RepresentationConfidenceDistribution {
+        min,
+        max,
+        mean,
+        buckets,
+    }
+}
+
+fn binding_relation_label(relation: BindingRelation) -> &'static str {
+    match relation {
+        BindingRelation::CooccursInTime => "cooccurs_in_time",
+        BindingRelation::CooccursInEstimatedSpace => "cooccurs_in_estimated_space",
+        BindingRelation::MovesTogether => "moves_together",
+        BindingRelation::PredictsSameFutureEvents => "predicts_same_future_events",
+        BindingRelation::NamedBy => "named_by",
+        BindingRelation::ProjectsTo => "projects_to",
+        BindingRelation::HasColorAtPose => "has_color_at_pose",
+        BindingRelation::LikelySameEntity => "likely_same_entity",
+        BindingRelation::ExplainsOutcome => "explains_outcome",
+        BindingRelation::Contradicts => "contradicts",
+        BindingRelation::RequiresReview => "requires_review",
+    }
+}
+
+async fn generate_pose_graph_report(args: &PoseGraphReportArgs) -> Result<PoseGraphReport> {
+    let config = PoseGraphConfig {
+        min_node_distance_m: args.min_node_distance_m,
+        min_node_heading_delta_rad: args.min_node_degrees.to_radians(),
+        max_ticks_between_nodes: args.max_ticks_between_nodes,
+        min_loop_confidence: args.min_loop_confidence,
+        ..PoseGraphConfig::default()
+    };
+    let mut builder = PoseGraphBuilder::new(config);
+    let mut memory = PlaceMemory::new();
+
+    if let Some(capture) = args.capture.as_deref() {
+        let reader = CaptureReader::open(capture).await?;
+        let mut records = reader.read_frames().await?;
+        records.sort_by_key(|record| record.t_ms);
+        for record in &records {
+            let frame_id = format!("capture-frame-{}", record.index);
+            let mut now = record.snapshot.to_now(record.t_ms);
+            set_now_frame_id(&mut now, &frame_id);
+            observe_pose_graph_now(&mut builder, &mut memory, &now, Some(frame_id));
+            memory.observe_now(&now);
+        }
+    } else {
+        let ledger = JsonlLedger::new(&args.ledger);
+        let mut frames = ledger.range(0, u64::MAX).await?;
+        frames.sort_by_key(|frame| frame.t_ms);
+        for frame in &frames {
+            observe_pose_graph_frame(&mut builder, &mut memory, frame);
+            memory.observe_frame(frame);
+        }
+    }
+
+    Ok(builder.finish_report())
+}
+
+fn observe_pose_graph_now(
+    builder: &mut PoseGraphBuilder,
+    memory: &mut PlaceMemory,
+    now: &Now,
+    source_frame_id: Option<String>,
+) {
+    let current_key = Some(memory.quantize(now.body.odometry.x_m, now.body.odometry.y_m));
+    let place_candidates = memory.recognize_places(current_key, &now.eye.scene_vectors, 0.0, 20);
+    let entity_labels = entity_labels_from_now(now);
+    let entity_candidates =
+        memory.recognize_entity_constellations(current_key, &entity_labels, 0.0, 10);
+    let loop_candidates = place_candidates
+        .iter()
+        .chain(entity_candidates.iter())
+        .map(|candidate| place_candidate_to_loop_input(candidate, source_frame_id.clone()))
+        .collect::<Vec<_>>();
+    builder.observe(
+        now.body.odometry,
+        now.t_ms,
+        source_frame_id,
+        &loop_candidates,
+    );
+}
+
+fn live_loop_candidates_from_now(
+    memory: &PlaceMemory,
+    now: &Now,
+    current_key: Option<pete_memory::PlaceCellKey>,
+    source_frame_id: Option<String>,
+) -> Vec<LoopClosureCandidateInput> {
+    let place_candidates = memory.recognize_places(current_key, &now.eye.scene_vectors, 0.85, 10);
+    let entity_labels = entity_labels_from_now(now);
+    let entity_candidates =
+        memory.recognize_entity_constellations(current_key, &entity_labels, 0.85, 10);
+    place_candidates
+        .iter()
+        .chain(entity_candidates.iter())
+        .map(|candidate| place_candidate_to_loop_input(candidate, source_frame_id.clone()))
+        .collect()
+}
+
+fn observe_pose_graph_frame(
+    builder: &mut PoseGraphBuilder,
+    memory: &mut PlaceMemory,
+    frame: &ExperienceFrame,
+) {
+    let current_key =
+        Some(memory.quantize(frame.now.body.odometry.x_m, frame.now.body.odometry.y_m));
+    let place_input = place_recognition_input_from_frame(frame);
+    let mut query_vectors = frame.now.eye.scene_vectors.clone();
+    query_vectors.extend(place_recognition_vectors_from_input(&place_input));
+    let place_candidates = memory.recognize_places(current_key, &query_vectors, 0.0, 20);
+    let entity_labels = entity_labels_from_place_input(&place_input);
+    let entity_candidates =
+        memory.recognize_entity_constellations(current_key, &entity_labels, 0.0, 10);
+    let loop_candidates = place_candidates
+        .iter()
+        .chain(entity_candidates.iter())
+        .map(|candidate| place_candidate_to_loop_input(candidate, Some(frame.id.to_string())))
+        .collect::<Vec<_>>();
+    builder.observe(
+        frame.now.body.odometry,
+        frame.t_ms,
+        Some(frame.id.to_string()),
+        &loop_candidates,
+    );
+}
+
+fn live_loop_candidates_from_frame(
+    memory: &PlaceMemory,
+    frame: &ExperienceFrame,
+    current_key: Option<pete_memory::PlaceCellKey>,
+) -> Vec<LoopClosureCandidateInput> {
+    let place_input = place_recognition_input_from_frame(frame);
+    let mut query_vectors = frame.now.eye.scene_vectors.clone();
+    query_vectors.extend(place_recognition_vectors_from_input(&place_input));
+    let place_candidates = memory.recognize_places(current_key, &query_vectors, 0.85, 10);
+    let entity_labels = entity_labels_from_place_input(&place_input);
+    let entity_candidates =
+        memory.recognize_entity_constellations(current_key, &entity_labels, 0.85, 10);
+    place_candidates
+        .iter()
+        .chain(entity_candidates.iter())
+        .map(|candidate| place_candidate_to_loop_input(candidate, Some(frame.id.to_string())))
+        .collect()
+}
+
+fn now_with_frame_id(now: &Now, frame_id: &str) -> Now {
+    let mut now = now.clone();
+    set_now_frame_id(&mut now, frame_id);
+    now
+}
+
+fn set_now_frame_id(now: &mut Now, frame_id: &str) {
+    now.extensions.insert(
+        "frame_id".to_string(),
+        serde_json::Value::String(frame_id.to_string()),
+    );
+}
+
+fn entity_labels_from_now(now: &Now) -> Vec<String> {
+    let mut labels: Vec<String> = now
+        .objects
+        .observations
+        .iter()
+        .filter(|obs| obs.confidence >= 0.3)
+        .map(|obs| obs.label.clone())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn entity_labels_from_place_input(input: &pete_memory::PlaceRecognitionInput) -> Vec<String> {
+    let mut labels: Vec<String> = input
+        .object_labels
+        .iter()
+        .chain(input.person_labels.iter())
+        .cloned()
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn place_candidate_to_loop_input(
+    candidate: &PlaceRecognitionCandidate,
+    source_frame_id: Option<String>,
+) -> LoopClosureCandidateInput {
+    LoopClosureCandidateInput {
+        target_pose: pete_core::Pose2 {
+            x_m: candidate.cell.center_x_m,
+            y_m: candidate.cell.center_y_m,
+            heading_rad: 0.0,
+        },
+        confidence: candidate.confidence,
+        similarity: candidate.similarity,
+        kind: match candidate.kind {
+            PlaceRecognitionKind::SamePlace => "same_place",
+            PlaceRecognitionKind::SimilarPlace => "similar_place",
+            PlaceRecognitionKind::EntityConstellation => "entity_constellation",
+        }
+        .to_string(),
+        target_frame_id: candidate
+            .source_instant_frame_id
+            .clone()
+            .or_else(|| candidate.source_frame_id.clone()),
+        source_frame_id,
+        source_experience_id: candidate.source_experience_id.clone(),
+        source_instant_frame_id: candidate.source_instant_frame_id.clone(),
+        source_vector_refs: candidate.source_vector_refs.clone(),
+        source_vector_id: Some(candidate.source_vector_id.clone()),
+        query_vector_id: candidate.query_vector_id.clone(),
+        query_experience_id: candidate.query_experience_id.clone(),
+    }
+}
+
+async fn run_embodied_demo(args: EmbodiedDemoArgs) -> Result<()> {
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let demo = pete_experience::demo_embodied_experience(now_ms).await?;
+    let mut impressions = demo.impressions.clone();
+    if let Some(summary) = demo.experience.summary_impression.clone() {
+        impressions.push(summary);
+    }
+
+    if let Some(root) = args.ledger.as_deref() {
+        let ledger = JsonlLedger::new(root);
+        let frame = ExperienceFrame {
+            id: uuid::Uuid::new_v4(),
+            t_ms: now_ms,
+            now: Now::blank(now_ms, BodySense::default()),
+            sensations: demo.sensations.clone(),
+            impressions: impressions.clone(),
+            experiences: vec![demo.experience.clone()],
+            z: None,
+            chosen_action: None,
+            conscious_command: None,
+            reign_input: None,
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Default::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: vec!["embodied demo pipeline".to_string()],
+        };
+        ledger.append(&frame).await?;
+        println!("wrote embodied demo frame to {}", root);
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&demo)?);
+        return Ok(());
+    }
+
+    println!("embodied experience {}", demo.experience.id);
+    println!("  summary: {}", demo.experience.text);
+    println!(
+        "  vector coverage: image={} face={} voice={} transcript={} impression={} experience={} fallback_count={}",
+        demo.coverage.image,
+        demo.coverage.face,
+        demo.coverage.voice,
+        demo.coverage.transcript,
+        demo.coverage.impression,
+        demo.coverage.experience,
+        demo.coverage.fallback_count
+    );
+    println!("  sensations: {}", demo.sensations.len());
+    for sensation in &demo.sensations {
+        let vector = sensation
+            .vector
+            .as_ref()
+            .map(|embedding| {
+                format!(
+                    "{}d {} purpose={} vectorizer={} fallback={}",
+                    embedding.dim,
+                    embedding.model_id,
+                    embedding.purpose,
+                    embedding.vectorizer_id,
+                    embedding.is_fallback
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+        println!(
+            "    - {} {:?}/{:?} parent={:?} vector={}",
+            sensation.kind, sensation.modality, sensation.payload_kind, sensation.parent_id, vector
+        );
+    }
+    println!("  impressions:");
+    for impression in &impressions {
+        let vector = impression
+            .vector
+            .as_ref()
+            .map(|embedding| {
+                format!(
+                    "{}d {} purpose={} vectorizer={} fallback={}",
+                    embedding.dim,
+                    embedding.model_id,
+                    embedding.purpose,
+                    embedding.vectorizer_id,
+                    embedding.is_fallback
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+        println!("    - {} vector={}", impression.text, vector);
+    }
+    Ok(())
+}
+
+async fn run_embodied_eval(args: EmbodiedEvalArgs) -> Result<()> {
+    match args.fixture {
+        EmbodiedEvalFixtureArg::Deterministic => {}
+    }
+    let omissions = args
+        .omit
+        .into_iter()
+        .map(EmbodiedEvalOmission::from)
+        .collect::<Vec<_>>();
+    let report = deterministic_embodied_eval_report_with_omissions(&omissions).await?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("embodied eval fixture={}", report.fixture);
+        println!("  frames: {}", report.frame_count);
+        println!("  instants: {}", report.instant_count);
+        println!(
+            "  instant teacher vectors: {}",
+            report.instant_teacher_vector_count
+        );
+        println!(
+            "  instant missing modalities: {}",
+            report.instant_missing_modality_count
+        );
+        println!("  primary sensations: {}", report.primary_sensation_count);
+        println!(
+            "  descendant sensations: {}",
+            report.descendant_sensation_count
+        );
+        println!(
+            "  vectorized sensations: {}",
+            report.vectorized_sensation_count
+        );
+        println!("  impressions: {}", report.impression_count);
+        println!("  summary impressions: {}", report.summary_impression_count);
+        println!(
+            "  learned experience latents: {}",
+            report.experience_latent_count
+        );
+        println!("  predictions: {}", report.prediction_count);
+        println!("  memory links: {}", report.memory_link_count);
+        println!("  recall sensations: {}", report.recall_sensation_count);
+        println!("  recall impressions: {}", report.recall_impression_count);
+        println!("  lineage edges: {}", report.lineage_edge_count);
+        if !report.warnings.is_empty() {
+            println!("  warnings:");
+            for warning in &report.warnings {
+                println!("    - {warning}");
+            }
+        }
+        if !report.failures.is_empty() {
+            println!("  failures:");
+            for failure in &report.failures {
+                println!("    - {failure}");
+            }
+        }
+    }
+
+    if report.passed() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "embodied eval failed: {}",
+            report.failures.join(", ")
+        ))
+    }
+}
+
+async fn generate_virtual_report(ledger_path: &str) -> Result<VirtualRunReport> {
+    let ledger = JsonlLedger::new(ledger_path);
+    let frames = ledger.frames().await?;
+    let transitions = ledger.transitions().await?;
+
+    let total_frames = frames.len();
+    let total_transitions = transitions.len();
+
+    let mut total_eye_frames = 0;
+    let mut total_ear_frames = 0;
+    let mut total_stuck_trap_events = 0;
+
+    let mut eye_sources = HashMap::new();
+    let mut babylon_eye_frames = 0;
+    let mut collisions = 0;
+    let mut charging_ticks = 0;
+    let mut charger_contacts = 0;
+    let mut was_charging = false;
+    let mut stuck_recovery_attempts = 0;
+    let mut stuck_recovery_successes = 0;
+    let mut trap_kinds = HashMap::new();
+    let mut ledger_gaps = Vec::new();
+    let mut warnings = Vec::new();
+
+    let mut min_battery = 1.0f32;
+    let mut max_after_min = 0.0f32;
+    let mut prev_t_ms = None;
+
+    for frame in &frames {
+        if !frame.now.eye.frames.is_empty() || !frame.now.eye.image_vectors.is_empty() {
+            total_eye_frames += 1;
+        }
+        if !frame.now.ear.features.is_empty() || frame.now.ear.transcript.is_some() {
+            total_ear_frames += 1;
+        }
+
+        // 1. Eye source tracking
+        if let Some(eye_frame) = &frame.now.eye_frame {
+            let src = eye_frame
+                .source
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
+            *eye_sources.entry(src.clone()).or_insert(0) += 1;
+            if src == "babylon-robot-eye" {
+                babylon_eye_frames += 1;
+            }
+        }
+
+        // 2. Collision tracking
+        if frame.now.body.flags.bump_left || frame.now.body.flags.bump_right {
+            collisions += 1;
+        }
+
+        // 3. Charger & Battery tracking
+        if frame.now.body.charging {
+            charging_ticks += 1;
+            if !was_charging {
+                charger_contacts += 1;
+            }
+            was_charging = true;
+        } else {
+            was_charging = false;
+        }
+
+        let bat = frame.now.body.battery_level;
+        if bat < min_battery {
+            min_battery = bat;
+            max_after_min = bat;
+        } else if bat > max_after_min {
+            max_after_min = bat;
+        }
+
+        // 4. Stuck recovery / Trap tracking
+        if let Some(val) = frame.now.extensions.get("sim.stuck") {
+            if let Ok(values) = serde_json::from_value::<Vec<f32>>(val.clone()) {
+                let event_started = values.get(6).copied().unwrap_or(0.0) > 0.0;
+                let recovered = values.get(7).copied().unwrap_or(0.0) > 0.0;
+                let trap_code = values.get(10).copied().unwrap_or(0.0);
+
+                if event_started {
+                    total_stuck_trap_events += 1;
+                    stuck_recovery_attempts += 1;
+                    let trap_name = match trap_code {
+                        1.0 => "Wall",
+                        2.0 => "Corner",
+                        3.0 => "Column",
+                        _ => "Unknown",
+                    }
+                    .to_string();
+                    *trap_kinds.entry(trap_name).or_insert(0) += 1;
+                }
+                if recovered {
+                    stuck_recovery_successes += 1;
+                }
+            }
+        }
+
+        // 5. Gap tracking
+        if let Some(prev) = prev_t_ms {
+            let diff = frame.t_ms.saturating_sub(prev);
+            if diff > 500 {
+                ledger_gaps.push(format!(
+                    "gap of {}ms between {}ms and {}ms",
+                    diff, prev, frame.t_ms
+                ));
+            }
+        }
+        prev_t_ms = Some(frame.t_ms);
+    }
+
+    let battery_delta = if let (Some(first), Some(last)) = (frames.first(), frames.last()) {
+        first.now.body.battery_level - last.now.body.battery_level
+    } else {
+        0.0
+    };
+
+    let battery_recovery_success = max_after_min - min_battery >= 0.05;
+
+    let duration_seconds = if let (Some(first), Some(last)) = (frames.first(), frames.last()) {
+        (last.t_ms.saturating_sub(first.t_ms) as f64) / 1000.0
+    } else {
+        0.0
+    };
+
+    let collision_rate = if total_frames > 0 {
+        collisions as f32 / total_frames as f32
+    } else {
+        0.0
+    };
+
+    let retina_coverage = if total_frames > 0 {
+        babylon_eye_frames as f32 / total_frames as f32
+    } else {
+        0.0
+    };
+
+    if total_frames == 0 {
+        warnings.push("ledger is empty".to_string());
+    } else if babylon_eye_frames == 0 {
+        warnings.push("no retina frames from babylon-robot-eye found in ledger".to_string());
+    }
+
+    Ok(VirtualRunReport {
+        total_frames,
+        total_transitions,
+        total_eye_frames,
+        total_ear_frames,
+        total_stuck_trap_events,
+        battery_delta,
+        duration_seconds,
+        eye_sources,
+        retina_coverage,
+        collisions,
+        collision_rate,
+        charger_contacts,
+        charging_ticks,
+        battery_recovery_success,
+        stuck_recovery_attempts,
+        stuck_recovery_successes,
+        trap_kinds,
+        ledger_gaps,
+        warnings,
+    })
+}
+
+async fn run_train_virtual(args: TrainVirtualArgs) -> Result<()> {
+    println!("Starting virtual training pipeline...");
+    println!("Ledger: {}", args.ledger);
+    println!("Out Dir: {}", args.out_dir);
+
+    // 1. Generate run report
+    let run_report = generate_virtual_report(&args.ledger).await?;
+    println!("Run report generated successfully.");
+
+    // Create out_dir
+    fs::create_dir_all(&args.out_dir)?;
+
+    // 2. Train selected behaviors
+    let behaviors = vec![
+        TrainableBehavior::Danger,
+        TrainableBehavior::Charge,
+        TrainableBehavior::EyeNext,
+        TrainableBehavior::EarNext,
+        TrainableBehavior::Future,
+    ];
+
+    let mut trained_summaries = HashMap::new();
+    for behavior in &behaviors {
+        let checkpoint_path = Path::new(&args.out_dir).join(behavior.config_key());
+        println!("Training behavior model: {:?}", behavior);
+        let summary = train_behavior(TrainBehaviorRequest {
+            behavior: behavior.clone(),
+            ledger_path: PathBuf::from(&args.ledger),
+            checkpoint_path,
+            epochs: args.epochs,
+            validation_split: 0.2,
+            seed: 7,
+        })
+        .await?;
+        trained_summaries.insert(behavior.clone(), summary);
+    }
+
+    // 3. Run scenario evaluations
+    println!("Running baseline scenario evaluation (all models Off)...");
+    let baseline_report_path = Path::new(&args.out_dir).join("baseline-scenario.json");
+    let baseline_args = EvalScenarioArgs {
+        scenario: ScenarioArg::MixedRoom,
+        episodes: 10,
+        steps: 100,
+        seed: 7,
+        tick_ms: 100,
+        out: Some(baseline_report_path.to_string_lossy().to_string()),
+        ledger: None,
+        capture_root: None,
+        memory_report: false,
+        danger_checkpoint: None,
+        danger_mode: DangerMode::Off,
+        charge_checkpoint: None,
+        charge_mode: ChargeMode::Off,
+        action_value_checkpoint: None,
+        action_value_mode: ActionValueMode::Off,
+        future_checkpoint: None,
+        future_mode: FutureMode::Hardcoded,
+        eye_next_checkpoint: None,
+        eye_next_mode: EyeNextMode::Off,
+        ear_next_checkpoint: None,
+        ear_next_mode: EarNextMode::Off,
+        experience_checkpoint: None,
+        experience_mode: ExperienceMode::Off,
+        action_selector: CliActionSelectorMode::Baseline,
+        llm: LlmArgs::default(),
+    };
+    run_eval_scenario(baseline_args).await?;
+    let baseline_report = load_scenario_report(&baseline_report_path.to_string_lossy())?;
+
+    println!("Running candidate scenario evaluation (new models ShadowInfer)...");
+    let candidate_report_path = Path::new(&args.out_dir).join("candidate-scenario.json");
+    let candidate_args = EvalScenarioArgs {
+        scenario: ScenarioArg::MixedRoom,
+        episodes: 10,
+        steps: 100,
+        seed: 7,
+        tick_ms: 100,
+        out: Some(candidate_report_path.to_string_lossy().to_string()),
+        ledger: None,
+        capture_root: None,
+        memory_report: false,
+        danger_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("danger")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        danger_mode: DangerMode::ShadowInfer,
+        charge_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("charge")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        charge_mode: ChargeMode::ShadowInfer,
+        action_value_checkpoint: None,
+        action_value_mode: ActionValueMode::Off,
+        future_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("future")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        future_mode: FutureMode::ShadowInfer,
+        eye_next_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("eye_next")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        eye_next_mode: EyeNextMode::ShadowInfer,
+        ear_next_checkpoint: Some(
+            Path::new(&args.out_dir)
+                .join("ear_next")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        ear_next_mode: EarNextMode::ShadowInfer,
+        experience_checkpoint: None,
+        experience_mode: ExperienceMode::Off,
+        action_selector: CliActionSelectorMode::Baseline,
+        llm: LlmArgs::default(),
+    };
+    run_eval_scenario(candidate_args).await?;
+    let candidate_report = load_scenario_report(&candidate_report_path.to_string_lossy())?;
+
+    // Compare scenario reports
+    let comparison_report_path = Path::new(&args.out_dir).join("comparison-scenario.json");
+    let comparison = compare_scenario_reports(
+        &baseline_report_path.to_string_lossy(),
+        &candidate_report_path.to_string_lossy(),
+        &baseline_report,
+        &candidate_report,
+    );
+    write_scenario_comparison_report(&comparison_report_path, &comparison)?;
+    println!(
+        "Evaluation comparison recommendation: {}",
+        comparison.recommendation.as_str()
+    );
+
+    // 4. Update/register models and run promotion gates
+    let registry_path = Path::new("data/models/registry.json");
+    let mut model_statuses = HashMap::new();
+    let timestamp = Utc::now().format("%Y%m%d_%H%M").to_string();
+
+    for behavior in &behaviors {
+        let name = format!("{}_virtual_{}", behavior.config_key(), timestamp);
+        let checkpoint = Path::new(&args.out_dir)
+            .join(behavior.config_key())
+            .to_string_lossy()
+            .to_string();
+        let behavior_report = Path::new(&checkpoint).join("evaluation.json");
+
+        println!("Registering candidate model {}...", name);
+        model_register(ModelRegisterArgs {
+            behavior: behavior.cli_name().to_string(),
+            checkpoint: checkpoint.clone(),
+            training_ledger: Some(args.ledger.clone()),
+            training_command: Some("just train virtual".to_string()),
+            behavior_report: Some(behavior_report.to_string_lossy().to_string()),
+            scenario_report: Some(candidate_report_path.to_string_lossy().to_string()),
+            comparison_report: Some(comparison_report_path.to_string_lossy().to_string()),
+            name: name.clone(),
+            notes: vec!["Automatically trained via virtual pipeline".to_string()],
+            parent: None,
+            registry: registry_path.to_string_lossy().to_string(),
+            overwrite: true,
+        })?;
+
+        // Load the registry to get the entry we just registered
+        let registry = load_model_registry(registry_path)?;
+        let entry = registry
+            .entries
+            .iter()
+            .find(|e| e.name == name && e.behavior == *behavior)
+            .unwrap()
+            .clone();
+
+        // Determine recommended promotion status
+        // First test Inference promotion
+        let inference_decision = promotion_gate(
+            &entry,
+            ModelStatus::Inference,
+            Some(&baseline_report),
+            Some(&candidate_report),
+            Some(&comparison),
+            args.allow_safety_critical_inference,
+        );
+
+        let mut new_status = ModelStatus::Registered;
+        let mut recommended_action = "keep hardcoded".to_string();
+        let mut warnings = Vec::new();
+
+        if inference_decision.allowed {
+            new_status = ModelStatus::Inference;
+            recommended_action = "inference".to_string();
+        } else {
+            // Test Shadow promotion
+            let shadow_decision = promotion_gate(
+                &entry,
+                ModelStatus::Shadow,
+                Some(&baseline_report),
+                Some(&candidate_report),
+                Some(&comparison),
+                args.allow_safety_critical_inference,
+            );
+            if shadow_decision.allowed {
+                new_status = ModelStatus::Shadow;
+                recommended_action = "shadow".to_string();
+            } else {
+                // Collect warnings for why promotion failed
+                warnings.extend(inference_decision.warnings);
+                warnings.extend(shadow_decision.warnings);
+            }
+        }
+
+        // Apply promotion if recommended status is higher than Registered
+        if new_status != ModelStatus::Registered {
+            println!("Promoting model {} to {}...", name, new_status.as_str());
+            model_promote(ModelPromoteArgs {
+                behavior: behavior.cli_name().to_string(),
+                name: name.clone(),
+                target: new_status,
+                baseline_report: Some(baseline_report_path.to_string_lossy().to_string()),
+                candidate_report: Some(candidate_report_path.to_string_lossy().to_string()),
+                comparison_report: Some(comparison_report_path.to_string_lossy().to_string()),
+                registry: registry_path.to_string_lossy().to_string(),
+                allow_safety_critical_inference: args.allow_safety_critical_inference,
+                notes: vec!["Automatically promoted via virtual pipeline".to_string()],
+            })?;
+        }
+
+        let loss = trained_summaries.get(behavior).and_then(|s| s.last_loss);
+
+        model_statuses.insert(
+            behavior.config_key().to_string(),
+            ModelTrainingStatus {
+                name,
+                trained: true,
+                previous_status: "registered".to_string(),
+                new_status: new_status.as_str().to_string(),
+                recommended_action,
+                warnings,
+                loss,
+                baseline_collision_rate: Some(baseline_report.summary.collision_rate),
+                candidate_collision_rate: Some(candidate_report.summary.collision_rate),
+                baseline_success_rate: Some(baseline_report.summary.success_rate),
+                candidate_success_rate: Some(candidate_report.summary.success_rate),
+            },
+        );
+    }
+
+    // 5. Write final consolidated training report
+    let final_report = VirtualTrainingReport {
+        timestamp: Utc::now().to_rfc3339(),
+        run_report,
+        models: model_statuses,
+        warnings: if comparison.recommendation
+            == ScenarioComparisonRecommendation::RegressionDetected
+        {
+            vec![
+                "Candidate models overall regressed on MixedRoom scenario against baseline"
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        },
+    };
+
+    let parent = Path::new(&args.report_out).parent();
+    if let Some(p) = parent {
+        fs::create_dir_all(p)?;
+    }
+    fs::write(
+        &args.report_out,
+        serde_json::to_string_pretty(&final_report)?,
+    )?;
+    println!(
+        "Consolidated training report written to {}",
+        args.report_out
+    );
+
+    Ok(())
+}
+
+#[derive(Debug, Parser)]
+struct RetinaMockSendArgs {
+    /// Server URL
+    #[arg(long, default_value = "https://localhost:8443")]
+    url: String,
+
+    /// Frame rate (FPS)
+    #[arg(long, default_value = "5")]
+    fps: u64,
+
+    /// Width of mock image
+    #[arg(long, default_value = "160")]
+    width: u32,
+
+    /// Height of mock image
+    #[arg(long, default_value = "90")]
+    height: u32,
+
+    /// Color pattern: "solid-red", "solid-green", "solid-blue", "gradient", or "noise"
+    #[arg(long, default_value = "gradient")]
+    pattern: String,
+}
+
+fn generate_mock_image_base64(
+    width: u32,
+    height: u32,
+    pattern: &str,
+    frame_index: usize,
+) -> Result<String> {
+    use base64::Engine;
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder;
+    use image::{Rgb, RgbImage};
+
+    let mut img = RgbImage::new(width, height);
+
+    match pattern {
+        "solid-red" => {
+            for pixel in img.pixels_mut() {
+                *pixel = Rgb([255, 0, 0]);
+            }
+        }
+        "solid-green" => {
+            for pixel in img.pixels_mut() {
+                *pixel = Rgb([0, 255, 0]);
+            }
+        }
+        "solid-blue" => {
+            for pixel in img.pixels_mut() {
+                *pixel = Rgb([0, 0, 255]);
+            }
+        }
+        "gradient" => {
+            for (x, y, pixel) in img.enumerate_pixels_mut() {
+                let r = ((x as f32 / width as f32) * 255.0) as u8;
+                let g = ((y as f32 / height as f32) * 255.0) as u8;
+                let b = ((frame_index * 10) % 256) as u8;
+                *pixel = Rgb([r, g, b]);
+            }
+        }
+        "noise" => {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            for pixel in img.pixels_mut() {
+                *pixel = Rgb([rng.gen(), rng.gen(), rng.gen()]);
+            }
+        }
+        _ => {
+            for (x, y, pixel) in img.enumerate_pixels_mut() {
+                let g = ((x as f32 / width as f32) * 255.0) as u8;
+                let b = ((y as f32 / height as f32) * 255.0) as u8;
+                *pixel = Rgb([0, g, b]);
+            }
+        }
+    }
+
+    let mut png_bytes = Vec::new();
+    PngEncoder::new(&mut png_bytes)
+        .write_image(&img, width, height, image::ColorType::Rgb8.into())
+        .context("failed to encode mock image as PNG")?;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    Ok(encoded)
+}
+
+async fn run_retina_mock_send(args: RetinaMockSendArgs) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("failed to build reqwest client")?;
+
+    let url = format!("{}/view/retina-frame", args.url.trim_end_matches('/'));
+    println!(
+        "Starting mock retina stream to {url} at {} FPS ({}x{})...",
+        args.fps, args.width, args.height
+    );
+
+    let interval = Duration::from_millis(1000 / args.fps.max(1));
+    let mut interval_timer = tokio::time::interval(interval);
+    let mut frame_index = 0;
+
+    let start_time = std::time::Instant::now();
+
+    loop {
+        interval_timer.tick().await;
+
+        let t_ms = start_time.elapsed().as_millis() as u64;
+        let base64_str =
+            match generate_mock_image_base64(args.width, args.height, &args.pattern, frame_index) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error generating mock image: {e}");
+                    continue;
+                }
+            };
+
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "source": "babylon-robot-eye",
+            "t_ms": t_ms,
+            "frame_index": frame_index,
+            "width": args.width,
+            "height": args.height,
+            "format": "Rgb8",
+            "encoding": "base64",
+            "data": format!("data:image/png;base64,{base64_str}")
+        });
+
+        let res = client.post(&url).json(&payload).send().await;
+
+        match res {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    println!(
+                        "[frame {}] Sent successfully (t_ms = {})",
+                        frame_index, t_ms
+                    );
+                } else {
+                    let err_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "unknown error".to_string());
+                    eprintln!(
+                        "[frame {}] FAILED with status {}: {}",
+                        frame_index, status, err_text
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("[frame {}] Request error: {}", frame_index, e);
+            }
+        }
+
+        frame_index += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pete_actions::ActionPrimitive;
+    use pete_body::BodySense;
+    use pete_core::Reward;
+    use pete_experience::{Experience, ExperienceLatent};
+    use pete_now::{
+        ExtensionSense, Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION,
+    };
+    use pete_sensors::World;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(prefix: &str) -> std::path::PathBuf {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn chirp_patterns_use_expected_note_sequences() {
+        for (pattern, expected) in [
+            ("Confirm", vec![79, 84, 79]),
+            ("Warning", vec![79, 75]),
+            ("Hello", vec![72, 76, 79]),
+            ("Goodbye", vec![79, 76, 72]),
+            ("Curious", vec![72, 76, 74]),
+            ("Idea", vec![76, 81, 84]),
+            ("GoalAcquired", vec![72, 79, 84, 91]),
+            ("goal-acquired", vec![72, 79, 84, 91]),
+            ("Searching", vec![72, 74, 76, 74]),
+            ("SawSomething", vec![84, 91]),
+            ("Surprise", vec![72, 84]),
+            ("Learned", vec![74, 79, 83]),
+            ("PersonRecognized", vec![76, 79, 84, 79]),
+            ("ObjectRecognized", vec![79, 84, 76]),
+            ("PlaceRecognized", vec![79, 84, 72]),
+            ("DidntUnderstand", vec![79, 81, 78]),
+            ("didn't-understand", vec![79, 81, 78]),
+            ("Docking", vec![67, 72, 76, 79]),
+            ("ChargingStarted", vec![60, 67, 72]),
+            ("Sleep", vec![79, 76, 72, 67]),
+            ("Wake", vec![67, 72, 79]),
+        ] {
+            let notes: Vec<u8> = chirp_pattern_song(pattern)
+                .tones
+                .into_iter()
+                .map(|tone| tone.note)
+                .collect();
+            assert_eq!(notes, expected, "pattern {pattern}");
+        }
+    }
+
+    #[test]
+    fn live_sim_default_llm_timeout_allows_slow_ollama_responses() {
+        let previous = std::env::var("PETE_LIVE_LLM_TIMEOUT_MS").ok();
+        std::env::remove_var("PETE_LIVE_LLM_TIMEOUT_MS");
+
+        let config = configured_llm_config_for_sim(&LlmArgs::default(), true).unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("PETE_LIVE_LLM_TIMEOUT_MS", value),
+            None => std::env::remove_var("PETE_LIVE_LLM_TIMEOUT_MS"),
+        }
+
+        assert_eq!(config.timeout_ms, DEFAULT_LIVE_LLM_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn background_sensor_keeps_asr_packet_ahead_of_latest_pcm() {
+        let mut state = BackgroundSenseState::default();
+        let asr = SensePacket::Ear(EarSense {
+            transcript: Some("hello robot".to_string()),
+            ..EarSense::default()
+        });
+        let pcm = SensePacket::EarPcm(PcmAudioFrame {
+            captured_at_ms: 42,
+            sample_rate_hz: 16_000,
+            channels: 1,
+            samples: vec![0; 160],
+        });
+
+        state.record_packet("microphone", asr);
+        state.record_packet("microphone", pcm);
+
+        let first = state.next_packet().expect("queued ASR packet");
+        assert!(matches!(
+            first,
+            SensePacket::Ear(EarSense {
+                transcript: Some(text),
+                ..
+            }) if text == "hello robot"
+        ));
+        assert!(matches!(state.next_packet(), Some(SensePacket::EarPcm(_))));
+    }
+
+    #[test]
+    fn sim_args_parse_virtual_live_tls_flags() {
+        let cli = Cli::try_parse_from([
+            "pete",
+            "sim",
+            "--live",
+            "--live-tls",
+            "--live-addr",
+            "0.0.0.0:9443",
+            "--live-tls-cert",
+            "certs/test.crt",
+            "--live-tls-key",
+            "certs/test.key",
+            "--scenario",
+            "charger-seeking",
+            "--steps",
+            "123",
+        ])
+        .unwrap();
+
+        let Command::Sim(args) = cli.command else {
+            panic!("expected sim command");
+        };
+        assert!(args.live);
+        assert!(args.live_tls);
+        assert_eq!(args.live_addr.port(), 9443);
+        assert_eq!(args.live_tls_cert, "certs/test.crt");
+        assert_eq!(args.live_tls_key, "certs/test.key");
+        assert_eq!(args.scenario, ScenarioArg::ChargerSeeking);
+        assert_eq!(args.steps, 123);
+    }
+
+    #[test]
+    fn scenario_arg_parses_all_public_slugs() {
+        for (slug, expected) in [
+            ("empty-room", ScenarioArg::EmptyRoom),
+            ("obstacle-avoidance", ScenarioArg::ObstacleAvoidance),
+            ("corner-trap", ScenarioArg::CornerTrap),
+            ("column-trap", ScenarioArg::ColumnTrap),
+            ("charger-seeking", ScenarioArg::ChargerSeeking),
+            ("person-speaker-room", ScenarioArg::PersonSpeakerRoom),
+            ("mixed-room", ScenarioArg::MixedRoom),
+            ("dream", ScenarioArg::Dream),
+        ] {
+            let cli = Cli::try_parse_from(["pete", "sim", "--scenario", slug]).unwrap();
+            let Command::Sim(args) = cli.command else {
+                panic!("expected sim command");
+            };
+            assert_eq!(args.scenario, expected);
+        }
+    }
+
+    fn eval_args(
+        scenario: ScenarioArg,
+        episodes: usize,
+        steps: usize,
+        out: Option<String>,
+    ) -> EvalScenarioArgs {
+        EvalScenarioArgs {
+            scenario,
+            episodes,
+            steps,
+            seed: 7,
+            tick_ms: 100,
+            out,
+            ledger: None,
+            capture_root: None,
+            memory_report: false,
+            danger_checkpoint: None,
+            danger_mode: DangerMode::Off,
+            charge_checkpoint: None,
+            charge_mode: ChargeMode::Off,
+            action_value_checkpoint: None,
+            action_value_mode: ActionValueMode::Off,
+            future_checkpoint: None,
+            future_mode: FutureMode::Hardcoded,
+            eye_next_checkpoint: None,
+            eye_next_mode: EyeNextMode::Off,
+            ear_next_checkpoint: None,
+            ear_next_mode: EarNextMode::Off,
+            experience_checkpoint: None,
+            experience_mode: ExperienceMode::Off,
+            action_selector: CliActionSelectorMode::Baseline,
+            llm: LlmArgs::default(),
+        }
+    }
+
+    fn replay_counterfactual_args(
+        capture: String,
+        out_ledger: Option<String>,
+        out_report: Option<String>,
+    ) -> ReplayCounterfactualArgs {
+        ReplayCounterfactualArgs {
+            capture,
+            edit: Vec::new(),
+            policy: "baseline".to_string(),
+            actions: None,
+            steps: Some(4),
+            out_ledger,
+            out_report,
+            llm: LlmArgs::default(),
+        }
+    }
+
+    #[test]
+    fn counterfactual_edit_parser_parses_supported_edits() {
+        assert_eq!(
+            parse_counterfactual_edit("move-charger:x=1.0,y=2.0").unwrap(),
+            CounterfactualEdit::MoveObject {
+                kind: CounterfactualObjectKind::Charger,
+                id: None,
+                x_m: 1.0,
+                y_m: 2.0,
+            }
+        );
+        assert_eq!(
+            parse_counterfactual_edit("set-battery:value=0.42").unwrap(),
+            CounterfactualEdit::SetBattery { value: 0.42 }
+        );
+        assert!(parse_counterfactual_edit("move-moon:x=1,y=2")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown counterfactual edit"));
+    }
+
+    #[test]
+    fn counterfactual_edits_move_charger_and_set_battery() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 9));
+        let mut metadata = scenario.metadata;
+        let edits = vec![
+            parse_counterfactual_edit("move-charger:x=1.0,y=1.0").unwrap(),
+            parse_counterfactual_edit("set-battery:value=0.75").unwrap(),
+        ];
+        let mut warnings = Vec::new();
+
+        apply_counterfactual_edits(&mut metadata, &edits, &mut warnings).unwrap();
+
+        let charger = metadata
+            .objects
+            .iter()
+            .find(|object| matches!(object.kind, pete_sim::SimObjectKind::Charger))
+            .unwrap();
+        assert_eq!((charger.x_m, charger.y_m), (1.0, 1.0));
+        assert_eq!(metadata.body.battery_level, 0.75);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("first matching object")));
+    }
+
+    #[test]
+    fn counterfactual_report_serializes_schema() {
+        let report = CounterfactualReport {
+            schema_version: 1,
+            source_capture: "capture".to_string(),
+            reconstructable: true,
+            edits: vec!["set-battery:value=0.5".to_string()],
+            policy: "stop".to_string(),
+            steps: 3,
+            summary: CounterfactualSummary {
+                collisions: 0,
+                charging_ticks: 1,
+                battery_delta: 0.1,
+                distance_traveled: 0.2,
+                final_distance_to_charger_m: Some(0.3),
+            },
+            warnings: Vec::new(),
+        };
+
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["summary"]["charging_ticks"], 1);
+    }
+
+    #[tokio::test]
+    async fn replay_counterfactual_baseline_writes_ledger_and_report() {
+        let temp_dir = temp_path("pete_counterfactual_baseline");
+        let capture_dir = temp_dir.join("capture");
+        let ledger_dir = temp_dir.join("ledger");
+        let report_path = temp_dir.join("report.json");
+        let mut scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 77));
+        let snapshot = scenario.world.snapshot().await.unwrap();
+        let mut writer = CaptureWriter::create(&capture_dir, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        writer.manifest_mut().scenario = Some(scenario.metadata);
+        writer
+            .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let args = replay_counterfactual_args(
+            capture_dir.to_string_lossy().to_string(),
+            Some(ledger_dir.to_string_lossy().to_string()),
+            Some(report_path.to_string_lossy().to_string()),
+        );
+        replay_counterfactual(args).await.unwrap();
+
+        let transitions = JsonlLedger::new(&ledger_dir).transitions().await.unwrap();
+        assert!(!transitions.is_empty());
+        let report: CounterfactualReport =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert!(report.reconstructable);
+        assert_eq!(report.steps, 4);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_counterfactual_with_moved_charger_writes_report() {
+        let temp_dir = temp_path("pete_counterfactual_moved_charger");
+        let capture_dir = temp_dir.join("capture");
+        let report_path = temp_dir.join("report.json");
+        let mut scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 78));
+        let snapshot = scenario.world.snapshot().await.unwrap();
+        let mut writer = CaptureWriter::create(&capture_dir, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        writer.manifest_mut().scenario = Some(scenario.metadata);
+        writer
+            .append_snapshot(snapshot.body.last_update_ms, snapshot, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let mut args = replay_counterfactual_args(
+            capture_dir.to_string_lossy().to_string(),
+            None,
+            Some(report_path.to_string_lossy().to_string()),
+        );
+        args.edit = vec!["move-charger:x=1.0,y=1.0".to_string()];
+        args.policy = "seek-charge".to_string();
+        replay_counterfactual(args).await.unwrap();
+
+        let report: CounterfactualReport =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report.edits, vec!["move-charger:x=1.0,y=1.0"]);
+        assert_eq!(report.policy, "seek-charge");
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("first matching object")));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_counterfactual_passive_capture_fails_clearly() {
+        let temp_dir = temp_path("pete_counterfactual_passive");
+        let capture_dir = temp_dir.join("capture");
+        let mut writer = CaptureWriter::create(&capture_dir, CaptureSource::Replay, Some(100))
+            .await
+            .unwrap();
+        writer
+            .append_snapshot(0, WorldSnapshot::default(), Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let err = replay_counterfactual(replay_counterfactual_args(
+            capture_dir.to_string_lossy().to_string(),
+            None,
+            None,
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(
+            "passive captures without reconstructable sim metadata cannot yet be counterfactually replayed"
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn tick_with_action(action: ActionPrimitive) -> RuntimeTick {
+        let now = Now::blank(100, BodySense::default());
+        RuntimeTick {
+            frame: ExperienceFrame {
+                id: uuid::Uuid::new_v4(),
+                t_ms: 100,
+                now,
+                sensations: Vec::new(),
+                impressions: Vec::new(),
+                experiences: Vec::new(),
+                z: None,
+                chosen_action: Some(action.clone()),
+                conscious_command: None,
+                reign_input: None,
+                reign_outcome: None,
+                predicted_futures: Vec::new(),
+                behavior_runs: Vec::new(),
+                actual_next: None,
+                reward: Reward::default(),
+                surprise: SurpriseSense::default(),
+                memory_recall: Vec::new(),
+                recollections: Vec::new(),
+                llm_teaching: Vec::new(),
+                counterfactuals: Vec::new(),
+                notes: Vec::new(),
+            },
+            experience: pete_experience::Experience::new(
+                "test",
+                "test",
+                Vec::new(),
+                Vec::new(),
+                100,
+                100,
+            ),
+            chosen_action: Some(action),
+            recall: Default::default(),
+            llm: Default::default(),
+            combobulation: None,
+            inline_learning: Default::default(),
+        }
+    }
+
+    fn scenario_report_for_comparison(
+        scenario: &str,
+        episodes: usize,
+        success_rate: f32,
+        collision_rate: f32,
+        mean_battery_delta: f32,
+        model_fallbacks: usize,
+    ) -> ScenarioEvaluationReport {
+        ScenarioEvaluationReport {
+            schema_version: 1,
+            scenario: scenario.to_string(),
+            base_seed: 7,
+            episodes,
+            steps_per_episode: 100,
+            tick_ms: 100,
+            action_selector_mode: "baseline".to_string(),
+            model_modes: HashMap::new(),
+            model_loading: RuntimeModelLoadReport::default(),
+            ledger: None,
+            capture_root: None,
+            summary: ScenarioEvaluationSummary {
+                success_rate,
+                collision_rate,
+                mean_collisions_per_episode: collision_rate * episodes as f32,
+                mean_battery_delta,
+                mean_final_battery: 0.5,
+                mean_distance_to_charger_final_m: None,
+                mean_nearest_obstacle_m: None,
+                mean_distance_traveled_m: 1.0,
+                mean_ticks_survived: 100.0,
+                mean_safety_interventions: 0.0,
+                behavior_run_records: 0,
+                model_fallbacks,
+                model_assisted_decisions: 0,
+                action_selector_safety_overrides: 0,
+                mean_chosen_score: None,
+                mean_candidate_score: None,
+                ..ScenarioEvaluationSummary::default()
+            },
+            memory: None,
+            episodes_detail: Vec::new(),
+            recommendation: "pass".to_string(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scenario_report_round_trips_json() {
+        let report = ScenarioEvaluationReport {
+            schema_version: 1,
+            scenario: "empty-room".to_string(),
+            base_seed: 7,
+            episodes: 1,
+            steps_per_episode: 2,
+            tick_ms: 100,
+            action_selector_mode: "baseline".to_string(),
+            model_modes: HashMap::new(),
+            model_loading: RuntimeModelLoadReport::default(),
+            ledger: None,
+            capture_root: None,
+            summary: ScenarioEvaluationSummary::default(),
+            memory: None,
+            episodes_detail: Vec::new(),
+            recommendation: "insufficient_data".to_string(),
+            warnings: Vec::new(),
+        };
+        let encoded = serde_json::to_string(&report).unwrap();
+        let decoded: ScenarioEvaluationReport = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.scenario, "empty-room");
+        assert_eq!(decoded.schema_version, 1);
+    }
+
+    #[test]
+    fn scenario_comparison_recommends_pass_candidate() {
+        let baseline = scenario_report_for_comparison("column-trap", 10, 0.7, 0.2, -0.02, 0);
+        let candidate = scenario_report_for_comparison("column-trap", 10, 0.8, 0.15, 0.01, 0);
+
+        let comparison =
+            compare_scenario_reports("baseline.json", "candidate.json", &baseline, &candidate);
+
+        assert_eq!(
+            comparison.recommendation,
+            ScenarioComparisonRecommendation::PassCandidate
+        );
+        assert_eq!(comparison.baseline_report_path, "baseline.json");
+        assert!(
+            comparison
+                .deltas
+                .get("success_rate")
+                .copied()
+                .unwrap_or_default()
+                > 0.0
+        );
+        assert!(comparison.warnings.is_empty());
+    }
+
+    #[test]
+    fn scenario_comparison_detects_regression() {
+        let baseline = scenario_report_for_comparison("column-trap", 10, 0.8, 0.1, 0.02, 0);
+        let candidate = scenario_report_for_comparison("column-trap", 10, 0.7, 0.3, -0.05, 2);
+
+        let comparison =
+            compare_scenario_reports("baseline.json", "candidate.json", &baseline, &candidate);
+
+        assert_eq!(
+            comparison.recommendation,
+            ScenarioComparisonRecommendation::RegressionDetected
+        );
+        assert!(comparison.compared_metrics.collision_rate.regression);
+        assert!(comparison.compared_metrics.model_fallbacks.regression);
+        assert!(comparison
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("collision_rate regressed")));
+    }
+
+    #[test]
+    fn scenario_comparison_reports_insufficient_data() {
+        let baseline = scenario_report_for_comparison("column-trap", 2, 0.8, 0.1, 0.0, 0);
+        let candidate = scenario_report_for_comparison("column-trap", 2, 0.8, 0.1, 0.0, 0);
+
+        let comparison =
+            compare_scenario_reports("baseline.json", "candidate.json", &baseline, &candidate);
+
+        assert_eq!(
+            comparison.recommendation,
+            ScenarioComparisonRecommendation::InsufficientData
+        );
+    }
+
+    #[test]
+    fn scenario_comparison_report_writes_json_artifact() {
+        let baseline = scenario_report_for_comparison("column-trap", 10, 0.7, 0.2, -0.02, 0);
+        let candidate = scenario_report_for_comparison("column-trap", 10, 0.8, 0.15, 0.01, 0);
+        let comparison =
+            compare_scenario_reports("baseline.json", "candidate.json", &baseline, &candidate);
+        let root = temp_path("pete_comparison_report");
+        let out = root.join("data/reports/comparisons/column-trap.json");
+
+        write_scenario_comparison_report(&out, &comparison).unwrap();
+        let decoded = load_scenario_comparison_report(&out.to_string_lossy()).unwrap();
+
+        assert_eq!(
+            decoded.recommendation,
+            ScenarioComparisonRecommendation::PassCandidate
+        );
+        assert!(
+            (decoded
+                .compared_metrics
+                .success_rate
+                .delta
+                .unwrap_or_default()
+                - 0.1)
+                .abs()
+                < 0.001
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn obstacle_metrics_count_collision_flags() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ObstacleAvoidance, 11));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::ObstacleAvoidance,
+            scenario.metadata,
+            0,
+            11,
+            None,
+            None,
+        );
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.flags.bump_left = true;
+        snapshot.body.flags.wall = true;
+        snapshot.body.flags.cliff_front_left = true;
+        snapshot.range.nearest_m = Some(0.2);
+        metrics.observe(
+            &snapshot,
+            &tick_with_action(ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 100,
+            }),
+        );
+        let report = metrics.finish();
+        assert_eq!(report.collisions, 1);
+        assert_eq!(report.wall_hits, 1);
+        assert_eq!(report.bumper_hits, 1);
+        assert_eq!(report.cliff_hits, 1);
+        assert_eq!(report.min_nearest_obstacle_m, Some(0.2));
+    }
+
+    #[test]
+    fn action_selector_fallbacks_do_not_count_as_model_fallbacks() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 14));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            14,
+            None,
+            None,
+        );
+        let mut tick = tick_with_action(ActionPrimitive::Stop);
+        tick.frame.now.extensions.insert(
+            "action_selector".to_string(),
+            serde_json::to_value(ActionSelectionDecision {
+                mode: ActionSelectorMode::ModelAssisted,
+                candidates: vec![pete_runtime::ActionSelectionCandidateScore {
+                    action: ActionPrimitive::Stop,
+                    score: -0.5,
+                    fallback_used: true,
+                    ..Default::default()
+                }],
+                selected_action: Some(ActionPrimitive::Stop),
+                baseline_action: Some(ActionPrimitive::Stop),
+                selected_score: Some(-0.5),
+                safety_overrode: true,
+                fallback_warnings: vec!["action selector used hardcoded score".to_string()],
+            })
+            .unwrap(),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.model_fallbacks, 0);
+        assert_eq!(episode.action_selector_fallbacks, 1);
+        assert_eq!(episode.action_selector_safety_overrides, 1);
+        assert_eq!(episode.model_assisted_decisions, 1);
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.model_fallbacks, 0);
+        assert_eq!(summary.action_selector_fallbacks, 1);
+    }
+
+    #[test]
+    fn baseline_recovery_yields_are_reported_separately_from_selector_fallbacks() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 16));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            16,
+            None,
+            None,
+        );
+        let turn_right = ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.75,
+            duration_ms: 500,
+        };
+        let mut tick = tick_with_action(turn_right.clone());
+        tick.frame.now.extensions.insert(
+            "action_selector".to_string(),
+            serde_json::to_value(ActionSelectionDecision {
+                mode: ActionSelectorMode::ModelAssisted,
+                candidates: vec![pete_runtime::ActionSelectionCandidateScore {
+                    action: turn_right.clone(),
+                    score: 1.0,
+                    fallback_used: false,
+                    ..Default::default()
+                }],
+                selected_action: Some(turn_right.clone()),
+                baseline_action: Some(turn_right.clone()),
+                selected_score: None,
+                safety_overrode: false,
+                fallback_warnings: vec![
+                    "model-assisted selector yielded to baseline trap recovery".to_string(),
+                ],
+            })
+            .unwrap(),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.action_selector_fallbacks, 0);
+        assert_eq!(episode.action_selector_guard_yields, 1);
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.action_selector_fallbacks, 0);
+        assert_eq!(summary.action_selector_guard_yields, 1);
+    }
+
+    #[test]
+    fn map_memory_decisions_are_counted_in_scenario_reports() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 17));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            17,
+            None,
+            None,
+        );
+        let mut tick = tick_with_action(ActionPrimitive::Turn {
+            direction: TurnDir::Right,
+            intensity: 0.5,
+            duration_ms: 1_000,
+        });
+        tick.frame.now.extensions.insert(
+            "action.motion_bridge".to_string(),
+            serde_json::json!({
+                "map_memory_decision": {
+                    "influenced": true,
+                    "navigation_intent": "avoid_known_danger_cell",
+                    "reason": "danger_safe_direction",
+                    "reason_string": "avoiding remembered danger using safe bearing",
+                    "signal": "memory.nearby_best_safe_direction_rad",
+                    "signal_value": -0.8,
+                    "signal_confidence": 0.9,
+                    "confidence": 0.9,
+                    "place_danger": 0.9,
+                    "place_charge_value": 0.0,
+                    "place_novelty": 0.2,
+                    "safe_direction_rad": -0.8,
+                    "charge_direction_rad": null,
+                    "selected_action": tick.chosen_action.clone(),
+                    "chosen_action": tick.chosen_action.clone(),
+                    "safety_overrode": false,
+                }
+            }),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.map_memory_decisions, 1);
+        assert_eq!(episode.danger_memory_decisions, 1);
+        assert_eq!(episode.charge_memory_decisions, 0);
+        assert_eq!(episode.novelty_memory_decisions, 0);
+        assert_eq!(
+            episode
+                .memory_navigation_intents
+                .get("avoid_known_danger_cell"),
+            Some(&1)
+        );
+        assert_eq!(
+            episode
+                .memory_navigation_reasons
+                .get("danger_safe_direction"),
+            Some(&1)
+        );
+        assert_eq!(
+            episode
+                .map_memory_signals
+                .get("memory.nearby_best_safe_direction_rad"),
+            Some(&1)
+        );
+        assert_eq!(episode.map_memory_safety_overrides, 0);
+        assert_eq!(episode.map_memory_decision_samples.len(), 1);
+        assert_eq!(
+            episode.map_memory_decision_samples[0].chosen_action,
+            tick.chosen_action
+        );
+        assert_eq!(
+            episode.map_memory_decision_samples[0].signal_value,
+            Some(-0.8)
+        );
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.map_memory_decisions, 1);
+        assert_eq!(summary.danger_memory_decisions, 1);
+        assert_eq!(
+            summary
+                .memory_navigation_intents
+                .get("avoid_known_danger_cell"),
+            Some(&1)
+        );
+        assert_eq!(
+            summary
+                .map_memory_signals
+                .get("memory.nearby_best_safe_direction_rad"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn low_confidence_memory_navigation_fallbacks_are_counted_in_reports() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 19));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::ChargerSeeking,
+            scenario.metadata,
+            0,
+            19,
+            None,
+            None,
+        );
+        let mut tick = tick_with_action(ActionPrimitive::Stop);
+        tick.frame.now.extensions.insert(
+            "action.motion_bridge".to_string(),
+            serde_json::json!({
+                "map_memory_decision": {
+                    "influenced": true,
+                    "navigation_intent": "stop_ask_for_help_when_uncertain",
+                    "reason": "charge_low_confidence_fallback",
+                    "reason_string": "critical battery but charger memory is too weak",
+                    "signal": "memory.nearby_best_charge_direction_rad",
+                    "signal_value": null,
+                    "signal_confidence": 0.1,
+                    "confidence": 0.1,
+                    "place_danger": 0.0,
+                    "place_charge_value": 0.1,
+                    "place_novelty": 0.2,
+                    "safe_direction_rad": null,
+                    "charge_direction_rad": null,
+                    "selected_action": tick.chosen_action.clone(),
+                    "chosen_action": tick.chosen_action.clone(),
+                    "safety_overrode": true,
+                }
+            }),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.map_memory_decisions, 1);
+        assert_eq!(episode.charge_memory_decisions, 1);
+        assert_eq!(episode.low_confidence_navigation_fallbacks, 1);
+        assert_eq!(episode.map_memory_safety_overrides, 1);
+        assert_eq!(
+            episode
+                .memory_navigation_reasons
+                .get("charge_low_confidence_fallback"),
+            Some(&1)
+        );
+        assert_eq!(
+            episode.map_memory_decision_samples[0].signal,
+            "memory.nearby_best_charge_direction_rad"
+        );
+        assert!(episode.map_memory_decision_samples[0].safety_overrode);
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.low_confidence_navigation_fallbacks, 1);
+        assert_eq!(summary.map_memory_safety_overrides, 1);
+    }
+
+    #[test]
+    fn shadow_train_script_errors_do_not_count_as_model_fallbacks() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 15));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            15,
+            None,
+            None,
+        );
+        metrics.observe_behavior_runs(&[ErasedBehaviorRunRecord {
+            behavior_id: "event_bump".to_string(),
+            regime: BehaviorRegime::ShadowTrain,
+            t_ms: 100,
+            input_json: Value::Null,
+            hardcoded_json: Some(Value::Null),
+            model_json: None,
+            selected_json: Some(Value::Null),
+            error: Some("event.bump.shadow.v0 has no observed script samples".to_string()),
+            disagreement: None,
+        }]);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.behavior_run_records, 1);
+        assert_eq!(episode.model_fallbacks, 0);
+    }
+
+    #[test]
+    fn stuck_metrics_count_recovery_events() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::CornerTrap, 11));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::CornerTrap,
+            scenario.metadata,
+            0,
+            11,
+            None,
+            None,
+        );
+        let mut started = WorldSnapshot::default();
+        started.extensions.push(ExtensionSense {
+            schema_version: 1,
+            name: "sim.stuck".to_string(),
+            values: vec![1.0, 1.0, 6.0, 100.0, 1.0, -1.0, 1.0, 0.0],
+        });
+        metrics.observe(
+            &started,
+            &tick_with_action(ActionPrimitive::Explore {
+                style: pete_actions::ExploreStyle::RandomWalk,
+                duration_ms: 100,
+            }),
+        );
+        let mut recovered = started.clone();
+        recovered.body.odometry.x_m = 0.1;
+        recovered.extensions[0].values = vec![0.0, 0.0, 0.0, 900.0, 0.0, -1.0, 0.0, 1.0];
+        metrics.observe(
+            &recovered,
+            &tick_with_action(ActionPrimitive::Explore {
+                style: pete_actions::ExploreStyle::RandomWalk,
+                duration_ms: 100,
+            }),
+        );
+
+        let report = metrics.finish();
+        assert_eq!(report.stuck_count, 1);
+        assert_eq!(report.stuck_ticks, 1);
+        assert_eq!(report.recovery_attempts, 1);
+        assert_eq!(report.stuck_duration, Some(900.0));
+        assert_eq!(report.mean_stuck_duration, Some(900.0));
+        assert_eq!(report.recovery_success_rate, Some(1.0));
+        assert_eq!(report.mean_recovery_ticks, Some(9.0));
+    }
+
+    #[test]
+    fn metrics_record_dead_battery_tick() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 12));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            12,
+            None,
+            None,
+        );
+        let mut alive = WorldSnapshot::default();
+        alive.body.battery_level = 0.01;
+        metrics.observe(&alive, &tick_with_action(ActionPrimitive::Stop));
+        let mut dead = alive.clone();
+        dead.body.battery_level = 0.0;
+        metrics.observe(&dead, &tick_with_action(ActionPrimitive::Stop));
+
+        let report = metrics.finish();
+        assert_eq!(report.dead_battery_tick, Some(1));
+    }
+
+    #[test]
+    fn charger_metrics_detect_success_and_battery_delta() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 12));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::ChargerSeeking,
+            scenario.metadata,
+            0,
+            12,
+            None,
+            None,
+        );
+        let mut start = WorldSnapshot::default();
+        start.body.battery_level = 0.2;
+        metrics.observe(&start, &tick_with_action(ActionPrimitive::Stop));
+        let mut charged = start.clone();
+        charged.body.battery_level = 0.26;
+        charged.body.charging = true;
+        metrics.observe(&charged, &tick_with_action(ActionPrimitive::Stop));
+        let report = metrics.finish();
+        assert_eq!(report.charging_ticks, 1);
+        assert!(report.battery_delta > 0.05);
+        assert!(report.success);
+    }
+
+    #[test]
+    fn charger_metrics_report_visibility_approach_and_bad_dock_boundaries() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ChargerSeeking, 12));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::ChargerSeeking,
+            scenario.metadata,
+            0,
+            12,
+            None,
+            None,
+        );
+        let mut visible = WorldSnapshot::default();
+        visible.body.odometry.heading_rad = 0.25;
+        visible.extensions.push(pete_now::ExtensionSense {
+            schema_version: 1,
+            name: "sim.world".to_string(),
+            values: vec![4.0, 4.0, 1.0, 0.4, 0.6],
+        });
+        metrics.observe(
+            &visible,
+            &tick_with_action(ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            }),
+        );
+
+        let mut far = visible.clone();
+        far.extensions[0].values[3] = 0.1;
+        far.extensions[0].values[4] = 0.0;
+        metrics.observe(&far, &tick_with_action(ActionPrimitive::Dock));
+
+        let report = metrics.finish();
+        assert_eq!(report.ticks_with_charger_visible, 1);
+        assert_eq!(report.ticks_with_charger_near, 1);
+        assert_eq!(report.ticks_approaching_charger, 1);
+        assert_eq!(report.ticks_docking_from_too_far, 1);
+        assert_eq!(report.final_heading_rad, Some(0.25));
+        assert!(report.final_bearing_to_charger_rad.is_some());
+    }
+
+    #[test]
+    fn social_metrics_detect_projected_senses() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::PersonAndSpeaker, 13));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::PersonAndSpeaker,
+            scenario.metadata,
+            0,
+            13,
+            None,
+            None,
+        );
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.eye.frames.push(vec![0.1, 0.2]);
+        snapshot.ear.features.push(vec![0.3]);
+        snapshot.voice.embeddings.push(vec![0.4]);
+        snapshot.face.embeddings.push(vec![0.5]);
+        snapshot.kinect.skeletons.push(Default::default());
+        metrics.observe(&snapshot, &tick_with_action(ActionPrimitive::Stop));
+        let report = metrics.finish();
+        assert_eq!(report.ticks_with_eye_frames, 1);
+        assert_eq!(report.ticks_with_ear_features, 1);
+        assert_eq!(report.ticks_with_voice_embeddings, 1);
+        assert_eq!(report.ticks_with_face_embeddings, 1);
+        assert_eq!(report.ticks_with_kinect_skeletons, 1);
+        assert!(report.success);
+    }
+
+    #[test]
+    fn recommendation_logic_classifies_common_outcomes() {
+        let strong = ScenarioEvaluationSummary {
+            success_rate: 0.9,
+            collision_rate: 0.01,
+            ..ScenarioEvaluationSummary::default()
+        };
+        assert_eq!(
+            scenario_recommendation(10, &strong),
+            "candidate_for_more_eval"
+        );
+        assert_eq!(scenario_recommendation(2, &strong), "insufficient_data");
+        let risky = ScenarioEvaluationSummary {
+            success_rate: 0.9,
+            collision_rate: 0.2,
+            ..ScenarioEvaluationSummary::default()
+        };
+        assert_eq!(
+            scenario_recommendation(10, &risky),
+            "reject_or_continue_training"
+        );
+    }
+
+    #[test]
+    fn memory_hit_rates_are_bounded() {
+        assert_eq!(hit_rate(3, 2), Some(1.0));
+        assert_eq!(hit_rate(1, 4), Some(0.25));
+        assert_eq!(hit_rate(1, 0), None);
+        assert_eq!(aggregate_hit_rate([(4, 2), (3, 1)].into_iter()), Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn hardware_env_report_has_expected_shape() {
+        let report = collect_hardware_env_report().await;
+        assert!(report.get("os").is_some());
+        assert!(report.get("architecture").is_some());
+        assert!(report.get("serial_devices").unwrap().is_array());
+        assert!(report.get("gps_serial_candidates").unwrap().is_array());
+        assert_eq!(report["default_gps"]["baud"].as_u64(), Some(9600));
+        assert!(report.get("i2c_devices").unwrap().is_array());
+        assert_eq!(
+            report["default_imu"]["device"].as_str(),
+            Some(DEFAULT_MPU6050_IMU_DEVICE)
+        );
+        assert!(report.get("camera_devices").unwrap().is_array());
+        assert!(report.get("audio_input_devices").unwrap().is_array());
+        assert!(report.get("kinect").unwrap().is_object());
+        assert!(report.get("data_dirs_writable").unwrap().is_object());
+    }
+
+    #[test]
+    fn imu_device_defaults_can_be_overridden_or_disabled() {
+        assert_eq!(
+            selected_imu_device(None, false),
+            Some(DEFAULT_MPU6050_IMU_DEVICE)
+        );
+        assert_eq!(selected_imu_device(None, true), None);
+        assert_eq!(
+            selected_imu_device(Some("/dev/i2c-1@0x69"), true),
+            Some("/dev/i2c-1@0x69")
+        );
+        assert_eq!(selected_imu_device(Some("none"), false), None);
+    }
+
+    #[test]
+    fn serial_auto_selection_keeps_gps_and_create_separate() {
+        let report = serde_json::json!({
+            "serial_devices": [
+                "/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_7-if00",
+                "/dev/ttyACM0",
+                "/dev/ttyUSB0"
+            ]
+        });
+
+        assert_eq!(
+            selected_create_port("auto", &report),
+            Some("/dev/ttyUSB0".to_string())
+        );
+        assert_eq!(
+            selected_gps_device(None, false, &report, Some("/dev/ttyUSB0")),
+            Some("/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_7-if00".to_string())
+        );
+        assert_eq!(
+            selected_gps_device(Some("/dev/ttyACM1"), false, &report, Some("/dev/ttyUSB0")),
+            Some("/dev/ttyACM1".to_string())
+        );
+        assert_eq!(
+            selected_gps_device(Some("none"), false, &report, Some("/dev/ttyUSB0")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn robot_cockpit_fallback_uses_sim_readonly_when_backend_missing() {
+        let (mut cockpit, mode, is_mock_body) =
+            open_robot_cockpit_or_fallback(None, RobotMode::Slow).unwrap();
+
+        assert_eq!(mode, RobotMode::ReadOnly);
+        assert!(is_mock_body);
+        assert!(cockpit.get_status().unwrap().summary().armed.is_some());
+    }
+
+    #[test]
+    fn sensor_only_live_publish_does_not_refresh_body_timestamp() {
+        let live_state = LiveViewState::new().with_real_slow_hardware_control();
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.last_update_ms = 1_234;
+        live_state.update(snapshot);
+
+        publish_live_sensor_only_snapshot(
+            &live_state,
+            &SensePacket::EyeFrame(EyeFrame {
+                captured_at_ms: 9_999,
+                width: 1,
+                height: 1,
+                format: EyeFrameFormat::Rgb8,
+                bytes: vec![0, 0, 0],
+                source: Some("test".to_string()),
+            }),
+        );
+
+        let latest = live_state.latest().unwrap();
+        assert_eq!(latest.body.last_update_ms, 1_234);
+        assert_eq!(
+            latest.eye_frame.as_ref().map(|frame| frame.captured_at_ms),
+            Some(9_999)
+        );
+    }
+
+    #[test]
+    fn missing_streams_generate_warnings() {
+        let mut counts = StreamCounts::default();
+        counts.observe(&WorldSnapshot::default());
+        let streams = counts.streams();
+        assert!(streams.present.contains(&"body".to_string()));
+        assert!(streams.missing.contains(&"rgb".to_string()));
+        assert!(counts
+            .warnings()
+            .iter()
+            .any(|warning| warning == "rgb stream missing"));
+    }
+
+    #[tokio::test]
+    async fn inspect_capture_reads_tiny_fake_capture() {
+        let temp_dir = temp_path("pete_inspect_capture");
+        let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::RealRobot, Some(100))
+            .await
+            .unwrap();
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.eye.frames.push(vec![0.1, 0.2]);
+        writer
+            .append_snapshot(100, snapshot, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let report = inspect_capture_report(&temp_dir).await.unwrap();
+        assert_eq!(report.frame_count, 1);
+        assert!(report.streams_present.contains(&"rgb".to_string()));
+        assert!(report.streams_missing.contains(&"audio".to_string()));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn pose_graph_report_reads_capture_frames_and_gates_loop_candidates() {
+        let temp_dir = temp_path("pete_pose_graph_capture");
+        let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+        let mut first = WorldSnapshot::default();
+        first.body.odometry.x_m = 0.0;
+        first.eye.scene_vectors.push(
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-first", vec![1.0, 0.0])
+                .with_source_frame_id("capture-frame-0"),
+        );
+        writer
+            .append_snapshot(100, first, Vec::new())
+            .await
+            .unwrap();
+
+        let mut second = WorldSnapshot::default();
+        second.body.odometry.x_m = 1.0;
+        second.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-query-strong",
+            vec![1.0, 0.0],
+        ));
+        second.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-query-weak",
+            vec![0.0, 1.0],
+        ));
+        writer
+            .append_snapshot(200, second, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let args = PoseGraphReportArgs {
+            ledger: "unused-when-capture-is-set".to_string(),
+            capture: Some(temp_dir.to_string_lossy().to_string()),
+            out: temp_dir
+                .join("pose-graph.json")
+                .to_string_lossy()
+                .to_string(),
+            min_node_distance_m: 0.5,
+            min_node_degrees: 15.0,
+            max_ticks_between_nodes: 10,
+            min_loop_confidence: 0.55,
+        };
+        let report = generate_pose_graph_report(&args).await.unwrap();
+
+        assert_eq!(report.nodes, 2);
+        assert_eq!(report.odometry_edges, 1);
+        assert_eq!(report.loop_candidate_edges, 2);
+        assert_eq!(report.active_loop_candidate_edges, 1);
+        assert_eq!(report.rejected_loop_candidates, 1);
+        assert_eq!(
+            report.rejected_candidates[0].reason,
+            "confidence 0.000 below gate 0.550"
+        );
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn pose_graph_report_uses_ledger_place_recognition_latents() {
+        let temp_dir = temp_path("pete_pose_graph_ledger");
+        let ledger = JsonlLedger::new(&temp_dir);
+
+        let first = pose_graph_test_frame(100, 0.0, vec![1.0, 0.0, 0.0]);
+        let first_experience_id = first.experiences[0].id.to_string();
+        let first_frame_id = first.id.to_string();
+        let second = pose_graph_test_frame(200, 1.0, vec![0.99, 0.01, 0.0]);
+        let second_experience_id = second.experiences[0].id.to_string();
+        ledger.append(&first).await.unwrap();
+        ledger.append(&second).await.unwrap();
+
+        let args = PoseGraphReportArgs {
+            ledger: temp_dir.to_string_lossy().to_string(),
+            capture: None,
+            out: temp_dir
+                .join("pose-graph.json")
+                .to_string_lossy()
+                .to_string(),
+            min_node_distance_m: 0.5,
+            min_node_degrees: 15.0,
+            max_ticks_between_nodes: 10,
+            min_loop_confidence: 0.55,
+        };
+        let report = generate_pose_graph_report(&args).await.unwrap();
+
+        assert_eq!(report.nodes, 2);
+        assert_eq!(report.odometry_edges, 1);
+        assert_eq!(report.loop_candidate_edges, 1);
+        assert_eq!(report.active_loop_candidate_edges, 1);
+        assert_eq!(report.rejected_loop_candidates, 0);
+        let loop_edge = report
+            .graph
+            .edges
+            .iter()
+            .find(|edge| {
+                matches!(
+                    edge.source,
+                    pete_map::PoseEdgeSource::LoopClosureCandidate { .. }
+                )
+            })
+            .expect("loop edge");
+        match &loop_edge.source {
+            pete_map::PoseEdgeSource::LoopClosureCandidate {
+                target_frame_id,
+                source_frame_id,
+                source_experience_id,
+                source_instant_frame_id,
+                query_experience_id,
+                ..
+            } => {
+                assert_eq!(target_frame_id.as_deref(), Some(first_frame_id.as_str()));
+                assert_eq!(
+                    source_frame_id.as_deref(),
+                    Some(second.id.to_string().as_str())
+                );
+                assert_eq!(
+                    source_experience_id.as_deref(),
+                    Some(first_experience_id.as_str())
+                );
+                assert_eq!(
+                    source_instant_frame_id.as_deref(),
+                    Some(first_frame_id.as_str())
+                );
+                assert_eq!(
+                    query_experience_id.as_deref(),
+                    Some(second_experience_id.as_str())
+                );
+            }
+            pete_map::PoseEdgeSource::Odometry => panic!("expected loop edge"),
+            pete_map::PoseEdgeSource::ScanMatch { .. } => panic!("expected loop edge"),
+        }
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn representation_report_writes_json_from_capture_fixture() {
+        let temp_dir = temp_path("pete_representation_report_capture");
+        let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::Sim, Some(100))
+            .await
+            .unwrap();
+
+        let mut first = WorldSnapshot::default();
+        first.body.odometry.x_m = 0.0;
+        first.range.nearest_m = Some(0.5);
+        first.eye.scene_vectors.push(
+            VectorArtifact::new(SCENE_VECTOR_COLLECTION, "scene-a", vec![1.0, 0.0])
+                .with_source_frame_id("capture-frame-0"),
+        );
+        writer
+            .append_snapshot(100, first, Vec::new())
+            .await
+            .unwrap();
+
+        let mut second = WorldSnapshot::default();
+        second.body.odometry.x_m = 0.8;
+        second.range.nearest_m = Some(0.45);
+        second.eye.scene_vectors.push(VectorArtifact::new(
+            SCENE_VECTOR_COLLECTION,
+            "scene-b",
+            vec![0.98, 0.02],
+        ));
+        writer
+            .append_snapshot(200, second, Vec::new())
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let out = temp_dir.join("reports/representation/report.json");
+        run_representation_report(RepresentationReportArgs {
+            ledger: "unused-when-capture-is-set".to_string(),
+            capture: Some(temp_dir.to_string_lossy().to_string()),
+            out: out.to_string_lossy().to_string(),
+        })
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+        assert_eq!(value["frame_count"], 2);
+        assert_eq!(value["input"]["source_type"], "capture");
+        assert!(value["entity_memory"].is_object());
+        assert!(value["map"].is_object());
+        assert!(value["pose_graph"].is_object());
+        assert!(value["place_recognition"].is_object());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn pose_graph_test_frame(t_ms: u64, x_m: f32, latent_vector: Vec<f32>) -> ExperienceFrame {
+        let mut now = Now::blank(t_ms, BodySense::default());
+        now.body.odometry.x_m = x_m;
+        let sensation_id = uuid::Uuid::new_v4();
+        let experience = Experience::new(
+            "test.place",
+            format!("test place at {x_m:.1}m"),
+            Vec::new(),
+            vec![sensation_id],
+            t_ms,
+            t_ms,
+        );
+        ExperienceFrame {
+            id: uuid::Uuid::new_v4(),
+            t_ms,
+            now,
+            sensations: Vec::new(),
+            impressions: Vec::new(),
+            experiences: vec![experience],
+            z: Some(ExperienceLatent {
+                t_ms,
+                z: latent_vector,
+                confidence: 1.0,
+                ..ExperienceLatent::default()
+            }),
+            chosen_action: None,
+            conscious_command: None,
+            reign_input: None,
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Reward::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "slow capture-real mock path can stall workspace test runs"]
+    async fn capture_real_mock_writes_manifest_and_frames() {
+        let temp_dir = temp_path("pete_capture_real_mock");
+        let args = CaptureRealArgs {
+            duration_seconds: 1,
+            out: temp_dir.to_string_lossy().to_string(),
+            ledger: None,
+            tick_ms: 1000,
+            cockpit: CockpitBackendArg::Sim,
+            create_port: "mock".to_string(),
+            create_baud: 57_600,
+            camera: None,
+            kinect_depth: false,
+            kinect_index: 0,
+            kinect_rgb_target_luma: 0.32,
+            kinect_rgb_auto_gain_max: 3.0,
+            kinect_rgb_gain: 1.0,
+            kinect_rgb_gamma: 0.80,
+            kinect_rgb_brightness: 0.0,
+            kinect_rgb_raw: false,
+            mic: None,
+            imu: None,
+            gps: None,
+            mock: true,
+            export_rgb: false,
+            export_depth: false,
+            export_audio: false,
+            export_pointcloud: false,
+            pointcloud_stride: 4,
+            llm: LlmArgs::default(),
+        };
+
+        capture_real(args).await.unwrap();
+        assert!(temp_dir.join("manifest.json").exists());
+        assert!(temp_dir.join("frames.jsonl").exists());
+        let report = inspect_capture_report(&temp_dir).await.unwrap();
+        assert_eq!(report.frame_count, 1);
+        assert!(report.streams_present.contains(&"body".to_string()));
+        assert!(report.streams_present.contains(&"audio".to_string()));
+        assert!(report.streams_present.contains(&"depth".to_string()));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "slow capture-real mock path can stall workspace test runs"]
+    async fn capture_real_mock_exports_assets_and_pointclouds() {
+        let temp_dir = temp_path("pete_capture_real_mock_assets");
+        let args = CaptureRealArgs {
+            duration_seconds: 1,
+            out: temp_dir.to_string_lossy().to_string(),
+            ledger: None,
+            tick_ms: 1000,
+            cockpit: CockpitBackendArg::Sim,
+            create_port: "mock".to_string(),
+            create_baud: 57_600,
+            camera: None,
+            kinect_depth: false,
+            kinect_index: 0,
+            kinect_rgb_target_luma: 0.32,
+            kinect_rgb_auto_gain_max: 3.0,
+            kinect_rgb_gain: 1.0,
+            kinect_rgb_gamma: 0.80,
+            kinect_rgb_brightness: 0.0,
+            kinect_rgb_raw: false,
+            mic: None,
+            imu: None,
+            gps: None,
+            mock: true,
+            export_rgb: true,
+            export_depth: true,
+            export_audio: true,
+            export_pointcloud: false,
+            pointcloud_stride: 4,
+            llm: LlmArgs::default(),
+        };
+
+        capture_real(args).await.unwrap();
+        capture_assets(CaptureAssetsArgs {
+            capture: temp_dir.to_string_lossy().to_string(),
+            pointcloud: true,
+            world_pointcloud: true,
+            stride: 1,
+            max_depth_m: 8.0,
+        })
+        .await
+        .unwrap();
+
+        let report = inspect_capture_report(&temp_dir).await.unwrap();
+        assert_eq!(
+            report.asset_counts,
+            vec![
+                ("rgb".to_string(), 1),
+                ("depth".to_string(), 1),
+                ("audio".to_string(), 1),
+                ("pointcloud".to_string(), 2)
+            ]
+        );
+        assert!(report
+            .asset_details
+            .iter()
+            .any(|detail| detail.contains("rgb metadata: 2x2")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("uncalibrated point cloud")));
+        let world_ply = temp_dir.join("assets/pointcloud/world-accumulated.ply");
+        let world_ply_text = fs::read_to_string(&world_ply).unwrap();
+        assert!(world_ply_text.contains("property float confidence"));
+        assert!(world_ply_text.contains("property uchar stable"));
+        let replay = replay_capture(ReplayCaptureArgs {
+            capture: temp_dir.to_string_lossy().to_string(),
+            ledger: temp_dir.join("ledger").to_string_lossy().to_string(),
+            llm: LlmArgs::default(),
+        })
+        .await;
+        assert!(replay.is_ok());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_empty_room_smoke_runs() {
+        let args = eval_args(ScenarioArg::EmptyRoom, 1, 3, None);
+        run_eval_scenario(args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_obstacle_writes_report() {
+        let temp_dir = temp_path("pete_eval_scenario_obstacle");
+        let out = temp_dir.join("obstacle.json");
+        let mut args = eval_args(
+            ScenarioArg::ObstacleAvoidance,
+            3,
+            5,
+            Some(out.to_string_lossy().to_string()),
+        );
+        args.memory_report = true;
+        run_eval_scenario(args).await.unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+        assert_eq!(report["scenario"], "obstacle-avoidance");
+        assert_eq!(report["action_selector_mode"], "baseline");
+        assert_eq!(report["episodes_detail"].as_array().unwrap().len(), 3);
+        assert!(report["memory"]["places_visited"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            report["episodes_detail"][0]["memory"]["danger_memory_ticks"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_model_assisted_empty_room_runs_and_reports_stats() {
+        let temp_dir = temp_path("pete_eval_scenario_model_assisted_empty");
+        let out = temp_dir.join("empty-model-assisted.json");
+        let mut args = eval_args(
+            ScenarioArg::EmptyRoom,
+            1,
+            3,
+            Some(out.to_string_lossy().to_string()),
+        );
+        args.action_selector = CliActionSelectorMode::ModelAssisted;
+        run_eval_scenario(args).await.unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+        assert_eq!(report["action_selector_mode"], "model-assisted");
+        assert_eq!(report["summary"]["model_assisted_decisions"], 3);
+        assert!(report["summary"]["mean_candidate_score"].is_number());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_model_assisted_charger_seeking_runs() {
+        let mut args = eval_args(ScenarioArg::ChargerSeeking, 1, 3, None);
+        args.action_selector = CliActionSelectorMode::ModelAssisted;
+        run_eval_scenario(args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn eval_scenario_optional_ledger_writes_transitions() {
+        let temp_dir = temp_path("pete_eval_scenario_ledger");
+        let ledger_dir = temp_dir.join("ledger");
+        let out = temp_dir.join("empty.json");
+        let mut args = eval_args(
+            ScenarioArg::EmptyRoom,
+            1,
+            4,
+            Some(out.to_string_lossy().to_string()),
+        );
+        args.ledger = Some(ledger_dir.to_string_lossy().to_string());
+        run_eval_scenario(args).await.unwrap();
+        let transitions = JsonlLedger::new(&ledger_dir).transitions().await.unwrap();
+        assert!(!transitions.is_empty());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn sim_curriculum_writes_one_capture_per_episode() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let temp_dir = std::env::temp_dir().join(format!("pete_curriculum_test_{now_ms}"));
+        let ledger_dir = temp_dir.join("ledger");
+        let capture_root = temp_dir.join("captures");
+
+        let args = SimCurriculumArgs {
+            scenario: ScenarioArg::PersonSpeakerRoom,
+            episodes: 2,
+            steps: 3,
+            seed: 7,
+            out: ledger_dir.to_str().unwrap().to_string(),
+            capture_root: Some(capture_root.to_str().unwrap().to_string()),
+            tick_ms: 100,
+            validation_ratio: 0.25,
+            test_ratio: 0.25,
+            llm: LlmArgs::default(),
+        };
+
+        run_sim_curriculum(args).await.unwrap();
+
+        let manifest_path = ledger_dir.join("manifest.json");
+        assert!(manifest_path.exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["scenario"], "person-speaker-room");
+        assert_eq!(manifest["episodes"], 2);
+        assert_eq!(manifest["splits"]["train"], 0);
+        assert_eq!(manifest["splits"]["validation"], 1);
+        assert_eq!(manifest["splits"]["test"], 1);
+        assert_eq!(
+            manifest["episodes_detail"][0]["capture"],
+            capture_root
+                .join("episode-000")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert!(capture_root
+            .join("episode-000")
+            .join("manifest.json")
+            .exists());
+        assert!(capture_root
+            .join("episode-001")
+            .join("manifest.json")
+            .exists());
+        let transitions = JsonlLedger::new(&ledger_dir).transitions().await.unwrap();
+        assert!(!transitions.is_empty());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_behavior_command_writes_json_to_out() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let temp_dir = std::env::temp_dir().join(format!("pete_eval_test_{}", now_ms));
+        let ledger_dir = temp_dir.join("ledger");
+        let session_dir = ledger_dir.join("2026-06-24");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let checkpoint_dir = temp_dir.join("checkpoint");
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+
+        // Write 5 mock transitions to have enough data for training and validation splits
+        let mut transitions = Vec::new();
+        for i in 0..5 {
+            let transition = ExperienceTransition {
+                id: uuid::Uuid::new_v4(),
+                before_frame_id: uuid::Uuid::new_v4(),
+                before: Now::blank(100 + i * 100, BodySense::default()),
+                before_z: ExperienceLatent {
+                    t_ms: 100 + i * 100,
+                    z: vec![0.1; 4],
+                    ..ExperienceLatent::default()
+                },
+                action: Some(ActionPrimitive::Stop),
+                predicted_futures: Vec::new(),
+                after: Now::blank(200 + i * 100, BodySense::default()),
+                after_z: ExperienceLatent {
+                    t_ms: 200 + i * 100,
+                    z: vec![0.2; 4],
+                    ..ExperienceLatent::default()
+                },
+                reward: Reward { value: 0.0 },
+                surprise: SurpriseSense::default(),
+                created_at_ms: 200 + i * 100,
+            };
+            transitions.push(transition);
+        }
+
+        let transitions_file = session_dir.join("transitions.jsonl");
+        let mut content = String::new();
+        for t in &transitions {
+            content.push_str(&serde_json::to_string(t).unwrap());
+            content.push('\n');
+        }
+        fs::write(&transitions_file, content).unwrap();
+
+        // Train first to create the checkpoint and metadata
+        pete_training::train_behavior(pete_training::TrainBehaviorRequest {
+            behavior: pete_training::TrainableBehavior::Danger,
+            ledger_path: ledger_dir.clone(),
+            checkpoint_path: checkpoint_dir.clone(),
+            epochs: 1,
+            validation_split: 0.2,
+            seed: 42,
+        })
+        .await
+        .unwrap();
+
+        // Prepare output path
+        let out_json_path = temp_dir.join("report.json");
+
+        let args = EvaluateBehaviorArgs {
+            behavior: "danger".to_string(),
+            ledger: ledger_dir.to_str().unwrap().to_string(),
+            checkpoint: Some(checkpoint_dir.to_str().unwrap().to_string()),
+            max_samples: None,
+            out: Some(out_json_path.to_str().unwrap().to_string()),
+        };
+
+        let cmd = EvaluateCommand {
+            model: EvaluateModel::Behavior(args),
+        };
+
+        let res = run_evaluate(cmd).await;
+        assert!(res.is_ok(), "run_evaluate failed: {:?}", res.err());
+
+        // Verify report file exists and has correct behavior name
+        assert!(out_json_path.exists());
+        let report_content = fs::read_to_string(&out_json_path).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&report_content).unwrap();
+        assert_eq!(report["behavior"], "danger");
+
+        // Clean up
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+}

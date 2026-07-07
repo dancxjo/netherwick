@@ -1,10 +1,10 @@
-# Current Netherwick State
+# Current Pete State
 
-This note records the current working shape of Netherwick after the first convincing real-world voxel milestone.
+This note records the current working shape of Pete after the first convincing real-world voxel milestone.
 
 ## What works now
 
-Netherwick can render aligned, colored 3D voxels from real sensor data. The output is blocky and Minecraft-like, but the important feature is not visual polish. The important feature is correspondence: colored voxel structures line up with real things in the room.
+Pete can render aligned, colored 3D voxels from real sensor data. The output is blocky and Minecraft-like, but the important feature is not visual polish. The important feature is correspondence: colored voxel structures line up with real things in the room.
 
 This means the perception stack has crossed from raw capture and loose point cloud experiments into an inspectable spatial model.
 
@@ -14,7 +14,7 @@ The LLM loop is also doing real work now. It is predicting counterfactual outcom
 
 ### Constellations
 
-A constellation should not be vision-only. The first obvious examples are stable arrangements of colored voxels, planes, corners, blobs, and depth edges, but the abstraction should apply to every modality Netherwick can observe or remember.
+A constellation should not be vision-only. The first obvious examples are stable arrangements of colored voxels, planes, corners, blobs, and depth edges, but the abstraction should apply to every modality Pete can observe or remember.
 
 A constellation is a recurrent signature across experience. It may include:
 
@@ -90,7 +90,7 @@ A golden run gives the project a fixed specimen. When a later change breaks spat
 
 ## Near-term definition of success
 
-Netherwick should be considered healthy when:
+Pete should be considered healthy when:
 
 - the voxel view shows real objects in stable 3D,
 - the 2D map agrees with the voxel/world frame,

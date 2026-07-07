@@ -1,6 +1,6 @@
-# Netherwick Worldlab
+# Pete Worldlab
 
-`netherwick-worldlab` records streams of `WorldSnapshot` values into reusable capture sessions and replays those sessions back through the normal runtime pipeline.
+`pete-worldlab` records streams of `WorldSnapshot` values into reusable capture sessions and replays those sessions back through the normal runtime pipeline.
 
 The v0 loop is:
 
@@ -33,7 +33,7 @@ data/captures/<capture-id>/
 Record a simulated session:
 
 ```bash
-cargo run -p netherwick-tools -- capture-sim \
+cargo run -p pete-tools -- capture-sim \
   --out data/captures/sim-test \
   --steps 100 \
   --seed 7
@@ -42,7 +42,7 @@ cargo run -p netherwick-tools -- capture-sim \
 Replay a capture into the runtime and write a normal ledger:
 
 ```bash
-cargo run -p netherwick-tools -- replay-capture \
+cargo run -p pete-tools -- replay-capture \
   --capture data/captures/sim-test \
   --ledger data/ledger/replay-test
 ```
@@ -52,7 +52,7 @@ Replay output uses the existing `JsonlLedger` conventions, so ledger frames and 
 Produce an offline pose graph report directly from a capture without correcting live pose:
 
 ```bash
-cargo run -p netherwick-tools -- pose-graph-report \
+cargo run -p pete-tools -- pose-graph-report \
   --capture data/captures/sim-test \
   --out data/reports/pose-graph/sim-test.json
 ```
@@ -79,13 +79,13 @@ The runtime now asks the configured `Recall` implementation for conservative loo
 Build a replay-first representation health report from capture or ledger input:
 
 ```bash
-cargo run --bin netherwick -- representation-report \
+cargo run --bin pete -- representation-report \
   --capture data/captures/real/rpi5-smoke \
   --out data/reports/representation/rpi5-smoke.json
 ```
 
 ```bash
-cargo run --bin netherwick -- representation-report \
+cargo run --bin pete -- representation-report \
   --ledger data/ledger/virtual-live \
   --out data/reports/representation/latest.json
 ```
@@ -93,7 +93,7 @@ cargo run --bin netherwick -- representation-report \
 Record a bounded real read-only session:
 
 ```bash
-cargo run -p netherwick-tools -- capture-real \
+cargo run -p pete-tools -- capture-real \
   --duration-seconds 60 \
   --out data/captures/real/rpi5-smoke
 ```
@@ -101,7 +101,7 @@ cargo run -p netherwick-tools -- capture-real \
 Record a mocked session with RGB, depth, and audio assets:
 
 ```bash
-cargo run --bin netherwick -- capture-real \
+cargo run --bin pete -- capture-real \
   --duration-seconds 3 \
   --mock \
   --out data/captures/real/mock-assets-smoke \
@@ -113,7 +113,7 @@ cargo run --bin netherwick -- capture-real \
 Export point-cloud v0 assets from captured depth:
 
 ```bash
-cargo run --bin netherwick -- capture-assets \
+cargo run --bin pete -- capture-assets \
   --capture data/captures/real/mock-assets-smoke \
   --pointcloud \
   --stride 4
@@ -122,7 +122,7 @@ cargo run --bin netherwick -- capture-assets \
 Inspect a capture:
 
 ```bash
-cargo run -p netherwick-tools -- inspect-capture \
+cargo run -p pete-tools -- inspect-capture \
   data/captures/real/rpi5-smoke
 ```
 

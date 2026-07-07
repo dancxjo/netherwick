@@ -38,9 +38,9 @@ The default voice is downloaded to the Tongues Piper model directory and autoloa
 To override the voice, set:
 
 ```bash
-NETHERWICK_TTS_PIPER_VOICE=/path/to/en_US-ryan-medium.onnx
-NETHERWICK_TTS_PIPER_CONFIG=/path/to/en_US-ryan-medium.onnx.json
-NETHERWICK_TTS_OUTPUT_DEVICE=
+PETE_TTS_PIPER_VOICE=/path/to/en_US-ryan-medium.onnx
+PETE_TTS_PIPER_CONFIG=/path/to/en_US-ryan-medium.onnx.json
+PETE_TTS_OUTPUT_DEVICE=
 ```
 
 Command-backed ASR uses the robot microphone and local Whisper:
@@ -48,8 +48,8 @@ Command-backed ASR uses the robot microphone and local Whisper:
 ```bash
 just setup-whisper
 MIC_DEVICE=default
-NETHERWICK_WHISPER_MODEL=/path/to/ggml-tiny.en.bin
-NETHERWICK_ASR_COMMAND=target/debug/netherwick whisper-transcribe
+PETE_WHISPER_MODEL=/path/to/ggml-tiny.en.bin
+PETE_ASR_COMMAND=target/debug/pete whisper-transcribe
 ```
 
 When configured, spoken bring-up lines are enqueued immediately and played sequentially on a background thread using Tongues Piper streaming plus CPAL output. `Song` and `Chirp` actions are rendered through Cockpit feedback/song verbs when the backend supports them. Later spoken actions emitted by event scripts are appended to the mouth queue. If the Piper voice or output device is unavailable, the robot should report the mouth as disabled and continue the robot run rather than blocking cockpit/sensor startup.

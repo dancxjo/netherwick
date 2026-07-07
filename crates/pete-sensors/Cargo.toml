@@ -1,0 +1,31 @@
+[package]
+name = "pete-sensors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["kinect-freenect", "face"]
+linux-hardware = ["dep:cpal", "dep:libc", "dep:serialport", "dep:v4l"]
+kinect-freenect = []
+face = ["dep:face_id", "dep:image"]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+face_id = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+cpal = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+serialport = { version = "4", optional = true }
+v4l = { version = "0.14", optional = true }
+pete-now = { path = "../pete-now" }
+pete-body = { path = "../pete-body" }
+pete-core = { path = "../pete-core" }
+pete-actions = { path = "../pete-actions" }
+
+[dev-dependencies]
+tokio.workspace = true

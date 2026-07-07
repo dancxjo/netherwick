@@ -1,11 +1,11 @@
 # Kinect / OpenKinect Path
 
-Netherwick keeps Kinect support optional so the default simulator and Linux sensor build stay light.
+Pete keeps Kinect support optional so the default simulator and Linux sensor build stay light.
 
 ## Feature
 
 ```sh
-cargo check -p netherwick-sensors --features kinect-freenect
+cargo check -p pete-sensors --features kinect-freenect
 ```
 
 The `kinect-freenect` feature exposes `FreenectKinectProvider`, which uses libfreenect sync reads and emits:
@@ -18,7 +18,7 @@ Kinect audio should be added later. OpenKinect/libfreenect audio support can req
 The existing V4L camera, CPAL microphone, and serial GPS provider are behind:
 
 ```sh
-cargo check -p netherwick-sensors --features linux-hardware
+cargo check -p pete-sensors --features linux-hardware
 ```
 
 ## Linux Build Notes
@@ -41,7 +41,7 @@ Install the libfreenect udev rules for non-root device access. The exact rules f
 
 ## Dark RGB Frames
 
-Kinect RGB frames are read through libfreenect, not `/dev/video*`, so V4L exposure controls usually do not apply. Netherwick applies a software RGB correction before the frame enters the dashboard or capture ledger.
+Kinect RGB frames are read through libfreenect, not `/dev/video*`, so V4L exposure controls usually do not apply. Pete applies a software RGB correction before the frame enters the dashboard or capture ledger.
 
 The default `just robot` path enables auto-gain with a moderate gamma lift:
 
@@ -57,7 +57,7 @@ Useful knobs:
 - `KINECT_RGB_GAMMA`: values below `1.0` lift shadows; values above `1.0` darken.
 - `KINECT_RGB_BRIGHTNESS`: additive offset in normalized RGB units, usually keep near `0.0`.
 
-Pass `--kinect-rgb-raw` to `netherwick-tools robot` or `capture-real` to disable software correction and inspect the raw libfreenect RGB frame.
+Pass `--kinect-rgb-raw` to `pete-tools robot` or `capture-real` to disable software correction and inspect the raw libfreenect RGB frame.
 
 ## Replay Recordings
 

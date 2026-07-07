@@ -9,7 +9,7 @@
       "created_at": "2026-06-24T16:01:55.899912870+00:00",
       "training": {
         "ledger": "data/ledger/curriculum/obstacle-v0",
-        "command": "target/debug/netherwick model-register --behavior danger --checkpoint data/models/danger_obstacle_smoke --training-ledger data/ledger/curriculum/obstacle-v0 --scenario-report data/reports/scenario/obstacle-baseline-smoke.json --name danger_obstacle_smoke --overwrite",
+        "command": "target/debug/pete model-register --behavior danger --checkpoint data/models/danger_obstacle_smoke --training-ledger data/ledger/curriculum/obstacle-v0 --scenario-report data/reports/scenario/obstacle-baseline-smoke.json --name danger_obstacle_smoke --overwrite",
         "epochs": null
       },
       "reports": {

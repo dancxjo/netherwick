@@ -1,6 +1,6 @@
 # `just go virtual`
 
-`just go virtual` starts Netherwick's Dream World: a simulated dream scenario updates the live view state, the server binds to `0.0.0.0`, and HTTPS pages are served for desktop browsers and LAN headset browsers.
+`just go virtual` starts Pete's Dream World: a simulated dream scenario updates the live view state, the server binds to `0.0.0.0`, and HTTPS pages are served for desktop browsers and LAN headset browsers.
 
 By default this mode collects experience into the ledger, starts Dream NEAT policy
 training in the background, and runs inline world-outcome learning. Startup
@@ -8,9 +8,9 @@ prints:
 
 ```text
 Virtual training theater is collecting experience.
-Dream NEAT policy training starts automatically. Set NETHERWICK_NEAT_TRAINING=0 to disable.
-Inline learning defaults to world-outcome. Set NETHERWICK_INLINE_LEARNING_MODE=off for collect-only.
-Offline training still exists: `cargo run --bin netherwick -- train behavior ...`
+Dream NEAT policy training starts automatically. Set PETE_NEAT_TRAINING=0 to disable.
+Inline learning defaults to world-outcome. Set PETE_INLINE_LEARNING_MODE=off for collect-only.
+Offline training still exists: `cargo run --bin pete -- train behavior ...`
 ```
 
 The `/view/scene` packet and `/view/3d` HUD expose `training_mode`, `ledger_path`, written frame/transition counts, loaded models, model modes, action selector mode, and `weights_updating`. For the default virtual run, expect `training_mode: "inline-world-outcome"` and `weights_updating: true`.
@@ -20,24 +20,24 @@ Ledger writing remains on; Pete still writes memory while learning from the stre
 Collect-only:
 
 ```bash
-NETHERWICK_INLINE_LEARNING_MODE=off \
+PETE_INLINE_LEARNING_MODE=off \
 just go virtual
 ```
 
 Inline world-outcome learning:
 
 ```bash
-NETHERWICK_INLINE_LEARNING_MODE=world-outcome \
-NETHERWICK_INLINE_TRAIN_STEPS_PER_TICK=1 \
-NETHERWICK_INLINE_BEHAVIORS=future,action_value \
+PETE_INLINE_LEARNING_MODE=world-outcome \
+PETE_INLINE_TRAIN_STEPS_PER_TICK=1 \
+PETE_INLINE_BEHAVIORS=future,action_value \
 just go virtual
 ```
 
 Shadow-only learning/status:
 
 ```bash
-NETHERWICK_INLINE_LEARNING_MODE=shadow-only \
-NETHERWICK_INLINE_BEHAVIORS=danger,charge,future \
+PETE_INLINE_LEARNING_MODE=shadow-only \
+PETE_INLINE_BEHAVIORS=danger,charge,future \
 just go virtual
 ```
 
@@ -53,20 +53,20 @@ loaded `dream-neat:<level>:genome-<id>` model entry.
 Tune or disable the automatic Dream NEAT run:
 
 ```bash
-NETHERWICK_NEAT_GENERATIONS=60 \
-NETHERWICK_NEAT_POPULATION=48 \
-NETHERWICK_NEAT_START_LEVEL=motion \
+PETE_NEAT_GENERATIONS=60 \
+PETE_NEAT_POPULATION=48 \
+PETE_NEAT_START_LEVEL=motion \
 just go virtual
 ```
 
 ```bash
-NETHERWICK_NEAT_TRAINING=0 just go virtual
+PETE_NEAT_TRAINING=0 just go virtual
 ```
 
 Use a specific visible-controller checkpoint:
 
 ```bash
-NETHERWICK_DREAM_POLICY_CHECKPOINT=data/models/dream-policy/neat/level-1-best.json \
+PETE_DREAM_POLICY_CHECKPOINT=data/models/dream-policy/neat/level-1-best.json \
 just go virtual
 ```
 
@@ -82,7 +82,7 @@ The 3D page shows live sensors and, in immersive VR, maps supported controller i
 
 WebXR immersive VR requires a secure browser context. `localhost` is often treated as secure, but a headset visiting a LAN IP usually needs HTTPS and a trusted local development certificate.
 
-The Justfile generates `certs/netherwick-dev.crt` and `certs/netherwick-dev.key` with SAN entries for `localhost`, `127.0.0.1`, `netherwick.local`, and the first detected LAN IP when available.
+The Justfile generates `certs/pete-dev.crt` and `certs/pete-dev.key` with SAN entries for `localhost`, `127.0.0.1`, `pete.local`, and the first detected LAN IP when available.
 
 If the headset warns about the certificate, accept the warning for local testing or install/trust the generated dev certificate on the headset.
 
@@ -91,13 +91,13 @@ If the headset warns about the certificate, accept the warning for local testing
 Change port:
 
 ```bash
-NETHERWICK_LIVE_PORT=9443 just go virtual
+PETE_LIVE_PORT=9443 just go virtual
 ```
 
 Change scenario:
 
 ```bash
-NETHERWICK_SCENARIO=charger-seeking just go virtual
+PETE_SCENARIO=charger-seeking just go virtual
 ```
 
 The default is `dream`, a seeded randomized Dream World. Re-run with the same
@@ -118,21 +118,21 @@ Useful scenario slugs:
 Dream generation knobs:
 
 ```bash
-NETHERWICK_SCENARIO=dream \
-NETHERWICK_DREAM_WEIRDNESS=0.65 \
-NETHERWICK_DREAM_DENSITY=0.7 \
-NETHERWICK_DREAM_SOCIALITY=0.5 \
-NETHERWICK_DREAM_HAZARD_BIAS=0.35 \
-NETHERWICK_DREAM_CHARGER_BIAS=0.4 \
+PETE_SCENARIO=dream \
+PETE_DREAM_WEIRDNESS=0.65 \
+PETE_DREAM_DENSITY=0.7 \
+PETE_DREAM_SOCIALITY=0.5 \
+PETE_DREAM_HAZARD_BIAS=0.35 \
+PETE_DREAM_CHARGER_BIAS=0.4 \
 just go virtual
 ```
 
-- `NETHERWICK_DREAM_WEIRDNESS`: increases odd labels, colors, size variance,
+- `PETE_DREAM_WEIRDNESS`: increases odd labels, colors, size variance,
   sound sources, landmarks, and asymmetric placement.
-- `NETHERWICK_DREAM_DENSITY`: increases object population.
-- `NETHERWICK_DREAM_SOCIALITY`: increases people and voices.
-- `NETHERWICK_DREAM_HAZARD_BIAS`: increases blockers and charger-adjacent decoys.
-- `NETHERWICK_DREAM_CHARGER_BIAS`: increases charger likelihood.
+- `PETE_DREAM_DENSITY`: increases object population.
+- `PETE_DREAM_SOCIALITY`: increases people and voices.
+- `PETE_DREAM_HAZARD_BIAS`: increases blockers and charger-adjacent decoys.
+- `PETE_DREAM_CHARGER_BIAS`: increases charger likelihood.
 
 Dream objects are not decorative-only. Obstacles and landmarks project into
 range, eye frames, Kinect depth/color, and collision; people project into face,
@@ -143,13 +143,13 @@ signal.
 Change the long-running step budget or tick delay:
 
 ```bash
-NETHERWICK_SIM_STEPS=500000 NETHERWICK_TICK_DELAY_MS=50 just go virtual
+PETE_SIM_STEPS=500000 PETE_TICK_DELAY_MS=50 just go virtual
 ```
 
 Open the desktop URL automatically when `xdg-open` is available:
 
 ```bash
-NETHERWICK_OPEN_BROWSER=1 just go virtual
+PETE_OPEN_BROWSER=1 just go virtual
 ```
 
 Print the detected headset URL without starting the theater:

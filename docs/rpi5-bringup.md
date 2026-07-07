@@ -58,13 +58,13 @@ The expected Cockpit UART baud rate is `115200`.
 
 `robot` and `capture-real` default to `--cockpit uart` and the first likely serial candidate from `hardware-env`. Pass `--cockpit uart --create-port /dev/ttyUSB0` when you want to pin the adapter, `--cockpit sim` for simulated Cockpit smoke tests, or `--mock` for `capture-real` no-hardware smoke tests.
 
-u-blox7 GPS receivers are read over USB serial at 9600 baud using NMEA. Netherwick auto-starts GPS on real runs by preferring `/dev/serial/by-id/*u-blox*`, `/dev/serial/by-id/*gps*`, or `/dev/serial/by-id/*gnss*`, then falling back to an unused `/dev/ttyACM*` device. Use `--gps /dev/serial/by-id/<u-blox-device>` to pin it, or `--gps none` to disable GPS capture.
+u-blox7 GPS receivers are read over USB serial at 9600 baud using NMEA. Pete auto-starts GPS on real runs by preferring `/dev/serial/by-id/*u-blox*`, `/dev/serial/by-id/*gps*`, or `/dev/serial/by-id/*gnss*`, then falling back to an unused `/dev/ttyACM*` device. Use `--gps /dev/serial/by-id/<u-blox-device>` to pin it, or `--gps none` to disable GPS capture.
 
 Kinect availability is detected best-effort through `freenect-*` tools or `pkg-config libfreenect`. A missing Kinect is a warning for capture-first bring-up, not a failure when other streams are useful.
 
 Camera devices are expected under `/dev/video*`. Microphones should be visible to ALSA, for example through `arecord -l`.
 
-MPU-6050 IMUs use I2C bus 1 by default on Raspberry Pi header pins: VCC to 3.3V physical pin 1, GND to pin 6, SDA to GPIO 2 physical pin 3, and SCL to GPIO 3 physical pin 5. Netherwick defaults `robot` and `capture-real` to `/dev/i2c-1` at address `0x68`, so no `--imu` flag is needed for the normal wiring. Use `--imu none` to disable IMU capture, or `--imu /dev/i2c-1@0x69` if AD0 is pulled high.
+MPU-6050 IMUs use I2C bus 1 by default on Raspberry Pi header pins: VCC to 3.3V physical pin 1, GND to pin 6, SDA to GPIO 2 physical pin 3, and SCL to GPIO 3 physical pin 5. Pete defaults `robot` and `capture-real` to `/dev/i2c-1` at address `0x68`, so no `--imu` flag is needed for the normal wiring. Use `--imu none` to disable IMU capture, or `--imu /dev/i2c-1@0x69` if AD0 is pulled high.
 
 After wiring, this should show address `68`:
 
@@ -77,8 +77,8 @@ i2cdetect -y 1
 Inspect the hardware environment:
 
 ```bash
-cargo run --bin netherwick -- hardware-env
-cargo run --bin netherwick -- hardware-env --json
+cargo run --bin pete -- hardware-env
+cargo run --bin pete -- hardware-env --json
 ```
 
 Bring up the default real hardware stack in slow mode with Kinect depth when available:
@@ -90,7 +90,7 @@ just robot
 Run a bounded read-only robot smoke:
 
 ```bash
-cargo run --bin netherwick -- robot \
+cargo run --bin pete -- robot \
   --mode read-only \
   --duration-seconds 30 \
   --ledger data/ledger/real/read-only-smoke
@@ -99,7 +99,7 @@ cargo run --bin netherwick -- robot \
 Record a real capture session:
 
 ```bash
-cargo run --bin netherwick -- capture-real \
+cargo run --bin pete -- capture-real \
   --duration-seconds 60 \
   --out data/captures/real/rpi5-smoke
 ```
@@ -107,14 +107,14 @@ cargo run --bin netherwick -- capture-real \
 Inspect the capture:
 
 ```bash
-cargo run --bin netherwick -- inspect-capture \
+cargo run --bin pete -- inspect-capture \
   data/captures/real/rpi5-smoke
 ```
 
 No-hardware smoke test:
 
 ```bash
-cargo run --bin netherwick -- capture-real \
+cargo run --bin pete -- capture-real \
   --duration-seconds 3 \
   --mock \
   --out data/captures/real/mock-smoke

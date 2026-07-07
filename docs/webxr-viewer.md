@@ -1,6 +1,6 @@
 # WebXR Instant Viewer
 
-Netherwick serves a browser Instant viewer for live embodied sessions at `/view/3d`. The existing 2D page at `/view` remains available.
+Pete serves a browser Instant viewer for live embodied sessions at `/view/3d`. The existing 2D page at `/view` remains available.
 
 ## Start The Live Server
 
@@ -11,7 +11,7 @@ just live-server
 For a local cargo smoke run:
 
 ```bash
-cargo run -p netherwick-tools -- sim \
+cargo run -p pete-tools -- sim \
   --live \
   --live-addr 127.0.0.1:8787 \
   --steps 100000 \
@@ -52,8 +52,8 @@ Commands are sent with `source: "Gamepad"` and short TTLs so steering expires qu
 
 The scene uses this mapping:
 
-- Netherwick sim/world `x_m` maps to Three.js `x`.
-- Netherwick sim/world `y_m` maps to Three.js `z`.
+- Pete sim/world `x_m` maps to Three.js `x`.
+- Pete sim/world `y_m` maps to Three.js `z`.
 - Three.js `y` is up.
 - `heading_rad` rotates around the Three.js `y` axis.
 

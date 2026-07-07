@@ -1,6 +1,6 @@
 # Real Robot Read-Only Bring-Up
 
-Read-only robot mode lets Netherwick ingest Cockpit status/events and optional sensor data without allowing motion. It is intended for hardware bring-up, ledger collection, capture/replay data, dashboard inspection, and Reign teaching data before any autonomous driving mode exists.
+Read-only robot mode lets Pete ingest Cockpit status/events and optional sensor data without allowing motion. It is intended for hardware bring-up, ledger collection, capture/replay data, dashboard inspection, and Reign teaching data before any autonomous driving mode exists.
 
 Read-only mode must not drive motors.
 
@@ -9,7 +9,7 @@ Read-only mode must not drive motors.
 Simulated Cockpit, no hardware:
 
 ```bash
-cargo run -p netherwick-tools -- robot \
+cargo run -p pete-tools -- robot \
   --mode read-only \
   --cockpit sim \
   --ledger data/ledger/robot-readonly \
@@ -25,7 +25,7 @@ just robot
 Brainstem Cockpit over UART:
 
 ```bash
-cargo run -p netherwick-tools -- robot \
+cargo run -p pete-tools -- robot \
   --mode read-only \
   --cockpit uart --create-port /dev/ttyUSB0 \
   --ledger data/ledger/robot-readonly
@@ -34,7 +34,7 @@ cargo run -p netherwick-tools -- robot \
 Capture and dashboard:
 
 ```bash
-cargo run -p netherwick-tools -- robot \
+cargo run -p pete-tools -- robot \
   --mode read-only \
   --cockpit sim \
   --capture data/captures/robot-readonly-001 \
@@ -69,13 +69,13 @@ Log out and back in after changing group membership. A missing cockpit UART devi
 
 ## Optional Sensors
 
-The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, and `--gps`. Camera and microphone are optional by default, so absent devices do not block read-only cockpit bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Netherwick finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. Passing `--require-camera`, `--require-mic`, `--require-imu`, or `--require-gps` makes the command fail if that provider is unavailable.
+The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, and `--gps`. Camera and microphone are optional by default, so absent devices do not block read-only cockpit bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Pete finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. Passing `--require-camera`, `--require-mic`, `--require-imu`, or `--require-gps` makes the command fail if that provider is unavailable.
 
-`--asr-command` enables the command-backed ASR tool for microphone input. Netherwick chunks voiced PCM, writes each finalized chunk to a temporary WAV file, appends that path to the configured command, and reads the transcript from stdout. The same value can be supplied with `NETHERWICK_ASR_COMMAND`. ASR output is delivered as `EarSense.asr` and follows the normal sensation/vector path.
+`--asr-command` enables the command-backed ASR tool for microphone input. Pete chunks voiced PCM, writes each finalized chunk to a temporary WAV file, appends that path to the configured command, and reads the transcript from stdout. The same value can be supplied with `PETE_ASR_COMMAND`. ASR output is delivered as `EarSense.asr` and follows the normal sensation/vector path.
 
 Current minimum support is robust no-data handling plus simulated/brainstem cockpit capture. Rich camera, microphone, IMU, and GPS producers can be wired behind hardware features without changing the read-only runner.
 
-MPU-6050 IMUs are supported on Linux I2C buses when `netherwick-tools` is built with the existing `linux-hardware` sensor feature. On a Raspberry Pi, wire VCC to 3.3V physical pin 1, GND to pin 6, SDA to GPIO 2 physical pin 3, and SCL to GPIO 3 physical pin 5. Enable I2C, add the user to the `i2c` group, and reboot:
+MPU-6050 IMUs are supported on Linux I2C buses when `pete-tools` is built with the existing `linux-hardware` sensor feature. On a Raspberry Pi, wire VCC to 3.3V physical pin 1, GND to pin 6, SDA to GPIO 2 physical pin 3, and SCL to GPIO 3 physical pin 5. Enable I2C, add the user to the `i2c` group, and reboot:
 
 ```bash
 sudo raspi-config nonint do_i2c 0
@@ -86,19 +86,19 @@ sudo reboot
 The default bus is `/dev/i2c-1` and the default MPU-6050 address is `0x68`, so this reads real IMU data with normal Pi wiring:
 
 ```bash
-cargo run -p netherwick-tools -- robot
+cargo run -p pete-tools -- robot
 ```
 
 If AD0 is high, include the address in the device string:
 
 ```bash
-cargo run -p netherwick-tools -- robot --imu /dev/i2c-1@0x69
+cargo run -p pete-tools -- robot --imu /dev/i2c-1@0x69
 ```
 
 u-blox7 GPS receivers are read over USB serial at 9600 baud using NMEA. Auto-detection prefers stable `/dev/serial/by-id/*u-blox*`, `*gps*`, or `*gnss*` paths and avoids the selected Create serial port. Pin a receiver explicitly when needed:
 
 ```bash
-cargo run -p netherwick-tools -- robot --gps /dev/serial/by-id/<u-blox-device>
+cargo run -p pete-tools -- robot --gps /dev/serial/by-id/<u-blox-device>
 ```
 
 ## Capture Output
@@ -113,7 +113,7 @@ frames.jsonl
 The capture source is `RealRobot` and can be replayed with:
 
 ```bash
-cargo run -p netherwick-tools -- replay-capture \
+cargo run -p pete-tools -- replay-capture \
   --capture data/captures/robot-readonly-001 \
   --ledger data/ledger/replay-robot-readonly
 ```

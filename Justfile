@@ -1,21 +1,21 @@
 set shell := ["bash", "-euxo", "pipefail", "-c"]
 set dotenv-load := true
 
-cockpit_port := env_var_or_default("NETHERWICK_COCKPIT_PORT", "auto")
+cockpit_port := env_var_or_default("PETE_COCKPIT_PORT", "auto")
 gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "")
 camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 mic_device := env_var_or_default("MIC_DEVICE", "")
 imu_device := env_var_or_default("IMU_DEVICE", "")
-robot_dashboard := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD", "0.0.0.0:3000")
-robot_dashboard_tls_cert := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD_TLS_CERT", "certs/netherwick-dev.crt")
-robot_dashboard_tls_key := env_var_or_default("NETHERWICK_ROBOT_DASHBOARD_TLS_KEY", "certs/netherwick-dev.key")
-kinect_depth := env_var_or_default("NETHERWICK_KINECT_DEPTH", "1")
+robot_dashboard := env_var_or_default("PETE_ROBOT_DASHBOARD", "0.0.0.0:3000")
+robot_dashboard_tls_cert := env_var_or_default("PETE_ROBOT_DASHBOARD_TLS_CERT", "certs/pete-dev.crt")
+robot_dashboard_tls_key := env_var_or_default("PETE_ROBOT_DASHBOARD_TLS_KEY", "certs/pete-dev.key")
+kinect_depth := env_var_or_default("PETE_KINECT_DEPTH", "1")
 kinect_rgb_target_luma := env_var_or_default("KINECT_RGB_TARGET_LUMA", "0.32")
 kinect_rgb_auto_gain_max := env_var_or_default("KINECT_RGB_AUTO_GAIN_MAX", "3.0")
 kinect_rgb_gain := env_var_or_default("KINECT_RGB_GAIN", "1.0")
 kinect_rgb_gamma := env_var_or_default("KINECT_RGB_GAMMA", "0.80")
 kinect_rgb_brightness := env_var_or_default("KINECT_RGB_BRIGHTNESS", "0.0")
-tts_output_device := env_var_or_default("NETHERWICK_TTS_OUTPUT_DEVICE", "")
+tts_output_device := env_var_or_default("PETE_TTS_OUTPUT_DEVICE", "")
 cyw43_firmware_ref := env_var_or_default("CYW43_FIRMWARE_REF", "main")
 pico_w_bootsel_url := env_var_or_default("PICO_W_BOOTSEL_URL", "http://192.168.4.1/command")
 pico_w_mount := env_var_or_default("PICO_W_MOUNT", "")
@@ -27,7 +27,7 @@ default *args:
 
 # Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, and local models.
 setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-ort setup-tts setup-whisper
-    @echo "netherwick Linux setup complete"
+    @echo "pete Linux setup complete"
     @echo "next: cargo check && just sim"
 
 # Install required system packages via apt.
@@ -81,7 +81,7 @@ setup-rust:
 
 # Fetch and build Piper's self-contained Rust ONNX package.
 setup-ort:
-    cargo check -p netherwick-mouth
+    cargo check -p pete-mouth
 
 # Install Kinect packages from apt when available.
 setup-kinect:
@@ -131,7 +131,7 @@ setup-tts:
 setup-whisper:
     #!/usr/bin/env bash
     set -euo pipefail
-    MODEL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/netherwick/models/whisper"
+    MODEL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/pete/models/whisper"
     MODEL="$MODEL_DIR/ggml-tiny.en.bin"
     mkdir -p "$MODEL_DIR"
     if [ ! -s "$MODEL" ]; then
@@ -154,19 +154,19 @@ check:
 
 # Build the brainstem firmware ELF for the configured chip backend.
 brainstem-build:
-    cd crates/netherwick-brainstem && cargo build --release
+    cd crates/pete-brainstem && cargo build --release
 
 # Convert the brainstem firmware ELF to a Pico UF2 for the RP2040 backend.
 brainstem-uf2: brainstem-build
     elf2uf2-rs \
-        crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem \
-        crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem.uf2
+        crates/pete-brainstem/target/thumbv6m-none-eabi/release/pete-brainstem \
+        crates/pete-brainstem/target/thumbv6m-none-eabi/release/pete-brainstem.uf2
 
 # Fetch CYW43 firmware blobs required by the Pico W backend.
 brainstem-fetch-cyw43:
     #!/usr/bin/env bash
     set -euo pipefail
-    dir="crates/netherwick-brainstem/firmware/cyw43"
+    dir="crates/pete-brainstem/firmware/cyw43"
     base="https://raw.githubusercontent.com/embassy-rs/embassy/{{cyw43_firmware_ref}}/cyw43-firmware"
     mkdir -p "$dir"
     for file in \
@@ -179,19 +179,19 @@ brainstem-fetch-cyw43:
 
 # Build the Brainstem Pico W firmware with AP/status support.
 brainstem-pico-w-build: brainstem-fetch-cyw43
-    cd crates/netherwick-brainstem && cargo build --release --no-default-features --features pico-w
+    cd crates/pete-brainstem && cargo build --release --no-default-features --features pico-w
 
 # Convert the Brainstem Pico W firmware ELF to UF2.
 brainstem-pico-w-uf2: brainstem-pico-w-build
     elf2uf2-rs \
-        crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem \
-        crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem-pico-w.uf2
+        crates/pete-brainstem/target/thumbv6m-none-eabi/release/pete-brainstem \
+        crates/pete-brainstem/target/thumbv6m-none-eabi/release/pete-brainstem-pico-w.uf2
 
 # Build the Pico W firmware, put the board in BOOTSEL over Wi-Fi, then copy the UF2.
 flash: brainstem-pico-w-uf2
     #!/usr/bin/env bash
     set -euo pipefail
-    uf2="crates/netherwick-brainstem/target/thumbv6m-none-eabi/release/netherwick-brainstem-pico-w.uf2"
+    uf2="crates/pete-brainstem/target/thumbv6m-none-eabi/release/pete-brainstem-pico-w.uf2"
     bootsel_url="{{pico_w_bootsel_url}}"
     mount_override="{{pico_w_mount}}"
     timeout_secs="{{pico_w_mount_timeout_secs}}"
@@ -255,20 +255,20 @@ flash: brainstem-pico-w-uf2
 compose-config:
     docker compose config
 
-# Build the netherwick-live compose image.
+# Build the pete-live compose image.
 compose-build:
-    docker compose build netherwick-live
+    docker compose build pete-live
 
 # Start shared backing services (neo4j and qdrant).
 servers:
     docker compose up -d neo4j qdrant
 
-# Start backing services plus the netherwick-live container.
+# Start backing services plus the pete-live container.
 live-server:
-    docker compose --profile netherwick up -d neo4j qdrant netherwick-live
+    docker compose --profile pete up -d neo4j qdrant pete-live
 
 # Follow docker compose logs for a selected service.
-server-logs service="netherwick-live":
+server-logs service="pete-live":
     docker compose logs -f {{service}}
 
 # Stop and remove compose services.
@@ -283,17 +283,17 @@ test:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Run simulator mode through netherwick-tools.
+# Run simulator mode through pete-tools.
 sim:
-    cargo run -p netherwick-tools -- sim
+    cargo run -p pete-tools -- sim
 
 # Speak through the robot mouth without starting the robot body or sensors.
-say text="Hello. My name is Pete Netherwick.":
-    NETHERWICK_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p netherwick-tools -- mouth "{{text}}"
+say text="Hello. My name is Pete.":
+    PETE_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p pete-tools -- mouth "{{text}}"
 
 # Transcribe a WAV file through the local Whisper ASR path.
 transcribe wav:
-    cargo run -p netherwick-tools -- whisper-transcribe "{{wav}}"
+    cargo run -p pete-tools -- whisper-transcribe "{{wav}}"
 
 # Bring up the real robot in slow mode with default hardware auto-detection.
 robot *args:
@@ -338,14 +338,14 @@ robot *args:
             -keyout "{{robot_dashboard_tls_key}}" \
             -out "{{robot_dashboard_tls_cert}}" \
             -days 365 \
-            -subj "/CN=netherwick.local" \
-            -addext "subjectAltName=DNS:localhost,DNS:netherwick.local,IP:127.0.0.1$LAN_SAN"
+            -subj "/CN=pete.local" \
+            -addext "subjectAltName=DNS:localhost,DNS:pete.local,IP:127.0.0.1$LAN_SAN"
     fi
-    NETHERWICK_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p netherwick-tools -- robot \
-        --mode "${NETHERWICK_ROBOT_MODE:-slow}" \
-        --cockpit "${NETHERWICK_COCKPIT_BACKEND:-uart}" \
+    PETE_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p pete-tools -- robot \
+        --mode "${PETE_ROBOT_MODE:-slow}" \
+        --cockpit "${PETE_COCKPIT_BACKEND:-uart}" \
         --create-port "{{cockpit_port}}" \
-        --ledger "${NETHERWICK_ROBOT_LEDGER:-data/ledger/real/robot}" \
+        --ledger "${PETE_ROBOT_LEDGER:-data/ledger/real/robot}" \
         "${CAMERA_ARGS[@]}" \
         "${KINECT_ARGS[@]}" \
         "${MIC_ARGS[@]}" \
@@ -366,13 +366,13 @@ go target="virtual":
         exit 2
     fi
     just dev-cert
-    PORT="${NETHERWICK_LIVE_PORT:-8787}"
+    PORT="${PETE_LIVE_PORT:-8787}"
     LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     if [ -z "$LAN_IP" ]; then LAN_IP="127.0.0.1"; fi
     echo
-    echo "Netherwick Dream World is starting."
+    echo "Pete Dream World is starting."
     echo "Virtual training theater is collecting experience."
-    echo "Inline learning defaults to world-outcome. Set NETHERWICK_INLINE_LEARNING_MODE=off for collect-only."
+    echo "Inline learning defaults to world-outcome. Set PETE_INLINE_LEARNING_MODE=off for collect-only."
     echo "Dream controller mode: mechanical Reign passthrough."
     echo "Models shadow the mechanics; no NEAT/evolution controller is used for live control."
     echo
@@ -389,28 +389,28 @@ go target="virtual":
     if command -v qrencode >/dev/null 2>&1; then
         qrencode -t ANSIUTF8 "https://$LAN_IP:$PORT/view/3d" || true
     fi
-    cargo build -p netherwick-tools
+    cargo build -p pete-tools
     SIM_DREAM_POLICY_ARGS=()
-    ACTION_SELECTOR="${NETHERWICK_ACTION_SELECTOR:-baseline}"
-    if [ -n "${NETHERWICK_DREAM_POLICY_CHECKPOINT:-}" ] || [ "${NETHERWICK_AUTO_DREAM_POLICY:-0}" = "1" ]; then
+    ACTION_SELECTOR="${PETE_ACTION_SELECTOR:-baseline}"
+    if [ -n "${PETE_DREAM_POLICY_CHECKPOINT:-}" ] || [ "${PETE_AUTO_DREAM_POLICY:-0}" = "1" ]; then
         echo "Visible Dream World controller: mechanical Reign passthrough (Dream NEAT ignored)"
     fi
     echo "Visible Dream World action selector: $ACTION_SELECTOR"
-    target/debug/netherwick sim \
+    target/debug/pete sim \
         --live \
         --live-tls \
         --live-addr "0.0.0.0:$PORT" \
-        --live-tls-cert certs/netherwick-dev.crt \
-        --live-tls-key certs/netherwick-dev.key \
+        --live-tls-cert certs/pete-dev.crt \
+        --live-tls-key certs/pete-dev.key \
         --action-selector "$ACTION_SELECTOR" \
-        --scenario "${NETHERWICK_SCENARIO:-dream}" \
-        --steps "${NETHERWICK_SIM_STEPS:-1000000000}" \
-        --tick-delay-ms "${NETHERWICK_TICK_DELAY_MS:-100}" \
-        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" \
+        --scenario "${PETE_SCENARIO:-dream}" \
+        --steps "${PETE_SIM_STEPS:-1000000000}" \
+        --tick-delay-ms "${PETE_TICK_DELAY_MS:-100}" \
+        --ledger "${PETE_LEDGER:-data/ledger/virtual-live}" \
         "${SIM_DREAM_POLICY_ARGS[@]}" &
     PID="$!"
     trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' INT TERM EXIT
-    if [ "${NETHERWICK_OPEN_BROWSER:-0}" = "1" ] && command -v xdg-open >/dev/null 2>&1; then
+    if [ "${PETE_OPEN_BROWSER:-0}" = "1" ] && command -v xdg-open >/dev/null 2>&1; then
         if command -v curl >/dev/null 2>&1; then
             for _ in $(seq 1 80); do
                 if curl -kfsS "https://127.0.0.1:$PORT/view/scene" >/dev/null 2>&1; then
@@ -454,11 +454,11 @@ train target="virtual":
         echo "usage: just train virtual"
         exit 2
     fi
-    cargo run -p netherwick-tools -- train virtual \
-        --ledger "${NETHERWICK_LEDGER:-data/ledger/virtual-live}" \
-        --out-dir "${NETHERWICK_MODEL_OUT:-data/models/virtual/latest}" \
-        --report-out "${NETHERWICK_REPORT_OUT:-data/reports/virtual/latest.json}" \
-        --epochs "${NETHERWICK_EPOCHS:-5}"
+    cargo run -p pete-tools -- train virtual \
+        --ledger "${PETE_LEDGER:-data/ledger/virtual-live}" \
+        --out-dir "${PETE_MODEL_OUT:-data/models/virtual/latest}" \
+        --report-out "${PETE_REPORT_OUT:-data/reports/virtual/latest.json}" \
+        --epochs "${PETE_EPOCHS:-5}"
 
 # Alias for `just train virtual`.
 train-virtual:
@@ -468,18 +468,18 @@ train-virtual:
 evolve clear="false":
     #!/usr/bin/env bash
     set -euo pipefail
-    START_LEVEL="${NETHERWICK_NEAT_START_LEVEL:-motion}"
-    GENERATIONS="${NETHERWICK_NEAT_GENERATIONS:-12}"
-    POPULATION="${NETHERWICK_NEAT_POPULATION:-24}"
-    if [ -n "${NETHERWICK_NEAT_SEED:-}" ]; then
-        SEED="${NETHERWICK_NEAT_SEED}"
+    START_LEVEL="${PETE_NEAT_START_LEVEL:-motion}"
+    GENERATIONS="${PETE_NEAT_GENERATIONS:-12}"
+    POPULATION="${PETE_NEAT_POPULATION:-24}"
+    if [ -n "${PETE_NEAT_SEED:-}" ]; then
+        SEED="${PETE_NEAT_SEED}"
     else
         SEED="$(date +%s)"
     fi
-    HIDDEN_DIM="${NETHERWICK_NEAT_HIDDEN_DIM:-10}"
-    CHECKPOINT_DIR="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
-    DATASET_DIR="${NETHERWICK_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
-    EXPORT_DATASET="${NETHERWICK_NEAT_EXPORT_DATASET:-false}"
+    HIDDEN_DIM="${PETE_NEAT_HIDDEN_DIM:-10}"
+    CHECKPOINT_DIR="${PETE_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
+    DATASET_DIR="${PETE_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
+    EXPORT_DATASET="${PETE_NEAT_EXPORT_DATASET:-false}"
     CLEAR_FLAG=()
     if [ "{{clear}}" = "true" ] || [ "{{clear}}" = "--clear" ]; then
         CLEAR_FLAG=(--clear)
@@ -495,8 +495,8 @@ evolve clear="false":
     echo "  dataset-dir:   $DATASET_DIR"
     echo "  export-dataset:$EXPORT_DATASET"
 
-    cargo build --release -p netherwick-tools
-    target/release/netherwick dream-train \
+    cargo build --release -p pete-tools
+    target/release/pete dream-train \
         --start-level "$START_LEVEL" \
         --generations "$GENERATIONS" \
         --population "$POPULATION" \
@@ -516,18 +516,18 @@ evolve-fast clear="false":
 evolve-quality clear="false":
     #!/usr/bin/env bash
     set -euo pipefail
-    START_LEVEL="${NETHERWICK_NEAT_START_LEVEL:-motion}"
-    GENERATIONS="${NETHERWICK_NEAT_QUALITY_GENERATIONS:-36}"
-    POPULATION="${NETHERWICK_NEAT_QUALITY_POPULATION:-64}"
-    if [ -n "${NETHERWICK_NEAT_SEED:-}" ]; then
-        SEED="${NETHERWICK_NEAT_SEED}"
+    START_LEVEL="${PETE_NEAT_START_LEVEL:-motion}"
+    GENERATIONS="${PETE_NEAT_QUALITY_GENERATIONS:-36}"
+    POPULATION="${PETE_NEAT_QUALITY_POPULATION:-64}"
+    if [ -n "${PETE_NEAT_SEED:-}" ]; then
+        SEED="${PETE_NEAT_SEED}"
     else
         SEED="$(date +%s)"
     fi
-    HIDDEN_DIM="${NETHERWICK_NEAT_QUALITY_HIDDEN_DIM:-14}"
-    CHECKPOINT_DIR="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
-    DATASET_DIR="${NETHERWICK_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
-    EXPORT_DATASET="${NETHERWICK_NEAT_EXPORT_DATASET:-false}"
+    HIDDEN_DIM="${PETE_NEAT_QUALITY_HIDDEN_DIM:-14}"
+    CHECKPOINT_DIR="${PETE_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
+    DATASET_DIR="${PETE_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
+    EXPORT_DATASET="${PETE_NEAT_EXPORT_DATASET:-false}"
     CLEAR_FLAG=()
     if [ "{{clear}}" = "true" ] || [ "{{clear}}" = "--clear" ]; then
         CLEAR_FLAG=(--clear)
@@ -543,8 +543,8 @@ evolve-quality clear="false":
     echo "  dataset-dir:   $DATASET_DIR"
     echo "  export-dataset:$EXPORT_DATASET"
 
-    cargo build --release -p netherwick-tools
-    target/release/netherwick dream-train \
+    cargo build --release -p pete-tools
+    target/release/pete dream-train \
         --start-level "$START_LEVEL" \
         --generations "$GENERATIONS" \
         --population "$POPULATION" \
@@ -582,20 +582,20 @@ evolve-infinite clear="false":
     CLEAR_VALUE="{{clear}}"
     CLEAR_VALUE="${CLEAR_VALUE#clear=}"
 
-    DATASET_DIR="${NETHERWICK_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
-    EXPORT_DATASET="${NETHERWICK_NEAT_EXPORT_DATASET:-false}"
-    CHECKPOINT_DIR="${NETHERWICK_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
-    BENCHMARK_EVERY="${NETHERWICK_EVOLVE_BENCHMARK_EVERY:-10}"
-    BENCHMARK_STEPS="${NETHERWICK_EVOLVE_BENCHMARK_STEPS:-160}"
-    BENCHMARK_ROOT="${NETHERWICK_EVOLVE_BENCHMARK_ROOT:-data/reports/scenario/evolve}"
-    BENCHMARK_LEDGER_ROOT="${NETHERWICK_EVOLVE_BENCHMARK_LEDGER_ROOT:-data/ledger/evolve-benchmark}"
+    DATASET_DIR="${PETE_NEAT_DATASET_DIR:-datasets/dream-policy/v0/episodes}"
+    EXPORT_DATASET="${PETE_NEAT_EXPORT_DATASET:-false}"
+    CHECKPOINT_DIR="${PETE_NEAT_CHECKPOINT_DIR:-data/models/dream-policy/neat}"
+    BENCHMARK_EVERY="${PETE_EVOLVE_BENCHMARK_EVERY:-10}"
+    BENCHMARK_STEPS="${PETE_EVOLVE_BENCHMARK_STEPS:-160}"
+    BENCHMARK_ROOT="${PETE_EVOLVE_BENCHMARK_ROOT:-data/reports/scenario/evolve}"
+    BENCHMARK_LEDGER_ROOT="${PETE_EVOLVE_BENCHMARK_LEDGER_ROOT:-data/ledger/evolve-benchmark}"
 
-    BENCHMARK_MAX_RUNS="${NETHERWICK_EVOLVE_BENCHMARK_MAX_RUNS:-64}"
-    BENCHMARK_MAX_AGE_DAYS="${NETHERWICK_EVOLVE_BENCHMARK_MAX_AGE_DAYS:-21}"
+    BENCHMARK_MAX_RUNS="${PETE_EVOLVE_BENCHMARK_MAX_RUNS:-64}"
+    BENCHMARK_MAX_AGE_DAYS="${PETE_EVOLVE_BENCHMARK_MAX_AGE_DAYS:-21}"
 
-    DATASET_MAX_FILES="${NETHERWICK_DATASET_MAX_FILES:-8000}"
-    DATASET_MAX_BYTES="${NETHERWICK_DATASET_MAX_BYTES:-536870912}"
-    DATASET_MAX_AGE_DAYS="${NETHERWICK_DATASET_MAX_AGE_DAYS:-10}"
+    DATASET_MAX_FILES="${PETE_DATASET_MAX_FILES:-8000}"
+    DATASET_MAX_BYTES="${PETE_DATASET_MAX_BYTES:-536870912}"
+    DATASET_MAX_AGE_DAYS="${PETE_DATASET_MAX_AGE_DAYS:-10}"
 
     prune_dataset() {
         mkdir -p "$DATASET_DIR"
@@ -685,7 +685,7 @@ evolve-infinite clear="false":
             local scenario_out="$out_dir/$scenario.json"
             rm -rf "$scenario_ledger"
 
-            target/release/netherwick sim \
+            target/release/pete sim \
                 --scenario "$scenario" \
                 --steps "$BENCHMARK_STEPS" \
                 --tick-delay-ms 0 \
@@ -693,7 +693,7 @@ evolve-infinite clear="false":
                 --ledger "$scenario_ledger" \
                 --dream-policy-checkpoint "$checkpoint" >/dev/null
 
-            target/release/netherwick virtual-report \
+            target/release/pete virtual-report \
                 --ledger "$scenario_ledger" \
                 --out "$scenario_out" >/dev/null
 
@@ -708,7 +708,7 @@ evolve-infinite clear="false":
     while true; do
         ITERATION="$((ITERATION + 1))"
         echo "$(cyan "iteration") #$ITERATION"
-        NETHERWICK_NEAT_EXPORT_DATASET="$EXPORT_DATASET" just evolve-quality clear="$CLEAR_VALUE"
+        PETE_NEAT_EXPORT_DATASET="$EXPORT_DATASET" just evolve-quality clear="$CLEAR_VALUE"
         if [ "$EXPORT_DATASET" = "true" ]; then
             prune_dataset
         else
@@ -732,30 +732,30 @@ dev-cert:
     else
         LAN_SAN=",IP:$LAN_IP"
     fi
-    if [ ! -f certs/netherwick-dev.crt ] || [ ! -f certs/netherwick-dev.key ]; then
+    if [ ! -f certs/pete-dev.crt ] || [ ! -f certs/pete-dev.key ]; then
         openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout certs/netherwick-dev.key \
-            -out certs/netherwick-dev.crt \
+            -keyout certs/pete-dev.key \
+            -out certs/pete-dev.crt \
             -days 365 \
-            -subj "/CN=netherwick.local" \
-            -addext "subjectAltName=DNS:localhost,DNS:netherwick.local,IP:127.0.0.1$LAN_SAN"
-        echo "generated certs/netherwick-dev.crt and certs/netherwick-dev.key"
+            -subj "/CN=pete.local" \
+            -addext "subjectAltName=DNS:localhost,DNS:pete.local,IP:127.0.0.1$LAN_SAN"
+        echo "generated certs/pete-dev.crt and certs/pete-dev.key"
     else
-        echo "using existing certs/netherwick-dev.crt and certs/netherwick-dev.key"
+        echo "using existing certs/pete-dev.crt and certs/pete-dev.key"
     fi
 
 # Print the LAN URL for the virtual 3D HTTPS view.
 virtual-url:
     #!/usr/bin/env bash
     set -euo pipefail
-    PORT="${NETHERWICK_LIVE_PORT:-8787}"
+    PORT="${PETE_LIVE_PORT:-8787}"
     LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
     if [ -z "$LAN_IP" ]; then LAN_IP="127.0.0.1"; fi
     echo "https://$LAN_IP:$PORT/view/3d"
 
-# Pass arbitrary arguments through to netherwick-tools.
+# Pass arbitrary arguments through to pete-tools.
 run *args:
-    cargo run -p netherwick-tools -- {{args}}
+    cargo run -p pete-tools -- {{args}}
 
 # Run an end-to-end model rehearsal sequence.
 rehearse-models:
@@ -778,7 +778,7 @@ eval-scenario-smoke:
 
 # Inspect ledger contents with the tools CLI.
 inspect-ledger:
-    cargo run -p netherwick-tools -- inspect-ledger
+    cargo run -p pete-tools -- inspect-ledger
 
 # Run workspace automation commands from xtask.
 xtask command="check":
@@ -786,12 +786,12 @@ xtask command="check":
 
 # Show cockpit wiring status and selected serial port.
 real-cockpit:
-    @echo "Cockpit backend: ${NETHERWICK_COCKPIT_BACKEND:-uart}"
+    @echo "Cockpit backend: ${PETE_COCKPIT_BACKEND:-uart}"
     @echo "Cockpit port: {{cockpit_port}}"
 
 # Print detected hardware-related environment status.
 hardware-env:
-    cargo run -p netherwick-tools -- hardware-env
+    cargo run -p pete-tools -- hardware-env
 
 # Remove build artifacts.
 clean:
