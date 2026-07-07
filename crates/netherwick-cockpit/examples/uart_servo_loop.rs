@@ -1,11 +1,11 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use netherwick_brainstem_client::{
-    BrainstemClient, EventCursor, UartBrainstemClient, UartBrainstemClientConfig,
+use netherwick_cockpit::{
+    Cockpit, EventCursor, UartCockpit, UartCockpitConfig,
 };
 
-fn main() -> netherwick_brainstem_client::Result<()> {
+fn main() -> netherwick_cockpit::Result<()> {
     let path = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("NETHERWICK_BRAINSTEM_UART").ok())
@@ -16,46 +16,46 @@ fn main() -> netherwick_brainstem_client::Result<()> {
         .map(|value| value.parse().expect("baud rate must be a u32"))
         .unwrap_or(115_200);
 
-    let config = UartBrainstemClientConfig::new(path).with_baud_rate(baud_rate);
-    let mut brainstem = UartBrainstemClient::connect_with_config(config)?;
+    let config = UartCockpitConfig::new(path).with_baud_rate(baud_rate);
+    let mut cockpit = UartCockpit::connect_with_config(config)?;
     let mut events = EventCursor::new();
 
-    let caps = brainstem.get_capabilities()?;
+    let caps = cockpit.get_capabilities()?;
     println!(
-        "brainstem body={} drive={} verbs={}",
+        "cockpit body={} drive={} verbs={}",
         caps.body_kind,
         caps.drive,
         caps.verbs.join(",")
     );
 
-    brainstem.arm()?;
-    brainstem.stream_sensors(true, 0, 250)?;
+    cockpit.arm()?;
+    cockpit.stream_sensors(true, 0, 250)?;
 
-    let run_result = run_servo_loop(&mut brainstem, &mut events);
+    let run_result = run_servo_loop(&mut cockpit, &mut events);
 
-    let _ = brainstem.stop();
-    let _ = brainstem.stream_sensors(false, 0, 0);
-    let _ = brainstem.disarm();
+    let _ = cockpit.stop();
+    let _ = cockpit.stream_sensors(false, 0, 0);
+    let _ = cockpit.disarm();
 
     run_result
 }
 
 fn run_servo_loop(
-    brainstem: &mut UartBrainstemClient,
+    cockpit: &mut UartCockpit,
     events: &mut EventCursor,
-) -> netherwick_brainstem_client::Result<()> {
+) -> netherwick_cockpit::Result<()> {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
-        brainstem.heartbeat_stop(900)?;
-        brainstem.cmd_vel(70, 0, 300)?;
+        cockpit.heartbeat_stop(900)?;
+        cockpit.cmd_vel(70, 0, 300)?;
 
-        let batch = events.poll(brainstem)?;
+        let batch = events.poll(cockpit)?;
         for event in &batch.events {
             println!("event {} {:?}", event.seq, event.kind);
         }
         if batch.has_stop_reason() {
             eprintln!("stop reason event observed; stopping");
-            brainstem.stop()?;
+            cockpit.stop()?;
             return Ok(());
         }
 

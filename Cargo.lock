@@ -5119,11 +5119,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "netherwick-brainstem-client"
+name = "netherwick-cockpit"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "serialport",
  "thiserror 1.0.69",
+ "tungstenite",
 ]
 
 [[package]]

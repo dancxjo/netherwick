@@ -1,10 +1,10 @@
-use netherwick_brainstem_client::{BrainstemClient, EventCursor, SimBrainstemClient};
+use netherwick_cockpit::{Cockpit, EventCursor, SimCockpit};
 
-fn main() -> netherwick_brainstem_client::Result<()> {
-    let mut brainstem = SimBrainstemClient::new();
+fn main() -> netherwick_cockpit::Result<()> {
+    let mut cockpit = SimCockpit::new();
     let mut cursor = EventCursor::new();
 
-    let caps = brainstem.get_capabilities()?;
+    let caps = cockpit.get_capabilities()?;
     println!(
         "sim capabilities body={} drive={} verbs={}",
         caps.body_kind,
@@ -12,29 +12,29 @@ fn main() -> netherwick_brainstem_client::Result<()> {
         caps.verbs.join(",")
     );
 
-    brainstem.arm()?;
+    cockpit.arm()?;
     println!("accepted arm");
-    print_events("after arm", &mut cursor, &mut brainstem)?;
+    print_events("after arm", &mut cursor, &mut cockpit)?;
 
-    brainstem.heartbeat_stop(250)?;
+    cockpit.heartbeat_stop(250)?;
     println!("accepted heartbeat_stop ttl_ms=250");
-    brainstem.cmd_vel(70, 0, 200)?;
+    cockpit.cmd_vel(70, 0, 200)?;
     println!("accepted cmd_vel linear_mm_s=70 angular_mrad_s=0 ttl_ms=200");
-    print_events("after cmd_vel", &mut cursor, &mut brainstem)?;
+    print_events("after cmd_vel", &mut cursor, &mut cockpit)?;
 
-    brainstem.advance_ms(200);
-    print_events("after ttl completion", &mut cursor, &mut brainstem)?;
+    cockpit.advance_ms(200);
+    print_events("after ttl completion", &mut cursor, &mut cockpit)?;
 
-    brainstem.cmd_vel(40, 0, 500)?;
+    cockpit.cmd_vel(40, 0, 500)?;
     println!("accepted cmd_vel linear_mm_s=40 angular_mrad_s=0 ttl_ms=500");
-    brainstem.trip_safety();
+    cockpit.trip_safety();
     println!("simulated safety stop");
-    let batch = print_events("after safety stop", &mut cursor, &mut brainstem)?;
+    let batch = print_events("after safety stop", &mut cursor, &mut cockpit)?;
     if batch.has_stop_reason() {
         println!("stop reason observed");
     }
 
-    let status = brainstem.get_status()?;
+    let status = cockpit.get_status()?;
     println!("final status {}", status.raw);
     Ok(())
 }
@@ -42,10 +42,10 @@ fn main() -> netherwick_brainstem_client::Result<()> {
 fn print_events(
     label: &str,
     cursor: &mut EventCursor,
-    brainstem: &mut SimBrainstemClient,
-) -> netherwick_brainstem_client::Result<netherwick_brainstem_client::EventBatch> {
+    cockpit: &mut SimCockpit,
+) -> netherwick_cockpit::Result<netherwick_cockpit::EventBatch> {
     let before = cursor.next_seq();
-    let batch = cursor.poll(brainstem)?;
+    let batch = cursor.poll(cockpit)?;
     println!(
         "{label}: cursor {} -> {} ({} events)",
         before,

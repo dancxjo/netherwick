@@ -218,8 +218,8 @@ Known remaining TODOs:
 
 Start without robot hardware and climb only when the previous rung is boring:
 
-1. Simulator tests: `cargo test -p netherwick-brainstem-client`.
-2. Local simulator smoke loop: `cargo run -p netherwick-brainstem-client --example sim_servo_loop`.
+1. Simulator tests: `cargo test -p netherwick-cockpit`.
+2. Local simulator smoke loop: `cargo run -p netherwick-cockpit --example sim_servo_loop`.
 3. UDP smoke test against a powered brainstem: `GET_CAPABILITIES`, `GET_EVENTS`, then a low-TTL `CMD_VEL`.
 4. UART smoke test over the forebrain link with the same compact protocol.
 5. Robot attached, wheels off floor: arm, heartbeat, short low-speed motion, stop, event cursor check.
@@ -383,9 +383,9 @@ printf 'CMD_VEL 3 80 0 250\n' | nc -u -w1 192.168.4.1 82
 
 ## Host Client Contract
 
-The host-side crate `netherwick-brainstem-client` defines the smallest stable motherbrain/forebrain client surface. It is intentionally body-neutral: callers do not see Create OI modes, packet ids, BRC, LEDs, songs, dock opcodes, or Create UART details.
+The host-side crate `netherwick-cockpit` defines the cockpit protocol: the stable surface a pilot uses to operate the brainstem. A pilot may be a human web cockpit, an LLM over UART, a simulator test, or a future learned controller over another transport. The protocol is body-neutral for normal control and keeps transport choice out of pilot logic.
 
-Primary low-latency transports are UDP on port `82` and direct forebrain UART. Both use the same compact line protocol and implement the same `BrainstemClient` trait. HTTP remains useful for smoke testing and operator inspection.
+`SimCockpit`, `UdpCockpit`, `UartCockpit`, `HttpCockpit`, and `WebSocketCockpit` all implement the same `Cockpit` trait. UDP on port `82` and direct forebrain UART use the compact line protocol; HTTP and WebSocket use firmware JSON. They are peer transports under the same request/response/event model.
 
 The Rust trait exposes:
 
@@ -404,20 +404,20 @@ stream_sensors(enabled, packet_id, period_ms)
 reset_odometry()
 ```
 
-Generic outward events are represented by `BrainstemEventKind`, matching the public event names from `get_events`: `SafetyTripped`, `HeartbeatExpired`, `EStopLatched`, `MotionRequested`, `SensorFrameDecoded`, command lifecycle events, and the rest of the body-neutral vocabulary.
+Generic outward events are represented by `CockpitEventKind`, matching the public event names from `get_events`: `SafetyTripped`, `HeartbeatExpired`, `EStopLatched`, `MotionRequested`, `SensorFrameDecoded`, command lifecycle events, and the rest of the body-neutral vocabulary.
 
 `EventCursor` tracks `next_seq`. Each poll checks `dropped_before_seq`; if history was missed, it returns `MissedEvents` so the motherbrain can stop instead of driving with a hole in its transcript.
 
 Servo-loop example:
 
 ```bash
-cargo run -p netherwick-brainstem-client --example servo_loop -- 192.168.4.1:82
+cargo run -p netherwick-cockpit --example servo_loop -- 192.168.4.1:82
 ```
 
 Direct UART servo-loop example:
 
 ```bash
-cargo run -p netherwick-brainstem-client --example uart_servo_loop -- /dev/ttyACM0 115200
+cargo run -p netherwick-cockpit --example uart_servo_loop -- /dev/ttyACM0 115200
 ```
 
 The UART example also accepts `NETHERWICK_BRAINSTEM_UART` and `NETHERWICK_BRAINSTEM_BAUD`; baud defaults to `115200`.

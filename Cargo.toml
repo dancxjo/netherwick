@@ -24,7 +24,7 @@ members = [
     "crates/netherwick-runtime",
     "crates/netherwick-server",
     "crates/netherwick-ui",
-    "crates/netherwick-brainstem-client",
+    "crates/netherwick-cockpit",
     "crates/netherwick-tools",
     "xtask",
 ]
