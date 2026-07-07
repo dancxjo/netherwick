@@ -60,6 +60,10 @@ pub trait Cockpit {
         expect_accepted(self.execute(CockpitRequest::Ping)?)
     }
 
+    fn bootsel(&mut self) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::Bootsel)?)
+    }
+
     fn arm(&mut self) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::Arm)?)
     }
@@ -380,7 +384,8 @@ pub enum EscapeDirection {
 pub enum SafetyAction {
     None,
     Stop,
-    EStop,
+    Backoff,
+    BumpEscape,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -393,12 +398,12 @@ pub struct SafetyPolicy {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackKind {
-    Ack,
-    Warn,
+    Ok,
     Error,
-    Ready,
-    Done,
-    Custom,
+    Armed,
+    LostTarget,
+    DockSeen,
+    Danger,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -412,7 +417,8 @@ pub struct SongTone {
 pub enum PowerStateRequest {
     Wake,
     Sleep,
-    Toggle,
+    PulseBrc,
+    StartOi,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -451,7 +457,8 @@ impl SafetyAction {
         match self {
             Self::None => "none",
             Self::Stop => "stop",
-            Self::EStop => "estop",
+            Self::Backoff => "backoff",
+            Self::BumpEscape => "bump_escape",
         }
     }
 }
@@ -459,12 +466,12 @@ impl SafetyAction {
 impl FeedbackKind {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Ack => "ack",
-            Self::Warn => "warn",
+            Self::Ok => "ok",
             Self::Error => "error",
-            Self::Ready => "ready",
-            Self::Done => "done",
-            Self::Custom => "custom",
+            Self::Armed => "armed",
+            Self::LostTarget => "lost_target",
+            Self::DockSeen => "dock_seen",
+            Self::Danger => "danger",
         }
     }
 }
@@ -474,7 +481,8 @@ impl PowerStateRequest {
         match self {
             Self::Wake => "wake",
             Self::Sleep => "sleep",
-            Self::Toggle => "toggle",
+            Self::PulseBrc => "pulse_brc",
+            Self::StartOi => "start_oi",
         }
     }
 }
@@ -639,6 +647,7 @@ impl StatusSummary {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CockpitRequest {
     Ping,
+    Bootsel,
     GetStatus,
     GetCapabilities,
     GetEvents { since_seq: u32 },
@@ -774,6 +783,7 @@ impl CockpitRequest {
     pub fn apply<C: Cockpit>(&self, client: &mut C) -> Result<CockpitResponse> {
         match self {
             Self::Ping => client.ping().map(|()| CockpitResponse::Accepted),
+            Self::Bootsel => client.bootsel().map(|()| CockpitResponse::Accepted),
             Self::GetStatus => Ok(CockpitResponse::Status(client.get_status()?)),
             Self::GetCapabilities => {
                 Ok(CockpitResponse::Capabilities(client.get_capabilities()?))
@@ -999,14 +1009,14 @@ impl CockpitRequest {
             if self.needs_seq() {
                 object.insert("seq".to_owned(), command_id.into());
             }
-            if let Some(tones) = json_tones_for_request(self) {
-                object.insert("tones".to_owned(), tones.into());
-            }
+            rewrite_for_firmware_json(self, object);
             if let Some(kind) = object.get_mut("kind") {
                 if kind == "get_status" {
                     *kind = "status".into();
                 } else if kind == "e_stop" {
                     *kind = "estop".into();
+                } else if kind == "clear_e_stop" {
+                    *kind = "clear_estop".into();
                 }
             }
         }
@@ -1017,6 +1027,7 @@ impl CockpitRequest {
         !matches!(
             self,
             Self::Ping
+                | Self::Bootsel
                 | Self::GetStatus
                 | Self::GetCapabilities
                 | Self::GetEvents { .. }
@@ -1035,6 +1046,7 @@ impl CockpitRequest {
     fn to_compact_line(&self, seq: u32) -> String {
         match self {
             Self::Ping => format!("PING {seq}\n"),
+            Self::Bootsel => format!("BOOTSEL {seq}\n"),
             Self::GetStatus => format!("STATUS {seq}\n"),
             Self::GetCapabilities => format!("GET_CAPABILITIES {seq}\n"),
             Self::GetEvents { since_seq } => format!("GET_EVENTS {seq} {since_seq}\n"),
@@ -1610,6 +1622,11 @@ impl Cockpit for SimCockpit {
                 Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
             }
             CockpitRequest::Ping => {
+                let id = self.accept_command();
+                self.complete_command(id);
+                Ok(CockpitResponse::Accepted)
+            }
+            CockpitRequest::Bootsel => {
                 let id = self.accept_command();
                 self.complete_command(id);
                 Ok(CockpitResponse::Accepted)
@@ -2500,18 +2517,29 @@ fn compact_tones(tones: &[SongTone]) -> String {
     encoded
 }
 
-fn json_tones_for_request(request: &CockpitRequest) -> Option<String> {
+fn rewrite_for_firmware_json(
+    request: &CockpitRequest,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) {
     match request {
         CockpitRequest::DefineChirp { tones, .. } | CockpitRequest::SongDefine { tones, .. } => {
-            Some(
+            object.insert(
+                "tones".to_owned(),
                 tones
                     .iter()
                     .map(|tone| format!("{}:{}", tone.note, tone.duration_64ths))
                     .collect::<Vec<_>>()
-                    .join(","),
-            )
+                    .join(",")
+                    .into(),
+            );
         }
-        _ => None,
+        CockpitRequest::SetSafetyPolicy { policy } => {
+            object.remove("policy");
+            object.insert("bump_action".to_owned(), policy.bump.as_str().into());
+            object.insert("cliff_action".to_owned(), policy.cliff.as_str().into());
+            object.insert("wheel_drop_latch".to_owned(), policy.wheel_drop_latch.into());
+        }
+        _ => {}
     }
 }
 
@@ -2526,6 +2554,7 @@ fn time_reached(now_ms: u32, deadline_ms: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn simulator_capabilities_round_trip() {
@@ -2535,6 +2564,113 @@ mod tests {
         assert_eq!(caps.drive, "differential");
         assert!(caps.verbs.contains(&"cmd_vel".to_owned()));
         assert!(caps.events.contains(&"safety_tripped".to_owned()));
+    }
+
+    #[test]
+    fn cockpit_request_covers_public_firmware_verbs() {
+        let cockpit_verbs: BTreeSet<_> = sample_cockpit_requests()
+            .into_iter()
+            .map(|(verb, _, _)| verb)
+            .filter(|verb| *verb != "bootsel")
+            .collect();
+        let firmware_verbs: BTreeSet<_> = [
+            "ping",
+            "status",
+            "get_capabilities",
+            "get_events",
+            "arm",
+            "disarm",
+            "stop",
+            "estop",
+            "clear_estop",
+            "clear_motion_queue",
+            "cmd_vel",
+            "drive_direct",
+            "drive_arc",
+            "drive_for",
+            "turn_by",
+            "arc_for",
+            "creep_until",
+            "scan_arc",
+            "face_bearing",
+            "track_bearing",
+            "hold_heading",
+            "turn_to_heading",
+            "dock_align",
+            "wall_follow",
+            "wiggle_align",
+            "bump_escape",
+            "unstick",
+            "cliff_guard",
+            "request_sensors",
+            "stream_sensors",
+            "set_safety_policy",
+            "song_define",
+            "song_play",
+            "define_chirp",
+            "play_feedback",
+            "power_state",
+            "calibrate_turn",
+            "reset_odometry",
+            "dock",
+            "set_lights",
+            "set_mode",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(cockpit_verbs, firmware_verbs);
+    }
+
+    #[test]
+    fn cockpit_requests_serialize_to_firmware_json_kinds() {
+        for (verb, expected_json_kind, _) in sample_cockpit_requests() {
+            let request = sample_request_for(verb);
+            let json = request.to_firmware_json(7).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                value.get("kind").and_then(serde_json::Value::as_str),
+                Some(expected_json_kind),
+                "{verb} serialized as {json}"
+            );
+            assert_eq!(value.get("command_id").and_then(serde_json::Value::as_u64), Some(7));
+        }
+    }
+
+    #[test]
+    fn cockpit_requests_serialize_to_compact_command_names() {
+        for (verb, _, expected_compact_name) in sample_cockpit_requests() {
+            let request = sample_request_for(verb);
+            let line = request.to_compact_line(9);
+            let first = line.split_ascii_whitespace().next().unwrap();
+            assert_eq!(first, expected_compact_name, "{verb} serialized as {line}");
+        }
+    }
+
+    #[test]
+    fn firmware_json_rewrites_policy_and_tones() {
+        let policy = CockpitRequest::SetSafetyPolicy {
+            policy: SafetyPolicy {
+                bump: SafetyAction::BumpEscape,
+                cliff: SafetyAction::Backoff,
+                wheel_drop_latch: true,
+            },
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&policy.to_firmware_json(1).unwrap()).unwrap();
+        assert!(value.get("policy").is_none());
+        assert_eq!(value["bump_action"], "bump_escape");
+        assert_eq!(value["cliff_action"], "backoff");
+        assert_eq!(value["wheel_drop_latch"], true);
+
+        let song = CockpitRequest::SongDefine {
+            id: 2,
+            tones: vec![SongTone {
+                note: 72,
+                duration_64ths: 8,
+            }],
+        };
+        let value: serde_json::Value = serde_json::from_str(&song.to_firmware_json(2).unwrap()).unwrap();
+        assert_eq!(value["tones"], "72:8");
     }
 
     #[test]
@@ -2795,5 +2931,212 @@ mod tests {
     fn non_utf8_response_maps_to_bad_response() {
         let err = response_from_bytes(&[0xff]).unwrap_err();
         assert!(matches!(err, CockpitError::BadResponse(_)));
+    }
+
+    fn sample_cockpit_requests() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            ("ping", "ping", "PING"),
+            ("bootsel", "bootsel", "BOOTSEL"),
+            ("status", "status", "STATUS"),
+            ("get_capabilities", "get_capabilities", "GET_CAPABILITIES"),
+            ("get_events", "get_events", "GET_EVENTS"),
+            ("arm", "arm", "ARM"),
+            ("disarm", "disarm", "DISARM"),
+            ("stop", "stop", "STOP"),
+            ("estop", "estop", "ESTOP"),
+            ("clear_estop", "clear_estop", "CLEAR_ESTOP"),
+            ("clear_motion_queue", "clear_motion_queue", "CLEAR_MOTION_QUEUE"),
+            ("cmd_vel", "cmd_vel", "CMD_VEL"),
+            ("drive_direct", "drive_direct", "DRIVE_DIRECT"),
+            ("drive_arc", "drive_arc", "DRIVE_ARC"),
+            ("drive_for", "drive_for", "DRIVE_FOR"),
+            ("turn_by", "turn_by", "TURN_BY"),
+            ("arc_for", "arc_for", "ARC_FOR"),
+            ("creep_until", "creep_until", "CREEP_UNTIL"),
+            ("scan_arc", "scan_arc", "SCAN_ARC"),
+            ("face_bearing", "face_bearing", "FACE_BEARING"),
+            ("track_bearing", "track_bearing", "TRACK_BEARING"),
+            ("hold_heading", "hold_heading", "HOLD_HEADING"),
+            ("turn_to_heading", "turn_to_heading", "TURN_TO_HEADING"),
+            ("dock_align", "dock_align", "DOCK_ALIGN"),
+            ("wall_follow", "wall_follow", "WALL_FOLLOW"),
+            ("wiggle_align", "wiggle_align", "WIGGLE_ALIGN"),
+            ("bump_escape", "bump_escape", "BUMP_ESCAPE"),
+            ("unstick", "unstick", "UNSTICK"),
+            ("cliff_guard", "cliff_guard", "CLIFF_GUARD"),
+            ("request_sensors", "request_sensors", "REQUEST_SENSORS"),
+            ("stream_sensors", "stream_sensors", "STREAM_SENSORS"),
+            ("set_safety_policy", "set_safety_policy", "SET_SAFETY_POLICY"),
+            ("song_define", "song_define", "SONG_DEFINE"),
+            ("song_play", "song_play", "SONG_PLAY"),
+            ("define_chirp", "define_chirp", "DEFINE_CHIRP"),
+            ("play_feedback", "play_feedback", "PLAY_FEEDBACK"),
+            ("power_state", "power_state", "POWER_STATE"),
+            ("calibrate_turn", "calibrate_turn", "CALIBRATE_TURN"),
+            ("reset_odometry", "reset_odometry", "RESET_ODOMETRY"),
+            ("dock", "dock", "DOCK"),
+            ("set_lights", "set_lights", "SET_LIGHTS"),
+            ("set_mode", "set_mode", "SET_MODE"),
+        ]
+    }
+
+    fn sample_request_for(verb: &str) -> CockpitRequest {
+        match verb {
+            "ping" => CockpitRequest::Ping,
+            "bootsel" => CockpitRequest::Bootsel,
+            "status" => CockpitRequest::GetStatus,
+            "get_capabilities" => CockpitRequest::GetCapabilities,
+            "get_events" => CockpitRequest::GetEvents { since_seq: 3 },
+            "arm" => CockpitRequest::Arm,
+            "disarm" => CockpitRequest::Disarm,
+            "stop" => CockpitRequest::Stop,
+            "estop" => CockpitRequest::EStop,
+            "clear_estop" => CockpitRequest::ClearEStop,
+            "clear_motion_queue" => CockpitRequest::ClearMotionQueue,
+            "cmd_vel" => CockpitRequest::CmdVel {
+                linear_mm_s: 10,
+                angular_mrad_s: 20,
+                ttl_ms: 300,
+            },
+            "drive_direct" => CockpitRequest::DriveDirect {
+                left_mm_s: 10,
+                right_mm_s: 11,
+                ttl_ms: 300,
+            },
+            "drive_arc" => CockpitRequest::DriveArc {
+                velocity_mm_s: 10,
+                radius_mm: 200,
+                ttl_ms: 300,
+            },
+            "drive_for" => CockpitRequest::DriveFor {
+                distance_mm: 300,
+                velocity_mm_s: 80,
+                timeout_ms: 2_000,
+            },
+            "turn_by" => CockpitRequest::TurnBy {
+                angle_mrad: 1_570,
+                angular_mrad_s: 800,
+                timeout_ms: 2_000,
+            },
+            "arc_for" => CockpitRequest::ArcFor {
+                velocity_mm_s: 80,
+                radius_mm: 250,
+                duration_ms: 1_000,
+            },
+            "creep_until" => CockpitRequest::CreepUntil {
+                velocity_mm_s: 40,
+                angular_mrad_s: 0,
+                timeout_ms: 1_000,
+            },
+            "scan_arc" => CockpitRequest::ScanArc {
+                angle_mrad: 3_140,
+                angular_mrad_s: 500,
+                timeout_ms: 4_000,
+            },
+            "face_bearing" => CockpitRequest::FaceBearing {
+                bearing_mrad: 100,
+                max_angular_mrad_s: 500,
+                tolerance_mrad: 35,
+                ttl_ms: 300,
+            },
+            "track_bearing" => CockpitRequest::TrackBearing {
+                bearing_mrad: 100,
+                range_mm: 900,
+                max_linear_mm_s: 120,
+                max_angular_mrad_s: 500,
+                stop_range_mm: 250,
+                ttl_ms: 300,
+            },
+            "hold_heading" => CockpitRequest::HoldHeading {
+                heading_error_mrad: 100,
+                velocity_mm_s: 80,
+                max_angular_mrad_s: 500,
+                ttl_ms: 300,
+            },
+            "turn_to_heading" => CockpitRequest::TurnToHeading {
+                heading_error_mrad: 100,
+                angular_mrad_s: 500,
+                tolerance_mrad: 35,
+                timeout_ms: 2_000,
+            },
+            "dock_align" => CockpitRequest::DockAlign {
+                bearing_mrad: 50,
+                range_mm: 600,
+                max_linear_mm_s: 80,
+                max_angular_mrad_s: 500,
+                stop_range_mm: 250,
+                ttl_ms: 300,
+            },
+            "wall_follow" => CockpitRequest::WallFollow {
+                distance_error_mm: 20,
+                velocity_mm_s: 80,
+                max_angular_mrad_s: 400,
+                ttl_ms: 300,
+            },
+            "wiggle_align" => CockpitRequest::WiggleAlign {
+                amplitude_mrad: 200,
+                angular_mrad_s: 500,
+                cycles: 2,
+            },
+            "bump_escape" => CockpitRequest::BumpEscape {
+                direction: EscapeDirection::Either,
+                backoff_mm_s: 80,
+                turn_angular_mrad_s: 900,
+            },
+            "unstick" => CockpitRequest::Unstick {
+                direction: EscapeDirection::Either,
+                backoff_mm_s: 90,
+                turn_angular_mrad_s: 900,
+            },
+            "cliff_guard" => CockpitRequest::CliffGuard { clear: false },
+            "request_sensors" => CockpitRequest::RequestSensors { packet_id: 0 },
+            "stream_sensors" => CockpitRequest::StreamSensors {
+                enabled: true,
+                packet_id: 0,
+                period_ms: 250,
+            },
+            "set_safety_policy" => CockpitRequest::SetSafetyPolicy {
+                policy: SafetyPolicy {
+                    bump: SafetyAction::Stop,
+                    cliff: SafetyAction::Stop,
+                    wheel_drop_latch: true,
+                },
+            },
+            "song_define" => CockpitRequest::SongDefine {
+                id: 1,
+                tones: sample_tones(),
+            },
+            "song_play" => CockpitRequest::SongPlay { id: 1 },
+            "define_chirp" => CockpitRequest::DefineChirp {
+                feedback: FeedbackKind::Ok,
+                tones: sample_tones(),
+            },
+            "play_feedback" => CockpitRequest::PlayFeedback {
+                feedback: FeedbackKind::Ok,
+            },
+            "power_state" => CockpitRequest::PowerState {
+                request: PowerStateRequest::Wake,
+            },
+            "calibrate_turn" => CockpitRequest::CalibrateTurn {
+                angular_mrad_s: 500,
+                duration_ms: 1_000,
+            },
+            "reset_odometry" => CockpitRequest::ResetOdometry,
+            "dock" => CockpitRequest::Dock,
+            "set_lights" => CockpitRequest::SetLights {
+                pattern: LightPattern::Status,
+            },
+            "set_mode" => CockpitRequest::SetMode {
+                mode: CreateOiMode::Safe,
+            },
+            other => panic!("missing sample for {other}"),
+        }
+    }
+
+    fn sample_tones() -> Vec<SongTone> {
+        vec![SongTone {
+            note: 72,
+            duration_64ths: 8,
+        }]
     }
 }

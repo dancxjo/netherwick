@@ -387,9 +387,11 @@ The host-side crate `netherwick-cockpit` defines the cockpit protocol: the stabl
 
 `SimCockpit`, `UdpCockpit`, `UartCockpit`, `HttpCockpit`, and `WebSocketCockpit` all implement the same `Cockpit` trait. UDP on port `82` and direct forebrain UART use the compact line protocol; HTTP and WebSocket use firmware JSON. They are peer transports under the same request/response/event model.
 
-The Rust trait exposes:
+The Rust trait exposes the complete firmware public verb set through both named helper methods and the `CockpitRequest` enum:
 
 ```rust
+ping()
+bootsel() // service/debug, not advertised as a normal body capability
 get_status()
 get_capabilities()
 get_events_since(since_seq)
@@ -398,10 +400,39 @@ disarm()
 stop()
 estop()
 clear_estop()
+clear_motion_queue()
 cmd_vel(linear_mm_s, angular_mrad_s, ttl_ms)
+drive_direct(left_mm_s, right_mm_s, ttl_ms)
+drive_arc(velocity_mm_s, radius_mm, ttl_ms)
+drive_for(distance_mm, velocity_mm_s, timeout_ms)
+turn_by(angle_mrad, angular_mrad_s, timeout_ms)
+arc_for(velocity_mm_s, radius_mm, duration_ms)
+creep_until(velocity_mm_s, angular_mrad_s, timeout_ms)
+scan_arc(angle_mrad, angular_mrad_s, timeout_ms)
+face_bearing(bearing_mrad, max_angular_mrad_s, tolerance_mrad, ttl_ms)
+track_bearing(bearing_mrad, range_mm, max_linear_mm_s, max_angular_mrad_s, stop_range_mm, ttl_ms)
+hold_heading(heading_error_mrad, velocity_mm_s, max_angular_mrad_s, ttl_ms)
+turn_to_heading(heading_error_mrad, angular_mrad_s, tolerance_mrad, timeout_ms)
+dock_align(bearing_mrad, range_mm, max_linear_mm_s, max_angular_mrad_s, stop_range_mm, ttl_ms)
+wall_follow(distance_error_mm, velocity_mm_s, max_angular_mrad_s, ttl_ms)
+wiggle_align(amplitude_mrad, angular_mrad_s, cycles)
+bump_escape(direction, backoff_mm_s, turn_angular_mrad_s)
+unstick(direction, backoff_mm_s, turn_angular_mrad_s)
+cliff_guard(clear)
 heartbeat_stop(timeout_ms)
+request_sensors(packet_id)
 stream_sensors(enabled, packet_id, period_ms)
+set_safety_policy(policy)
+song_define(id, tones)
+song_play(id)
+define_chirp(kind, tones)
+play_feedback(kind)
+power_state(request)
+calibrate_turn(angular_mrad_s, duration_ms)
 reset_odometry()
+dock()
+set_lights(pattern)
+set_mode(mode)
 ```
 
 Generic outward events are represented by `CockpitEventKind`, matching the public event names from `get_events`: `SafetyTripped`, `HeartbeatExpired`, `EStopLatched`, `MotionRequested`, `SensorFrameDecoded`, command lifecycle events, and the rest of the body-neutral vocabulary.
