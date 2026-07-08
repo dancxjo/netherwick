@@ -18,6 +18,8 @@ for fast iteration after one small print or FreeCAD inspection.
 """
 
 from build123d import *
+from pathlib import Path
+import struct
 
 # ------------------------------------------------------------
 # Coordinate system
@@ -94,12 +96,42 @@ YOKE_PAD_H = 2.0
 YOKE_X = DSUB_W / 2 + 5.0
 YOKE_RIB_T = 2.0
 
+# ASCII STL is larger than binary, but easier to inspect and friendlier to
+# viewers/importers that get confused by OpenCASCADE binary STL headers.
+STL_ASCII = True
+STL_TOLERANCE = 0.001
+STL_ANGULAR_TOLERANCE = 0.1
+
 
 def safe_fillet(edges, radius):
     try:
         fillet(edges, radius=radius)
     except Exception as exc:
         print(f"Skipping fillet radius={radius}: {exc}")
+
+
+def export_printable_stl(shape, path):
+    ok = export_stl(
+        shape,
+        path,
+        tolerance=STL_TOLERANCE,
+        angular_tolerance=STL_ANGULAR_TOLERANCE,
+        ascii_format=STL_ASCII,
+    )
+    if not ok:
+        raise RuntimeError(f"STL export failed: {path}")
+    return audit_stl(path)
+
+
+def audit_stl(path):
+    data = Path(path).read_bytes()
+    if data.lstrip().startswith(b"solid"):
+        triangles = data.count(b"facet normal")
+        return f"{path}: ASCII STL, {triangles} facets, {len(data)} bytes"
+    if len(data) < 84:
+        raise RuntimeError(f"STL export is too small to contain a binary header: {path}")
+    triangles = struct.unpack("<I", data[80:84])[0]
+    return f"{path}: binary STL, {triangles} facets, {len(data)} bytes"
 
 
 def make_bottom_box():
@@ -258,11 +290,11 @@ with BuildPart() as assembly:
 
 # Export separate and combined files.
 export_step(bottom, "create1_brainstem_row0_box_v4_bottom.step")
-export_stl(bottom, "create1_brainstem_row0_box_v4_bottom.stl")
+bottom_stl = export_printable_stl(bottom, "create1_brainstem_row0_box_v4_bottom.stl")
 export_step(lid, "create1_brainstem_row0_box_v4_lid.step")
-export_stl(lid, "create1_brainstem_row0_box_v4_lid.stl")
+lid_stl = export_printable_stl(lid, "create1_brainstem_row0_box_v4_lid.stl")
 export_step(assembly.part, "create1_brainstem_row0_box_v4_assembly.step")
-export_stl(assembly.part, "create1_brainstem_row0_box_v4_assembly.stl")
+assembly_stl = export_printable_stl(assembly.part, "create1_brainstem_row0_box_v4_assembly.stl")
 
 try:
     show_object(assembly.part)
@@ -273,3 +305,7 @@ print("Wrote:")
 print("  create1_brainstem_row0_box_v4_bottom.step/.stl")
 print("  create1_brainstem_row0_box_v4_lid.step/.stl")
 print("  create1_brainstem_row0_box_v4_assembly.step/.stl")
+print("STL audit:")
+print(f"  {bottom_stl}")
+print(f"  {lid_stl}")
+print(f"  {assembly_stl}")

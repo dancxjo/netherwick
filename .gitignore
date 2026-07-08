@@ -26,3 +26,10 @@ firmware/
 
 .venv
 .vscode/settings.json
+
+# CAD generation intermediates. Keep print-ready STL meshes in Git.
+skeleton/**/*.step
+skeleton/**/*.stp
+skeleton/**/*.brep
+skeleton/**/*.brep.gz
+!skeleton/**/*.stl
