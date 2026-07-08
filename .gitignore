@@ -33,3 +33,4 @@ skeleton/**/*.stp
 skeleton/**/*.brep
 skeleton/**/*.brep.gz
 !skeleton/**/*.stl
+*.step

@@ -1,17 +1,16 @@
 """
-create1_brainstem_row0_box_v4.py
+skull.py
 
-A first tangible build123d model for the Netherwick / Pete brainstem enclosure.
+A build123d model for the Netherwick / Pete brainstem command cube.
 
 Architecture:
-- Full-width Row-0 command-module-style box sitting on the Create 1 shelf.
-- Plinth / cargo-bay D-sub connector lives in row 0.0, butted against the north wall.
-- Enclosure body occupies row 0.1, with a rectangular north-center bite around the plinth.
-- Bottom is a hollow open-top box; top is a snap lid with a small front lip.
-- MPU-6050 hangs from the lid on the west/left side of the connector.
-- Pico W hangs from the lid on the east/right side of the connector, USB facing north.
-- TXS0108E level shifter sits belly-up on the floor in a snap dock.
-- Connector seating/extraction yoke ribs route push/pull loads toward D-sub shell/flanges.
+- Low-profile cube cap centered on the Create 1 cargo-bay connector plinth.
+- North wall has an exact-width plinth notch with a tiny lower lead-in/funnel.
+- Pull backward/south to disengage; a small south shelf-cliff acts as a mild fulcrum.
+- Bottom is a hollow open-top cube; top is a translucent-black hinged/snap lid.
+- MPU-6050 and Pico W hang under the lid and remain visible through that lid.
+- TXS0108E level shifter sits dead-bug on the floor, centered south of the plinth.
+- No full-width row, no side pods, no screw dependency, no yoke drama.
 
 This is a fit/design model, not a final measured part. The constants at top are meant
 for fast iteration after one small print or FreeCAD inspection.
@@ -28,18 +27,21 @@ import struct
 # Z: up from shelf top.
 # ------------------------------------------------------------
 
-# Overall row-0 box dimensions. These are deliberately conservative placeholders.
-BOX_W = 194.0          # full cargo bay / shelf width, mm-ish from mesh-derived width
-BOX_D = 42.0           # row-0 usable shelf depth south of plinth strip
-BOX_H = 18.0           # bottom box wall height
+# Overall cube dimensions. Still deliberately conservative placeholders.
+BOX_W = 88.0           # compact cap, not cargo-bay full width
+BOX_D = 45.0           # enough south room for TXS dock and extraction grip
+BOX_H = 16.0           # low-profile bottom box wall height
 WALL = 2.2
 FLOOR = 1.8
 CLEAR = 0.45
 
 # Plinth / D-sub north bite. The plinth sits along the north edge, centered in X.
-PLINTH_W = 64.0        # includes clearance around raised plastic plinth
+PLINTH_W = 64.0        # exact nominal raised-plinth width before print clearance
 PLINTH_D = 18.0        # how far south the bite intrudes from north wall
 PLINTH_CLEAR_H = 12.0  # clearance height under/around connector shell
+PLINTH_FUNNEL_EXTRA_W = 5.0
+PLINTH_FUNNEL_D = 4.2
+PLINTH_FUNNEL_H = 5.0
 
 # D-sub male connector shell/flange approximation, used for clearance/yoke pads.
 DSUB_W = 56.0
@@ -48,53 +50,77 @@ DSUB_H = 13.0
 DSUB_Z = FLOOR + 4.5   # approximate shell center height inside box
 DSUB_Y = BOX_D / 2 - PLINTH_D + 7.0
 
-# Screw holes at west/east ends, left open for now.
-SCREW_X = 82.0
-SCREW_Y = -5.0
-SCREW_R = 2.0
-SCREW_BOSS_R = 5.5
+# South extraction shelf-cliff. Keep this shallow: it should pry gently, not lever
+# the D-sub hard enough to bend pins.
+FULCRUM_W = 24.0
+FULCRUM_D = 5.0
+FULCRUM_H = 2.6
+FULCRUM_Y = -BOX_D / 2 - FULCRUM_D / 2 + 0.8
 
 # Lid parameters
 LID_THICK = 2.0
 LID_OVERLAP = 1.2      # lid pockets down inside bottom box
 LID_CLEAR = 0.25
-LIP_W = 42.0
-LIP_D = 5.0
-LIP_H = 3.0
+HINGE_W = 10.0
+HINGE_D = 3.4
+HINGE_H = 3.0
+SNAP_TAB_W = 10.0
+SNAP_TAB_D = 2.0
+SNAP_TAB_H = 1.7
 
-# Board guesses. Adjust to your exact breakouts.
-MPU_W = 21.0
-MPU_D = 16.0
-MPU_HOLE_SPAN_Y = 10.5
-MPU_HOLE_X_FROM_CENTER = 7.0
-MPU_X = -38.0
-MPU_Y = -7.0
+# Board dimensions and hole positions.
+#
+# Pico source notes:
+# - ncarandini/KiCad-RP-Pico gives the 21 x 51 mm board outline and SWD holes.
+# - The official Raspberry Pi Pico mechanical drawing gives the four 2.1 mm
+#   mounting holes. In normal Pico coordinates their centers are at
+#   x = +/-5.7, y = +/-23.5. This enclosure keeps the Pico crosswise, so those
+#   become local x = +/-23.5, y = +/-5.7.
+#
+# MPU/GY-521 source notes:
+# - Common GY-521-style MPU-6050 footprint: board outline 16.51 x 20.574 mm,
+#   two mounting holes on the side opposite the pin header, at local
+#   x = +5.715 and y = +/-8.001 from board center.
+MPU_W = 16.51
+MPU_D = 20.574
+MPU_HOLE_SPAN_Y = 16.002
+MPU_HOLE_X_FROM_CENTER = 5.715
+MPU_X = -29.0
+MPU_Y = -6.0
 MPU_POST_R = 1.25
-MPU_POST_H = 7.0
+MPU_POST_H = 6.0
 MPU_LED_WINDOW_R = 2.0
 
 PICO_W = 51.0
 PICO_D = 21.0
-PICO_X = 43.0
-PICO_Y = -8.0
-PICO_POST_R = 1.25
-PICO_POST_H = 7.0
+PICO_X = 14.0
+PICO_Y = -7.0
+PICO_MOUNT_X = 23.5
+PICO_MOUNT_Y = 5.7
+PICO_MOUNT_HOLE_D = 2.1
+PICO_POST_R = PICO_MOUNT_HOLE_D / 2 - 0.10
+PICO_POST_H = 6.0
 USB_EXIT_W = 14.0
 USB_EXIT_D = 8.0
+PICO_RESET_X = PICO_X - 18.0
+PICO_RESET_Y = PICO_Y + 7.2
+RESET_PUSHER_R = 2.4
+RESET_PUSHER_POST_R = 1.0
+RESET_PUSHER_POST_H = 4.0
 
-TXS_W = 33.0
-TXS_D = 16.0
+# TXS0108E floor board. The pictured HW-221/CJMCU-style boards vary, but the
+# closest documented breakout family is 26 x 15.5 mm with M2 mounting holes on
+# a 22 mm pitch. The floor uses small locating pegs, not screw dependency.
+TXS_W = 26.0
+TXS_D = 15.5
 TXS_X = 0.0
-TXS_Y = -18.0
+TXS_Y = -15.0
 TXS_DOCK_WALL = 1.2
 TXS_DOCK_H = 3.0
-
-# Yoke ribs / contact pads. These are conceptual and intentionally visible.
-YOKE_PAD_W = 8.0
-YOKE_PAD_D = 6.0
-YOKE_PAD_H = 2.0
-YOKE_X = DSUB_W / 2 + 5.0
-YOKE_RIB_T = 2.0
+TXS_MOUNT_PITCH_X = 22.0
+TXS_MOUNT_HOLE_D = 2.0
+TXS_LOCATOR_PEG_R = TXS_MOUNT_HOLE_D / 2 - 0.10
+TXS_LOCATOR_PEG_H = 1.6
 
 # ASCII STL is larger than binary, but easier to inspect and friendlier to
 # viewers/importers that get confused by OpenCASCADE binary STL headers.
@@ -135,7 +161,7 @@ def audit_stl(path):
 
 
 def make_bottom_box():
-    """Bottom open-top hollow box with north-center plinth bite."""
+    """Bottom open-top command cube with north-center plinth bite."""
     with BuildPart() as p:
         # Main solid slab/walls envelope, aligned so north edge is +Y.
         Box(BOX_W, BOX_D, BOX_H, align=(Align.CENTER, Align.CENTER, Align.MIN))
@@ -150,13 +176,23 @@ def make_bottom_box():
                 align=(Align.CENTER, Align.CENTER, Align.MIN),
             )
 
-        # North-center plinth bite through the north wall and body.
-        # This represents row 0.0: plinth/connector strip butted against north wall.
+        # North-center exact-width plinth bite through the north wall and body.
         with Locations((0, BOX_D / 2 - PLINTH_D / 2 + CLEAR, 0)):
             Box(
                 PLINTH_W + 2 * CLEAR,
                 PLINTH_D + 2 * CLEAR,
                 PLINTH_CLEAR_H,
+                mode=Mode.SUBTRACT,
+                align=(Align.CENTER, Align.CENTER, Align.MIN),
+            )
+
+        # Tiny lower lead-in/funnel at the south mouth of the notch. It is only
+        # low on the wall, so the upper notch remains an exact-width locator.
+        with Locations((0, BOX_D / 2 - PLINTH_D - PLINTH_FUNNEL_D / 2 + CLEAR, 0)):
+            Box(
+                PLINTH_W + PLINTH_FUNNEL_EXTRA_W + 2 * CLEAR,
+                PLINTH_FUNNEL_D + 2 * CLEAR,
+                PLINTH_FUNNEL_H,
                 mode=Mode.SUBTRACT,
                 align=(Align.CENTER, Align.CENTER, Align.MIN),
             )
@@ -171,13 +207,6 @@ def make_bottom_box():
                 align=(Align.CENTER, Align.CENTER, Align.CENTER),
             )
 
-        # Screw bosses with through holes, at west/east ends.
-        for sx in (-SCREW_X, SCREW_X):
-            with Locations((sx, SCREW_Y, FLOOR)):
-                Cylinder(SCREW_BOSS_R, BOX_H - FLOOR, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
-            with Locations((sx, SCREW_Y, -0.1)):
-                Cylinder(SCREW_R, BOX_H + 0.2, mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, Align.MIN))
-
         # TXS0108E belly-up snap dock on the floor: four low retaining rails.
         dock_outer_w = TXS_W + 2 * TXS_DOCK_WALL + 0.8
         dock_outer_d = TXS_D + 2 * TXS_DOCK_WALL + 0.8
@@ -190,36 +219,33 @@ def make_bottom_box():
             with Locations((TXS_X, y, FLOOR)):
                 Box(dock_outer_w, TXS_DOCK_WALL, TXS_DOCK_H * 0.75, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
 
-        # Connector yoke pads: pads near D-sub side wings/flanges.
-        # They should become real measured contact surfaces later.
-        for x in (-YOKE_X, YOKE_X):
-            with Locations((x, DSUB_Y, DSUB_Z + DSUB_H / 2 + 0.6)):
-                Box(YOKE_PAD_W, YOKE_PAD_D, YOKE_PAD_H, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.CENTER))
+        # Two low locator pegs for the TXS0108E mounting holes. These keep the
+        # dead-bug board centered without making the enclosure depend on screws.
+        for x in (TXS_X - TXS_MOUNT_PITCH_X / 2, TXS_X + TXS_MOUNT_PITCH_X / 2):
+            with Locations((x, TXS_Y, FLOOR)):
+                Cylinder(TXS_LOCATOR_PEG_R, TXS_LOCATOR_PEG_H, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
 
-        # Diagonal-ish yoke ribs approximated as vertical web plates from side walls toward pads.
-        # These make push-down load find the connector zone and pull-up load lift the connector wings.
-        for sign in (-1, 1):
-            x_mid = sign * (BOX_W / 2 - 22)
-            x_pad = sign * YOKE_X
-            # Use a hull-like rectangle path approximated with a long thin rib rotated in top view.
-            dx = x_mid - x_pad
-            dy = -10.0
-            length = (dx * dx + dy * dy) ** 0.5
-            angle = 0  # keep straight X rib for printability in this first model
-            with Locations((sign * ((abs(x_mid) + abs(x_pad)) / 2), DSUB_Y - 7.0, FLOOR)):
-                Box(length, YOKE_RIB_T, BOX_H - FLOOR - 2.0, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
+        # Small south shelf-cliff for pull-back extraction. It is narrow and low,
+        # acting as a mild fulcrum while the D-sub lifts gently out of engagement.
+        with Locations((0, FULCRUM_Y, 0)):
+            Box(FULCRUM_W, FULCRUM_D, FULCRUM_H, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
 
-        # Small snap sockets on the inside south wall for the lid lip tabs.
-        for x in (-55, 55):
+        # Small snap sockets on the inside south wall for the lid tabs.
+        for x in (-22, 22):
             with Locations((x, -BOX_D / 2 + WALL / 2, BOX_H - 5.0)):
-                Box(14, WALL + 0.4, 2.2, mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, Align.CENTER))
+                Box(SNAP_TAB_W + 2.0, WALL + 0.4, SNAP_TAB_H + 0.5, mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, Align.CENTER))
 
-        safe_fillet(p.part.edges().filter_by(Axis.Z), 0.6)
+        # North hinge receiver reliefs; the lid has matching knuckles.
+        for x in (-22, 0, 22):
+            with Locations((x, BOX_D / 2 - WALL / 2, BOX_H - 2.2)):
+                Box(HINGE_W + 1.0, WALL + 0.8, 2.8, mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, Align.CENTER))
+
+        safe_fillet(p.part.edges().filter_by(Axis.Z), 0.25)
         return p.part
 
 
 def make_lid():
-    """Snap lid with downward mounting posts for MPU and Pico."""
+    """Translucent-black style snap/hinge lid with downward board mounts."""
     with BuildPart() as p:
         # Flat top slab, slightly inset to pocket into bottom walls.
         Box(
@@ -228,6 +254,7 @@ def make_lid():
             LID_THICK,
             align=(Align.CENTER, Align.CENTER, Align.MIN),
         )
+        safe_fillet(p.part.edges().filter_by(Axis.Z), 0.4)
 
         # Downward skirt that pockets inside bottom box.
         skirt_w = BOX_W - 2 * WALL - 2 * LID_CLEAR
@@ -242,14 +269,15 @@ def make_lid():
         with Locations((0, BOX_D / 2 - PLINTH_D / 2 + CLEAR, -LID_OVERLAP - 0.1)):
             Box(PLINTH_W + 2 * CLEAR, PLINTH_D + 2 * CLEAR, LID_THICK + LID_OVERLAP + 0.3, mode=Mode.SUBTRACT)
 
-        # Front lip handle, kindergarten coloring-box style.
-        with Locations((0, -BOX_D / 2 - LIP_D / 2 + 0.8, 0)):
-            Box(LIP_W, LIP_D, LIP_H, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
-
         # Small snap tabs that fit bottom south-wall sockets.
-        for x in (-55, 55):
-            with Locations((x, -BOX_D / 2 + WALL / 2, -1.8)):
-                Box(12, WALL, 1.8, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
+        for x in (-22, 22):
+            with Locations((x, -BOX_D / 2 + WALL / 2, -SNAP_TAB_H)):
+                Box(SNAP_TAB_W, SNAP_TAB_D, SNAP_TAB_H, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
+
+        # Simple print-friendly hinge knuckles on the north edge.
+        for x in (-22, 0, 22):
+            with Locations((x, BOX_D / 2 + HINGE_D / 2 - 0.8, 0)):
+                Box(HINGE_W, HINGE_D, HINGE_H, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
 
         # MPU-6050 downward posts; pins presumed on west/left side, board hangs below lid.
         # Two holes are on east/right side, so posts sit just east of board centerline.
@@ -260,9 +288,9 @@ def make_lid():
         with Locations((MPU_X, MPU_Y, -0.1)):
             Cylinder(MPU_LED_WINDOW_R, LID_THICK + 0.2, mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, Align.MIN))
 
-        # Pico W hanging posts, generic four-corner-ish pads/pegs.
-        for x in (PICO_X - PICO_W / 2 + 4, PICO_X + PICO_W / 2 - 4):
-            for y in (PICO_Y - PICO_D / 2 + 4, PICO_Y + PICO_D / 2 - 4):
+        # Pico W hanging posts at the real 2.1 mm mounting-hole centers.
+        for x in (PICO_X - PICO_MOUNT_X, PICO_X + PICO_MOUNT_X):
+            for y in (PICO_Y - PICO_MOUNT_Y, PICO_Y + PICO_MOUNT_Y):
                 with Locations((x, y, -PICO_POST_H)):
                     Cylinder(PICO_POST_R, PICO_POST_H, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
 
@@ -270,12 +298,13 @@ def make_lid():
         with Locations((PICO_X, BOX_D / 2 - USB_EXIT_D / 2, -0.1)):
             Box(USB_EXIT_W, USB_EXIT_D, LID_THICK + 1.0, mode=Mode.SUBTRACT, align=(Align.CENTER, Align.CENTER, Align.MIN))
 
-        # Lid-side compression ribs above connector. Push anywhere, load routes toward D-sub zone.
-        for sign in (-1, 1):
-            with Locations((sign * 35, DSUB_Y - 5, -6.0)):
-                Box(42, 2.0, 6.0, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
+        # Reset pusher over the Pico reset position: small proud top button with
+        # a short underside post that reaches toward the board switch.
+        with Locations((PICO_RESET_X, PICO_RESET_Y, LID_THICK)):
+            Cylinder(RESET_PUSHER_R, 0.9, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
+        with Locations((PICO_RESET_X, PICO_RESET_Y, -RESET_PUSHER_POST_H)):
+            Cylinder(RESET_PUSHER_POST_R, RESET_PUSHER_POST_H, mode=Mode.ADD, align=(Align.CENTER, Align.CENTER, Align.MIN))
 
-        safe_fillet(p.part.edges().filter_by(Axis.Z), 0.5)
         return p.part
 
 
@@ -289,12 +318,12 @@ with BuildPart() as assembly:
         add(lid)
 
 # Export separate and combined files.
-export_step(bottom, "create1_brainstem_row0_box_v4_bottom.step")
-bottom_stl = export_printable_stl(bottom, "create1_brainstem_row0_box_v4_bottom.stl")
-export_step(lid, "create1_brainstem_row0_box_v4_lid.step")
-lid_stl = export_printable_stl(lid, "create1_brainstem_row0_box_v4_lid.stl")
-export_step(assembly.part, "create1_brainstem_row0_box_v4_assembly.step")
-assembly_stl = export_printable_stl(assembly.part, "create1_brainstem_row0_box_v4_assembly.stl")
+export_step(bottom, "skull_bottom.step")
+bottom_stl = export_printable_stl(bottom, "skull_bottom.stl")
+export_step(lid, "skull_lid.step")
+lid_stl = export_printable_stl(lid, "skull_lid.stl")
+export_step(assembly.part, "skull_assembly.step")
+assembly_stl = export_printable_stl(assembly.part, "skull_assembly.stl")
 
 try:
     show_object(assembly.part)
@@ -302,9 +331,9 @@ except NameError:
     pass
 
 print("Wrote:")
-print("  create1_brainstem_row0_box_v4_bottom.step/.stl")
-print("  create1_brainstem_row0_box_v4_lid.step/.stl")
-print("  create1_brainstem_row0_box_v4_assembly.step/.stl")
+print("  skull_bottom.step/.stl")
+print("  skull_lid.step/.stl")
+print("  skull_assembly.step/.stl")
 print("STL audit:")
 print(f"  {bottom_stl}")
 print(f"  {lid_stl}")

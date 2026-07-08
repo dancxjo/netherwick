@@ -168,9 +168,9 @@ skull:
     set -euo pipefail
     cd skeleton/brainstem
     if [ -x .venv/bin/python ]; then
-        .venv/bin/python create1_brainstem_row0_box_v4.py
+        .venv/bin/python skull.py
     else
-        python create1_brainstem_row0_box_v4.py
+        python skull.py
     fi
 
 # Fetch CYW43 firmware blobs required by the Pico W backend.
