@@ -162,6 +162,17 @@ brainstem-uf2: brainstem-build
         crates/pete-brainstem/target/thumbv6m-none-eabi/release/pete-brainstem \
         crates/pete-brainstem/target/thumbv6m-none-eabi/release/pete-brainstem.uf2
 
+# Generate the Row-0 brainstem skull enclosure STL/STEP files.
+skull:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd skeleton/brainstem
+    if [ -x .venv/bin/python ]; then
+        .venv/bin/python create1_brainstem_row0_box_v4.py
+    else
+        python create1_brainstem_row0_box_v4.py
+    fi
+
 # Fetch CYW43 firmware blobs required by the Pico W backend.
 brainstem-fetch-cyw43:
     #!/usr/bin/env bash
