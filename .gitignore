@@ -25,3 +25,4 @@ target/
 firmware/
 
 .venv
+.vscode/settings.json
