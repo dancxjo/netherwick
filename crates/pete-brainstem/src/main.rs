@@ -5,6 +5,8 @@ mod arch;
 mod body;
 mod capabilities;
 mod commands;
+#[cfg(any(feature = "pico-w", test))]
+mod dhcp;
 mod drivers;
 mod events;
 mod hardware;

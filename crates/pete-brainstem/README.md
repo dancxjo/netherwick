@@ -315,7 +315,7 @@ The Pico W backend starts an open AP:
 SSID: pete-xxxx, where xxxx is a 4-digit base-36 stable instance id
 Device IP: 192.168.4.1
 Hostname: pete.local via mDNS announcement
-DHCP: offers 192.168.4.2/24 with router/DNS set to 192.168.4.1
+DHCP: offers 192.168.4.2-192.168.4.9/24 with router/DNS set to 192.168.4.1
 ```
 
 The interface exposes the body-neutral brainstem surface:

@@ -19,12 +19,14 @@ const UART_DRAIN_LIMIT: usize = 128;
 
 pub struct CreateUart {
     pending_sensor_packet: Option<u8>,
+    sensor_bytes: Vec<u8, 32>,
 }
 
 impl CreateUart {
     pub const fn new() -> Self {
         Self {
             pending_sensor_packet: None,
+            sensor_bytes: Vec::new(),
         }
     }
 
@@ -35,12 +37,10 @@ impl CreateUart {
     ) where
         H: BrainstemHardware,
     {
-        let mut bytes = Vec::new();
         let mut drained = 0;
 
         loop {
             if drained >= UART_DRAIN_LIMIT {
-                self.push_packet(events, &mut bytes);
                 break;
             }
 
@@ -48,23 +48,30 @@ impl CreateUart {
                 SerialRead::Byte(byte) => {
                     drained += 1;
                     status::mark_uart_rx_ok(hardware.now_us() / 1_000);
-                    if bytes.push(byte).is_err() {
-                        self.push_packet(events, &mut bytes);
-                        let _ = bytes.push(byte);
+                    let Some(packet_id) = self.pending_sensor_packet else {
+                        continue;
+                    };
+                    let Some(expected_len) = sensor_packet_length(packet_id) else {
+                        self.discard_pending_response();
+                        continue;
+                    };
+                    if self.sensor_bytes.push(byte).is_err() {
+                        self.discard_pending_response();
+                        continue;
+                    }
+                    if self.sensor_bytes.len() == expected_len {
+                        self.push_packet(events);
                     }
                 }
-                SerialRead::WouldBlock => {
-                    self.push_packet(events, &mut bytes);
-                    break;
-                }
+                SerialRead::WouldBlock => break,
                 SerialRead::Error(UartReadError::Overrun) => {
                     status::mark_uart_rx_error_detail(UartReadError::Overrun);
-                    self.push_packet(events, &mut bytes);
+                    self.discard_pending_response();
                     drained += 1;
                 }
                 SerialRead::Error(error) => {
                     status::mark_uart_rx_error_detail(error);
-                    self.push_packet(events, &mut bytes);
+                    self.discard_pending_response();
                     break;
                 }
             }
@@ -79,8 +86,13 @@ impl CreateUart {
     where
         H: BrainstemHardware,
     {
+        self.sensor_bytes.clear();
         self.pending_sensor_packet = Some(packet_id);
-        self.send_bytes(hardware, &[OI_SENSORS, packet_id])
+        if let Err(error) = self.send_bytes(hardware, &[OI_SENSORS, packet_id]) {
+            self.discard_pending_response();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn flush_rx<H>(&mut self, hardware: &mut H)
@@ -88,6 +100,7 @@ impl CreateUart {
         H: BrainstemHardware,
     {
         hardware.drain_uart_rx();
+        self.discard_pending_response();
     }
 
     pub fn start_oi<H, const N: usize>(
@@ -309,17 +322,13 @@ impl CreateUart {
             .map_err(|_| BrainstemError::UartFraming)
     }
 
-    fn push_packet<const N: usize>(
-        &mut self,
-        events: &mut Deque<BrainstemEvent, N>,
-        bytes: &mut Vec<u8, 32>,
-    ) {
-        if bytes.is_empty() {
+    fn push_packet<const N: usize>(&mut self, events: &mut Deque<BrainstemEvent, N>) {
+        if self.sensor_bytes.is_empty() {
             return;
         }
 
         let packet_id = self.pending_sensor_packet.take().unwrap_or(0);
-        let raw_bytes = core::mem::take(bytes);
+        let raw_bytes = core::mem::take(&mut self.sensor_bytes);
         status::mark_uart_packet(raw_bytes.len());
 
         if let Some(sensors) = decode_sensor_packet(packet_id, &raw_bytes) {
@@ -327,6 +336,11 @@ impl CreateUart {
             let event = BrainstemEvent::CreateSensorPacketDecoded { packet_id, sensors };
             status::signal_event(&event);
             let _ = events.push_back(event);
+        } else if sensor_packet_is_decoded(packet_id) {
+            let event = BrainstemEvent::Error(BrainstemError::InvalidPacket);
+            status::signal_event(&event);
+            let _ = events.push_back(event);
+            return;
         }
 
         let event = BrainstemEvent::CreatePacketReceived {
@@ -336,12 +350,33 @@ impl CreateUart {
         status::signal_event(&event);
         let _ = events.push_back(event);
     }
+
+    fn discard_pending_response(&mut self) {
+        self.pending_sensor_packet = None;
+        self.sensor_bytes.clear();
+    }
+}
+
+fn sensor_packet_length(packet_id: u8) -> Option<usize> {
+    match packet_id {
+        0 => Some(26),
+        7..=18 | 21 | 24 => Some(1),
+        19 | 20 | 22 | 23 | 25..=31 => Some(2),
+        _ => None,
+    }
+}
+
+fn sensor_packet_is_decoded(packet_id: u8) -> bool {
+    matches!(
+        packet_id,
+        0 | 7..=14 | 17..=26 | 28..=31
+    )
 }
 
 fn decode_sensor_packet(packet_id: u8, bytes: &[u8]) -> Option<CreateSensorPacket> {
     let mut sensors = CreateSensorPacket::default();
     match packet_id {
-        0 if bytes.len() >= 26 => {
+        0 if bytes.len() == 26 && valid_group_zero(bytes) => {
             apply_bumps_wheel_drops(&mut sensors.flags, bytes[0]);
             sensors.flags.wall = bytes[1] != 0;
             sensors.flags.cliff_left = bytes[2] != 0;
@@ -363,31 +398,31 @@ fn decode_sensor_packet(packet_id: u8, bytes: &[u8]) -> Option<CreateSensorPacke
             sensors.capacity_mah = u16::from_be_bytes([bytes[24], bytes[25]]);
             Some(sensors)
         }
-        7 if bytes.len() == 1 => {
+        7 if bytes.len() == 1 && valid_bumps_wheel_drops(bytes[0]) => {
             apply_bumps_wheel_drops(&mut sensors.flags, bytes[0]);
             Some(sensors)
         }
-        8 if bytes.len() == 1 => {
+        8 if bytes.len() == 1 && valid_bool(bytes[0]) => {
             sensors.flags.wall = bytes[0] != 0;
             Some(sensors)
         }
-        9 if bytes.len() == 1 => {
+        9 if bytes.len() == 1 && valid_bool(bytes[0]) => {
             sensors.flags.cliff_left = bytes[0] != 0;
             Some(sensors)
         }
-        10 if bytes.len() == 1 => {
+        10 if bytes.len() == 1 && valid_bool(bytes[0]) => {
             sensors.flags.cliff_front_left = bytes[0] != 0;
             Some(sensors)
         }
-        11 if bytes.len() == 1 => {
+        11 if bytes.len() == 1 && valid_bool(bytes[0]) => {
             sensors.flags.cliff_front_right = bytes[0] != 0;
             Some(sensors)
         }
-        12 if bytes.len() == 1 => {
+        12 if bytes.len() == 1 && valid_bool(bytes[0]) => {
             sensors.flags.cliff_right = bytes[0] != 0;
             Some(sensors)
         }
-        13 if bytes.len() == 1 => {
+        13 if bytes.len() == 1 && valid_bool(bytes[0]) => {
             sensors.flags.virtual_wall = bytes[0] != 0;
             Some(sensors)
         }
@@ -399,7 +434,7 @@ fn decode_sensor_packet(packet_id: u8, bytes: &[u8]) -> Option<CreateSensorPacke
             sensors.ir_byte = bytes[0];
             Some(sensors)
         }
-        18 if bytes.len() == 1 => {
+        18 if bytes.len() == 1 && valid_buttons(bytes[0]) => {
             sensors.buttons = bytes[0];
             Some(sensors)
         }
@@ -412,7 +447,7 @@ fn decode_sensor_packet(packet_id: u8, bytes: &[u8]) -> Option<CreateSensorPacke
             sensors.angle_mrad = degrees_to_mrad(angle_deg);
             Some(sensors)
         }
-        21 if bytes.len() == 1 => {
+        21 if bytes.len() == 1 && valid_charging_state(bytes[0]) => {
             sensors.charging_state = bytes[0];
             Some(sensors)
         }
@@ -456,6 +491,29 @@ fn decode_sensor_packet(packet_id: u8, bytes: &[u8]) -> Option<CreateSensorPacke
     }
 }
 
+fn valid_group_zero(bytes: &[u8]) -> bool {
+    valid_bumps_wheel_drops(bytes[0])
+        && bytes[1..=6].iter().all(|byte| valid_bool(*byte))
+        && valid_buttons(bytes[11])
+        && valid_charging_state(bytes[16])
+}
+
+fn valid_bumps_wheel_drops(byte: u8) -> bool {
+    byte & !0b0001_1111 == 0
+}
+
+fn valid_bool(byte: u8) -> bool {
+    byte <= 1
+}
+
+fn valid_buttons(byte: u8) -> bool {
+    byte & !0b0000_1111 == 0
+}
+
+fn valid_charging_state(byte: u8) -> bool {
+    byte <= 5
+}
+
 fn apply_bumps_wheel_drops(flags: &mut CreateSensorFlags, byte: u8) {
     flags.bump_right = byte & 0b0000_0001 != 0;
     flags.bump_left = byte & 0b0000_0010 != 0;
@@ -465,4 +523,134 @@ fn apply_bumps_wheel_drops(flags: &mut CreateSensorFlags, byte: u8) {
 fn degrees_to_mrad(degrees: i16) -> i16 {
     let mrad = degrees as i32 * 17_453 / 1_000;
     mrad.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct TestHardware {
+        rx: VecDeque<SerialRead>,
+        tx: std::vec::Vec<u8>,
+    }
+
+    impl TestHardware {
+        fn new() -> Self {
+            Self {
+                rx: VecDeque::new(),
+                tx: std::vec::Vec::new(),
+            }
+        }
+    }
+
+    impl BrainstemHardware for TestHardware {
+        fn delay_ms(&mut self, _ms: u32) {}
+        fn now_us(&mut self) -> u32 {
+            0
+        }
+        fn feed_watchdog(&mut self) {}
+        fn set_power_toggle(&mut self, _high: bool) {}
+        fn set_brc(&mut self, _high: bool) {}
+        fn set_indicators(&mut self, _on: bool) {}
+        fn set_primary_indicator(&mut self, _on: bool) {}
+        fn write_byte(&mut self, byte: u8) -> Result<(), ()> {
+            self.tx.push(byte);
+            Ok(())
+        }
+        fn flush_uart(&mut self) -> Result<(), ()> {
+            Ok(())
+        }
+        fn read_byte(&mut self) -> SerialRead {
+            self.rx.pop_front().unwrap_or(SerialRead::WouldBlock)
+        }
+    }
+
+    fn valid_group_zero() -> [u8; 26] {
+        let mut packet = [0; 26];
+        packet[17..19].copy_from_slice(&14_400u16.to_be_bytes());
+        packet[19..21].copy_from_slice(&(-250i16).to_be_bytes());
+        packet[22..24].copy_from_slice(&1_800u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&3_000u16.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn group_zero_requires_exact_length() {
+        let packet = valid_group_zero();
+        assert!(decode_sensor_packet(0, &packet).is_some());
+
+        let mut oversized = [0; 27];
+        oversized[..26].copy_from_slice(&packet);
+        assert!(decode_sensor_packet(0, &oversized).is_none());
+        assert!(decode_sensor_packet(0, &packet[..25]).is_none());
+    }
+
+    #[test]
+    fn group_zero_rejects_impossible_safety_and_status_fields() {
+        let mut packet = valid_group_zero();
+        packet[2] = b'1';
+        assert!(decode_sensor_packet(0, &packet).is_none());
+
+        packet = valid_group_zero();
+        packet[16] = 90;
+        assert!(decode_sensor_packet(0, &packet).is_none());
+
+        packet = valid_group_zero();
+        packet[11] = 0b1000_0000;
+        assert!(decode_sensor_packet(0, &packet).is_none());
+    }
+
+    #[test]
+    fn packet_lengths_cover_the_advertised_sensor_range() {
+        assert_eq!(sensor_packet_length(0), Some(26));
+        for packet_id in 7..=31 {
+            assert!(sensor_packet_length(packet_id).is_some());
+        }
+        assert_eq!(sensor_packet_length(6), None);
+        assert_eq!(sensor_packet_length(32), None);
+    }
+
+    #[test]
+    fn poll_accumulates_fragmented_responses_until_exact_length() {
+        let mut uart = CreateUart::new();
+        let mut hardware = TestHardware::new();
+        let mut events = Deque::<BrainstemEvent, 4>::new();
+        let packet = valid_group_zero();
+
+        assert!(uart.request_sensor_packet(&mut hardware, 0).is_ok());
+        hardware
+            .rx
+            .extend(packet[..10].iter().copied().map(SerialRead::Byte));
+        uart.poll(&mut hardware, &mut events);
+        assert!(events.is_empty());
+        assert_eq!(uart.sensor_bytes.len(), 10);
+
+        hardware
+            .rx
+            .extend(packet[10..].iter().copied().map(SerialRead::Byte));
+        uart.poll(&mut hardware, &mut events);
+        assert_eq!(events.len(), 2);
+        assert!(uart.pending_sensor_packet.is_none());
+        assert!(uart.sensor_bytes.is_empty());
+    }
+
+    #[test]
+    fn poll_discards_partial_response_after_framing_error() {
+        let mut uart = CreateUart::new();
+        let mut hardware = TestHardware::new();
+        let mut events = Deque::<BrainstemEvent, 4>::new();
+
+        assert!(uart.request_sensor_packet(&mut hardware, 0).is_ok());
+        hardware.rx.extend([
+            SerialRead::Byte(0),
+            SerialRead::Byte(0),
+            SerialRead::Error(UartReadError::Framing),
+        ]);
+        uart.poll(&mut hardware, &mut events);
+
+        assert!(events.is_empty());
+        assert!(uart.pending_sensor_packet.is_none());
+        assert!(uart.sensor_bytes.is_empty());
+    }
 }

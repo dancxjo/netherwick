@@ -34,6 +34,7 @@ use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
     SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
+use crate::dhcp::{DhcpClient, DhcpGrant, DhcpLeaseState, DhcpRequest, DHCP_LEASE_SECONDS};
 use crate::drivers::imu::{ImuDriver, ImuHealth, ImuSample, Mpu6050};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
@@ -45,7 +46,6 @@ const INSTANCE_ID_MODULUS: u32 = INSTANCE_ID_BASE.pow(4);
 const MDNS_NAME: &[u8] = b"\x04pete\x05local\x00";
 const AP_CHANNEL: u8 = 6;
 const AP_IP_OCTETS: [u8; 4] = [192, 168, 4, 1];
-const DHCP_LEASE_IP_OCTETS: [u8; 4] = [192, 168, 4, 2];
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 const HTTP_PORT: u16 = 80;
 const HTTP_TASKS: usize = 3;
@@ -55,8 +55,6 @@ const DNS_PORT: u16 = 53;
 const MDNS_PORT: u16 = 5353;
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
-const DHCP_LEASE_SECONDS: u32 = 3_600;
-const DHCP_OFFER_HOLD_SECONDS: u32 = 30;
 const HTTP_FLUSH_TIMEOUT_MS: u64 = 250;
 const LED_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const LED_BLINK_ON_MS: u64 = 120;
@@ -1006,7 +1004,7 @@ function pctBar(id,value,max,badAt,warnAt){let e=$(id),i=e&&e.querySelector('i')
 function imuClass(imu){let h=imu.health||'unknown',age=imu.sample_age_ms||0;if(h==='fault'||h==='absent'||age>2000)return'badtext';if(h!=='ok'||age>500)return'muted';return'oktext'}
 function showImu(imu){imu=imu||{};let present=imu.present||'unknown',health=imu.health||'unknown',age=imu.sample_age_ms||0,poll=imu.poll_period_ms||0,yaw=(imu.yaw_mrad||0)/1000,rate=(imu.yaw_rate_mrad_s||0)/1000,acc=(imu.accel_magnitude_mm_s2||0)/1000,tilt=(imu.tilt_magnitude_mrad||0)/1000,rough=(imu.roughness_mm_s2||0)/1000,impact=(imu.impact_score_mm_s2||0)/1000;let cls=imuClass(imu);$('imuhealth').textContent=title(health)+' / '+title(present)+' / age '+age+' ms / '+poll+' ms poll';$('imuhealth').className=cls;$('imuyaw').textContent=num(yaw,2)+' rad / '+num(yaw*57.2958,1)+' deg';$('imuyaw').className=cls;$('imuaccel').textContent=num(acc,2)+' m/s2';$('imuaccel').className=acc>16?'badtext':acc>12?'muted':cls;$('imutilt').textContent=num(tilt,2)+' rad / '+num(tilt*57.2958,1)+' deg';$('imutilt').className=tilt>.65?'badtext':tilt>.35?'muted':cls;$('imurates').textContent='yaw '+num(rate,2)+' rad/s / xyz '+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.x||0)/1000,2)+','+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.y||0)/1000,2)+','+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.z||0)/1000,2);$('imurates').className=cls;$('imurough').textContent=num(rough,2)+' m/s2';$('imurough').className=rough>8?'badtext':rough>3?'muted':cls;$('imuimpact').textContent=num(impact,2)+' m/s2';$('imuimpact').className=impact>18?'badtext':impact>8?'muted':cls;$('imumotion').textContent=title(imu.motion_consistency||'unknown')+' / '+title(imu.calibration||'uncalibrated');$('imumotion').className=(imu.motion_consistency==='inconsistent'||imu.calibration==='uncalibrated')?'muted':cls;pctBar('imuaccelbar',imu.accel_magnitude_mm_s2||0,22000,18000,13000);pctBar('imutiltbar',imu.tilt_magnitude_mrad||0,1000,650,350);pctBar('imuroughbar',imu.roughness_mm_s2||0,12000,8000,3000);pctBar('imuimpactbar',imu.impact_score_mm_s2||0,22000,18000,8000)}
 function showStatus(s){let cs=s.create_sensors||{},od=s.odometry||{},imu=s.imu||{},music=s.create_songs||{},fatal=s.current_runtime_state==='error'||(s.last_error&&s.last_error!=='none'),contact=cs.bump_left||cs.bump_right||cs.wall||cs.virtual_wall,imuDanger=imu.health==='fault'||imu.health==='absent'||(imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000,safetyStop=cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,pct=battPct(cs),flags=flagList(cs);if((imu.tilt_magnitude_mrad||0)>=650)flags.push('tilt');if((imu.impact_score_mm_s2||0)>=18000)flags.push('impact');if(imu.motion_consistency==='inconsistent')flags.push('motion mismatch');pill(net,wsOpen?'control ws':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),fatal?'fatal/error':safetyStop?'safety stop':contact?'contact':'clear',fatal||safetyStop?'bad':contact?'warn':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health)+' / IMU '+title(imu.health||'unknown');$('runtime').textContent=title(s.current_runtime_state)+' / demo '+title(s.demo_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=flags.join(', ')||'clear';$('safetyread').className=fatal||safetyStop?'badtext':contact?'muted':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / IR '+(cs.ir_byte||0)+' / buttons '+(cs.buttons||0)+' / cliff sig '+(cs.cliff_left_signal||0)+','+(cs.cliff_front_left_signal||0)+','+(cs.cliff_front_right_signal||0)+','+(cs.cliff_right_signal||0);$('battery').textContent=(pct===null?'--':pct+'%')+' / '+(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh / charge state '+(cs.charging_state||0);$('battery').className=pct!==null&&pct<=20?'badtext':'muted';$('odom').textContent='delta '+(cs.distance_mm||0)+' mm / '+(cs.angle_mrad||0)+' mrad / total '+(od.distance_mm||0)+' mm / '+(od.heading_mrad||0)+' mrad / resets '+(od.reset_count||0);showImu(imu);$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=fatal?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=fatal?'badtext':'muted'}
-function handleEvents(batch){eventBusy=false;if(batch.dropped_before_seq){$('events').textContent='missed before '+batch.dropped_before_seq;pill($('safety'),'event history missed','bad');addLog('missed event history before '+batch.dropped_before_seq);stop()}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}eventCursor=Math.max(0,(batch.next_seq||1)-1);(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched','wheel_drop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k+' '+(e.a||0));stop()}else if(['bump_changed','wall_changed','virtual_wall_changed','buttons_changed','ir_changed','charging_state_changed','battery_low','cliff_changed','wheel_drop_cleared','safety_cleared'].indexOf(k)>=0){addLog(k+' '+(e.a||0))}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0))}else if(k==='motion_stopped'){addLog('motion stopped')}else if(k==='error'){pill($('safety'),'fatal/error','bad');addLog('error '+(e.a||0));stop()}})}
+function handleEvents(batch){eventBusy=false;let stopNeeded=false;eventCursor=Math.max(0,(batch.next_seq||1)-1);if(batch.dropped_before_seq){$('events').textContent='recovered after '+batch.dropped_before_seq;pill($('safety'),'event history recovered','warn');addLog('recovered event history after '+batch.dropped_before_seq);stopNeeded=true}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched','wheel_drop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k+' '+(e.a||0));stopNeeded=true}else if(['bump_changed','wall_changed','virtual_wall_changed','buttons_changed','ir_changed','charging_state_changed','battery_low','cliff_changed','wheel_drop_cleared','safety_cleared'].indexOf(k)>=0){addLog(k+' '+(e.a||0))}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0))}else if(k==='motion_stopped'){addLog('motion stopped')}else if(k==='error'){pill($('safety'),'fatal/error','bad');addLog('error '+(e.a||0));stopNeeded=true}});if(stopNeeded)stop()}
 function pollEvents(){if(eventBusy)return;eventBusy=true;sendCockpit({kind:'get_events',since_seq:eventCursor},false).then(j=>{if(j&&j.type==='events')handleEvents(j);else eventBusy=false}).catch(_=>{eventBusy=false})}
 function refresh(){if(statusBusy)return;statusBusy=true;if(wsOpen&&ws&&ws.readyState===1&&ws.bufferedAmount<384){ws.send(JSON.stringify({kind:'status',command_id:id++}));statusBusy=false;return}fetch('/status.json').then(r=>r.json()).then(showStatus).catch(_=>pill(net,'offline','bad')).finally(()=>statusBusy=false)}
 applyCaps();setInterval(refresh,750);setInterval(pollEvents,600);refresh();requestCaps();
@@ -2354,7 +2352,7 @@ fn build_dhcp_reply<'a>(
     response[3] = request[3];
     response[4..8].copy_from_slice(&request[4..8]);
     response[10..12].copy_from_slice(&request[10..12]);
-    response[16..20].copy_from_slice(&DHCP_LEASE_IP_OCTETS);
+    response[16..20].copy_from_slice(&grant.lease_ip());
     response[20..24].copy_from_slice(&AP_IP_OCTETS);
     response[28..44].copy_from_slice(&request[28..44]);
     response[236..240].copy_from_slice(&[99, 130, 83, 99]);
@@ -2370,17 +2368,6 @@ fn build_dhcp_reply<'a>(
     Some(&response[..i + 1])
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct DhcpClient {
-    hardware_address: [u8; 6],
-}
-
-#[derive(Clone, Copy)]
-struct DhcpRequest {
-    message_type: u8,
-    client: DhcpClient,
-}
-
 impl DhcpRequest {
     fn parse(packet: &[u8]) -> Option<Self> {
         if packet.len() < 240 || packet[0] != 1 || packet[1] != 1 || packet[2] < 6 {
@@ -2390,93 +2377,10 @@ impl DhcpRequest {
         let mut hardware_address = [0; 6];
         hardware_address.copy_from_slice(&packet[28..34]);
 
-        Some(Self {
-            message_type: dhcp_message_type(packet)?,
-            client: DhcpClient { hardware_address },
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DhcpLease {
-    client: DhcpClient,
-    expires_at_ms: u64,
-}
-
-#[derive(Clone, Copy)]
-enum DhcpGrant {
-    Offer,
-    Ack,
-}
-
-impl DhcpGrant {
-    fn reply_message_type(self) -> u8 {
-        match self {
-            Self::Offer => 2,
-            Self::Ack => 5,
-        }
-    }
-}
-
-struct DhcpLeaseState {
-    active: Option<DhcpLease>,
-}
-
-impl DhcpLeaseState {
-    const fn new() -> Self {
-        Self { active: None }
-    }
-
-    fn grant(&mut self, request: DhcpRequest, now_ms: u64) -> Option<DhcpGrant> {
-        self.clear_expired(now_ms);
-
-        match request.message_type {
-            1 => self
-                .reserve(request.client, now_ms, DHCP_OFFER_HOLD_SECONDS)
-                .then_some(DhcpGrant::Offer),
-            3 => self
-                .reserve(request.client, now_ms, DHCP_LEASE_SECONDS)
-                .then_some(DhcpGrant::Ack),
-            7 => {
-                self.release(request.client);
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn reserve(&mut self, client: DhcpClient, now_ms: u64, seconds: u32) -> bool {
-        if let Some(active) = self.active {
-            if active.client != client {
-                return false;
-            }
-        }
-
-        self.active = Some(DhcpLease {
-            client,
-            expires_at_ms: now_ms.saturating_add(seconds as u64 * 1_000),
-        });
-        true
-    }
-
-    fn release(&mut self, client: DhcpClient) {
-        if self
-            .active
-            .map(|active| active.client == client)
-            .unwrap_or(false)
-        {
-            self.active = None;
-        }
-    }
-
-    fn clear_expired(&mut self, now_ms: u64) {
-        if self
-            .active
-            .map(|active| now_ms >= active.expires_at_ms)
-            .unwrap_or(false)
-        {
-            self.active = None;
-        }
+        Some(Self::new(
+            dhcp_message_type(packet)?,
+            DhcpClient::new(hardware_address),
+        ))
     }
 }
 
