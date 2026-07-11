@@ -17,7 +17,7 @@ kind = "create_oi"
 drive = "differential"
 ```
 
-`body.toml` declares robot capabilities and timings: Create OI UART settings, supported body modes and sensor packets, differential drive, public verbs/events/sensors/outputs/safety features, feedback slots, motion limits, TTL limits, default OI mode, and demo timing. To support another robot body, add a new body kind, capability declaration, and driver implementation, then point the runtime at that driver without changing the generic capability renderers.
+`body.toml` declares robot capabilities and timings: Create OI UART settings, supported body modes and sensor packets, differential drive, public verbs/events/sensors/outputs/safety features, feedback slots, motion limits, TTL limits, and the default OI mode. To support another robot body, add a new body kind, capability declaration, and driver implementation, then point the runtime at that driver without changing the generic capability renderers.
 
 Current board:
 
@@ -53,7 +53,7 @@ gpio = 19
 
 UART is `57600 8N1`.
 
-The IMU path is short-horizon inertial telemetry plus local tilt/impact reflex safety. It is not SLAM, global pose, or autonomous recovery; higher-level mapping must treat IMU status as one sensor input with explicit freshness and health.
+The IMU path is short-horizon inertial telemetry plus local tilt/impact reflex safety. It is not SLAM, global pose, or autonomous recovery; higher-level mapping must treat IMU status as one sensor input with explicit freshness and health. The IMU is optional at runtime: when it is absent, the brainstem reports `imu.health = "absent"`, continues operating without inertial reflexes, and periodically probes for a newly attached device.
 
 Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external level shifting or a divider is present on the Create TX to Pico GP1 line.
 
@@ -321,7 +321,7 @@ DHCP: offers 192.168.4.2-192.168.4.9/24 with router/DNS set to 192.168.4.1
 The interface exposes the body-neutral brainstem surface:
 
 - `http://192.168.4.1/` serves the operator interface.
-- `http://192.168.4.1/status.json` serves firmware/body/runtime/Create/UART/demo status.
+- `http://192.168.4.1/status.json` serves firmware/body/runtime/Create/UART status.
 - `POST http://192.168.4.1/command` accepts one low-level command atom.
 - `POST http://192.168.4.1/command` with `{"kind":"get_capabilities"}` returns the body capability contract.
 - `POST http://192.168.4.1/command` with `{"kind":"get_events","since_seq":0}` returns the outward event log.
@@ -329,7 +329,7 @@ The interface exposes the body-neutral brainstem surface:
 - UDP control is available on port `82` using the same ASCII line format as forebrain UART.
 - `http://pete.local/` and `http://pete.local/status.json` may work on clients that support mDNS on the AP network.
 
-The status JSON includes firmware name/version, body name/kind, uptime, runtime state, body/Create diagnostic state, UART RX health, last UART packet timestamp, current command, command lifecycle ids, event sequence, last error, demo state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, forebrain UART status, sensor state, battery state, song state, and odometry accumulator state.
+The status JSON includes firmware name/version, body name/kind, uptime, runtime state, body/Create diagnostic state, UART RX health, last UART packet timestamp, current command, command lifecycle ids, event sequence, last error, body state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, forebrain UART status, sensor state, battery state, song state, and odometry accumulator state.
 
 The crate keeps local self-signed certificate material out of version control under:
 
@@ -604,24 +604,13 @@ The Pico W onboard LED normally emits a one-blink heartbeat every 15 seconds. Ev
 
 Wi-Fi/AP/DHCP/HTTP/mDNS failure does not prevent motor stop, UART timeout handling, power safety, or the error blink pattern. The Wi-Fi lane is not allowed to call robot drivers directly; future operator commands must enter through a bounded command queue consumed by the runtime lane.
 
-## Demo Behavior
+## Startup and Arming
 
-On boot the firmware:
+On boot, the firmware blinks the onboard Pico LED as soon as RP2040 GPIO is initialized, starts its safety and command lanes, and remains idle. It does not wake or move the Create automatically.
 
-1. Blinks the onboard Pico LED as soon as RP2040 GPIO is initialized, then blinks the onboard LED and optional GP20 LED from the runtime.
-2. Enqueues the demo `BrainstemCommand` script.
-3. Pulses Create Power Toggle to wake the robot.
-4. Polls the Create OI sensor stream until UART bytes confirm the robot is alive.
-5. Pulses BRC low and releases it if `gpio.create_brc.enabled = true`.
-6. Sends Open Interface `Start`.
-7. Enters `Safe` mode.
-8. Sends a tiny movement jig: short forward, short left turn, short right turn, stop.
-9. Sends Stop, then pulses Create Power Toggle again.
-10. Leaves the controller in a safe idle blink loop.
+An explicit `arm` command wakes the Create, confirms it is responsive, pulses BRC when enabled, starts Open Interface, and enters `Safe` mode. Once that sequence succeeds, the brainstem plays the `armed` feedback cue. Its default notes are F-G-B: *fasolsi*, Solresol for “prepare / make ready.” `define_chirp` can replace the cue.
 
-Motor movement is safety-gated: the built-in script only reaches drive commands after UART RX/responses confirm the Create is alive. Timeout, UART framing error, or invalid response skips the jig, sends Stop, and enters the repeating three-blink error pattern.
-
-All drive commands carry a duration. The tick-driven runtime treats that duration as a deadline and sends Stop when it expires, before power-cycle, before idle, and on errors.
+Motor movement remains safety-gated. Timeout, UART framing error, or invalid response sends Stop and enters the repeating three-blink error pattern. All drive commands carry a duration; the tick-driven runtime treats that duration as a deadline and sends Stop when it expires, before power-cycle, before idle, and on errors.
 
 ## Porting
 
@@ -629,6 +618,6 @@ Runtime behavior lives in `src/runtime.rs` and depends on the `BrainstemHardware
 
 To add a new controller, implement `BrainstemHardware` for that board, provide its entry point and linker/build config, and keep pin polarity and voltage assumptions documented in the backend.
 
-To add a new robot body, add a body kind in `body.toml`/`build.rs`, declare its verbs/events/sensors/outputs/safety/features/limits, add a descriptor constructor in `body.rs`, implement a driver that maps the generic runtime surface to that body's hardware protocol, and emit generic outward events from the driver/runtime boundary. The generic capability JSON/compact renderers should not need edits for the new body. A later Orange Pi process can replace the built-in demo script by sending serialized `BrainstemCommand` values over UART, SPI, or USB into the same command queue.
+To add a new robot body, add a body kind in `body.toml`/`build.rs`, declare its verbs/events/sensors/outputs/safety/features/limits, add a descriptor constructor in `body.rs`, implement a driver that maps the generic runtime surface to that body's hardware protocol, and emit generic outward events from the driver/runtime boundary. The generic capability JSON/compact renderers should not need edits for the new body. A later Orange Pi process can send serialized `BrainstemCommand` values over UART, SPI, or USB into the same command queue.
 
 If a command fails, the firmware sends a stop command and enters a repeating three-blink error pattern.

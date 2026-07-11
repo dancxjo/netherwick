@@ -27,7 +27,7 @@ static UART_RX_HEALTH: AtomicU8 = AtomicU8::new(UNKNOWN);
 static CURRENT_COMMAND: AtomicU8 = AtomicU8::new(CommandCode::None as u8);
 static LAST_ERROR: AtomicU8 = AtomicU8::new(ErrorCode::None as u8);
 static LAST_ERROR_UART_READ_ERROR: AtomicU8 = AtomicU8::new(UartReadErrorCode::None as u8);
-static DEMO_STATE: AtomicU8 = AtomicU8::new(DemoState::NotStarted as u8);
+static BODY_STATE: AtomicU8 = AtomicU8::new(BodyState::NotStarted as u8);
 static LAST_UART_PACKET_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
 static LAST_UART_READ_ERROR: AtomicU8 = AtomicU8::new(UartReadErrorCode::None as u8);
 static UART_RX_BYTES: AtomicU32 = AtomicU32::new(0);
@@ -155,7 +155,7 @@ pub struct BrainstemStatus {
     pub last_error: u8,
     pub last_error_uart_read_error: u8,
     pub last_error_action: u8,
-    pub demo_state: u8,
+    pub body_state: u8,
     pub wifi_state: u8,
     pub https_state: u8,
     pub http_requests: u32,
@@ -226,14 +226,14 @@ pub struct BrainstemStatus {
 #[repr(u8)]
 pub enum RuntimeState {
     Booting = 1,
-    RunningDemo = 2,
+    Running = 2,
     Idle = 3,
     Error = 4,
 }
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
-pub enum DemoState {
+pub enum BodyState {
     NotStarted = 1,
     WaitingForCreate = 2,
     OiStarted = 3,
@@ -467,8 +467,8 @@ pub fn set_runtime_state(state: RuntimeState) {
     RUNTIME_STATE.store(state as u8, Ordering::Relaxed);
 }
 
-pub fn set_demo_state(state: DemoState) {
-    DEMO_STATE.store(state as u8, Ordering::Relaxed);
+pub fn set_body_state(state: BodyState) {
+    BODY_STATE.store(state as u8, Ordering::Relaxed);
 }
 
 pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
@@ -1921,7 +1921,7 @@ pub fn set_error(error: BrainstemError) {
         Ordering::Relaxed,
     );
     set_runtime_state(RuntimeState::Error);
-    set_demo_state(DemoState::Error);
+    set_body_state(BodyState::Error);
     request_led_blinks(8);
 }
 
@@ -2451,7 +2451,7 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         last_error: LAST_ERROR.load(Ordering::Relaxed),
         last_error_uart_read_error: LAST_ERROR_UART_READ_ERROR.load(Ordering::Relaxed),
         last_error_action: LAST_ERROR_ACTION.load(Ordering::Relaxed),
-        demo_state: DEMO_STATE.load(Ordering::Relaxed),
+        body_state: BODY_STATE.load(Ordering::Relaxed),
         wifi_state: WIFI_STATE.load(Ordering::Relaxed),
         https_state: HTTPS_STATE.load(Ordering::Relaxed),
         http_requests: HTTP_REQUESTS.load(Ordering::Relaxed),
@@ -2575,7 +2575,7 @@ struct StatusJson {
     last_error_uart_read_error: &'static str,
     last_error_action: &'static str,
     last_error_hint: &'static str,
-    demo_state: &'static str,
+    body_state: &'static str,
     wifi_state: &'static str,
     https_state: &'static str,
     http_requests: u32,
@@ -2712,7 +2712,7 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         last_error_uart_read_error: uart_read_error_text(snapshot.last_error_uart_read_error),
         last_error_action: runtime_action_text(snapshot.last_error_action),
         last_error_hint: error_hint_text(snapshot),
-        demo_state: demo_state_text(snapshot.demo_state),
+        body_state: body_state_text(snapshot.body_state),
         wifi_state: wifi_state_text(snapshot.wifi_state),
         https_state: https_state_text(snapshot.https_state),
         http_requests: snapshot.http_requests,
@@ -2866,7 +2866,7 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
 fn runtime_state_text(code: u8) -> &'static str {
     match code {
         x if x == RuntimeState::Booting as u8 => "booting",
-        x if x == RuntimeState::RunningDemo as u8 => "running_demo",
+        x if x == RuntimeState::Running as u8 => "running",
         x if x == RuntimeState::Idle as u8 => "idle",
         x if x == RuntimeState::Error as u8 => "error",
         _ => "unknown",
@@ -2874,15 +2874,15 @@ fn runtime_state_text(code: u8) -> &'static str {
 }
 
 #[cfg(feature = "pico-w")]
-fn demo_state_text(code: u8) -> &'static str {
+fn body_state_text(code: u8) -> &'static str {
     match code {
-        x if x == DemoState::NotStarted as u8 => "not_started",
-        x if x == DemoState::WaitingForCreate as u8 => "waiting_for_create",
-        x if x == DemoState::OiStarted as u8 => "oi_started",
-        x if x == DemoState::Moving as u8 => "moving",
-        x if x == DemoState::PowerCycling as u8 => "power_cycling",
-        x if x == DemoState::Idle as u8 => "idle",
-        x if x == DemoState::Error as u8 => "error",
+        x if x == BodyState::NotStarted as u8 => "not_started",
+        x if x == BodyState::WaitingForCreate as u8 => "waiting_for_create",
+        x if x == BodyState::OiStarted as u8 => "oi_started",
+        x if x == BodyState::Moving as u8 => "moving",
+        x if x == BodyState::PowerCycling as u8 => "power_cycling",
+        x if x == BodyState::Idle as u8 => "idle",
+        x if x == BodyState::Error as u8 => "error",
         _ => "unknown",
     }
 }

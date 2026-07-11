@@ -3,13 +3,13 @@ use heapless::Deque;
 use crate::body;
 use crate::commands::{
     BrainstemCommand, EscapeDirection, FeedbackKind, PowerStateRequest, RuntimeCommand,
-    SafetyAction, SafetyPolicy, SongTone, ARM_SCRIPT, DEMO_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
+    SafetyAction, SafetyPolicy, SongTone, ARM_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
     RESTART_CREATE_SCRIPT,
 };
 use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::BrainstemHardware;
-use crate::status::{self, DemoState, RuntimeActionCode, RuntimeState};
+use crate::status::{self, BodyState, RuntimeActionCode, RuntimeState};
 
 const EVENT_QUEUE_CAPACITY: usize = 16;
 const COMMAND_QUEUE_CAPACITY: usize = 16;
@@ -119,7 +119,7 @@ where
         status::signal_event(&BrainstemEvent::Boot);
         let _ = events.push_back(BrainstemEvent::Boot);
         status::set_runtime_state(RuntimeState::Booting);
-        status::set_demo_state(DemoState::NotStarted);
+        status::set_body_state(BodyState::NotStarted);
         Self {
             hardware,
             events,
@@ -151,23 +151,17 @@ where
         }
     }
 
-    pub fn run_demo(mut self) -> ! {
-        self.start_demo();
+    pub fn run(mut self) -> ! {
+        self.start();
         loop {
             self.tick();
             self.hardware.delay_ms(RUNTIME_TICK_MS);
         }
     }
 
-    pub fn start_demo(&mut self) {
-        status::set_runtime_state(RuntimeState::RunningDemo);
+    fn start(&mut self) {
         self.leds.boot_indicator(&mut self.hardware);
-        for command in DEMO_SCRIPT {
-            let _ = self.commands.push_back(QueuedCommand {
-                command_id: 0,
-                command: *command,
-            });
-        }
+        self.enter_idle();
     }
 
     #[allow(dead_code)]
@@ -256,7 +250,7 @@ where
                 }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
-                    status::set_runtime_state(RuntimeState::RunningDemo);
+                    status::set_runtime_state(RuntimeState::Running);
                 }
             }
             BrainstemCommand::Disarm => {
@@ -284,7 +278,7 @@ where
                     });
                 }
                 self.mode = RuntimeMode::Running;
-                status::set_runtime_state(RuntimeState::RunningDemo);
+                status::set_runtime_state(RuntimeState::Running);
             }
             BrainstemCommand::CmdVel { .. } => {
                 if let Some(command) = runtime_command_from_forebrain(command) {
@@ -292,7 +286,7 @@ where
                 }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
-                    status::set_runtime_state(RuntimeState::RunningDemo);
+                    status::set_runtime_state(RuntimeState::Running);
                 }
             }
             _ => {
@@ -304,7 +298,7 @@ where
                 }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
-                    status::set_runtime_state(RuntimeState::RunningDemo);
+                    status::set_runtime_state(RuntimeState::Running);
                 }
             }
         }
@@ -368,7 +362,7 @@ where
                 self.create_responsive = false;
                 status::set_create_power_unknown();
                 status::set_oi_mode_unknown();
-                status::set_demo_state(DemoState::WaitingForCreate);
+                status::set_body_state(BodyState::WaitingForCreate);
                 self.active = ActiveAction::WaitForCreate {
                     deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
                     next_probe_ms: now_ms,
@@ -380,7 +374,7 @@ where
             RuntimeCommand::SleepCreate => {
                 self.create_responsive = false;
                 status::set_oi_mode_unknown();
-                status::set_demo_state(DemoState::PowerCycling);
+                status::set_body_state(BodyState::PowerCycling);
                 self.stop_drive()?;
                 self.push_event(BrainstemEvent::CreatePowerOffRequested);
                 self.hardware.set_power_toggle(true);
@@ -403,7 +397,7 @@ where
                 self.ensure_create_responsive()?;
                 self.create_uart
                     .start_oi(&mut self.hardware, &mut self.events)?;
-                status::set_demo_state(DemoState::OiStarted);
+                status::set_body_state(BodyState::OiStarted);
                 self.active = ActiveAction::Settle {
                     until_ms: now_ms.wrapping_add(body::POST_START_SETTLE_MS),
                 };
@@ -1250,7 +1244,7 @@ where
         };
         self.ensure_motion_allowed()?;
 
-        status::set_demo_state(DemoState::Moving);
+        status::set_body_state(BodyState::Moving);
         self.stop_sent = false;
         self.create_uart.drive_direct(
             &mut self.hardware,
@@ -1278,7 +1272,7 @@ where
         };
         self.ensure_motion_allowed()?;
 
-        status::set_demo_state(DemoState::Moving);
+        status::set_body_state(BodyState::Moving);
         self.stop_sent = false;
         self.create_uart.drive_arc(
             &mut self.hardware,
@@ -1330,7 +1324,7 @@ where
         self.mode = RuntimeMode::Idle;
         self.active = ActiveAction::None;
         status::set_runtime_state(RuntimeState::Idle);
-        status::set_demo_state(DemoState::Idle);
+        status::set_body_state(BodyState::Idle);
         status::set_command(None);
         self.hardware.set_indicators(false);
         self.idle_blink_next_ms = self.now_ms();
@@ -1780,7 +1774,8 @@ fn default_feedback_tones(kind: FeedbackKind) -> ([SongTone; MAX_SONG_TONES], u8
     let notes: &[(u8, u8)] = match kind {
         FeedbackKind::Ok => &[(76, 6), (84, 10)],
         FeedbackKind::Error => &[(45, 12), (40, 16)],
-        FeedbackKind::Armed => &[(60, 6), (67, 6), (72, 10)],
+        // Solresol "fasolsi": prepare / make ready.
+        FeedbackKind::Armed => &[(65, 8), (67, 8), (71, 12)],
         FeedbackKind::LostTarget => &[(55, 8), (52, 8), (48, 12)],
         FeedbackKind::DockSeen => &[(67, 8), (71, 8), (74, 12)],
         FeedbackKind::Danger => &[(40, 6), (40, 6), (40, 12)],
@@ -1871,6 +1866,31 @@ mod tests {
     }
 
     #[test]
+    fn startup_enters_idle_without_queuing_body_commands() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(0));
+
+        runtime.start();
+
+        assert!(runtime.commands.is_empty());
+        assert!(matches!(runtime.mode, RuntimeMode::Idle));
+        assert_eq!(
+            status::snapshot(0).current_runtime_state,
+            RuntimeState::Idle as u8
+        );
+    }
+
+    #[test]
+    fn armed_feedback_says_fasolsi() {
+        let (tones, count) = default_feedback_tones(FeedbackKind::Armed);
+
+        assert_eq!(count, 3);
+        assert_eq!(tones[0].note, 65); // fa
+        assert_eq!(tones[1].note, 67); // sol
+        assert_eq!(tones[2].note, 71); // si
+    }
+
+    #[test]
     fn runtime_poll_imu_sample_updates_status() {
         let _guard = status::status_test_guard();
         status::clear_imu_orientation_calibration();
@@ -1889,6 +1909,24 @@ mod tests {
         assert_eq!(snapshot.imu_health, status::ImuHealthCode::Ok as u8);
         assert_eq!(snapshot.imu_sample_count, 1);
         assert_eq!(snapshot.imu_yaw_rate_mrad_s, 500);
+    }
+
+    #[test]
+    fn missing_imu_does_not_stop_motion() {
+        let _guard = status::status_test_guard();
+        let mut hardware = FakeHardware::new(1_000);
+        hardware.imu_health = Some(crate::drivers::imu::ImuHealth::Absent);
+        let mut runtime = Runtime::new(hardware);
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(77);
+
+        runtime.tick();
+
+        let snapshot = status::snapshot(1_000);
+        assert_eq!(snapshot.imu_health, status::ImuHealthCode::Absent as u8);
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert!(!runtime.safety_latched);
     }
 
     #[test]

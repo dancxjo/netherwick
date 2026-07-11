@@ -154,7 +154,7 @@ where
         let mut who_am_i = [0u8; 1];
         self.bus
             .write_read(self.address, &[Register::WhoAmI as u8], &mut who_am_i)
-            .map_err(|_| ImuHealth::Fault)?;
+            .map_err(|_| ImuHealth::Absent)?;
         if who_am_i[0] != 0x68 && who_am_i[0] != 0x70 {
             return Err(ImuHealth::Absent);
         }
@@ -452,6 +452,25 @@ mod tests {
         fn write_read(&mut self, _address: u8, _bytes: &[u8], _read: &mut [u8]) -> Result<(), ()> {
             Ok(())
         }
+    }
+
+    struct MissingBus;
+
+    impl ImuI2cBus for MissingBus {
+        fn write(&mut self, _address: u8, _bytes: &[u8]) -> Result<(), ()> {
+            Err(())
+        }
+
+        fn write_read(&mut self, _address: u8, _bytes: &[u8], _read: &mut [u8]) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    #[test]
+    fn missing_device_is_reported_as_absent() {
+        let mut imu = Mpu6050::new(MissingBus);
+
+        assert!(matches!(imu.poll(0), Err(ImuHealth::Absent)));
     }
 
     #[test]

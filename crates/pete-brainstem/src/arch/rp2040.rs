@@ -141,7 +141,7 @@ impl BrainstemHardware for Rp2040Brainstem {
     }
 
     fn feed_watchdog(&mut self) {
-        // The bare RP2040 demo backend does not enable the watchdog yet.
+        // The bare RP2040 backend does not enable the watchdog yet.
     }
 
     fn set_power_toggle(&mut self, high: bool) {

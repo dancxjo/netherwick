@@ -431,6 +431,9 @@ pub(crate) const ARM_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::PulseBrc,
     RuntimeCommand::StartOi,
     RuntimeCommand::SetMode(CreateOiMode::Safe),
+    RuntimeCommand::PlayFeedback {
+        kind: FeedbackKind::Armed,
+    },
 ];
 
 pub(crate) const DISARM_SCRIPT: &[RuntimeCommand] =
@@ -443,27 +446,4 @@ pub(crate) const RESTART_CREATE_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::PulseBrc,
     RuntimeCommand::StartOi,
     RuntimeCommand::SetMode(CreateOiMode::Safe),
-];
-
-pub(crate) const DEMO_SCRIPT: &[RuntimeCommand] = &[
-    RuntimeCommand::WakeCreate,
-    RuntimeCommand::PulseBrc,
-    RuntimeCommand::StartOi,
-    RuntimeCommand::SetMode(CreateOiMode::Safe),
-    RuntimeCommand::DriveDirect {
-        left_mm_s: 100,
-        right_mm_s: 100,
-        duration_ms: Some(500),
-    },
-    RuntimeCommand::DriveDirect {
-        left_mm_s: -80,
-        right_mm_s: 80,
-        duration_ms: Some(400),
-    },
-    RuntimeCommand::DriveDirect {
-        left_mm_s: 80,
-        right_mm_s: -80,
-        duration_ms: Some(400),
-    },
-    RuntimeCommand::Stop,
 ];

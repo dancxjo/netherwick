@@ -19,7 +19,7 @@ use panic_halt as _;
 #[cfg(all(not(test), feature = "rp2040", not(feature = "pico-w")))]
 #[rp2040_hal::entry]
 fn main() -> ! {
-    runtime::Runtime::new(arch::rp2040::Rp2040Brainstem::new()).run_demo();
+    runtime::Runtime::new(arch::rp2040::Rp2040Brainstem::new()).run();
 }
 
 #[cfg(all(not(test), feature = "pico-w"))]
