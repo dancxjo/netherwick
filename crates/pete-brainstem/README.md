@@ -459,9 +459,14 @@ power_state(request)
 calibrate_turn(angular_mrad_s, duration_ms)
 reset_odometry()
 dock()
-set_lights(pattern)
+set_lights(led_bits, color, intensity)
 set_mode(mode)
 ```
+
+`set_lights` is deliberately mechanical: `led_bits` is the low four binary LED channels,
+`color` is the Create power-LED value from green (`0`) through amber (`128`) to red (`255`),
+and `intensity` is the raw `0..255` brightness value. Higher layers may assign meaning to
+those outputs; the brainstem contract does not.
 
 Generic outward events are represented by `CockpitEventKind`, matching the public event names from `get_events`: `SafetyTripped`, `HeartbeatExpired`, `EStopLatched`, `MotionRequested`, `SensorFrameDecoded`, command lifecycle events, and the rest of the body-neutral vocabulary.
 
@@ -556,7 +561,7 @@ RESET_ODOMETRY seq
 SONG_PLAY seq id
 SONG_DEFINE seq id note duration_64ths...
 DOCK seq
-SET_LIGHTS seq off|status|clean|dock|spot|max
+SET_LIGHTS seq led_bits color intensity
 SET_MODE seq passive|safe|full
 BOOTSEL seq
 ```

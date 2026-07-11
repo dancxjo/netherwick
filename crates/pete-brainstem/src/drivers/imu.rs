@@ -171,6 +171,13 @@ where
         self.initialized = true;
         Ok(())
     }
+
+    pub fn restart(&mut self) -> Result<(), ImuHealth> {
+        self.initialized = false;
+        self.bus
+            .write(self.address, &[Register::PwrMgmt1 as u8, 0x80])
+            .map_err(|_| ImuHealth::Fault)
+    }
 }
 
 impl<B> ImuDriver for Mpu6050<B>
@@ -187,15 +194,19 @@ where
             .write_read(self.address, &[Register::AccelXoutH as u8], &mut bytes)
             .map_err(|_| ImuHealth::Fault)?;
 
-        Ok(Some(ImuSample {
-            timestamp_ms: now_ms,
-            accel_x_mm_s2: accel_raw_to_mm_s2(read_i16(&bytes, 0)),
-            accel_y_mm_s2: accel_raw_to_mm_s2(read_i16(&bytes, 2)),
-            accel_z_mm_s2: accel_raw_to_mm_s2(read_i16(&bytes, 4)),
-            gyro_x_mrad_s: gyro_raw_to_mrad_s(read_i16(&bytes, 8)),
-            gyro_y_mrad_s: gyro_raw_to_mrad_s(read_i16(&bytes, 10)),
-            gyro_z_mrad_s: gyro_raw_to_mrad_s(read_i16(&bytes, 12)),
-        }))
+        Ok(Some(decode_mpu6050_sample(now_ms, &bytes)))
+    }
+}
+
+pub(crate) fn decode_mpu6050_sample(now_ms: u32, bytes: &[u8; 14]) -> ImuSample {
+    ImuSample {
+        timestamp_ms: now_ms,
+        accel_x_mm_s2: accel_raw_to_mm_s2(read_i16(bytes, 0)),
+        accel_y_mm_s2: accel_raw_to_mm_s2(read_i16(bytes, 2)),
+        accel_z_mm_s2: accel_raw_to_mm_s2(read_i16(bytes, 4)),
+        gyro_x_mrad_s: gyro_raw_to_mrad_s(read_i16(bytes, 8)),
+        gyro_y_mrad_s: gyro_raw_to_mrad_s(read_i16(bytes, 10)),
+        gyro_z_mrad_s: gyro_raw_to_mrad_s(read_i16(bytes, 12)),
     }
 }
 
@@ -426,6 +437,36 @@ fn reference_component(value: i16) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingBus {
+        writes: std::vec::Vec<std::vec::Vec<u8>>,
+    }
+
+    impl ImuI2cBus for RecordingBus {
+        fn write(&mut self, _address: u8, bytes: &[u8]) -> Result<(), ()> {
+            self.writes.push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn write_read(&mut self, _address: u8, _bytes: &[u8], _read: &mut [u8]) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn restart_resets_the_device_and_forces_reinitialization() {
+        let mut imu = Mpu6050::new(RecordingBus::default());
+        imu.initialized = true;
+
+        assert!(imu.restart().is_ok());
+
+        assert!(!imu.initialized);
+        assert_eq!(
+            imu.bus.writes.as_slice(),
+            &[std::vec![Register::PwrMgmt1 as u8, 0x80]]
+        );
+    }
 
     #[test]
     fn gravity_calibration_detects_down_from_stationary_sample() {

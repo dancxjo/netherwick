@@ -5,7 +5,7 @@ use core::{
 
 use crate::body;
 use crate::commands::{
-    BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
+    BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, PowerStateRequest,
     RuntimeCommand, SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
 use crate::drivers::imu::{
@@ -459,6 +459,8 @@ enum ControlCommandCode {
     GetEvents = 42,
     ZeroImuOrientation = 43,
     ClearImuOrientation = 44,
+    RestartMpu = 45,
+    RestartCreate = 46,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -513,6 +515,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::ResetOdometry)
         | Some(RuntimeCommand::ZeroImuOrientation)
         | Some(RuntimeCommand::ClearImuOrientation)
+        | Some(RuntimeCommand::RestartMpu)
         | Some(RuntimeCommand::SongDefine { .. })
         | Some(RuntimeCommand::SongPlay { .. })
         | Some(RuntimeCommand::Dock)
@@ -728,11 +731,15 @@ fn encode_control_command(
             ))
         }
         BrainstemCommand::Dock => Some((ControlCommandCode::Dock, 0, 0, 0, 0, None)),
-        BrainstemCommand::SetLights { pattern } => Some((
+        BrainstemCommand::SetLights {
+            led_bits,
+            color,
+            intensity,
+        } => Some((
             ControlCommandCode::SetLights,
-            encode_light_pattern(pattern) as u32,
-            0,
-            0,
+            led_bits as u32,
+            color as u32,
+            intensity as u32,
             0,
             None,
         )),
@@ -1025,6 +1032,10 @@ fn encode_control_command(
         BrainstemCommand::ClearImuOrientation { .. } => {
             Some((ControlCommandCode::ClearImuOrientation, 0, 0, 0, 0, None))
         }
+        BrainstemCommand::RestartMpu => Some((ControlCommandCode::RestartMpu, 0, 0, 0, 0, None)),
+        BrainstemCommand::RestartCreate => {
+            Some((ControlCommandCode::RestartCreate, 0, 0, 0, 0, None))
+        }
         BrainstemCommand::GetCapabilities => {
             Some((ControlCommandCode::GetCapabilities, 0, 0, 0, 0, None))
         }
@@ -1089,7 +1100,9 @@ fn decode_control_command(
         }
         x if x == ControlCommandCode::Dock as u8 => Some(BrainstemCommand::Dock),
         x if x == ControlCommandCode::SetLights as u8 => Some(BrainstemCommand::SetLights {
-            pattern: decode_light_pattern(a as u8)?,
+            led_bits: a as u8,
+            color: b as u8,
+            intensity: c as u8,
         }),
         x if x == ControlCommandCode::FaceBearing as u8 => Some(BrainstemCommand::FaceBearing {
             bearing_mrad: decode_i16(a),
@@ -1262,6 +1275,8 @@ fn decode_control_command(
         x if x == ControlCommandCode::ClearImuOrientation as u8 => {
             Some(BrainstemCommand::ClearImuOrientation { seq })
         }
+        x if x == ControlCommandCode::RestartMpu as u8 => Some(BrainstemCommand::RestartMpu),
+        x if x == ControlCommandCode::RestartCreate as u8 => Some(BrainstemCommand::RestartCreate),
         x if x == ControlCommandCode::GetCapabilities as u8 => {
             Some(BrainstemCommand::GetCapabilities)
         }
@@ -1446,30 +1461,6 @@ fn unpack_song_tone(value: u32) -> SongTone {
     SongTone {
         note: (value >> 8) as u8,
         duration_64ths: value as u8,
-    }
-}
-
-#[cfg(feature = "pico-w")]
-fn encode_light_pattern(pattern: LightPattern) -> u8 {
-    match pattern {
-        LightPattern::Off => 0,
-        LightPattern::Status => 1,
-        LightPattern::Clean => 2,
-        LightPattern::Dock => 3,
-        LightPattern::Spot => 4,
-        LightPattern::Max => 5,
-    }
-}
-
-fn decode_light_pattern(value: u8) -> Option<LightPattern> {
-    match value {
-        0 => Some(LightPattern::Off),
-        1 => Some(LightPattern::Status),
-        2 => Some(LightPattern::Clean),
-        3 => Some(LightPattern::Dock),
-        4 => Some(LightPattern::Spot),
-        5 => Some(LightPattern::Max),
-        _ => None,
     }
 }
 
@@ -3063,6 +3054,8 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::ResetOdometry as u8 => "reset_odometry",
         x if x == ControlCommandCode::ZeroImuOrientation as u8 => "zero_imu_orientation",
         x if x == ControlCommandCode::ClearImuOrientation as u8 => "clear_imu_orientation",
+        x if x == ControlCommandCode::RestartMpu as u8 => "restart_mpu",
+        x if x == ControlCommandCode::RestartCreate as u8 => "restart_create",
         x if x == ControlCommandCode::GetCapabilities as u8 => "get_capabilities",
         _ => "none",
     }

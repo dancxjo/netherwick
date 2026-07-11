@@ -181,6 +181,8 @@ pub enum BrainstemCommand {
     ClearImuOrientation {
         seq: u32,
     },
+    RestartMpu,
+    RestartCreate,
     GetCapabilities,
     GetEvents {
         since_seq: u32,
@@ -200,18 +202,10 @@ pub enum BrainstemCommand {
     },
     Dock,
     SetLights {
-        pattern: LightPattern,
+        led_bits: u8,
+        color: u8,
+        intensity: u8,
     },
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum LightPattern {
-    Off,
-    Status,
-    Clean,
-    Dock,
-    Spot,
-    Max,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -406,6 +400,7 @@ pub(crate) enum RuntimeCommand {
     ResetOdometry,
     ZeroImuOrientation,
     ClearImuOrientation,
+    RestartMpu,
     PulseBrc,
     StartOi,
     SetMode(CreateOiMode),
@@ -425,7 +420,9 @@ pub(crate) enum RuntimeCommand {
     },
     Dock,
     SetLights {
-        pattern: LightPattern,
+        led_bits: u8,
+        color: u8,
+        intensity: u8,
     },
 }
 
@@ -438,6 +435,15 @@ pub(crate) const ARM_SCRIPT: &[RuntimeCommand] = &[
 
 pub(crate) const DISARM_SCRIPT: &[RuntimeCommand] =
     &[RuntimeCommand::Stop, RuntimeCommand::SleepCreate];
+
+pub(crate) const RESTART_CREATE_SCRIPT: &[RuntimeCommand] = &[
+    RuntimeCommand::Stop,
+    RuntimeCommand::SleepCreate,
+    RuntimeCommand::WakeCreate,
+    RuntimeCommand::PulseBrc,
+    RuntimeCommand::StartOi,
+    RuntimeCommand::SetMode(CreateOiMode::Safe),
+];
 
 pub(crate) const DEMO_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::WakeCreate,

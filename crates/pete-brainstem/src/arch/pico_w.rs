@@ -11,13 +11,15 @@ use embassy_net::{
     StackResources,
 };
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::i2c::{Blocking as I2cBlocking, Config as I2cConfig, I2c};
+use embassy_rp::i2c::{
+    Async as I2cAsync, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler,
+};
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
 use embassy_rp::peripherals::{
     DMA_CH0, I2C1, PIN_0, PIN_1, PIN_18, PIN_19, PIN_2, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29,
     PIN_3, PIN_4, PIN_5, PIO0, UART0, UART1,
 };
-use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::rom_data::reset_to_usb_boot;
 use embassy_rp::uart::{
     Blocking, Config as UartConfig, DataBits, Error as UartError, Parity, StopBits, Uart,
@@ -26,16 +28,17 @@ use embassy_rp::{bind_interrupts, dma, Peri};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_nb::serial::Read as _;
 use embedded_io_async::Write;
+use portable_atomic::{AtomicBool, Ordering};
 use static_cell::StaticCell;
 
 use crate::body;
 use crate::capabilities;
 use crate::commands::{
-    BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, LightPattern, PowerStateRequest,
-    SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
+    BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, PowerStateRequest, SafetyAction,
+    SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
 use crate::dhcp::{DhcpClient, DhcpGrant, DhcpLeaseState, DhcpRequest, DHCP_LEASE_SECONDS};
-use crate::drivers::imu::{ImuDriver, ImuHealth, ImuSample, Mpu6050};
+use crate::drivers::imu::{decode_mpu6050_sample, ImuHealth};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 use crate::status;
@@ -63,17 +66,28 @@ const FOREBRAIN_UART_BAUD: u32 = 115_200;
 const FOREBRAIN_LINE_MAX: usize = 96;
 const FOREBRAIN_POLL_MS: u64 = 2;
 const FOREBRAIN_LINE_TIMEOUT_MS: u32 = 100;
+const IMU_I2C_FREQUENCY_HZ: u32 = 100_000;
+const IMU_I2C_TIMEOUT_MS: u64 = 25;
+const IMU_RETRY_MS: u64 = 250;
+const MPU6050_ADDRESS_LOW: u8 = 0x68;
+const MPU6050_ADDRESS_HIGH: u8 = 0x69;
+const MPU6050_WHO_AM_I: u8 = 0x75;
+const MPU6050_PWR_MGMT_1: u8 = 0x6b;
+const MPU6050_GYRO_CONFIG: u8 = 0x1b;
+const MPU6050_ACCEL_CONFIG: u8 = 0x1c;
+const MPU6050_ACCEL_XOUT_H: u8 = 0x3b;
 
 static mut CORE1_STACK: CoreStack<8192> = CoreStack::new();
+static IMU_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
+    I2C1_IRQ => I2cInterruptHandler<I2C1>;
 });
 
 pub struct PicoWBrainstem {
     uart: Uart<'static, Blocking>,
-    imu: Option<Mpu6050<I2c<'static, I2C1, I2cBlocking>>>,
     power_toggle: Output<'static>,
     brc: Output<'static>,
     status_led: Output<'static>,
@@ -85,9 +99,6 @@ impl PicoWBrainstem {
         uart0: Peri<'static, UART0>,
         tx: Peri<'static, PIN_0>,
         rx: Peri<'static, PIN_1>,
-        i2c1: Peri<'static, I2C1>,
-        i2c_sda: Peri<'static, PIN_2>,
-        i2c_scl: Peri<'static, PIN_3>,
         power_toggle: Peri<'static, PIN_18>,
         brc: Peri<'static, PIN_19>,
         status_led: Peri<'static, PIN_20>,
@@ -97,19 +108,8 @@ impl PicoWBrainstem {
         uart_config.data_bits = DataBits::DataBits8;
         uart_config.stop_bits = StopBits::STOP1;
         uart_config.parity = Parity::ParityNone;
-        let imu = if body::IMU_ENABLED {
-            let mut i2c_config = I2cConfig::default();
-            i2c_config.frequency = 400_000;
-            Some(Mpu6050::new(I2c::new_blocking(
-                i2c1, i2c_scl, i2c_sda, i2c_config,
-            )))
-        } else {
-            None
-        };
-
         Self {
             uart: Uart::new_blocking(uart0, tx, rx, uart_config),
-            imu,
             power_toggle: Output::new(power_toggle, Level::Low),
             brc: Output::new(brc, Level::High),
             status_led: Output::new(status_led, Level::Low),
@@ -163,11 +163,12 @@ impl BrainstemHardware for PicoWBrainstem {
         }
     }
 
-    fn poll_imu_sample(&mut self, now_ms: u32) -> Result<Option<ImuSample>, ImuHealth> {
-        let Some(imu) = self.imu.as_mut() else {
+    fn restart_imu(&mut self) -> Result<(), ImuHealth> {
+        if !body::IMU_ENABLED {
             return Err(ImuHealth::Absent);
-        };
-        imu.poll(now_ms)
+        }
+        IMU_RESTART_REQUESTED.store(true, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -182,9 +183,7 @@ fn map_uart_error(error: UartError) -> UartReadError {
 }
 
 pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
-    let hardware = PicoWBrainstem::new(
-        p.UART0, p.PIN_0, p.PIN_1, p.I2C1, p.PIN_2, p.PIN_3, p.PIN_18, p.PIN_19, p.PIN_20,
-    );
+    let hardware = PicoWBrainstem::new(p.UART0, p.PIN_0, p.PIN_1, p.PIN_18, p.PIN_19, p.PIN_20);
 
     spawn_core1(
         p.CORE1,
@@ -194,6 +193,7 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
 
     spawn_wifi_lane(
         p.PIO0, p.DMA_CH0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.UART1, p.PIN_4, p.PIN_5,
+        p.I2C1, p.PIN_2, p.PIN_3,
     );
 }
 
@@ -208,6 +208,9 @@ fn spawn_wifi_lane(
     forebrain_uart: Peri<'static, UART1>,
     forebrain_tx: Peri<'static, PIN_4>,
     forebrain_rx: Peri<'static, PIN_5>,
+    i2c1: Peri<'static, I2C1>,
+    i2c_sda: Peri<'static, PIN_2>,
+    i2c_scl: Peri<'static, PIN_3>,
 ) -> ! {
     static EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
     let executor = EXECUTOR.init(embassy_executor::Executor::new());
@@ -220,6 +223,7 @@ fn spawn_wifi_lane(
             forebrain_uart_task(forebrain_uart, forebrain_tx, forebrain_rx)
                 .expect("spawn forebrain uart task"),
         );
+        spawner.spawn(imu_task(i2c1, i2c_sda, i2c_scl).expect("spawn imu task"));
     })
 }
 
@@ -356,6 +360,121 @@ async fn cyw43_runner_task(
 #[embassy_executor::task]
 async fn net_runner_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn imu_task(
+    i2c1: Peri<'static, I2C1>,
+    sda: Peri<'static, PIN_2>,
+    scl: Peri<'static, PIN_3>,
+) -> ! {
+    if !body::IMU_ENABLED {
+        status::mark_imu_health(ImuHealth::Absent);
+        core::future::pending().await
+    }
+
+    let mut config = I2cConfig::default();
+    config.frequency = IMU_I2C_FREQUENCY_HZ;
+    let mut i2c = I2c::new_async(i2c1, scl, sda, Irqs, config);
+    let mut address = None;
+
+    loop {
+        if IMU_RESTART_REQUESTED.swap(false, Ordering::Relaxed) {
+            if let Some(active_address) = address {
+                let _ =
+                    imu_write_with_timeout(&mut i2c, active_address, [MPU6050_PWR_MGMT_1, 0x80])
+                        .await;
+                Timer::after_millis(100).await;
+            }
+            address = None;
+        }
+
+        let active_address = match address {
+            Some(address) => address,
+            None => match initialize_imu(&mut i2c).await {
+                Some(found_address) => {
+                    address = Some(found_address);
+                    found_address
+                }
+                None => {
+                    status::mark_imu_health(ImuHealth::Fault);
+                    Timer::after_millis(IMU_RETRY_MS).await;
+                    continue;
+                }
+            },
+        };
+
+        let mut bytes = [0u8; 14];
+        if imu_write_read_with_timeout(&mut i2c, active_address, MPU6050_ACCEL_XOUT_H, &mut bytes)
+            .await
+        {
+            status::mark_imu_sample(decode_mpu6050_sample(
+                Instant::now().as_millis() as u32,
+                &bytes,
+            ));
+        } else {
+            status::mark_imu_health(ImuHealth::Fault);
+            address = None;
+        }
+
+        Timer::after_millis(body::IMU_POLL_PERIOD_MS.max(1) as u64).await;
+    }
+}
+
+async fn initialize_imu(i2c: &mut I2c<'static, I2C1, I2cAsync>) -> Option<u8> {
+    for address in [MPU6050_ADDRESS_LOW, MPU6050_ADDRESS_HIGH] {
+        let mut who_am_i = [0u8; 1];
+        if !imu_write_read_with_timeout(i2c, address, MPU6050_WHO_AM_I, &mut who_am_i).await
+            || (who_am_i[0] != 0x68 && who_am_i[0] != 0x70)
+        {
+            continue;
+        }
+
+        for command in [
+            [MPU6050_PWR_MGMT_1, 0x00],
+            [MPU6050_GYRO_CONFIG, 0x00],
+            [MPU6050_ACCEL_CONFIG, 0x00],
+        ] {
+            if !imu_write_with_timeout(i2c, address, command).await {
+                return None;
+            }
+        }
+        return Some(address);
+    }
+    None
+}
+
+async fn imu_write_with_timeout(
+    i2c: &mut I2c<'static, I2C1, I2cAsync>,
+    address: u8,
+    bytes: [u8; 2],
+) -> bool {
+    match select(
+        i2c.write_async(address, bytes),
+        Timer::after_millis(IMU_I2C_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(())) => true,
+        Either::First(Err(_)) | Either::Second(()) => false,
+    }
+}
+
+async fn imu_write_read_with_timeout(
+    i2c: &mut I2c<'static, I2C1, I2cAsync>,
+    address: u8,
+    register: u8,
+    bytes: &mut [u8],
+) -> bool {
+    match select(
+        i2c.write_read_async(address, [register], bytes),
+        Timer::after_millis(IMU_I2C_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(())) => true,
+        Either::First(Err(_)) | Either::Second(()) => false,
+    }
 }
 
 #[embassy_executor::task]
@@ -877,7 +996,7 @@ button{min-height:42px;border:1px solid #b9c2bd;border-radius:7px;background:#ff
 button:active,.active{transform:translateY(1px);background:#eef2ef}button:disabled{opacity:.55}.primary{background:#dceee6;border-color:#8eb99f}.stop{background:#202522;color:#fff;border-color:#202522}.danger{background:#9d2830;color:#fff;border-color:#842029}.warnbtn{background:#fff3d6;border-color:#d8b24a}.blue{background:#e7f0fb;border-color:#9bbbe0}
 .pad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.pad button{min-height:48px}.pad .center{grid-column:2}
 .seg{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.seg button{min-height:38px;font-size:12px}
-label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;gap:6px}.slider input{width:100%}input{width:100%;min-height:40px;border:1px solid #cbd3ce;border-radius:7px;padding:8px;font:inherit;background:#fff}
+label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;gap:6px}.slider input{width:100%}input,select{width:100%;min-height:40px;border:1px solid #cbd3ce;border-radius:7px;padding:8px;font:inherit;background:#fff}
 .readout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;font-size:13px}.tile{background:#f6f8f6;border:1px solid #e1e6e2;border-radius:7px;padding:8px;min-height:50px}
 .tile b{display:block;color:#4e5852;font-size:11px;text-transform:uppercase;margin-bottom:3px}.tile span,.tile div{overflow-wrap:anywhere}.wide{grid-column:1/-1}.muted{color:#68736c}.badtext{color:#a1262f}.oktext{color:#287142}
 .imu{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.imu .tile{min-height:58px}.bar{height:7px;border-radius:999px;background:#dfe6e2;overflow:hidden;margin-top:6px}.bar i{display:block;height:100%;width:0;background:#1f6f78}.bar.warn i{background:#d49832}.bar.bad i{background:#b12c37}
@@ -906,9 +1025,9 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <section class="panel controls">
 <div class="controlgrid">
 <div class="cluster"><h2>Mode</h2><div class="seg"><button id="arm" class="primary">Arm</button><button id="safe">Safe</button><button id="full">Full</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
-<div class="cluster"><h2>Lights</h2><div class="seg"><button data-lights="off">Off</button><button data-lights="status">Status</button><button data-lights="clean">Clean</button><button data-lights="dock">Dock</button><button data-lights="spot">Spot</button><button data-lights="max">Max</button></div></div>
+<div class="cluster"><h2>LEDs</h2><div class="split"><div class="field"><label for="ledcolor">LED 1 color</label><select id="ledcolor"><option value="0">Green</option><option value="128" selected>Amber</option><option value="255">Red</option></select></div><div class="slider"><label for="ledintensity">LED 1 intensity <span id="ledintensityv">25</span>%</label><input id="ledintensity" type="range" min="0" max="100" value="25"></div></div><label>Binary channels</label><div class="seg"><button data-led-bit="1">LED 2 OFF</button><button data-led-bit="2">LED 3 OFF</button><button data-led-bit="4">LED 4 OFF</button><button data-led-bit="8">LED 5 OFF</button></div><div class="row"><button id="ledapply" class="primary">Apply LEDs</button><button id="ledoff">All Off</button></div></div>
 <div class="cluster"><h2>Primitives</h2><div class="seg"><button data-action="drive_for">Drive 300</button><button data-action="turn_left">Turn L</button><button data-action="turn_right">Turn R</button><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div></div>
-<div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="imuzero">Zero IMU</button><button id="imuclear">Clear IMU</button><button id="stream">Stream Sensors</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
+<div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="imuzero">Zero IMU</button><button id="imuclear">Clear IMU</button><button id="mpurestart" class="warnbtn">Restart MPU</button><button id="createrestart" class="warnbtn">Restart Create</button><button id="stream">Stream Sensors</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
 <div class="cluster wide"><h2>Music</h2><div class="split"><div class="field"><label for="songid">Slot</label><input id="songid" inputmode="numeric" value="0"></div><div class="field"><label for="tones">Tones</label><input id="tones" value="72:8,76:8,79:16"></div></div><div class="row"><button id="songdef" class="primary">Define</button><button id="songplay">Play</button><button id="song">Chirp</button></div></div>
 </div>
 </section>
@@ -946,7 +1065,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 </div>
 </div>
 <script>
-let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='',statusBusy=false,lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,eventBusy=false,caps=null;
+let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='',statusBusy=false,lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,eventBusy=false,caps=null,ledBits=0;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
 const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','calibrate_turn','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
 const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',heartbeat:'heartbeat_stop'};
@@ -959,8 +1078,10 @@ function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control
 function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='events'){handleEvents(j);return}if(j.verbs){caps=j;applyCaps();pill(net,'capabilities','ok');return}let ok=j.accepted!==false;pill(net,ok?'accepted':'rejected',ok?'ok':'warn');if(!ok)addLog('rejected '+(j.message||j.command_id||''));else if(j.message)addLog(j.message+' '+(j.command_id||''))}
 function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(ack===false)o.ack=false;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;if(wsOpen&&ws&&ws.readyState===1){if(ws.bufferedAmount<384){ws.send(body);if(ack!==false)addLog('sent '+name);return Promise.resolve({accepted:true})}pill(net,'throttled','warn');return Promise.resolve({accepted:false,message:'throttled'})}return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
 function requestCaps(){sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps()}})}
-function applyCaps(){setDisabled(['arm'],'arm');setDisabled(['disarm'],'disarm');setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');setDisabled(['imuzero'],'zero_imu_orientation');setDisabled(['imuclear'],'clear_imu_orientation');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});document.querySelectorAll('[data-lights]').forEach(b=>b.disabled=!hasVerb('set_lights'));['dock','safe','full','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='safe'||x==='full'?'set_mode':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
-function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('.active').forEach(b=>b.classList.remove('active'));sendCockpit({kind:'stop'})}
+function applyCaps(){setDisabled(['arm'],'arm');setDisabled(['disarm'],'disarm');setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');setDisabled(['imuzero'],'zero_imu_orientation');setDisabled(['imuclear'],'clear_imu_orientation');setDisabled(['mpurestart'],'restart_mpu');setDisabled(['createrestart'],'restart_create');setDisabled(['ledapply','ledoff','ledcolor','ledintensity'],'set_lights');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});document.querySelectorAll('[data-led-bit]').forEach(b=>b.disabled=!hasVerb('set_lights'));['dock','safe','full','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='safe'||x==='full'?'set_mode':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
+function sendLights(){let pct=+$('ledintensity').value;sendCockpit({kind:'set_lights',led_bits:ledBits,color:+$('ledcolor').value,intensity:Math.round(pct*255/100)})}
+function renderLedBits(){document.querySelectorAll('[data-led-bit]').forEach((b,i)=>{let on=(ledBits&+b.dataset.ledBit)!==0;b.classList.toggle('active',on);b.textContent='LED '+(i+2)+' '+(on?'ON':'OFF')})}
+function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('[data-drive].active').forEach(b=>b.classList.remove('active'));sendCockpit({kind:'stop'})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
 function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
 function refreshHeartbeat(){if(!hasVerb('heartbeat_stop'))return;let now=Date.now();if(now-lastHeartbeatAt>550){lastHeartbeatAt=now;sendCockpit({kind:'heartbeat_stop',timeout_ms:900},false)}}
@@ -985,17 +1106,22 @@ $('dock').onclick=()=>sendCockpit({kind:'dock'})
 $('ping').onclick=()=>sendCockpit({kind:'ping'})
 $('imuzero').onclick=()=>sendCockpit({kind:'zero_imu_orientation'})
 $('imuclear').onclick=()=>sendCockpit({kind:'clear_imu_orientation'})
+$('mpurestart').onclick=()=>sendCockpit({kind:'restart_mpu'})
+$('createrestart').onclick=()=>sendCockpit({kind:'restart_create'})
 $('songdef').onclick=defineSong
 $('songplay').onclick=()=>sendCockpit({kind:'song_play',id:songSlot()})
 $('song').onclick=()=>defineSong().then(()=>sendCockpit({kind:'song_play',id:songSlot()}))
 $('stream').onclick=()=>sendCockpit({kind:'stream_sensors',enabled:true,packet_id:0,period_ms:250})
 $('bootsel').onclick=()=>sendCockpit({kind:'bootsel'})
 $('refresh').onclick=refresh
-document.querySelectorAll('[data-lights]').forEach(b=>b.onclick=()=>sendCockpit({kind:'set_lights',pattern:b.dataset.lights}))
+document.querySelectorAll('[data-led-bit]').forEach(b=>b.onclick=()=>{ledBits^=+b.dataset.ledBit;renderLedBits()})
 document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>behavior(b.dataset.action))
 document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveKind=b.dataset.drive;b.classList.add('active');sendDrive();timer=setInterval(sendDrive,190);b.setPointerCapture(e.pointerId)};b.onpointerup=b.onpointercancel=stop})
 $('speed').oninput=()=>$('speedv').textContent=$('speed').value
 $('turn').oninput=()=>$('turnv').textContent=$('turn').value
+$('ledintensity').oninput=()=>$('ledintensityv').textContent=$('ledintensity').value
+$('ledapply').onclick=sendLights
+$('ledoff').onclick=()=>{ledBits=0;$('ledintensity').value=0;$('ledintensityv').textContent='0';renderLedBits();sendLights()}
 function time(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60),h=Math.floor(m/60);return h+'h '+(m%60)+'m '+(s%60)+'s'}
 function flagList(cs){let f=[];if(cs.bump_left)f.push('bump L');if(cs.bump_right)f.push('bump R');if(cs.wall)f.push('wall');if(cs.virtual_wall)f.push('virtual wall');if(cs.wheel_drop)f.push('wheel drop');if(cs.cliff_left)f.push('cliff L');if(cs.cliff_front_left)f.push('cliff FL');if(cs.cliff_front_right)f.push('cliff FR');if(cs.cliff_right)f.push('cliff R');return f}
 function battPct(cs){return cs.capacity_mah?Math.min(100,Math.round((cs.charge_mah||0)*100/cs.capacity_mah)):null}
@@ -1409,9 +1535,19 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             }
         }
         "DOCK" => BrainstemCommand::Dock,
-        "SET_LIGHTS" => BrainstemCommand::SetLights {
-            pattern: parse_light_pattern(parts.next().ok_or(seq)?).ok_or(seq)?,
-        },
+        "SET_LIGHTS" => {
+            let led_bits = parse_u32(parts.next()).ok_or(seq)?;
+            let color = parse_u32(parts.next()).ok_or(seq)?;
+            let intensity = parse_u32(parts.next()).ok_or(seq)?;
+            if led_bits > 0x0f || color > u8::MAX as u32 || intensity > u8::MAX as u32 {
+                return Err(seq);
+            }
+            BrainstemCommand::SetLights {
+                led_bits: led_bits as u8,
+                color: color as u8,
+                intensity: intensity as u8,
+            }
+        }
         _ => return Err(seq),
     };
 
@@ -1766,6 +1902,8 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
         "clear_imu_orientation" => Some(BrainstemCommand::ClearImuOrientation {
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
+        "restart_mpu" => Some(BrainstemCommand::RestartMpu),
+        "restart_create" => Some(BrainstemCommand::RestartCreate),
         "get_capabilities" => Some(BrainstemCommand::GetCapabilities),
         "get_events" => Some(BrainstemCommand::GetEvents {
             since_seq: json_u32(body, "since_seq").unwrap_or(0),
@@ -1784,21 +1922,19 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             })
         }
         "dock" => Some(BrainstemCommand::Dock),
-        "set_lights" => Some(BrainstemCommand::SetLights {
-            pattern: parse_light_pattern(json_str(body, "pattern")?)?,
-        }),
-        _ => None,
-    }
-}
-
-fn parse_light_pattern(pattern: &str) -> Option<LightPattern> {
-    match pattern {
-        "off" => Some(LightPattern::Off),
-        "status" => Some(LightPattern::Status),
-        "clean" => Some(LightPattern::Clean),
-        "dock" => Some(LightPattern::Dock),
-        "spot" => Some(LightPattern::Spot),
-        "max" => Some(LightPattern::Max),
+        "set_lights" => {
+            let led_bits = json_u32(body, "led_bits")?;
+            let color = json_u32(body, "color")?;
+            let intensity = json_u32(body, "intensity")?;
+            if led_bits > 0x0f || color > u8::MAX as u32 || intensity > u8::MAX as u32 {
+                return None;
+            }
+            Some(BrainstemCommand::SetLights {
+                led_bits: led_bits as u8,
+                color: color as u8,
+                intensity: intensity as u8,
+            })
+        }
         _ => None,
     }
 }

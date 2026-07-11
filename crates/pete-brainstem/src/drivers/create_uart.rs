@@ -1,6 +1,6 @@
 use heapless::{Deque, Vec};
 
-use crate::commands::{CreateOiMode, LightPattern, SongTone, MAX_SONG_TONES};
+use crate::commands::{CreateOiMode, SongTone, MAX_SONG_TONES};
 use crate::events::{BrainstemError, BrainstemEvent, CreateSensorFlags, CreateSensorPacket};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::status;
@@ -263,20 +263,14 @@ impl CreateUart {
         &mut self,
         hardware: &mut H,
         _events: &mut Deque<BrainstemEvent, N>,
-        pattern: LightPattern,
+        led_bits: u8,
+        color: u8,
+        intensity: u8,
     ) -> Result<(), BrainstemError>
     where
         H: BrainstemHardware,
     {
-        let (bits, color, intensity) = match pattern {
-            LightPattern::Off => (0, 0, 0),
-            LightPattern::Status => (0b0010, 128, 160),
-            LightPattern::Clean => (0b0010, 0, 255),
-            LightPattern::Dock => (0b0100, 255, 255),
-            LightPattern::Spot => (0b1000, 255, 180),
-            LightPattern::Max => (0b1111, 255, 255),
-        };
-        self.send_bytes(hardware, &[OI_LEDS, bits, color, intensity])
+        self.send_bytes(hardware, &[OI_LEDS, led_bits & 0x0f, color, intensity])
     }
 
     fn drive<H>(
@@ -609,6 +603,19 @@ mod tests {
         }
         assert_eq!(sensor_packet_length(6), None);
         assert_eq!(sensor_packet_length(32), None);
+    }
+
+    #[test]
+    fn set_lights_sends_raw_mechanical_values() {
+        let mut uart = CreateUart::new();
+        let mut hardware = TestHardware::new();
+        let mut events = Deque::<BrainstemEvent, 1>::new();
+
+        assert!(uart
+            .set_lights(&mut hardware, &mut events, 0b1_0101, 128, 64)
+            .is_ok());
+
+        assert_eq!(hardware.tx, [OI_LEDS, 0b0101, 128, 64]);
     }
 
     #[test]

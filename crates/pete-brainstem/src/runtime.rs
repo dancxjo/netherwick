@@ -4,6 +4,7 @@ use crate::body;
 use crate::commands::{
     BrainstemCommand, EscapeDirection, FeedbackKind, PowerStateRequest, RuntimeCommand,
     SafetyAction, SafetyPolicy, SongTone, ARM_SCRIPT, DEMO_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
+    RESTART_CREATE_SCRIPT,
 };
 use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
 use crate::events::{BrainstemError, BrainstemEvent};
@@ -270,6 +271,20 @@ where
                     });
                 }
                 self.mode = RuntimeMode::Running;
+            }
+            BrainstemCommand::RestartCreate => {
+                self.interrupt_active_command();
+                self.commands.clear();
+                self.active = ActiveAction::None;
+                self.heartbeat_stop_at_ms = None;
+                for command in RESTART_CREATE_SCRIPT.iter().rev() {
+                    let _ = self.commands.push_front(QueuedCommand {
+                        command_id,
+                        command: *command,
+                    });
+                }
+                self.mode = RuntimeMode::Running;
+                status::set_runtime_state(RuntimeState::RunningDemo);
             }
             BrainstemCommand::CmdVel { .. } => {
                 if let Some(command) = runtime_command_from_forebrain(command) {
@@ -635,6 +650,10 @@ where
             RuntimeCommand::ClearImuOrientation => {
                 status::clear_imu_orientation_calibration();
             }
+            RuntimeCommand::RestartMpu => match self.hardware.restart_imu() {
+                Ok(()) => status::mark_imu_health(crate::drivers::imu::ImuHealth::Unknown),
+                Err(health) => status::mark_imu_health(health),
+            },
             RuntimeCommand::SongPlay { id } => {
                 self.ensure_create_responsive()?;
                 self.create_uart
@@ -659,9 +678,18 @@ where
                 self.create_uart
                     .seek_dock(&mut self.hardware, &mut self.events)?;
             }
-            RuntimeCommand::SetLights { pattern } => {
-                self.create_uart
-                    .set_lights(&mut self.hardware, &mut self.events, pattern)?;
+            RuntimeCommand::SetLights {
+                led_bits,
+                color,
+                intensity,
+            } => {
+                self.create_uart.set_lights(
+                    &mut self.hardware,
+                    &mut self.events,
+                    led_bits,
+                    color,
+                    intensity,
+                )?;
             }
         }
 
@@ -1425,7 +1453,8 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         | BrainstemCommand::Status
         | BrainstemCommand::Bootsel
         | BrainstemCommand::Arm
-        | BrainstemCommand::Disarm => None,
+        | BrainstemCommand::Disarm
+        | BrainstemCommand::RestartCreate => None,
         BrainstemCommand::Stop => Some(RuntimeCommand::Stop),
         BrainstemCommand::EStop => Some(RuntimeCommand::EStop),
         BrainstemCommand::ClearEStop => Some(RuntimeCommand::ClearEStop),
@@ -1669,6 +1698,7 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         BrainstemCommand::ResetOdometry { .. } => Some(RuntimeCommand::ResetOdometry),
         BrainstemCommand::ZeroImuOrientation { .. } => Some(RuntimeCommand::ZeroImuOrientation),
         BrainstemCommand::ClearImuOrientation { .. } => Some(RuntimeCommand::ClearImuOrientation),
+        BrainstemCommand::RestartMpu => Some(RuntimeCommand::RestartMpu),
         BrainstemCommand::SongPlay { id } => Some(RuntimeCommand::SongPlay { id }),
         BrainstemCommand::SongDefine {
             id,
@@ -1681,7 +1711,15 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             tone_count,
         }),
         BrainstemCommand::Dock => Some(RuntimeCommand::Dock),
-        BrainstemCommand::SetLights { pattern } => Some(RuntimeCommand::SetLights { pattern }),
+        BrainstemCommand::SetLights {
+            led_bits,
+            color,
+            intensity,
+        } => Some(RuntimeCommand::SetLights {
+            led_bits,
+            color,
+            intensity,
+        }),
         BrainstemCommand::GetCapabilities => None,
         BrainstemCommand::GetEvents { .. } => None,
     }

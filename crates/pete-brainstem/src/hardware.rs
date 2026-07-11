@@ -36,6 +36,10 @@ pub trait BrainstemHardware {
         Ok(None)
     }
 
+    fn restart_imu(&mut self) -> Result<(), ImuHealth> {
+        Err(ImuHealth::Absent)
+    }
+
     fn drain_uart_rx(&mut self) {
         for _ in 0..256 {
             match self.read_byte() {

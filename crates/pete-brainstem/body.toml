@@ -70,6 +70,8 @@ verbs = [
   "reset_odometry",
   "zero_imu_orientation",
   "clear_imu_orientation",
+  "restart_mpu",
+  "restart_create",
   "dock",
   "set_lights",
   "set_mode",
