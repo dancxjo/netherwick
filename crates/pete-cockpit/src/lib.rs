@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serialport::SerialPort;
@@ -212,6 +212,19 @@ impl Default for CockpitLimits {
 }
 
 pub trait Cockpit {
+    /// Production possession metadata, when this connector owns a scoped
+    /// motherbrain lease. Read-only and legacy connectors return `None`.
+    fn possession_snapshot(&self) -> Option<PossessionSnapshot> {
+        None
+    }
+
+    /// Surrender motherbrain possession. The brainstem wire operation remains
+    /// DISARM, but that implementation detail is not the motherbrain lifecycle
+    /// vocabulary.
+    fn exorcize(&mut self) -> Result<()> {
+        self.disarm()
+    }
+
     /// Unscoped transport operation. Production brainstems accept only
     /// read-only and emergency requests here; state-changing requests fail
     /// closed. Use `SessionCockpit`, `ControlCockpit`, or `ServiceCockpit` for
@@ -577,6 +590,14 @@ pub trait Cockpit {
 }
 
 impl<T: Cockpit + ?Sized> Cockpit for Box<T> {
+    fn possession_snapshot(&self) -> Option<PossessionSnapshot> {
+        (**self).possession_snapshot()
+    }
+
+    fn exorcize(&mut self) -> Result<()> {
+        (**self).exorcize()
+    }
+
     fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
         (**self).execute(request)
     }
@@ -2376,6 +2397,12 @@ impl<C: Cockpit> SafeCockpit<C> {
         &mut self.client
     }
 
+    pub fn replace_client(&mut self, client: C) {
+        self.client = client;
+        self.cursor = EventCursor::new();
+        self.contract = None;
+    }
+
     pub fn refresh_status(&mut self) -> Result<StatusSummary> {
         Ok(self.client.get_status()?.summary())
     }
@@ -2996,16 +3023,22 @@ impl SimCockpit {
         let lease_alive = self
             .control_lease_expires_at_ms
             .is_some_and(|deadline| !time_reached(self.now_ms, deadline));
+        let continuing_owner = lease_alive
+            && self.control_lease.as_ref().is_some_and(|lease| {
+                lease.session_id == session.session_id && lease.authority == authority
+            });
         if authority == ControlAuthority::ForebrainRecovery && lease_alive {
             return Err(CockpitError::Policy(
                 "current controller lease has not expired".into(),
             ));
         }
-        // Every ownership transition is stop -> revoke -> install, and never
-        // inherits arming or heartbeat state.
-        self.interrupt_active_motion();
-        self.heartbeat_stop_at_ms = None;
-        self.armed = false;
+        // A renewal by the same live owner atomically replaces only the lease.
+        // A true ownership transition stops and clears inherited state.
+        if !continuing_owner {
+            self.interrupt_active_motion();
+            self.heartbeat_stop_at_ms = None;
+            self.armed = authority == ControlAuthority::Motherbrain;
+        }
         self.control_lease = None;
         self.control_lease_expires_at_ms = None;
         self.lease_generation = self.lease_generation.wrapping_add(1).max(1);
@@ -3694,6 +3727,329 @@ pub struct SessionCockpit<C> {
     cursor: EventCursor,
     control_lease: Option<ControlLease>,
     service_lease: Option<ServiceLease>,
+}
+
+/// Production control boundary for a motherbrain-owned brainstem session.
+///
+/// Possession is the live `Motherbrain` lease itself. There is deliberately no
+/// second local "armed" state and no Create OI surface here: callers can send
+/// bounded body intents, STOP/DISARM, and inspect brainstem telemetry only.
+pub struct MotherbrainPossession<C: Cockpit> {
+    session: SessionCockpit<C>,
+    lease_acquired_at: Instant,
+    lease_ttl_ms: u32,
+    renew_margin_ms: u32,
+    motion_ttl_ms: u32,
+    heartbeat_timeout_ms: u32,
+    max_linear_mm_s: i16,
+    max_angular_mrad_s: i16,
+    motor_gate_open: bool,
+    refusal_reason: Option<String>,
+    last_applied_at: Option<Instant>,
+    last_applied_command: Option<MotorCommand>,
+    last_status: Option<StatusSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PossessionSnapshot {
+    pub brainstem_device_id: String,
+    pub brainstem_boot_id: String,
+    pub session_id: String,
+    pub lease_id: String,
+    pub lease_generation: u32,
+    pub lease_remaining_ms: u32,
+    pub possessed: bool,
+    pub moving: Option<bool>,
+    pub brainstem_armed: Option<bool>,
+    pub body_health: Option<String>,
+    pub uart_health: Option<String>,
+    pub safety_tripped: Option<bool>,
+    pub estop_latched: Option<bool>,
+    pub refusal_reason: Option<String>,
+    pub last_applied_command_age_ms: Option<u64>,
+    pub last_applied_command: Option<MotorCommand>,
+}
+
+impl<C: Cockpit> MotherbrainPossession<C> {
+    pub fn acquire(mut session: SessionCockpit<C>, lease_ttl_ms: u32) -> Result<Self> {
+        let lease_ttl_ms = lease_ttl_ms.max(1_000);
+        session.acquire_control(ControlAuthority::Motherbrain, lease_ttl_ms)?;
+        // A newly acquired authority always begins stopped. Do not select or
+        // otherwise expose Create OI modes from the motherbrain.
+        expect_accepted(session.execute(CockpitRequest::Stop)?)?;
+        let heartbeat_timeout_ms = 750;
+        expect_accepted(session.execute(CockpitRequest::HeartbeatStop {
+            timeout_ms: heartbeat_timeout_ms,
+        })?)?;
+        Ok(Self {
+            session,
+            lease_acquired_at: Instant::now(),
+            lease_ttl_ms,
+            renew_margin_ms: (lease_ttl_ms / 3).max(500),
+            motion_ttl_ms: 300,
+            heartbeat_timeout_ms,
+            max_linear_mm_s: 50,
+            max_angular_mrad_s: 500,
+            motor_gate_open: true,
+            refusal_reason: None,
+            last_applied_at: None,
+            last_applied_command: None,
+            last_status: None,
+        })
+    }
+
+    pub fn with_limits(mut self, linear_mm_s: i16, angular_mrad_s: i16) -> Self {
+        self.max_linear_mm_s = linear_mm_s.abs().min(50);
+        self.max_angular_mrad_s = angular_mrad_s.abs().min(500);
+        self
+    }
+
+    pub fn snapshot(&self) -> PossessionSnapshot {
+        let lease = self.session.control_lease.as_ref();
+        let elapsed = self.lease_acquired_at.elapsed().as_millis() as u64;
+        PossessionSnapshot {
+            brainstem_device_id: self.session.session().peer_device_id.clone(),
+            brainstem_boot_id: self.session.session().peer_boot_id.clone(),
+            session_id: self.session.session().session_id.clone(),
+            lease_id: lease
+                .map(|lease| lease.lease_id.clone())
+                .unwrap_or_default(),
+            lease_generation: lease.map(|lease| lease.generation).unwrap_or_default(),
+            lease_remaining_ms: u64::from(self.lease_ttl_ms)
+                .saturating_sub(elapsed)
+                .min(u64::from(u32::MAX)) as u32,
+            possessed: self.motor_gate_open && lease.is_some(),
+            moving: self
+                .last_status
+                .as_ref()
+                .and_then(|status| status.active_motion),
+            brainstem_armed: self.last_status.as_ref().and_then(|status| status.armed),
+            body_health: self
+                .last_status
+                .as_ref()
+                .and_then(|status| status.runtime_state.clone()),
+            uart_health: self.last_status.as_ref().and_then(|status| {
+                value_for(&status.raw, "create_uart_health")
+                    .or_else(|| value_for(&status.raw, "uart_health"))
+                    .map(ToOwned::to_owned)
+            }),
+            safety_tripped: self
+                .last_status
+                .as_ref()
+                .and_then(|status| status.safety_tripped),
+            estop_latched: self
+                .last_status
+                .as_ref()
+                .and_then(|status| status.estop_latched),
+            refusal_reason: self.refusal_reason.clone(),
+            last_applied_command_age_ms: self
+                .last_applied_at
+                .map(|instant| instant.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            last_applied_command: self.last_applied_command,
+        }
+    }
+
+    pub fn maintain(&mut self) -> Result<()> {
+        if !self.motor_gate_open {
+            return Err(CockpitError::Policy(
+                self.refusal_reason
+                    .clone()
+                    .unwrap_or_else(|| "not possessed".into()),
+            ));
+        }
+        let renew_at = self.lease_ttl_ms.saturating_sub(self.renew_margin_ms);
+        if self.lease_acquired_at.elapsed() < Duration::from_millis(u64::from(renew_at)) {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .session
+            .acquire_control(ControlAuthority::Motherbrain, self.lease_ttl_ms)
+        {
+            self.close_gate(format!("control lease renewal failed: {error}"));
+            return Err(error);
+        }
+        self.lease_acquired_at = Instant::now();
+        Ok(())
+    }
+
+    fn close_gate(&mut self, reason: String) {
+        self.motor_gate_open = false;
+        self.refusal_reason = Some(reason);
+    }
+
+    pub fn exorcize(&mut self) -> Result<()> {
+        let stop = self
+            .session
+            .execute(CockpitRequest::Stop)
+            .and_then(expect_accepted);
+        let disarm = self
+            .session
+            .execute(CockpitRequest::Disarm)
+            .and_then(expect_accepted);
+        self.close_gate("possession exorcized".into());
+        stop.and(disarm)
+    }
+
+    fn execute_scoped(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+        if request.authorization_class() != AuthorizationClass::Emergency {
+            self.maintain()?;
+        }
+        if matches!(request, CockpitRequest::SetMode { .. }) {
+            return Err(CockpitError::Policy(
+                "Create OI is private to the brainstem".into(),
+            ));
+        }
+        if matches!(request, CockpitRequest::Arm) {
+            return Err(CockpitError::Policy(
+                "the motherbrain lease is the possession gate; no second arm layer exists".into(),
+            ));
+        }
+        if matches!(request, CockpitRequest::PowerState { .. }) {
+            return Err(CockpitError::Policy(
+                "body power control is outside production possession".into(),
+            ));
+        }
+        let request = match request {
+            CockpitRequest::CmdVel {
+                linear_mm_s,
+                angular_mrad_s,
+                ..
+            } => {
+                expect_accepted(self.session.execute(CockpitRequest::HeartbeatStop {
+                    timeout_ms: self.heartbeat_timeout_ms,
+                })?)?;
+                CockpitRequest::CmdVel {
+                    linear_mm_s: linear_mm_s.clamp(-self.max_linear_mm_s, self.max_linear_mm_s),
+                    angular_mrad_s: angular_mrad_s
+                        .clamp(-self.max_angular_mrad_s, self.max_angular_mrad_s),
+                    ttl_ms: self.motion_ttl_ms,
+                }
+            }
+            other => other,
+        };
+        let response = self.session.execute(request.clone());
+        match response {
+            Ok(response) => {
+                match request {
+                    CockpitRequest::CmdVel {
+                        linear_mm_s,
+                        angular_mrad_s,
+                        ..
+                    } => {
+                        self.last_applied_at = Some(Instant::now());
+                        self.last_applied_command = Some(MotorCommand {
+                            forward: mm_s_to_meters_per_second(linear_mm_s),
+                            turn: mrad_s_to_radians_per_second(angular_mrad_s),
+                        });
+                    }
+                    CockpitRequest::Stop => {
+                        self.last_applied_at = Some(Instant::now());
+                        self.last_applied_command = Some(MotorCommand::stop());
+                    }
+                    _ => {}
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                if request.authorization_class() == AuthorizationClass::ControlLease {
+                    self.close_gate(format!("scoped command failed: {error}"));
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<C: Cockpit> Drop for MotherbrainPossession<C> {
+    fn drop(&mut self) {
+        let _ = self.session.execute(CockpitRequest::Stop);
+        let _ = self.session.execute(CockpitRequest::Disarm);
+    }
+}
+
+impl<C: Cockpit> Cockpit for MotherbrainPossession<C> {
+    fn possession_snapshot(&self) -> Option<PossessionSnapshot> {
+        Some(self.snapshot())
+    }
+
+    fn exorcize(&mut self) -> Result<()> {
+        MotherbrainPossession::exorcize(self)
+    }
+
+    fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+        match request.authorization_class() {
+            AuthorizationClass::ReadOnly => {
+                if self.motor_gate_open {
+                    self.maintain()?;
+                }
+                let response = match self.session.execute(request) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.close_gate(format!("brainstem status/event failure: {error}"));
+                        return Err(error);
+                    }
+                };
+                if let CockpitResponse::Status(status) = &response {
+                    let summary = status.summary();
+                    self.last_status = Some(summary.clone());
+                    if summary.estop_latched == Some(true) || summary.safety_tripped == Some(true) {
+                        self.close_gate("brainstem safety refusal".into());
+                    }
+                }
+                Ok(response)
+            }
+            AuthorizationClass::Emergency
+            | AuthorizationClass::Session
+            | AuthorizationClass::ControlLease => self.execute_scoped(request),
+            AuthorizationClass::ServiceLease => Err(CockpitError::Policy(
+                "service operations are outside motherbrain possession".into(),
+            )),
+        }
+    }
+
+    fn handshake(&mut self, _hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        Err(CockpitError::Policy(
+            "possession session is already established".into(),
+        ))
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        if session.session_id != self.session.session().session_id {
+            return Err(CockpitError::Policy("session replacement detected".into()));
+        }
+        self.execute(request)
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        session: &CockpitSession,
+        lease: &ControlLease,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        let current = self.session.control_lease.as_ref();
+        if session.session_id != self.session.session().session_id
+            || current.map(|value| (&value.lease_id, value.generation))
+                != Some((&lease.lease_id, lease.generation))
+        {
+            return Err(CockpitError::Policy("superseded possession lease".into()));
+        }
+        self.execute(request)
+    }
+
+    fn execute_with_service_lease(
+        &mut self,
+        _session: &CockpitSession,
+        _lease: &ServiceLease,
+        _request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        Err(CockpitError::Policy(
+            "service operations are outside motherbrain possession".into(),
+        ))
+    }
 }
 
 impl<C: Cockpit> SessionCockpit<C> {
@@ -7299,5 +7655,65 @@ mod tests {
             note: 72,
             duration_64ths: 8,
         }]
+    }
+
+    #[test]
+    fn production_possession_renews_and_replaces_lease() {
+        let ready = establish_session(SimCockpit::new(), hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 1_000).unwrap();
+        let first = possession.snapshot();
+        possession.lease_acquired_at = Instant::now() - Duration::from_millis(800);
+        possession.maintain().unwrap();
+        let renewed = possession.snapshot();
+        assert!(renewed.possessed);
+        assert!(renewed.lease_generation > first.lease_generation);
+        assert_ne!(renewed.lease_id, first.lease_id);
+    }
+
+    #[test]
+    fn renewal_failure_closes_motor_gate() {
+        let ready = establish_session(SimCockpit::new(), hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 1_000).unwrap();
+        possession.lease_acquired_at = Instant::now() - Duration::from_millis(800);
+        possession
+            .session
+            .connector_mut()
+            .handshake(hello().new_attempt())
+            .unwrap();
+        assert!(possession.maintain().is_err());
+        assert!(!possession.snapshot().possessed);
+        assert!(possession
+            .execute(CockpitRequest::CmdVel {
+                linear_mm_s: 1,
+                angular_mrad_s: 0,
+                ttl_ms: 100,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn production_possession_clamps_motion_and_hides_oi() {
+        let ready = establish_session(SimCockpit::new(), hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 1_000).unwrap();
+        possession
+            .execute(CockpitRequest::CmdVel {
+                linear_mm_s: 500,
+                angular_mrad_s: 5_000,
+                ttl_ms: 10_000,
+            })
+            .unwrap();
+        let events = possession.session.poll_events().unwrap();
+        let motion = events
+            .events
+            .iter()
+            .find(|event| event.kind == CockpitEventKind::MotionRequested)
+            .unwrap();
+        assert_eq!(motion.a, pack_i16_pair(50, 500));
+        assert_eq!(motion.b, 300);
+        assert!(possession
+            .execute(CockpitRequest::SetMode {
+                mode: CreateOiMode::Full,
+            })
+            .is_err());
     }
 }

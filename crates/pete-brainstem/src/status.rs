@@ -895,6 +895,12 @@ pub fn pending_authority_transition() -> Option<u32> {
     let request = AUTHORITY_REQUEST.load(Ordering::Acquire);
     (request != 0 && request != AUTHORITY_ACK.load(Ordering::Acquire)).then_some(request)
 }
+pub fn pending_authority_continues_owner(now_ms: u32) -> bool {
+    !authority_expired(now_ms)
+        && ACTIVE_LEASE_SESSION_HASH.load(Ordering::Acquire) != 0
+        && ACTIVE_LEASE_SESSION_HASH.load(Ordering::Acquire)
+            == PENDING_LEASE_SESSION_HASH.load(Ordering::Acquire)
+}
 pub fn acknowledge_authority_transition(generation: u32) {
     revoke_service_authority();
     ACTIVE_LEASE_HASH.store(

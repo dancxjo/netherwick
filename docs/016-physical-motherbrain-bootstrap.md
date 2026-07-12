@@ -29,7 +29,14 @@ cargo run -p pete-cockpit --example motherbrain_bootstrap -- --lease-expiry-smok
 It proves that an expired lease and a superseded lease fail closed, a newly
 issued lease advances identity and generation, and only the fresh lease can
 send a lease-bound heartbeat stop. It finishes stopped while the brainstem
-continues supervising the Create in Full mode.
+continues supervising the body. Create OI is not exposed to the motherbrain.
+
+The example remains a bounded protocol proof. The production path is now
+`pete-tools robot --mode possession-slow`; use the guarded wheels-off-floor
+command in [real-robot-readonly.md](real-robot-readonly.md). Acquiring the
+motherbrain lease is possession—there is no second arm layer. On orderly exit,
+the production runner requires STOP and exorcize acknowledgements. Exorcize is
+translated internally to the brainstem's DISARM wire command.
 
 Useful diagnostics:
 

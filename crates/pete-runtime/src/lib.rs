@@ -14,14 +14,10 @@ use pete_behaviors::{
     ReplaceableBehavior, TargetExtractor, TrainingSample, TrainingSource,
 };
 use pete_body::{BodyFlags, BodySense};
-use pete_cockpit::{
-    Cockpit, MotionCommand, MotorCommand, SafeCockpit, StatusSummary,
-};
+use pete_cockpit::{Cockpit, MotionCommand, MotorCommand, SafeCockpit, StatusSummary};
 use pete_conductor::{Conductor, ConductorInput, NavigationIntent, SimpleConductor};
 use pete_core::{Pose2, Provenance, Reward, TimeMs};
-use pete_events::{
-    default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response,
-};
+use pete_events::{default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response};
 use pete_experience::{
     action_features, action_value_input_from_transition_like,
     action_value_target_from_reward_surprise, charge_input_from_transition_like,
@@ -39,9 +35,7 @@ use pete_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
 };
 use pete_llm::{Combobulation, LiveImageEnricher, LlmAgent, LlmTickResult};
-use pete_map::{
-    observation_from_now, LocalMap, LoopClosureCandidateInput, MAP_EXTENSION_NAME,
-};
+use pete_map::{observation_from_now, LocalMap, LoopClosureCandidateInput, MAP_EXTENSION_NAME};
 use pete_memory::{
     attach_memory_links_to_frame, place_recognition_input_from_query_now, MemoryStore,
     PlaceRecognitionCandidate, PlaceRecognitionKind, Recall, RecallBundle, RecallQuery,
@@ -4662,6 +4656,7 @@ where
                     self.now_builder
                         .build(pre_body_t_ms, body_before.clone(), Vec::new())?;
                 now.self_sense.mode = Some("slow".to_string());
+                self.insert_possession_snapshot(&mut now);
                 now.extensions.insert(
                     "source".to_string(),
                     serde_json::Value::String("real_robot".to_string()),
@@ -4700,6 +4695,7 @@ where
         self.frame_processor.process_packets(t_ms, &mut packets);
         let mut now = self.now_builder.build(t_ms, body_before.clone(), packets)?;
         now.self_sense.mode = Some("slow".to_string());
+        self.insert_possession_snapshot(&mut now);
         now.extensions.insert(
             "source".to_string(),
             serde_json::Value::String("real_robot".to_string()),
@@ -4729,7 +4725,7 @@ where
             }
             if reign_input_drives_real_slow(&input) {
                 let desired_motor =
-                    action_to_motor_command(input.command.to_action().as_ref()).clamped(0.15, 0.25);
+                    action_to_motor_command(input.command.to_action().as_ref()).clamped(0.05, 0.5);
                 let block_reason = real_slow_body_block_reason(&body_before);
                 let final_motor = if block_reason.is_none() {
                     desired_motor
@@ -4759,7 +4755,7 @@ where
             .runtime
             .tick(now.clone(), ExperienceLatent::default(), Vec::new())
             .await?;
-        let chosen_motor = final_motor_from_tick(&tick).clamped(0.15, 0.25);
+        let chosen_motor = final_motor_from_tick(&tick).clamped(0.05, 0.5);
         let manual_drive = tick
             .frame
             .reign_input
@@ -4830,6 +4826,17 @@ where
                 now.extensions
                     .insert("robot.initialization".to_string(), initialization);
             }
+        }
+    }
+
+    fn insert_possession_snapshot(&mut self, now: &mut Now) {
+        if let Some(snapshot) = self.cockpit.client_mut().possession_snapshot() {
+            now.extensions.insert(
+                "brainstem.possession".to_string(),
+                serde_json::to_value(snapshot).unwrap_or_else(|error| {
+                    serde_json::json!({"possessed": false, "refusal_reason": error.to_string()})
+                }),
+            );
         }
     }
 }
@@ -4919,6 +4926,18 @@ fn annotate_snapshot_from_tick(snapshot: &mut WorldSnapshot, tick: &RuntimeTick)
         .extensions
         .get("action.motion_bridge")
         .cloned();
+    if let Some(possession) = tick.frame.now.extensions.get("brainstem.possession") {
+        let debug = snapshot
+            .action_debug
+            .get_or_insert_with(|| serde_json::json!({}));
+        if !debug.is_object() {
+            *debug = serde_json::json!({});
+        }
+        debug
+            .as_object_mut()
+            .expect("action debug was normalized to an object")
+            .insert("brainstem_possession".to_string(), possession.clone());
+    }
 }
 
 fn motor_command_to_motion(motor: MotorCommand) -> MotionCommand {
@@ -5082,8 +5101,7 @@ fn reign_input_outputs_real_slow_directly(input: &ReignInput) -> bool {
     }
     matches!(
         input.command,
-        pete_actions::ReignCommand::Speak { .. }
-            | pete_actions::ReignCommand::Chirp { .. }
+        pete_actions::ReignCommand::Speak { .. } | pete_actions::ReignCommand::Chirp { .. }
     )
 }
 
@@ -5132,10 +5150,7 @@ fn pose_json(body: &pete_body::BodySense) -> serde_json::Value {
     })
 }
 
-fn movement_delta_m(
-    before: &pete_body::BodySense,
-    after: &pete_body::BodySense,
-) -> f32 {
+fn movement_delta_m(before: &pete_body::BodySense, after: &pete_body::BodySense) -> f32 {
     distance_between_points(
         (before.odometry.x_m, before.odometry.y_m),
         (after.odometry.x_m, after.odometry.y_m),
@@ -7918,14 +7933,11 @@ mod tests {
             },
         };
 
-        assert!(behavior
-            .infer(&named, 10)
-            .unwrap()
-            .chosen
-            .actions
-            .contains(&EventScriptAction::Say {
+        assert!(behavior.infer(&named, 10).unwrap().chosen.actions.contains(
+            &EventScriptAction::Say {
                 text: "Hello Ada".to_string()
-            }));
+            }
+        ));
         assert!(behavior
             .infer(&unnamed, 10)
             .unwrap()
@@ -8554,7 +8566,7 @@ mod tests {
         assert_eq!(
             motors.lock().unwrap().as_slice(),
             &[MotorCommand {
-                forward: 0.15,
+                forward: 0.05,
                 turn: 0.0
             }]
         );
@@ -8603,7 +8615,7 @@ mod tests {
         assert_eq!(
             motors.lock().unwrap().as_slice(),
             &[MotorCommand {
-                forward: 0.15,
+                forward: 0.05,
                 turn: 0.0
             }]
         );
@@ -8659,8 +8671,8 @@ mod tests {
         assert_eq!(
             motors.lock().unwrap().as_slice(),
             &[MotorCommand {
-                forward: 0.15,
-                turn: -0.25
+                forward: 0.05,
+                turn: -0.5
             }]
         );
         assert!(matches!(
@@ -9519,9 +9531,7 @@ mod tests {
     #[tokio::test]
     async fn observe_or_suggest_reign_does_not_mechanically_override_selector() {
         for mode in [ReignMode::ObserveOnly, ReignMode::Suggest] {
-            let ledger = JsonlLedger::new(format!(
-                "/tmp/pete-runtime-non-driving-reign-{mode:?}"
-            ));
+            let ledger = JsonlLedger::new(format!("/tmp/pete-runtime-non-driving-reign-{mode:?}"));
             let memory = InMemoryExperienceStore::new();
             let recall = memory.clone();
             let mut runtime = MinimalRuntime::new(
@@ -11375,8 +11385,7 @@ mod tests {
     }
 
     fn danger_checkpoint_root(name: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("pete-{name}-checkpoint-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("pete-{name}-checkpoint-{}", Uuid::new_v4()));
         let _ = fs::remove_dir_all(&root);
         root
     }
@@ -11425,10 +11434,7 @@ mod tests {
         let input = ActionValueInput::from_parts(Vec::new(), Some(&action), &now);
         let mut trainer = ActionValueNetTrainer::new(input.flat_features().len());
         trainer
-            .train_step(
-                &input,
-                &pete_experience::ActionValueTarget { value: 0.25 },
-            )
+            .train_step(&input, &pete_experience::ActionValueTarget { value: 0.25 })
             .unwrap();
         trainer.save_checkpoint(root).unwrap();
     }

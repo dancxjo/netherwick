@@ -3,8 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use pete_cockpit::{
-    establish_session, AddressFamily, Cockpit, CockpitRequest, ControlAuthority, CreateOiMode,
-    FeedbackKind, HandshakeHello, HttpCockpit, MotherbrainBootstrap, PowerStateRequest,
+    AddressFamily, Cockpit, CockpitRequest, ControlAuthority, MotherbrainBootstrap,
     RegisterNetworkEndpoint,
 };
 
@@ -12,33 +11,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = dotenvy::dotenv();
     let args = std::env::args().collect::<Vec<_>>();
     let smoke = args.iter().any(|arg| arg == "--possess-smoke");
-    let full_control = args.iter().any(|arg| arg == "--full-control");
     let lease_expiry_smoke = args.iter().any(|arg| arg == "--lease-expiry-smoke");
     let wheels_off_floor = args.iter().any(|arg| arg == "--wheels-off-floor");
     if smoke && !wheels_off_floor {
         return Err("--possess-smoke requires --wheels-off-floor".into());
-    }
-    if full_control {
-        let host = std::env::var("PETE_BRAINSTEM_HTTP_HOST")
-            .unwrap_or_else(|_| "192.168.4.1:80".into());
-        let connector = HttpCockpit::connect(host);
-        let mut ready = establish_session(connector, HandshakeHello::default_motherbrain(), None)?;
-        ready.acquire_control(ControlAuthority::Motherbrain, 5_000)?;
-        ready.execute(CockpitRequest::PowerState {
-            request: PowerStateRequest::StartOi,
-        })?;
-        ready.execute(CockpitRequest::SetMode {
-            mode: CreateOiMode::Full,
-        })?;
-        ready.execute(CockpitRequest::PlayFeedback {
-            feedback: FeedbackKind::Armed,
-        })?;
-        let status = ready.execute(CockpitRequest::GetStatus)?;
-        let pete_cockpit::CockpitResponse::Status(status) = status else {
-            return Err("full-control status response was malformed".into());
-        };
-        eprintln!("full-control assertion sent; status={:?}", status.summary());
-        return Ok(());
     }
     let mut bootstrap = MotherbrainBootstrap::from_host();
     bootstrap.expected_brainstem_device_id = std::env::var("PETE_BRAINSTEM_DEVICE_ID").ok();
@@ -138,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if summary.active_motion == Some(true) {
             return Err("lease expiry smoke did not finish stopped".into());
         }
-        eprintln!("lease expiry smoke complete: stopped; brainstem remains in full mode");
+        eprintln!("lease expiry smoke complete: stopped; body remains brainstem-supervised");
     } else if smoke {
         ready.execute(CockpitRequest::CmdVel {
             linear_mm_s: 50,

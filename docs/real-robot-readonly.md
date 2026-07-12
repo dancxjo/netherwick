@@ -1,4 +1,4 @@
-# Real Robot Read-Only Bring-Up
+# Real Robot Read-Only and Possession Bring-Up
 
 Read-only robot mode lets Pete ingest Cockpit status/events and optional sensor data without allowing motion. It is intended for hardware bring-up, ledger collection, capture/replay data, dashboard inspection, and Reign teaching data before any autonomous driving mode exists.
 
@@ -27,7 +27,7 @@ Brainstem Cockpit over UART:
 ```bash
 cargo run -p pete-tools -- robot \
   --mode read-only \
-  --cockpit uart --create-port /dev/ttyUSB0 \
+  --cockpit uart --create-port /dev/serial/by-id/DEVICE \
   --ledger data/ledger/robot-readonly
 ```
 
@@ -56,6 +56,52 @@ ReadOnlyActionSuppressed
 ```
 
 The `Now` extension `read_only_motor_gate` records `motor_applied: false`, `final_motor: Stop`, and `safety_reason: ReadOnlyMode`.
+
+## Production possession/slow mode
+
+Possession is the live motherbrain control lease; there is no additional
+motherbrain arm layer. This mode is never the default and must be selected
+explicitly. The motherbrain receives only the brainstem's body/safety
+interface. Create OI access and mode selection remain private to the
+brainstem.
+
+With the wheels off the floor:
+
+```bash
+cargo run -p pete-tools -- robot \
+  --mode possession-slow \
+  --cockpit uart \
+  --create-port /dev/serial/by-id/DEVICE \
+  --brainstem-device-id BRAINSTEM_ID \
+  --brainstem-boot-id BOOT_ID \
+  --max-linear-mm-s 50 \
+  --max-angular-mrad-s 500 \
+  --tick-ms 100 \
+  --duration-seconds 30 \
+  --ledger data/ledger/real/possession-wheels-off-floor \
+  --capture data/captures/real/possession-wheels-off-floor
+```
+
+The explicit mode selection is the attended possession gate. Startup performs
+a fresh handshake, verifies identity and the live contract/safety snapshot,
+acquires the motherbrain lease, and sends STOP. Runtime motion is limited to
+50 mm/s linear and 500 mrad/s angular with a 300 ms command TTL and a 750 ms
+heartbeat stop. Missing hardware, an unstable device path, identity mismatch,
+or acquisition failure aborts; possession mode never downgrades.
+
+Normal exit requires acknowledged STOP, acknowledged exorcize (translated to
+the brainstem's DISARM wire command), and final status
+showing no active motion and `armed == false`. Transport loss relies on the
+short command, heartbeat, and lease expiries and never triggers a power toggle.
+
+After transport loss, the runner closes its local motor gate and retries the
+same stable USB path with exponential backoff (250 ms through 5 seconds by
+default). Every attempt performs a new handshake and acquires a new lease; the
+old session and lease are never reused. The configured device and boot IDs must
+both match. A reboot/boot-ID change stops retrying and requires the operator to
+restart with the newly observed `--brainstem-boot-id`, making acceptance
+explicit. Override only the bounded timing with
+`--reconnect-initial-backoff-ms` and `--reconnect-max-backoff-ms`.
 
 ## Hardware Notes
 
@@ -120,6 +166,6 @@ cargo run -p pete-tools -- replay-capture \
 
 ## What It Does Not Do
 
-Read-only mode does not implement autonomous real robot motion, slow driving, docking, Kinect/libfreenect integration, online model promotion, a bundled ASR model, TTS, or face recognition training.
-
-The next movement-capable milestone is a separate slow mode with explicit motor gating and hardware acceptance tests.
+Read-only mode never requests authority or emits motor mutations. Possession
+mode does not expose Create OI, toggle body power during recovery, weaken
+brainstem safety, or enable unattended roaming.

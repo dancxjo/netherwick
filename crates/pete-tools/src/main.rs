@@ -13,11 +13,12 @@ use pete_actions::{ApproachTarget, ExploreStyle, TurnDir};
 use pete_autonomic::SimpleSafety;
 use pete_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use pete_body::{BodySense, BodySong, BodyTone};
-use pete_cockpit::{Cockpit, SimCockpit as LocalSimCockpit, SongTone, UartCockpit};
-use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
-use pete_ledger::{
-    ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter,
+use pete_cockpit::{
+    establish_session, Cockpit, CockpitError, HandshakeHello, MotherbrainPossession,
+    SimCockpit as LocalSimCockpit, SongTone, UartCockpit,
 };
+use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
+use pete_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter};
 use pete_llm::{ConfiguredLlmAgent, LiveImageEnricher, LlmConfig, LlmProvider};
 use pete_map::{
     observation_from_now, transform_point_to_world, LocalMap, LoopClosureCandidateInput,
@@ -208,11 +209,7 @@ struct SimArgs {
         env = "PETE_INLINE_LEARNING_MODE"
     )]
     inline_learning_mode: InlineLearningModeArg,
-    #[arg(
-        long,
-        default_value_t = 1,
-        env = "PETE_INLINE_TRAIN_STEPS_PER_TICK"
-    )]
+    #[arg(long, default_value_t = 1, env = "PETE_INLINE_TRAIN_STEPS_PER_TICK")]
     inline_train_steps_per_tick: usize,
     #[arg(long, env = "PETE_INLINE_BEHAVIORS")]
     inline_behaviors: Option<String>,
@@ -501,6 +498,20 @@ struct RobotArgs {
     dashboard_tls_key: String,
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
+    /// Expected brainstem device identity. Required for physical possession.
+    #[arg(long)]
+    brainstem_device_id: Option<String>,
+    /// Expected boot identity. Required for physical possession and reconnect.
+    #[arg(long)]
+    brainstem_boot_id: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    max_linear_mm_s: i16,
+    #[arg(long, default_value_t = 500)]
+    max_angular_mrad_s: i16,
+    #[arg(long, default_value_t = 250)]
+    reconnect_initial_backoff_ms: u64,
+    #[arg(long, default_value_t = 5_000)]
+    reconnect_max_backoff_ms: u64,
     #[arg(long)]
     steps: Option<usize>,
     #[arg(long)]
@@ -526,7 +537,7 @@ struct HardwareEnvArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum RobotModeArg {
     ReadOnly,
-    Slow,
+    PossessionSlow,
     Disabled,
 }
 
@@ -847,21 +858,13 @@ struct TrainUnifiedExperienceArgs {
 
 #[derive(Debug, Parser)]
 struct InspectLedgerArgs {
-    #[arg(
-        long,
-        default_value = "data/ledger/virtual-live",
-        env = "PETE_LEDGER"
-    )]
+    #[arg(long, default_value = "data/ledger/virtual-live", env = "PETE_LEDGER")]
     ledger: String,
 }
 
 #[derive(Debug, Parser)]
 struct VirtualReportArgs {
-    #[arg(
-        long,
-        default_value = "data/ledger/virtual-live",
-        env = "PETE_LEDGER"
-    )]
+    #[arg(long, default_value = "data/ledger/virtual-live", env = "PETE_LEDGER")]
     ledger: String,
     #[arg(long, default_value = "data/reports/virtual/latest.json")]
     out: String,
@@ -869,11 +872,7 @@ struct VirtualReportArgs {
 
 #[derive(Debug, Parser)]
 struct PoseGraphReportArgs {
-    #[arg(
-        long,
-        default_value = "data/ledger/virtual-live",
-        env = "PETE_LEDGER"
-    )]
+    #[arg(long, default_value = "data/ledger/virtual-live", env = "PETE_LEDGER")]
     ledger: String,
     #[arg(long)]
     capture: Option<String>,
@@ -915,11 +914,7 @@ struct GeometryDebugArgs {
 
 #[derive(Debug, Parser)]
 struct RepresentationReportArgs {
-    #[arg(
-        long,
-        default_value = "data/ledger/virtual-live",
-        env = "PETE_LEDGER"
-    )]
+    #[arg(long, default_value = "data/ledger/virtual-live", env = "PETE_LEDGER")]
     ledger: String,
     #[arg(long)]
     capture: Option<String>,
@@ -1049,11 +1044,7 @@ struct RepresentationConfidenceDistribution {
 
 #[derive(Debug, Parser)]
 struct TrainVirtualArgs {
-    #[arg(
-        long,
-        default_value = "data/ledger/virtual-live",
-        env = "PETE_LEDGER"
-    )]
+    #[arg(long, default_value = "data/ledger/virtual-live", env = "PETE_LEDGER")]
     ledger: String,
     #[arg(
         long,
@@ -1284,12 +1275,9 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             });
         } else {
             tokio::spawn(async move {
-                if let Err(error) = pete_server::serve_live_view_with_reign(
-                    live_addr,
-                    server_state,
-                    reign_state,
-                )
-                .await
+                if let Err(error) =
+                    pete_server::serve_live_view_with_reign(live_addr, server_state, reign_state)
+                        .await
                 {
                     eprintln!("live robot view server stopped: {error}");
                 }
@@ -1443,9 +1431,7 @@ fn inline_learning_behaviors(list: Option<&str>) -> Result<InlineLearningBehavio
     Ok(behaviors)
 }
 
-fn live_scene_metadata_from_scenario(
-    metadata: &pete_sim::ScenarioMetadata,
-) -> LiveSceneMetadata {
+fn live_scene_metadata_from_scenario(metadata: &pete_sim::ScenarioMetadata) -> LiveSceneMetadata {
     LiveSceneMetadata {
         arena: Some(SceneArena {
             width_m: metadata.arena.width_m,
@@ -4134,29 +4120,27 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
 
     let create_port = selected_cockpit_port(args.cockpit, &args.create_port, &env_report);
 
-    let cockpit: Box<dyn Cockpit + Send> =
-        if args.mock || create_port.as_deref() == Some("mock") {
-            device_availability["create"] =
-                serde_json::json!({"present": true, "source": "sim-cockpit"});
-            Box::new(LocalSimCockpit::new().with_unscoped_bench_mode())
-        } else if let Some(create_port) = &create_port {
-            match UartCockpit::connect(create_port) {
-                Ok(cockpit) => {
-                    device_availability["create"] = serde_json::json!({
-                        "present": true,
-                        "port": create_port,
-                        "baud": args.create_baud,
-                        "backend": "uart-cockpit"
-                    });
-                    Box::new(cockpit)
-                }
-                Err(error) => {
-                    anyhow::bail!("failed to open cockpit UART device {create_port}: {error}");
-                }
+    let cockpit: Box<dyn Cockpit + Send> = if args.mock || create_port.as_deref() == Some("mock") {
+        device_availability["create"] =
+            serde_json::json!({"present": true, "source": "sim-cockpit"});
+        Box::new(LocalSimCockpit::new().with_unscoped_bench_mode())
+    } else if let Some(create_port) = &create_port {
+        match UartCockpit::connect(create_port) {
+            Ok(cockpit) => {
+                device_availability["create"] = serde_json::json!({
+                    "present": true,
+                    "port": create_port,
+                    "baud": args.create_baud,
+                    "backend": "uart-cockpit"
+                });
+                Box::new(cockpit)
             }
+            Err(error) => {
+                anyhow::bail!("failed to open cockpit UART device {create_port}: {error}");
+            }
+        }
     } else {
-        warnings
-            .push("cockpit UART device not found; using simulated cockpit status".to_string());
+        warnings.push("cockpit UART device not found; using simulated cockpit status".to_string());
         device_availability["create"] =
             serde_json::json!({"present": false, "reason": "no cockpit serial candidate"});
         Box::new(LocalSimCockpit::new().with_unscoped_bench_mode())
@@ -4634,15 +4618,21 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let create_port = selected_cockpit_port(args.cockpit, &args.create_port, &env_report);
     let robot_mode = match args.mode {
         RobotModeArg::ReadOnly => RobotMode::ReadOnly,
-        RobotModeArg::Slow => RobotMode::Slow,
+        RobotModeArg::PossessionSlow => RobotMode::Slow,
         RobotModeArg::Disabled => RobotMode::Disabled,
     };
     if robot_mode == RobotMode::Disabled {
         anyhow::bail!("--mode disabled does not start the real robot runner");
     }
 
-    let (cockpit, robot_mode, is_mock_body) =
-        open_robot_cockpit_or_fallback(create_port.as_deref(), robot_mode)?;
+    let (cockpit, robot_mode, is_mock_body) = open_robot_cockpit_or_fallback(
+        create_port.as_deref(),
+        robot_mode,
+        args.brainstem_device_id.as_deref(),
+        args.brainstem_boot_id.as_deref(),
+        args.max_linear_mm_s,
+        args.max_angular_mrad_s,
+    )?;
 
     let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
     let live_state = args.dashboard.map(|_| {
@@ -4693,8 +4683,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         } else {
             tokio::spawn(async move {
                 if let Err(error) =
-                    pete_server::serve_live_view_with_reign(addr, server_state, reign_state)
-                        .await
+                    pete_server::serve_live_view_with_reign(addr, server_state, reign_state).await
                 {
                     eprintln!("live robot view server stopped: {error}");
                 }
@@ -4914,7 +4903,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         None => None,
     };
 
-    enqueue_default_bringup_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &initialization);
+    enqueue_default_bringup_outputs(
+        &mouth,
+        runner.cockpit.client_mut().as_mut(),
+        &initialization,
+    );
 
     let max_steps = args.steps.or_else(|| {
         args.duration_seconds
@@ -4932,9 +4925,19 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         };
         let (snapshot, tick) = match tick_result {
             Ok(values) => values,
-            Err(error) if matches!(robot_mode, RobotMode::ReadOnly | RobotMode::Slow) => {
+            Err(error)
+                if robot_mode == RobotMode::Slow && is_reconnectable_cockpit_error(&error) =>
+            {
+                eprintln!("possession transport/session lost; motor gate closed: {error}");
+                let replacement =
+                    reconnect_possession_cockpit(create_port.as_deref(), &args).await?;
+                runner.cockpit.replace_client(replacement);
+                eprintln!("possession reconnected with fresh session and lease; stopped=true");
+                continue;
+            }
+            Err(error) if robot_mode == RobotMode::ReadOnly => {
                 if is_transient_robot_timeout(&error) {
-                    eprintln!("{robot_mode:?} tick timed out; continuing");
+                    eprintln!("read-only tick timed out; continuing");
                     tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
                     continue;
                 }
@@ -4965,6 +4968,36 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
     }
 
+    if robot_mode == RobotMode::Slow {
+        // Preserve acknowledgement semantics: STOP must succeed before DISARM,
+        // and an absent acknowledgement makes the run fail rather than print a
+        // misleading clean shutdown.
+        runner
+            .cockpit
+            .client_mut()
+            .stop()
+            .context("possession shutdown STOP was not acknowledged")?;
+        runner
+            .cockpit
+            .client_mut()
+            .exorcize()
+            .context("possession exorcize was not acknowledged")?;
+        let final_status = runner
+            .cockpit
+            .client_mut()
+            .get_status()
+            .context("possession final status was not acknowledged")?
+            .summary();
+        if final_status.active_motion == Some(true) || final_status.armed == Some(true) {
+            anyhow::bail!(
+                "possession shutdown did not prove stopped/disarmed: moving={:?} armed={:?}",
+                final_status.active_motion,
+                final_status.armed
+            );
+        }
+        println!("possession exorcize acknowledged: stopped=true possessed=false");
+    }
+
     let capture_summary = if let Some(writer) = capture {
         let manifest = writer.finish().await?;
         format!(
@@ -4985,6 +5018,42 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         capture_summary
     );
     Ok(())
+}
+
+async fn reconnect_possession_cockpit(
+    create_port: Option<&str>,
+    args: &RobotArgs,
+) -> Result<Box<dyn Cockpit + Send>> {
+    let mut backoff_ms = args.reconnect_initial_backoff_ms.max(1);
+    let max_backoff_ms = args.reconnect_max_backoff_ms.max(backoff_ms).min(60_000);
+    loop {
+        match open_robot_cockpit_or_fallback(
+            create_port,
+            RobotMode::Slow,
+            args.brainstem_device_id.as_deref(),
+            args.brainstem_boot_id.as_deref(),
+            args.max_linear_mm_s,
+            args.max_angular_mrad_s,
+        ) {
+            Ok((cockpit, RobotMode::Slow, _)) => return Ok(cockpit),
+            Ok(_) => anyhow::bail!("possession reconnect attempted an invalid fallback"),
+            Err(error) if is_identity_acceptance_error(&error) => return Err(error),
+            Err(error) => {
+                eprintln!("possession reconnect failed: {error}; retrying in {backoff_ms} ms");
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = next_reconnect_backoff_ms(backoff_ms, max_backoff_ms);
+            }
+        }
+    }
+}
+
+fn next_reconnect_backoff_ms(current_ms: u64, maximum_ms: u64) -> u64 {
+    current_ms.saturating_mul(2).min(maximum_ms.max(1))
+}
+
+fn is_identity_acceptance_error(error: &AnyhowError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("identity mismatch") || message.contains("requires --brainstem")
 }
 
 fn run_mouth(args: MouthArgs) -> Result<()> {
@@ -5156,6 +5225,10 @@ fn robot_initialization_metadata(
         "tick_ms": args.tick_ms,
         "dashboard": args.dashboard.map(|addr| addr.to_string()),
         "capture": args.capture.clone(),
+        "brainstem_device_id": args.brainstem_device_id.clone(),
+        "brainstem_boot_id": args.brainstem_boot_id.clone(),
+        "reconnect_initial_backoff_ms": args.reconnect_initial_backoff_ms,
+        "reconnect_max_backoff_ms": args.reconnect_max_backoff_ms,
     })
 }
 
@@ -5314,7 +5387,10 @@ fn play_body_song(cockpit: &mut dyn Cockpit, label: &str, song: BodySong) {
             duration_64ths: tone.duration_64ths,
         })
         .collect::<Vec<_>>();
-    match cockpit.song_define(0, &tones).and_then(|()| cockpit.song_play(0)) {
+    match cockpit
+        .song_define(0, &tones)
+        .and_then(|()| cockpit.song_play(0))
+    {
         Ok(()) => println!("robot cockpit song played: {label}"),
         Err(error) => println!("robot cockpit song skipped: {error}; song {label}"),
     }
@@ -5400,14 +5476,19 @@ fn requested_robot_sensor_count(args: &RobotArgs) -> usize {
 
 fn open_robot_cockpit_or_fallback(
     create_port: Option<&str>,
-    mut robot_mode: RobotMode,
+    robot_mode: RobotMode,
+    expected_device_id: Option<&str>,
+    expected_boot_id: Option<&str>,
+    max_linear_mm_s: i16,
+    max_angular_mrad_s: i16,
 ) -> Result<(Box<dyn Cockpit + Send>, RobotMode, bool)> {
     if create_port == Some("mock") {
         if robot_mode == RobotMode::Slow {
-            println!(
-                "warning: cockpit mock does not support real motorized slow mode; running in read-only mode instead"
-            );
-            robot_mode = RobotMode::ReadOnly;
+            let connector: Box<dyn Cockpit + Send> = Box::new(LocalSimCockpit::new());
+            let ready = establish_session(connector, HandshakeHello::default_motherbrain(), None)?;
+            let possession = MotherbrainPossession::acquire(ready, 5_000)?
+                .with_limits(max_linear_mm_s, max_angular_mrad_s);
+            return Ok((Box::new(possession), robot_mode, true));
         }
         return Ok((
             Box::new(LocalSimCockpit::new().with_unscoped_bench_mode()),
@@ -5418,10 +5499,9 @@ fn open_robot_cockpit_or_fallback(
 
     let Some(create_port) = create_port else {
         if robot_mode == RobotMode::Slow {
-            println!(
-                "warning: no cockpit UART device found; falling back to simulated cockpit in read-only mode"
+            anyhow::bail!(
+                "possession-slow requires a stable brainstem USB CDC device; none was found"
             );
-            robot_mode = RobotMode::ReadOnly;
         } else {
             println!("warning: no cockpit UART device found; falling back to simulated cockpit");
         }
@@ -5433,13 +5513,40 @@ fn open_robot_cockpit_or_fallback(
     };
 
     match UartCockpit::connect(create_port) {
+        Ok(cockpit) if robot_mode == RobotMode::Slow => {
+            if !create_port.starts_with("/dev/serial/by-id/") {
+                anyhow::bail!(
+                    "possession-slow requires a stable /dev/serial/by-id brainstem path, got {create_port}"
+                );
+            }
+            let expected_device_id = expected_device_id.context(
+                "possession-slow requires --brainstem-device-id to prevent identity fallback",
+            )?;
+            let expected_boot_id = expected_boot_id.context(
+                "possession-slow requires --brainstem-boot-id; a boot change needs explicit acceptance",
+            )?;
+            let connector: Box<dyn Cockpit + Send> = Box::new(cockpit);
+            let ready = establish_session(connector, HandshakeHello::default_motherbrain(), None)?;
+            if ready.session().peer_device_id != expected_device_id {
+                anyhow::bail!(
+                    "brainstem identity mismatch: expected {expected_device_id}, received {}",
+                    ready.session().peer_device_id
+                );
+            }
+            if ready.session().peer_boot_id != expected_boot_id {
+                anyhow::bail!(
+                    "brainstem boot identity mismatch: expected {expected_boot_id}, received {}",
+                    ready.session().peer_boot_id
+                );
+            }
+            let possession = MotherbrainPossession::acquire(ready, 5_000)?
+                .with_limits(max_linear_mm_s, max_angular_mrad_s);
+            Ok((Box::new(possession), robot_mode, false))
+        }
         Ok(cockpit) => Ok((Box::new(cockpit), robot_mode, false)),
         Err(error) => {
             if robot_mode == RobotMode::Slow {
-                println!(
-                    "warning: failed to open cockpit UART device {create_port}: {error}; falling back to simulated cockpit in read-only mode"
-                );
-                robot_mode = RobotMode::ReadOnly;
+                anyhow::bail!("failed to open possession brainstem {create_port}: {error}");
             } else {
                 println!(
                     "warning: failed to open cockpit UART device {create_port}: {error}; falling back to simulated cockpit"
@@ -5700,9 +5807,9 @@ fn selected_cockpit_port(
 }
 
 fn create_serial_priority(device: &str) -> u8 {
-    if device.contains("/dev/ttyUSB") {
+    if device.contains("/dev/serial/by-id") {
         0
-    } else if device.contains("/dev/serial/by-id") {
+    } else if device.contains("/dev/ttyUSB") {
         1
     } else if device.contains("/dev/ttyACM") {
         2
@@ -6708,6 +6815,36 @@ async fn inspect_ledger(args: InspectLedgerArgs) -> Result<()> {
 
 fn is_transient_readonly_timeout(error: &AnyhowError) -> bool {
     is_transient_robot_timeout(error)
+}
+
+fn is_reconnectable_cockpit_error(error: &AnyhowError) -> bool {
+    if is_transient_robot_timeout(error) {
+        return true;
+    }
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<CockpitError>()
+            .is_some_and(|cockpit| match cockpit {
+                CockpitError::Io(_)
+                | CockpitError::Serial(_)
+                | CockpitError::WebSocket(_)
+                | CockpitError::BadResponse(_)
+                | CockpitError::Json(_)
+                | CockpitError::FrameTooLarge { .. }
+                | CockpitError::InvalidSession { .. }
+                | CockpitError::SessionRequired => true,
+                CockpitError::Rejected { reason, .. } => {
+                    reason.contains("invalid_session")
+                        || reason.contains("invalid_control_lease")
+                        || reason.contains("control_lease_required")
+                }
+                CockpitError::Policy(_)
+                | CockpitError::MissedEvents { .. }
+                | CockpitError::HandshakeRejected(_)
+                | CockpitError::StaleHandshake { .. }
+                | CockpitError::UnsafeHandshake(_) => false,
+            })
+    })
 }
 
 fn is_transient_robot_timeout(error: &AnyhowError) -> bool {
@@ -10533,9 +10670,7 @@ mod tests {
     use pete_body::BodySense;
     use pete_core::Reward;
     use pete_experience::{Experience, ExperienceLatent};
-    use pete_now::{
-        ExtensionSense, Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION,
-    };
+    use pete_now::{ExtensionSense, Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION};
     use pete_sensors::World;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -11649,13 +11784,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn robot_cockpit_fallback_uses_sim_readonly_when_backend_missing() {
-        let (mut cockpit, mode, is_mock_body) =
-            open_robot_cockpit_or_fallback(None, RobotMode::Slow).unwrap();
+    async fn possession_mode_never_falls_back_when_brainstem_is_missing() {
+        let result = open_robot_cockpit_or_fallback(None, RobotMode::Slow, None, None, 50, 500);
+        let error = match result {
+            Ok(_) => panic!("possession unexpectedly fell back"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("stable brainstem USB CDC"));
+    }
 
-        assert_eq!(mode, RobotMode::ReadOnly);
-        assert!(is_mock_body);
-        assert!(cockpit.get_status().unwrap().summary().armed.is_some());
+    #[test]
+    fn possession_reconnect_backoff_is_exponential_and_bounded() {
+        assert_eq!(next_reconnect_backoff_ms(250, 5_000), 500);
+        assert_eq!(next_reconnect_backoff_ms(4_000, 5_000), 5_000);
+        assert_eq!(next_reconnect_backoff_ms(5_000, 5_000), 5_000);
+    }
+
+    #[test]
+    fn simulated_possession_reconnect_gets_fresh_session_and_lease() {
+        let (mut first, _, _) =
+            open_robot_cockpit_or_fallback(Some("mock"), RobotMode::Slow, None, None, 50, 500)
+                .unwrap();
+        let first_snapshot = first.possession_snapshot().unwrap();
+        first
+            .cmd_vel(50, 0, 30_000)
+            .expect("first lease applies bounded motion");
+        drop(first);
+
+        let (mut second, _, _) =
+            open_robot_cockpit_or_fallback(Some("mock"), RobotMode::Slow, None, None, 50, 500)
+                .unwrap();
+        let second_snapshot = second.possession_snapshot().unwrap();
+        assert_ne!(first_snapshot.session_id, second_snapshot.session_id);
+        assert_ne!(first_snapshot.lease_id, second_snapshot.lease_id);
+        assert!(second_snapshot.possessed);
+        assert_eq!(
+            second.get_status().unwrap().summary().active_motion,
+            Some(false)
+        );
     }
 
     #[test]

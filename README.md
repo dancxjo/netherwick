@@ -137,6 +137,27 @@ cargo run --bin pete -- capture-real --duration-seconds 60 --out data/captures/r
 cargo run --bin pete -- inspect-capture data/captures/real/rpi5-smoke
 ```
 
+After read-only validation, the guarded production possession command is
+explicit and wheels-off-floor first:
+
+```bash
+cargo run -p pete-tools -- robot --mode possession-slow \
+  --cockpit uart --create-port /dev/serial/by-id/DEVICE \
+  --brainstem-device-id BRAINSTEM_ID \
+  --brainstem-boot-id BOOT_ID \
+  --max-linear-mm-s 50 --max-angular-mrad-s 500 \
+  --duration-seconds 30 \
+  --ledger data/ledger/real/possession-wheels-off-floor \
+  --capture data/captures/real/possession-wheels-off-floor
+```
+
+The motherbrain control lease is possession; there is no separate arm layer.
+The runner begins with STOP, never exposes Create OI, and does not fall back to
+another device or transport. Orderly shutdown requires acknowledged STOP then
+exorcize (the brainstem DISARM wire operation) and final stopped/unpossessed
+status. Serial loss is handled by the short
+command, heartbeat, and lease deadlines; no power toggle is attempted.
+
 See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions, device expectations, success criteria, and failure behavior.
 
 ## Docker services

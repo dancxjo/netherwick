@@ -255,6 +255,10 @@ where
         let Some(generation) = status::pending_authority_transition() else {
             return;
         };
+        if status::pending_authority_continues_owner(self.now_ms()) {
+            status::acknowledge_authority_transition(generation);
+            return;
+        }
         self.interrupt_active_command();
         self.commands.clear();
         self.active = ActiveAction::None;
