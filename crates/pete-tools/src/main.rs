@@ -14,7 +14,7 @@ use pete_autonomic::SimpleSafety;
 use pete_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use pete_body::{BodySense, BodySong, BodyTone};
 use pete_cockpit::{
-    establish_session, Cockpit, CockpitError, HandshakeHello, MotherbrainPossession,
+    establish_session, Cockpit, CockpitError, HandshakeHello, HttpCockpit, MotherbrainPossession,
     SimCockpit as LocalSimCockpit, SongTone, UartCockpit,
 };
 use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
@@ -456,6 +456,13 @@ struct RobotArgs {
     cockpit: CockpitBackendArg,
     #[arg(long, default_value = "auto")]
     create_port: String,
+    /// Brainstem HTTP address used by the Wi-Fi Cockpit backend.
+    #[arg(
+        long,
+        default_value = "192.168.4.1:80",
+        env = "PETE_BRAINSTEM_HTTP_HOST"
+    )]
+    brainstem_host: String,
     #[arg(long, default_value_t = 57_600)]
     create_baud: u32,
     #[arg(long, default_value = "data/ledger/robot-readonly")]
@@ -548,6 +555,7 @@ enum RobotModeArg {
 enum CockpitBackendArg {
     Sim,
     Uart,
+    Wifi,
 }
 
 #[derive(Debug, Parser)]
@@ -578,6 +586,13 @@ struct CaptureRealArgs {
     cockpit: CockpitBackendArg,
     #[arg(long, default_value = "auto")]
     create_port: String,
+    /// Brainstem HTTP address used by the Wi-Fi Cockpit backend.
+    #[arg(
+        long,
+        default_value = "192.168.4.1:80",
+        env = "PETE_BRAINSTEM_HTTP_HOST"
+    )]
+    brainstem_host: String,
     #[arg(long, default_value_t = 57_600)]
     create_baud: u32,
     #[arg(long)]
@@ -4121,25 +4136,40 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         "kinect": env_report["kinect"].clone(),
     });
 
-    let create_port = selected_cockpit_port(args.cockpit, &args.create_port, &env_report);
+    let create_port = selected_cockpit_endpoint(
+        args.cockpit,
+        &args.create_port,
+        &args.brainstem_host,
+        &env_report,
+    );
 
     let cockpit: Box<dyn Cockpit + Send> = if args.mock || create_port.as_deref() == Some("mock") {
         device_availability["create"] =
             serde_json::json!({"present": true, "source": "sim-cockpit"});
         Box::new(LocalSimCockpit::new().with_unscoped_bench_mode())
     } else if let Some(create_port) = &create_port {
-        match UartCockpit::connect(create_port) {
+        let opened: pete_cockpit::Result<Box<dyn Cockpit + Send>> = match args.cockpit {
+            CockpitBackendArg::Wifi => Ok(Box::new(HttpCockpit::connect(create_port))),
+            CockpitBackendArg::Uart => UartCockpit::connect(create_port)
+                .map(|cockpit| Box::new(cockpit) as Box<dyn Cockpit + Send>),
+            CockpitBackendArg::Sim => unreachable!("sim resolves to mock"),
+        };
+        match opened {
             Ok(cockpit) => {
                 device_availability["create"] = serde_json::json!({
                     "present": true,
-                    "port": create_port,
+                    "endpoint": create_port,
                     "baud": args.create_baud,
-                    "backend": "uart-cockpit"
+                    "backend": match args.cockpit {
+                        CockpitBackendArg::Wifi => "wifi-http-cockpit",
+                        CockpitBackendArg::Uart => "uart-cockpit",
+                        CockpitBackendArg::Sim => "sim-cockpit",
+                    }
                 });
-                Box::new(cockpit)
+                cockpit
             }
             Err(error) => {
-                anyhow::bail!("failed to open cockpit UART device {create_port}: {error}");
+                anyhow::bail!("failed to open cockpit endpoint {create_port}: {error}");
             }
         }
     } else {
@@ -4618,7 +4648,12 @@ fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SenseP
 
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
-    let create_port = selected_cockpit_port(args.cockpit, &args.create_port, &env_report);
+    let create_port = selected_cockpit_endpoint(
+        args.cockpit,
+        &args.create_port,
+        &args.brainstem_host,
+        &env_report,
+    );
     let robot_mode = match args.mode {
         RobotModeArg::ReadOnly => RobotMode::ReadOnly,
         RobotModeArg::PossessionSlow => RobotMode::Slow,
@@ -4629,6 +4664,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     }
 
     let (mut cockpit, robot_mode, is_mock_body) = open_robot_cockpit_or_fallback(
+        args.cockpit,
         create_port.as_deref(),
         robot_mode,
         args.brainstem_device_id.as_deref(),
@@ -5081,6 +5117,7 @@ async fn reconnect_possession_cockpit(
     let max_backoff_ms = args.reconnect_max_backoff_ms.max(backoff_ms).min(60_000);
     loop {
         match open_robot_cockpit_or_fallback(
+            args.cockpit,
             create_port,
             RobotMode::Slow,
             args.brainstem_device_id.as_deref(),
@@ -5530,6 +5567,7 @@ fn requested_robot_sensor_count(args: &RobotArgs) -> usize {
 }
 
 fn open_robot_cockpit_or_fallback(
+    backend: CockpitBackendArg,
     create_port: Option<&str>,
     robot_mode: RobotMode,
     expected_device_id: Option<&str>,
@@ -5567,9 +5605,16 @@ fn open_robot_cockpit_or_fallback(
         ));
     };
 
-    match UartCockpit::connect(create_port) {
+    let opened: pete_cockpit::Result<Box<dyn Cockpit + Send>> = match backend {
+        CockpitBackendArg::Wifi => Ok(Box::new(HttpCockpit::connect(create_port))),
+        CockpitBackendArg::Uart => UartCockpit::connect(create_port)
+            .map(|cockpit| Box::new(cockpit) as Box<dyn Cockpit + Send>),
+        CockpitBackendArg::Sim => unreachable!("sim resolves to mock"),
+    };
+    match opened {
         Ok(cockpit) if robot_mode == RobotMode::Slow => {
-            if !create_port.starts_with("/dev/serial/by-id/") {
+            if backend == CockpitBackendArg::Uart && !create_port.starts_with("/dev/serial/by-id/")
+            {
                 anyhow::bail!(
                     "possession-slow requires a stable /dev/serial/by-id brainstem path, got {create_port}"
                 );
@@ -5580,8 +5625,7 @@ fn open_robot_cockpit_or_fallback(
             let expected_boot_id = expected_boot_id.context(
                 "possession-slow requires --brainstem-boot-id; a boot change needs explicit acceptance",
             )?;
-            let connector: Box<dyn Cockpit + Send> = Box::new(cockpit);
-            let ready = establish_session(connector, HandshakeHello::default_motherbrain(), None)?;
+            let ready = establish_session(cockpit, HandshakeHello::default_motherbrain(), None)?;
             if ready.session().peer_device_id != expected_device_id {
                 anyhow::bail!(
                     "brainstem identity mismatch: expected {expected_device_id}, received {}",
@@ -5598,7 +5642,7 @@ fn open_robot_cockpit_or_fallback(
                 .with_limits(max_linear_mm_s, max_angular_mrad_s);
             Ok((Box::new(possession), robot_mode, false))
         }
-        Ok(cockpit) => Ok((Box::new(cockpit), robot_mode, false)),
+        Ok(cockpit) => Ok((cockpit, robot_mode, false)),
         Err(error) => {
             if robot_mode == RobotMode::Slow {
                 anyhow::bail!("failed to open possession brainstem {create_port}: {error}");
@@ -5850,14 +5894,16 @@ fn selected_create_port(requested: &str, env_report: &Value) -> Option<String> {
     candidates.into_iter().next()
 }
 
-fn selected_cockpit_port(
+fn selected_cockpit_endpoint(
     backend: CockpitBackendArg,
     requested: &str,
+    brainstem_host: &str,
     env_report: &Value,
 ) -> Option<String> {
     match backend {
         CockpitBackendArg::Sim => Some("mock".to_string()),
         CockpitBackendArg::Uart => selected_create_port(requested, env_report),
+        CockpitBackendArg::Wifi => Some(brainstem_host.to_string()),
     }
 }
 
@@ -11840,7 +11886,15 @@ mod tests {
 
     #[tokio::test]
     async fn possession_mode_never_falls_back_when_brainstem_is_missing() {
-        let result = open_robot_cockpit_or_fallback(None, RobotMode::Slow, None, None, 50, 500);
+        let result = open_robot_cockpit_or_fallback(
+            CockpitBackendArg::Uart,
+            None,
+            RobotMode::Slow,
+            None,
+            None,
+            50,
+            500,
+        );
         let error = match result {
             Ok(_) => panic!("possession unexpectedly fell back"),
             Err(error) => error,
@@ -11857,18 +11911,32 @@ mod tests {
 
     #[test]
     fn simulated_possession_reconnect_gets_fresh_session_and_lease() {
-        let (mut first, _, _) =
-            open_robot_cockpit_or_fallback(Some("mock"), RobotMode::Slow, None, None, 50, 500)
-                .unwrap();
+        let (mut first, _, _) = open_robot_cockpit_or_fallback(
+            CockpitBackendArg::Sim,
+            Some("mock"),
+            RobotMode::Slow,
+            None,
+            None,
+            50,
+            500,
+        )
+        .unwrap();
         let first_snapshot = first.possession_snapshot().unwrap();
         first
             .cmd_vel(50, 0, 30_000)
             .expect("first lease applies bounded motion");
         drop(first);
 
-        let (mut second, _, _) =
-            open_robot_cockpit_or_fallback(Some("mock"), RobotMode::Slow, None, None, 50, 500)
-                .unwrap();
+        let (mut second, _, _) = open_robot_cockpit_or_fallback(
+            CockpitBackendArg::Sim,
+            Some("mock"),
+            RobotMode::Slow,
+            None,
+            None,
+            50,
+            500,
+        )
+        .unwrap();
         let second_snapshot = second.possession_snapshot().unwrap();
         assert_ne!(first_snapshot.session_id, second_snapshot.session_id);
         assert_ne!(first_snapshot.lease_id, second_snapshot.lease_id);
@@ -12182,6 +12250,7 @@ mod tests {
             tick_ms: 1000,
             cockpit: CockpitBackendArg::Sim,
             create_port: "mock".to_string(),
+            brainstem_host: "192.168.4.1:80".to_string(),
             create_baud: 57_600,
             camera: None,
             kinect_depth: false,
@@ -12226,6 +12295,7 @@ mod tests {
             tick_ms: 1000,
             cockpit: CockpitBackendArg::Sim,
             create_port: "mock".to_string(),
+            brainstem_host: "192.168.4.1:80".to_string(),
             create_baud: 57_600,
             camera: None,
             kinect_depth: false,

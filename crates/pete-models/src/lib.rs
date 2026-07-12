@@ -2688,10 +2688,8 @@ mod tests {
 
     #[test]
     fn danger_checkpoint_rejects_dimension_mismatch() {
-        let dir = std::env::temp_dir().join(format!(
-            "pete-danger-checkpoint-mismatch-{}",
-            now_ms()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pete-danger-checkpoint-mismatch-{}", now_ms()));
         let trainer = DangerNetTrainer::new(3);
 
         trainer.save_checkpoint(&dir).unwrap();
@@ -2792,8 +2790,7 @@ mod tests {
 
     #[test]
     fn action_value_checkpoint_round_trips_prediction_shape() {
-        let dir =
-            std::env::temp_dir().join(format!("pete-action-value-checkpoint-{}", now_ms()));
+        let dir = std::env::temp_dir().join(format!("pete-action-value-checkpoint-{}", now_ms()));
         let now = Now::blank(1, BodySense::default());
         let input =
             ActionValueInput::from_parts(vec![0.1, 0.2], Some(&ActionPrimitive::Dock), &now);
@@ -2904,10 +2901,8 @@ mod tests {
 
     #[test]
     fn future_checkpoint_rejects_dimension_mismatch() {
-        let dir = std::env::temp_dir().join(format!(
-            "pete-future-checkpoint-mismatch-{}",
-            now_ms()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pete-future-checkpoint-mismatch-{}", now_ms()));
         let trainer = FutureNetTrainer::new(4, 2);
 
         trainer.save_checkpoint(&dir).unwrap();
@@ -3074,8 +3069,7 @@ mod tests {
 
     #[test]
     fn experience_autoencoder_checkpoint_round_trips_prediction_shape() {
-        let dir =
-            std::env::temp_dir().join(format!("pete-experience-checkpoint-{}", now_ms()));
+        let dir = std::env::temp_dir().join(format!("pete-experience-checkpoint-{}", now_ms()));
         let mut now = Now::blank(1, BodySense::default());
         now.eye.frames = vec![vec![0.2, 0.4, 0.6, 0.8]];
         now.ear.features = vec![vec![0.2, 0.4, 0.6, 0.8]];

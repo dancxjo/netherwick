@@ -3026,8 +3026,7 @@ mod tests {
 
     #[tokio::test]
     async fn kinect_replay_emits_kinect_then_eye_packet() {
-        let root =
-            std::env::temp_dir().join(format!("pete-kinect-replay-{}", unix_time_ms()));
+        let root = std::env::temp_dir().join(format!("pete-kinect-replay-{}", unix_time_ms()));
         std::fs::create_dir_all(root.join("rgb")).unwrap();
         std::fs::create_dir_all(root.join("depth")).unwrap();
         std::fs::write(root.join("rgb/frame.raw"), [0u8, 128, 255]).unwrap();

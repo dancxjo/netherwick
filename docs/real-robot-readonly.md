@@ -71,9 +71,12 @@ With the wheels off the floor:
 just possess
 ```
 
-The recipe requires `PETE_BRAINSTEM_DEVICE_ID` and `PETE_BRAINSTEM_BOOT_ID` in
-`.env`; `PETE_COCKPIT_PORT` may pin the `/dev/serial/by-id/DEVICE` path. Its
-expanded command is:
+The recipe requires `PETE_BRAINSTEM_DEVICE_ID` in `.env`;
+`PETE_COCKPIT_PORT` may pin the `/dev/serial/by-id/DEVICE` path. On a boot-ID
+mismatch, it accepts the newly observed boot only after the device-ID check has
+succeeded, updates `PETE_BRAINSTEM_BOOT_ID` in `.env`, and retries once. Its
+Wi-Fi path also performs the required USB identity bootstrap automatically
+after a cold-boot identity rejection. Its expanded command is:
 
 ```bash
 cargo run -p pete-tools -- robot \

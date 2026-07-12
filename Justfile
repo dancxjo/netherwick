@@ -392,22 +392,59 @@ possess *args:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${PETE_BRAINSTEM_DEVICE_ID:?set PETE_BRAINSTEM_DEVICE_ID in .env}"
-    : "${PETE_BRAINSTEM_BOOT_ID:?set PETE_BRAINSTEM_BOOT_ID in .env}"
-    echo "Taking brainstem possession on {{cockpit_port}}"
-    echo "device=$PETE_BRAINSTEM_DEVICE_ID boot=$PETE_BRAINSTEM_BOOT_ID"
-    echo "limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
-    PETE_ROBOT_MODE=possession-slow \
-    PETE_ROBOT_LEDGER="${PETE_POSSESSION_LEDGER:-data/ledger/real/possession}" \
-    CAMERA_DEVICE="" MIC_DEVICE="" IMU_DEVICE="" GPS_SERIAL_PORT="" PETE_KINECT_DEPTH=0 \
-    just robot \
-        --brainstem-device-id "$PETE_BRAINSTEM_DEVICE_ID" \
-        --brainstem-boot-id "$PETE_BRAINSTEM_BOOT_ID" \
-        --max-linear-mm-s 50 \
-        --max-angular-mrad-s 500 \
-        --autonomous-motion \
-        --imu none --gps none \
-        --llm-provider disabled \
-        --capture "${PETE_POSSESSION_CAPTURE:-data/captures/real/possession}" {{args}}
+    BOOT_ID="${PETE_BRAINSTEM_BOOT_ID:-unknown}"
+    run_possession() {
+        echo "Taking brainstem possession over ${PETE_COCKPIT_BACKEND:-wifi} at ${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}"
+        echo "device=$PETE_BRAINSTEM_DEVICE_ID boot=$BOOT_ID"
+        echo "limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
+        PETE_ROBOT_MODE=possession-slow \
+        PETE_COCKPIT_BACKEND="${PETE_COCKPIT_BACKEND:-wifi}" \
+        PETE_ROBOT_LEDGER="${PETE_POSSESSION_LEDGER:-data/ledger/real/possession}" \
+        CAMERA_DEVICE="" MIC_DEVICE="" IMU_DEVICE="" GPS_SERIAL_PORT="" PETE_KINECT_DEPTH=0 \
+        just robot \
+            --brainstem-device-id "$PETE_BRAINSTEM_DEVICE_ID" \
+            --brainstem-boot-id "$BOOT_ID" \
+            --max-linear-mm-s 50 \
+            --max-angular-mrad-s 500 \
+            --autonomous-motion \
+            --imu none --gps none \
+            --llm-provider disabled \
+            --capture "${PETE_POSSESSION_CAPTURE:-data/captures/real/possession}" {{args}}
+    }
+
+    LOG="$(mktemp)"
+    trap 'rm -f "$LOG"' EXIT
+    set +e
+    run_possession 2>&1 | tee "$LOG"
+    STATUS=${PIPESTATUS[0]}
+    set -e
+    if [ "$STATUS" -eq 0 ]; then exit 0; fi
+
+    if [ "${PETE_COCKPIT_BACKEND:-wifi}" = "wifi" ] \
+        && grep -q 'reason_code: InvalidIdentity' "$LOG"; then
+        echo "Wi-Fi identity continuity is not established; bootstrapping the pinned brainstem over USB."
+        cargo run -q -p pete-cockpit --example motherbrain_bootstrap -- --identity-only
+        : > "$LOG"
+        set +e
+        run_possession 2>&1 | tee "$LOG"
+        STATUS=${PIPESTATUS[0]}
+        set -e
+        if [ "$STATUS" -eq 0 ]; then exit 0; fi
+    fi
+
+    LIVE_BOOT_ID="$(sed -n 's/^Error: brainstem boot identity mismatch: expected .* received \([^[:space:]]*\)$/\1/p' "$LOG" | tail -n 1)"
+    if [ -z "$LIVE_BOOT_ID" ]; then exit "$STATUS"; fi
+
+    if [ -f .env ] && grep -q '^PETE_BRAINSTEM_BOOT_ID=' .env; then
+        ESCAPED_BOOT_ID="$(printf '%s' "$LIVE_BOOT_ID" | sed 's/[\&/]/\\&/g')"
+        sed -i "s/^PETE_BRAINSTEM_BOOT_ID=.*/PETE_BRAINSTEM_BOOT_ID=$ESCAPED_BOOT_ID/" .env
+    else
+        printf '\nPETE_BRAINSTEM_BOOT_ID=%s\n' "$LIVE_BOOT_ID" >> .env
+    fi
+    BOOT_ID="$LIVE_BOOT_ID"
+    export PETE_BRAINSTEM_BOOT_ID="$BOOT_ID"
+    echo "Accepted current boot identity for pinned device $PETE_BRAINSTEM_DEVICE_ID; updated .env and retrying."
+    run_possession
 
 # Launch the virtual dream world with HTTPS live view.
 go target="virtual":

@@ -1039,6 +1039,11 @@ where
         self.create_uart
             .stop(&mut self.hardware, &mut self.events)?;
         self.stop_sent = true;
+        // Once STOP has been sent successfully there is no live motion for the
+        // heartbeat watchdog to supervise. Leaving the old deadline armed
+        // would later revoke an otherwise valid control lease after a normal
+        // TTL-bounded motion pulse had already stopped.
+        self.heartbeat_stop_at_ms = None;
         Ok(())
     }
 
@@ -2130,6 +2135,19 @@ mod tests {
 
         assert!(runtime.hardware.writes.contains(&132));
         assert_eq!(status::snapshot(1_000).oi_mode, 3);
+    }
+
+    #[test]
+    fn completed_motion_disarms_heartbeat_without_revoking_lease() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(301));
+        runtime.heartbeat_stop_at_ms = Some(750);
+        runtime.active = ActiveAction::Driving { stop_at_ms: 300 };
+
+        assert!(runtime.advance_active_action().is_ok());
+
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert_eq!(runtime.heartbeat_stop_at_ms, None);
     }
 
     #[test]

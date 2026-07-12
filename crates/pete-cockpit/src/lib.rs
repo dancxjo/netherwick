@@ -3915,11 +3915,10 @@ impl<C: Cockpit> MotherbrainPossession<C> {
         // DISARM but omitted it from the advertised verbs. Use only the current
         // validated session and lease; this is never an unscoped fallback.
         let session = self.session.session().clone();
-        let lease = self
-            .session
-            .control_lease
-            .clone()
-            .ok_or_else(|| CockpitError::Policy("exorcize requires the current lease".into()))?;
+        let lease =
+            self.session.control_lease.clone().ok_or_else(|| {
+                CockpitError::Policy("exorcize requires the current lease".into())
+            })?;
         let mut disarm = None;
         for _ in 0..25 {
             match self.session.connector_mut().execute_with_lease(
@@ -4449,36 +4448,49 @@ impl MotherbrainBootstrap {
         }
         let mut errors = Vec::new();
         for path in paths {
-            let connector = match UartCockpit::connect_with_config(
-                UartCockpitConfig::new(&path).with_data_terminal_ready(true),
-            ) {
-                Ok(connector) => connector,
-                Err(error) => {
-                    errors.push(CandidateFailure {
-                        path: path.clone(),
-                        cause: BootstrapError::SerialOpenFailed {
+            // Opening a Pico USB CDC endpoint and asserting DTR can race the
+            // firmware's wait_connection loop, especially immediately after
+            // flashing. Give it a short settle period and retry transient
+            // open/handshake failures on this same pinned path.
+            for attempt in 1..=3 {
+                let connector = match UartCockpit::connect_with_config(
+                    UartCockpitConfig::new(&path)
+                        .with_timeout(Duration::from_secs(2))
+                        .with_data_terminal_ready(true),
+                ) {
+                    Ok(connector) => connector,
+                    Err(error) => {
+                        errors.push(CandidateFailure {
                             path: path.clone(),
-                            source: error,
-                        }
-                        .to_string(),
-                    });
-                    continue;
+                            cause: format!(
+                                "attempt {attempt}: {}",
+                                BootstrapError::SerialOpenFailed {
+                                    path: path.clone(),
+                                    source: error,
+                                }
+                            ),
+                        });
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
+                };
+                std::thread::sleep(Duration::from_millis(250));
+                match (|| -> Result<_> {
+                    let ready = establish_session(
+                        Box::new(connector) as Box<dyn Cockpit>,
+                        self.hello.new_attempt(),
+                        None,
+                    )?;
+                    self.validate_identity(ready.session())?;
+                    Ok(ready)
+                })() {
+                    Ok(ready) => return Ok(ready),
+                    Err(error) => errors.push(CandidateFailure {
+                        path: path.clone(),
+                        cause: format!("attempt {attempt}: {error}"),
+                    }),
                 }
-            };
-            match (|| -> Result<_> {
-                let ready = establish_session(
-                    Box::new(connector) as Box<dyn Cockpit>,
-                    self.hello.new_attempt(),
-                    None,
-                )?;
-                self.validate_identity(ready.session())?;
-                Ok(ready)
-            })() {
-                Ok(ready) => return Ok(ready),
-                Err(error) => errors.push(CandidateFailure {
-                    path,
-                    cause: error.to_string(),
-                }),
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
         Err(BootstrapError::CandidateFailures { failures: errors })

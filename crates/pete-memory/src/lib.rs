@@ -8281,8 +8281,7 @@ impl Neo4jConfig {
                     .and_then(|uri| neo4j_http_url_from_uri(&uri))
             })
             .unwrap_or_else(|| "http://localhost:7474".to_string());
-        let database =
-            std::env::var("PETE_NEO4J_DATABASE").unwrap_or_else(|_| "neo4j".to_string());
+        let database = std::env::var("PETE_NEO4J_DATABASE").unwrap_or_else(|_| "neo4j".to_string());
         Some(Self {
             http_url,
             user,
@@ -13696,9 +13695,7 @@ mod tests {
             .any(|warning| warning == "omitted recall"));
     }
 
-    fn stable_instant_shape(
-        instant: &pete_experience::ExperienceInstant,
-    ) -> serde_json::Value {
+    fn stable_instant_shape(instant: &pete_experience::ExperienceInstant) -> serde_json::Value {
         serde_json::json!({
             "schema_version": instant.schema_version,
             "t_ms": instant.t_ms,

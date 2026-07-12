@@ -956,20 +956,15 @@ pub fn active_authority_matches(session_hash: u32, lease_hash: u32, now_ms: u32)
         && ACTIVE_LEASE_HASH.load(Ordering::Acquire) == lease_hash
         && ACTIVE_LEASE_SESSION_HASH.load(Ordering::Acquire) == session_hash
 }
-pub fn refresh_authority_heartbeat(
+pub fn authority_heartbeat_valid(
     session_hash: u32,
     lease_hash: u32,
     now_ms: u32,
-    timeout_ms: u32,
 ) -> bool {
-    if !active_authority_matches(session_hash, lease_hash, now_ms) {
-        return false;
-    }
-    ACTIVE_LEASE_EXPIRES_MS.store(
-        now_ms.wrapping_add(timeout_ms.clamp(250, 60_000)),
-        Ordering::Release,
-    );
-    true
+    // HEARTBEAT_STOP has its own runtime deadline. It must validate the
+    // negotiated authority, but must not shorten (or extend) the control
+    // lease to the motion heartbeat timeout.
+    active_authority_matches(session_hash, lease_hash, now_ms)
 }
 pub fn revoke_authority() {
     let previous = ACTIVE_LEASE_HASH.load(Ordering::Acquire);
@@ -3623,6 +3618,20 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].seq, 1);
         assert_eq!(records[1].seq, 2);
+    }
+
+    #[test]
+    fn motion_heartbeat_does_not_shorten_control_lease() {
+        let _guard = status_test_guard();
+        revoke_authority();
+        request_authority_transition(77, 22, 11, 5_000);
+        acknowledge_authority_transition(77);
+
+        assert!(authority_heartbeat_valid(11, 22, 1_000));
+        assert!(active_authority_matches(11, 22, 2_000));
+        assert!(!active_authority_matches(11, 22, 5_000));
+
+        revoke_authority();
     }
 
     #[test]

@@ -144,9 +144,12 @@ explicit and wheels-off-floor first:
 just possess
 ```
 
-Set `PETE_BRAINSTEM_DEVICE_ID` and `PETE_BRAINSTEM_BOOT_ID` in `.env` first;
-optionally pin `PETE_COCKPIT_PORT=/dev/serial/by-id/DEVICE`. The recipe expands
-to the guarded command below:
+Set `PETE_BRAINSTEM_DEVICE_ID` in `.env` first; optionally pin
+`PETE_COCKPIT_PORT=/dev/serial/by-id/DEVICE`. The recipe learns the current
+boot ID from the pinned device, saves it as `PETE_BRAINSTEM_BOOT_ID`, and
+retries automatically after a brainstem reboot. After a cold boot, a rejected
+Wi-Fi identity is automatically established over the pinned USB brainstem
+before retrying. It expands to the guarded command below:
 
 ```bash
 cargo run -p pete-tools -- robot --mode possession-slow \

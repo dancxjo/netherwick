@@ -4,9 +4,7 @@ use anyhow::Result;
 use pete_actions::{ActionPrimitive, ApproachTarget, InspectTarget, ReignInput, TurnDir};
 use pete_autonomic::{SafetyDecision, SafetyReason};
 use pete_core::{Provenance, TimeMs};
-use pete_experience::{
-    Experience, ExperienceLatent, FuturePrediction, Impression, Sensation,
-};
+use pete_experience::{Experience, ExperienceLatent, FuturePrediction, Impression, Sensation};
 use pete_llm::LlmTeaching;
 use pete_memory::RecallBundle;
 use pete_now::{LlmSense, MemorySense, Now, ObjectClass};

@@ -2469,14 +2469,10 @@ mod tests {
         let registry = SensationVectorizerRegistry::with_defaults();
         let mut now = Now::blank(410, BodySense::default());
         now.voice.vectors.push(
-            pete_now::VectorArtifact::new(
-                "voices",
-                "voice-vector-1",
-                vec![0.1, 0.3, 0.5, 0.7],
-            )
-            .with_model("pete.voice.test.v0")
-            .with_source_id("voice-1")
-            .with_occurred_at_ms(405),
+            pete_now::VectorArtifact::new("voices", "voice-vector-1", vec![0.1, 0.3, 0.5, 0.7])
+                .with_model("pete.voice.test.v0")
+                .with_source_id("voice-1")
+                .with_occurred_at_ms(405),
         );
         let voice = primary_sensations_from_now(&now)
             .into_iter()
@@ -2523,10 +2519,11 @@ mod tests {
             .sensations
             .iter()
             .filter_map(|sensation| sensation.vector.as_ref())
-            .any(|vector| vector.vectorizer_id
-                == "precomputed.voices.pete/voice_vector/16d"
-                && vector.collection == "voices"
-                && vector.purpose == "voice_identity"));
+            .any(
+                |vector| vector.vectorizer_id == "precomputed.voices.pete/voice_vector/16d"
+                    && vector.collection == "voices"
+                    && vector.purpose == "voice_identity"
+            ));
     }
 
     #[tokio::test]
@@ -2714,10 +2711,7 @@ mod tests {
             .as_ref()
             .and_then(|impression| impression.vector.as_ref())
             .expect("speech impression semantic vector");
-        assert_eq!(
-            speech_impression_vector.model_id,
-            "pete.text.hashing.v1"
-        );
+        assert_eq!(speech_impression_vector.model_id, "pete.text.hashing.v1");
         assert_eq!(speech_impression_vector.purpose, "impression_semantic");
         assert_eq!(speech_impression_vector.collection, "impressions");
         assert!(!speech_impression_vector.is_fallback);
@@ -6533,15 +6527,11 @@ pub async fn demo_embodied_experience(now_ms: TimeMs) -> Result<EmbodiedDemo> {
         source: Some("demo.synthetic_camera".to_string()),
     });
     now.face.vectors.push(
-        pete_now::VectorArtifact::new(
-            "faces",
-            "demo-face-vector",
-            vec![0.17, 0.41, 0.73, 0.29],
-        )
-        .with_model("face_id/0.4.1")
-        .with_source_id("demo-face")
-        .with_source_frame_id("demo-synthetic-frame")
-        .with_occurred_at_ms(now_ms),
+        pete_now::VectorArtifact::new("faces", "demo-face-vector", vec![0.17, 0.41, 0.73, 0.29])
+            .with_model("face_id/0.4.1")
+            .with_source_id("demo-face")
+            .with_source_frame_id("demo-synthetic-frame")
+            .with_occurred_at_ms(now_ms),
     );
     now.ear.transcript = Some("hello pete, this is a transcript vector test".to_string());
     now.ear.asr.transcript = now.ear.transcript.clone();

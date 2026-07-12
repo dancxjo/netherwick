@@ -1,3 +1,4 @@
-cockpit = "uart"
+cockpit = "wifi"
+brainstem_host = "192.168.4.1:80"
 platform = "orange-pi-5"
 real_robot = false

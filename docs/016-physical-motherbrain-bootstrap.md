@@ -5,6 +5,25 @@ the shared `UartCockpit` line-protocol implementation for both USB CDC device
 nodes and GPIO UART; USB discovery always uses the stable `/dev/serial/by-id`
 symlink and never assumes `/dev/ttyACM0`.
 
+The production motherbrain can use that same Cockpit contract over the Pico W
+HTTP service. Once USB has established the motherbrain identity, disconnect the
+USB data cable and run:
+
+```sh
+PETE_COCKPIT_BACKEND=wifi \
+PETE_BRAINSTEM_HTTP_HOST=192.168.4.1:80 \
+just possess
+```
+
+`just possess` now defaults to Wi-Fi; set `PETE_COCKPIT_BACKEND=uart` when a
+wired recovery session is intentional. Wi-Fi possession retains the pinned
+`PETE_BRAINSTEM_DEVICE_ID` check, automatically records a changed boot ID for
+that device in `.env`, and reconnects through the selected transport. The
+firmware deliberately requires one wired identity establishment after a
+brainstem cold boot because its AP is open and the current identity continuity
+mechanism is not cryptographic authentication. When the pinned USB brainstem is
+connected, `just possess` performs that wired identity bootstrap automatically.
+
 ## Bring-up
 
 1. Build service-mode firmware: `just brainstem-pico-w-uf2`.

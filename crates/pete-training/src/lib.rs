@@ -6,9 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use pete_actions::ActionPrimitive;
-use pete_behaviors::{
-    BehaviorConfig, BehaviorRegime, BehaviorRegistryConfig, FallbackPolicy,
-};
+use pete_behaviors::{BehaviorConfig, BehaviorRegime, BehaviorRegistryConfig, FallbackPolicy};
 use pete_core::TimeMs;
 use pete_experience::{
     action_features, action_value_input_from_transition_like,
@@ -839,12 +837,10 @@ pub mod dream_policy {
             let desired = action_to_motor_command(Some(&action));
             let decision = safety.filter(&now, desired);
             let before_pose = now.body.odometry;
-            scenario
-                .motors
-                .apply_motion(MotionCommand::Drive {
-                    forward_m_s: decision.command.forward,
-                    turn_rad_s: decision.command.turn,
-                })?;
+            scenario.motors.apply_motion(MotionCommand::Drive {
+                forward_m_s: decision.command.forward,
+                turn_rad_s: decision.command.turn,
+            })?;
             let next_snapshot = scenario.world.snapshot().await?;
             let next_now = next_snapshot.to_now(next_snapshot.body.last_update_ms);
             let next_observation = build_observation(
@@ -1365,10 +1361,8 @@ pub mod dream_policy {
                 best_score: 12.0,
                 genome,
             };
-            let path = std::env::temp_dir().join(format!(
-                "pete-dream-genome-{}.json",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("pete-dream-genome-{}.json", std::process::id()));
             save_best_genome(&checkpoint, &path).unwrap();
             let loaded = load_best_genome(&path).unwrap();
             let _ = fs::remove_file(&path);

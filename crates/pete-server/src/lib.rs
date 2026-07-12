@@ -15,9 +15,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
-use pete_actions::{
-    ActionPrimitive, ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir,
-};
+use pete_actions::{ActionPrimitive, ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir};
 use pete_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use pete_cockpit::{MotionCommand, MotorCommand};
 use pete_core::TimeMs;

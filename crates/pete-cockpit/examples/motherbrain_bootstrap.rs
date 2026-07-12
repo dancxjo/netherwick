@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let smoke = args.iter().any(|arg| arg == "--possess-smoke");
     let lease_expiry_smoke = args.iter().any(|arg| arg == "--lease-expiry-smoke");
+    let identity_only = args.iter().any(|arg| arg == "--identity-only");
     let wheels_off_floor = args.iter().any(|arg| arg == "--wheels-off-floor");
     if smoke && !wheels_off_floor {
         return Err("--possess-smoke requires --wheels-off-floor".into());
@@ -33,6 +34,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "safety: stopped={}, disarmed={}, estop={}",
         !welcome_safety.active_motion, !welcome_safety.armed, welcome_safety.estop_latched
     );
+    if identity_only {
+        eprintln!("wired motherbrain identity established");
+        return Ok(());
+    }
 
     if let (Ok(address), Ok(lease_identity)) = (
         std::env::var("PETE_BRAINSTEM_WIFI_IPV4"),

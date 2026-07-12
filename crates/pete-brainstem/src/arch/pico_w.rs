@@ -3,7 +3,6 @@ use core::fmt::Write as _;
 use cyw43::aligned_bytes;
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -27,6 +26,8 @@ use embassy_rp::uart::{
 };
 use embassy_rp::{bind_interrupts, dma, Peri};
 use embassy_time::{Duration, Instant, Timer};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcAcmState};
+use embassy_usb::UsbDevice;
 use embedded_hal_nb::serial::Read as _;
 use embedded_io_async::Write;
 use pete_cockpit_protocol::TransportKind;
@@ -89,6 +90,9 @@ static BRAINSTEM_INSTANCE_ID: AtomicU32 = AtomicU32::new(0);
 static BRAINSTEM_BOOT_ID: AtomicU32 = AtomicU32::new(0);
 static AUTHORITY_GENERATION: AtomicU32 = AtomicU32::new(0);
 static SERVICE_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+type UsbDriver = embassy_rp::usb::Driver<'static, USB>;
+type BrainstemUsbDevice = UsbDevice<'static, UsbDriver>;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
@@ -258,7 +262,7 @@ fn spawn_wifi_lane(
                 .expect("spawn forebrain uart task"),
         );
         spawner.spawn(imu_task(i2c1, i2c_sda, i2c_scl).expect("spawn imu task"));
-        spawner.spawn(usb_cdc_task(usb).expect("spawn USB CDC task"));
+        spawn_usb_cdc_tasks(&spawner, usb);
     })
 }
 
@@ -601,13 +605,9 @@ async fn forebrain_uart_task(
     }
 }
 
-#[embassy_executor::task]
-async fn usb_cdc_task(usb: Peri<'static, USB>) -> ! {
-    use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-    use embassy_usb::{Builder, Config};
-
+fn spawn_usb_cdc_tasks(spawner: &Spawner, usb: Peri<'static, USB>) {
     let driver = embassy_rp::usb::Driver::new(usb, Irqs);
-    let mut config = Config::new(0x1209, 0x5054);
+    let mut config = embassy_usb::Config::new(0x1209, 0x5054);
     config.manufacturer = Some("Pete Robotics");
     config.product = Some("Pete Brainstem Cockpit");
     let mut serial = heapless::String::<24>::new();
@@ -616,69 +616,74 @@ async fn usb_cdc_task(usb: Peri<'static, USB>) -> ! {
         "{:08x}",
         BRAINSTEM_INSTANCE_ID.load(Ordering::Acquire)
     );
-    config.serial_number = Some(serial.as_str());
+    static SERIAL_NUMBER: StaticCell<heapless::String<24>> = StaticCell::new();
+    config.serial_number = Some(SERIAL_NUMBER.init(serial).as_str());
     config.max_power = 100;
+    config.max_packet_size_0 = 64;
 
-    let mut config_descriptor = [0; 256];
-    let mut bos_descriptor = [0; 256];
-    let mut msos_descriptor = [0; 128];
-    let mut control_buf = [0; 64];
-    let mut state = State::new();
-    let mut builder = Builder::new(
+    static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+    static CDC_STATE: StaticCell<CdcAcmState<'static>> = StaticCell::new();
+    let mut builder = embassy_usb::Builder::new(
         driver,
         config,
-        &mut config_descriptor,
-        &mut bos_descriptor,
-        &mut msos_descriptor,
-        &mut control_buf,
+        CONFIG_DESCRIPTOR.init([0; 256]),
+        BOS_DESCRIPTOR.init([0; 256]),
+        &mut [],
+        CONTROL_BUF.init([0; 64]),
     );
-    let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
-    let mut device = builder.build();
+    let class = CdcAcmClass::new(&mut builder, CDC_STATE.init(CdcAcmState::new()), 64);
+    let device = builder.build();
+    spawner.spawn(usb_device_task(device).expect("spawn USB device task"));
+    spawner.spawn(usb_cdc_task(class).expect("spawn USB CDC task"));
+}
 
-    let io = async {
-        let mut packet = [0u8; 64];
-        let mut line = heapless::Vec::<u8, FOREBRAIN_LINE_MAX>::new();
-        let mut response = heapless::String::<4096>::new();
+#[embassy_executor::task]
+async fn usb_device_task(mut device: BrainstemUsbDevice) -> ! {
+    device.run().await
+}
+
+#[embassy_executor::task]
+async fn usb_cdc_task(mut class: CdcAcmClass<'static, UsbDriver>) -> ! {
+    let mut packet = [0u8; 64];
+    let mut line = heapless::Vec::<u8, FOREBRAIN_LINE_MAX>::new();
+    let mut response = heapless::String::<4096>::new();
+    loop {
+        class.wait_connection().await;
+        line.clear();
         loop {
-            class.wait_connection().await;
-            line.clear();
-            loop {
-                let len = match class.read_packet(&mut packet).await {
-                    Ok(len) => len,
-                    Err(_) => break,
-                };
-                for byte in &packet[..len] {
-                    match *byte {
-                        b'\r' => {}
-                        b'\n' => {
-                            if let Ok(command) = core::str::from_utf8(&line) {
-                                let _ = handle_compact_control_line(
-                                    command,
-                                    &mut response,
-                                    TransportKind::UsbCdc as u8,
-                                );
-                                for chunk in response.as_bytes().chunks(64) {
-                                    if class.write_packet(chunk).await.is_err() {
-                                        break;
-                                    }
+            let len = match class.read_packet(&mut packet).await {
+                Ok(len) => len,
+                Err(_) => break,
+            };
+            for byte in &packet[..len] {
+                match *byte {
+                    b'\r' => {}
+                    b'\n' => {
+                        if let Ok(command) = core::str::from_utf8(&line) {
+                            let _ = handle_compact_control_line(
+                                command,
+                                &mut response,
+                                TransportKind::UsbCdc as u8,
+                            );
+                            for chunk in response.as_bytes().chunks(64) {
+                                if class.write_packet(chunk).await.is_err() {
+                                    break;
                                 }
                             }
-                            line.clear();
                         }
-                        byte => {
-                            if line.push(byte).is_err() {
-                                line.clear();
-                                let _ = class.write_packet(b"ERR 0 line_too_long\n").await;
-                            }
+                        line.clear();
+                    }
+                    byte => {
+                        if line.push(byte).is_err() {
+                            line.clear();
+                            let _ = class.write_packet(b"ERR 0 line_too_long\n").await;
                         }
                     }
                 }
             }
         }
-    };
-    join(device.run(), io).await;
-    loop {
-        Timer::after_secs(60).await;
     }
 }
 
@@ -2382,12 +2387,7 @@ fn json_authority_valid(body: &str) -> bool {
     let lease_hash = session::token_hash(lease_id);
     let now = Instant::now().as_millis() as u32;
     if json_str(body, "kind") == Some("heartbeat_stop") {
-        status::refresh_authority_heartbeat(
-            session_hash,
-            lease_hash,
-            now,
-            json_u32(body, "timeout_ms").unwrap_or(1_000),
-        )
+        status::authority_heartbeat_valid(session_hash, lease_hash, now)
     } else {
         status::active_authority_matches(session_hash, lease_hash, now)
     }
@@ -2418,8 +2418,8 @@ fn compact_authority_valid(
             let session_hash = session::token_hash(session_id);
             let lease_hash = session::token_hash(lease);
             let now = Instant::now().as_millis() as u32;
-            if let BrainstemCommand::HeartbeatStop { timeout_ms, .. } = command {
-                status::refresh_authority_heartbeat(session_hash, lease_hash, now, timeout_ms)
+            if let BrainstemCommand::HeartbeatStop { .. } = command {
+                status::authority_heartbeat_valid(session_hash, lease_hash, now)
             } else {
                 status::active_authority_matches(session_hash, lease_hash, now)
             }
