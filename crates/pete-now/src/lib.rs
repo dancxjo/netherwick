@@ -519,6 +519,8 @@ fn last_word_boundary_at_or_before(text: &str, limit: usize) -> Option<usize> {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RangeSense {
     pub schema_version: u32,
+    #[serde(default)]
+    pub captured_at_ms: u64,
     pub beams: Vec<f32>,
     pub nearest_m: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -527,6 +529,21 @@ pub struct RangeSense {
     pub frame: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Pose of the range sensor in the robot base frame. Positive X is
+    /// forward, positive Y is left, positive Z is up. Positive pitch tilts
+    /// the sensor plane downward in front of the robot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extrinsics: Option<RangeExtrinsics>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RangeExtrinsics {
+    pub forward_m: f32,
+    pub left_m: f32,
+    pub height_m: f32,
+    pub roll_rad: f32,
+    pub pitch_rad: f32,
+    pub yaw_rad: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

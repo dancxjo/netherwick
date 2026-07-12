@@ -66,7 +66,20 @@ HLS-LFCD2 / ROBOTIS LDS-01 lidars are read directly at 230400 baud; ROS is not r
 LIDAR_SERIAL_PORT=/dev/serial/by-id/<usb2lds-device> just robot --require-lidar
 ```
 
-The same environment variable carries through `just possess`. Set `LIDAR_YAW_DEG` to the counter-clockwise mounting correction when the lidar's zero direction is not Pete's forward axis. Use `--lidar none` to disable it. The provider emits 360 one-degree `RangeSense` beams into the existing occupancy-map and scan-matching path. Mount the lidar near the robot center; the current range model applies yaw but does not model a translational sensor offset.
+The same environment variables carry through `just possess`. Describe the physical mount in `.env` (illustrative values—replace them with measurements):
+
+```dotenv
+LIDAR_HEIGHT_M=0.42
+LIDAR_FORWARD_M=0.18
+LIDAR_LEFT_M=0
+LIDAR_PITCH_DEG=20
+LIDAR_ROLL_DEG=0
+LIDAR_YAW_DEG=0
+```
+
+Coordinates are robot-relative: forward, left, and up are positive. Positive pitch points the front of the scan plane down. The provider emits 360 one-degree `RangeSense` beams. Calibrated endpoints join Kinect points in the shared odometry-aligned voxel cloud; successive poses during forward motion or a spin build the 3D surface. Floor returns remain in 3D but are excluded from the planar obstacle map. Use `--lidar none` to disable the sensor.
+
+Because LFCD2 publishes full sweeps rather than per-beam poses, rotate slowly for cleaner geometry. Point-cloud quality is bounded by lidar mount calibration, odometry/IMU accuracy, and motion during each scan.
 
 Kinect availability is detected best-effort through `freenect-*` tools or `pkg-config libfreenect`. A missing Kinect is a warning for capture-first bring-up, not a failure when other streams are useful.
 

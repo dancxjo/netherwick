@@ -111,9 +111,11 @@ the brainstem's cursor-bounded event stream and publishes it as
 `brainstem.interface`. A missed event-history window is an error rather than a
 silent skip. The underlying Create OI remains private to brainstem firmware.
 
-Normal exit, SIGINT, and SIGTERM require acknowledged STOP, acknowledged exorcize (translated to
-the brainstem's DISARM wire command), and final status
-showing no active motion and `armed == false`. Transport loss relies on the
+Normal exit, SIGINT, and SIGTERM require acknowledged STOP, acknowledged
+exorcize, and final status. Exorcize releases motherbrain control but leaves
+Create OI power and Full-mode supervision with the brainstem. Final status must
+show no active motion; OI `armed` may remain true because Full mode is retained.
+Transport loss relies on the
 short command, heartbeat, and lease expiries and never triggers a power toggle.
 
 After transport loss, the runner closes its local motor gate and retries the
@@ -177,7 +179,21 @@ cargo run -p pete-tools -- robot \
   --require-lidar
 ```
 
-Use `--lidar-yaw-deg N` (or `LIDAR_YAW_DEG=N` through `just robot`) for a counter-clockwise mounting correction. The lidar scan takes precedence over Kinect-derived fallback range for mapping on ticks where both are present.
+Use `--lidar-height-m`, `--lidar-forward-m`, `--lidar-left-m`, and the `--lidar-{roll,pitch,yaw}-deg` options to describe the mount. Positive pitch tilts the forward scan toward the floor. The same names in uppercase (`LIDAR_HEIGHT_M`, `LIDAR_PITCH_DEG`, and so on) work through `.env` and `just robot`.
+
+Lidar endpoints and Kinect depth points enter the same odometry-aligned voxel cloud. A forward trajectory or slow in-place spin therefore accumulates the tilted scan plane into a 3D world cloud. Repeated cached scans are deduplicated so one physical scan is not projected through several later poses, and floor-height lidar returns are kept out of the 2D obstacle map.
+
+To capture and export the combined cloud:
+
+```bash
+cargo run -p pete-tools -- capture-real \
+  --duration-seconds 20 \
+  --lidar /dev/serial/by-id/<usb2lds-device> \
+  --export-pointcloud \
+  --out data/captures/real/lidar-spin
+```
+
+This writes `assets/pointcloud/world-accumulated.ply`. Rotate slowly: the LFCD2 stream and body odometry are associated per completed sweep, so rapid motion produces scan distortion.
 
 ## Capture Output
 

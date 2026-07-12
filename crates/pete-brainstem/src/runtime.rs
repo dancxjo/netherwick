@@ -2314,6 +2314,12 @@ mod tests {
     }
 
     #[test]
+    fn legacy_disarm_stops_without_sleeping_create() {
+        assert_eq!(DISARM_SCRIPT.len(), 1);
+        assert!(matches!(DISARM_SCRIPT[0], RuntimeCommand::Stop));
+    }
+
+    #[test]
     fn responsive_create_is_refreshed_in_full_mode() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));

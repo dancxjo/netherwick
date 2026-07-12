@@ -859,6 +859,8 @@ fn reset_point_cloud(cloud: &mut VoxelPointCloud) {
     cloud.observations = 0;
     cloud.raw_points_seen = 0;
     cloud.orientation_status = Default::default();
+    cloud.last_kinect_capture_ms = None;
+    cloud.last_range_capture_ms = None;
 }
 
 fn default_behavior_nodes() -> Vec<BehaviorNodeState> {

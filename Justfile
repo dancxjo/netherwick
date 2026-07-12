@@ -5,6 +5,11 @@ cockpit_port := env_var_or_default("PETE_COCKPIT_PORT", "auto")
 gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "")
 lidar_serial_port := env_var_or_default("LIDAR_SERIAL_PORT", "")
 lidar_yaw_deg := env_var_or_default("LIDAR_YAW_DEG", "0")
+lidar_pitch_deg := env_var_or_default("LIDAR_PITCH_DEG", "0")
+lidar_roll_deg := env_var_or_default("LIDAR_ROLL_DEG", "0")
+lidar_height_m := env_var_or_default("LIDAR_HEIGHT_M", "0")
+lidar_forward_m := env_var_or_default("LIDAR_FORWARD_M", "0")
+lidar_left_m := env_var_or_default("LIDAR_LEFT_M", "0")
 camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 mic_device := env_var_or_default("MIC_DEVICE", "")
 imu_device := env_var_or_default("IMU_DEVICE", "")
@@ -347,6 +352,53 @@ say text="Hello. My name is Pete.":
 transcribe wav:
     cargo run -p pete-tools -- whisper-transcribe "{{wav}}"
 
+# Select the real Cockpit transport. Explicit configuration wins; otherwise
+# prefer a responsive USB/UART brainstem and use Wi-Fi only while attached to
+# one of the brainstem's pete-* access points.
+[private]
+_robot-cockpit-backend:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "${PETE_COCKPIT_BACKEND:-}" ]; then
+        printf '%s\n' "$PETE_COCKPIT_BACKEND"
+        exit 0
+    fi
+
+    PORT="{{cockpit_port}}"
+    if [ "$PORT" = auto ]; then
+        shopt -s nullglob
+        CANDIDATES=(/dev/serial/by-id/*Pete_Brainstem* /dev/ttyACM* /dev/ttyUSB*)
+        PORT="${CANDIDATES[0]:-}"
+    fi
+    if [ "${PETE_SKIP_COCKPIT_UART:-0}" != 1 ] \
+        && [ -n "$PORT" ] \
+        && cargo run -q -p pete-cockpit --example contract_check -- uart "$PORT" >/dev/null 2>&1; then
+        printf 'uart\n'
+        exit 0
+    fi
+
+    SSID=""
+    if command -v nmcli >/dev/null 2>&1; then
+        SSID="$(nmcli -t -f active,ssid dev wifi 2>/dev/null | sed -n 's/^yes://p' | head -n 1)"
+    elif command -v iwgetid >/dev/null 2>&1; then
+        SSID="$(iwgetid -r 2>/dev/null || true)"
+    fi
+    if [[ "${SSID,,}" == pete-* ]] \
+        && command -v curl >/dev/null 2>&1 \
+        && curl -fsS --connect-timeout 1 --max-time 2 \
+            "http://${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}/status.json" >/dev/null; then
+        printf 'wifi\n'
+        exit 0
+    fi
+
+    # Preserve the existing UART behavior (including its diagnostics) when no
+    # verified real transport is available.
+    if [ "${PETE_SKIP_COCKPIT_UART:-0}" = 1 ]; then
+        printf 'none\n'
+    else
+        printf 'uart\n'
+    fi
+
 # Bring up the real robot read-only by default with hardware auto-detection.
 robot *args:
     #!/usr/bin/env bash
@@ -370,7 +422,15 @@ robot *args:
         GPS_ARGS+=(--gps "{{gps_serial_port}}")
     fi
     if [ -n "{{lidar_serial_port}}" ]; then
-        LIDAR_ARGS+=(--lidar "{{lidar_serial_port}}" --lidar-yaw-deg "{{lidar_yaw_deg}}")
+        LIDAR_ARGS+=(
+            --lidar "{{lidar_serial_port}}"
+            --lidar-yaw-deg "{{lidar_yaw_deg}}"
+            --lidar-pitch-deg "{{lidar_pitch_deg}}"
+            --lidar-roll-deg "{{lidar_roll_deg}}"
+            --lidar-height-m "{{lidar_height_m}}"
+            --lidar-forward-m "{{lidar_forward_m}}"
+            --lidar-left-m "{{lidar_left_m}}"
+        )
     fi
     if [ "{{kinect_depth}}" = "1" ] || [ "{{kinect_depth}}" = "true" ] || [ "{{kinect_depth}}" = "on" ]; then
         KINECT_ARGS+=(
@@ -397,9 +457,13 @@ robot *args:
             -subj "/CN=pete.local" \
             -addext "subjectAltName=DNS:localhost,DNS:pete.local,IP:127.0.0.1$LAN_SAN"
     fi
+    COCKPIT_BACKEND="$(just --quiet _robot-cockpit-backend)"
+    if [ -z "${PETE_COCKPIT_BACKEND:-}" ] && [ "$COCKPIT_BACKEND" = wifi ]; then
+        echo "Cockpit USB/UART unavailable; using Pete brainstem Wi-Fi at ${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}."
+    fi
     PETE_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p pete-tools -- robot \
         --mode "${PETE_ROBOT_MODE:-read-only}" \
-        --cockpit "${PETE_COCKPIT_BACKEND:-uart}" \
+        --cockpit "$COCKPIT_BACKEND" \
         --create-port "{{cockpit_port}}" \
         --ledger "${PETE_ROBOT_LEDGER:-data/ledger/real/robot}" \
         "${CAMERA_ARGS[@]}" \
@@ -419,6 +483,10 @@ possess *args:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${PETE_BRAINSTEM_DEVICE_ID:?set PETE_BRAINSTEM_DEVICE_ID in .env}"
+    BACKEND_WAS_EXPLICIT=0
+    if [ -n "${PETE_COCKPIT_BACKEND:-}" ]; then BACKEND_WAS_EXPLICIT=1; fi
+    COCKPIT_BACKEND="$(just --quiet _robot-cockpit-backend)"
+    export PETE_COCKPIT_BACKEND="$COCKPIT_BACKEND"
     BOOT_ID="${PETE_BRAINSTEM_BOOT_ID:-unknown}"
     run_possession() {
         echo "Taking brainstem possession over ${PETE_COCKPIT_BACKEND:-wifi} at ${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}"
@@ -447,7 +515,22 @@ possess *args:
     set -e
     if [ "$STATUS" -eq 0 ]; then exit 0; fi
 
-    if [ "${PETE_COCKPIT_BACKEND:-wifi}" = "wifi" ] \
+    if [ "$BACKEND_WAS_EXPLICIT" -eq 0 ] && [ "$COCKPIT_BACKEND" = uart ]; then
+        WIFI_BACKEND="$(PETE_COCKPIT_BACKEND= PETE_SKIP_COCKPIT_UART=1 just --quiet _robot-cockpit-backend)"
+        if [ "$WIFI_BACKEND" = wifi ]; then
+            COCKPIT_BACKEND=wifi
+            export PETE_COCKPIT_BACKEND="$COCKPIT_BACKEND"
+            echo "Brainstem USB/UART failed; retrying possession over Pete Wi-Fi at ${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}."
+            : > "$LOG"
+            set +e
+            run_possession 2>&1 | tee "$LOG"
+            STATUS=${PIPESTATUS[0]}
+            set -e
+            if [ "$STATUS" -eq 0 ]; then exit 0; fi
+        fi
+    fi
+
+    if [ "$COCKPIT_BACKEND" = wifi ] \
         && grep -q 'reason_code: InvalidIdentity' "$LOG"; then
         echo "Wi-Fi identity continuity is not established; bootstrapping the pinned brainstem over USB."
         cargo run -q -p pete-cockpit --example motherbrain_bootstrap -- --identity-only

@@ -6,9 +6,9 @@ use pete_actions::{ActionPrimitive, LlmActionProposal};
 use pete_body::BodySense;
 use pete_now::{
     AsrSense, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense,
-    ObjectClass, ObjectObservation, ObjectObservationSource, ObjectSense, RangeSense,
-    TranscriptCandidateEvent, TranscriptCandidateTracker, TranscriptStabilityState, VectorArtifact,
-    VoiceSense, FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION,
+    ObjectClass, ObjectObservation, ObjectObservationSource, ObjectSense, RangeExtrinsics,
+    RangeSense, TranscriptCandidateEvent, TranscriptCandidateTracker, TranscriptStabilityState,
+    VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION,
     IMAGE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
     TRANSCRIPT_VECTOR_COLLECTION,
 };
@@ -462,11 +462,13 @@ fn range_from_kinect_depth_with_config(
     let nearest_m = beams.iter().copied().reduce(f32::min);
     Some(RangeSense {
         schema_version: 1,
+        captured_at_ms: kinect.captured_at_ms,
         beams,
         nearest_m,
         beam_angles_rad: Vec::new(),
         frame: None,
         source: Some("kinect_depth_legacy_range".to_string()),
+        extrinsics: None,
     })
 }
 
@@ -553,11 +555,13 @@ fn range_from_depth_image(
     let nearest_m = beams.iter().copied().reduce(f32::min);
     Some(RangeSense {
         schema_version: 1,
+        captured_at_ms: 0,
         beams,
         nearest_m,
         beam_angles_rad: angles,
         frame: Some("robot_base".to_string()),
         source: Some("kinect_depth_image".to_string()),
+        extrinsics: None,
     })
 }
 
@@ -604,11 +608,13 @@ fn range_from_compact_depth(
     let nearest_m = beams.iter().copied().reduce(f32::min);
     Some(RangeSense {
         schema_version: 1,
+        captured_at_ms: 0,
         beams,
         nearest_m,
         beam_angles_rad: angles,
         frame: Some("robot_base".to_string()),
         source: Some("kinect_compact_depth".to_string()),
+        extrinsics: None,
     })
 }
 
@@ -2755,6 +2761,16 @@ impl Lfcd2SenseProvider {
     /// Opens the lidar and rotates every beam by `yaw_offset_rad` in the robot
     /// base frame. Positive yaw is counter-clockwise.
     pub fn with_yaw_offset(port: &str, yaw_offset_rad: f32) -> Result<Self> {
+        Self::with_extrinsics(
+            port,
+            RangeExtrinsics {
+                yaw_rad: yaw_offset_rad,
+                ..RangeExtrinsics::default()
+            },
+        )
+    }
+
+    pub fn with_extrinsics(port: &str, extrinsics: RangeExtrinsics) -> Result<Self> {
         #[cfg(feature = "linux-hardware")]
         {
             let mut port = serialport::new(port, Self::BAUD_RATE)
@@ -2767,7 +2783,7 @@ impl Lfcd2SenseProvider {
                 .context("failed to send HLS-LFCD2 start command")?;
             Ok(Self {
                 port,
-                parser: Lfcd2Parser::new(yaw_offset_rad),
+                parser: Lfcd2Parser::new(extrinsics),
                 last_scan: None,
                 last_scan_at: None,
             })
@@ -2775,7 +2791,7 @@ impl Lfcd2SenseProvider {
         #[cfg(not(feature = "linux-hardware"))]
         {
             let _ = port;
-            let _ = yaw_offset_rad;
+            let _ = extrinsics;
             anyhow::bail!("linux-hardware feature is not enabled");
         }
     }
@@ -2852,19 +2868,19 @@ struct Lfcd2Parser {
     received_segments: [bool; LFCD2_SEGMENTS_PER_SCAN],
     received_count: usize,
     scan_started: bool,
-    yaw_offset_rad: f32,
+    extrinsics: RangeExtrinsics,
 }
 
 #[cfg(any(feature = "linux-hardware", test))]
 impl Lfcd2Parser {
-    fn new(yaw_offset_rad: f32) -> Self {
+    fn new(extrinsics: RangeExtrinsics) -> Self {
         Self {
             buffer: Vec::new(),
             ranges_m: [0.0; LFCD2_BEAMS_PER_SCAN],
             received_segments: [false; LFCD2_SEGMENTS_PER_SCAN],
             received_count: 0,
             scan_started: false,
-            yaw_offset_rad,
+            extrinsics,
         }
     }
 
@@ -2930,15 +2946,17 @@ impl Lfcd2Parser {
                     .filter(|range| *range > 0.0 && range.is_finite())
                     .min_by(f32::total_cmp);
                 let beam_angles_rad = (0..LFCD2_BEAMS_PER_SCAN)
-                    .map(|index| (index as f32).to_radians() + self.yaw_offset_rad)
+                    .map(|index| (index as f32).to_radians())
                     .collect();
                 return Some(RangeSense {
                     schema_version: 1,
+                    captured_at_ms: unix_time_ms(),
                     beams,
                     nearest_m,
                     beam_angles_rad,
-                    frame: Some("robot_base".to_string()),
+                    frame: Some("hls_lfcd2".to_string()),
                     source: Some("hls_lfcd2".to_string()),
+                    extrinsics: Some(self.extrinsics),
                 });
             }
         }
@@ -3409,7 +3427,14 @@ mod tests {
 
     #[test]
     fn lfcd2_parser_builds_clockwise_native_segments_into_a_full_scan() {
-        let mut parser = Lfcd2Parser::new(0.25);
+        let extrinsics = RangeExtrinsics {
+            forward_m: 0.18,
+            height_m: 0.42,
+            pitch_rad: 20.0_f32.to_radians(),
+            yaw_rad: 0.25,
+            ..RangeExtrinsics::default()
+        };
+        let mut parser = Lfcd2Parser::new(extrinsics);
         let mut stream = vec![0x00, 0x11, 0xfa, 0x01];
         for segment in 0..LFCD2_SEGMENTS_PER_SCAN {
             stream.extend_from_slice(&lfcd2_test_segment(segment));
@@ -3421,18 +3446,19 @@ mod tests {
         assert_eq!(scan.schema_version, 1);
         assert_eq!(scan.beams.len(), LFCD2_BEAMS_PER_SCAN);
         assert_eq!(scan.beam_angles_rad.len(), LFCD2_BEAMS_PER_SCAN);
-        assert_eq!(scan.frame.as_deref(), Some("robot_base"));
+        assert_eq!(scan.frame.as_deref(), Some("hls_lfcd2"));
         assert_eq!(scan.source.as_deref(), Some("hls_lfcd2"));
+        assert_eq!(scan.extrinsics, Some(extrinsics));
         assert!((scan.nearest_m.expect("nearest range") - 0.12).abs() < 0.0001);
         assert!((scan.beams[359] - 0.12).abs() < 0.0001);
         assert!((scan.beams[0] - 0.479).abs() < 0.0001);
-        assert!((scan.beam_angles_rad[0] - 0.25).abs() < 0.0001);
-        assert!((scan.beam_angles_rad[359] - (359.0_f32.to_radians() + 0.25)).abs() < 0.0001);
+        assert!(scan.beam_angles_rad[0].abs() < 0.0001);
+        assert!((scan.beam_angles_rad[359] - 359.0_f32.to_radians()).abs() < 0.0001);
     }
 
     #[test]
     fn lfcd2_parser_rejects_out_of_range_measurements() {
-        let mut parser = Lfcd2Parser::new(0.0);
+        let mut parser = Lfcd2Parser::new(RangeExtrinsics::default());
         let mut stream = Vec::new();
         for segment in 0..LFCD2_SEGMENTS_PER_SCAN {
             let mut packet = lfcd2_test_segment(segment);

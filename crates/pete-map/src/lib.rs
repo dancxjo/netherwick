@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use pete_core::{Pose2, TimeMs};
-use pete_now::{EyeFrame, EyeFrameFormat, ImuSense, KinectSense, Now, RangeSense};
+use pete_now::{EyeFrame, EyeFrameFormat, ImuSense, KinectSense, Now, RangeExtrinsics, RangeSense};
 use pete_sensors::WorldSnapshot;
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +149,10 @@ pub struct VoxelPointCloud {
     pub observations: u64,
     pub raw_points_seen: u64,
     pub orientation_status: OrientationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_kinect_capture_ms: Option<TimeMs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_range_capture_ms: Option<TimeMs>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -634,6 +638,8 @@ impl VoxelPointCloud {
             observations: 0,
             raw_points_seen: 0,
             orientation_status: OrientationStatus::default(),
+            last_kinect_capture_ms: None,
+            last_range_capture_ms: None,
         }
     }
 
@@ -642,11 +648,40 @@ impl VoxelPointCloud {
         snapshot: &WorldSnapshot,
         t_ms: TimeMs,
     ) -> PointCloudSummary {
-        if let Some(observation) = pointcloud_observation_from_snapshot(snapshot, t_ms, self.config)
+        let new_kinect = snapshot.kinect.captured_at_ms == 0
+            || self.last_kinect_capture_ms != Some(snapshot.kinect.captured_at_ms);
+        let new_range = snapshot.range.captured_at_ms == 0
+            || self.last_range_capture_ms != Some(snapshot.range.captured_at_ms);
+        let mut observations = pointcloud_observations_from_snapshot(snapshot, t_ms, self.config);
+        observations.retain(|observation| {
+            if observation.source == "kinect_depth" {
+                new_kinect
+            } else {
+                new_range
+            }
+        });
+        if new_kinect
+            && snapshot.kinect.captured_at_ms > 0
+            && observations
+                .iter()
+                .any(|observation| observation.source == "kinect_depth")
         {
-            self.integrate_observation(observation);
-        } else {
+            self.last_kinect_capture_ms = Some(snapshot.kinect.captured_at_ms);
+        }
+        if new_range
+            && snapshot.range.captured_at_ms > 0
+            && observations
+                .iter()
+                .any(|observation| observation.source != "kinect_depth")
+        {
+            self.last_range_capture_ms = Some(snapshot.range.captured_at_ms);
+        }
+        if observations.is_empty() {
             self.decay_stale(t_ms);
+        } else {
+            for observation in observations {
+                self.integrate_observation(observation);
+            }
         }
         self.summary()
     }
@@ -1972,16 +2007,37 @@ fn observation_from_parts(
             if !angle_rad.is_finite() {
                 return None;
             }
+            let (angle_rad, planar_distance, endpoint_height, tilted_sensor) = range
+                .extrinsics
+                .map(|extrinsics| {
+                    let endpoint = range_endpoint_in_robot(distance, angle_rad, extrinsics);
+                    (
+                        endpoint.y_m.atan2(endpoint.x_m),
+                        endpoint.x_m.hypot(endpoint.y_m),
+                        endpoint.z_m,
+                        extrinsics.pitch_rad.abs() > 1.0e-4 || extrinsics.roll_rad.abs() > 1.0e-4,
+                    )
+                })
+                .unwrap_or((angle_rad, distance, 0.0, false));
+            // A downward-tilted lidar sees the floor by design. Keep those
+            // returns in the 3D cloud, but do not turn the floor into a ring of
+            // obstacles in the planar occupancy map.
+            if tilted_sensor && endpoint_height <= 0.05 {
+                return None;
+            }
+            if !planar_distance.is_finite() || planar_distance <= 0.0 {
+                return None;
+            }
             let nearest_hit = range
                 .nearest_m
                 .filter(|nearest| nearest.is_finite())
                 .map(|nearest| (distance - nearest).abs() <= config.hit_epsilon_m)
                 .unwrap_or(false);
-            let hit = distance <= config.max_range_m
+            let hit = planar_distance <= config.max_range_m
                 && (nearest_hit || distance < config.max_range_m - config.hit_epsilon_m);
             Some(RangeBeam {
                 angle_rad,
-                distance_m: distance,
+                distance_m: planar_distance,
                 hit,
                 confidence: if hit { 0.9 } else { 0.65 },
             })
@@ -2045,22 +2101,118 @@ pub fn pointcloud_observation_from_snapshot(
     t_ms: TimeMs,
     config: PointCloudConfig,
 ) -> Option<PointCloudObservation> {
+    pointcloud_observations_from_snapshot(snapshot, t_ms, config)
+        .into_iter()
+        .next()
+}
+
+pub fn pointcloud_observations_from_snapshot(
+    snapshot: &WorldSnapshot,
+    t_ms: TimeMs,
+    config: PointCloudConfig,
+) -> Vec<PointCloudObservation> {
     let color = snapshot
         .eye_frame
         .as_ref()
         .and_then(DepthColorImage::from_eye_frame);
-    pointcloud_observation_from_kinect_with_color(
+    let pose = snapshot.body.odometry;
+    let orientation = orientation_from_snapshot(snapshot);
+    let pose_confidence = odometry_confidence_from_motion(
+        snapshot.body.velocity.forward_m_s,
+        snapshot.body.velocity.turn_rad_s,
+    );
+    let mut observations = Vec::new();
+    if let Some(observation) = pointcloud_observation_from_kinect_with_color(
         &snapshot.kinect,
-        snapshot.body.odometry,
-        orientation_from_snapshot(snapshot),
-        odometry_confidence_from_motion(
-            snapshot.body.velocity.forward_m_s,
-            snapshot.body.velocity.turn_rad_s,
-        ),
+        pose,
+        orientation,
+        pose_confidence,
         t_ms,
         config,
         color.as_ref(),
-    )
+    ) {
+        observations.push(observation);
+    }
+    if let Some(observation) = pointcloud_observation_from_range(
+        &snapshot.range,
+        pose,
+        orientation,
+        pose_confidence,
+        t_ms,
+        config,
+    ) {
+        observations.push(observation);
+    }
+    observations
+}
+
+pub fn pointcloud_observation_from_range(
+    range: &RangeSense,
+    pose: Pose2,
+    orientation: OrientationEstimate,
+    pose_confidence: f32,
+    t_ms: TimeMs,
+    config: PointCloudConfig,
+) -> Option<PointCloudObservation> {
+    let extrinsics = range.extrinsics?;
+    if range.beams.is_empty() || range.beam_angles_rad.len() != range.beams.len() {
+        return None;
+    }
+    let stride = range
+        .beams
+        .len()
+        .div_ceil(config.max_points_per_observation.max(1))
+        .max(1);
+    let source_frame_id =
+        (range.captured_at_ms > 0).then(|| format!("range-{}", range.captured_at_ms));
+    let points = range
+        .beams
+        .iter()
+        .zip(&range.beam_angles_rad)
+        .enumerate()
+        .step_by(stride)
+        .filter_map(|(index, (distance_m, angle_rad))| {
+            if !distance_m.is_finite()
+                || *distance_m <= 0.0
+                || *distance_m > config.max_depth_m
+                || !angle_rad.is_finite()
+            {
+                return None;
+            }
+            Some(PointCloudPoint {
+                position: range_endpoint_in_robot(*distance_m, *angle_rad, extrinsics),
+                color_rgb: None,
+                confidence: pose_confidence,
+                depth_index: Some(index),
+                depth_uv: None,
+                depth_image_size: None,
+                source_frame_id: source_frame_id.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        return None;
+    }
+    Some(PointCloudObservation {
+        frame: PointCloudFrame::RobotBase,
+        pose: PoseEstimate {
+            pose,
+            confidence: pose_confidence,
+            covariance: [0.05, 0.05, 0.10],
+            source: "odometry".to_string(),
+            t_ms,
+        },
+        orientation,
+        points,
+        source: range.source.clone().unwrap_or_else(|| "range".to_string()),
+        t_ms,
+        metadata: serde_json::json!({
+            "beam_count": range.beams.len(),
+            "sample_stride": stride,
+            "sensor_extrinsics": extrinsics,
+            "orientation": orientation,
+        }),
+    })
 }
 
 pub fn pointcloud_observation_from_kinect(
@@ -2355,6 +2507,29 @@ fn rotate_robot_extrinsic(point: Point3D, pitch_rad: f32, roll_rad: f32, yaw_rad
         x_m: x,
         y_m: yawed_y,
         z_m: z,
+    }
+}
+
+fn range_endpoint_in_robot(
+    distance_m: f32,
+    angle_rad: f32,
+    extrinsics: RangeExtrinsics,
+) -> Point3D {
+    let sensor = Point3D {
+        x_m: distance_m * angle_rad.cos(),
+        y_m: distance_m * angle_rad.sin(),
+        z_m: 0.0,
+    };
+    let rotated = rotate_robot_extrinsic(
+        sensor,
+        extrinsics.pitch_rad,
+        extrinsics.roll_rad,
+        extrinsics.yaw_rad,
+    );
+    Point3D {
+        x_m: rotated.x_m + extrinsics.forward_m,
+        y_m: rotated.y_m + extrinsics.left_m,
+        z_m: rotated.z_m + extrinsics.height_m,
     }
 }
 
@@ -3540,6 +3715,91 @@ mod tests {
             observation.points[1].source_frame_id.as_deref(),
             Some("kinect-depth-123")
         );
+    }
+
+    #[test]
+    fn tilted_lidar_ground_returns_feed_3d_cloud_but_not_planar_obstacles() {
+        let range = RangeSense {
+            schema_version: 1,
+            captured_at_ms: 123,
+            beams: vec![2.0_f32.sqrt()],
+            nearest_m: Some(2.0_f32.sqrt()),
+            beam_angles_rad: vec![0.0],
+            frame: Some("hls_lfcd2".to_string()),
+            source: Some("hls_lfcd2".to_string()),
+            extrinsics: Some(RangeExtrinsics {
+                height_m: 1.0,
+                pitch_rad: std::f32::consts::FRAC_PI_4,
+                ..RangeExtrinsics::default()
+            }),
+        };
+        let observation = pointcloud_observation_from_range(
+            &range,
+            pose(0.0, 0.0, 0.0),
+            OrientationEstimate::default(),
+            0.9,
+            500,
+            PointCloudConfig::default(),
+        )
+        .expect("tilted lidar observation");
+
+        assert_eq!(observation.frame, PointCloudFrame::RobotBase);
+        assert_eq!(observation.source, "hls_lfcd2");
+        assert_eq!(observation.points.len(), 1);
+        assert!((observation.points[0].position.x_m - 1.0).abs() < 0.001);
+        assert!(observation.points[0].position.y_m.abs() < 0.001);
+        assert!(observation.points[0].position.z_m.abs() < 0.001);
+
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.range = range;
+        let planar = observation_from_snapshot(&snapshot, 500, MapConfig::default());
+        assert!(planar.range_beams.is_empty());
+    }
+
+    #[test]
+    fn robot_spin_accumulates_tilted_lidar_plane_into_world_cloud() {
+        let mut cloud = VoxelPointCloud::new(PointCloudConfig {
+            voxel_size_m: 0.05,
+            ..PointCloudConfig::default()
+        });
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.range = RangeSense {
+            schema_version: 1,
+            captured_at_ms: 100,
+            beams: vec![1.0],
+            nearest_m: Some(1.0),
+            beam_angles_rad: vec![0.0],
+            source: Some("hls_lfcd2".to_string()),
+            extrinsics: Some(RangeExtrinsics {
+                height_m: 0.5,
+                pitch_rad: 30.0_f32.to_radians(),
+                ..RangeExtrinsics::default()
+            }),
+            ..RangeSense::default()
+        };
+
+        snapshot.body.odometry.heading_rad = 0.0;
+        cloud.observe_snapshot(&snapshot, 100);
+        snapshot.body.odometry.heading_rad = std::f32::consts::FRAC_PI_2;
+        cloud.observe_snapshot(&snapshot, 150);
+        assert_eq!(
+            cloud.observations, 1,
+            "cached scan must not smear across poses"
+        );
+        snapshot.range.captured_at_ms = 200;
+        cloud.observe_snapshot(&snapshot, 200);
+
+        assert_eq!(cloud.observations, 2);
+        assert_eq!(cloud.raw_points_seen, 2);
+        assert_eq!(cloud.voxels.len(), 2);
+        assert!(cloud
+            .voxels
+            .values()
+            .any(|point| point.position.x_m > 0.8 && point.position.y_m.abs() < 0.05));
+        assert!(cloud
+            .voxels
+            .values()
+            .any(|point| point.position.y_m > 0.8 && point.position.x_m.abs() < 0.05));
     }
 
     #[test]

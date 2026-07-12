@@ -225,11 +225,10 @@ pub trait Cockpit {
         None
     }
 
-    /// Surrender motherbrain possession. The brainstem wire operation remains
-    /// DISARM, but that implementation detail is not the motherbrain lifecycle
-    /// vocabulary.
+    /// Surrender motherbrain possession after stopping motion. This does not
+    /// surrender the brainstem's independent ownership of Create OI.
     fn exorcize(&mut self) -> Result<()> {
-        self.disarm()
+        self.stop()
     }
 
     /// Unscoped transport operation. Production brainstems accept only
@@ -3944,37 +3943,8 @@ impl<C: Cockpit> MotherbrainPossession<C> {
             self.close_gate("possession exorcized".into());
             return Err(error);
         }
-        // Mandatory wire-level surrender. Early production firmware implements
-        // DISARM but omitted it from the advertised verbs. Use only the current
-        // validated session and lease; this is never an unscoped fallback.
-        let session = self.session.session().clone();
-        let lease =
-            self.session.control_lease.clone().ok_or_else(|| {
-                CockpitError::Policy("exorcize requires the current lease".into())
-            })?;
-        let mut disarm = None;
-        for _ in 0..25 {
-            match self.session.connector_mut().execute_with_lease(
-                &session,
-                &lease,
-                CockpitRequest::Disarm,
-            ) {
-                Err(error) if error.to_string().contains("busy") => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                result => {
-                    disarm = Some(result.and_then(expect_accepted));
-                    break;
-                }
-            }
-        }
-        let disarm = disarm.unwrap_or_else(|| {
-            Err(CockpitError::Policy(
-                "exorcize DISARM remained busy after STOP".into(),
-            ))
-        });
         self.close_gate("possession exorcized".into());
-        disarm
+        Ok(())
     }
 
     fn execute_scoped(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
@@ -4050,7 +4020,6 @@ impl<C: Cockpit> MotherbrainPossession<C> {
 impl<C: Cockpit> Drop for MotherbrainPossession<C> {
     fn drop(&mut self) {
         let _ = self.session.execute(CockpitRequest::Stop);
-        let _ = self.session.execute(CockpitRequest::Disarm);
     }
 }
 
@@ -7908,7 +7877,7 @@ mod tests {
     }
 
     #[test]
-    fn exorcize_does_not_disarm_until_stop_is_acknowledged() {
+    fn exorcize_closes_gate_only_after_stop_is_acknowledged() {
         let cockpit = StopRejectingCockpit {
             inner: SimCockpit::new(),
             reject_stop: false,
@@ -7919,6 +7888,22 @@ mod tests {
         possession.session.connector_mut().reject_stop = true;
 
         assert!(possession.exorcize().is_err());
+        assert!(!possession.snapshot().possessed);
+        assert_eq!(possession.session.connector_mut().disarm_requests, 0);
+    }
+
+    #[test]
+    fn exorcize_stops_without_disarming_create_oi() {
+        let cockpit = StopRejectingCockpit {
+            inner: SimCockpit::new(),
+            reject_stop: false,
+            disarm_requests: 0,
+        };
+        let ready = establish_session(cockpit, hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 1_000).unwrap();
+
+        possession.exorcize().unwrap();
+
         assert!(!possession.snapshot().possessed);
         assert_eq!(possession.session.connector_mut().disarm_requests, 0);
     }

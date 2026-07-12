@@ -34,7 +34,9 @@ use pete_memory::{
 };
 use pete_models::MODEL_REGISTRY;
 use pete_mouth::QueuedPiperCpalMouth;
-use pete_now::{EarSense, ExtensionSense, KinectSense, Now, RangeSense, SurpriseSense};
+use pete_now::{
+    EarSense, ExtensionSense, KinectSense, Now, RangeExtrinsics, RangeSense, SurpriseSense,
+};
 use pete_runtime::{
     ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
     InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, ReignQueue, RobotMode,
@@ -494,11 +496,22 @@ struct RobotArgs {
     #[arg(long)]
     gps: Option<String>,
     /// HLS-LFCD2 / LDS-01 serial device. Omit for best-effort auto-detection.
-    #[arg(long)]
+    #[arg(long, env = "LIDAR_SERIAL_PORT")]
     lidar: Option<String>,
     /// Counter-clockwise mounting offset from the robot's forward axis.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_YAW_DEG")]
     lidar_yaw_deg: f32,
+    /// Downward tilt of the lidar scan plane; positive values look toward the ground ahead.
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_PITCH_DEG")]
+    lidar_pitch_deg: f32,
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_ROLL_DEG")]
+    lidar_roll_deg: f32,
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_HEIGHT_M")]
+    lidar_height_m: f32,
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_FORWARD_M")]
+    lidar_forward_m: f32,
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_LEFT_M")]
+    lidar_left_m: f32,
     #[arg(long)]
     capture: Option<String>,
     #[arg(long)]
@@ -628,11 +641,22 @@ struct CaptureRealArgs {
     #[arg(long)]
     gps: Option<String>,
     /// HLS-LFCD2 / LDS-01 serial device. Omit for best-effort auto-detection.
-    #[arg(long)]
+    #[arg(long, env = "LIDAR_SERIAL_PORT")]
     lidar: Option<String>,
     /// Counter-clockwise mounting offset from the robot's forward axis.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_YAW_DEG")]
     lidar_yaw_deg: f32,
+    /// Downward tilt of the lidar scan plane; positive values look toward the ground ahead.
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_PITCH_DEG")]
+    lidar_pitch_deg: f32,
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_ROLL_DEG")]
+    lidar_roll_deg: f32,
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_HEIGHT_M")]
+    lidar_height_m: f32,
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_FORWARD_M")]
+    lidar_forward_m: f32,
+    #[arg(long, default_value_t = 0.0, env = "LIDAR_LEFT_M")]
+    lidar_left_m: f32,
     #[arg(long)]
     mock: bool,
     #[arg(long)]
@@ -4296,15 +4320,6 @@ where
             );
         }
     }
-    if args.export_pointcloud
-        && !warnings
-            .iter()
-            .any(|warning| warning.contains("uncalibrated point cloud"))
-    {
-        warnings
-            .push("uncalibrated point cloud: using approximate placeholder intrinsics".to_string());
-    }
-
     let mut stream_counts = StreamCounts::default();
     let mut events_written = 0usize;
     let mut frame_index = 0u64;
@@ -4382,7 +4397,7 @@ where
         capture_assets(CaptureAssetsArgs {
             capture: args.out.clone(),
             pointcloud: true,
-            world_pointcloud: false,
+            world_pointcloud: true,
             stride: args.pointcloud_stride,
             max_depth_m: 8.0,
         })
@@ -4770,6 +4785,14 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     }
 
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
+    let lidar_extrinsics = lidar_extrinsics(
+        args.lidar_forward_m,
+        args.lidar_left_m,
+        args.lidar_height_m,
+        args.lidar_roll_deg,
+        args.lidar_pitch_deg,
+        args.lidar_yaw_deg,
+    );
 
     if args.kinect_depth {
         if let Some(device) = &args.camera {
@@ -4888,11 +4911,16 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             }
             println!("{error}; continuing without lidar");
         } else {
-            match Lfcd2SenseProvider::with_yaw_offset(device, args.lidar_yaw_deg.to_radians()) {
+            match Lfcd2SenseProvider::with_extrinsics(device, lidar_extrinsics) {
                 Ok(provider) => {
                     println!(
-                        "HLS-LFCD2 lidar: {device} at {} baud (yaw {} deg)",
+                        "HLS-LFCD2 lidar: {device} at {} baud (position [{}, {}, {}] m, roll/pitch/yaw [{}, {}, {}] deg)",
                         Lfcd2SenseProvider::BAUD_RATE,
+                        args.lidar_forward_m,
+                        args.lidar_left_m,
+                        args.lidar_height_m,
+                        args.lidar_roll_deg,
+                        args.lidar_pitch_deg,
                         args.lidar_yaw_deg
                     );
                     sensors.push(Box::new(provider));
@@ -5108,9 +5136,9 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     }
 
     if robot_mode == RobotMode::Slow {
-        // Preserve acknowledgement semantics: STOP must succeed before DISARM,
-        // and an absent acknowledgement makes the run fail rather than print a
-        // misleading clean shutdown.
+        // Preserve acknowledgement semantics: motion must be stopped before
+        // surrendering the motherbrain gate. The brainstem continues owning
+        // and supervising Create OI in Full mode.
         runner
             .cockpit
             .client_mut()
@@ -5127,14 +5155,14 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             .get_status()
             .context("possession final status was not acknowledged")?
             .summary();
-        if final_status.active_motion == Some(true) || final_status.armed == Some(true) {
+        if final_status.active_motion == Some(true) {
             anyhow::bail!(
-                "possession shutdown did not prove stopped/disarmed: moving={:?} armed={:?}",
+                "possession shutdown did not prove stopped: moving={:?} armed={:?}",
                 final_status.active_motion,
                 final_status.armed
             );
         }
-        println!("possession exorcize acknowledged: stopped=true possessed=false");
+        println!("possession exorcize acknowledged: stopped=true possessed=false; brainstem OI supervision retained");
     }
 
     let capture_summary = if let Some(writer) = capture {
@@ -5858,7 +5886,15 @@ fn add_optional_real_sensors(
                 "lidar {device} conflicts with the selected brainstem cockpit device"
             ));
         } else {
-            match Lfcd2SenseProvider::with_yaw_offset(device, args.lidar_yaw_deg.to_radians()) {
+            let extrinsics = lidar_extrinsics(
+                args.lidar_forward_m,
+                args.lidar_left_m,
+                args.lidar_height_m,
+                args.lidar_roll_deg,
+                args.lidar_pitch_deg,
+                args.lidar_yaw_deg,
+            );
+            match Lfcd2SenseProvider::with_extrinsics(device, extrinsics) {
                 Ok(provider) => {
                     sensors.push(Box::new(provider));
                     availability["lidar"] = serde_json::json!({
@@ -5866,7 +5902,7 @@ fn add_optional_real_sensors(
                         "device": device,
                         "kind": "hls-lfcd2",
                         "baud": Lfcd2SenseProvider::BAUD_RATE,
-                        "yaw_deg": args.lidar_yaw_deg
+                        "extrinsics": extrinsics
                     });
                 }
                 Err(error) => {
@@ -6117,6 +6153,24 @@ fn selected_lidar_device(
     serial_device_strings(env_report)
         .into_iter()
         .find(|device| looks_like_lidar_serial_device(device))
+}
+
+fn lidar_extrinsics(
+    forward_m: f32,
+    left_m: f32,
+    height_m: f32,
+    roll_deg: f32,
+    pitch_deg: f32,
+    yaw_deg: f32,
+) -> RangeExtrinsics {
+    RangeExtrinsics {
+        forward_m,
+        left_m,
+        height_m,
+        roll_rad: roll_deg.to_radians(),
+        pitch_rad: pitch_deg.to_radians(),
+        yaw_rad: yaw_deg.to_radians(),
+    }
 }
 
 fn looks_like_lidar_serial_device(device: &str) -> bool {
@@ -12472,6 +12526,11 @@ mod tests {
             gps: None,
             lidar: None,
             lidar_yaw_deg: 0.0,
+            lidar_pitch_deg: 0.0,
+            lidar_roll_deg: 0.0,
+            lidar_height_m: 0.0,
+            lidar_forward_m: 0.0,
+            lidar_left_m: 0.0,
             mock: true,
             export_rgb: false,
             export_depth: false,
@@ -12519,6 +12578,11 @@ mod tests {
             gps: None,
             lidar: None,
             lidar_yaw_deg: 0.0,
+            lidar_pitch_deg: 0.0,
+            lidar_roll_deg: 0.0,
+            lidar_height_m: 0.0,
+            lidar_forward_m: 0.0,
+            lidar_left_m: 0.0,
             mock: true,
             export_rgb: true,
             export_depth: true,

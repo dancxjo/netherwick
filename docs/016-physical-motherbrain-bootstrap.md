@@ -54,8 +54,9 @@ The example remains a bounded protocol proof. The production path is now
 `pete-tools robot --mode possession-slow`; use the guarded wheels-off-floor
 command in [real-robot-readonly.md](real-robot-readonly.md). Acquiring the
 motherbrain lease is possession—there is no second arm layer. On orderly exit,
-the production runner requires STOP and exorcize acknowledgements. Exorcize is
-translated internally to the brainstem's DISARM wire command.
+the production runner requires STOP and exorcize acknowledgements. Exorcize
+releases the motherbrain possession gate without changing Create OI power or
+mode; the brainstem continues its independent Full-mode supervision.
 
 Useful diagnostics:
 

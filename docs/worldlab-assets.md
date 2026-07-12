@@ -51,7 +51,9 @@ Depth assets are 16-bit grayscale PNG files containing millimeters. The current 
 
 Audio assets are WAV PCM16 chunks from `PcmAudioFrame`, with sample rate and channel count recorded in frame metadata.
 
-Point-cloud v0 assets are ASCII PLY files generated from depth. The conversion uses a max-depth filter and a stride/downsample factor. Until calibrated intrinsics are supplied, Worldlab uses approximate placeholder intrinsics and writes an `uncalibrated point cloud` warning into the manifest.
+Per-frame point-cloud v0 assets are ASCII PLY files generated from depth. The conversion uses a max-depth filter and a stride/downsample factor. Until calibrated intrinsics are supplied, Worldlab uses approximate placeholder intrinsics and writes an `uncalibrated point cloud` warning into the manifest.
+
+The accumulated world PLY also consumes calibrated `RangeSense` scans. A pitched HLS-LFCD2 therefore shares the same odometry-aligned voxel cloud with Kinect depth; capture poses from forward motion or a slow spin supply the third dimension. Run `capture-assets` with `--world-pointcloud`, or use `capture-real --export-pointcloud`, to write `assets/pointcloud/world-accumulated.ply`.
 
 ## Commands
 

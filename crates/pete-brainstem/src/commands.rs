@@ -440,8 +440,10 @@ pub(crate) const ACQUIRE_CREATE_SCRIPT: &[RuntimeCommand] = &[
     },
 ];
 
-pub(crate) const DISARM_SCRIPT: &[RuntimeCommand] =
-    &[RuntimeCommand::Stop, RuntimeCommand::SleepCreate];
+// DISARM is retained as a legacy wire verb, but surrendering a controller must
+// not surrender the brainstem's ownership of Create OI.  Stop the wheels and
+// leave mode/power supervision to `maintain_full_mode`.
+pub(crate) const DISARM_SCRIPT: &[RuntimeCommand] = &[RuntimeCommand::Stop];
 
 pub(crate) const RESTART_CREATE_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::Stop,

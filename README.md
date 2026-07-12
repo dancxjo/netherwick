@@ -157,10 +157,10 @@ retries automatically after a brainstem reboot. After a cold boot, a rejected
 Wi-Fi identity is automatically established over the pinned USB brainstem
 before retrying. It expands to the guarded command below:
 
-An HLS-LFCD2 / LDS-01 can run alongside either path. Set
-`LIDAR_SERIAL_PORT=/dev/serial/by-id/DEVICE` (and, if needed,
-`LIDAR_YAW_DEG`) in `.env`; `just robot` and `just possess` then feed its
-360-degree scans into Pete's existing range map and scan matcher.
+An HLS-LFCD2 / LDS-01 can run alongside either path. Set its serial path and
+mount pose in `.env`; `just robot` and `just possess` then feed its 360-degree
+scans into Pete's planar map and shared Kinect/lidar 3D voxel cloud. A pitched
+scan accumulates into 3D as odometry changes during forward motion or a spin.
 
 ```bash
 cargo run -p pete-tools -- robot --mode possession-slow \
@@ -176,8 +176,9 @@ cargo run -p pete-tools -- robot --mode possession-slow \
 The motherbrain control lease is possession; there is no separate arm layer.
 The runner begins with STOP, never exposes Create OI, and does not fall back to
 another device or transport. Orderly shutdown requires acknowledged STOP then
-exorcize (the brainstem DISARM wire operation) and final stopped/unpossessed
-status. Serial loss is handled by the short
+exorcize and final stopped/unpossessed status. Exorcize releases motherbrain
+control without disarming Create OI; the brainstem keeps supervising it in Full
+mode. Serial loss is handled by the short
 command, heartbeat, and lease deadlines; no power toggle is attempted.
 
 See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions, device expectations, success criteria, and failure behavior.
