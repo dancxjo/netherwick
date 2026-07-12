@@ -3902,6 +3902,18 @@ impl<C: Cockpit> MotherbrainPossession<C> {
         self.refusal_reason = Some(reason);
     }
 
+    fn execute_with_busy_retry(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+        for attempt in 0..25 {
+            match self.session.execute(request.clone()) {
+                Err(CockpitError::Rejected { reason, .. }) if reason == "busy" && attempt < 24 => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("bounded busy retry always returns on its final attempt")
+    }
+
     pub fn exorcize(&mut self) -> Result<()> {
         let stop = self
             .session
@@ -3969,7 +3981,7 @@ impl<C: Cockpit> MotherbrainPossession<C> {
                 angular_mrad_s,
                 ..
             } => {
-                expect_accepted(self.session.execute(CockpitRequest::HeartbeatStop {
+                expect_accepted(self.execute_with_busy_retry(CockpitRequest::HeartbeatStop {
                     timeout_ms: self.heartbeat_timeout_ms,
                 })?)?;
                 CockpitRequest::CmdVel {
@@ -3981,7 +3993,7 @@ impl<C: Cockpit> MotherbrainPossession<C> {
             }
             other => other,
         };
-        let response = self.session.execute(request.clone());
+        let response = self.execute_with_busy_retry(request.clone());
         match response {
             Ok(response) => {
                 match request {
@@ -5875,6 +5887,57 @@ mod tests {
         inner: SimCockpit,
         reject_stop: bool,
         disarm_requests: usize,
+    }
+
+    struct BusyOnceCockpit {
+        inner: SimCockpit,
+        busy_remaining: usize,
+        attempts: usize,
+    }
+
+    impl Cockpit for BusyOnceCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+            self.inner.execute(request)
+        }
+
+        fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+            self.inner.handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &CockpitSession,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            self.inner.execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &CockpitSession,
+            lease: &ControlLease,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            self.attempts += 1;
+            if self.busy_remaining > 0 {
+                self.busy_remaining -= 1;
+                return Err(CockpitError::Rejected {
+                    command_id: self.attempts as u32,
+                    reason: "busy".into(),
+                });
+            }
+            self.inner.execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &CockpitSession,
+            lease: &ServiceLease,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            self.inner
+                .execute_with_service_lease(session, lease, request)
+        }
     }
 
     impl Cockpit for StopRejectingCockpit {
@@ -7790,6 +7853,31 @@ mod tests {
         assert!(renewed.possessed);
         assert!(renewed.lease_generation > first.lease_generation);
         assert_ne!(renewed.lease_id, first.lease_id);
+    }
+
+    #[test]
+    fn production_possession_retries_transient_busy_commands() {
+        let cockpit = BusyOnceCockpit {
+            inner: SimCockpit::new(),
+            busy_remaining: 0,
+            attempts: 0,
+        };
+        let ready = establish_session(cockpit, hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 1_000).unwrap();
+        possession.session.connector_mut().busy_remaining = 1;
+        let attempts_before = possession.session.connector_mut().attempts;
+
+        possession
+            .execute(CockpitRequest::PlayFeedback {
+                feedback: FeedbackKind::Ok,
+            })
+            .unwrap();
+
+        assert_eq!(
+            possession.session.connector_mut().attempts,
+            attempts_before + 2
+        );
+        assert!(possession.snapshot().possessed);
     }
 
     #[test]
