@@ -46,7 +46,7 @@ use std::io::{ErrorKind, Read};
 #[cfg(feature = "linux-hardware")]
 use std::os::fd::AsRawFd;
 #[cfg(feature = "linux-hardware")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "linux-hardware")]
 use v4l::buffer::Type;
 #[cfg(feature = "linux-hardware")]
@@ -2729,6 +2729,222 @@ pub struct GpsSenseProvider {
     last_fix: GpsSense,
 }
 
+/// Native serial provider for the Hitachi-LG HLS-LFCD2 / ROBOTIS LDS-01.
+///
+/// The sensor emits one 42-byte segment for each six degrees of a 360-degree
+/// sweep. This provider follows the sensor's native clockwise ordering and
+/// converts it to the counter-clockwise angle convention used by `RangeSense`.
+pub struct Lfcd2SenseProvider {
+    #[cfg(feature = "linux-hardware")]
+    port: Box<dyn SerialPort>,
+    #[cfg(feature = "linux-hardware")]
+    parser: Lfcd2Parser,
+    #[cfg(feature = "linux-hardware")]
+    last_scan: Option<RangeSense>,
+    #[cfg(feature = "linux-hardware")]
+    last_scan_at: Option<Instant>,
+}
+
+impl Lfcd2SenseProvider {
+    pub const BAUD_RATE: u32 = 230_400;
+
+    pub fn new(port: &str) -> Result<Self> {
+        Self::with_yaw_offset(port, 0.0)
+    }
+
+    /// Opens the lidar and rotates every beam by `yaw_offset_rad` in the robot
+    /// base frame. Positive yaw is counter-clockwise.
+    pub fn with_yaw_offset(port: &str, yaw_offset_rad: f32) -> Result<Self> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            let mut port = serialport::new(port, Self::BAUD_RATE)
+                .timeout(Duration::from_millis(4))
+                .open()
+                .with_context(|| format!("failed to open HLS-LFCD2 lidar at {port}"))?;
+            // Older LFCD2 firmware requires this command. Newer firmware starts
+            // on power-up and safely tolerates it.
+            port.write_all(b"b")
+                .context("failed to send HLS-LFCD2 start command")?;
+            Ok(Self {
+                port,
+                parser: Lfcd2Parser::new(yaw_offset_rad),
+                last_scan: None,
+                last_scan_at: None,
+            })
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            let _ = port;
+            let _ = yaw_offset_rad;
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
+    }
+}
+
+#[async_trait]
+impl SenseProducer for Lfcd2SenseProvider {
+    async fn poll(&mut self) -> Result<SensePacket> {
+        #[cfg(feature = "linux-hardware")]
+        {
+            // RealRobotRunner gives each sensor a 25 ms budget. Consume the
+            // serial backlog incrementally and retain the latest scan between
+            // native ~5 Hz updates without blocking a control tick.
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match self.port.read(&mut chunk) {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        if let Some(scan) = self.parser.push(&chunk[..count]) {
+                            self.last_scan = Some(scan);
+                            self.last_scan_at = Some(Instant::now());
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::TimedOut => {}
+                    Err(error) => return Err(error).context("failed to read HLS-LFCD2 lidar"),
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+            if self
+                .last_scan_at
+                .is_some_and(|at| at.elapsed() <= Duration::from_millis(500))
+            {
+                return Ok(SensePacket::Range(
+                    self.last_scan.clone().expect("scan timestamp without scan"),
+                ));
+            }
+            anyhow::bail!("no fresh complete HLS-LFCD2 scan is available");
+        }
+        #[cfg(not(feature = "linux-hardware"))]
+        {
+            anyhow::bail!("linux-hardware feature is not enabled");
+        }
+    }
+}
+
+#[cfg(feature = "linux-hardware")]
+impl Drop for Lfcd2SenseProvider {
+    fn drop(&mut self) {
+        let _ = self.port.write_all(b"e");
+    }
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+const LFCD2_SEGMENT_BYTES: usize = 42;
+#[cfg(any(feature = "linux-hardware", test))]
+const LFCD2_SEGMENTS_PER_SCAN: usize = 60;
+#[cfg(any(feature = "linux-hardware", test))]
+const LFCD2_BEAMS_PER_SEGMENT: usize = 6;
+#[cfg(any(feature = "linux-hardware", test))]
+const LFCD2_BEAMS_PER_SCAN: usize = 360;
+#[cfg(any(feature = "linux-hardware", test))]
+const LFCD2_MIN_RANGE_M: f32 = 0.12;
+#[cfg(any(feature = "linux-hardware", test))]
+const LFCD2_MAX_RANGE_M: f32 = 3.5;
+
+#[cfg(any(feature = "linux-hardware", test))]
+#[derive(Clone, Debug)]
+struct Lfcd2Parser {
+    buffer: Vec<u8>,
+    ranges_m: [f32; LFCD2_BEAMS_PER_SCAN],
+    received_segments: [bool; LFCD2_SEGMENTS_PER_SCAN],
+    received_count: usize,
+    scan_started: bool,
+    yaw_offset_rad: f32,
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+impl Lfcd2Parser {
+    fn new(yaw_offset_rad: f32) -> Self {
+        Self {
+            buffer: Vec::new(),
+            ranges_m: [0.0; LFCD2_BEAMS_PER_SCAN],
+            received_segments: [false; LFCD2_SEGMENTS_PER_SCAN],
+            received_count: 0,
+            scan_started: false,
+            yaw_offset_rad,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Option<RangeSense> {
+        self.buffer.extend_from_slice(bytes);
+        loop {
+            let Some(start) = self
+                .buffer
+                .windows(2)
+                .position(|pair| pair[0] == 0xfa && (0xa0..=0xdb).contains(&pair[1]))
+            else {
+                let retain_sync_prefix = self.buffer.last() == Some(&0xfa);
+                self.buffer.clear();
+                if retain_sync_prefix {
+                    self.buffer.push(0xfa);
+                }
+                return None;
+            };
+            if start > 0 {
+                self.buffer.drain(..start);
+            }
+            if self.buffer.len() < LFCD2_SEGMENT_BYTES {
+                return None;
+            }
+
+            let packet = self.buffer.drain(..LFCD2_SEGMENT_BYTES).collect::<Vec<_>>();
+            let segment = usize::from(packet[1] - 0xa0);
+            if segment == 0 {
+                self.ranges_m.fill(0.0);
+                self.received_segments.fill(false);
+                self.received_count = 0;
+                self.scan_started = true;
+            } else if !self.scan_started {
+                continue;
+            }
+
+            for beam_in_segment in 0..LFCD2_BEAMS_PER_SEGMENT {
+                let raw_index = segment * LFCD2_BEAMS_PER_SEGMENT + beam_in_segment;
+                let offset = 4 + beam_in_segment * 6;
+                let range_mm = u16::from_le_bytes([packet[offset + 2], packet[offset + 3]]);
+                let range_m = f32::from(range_mm) / 1000.0;
+                // The official driver reverses raw indices so increasing output
+                // angles are counter-clockwise (raw 0 degrees becomes 359).
+                let output_index = LFCD2_BEAMS_PER_SCAN - 1 - raw_index;
+                self.ranges_m[output_index] =
+                    if (LFCD2_MIN_RANGE_M..=LFCD2_MAX_RANGE_M).contains(&range_m) {
+                        range_m
+                    } else {
+                        0.0
+                    };
+            }
+
+            if !self.received_segments[segment] {
+                self.received_segments[segment] = true;
+                self.received_count += 1;
+            }
+            if self.received_count == LFCD2_SEGMENTS_PER_SCAN {
+                self.scan_started = false;
+                let beams = self.ranges_m.to_vec();
+                let nearest_m = beams
+                    .iter()
+                    .copied()
+                    .filter(|range| *range > 0.0 && range.is_finite())
+                    .min_by(f32::total_cmp);
+                let beam_angles_rad = (0..LFCD2_BEAMS_PER_SCAN)
+                    .map(|index| (index as f32).to_radians() + self.yaw_offset_rad)
+                    .collect();
+                return Some(RangeSense {
+                    schema_version: 1,
+                    beams,
+                    nearest_m,
+                    beam_angles_rad,
+                    frame: Some("robot_base".to_string()),
+                    source: Some("hls_lfcd2".to_string()),
+                });
+            }
+        }
+    }
+}
+
 impl GpsSenseProvider {
     pub fn new(port: &str, baud_rate: u32) -> Result<Self> {
         #[cfg(feature = "linux-hardware")]
@@ -3189,6 +3405,64 @@ mod tests {
 
         assert_eq!(now.range.beams, vec![0.7]);
         assert_eq!(now.range.nearest_m, Some(0.7));
+    }
+
+    #[test]
+    fn lfcd2_parser_builds_clockwise_native_segments_into_a_full_scan() {
+        let mut parser = Lfcd2Parser::new(0.25);
+        let mut stream = vec![0x00, 0x11, 0xfa, 0x01];
+        for segment in 0..LFCD2_SEGMENTS_PER_SCAN {
+            stream.extend_from_slice(&lfcd2_test_segment(segment));
+        }
+
+        assert!(parser.push(&stream[..777]).is_none());
+        let scan = parser.push(&stream[777..]).expect("complete LFCD2 scan");
+
+        assert_eq!(scan.schema_version, 1);
+        assert_eq!(scan.beams.len(), LFCD2_BEAMS_PER_SCAN);
+        assert_eq!(scan.beam_angles_rad.len(), LFCD2_BEAMS_PER_SCAN);
+        assert_eq!(scan.frame.as_deref(), Some("robot_base"));
+        assert_eq!(scan.source.as_deref(), Some("hls_lfcd2"));
+        assert!((scan.nearest_m.expect("nearest range") - 0.12).abs() < 0.0001);
+        assert!((scan.beams[359] - 0.12).abs() < 0.0001);
+        assert!((scan.beams[0] - 0.479).abs() < 0.0001);
+        assert!((scan.beam_angles_rad[0] - 0.25).abs() < 0.0001);
+        assert!((scan.beam_angles_rad[359] - (359.0_f32.to_radians() + 0.25)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn lfcd2_parser_rejects_out_of_range_measurements() {
+        let mut parser = Lfcd2Parser::new(0.0);
+        let mut stream = Vec::new();
+        for segment in 0..LFCD2_SEGMENTS_PER_SCAN {
+            let mut packet = lfcd2_test_segment(segment);
+            if segment == 0 {
+                packet[6..8].copy_from_slice(&119_u16.to_le_bytes());
+                packet[12..14].copy_from_slice(&3501_u16.to_le_bytes());
+            }
+            stream.extend_from_slice(&packet);
+        }
+
+        let scan = parser.push(&stream).expect("complete LFCD2 scan");
+        assert_eq!(scan.beams[359], 0.0);
+        assert_eq!(scan.beams[358], 0.0);
+        assert!((scan.nearest_m.expect("nearest valid range") - 0.122).abs() < 0.0001);
+    }
+
+    fn lfcd2_test_segment(segment: usize) -> [u8; LFCD2_SEGMENT_BYTES] {
+        let mut packet = [0u8; LFCD2_SEGMENT_BYTES];
+        packet[0] = 0xfa;
+        packet[1] = 0xa0 + segment as u8;
+        packet[2..4].copy_from_slice(&3000_u16.to_le_bytes());
+        for beam_in_segment in 0..LFCD2_BEAMS_PER_SEGMENT {
+            let raw_index = segment * LFCD2_BEAMS_PER_SEGMENT + beam_in_segment;
+            let offset = 4 + beam_in_segment * 6;
+            packet[offset..offset + 2]
+                .copy_from_slice(&(1000_u16 + raw_index as u16).to_le_bytes());
+            packet[offset + 2..offset + 4]
+                .copy_from_slice(&(120_u16 + raw_index as u16).to_le_bytes());
+        }
+        packet
     }
 
     #[test]

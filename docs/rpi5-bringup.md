@@ -35,7 +35,7 @@ Add the user to the common hardware groups, then log out and back in:
 sudo usermod -aG dialout,i2c,video,audio "$USER"
 ```
 
-`dialout` is normally required for `/dev/ttyUSB*` or `/dev/ttyACM*` Create serial and USB GPS devices. `i2c` is normally required for `/dev/i2c-*` IMU access. `video` is normally required for `/dev/video*` camera access. `audio` may be required for microphone capture.
+`dialout` is normally required for `/dev/ttyUSB*` or `/dev/ttyACM*` brainstem, USB GPS, and HLS-LFCD2 lidar devices. `i2c` is normally required for `/dev/i2c-*` IMU access. `video` is normally required for `/dev/video*` camera access. `audio` may be required for microphone capture.
 
 Enable the Pi I2C bus before plugging in the MPU-6050:
 
@@ -59,6 +59,14 @@ The expected Cockpit UART baud rate is `115200`.
 `robot` and `capture-real` default to `--cockpit uart` and the first likely serial candidate from `hardware-env`. Pass `--cockpit uart --create-port /dev/ttyUSB0` when you want to pin the adapter, `--cockpit sim` for simulated Cockpit smoke tests, or `--mock` for `capture-real` no-hardware smoke tests.
 
 u-blox7 GPS receivers are read over USB serial at 9600 baud using NMEA. Pete auto-starts GPS on real runs by preferring `/dev/serial/by-id/*u-blox*`, `/dev/serial/by-id/*gps*`, or `/dev/serial/by-id/*gnss*`, then falling back to an unused `/dev/ttyACM*` device. Use `--gps /dev/serial/by-id/<u-blox-device>` to pin it, or `--gps none` to disable GPS capture.
+
+HLS-LFCD2 / ROBOTIS LDS-01 lidars are read directly at 230400 baud; ROS is not required. Pete auto-starts a stable serial path whose name contains `hls-lfcd`, `lfcd2`, `usb2lds`, `lidar`, or `lds-01`, and reserves that device so Cockpit auto-selection cannot claim it. Generic FTDI adapters often have no recognizable name, so pin those explicitly:
+
+```bash
+LIDAR_SERIAL_PORT=/dev/serial/by-id/<usb2lds-device> just robot --require-lidar
+```
+
+The same environment variable carries through `just possess`. Set `LIDAR_YAW_DEG` to the counter-clockwise mounting correction when the lidar's zero direction is not Pete's forward axis. Use `--lidar none` to disable it. The provider emits 360 one-degree `RangeSense` beams into the existing occupancy-map and scan-matching path. Mount the lidar near the robot center; the current range model applies yaw but does not model a translational sensor offset.
 
 Kinect availability is detected best-effort through `freenect-*` tools or `pkg-config libfreenect`. A missing Kinect is a warning for capture-first bring-up, not a failure when other streams are useful.
 
@@ -122,7 +130,7 @@ cargo run --bin pete -- capture-real \
 
 ## What Success Looks Like
 
-`hardware-env` reports OS, architecture, CPU, memory, likely serial devices, GPS serial candidates/default, I2C devices, default MPU-6050 bus/pins, cameras, audio inputs, Kinect/libfreenect availability, permissions hints, writable data directories, and whether the host looks like Raspberry Pi hardware.
+`hardware-env` reports OS, architecture, CPU, memory, likely serial devices, GPS and HLS-LFCD2 lidar candidates/defaults, I2C devices, default MPU-6050 bus/pins, cameras, audio inputs, Kinect/libfreenect availability, permissions hints, writable data directories, and whether the host looks like Raspberry Pi hardware.
 
 `capture-real` writes:
 

@@ -137,7 +137,7 @@ Log out and back in after changing group membership. A missing cockpit UART devi
 
 ## Optional Sensors
 
-The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, and `--gps`. Camera and microphone are optional by default, so absent devices do not block read-only cockpit bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Pete finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. Passing `--require-camera`, `--require-mic`, `--require-imu`, or `--require-gps` makes the command fail if that provider is unavailable.
+The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, `--gps`, and `--lidar`. Camera and microphone are optional by default, so absent devices do not block read-only cockpit bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Pete finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. HLS-LFCD2 / LDS-01 lidar auto-starts when its stable serial name is recognizable; otherwise pin it with `--lidar /dev/serial/by-id/DEVICE` or `LIDAR_SERIAL_PORT`. Passing `--require-camera`, `--require-mic`, `--require-imu`, `--require-gps`, or `--require-lidar` makes the command fail if that provider is unavailable.
 
 `--asr-command` enables the command-backed ASR tool for microphone input. Pete chunks voiced PCM, writes each finalized chunk to a temporary WAV file, appends that path to the configured command, and reads the transcript from stdout. The same value can be supplied with `PETE_ASR_COMMAND`. ASR output is delivered as `EarSense.asr` and follows the normal sensation/vector path.
 
@@ -168,6 +168,16 @@ u-blox7 GPS receivers are read over USB serial at 9600 baud using NMEA. Auto-det
 ```bash
 cargo run -p pete-tools -- robot --gps /dev/serial/by-id/<u-blox-device>
 ```
+
+HLS-LFCD2 / ROBOTIS LDS-01 produces native 360-degree scans at 230400 baud. Pete sends the legacy start command and decodes the 42-byte segments into 360 `RangeSense` beams. Pin and require it during bring-up with:
+
+```bash
+cargo run -p pete-tools -- robot \
+  --lidar /dev/serial/by-id/<usb2lds-device> \
+  --require-lidar
+```
+
+Use `--lidar-yaw-deg N` (or `LIDAR_YAW_DEG=N` through `just robot`) for a counter-clockwise mounting correction. The lidar scan takes precedence over Kinect-derived fallback range for mapping on ticks where both are present.
 
 ## Capture Output
 

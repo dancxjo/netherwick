@@ -157,6 +157,11 @@ retries automatically after a brainstem reboot. After a cold boot, a rejected
 Wi-Fi identity is automatically established over the pinned USB brainstem
 before retrying. It expands to the guarded command below:
 
+An HLS-LFCD2 / LDS-01 can run alongside either path. Set
+`LIDAR_SERIAL_PORT=/dev/serial/by-id/DEVICE` (and, if needed,
+`LIDAR_YAW_DEG`) in `.env`; `just robot` and `just possess` then feed its
+360-degree scans into Pete's existing range map and scan matcher.
+
 ```bash
 cargo run -p pete-tools -- robot --mode possession-slow \
   --cockpit uart --create-port /dev/serial/by-id/DEVICE \

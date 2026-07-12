@@ -42,8 +42,8 @@ use pete_runtime::{
 };
 use pete_sensors::{
     AsrToolConfig, CameraSenseProvider, DepthRangeProjectionConfig, EyeFrame, EyeFrameFormat,
-    FrameProcessor, GpsSenseProvider, ImuSenseProvider, MicrophoneSenseProvider, PcmAudioFrame,
-    SensePacket, SenseProducer, World, WorldSnapshot,
+    FrameProcessor, GpsSenseProvider, ImuSenseProvider, Lfcd2SenseProvider,
+    MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World, WorldSnapshot,
 };
 #[cfg(feature = "kinect-freenect")]
 use pete_sensors::{FreenectKinectProvider, KinectRgbAdjustment};
@@ -493,6 +493,12 @@ struct RobotArgs {
     imu: Option<String>,
     #[arg(long)]
     gps: Option<String>,
+    /// HLS-LFCD2 / LDS-01 serial device. Omit for best-effort auto-detection.
+    #[arg(long)]
+    lidar: Option<String>,
+    /// Counter-clockwise mounting offset from the robot's forward axis.
+    #[arg(long, default_value_t = 0.0)]
+    lidar_yaw_deg: f32,
     #[arg(long)]
     capture: Option<String>,
     #[arg(long)]
@@ -534,6 +540,8 @@ struct RobotArgs {
     require_imu: bool,
     #[arg(long)]
     require_gps: bool,
+    #[arg(long)]
+    require_lidar: bool,
     #[command(flatten)]
     llm: LlmArgs,
 }
@@ -619,6 +627,12 @@ struct CaptureRealArgs {
     imu: Option<String>,
     #[arg(long)]
     gps: Option<String>,
+    /// HLS-LFCD2 / LDS-01 serial device. Omit for best-effort auto-detection.
+    #[arg(long)]
+    lidar: Option<String>,
+    /// Counter-clockwise mounting offset from the robot's forward axis.
+    #[arg(long, default_value_t = 0.0)]
+    lidar_yaw_deg: f32,
     #[arg(long)]
     mock: bool,
     #[arg(long)]
@@ -4094,6 +4108,16 @@ async fn hardware_env(args: HardwareEnvArgs) -> Result<()> {
             .as_str()
             .unwrap_or("not detected")
     );
+    print_json_list(
+        "  lidar serial candidates",
+        &report["lidar_serial_candidates"],
+    );
+    println!(
+        "  default lidar: {}",
+        report["default_lidar"]["device"]
+            .as_str()
+            .unwrap_or("not detected")
+    );
     print_json_list("  i2c devices", &report["i2c_devices"]);
     println!(
         "  default imu: {}",
@@ -4125,6 +4149,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
     }
 
     let env_report = collect_hardware_env_report().await;
+    let lidar_device = selected_lidar_device(args.lidar.as_deref(), args.mock, &env_report);
     let mut warnings = Vec::new();
     let mut device_availability = serde_json::json!({
         "mock": args.mock,
@@ -4133,6 +4158,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         "microphone": null,
         "imu": null,
         "gps": null,
+        "lidar": null,
         "kinect": env_report["kinect"].clone(),
     });
 
@@ -4141,6 +4167,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         &args.create_port,
         &args.brainstem_host,
         &env_report,
+        lidar_device.as_deref(),
     );
 
     let cockpit: Box<dyn Cockpit + Send> = if args.mock || create_port.as_deref() == Some("mock") {
@@ -4193,6 +4220,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
             &args,
             &env_report,
             create_port.as_deref(),
+            lidar_device.as_deref(),
             &mut sensors,
             &mut device_availability,
             &mut warnings,
@@ -4648,11 +4676,17 @@ fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SenseP
 
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
+    let lidar_device = selected_lidar_device(
+        args.lidar.as_deref(),
+        args.cockpit == CockpitBackendArg::Sim,
+        &env_report,
+    );
     let create_port = selected_cockpit_endpoint(
         args.cockpit,
         &args.create_port,
         &args.brainstem_host,
         &env_report,
+        lidar_device.as_deref(),
     );
     let robot_mode = match args.mode {
         RobotModeArg::ReadOnly => RobotMode::ReadOnly,
@@ -4838,6 +4872,46 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 }
             }
         }
+    }
+
+    if let Some(device) = lidar_device.as_deref() {
+        if create_port
+            .as_deref()
+            .map(|create| same_serial_device(create, device))
+            .unwrap_or(false)
+        {
+            let error = format!(
+                "lidar {device} is also selected as the brainstem cockpit device; pin PETE_COCKPIT_PORT and LIDAR_SERIAL_PORT to distinct devices"
+            );
+            if args.require_lidar || args.lidar.is_some() {
+                anyhow::bail!(error);
+            }
+            println!("{error}; continuing without lidar");
+        } else {
+            match Lfcd2SenseProvider::with_yaw_offset(device, args.lidar_yaw_deg.to_radians()) {
+                Ok(provider) => {
+                    println!(
+                        "HLS-LFCD2 lidar: {device} at {} baud (yaw {} deg)",
+                        Lfcd2SenseProvider::BAUD_RATE,
+                        args.lidar_yaw_deg
+                    );
+                    sensors.push(Box::new(provider));
+                }
+                Err(err) => {
+                    if args.require_lidar {
+                        anyhow::bail!("failed to initialize HLS-LFCD2 lidar: {err}");
+                    } else {
+                        println!(
+                            "failed to initialize HLS-LFCD2 lidar: {err}; continuing without it"
+                        );
+                    }
+                }
+            }
+        }
+    } else if args.require_lidar {
+        anyhow::bail!(
+            "--require-lidar was set but no HLS-LFCD2 device was detected; pass --lidar /dev/serial/by-id/DEVICE"
+        );
     }
 
     if let Some(device) = selected_gps_device(
@@ -5765,10 +5839,51 @@ fn add_optional_real_sensors(
     args: &CaptureRealArgs,
     env_report: &Value,
     create_port: Option<&str>,
+    lidar_device: Option<&str>,
     sensors: &mut Vec<Box<dyn SenseProducer + Send>>,
     availability: &mut Value,
     warnings: &mut Vec<String>,
 ) {
+    if let Some(device) = lidar_device {
+        if create_port
+            .map(|create| same_serial_device(create, device))
+            .unwrap_or(false)
+        {
+            availability["lidar"] = serde_json::json!({
+                "present": false,
+                "device": device,
+                "reason": "same serial device selected for the brainstem cockpit"
+            });
+            warnings.push(format!(
+                "lidar {device} conflicts with the selected brainstem cockpit device"
+            ));
+        } else {
+            match Lfcd2SenseProvider::with_yaw_offset(device, args.lidar_yaw_deg.to_radians()) {
+                Ok(provider) => {
+                    sensors.push(Box::new(provider));
+                    availability["lidar"] = serde_json::json!({
+                        "present": true,
+                        "device": device,
+                        "kind": "hls-lfcd2",
+                        "baud": Lfcd2SenseProvider::BAUD_RATE,
+                        "yaw_deg": args.lidar_yaw_deg
+                    });
+                }
+                Err(error) => {
+                    availability["lidar"] = serde_json::json!({
+                        "present": false,
+                        "device": device,
+                        "error": error.to_string()
+                    });
+                    warnings.push(format!("HLS-LFCD2 lidar unavailable: {error}"));
+                }
+            }
+        }
+    } else {
+        availability["lidar"] =
+            serde_json::json!({"present": false, "reason": "disabled or not detected"});
+    }
+
     if args.kinect_depth {
         if let Some(device) = &args.camera {
             warnings.push(format!(
@@ -5889,13 +6004,23 @@ fn add_optional_real_sensors(
     }
 }
 
-fn selected_create_port(requested: &str, env_report: &Value) -> Option<String> {
+fn selected_create_port(
+    requested: &str,
+    env_report: &Value,
+    reserved_lidar_port: Option<&str>,
+) -> Option<String> {
     if requested != "auto" {
         return Some(requested.to_string());
     }
     let mut candidates = serial_device_strings(env_report)
         .into_iter()
-        .filter(|device| !looks_like_gps_serial_device(device))
+        .filter(|device| {
+            !looks_like_gps_serial_device(device)
+                && !looks_like_lidar_serial_device(device)
+                && reserved_lidar_port
+                    .map(|reserved| !same_serial_device(device, reserved))
+                    .unwrap_or(true)
+        })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|device| create_serial_priority(device));
     candidates.into_iter().next()
@@ -5906,10 +6031,11 @@ fn selected_cockpit_endpoint(
     requested: &str,
     brainstem_host: &str,
     env_report: &Value,
+    reserved_lidar_port: Option<&str>,
 ) -> Option<String> {
     match backend {
         CockpitBackendArg::Sim => Some("mock".to_string()),
-        CockpitBackendArg::Uart => selected_create_port(requested, env_report),
+        CockpitBackendArg::Uart => selected_create_port(requested, env_report, reserved_lidar_port),
         CockpitBackendArg::Wifi => Some(brainstem_host.to_string()),
     }
 }
@@ -5977,10 +6103,52 @@ fn looks_like_gps_serial_device(device: &str) -> bool {
         || lower.contains("gnss")
 }
 
-fn gps_disabled_value(value: &str) -> bool {
+fn selected_lidar_device(
+    requested: Option<&str>,
+    suppress_default: bool,
+    env_report: &Value,
+) -> Option<String> {
+    match requested.map(str::trim) {
+        Some(value) if serial_sensor_disabled_value(value) => return None,
+        Some(value) if !value.is_empty() => return Some(value.to_string()),
+        _ if suppress_default => return None,
+        _ => {}
+    }
+    serial_device_strings(env_report)
+        .into_iter()
+        .find(|device| looks_like_lidar_serial_device(device))
+}
+
+fn looks_like_lidar_serial_device(device: &str) -> bool {
+    let lower = device.to_lowercase();
+    lower.contains("hls-lfcd")
+        || lower.contains("hls_lfcd")
+        || lower.contains("lfcd2")
+        || lower.contains("usb2lds")
+        || lower.contains("lidar")
+        || lower.contains("lds-01")
+        || lower.contains("lds_01")
+}
+
+fn same_serial_device(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    std::fs::canonicalize(left)
+        .ok()
+        .zip(std::fs::canonicalize(right).ok())
+        .map(|(left, right)| left == right)
+        .unwrap_or(false)
+}
+
+fn serial_sensor_disabled_value(value: &str) -> bool {
     value.eq_ignore_ascii_case("none")
         || value.eq_ignore_ascii_case("off")
         || value.eq_ignore_ascii_case("disabled")
+}
+
+fn gps_disabled_value(value: &str) -> bool {
+    serial_sensor_disabled_value(value)
 }
 
 fn selected_imu_device(requested: Option<&str>, suppress_default: bool) -> Option<&str> {
@@ -6143,6 +6311,12 @@ async fn collect_hardware_env_report() -> Value {
             .find(|device| device.contains("/dev/ttyACM"))
             .cloned()
     });
+    let lidar_serial_candidates = serial_devices
+        .iter()
+        .filter(|device| looks_like_lidar_serial_device(device))
+        .cloned()
+        .collect::<Vec<_>>();
+    let default_lidar_device = lidar_serial_candidates.first().cloned();
     let i2c_devices = list_matching_paths(&["/dev/i2c-"]);
     let camera_devices = list_matching_paths(&["/dev/video"]);
     let audio_input_devices = audio_input_devices();
@@ -6164,6 +6338,13 @@ async fn collect_hardware_env_report() -> Value {
             "device": default_gps_device,
             "baud": 9600,
             "protocol": "nmea"
+        },
+        "lidar_serial_candidates": lidar_serial_candidates,
+        "default_lidar": {
+            "kind": "hls-lfcd2",
+            "device": default_lidar_device,
+            "baud": Lfcd2SenseProvider::BAUD_RATE,
+            "protocol": "lfcd2-42-byte-segments"
         },
         "i2c_devices": i2c_devices,
         "default_imu": {
@@ -11838,6 +12019,11 @@ mod tests {
         assert!(report.get("serial_devices").unwrap().is_array());
         assert!(report.get("gps_serial_candidates").unwrap().is_array());
         assert_eq!(report["default_gps"]["baud"].as_u64(), Some(9600));
+        assert!(report.get("lidar_serial_candidates").unwrap().is_array());
+        assert_eq!(
+            report["default_lidar"]["baud"].as_u64(),
+            Some(u64::from(Lfcd2SenseProvider::BAUD_RATE))
+        );
         assert!(report.get("i2c_devices").unwrap().is_array());
         assert_eq!(
             report["default_imu"]["device"].as_str(),
@@ -11864,17 +12050,24 @@ mod tests {
     }
 
     #[test]
-    fn serial_auto_selection_keeps_gps_and_create_separate() {
+    fn serial_auto_selection_keeps_lidar_gps_and_create_separate() {
         let report = serde_json::json!({
             "serial_devices": [
+                "/dev/serial/by-id/usb-ROBOTIS_USB2LDS_LDS-01",
                 "/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_7-if00",
                 "/dev/ttyACM0",
                 "/dev/ttyUSB0"
             ]
         });
 
+        let lidar = selected_lidar_device(None, false, &report);
         assert_eq!(
-            selected_create_port("auto", &report),
+            lidar.as_deref(),
+            Some("/dev/serial/by-id/usb-ROBOTIS_USB2LDS_LDS-01")
+        );
+
+        assert_eq!(
+            selected_create_port("auto", &report, lidar.as_deref()),
             Some("/dev/ttyUSB0".to_string())
         );
         assert_eq!(
@@ -11888,6 +12081,11 @@ mod tests {
         assert_eq!(
             selected_gps_device(Some("none"), false, &report, Some("/dev/ttyUSB0")),
             None
+        );
+        assert_eq!(selected_lidar_device(Some("none"), false, &report), None);
+        assert_eq!(
+            selected_lidar_device(Some("/dev/ttyUSB9"), true, &report),
+            Some("/dev/ttyUSB9".to_string())
         );
     }
 
@@ -12272,6 +12470,8 @@ mod tests {
             mic: None,
             imu: None,
             gps: None,
+            lidar: None,
+            lidar_yaw_deg: 0.0,
             mock: true,
             export_rgb: false,
             export_depth: false,
@@ -12317,6 +12517,8 @@ mod tests {
             mic: None,
             imu: None,
             gps: None,
+            lidar: None,
+            lidar_yaw_deg: 0.0,
             mock: true,
             export_rgb: true,
             export_depth: true,

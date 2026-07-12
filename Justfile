@@ -3,6 +3,8 @@ set dotenv-load := true
 
 cockpit_port := env_var_or_default("PETE_COCKPIT_PORT", "auto")
 gps_serial_port := env_var_or_default("GPS_SERIAL_PORT", "")
+lidar_serial_port := env_var_or_default("LIDAR_SERIAL_PORT", "")
+lidar_yaw_deg := env_var_or_default("LIDAR_YAW_DEG", "0")
 camera_device := env_var_or_default("CAMERA_DEVICE", "/dev/video0")
 mic_device := env_var_or_default("MIC_DEVICE", "")
 imu_device := env_var_or_default("IMU_DEVICE", "")
@@ -353,6 +355,7 @@ robot *args:
     MIC_ARGS=()
     IMU_ARGS=()
     GPS_ARGS=()
+    LIDAR_ARGS=()
     KINECT_ARGS=()
     if [ -n "{{camera_device}}" ]; then
         CAMERA_ARGS+=(--camera "{{camera_device}}")
@@ -365,6 +368,9 @@ robot *args:
     fi
     if [ -n "{{gps_serial_port}}" ]; then
         GPS_ARGS+=(--gps "{{gps_serial_port}}")
+    fi
+    if [ -n "{{lidar_serial_port}}" ]; then
+        LIDAR_ARGS+=(--lidar "{{lidar_serial_port}}" --lidar-yaw-deg "{{lidar_yaw_deg}}")
     fi
     if [ "{{kinect_depth}}" = "1" ] || [ "{{kinect_depth}}" = "true" ] || [ "{{kinect_depth}}" = "on" ]; then
         KINECT_ARGS+=(
@@ -401,6 +407,7 @@ robot *args:
         "${MIC_ARGS[@]}" \
         "${IMU_ARGS[@]}" \
         "${GPS_ARGS[@]}" \
+        "${LIDAR_ARGS[@]}" \
         --dashboard "{{robot_dashboard}}" \
         --dashboard-tls \
         --dashboard-tls-cert "{{robot_dashboard_tls_cert}}" \
