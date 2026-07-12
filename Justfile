@@ -325,7 +325,7 @@ say text="Hello. My name is Pete.":
 transcribe wav:
     cargo run -p pete-tools -- whisper-transcribe "{{wav}}"
 
-# Bring up the real robot in slow mode with default hardware auto-detection.
+# Bring up the real robot read-only by default with hardware auto-detection.
 robot *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -372,7 +372,7 @@ robot *args:
             -addext "subjectAltName=DNS:localhost,DNS:pete.local,IP:127.0.0.1$LAN_SAN"
     fi
     PETE_TTS_OUTPUT_DEVICE="{{tts_output_device}}" cargo run -p pete-tools -- robot \
-        --mode "${PETE_ROBOT_MODE:-slow}" \
+        --mode "${PETE_ROBOT_MODE:-read-only}" \
         --cockpit "${PETE_COCKPIT_BACKEND:-uart}" \
         --create-port "{{cockpit_port}}" \
         --ledger "${PETE_ROBOT_LEDGER:-data/ledger/real/robot}" \
@@ -386,6 +386,24 @@ robot *args:
         --dashboard-tls-cert "{{robot_dashboard_tls_cert}}" \
         --dashboard-tls-key "{{robot_dashboard_tls_key}}" \
         {{args}}
+
+# Take and maintain motherbrain possession using the pinned physical brainstem.
+possess *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${PETE_BRAINSTEM_DEVICE_ID:?set PETE_BRAINSTEM_DEVICE_ID in .env}"
+    : "${PETE_BRAINSTEM_BOOT_ID:?set PETE_BRAINSTEM_BOOT_ID in .env}"
+    echo "Taking brainstem possession on {{cockpit_port}}"
+    echo "device=$PETE_BRAINSTEM_DEVICE_ID boot=$PETE_BRAINSTEM_BOOT_ID"
+    echo "limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
+    PETE_ROBOT_MODE=possession-slow \
+    PETE_ROBOT_LEDGER="${PETE_POSSESSION_LEDGER:-data/ledger/real/possession}" \
+    just robot \
+        --brainstem-device-id "$PETE_BRAINSTEM_DEVICE_ID" \
+        --brainstem-boot-id "$PETE_BRAINSTEM_BOOT_ID" \
+        --max-linear-mm-s 50 \
+        --max-angular-mrad-s 500 \
+        --capture "${PETE_POSSESSION_CAPTURE:-data/captures/real/possession}" {{args}}
 
 # Launch the virtual dream world with HTTPS live view.
 go target="virtual":

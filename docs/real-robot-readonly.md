@@ -68,6 +68,14 @@ brainstem.
 With the wheels off the floor:
 
 ```bash
+just possess
+```
+
+The recipe requires `PETE_BRAINSTEM_DEVICE_ID` and `PETE_BRAINSTEM_BOOT_ID` in
+`.env`; `PETE_COCKPIT_PORT` may pin the `/dev/serial/by-id/DEVICE` path. Its
+expanded command is:
+
+```bash
 cargo run -p pete-tools -- robot \
   --mode possession-slow \
   --cockpit uart \

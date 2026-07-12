@@ -141,6 +141,14 @@ After read-only validation, the guarded production possession command is
 explicit and wheels-off-floor first:
 
 ```bash
+just possess
+```
+
+Set `PETE_BRAINSTEM_DEVICE_ID` and `PETE_BRAINSTEM_BOOT_ID` in `.env` first;
+optionally pin `PETE_COCKPIT_PORT=/dev/serial/by-id/DEVICE`. The recipe expands
+to the guarded command below:
+
+```bash
 cargo run -p pete-tools -- robot --mode possession-slow \
   --cockpit uart --create-port /dev/serial/by-id/DEVICE \
   --brainstem-device-id BRAINSTEM_ID \
