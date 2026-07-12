@@ -508,6 +508,9 @@ struct RobotArgs {
     max_linear_mm_s: i16,
     #[arg(long, default_value_t = 500)]
     max_angular_mrad_s: i16,
+    /// Permit executive-selected actions to drive physical wheels in possession-slow mode.
+    #[arg(long)]
+    autonomous_motion: bool,
     #[arg(long, default_value_t = 250)]
     reconnect_initial_backoff_ms: u64,
     #[arg(long, default_value_t = 5_000)]
@@ -4625,7 +4628,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         anyhow::bail!("--mode disabled does not start the real robot runner");
     }
 
-    let (cockpit, robot_mode, is_mock_body) = open_robot_cockpit_or_fallback(
+    let (mut cockpit, robot_mode, is_mock_body) = open_robot_cockpit_or_fallback(
         create_port.as_deref(),
         robot_mode,
         args.brainstem_device_id.as_deref(),
@@ -4633,6 +4636,9 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         args.max_linear_mm_s,
         args.max_angular_mrad_s,
     )?;
+    let brainstem_capabilities = cockpit
+        .get_capabilities()
+        .context("failed to read the brainstem capability contract")?;
 
     let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
     let live_state = args.dashboard.map(|_| {
@@ -4886,11 +4892,14 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         create_port.as_deref(),
         active_sensor_count,
         init_body.as_ref(),
+        &brainstem_capabilities,
     );
     let mut runner = RealRobotRunner::new(robot_mode, cockpit, sensors, runtime)
         .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
         .with_live_image_enricher(live_image_enricher)
-        .with_robot_initialization(initialization.clone());
+        .with_robot_initialization(initialization.clone())
+        .with_brainstem_interface(serde_json::to_value(&brainstem_capabilities)?)
+        .with_autonomous_motion(args.autonomous_motion);
     runner.tick_ms = args.tick_ms;
     for warning in frame_processor_warnings {
         println!("{warning}");
@@ -4915,15 +4924,25 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         args.duration_seconds
             .map(|seconds| duration_to_steps(seconds, args.tick_ms))
     });
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     let mut played_reign_audio = HashSet::new();
     while max_steps
         .map(|limit| runner.tick_count < limit)
         .unwrap_or(true)
     {
-        let tick_result = match robot_mode {
-            RobotMode::ReadOnly => runner.tick_read_only().await,
-            RobotMode::Slow => runner.tick_slow_manual().await,
-            RobotMode::Disabled => unreachable!("disabled mode bailed before runner start"),
+        let tick_result = tokio::select! {
+            signal = &mut shutdown => {
+                println!("received {signal}; stopping robot and surrendering possession");
+                break;
+            }
+            result = async {
+                match robot_mode {
+                    RobotMode::ReadOnly => runner.tick_read_only().await,
+                    RobotMode::Slow => runner.tick_slow_manual().await,
+                    RobotMode::Disabled => unreachable!("disabled mode bailed before runner start"),
+                }
+            } => result,
         };
         let (snapshot, tick) = match tick_result {
             Ok(values) => values,
@@ -4969,7 +4988,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             "robot {:?} tick {}: battery {:.2}, chosen {:?}",
             robot_mode, runner.tick_count, tick.frame.now.body.battery_level, tick.chosen_action
         );
-        tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+        tokio::select! {
+            signal = &mut shutdown => {
+                println!("received {signal}; stopping robot and surrendering possession");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(args.tick_ms)) => {}
+        }
     }
 
     if robot_mode == RobotMode::Slow {
@@ -5022,6 +5047,30 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         capture_summary
     );
     Ok(())
+}
+
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.expect("failed to install Ctrl-C handler");
+                "SIGINT"
+            }
+            _ = terminate.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+        "Ctrl-C"
+    }
 }
 
 async fn reconnect_possession_cockpit(
@@ -5203,6 +5252,7 @@ fn robot_initialization_metadata(
     create_port: Option<&str>,
     active_sensor_count: usize,
     init_body: Option<&BodySense>,
+    brainstem_capabilities: &pete_cockpit::CockpitCapabilities,
 ) -> serde_json::Value {
     let body_status = if is_mock_body {
         "mock Create body connected".to_string()
@@ -5219,6 +5269,7 @@ fn robot_initialization_metadata(
     serde_json::json!({
         "mode": mode,
         "body": body_status,
+        "brainstem_capabilities": brainstem_capabilities,
         "battery_percent": init_body.map(|body| {
             (body.battery_level.clamp(0.0, 1.0) * 100.0).round() as u32
         }),

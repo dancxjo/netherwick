@@ -404,6 +404,7 @@ possess *args:
         --brainstem-boot-id "$PETE_BRAINSTEM_BOOT_ID" \
         --max-linear-mm-s 50 \
         --max-angular-mrad-s 500 \
+        --autonomous-motion \
         --imu none --gps none \
         --llm-provider disabled \
         --capture "${PETE_POSSESSION_CAPTURE:-data/captures/real/possession}" {{args}}

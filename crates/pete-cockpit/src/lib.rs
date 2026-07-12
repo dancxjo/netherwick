@@ -2428,6 +2428,13 @@ impl<C: Cockpit> SafeCockpit<C> {
         Ok(status)
     }
 
+    /// Consume the next cursor-bounded batch from the brainstem interface.
+    /// A reported history gap is an error; callers never silently skip body
+    /// events and pretend their view is continuous.
+    pub fn poll_events(&mut self) -> Result<EventBatch> {
+        self.cursor.poll(&mut self.client)
+    }
+
     pub fn refresh_contract(&mut self) -> Result<&CockpitContract> {
         let capabilities = self.client.get_capabilities()?;
         let contract = CockpitContract::new(capabilities);

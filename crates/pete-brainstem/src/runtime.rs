@@ -21,7 +21,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 16;
 const RUNTIME_TICK_MS: u32 = 10;
 const SENSOR_PROBE_PERIOD_MS: u32 = 100;
 const FULL_MODE_REFRESH_PERIOD_MS: u32 = 1_000;
-const SUPERVISION_LIGHT_PERIOD_MS: u32 = 180;
+const HEALTHY_LIGHT_STEP_MS: u32 = 100;
 const LOW_BATTERY_PERCENT: u32 = 20;
 const WAKE_PROBE_RESPONSE_BYTES_REQUIRED: u8 = 1;
 const CREATE_AXLE_TRACK_MM: i32 = 258;
@@ -37,6 +37,22 @@ enum RuntimeMode {
     Running,
     Idle,
     Error,
+}
+
+fn healthy_supervision_lights(phase: u8) -> (u8, u8, u8, u32) {
+    let breath_phase = phase & 31;
+    let breath_level = if breath_phase < 16 {
+        breath_phase
+    } else {
+        31 - breath_phase
+    };
+    let power_intensity = 40 + breath_level * 12;
+    let led_bits = if (phase / 8) & 1 == 0 {
+        CREATE_LED_PLAY
+    } else {
+        CREATE_LED_ADVANCE
+    };
+    (led_bits, 0, power_intensity, HEALTHY_LIGHT_STEP_MS)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -338,12 +354,8 @@ where
         } else if self.estop_latched || self.safety_latched {
             (CREATE_BUTTON_LED_MASK, 255, 255, 500)
         } else {
-            // Three-light bounce: power -> play -> advance -> play.
-            match self.supervision_light_phase & 3 {
-                0 => (0, 0, 220, SUPERVISION_LIGHT_PERIOD_MS),
-                1 | 3 => (CREATE_LED_PLAY, 0, 0, SUPERVISION_LIGHT_PERIOD_MS),
-                _ => (CREATE_LED_ADVANCE, 0, 0, SUPERVISION_LIGHT_PERIOD_MS),
-            }
+            // Breathe POWER while PLAY and ADVANCE alternate more quickly.
+            healthy_supervision_lights(self.supervision_light_phase)
         };
         self.create_uart
             .set_supervision_lights(&mut self.hardware, led_bits, color, intensity)?;
@@ -2062,6 +2074,30 @@ mod tests {
             }
             Ok(self.imu_sample.take())
         }
+    }
+
+    #[test]
+    fn healthy_supervision_lights_breathe_power_and_alternate_buttons() {
+        assert_eq!(
+            healthy_supervision_lights(0),
+            (CREATE_LED_PLAY, 0, 40, HEALTHY_LIGHT_STEP_MS)
+        );
+        assert_eq!(
+            healthy_supervision_lights(8),
+            (CREATE_LED_ADVANCE, 0, 136, HEALTHY_LIGHT_STEP_MS)
+        );
+        assert_eq!(
+            healthy_supervision_lights(15),
+            (CREATE_LED_ADVANCE, 0, 220, HEALTHY_LIGHT_STEP_MS)
+        );
+        assert_eq!(
+            healthy_supervision_lights(16),
+            (CREATE_LED_PLAY, 0, 220, HEALTHY_LIGHT_STEP_MS)
+        );
+        assert_eq!(
+            healthy_supervision_lights(32),
+            healthy_supervision_lights(0)
+        );
     }
 
     #[test]

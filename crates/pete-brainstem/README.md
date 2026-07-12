@@ -628,10 +628,11 @@ power button.
 
 Once acquisition succeeds, the brainstem plays F-G-B, *fasolsi*, for “prepare /
 make ready.” A control-lease transition gets its own short Solresol-style
-acknowledgement; runtime errors get a descending warning phrase. The three
-available Create lights continuously bounce power → LED 2 → LED 3 → LED 2 while
-healthy. A safety latch holds all three red, and runtime error alternates all
-three red/off. These lights are brainstem-owned rather than caller-controlled.
+acknowledgement; runtime errors get a descending warning phrase. While healthy,
+POWER breathes between low and high intensity over 3.2 seconds while PLAY and
+ADVANCE alternate every 800 ms. A safety latch holds all three red, and runtime
+error alternates all three red/off. These lights are brainstem-owned rather than
+caller-controlled.
 
 Motor movement remains safety-gated. Timeout, UART framing error, or invalid response sends Stop and enters the repeating three-blink error pattern. All drive commands carry a duration; the tick-driven runtime treats that duration as a deadline and sends Stop when it expires, before power-cycle, before idle, and on errors.
 

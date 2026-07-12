@@ -4525,10 +4525,14 @@ pub struct RealRobotRunner<R, C> {
     pub runtime: R,
     pub tick_ms: u64,
     pub tick_count: usize,
+    /// Allow executive-selected motion to reach real slow hardware. Direct
+    /// WebRemote/Gamepad commands remain available regardless of this gate.
+    pub autonomous_motion: bool,
     now_builder: NowBuilder,
     frame_processor: FrameProcessor,
     live_image_enricher: Option<LiveImageEnricher>,
     robot_initialization: Option<serde_json::Value>,
+    brainstem_interface: Option<serde_json::Value>,
 }
 
 impl<R, C> RealRobotRunner<R, C>
@@ -4549,10 +4553,12 @@ where
             runtime,
             tick_ms: 100,
             tick_count: 0,
+            autonomous_motion: false,
             now_builder: NowBuilder::new(),
             frame_processor: FrameProcessor::new(),
             live_image_enricher: None,
             robot_initialization: None,
+            brainstem_interface: None,
         }
     }
 
@@ -4568,6 +4574,16 @@ where
 
     pub fn with_robot_initialization(mut self, initialization: serde_json::Value) -> Self {
         self.robot_initialization = Some(initialization);
+        self
+    }
+
+    pub fn with_brainstem_interface(mut self, capabilities: serde_json::Value) -> Self {
+        self.brainstem_interface = Some(capabilities);
+        self
+    }
+
+    pub fn with_autonomous_motion(mut self, enabled: bool) -> Self {
+        self.autonomous_motion = enabled;
         self
     }
 
@@ -4601,6 +4617,7 @@ where
         }
 
         let body = body_sense_from_cockpit_status(self.cockpit.refresh_status()?, wall_time_ms());
+        let brainstem_events = self.cockpit.poll_events()?;
         let mut packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
@@ -4627,6 +4644,7 @@ where
             }),
         );
         self.insert_robot_initialization(&mut now);
+        self.insert_brainstem_interface(&mut now, &brainstem_events);
         enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
 
         let tick = self
@@ -4646,6 +4664,7 @@ where
         }
 
         let pre_body_t_ms = wall_time_ms();
+        let brainstem_events = self.cockpit.poll_events()?;
         if let Some(input) = self.runtime.reign_sense(pre_body_t_ms)?.latest {
             if reign_input_outputs_real_slow_directly(&input) {
                 let body_before = pete_body::BodySense {
@@ -4666,6 +4685,7 @@ where
                     serde_json::Value::String("slow".to_string()),
                 );
                 self.insert_robot_initialization(&mut now);
+                self.insert_brainstem_interface(&mut now, &brainstem_events);
                 now.reign.latest = Some(input.clone());
                 now.reign.active = true;
                 now.reign.mode = Some(input.mode.clone());
@@ -4705,6 +4725,7 @@ where
             serde_json::Value::String("slow".to_string()),
         );
         self.insert_robot_initialization(&mut now);
+        self.insert_brainstem_interface(&mut now, &brainstem_events);
 
         now.reign = self.runtime.reign_sense(t_ms)?;
         if let Some(input) = now.reign.latest.clone() {
@@ -4762,7 +4783,8 @@ where
             .as_ref()
             .map(reign_input_drives_real_slow)
             .unwrap_or(false);
-        let block_reason = real_slow_motor_block_reason(&body_before, &tick, manual_drive);
+        let block_reason =
+            real_slow_motor_block_reason(&body_before, &tick, manual_drive, self.autonomous_motion);
         let final_motor = if block_reason.is_none() {
             chosen_motor
         } else {
@@ -4808,6 +4830,10 @@ where
                 serde_json::json!(manual_drive),
             );
             object.insert(
+                "autonomous_hardware_gate".to_string(),
+                serde_json::json!(self.autonomous_motion),
+            );
+            object.insert(
                 "why_not_moving".to_string(),
                 block_reason
                     .clone()
@@ -4838,6 +4864,25 @@ where
                 }),
             );
         }
+    }
+
+    fn insert_brainstem_interface(&self, now: &mut Now, events: &pete_cockpit::EventBatch) {
+        if let Some(capabilities) = &self.brainstem_interface {
+            now.extensions.insert(
+                "brainstem.interface".to_string(),
+                serde_json::json!({
+                    "capabilities": capabilities,
+                    "source": "brainstem",
+                    "underlying_body_private": true,
+                }),
+            );
+        }
+        now.extensions.insert(
+            "brainstem.events".to_string(),
+            serde_json::to_value(events).unwrap_or_else(
+                |error| serde_json::json!({"error": error.to_string(), "events": []}),
+            ),
+        );
     }
 }
 
@@ -5126,9 +5171,13 @@ fn real_slow_motor_block_reason(
     body: &pete_body::BodySense,
     tick: &RuntimeTick,
     manual_drive: bool,
+    autonomous_motion: bool,
 ) -> Option<String> {
-    if !manual_drive {
-        return Some("real slow mode requires active WebRemote/Gamepad Direct command".to_string());
+    if !manual_drive && !autonomous_motion {
+        return Some(
+            "real slow mode requires active WebRemote/Gamepad Direct command or explicit autonomous motion authorization"
+                .to_string(),
+        );
     }
     if let Some(reason) = real_slow_body_block_reason(body) {
         return Some(reason);
@@ -8428,6 +8477,59 @@ mod tests {
 
         assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(motors.lock().unwrap().as_slice(), &[MotorCommand::stop()]);
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_applies_executive_motion_when_explicitly_authorized() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingCockpit {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let mut runner =
+            RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), StubRuntime)
+                .with_brainstem_interface(serde_json::json!({
+                    "verbs": ["status", "get_events", "cmd_vel"]
+                }))
+                .with_autonomous_motion(true);
+
+        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            motors.lock().unwrap().as_slice(),
+            &[MotorCommand {
+                forward: 0.05,
+                turn: 0.0,
+            }]
+        );
+        assert_eq!(
+            snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("autonomous_hardware_gate"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            tick.frame
+                .now
+                .extensions
+                .get("brainstem.events")
+                .and_then(|extension| extension.get("events"))
+                .and_then(|events| events.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            tick.frame.now.extensions["brainstem.interface"]["underlying_body_private"],
+            serde_json::json!(true)
+        );
     }
 
     #[tokio::test]

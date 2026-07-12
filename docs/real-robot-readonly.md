@@ -84,20 +84,31 @@ cargo run -p pete-tools -- robot \
   --brainstem-boot-id BOOT_ID \
   --max-linear-mm-s 50 \
   --max-angular-mrad-s 500 \
+  --autonomous-motion \
   --tick-ms 100 \
   --duration-seconds 30 \
   --ledger data/ledger/real/possession-wheels-off-floor \
   --capture data/captures/real/possession-wheels-off-floor
 ```
 
-The explicit mode selection is the attended possession gate. Startup performs
+The explicit mode selection and `--autonomous-motion` flag authorize executive
+actions to reach the physical wheel bridge. Direct WebRemote/Gamepad commands
+continue to override the executive. Startup performs
 a fresh handshake, verifies identity and the live contract/safety snapshot,
-acquires the motherbrain lease, and sends STOP. Runtime motion is limited to
+publishes the complete validated brainstem capability contract into robot
+initialization context for the motherbrain, acquires the motherbrain lease, and
+sends STOP. Runtime motion is limited to
 50 mm/s linear and 500 mrad/s angular with a 300 ms command TTL and a 750 ms
 heartbeat stop. Missing hardware, an unstable device path, identity mismatch,
 or acquisition failure aborts; possession mode never downgrades.
 
-Normal exit requires acknowledged STOP, acknowledged exorcize (translated to
+The brainstem is the motherbrain's body interface. Every real-robot tick polls
+the brainstem's cursor-bounded event stream and publishes it as
+`brainstem.events`; the validated interface contract is published as
+`brainstem.interface`. A missed event-history window is an error rather than a
+silent skip. The underlying Create OI remains private to brainstem firmware.
+
+Normal exit, SIGINT, and SIGTERM require acknowledged STOP, acknowledged exorcize (translated to
 the brainstem's DISARM wire command), and final status
 showing no active motion and `armed == false`. Transport loss relies on the
 short command, heartbeat, and lease expiries and never triggers a power toggle.
