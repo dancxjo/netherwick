@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,9 @@ use serialport::SerialPort;
 use thiserror::Error;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
+
+mod handshake;
+pub use handshake::*;
 
 pub type Result<T> = std::result::Result<T, CockpitError>;
 const DEFAULT_SIM_EVENT_CAPACITY: usize = 32;
@@ -118,6 +122,18 @@ pub enum CockpitError {
     Policy(String),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("handshake rejected ({0:?})")]
+    HandshakeRejected(HandshakeReject),
+    #[error("stale handshake response: expected nonce {expected}, received {received}")]
+    StaleHandshake { expected: String, received: String },
+    #[error("unsafe handshake response: {0}")]
+    UnsafeHandshake(String),
+    #[error("handshake frame exceeds {max} bytes")]
+    FrameTooLarge { max: usize },
+    #[error("request requires an active cockpit session")]
+    SessionRequired,
+    #[error("session {session_id} is not the active session")]
+    InvalidSession { session_id: String },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -126,6 +142,64 @@ pub struct CockpitLimits {
     pub max_angular_mrad_s: i16,
     pub min_ttl_ms: u32,
     pub max_ttl_ms: u32,
+}
+
+pub const DEFAULT_INTERNAL_DOMAIN: &str = "pete.internal";
+pub const RESERVED_NETWORK_NAMES: &[&str] = &[
+    "pete",
+    "brainstem",
+    "motherbrain",
+    "forebrain",
+    "gateway",
+    "control",
+];
+
+pub fn encode_dhcp_lease_identity(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegisterNetworkEndpoint {
+    pub role: EndpointRole,
+    pub device_id: String,
+    pub interface_id: String,
+    pub address_family: AddressFamily,
+    pub address: String,
+    pub hostname: String,
+    pub lease_identity: String,
+    pub ttl_seconds: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NetworkEndpointRegistered {
+    pub session_id: String,
+    pub fqdn: String,
+    pub address: String,
+    pub ttl_seconds: u32,
+    pub registration_generation: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NetworkLease {
+    pub leased_ip: String,
+    pub client_mac: String,
+    pub dhcp_client_identifier: String,
+    pub requested_hostname: Option<String>,
+    pub lease_start: u64,
+    pub lease_expiry: u64,
 }
 
 impl Default for CockpitLimits {
@@ -141,6 +215,29 @@ impl Default for CockpitLimits {
 
 pub trait Cockpit {
     fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse>;
+
+    fn handshake(&mut self, _hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        Err(CockpitError::BadResponse(
+            "connector does not implement handshake".into(),
+        ))
+    }
+
+    fn execute_in_session(
+        &mut self,
+        _session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        self.execute(request)
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        session: &CockpitSession,
+        _lease: &ControlLease,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        self.execute_in_session(session, request)
+    }
 
     fn get_status(&mut self) -> Result<CockpitStatus> {
         match self.execute(CockpitRequest::GetStatus)? {
@@ -481,6 +578,27 @@ pub trait Cockpit {
 impl<T: Cockpit + ?Sized> Cockpit for Box<T> {
     fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
         (**self).execute(request)
+    }
+
+    fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        (**self).handshake(hello)
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        (**self).execute_in_session(session, request)
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        session: &CockpitSession,
+        lease: &ControlLease,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        (**self).execute_with_lease(session, lease, request)
     }
 }
 
@@ -1265,10 +1383,17 @@ fn battery_percent(charge_mah: Option<u32>, capacity_mah: Option<u32>) -> Option
 pub enum CockpitRequest {
     Ping,
     Bootsel,
+    RestartMpu,
+    RestartCreate,
     GetStatus,
     GetCapabilities,
     GetEvents {
         since_seq: u32,
+    },
+    RegisterNetworkEndpoint(RegisterNetworkEndpoint),
+    AcquireControlLease {
+        authority: ControlAuthority,
+        ttl_ms: u32,
     },
     Arm,
     Disarm,
@@ -1422,13 +1547,36 @@ pub enum CockpitRequest {
 }
 
 impl CockpitRequest {
+    pub fn requires_session(&self) -> bool {
+        !matches!(
+            self,
+            Self::Ping | Self::GetStatus | Self::GetCapabilities | Self::GetEvents { .. }
+        )
+    }
+
+    pub fn requires_control_authority(&self) -> bool {
+        self.requires_session()
+            && !matches!(
+                self,
+                Self::RegisterNetworkEndpoint(_)
+                    | Self::AcquireControlLease { .. }
+                    | Self::Stop
+                    | Self::EStop
+                    | Self::Disarm
+            )
+    }
+
     pub fn verb(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
             Self::Bootsel => "bootsel",
+            Self::RestartMpu => "restart_mpu",
+            Self::RestartCreate => "restart_create",
             Self::GetStatus => "status",
             Self::GetCapabilities => "get_capabilities",
             Self::GetEvents { .. } => "get_events",
+            Self::RegisterNetworkEndpoint(_) => "register_network_endpoint",
+            Self::AcquireControlLease { .. } => "acquire_control_lease",
             Self::Arm => "arm",
             Self::Disarm => "disarm",
             Self::Stop => "stop",
@@ -1474,7 +1622,9 @@ impl CockpitRequest {
 
     pub fn required_capability(&self) -> Option<&'static str> {
         match self {
-            Self::Bootsel => None,
+            Self::Bootsel | Self::RegisterNetworkEndpoint(_) | Self::AcquireControlLease { .. } => {
+                None
+            }
             other => Some(other.verb()),
         }
     }
@@ -1511,11 +1661,14 @@ impl CockpitRequest {
         match self {
             Self::Ping => client.ping().map(|()| CockpitResponse::Accepted),
             Self::Bootsel => client.bootsel().map(|()| CockpitResponse::Accepted),
+            Self::RestartMpu | Self::RestartCreate => client.execute(self.clone()),
             Self::GetStatus => Ok(CockpitResponse::Status(client.get_status()?)),
             Self::GetCapabilities => Ok(CockpitResponse::Capabilities(client.get_capabilities()?)),
             Self::GetEvents { since_seq } => Ok(CockpitResponse::Events(
                 client.get_events_since(*since_seq)?,
             )),
+            Self::RegisterNetworkEndpoint(_) => Err(CockpitError::SessionRequired),
+            Self::AcquireControlLease { .. } => Err(CockpitError::SessionRequired),
             Self::Arm => client.arm().map(|()| CockpitResponse::Accepted),
             Self::Disarm => client.disarm().map(|()| CockpitResponse::Accepted),
             Self::Stop => client.stop().map(|()| CockpitResponse::Accepted),
@@ -1756,11 +1909,45 @@ impl CockpitRequest {
         Ok(serde_json::to_string(&value)?)
     }
 
+    pub fn to_firmware_json_with_session(
+        &self,
+        command_id: u32,
+        session_id: &str,
+    ) -> Result<String> {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&self.to_firmware_json(command_id)?)?;
+        value
+            .as_object_mut()
+            .expect("request serializes as object")
+            .insert(
+                "session_id".to_owned(),
+                serde_json::Value::String(session_id.to_owned()),
+            );
+        Ok(serde_json::to_string(&value)?)
+    }
+
+    pub fn to_firmware_json_with_authority(
+        &self,
+        command_id: u32,
+        session_id: &str,
+        lease_id: &str,
+    ) -> Result<String> {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&self.to_firmware_json_with_session(command_id, session_id)?)?;
+        value
+            .as_object_mut()
+            .expect("request serializes as object")
+            .insert("lease_id".into(), lease_id.into());
+        Ok(serde_json::to_string(&value)?)
+    }
+
     fn needs_seq(&self) -> bool {
         !matches!(
             self,
             Self::Ping
                 | Self::Bootsel
+                | Self::RestartMpu
+                | Self::RestartCreate
                 | Self::GetStatus
                 | Self::GetCapabilities
                 | Self::GetEvents { .. }
@@ -1780,9 +1967,25 @@ impl CockpitRequest {
         match self {
             Self::Ping => format!("PING {seq}\n"),
             Self::Bootsel => format!("BOOTSEL {seq}\n"),
+            Self::RestartMpu => format!("RESTART_MPU {seq}\n"),
+            Self::RestartCreate => format!("RESTART_CREATE {seq}\n"),
             Self::GetStatus => format!("STATUS {seq}\n"),
             Self::GetCapabilities => format!("GET_CAPABILITIES {seq}\n"),
             Self::GetEvents { since_seq } => format!("GET_EVENTS {seq} {since_seq}\n"),
+            Self::RegisterNetworkEndpoint(registration) => format!(
+                "REGISTER_NETWORK_ENDPOINT {seq} {} {} {} {} {} {} {}\n",
+                match registration.role { EndpointRole::Motherbrain => "motherbrain", EndpointRole::Forebrain => "forebrain", EndpointRole::Brainstem => "brainstem", EndpointRole::Operator => "operator", EndpointRole::Simulator => "simulator", EndpointRole::ServiceTool => "service_tool" },
+                registration.device_id,
+                registration.interface_id,
+                registration.address,
+                registration.hostname,
+                registration.lease_identity,
+                registration.ttl_seconds,
+            ),
+            Self::AcquireControlLease { authority, ttl_ms } => format!(
+                "ACQUIRE_CONTROL_LEASE {seq} {} {ttl_ms}\n",
+                match authority { ControlAuthority::Motherbrain => "motherbrain", ControlAuthority::ForebrainRecovery => "forebrain_recovery", ControlAuthority::OperatorDebug => "operator_debug" }
+            ),
             Self::Arm => format!("ARM {seq}\n"),
             Self::Disarm => format!("DISARM {seq}\n"),
             Self::Stop => format!("STOP {seq}\n"),
@@ -1937,6 +2140,29 @@ impl CockpitRequest {
             Self::SetLights { pattern } => format!("SET_LIGHTS {seq} {}\n", pattern.as_str()),
         }
     }
+
+    pub fn to_compact_line_with_session(&self, seq: u32, session_id: &str) -> String {
+        let mut line = self.to_compact_line(seq);
+        line.pop();
+        line.push_str(" session_id=");
+        line.push_str(session_id);
+        line.push('\n');
+        line
+    }
+
+    pub fn to_compact_line_with_authority(
+        &self,
+        seq: u32,
+        session_id: &str,
+        lease_id: &str,
+    ) -> String {
+        let mut line = self.to_compact_line_with_session(seq, session_id);
+        line.pop();
+        line.push_str(" lease_id=");
+        line.push_str(lease_id);
+        line.push('\n');
+        line
+    }
     pub fn to_bridge_json(&self, command_id: u32) -> Result<String> {
         self.to_firmware_json(command_id)
     }
@@ -1948,6 +2174,8 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "status",
         "get_capabilities",
         "get_events",
+        "restart_mpu",
+        "restart_create",
         "arm",
         "disarm",
         "stop",
@@ -2003,6 +2231,8 @@ pub enum CockpitResponse {
     Status(CockpitStatus),
     Capabilities(CockpitCapabilities),
     Events(EventBatch),
+    NetworkEndpointRegistered(NetworkEndpointRegistered),
+    ControlLeaseGranted(ControlLease),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2198,6 +2428,15 @@ pub enum CockpitEventKind {
     TiltChanged,
     MotionInconsistencyDetected,
     ImpactDetected,
+    SessionOpened,
+    SessionReplaced,
+    SessionClosed,
+    SessionRejected,
+    PeerRebootDetected,
+    TransportChanged,
+    DhcpLeaseChanged,
+    DnsRegistrationChanged,
+    AuthorityChanged,
     Error,
     Unknown(String),
 }
@@ -2240,6 +2479,15 @@ impl From<&str> for CockpitEventKind {
             "tilt_changed" => Self::TiltChanged,
             "motion_inconsistency_detected" => Self::MotionInconsistencyDetected,
             "impact_detected" => Self::ImpactDetected,
+            "session_opened" => Self::SessionOpened,
+            "session_replaced" => Self::SessionReplaced,
+            "session_closed" => Self::SessionClosed,
+            "session_rejected" => Self::SessionRejected,
+            "peer_reboot_detected" => Self::PeerRebootDetected,
+            "transport_changed" => Self::TransportChanged,
+            "dhcp_lease_changed" => Self::DhcpLeaseChanged,
+            "dns_registration_changed" => Self::DnsRegistrationChanged,
+            "authority_changed" => Self::AuthorityChanged,
             "error" => Self::Error,
             other => Self::Unknown(other.to_owned()),
         }
@@ -2284,6 +2532,15 @@ impl CockpitEventKind {
             Self::TiltChanged => "tilt_changed",
             Self::MotionInconsistencyDetected => "motion_inconsistency_detected",
             Self::ImpactDetected => "impact_detected",
+            Self::SessionOpened => "session_opened",
+            Self::SessionReplaced => "session_replaced",
+            Self::SessionClosed => "session_closed",
+            Self::SessionRejected => "session_rejected",
+            Self::PeerRebootDetected => "peer_reboot_detected",
+            Self::TransportChanged => "transport_changed",
+            Self::DhcpLeaseChanged => "dhcp_lease_changed",
+            Self::DnsRegistrationChanged => "dns_registration_changed",
+            Self::AuthorityChanged => "authority_changed",
             Self::Error => "error",
             Self::Unknown(kind) => kind.as_str(),
         }
@@ -2324,6 +2581,21 @@ pub struct SimCockpit {
     heartbeat_stop_at_ms: Option<u32>,
     odometry_reset_count: u32,
     imu_calibration: u8,
+    device_id: String,
+    boot_id: String,
+    active_session: Option<CockpitSession>,
+    sessions: Vec<CockpitSession>,
+    control_lease: Option<ControlLease>,
+    control_lease_expires_at_ms: Option<u32>,
+    lease_generation: u32,
+    session_serial: u64,
+    last_hello: Option<(HandshakeHello, HandshakeResponse)>,
+    leases: HashMap<String, NetworkLease>,
+    dns_records: HashMap<String, (String, u64, u32)>,
+    registration_generation: u32,
+    internal_domain: String,
+    operator_debug_allowed: bool,
+    recovery_forebrain_device_id: Option<String>,
 }
 
 impl SimCockpit {
@@ -2431,6 +2703,21 @@ impl SimCockpit {
             heartbeat_stop_at_ms: None,
             odometry_reset_count: 0,
             imu_calibration: 3,
+            device_id: "pete-brainstem-sim".into(),
+            boot_id: fresh_sim_boot_id(),
+            active_session: None,
+            sessions: Vec::new(),
+            control_lease: None,
+            control_lease_expires_at_ms: None,
+            lease_generation: 0,
+            session_serial: 0,
+            last_hello: None,
+            leases: HashMap::new(),
+            dns_records: HashMap::new(),
+            registration_generation: 0,
+            internal_domain: DEFAULT_INTERNAL_DOMAIN.into(),
+            operator_debug_allowed: false,
+            recovery_forebrain_device_id: None,
         };
         sim.push_event(CockpitEventKind::Boot, 0, 0, 0);
         sim
@@ -2447,8 +2734,212 @@ impl SimCockpit {
         self
     }
 
+    pub fn with_identity(
+        mut self,
+        device_id: impl Into<String>,
+        boot_id: impl Into<String>,
+    ) -> Self {
+        self.device_id = device_id.into();
+        self.boot_id = boot_id.into();
+        self
+    }
+
+    pub fn with_takeover_policy(
+        mut self,
+        operator_debug_allowed: bool,
+        recovery_forebrain_device_id: Option<String>,
+    ) -> Self {
+        self.operator_debug_allowed = operator_debug_allowed;
+        self.recovery_forebrain_device_id = recovery_forebrain_device_id;
+        self
+    }
+
+    pub fn reboot(&mut self) {
+        self.boot_id = fresh_sim_boot_id();
+        self.active_session = None;
+        self.sessions.clear();
+        self.control_lease = None;
+        self.control_lease_expires_at_ms = None;
+        self.armed = false;
+        self.interrupt_active_motion();
+        self.heartbeat_stop_at_ms = None;
+        self.last_hello = None;
+        self.push_event(CockpitEventKind::Boot, 0, 0, 0);
+    }
+
+    pub fn active_session(&self) -> Option<&CockpitSession> {
+        self.active_session.as_ref()
+    }
+
+    pub fn add_network_lease(&mut self, lease: NetworkLease) {
+        let identity = lease.dhcp_client_identifier.clone();
+        if let Some(hostname) = lease.requested_hostname.as_deref() {
+            if !RESERVED_NETWORK_NAMES.contains(&hostname) {
+                let fqdn = format!("{hostname}.{}", self.internal_domain);
+                self.dns_records
+                    .insert(fqdn, (lease.leased_ip.clone(), lease.lease_expiry, 0));
+            }
+        }
+        self.leases.insert(identity, lease);
+    }
+
+    pub fn resolve_internal_name(&mut self, name: &str) -> Option<String> {
+        self.expire_network_records();
+        let canonical = match name {
+            "pete" | "brainstem" => format!("brainstem.{}", self.internal_domain),
+            other if !other.contains('.') => format!("{other}.{}", self.internal_domain),
+            other => other.to_owned(),
+        };
+        if canonical == format!("brainstem.{}", self.internal_domain) {
+            return Some("192.168.4.1".into());
+        }
+        self.dns_records
+            .get(&canonical)
+            .map(|record| record.0.clone())
+    }
+
+    fn expire_network_records(&mut self) {
+        let now = (self.now_ms / 1_000) as u64;
+        self.leases.retain(|_, lease| lease.lease_expiry > now);
+        self.dns_records.retain(|_, (_, expiry, _)| *expiry > now);
+    }
+
+    fn register_network_endpoint(
+        &mut self,
+        session: &CockpitSession,
+        registration: RegisterNetworkEndpoint,
+    ) -> Result<CockpitResponse> {
+        if session.local_role != EndpointRole::Motherbrain
+            || !self
+                .active_session
+                .as_ref()
+                .is_some_and(|active| active.session_id == session.session_id)
+            || registration.role != EndpointRole::Motherbrain
+            || registration.device_id != session.local_device_id
+            || registration.hostname != "motherbrain"
+        {
+            return Err(CockpitError::Policy(
+                "reserved motherbrain registration requires the active motherbrain identity".into(),
+            ));
+        }
+        self.expire_network_records();
+        let lease = self
+            .leases
+            .get(&registration.lease_identity)
+            .ok_or_else(|| {
+                CockpitError::Policy(
+                    "network registration does not match an active DHCP lease".into(),
+                )
+            })?;
+        if lease.leased_ip != registration.address {
+            return Err(CockpitError::Policy(
+                "registered address does not match the DHCP lease".into(),
+            ));
+        }
+        self.registration_generation = self.registration_generation.wrapping_add(1).max(1);
+        let ttl = registration
+            .ttl_seconds
+            .min(
+                (lease
+                    .lease_expiry
+                    .saturating_sub((self.now_ms / 1_000) as u64)) as u32,
+            )
+            .max(1);
+        let fqdn = format!("motherbrain.{}", self.internal_domain);
+        self.dns_records.insert(
+            fqdn.clone(),
+            (
+                registration.address.clone(),
+                (self.now_ms / 1_000) as u64 + ttl as u64,
+                self.registration_generation,
+            ),
+        );
+        Ok(CockpitResponse::NetworkEndpointRegistered(
+            NetworkEndpointRegistered {
+                session_id: session.session_id.clone(),
+                fqdn,
+                address: registration.address,
+                ttl_seconds: ttl,
+                registration_generation: self.registration_generation,
+            },
+        ))
+    }
+
+    fn acquire_control_lease(
+        &mut self,
+        session: &CockpitSession,
+        authority: ControlAuthority,
+        ttl_ms: u32,
+    ) -> Result<CockpitResponse> {
+        let allowed = matches!(
+            (session.local_role, authority),
+            (EndpointRole::Motherbrain, ControlAuthority::Motherbrain)
+                | (EndpointRole::Forebrain, ControlAuthority::ForebrainRecovery)
+                | (EndpointRole::Operator, ControlAuthority::OperatorDebug)
+        );
+        if !allowed {
+            return Err(CockpitError::Policy(
+                "role is not eligible for requested control authority".into(),
+            ));
+        }
+        if authority == ControlAuthority::OperatorDebug && !self.operator_debug_allowed {
+            return Err(CockpitError::Policy(
+                "operator debug policy is disabled".into(),
+            ));
+        }
+        if authority == ControlAuthority::ForebrainRecovery
+            && self.recovery_forebrain_device_id.as_deref()
+                != Some(session.local_device_id.as_str())
+        {
+            return Err(CockpitError::Policy(
+                "forebrain is not the configured recovery identity".into(),
+            ));
+        }
+        let lease_alive = self
+            .control_lease_expires_at_ms
+            .is_some_and(|deadline| !time_reached(self.now_ms, deadline));
+        if authority == ControlAuthority::ForebrainRecovery && lease_alive {
+            return Err(CockpitError::Policy(
+                "current controller lease has not expired".into(),
+            ));
+        }
+        // Every ownership transition is stop -> revoke -> install, and never
+        // inherits arming or heartbeat state.
+        self.interrupt_active_motion();
+        self.heartbeat_stop_at_ms = None;
+        self.armed = false;
+        self.control_lease = None;
+        self.control_lease_expires_at_ms = None;
+        self.lease_generation = self.lease_generation.wrapping_add(1).max(1);
+        let lease = ControlLease {
+            lease_id: format!(
+                "lease-{}-{}",
+                self.lease_generation,
+                uuid::Uuid::new_v4().simple()
+            ),
+            session_id: session.session_id.clone(),
+            owner_role: session.local_role,
+            authority,
+            ttl_ms: ttl_ms.clamp(250, 60_000),
+            generation: self.lease_generation,
+        };
+        self.control_lease = Some(lease.clone());
+        self.control_lease_expires_at_ms = Some(self.now_ms.wrapping_add(lease.ttl_ms));
+        Ok(CockpitResponse::ControlLeaseGranted(lease))
+    }
+
     pub fn advance_ms(&mut self, ms: u32) {
         self.now_ms = self.now_ms.wrapping_add(ms);
+        if self
+            .control_lease_expires_at_ms
+            .is_some_and(|deadline| time_reached(self.now_ms, deadline))
+        {
+            self.interrupt_active_motion();
+            self.heartbeat_stop_at_ms = None;
+            self.armed = false;
+            self.control_lease = None;
+            self.control_lease_expires_at_ms = None;
+        }
         self.complete_due_cmd_vel();
         self.expire_heartbeat_if_due();
     }
@@ -2650,6 +3141,7 @@ impl Cockpit for SimCockpit {
             CockpitRequest::GetEvents { since_seq } => {
                 Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
             }
+            CockpitRequest::RegisterNetworkEndpoint(_) => Err(CockpitError::SessionRequired),
             CockpitRequest::Ping => {
                 let id = self.accept_command();
                 self.complete_command(id);
@@ -2697,6 +3189,157 @@ impl Cockpit for SimCockpit {
                 Ok(CockpitResponse::Accepted)
             }
         }
+    }
+
+    fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        if let Some((cached_hello, cached_response)) = &self.last_hello {
+            if cached_hello == &hello {
+                return HandshakeOutcome::validate(&hello, cached_response.clone());
+            }
+        }
+        self.session_serial = self.session_serial.wrapping_add(1).max(1);
+        let establishes_primary = hello.role == EndpointRole::Motherbrain
+            && hello.session_purpose == SessionPurpose::Control;
+        let had_session = establishes_primary && self.active_session.is_some();
+        let peer_reboot = self.active_session.as_ref().is_some_and(|session| {
+            session.local_device_id == hello.device_id && session.local_boot_id != hello.boot_id
+        });
+        let response = negotiate(
+            &hello,
+            &self.device_id,
+            &self.boot_id,
+            self.capabilities.clone(),
+            SafetySnapshot {
+                armed: if establishes_primary {
+                    false
+                } else {
+                    self.armed
+                },
+                estop_latched: self.estop_latched,
+                safety_tripped: self.safety_tripped,
+                active_motion: if establishes_primary {
+                    false
+                } else {
+                    self.active_cmd_vel.is_some()
+                },
+                runtime_state: if self.active_cmd_vel.is_some() && !establishes_primary {
+                    "moving".into()
+                } else {
+                    "idle".into()
+                },
+            },
+            self.next_event_seq,
+            SoftwareInfo {
+                software_name: "pete-brainstem-sim".into(),
+                software_version: env!("CARGO_PKG_VERSION").into(),
+                build_id: "sim".into(),
+            },
+            self.session_serial,
+        );
+        if matches!(response, HandshakeResponse::Reject(_)) {
+            self.push_event(CockpitEventKind::SessionRejected, 0, 0, 0);
+        }
+        let outcome = HandshakeOutcome::validate(&hello, response.clone())?;
+        // Installing a valid session is a synchronous safety operation: old
+        // motion and leases are revoked before WELCOME becomes observable.
+        // Rejected/malformed hellos never mutate command state.
+        if establishes_primary {
+            self.sessions
+                .retain(|session| session.local_role != EndpointRole::Motherbrain);
+            self.dns_records
+                .remove(&format!("motherbrain.{}", self.internal_domain));
+            self.interrupt_active_motion();
+            self.heartbeat_stop_at_ms = None;
+            self.armed = false;
+            self.control_lease = None;
+            self.control_lease_expires_at_ms = None;
+            self.active_session = Some(outcome.session.clone());
+            self.push_event(
+                if had_session {
+                    CockpitEventKind::SessionReplaced
+                } else {
+                    CockpitEventKind::SessionOpened
+                },
+                0,
+                0,
+                0,
+            );
+        } else {
+            self.push_event(CockpitEventKind::SessionOpened, 0, 0, 0);
+        }
+        self.sessions
+            .retain(|session| session.session_id != outcome.session.session_id);
+        self.sessions.push(outcome.session.clone());
+        if peer_reboot {
+            self.push_event(CockpitEventKind::PeerRebootDetected, 0, 0, 0);
+        }
+        self.last_hello = Some((hello, response));
+        Ok(outcome)
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        if request.requires_session() {
+            let valid = self
+                .sessions
+                .iter()
+                .any(|active| active.session_id == session.session_id);
+            if !valid {
+                return Err(CockpitError::InvalidSession {
+                    session_id: session.session_id.clone(),
+                });
+            }
+        }
+        if let CockpitRequest::RegisterNetworkEndpoint(registration) = request {
+            return self.register_network_endpoint(session, registration);
+        }
+        if let CockpitRequest::AcquireControlLease { authority, ttl_ms } = request {
+            return self.acquire_control_lease(session, authority, ttl_ms);
+        }
+        if matches!(request, CockpitRequest::Bootsel) {
+            return Err(CockpitError::Policy(
+                "BOOTSEL requires separate service authorization".into(),
+            ));
+        }
+        if request.requires_control_authority() {
+            let valid = self
+                .control_lease
+                .as_ref()
+                .is_some_and(|lease| lease.session_id == session.session_id)
+                && self
+                    .control_lease_expires_at_ms
+                    .is_some_and(|deadline| !time_reached(self.now_ms, deadline));
+            if !valid {
+                return Err(CockpitError::Policy(
+                    "request requires the active control lease".into(),
+                ));
+            }
+            if let CockpitRequest::HeartbeatStop { timeout_ms } = &request {
+                self.control_lease_expires_at_ms =
+                    Some(self.now_ms.wrapping_add((*timeout_ms).clamp(250, 60_000)));
+            }
+        }
+        self.execute(request)
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        session: &CockpitSession,
+        lease: &ControlLease,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        let valid = self.control_lease.as_ref().is_some_and(|active| {
+            active.lease_id == lease.lease_id && active.session_id == session.session_id
+        });
+        if !valid {
+            return Err(CockpitError::Policy(
+                "unknown or replaced control lease".into(),
+            ));
+        }
+        self.execute_in_session(session, request)
     }
 
     fn get_status(&mut self) -> Result<CockpitStatus> {
@@ -2890,10 +3533,264 @@ impl Default for EventCursor {
     }
 }
 
+impl EventCursor {
+    pub fn from_event_next_seq(next_seq: u32) -> Self {
+        Self {
+            next_seq: next_seq.saturating_sub(1),
+        }
+    }
+}
+
+/// A transport-neutral, validated command session. Construction is only
+/// possible through `establish_session`, so capabilities and safety state came
+/// from the live WELCOME rather than a cache.
+pub struct SessionCockpit<C> {
+    connector: C,
+    outcome: HandshakeOutcome,
+    cursor: EventCursor,
+    control_lease: Option<ControlLease>,
+}
+
+impl<C: Cockpit> SessionCockpit<C> {
+    pub fn session(&self) -> &CockpitSession {
+        &self.outcome.session
+    }
+    pub fn contract(&self) -> &CockpitContract {
+        &self.outcome.contract
+    }
+    pub fn outcome(&self) -> &HandshakeOutcome {
+        &self.outcome
+    }
+    pub fn connector_mut(&mut self) -> &mut C {
+        &mut self.connector
+    }
+
+    pub fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+        self.outcome.contract.validate_request(&request)?;
+        if request.requires_control_authority() {
+            let lease = self
+                .control_lease
+                .as_ref()
+                .ok_or_else(|| CockpitError::Policy("no control lease has been acquired".into()))?;
+            self.connector
+                .execute_with_lease(&self.outcome.session, lease, request)
+        } else {
+            self.connector
+                .execute_in_session(&self.outcome.session, request)
+        }
+    }
+
+    pub fn acquire_control(
+        &mut self,
+        authority: ControlAuthority,
+        ttl_ms: u32,
+    ) -> Result<&ControlLease> {
+        let response = self.connector.execute_in_session(
+            &self.outcome.session,
+            CockpitRequest::AcquireControlLease { authority, ttl_ms },
+        )?;
+        let CockpitResponse::ControlLeaseGranted(lease) = response else {
+            return Err(CockpitError::BadResponse(format!("{response:?}")));
+        };
+        self.control_lease = Some(lease);
+        Ok(self.control_lease.as_ref().expect("lease was installed"))
+    }
+
+    pub fn read_only(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+        if request.requires_session() {
+            return Err(CockpitError::Policy(
+                "read_only accepts recovery requests only".into(),
+            ));
+        }
+        self.connector.execute(request)
+    }
+
+    pub fn poll_events(&mut self) -> Result<EventBatch> {
+        self.cursor.poll(&mut self.connector)
+    }
+
+    pub fn into_parts(self) -> (C, HandshakeOutcome) {
+        (self.connector, self.outcome)
+    }
+}
+
+pub fn establish_session<C: Cockpit>(
+    mut connector: C,
+    hello: HandshakeHello,
+    prior: Option<&CockpitSession>,
+) -> Result<SessionCockpit<C>> {
+    let outcome = connector.handshake(hello)?.classify_against(prior);
+    outcome.contract.validate_event_vocabulary()?;
+    let report = outcome.contract.validate_local_model();
+    if !report.missing_verbs.is_empty() {
+        return Err(CockpitError::Policy(format!(
+            "live capability contract contains unsupported verbs: {}",
+            report.missing_verbs.join(",")
+        )));
+    }
+    if outcome.welcome.safety_snapshot.armed || outcome.welcome.safety_snapshot.active_motion {
+        return Err(CockpitError::UnsafeHandshake(
+            "brainstem is not ready-but-disarmed".into(),
+        ));
+    }
+    let cursor = EventCursor::from_event_next_seq(outcome.event_cursor);
+    Ok(SessionCockpit {
+        connector,
+        outcome,
+        cursor,
+        control_lease: None,
+    })
+}
+
+pub fn establish_diagnostic_session<C: Cockpit>(
+    mut connector: C,
+    mut hello: HandshakeHello,
+    prior: Option<&CockpitSession>,
+) -> Result<SessionCockpit<C>> {
+    hello.session_purpose = SessionPurpose::Diagnostic;
+    let outcome = connector.handshake(hello)?.classify_against(prior);
+    outcome.contract.validate_event_vocabulary()?;
+    let cursor = EventCursor::from_event_next_seq(outcome.event_cursor);
+    Ok(SessionCockpit {
+        connector,
+        outcome,
+        cursor,
+        control_lease: None,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplacementPolicy {
+    Reject,
+    Accept,
+}
+
+/// Owns exactly one command connector. Switching always performs a fresh
+/// handshake; backup status probes should use a separate read-only connector.
+pub struct FailoverCockpit {
+    active: SessionCockpit<Box<dyn Cockpit>>,
+}
+
+impl FailoverCockpit {
+    pub fn new(active: SessionCockpit<Box<dyn Cockpit>>) -> Self {
+        Self { active }
+    }
+    pub fn active(&self) -> &SessionCockpit<Box<dyn Cockpit>> {
+        &self.active
+    }
+    pub fn active_mut(&mut self) -> &mut SessionCockpit<Box<dyn Cockpit>> {
+        &mut self.active
+    }
+
+    pub fn failover(
+        &mut self,
+        backup: Box<dyn Cockpit>,
+        hello: HandshakeHello,
+        replacement_policy: ReplacementPolicy,
+    ) -> Result<()> {
+        let prior = self.active.session().clone();
+        let replacement = establish_session(backup, hello.new_attempt(), Some(&prior))?;
+        if replacement.outcome().classification == ReconnectClassification::ReplacementBrainstem
+            && replacement_policy == ReplacementPolicy::Reject
+        {
+            return Err(CockpitError::Policy(format!(
+                "replacement brainstem {} requires explicit acceptance",
+                replacement.session().peer_device_id
+            )));
+        }
+        // Best effort on a failed physical lane. The new handshake already
+        // synchronously stopped and disarmed the brainstem before WELCOME.
+        let _ = self.active.execute(CockpitRequest::Stop);
+        let _ = self.active.execute(CockpitRequest::Disarm);
+        self.active = replacement;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MotherbrainBootstrap {
+    pub hello: HandshakeHello,
+    pub expected_brainstem_device_id: Option<String>,
+}
+
+impl MotherbrainBootstrap {
+    pub fn from_host() -> Self {
+        Self {
+            hello: HandshakeHello::default_motherbrain(),
+            expected_brainstem_device_id: None,
+        }
+    }
+
+    pub fn connect_usb(&self) -> Result<SessionCockpit<Box<dyn Cockpit>>> {
+        let paths = discover_usb_serial_by_id()?;
+        if paths.is_empty() {
+            return Err(CockpitError::BadResponse(
+                "no stable /dev/serial/by-id cockpit candidates".into(),
+            ));
+        }
+        let mut errors = Vec::new();
+        for path in paths {
+            match UartCockpit::connect(&path).and_then(|connector| {
+                let ready = establish_session(
+                    Box::new(connector) as Box<dyn Cockpit>,
+                    self.hello.new_attempt(),
+                    None,
+                )?;
+                self.validate_identity(ready.session())?;
+                Ok(ready)
+            }) {
+                Ok(ready) => return Ok(ready),
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            }
+        }
+        Err(CockpitError::BadResponse(format!(
+            "USB bootstrap failed: {}",
+            errors.join("; ")
+        )))
+    }
+
+    pub fn connect_backup(
+        &self,
+        connector: Box<dyn Cockpit>,
+        prior: &CockpitSession,
+    ) -> Result<SessionCockpit<Box<dyn Cockpit>>> {
+        let ready = establish_session(connector, self.hello.new_attempt(), Some(prior))?;
+        self.validate_identity(ready.session())?;
+        Ok(ready)
+    }
+
+    pub fn register_network(
+        &self,
+        ready: &mut SessionCockpit<Box<dyn Cockpit>>,
+        endpoint: RegisterNetworkEndpoint,
+    ) -> Result<NetworkEndpointRegistered> {
+        match ready.execute(CockpitRequest::RegisterNetworkEndpoint(endpoint))? {
+            CockpitResponse::NetworkEndpointRegistered(registered) => Ok(registered),
+            response => Err(CockpitError::BadResponse(format!("{response:?}"))),
+        }
+    }
+
+    fn validate_identity(&self, session: &CockpitSession) -> Result<()> {
+        if self
+            .expected_brainstem_device_id
+            .as_deref()
+            .is_some_and(|expected| expected != session.peer_device_id)
+        {
+            return Err(CockpitError::Policy(format!(
+                "brainstem identity {} did not match configured {}",
+                session.peer_device_id,
+                self.expected_brainstem_device_id.as_deref().unwrap_or("")
+            )));
+        }
+        Ok(())
+    }
+}
+
 pub struct HttpCockpit {
     host: String,
     next_command_id: u32,
     timeout: Duration,
+    active_session_id: Option<String>,
 }
 
 impl HttpCockpit {
@@ -2902,6 +3799,7 @@ impl HttpCockpit {
             host: host.into(),
             next_command_id: 1,
             timeout: Duration::from_millis(750),
+            active_session_id: None,
         }
     }
 
@@ -2915,7 +3813,7 @@ impl HttpCockpit {
         command_id
     }
 
-    fn post_command(&mut self, body: &str) -> Result<String> {
+    fn post(&mut self, path: &str, body: &str) -> Result<String> {
         let addr = self
             .host
             .to_socket_addrs()?
@@ -2926,7 +3824,7 @@ impl HttpCockpit {
         stream.set_write_timeout(Some(self.timeout))?;
         write!(
             stream,
-            "POST /command HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             self.host,
             body.len(),
             body
@@ -2942,7 +3840,44 @@ impl Cockpit for HttpCockpit {
     fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
         let command_id = self.command_id();
         let body = request.to_firmware_json(command_id)?;
-        let response = self.post_command(&body)?;
+        let response = self.post("/command", &body)?;
+        parse_json_cockpit_response(command_id, &request, &response)
+    }
+
+    fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        let body = serde_json::to_string(&hello)?;
+        let response = self.post("/handshake", &body)?;
+        let outcome = HandshakeOutcome::validate(&hello, serde_json::from_str(&response)?)?;
+        self.active_session_id = Some(outcome.session.session_id.clone());
+        Ok(outcome)
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        ensure_connector_session(&self.active_session_id, session)?;
+        let command_id = self.command_id();
+        let body = request.to_firmware_json_with_session(command_id, &session.session_id)?;
+        let response = self.post("/command", &body)?;
+        parse_json_cockpit_response(command_id, &request, &response)
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        session: &CockpitSession,
+        lease: &ControlLease,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        ensure_connector_session(&self.active_session_id, session)?;
+        let command_id = self.command_id();
+        let body = request.to_firmware_json_with_authority(
+            command_id,
+            &session.session_id,
+            &lease.lease_id,
+        )?;
+        let response = self.post("/command", &body)?;
         parse_json_cockpit_response(command_id, &request, &response)
     }
 }
@@ -2950,6 +3885,7 @@ impl Cockpit for HttpCockpit {
 pub struct WebSocketCockpit {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     next_command_id: u32,
+    active_session_id: Option<String>,
 }
 
 impl WebSocketCockpit {
@@ -2958,6 +3894,7 @@ impl WebSocketCockpit {
         Ok(Self {
             socket,
             next_command_id: 1,
+            active_session_id: None,
         })
     }
 
@@ -2997,6 +3934,108 @@ impl Cockpit for WebSocketCockpit {
             }
         }
     }
+
+    fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        let mut value = serde_json::to_value(&hello)?;
+        value
+            .as_object_mut()
+            .expect("hello serializes as object")
+            .insert("kind".into(), serde_json::Value::String("hello".into()));
+        self.socket
+            .send(Message::Text(serde_json::to_string(&value)?.into()))?;
+        loop {
+            match self.socket.read()? {
+                Message::Text(text) => {
+                    let outcome =
+                        HandshakeOutcome::validate(&hello, serde_json::from_str(text.as_str())?)?;
+                    self.active_session_id = Some(outcome.session.session_id.clone());
+                    return Ok(outcome);
+                }
+                Message::Binary(bytes) => {
+                    let outcome =
+                        HandshakeOutcome::validate(&hello, serde_json::from_slice(&bytes)?)?;
+                    self.active_session_id = Some(outcome.session.session_id.clone());
+                    return Ok(outcome);
+                }
+                Message::Ping(bytes) => self.socket.send(Message::Pong(bytes))?,
+                Message::Close(_) => {
+                    return Err(CockpitError::BadResponse(
+                        "websocket closed during handshake".into(),
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        ensure_connector_session(&self.active_session_id, session)?;
+        let command_id = self.command_id();
+        let body = request.to_firmware_json_with_session(command_id, &session.session_id)?;
+        self.socket.send(Message::Text(body.into()))?;
+        loop {
+            match self.socket.read()? {
+                Message::Text(text) => {
+                    return parse_json_cockpit_response(command_id, &request, text.as_str())
+                }
+                Message::Binary(bytes) => {
+                    return parse_json_cockpit_response(
+                        command_id,
+                        &request,
+                        &response_from_bytes(&bytes)?,
+                    )
+                }
+                Message::Ping(bytes) => self.socket.send(Message::Pong(bytes))?,
+                Message::Close(_) => {
+                    return Err(CockpitError::BadResponse(
+                        "websocket closed before response".into(),
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        session: &CockpitSession,
+        lease: &ControlLease,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        ensure_connector_session(&self.active_session_id, session)?;
+        let command_id = self.command_id();
+        let body = request.to_firmware_json_with_authority(
+            command_id,
+            &session.session_id,
+            &lease.lease_id,
+        )?;
+        self.socket.send(Message::Text(body.into()))?;
+        loop {
+            match self.socket.read()? {
+                Message::Text(text) => {
+                    return parse_json_cockpit_response(command_id, &request, text.as_str())
+                }
+                Message::Binary(bytes) => {
+                    return parse_json_cockpit_response(
+                        command_id,
+                        &request,
+                        &response_from_bytes(&bytes)?,
+                    )
+                }
+                Message::Ping(bytes) => self.socket.send(Message::Pong(bytes))?,
+                Message::Close(_) => {
+                    return Err(CockpitError::BadResponse(
+                        "websocket closed before response".into(),
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 pub struct UdpCockpit {
@@ -3004,6 +4043,7 @@ pub struct UdpCockpit {
     brainstem: SocketAddr,
     next_seq: u32,
     timeout: Duration,
+    active_session_id: Option<String>,
 }
 
 impl UdpCockpit {
@@ -3017,6 +4057,7 @@ impl UdpCockpit {
             brainstem,
             next_seq: 1,
             timeout,
+            active_session_id: None,
         })
     }
 
@@ -3029,7 +4070,7 @@ impl UdpCockpit {
 
     fn request(&mut self, line: String) -> Result<String> {
         self.socket.send_to(line.as_bytes(), self.brainstem)?;
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; MAX_COMPACT_HANDSHAKE_FRAME_LEN];
         let (len, _) = self.socket.recv_from(&mut buf)?;
         response_from_bytes(&buf[..len])
     }
@@ -3050,6 +4091,41 @@ impl Cockpit for UdpCockpit {
     fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
         let seq = self.seq();
         let response = self.request(request.to_compact_line(seq))?;
+        parse_compact_cockpit_response(seq, &request, &response)
+    }
+
+    fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        let response = self.request(encode_compact_hello(&hello)?)?;
+        let outcome = HandshakeOutcome::validate(&hello, decode_compact_response(&response)?)?;
+        self.active_session_id = Some(outcome.session.session_id.clone());
+        Ok(outcome)
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        ensure_connector_session(&self.active_session_id, session)?;
+        let seq = self.seq();
+        let response =
+            self.request(request.to_compact_line_with_session(seq, &session.session_id))?;
+        parse_compact_cockpit_response(seq, &request, &response)
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        session: &CockpitSession,
+        lease: &ControlLease,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        ensure_connector_session(&self.active_session_id, session)?;
+        let seq = self.seq();
+        let response = self.request(request.to_compact_line_with_authority(
+            seq,
+            &session.session_id,
+            &lease.lease_id,
+        ))?;
         parse_compact_cockpit_response(seq, &request, &response)
     }
 
@@ -3136,7 +4212,22 @@ impl Cockpit for UdpCockpit {
 
 pub const DEFAULT_UART_BAUD_RATE: u32 = 115_200;
 pub const DEFAULT_UART_TIMEOUT: Duration = Duration::from_millis(750);
-pub const DEFAULT_UART_MAX_RESPONSE_LEN: usize = 2048;
+pub const DEFAULT_UART_MAX_RESPONSE_LEN: usize = MAX_COMPACT_HANDSHAKE_FRAME_LEN;
+
+/// Enumerate stable Linux serial symlinks. Callers may further filter by USB
+/// VID/PID or a configured identity hint, but must confirm identity by
+/// handshake rather than trusting the filename.
+pub fn discover_usb_serial_by_id() -> Result<Vec<PathBuf>> {
+    let directory = Path::new("/dev/serial/by-id");
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = std::fs::read_dir(directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct UartCockpitConfig {
@@ -3177,6 +4268,7 @@ pub struct UartCockpit {
     next_seq: u32,
     timeout: Duration,
     max_response_len: usize,
+    active_session_id: Option<String>,
 }
 
 impl UartCockpit {
@@ -3193,6 +4285,7 @@ impl UartCockpit {
             next_seq: 1,
             timeout: config.timeout,
             max_response_len: config.max_response_len,
+            active_session_id: None,
         })
     }
 
@@ -3202,6 +4295,7 @@ impl UartCockpit {
             next_seq: 1,
             timeout: DEFAULT_UART_TIMEOUT,
             max_response_len: DEFAULT_UART_MAX_RESPONSE_LEN,
+            active_session_id: None,
         }
     }
 
@@ -3237,6 +4331,41 @@ impl Cockpit for UartCockpit {
     fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
         let seq = self.seq();
         let response = self.request(request.to_compact_line(seq))?;
+        parse_compact_cockpit_response(seq, &request, &response)
+    }
+
+    fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        let response = self.request(encode_compact_hello(&hello)?)?;
+        let outcome = HandshakeOutcome::validate(&hello, decode_compact_response(&response)?)?;
+        self.active_session_id = Some(outcome.session.session_id.clone());
+        Ok(outcome)
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        ensure_connector_session(&self.active_session_id, session)?;
+        let seq = self.seq();
+        let response =
+            self.request(request.to_compact_line_with_session(seq, &session.session_id))?;
+        parse_compact_cockpit_response(seq, &request, &response)
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        session: &CockpitSession,
+        lease: &ControlLease,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        ensure_connector_session(&self.active_session_id, session)?;
+        let seq = self.seq();
+        let response = self.request(request.to_compact_line_with_authority(
+            seq,
+            &session.session_id,
+            &lease.lease_id,
+        ))?;
         parse_compact_cockpit_response(seq, &request, &response)
     }
 
@@ -3350,6 +4479,16 @@ fn response_from_bytes(bytes: &[u8]) -> Result<String> {
     Ok(response)
 }
 
+fn ensure_connector_session(active: &Option<String>, session: &CockpitSession) -> Result<()> {
+    if active.as_deref() == Some(session.session_id.as_str()) {
+        Ok(())
+    } else {
+        Err(CockpitError::InvalidSession {
+            session_id: session.session_id.clone(),
+        })
+    }
+}
+
 fn expect_ok(seq: u32, response: &str) -> Result<()> {
     let mut parts = response.split_ascii_whitespace();
     match (
@@ -3456,6 +4595,51 @@ fn parse_compact_cockpit_response(
         CockpitRequest::GetEvents { since_seq } => Ok(CockpitResponse::Events(parse_events(
             seq, *since_seq, response,
         )?)),
+        CockpitRequest::RegisterNetworkEndpoint(_) => {
+            expect_ok(seq, response)?;
+            Ok(CockpitResponse::NetworkEndpointRegistered(
+                NetworkEndpointRegistered {
+                    session_id: value_for(response, "session_id")
+                        .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                        .into(),
+                    fqdn: value_for(response, "fqdn")
+                        .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                        .into(),
+                    address: value_for(response, "address")
+                        .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                        .into(),
+                    ttl_seconds: number_for(response, "ttl")
+                        .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+                    registration_generation: number_for(response, "generation")
+                        .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+                },
+            ))
+        }
+        CockpitRequest::AcquireControlLease { .. } => {
+            expect_ok(seq, response)?;
+            let owner_role = serde_json::from_value(serde_json::Value::String(
+                value_for(response, "owner_role")
+                    .unwrap_or("unknown")
+                    .into(),
+            ))?;
+            let authority = serde_json::from_value(serde_json::Value::String(
+                value_for(response, "authority").unwrap_or("unknown").into(),
+            ))?;
+            Ok(CockpitResponse::ControlLeaseGranted(ControlLease {
+                lease_id: value_for(response, "lease_id")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                    .into(),
+                session_id: value_for(response, "session_id")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                    .into(),
+                owner_role,
+                authority,
+                ttl_ms: number_for(response, "ttl_ms")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+                generation: number_for(response, "generation")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+            }))
+        }
         _ => {
             expect_ok(seq, response)?;
             Ok(CockpitResponse::Accepted)
@@ -3487,6 +4671,50 @@ fn parse_json_cockpit_response(
         CockpitRequest::GetEvents { since_seq } => Ok(CockpitResponse::Events(parse_json_events(
             *since_seq, &value,
         )?)),
+        CockpitRequest::RegisterNetworkEndpoint(_) => {
+            let registered = NetworkEndpointRegistered {
+                session_id: json_str_value(&value, "session_id")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                    .into(),
+                fqdn: json_str_value(&value, "fqdn")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                    .into(),
+                address: json_str_value(&value, "address")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                    .into(),
+                ttl_seconds: json_u32_value(&value, "ttl_seconds")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+                registration_generation: json_u32_value(&value, "registration_generation")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+            };
+            Ok(CockpitResponse::NetworkEndpointRegistered(registered))
+        }
+        CockpitRequest::AcquireControlLease { .. } => {
+            Ok(CockpitResponse::ControlLeaseGranted(ControlLease {
+                lease_id: json_str_value(&value, "lease_id")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                    .into(),
+                session_id: json_str_value(&value, "session_id")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?
+                    .into(),
+                owner_role: serde_json::from_value(
+                    value
+                        .get("owner_role")
+                        .cloned()
+                        .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+                )?,
+                authority: serde_json::from_value(
+                    value
+                        .get("authority")
+                        .cloned()
+                        .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+                )?,
+                ttl_ms: json_u32_value(&value, "ttl_ms")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+                generation: json_u32_value(&value, "generation")
+                    .ok_or_else(|| CockpitError::BadResponse(response.into()))?,
+            }))
+        }
         _ => {
             if value.get("accepted").and_then(serde_json::Value::as_bool) == Some(true) {
                 Ok(CockpitResponse::Accepted)
@@ -3603,7 +4831,13 @@ fn http_body(response: &str) -> Result<String> {
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| CockpitError::BadResponse(response.to_owned()))?;
-    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+    let protocol_rejection = (head.starts_with("HTTP/1.1 409")
+        || head.starts_with("HTTP/1.0 409")
+        || head.starts_with("HTTP/1.1 422")
+        || head.starts_with("HTTP/1.0 422"))
+        && body.trim_start().starts_with('{');
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") && !protocol_rejection
+    {
         return Err(CockpitError::BadResponse(head.to_owned()));
     }
     Ok(body.trim().to_owned())
@@ -3715,10 +4949,525 @@ fn time_reached(now_ms: u32, deadline_ms: u32) -> bool {
     now_ms.wrapping_sub(deadline_ms) < u32::MAX / 2
 }
 
+fn fresh_sim_boot_id() -> String {
+    format!("simboot-{}", uuid::Uuid::new_v4().simple())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    fn hello() -> HandshakeHello {
+        HandshakeHello::motherbrain("pete-motherbrain-test")
+    }
+
+    #[test]
+    fn process_boot_identity_is_stable_while_handshake_nonces_are_fresh() {
+        let first = hello();
+        let second = hello();
+        assert_eq!(first.boot_id, second.boot_id);
+        assert_ne!(first.handshake_nonce, second.handshake_nonce);
+        assert_eq!(first.boot_id, first.new_attempt().boot_id);
+        assert_ne!(first.handshake_nonce, first.new_attempt().handshake_nonce);
+    }
+
+    #[test]
+    fn handshake_conformance_success_minor_and_json_compact_parity() {
+        let mut sim = SimCockpit::new();
+        let hello = hello();
+        let outcome = sim.handshake(hello.clone()).unwrap();
+        assert_eq!(outcome.welcome.protocol_minor, PROTOCOL_MINOR_MAX);
+        assert_eq!(
+            outcome.welcome.echoed_handshake_nonce,
+            hello.handshake_nonce
+        );
+        assert!(!outcome.welcome.safety_snapshot.armed);
+        assert!(!outcome.welcome.safety_snapshot.active_motion);
+        assert_eq!(
+            outcome.contract.capabilities(),
+            &outcome.welcome.capability_contract
+        );
+
+        let hello_line = encode_compact_hello(&hello).unwrap();
+        assert_eq!(decode_compact_hello(&hello_line).unwrap(), hello);
+        let response = HandshakeResponse::Welcome(outcome.welcome.clone());
+        let line = encode_compact_response(&response).unwrap();
+        assert_eq!(decode_compact_response(&line).unwrap(), response);
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HandshakeResponse>(&json).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn handshake_structured_rejections_and_stale_nonce() {
+        let caps = SimCockpit::new().get_capabilities().unwrap();
+        let safety = SafetySnapshot {
+            armed: false,
+            estop_latched: false,
+            safety_tripped: false,
+            active_motion: false,
+            runtime_state: "idle".into(),
+        };
+        let software = SoftwareInfo {
+            software_name: "test".into(),
+            software_version: "1".into(),
+            build_id: "x".into(),
+        };
+        let mut major = hello();
+        major.protocol_major += 1;
+        assert!(matches!(
+            negotiate(
+                &major,
+                "brain",
+                "boot",
+                caps.clone(),
+                safety.clone(),
+                1,
+                software.clone(),
+                1
+            ),
+            HandshakeResponse::Reject(HandshakeReject {
+                reason_code: HandshakeRejectReason::ProtocolMajorMismatch,
+                ..
+            })
+        ));
+        let mut wrong_role = hello();
+        wrong_role.role = EndpointRole::Brainstem;
+        assert!(matches!(
+            negotiate(
+                &wrong_role,
+                "brain",
+                "boot",
+                caps.clone(),
+                safety.clone(),
+                1,
+                software.clone(),
+                1
+            ),
+            HandshakeResponse::Reject(HandshakeReject {
+                reason_code: HandshakeRejectReason::WrongRole,
+                ..
+            })
+        ));
+        let mut feature = hello();
+        feature
+            .required_features
+            .push(HandshakeFeature::Unknown("future_required".into()));
+        assert!(matches!(
+            negotiate(&feature, "brain", "boot", caps, safety, 1, software, 1),
+            HandshakeResponse::Reject(HandshakeReject {
+                reason_code: HandshakeRejectReason::MissingRequiredFeature,
+                ..
+            })
+        ));
+
+        let mut sim = SimCockpit::new();
+        let hello = hello();
+        let mut response = match negotiate(
+            &hello,
+            "brain",
+            "boot",
+            sim.get_capabilities().unwrap(),
+            SafetySnapshot {
+                armed: false,
+                estop_latched: false,
+                safety_tripped: false,
+                active_motion: false,
+                runtime_state: "idle".into(),
+            },
+            1,
+            SoftwareInfo {
+                software_name: "x".into(),
+                software_version: "1".into(),
+                build_id: "x".into(),
+            },
+            1,
+        ) {
+            HandshakeResponse::Welcome(w) => w,
+            _ => unreachable!(),
+        };
+        response.echoed_handshake_nonce = "old-nonce".into();
+        assert!(matches!(
+            HandshakeOutcome::validate(&hello, HandshakeResponse::Welcome(response)),
+            Err(CockpitError::StaleHandshake { .. })
+        ));
+    }
+
+    #[test]
+    fn compact_handshake_rejects_malformed_and_oversized_frames() {
+        assert!(decode_compact_hello("HELLO !!!\n").is_err());
+        let oversized = format!("HELLO {}\n", "a".repeat(MAX_COMPACT_HANDSHAKE_FRAME_LEN));
+        assert!(matches!(
+            decode_compact_hello(&oversized),
+            Err(CockpitError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn compact_line_decoder_handles_fragmentation_and_multiple_frames() {
+        let mut decoder = CompactLineDecoder::new(32);
+        assert!(decoder.push(b"HEL").unwrap().is_empty());
+        assert_eq!(
+            decoder.push(b"LO one\nPING two\npart").unwrap(),
+            vec!["HELLO one", "PING two"]
+        );
+        assert_eq!(decoder.push(b"ial\n").unwrap(), vec!["partial"]);
+        assert!(matches!(
+            CompactLineDecoder::new(2).push(b"abc"),
+            Err(CockpitError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn session_replacement_stops_disarms_and_rejects_old_session_without_clearing_estop() {
+        let mut sim = SimCockpit::new();
+        let first = sim.handshake(hello()).unwrap();
+        sim.execute_in_session(
+            &first.session,
+            CockpitRequest::AcquireControlLease {
+                authority: ControlAuthority::Motherbrain,
+                ttl_ms: 1_000,
+            },
+        )
+        .unwrap();
+        sim.execute_in_session(&first.session, CockpitRequest::Arm)
+            .unwrap();
+        sim.execute_in_session(
+            &first.session,
+            CockpitRequest::CmdVel {
+                linear_mm_s: 100,
+                angular_mrad_s: 0,
+                ttl_ms: 1_000,
+            },
+        )
+        .unwrap();
+        sim.execute_in_session(&first.session, CockpitRequest::EStop)
+            .unwrap();
+
+        let second = sim.handshake(hello()).unwrap();
+        let cockpit_status = sim.get_status().unwrap();
+        let status = cockpit_status.summary();
+        assert_eq!(status.armed, Some(false));
+        assert!(cockpit_status.raw.contains("active_cmd_vel=false"));
+        assert_eq!(status.estop_latched, Some(true));
+        assert_ne!(first.session.session_id, second.session.session_id);
+        assert!(matches!(
+            sim.execute_in_session(&first.session, CockpitRequest::Arm),
+            Err(CockpitError::InvalidSession { .. })
+        ));
+    }
+
+    #[test]
+    fn reconnect_classifies_transport_reboot_and_replacement() {
+        let mut sim = SimCockpit::new().with_identity("brain-a", "boot-a");
+        let first = sim.handshake(hello()).unwrap();
+        let reconnect = sim
+            .handshake(hello())
+            .unwrap()
+            .classify_against(Some(&first.session));
+        assert_eq!(
+            reconnect.classification,
+            ReconnectClassification::TransportReconnect
+        );
+        let mut rebooted = SimCockpit::new().with_identity("brain-a", "boot-b");
+        let reboot = rebooted
+            .handshake(hello())
+            .unwrap()
+            .classify_against(Some(&first.session));
+        assert_eq!(
+            reboot.classification,
+            ReconnectClassification::BrainstemReboot
+        );
+        let mut replacement = SimCockpit::new().with_identity("brain-b", "boot-c");
+        let replacement = replacement
+            .handshake(hello())
+            .unwrap()
+            .classify_against(Some(&first.session));
+        assert_eq!(
+            replacement.classification,
+            ReconnectClassification::ReplacementBrainstem
+        );
+    }
+
+    #[test]
+    fn duplicate_hello_is_idempotent() {
+        let mut sim = SimCockpit::new();
+        let hello = hello();
+        let first = sim.handshake(hello.clone()).unwrap();
+        let duplicate = sim.handshake(hello).unwrap();
+        assert_eq!(first.session.session_id, duplicate.session.session_id);
+    }
+
+    #[test]
+    fn failover_same_device_creates_fresh_single_authority_session() {
+        let primary: Box<dyn Cockpit> =
+            Box::new(SimCockpit::new().with_identity("brain-a", "boot-a"));
+        let ready = establish_session(primary, hello(), None).unwrap();
+        let old_session = ready.session().clone();
+        let mut failover = FailoverCockpit::new(ready);
+        let backup: Box<dyn Cockpit> =
+            Box::new(SimCockpit::new().with_identity("brain-a", "boot-a"));
+        failover
+            .failover(backup, hello(), ReplacementPolicy::Reject)
+            .unwrap();
+        assert_ne!(
+            old_session.session_id,
+            failover.active().session().session_id
+        );
+        assert_eq!(
+            failover.active().outcome().classification,
+            ReconnectClassification::TransportReconnect
+        );
+        failover
+            .active_mut()
+            .acquire_control(ControlAuthority::Motherbrain, 1_000)
+            .unwrap();
+        assert!(failover.active_mut().execute(CockpitRequest::Arm).is_ok());
+    }
+
+    #[test]
+    fn operator_debug_and_forebrain_recovery_transitions_stop_and_revoke() {
+        let mut sim = SimCockpit::new().with_takeover_policy(true, Some("forebrain-alpha".into()));
+        let mother = sim.handshake(hello()).unwrap();
+        let mother_lease = match sim
+            .execute_in_session(
+                &mother.session,
+                CockpitRequest::AcquireControlLease {
+                    authority: ControlAuthority::Motherbrain,
+                    ttl_ms: 500,
+                },
+            )
+            .unwrap()
+        {
+            CockpitResponse::ControlLeaseGranted(lease) => lease,
+            other => panic!("{other:?}"),
+        };
+        sim.execute_with_lease(&mother.session, &mother_lease, CockpitRequest::Arm)
+            .unwrap();
+        sim.execute_with_lease(
+            &mother.session,
+            &mother_lease,
+            CockpitRequest::CmdVel {
+                linear_mm_s: 100,
+                angular_mrad_s: 0,
+                ttl_ms: 1_000,
+            },
+        )
+        .unwrap();
+
+        let mut operator_hello = HandshakeHello::motherbrain("operator-laptop");
+        operator_hello.role = EndpointRole::Operator;
+        let operator = sim.handshake(operator_hello).unwrap();
+        assert!(sim
+            .get_status()
+            .unwrap()
+            .raw
+            .contains("active_cmd_vel=true"));
+        let debug_lease = match sim
+            .execute_in_session(
+                &operator.session,
+                CockpitRequest::AcquireControlLease {
+                    authority: ControlAuthority::OperatorDebug,
+                    ttl_ms: 500,
+                },
+            )
+            .unwrap()
+        {
+            CockpitResponse::ControlLeaseGranted(lease) => lease,
+            other => panic!("{other:?}"),
+        };
+        assert!(sim
+            .get_status()
+            .unwrap()
+            .raw
+            .contains("active_cmd_vel=false"));
+        assert!(sim
+            .execute_with_lease(&mother.session, &mother_lease, CockpitRequest::Arm)
+            .is_err());
+
+        let mut forebrain_hello = HandshakeHello::forebrain("forebrain-alpha");
+        forebrain_hello.handshake_nonce = "forebrain-recovery".into();
+        let forebrain = sim.handshake(forebrain_hello).unwrap();
+        assert!(sim
+            .execute_in_session(
+                &forebrain.session,
+                CockpitRequest::AcquireControlLease {
+                    authority: ControlAuthority::ForebrainRecovery,
+                    ttl_ms: 500
+                }
+            )
+            .is_err());
+        sim.advance_ms(debug_lease.ttl_ms);
+        let recovery = sim
+            .execute_in_session(
+                &forebrain.session,
+                CockpitRequest::AcquireControlLease {
+                    authority: ControlAuthority::ForebrainRecovery,
+                    ttl_ms: 500,
+                },
+            )
+            .unwrap();
+        assert!(matches!(recovery, CockpitResponse::ControlLeaseGranted(_)));
+        assert!(sim
+            .execute_with_lease(&operator.session, &debug_lease, CockpitRequest::Arm)
+            .is_err());
+    }
+
+    #[test]
+    fn takeover_roles_are_default_deny() {
+        let mut sim = SimCockpit::new();
+        let operator = sim
+            .handshake(HandshakeHello::operator("operator-laptop"))
+            .unwrap();
+        assert!(sim
+            .execute_in_session(
+                &operator.session,
+                CockpitRequest::AcquireControlLease {
+                    authority: ControlAuthority::OperatorDebug,
+                    ttl_ms: 500,
+                }
+            )
+            .is_err());
+        let forebrain = sim
+            .handshake(HandshakeHello::forebrain("forebrain-alpha"))
+            .unwrap();
+        assert!(sim
+            .execute_in_session(
+                &forebrain.session,
+                CockpitRequest::AcquireControlLease {
+                    authority: ControlAuthority::ForebrainRecovery,
+                    ttl_ms: 500,
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn ready_connector_initializes_cursor_at_welcome_without_dropping_session_event() {
+        let mut ready = establish_session(SimCockpit::new(), hello(), None).unwrap();
+        let batch = ready.poll_events().unwrap();
+        assert_eq!(batch.dropped_before_seq, 0);
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::SessionOpened));
+    }
+
+    fn motherbrain_registration(address: &str, lease: &str) -> RegisterNetworkEndpoint {
+        RegisterNetworkEndpoint {
+            role: EndpointRole::Motherbrain,
+            device_id: "pete-motherbrain-test".into(),
+            interface_id: "wlan0".into(),
+            address_family: AddressFamily::Ipv4,
+            address: address.into(),
+            hostname: "motherbrain".into(),
+            lease_identity: lease.into(),
+            ttl_seconds: 600,
+        }
+    }
+
+    #[test]
+    fn authenticated_motherbrain_registers_lease_and_reserved_dhcp_name_cannot() {
+        let mut sim = SimCockpit::new();
+        sim.add_network_lease(NetworkLease {
+            leased_ip: "192.168.4.2".into(),
+            client_mac: "02:00:00:00:00:02".into(),
+            dhcp_client_identifier: "mb-client".into(),
+            requested_hostname: Some("motherbrain".into()),
+            lease_start: 0,
+            lease_expiry: 3_600,
+        });
+        assert_eq!(sim.resolve_internal_name("motherbrain"), None);
+        let outcome = sim.handshake(hello()).unwrap();
+        let response = sim
+            .execute_in_session(
+                &outcome.session,
+                CockpitRequest::RegisterNetworkEndpoint(motherbrain_registration(
+                    "192.168.4.2",
+                    "mb-client",
+                )),
+            )
+            .unwrap();
+        let CockpitResponse::NetworkEndpointRegistered(registered) = response else {
+            panic!("registration response")
+        };
+        assert_eq!(
+            registered.fqdn,
+            format!("motherbrain.{DEFAULT_INTERNAL_DOMAIN}")
+        );
+        assert_eq!(
+            sim.resolve_internal_name("motherbrain"),
+            Some("192.168.4.2".into())
+        );
+        assert_eq!(
+            sim.resolve_internal_name("pete"),
+            Some("192.168.4.1".into())
+        );
+        assert_eq!(
+            sim.resolve_internal_name("brainstem"),
+            Some("192.168.4.1".into())
+        );
+    }
+
+    #[test]
+    fn network_registration_rejects_no_session_forebrain_and_lease_mismatch() {
+        let mut sim = SimCockpit::new();
+        let registration = motherbrain_registration("192.168.4.2", "mb-client");
+        assert!(matches!(
+            sim.execute(CockpitRequest::RegisterNetworkEndpoint(
+                registration.clone()
+            )),
+            Err(CockpitError::SessionRequired)
+        ));
+
+        let mut forebrain_hello = HandshakeHello::forebrain("pete-forebrain-lab");
+        forebrain_hello.handshake_nonce = "forebrain-attempt".into();
+        let forebrain = sim.handshake(forebrain_hello).unwrap();
+        assert!(matches!(
+            sim.execute_in_session(
+                &forebrain.session,
+                CockpitRequest::RegisterNetworkEndpoint(registration.clone())
+            ),
+            Err(CockpitError::Policy(_))
+        ));
+
+        let outcome = sim.handshake(hello()).unwrap();
+        assert!(matches!(
+            sim.execute_in_session(
+                &outcome.session,
+                CockpitRequest::RegisterNetworkEndpoint(registration)
+            ),
+            Err(CockpitError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn expired_lease_removes_registered_dns_record() {
+        let mut sim = SimCockpit::new();
+        sim.add_network_lease(NetworkLease {
+            leased_ip: "192.168.4.2".into(),
+            client_mac: "mac".into(),
+            dhcp_client_identifier: "lease".into(),
+            requested_hostname: None,
+            lease_start: 0,
+            lease_expiry: 2,
+        });
+        let outcome = sim.handshake(hello()).unwrap();
+        sim.execute_in_session(
+            &outcome.session,
+            CockpitRequest::RegisterNetworkEndpoint(motherbrain_registration(
+                "192.168.4.2",
+                "lease",
+            )),
+        )
+        .unwrap();
+        assert!(sim.resolve_internal_name("motherbrain").is_some());
+        sim.advance_ms(2_000);
+        assert_eq!(sim.resolve_internal_name("motherbrain"), None);
+    }
 
     #[test]
     fn simulator_capabilities_round_trip() {
@@ -4361,6 +6110,8 @@ mod tests {
         vec![
             ("ping", "ping", "PING"),
             ("bootsel", "bootsel", "BOOTSEL"),
+            ("restart_mpu", "restart_mpu", "RESTART_MPU"),
+            ("restart_create", "restart_create", "RESTART_CREATE"),
             ("status", "status", "STATUS"),
             ("get_capabilities", "get_capabilities", "GET_CAPABILITIES"),
             ("get_events", "get_events", "GET_EVENTS"),
@@ -4515,6 +6266,8 @@ mod tests {
         match verb {
             "ping" => CockpitRequest::Ping,
             "bootsel" => CockpitRequest::Bootsel,
+            "restart_mpu" => CockpitRequest::RestartMpu,
+            "restart_create" => CockpitRequest::RestartCreate,
             "status" => CockpitRequest::GetStatus,
             "get_capabilities" => CockpitRequest::GetCapabilities,
             "get_events" => CockpitRequest::GetEvents { since_seq: 3 },

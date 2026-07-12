@@ -128,6 +128,31 @@ static EVENT_KIND: [AtomicU8; EVENT_LOG_CAPACITY] =
 static EVENT_A: [AtomicU32; EVENT_LOG_CAPACITY] = [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
 static EVENT_B: [AtomicU32; EVENT_LOG_CAPACITY] = [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
 static EVENT_C: [AtomicU32; EVENT_LOG_CAPACITY] = [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
+static SESSION_REPLACE_REQUEST: AtomicU32 = AtomicU32::new(0);
+static SESSION_REPLACE_ACK: AtomicU32 = AtomicU32::new(0);
+static PENDING_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
+static PENDING_PEER_DEVICE_HASH: AtomicU32 = AtomicU32::new(0);
+static PENDING_PEER_BOOT_HASH: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_PEER_DEVICE_HASH: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_PEER_BOOT_HASH: AtomicU32 = AtomicU32::new(0);
+const DIAGNOSTIC_SESSION_CAPACITY: usize = 4;
+static DIAGNOSTIC_SESSION_HASH: [AtomicU32; DIAGNOSTIC_SESSION_CAPACITY] =
+    [const { AtomicU32::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
+static DIAGNOSTIC_PEER_HASH: [AtomicU32; DIAGNOSTIC_SESSION_CAPACITY] =
+    [const { AtomicU32::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
+static DIAGNOSTIC_ROLE: [AtomicU8; DIAGNOSTIC_SESSION_CAPACITY] =
+    [const { AtomicU8::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
+static ACTIVE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_SESSION_GENERATION: AtomicU32 = AtomicU32::new(0);
+static SESSION_SAFETY_FLAGS: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_TRANSPORT: AtomicU8 = AtomicU8::new(0);
+static AUTHORITY_REQUEST: AtomicU32 = AtomicU32::new(0);
+static AUTHORITY_ACK: AtomicU32 = AtomicU32::new(0);
+static PENDING_LEASE_HASH: AtomicU32 = AtomicU32::new(0);
+static PENDING_LEASE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_LEASE_HASH: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_LEASE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_LEASE_EXPIRES_MS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -362,6 +387,14 @@ pub enum PublicEventKind {
     MotionInconsistencyDetected = 34,
     ImpactDetected = 35,
     Error = 36,
+    SessionOpened = 37,
+    SessionReplaced = 38,
+    SessionRejected = 39,
+    TransportChanged = 40,
+    PeerRebootDetected = 41,
+    DhcpLeaseChanged = 42,
+    DnsRegistrationChanged = 43,
+    AuthorityChanged = 44,
 }
 
 #[derive(Clone, Copy)]
@@ -644,6 +677,248 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
         ttl_ms,
         seq,
     })
+}
+
+pub fn request_session_replace(
+    generation: u32,
+    session_hash: u32,
+    peer_device_hash: u32,
+    peer_boot_hash: u32,
+) {
+    PENDING_SESSION_HASH.store(session_hash, Ordering::Release);
+    PENDING_PEER_DEVICE_HASH.store(peer_device_hash, Ordering::Release);
+    PENDING_PEER_BOOT_HASH.store(peer_boot_hash, Ordering::Release);
+    SESSION_REPLACE_REQUEST.store(generation.max(1), Ordering::Release);
+}
+
+pub fn pending_session_replace() -> Option<u32> {
+    let request = SESSION_REPLACE_REQUEST.load(Ordering::Acquire);
+    (request != 0 && request != SESSION_REPLACE_ACK.load(Ordering::Acquire)).then_some(request)
+}
+
+pub fn pending_session_hash() -> u32 {
+    PENDING_SESSION_HASH.load(Ordering::Acquire)
+}
+
+pub fn acknowledge_session_replace(generation: u32, session_hash: u32) {
+    // Publish identity only after the runtime lane has synchronously stopped,
+    // cleared its queue and revoked heartbeat state.
+    let previous = ACTIVE_SESSION_HASH.load(Ordering::Acquire);
+    ACTIVE_SESSION_HASH.store(session_hash, Ordering::Release);
+    ACTIVE_SESSION_GENERATION.store(generation, Ordering::Release);
+    let previous_device = ACTIVE_PEER_DEVICE_HASH.load(Ordering::Acquire);
+    let previous_boot = ACTIVE_PEER_BOOT_HASH.load(Ordering::Acquire);
+    let peer_device = PENDING_PEER_DEVICE_HASH.load(Ordering::Acquire);
+    let peer_boot = PENDING_PEER_BOOT_HASH.load(Ordering::Acquire);
+    ACTIVE_PEER_DEVICE_HASH.store(peer_device, Ordering::Release);
+    ACTIVE_PEER_BOOT_HASH.store(peer_boot, Ordering::Release);
+    SESSION_REPLACE_ACK.store(generation, Ordering::Release);
+    ACTIVE_LEASE_HASH.store(0, Ordering::Release);
+    ACTIVE_LEASE_SESSION_HASH.store(0, Ordering::Release);
+    ACTIVE_LEASE_EXPIRES_MS.store(0, Ordering::Release);
+    record_public_event(
+        if previous == 0 {
+            PublicEventKind::SessionOpened
+        } else {
+            PublicEventKind::SessionReplaced
+        },
+        generation,
+        previous,
+        session_hash,
+    );
+    if previous_device == peer_device && previous_boot != 0 && previous_boot != peer_boot {
+        record_public_event(
+            PublicEventKind::PeerRebootDetected,
+            previous_boot,
+            peer_boot,
+            0,
+        );
+    }
+}
+
+pub fn mark_session_rejected(reason: u32) {
+    record_public_event(PublicEventKind::SessionRejected, reason, 0, 0);
+}
+
+pub fn session_replace_acked(generation: u32) -> bool {
+    SESSION_REPLACE_ACK.load(Ordering::Acquire) == generation
+}
+
+pub fn active_session_matches(session_hash: u32) -> bool {
+    session_hash != 0
+        && (ACTIVE_SESSION_HASH.load(Ordering::Acquire) == session_hash
+            || DIAGNOSTIC_SESSION_HASH
+                .iter()
+                .any(|entry| entry.load(Ordering::Acquire) == session_hash))
+}
+pub fn active_peer_matches(device_hash: u32) -> bool {
+    device_hash != 0 && ACTIVE_PEER_DEVICE_HASH.load(Ordering::Acquire) == device_hash
+}
+pub fn session_peer_matches(session_hash: u32, peer_hash: u32) -> bool {
+    if ACTIVE_SESSION_HASH.load(Ordering::Acquire) == session_hash {
+        return ACTIVE_PEER_DEVICE_HASH.load(Ordering::Acquire) == peer_hash;
+    }
+    DIAGNOSTIC_SESSION_HASH
+        .iter()
+        .position(|entry| entry.load(Ordering::Acquire) == session_hash)
+        .is_some_and(|slot| DIAGNOSTIC_PEER_HASH[slot].load(Ordering::Acquire) == peer_hash)
+}
+
+pub fn register_diagnostic_session(session_hash: u32, peer_hash: u32, role: u8) {
+    let slot = DIAGNOSTIC_SESSION_HASH
+        .iter()
+        .position(|entry| entry.load(Ordering::Acquire) == session_hash)
+        .or_else(|| {
+            DIAGNOSTIC_SESSION_HASH
+                .iter()
+                .position(|entry| entry.load(Ordering::Acquire) == 0)
+        })
+        .unwrap_or((session_hash as usize) % DIAGNOSTIC_SESSION_CAPACITY);
+    DIAGNOSTIC_PEER_HASH[slot].store(peer_hash, Ordering::Release);
+    DIAGNOSTIC_ROLE[slot].store(role, Ordering::Release);
+    DIAGNOSTIC_SESSION_HASH[slot].store(session_hash, Ordering::Release);
+    record_public_event(
+        PublicEventKind::SessionOpened,
+        role as u32,
+        peer_hash,
+        session_hash,
+    );
+}
+
+pub fn session_role(session_hash: u32) -> Option<u8> {
+    if ACTIVE_SESSION_HASH.load(Ordering::Acquire) == session_hash {
+        return Some(1);
+    }
+    DIAGNOSTIC_SESSION_HASH
+        .iter()
+        .position(|entry| entry.load(Ordering::Acquire) == session_hash)
+        .map(|slot| DIAGNOSTIC_ROLE[slot].load(Ordering::Acquire))
+}
+
+pub fn set_session_safety_snapshot(estop_latched: bool, safety_tripped: bool) {
+    SESSION_SAFETY_FLAGS.store(
+        (estop_latched as u32) | ((safety_tripped as u32) << 1),
+        Ordering::Release,
+    );
+}
+
+pub fn session_safety_snapshot() -> (bool, bool) {
+    let flags = SESSION_SAFETY_FLAGS.load(Ordering::Acquire);
+    (flags & 1 != 0, flags & 2 != 0)
+}
+
+pub fn request_authority_transition(
+    generation: u32,
+    lease_hash: u32,
+    session_hash: u32,
+    expires_ms: u32,
+) {
+    PENDING_LEASE_HASH.store(lease_hash, Ordering::Release);
+    PENDING_LEASE_SESSION_HASH.store(session_hash, Ordering::Release);
+    ACTIVE_LEASE_EXPIRES_MS.store(expires_ms, Ordering::Release);
+    AUTHORITY_REQUEST.store(generation.max(1), Ordering::Release);
+}
+pub fn pending_authority_transition() -> Option<u32> {
+    let request = AUTHORITY_REQUEST.load(Ordering::Acquire);
+    (request != 0 && request != AUTHORITY_ACK.load(Ordering::Acquire)).then_some(request)
+}
+pub fn acknowledge_authority_transition(generation: u32) {
+    ACTIVE_LEASE_HASH.store(
+        PENDING_LEASE_HASH.load(Ordering::Acquire),
+        Ordering::Release,
+    );
+    ACTIVE_LEASE_SESSION_HASH.store(
+        PENDING_LEASE_SESSION_HASH.load(Ordering::Acquire),
+        Ordering::Release,
+    );
+    AUTHORITY_ACK.store(generation, Ordering::Release);
+    record_public_event(
+        PublicEventKind::AuthorityChanged,
+        generation,
+        ACTIVE_LEASE_SESSION_HASH.load(Ordering::Acquire),
+        ACTIVE_LEASE_HASH.load(Ordering::Acquire),
+    );
+}
+pub fn authority_transition_acked(generation: u32) -> bool {
+    AUTHORITY_ACK.load(Ordering::Acquire) == generation
+}
+pub fn authority_expired(now_ms: u32) -> bool {
+    let deadline = ACTIVE_LEASE_EXPIRES_MS.load(Ordering::Acquire);
+    deadline == 0 || now_ms.wrapping_sub(deadline) < u32::MAX / 2
+}
+pub fn active_authority_matches(session_hash: u32, lease_hash: u32, now_ms: u32) -> bool {
+    !authority_expired(now_ms)
+        && ACTIVE_LEASE_HASH.load(Ordering::Acquire) == lease_hash
+        && ACTIVE_LEASE_SESSION_HASH.load(Ordering::Acquire) == session_hash
+}
+pub fn refresh_authority_heartbeat(
+    session_hash: u32,
+    lease_hash: u32,
+    now_ms: u32,
+    timeout_ms: u32,
+) -> bool {
+    if !active_authority_matches(session_hash, lease_hash, now_ms) {
+        return false;
+    }
+    ACTIVE_LEASE_EXPIRES_MS.store(
+        now_ms.wrapping_add(timeout_ms.clamp(250, 60_000)),
+        Ordering::Release,
+    );
+    true
+}
+pub fn revoke_authority() {
+    let previous = ACTIVE_LEASE_HASH.load(Ordering::Acquire);
+    ACTIVE_LEASE_HASH.store(0, Ordering::Release);
+    ACTIVE_LEASE_SESSION_HASH.store(0, Ordering::Release);
+    ACTIVE_LEASE_EXPIRES_MS.store(0, Ordering::Release);
+    if previous != 0 {
+        record_public_event(PublicEventKind::AuthorityChanged, 0, previous, 0);
+    }
+}
+pub fn mark_dhcp_lease_changed(identity_hash: u32, ip: u32) {
+    record_public_event(PublicEventKind::DhcpLeaseChanged, identity_hash, ip, 0);
+}
+pub fn mark_dns_registration_changed(generation: u32, ip: u32) {
+    record_public_event(PublicEventKind::DnsRegistrationChanged, generation, ip, 0);
+}
+pub fn take_expired_authority(now_ms: u32) -> bool {
+    if ACTIVE_LEASE_HASH.load(Ordering::Acquire) != 0 && authority_expired(now_ms) {
+        revoke_authority();
+        true
+    } else {
+        false
+    }
+}
+
+pub struct SessionDiagnostics {
+    pub primary_session_generation: u32,
+    pub diagnostic_sessions: u8,
+    pub authority_generation: u32,
+    pub authority_active: bool,
+}
+
+pub fn session_diagnostics(now_ms: u32) -> SessionDiagnostics {
+    SessionDiagnostics {
+        primary_session_generation: ACTIVE_SESSION_GENERATION.load(Ordering::Acquire),
+        diagnostic_sessions: DIAGNOSTIC_SESSION_HASH
+            .iter()
+            .filter(|entry| entry.load(Ordering::Acquire) != 0)
+            .count() as u8,
+        authority_generation: AUTHORITY_ACK.load(Ordering::Acquire),
+        authority_active: !authority_expired(now_ms),
+    }
+}
+pub fn mark_transport_changed(transport: u8) {
+    let previous = ACTIVE_TRANSPORT.load(Ordering::Acquire);
+    ACTIVE_TRANSPORT.store(transport, Ordering::Release);
+    if previous != 0 && previous != transport {
+        record_public_event(
+            PublicEventKind::TransportChanged,
+            previous as u32,
+            transport as u32,
+            0,
+        );
+    }
 }
 
 #[cfg(feature = "pico-w")]
@@ -2857,6 +3132,14 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
             "motion_inconsistency_detected"
         }
         x if x == PublicEventKind::ImpactDetected as u8 => "impact_detected",
+        x if x == PublicEventKind::SessionOpened as u8 => "session_opened",
+        x if x == PublicEventKind::SessionReplaced as u8 => "session_replaced",
+        x if x == PublicEventKind::SessionRejected as u8 => "session_rejected",
+        x if x == PublicEventKind::TransportChanged as u8 => "transport_changed",
+        x if x == PublicEventKind::PeerRebootDetected as u8 => "peer_reboot_detected",
+        x if x == PublicEventKind::DhcpLeaseChanged as u8 => "dhcp_lease_changed",
+        x if x == PublicEventKind::DnsRegistrationChanged as u8 => "dns_registration_changed",
+        x if x == PublicEventKind::AuthorityChanged as u8 => "authority_changed",
         x if x == PublicEventKind::Error as u8 => "error",
         _ => "none",
     }

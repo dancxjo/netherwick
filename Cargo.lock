@@ -5752,12 +5752,21 @@ dependencies = [
 name = "pete-cockpit"
 version = "0.1.0"
 dependencies = [
+ "pete-cockpit-protocol",
  "serde",
  "serde_json",
  "serialport",
  "thiserror 1.0.69",
  "toml 0.8.23",
  "tungstenite",
+ "uuid",
+]
+
+[[package]]
+name = "pete-cockpit-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

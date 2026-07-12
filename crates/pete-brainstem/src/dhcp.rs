@@ -3,15 +3,68 @@ const DHCP_POOL_FIRST_HOST: u8 = 2;
 const DHCP_POOL_SIZE: usize = 8;
 pub const DHCP_LEASE_SECONDS: u32 = 3_600;
 const DHCP_OFFER_HOLD_SECONDS: u32 = 30;
+use crate::network_registry;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq)]
 pub struct DhcpClient {
     hardware_address: [u8; 6],
+    client_identifier: [u8; 32],
+    client_identifier_len: u8,
+    requested_hostname: [u8; 32],
+    requested_hostname_len: u8,
+}
+
+impl PartialEq for DhcpClient {
+    fn eq(&self, other: &Self) -> bool {
+        self.lease_identity() == other.lease_identity()
+    }
+}
+
+pub fn hostname_is_reserved(hostname: &[u8]) -> bool {
+    [
+        b"pete".as_slice(),
+        b"brainstem",
+        b"motherbrain",
+        b"forebrain",
+        b"gateway",
+        b"control",
+    ]
+    .iter()
+    .any(|reserved| hostname.eq_ignore_ascii_case(reserved))
 }
 
 impl DhcpClient {
     pub const fn new(hardware_address: [u8; 6]) -> Self {
-        Self { hardware_address }
+        Self {
+            hardware_address,
+            client_identifier: [0; 32],
+            client_identifier_len: 0,
+            requested_hostname: [0; 32],
+            requested_hostname_len: 0,
+        }
+    }
+
+    pub fn with_metadata(mut self, client_identifier: &[u8], requested_hostname: &[u8]) -> Self {
+        let id_len = client_identifier.len().min(self.client_identifier.len());
+        self.client_identifier[..id_len].copy_from_slice(&client_identifier[..id_len]);
+        self.client_identifier_len = id_len as u8;
+        let hostname_len = requested_hostname.len().min(self.requested_hostname.len());
+        self.requested_hostname[..hostname_len]
+            .copy_from_slice(&requested_hostname[..hostname_len]);
+        self.requested_hostname_len = hostname_len as u8;
+        self
+    }
+
+    pub fn lease_identity(&self) -> &[u8] {
+        if self.client_identifier_len == 0 {
+            &self.hardware_address
+        } else {
+            &self.client_identifier[..self.client_identifier_len as usize]
+        }
+    }
+
+    pub fn requested_hostname(&self) -> &[u8] {
+        &self.requested_hostname[..self.requested_hostname_len as usize]
     }
 }
 
@@ -27,6 +80,10 @@ impl DhcpRequest {
             message_type,
             client,
         }
+    }
+
+    pub fn client(self) -> DhcpClient {
+        self.client
     }
 }
 
@@ -98,7 +155,11 @@ impl DhcpLeaseState {
             }
         }
 
-        let slot_index = self.active.iter().position(|lease| lease.is_none())?;
+        let preferred = network_registry::lease_identity_is_motherbrain(client.lease_identity())
+            .then_some(0)
+            .filter(|index| self.active[*index].is_none());
+        let slot_index =
+            preferred.or_else(|| self.active.iter().position(|lease| lease.is_none()))?;
         let ip = [
             AP_NETWORK[0],
             AP_NETWORK[1],
@@ -184,5 +245,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after_expiry.lease_ip(), first.lease_ip());
+    }
+
+    #[test]
+    fn reserved_names_are_not_ordinary_dhcp_names() {
+        for name in [b"pete".as_slice(), b"MOTHERBRAIN", b"control"] {
+            assert!(hostname_is_reserved(name));
+        }
+        assert!(!hostname_is_reserved(b"operator-laptop"));
     }
 }

@@ -1,0 +1,19 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">Pete Motherbrain on %h</name>
+  <service>
+    <type>_pete-motherbrain._tcp</type>
+    <port>8787</port>
+    <txt-record>role=motherbrain</txt-record>
+    <txt-record>protocol_major=1</txt-record>
+  </service>
+  <service>
+    <type>_pete-cockpit._tcp</type>
+    <port>8787</port>
+  </service>
+  <service>
+    <type>_pete-events._tcp</type>
+    <port>8787</port>
+  </service>
+</service-group>

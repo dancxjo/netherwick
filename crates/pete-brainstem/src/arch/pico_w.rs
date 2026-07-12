@@ -3,6 +3,7 @@ use core::fmt::Write as _;
 use cyw43::aligned_bytes;
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -17,7 +18,7 @@ use embassy_rp::i2c::{
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
 use embassy_rp::peripherals::{
     DMA_CH0, I2C1, PIN_0, PIN_1, PIN_18, PIN_19, PIN_2, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29,
-    PIN_3, PIN_4, PIN_5, PIO0, UART0, UART1,
+    PIN_3, PIN_4, PIN_5, PIO0, UART0, UART1, USB,
 };
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::rom_data::reset_to_usb_boot;
@@ -28,7 +29,8 @@ use embassy_rp::{bind_interrupts, dma, Peri};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_nb::serial::Read as _;
 use embedded_io_async::Write;
-use portable_atomic::{AtomicBool, Ordering};
+use pete_cockpit_protocol::TransportKind;
+use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use crate::body;
@@ -40,7 +42,9 @@ use crate::commands::{
 use crate::dhcp::{DhcpClient, DhcpGrant, DhcpLeaseState, DhcpRequest, DHCP_LEASE_SECONDS};
 use crate::drivers::imu::{decode_mpu6050_sample, ImuHealth};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
+use crate::network_registry;
 use crate::runtime::Runtime;
+use crate::session;
 use crate::status;
 
 const AP_SSID_PREFIX: &str = "pete-";
@@ -63,7 +67,7 @@ const LED_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const LED_BLINK_ON_MS: u64 = 120;
 const LED_BLINK_OFF_MS: u64 = 120;
 const FOREBRAIN_UART_BAUD: u32 = 115_200;
-const FOREBRAIN_LINE_MAX: usize = 96;
+const FOREBRAIN_LINE_MAX: usize = 1024;
 const FOREBRAIN_POLL_MS: u64 = 2;
 const FOREBRAIN_LINE_TIMEOUT_MS: u32 = 100;
 const IMU_I2C_FREQUENCY_HZ: u32 = 100_000;
@@ -79,11 +83,15 @@ const MPU6050_ACCEL_XOUT_H: u8 = 0x3b;
 
 static mut CORE1_STACK: CoreStack<8192> = CoreStack::new();
 static IMU_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+static BRAINSTEM_INSTANCE_ID: AtomicU32 = AtomicU32::new(0);
+static BRAINSTEM_BOOT_ID: AtomicU32 = AtomicU32::new(0);
+static AUTHORITY_GENERATION: AtomicU32 = AtomicU32::new(0);
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
     I2C1_IRQ => I2cInterruptHandler<I2C1>;
+    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
 });
 
 pub struct PicoWBrainstem {
@@ -183,6 +191,15 @@ fn map_uart_error(error: UartError) -> UartReadError {
 }
 
 pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
+    let mut flash = embassy_rp::flash::Flash::<_, _, { 2 * 1024 * 1024 }>::new_blocking(p.FLASH);
+    let mut unique_id = [0u8; 8];
+    let _ = flash.blocking_unique_id(&mut unique_id);
+    let instance = stable_board_id(&unique_id).max(1);
+    BRAINSTEM_INSTANCE_ID.store(instance, Ordering::Release);
+    BRAINSTEM_BOOT_ID.store(
+        instance.rotate_left(11) ^ boot_entropy().max(1),
+        Ordering::Release,
+    );
     let hardware = PicoWBrainstem::new(p.UART0, p.PIN_0, p.PIN_1, p.PIN_18, p.PIN_19, p.PIN_20);
 
     spawn_core1(
@@ -193,7 +210,7 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
 
     spawn_wifi_lane(
         p.PIO0, p.DMA_CH0, p.PIN_23, p.PIN_24, p.PIN_25, p.PIN_29, p.UART1, p.PIN_4, p.PIN_5,
-        p.I2C1, p.PIN_2, p.PIN_3,
+        p.I2C1, p.PIN_2, p.PIN_3, p.USB,
     );
 }
 
@@ -211,6 +228,7 @@ fn spawn_wifi_lane(
     i2c1: Peri<'static, I2C1>,
     i2c_sda: Peri<'static, PIN_2>,
     i2c_scl: Peri<'static, PIN_3>,
+    usb: Peri<'static, USB>,
 ) -> ! {
     static EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
     let executor = EXECUTOR.init(embassy_executor::Executor::new());
@@ -224,6 +242,7 @@ fn spawn_wifi_lane(
                 .expect("spawn forebrain uart task"),
         );
         spawner.spawn(imu_task(i2c1, i2c_sda, i2c_scl).expect("spawn imu task"));
+        spawner.spawn(usb_cdc_task(usb).expect("spawn USB CDC task"));
     })
 }
 
@@ -348,6 +367,26 @@ fn stable_instance_id(address: HardwareAddress) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash % INSTANCE_ID_MODULUS
+}
+
+fn stable_board_id(unique_id: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in unique_id {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn boot_entropy() -> u32 {
+    let mut value = 0u32;
+    for _ in 0..32 {
+        for _ in 0..37 {
+            cortex_m::asm::nop();
+        }
+        value = (value << 1) | rp_pac::ROSC.randombit().read().randombit() as u32;
+    }
+    value ^ Instant::now().as_micros() as u32
 }
 
 #[embassy_executor::task]
@@ -546,12 +585,93 @@ async fn forebrain_uart_task(
     }
 }
 
+#[embassy_executor::task]
+async fn usb_cdc_task(usb: Peri<'static, USB>) -> ! {
+    use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+    use embassy_usb::{Builder, Config};
+
+    let driver = embassy_rp::usb::Driver::new(usb, Irqs);
+    let mut config = Config::new(0x1209, 0x5054);
+    config.manufacturer = Some("Pete Robotics");
+    config.product = Some("Pete Brainstem Cockpit");
+    let mut serial = heapless::String::<24>::new();
+    let _ = write!(
+        serial,
+        "{:08x}",
+        BRAINSTEM_INSTANCE_ID.load(Ordering::Acquire)
+    );
+    config.serial_number = Some(serial.as_str());
+    config.max_power = 100;
+
+    let mut config_descriptor = [0; 256];
+    let mut bos_descriptor = [0; 256];
+    let mut msos_descriptor = [0; 128];
+    let mut control_buf = [0; 64];
+    let mut state = State::new();
+    let mut builder = Builder::new(
+        driver,
+        config,
+        &mut config_descriptor,
+        &mut bos_descriptor,
+        &mut msos_descriptor,
+        &mut control_buf,
+    );
+    let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
+    let mut device = builder.build();
+
+    let io = async {
+        let mut packet = [0u8; 64];
+        let mut line = heapless::Vec::<u8, FOREBRAIN_LINE_MAX>::new();
+        let mut response = heapless::String::<4096>::new();
+        loop {
+            class.wait_connection().await;
+            line.clear();
+            loop {
+                let len = match class.read_packet(&mut packet).await {
+                    Ok(len) => len,
+                    Err(_) => break,
+                };
+                for byte in &packet[..len] {
+                    match *byte {
+                        b'\r' => {}
+                        b'\n' => {
+                            if let Ok(command) = core::str::from_utf8(&line) {
+                                let _ = handle_compact_control_line(
+                                    command,
+                                    &mut response,
+                                    TransportKind::UsbCdc as u8,
+                                );
+                                for chunk in response.as_bytes().chunks(64) {
+                                    if class.write_packet(chunk).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            line.clear();
+                        }
+                        byte => {
+                            if line.push(byte).is_err() {
+                                line.clear();
+                                let _ = class.write_packet(b"ERR 0 line_too_long\n").await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    join(device.run(), io).await;
+    loop {
+        Timer::after_secs(60).await;
+    }
+}
+
 #[embassy_executor::task(pool_size = 3)]
 async fn http_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 2048];
-    let mut request = [0; 512];
-    let mut json = [0; 3072];
+    let mut request = [0; 1024];
+    let mut json = [0; 4096];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -561,7 +681,7 @@ async fn http_task(stack: Stack<'static>) -> ! {
             continue;
         }
 
-        let n = match socket.read(&mut request).await {
+        let n = match read_http_request(&mut socket, &mut request).await {
             Ok(n) => n,
             Err(_) => {
                 socket.abort();
@@ -586,6 +706,24 @@ async fn http_task(stack: Stack<'static>) -> ! {
                     Err(_) => write_plain_status(&mut socket, 500, "Internal Server Error").await,
                 }
             }
+            (Some("GET"), Some("/network.json")) => {
+                let now = Instant::now().as_millis() as u32;
+                match render_network_diagnostics(&mut json, now) {
+                    Some(body) => {
+                        write_response(&mut socket, "application/json", body.as_bytes()).await
+                    }
+                    None => write_plain_status(&mut socket, 500, "Internal Server Error").await,
+                }
+            }
+            (Some("GET"), Some("/sessions.json")) => {
+                let now = Instant::now().as_millis() as u32;
+                match render_session_diagnostics(&mut json, now) {
+                    Some(body) => {
+                        write_response(&mut socket, "application/json", body.as_bytes()).await
+                    }
+                    None => write_plain_status(&mut socket, 500, "Internal Server Error").await,
+                }
+            }
             (Some("POST"), Some("/command")) => {
                 match handle_command_request(&request[..n], &mut json) {
                     Ok(body) => {
@@ -606,6 +744,62 @@ async fn http_task(stack: Stack<'static>) -> ! {
                     }
                     Err(CommandParseError::BadRequest) => {
                         write_plain_status(&mut socket, 400, "Bad Request").await
+                    }
+                }
+            }
+            (Some("POST"), Some("/handshake")) => {
+                let body = request_body(&request[..n]);
+                let malformed = body.is_none_or(|body| session::parse_json(body).is_err());
+                if malformed {
+                    let rejection = render_handshake_reject(
+                        &mut json,
+                        "",
+                        session::RejectReason::InvalidIdentity,
+                    )
+                    .unwrap_or("{\"kind\":\"reject\",\"reason_code\":\"internal_error\"}");
+                    write_response_status(
+                        &mut socket,
+                        400,
+                        "Bad Request",
+                        "application/json",
+                        rejection.as_bytes(),
+                    )
+                    .await
+                } else {
+                    match handle_handshake_json(
+                        body.unwrap_or(""),
+                        &mut json,
+                        TransportKind::Http as u8,
+                    ) {
+                        Some(body) if body.contains("\"kind\":\"reject\"") => {
+                            write_response_status(
+                                &mut socket,
+                                409,
+                                "Conflict",
+                                "application/json",
+                                body.as_bytes(),
+                            )
+                            .await
+                        }
+                        Some(body) => {
+                            write_response(&mut socket, "application/json", body.as_bytes()).await
+                        }
+                        None => {
+                            let rejection = render_handshake_reject(
+                                &mut json,
+                                "",
+                                session::RejectReason::InternalError,
+                            )
+                            .unwrap_or("{\"kind\":\"reject\",\"reason_code\":\"internal_error\"}");
+                            write_response_status(
+                                &mut socket,
+                                500,
+                                "Internal Server Error",
+                                "application/json",
+                                rejection.as_bytes(),
+                            )
+                            .await
+                        }
                     }
                 }
             }
@@ -634,8 +828,8 @@ async fn websocket_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0; 1024];
     let mut tx_buffer = [0; 2048];
     let mut request = [0; 512];
-    let mut payload = [0; 256];
-    let mut response = [0; 3072];
+    let mut payload = [0; 1024];
+    let mut response = [0; 4096];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -739,8 +933,8 @@ async fn udp_control_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0; 512];
     let mut tx_meta = [PacketMetadata::EMPTY; 2];
     let mut tx_buffer = [0; 2048];
-    let mut request = [0; 128];
-    let mut response = heapless::String::<2048>::new();
+    let mut request = [0; 1024];
+    let mut response = heapless::String::<4096>::new();
 
     loop {
         let mut socket = UdpSocket::new(
@@ -762,7 +956,9 @@ async fn udp_control_task(stack: Stack<'static>) -> ! {
             let Ok(line) = core::str::from_utf8(&request[..len]) else {
                 continue;
             };
-            let Some(boot_to_usb) = handle_udp_control_line(line.trim(), &mut response) else {
+            let Some(boot_to_usb) =
+                handle_compact_control_line(line.trim(), &mut response, TransportKind::Udp as u8)
+            else {
                 continue;
             };
             let _ = socket.send_to(response.as_bytes(), endpoint).await;
@@ -813,8 +1009,8 @@ async fn mdns_task(stack: Stack<'static>) -> ! {
     let mut rx_meta = [PacketMetadata::EMPTY; 2];
     let mut rx_buffer = [0; 256];
     let mut tx_meta = [PacketMetadata::EMPTY; 2];
-    let mut tx_buffer = [0; 256];
-    let mut packet = [0; 96];
+    let mut tx_buffer = [0; 768];
+    let mut packet = [0; 768];
     let endpoint = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(224, 0, 0, 251)), MDNS_PORT);
 
     loop {
@@ -875,6 +1071,12 @@ async fn dhcp_task(stack: Stack<'static>) -> ! {
             let Some(grant) = leases.grant(dhcp_request, Instant::now().as_millis() as u64) else {
                 continue;
             };
+            let client = dhcp_request.client();
+            network_registry::record_lease(
+                client.lease_identity(),
+                grant.lease_ip(),
+                (Instant::now().as_millis() as u32).wrapping_add(DHCP_LEASE_SECONDS * 1_000),
+            );
             let Some(reply) = build_dhcp_reply(grant, &request[..len], &mut response) else {
                 continue;
             };
@@ -894,6 +1096,61 @@ async fn write_response(
         header,
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         content_type,
+        body.len()
+    );
+    socket.write_all(header.as_bytes()).await?;
+    socket.write_all(body).await?;
+    flush_tcp_with_timeout(socket).await
+}
+
+async fn read_http_request(
+    socket: &mut TcpSocket<'_>,
+    buffer: &mut [u8],
+) -> Result<usize, embassy_net::tcp::Error> {
+    let mut used = 0;
+    loop {
+        if used == buffer.len() {
+            return Ok(used);
+        }
+        let read = socket.read(&mut buffer[used..]).await?;
+        if read == 0 {
+            return Ok(used);
+        }
+        used += read;
+        let Some(header_end) = buffer[..used]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        else {
+            continue;
+        };
+        let header = core::str::from_utf8(&buffer[..header_end]).unwrap_or("");
+        let content_length = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if used >= header_end.saturating_add(content_length) {
+            return Ok(used);
+        }
+    }
+}
+
+async fn write_response_status(
+    socket: &mut TcpSocket<'_>,
+    code: u16,
+    text: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<bool, embassy_net::tcp::Error> {
+    let mut header = heapless::String::<192>::new();
+    let _ = write!(
+        header,
+        "HTTP/1.1 {code} {text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     socket.write_all(header.as_bytes()).await?;
@@ -1146,12 +1403,176 @@ enum CommandParseError {
     Busy(u32),
 }
 
+fn handle_handshake_json<'a>(body: &str, buffer: &'a mut [u8], transport: u8) -> Option<&'a str> {
+    let hello = match session::parse_json(body) {
+        Ok(hello) => hello,
+        Err(reason) => return render_handshake_reject(buffer, "", reason),
+    };
+    let mut device_id = heapless::String::<32>::new();
+    let mut boot_id = heapless::String::<32>::new();
+    let instance = BRAINSTEM_INSTANCE_ID.load(Ordering::Acquire);
+    if instance == 0 {
+        return render_handshake_reject(
+            buffer,
+            hello.handshake_nonce.as_str(),
+            session::RejectReason::InvalidIdentity,
+        );
+    }
+    let _ = write!(device_id, "pete-brainstem-{instance:04x}");
+    let _ = write!(
+        boot_id,
+        "bsboot-{:08x}",
+        BRAINSTEM_BOOT_ID.load(Ordering::Acquire)
+    );
+    let accepted = match session::validate(&hello, device_id.as_str(), boot_id.as_str()) {
+        Ok(accepted) => accepted,
+        Err(reason) => {
+            return render_handshake_reject(buffer, hello.handshake_nonce.as_str(), reason)
+        }
+    };
+    let session_hash = session::token_hash(accepted.session_id.as_str());
+    let peer_hash = session::token_hash(hello.device_id.as_str());
+    if hello.role == session::EndpointRole::Motherbrain
+        && hello.session_purpose == session::SessionPurpose::Control
+    {
+        if transport != TransportKind::HardwareUart as u8
+            && transport != TransportKind::UsbCdc as u8
+            && !status::active_peer_matches(peer_hash)
+        {
+            return render_handshake_reject(
+                buffer,
+                hello.handshake_nonce.as_str(),
+                session::RejectReason::InvalidIdentity,
+            );
+        }
+        status::request_session_replace(
+            accepted.generation,
+            session_hash,
+            peer_hash,
+            session::token_hash(hello.boot_id.as_str()),
+        );
+        for _ in 0..250 {
+            if status::session_replace_acked(accepted.generation) {
+                break;
+            }
+            embassy_time::block_for(Duration::from_millis(1));
+        }
+        if !status::session_replace_acked(accepted.generation) {
+            return None;
+        }
+        status::mark_transport_changed(transport);
+    } else {
+        let role = match hello.role {
+            session::EndpointRole::Forebrain => 2,
+            session::EndpointRole::Operator => 3,
+            session::EndpointRole::ServiceTool => 4,
+            _ => 0,
+        };
+        status::register_diagnostic_session(session_hash, peer_hash, role);
+    }
+    render_handshake_welcome(
+        buffer,
+        &hello,
+        &accepted,
+        device_id.as_str(),
+        boot_id.as_str(),
+    )
+}
+
+fn render_handshake_reject<'a>(
+    buffer: &'a mut [u8],
+    nonce: &str,
+    reason: session::RejectReason,
+) -> Option<&'a str> {
+    status::mark_session_rejected(reason.code());
+    let mut response = heapless::String::<512>::new();
+    write!(response, "{{\"kind\":\"reject\",\"echoed_handshake_nonce\":\"{nonce}\",\"reason_code\":\"{}\",\"message\":\"handshake rejected\",\"supported_protocol_major\":1,\"supported_minor_min\":0,\"supported_minor_max\":0}}", reason.as_str()).ok()?;
+    copy_response(buffer, response.as_str())
+}
+
+fn render_handshake_welcome<'a>(
+    buffer: &'a mut [u8],
+    hello: &session::Hello,
+    accepted: &session::AcceptedHello,
+    device_id: &str,
+    boot_id: &str,
+) -> Option<&'a str> {
+    let caps = capabilities::current();
+    let snapshot = status::snapshot(Instant::now().as_millis() as u32);
+    let (estop_latched, safety_tripped) = status::session_safety_snapshot();
+    let mut response = heapless::String::<4096>::new();
+    write!(response, "{{\"kind\":\"welcome\",\"role\":\"brainstem\",\"device_id\":\"{device_id}\",\"boot_id\":\"{boot_id}\",\"echoed_handshake_nonce\":\"{}\",\"session_id\":\"{}\",\"protocol_major\":1,\"protocol_minor\":{},\"supported_features\":[\"session_ids\",\"event_cursor\",\"heartbeat\",\"transport_failover\"],\"required_features\":[\"session_ids\"],\"heartbeat_min_ms\":250,\"heartbeat_max_ms\":2000,\"command_ttl_min_ms\":{},\"command_ttl_max_ms\":{},\"current_event_next_seq\":{},\"capability_contract\":{{\"body_kind\":\"{}\",\"drive\":\"{}\",", hello.handshake_nonce, accepted.session_id, accepted.negotiated_minor, caps.min_ttl_ms, caps.max_ttl_ms, snapshot.event_next_seq, caps.body_kind, caps.drive).ok()?;
+    write_json_array(&mut response, "verbs", caps.verbs)?;
+    write_json_array(&mut response, "sensors", caps.sensors)?;
+    write_json_array(&mut response, "outputs", caps.outputs)?;
+    write_json_array(&mut response, "safety", caps.safety)?;
+    write_json_array(&mut response, "events", caps.events)?;
+    let active_motion = snapshot.body_state == status::BodyState::Moving as u8;
+    write!(response, "\"limits\":{{\"max_linear_mm_s\":{},\"max_angular_mrad_s\":{},\"min_ttl_ms\":{},\"max_ttl_ms\":{}}}}},\"software\":{{\"software_name\":\"{}\",\"software_version\":\"{}\",\"build_id\":\"{}\"}},\"safety_snapshot\":{{\"armed\":false,\"estop_latched\":{},\"safety_tripped\":{},\"active_motion\":{},\"runtime_state\":\"{}\"}}}}", caps.max_linear_mm_s, caps.max_angular_mrad_s, caps.min_ttl_ms, caps.max_ttl_ms, caps.firmware_name, caps.firmware_version, option_env!("PETE_BUILD_ID").unwrap_or("development"), estop_latched, safety_tripped, active_motion, if active_motion { "moving" } else { "idle" }).ok()?;
+    copy_response(buffer, response.as_str())
+}
+
+fn write_json_array<const N: usize>(
+    response: &mut heapless::String<N>,
+    key: &str,
+    values: &[&str],
+) -> Option<()> {
+    write!(response, "\"{key}\":[").ok()?;
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            response.push(',').ok()?;
+        }
+        write!(response, "\"{value}\"").ok()?;
+    }
+    response.push_str("],").ok()?;
+    Some(())
+}
+
+fn copy_response<'a>(buffer: &'a mut [u8], response: &str) -> Option<&'a str> {
+    if response.len() > buffer.len() {
+        return None;
+    }
+    buffer[..response.len()].copy_from_slice(response.as_bytes());
+    core::str::from_utf8(&buffer[..response.len()]).ok()
+}
+
+fn render_network_diagnostics(buffer: &mut [u8], now_ms: u32) -> Option<&str> {
+    let diagnostics = network_registry::diagnostics(now_ms);
+    let mut response = heapless::String::<256>::new();
+    write!(
+        response,
+        "{{\"active_leases\":{},\"registration_generation\":{},\"motherbrain_address\":",
+        diagnostics.active_leases, diagnostics.registration_generation
+    )
+    .ok()?;
+    if let Some(ip) = diagnostics.motherbrain_ip {
+        write!(response, "\"{}.{}.{}.{}\"", ip[0], ip[1], ip[2], ip[3]).ok()?;
+    } else {
+        response.push_str("null").ok()?;
+    }
+    response.push('}').ok()?;
+    copy_response(buffer, response.as_str())
+}
+
+fn render_session_diagnostics(buffer: &mut [u8], now_ms: u32) -> Option<&str> {
+    let diagnostics = status::session_diagnostics(now_ms);
+    let mut response = heapless::String::<256>::new();
+    write!(response, "{{\"primary_session_generation\":{},\"diagnostic_sessions\":{},\"authority_generation\":{},\"authority_active\":{}}}", diagnostics.primary_session_generation, diagnostics.diagnostic_sessions, diagnostics.authority_generation, diagnostics.authority_active).ok()?;
+    copy_response(buffer, response.as_str())
+}
+
 fn handle_command_request<'a>(
     request: &[u8],
     buffer: &'a mut [u8],
 ) -> Result<&'a str, CommandParseError> {
     let body = request_body(request).ok_or(CommandParseError::BadRequest)?;
     let command_id = json_u32(body, "command_id").ok_or(CommandParseError::BadRequest)?;
+    if json_str(body, "kind") == Some("register_network_endpoint") {
+        return handle_network_registration_json(body, buffer).ok_or(CommandParseError::BadRequest);
+    }
+    if json_str(body, "kind") == Some("acquire_control_lease") {
+        return handle_authority_json(body, buffer).ok_or(CommandParseError::BadRequest);
+    }
     let command = parse_command(command_id, body).ok_or(CommandParseError::BadRequest)?;
     if matches!(command, BrainstemCommand::Status) {
         let snapshot = status::snapshot(Instant::now().as_millis() as u32);
@@ -1169,7 +1590,21 @@ fn handle_command_request<'a>(
             .ok_or(CommandParseError::BadRequest);
     }
     if matches!(command, BrainstemCommand::Bootsel) {
-        return render_bootsel_response(buffer, command_id).ok_or(CommandParseError::BadRequest);
+        return render_command_response(
+            buffer,
+            false,
+            command_id,
+            "service_authorization_required",
+        )
+        .ok_or(CommandParseError::BadRequest);
+    }
+    if command_requires_session(command) && !json_session_valid(body) {
+        return render_command_response(buffer, false, command_id, "invalid_session")
+            .ok_or(CommandParseError::BadRequest);
+    }
+    if command_requires_authority(command) && !json_authority_valid(body) {
+        return render_command_response(buffer, false, command_id, "invalid_control_lease")
+            .ok_or(CommandParseError::BadRequest);
     }
     if !status::submit_control_command(command_id, command) {
         return Err(CommandParseError::Busy(command_id));
@@ -1179,6 +1614,15 @@ fn handle_command_request<'a>(
 }
 
 fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    if json_str(body, "kind") == Some("hello") {
+        return handle_handshake_json(body, buffer, TransportKind::WebSocket as u8);
+    }
+    if json_str(body, "kind") == Some("register_network_endpoint") {
+        return handle_network_registration_json(body, buffer);
+    }
+    if json_str(body, "kind") == Some("acquire_control_lease") {
+        return handle_authority_json(body, buffer);
+    }
     if json_str(body, "kind") == Some("status") {
         let snapshot = status::snapshot(Instant::now().as_millis() as u32);
         return render_status_websocket_response(snapshot, buffer);
@@ -1200,7 +1644,18 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
         let command_id = json_u32(body, "command_id")?;
         let command = parse_command(command_id, body)?;
         if matches!(command, BrainstemCommand::Bootsel) {
-            return render_bootsel_response(buffer, command_id);
+            return render_command_response(
+                buffer,
+                false,
+                command_id,
+                "service_authorization_required",
+            );
+        }
+        if command_requires_session(command) && !json_session_valid(body) {
+            return render_command_response(buffer, false, command_id, "invalid_session");
+        }
+        if command_requires_authority(command) && !json_authority_valid(body) {
+            return render_command_response(buffer, false, command_id, "invalid_control_lease");
         }
         let accepted = status::submit_control_command(command_id, command);
         if accepted {
@@ -1218,7 +1673,18 @@ fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     let command_id = json_u32(body, "command_id")?;
     let command = parse_command(command_id, body)?;
     if matches!(command, BrainstemCommand::Bootsel) {
-        return render_bootsel_response(buffer, command_id);
+        return render_command_response(
+            buffer,
+            false,
+            command_id,
+            "service_authorization_required",
+        );
+    }
+    if command_requires_session(command) && !json_session_valid(body) {
+        return render_command_response(buffer, false, command_id, "invalid_session");
+    }
+    if command_requires_authority(command) && !json_authority_valid(body) {
+        return render_command_response(buffer, false, command_id, "invalid_control_lease");
     }
     if !status::submit_control_command(command_id, command) {
         return render_command_response(buffer, false, command_id, "busy");
@@ -1263,7 +1729,39 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
         }
     };
 
-    let (seq, command) = match parse_forebrain_uart_command(line) {
+    if let Some(body) = line.strip_prefix("HELLO ") {
+        let mut response = [0u8; 4096];
+        if let Some(welcome) =
+            handle_handshake_json(body, &mut response, TransportKind::HardwareUart as u8)
+        {
+            let prefix = if welcome.contains("\"kind\":\"reject\"") {
+                b"REJECT ".as_slice()
+            } else {
+                b"WELCOME ".as_slice()
+            };
+            write_forebrain_uart_line(uart, prefix);
+            write_forebrain_uart_line(uart, welcome.as_bytes());
+            write_forebrain_uart_line(uart, b"\n");
+        } else {
+            write_forebrain_uart_line(uart, b"ERR 0 handshake\n");
+        }
+        return;
+    }
+    if line.starts_with("REGISTER_NETWORK_ENDPOINT ") {
+        let mut response = heapless::String::<512>::new();
+        handle_network_registration_compact(line, &mut response);
+        write_forebrain_uart_line(uart, response.as_bytes());
+        return;
+    }
+    if line.starts_with("ACQUIRE_CONTROL_LEASE ") {
+        let mut response = heapless::String::<512>::new();
+        handle_authority_compact(line, &mut response);
+        write_forebrain_uart_line(uart, response.as_bytes());
+        return;
+    }
+
+    let (command_line, session_id, lease_id) = compact_envelope(line);
+    let (seq, command) = match parse_forebrain_uart_command(command_line) {
         Ok(parsed) => parsed,
         Err(seq) => {
             status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Parse);
@@ -1275,8 +1773,8 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
 
     status::mark_forebrain_uart_command(seq, Instant::now().as_millis() as u32);
     if matches!(command, BrainstemCommand::Bootsel) {
-        write_forebrain_uart_ok(uart, seq);
-        reset_to_usb_boot(0, 0);
+        write_forebrain_uart_error(uart, seq, "service_authorization_required");
+        return;
     }
     if matches!(command, BrainstemCommand::GetCapabilities) {
         write_forebrain_uart_capabilities(uart, seq);
@@ -1284,6 +1782,16 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
     }
     if let BrainstemCommand::GetEvents { since_seq } = command {
         write_forebrain_uart_events(uart, seq, since_seq);
+        return;
+    }
+    if command_requires_session(command) && !session_id.is_some_and(compact_session_valid) {
+        write_forebrain_uart_error(uart, seq, "invalid_session");
+        return;
+    }
+    if command_requires_authority(command)
+        && !compact_authority_valid(command, session_id, lease_id)
+    {
+        write_forebrain_uart_error(uart, seq, "invalid_control_lease");
         return;
     }
 
@@ -1558,12 +2066,37 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
     Ok((seq, command))
 }
 
-fn handle_udp_control_line<const N: usize>(
+fn handle_compact_control_line<const N: usize>(
     line: &str,
     response: &mut heapless::String<N>,
+    transport: u8,
 ) -> Option<bool> {
     response.clear();
-    let (seq, command) = match parse_forebrain_uart_command(line) {
+    if let Some(body) = line.strip_prefix("HELLO ") {
+        let mut buffer = [0u8; 4096];
+        if let Some(welcome) = handle_handshake_json(body, &mut buffer, transport) {
+            let prefix = if welcome.contains("\"kind\":\"reject\"") {
+                "REJECT "
+            } else {
+                "WELCOME "
+            };
+            response.push_str(prefix).ok()?;
+            response.push_str(welcome).ok()?;
+            response.push('\n').ok()?;
+            return Some(false);
+        }
+        return None;
+    }
+    if line.starts_with("REGISTER_NETWORK_ENDPOINT ") {
+        handle_network_registration_compact(line, response);
+        return Some(false);
+    }
+    if line.starts_with("ACQUIRE_CONTROL_LEASE ") {
+        handle_authority_compact(line, response);
+        return Some(false);
+    }
+    let (command_line, session_id, lease_id) = compact_envelope(line);
+    let (seq, command) = match parse_forebrain_uart_command(command_line) {
         Ok(parsed) => parsed,
         Err(seq) => {
             let _ = writeln!(response, "ERR {seq} parse");
@@ -1586,10 +2119,20 @@ fn handle_udp_control_line<const N: usize>(
             Some(false)
         }
         BrainstemCommand::Bootsel => {
-            let _ = writeln!(response, "OK {seq} bootsel");
-            Some(true)
+            let _ = writeln!(response, "ERR {seq} service_authorization_required");
+            Some(false)
         }
         command => {
+            if command_requires_session(command) && !session_id.is_some_and(compact_session_valid) {
+                let _ = writeln!(response, "ERR {seq} invalid_session");
+                return Some(false);
+            }
+            if command_requires_authority(command)
+                && !compact_authority_valid(command, session_id, lease_id)
+            {
+                let _ = writeln!(response, "ERR {seq} invalid_control_lease");
+                return Some(false);
+            }
             if status::submit_control_command(seq, command) {
                 let _ = writeln!(response, "OK {seq}");
             } else {
@@ -1597,6 +2140,282 @@ fn handle_udp_control_line<const N: usize>(
             }
             Some(false)
         }
+    }
+}
+
+fn command_requires_session(command: BrainstemCommand) -> bool {
+    !matches!(
+        command,
+        BrainstemCommand::Status
+            | BrainstemCommand::Ping
+            | BrainstemCommand::GetCapabilities
+            | BrainstemCommand::GetEvents { .. }
+            | BrainstemCommand::Stop
+            | BrainstemCommand::EStop
+    )
+}
+fn command_requires_authority(command: BrainstemCommand) -> bool {
+    command_requires_session(command) && !matches!(command, BrainstemCommand::Disarm)
+}
+
+fn json_session_valid(body: &str) -> bool {
+    json_str(body, "session_id").is_some_and(compact_session_valid)
+}
+fn json_authority_valid(body: &str) -> bool {
+    let Some(session_id) = json_str(body, "session_id") else {
+        return false;
+    };
+    let Some(lease_id) = json_str(body, "lease_id") else {
+        return false;
+    };
+    let session_hash = session::token_hash(session_id);
+    let lease_hash = session::token_hash(lease_id);
+    let now = Instant::now().as_millis() as u32;
+    if json_str(body, "kind") == Some("heartbeat_stop") {
+        status::refresh_authority_heartbeat(
+            session_hash,
+            lease_hash,
+            now,
+            json_u32(body, "timeout_ms").unwrap_or(1_000),
+        )
+    } else {
+        status::active_authority_matches(session_hash, lease_hash, now)
+    }
+}
+fn compact_authority_valid(
+    command: BrainstemCommand,
+    session_id: Option<&str>,
+    lease_id: Option<&str>,
+) -> bool {
+    match (session_id, lease_id) {
+        (Some(session_id), Some(lease)) => {
+            let session_hash = session::token_hash(session_id);
+            let lease_hash = session::token_hash(lease);
+            let now = Instant::now().as_millis() as u32;
+            if let BrainstemCommand::HeartbeatStop { timeout_ms, .. } = command {
+                status::refresh_authority_heartbeat(session_hash, lease_hash, now, timeout_ms)
+            } else {
+                status::active_authority_matches(session_hash, lease_hash, now)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn compact_session_valid(session_id: &str) -> bool {
+    status::active_session_matches(session::token_hash(session_id))
+}
+
+fn compact_session(line: &str) -> (&str, Option<&str>) {
+    let (command, session, _) = compact_envelope(line);
+    (command, session)
+}
+fn compact_envelope(line: &str) -> (&str, Option<&str>, Option<&str>) {
+    let (without_lease, lease) = match line.rsplit_once(" lease_id=") {
+        Some((command, lease)) if !lease.contains(' ') => (command, Some(lease)),
+        _ => (line, None),
+    };
+    match without_lease.rsplit_once(" session_id=") {
+        Some((command, session_id)) if !session_id.contains(' ') => {
+            (command, Some(session_id), lease)
+        }
+        _ => (without_lease, None, lease),
+    }
+}
+
+fn handle_network_registration_json<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    let session_id = json_str(body, "session_id")?;
+    let device_id = json_str(body, "device_id")?;
+    let session_hash = session::token_hash(session_id);
+    let device_hash = session::token_hash(device_id);
+    if !compact_session_valid(session_id)
+        || status::session_role(session_hash) != Some(1)
+        || !status::session_peer_matches(session_hash, device_hash)
+        || json_str(body, "role") != Some("motherbrain")
+        || json_str(body, "hostname") != Some("motherbrain")
+    {
+        return render_registration_reject(buffer, "invalid_session_or_identity");
+    }
+    let address = parse_ipv4(json_str(body, "address")?)?;
+    let lease_identity = json_str(body, "lease_identity")?;
+    let ttl = json_u32(body, "ttl_seconds")
+        .unwrap_or(60)
+        .clamp(1, DHCP_LEASE_SECONDS);
+    let Some((ttl, generation)) = network_registry::register_motherbrain(
+        lease_identity.as_bytes(),
+        address,
+        ttl,
+        Instant::now().as_millis() as u32,
+    ) else {
+        return render_registration_reject(buffer, "lease_mismatch");
+    };
+    let mut response = heapless::String::<512>::new();
+    write!(response, "{{\"accepted\":true,\"session_id\":\"{session_id}\",\"fqdn\":\"motherbrain.pete.internal\",\"address\":\"{}.{}.{}.{}\",\"ttl_seconds\":{ttl},\"registration_generation\":{generation}}}", address[0], address[1], address[2], address[3]).ok()?;
+    copy_response(buffer, response.as_str())
+}
+
+fn render_registration_reject<'a>(buffer: &'a mut [u8], reason: &str) -> Option<&'a str> {
+    let mut response = heapless::String::<192>::new();
+    write!(response, "{{\"accepted\":false,\"message\":\"{reason}\"}}").ok()?;
+    copy_response(buffer, response.as_str())
+}
+
+fn handle_network_registration_compact<const N: usize>(
+    line: &str,
+    response: &mut heapless::String<N>,
+) {
+    response.clear();
+    let (command, session_id) = compact_session(line);
+    let mut fields = command.split_ascii_whitespace();
+    let valid = fields.next() == Some("REGISTER_NETWORK_ENDPOINT");
+    let seq = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let role = fields.next();
+    let device_id = fields.next();
+    let _interface_id = fields.next();
+    let address_text = fields.next();
+    let hostname = fields.next();
+    let lease_identity = fields.next();
+    let ttl = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(60);
+    let Some(address) = address_text.and_then(parse_ipv4) else {
+        let _ = writeln!(response, "ERR {seq} malformed_registration");
+        return;
+    };
+    if !valid
+        || role != Some("motherbrain")
+        || hostname != Some("motherbrain")
+        || !session_id.is_some_and(compact_session_valid)
+        || !device_id.is_some_and(|id| {
+            let session_hash = session::token_hash(session_id.unwrap_or(""));
+            status::session_role(session_hash) == Some(1)
+                && status::session_peer_matches(session_hash, session::token_hash(id))
+        })
+    {
+        let _ = writeln!(response, "ERR {seq} invalid_session_or_identity");
+        return;
+    }
+    let Some((ttl, generation)) = lease_identity.and_then(|identity| {
+        network_registry::register_motherbrain(
+            identity.as_bytes(),
+            address,
+            ttl,
+            Instant::now().as_millis() as u32,
+        )
+    }) else {
+        let _ = writeln!(response, "ERR {seq} lease_mismatch");
+        return;
+    };
+    let _ = writeln!(response, "OK {seq} NETWORK_ENDPOINT_REGISTERED session_id={} fqdn=motherbrain.pete.internal address={}.{}.{}.{} ttl={} generation={}", session_id.unwrap_or(""), address[0], address[1], address[2], address[3], ttl, generation);
+}
+
+fn parse_ipv4(value: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut parts = value.split('.');
+    for octet in &mut octets {
+        *octet = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(octets)
+}
+
+fn handle_authority_json<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    let session_id = json_str(body, "session_id")?;
+    let authority = json_str(body, "authority")?;
+    let ttl_ms = json_u32(body, "ttl_ms").unwrap_or(2_000).clamp(250, 60_000);
+    let session_hash = session::token_hash(session_id);
+    if !authority_policy_allows(session_hash, authority, Instant::now().as_millis() as u32) {
+        return render_registration_reject(buffer, "authority_policy_rejected");
+    }
+    let (lease_id, generation) = install_authority(session_hash, ttl_ms)?;
+    let mut response = heapless::String::<512>::new();
+    write!(response, "{{\"accepted\":true,\"type\":\"control_lease_granted\",\"lease_id\":\"{lease_id}\",\"session_id\":\"{session_id}\",\"owner_role\":\"{}\",\"authority\":\"{authority}\",\"ttl_ms\":{ttl_ms},\"generation\":{generation}}}", role_name(status::session_role(session_hash)?)).ok()?;
+    copy_response(buffer, response.as_str())
+}
+
+fn handle_authority_compact<const N: usize>(line: &str, response: &mut heapless::String<N>) {
+    response.clear();
+    let (command, session_id) = compact_session(line);
+    let mut fields = command.split_ascii_whitespace();
+    let valid = fields.next() == Some("ACQUIRE_CONTROL_LEASE");
+    let seq = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let authority = fields.next().unwrap_or("");
+    let ttl_ms = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(2_000)
+        .clamp(250, 60_000);
+    let Some(session_id) = session_id else {
+        let _ = writeln!(response, "ERR {seq} invalid_session");
+        return;
+    };
+    let session_hash = session::token_hash(session_id);
+    if !valid
+        || !authority_policy_allows(session_hash, authority, Instant::now().as_millis() as u32)
+    {
+        let _ = writeln!(response, "ERR {seq} authority_policy_rejected");
+        return;
+    }
+    let Some((lease_id, generation)) = install_authority(session_hash, ttl_ms) else {
+        let _ = writeln!(response, "ERR {seq} authority_transition_timeout");
+        return;
+    };
+    let _ = writeln!(response, "OK {seq} CONTROL_LEASE_GRANTED lease_id={lease_id} session_id={session_id} owner_role={} authority={authority} ttl_ms={ttl_ms} generation={generation}", role_name(status::session_role(session_hash).unwrap_or(0)));
+}
+
+fn authority_policy_allows(session_hash: u32, authority: &str, now_ms: u32) -> bool {
+    match (status::session_role(session_hash), authority) {
+        (Some(1), "motherbrain") => true,
+        (Some(3), "operator_debug") => cfg!(feature = "operator-debug"),
+        (Some(2), "forebrain_recovery") => {
+            status::authority_expired(now_ms)
+                && option_env!("PETE_RECOVERY_FOREBRAIN_ID").is_some_and(|device_id| {
+                    status::session_peer_matches(session_hash, session::token_hash(device_id))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn install_authority(session_hash: u32, ttl_ms: u32) -> Option<(heapless::String<40>, u32)> {
+    let generation = AUTHORITY_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1);
+    let mut lease_id = heapless::String::<40>::new();
+    write!(lease_id, "lease-{generation:08x}-{session_hash:08x}").ok()?;
+    let now = Instant::now().as_millis() as u32;
+    status::request_authority_transition(
+        generation,
+        session::token_hash(lease_id.as_str()),
+        session_hash,
+        now.wrapping_add(ttl_ms),
+    );
+    for _ in 0..250 {
+        if status::authority_transition_acked(generation) {
+            return Some((lease_id, generation));
+        }
+        embassy_time::block_for(Duration::from_millis(1));
+    }
+    None
+}
+
+fn role_name(role: u8) -> &'static str {
+    match role {
+        1 => "motherbrain",
+        2 => "forebrain",
+        3 => "operator",
+        4 => "service_tool",
+        _ => "unknown",
     }
 }
 
@@ -1695,12 +2514,6 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.imu_motion_consistency,
         snapshot.imu_calibration_state
     );
-}
-
-fn render_bootsel_response(buffer: &mut [u8], command_id: u32) -> Option<&str> {
-    let body = render_command_response(buffer, true, command_id, "bootsel")?;
-    reset_to_usb_boot(0, 0);
-    Some(body)
 }
 
 fn write_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
@@ -2342,37 +3155,77 @@ fn json_i32(body: &str, key: &str) -> Option<i32> {
     value[..end].parse().ok()
 }
 
-fn build_mdns_announcement(packet: &mut [u8; 96]) -> usize {
-    let mut i = 0;
-    let header = [
-        0x00, 0x00, // transaction id
-        0x84, 0x00, // response, authoritative answer
-        0x00, 0x00, // questions
-        0x00, 0x01, // answers
-        0x00, 0x00, // authority records
-        0x00, 0x00, // additional records
-    ];
-    packet[i..i + header.len()].copy_from_slice(&header);
-    i += header.len();
-    packet[i..i + MDNS_NAME.len()].copy_from_slice(MDNS_NAME);
-    i += MDNS_NAME.len();
-    let answer = [
-        0x00, 0x01, // A
-        0x80, 0x01, // IN, cache flush
-        0x00, 0x00, 0x00, 0x78, // TTL 120s
-        0x00, 0x04, // IPv4 length
-        192, 168, 4, 1,
-    ];
-    packet[i..i + answer.len()].copy_from_slice(&answer);
-    i + answer.len()
+fn build_mdns_announcement(packet: &mut [u8; 768]) -> usize {
+    packet.fill(0);
+    packet[2..4].copy_from_slice(&[0x84, 0x00]);
+    packet[6..8].copy_from_slice(&9u16.to_be_bytes());
+    let mut i = 12;
+    i = mdns_a(packet, i, MDNS_NAME, AP_IP_OCTETS).unwrap_or(12);
+    for (service, port) in [
+        (
+            b"\x0f_pete-brainstem\x04_tcp\x05local\x00".as_slice(),
+            HTTP_PORT,
+        ),
+        (
+            b"\x0b_pete-debug\x04_tcp\x05local\x00".as_slice(),
+            HTTP_PORT,
+        ),
+        (
+            b"\x0d_pete-control\x04_tcp\x05local\x00".as_slice(),
+            WS_CONTROL_PORT,
+        ),
+        (
+            b"\x0d_pete-control\x04_udp\x05local\x00".as_slice(),
+            UDP_CONTROL_PORT,
+        ),
+    ] {
+        let mut instance = heapless::Vec::<u8, 64>::new();
+        let _ = instance.extend_from_slice(b"\x09brainstem");
+        let _ = instance.extend_from_slice(service);
+        i = mdns_ptr(packet, i, service, &instance).unwrap_or(i);
+        i = mdns_srv(packet, i, &instance, port, MDNS_NAME).unwrap_or(i);
+    }
+    i
+}
+
+fn mdns_a(packet: &mut [u8], mut i: usize, name: &[u8], ip: [u8; 4]) -> Option<usize> {
+    i = put_bytes(packet, i, name)?;
+    i = put_bytes(packet, i, &[0, 1, 0x80, 1, 0, 0, 0, 120, 0, 4])?;
+    put_bytes(packet, i, &ip)
+}
+fn mdns_ptr(packet: &mut [u8], mut i: usize, name: &[u8], target: &[u8]) -> Option<usize> {
+    i = put_bytes(packet, i, name)?;
+    i = put_bytes(packet, i, &[0, 12, 0, 1, 0, 0, 0, 120])?;
+    i = put_bytes(packet, i, &(target.len() as u16).to_be_bytes())?;
+    put_bytes(packet, i, target)
+}
+fn mdns_srv(
+    packet: &mut [u8],
+    mut i: usize,
+    name: &[u8],
+    port: u16,
+    target: &[u8],
+) -> Option<usize> {
+    i = put_bytes(packet, i, name)?;
+    i = put_bytes(packet, i, &[0, 33, 0x80, 1, 0, 0, 0, 120])?;
+    i = put_bytes(packet, i, &((6 + target.len()) as u16).to_be_bytes())?;
+    i = put_bytes(packet, i, &[0, 0, 0, 0])?;
+    i = put_bytes(packet, i, &port.to_be_bytes())?;
+    put_bytes(packet, i, target)
+}
+fn put_bytes(packet: &mut [u8], offset: usize, bytes: &[u8]) -> Option<usize> {
+    let end = offset.checked_add(bytes.len())?;
+    packet.get_mut(offset..end)?.copy_from_slice(bytes);
+    Some(end)
 }
 
 fn build_dns_reply<'a>(query: &[u8], response: &'a mut [u8; 512]) -> Option<&'a [u8]> {
     let question = parse_dns_question(query)?;
-    if !dns_name_matches_pete(&query[12..question.name_end])
-        || !matches!(question.qtype, 1 | 255)
-        || !matches!(question.qclass, 1 | 255)
-    {
+    let answer_ip = dns_answer_ip(
+        &query[12..question.name_end],
+        Instant::now().as_millis() as u32,
+    )?;
+    if !matches!(question.qtype, 1 | 255) || !matches!(question.qclass, 1 | 255) {
         return None;
     }
 
@@ -2402,10 +3255,10 @@ fn build_dns_reply<'a>(query: &[u8], response: &'a mut [u8; 512]) -> Option<&'a 
         0x3c, // TTL 60s
         0x00,
         0x04, // IPv4 length
-        AP_IP_OCTETS[0],
-        AP_IP_OCTETS[1],
-        AP_IP_OCTETS[2],
-        AP_IP_OCTETS[3],
+        answer_ip[0],
+        answer_ip[1],
+        answer_ip[2],
+        answer_ip[3],
     ];
     if i + answer.len() > response.len() {
         return None;
@@ -2460,11 +3313,29 @@ fn parse_dns_question(packet: &[u8]) -> Option<DnsQuestion> {
     })
 }
 
-fn dns_name_matches_pete(name: &[u8]) -> bool {
-    name.len() == MDNS_NAME.len()
-        && name
+fn dns_answer_ip(name: &[u8], now_ms: u32) -> Option<[u8; 4]> {
+    const PETE_INTERNAL: &[u8] = b"\x04pete\x08internal\x00";
+    const BRAINSTEM_INTERNAL: &[u8] = b"\x09brainstem\x04pete\x08internal\x00";
+    const GATEWAY_INTERNAL: &[u8] = b"\x07gateway\x04pete\x08internal\x00";
+    const MOTHERBRAIN_INTERNAL: &[u8] = b"\x0bmotherbrain\x04pete\x08internal\x00";
+    if dns_name_eq(name, PETE_INTERNAL)
+        || dns_name_eq(name, BRAINSTEM_INTERNAL)
+        || dns_name_eq(name, GATEWAY_INTERNAL)
+        || dns_name_eq(name, MDNS_NAME)
+    {
+        return Some(AP_IP_OCTETS);
+    }
+    if dns_name_eq(name, MOTHERBRAIN_INTERNAL) {
+        return network_registry::resolve_motherbrain(now_ms);
+    }
+    None
+}
+
+fn dns_name_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
             .iter()
-            .zip(MDNS_NAME.iter())
+            .zip(right)
             .all(|(left, right)| dns_byte_eq(*left, *right))
 }
 
@@ -2513,14 +3384,20 @@ impl DhcpRequest {
         let mut hardware_address = [0; 6];
         hardware_address.copy_from_slice(&packet[28..34]);
 
+        let client_identifier = dhcp_option(packet, 61).unwrap_or(&[]);
+        let requested_hostname = dhcp_option(packet, 12).unwrap_or(&[]);
         Some(Self::new(
             dhcp_message_type(packet)?,
-            DhcpClient::new(hardware_address),
+            DhcpClient::new(hardware_address).with_metadata(client_identifier, requested_hostname),
         ))
     }
 }
 
 fn dhcp_message_type(packet: &[u8]) -> Option<u8> {
+    dhcp_option(packet, 53).and_then(|value| (value.len() == 1).then_some(value[0]))
+}
+
+fn dhcp_option(packet: &[u8], wanted: u8) -> Option<&[u8]> {
     if packet.len() < 240 || packet[236..240] != [99, 130, 83, 99] {
         return None;
     }
@@ -2541,8 +3418,8 @@ fn dhcp_message_type(packet: &[u8]) -> Option<u8> {
                 if i + len > packet.len() {
                     return None;
                 }
-                if option == 53 && len == 1 {
-                    return Some(packet[i]);
+                if option == wanted {
+                    return Some(&packet[i..i + len]);
                 }
                 i += len;
             }

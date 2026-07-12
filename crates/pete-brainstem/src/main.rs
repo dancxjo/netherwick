@@ -10,7 +10,9 @@ mod dhcp;
 mod drivers;
 mod events;
 mod hardware;
+mod network_registry;
 mod runtime;
+mod session;
 mod status;
 
 #[cfg(not(test))]

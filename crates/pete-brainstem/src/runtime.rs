@@ -9,6 +9,7 @@ use crate::commands::{
 use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::BrainstemHardware;
+use crate::network_registry;
 use crate::status::{self, BodyState, RuntimeActionCode, RuntimeState};
 
 const EVENT_QUEUE_CAPACITY: usize = 16;
@@ -191,6 +192,13 @@ where
             self.enter_error(error);
             return;
         }
+        if status::take_expired_authority(self.now_ms()) {
+            self.interrupt_active_command();
+            self.commands.clear();
+            self.active = ActiveAction::None;
+            self.heartbeat_stop_at_ms = None;
+            let _ = self.stop_drive();
+        }
 
         match self.mode {
             RuntimeMode::Running => {
@@ -213,9 +221,46 @@ where
     }
 
     fn poll(&mut self) {
+        self.poll_session_replace();
+        self.poll_authority_transition();
         self.timers.poll(&mut self.hardware, &mut self.events);
         self.create_uart.poll(&mut self.hardware, &mut self.events);
         self.poll_control_command();
+    }
+
+    fn poll_authority_transition(&mut self) {
+        let Some(generation) = status::pending_authority_transition() else {
+            return;
+        };
+        self.interrupt_active_command();
+        self.commands.clear();
+        self.active = ActiveAction::None;
+        self.heartbeat_stop_at_ms = None;
+        let _ = self.stop_drive();
+        status::set_command(None);
+        status::set_runtime_state(RuntimeState::Idle);
+        status::set_body_state(BodyState::Idle);
+        status::acknowledge_authority_transition(generation);
+    }
+
+    fn poll_session_replace(&mut self) {
+        let Some(generation) = status::pending_session_replace() else {
+            return;
+        };
+        self.interrupt_active_command();
+        self.commands.clear();
+        self.active = ActiveAction::None;
+        self.heartbeat_stop_at_ms = None;
+        self.sensor_stream = None;
+        network_registry::clear_motherbrain_registration();
+        let _ = self.stop_drive();
+        status::set_command(None);
+        status::set_runtime_state(RuntimeState::Idle);
+        status::set_body_state(BodyState::Idle);
+        status::set_session_safety_snapshot(self.estop_latched, self.safety_latched);
+        // The session module supplies the pending hash before requesting the
+        // barrier. Until it is wired, generation itself is a fail-closed token.
+        status::acknowledge_session_replace(generation, status::pending_session_hash());
     }
 
     fn poll_control_command(&mut self) {
@@ -1311,6 +1356,7 @@ where
             self.commands.clear();
             self.active = ActiveAction::None;
             self.heartbeat_stop_at_ms = None;
+            status::revoke_authority();
             status::mark_heartbeat_expired();
             status::mark_safety_tripped(status::SafetyEventKind::Heartbeat);
             self.stop_drive()?;
@@ -1894,6 +1940,7 @@ mod tests {
     fn runtime_poll_imu_sample_updates_status() {
         let _guard = status::status_test_guard();
         status::clear_imu_orientation_calibration();
+        let previous_samples = status::snapshot(1_000).imu_sample_count;
         let mut runtime = Runtime::new(FakeHardware::with_imu_sample(
             1_000,
             ImuSample {
@@ -1907,7 +1954,7 @@ mod tests {
 
         let snapshot = status::snapshot(1_000);
         assert_eq!(snapshot.imu_health, status::ImuHealthCode::Ok as u8);
-        assert_eq!(snapshot.imu_sample_count, 1);
+        assert_eq!(snapshot.imu_sample_count, previous_samples.wrapping_add(1));
         assert_eq!(snapshot.imu_yaw_rate_mrad_s, 500);
     }
 

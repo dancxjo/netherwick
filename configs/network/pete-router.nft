@@ -1,0 +1,37 @@
+flush ruleset
+
+define external_if = "wlan0"
+define brainstem_if = "wlan1"
+define interbrain_if = "eth0"
+define brainstem_net = 192.168.4.0/24
+define interbrain_net = 10.42.0.0/24
+
+table inet pete {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        iifname $interbrain_if ip saddr $interbrain_net accept
+        iifname $brainstem_if ip saddr $brainstem_net udp dport { 53, 5353 } accept
+        iifname $brainstem_if ip saddr $brainstem_net tcp dport { 80, 81 } accept
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        # Forebrain discovery, diagnostics, handshake, and policy-governed
+        # recovery. Protocol authorization still occurs at the brainstem.
+        iifname $interbrain_if oifname $brainstem_if ip daddr $brainstem_net udp dport { 53, 82, 5353 } accept
+        iifname $interbrain_if oifname $brainstem_if ip daddr $brainstem_net tcp dport { 80, 81 } accept
+        # Internet access for interbrain nodes is routed/NATed, not bridged.
+        iifname $interbrain_if oifname $external_if ip saddr $interbrain_net accept
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname $external_if ip saddr $interbrain_net masquerade
+    }
+}
+

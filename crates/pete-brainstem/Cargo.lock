@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -526,6 +538,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "embassy-usb"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a25746d8b152b72fbf2a217f489a083dbbe243f281f09184a1f2cfbe9bbb245f"
+dependencies = [
+ "bitflags 2.13.0",
+ "embassy-futures",
+ "embassy-net-driver-channel",
+ "embassy-sync",
+ "embassy-time",
+ "embassy-usb-driver",
+ "embedded-io-async 0.7.0",
+ "heapless 0.9.3",
+ "ssmarshal",
+ "usbd-hid",
+]
+
+[[package]]
 name = "embassy-usb-driver"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,6 +681,12 @@ checksum = "eabffdaee24bd1bf95c5ef7cec31260444317e72ea56c4c91750e8b7ee58d5f1"
 dependencies = [
  "log",
 ]
+
+[[package]]
+name = "encode_unicode"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a357d28ed41a50f9c765dbfe56cbc04a64e53e5fc58ba79fbc34c10ef3df831f"
 
 [[package]]
 name = "equivalent"
@@ -867,6 +903,15 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43a3c133739dddd0d2990f9a4bdf8eb4b21ef50e4851ca85ab661199821d510e"
+dependencies = [
+ "ahash",
+]
+
+[[package]]
+name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
@@ -905,7 +950,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1148,6 +1193,7 @@ dependencies = [
  "embassy-net",
  "embassy-rp",
  "embassy-time",
+ "embassy-usb",
  "embedded-hal 1.0.0",
  "embedded-hal-nb",
  "embedded-io-async 0.7.0",
@@ -1155,13 +1201,22 @@ dependencies = [
  "heapless 0.8.0",
  "nb 1.1.0",
  "panic-halt",
+ "pete-cockpit-protocol",
  "portable-atomic",
+ "rp-pac",
  "rp2040-boot2",
  "rp2040-hal",
  "serde",
  "serde-json-core",
  "static_cell",
  "toml",
+]
+
+[[package]]
+name = "pete-cockpit-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -1625,6 +1680,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssmarshal"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3e6ad23b128192ed337dfa4f1b8099ced0c2bf30d61e551b65fda5916dbb850"
+dependencies = [
+ "encode_unicode",
+ "serde",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1840,6 +1905,41 @@ checksum = "98816b1accafbb09085168b90f27e93d790b4bfa19d883466b5e53315b5f06a6"
 dependencies = [
  "heapless 0.8.0",
  "portable-atomic",
+]
+
+[[package]]
+name = "usbd-hid"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68beab087e4971a2fe76f631478b0e91d39593f58efd2775026ce6dc07a7bac6"
+dependencies = [
+ "usb-device",
+ "usbd-hid-macros",
+]
+
+[[package]]
+name = "usbd-hid-descriptors"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b297f021719c4308d5d0c61b6c1e7c6b3ba383deba774b49aa5484f996bdb8f1"
+dependencies = [
+ "bitfield 0.14.0",
+]
+
+[[package]]
+name = "usbd-hid-macros"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "011a3219e0933f5b3ad7dc90d9a66541a967d084c98c067deed1cd608e557ed7"
+dependencies = [
+ "byteorder",
+ "hashbrown 0.13.2",
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.118",
+ "usbd-hid-descriptors",
 ]
 
 [[package]]

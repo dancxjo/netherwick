@@ -325,6 +325,13 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
     );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let memory_layout = manifest_dir.join("memory.x");
+    fs::copy(&memory_layout, out_dir.join("memory.x")).unwrap();
+    println!("cargo:rerun-if-changed={}", memory_layout.display());
+    println!("cargo:rustc-link-search={}", out_dir.display());
+    if env::var("TARGET").as_deref() == Ok("thumbv6m-none-eabi") {
+        println!("cargo:rustc-link-arg=-Tlink.x");
+    }
     fs::write(out_dir.join("body_config.rs"), generated).unwrap();
 }
 

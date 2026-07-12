@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use pete_body::{BodySense, CliffSensors};
 use pete_cockpit::{
-    mrad_s_to_radians_per_second, mm_s_to_meters_per_second, Cockpit, CockpitCapabilities,
+    mm_s_to_meters_per_second, mrad_s_to_radians_per_second, Cockpit, CockpitCapabilities,
     CockpitRequest, CockpitResponse, CockpitStatus, EventBatch, MotionCommand,
 };
 use pete_now::{
@@ -10,9 +10,7 @@ use pete_now::{
     KinectSkeletonSense, ObjectClass, ObjectObservation, ObjectObservationSource, ObjectSense,
     RangeSense, VectorArtifact, VoiceSense, OBJECT_VECTOR_COLLECTION,
 };
-use pete_sensors::{
-    EyeFrame, EyeFrameFormat, PcmAudioFrame, World, WorldSnapshot, WorldUpdate,
-};
+use pete_sensors::{EyeFrame, EyeFrameFormat, PcmAudioFrame, World, WorldSnapshot, WorldUpdate};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -129,6 +127,7 @@ pub struct VirtualWorld {
 #[derive(Clone, Debug)]
 pub struct SimCockpit {
     state: Arc<Mutex<VirtualWorldState>>,
+    protocol: Arc<Mutex<pete_cockpit::SimCockpit>>,
 }
 
 impl VirtualWorld {
@@ -153,7 +152,10 @@ impl VirtualWorld {
             Self {
                 state: Arc::clone(&state),
             },
-            SimCockpit { state },
+            SimCockpit {
+                state,
+                protocol: Arc::new(Mutex::new(pete_cockpit::SimCockpit::new())),
+            },
         )
     }
 
@@ -408,6 +410,32 @@ impl Cockpit for SimCockpit {
         }
     }
 
+    fn handshake(
+        &mut self,
+        hello: pete_cockpit::HandshakeHello,
+    ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+        self.protocol
+            .lock()
+            .expect("sim protocol mutex poisoned")
+            .handshake(hello)
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &pete_cockpit::CockpitSession,
+        request: CockpitRequest,
+    ) -> pete_cockpit::Result<CockpitResponse> {
+        let protocol_response = self
+            .protocol
+            .lock()
+            .expect("sim protocol mutex poisoned")
+            .execute_in_session(session, request.clone())?;
+        if matches!(request, CockpitRequest::RegisterNetworkEndpoint(_)) {
+            return Ok(protocol_response);
+        }
+        self.execute(request)
+    }
+
     fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
         let body = self
             .state
@@ -449,10 +477,20 @@ impl Cockpit for SimCockpit {
         Ok(CockpitCapabilities {
             body_kind: "sim".to_string(),
             drive: "differential".to_string(),
-            verbs: ["ping", "status", "get_capabilities", "get_events", "arm", "disarm", "stop", "cmd_vel", "heartbeat_stop"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            verbs: [
+                "ping",
+                "status",
+                "get_capabilities",
+                "get_events",
+                "arm",
+                "disarm",
+                "stop",
+                "cmd_vel",
+                "heartbeat_stop",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
             sensors: ["bump", "cliff", "wheel_drop", "wall", "battery", "odometry"]
                 .into_iter()
                 .map(str::to_string)
@@ -1110,7 +1148,8 @@ mod tests {
         }
 
         let body = motor
-            .apply_motion(MotionCommand::Forward { speed_m_s: 1.0 }).unwrap();
+            .apply_motion(MotionCommand::Forward { speed_m_s: 1.0 })
+            .unwrap();
 
         assert!(body.odometry.x_m >= 0.2 - f32::EPSILON);
         assert!(body.flags.bump_left && body.flags.bump_right);
@@ -1144,7 +1183,8 @@ mod tests {
         }
 
         let body = motor
-            .apply_motion(MotionCommand::Forward { speed_m_s: 2.0 }).unwrap();
+            .apply_motion(MotionCommand::Forward { speed_m_s: 2.0 })
+            .unwrap();
 
         assert!(body.odometry.x_m < 0.8);
         assert!(body.flags.bump_left || body.flags.bump_right);

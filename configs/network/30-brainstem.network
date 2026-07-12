@@ -1,0 +1,15 @@
+[Match]
+Name=wlan1
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+IPForward=yes
+
+[DHCPv4]
+RouteMetric=500
+UseDNS=no
+ClientIdentifier=duid
+SendHostname=yes
+Hostname=pete-motherbrain
+

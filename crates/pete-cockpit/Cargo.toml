@@ -6,11 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+pete-cockpit-protocol = { path = "../pete-cockpit-protocol", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 serialport = "4"
 thiserror.workspace = true
 tungstenite = "0.29"
+uuid.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
@@ -30,3 +32,7 @@ path = "examples/sim_servo_loop.rs"
 [[example]]
 name = "contract_check"
 path = "examples/contract_check.rs"
+
+[[example]]
+name = "motherbrain_bootstrap"
+path = "examples/motherbrain_bootstrap.rs"
