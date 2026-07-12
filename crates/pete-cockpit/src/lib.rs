@@ -1561,6 +1561,15 @@ pub enum CockpitRequest {
 }
 
 impl CockpitRequest {
+    fn required_service_scope(&self) -> Option<ServiceScope> {
+        match self {
+            Self::Bootsel => Some(ServiceScope::Bootsel),
+            Self::RestartMpu => Some(ServiceScope::RestartMpu),
+            Self::RestartCreate => Some(ServiceScope::RestartCreate),
+            _ => None,
+        }
+    }
+
     pub fn authorization_class(&self) -> AuthorizationClass {
         match self {
             Self::Ping | Self::GetStatus | Self::GetCapabilities | Self::GetEvents { .. } => {
@@ -2028,7 +2037,9 @@ impl CockpitRequest {
             Self::AcquireServiceLease { scope, ttl_ms } => format!(
                 "ACQUIRE_SERVICE_LEASE {seq} {} {ttl_ms}\n",
                 match scope {
-                    ServiceScope::BrainstemMaintenance => "brainstem_maintenance",
+                    ServiceScope::Bootsel => "bootsel",
+                    ServiceScope::RestartMpu => "restart_mpu",
+                    ServiceScope::RestartCreate => "restart_create",
                 }
             ),
             Self::Arm => format!("ARM {seq}\n"),
@@ -3707,6 +3718,9 @@ impl<C: Cockpit> SessionCockpit<C> {
                 let lease = self.service_lease.as_ref().ok_or_else(|| {
                     CockpitError::Policy("no service lease has been acquired".into())
                 })?;
+                if request.required_service_scope() != Some(lease.scope) {
+                    return Err(CockpitError::Policy("service_scope_denied".into()));
+                }
                 self.connector
                     .execute_with_service_lease(&self.outcome.session, lease, request)
             }
@@ -3957,6 +3971,40 @@ pub struct MotherbrainBootstrap {
     pub expected_brainstem_device_id: Option<String>,
 }
 
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    #[error("brainstem not found under /dev/serial/by-id")]
+    BrainstemNotFound,
+    #[error("serial open failed for {path}: {source}")]
+    SerialOpenFailed { path: PathBuf, source: CockpitError },
+    #[error("handshake failed on {path}: {source}")]
+    HandshakeFailed { path: PathBuf, source: CockpitError },
+    #[error("wrong brainstem identity: expected {expected}, received {received}")]
+    WrongBrainstem { expected: String, received: String },
+    #[error("unsafe welcome: {0}")]
+    UnsafeWelcome(String),
+    #[error("capability mismatch: {0}")]
+    CapabilityMismatch(String),
+    #[error("event history missed before sequence {dropped_before_seq}")]
+    EventHistoryMissed { dropped_before_seq: u32 },
+    #[error("brainstem network is not ready: {0}")]
+    NetworkNotReady(String),
+    #[error("network registration rejected: {0}")]
+    NetworkRegistrationRejected(String),
+    #[error("control lease rejected: {0}")]
+    ControlLeaseRejected(String),
+    #[error("DNS verification failed for {0}")]
+    DnsVerificationFailed(String),
+    #[error("all USB CDC candidates failed: {failures:?}")]
+    CandidateFailures { failures: Vec<CandidateFailure> },
+}
+
+#[derive(Debug)]
+pub struct CandidateFailure {
+    pub path: PathBuf,
+    pub cause: String,
+}
+
 impl MotherbrainBootstrap {
     pub fn from_host() -> Self {
         Self {
@@ -3965,16 +4013,36 @@ impl MotherbrainBootstrap {
         }
     }
 
-    pub fn connect_usb(&self) -> Result<SessionCockpit<Box<dyn Cockpit>>> {
-        let paths = discover_usb_serial_by_id()?;
+    /// USB CDC enumerates as a serial byte stream; `UartCockpit` is the shared
+    /// line-protocol implementation, not an assertion that this is GPIO UART.
+    pub fn connect_usb(
+        &self,
+    ) -> std::result::Result<SessionCockpit<Box<dyn Cockpit>>, BootstrapError> {
+        let paths =
+            discover_usb_serial_by_id().map_err(|error| BootstrapError::HandshakeFailed {
+                path: PathBuf::from("/dev/serial/by-id"),
+                source: error,
+            })?;
         if paths.is_empty() {
-            return Err(CockpitError::BadResponse(
-                "no stable /dev/serial/by-id cockpit candidates".into(),
-            ));
+            return Err(BootstrapError::BrainstemNotFound);
         }
         let mut errors = Vec::new();
         for path in paths {
-            match UartCockpit::connect(&path).and_then(|connector| {
+            let connector = match UartCockpit::connect(&path) {
+                Ok(connector) => connector,
+                Err(error) => {
+                    errors.push(CandidateFailure {
+                        path: path.clone(),
+                        cause: BootstrapError::SerialOpenFailed {
+                            path: path.clone(),
+                            source: error,
+                        }
+                        .to_string(),
+                    });
+                    continue;
+                }
+            };
+            match (|| -> Result<_> {
                 let ready = establish_session(
                     Box::new(connector) as Box<dyn Cockpit>,
                     self.hello.new_attempt(),
@@ -3982,15 +4050,15 @@ impl MotherbrainBootstrap {
                 )?;
                 self.validate_identity(ready.session())?;
                 Ok(ready)
-            }) {
+            })() {
                 Ok(ready) => return Ok(ready),
-                Err(error) => errors.push(format!("{}: {error}", path.display())),
+                Err(error) => errors.push(CandidateFailure {
+                    path,
+                    cause: error.to_string(),
+                }),
             }
         }
-        Err(CockpitError::BadResponse(format!(
-            "USB bootstrap failed: {}",
-            errors.join("; ")
-        )))
+        Err(BootstrapError::CandidateFailures { failures: errors })
     }
 
     pub fn connect_backup(
@@ -6073,7 +6141,7 @@ mod tests {
             .execute_in_session(
                 &mother.session,
                 CockpitRequest::AcquireServiceLease {
-                    scope: ServiceScope::BrainstemMaintenance,
+                    scope: ServiceScope::Bootsel,
                     ttl_ms: 500,
                 },
             )

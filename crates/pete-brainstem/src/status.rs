@@ -162,6 +162,7 @@ static ACTIVE_LEASE_EXPIRES_MS: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SERVICE_LEASE_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SERVICE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SERVICE_LEASE_EXPIRES_MS: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_SERVICE_SCOPE: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -891,22 +892,25 @@ pub fn acknowledge_authority_transition(generation: u32) {
         ACTIVE_LEASE_HASH.load(Ordering::Acquire),
     );
 }
-pub fn install_service_authority(session_hash: u32, lease_hash: u32, expires_ms: u32) {
+pub fn install_service_authority(session_hash: u32, lease_hash: u32, expires_ms: u32, scope: u8) {
     ACTIVE_SERVICE_SESSION_HASH.store(session_hash, Ordering::Release);
     ACTIVE_SERVICE_LEASE_HASH.store(lease_hash, Ordering::Release);
     ACTIVE_SERVICE_LEASE_EXPIRES_MS.store(expires_ms, Ordering::Release);
+    ACTIVE_SERVICE_SCOPE.store(scope, Ordering::Release);
 }
-pub fn active_service_authority_matches(session_hash: u32, lease_hash: u32, now_ms: u32) -> bool {
+pub fn active_service_authority_matches(session_hash: u32, lease_hash: u32, now_ms: u32, scope: u8) -> bool {
     let deadline = ACTIVE_SERVICE_LEASE_EXPIRES_MS.load(Ordering::Acquire);
     deadline != 0
         && now_ms.wrapping_sub(deadline) >= u32::MAX / 2
         && ACTIVE_SERVICE_SESSION_HASH.load(Ordering::Acquire) == session_hash
         && ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire) == lease_hash
+        && ACTIVE_SERVICE_SCOPE.load(Ordering::Acquire) == scope
 }
 pub fn revoke_service_authority() {
     ACTIVE_SERVICE_LEASE_HASH.store(0, Ordering::Release);
     ACTIVE_SERVICE_SESSION_HASH.store(0, Ordering::Release);
     ACTIVE_SERVICE_LEASE_EXPIRES_MS.store(0, Ordering::Release);
+    ACTIVE_SERVICE_SCOPE.store(0, Ordering::Release);
 }
 pub fn authority_transition_acked(generation: u32) -> bool {
     AUTHORITY_ACK.load(Ordering::Acquire) == generation
@@ -979,8 +983,8 @@ pub fn session_diagnostics(now_ms: u32) -> SessionDiagnostics {
         service_authority_active: ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire) != 0
             && active_service_authority_matches(
                 ACTIVE_SERVICE_SESSION_HASH.load(Ordering::Acquire),
-                ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire),
-                now_ms,
+                ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire), now_ms,
+                ACTIVE_SERVICE_SCOPE.load(Ordering::Acquire),
             ),
     }
 }

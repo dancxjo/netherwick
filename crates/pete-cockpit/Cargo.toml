@@ -36,3 +36,7 @@ path = "examples/contract_check.rs"
 [[example]]
 name = "motherbrain_bootstrap"
 path = "examples/motherbrain_bootstrap.rs"
+
+[[example]]
+name = "service_bootsel"
+path = "examples/service_bootsel.rs"

@@ -190,7 +190,7 @@ brainstem-fetch-cyw43:
 
 # Build the Brainstem Pico W firmware with AP/status support.
 brainstem-pico-w-build: brainstem-fetch-cyw43
-    cd crates/pete-brainstem && cargo build --release --no-default-features --features pico-w
+    cd crates/pete-brainstem && cargo build --release --no-default-features --features pico-w,service-mode
 
 # Convert the Brainstem Pico W firmware ELF to UF2.
 brainstem-pico-w-uf2: brainstem-pico-w-build
@@ -212,45 +212,60 @@ flash: brainstem-pico-w-uf2
         exit 1
     fi
 
-    echo "Requesting BOOTSEL via $bootsel_url"
-    curl -fsS --max-time 3 \
-        -H "Content-Type: application/json" \
-        -d '{"kind":"bootsel","command_id":1}' \
-        "$bootsel_url" >/dev/null || true
-
-    echo "Waiting for RPI-RP2 mount"
-    deadline=$((SECONDS + timeout_secs))
-    mount_path=""
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        candidates=()
-        if [ -n "$mount_override" ]; then
-            candidates+=("$mount_override")
+    find_rpi_rp2_mount() {
+        local candidate
+        if [ -n "$mount_override" ] && [ -d "$mount_override" ] && [ -w "$mount_override" ]; then
+            printf '%s\n' "$mount_override"
+            return 0
         fi
-        candidates+=(
-            "/media/$USER/RPI-RP2"
-            "/run/media/$USER/RPI-RP2"
-            "/media/RPI-RP2"
-            "/Volumes/RPI-RP2"
-        )
-
-        for candidate in "${candidates[@]}"; do
+        for candidate in \
+            "/media/$USER/RPI-RP2" \
+            "/run/media/$USER/RPI-RP2" \
+            "/media/RPI-RP2" \
+            "/Volumes/RPI-RP2"; do
             if [ -d "$candidate" ] && [ -w "$candidate" ]; then
-                mount_path="$candidate"
-                break 2
+                printf '%s\n' "$candidate"
+                return 0
             fi
         done
-
         if command -v lsblk >/dev/null 2>&1; then
             while IFS= read -r candidate; do
                 if [ -n "$candidate" ] && [ -d "$candidate" ] && [ -w "$candidate" ]; then
-                    mount_path="$candidate"
-                    break 2
+                    printf '%s\n' "$candidate"
+                    return 0
                 fi
             done < <(lsblk -rpo LABEL,MOUNTPOINT | awk '$1 == "RPI-RP2" { print $2 }')
         fi
+        return 1
+    }
 
-        sleep 1
-    done
+    mount_path=""
+    if mount_path="$(find_rpi_rp2_mount)"; then
+        echo "RPI-RP2 already mounted at $mount_path; skipping BOOTSEL request"
+    else
+        echo "Requesting authorized BOOTSEL via $bootsel_url"
+        host="${bootsel_url#http://}"
+        host="${host%%/*}"
+        if ! PETE_BRAINSTEM_HTTP_HOST="$host" cargo run -q -p pete-cockpit --example service_bootsel; then
+            if [ "${PETE_ALLOW_LEGACY_BOOTSEL:-0}" != "1" ]; then
+                echo "Authorized BOOTSEL failed; legacy fallback is disabled." >&2
+                echo "Set PETE_ALLOW_LEGACY_BOOTSEL=1 only for explicit development recovery." >&2
+                exit 1
+            fi
+            echo "WARNING: USING UNAUDITED LEGACY BOOTSEL DEVELOPMENT FALLBACK" >&2
+            curl -fsS --max-time 3 -H "Content-Type: application/json" \
+                -d '{"kind":"bootsel","command_id":1}' "$bootsel_url" >/dev/null
+        fi
+
+        echo "Waiting for RPI-RP2 mount"
+        deadline=$((SECONDS + timeout_secs))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+            if mount_path="$(find_rpi_rp2_mount)"; then
+                break
+            fi
+            sleep 1
+        done
+    fi
 
     if [ -z "$mount_path" ]; then
         echo "Timed out waiting for RPI-RP2. Set PICO_W_MOUNT=/path/to/RPI-RP2 if it mounted somewhere unusual." >&2

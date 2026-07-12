@@ -694,6 +694,12 @@ async fn http_task(stack: Stack<'static>) -> ! {
         status::mark_http_request(uptime_ms);
         let method = request_method(&request[..n]);
         let path = request_path(&request[..n]);
+        let bootsel_accepted = cfg!(feature = "service-mode")
+            && method == Some("POST")
+            && path == Some("/command")
+            && request_body(&request[..n]).is_some_and(|body| {
+                json_str(body, "kind") == Some("bootsel") && json_service_authority_valid(body)
+            });
         let result = match (method, path) {
             (Some("GET"), Some("/") | Some("/index.html")) => {
                 write_response(&mut socket, "text/html; charset=utf-8", index_html()).await
@@ -811,6 +817,10 @@ async fn http_task(stack: Stack<'static>) -> ! {
             Ok(true) => {
                 status::mark_http_response_flushed();
                 socket.close();
+                if bootsel_accepted {
+                    Timer::after_millis(150).await;
+                    reset_to_usb_boot(0, 0);
+                }
             }
             Ok(false) => {
                 status::mark_http_response_error();
@@ -1627,7 +1637,8 @@ fn handle_command_request<'a>(
             .ok_or(CommandParseError::BadRequest);
     }
     if matches!(command, BrainstemCommand::Bootsel) {
-        return render_command_response(buffer, false, command_id, "service_operation_disabled")
+        return render_command_response(buffer, cfg!(feature = "service-mode"), command_id,
+            if cfg!(feature = "service-mode") { "bootsel_accepted" } else { "service_operation_disabled" })
             .ok_or(CommandParseError::BadRequest);
     }
     if !status::submit_control_command(command_id, command) {
@@ -1823,7 +1834,7 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
 
     status::mark_forebrain_uart_command(seq, Instant::now().as_millis() as u32);
     if matches!(command, BrainstemCommand::Bootsel) {
-        if !compact_service_authority_valid(session_id, service_lease_id) {
+        if !compact_service_authority_valid(session_id, service_lease_id, command) {
             write_forebrain_uart_error(uart, seq, "service_authorization_required");
             return;
         }
@@ -1849,7 +1860,7 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
         return;
     }
     if command_requires_service_authority(command)
-        && !compact_service_authority_valid(session_id, service_lease_id)
+        && !compact_service_authority_valid(session_id, service_lease_id, command)
     {
         write_forebrain_uart_error(uart, seq, "invalid_service_lease");
         return;
@@ -2183,13 +2194,20 @@ fn handle_compact_control_line<const N: usize>(
             Some(false)
         }
         BrainstemCommand::Bootsel => {
-            let reason = if compact_service_authority_valid(session_id, service_lease_id) {
-                "service_operation_disabled"
+            if compact_service_authority_valid(session_id, service_lease_id, command)
+                && cfg!(feature = "service-mode")
+            {
+                let _ = writeln!(response, "OK {seq} bootsel_accepted");
+                Some(true)
             } else {
-                "service_authorization_required"
-            };
-            let _ = writeln!(response, "ERR {seq} {reason}");
-            Some(false)
+                let reason = if cfg!(feature = "service-mode") {
+                    "service_authorization_required"
+                } else {
+                    "service_operation_disabled"
+                };
+                let _ = writeln!(response, "ERR {seq} {reason}");
+                Some(false)
+            }
         }
         command => {
             if command_requires_session(command) && !session_id.is_some_and(compact_session_valid) {
@@ -2203,7 +2221,7 @@ fn handle_compact_control_line<const N: usize>(
                 return Some(false);
             }
             if command_requires_service_authority(command)
-                && !compact_service_authority_valid(session_id, service_lease_id)
+                && !compact_service_authority_valid(session_id, service_lease_id, command)
             {
                 let _ = writeln!(response, "ERR {seq} invalid_service_lease");
                 return Some(false);
@@ -2276,6 +2294,7 @@ fn json_service_authority_valid(body: &str) -> bool {
         session::token_hash(session_id),
         session::token_hash(lease_id),
         Instant::now().as_millis() as u32,
+        json_str(body, "kind").and_then(service_scope_code).unwrap_or(0),
     )
 }
 fn compact_authority_valid(
@@ -2323,12 +2342,18 @@ fn compact_envelope(line: &str) -> (&str, Option<&str>, Option<&str>, Option<&st
     }
 }
 
-fn compact_service_authority_valid(session_id: Option<&str>, lease_id: Option<&str>) -> bool {
+fn compact_service_authority_valid(session_id: Option<&str>, lease_id: Option<&str>, command: BrainstemCommand) -> bool {
+    let scope = match command {
+        BrainstemCommand::Bootsel => 1,
+        BrainstemCommand::RestartMpu => 2,
+        BrainstemCommand::RestartCreate => 3,
+        _ => 0,
+    };
     match (session_id, lease_id) {
         (Some(session_id), Some(lease_id)) => status::active_service_authority_matches(
             session::token_hash(session_id),
             session::token_hash(lease_id),
-            Instant::now().as_millis() as u32,
+            Instant::now().as_millis() as u32, scope,
         ),
         _ => false,
     }
@@ -2451,12 +2476,13 @@ fn handle_service_authority_json<'a>(body: &str, buffer: &'a mut [u8]) -> Option
     let scope = json_str(body, "scope")?;
     let ttl_ms = json_u32(body, "ttl_ms").unwrap_or(2_000).clamp(250, 30_000);
     let session_hash = session::token_hash(session_id);
-    if scope != "brainstem_maintenance" || !service_policy_allows(session_hash) {
+    let scope_code = service_scope_code(scope)?;
+    if !service_policy_allows(session_hash) {
         return render_registration_reject(buffer, "service_policy_rejected");
     }
-    let (lease_id, generation) = install_service_authority(session_hash, ttl_ms)?;
+    let (lease_id, generation) = install_service_authority(session_hash, ttl_ms, scope_code)?;
     let mut response = heapless::String::<512>::new();
-    write!(response, "{{\"accepted\":true,\"type\":\"service_lease_granted\",\"lease_id\":\"{lease_id}\",\"session_id\":\"{session_id}\",\"owner_role\":\"{}\",\"scope\":\"brainstem_maintenance\",\"ttl_ms\":{ttl_ms},\"generation\":{generation}}}", role_name(status::session_role(session_hash)?)).ok()?;
+    write!(response, "{{\"accepted\":true,\"type\":\"service_lease_granted\",\"lease_id\":\"{lease_id}\",\"session_id\":\"{session_id}\",\"owner_role\":\"{}\",\"scope\":\"{scope}\",\"ttl_ms\":{ttl_ms},\"generation\":{generation}}}", role_name(status::session_role(session_hash)?)).ok()?;
     copy_response(buffer, response.as_str())
 }
 
@@ -2483,15 +2509,19 @@ fn handle_service_authority_compact<const N: usize>(
         return;
     };
     let session_hash = session::token_hash(session_id);
-    if !valid || scope != "brainstem_maintenance" || !service_policy_allows(session_hash) {
+    let Some(scope_code) = service_scope_code(scope) else {
+        let _ = writeln!(response, "ERR {seq} service_scope_denied");
+        return;
+    };
+    if !valid || !service_policy_allows(session_hash) {
         let _ = writeln!(response, "ERR {seq} service_policy_rejected");
         return;
     }
-    let Some((lease_id, generation)) = install_service_authority(session_hash, ttl_ms) else {
+    let Some((lease_id, generation)) = install_service_authority(session_hash, ttl_ms, scope_code) else {
         let _ = writeln!(response, "ERR {seq} authority_transition_timeout");
         return;
     };
-    let _ = writeln!(response, "OK {seq} SERVICE_LEASE_GRANTED lease_id={lease_id} session_id={session_id} owner_role={} scope=brainstem_maintenance ttl_ms={ttl_ms} generation={generation}", role_name(status::session_role(session_hash).unwrap_or(0)));
+    let _ = writeln!(response, "OK {seq} SERVICE_LEASE_GRANTED lease_id={lease_id} session_id={session_id} owner_role={} scope={scope} ttl_ms={ttl_ms} generation={generation}", role_name(status::session_role(session_hash).unwrap_or(0)));
 }
 
 fn service_policy_allows(session_hash: u32) -> bool {
@@ -2523,6 +2553,7 @@ fn service_policy_allows(session_hash: u32) -> bool {
 fn install_service_authority(
     session_hash: u32,
     ttl_ms: u32,
+    scope: u8,
 ) -> Option<(heapless::String<40>, u32)> {
     // Entering service authority uses the same synchronous stop/revoke barrier
     // as a controller transition, but installs a separate non-motion lease.
@@ -2550,6 +2581,7 @@ fn install_service_authority(
         session_hash,
         session::token_hash(lease_id.as_str()),
         (Instant::now().as_millis() as u32).wrapping_add(ttl_ms),
+        scope,
     );
     Some((lease_id, generation))
 }
@@ -2651,6 +2683,15 @@ fn install_authority(session_hash: u32, ttl_ms: u32) -> Option<(heapless::String
         embassy_time::block_for(Duration::from_millis(1));
     }
     None
+}
+
+fn service_scope_code(scope: &str) -> Option<u8> {
+    match scope {
+        "bootsel" => Some(1),
+        "restart_mpu" => Some(2),
+        "restart_create" => Some(3),
+        _ => None,
+    }
 }
 
 fn role_name(role: u8) -> &'static str {

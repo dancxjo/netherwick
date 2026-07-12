@@ -60,7 +60,9 @@ pub enum AuthorizationClass {
     serde(rename_all = "snake_case")
 )]
 pub enum ServiceScope {
-    BrainstemMaintenance,
+    Bootsel,
+    RestartMpu,
+    RestartCreate,
 }
 
 pub const fn role_can_request_control(
@@ -84,7 +86,7 @@ pub const fn role_can_request_service(
     purpose: SessionPurpose,
     transport: TransportKind,
 ) -> bool {
-    matches!(transport, TransportKind::UsbCdc)
+    matches!(transport, TransportKind::UsbCdc | TransportKind::Http)
         && (matches!(
             (role, purpose),
             (EndpointRole::Motherbrain, SessionPurpose::Control)
