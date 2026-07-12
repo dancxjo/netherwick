@@ -1,108 +1,194 @@
 # pete
 
-`pete` is a Rust workspace for Pete, an embodied self-training robot architecture.
+`pete` is a Rust workspace for Pete, an embodied, self-training machine with a
+robot body, local reflexes, inspectable perception, durable experience, learned
+behaviors, and higher-brain training infrastructure.
 
-Pete now has a working real-world perception path: Kinect RGB and depth data can be fused into aligned, Minecrafty but properly colored 3D voxels that correspond to real objects in real space. The current milestone is important because Pete is no longer only passing sensor packets around. It is beginning to hold a visible world model that a human can inspect, debug, and eventually enter through the WebXR viewer.
+Pete is no longer only a simulation architecture or a collection of sensor
+experiments. The repository now contains a working vertical slice from physical
+body control through perception and experience exchange:
 
-The project still keeps the larger PETE architecture in view. Pete gathers raw sensors, memory recalls, internal drives, model predictions, surprise, and LLM guidance into `Now`. `Now` is compressed into an `ExperienceLatent`, used to imagine futures, choose actions, and train from consequences.
+- a Pico W brainstem owns the iRobot Create Open Interface, immediate safety,
+  bounded motion, possession, body supervision, and ordered physical events;
+- a common Cockpit contract exposes the same body capabilities over simulator,
+  UART, UDP, HTTP, and WebSocket transports;
+- the motherbrain can establish the physical brainstem identity, acquire a
+  guarded control lease, stream sensors, issue short-lived motion, and stop on
+  safety events or missing history;
+- Kinect RGB/depth and optional HLS-LFCD2 lidar can contribute to a shared,
+  inspectable 3D voxel world;
+- an experience ledger, replay/evaluation paths, model registry, and promotion
+  gates support learning without replacing safe hand-written behavior blindly;
+- the higher-brain framework can provision forebrains, export immutable
+  experience bundles, run durable jobs, return model candidates, and activate
+  or roll them back atomically;
+- the X1202 UPS integration has telemetry, charge-control, service, and
+  motherbrain-reset plumbing, with final electrical and dock-readiness
+  validation dependent on the physical board.
 
-Pete acts through high-level action primitives. A hard-coded autonomic layer keeps the body safe. The LLM may command, reflect, critique, and teach, but cannot bypass safety.
+The project still follows one central rule: intelligence may request physical
+action, but it may not bypass the body-local controller that owns the
+consequences.
 
-The LLM loop is now active as a trainer, critic, and planner. It predicts counterfactual outcomes, critiques training data, and suggests motion intents. Movement itself is still not responding downstream, so the current debugging target is the command-to-base path: safety vetoes, robot mode, stale base connection, controller regression, or body-state refusal.
+## Where we are now
 
-Every hard-coded behavior is replaceable. It can run directly, shadow-train a model, compare with a model, promote a model, or fall back to safe hand-written logic.
+### Body control
 
-Pete is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.
+The Create control path is implemented rather than hypothetical.
 
-Pete's higher-brain split now has a reproducible forebrain, a strictly separate
-bulk-data plane, immutable experience bundles, durable training jobs, and
-atomic candidate activation/rollback. See
-[docs/018-higher-brain-framework.md](docs/018-higher-brain-framework.md) for the
-architecture, provisioning, enrollment, and simulated end-to-end workflow.
+- The brainstem acquires and supervises Create OI, maintains the required body
+  mode, decodes sensor frames, and owns stop behavior.
+- Possession is an explicit, identity-bound control lease. There is no separate
+  higher-level arm state that can evade the brainstem's authority.
+- Motion commands are bounded by TTL, heartbeat, lease, body state, and safety
+  policy.
+- Stop and emergency stop preempt ordinary work.
+- Bump, cliff, wheel-drop, tilt, impact, UART, stale-command, and missed-event
+  conditions are represented in the safety and event paths.
+- The body remains supervised when motherbrain possession is released.
+- A dedicated forebrain UART lane and the Pico W network services enter through
+  bounded command handling rather than direct hardware access.
 
-## Current milestone
+Real-hardware work is now validation and refinement: repeatable cold starts,
+longer possession runs, sensor calibration, dock-state interpretation, UPS
+integration, and capture of golden sessions. It is no longer a search for a
+basic command-to-wheel route.
 
-The live perception stack has matured from loose point clouds and transient hypotheses into an inspectable 3D voxel world:
+See [crates/pete-brainstem/README.md](crates/pete-brainstem/README.md) for wiring,
+firmware, transport, protocol, and bring-up details.
 
-- Kinect depth and RGB are being aligned into colored voxels.
-- The voxel output is coarse, blocky, and intentionally debuggable.
-- Visible structures in the voxel scene correspond to real things in the room.
-- The 3D/WebXR viewer is the main inspection surface for the current world model.
-- The 2D map path needs restoration after drifting out of alignment and then failing.
-- Movement is temporarily under investigation: commands may be blocked by a safety veto, dropped by a controller path, or blocked by robot mode/state.
+### The brainstem is broader than Pete's first body
 
-The next good artifact is a capture set: screenshots, video capture, and a short golden run containing RGB, depth, IMU, odometry, command traces, safety decisions, and map/voxel outputs from the same session.
+The current driver targets the iRobot Create, but the architectural role is a
+deterministic controller for embodied machinery. A brainstem owns local
+hardware, immediate sensing, actuator authority, bounded execution, safety
+invariants, and an ordered account of what physically occurred.
+
+That same model can describe a pinball playfield, a toaster oven, an electric
+kettle, an industrial fixture, or another robot. The higher process chooses
+goals; the brainstem retains final authority over relays, coils, heaters,
+motors, and safe transitions.
+
+The normative body-model document defines the layers, command lifecycle,
+body-defined safety semantics, worked examples, current Create-shaped seams,
+and the path toward a real second body:
+
+[docs/019-brainstem-body-model.md](docs/019-brainstem-body-model.md)
+
+### Perception and world model
+
+The strongest current perception artifact is an inspectable 3D voxel world.
+
+- Kinect depth and RGB can be aligned into coarse colored voxels that correspond
+  to real structures in the room.
+- The 3D and WebXR views are the primary inspection surfaces.
+- HLS-LFCD2 lidar support can feed planar scans into the 2D map and the same
+  Kinect/lidar 3D cloud using configured sensor extrinsics.
+- The intentionally blocky representation favors spatial trust and debugging
+  over visual polish.
+- The 2D occupancy path still needs systematic comparison against the shared
+  coordinate frame and known-good captures.
+
+The next important evidence is a golden run that preserves synchronized RGB,
+depth, lidar, IMU, odometry, body events, command traces, safety decisions, and
+rendered map/voxel outputs from the same session.
+
+### Learning and experience
+
+Pete gathers raw sensors, body state, memory recalls, internal drives, model
+predictions, surprise, and higher-level guidance into `Now`. `Now` can be
+compressed into an `ExperienceLatent`, used to imagine futures, choose actions,
+and train from consequences.
+
+Every hand-written behavior is intended to be replaceable through an explicit
+process: run directly, shadow a model, compare outcomes, promote a candidate,
+and retain a safe fallback. Learned artifacts do not receive direct brainstem
+or actuator authority.
+
+A **constellation** is a repeatable pattern of experience rather than merely a
+visual cluster. The search begins with arrangements that recur across time,
+viewpoint, modality, action, and consequence, then promotes stable patterns
+into objects, places, affordances, or training specimens.
+
+See:
+
+- [docs/013-feature-registry.md](docs/013-feature-registry.md) for the universal
+  observation layer;
+- [docs/constellations.md](docs/constellations.md) for generalized pattern
+  discovery;
+- [docs/scenario-evaluation.md](docs/scenario-evaluation.md) for repeatable
+  evaluation;
+- [docs/model-registry.md](docs/model-registry.md) for checkpoint registration
+  and promotion gates.
+
+### Higher-brain split
+
+Pete now has deliberately separate bodily control and bulk-data planes.
+
+- The Pico W brainstem exclusively owns bodily safety, possession, bounded
+  commands, reflexes, and recovery authority.
+- The Pi 5 motherbrain remains canonical for Pete's live experience, graph,
+  vector stores, inference state, and bounded online learning.
+- Forebrains are enrolled compute nodes that receive immutable exports and run
+  authorized jobs without acquiring motion authority.
+- Experience bundles are checksummed, resumable, and immutable.
+- Jobs are durable and restart-aware.
+- Returned candidates are treated as untrusted until validated, staged, and
+  explicitly activated.
+- Activation and rollback use atomic model pointers.
+
+See [docs/018-higher-brain-framework.md](docs/018-higher-brain-framework.md) for
+the protocol, provisioning, authorization, transfer, jobs, candidate lifecycle,
+and simulated end-to-end exercise.
 
 ## Architecture sketch
 
 ```text
-sensors
-  -> synchronized RGB/depth/IMU/body events
-  -> point cloud / voxel projection
-  -> Features
-  -> 3D live view and WebXR inspection
-  -> 2D map / occupancy surface
-  -> cross-modal constellations
-  -> object, place, affordance, and action hypotheses
-  -> Now / ExperienceLatent
-  -> prediction, memory, action, and training loops
+physical body and sensors
+    -> brainstem safety/runtime lane
+       -> body state, reflexes, bounded actions, ordered events
+    -> synchronized RGB/depth/lidar/IMU/body observations
+       -> Features
+       -> point cloud, voxel world, and 2D occupancy
+       -> cross-modal constellations
+       -> object, place, affordance, and action hypotheses
+       -> Now / ExperienceLatent
+       -> prediction, memory, action, evaluation, and training
+       -> immutable experience bundles
+       -> forebrain jobs and candidate models
+       -> validation, staging, activation, and rollback
 ```
 
-The present engineering emphasis is not beauty. It is spatial trust. A crude voxel world that stays aligned is more useful than a polished render that cannot be believed.
+The architecture separates three questions that are easy to blur together:
 
-See [docs/013-feature-registry.md](docs/013-feature-registry.md) for the universal observation layer: everything Pete observes should become a Feature before new learning systems consume it.
+1. **What is physically happening?** The brainstem and sensors provide the
+   authoritative local transcript.
+2. **What does it mean, and what should happen next?** The motherbrain performs
+   perception, memory, planning, and live inference.
+3. **What can be learned from accumulated experience?** Forebrains perform
+   heavier replay, analysis, training, and evaluation on immutable exports.
 
-## Constellations
+## Near-term work
 
-A **constellation** is a repeatable pattern of experience, not merely a visual cluster. The first obvious constellations come from nearby colored voxels, planes, corners, and depth edges, but the abstraction should generalize across all modalities:
+The next milestones are integration milestones rather than another wholesale
+architectural restart:
 
-- geometry: points, voxels, surfaces, occupancy, relative position,
-- color and image evidence,
-- motion and odometry,
-- robot body state,
-- audio and speech events,
-- text labels and image descriptions,
-- memory recalls,
-- prediction error and surprise,
-- LLM counterfactuals, critiques, and suggested actions.
-
-The search target is not yet "chair" or "kitchen." The search target is "I have seen this arrangement before." Once a constellation survives time, viewpoint changes, lighting changes, motion, and critique, it can be promoted into an object, place, affordance, or training specimen.
-
-See [docs/constellations.md](docs/constellations.md) for the generalized pattern-search model.
-
-## Active debugging tracks
-
-### 3D voxel world
-
-The voxel path is currently the strongest signal. Keep it capture-first and regression-friendly:
-
-```bash
-just live-server
-# open the 3D/WebXR view printed by the server, or visit /view/3d
-```
-
-When the world looks right, save screenshots and a short video. When it looks wrong, preserve the input capture rather than only the rendered failure.
-
-### 2D map restoration
-
-The 2D map previously drifted out of alignment and then stopped working. Treat it as a derived product of the same spatial truth used by the voxel view:
-
-1. Verify that the coordinate frame used for voxel projection is the same frame the 2D map consumes.
-2. Confirm that map updates are still being emitted.
-3. Check whether the map renderer is alive but receiving empty or invalid data.
-4. Compare a known-good capture against the current map path.
-
-### Movement restoration
-
-Movement is expected to remain conservative. Debug it from command intent outward:
-
-1. Did a movement intent get generated?
-2. Did the controller receive it?
-3. Did the safety layer veto it?
-4. Is the base in the correct mode to accept motion?
-5. Did the robot report a fault, dock state, cliff signal, bumper signal, or stale serial/body connection?
-
-Do not bypass safety just to make the wheels turn. The goal is to make the vetoes inspectable so the system can explain why the body refuses to move.
+1. Validate the X1202 UPS telemetry, charging control, external-power signals,
+   and Pi RUN reset path on the physical board.
+2. Derive trustworthy dock and charging readiness from the real Create and UPS
+   status paths.
+3. Record a synchronized golden physical run and preserve it as a regression
+   fixture.
+4. Calibrate Kinect, lidar, IMU, and odometry frames against the same physical
+   scene.
+5. Restore and validate the 2D map as a projection of shared spatial truth.
+6. Exercise possession, heartbeat expiry, event loss, reconnection, stop, and
+   exorcize across repeated cold boots.
+7. Move remaining Create controller tuning constants into the body contract.
+8. Generalize motion-centric runtime terms into body actions and implement a
+   deliberately non-mobile second body or safe low-voltage fixture.
+9. Exercise higher-brain transfer interruption, candidate return, activation,
+   and rollback across the actual Pi and forebrain links.
 
 ## Setup
 
@@ -114,7 +200,8 @@ sudo apt-get install -y just
 just setup
 ```
 
-`just setup` installs the Linux build dependencies plus Kinect 1 userspace support through `libfreenect` when distro packages are available.
+`just setup` installs the Linux build dependencies plus Kinect 1 userspace
+support through `libfreenect` when distro packages are available.
 
 Useful commands:
 
@@ -130,37 +217,42 @@ just inspect-ledger
 just hardware-env
 ```
 
-Scenario reports can be generated with `just run eval-scenario --scenario empty-room --episodes 2 --steps 10 --out data/reports/scenario/empty-smoke.json`. See [docs/scenario-evaluation.md](docs/scenario-evaluation.md) for baseline-vs-checkpoint comparison notes and [docs/model-registry.md](docs/model-registry.md) for checkpoint registration and promotion gates.
+Scenario reports can be generated with:
+
+```bash
+just run eval-scenario --scenario empty-room --episodes 2 --steps 10 \
+  --out data/reports/scenario/empty-smoke.json
+```
 
 ## Hardware bring-up
 
-Pete's Raspberry Pi 5 hardware path starts capture-first: inspect devices, run bounded read-only body/sensor ticks, record Worldlab captures, and inspect the result. Autonomous motor movement is not enabled by default.
+Pete's Raspberry Pi 5 hardware path starts capture-first: inspect devices, run
+bounded read-only body and sensor ticks, record Worldlab captures, and inspect
+the result. Autonomous motor movement is not enabled by default.
 
 ```bash
 cargo run --bin pete -- hardware-env
-cargo run --bin pete -- robot --mode read-only --duration-seconds 30 --ledger data/ledger/real/read-only-smoke
-cargo run --bin pete -- capture-real --duration-seconds 60 --out data/captures/real/rpi5-smoke
+cargo run --bin pete -- robot --mode read-only --duration-seconds 30 \
+  --ledger data/ledger/real/read-only-smoke
+cargo run --bin pete -- capture-real --duration-seconds 60 \
+  --out data/captures/real/rpi5-smoke
 cargo run --bin pete -- inspect-capture data/captures/real/rpi5-smoke
 ```
 
-After read-only validation, the guarded production possession command is
-explicit and wheels-off-floor first:
+After read-only validation, guarded production possession is explicit and
+wheels-off-floor first:
 
 ```bash
 just possess
 ```
 
 Set `PETE_BRAINSTEM_DEVICE_ID` in `.env` first; optionally pin
-`PETE_COCKPIT_PORT=/dev/serial/by-id/DEVICE`. The recipe learns the current
-boot ID from the pinned device, saves it as `PETE_BRAINSTEM_BOOT_ID`, and
-retries automatically after a brainstem reboot. After a cold boot, a rejected
-Wi-Fi identity is automatically established over the pinned USB brainstem
-before retrying. It expands to the guarded command below:
+`PETE_COCKPIT_PORT=/dev/serial/by-id/DEVICE`. The recipe learns the current boot
+ID from the pinned device, saves it as `PETE_BRAINSTEM_BOOT_ID`, and retries
+after a brainstem reboot. After a cold boot, a rejected Wi-Fi identity can be
+established over the pinned USB brainstem before retrying.
 
-An HLS-LFCD2 / LDS-01 can run alongside either path. Set its serial path and
-mount pose in `.env`; `just robot` and `just possess` then feed its 360-degree
-scans into Pete's planar map and shared Kinect/lidar 3D voxel cloud. A pitched
-scan accumulates into 3D as odometry changes during forward motion or a spin.
+The guarded command is equivalent to:
 
 ```bash
 cargo run -p pete-tools -- robot --mode possession-slow \
@@ -173,31 +265,45 @@ cargo run -p pete-tools -- robot --mode possession-slow \
   --capture data/captures/real/possession-wheels-off-floor
 ```
 
-The motherbrain control lease is possession; there is no separate arm layer.
-The runner begins with STOP, never exposes Create OI, and does not fall back to
-another device or transport. Orderly shutdown requires acknowledged STOP then
-exorcize and final stopped/unpossessed status. Exorcize releases motherbrain
-control without disarming Create OI; the brainstem keeps supervising it in Full
-mode. Serial loss is handled by the short
-command, heartbeat, and lease deadlines; no power toggle is attempted.
+An HLS-LFCD2 or LDS-01 can run alongside either path. Set its serial path and
+mount pose in `.env`; `just robot` and `just possess` then feed its 360-degree
+scans into Pete's planar map and shared Kinect/lidar 3D voxel cloud. A pitched
+scan can accumulate into 3D as odometry changes during forward motion or a
+spin.
 
-See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions, device expectations, success criteria, and failure behavior.
+The runner begins with STOP, never exposes Create OI, and does not fall back to
+another device or transport. Orderly shutdown requires acknowledged STOP,
+exorcize, and final stopped/unpossessed status. Exorcize releases motherbrain
+control without abandoning brainstem supervision of the Create. Serial loss is
+handled by short command, heartbeat, and lease deadlines; no blind power toggle
+is attempted.
+
+See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions,
+device expectations, success criteria, and failure behavior.
 
 ## Docker services
 
-Copy `.env.example` to `.env` if you want to override ports or passwords. Then:
+Copy `.env.example` to `.env` to override ports or passwords, then run:
 
 ```bash
 just servers      # Neo4j + Qdrant
 just live-server  # Neo4j + Qdrant + live sim server
 ```
 
-The live view is at `http://localhost:8787/view`, with a 3D/WebXR sensorium at `http://localhost:8787/view/3d` and compact scene JSON at `http://localhost:8787/view/scene`. In immersive VR, supported controllers can feed short-lived Reign commands into the virtual session. Neo4j Browser is at `http://localhost:7474` with the default `.env.example` credentials.
+The live view is at `http://localhost:8787/view`, with a 3D/WebXR sensorium at
+`http://localhost:8787/view/3d` and compact scene JSON at
+`http://localhost:8787/view/scene`. In immersive VR, supported controllers can
+feed short-lived Reign commands into the virtual session. Neo4j Browser is at
+`http://localhost:7474` with the default `.env.example` credentials.
 
-For a one-command HTTPS Dream World training run, run:
+For a one-command HTTPS Dream World training run:
 
 ```bash
 just go virtual
 ```
 
-It starts a long-running Dream World, serves HTTPS on `0.0.0.0`, and prints desktop/headset URLs for `/view/3d` plus `/view/scene`. See [docs/go-virtual.md](docs/go-virtual.md) for certificate, headset, scenario, and LAN security notes. See [docs/webxr-viewer.md](docs/webxr-viewer.md) for desktop controls, WebXR caveats, capture replay hooks, and sensor-view privacy notes.
+It starts a long-running Dream World, serves HTTPS on `0.0.0.0`, and prints
+desktop/headset URLs for `/view/3d` plus `/view/scene`. See
+[docs/go-virtual.md](docs/go-virtual.md) for certificate, headset, scenario, and
+LAN security notes. See [docs/webxr-viewer.md](docs/webxr-viewer.md) for desktop
+controls, WebXR caveats, capture replay hooks, and sensor-view privacy notes.
