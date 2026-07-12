@@ -256,6 +256,9 @@ pub enum PowerStateRequest {
     Sleep,
     PulseBrc,
     StartOi,
+    DebugBaud19200,
+    DebugBaud57600,
+    DebugBaud115200,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Default)]
@@ -403,6 +406,7 @@ pub(crate) enum RuntimeCommand {
     RestartMpu,
     PulseBrc,
     StartOi,
+    SetCreateBaud(u32),
     SetMode(CreateOiMode),
     Drive {
         left_mm_s: i16,
@@ -426,11 +430,10 @@ pub(crate) enum RuntimeCommand {
     },
 }
 
-pub(crate) const ARM_SCRIPT: &[RuntimeCommand] = &[
-    RuntimeCommand::WakeCreate,
+pub(crate) const ACQUIRE_CREATE_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::PulseBrc,
     RuntimeCommand::StartOi,
-    RuntimeCommand::SetMode(CreateOiMode::Safe),
+    RuntimeCommand::SetMode(CreateOiMode::Full),
     RuntimeCommand::PlayFeedback {
         kind: FeedbackKind::Armed,
     },
@@ -445,5 +448,5 @@ pub(crate) const RESTART_CREATE_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::WakeCreate,
     RuntimeCommand::PulseBrc,
     RuntimeCommand::StartOi,
-    RuntimeCommand::SetMode(CreateOiMode::Safe),
+    RuntimeCommand::SetMode(CreateOiMode::Full),
 ];

@@ -3,7 +3,7 @@ use heapless::Deque;
 use crate::body;
 use crate::commands::{
     BrainstemCommand, EscapeDirection, FeedbackKind, PowerStateRequest, RuntimeCommand,
-    SafetyAction, SafetyPolicy, SongTone, ARM_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
+    SafetyAction, SafetyPolicy, SongTone, ACQUIRE_CREATE_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
     RESTART_CREATE_SCRIPT,
 };
 use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
@@ -16,7 +16,10 @@ const EVENT_QUEUE_CAPACITY: usize = 16;
 const COMMAND_QUEUE_CAPACITY: usize = 16;
 const RUNTIME_TICK_MS: u32 = 10;
 const SENSOR_PROBE_PERIOD_MS: u32 = 100;
-const WAKE_PROBE_RESPONSE_BYTES_REQUIRED: u8 = 2;
+const FULL_MODE_REFRESH_PERIOD_MS: u32 = 1_000;
+const SUPERVISION_LIGHT_PERIOD_MS: u32 = 180;
+const LOW_BATTERY_PERCENT: u32 = 20;
+const WAKE_PROBE_RESPONSE_BYTES_REQUIRED: u8 = 1;
 const CREATE_AXLE_TRACK_MM: i32 = 258;
 const BEARING_SLOWDOWN_MRAD: i32 = 1_000;
 const MIN_TRACK_SPEED_MM_S: i32 = 35;
@@ -95,6 +98,9 @@ where
     heartbeat_stop_at_ms: Option<u32>,
     sensor_stream: Option<SensorStream>,
     next_imu_poll_ms: u32,
+    next_full_mode_refresh_ms: u32,
+    next_supervision_light_ms: u32,
+    supervision_light_phase: u8,
     safety_policy: SafetyPolicy,
     safety_latched: bool,
     chirps: [[SongTone; MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
@@ -135,6 +141,9 @@ where
             heartbeat_stop_at_ms: None,
             sensor_stream: None,
             next_imu_poll_ms: 0,
+            next_full_mode_refresh_ms: 0,
+            next_supervision_light_ms: 0,
+            supervision_light_phase: 0,
             safety_policy: SafetyPolicy::default(),
             safety_latched: false,
             chirps: [[SongTone::default(); MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
@@ -162,7 +171,8 @@ where
 
     fn start(&mut self) {
         self.leds.boot_indicator(&mut self.hardware);
-        self.enter_idle();
+        self.queue_create_acquisition(0);
+        status::set_runtime_state(RuntimeState::Running);
     }
 
     #[allow(dead_code)]
@@ -189,6 +199,14 @@ where
             return;
         }
         if let Err(error) = self.enforce_heartbeat_stop() {
+            self.enter_error(error);
+            return;
+        }
+        if let Err(error) = self.maintain_full_mode() {
+            self.enter_error(error);
+            return;
+        }
+        if let Err(error) = self.animate_supervision_lights() {
             self.enter_error(error);
             return;
         }
@@ -225,6 +243,11 @@ where
         self.poll_authority_transition();
         self.timers.poll(&mut self.hardware, &mut self.events);
         self.create_uart.poll(&mut self.hardware, &mut self.events);
+        let snapshot = status::snapshot(self.now_ms());
+        if matches!(snapshot.oi_mode, 1..=3) {
+            self.create_responsive = true;
+            status::set_create_power_on(true);
+        }
         self.poll_control_command();
     }
 
@@ -241,6 +264,84 @@ where
         status::set_runtime_state(RuntimeState::Idle);
         status::set_body_state(BodyState::Idle);
         status::acknowledge_authority_transition(generation);
+        let _ = self.commands.push_back(QueuedCommand {
+            command_id: 0,
+            command: RuntimeCommand::PlayFeedback {
+                kind: FeedbackKind::Ok,
+            },
+        });
+    }
+
+    fn queue_create_acquisition(&mut self, command_id: u32) {
+        for command in ACQUIRE_CREATE_SCRIPT {
+            let _ = self.commands.push_back(QueuedCommand {
+                command_id,
+                command: *command,
+            });
+        }
+        self.mode = RuntimeMode::Running;
+    }
+
+    fn maintain_full_mode(&mut self) -> Result<(), BrainstemError> {
+        let now_ms = self.now_ms();
+        let snapshot = status::snapshot(now_ms);
+        if !time_reached(now_ms, self.next_full_mode_refresh_ms)
+            || low_battery_and_charging(&snapshot)
+        {
+            return Ok(());
+        }
+
+        // RX health is evidence, not permission to transmit. If the Create has
+        // rebooted, gone passive, or our wake probe was wrong, START + FULL is
+        // the idempotent assertion that lets the brainstem regain control.
+        if !self.create_responsive || snapshot.oi_mode != 3 {
+            self.create_uart
+                .start_oi(&mut self.hardware, &mut self.events)?;
+        }
+        self.create_uart.set_mode(
+            &mut self.hardware,
+            &mut self.events,
+            crate::commands::CreateOiMode::Full,
+        )?;
+        if snapshot.oi_mode == 0 {
+            self.create_uart.start_mode_stream(&mut self.hardware)?;
+        }
+        self.next_full_mode_refresh_ms = now_ms.wrapping_add(FULL_MODE_REFRESH_PERIOD_MS);
+        Ok(())
+    }
+
+    fn animate_supervision_lights(&mut self) -> Result<(), BrainstemError> {
+        let now_ms = self.now_ms();
+        if !self.create_responsive
+            || status::snapshot(now_ms).oi_mode != 3
+            || !time_reached(now_ms, self.next_supervision_light_ms)
+        {
+            return Ok(());
+        }
+
+        let (led_bits, color, intensity, period_ms) = if self.mode == RuntimeMode::Error {
+            let on = self.supervision_light_phase & 1 == 0;
+            (
+                if on { 0x03 } else { 0 },
+                255,
+                if on { 255 } else { 0 },
+                300,
+            )
+        } else if self.estop_latched || self.safety_latched {
+            (0x03, 255, 255, 500)
+        } else {
+            // Three-light bounce: power -> binary 1 -> binary 2 -> binary 1.
+            match self.supervision_light_phase & 3 {
+                0 => (0, 0, 220, SUPERVISION_LIGHT_PERIOD_MS),
+                1 | 3 => (0x01, 0, 0, SUPERVISION_LIGHT_PERIOD_MS),
+                _ => (0x02, 0, 0, SUPERVISION_LIGHT_PERIOD_MS),
+            }
+        };
+        self.create_uart
+            .set_supervision_lights(&mut self.hardware, led_bits, color, intensity)?;
+        self.supervision_light_phase = self.supervision_light_phase.wrapping_add(1);
+        self.next_supervision_light_ms = now_ms.wrapping_add(period_ms);
+        Ok(())
     }
 
     fn poll_session_replace(&mut self) {
@@ -287,12 +388,7 @@ where
                 self.mode = RuntimeMode::Running;
             }
             BrainstemCommand::Arm => {
-                for command in ARM_SCRIPT {
-                    let _ = self.commands.push_back(QueuedCommand {
-                        command_id,
-                        command: *command,
-                    });
-                }
+                self.queue_create_acquisition(command_id);
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
                     status::set_runtime_state(RuntimeState::Running);
@@ -439,7 +535,6 @@ where
                 }
             }
             RuntimeCommand::StartOi => {
-                self.ensure_create_responsive()?;
                 self.create_uart
                     .start_oi(&mut self.hardware, &mut self.events)?;
                 status::set_body_state(BodyState::OiStarted);
@@ -447,11 +542,22 @@ where
                     until_ms: now_ms.wrapping_add(body::POST_START_SETTLE_MS),
                 };
             }
+            RuntimeCommand::SetCreateBaud(baud) => {
+                self.create_uart.flush_rx(&mut self.hardware);
+                self.hardware
+                    .set_create_uart_baud(baud)
+                    .map_err(|_| BrainstemError::UartFraming)?;
+                self.create_responsive = false;
+                status::set_oi_mode_unknown();
+                self.next_full_mode_refresh_ms = now_ms;
+            }
             RuntimeCommand::SetMode(mode) => {
-                self.ensure_create_responsive()?;
                 self.create_uart
                     .set_mode(&mut self.hardware, &mut self.events, mode)?;
-                status::set_oi_mode(mode);
+                if mode == crate::commands::CreateOiMode::Full {
+                    self.next_full_mode_refresh_ms =
+                        now_ms.wrapping_add(FULL_MODE_REFRESH_PERIOD_MS);
+                }
                 self.active = ActiveAction::Settle {
                     until_ms: now_ms.wrapping_add(body::POST_MODE_SETTLE_MS),
                 };
@@ -617,7 +723,6 @@ where
                 duration_ms,
             } => self.start_drive_arc(velocity_mm_s, radius_mm, duration_ms, now_ms)?,
             RuntimeCommand::RequestSensors { packet_id } => {
-                self.ensure_create_responsive()?;
                 self.create_uart
                     .request_sensor_packet(&mut self.hardware, packet_id)?;
             }
@@ -661,6 +766,11 @@ where
                 )?;
             }
             RuntimeCommand::PlayFeedback { kind } => {
+                if !self.create_responsive {
+                    self.active = ActiveAction::None;
+                    self.complete_active_command();
+                    return Ok(());
+                }
                 self.ensure_create_responsive()?;
                 let (tones, tone_count) = self.feedback_tones(kind);
                 self.create_uart.define_song(
@@ -840,12 +950,16 @@ where
                         };
                         return Ok(());
                     }
-                    self.stop_drive()?;
                     self.create_responsive = false;
                     status::set_create_power_unknown();
                     status::set_oi_mode_unknown();
                     status::mark_uart_rx_error();
-                    return Err(BrainstemError::CreateNoResponse);
+                    // Do not strand supervision in Error because RX failed.
+                    // The queued START/FULL commands and periodic assertion
+                    // still have value when the receive side is broken.
+                    self.active = ActiveAction::None;
+                    self.complete_active_command();
+                    return Ok(());
                 }
 
                 if time_reached(now_ms, next_probe_ms) {
@@ -1209,6 +1323,7 @@ where
             self.commands.clear();
             self.stop_drive()?;
             self.active = ActiveAction::None;
+            let _ = self.play_feedback_now(FeedbackKind::Danger);
             return Ok(());
         }
 
@@ -1227,7 +1342,9 @@ where
         } else {
             SafetyAction::Stop
         };
-        self.apply_safety_action(action)
+        self.apply_safety_action(action)?;
+        let _ = self.play_feedback_now(FeedbackKind::Danger);
+        Ok(())
     }
 
     fn apply_safety_action(&mut self, action: SafetyAction) -> Result<(), BrainstemError> {
@@ -1274,6 +1391,20 @@ where
             return (self.chirps[index], self.chirp_counts[index]);
         }
         default_feedback_tones(kind)
+    }
+
+    fn play_feedback_now(&mut self, kind: FeedbackKind) -> Result<(), BrainstemError> {
+        self.ensure_create_responsive()?;
+        let (tones, tone_count) = self.feedback_tones(kind);
+        self.create_uart.define_song(
+            &mut self.hardware,
+            &mut self.events,
+            feedback_slot(kind),
+            &tones,
+            tone_count,
+        )?;
+        self.create_uart
+            .play_song(&mut self.hardware, &mut self.events, feedback_slot(kind))
     }
 
     fn start_drive_direct(
@@ -1395,6 +1526,9 @@ where
         self.error_blink_next_ms = self.now_ms();
         self.error_blink_count = 0;
         self.error_blink_on = false;
+        if self.create_responsive {
+            let _ = self.play_feedback_now(FeedbackKind::Error);
+        }
     }
 
     fn error_tick(&mut self) {
@@ -1485,6 +1619,14 @@ where
 
 fn time_reached(now_ms: u32, deadline_ms: u32) -> bool {
     now_ms.wrapping_sub(deadline_ms) < u32::MAX / 2
+}
+
+fn low_battery_and_charging(snapshot: &status::BrainstemStatus) -> bool {
+    let actively_charging = matches!(snapshot.create_sensor_charging_state, 1..=3);
+    actively_charging
+        && snapshot.create_sensor_capacity_mah > 0
+        && u32::from(snapshot.create_sensor_charge_mah) * 100
+            <= u32::from(snapshot.create_sensor_capacity_mah) * LOW_BATTERY_PERCENT
 }
 
 fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCommand> {
@@ -1726,6 +1868,9 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             PowerStateRequest::Sleep => Some(RuntimeCommand::SleepCreate),
             PowerStateRequest::PulseBrc => Some(RuntimeCommand::PulseBrc),
             PowerStateRequest::StartOi => Some(RuntimeCommand::StartOi),
+            PowerStateRequest::DebugBaud19200 => Some(RuntimeCommand::SetCreateBaud(19_200)),
+            PowerStateRequest::DebugBaud57600 => Some(RuntimeCommand::SetCreateBaud(57_600)),
+            PowerStateRequest::DebugBaud115200 => Some(RuntimeCommand::SetCreateBaud(115_200)),
         },
         BrainstemCommand::CalibrateTurn {
             angular_mrad_s,
@@ -1912,17 +2057,73 @@ mod tests {
     }
 
     #[test]
-    fn startup_enters_idle_without_queuing_body_commands() {
+    fn startup_acquires_create_in_full_mode() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(0));
 
         runtime.start();
 
-        assert!(runtime.commands.is_empty());
-        assert!(matches!(runtime.mode, RuntimeMode::Idle));
+        assert_eq!(runtime.commands.len(), ACQUIRE_CREATE_SCRIPT.len());
+        assert!(runtime.commands.iter().any(|queued| matches!(
+            queued.command,
+            RuntimeCommand::SetMode(crate::commands::CreateOiMode::Full)
+        )));
+        assert!(matches!(runtime.mode, RuntimeMode::Running));
         assert_eq!(
             status::snapshot(0).current_runtime_state,
-            RuntimeState::Idle as u8
+            RuntimeState::Running as u8
+        );
+    }
+
+    #[test]
+    fn responsive_create_is_refreshed_in_full_mode() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        status::set_oi_mode(crate::commands::CreateOiMode::Full);
+
+        assert!(runtime.maintain_full_mode().is_ok());
+
+        assert!(runtime.hardware.writes.contains(&132));
+        assert_eq!(status::snapshot(1_000).oi_mode, 3);
+    }
+
+    #[test]
+    fn unresponsive_create_still_gets_start_and_full() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+
+        assert!(runtime.maintain_full_mode().is_ok());
+
+        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132]);
+        assert_eq!(status::snapshot(1_000).oi_mode, 3);
+    }
+
+    #[test]
+    fn low_battery_while_charging_pauses_full_mode_assertion() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charging_state: 2,
+                charge_mah: 200,
+                capacity_mah: 2_000,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+
+        assert!(runtime.maintain_full_mode().is_ok());
+
+        assert!(runtime.hardware.writes.is_empty());
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charging_state: 0,
+                charge_mah: 2_000,
+                capacity_mah: 2_000,
+                ..crate::events::CreateSensorPacket::default()
+            },
         );
     }
 

@@ -668,6 +668,9 @@ pub enum PowerStateRequest {
     Sleep,
     PulseBrc,
     StartOi,
+    DebugBaud19200,
+    DebugBaud57600,
+    DebugBaud115200,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -732,6 +735,9 @@ impl PowerStateRequest {
             Self::Sleep => "sleep",
             Self::PulseBrc => "pulse_brc",
             Self::StartOi => "start_oi",
+            Self::DebugBaud19200 => "debug_baud_19200",
+            Self::DebugBaud57600 => "debug_baud_57600",
+            Self::DebugBaud115200 => "debug_baud_115200",
         }
     }
 }
@@ -4145,7 +4151,23 @@ impl HttpCockpit {
         )?;
         stream.flush()?;
         let mut response = String::new();
-        stream.read_to_string(&mut response)?;
+        let mut bytes = [0u8; 1024];
+        loop {
+            match stream.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(len) => response.push_str(&String::from_utf8_lossy(&bytes[..len])),
+                Err(error)
+                    if !response.is_empty()
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         http_body(&response)
     }
 }

@@ -7,9 +7,9 @@ drive = "differential"
 baud = 57600
 data_bits = 8
 stop_bits = 1
-default_mode = "safe"
-sensor_probe_packet = 25
-supported_sensor_packets = "0,7-31"
+default_mode = "full"
+sensor_probe_packet = 35
+supported_sensor_packets = "0,7-31,35"
 supported_modes = ["passive", "safe", "full"]
 
 [timing]
@@ -31,8 +31,6 @@ verbs = [
   "status",
   "get_capabilities",
   "get_events",
-  "arm",
-  "disarm",
   "stop",
   "estop",
   "clear_estop",
@@ -73,8 +71,6 @@ verbs = [
   "restart_mpu",
   "restart_create",
   "dock",
-  "set_lights",
-  "set_mode",
 ]
 sensors = [
   "bump",
@@ -88,7 +84,7 @@ sensors = [
   "odometry_delta",
   "imu",
 ]
-outputs = ["lights", "song", "dock", "power_toggle", "brc"]
+outputs = ["song", "dock", "power_toggle", "brc"]
 safety = ["bump", "cliff", "wheel_drop", "estop", "heartbeat", "tilt", "impact"]
 feedback = ["ok", "error", "armed", "lost_target", "dock_seen", "danger"]
 events = [

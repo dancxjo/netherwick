@@ -246,7 +246,11 @@ flash: brainstem-pico-w-uf2
         echo "Requesting authorized BOOTSEL via $bootsel_url"
         host="${bootsel_url#http://}"
         host="${host%%/*}"
-        if ! PETE_BRAINSTEM_HTTP_HOST="$host" cargo run -q -p pete-cockpit --example service_bootsel; then
+        if [[ "$host" != *:* ]]; then
+            host="$host:80"
+        fi
+        if ! PETE_BRAINSTEM_HTTP_HOST="$host" cargo run -q -p pete-cockpit --example service_bootsel \
+            && ! PETE_BOOTSEL_USB=1 cargo run -q -p pete-cockpit --example service_bootsel; then
             if [ "${PETE_ALLOW_LEGACY_BOOTSEL:-0}" != "1" ]; then
                 echo "Authorized BOOTSEL failed; legacy fallback is disabled." >&2
                 echo "Set PETE_ALLOW_LEGACY_BOOTSEL=1 only for explicit development recovery." >&2

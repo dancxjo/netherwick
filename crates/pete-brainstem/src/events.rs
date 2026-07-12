@@ -10,6 +10,7 @@ pub struct CreateSensorPacket {
     pub distance_mm: i16,
     pub angle_mrad: i16,
     pub charging_state: u8,
+    pub oi_mode: u8,
     pub voltage_mv: u16,
     pub current_ma: i16,
     pub temperature_c: i8,

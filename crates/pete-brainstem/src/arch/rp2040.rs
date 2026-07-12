@@ -39,7 +39,7 @@ type CreateUart = UartPeripheral<
     pac::UART0,
     (
         Pin<Gpio0, FunctionUart, PullDown>,
-        Pin<Gpio1, FunctionUart, PullDown>,
+        Pin<Gpio1, FunctionUart, PullUp>,
     ),
 >;
 
@@ -92,7 +92,9 @@ impl Rp2040Brainstem {
 
         let uart_pins = (
             pins.gpio0.into_function::<FunctionUart>(),
-            pins.gpio1.into_function::<FunctionUart>(),
+            pins.gpio1
+                .into_pull_up_input()
+                .into_function::<FunctionUart>(),
         );
         let uart = UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
             .enable(

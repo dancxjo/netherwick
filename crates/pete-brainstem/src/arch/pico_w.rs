@@ -63,6 +63,8 @@ const MDNS_PORT: u16 = 5353;
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
 const HTTP_FLUSH_TIMEOUT_MS: u64 = 250;
+const SSE_STATUS_INTERVAL_MS: u64 = 750;
+const SSE_EVENT_CHECK_INTERVAL_MS: u64 = 100;
 const LED_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const LED_BLINK_ON_MS: u64 = 120;
 const LED_BLINK_OFF_MS: u64 = 120;
@@ -117,8 +119,16 @@ impl PicoWBrainstem {
         uart_config.data_bits = DataBits::DataBits8;
         uart_config.stop_bits = StopBits::STOP1;
         uart_config.parity = Parity::ParityNone;
+        let uart = Uart::new_blocking(uart0, tx, rx, uart_config);
+        // UART idles high. Keep the Create RX input at a defined idle level
+        // while the robot or level shifter is unpowered instead of accepting
+        // the RP2040 pad's reset pull-down as break/framing noise.
+        rp_pac::PADS_BANK0.gpio(1).modify(|w| {
+            w.set_pue(true);
+            w.set_pde(false);
+        });
         Self {
-            uart: Uart::new_blocking(uart0, tx, rx, uart_config),
+            uart,
             power_toggle: Output::new(power_toggle, Level::Low),
             brc: Output::new(brc, Level::High),
             status_led: Output::new(status_led, Level::Low),
@@ -170,6 +180,11 @@ impl BrainstemHardware for PicoWBrainstem {
             Err(nb::Error::WouldBlock) => SerialRead::WouldBlock,
             Err(nb::Error::Other(error)) => SerialRead::Error(map_uart_error(error)),
         }
+    }
+
+    fn set_create_uart_baud(&mut self, baud: u32) -> Result<(), ()> {
+        self.uart.set_baudrate(baud);
+        Ok(())
     }
 
     fn restart_imu(&mut self) -> Result<(), ImuHealth> {
@@ -704,6 +719,10 @@ async fn http_task(stack: Stack<'static>) -> ! {
             (Some("GET"), Some("/") | Some("/index.html")) => {
                 write_response(&mut socket, "text/html; charset=utf-8", index_html()).await
             }
+            (Some("GET"), Some(path)) if path == "/events" || path.starts_with("/events?") => {
+                let since_seq = request_sse_cursor(&request[..n]);
+                stream_sse(&mut socket, &mut json, since_seq).await
+            }
             (Some("GET"), Some("/status.json")) => {
                 let snapshot = status::snapshot(uptime_ms);
                 match status::render_json(snapshot, &mut json) {
@@ -1114,6 +1133,73 @@ async fn write_response(
     flush_tcp_with_timeout(socket).await
 }
 
+async fn stream_sse(
+    socket: &mut TcpSocket<'_>,
+    json: &mut [u8],
+    mut since_seq: u32,
+) -> Result<bool, embassy_net::tcp::Error> {
+    socket
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\nretry: 1000\r\n\r\n",
+        )
+        .await?;
+    if !flush_tcp_with_timeout(socket).await? {
+        return Ok(false);
+    }
+
+    let mut next_status_ms = 0;
+    loop {
+        let now_ms = Instant::now().as_millis() as u64;
+        if now_ms >= next_status_ms {
+            let snapshot = status::snapshot(now_ms as u32);
+            let body = match status::render_json(snapshot, json) {
+                Ok(body) => body,
+                Err(_) => return Ok(false),
+            };
+            match write_sse_event(socket, "status", None, body).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return Ok(true),
+            }
+            next_status_ms = now_ms.saturating_add(SSE_STATUS_INTERVAL_MS);
+        }
+
+        let event_next_seq = status::event_next_seq();
+        if event_next_seq != since_seq.saturating_add(1) {
+            let body = match status::render_events_json(since_seq, json) {
+                Some(body) => body,
+                None => return Ok(false),
+            };
+            let last_seq = json_u32(body, "next_seq")
+                .unwrap_or(event_next_seq)
+                .saturating_sub(1);
+            match write_sse_event(socket, "events", Some(last_seq), body).await {
+                Ok(true) => since_seq = last_seq,
+                Ok(false) | Err(_) => return Ok(true),
+            }
+        }
+
+        Timer::after_millis(SSE_EVENT_CHECK_INTERVAL_MS).await;
+    }
+}
+
+async fn write_sse_event(
+    socket: &mut TcpSocket<'_>,
+    event: &str,
+    id: Option<u32>,
+    body: &str,
+) -> Result<bool, embassy_net::tcp::Error> {
+    let mut prefix = heapless::String::<64>::new();
+    let _ = write!(prefix, "event: {event}\r\n");
+    if let Some(id) = id {
+        let _ = write!(prefix, "id: {id}\r\n");
+    }
+    let _ = prefix.push_str("data: ");
+    socket.write_all(prefix.as_bytes()).await?;
+    socket.write_all(body.trim_end().as_bytes()).await?;
+    socket.write_all(b"\r\n\r\n").await?;
+    flush_tcp_with_timeout(socket).await
+}
+
 async fn read_http_request(
     socket: &mut TcpSocket<'_>,
     buffer: &mut [u8],
@@ -1216,6 +1302,32 @@ fn request_method(request: &[u8]) -> Option<&str> {
     line.split(' ').next()
 }
 
+fn request_sse_cursor(request: &[u8]) -> u32 {
+    let requested = request_header(request, "Last-Event-ID")
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            let query = request_path(request)?.split_once('?')?.1;
+            query.split('&').find_map(|field| {
+                let (name, value) = field.split_once('=')?;
+                (name == "since").then(|| value.parse().ok()).flatten()
+            })
+        });
+    let next_seq = status::event_next_seq();
+    match requested {
+        Some(cursor) if cursor < next_seq => cursor,
+        Some(_) => 0,
+        None => next_seq.saturating_sub(1),
+    }
+}
+
+fn request_header<'a>(request: &'a [u8], wanted: &str) -> Option<&'a str> {
+    let request = core::str::from_utf8(request).ok()?;
+    request.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case(wanted).then(|| value.trim())
+    })
+}
+
 fn index_html() -> &'static [u8] {
     // Embedded browser cockpit mapping to the host-side pete-cockpit contract:
     //
@@ -1225,11 +1337,8 @@ fn index_html() -> &'static [u8] {
     // STOP                          stop                  Stop                           stop
     // E-STOP                        estop                 EStop                          estop
     // Clear E-Stop                  clear_estop           ClearEStop                     clear_estop
-    // Arm / Disarm                  arm / disarm          Arm / Disarm                   arm / disarm
-    // Safe / Full                   set_mode              SetMode                        set_mode
     // Dock                          dock                  Dock                           dock
     // Ping                          ping                  Ping                           ping
-    // Lights                        set_lights            SetLights                      set_lights
     // Drive 300                     drive_for             DriveFor                       drive_for
     // Turn L/R                      turn_by               TurnBy                         turn_by
     // Creep                         creep_until           CreepUntil                     creep_until
@@ -1239,7 +1348,7 @@ fn index_html() -> &'static [u8] {
     // Unstick                       unstick               Unstick                        unstick
     // Cliff Stop                    cliff_guard           CliffGuard                     cliff_guard
     // Music Define / Play           song_define/play      SongDefine / SongPlay          song_define/song_play
-    // Refresh                       status/get_events     GetStatus / GetEvents          status/get_events
+    // Refresh                       reconnect /events SSE (no command)
     // BOOTSEL                       bootsel               Bootsel                        service/debug only
     br#"<!doctype html>
 <html>
@@ -1292,8 +1401,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 </section>
 <section class="panel controls">
 <div class="controlgrid">
-<div class="cluster"><h2>Mode</h2><div class="seg"><button id="arm" class="primary">Arm</button><button id="safe">Safe</button><button id="full">Full</button><button id="disarm">Disarm</button><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
-<div class="cluster"><h2>LEDs</h2><div class="split"><div class="field"><label for="ledcolor">LED 1 color</label><select id="ledcolor"><option value="0">Green</option><option value="128" selected>Amber</option><option value="255">Red</option></select></div><div class="slider"><label for="ledintensity">LED 1 intensity <span id="ledintensityv">25</span>%</label><input id="ledintensity" type="range" min="0" max="100" value="25"></div></div><label>Binary channels</label><div class="seg"><button data-led-bit="1">LED 2 OFF</button><button data-led-bit="2">LED 3 OFF</button><button data-led-bit="4">LED 4 OFF</button><button data-led-bit="8">LED 5 OFF</button></div><div class="row"><button id="ledapply" class="primary">Apply LEDs</button><button id="ledoff">All Off</button></div></div>
+<div class="cluster"><h2>Robot</h2><p class="muted">Brainstem continuously supervises the Create in Full mode.</p><div class="seg"><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
 <div class="cluster"><h2>Primitives</h2><div class="seg"><button data-action="drive_for">Drive 300</button><button data-action="turn_left">Turn L</button><button data-action="turn_right">Turn R</button><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div></div>
 <div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="imuzero">Zero IMU</button><button id="imuclear">Clear IMU</button><button id="mpurestart" class="warnbtn">Restart MPU</button><button id="createrestart" class="warnbtn">Restart Create</button><button id="stream">Stream Sensors</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
 <div class="cluster wide"><h2>Music</h2><div class="split"><div class="field"><label for="songid">Slot</label><input id="songid" inputmode="numeric" value="0"></div><div class="field"><label for="tones">Tones</label><input id="tones" value="72:8,76:8,79:16"></div></div><div class="row"><button id="songdef" class="primary">Define</button><button id="songplay">Play</button><button id="song">Chirp</button></div></div>
@@ -1333,7 +1441,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 </div>
 </div>
 <script>
-let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,driveKind='',statusBusy=false,lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,eventBusy=false,caps=null,ledBits=0,sessionId='',controlLeaseId='';
+let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,sse=null,sseOpen=false,driveKind='',lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,caps=null,sessionId='',controlLeaseId='';
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
 const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','calibrate_turn','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
 const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',heartbeat:'heartbeat_stop'};
@@ -1343,15 +1451,14 @@ function addLog(text){let t=new Date().toLocaleTimeString();log.textContent=(t+'
 function hasVerb(v){return !!(caps&&caps.verbs&&caps.verbs.indexOf(v)>=0)}
 function setDisabled(ids,verb){ids.forEach(x=>{let e=$(x);if(e)e.disabled=!hasVerb(verb)})}
 function token(prefix){let a=new Uint32Array(2);crypto.getRandomValues(a);return prefix+'-'+a[0].toString(16)+'-'+a[1].toString(16)}
-function establishBrowserSession(){controlLeaseId='';let boot=sessionStorage.getItem('pete-browser-boot');if(!boot){boot=token('browserboot');sessionStorage.setItem('pete-browser-boot',boot)}let nonce=token('hello'),hello={role:'operator',session_purpose:'control',device_id:token('browser'),boot_id:boot,handshake_nonce:nonce,protocol_major:1,protocol_minor_min:0,protocol_minor_max:0,supported_features:['session_ids','event_cursor','heartbeat','transport_failover'],required_features:['session_ids'],preferred_heartbeat_ms:500};pill($('session'),'handshaking','warn');return fetch('/handshake',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(hello)}).then(r=>r.json()).then(j=>{if(j.kind!=='welcome'||j.echoed_handshake_nonce!==nonce)throw new Error(j.reason_code||'invalid welcome');sessionId=j.session_id;eventCursor=Math.max(0,(j.current_event_next_seq||1)-1);pill($('session'),'session '+sessionId.slice(-8),'ok');pill(net,'session HTTP','ok');addLog('session opened '+sessionId);requestCaps();pollEvents();return j}).catch(e=>{sessionId='';pill($('session'),'session failed','bad');addLog('handshake failed '+e.message);throw e})}
+function establishBrowserSession(){controlLeaseId='';let boot=sessionStorage.getItem('pete-browser-boot');if(!boot){boot=token('browserboot');sessionStorage.setItem('pete-browser-boot',boot)}let nonce=token('hello'),hello={role:'operator',session_purpose:'control',device_id:token('browser'),boot_id:boot,handshake_nonce:nonce,protocol_major:1,protocol_minor_min:0,protocol_minor_max:0,supported_features:['session_ids','event_cursor','heartbeat','transport_failover'],required_features:['session_ids'],preferred_heartbeat_ms:500};pill($('session'),'handshaking','warn');return fetch('/handshake',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(hello)}).then(r=>r.json()).then(j=>{if(j.kind!=='welcome'||j.echoed_handshake_nonce!==nonce)throw new Error(j.reason_code||'invalid welcome');sessionId=j.session_id;eventCursor=Math.max(0,(j.current_event_next_seq||1)-1);pill($('session'),'session '+sessionId.slice(-8),'ok');pill(net,'session HTTP','ok');addLog('session opened '+sessionId);requestCaps();connectSse();return j}).catch(e=>{sessionId='';pill($('session'),'session failed','bad');addLog('handshake failed '+e.message);throw e})}
 function acquireBrowserControl(){if(!sessionId){addLog('open a session first');return}let body={kind:'acquire_control_lease',command_id:id++,session_id:sessionId,authority:'operator_debug',ttl_ms:60000};fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(j=>{if(j.accepted&&j.type==='control_lease_granted'){controlLeaseId=j.lease_id;pill($('session'),'operator control','ok');addLog('control lease '+j.lease_id+' (60 seconds)')}else{controlLeaseId='';handleReply(j)}}).catch(e=>addLog('control request failed '+e.message))}
-function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;pill(net,'control ws','ok');requestCaps();refresh();pollEvents()};ws.onclose=()=>{wsOpen=false;pill(net,'reconnecting','warn');setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false;pill(net,'ws error','warn')};ws.onmessage=e=>{try{handleReply(JSON.parse(e.data))}catch(_){}}}catch(_){wsOpen=false}}
+function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;pill(net,'control ws','ok');requestCaps()};ws.onclose=()=>{wsOpen=false;pill(net,'reconnecting','warn');setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false;pill(net,'ws error','warn')};ws.onmessage=e=>{try{handleReply(JSON.parse(e.data))}catch(_){}}}catch(_){wsOpen=false}}
+function connectSse(){if(sse)sse.close();sseOpen=false;sse=new EventSource('/events?since='+eventCursor);sse.onopen=()=>{sseOpen=true;pill(net,'telemetry sse','ok')};sse.addEventListener('status',e=>{try{showStatus(JSON.parse(e.data))}catch(_){}});sse.addEventListener('events',e=>{try{handleEvents(JSON.parse(e.data))}catch(_){}});sse.onerror=()=>{sseOpen=false;pill(net,'sse reconnecting','warn')}}
 function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='events'){handleEvents(j);return}if(j.verbs){caps=j;applyCaps();pill(net,'capabilities','ok');return}let ok=j.accepted!==false,reason=j.message||j.reason||'';if(!ok&&(reason==='invalid_control_lease'||reason==='control_lease_required')){controlLeaseId='';pill($('session'),'session; control expired','warn');addLog('control authority expired; press Request control')}if(!ok&&(reason==='invalid_session'||reason==='session_required')){sessionId='';controlLeaseId='';pill($('session'),'session expired','bad');addLog('session expired; press New session')}pill(net,ok?'accepted':'rejected',ok?'ok':'warn');if(!ok)addLog('rejected '+(reason||j.command_id||''));else if(j.message)addLog(j.message+' '+(j.command_id||''))}
 function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(sessionId)o.session_id=sessionId;if(controlLeaseId)o.lease_id=controlLeaseId;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
 function requestCaps(){sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps()}})}
-function applyCaps(){setDisabled(['arm'],'arm');setDisabled(['disarm'],'disarm');setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');setDisabled(['imuzero'],'zero_imu_orientation');setDisabled(['imuclear'],'clear_imu_orientation');setDisabled(['mpurestart'],'restart_mpu');setDisabled(['createrestart'],'restart_create');setDisabled(['ledapply','ledoff','ledcolor','ledintensity'],'set_lights');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});document.querySelectorAll('[data-led-bit]').forEach(b=>b.disabled=!hasVerb('set_lights'));['dock','safe','full','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='safe'||x==='full'?'set_mode':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
-function sendLights(){let pct=+$('ledintensity').value;sendCockpit({kind:'set_lights',led_bits:ledBits,color:+$('ledcolor').value,intensity:Math.round(pct*255/100)})}
-function renderLedBits(){document.querySelectorAll('[data-led-bit]').forEach((b,i)=>{let on=(ledBits&+b.dataset.ledBit)!==0;b.classList.toggle('active',on);b.textContent='LED '+(i+2)+' '+(on?'ON':'OFF')})}
+function applyCaps(){setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');setDisabled(['imuzero'],'zero_imu_orientation');setDisabled(['imuclear'],'clear_imu_orientation');setDisabled(['mpurestart'],'restart_mpu');setDisabled(['createrestart'],'restart_create');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});['dock','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
 function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('[data-drive].active').forEach(b=>b.classList.remove('active'));sendCockpit({kind:'stop'})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
 function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
@@ -1371,10 +1478,6 @@ $('sessionnew').onclick=establishBrowserSession
 $('controllease').onclick=acquireBrowserControl
 $('estop').onclick=()=>sendCockpit({kind:'estop'})
 $('clear').onclick=()=>sendCockpit({kind:'clear_estop'})
-$('arm').onclick=()=>sendCockpit({kind:'arm'})
-$('safe').onclick=()=>sendCockpit({kind:'set_mode',mode:'safe'})
-$('full').onclick=()=>sendCockpit({kind:'set_mode',mode:'full'})
-$('disarm').onclick=()=>sendCockpit({kind:'disarm'})
 $('dock').onclick=()=>sendCockpit({kind:'dock'})
 $('ping').onclick=()=>sendCockpit({kind:'ping'})
 $('imuzero').onclick=()=>sendCockpit({kind:'zero_imu_orientation'})
@@ -1386,15 +1489,11 @@ $('songplay').onclick=()=>sendCockpit({kind:'song_play',id:songSlot()})
 $('song').onclick=()=>defineSong().then(()=>sendCockpit({kind:'song_play',id:songSlot()}))
 $('stream').onclick=()=>sendCockpit({kind:'stream_sensors',enabled:true,packet_id:0,period_ms:250})
 $('bootsel').onclick=()=>sendCockpit({kind:'bootsel'})
-$('refresh').onclick=refresh
-document.querySelectorAll('[data-led-bit]').forEach(b=>b.onclick=()=>{ledBits^=+b.dataset.ledBit;renderLedBits()})
+$('refresh').onclick=connectSse
 document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>behavior(b.dataset.action))
 document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveKind=b.dataset.drive;b.classList.add('active');sendDrive();timer=setInterval(sendDrive,190);b.setPointerCapture(e.pointerId)};b.onpointerup=b.onpointercancel=stop})
 $('speed').oninput=()=>$('speedv').textContent=$('speed').value
 $('turn').oninput=()=>$('turnv').textContent=$('turn').value
-$('ledintensity').oninput=()=>$('ledintensityv').textContent=$('ledintensity').value
-$('ledapply').onclick=sendLights
-$('ledoff').onclick=()=>{ledBits=0;$('ledintensity').value=0;$('ledintensityv').textContent='0';renderLedBits();sendLights()}
 function time(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60),h=Math.floor(m/60);return h+'h '+(m%60)+'m '+(s%60)+'s'}
 function flagList(cs){let f=[];if(cs.bump_left)f.push('bump L');if(cs.bump_right)f.push('bump R');if(cs.wall)f.push('wall');if(cs.virtual_wall)f.push('virtual wall');if(cs.wheel_drop)f.push('wheel drop');if(cs.cliff_left)f.push('cliff L');if(cs.cliff_front_left)f.push('cliff FL');if(cs.cliff_front_right)f.push('cliff FR');if(cs.cliff_right)f.push('cliff R');return f}
 function battPct(cs){return cs.capacity_mah?Math.min(100,Math.round((cs.charge_mah||0)*100/cs.capacity_mah)):null}
@@ -1402,12 +1501,9 @@ function num(v,d=0){return typeof v==='number'&&isFinite(v)?v.toFixed(d):'--'}
 function pctBar(id,value,max,badAt,warnAt){let e=$(id),i=e&&e.querySelector('i');if(!e||!i)return;let p=Math.max(0,Math.min(100,(value||0)*100/max));i.style.width=p+'%';e.className='bar '+((value||0)>=badAt?'bad':(value||0)>=warnAt?'warn':'')}
 function imuClass(imu){let h=imu.health||'unknown',age=imu.sample_age_ms||0;if(h==='fault'||(h==='ok'&&age>2000))return'badtext';if(h!=='ok'||age>500)return'muted';return'oktext'}
 function showImu(imu){imu=imu||{};let present=imu.present||'unknown',health=imu.health||'unknown',age=imu.sample_age_ms||0,poll=imu.poll_period_ms||0,yaw=(imu.yaw_mrad||0)/1000,rate=(imu.yaw_rate_mrad_s||0)/1000,acc=(imu.accel_magnitude_mm_s2||0)/1000,tilt=(imu.tilt_magnitude_mrad||0)/1000,rough=(imu.roughness_mm_s2||0)/1000,impact=(imu.impact_score_mm_s2||0)/1000;let cls=imuClass(imu);$('imuhealth').textContent=title(health)+' / '+title(present)+' / age '+age+' ms / '+poll+' ms poll';$('imuhealth').className=cls;$('imuyaw').textContent=num(yaw,2)+' rad / '+num(yaw*57.2958,1)+' deg';$('imuyaw').className=cls;$('imuaccel').textContent=num(acc,2)+' m/s\u00B2';$('imuaccel').className=acc>16?'badtext':acc>12?'muted':cls;$('imutilt').textContent=num(tilt,2)+' rad / '+num(tilt*57.2958,1)+' deg';$('imutilt').className=tilt>.65?'badtext':tilt>.35?'muted':cls;$('imurates').textContent='yaw '+num(rate,2)+' rad/s / xyz '+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.x||0)/1000,2)+','+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.y||0)/1000,2)+','+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.z||0)/1000,2);$('imurates').className=cls;$('imurough').textContent=num(rough,2)+' m/s\u00B2';$('imurough').className=rough>8?'badtext':rough>3?'muted':cls;$('imuimpact').textContent=num(impact,2)+' m/s\u00B2';$('imuimpact').className=impact>18?'badtext':impact>8?'muted':cls;$('imumotion').textContent=title(imu.motion_consistency||'unknown')+' / '+title(imu.calibration||'uncalibrated');$('imumotion').className=(imu.motion_consistency==='inconsistent'||imu.calibration==='uncalibrated')?'muted':cls;pctBar('imuaccelbar',imu.accel_magnitude_mm_s2||0,22000,18000,13000);pctBar('imutiltbar',imu.tilt_magnitude_mrad||0,1000,650,350);pctBar('imuroughbar',imu.roughness_mm_s2||0,12000,8000,3000);pctBar('imuimpactbar',imu.impact_score_mm_s2||0,22000,18000,8000)}
-function showStatus(s){let cs=s.create_sensors||{},od=s.odometry||{},imu=s.imu||{},music=s.create_songs||{},fatal=s.current_runtime_state==='error'||(s.last_error&&s.last_error!=='none'),contact=cs.bump_left||cs.bump_right||cs.wall||cs.virtual_wall,imuOk=imu.health==='ok',imuDanger=imu.health==='fault'||(imuOk&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safetyStop=cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,pct=battPct(cs),flags=flagList(cs);if(imuOk&&(imu.tilt_magnitude_mrad||0)>=650)flags.push('tilt');if(imuOk&&(imu.impact_score_mm_s2||0)>=18000)flags.push('impact');if(imuOk&&imu.motion_consistency==='inconsistent')flags.push('motion mismatch');pill(net,wsOpen?'control ws':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),fatal?'fatal/error':safetyStop?'safety stop':contact?'contact':'clear',fatal||safetyStop?'bad':contact?'warn':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health)+' / IMU '+title(imu.health||'unknown');$('runtime').textContent=title(s.current_runtime_state)+' / body '+title(s.body_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=flags.join(', ')||'clear';$('safetyread').className=fatal||safetyStop?'badtext':contact?'muted':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / IR '+(cs.ir_byte||0)+' / buttons '+(cs.buttons||0)+' / cliff sig '+(cs.cliff_left_signal||0)+','+(cs.cliff_front_left_signal||0)+','+(cs.cliff_front_right_signal||0)+','+(cs.cliff_right_signal||0);$('battery').textContent=(pct===null?'--':pct+'%')+' / '+(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh / charge state '+(cs.charging_state||0);$('battery').className=pct!==null&&pct<=20?'badtext':'muted';$('odom').textContent='delta '+(cs.distance_mm||0)+' mm / '+(cs.angle_mrad||0)+' mrad / total '+(od.distance_mm||0)+' mm / '+(od.heading_mrad||0)+' mrad / resets '+(od.reset_count||0);showImu(imu);$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=fatal?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=fatal?'badtext':'muted'}
-function handleEvents(batch){eventBusy=false;let stopNeeded=false;eventCursor=Math.max(0,(batch.next_seq||1)-1);if(batch.dropped_before_seq){$('events').textContent='recovered after '+batch.dropped_before_seq;pill($('safety'),'event history recovered','warn');addLog('recovered event history after '+batch.dropped_before_seq);stopNeeded=true}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched','wheel_drop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k+' '+(e.a||0));stopNeeded=true}else if(['bump_changed','wall_changed','virtual_wall_changed','buttons_changed','ir_changed','charging_state_changed','battery_low','cliff_changed','wheel_drop_cleared','safety_cleared'].indexOf(k)>=0){addLog(k+' '+(e.a||0))}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0))}else if(k==='motion_stopped'){addLog('motion stopped')}else if(k==='error'){pill($('safety'),'fatal/error','bad');addLog('error '+(e.a||0));stopNeeded=true}});if(stopNeeded)stop()}
-function pollEvents(){if(eventBusy)return;eventBusy=true;sendCockpit({kind:'get_events',since_seq:eventCursor},false).then(j=>{if(j&&j.type==='events')handleEvents(j);else eventBusy=false}).catch(_=>{eventBusy=false})}
-function refresh(){if(statusBusy)return;statusBusy=true;fetch('/status.json').then(r=>r.json()).then(showStatus).catch(_=>pill(net,'offline','bad')).finally(()=>statusBusy=false)}
-applyCaps();setInterval(refresh,750);setInterval(pollEvents,600);refresh();
-establishBrowserSession().catch(()=>{});
+function showStatus(s){let cs=s.create_sensors||{},od=s.odometry||{},imu=s.imu||{},music=s.create_songs||{},fatal=s.current_runtime_state==='error'||(s.last_error&&s.last_error!=='none'),contact=cs.bump_left||cs.bump_right||cs.wall||cs.virtual_wall,imuOk=imu.health==='ok',imuDanger=imu.health==='fault'||(imuOk&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safetyStop=cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,pct=battPct(cs),flags=flagList(cs);if(imuOk&&(imu.tilt_magnitude_mrad||0)>=650)flags.push('tilt');if(imuOk&&(imu.impact_score_mm_s2||0)>=18000)flags.push('impact');if(imuOk&&imu.motion_consistency==='inconsistent')flags.push('motion mismatch');pill(net,wsOpen?'control ws':sseOpen?'telemetry sse':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),fatal?'fatal/error':safetyStop?'safety stop':contact?'contact':'clear',fatal||safetyStop?'bad':contact?'warn':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health)+' / IMU '+title(imu.health||'unknown');$('runtime').textContent=title(s.current_runtime_state)+' / body '+title(s.body_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=flags.join(', ')||'clear';$('safetyread').className=fatal||safetyStop?'badtext':contact?'muted':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / IR '+(cs.ir_byte||0)+' / buttons '+(cs.buttons||0)+' / cliff sig '+(cs.cliff_left_signal||0)+','+(cs.cliff_front_left_signal||0)+','+(cs.cliff_front_right_signal||0)+','+(cs.cliff_right_signal||0);$('battery').textContent=(pct===null?'--':pct+'%')+' / '+(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh / charge state '+(cs.charging_state||0);$('battery').className=pct!==null&&pct<=20?'badtext':'muted';$('odom').textContent='delta '+(cs.distance_mm||0)+' mm / '+(cs.angle_mrad||0)+' mrad / total '+(od.distance_mm||0)+' mm / '+(od.heading_mrad||0)+' mrad / resets '+(od.reset_count||0);showImu(imu);$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=fatal?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=fatal?'badtext':'muted'}
+function handleEvents(batch){let stopNeeded=false;eventCursor=Math.max(0,(batch.next_seq||1)-1);if(batch.dropped_before_seq){$('events').textContent='recovered after '+batch.dropped_before_seq;pill($('safety'),'event history recovered','warn');addLog('recovered event history after '+batch.dropped_before_seq);stopNeeded=true}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched','wheel_drop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k+' '+(e.a||0));stopNeeded=true}else if(['bump_changed','wall_changed','virtual_wall_changed','buttons_changed','ir_changed','charging_state_changed','battery_low','cliff_changed','wheel_drop_cleared','safety_cleared'].indexOf(k)>=0){addLog(k+' '+(e.a||0))}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0))}else if(k==='motion_stopped'){addLog('motion stopped')}else if(k==='error'){pill($('safety'),'fatal/error','bad');addLog('error '+(e.a||0));stopNeeded=true}});if(stopNeeded)stop()}
+applyCaps();establishBrowserSession().catch(connectSse);
 </script>
 </body>
 </html>
@@ -1642,9 +1738,17 @@ fn handle_command_request<'a>(
             .ok_or(CommandParseError::BadRequest);
     }
     if matches!(command, BrainstemCommand::Bootsel) {
-        return render_command_response(buffer, cfg!(feature = "service-mode"), command_id,
-            if cfg!(feature = "service-mode") { "bootsel_accepted" } else { "service_operation_disabled" })
-            .ok_or(CommandParseError::BadRequest);
+        return render_command_response(
+            buffer,
+            cfg!(feature = "service-mode"),
+            command_id,
+            if cfg!(feature = "service-mode") {
+                "bootsel_accepted"
+            } else {
+                "service_operation_disabled"
+            },
+        )
+        .ok_or(CommandParseError::BadRequest);
     }
     if !status::submit_control_command(command_id, command) {
         return Err(CommandParseError::Busy(command_id));
@@ -2299,7 +2403,9 @@ fn json_service_authority_valid(body: &str) -> bool {
         session::token_hash(session_id),
         session::token_hash(lease_id),
         Instant::now().as_millis() as u32,
-        json_str(body, "kind").and_then(service_scope_code).unwrap_or(0),
+        json_str(body, "kind")
+            .and_then(service_scope_code)
+            .unwrap_or(0),
     )
 }
 fn compact_authority_valid(
@@ -2337,7 +2443,7 @@ fn compact_envelope(line: &str) -> (&str, Option<&str>, Option<&str>, Option<&st
     };
     let (without_lease, lease) = match without_service.rsplit_once(" lease_id=") {
         Some((command, lease)) if !lease.contains(' ') => (command, Some(lease)),
-        _ => (line, None),
+        _ => (without_service, None),
     };
     match without_lease.rsplit_once(" session_id=") {
         Some((command, session_id)) if !session_id.contains(' ') => {
@@ -2347,7 +2453,11 @@ fn compact_envelope(line: &str) -> (&str, Option<&str>, Option<&str>, Option<&st
     }
 }
 
-fn compact_service_authority_valid(session_id: Option<&str>, lease_id: Option<&str>, command: BrainstemCommand) -> bool {
+fn compact_service_authority_valid(
+    session_id: Option<&str>,
+    lease_id: Option<&str>,
+    command: BrainstemCommand,
+) -> bool {
     let scope = match command {
         BrainstemCommand::Bootsel => 1,
         BrainstemCommand::RestartMpu => 2,
@@ -2358,7 +2468,8 @@ fn compact_service_authority_valid(session_id: Option<&str>, lease_id: Option<&s
         (Some(session_id), Some(lease_id)) => status::active_service_authority_matches(
             session::token_hash(session_id),
             session::token_hash(lease_id),
-            Instant::now().as_millis() as u32, scope,
+            Instant::now().as_millis() as u32,
+            scope,
         ),
         _ => false,
     }
@@ -2522,7 +2633,8 @@ fn handle_service_authority_compact<const N: usize>(
         let _ = writeln!(response, "ERR {seq} service_policy_rejected");
         return;
     }
-    let Some((lease_id, generation)) = install_service_authority(session_hash, ttl_ms, scope_code) else {
+    let Some((lease_id, generation)) = install_service_authority(session_hash, ttl_ms, scope_code)
+    else {
         let _ = writeln!(response, "ERR {seq} authority_transition_timeout");
         return;
     };
@@ -2772,7 +2884,7 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
     let snapshot = status::snapshot(Instant::now().as_millis() as u32);
     let _ = writeln!(
         response,
-        "OK {seq} STATUS runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_len={} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_yaw_rate_mrad_s={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={}",
+        "OK {seq} STATUS runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_len={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_yaw_rate_mrad_s={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={}",
         snapshot.current_runtime_state,
         snapshot.body_state,
         snapshot.current_runtime_action,
@@ -2787,6 +2899,16 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.uart_rx_bytes,
         snapshot.uart_rx_packets,
         snapshot.last_uart_packet_len,
+        snapshot.uart_tx_bytes,
+        snapshot.last_uart_rx_byte,
+        snapshot.last_uart_tx_byte,
+        snapshot.last_uart_rx_timestamp_ms,
+        snapshot.last_uart_tx_timestamp_ms,
+        snapshot.uart_rx_overruns,
+        snapshot.uart_rx_breaks,
+        snapshot.uart_rx_parity_errors,
+        snapshot.uart_rx_framing_errors,
+        snapshot.uart_rx_other_errors,
         snapshot.wake_probe_response_bytes,
         snapshot.wake_probe_expected_bytes,
         snapshot.forebrain_uart_rx_bytes,
@@ -3079,6 +3201,9 @@ fn parse_power_request(request: &str) -> Option<PowerStateRequest> {
         "sleep" | "SLEEP" => Some(PowerStateRequest::Sleep),
         "pulse_brc" | "PULSE_BRC" => Some(PowerStateRequest::PulseBrc),
         "start_oi" | "START_OI" => Some(PowerStateRequest::StartOi),
+        "debug_baud_19200" | "DEBUG_BAUD_19200" => Some(PowerStateRequest::DebugBaud19200),
+        "debug_baud_57600" | "DEBUG_BAUD_57600" => Some(PowerStateRequest::DebugBaud57600),
+        "debug_baud_115200" | "DEBUG_BAUD_115200" => Some(PowerStateRequest::DebugBaud115200),
         _ => None,
     }
 }
@@ -3403,13 +3528,22 @@ impl Sha1 {
 }
 
 fn json_str<'a>(body: &'a str, key: &str) -> Option<&'a str> {
-    let key_start = body.find(key)?;
-    let after_key = &body[key_start + key.len()..];
-    let colon = after_key.find(':')?;
-    let after_colon = after_key[colon + 1..].trim_start();
-    let value = after_colon.strip_prefix('"')?;
+    let value = json_value(body, key)?.strip_prefix('"')?;
     let end = value.find('"')?;
     Some(&value[..end])
+}
+
+fn json_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = body.as_bytes();
+    for (start, _) in body.match_indices(key) {
+        let end = start.checked_add(key.len())?;
+        if start == 0 || end >= bytes.len() || bytes[start - 1] != b'"' || bytes[end] != b'"' {
+            continue;
+        }
+        let after_key = body[end + 1..].trim_start();
+        return Some(after_key.strip_prefix(':')?.trim_start());
+    }
+    None
 }
 
 fn json_u32(body: &str, key: &str) -> Option<u32> {
@@ -3421,10 +3555,7 @@ fn json_i16(body: &str, key: &str) -> Option<i16> {
 }
 
 fn json_bool(body: &str, key: &str) -> Option<bool> {
-    let key_start = body.find(key)?;
-    let after_key = &body[key_start + key.len()..];
-    let colon = after_key.find(':')?;
-    let value = after_key[colon + 1..].trim_start();
+    let value = json_value(body, key)?;
     if value.starts_with("true") {
         Some(true)
     } else if value.starts_with("false") {
@@ -3435,10 +3566,7 @@ fn json_bool(body: &str, key: &str) -> Option<bool> {
 }
 
 fn json_i32(body: &str, key: &str) -> Option<i32> {
-    let key_start = body.find(key)?;
-    let after_key = &body[key_start + key.len()..];
-    let colon = after_key.find(':')?;
-    let value = after_key[colon + 1..].trim_start();
+    let value = json_value(body, key)?;
     let end = value
         .find(|c: char| !(c == '-' || c.is_ascii_digit()))
         .unwrap_or(value.len());

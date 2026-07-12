@@ -28,7 +28,8 @@ cargo run -p pete-cockpit --example motherbrain_bootstrap -- --lease-expiry-smok
 
 It proves that an expired lease and a superseded lease fail closed, a newly
 issued lease advances identity and generation, and only the fresh lease can
-send a lease-bound heartbeat stop. It finishes with STOP and DISARM.
+send a lease-bound heartbeat stop. It finishes stopped while the brainstem
+continues supervising the Create in Full mode.
 
 Useful diagnostics:
 

@@ -19,10 +19,6 @@ fn main() -> pete_cockpit::Result<()> {
     );
 
     cockpit.acquire_control(ControlAuthority::Motherbrain, 1_000)?;
-    cockpit.control()?.arm()?;
-    println!("accepted arm");
-    print_events("after arm", &mut cockpit)?;
-
     cockpit.execute(CockpitRequest::HeartbeatStop { timeout_ms: 250 })?;
     println!("accepted heartbeat_stop ttl_ms=250");
     cockpit.control()?.cmd_vel(70, 0, 200)?;

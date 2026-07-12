@@ -32,6 +32,10 @@ pub trait BrainstemHardware {
     fn flush_uart(&mut self) -> Result<(), ()>;
     fn read_byte(&mut self) -> SerialRead;
 
+    fn set_create_uart_baud(&mut self, _baud: u32) -> Result<(), ()> {
+        Err(())
+    }
+
     fn poll_imu_sample(&mut self, _now_ms: u32) -> Result<Option<ImuSample>, ImuHealth> {
         Ok(None)
     }

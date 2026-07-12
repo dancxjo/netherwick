@@ -26,22 +26,17 @@ fn main() -> pete_cockpit::Result<()> {
         caps.verbs.join(",")
     );
 
-    cockpit.arm()?;
     cockpit.stream_sensors(true, 0, 250)?;
 
     let run_result = run_servo_loop(&mut cockpit, &mut events);
 
     let _ = cockpit.stop();
     let _ = cockpit.stream_sensors(false, 0, 0);
-    let _ = cockpit.disarm();
 
     run_result
 }
 
-fn run_servo_loop(
-    cockpit: &mut UartCockpit,
-    events: &mut EventCursor,
-) -> pete_cockpit::Result<()> {
+fn run_servo_loop(cockpit: &mut UartCockpit, events: &mut EventCursor) -> pete_cockpit::Result<()> {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
         cockpit.heartbeat_stop(900)?;

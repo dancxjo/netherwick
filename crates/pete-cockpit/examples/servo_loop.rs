@@ -22,7 +22,6 @@ fn main() -> pete_cockpit::Result<()> {
         caps.verbs.join(",")
     );
 
-    cockpit.arm()?;
     cockpit.stream_sensors(true, 0, 250)?;
 
     let start = Instant::now();

@@ -33,6 +33,16 @@ static LAST_UART_READ_ERROR: AtomicU8 = AtomicU8::new(UartReadErrorCode::None as
 static UART_RX_BYTES: AtomicU32 = AtomicU32::new(0);
 static UART_RX_PACKETS: AtomicU32 = AtomicU32::new(0);
 static LAST_UART_PACKET_LEN: AtomicU32 = AtomicU32::new(0);
+static UART_TX_BYTES: AtomicU32 = AtomicU32::new(0);
+static LAST_UART_RX_BYTE: AtomicU8 = AtomicU8::new(0);
+static LAST_UART_TX_BYTE: AtomicU8 = AtomicU8::new(0);
+static LAST_UART_RX_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
+static LAST_UART_TX_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
+static UART_RX_OVERRUNS: AtomicU32 = AtomicU32::new(0);
+static UART_RX_BREAKS: AtomicU32 = AtomicU32::new(0);
+static UART_RX_PARITY_ERRORS: AtomicU32 = AtomicU32::new(0);
+static UART_RX_FRAMING_ERRORS: AtomicU32 = AtomicU32::new(0);
+static UART_RX_OTHER_ERRORS: AtomicU32 = AtomicU32::new(0);
 static WAKE_PROBE_RESPONSE_BYTES: AtomicU32 = AtomicU32::new(0);
 static WAKE_PROBE_EXPECTED_BYTES: AtomicU32 = AtomicU32::new(0);
 static CURRENT_RUNTIME_ACTION: AtomicU8 = AtomicU8::new(RuntimeActionCode::None as u8);
@@ -183,6 +193,16 @@ pub struct BrainstemStatus {
     pub uart_rx_bytes: u32,
     pub uart_rx_packets: u32,
     pub last_uart_packet_len: u32,
+    pub uart_tx_bytes: u32,
+    pub last_uart_rx_byte: u8,
+    pub last_uart_tx_byte: u8,
+    pub last_uart_rx_timestamp_ms: u32,
+    pub last_uart_tx_timestamp_ms: u32,
+    pub uart_rx_overruns: u32,
+    pub uart_rx_breaks: u32,
+    pub uart_rx_parity_errors: u32,
+    pub uart_rx_framing_errors: u32,
+    pub uart_rx_other_errors: u32,
     pub wake_probe_response_bytes: u32,
     pub wake_probe_expected_bytes: u32,
     pub current_command: u8,
@@ -559,6 +579,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::ZeroImuOrientation)
         | Some(RuntimeCommand::ClearImuOrientation)
         | Some(RuntimeCommand::RestartMpu)
+        | Some(RuntimeCommand::SetCreateBaud(_))
         | Some(RuntimeCommand::SongDefine { .. })
         | Some(RuntimeCommand::SongPlay { .. })
         | Some(RuntimeCommand::Dock)
@@ -898,7 +919,12 @@ pub fn install_service_authority(session_hash: u32, lease_hash: u32, expires_ms:
     ACTIVE_SERVICE_LEASE_EXPIRES_MS.store(expires_ms, Ordering::Release);
     ACTIVE_SERVICE_SCOPE.store(scope, Ordering::Release);
 }
-pub fn active_service_authority_matches(session_hash: u32, lease_hash: u32, now_ms: u32, scope: u8) -> bool {
+pub fn active_service_authority_matches(
+    session_hash: u32,
+    lease_hash: u32,
+    now_ms: u32,
+    scope: u8,
+) -> bool {
     let deadline = ACTIVE_SERVICE_LEASE_EXPIRES_MS.load(Ordering::Acquire);
     deadline != 0
         && now_ms.wrapping_sub(deadline) >= u32::MAX / 2
@@ -983,7 +1009,8 @@ pub fn session_diagnostics(now_ms: u32) -> SessionDiagnostics {
         service_authority_active: ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire) != 0
             && active_service_authority_matches(
                 ACTIVE_SERVICE_SESSION_HASH.load(Ordering::Acquire),
-                ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire), now_ms,
+                ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire),
+                now_ms,
                 ACTIVE_SERVICE_SCOPE.load(Ordering::Acquire),
             ),
     }
@@ -1772,6 +1799,9 @@ fn encode_power_request(request: PowerStateRequest) -> u8 {
         PowerStateRequest::Sleep => 2,
         PowerStateRequest::PulseBrc => 3,
         PowerStateRequest::StartOi => 4,
+        PowerStateRequest::DebugBaud19200 => 5,
+        PowerStateRequest::DebugBaud57600 => 6,
+        PowerStateRequest::DebugBaud115200 => 7,
     }
 }
 
@@ -1781,6 +1811,9 @@ fn decode_power_request(value: u8) -> Option<PowerStateRequest> {
         2 => Some(PowerStateRequest::Sleep),
         3 => Some(PowerStateRequest::PulseBrc),
         4 => Some(PowerStateRequest::StartOi),
+        5 => Some(PowerStateRequest::DebugBaud19200),
+        6 => Some(PowerStateRequest::DebugBaud57600),
+        7 => Some(PowerStateRequest::DebugBaud115200),
         _ => None,
     }
 }
@@ -1844,15 +1877,26 @@ pub fn set_oi_mode_unknown() {
     OI_MODE.store(UNKNOWN, Ordering::Relaxed);
 }
 
-pub fn mark_uart_rx_ok(timestamp_ms: u32) {
-    UART_RX_HEALTH.store(ON, Ordering::Relaxed);
-    LAST_UART_READ_ERROR.store(UartReadErrorCode::None as u8, Ordering::Relaxed);
-    LAST_UART_PACKET_TIMESTAMP_MS.store(timestamp_ms, Ordering::Relaxed);
+pub fn mark_uart_rx_byte(byte: u8, timestamp_ms: u32) {
+    LAST_UART_RX_BYTE.store(byte, Ordering::Relaxed);
+    LAST_UART_RX_TIMESTAMP_MS.store(timestamp_ms, Ordering::Relaxed);
+    increment(&UART_RX_BYTES);
+}
+
+pub fn mark_uart_tx_byte(byte: u8, timestamp_ms: u32) {
+    LAST_UART_TX_BYTE.store(byte, Ordering::Relaxed);
+    LAST_UART_TX_TIMESTAMP_MS.store(timestamp_ms, Ordering::Relaxed);
+    increment(&UART_TX_BYTES);
 }
 
 pub fn mark_uart_packet(len: usize) {
+    UART_RX_HEALTH.store(ON, Ordering::Relaxed);
+    LAST_UART_READ_ERROR.store(UartReadErrorCode::None as u8, Ordering::Relaxed);
+    LAST_UART_PACKET_TIMESTAMP_MS.store(
+        LAST_UART_RX_TIMESTAMP_MS.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
     increment(&UART_RX_PACKETS);
-    increment_by(&UART_RX_BYTES, len as u32);
     LAST_UART_PACKET_LEN.store(len as u32, Ordering::Relaxed);
 }
 
@@ -1877,6 +1921,9 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     };
 
     CREATE_SENSOR_LAST_PACKET_ID.store(packet_id, Ordering::Relaxed);
+    if packet_id == 35 {
+        OI_MODE.store(sensors.oi_mode, Ordering::Relaxed);
+    }
     CREATE_SENSOR_FLAGS.store(new_flags, Ordering::Relaxed);
     CREATE_SENSOR_DISTANCE_MM.store(encode_signed_i16(sensors.distance_mm), Ordering::Relaxed);
     CREATE_SENSOR_ANGLE_MRAD.store(encode_signed_i16(sensors.angle_mrad), Ordering::Relaxed);
@@ -2226,11 +2273,26 @@ pub fn mark_uart_rx_error() {
 pub fn mark_uart_rx_error_detail(error: UartReadError) {
     UART_RX_HEALTH.store(OFF, Ordering::Relaxed);
     let code = match error {
-        UartReadError::Overrun => UartReadErrorCode::Overrun,
-        UartReadError::Break => UartReadErrorCode::Break,
-        UartReadError::Parity => UartReadErrorCode::Parity,
-        UartReadError::Framing => UartReadErrorCode::Framing,
-        UartReadError::Other => UartReadErrorCode::Other,
+        UartReadError::Overrun => {
+            increment(&UART_RX_OVERRUNS);
+            UartReadErrorCode::Overrun
+        }
+        UartReadError::Break => {
+            increment(&UART_RX_BREAKS);
+            UartReadErrorCode::Break
+        }
+        UartReadError::Parity => {
+            increment(&UART_RX_PARITY_ERRORS);
+            UartReadErrorCode::Parity
+        }
+        UartReadError::Framing => {
+            increment(&UART_RX_FRAMING_ERRORS);
+            UartReadErrorCode::Framing
+        }
+        UartReadError::Other => {
+            increment(&UART_RX_OTHER_ERRORS);
+            UartReadErrorCode::Other
+        }
     };
     LAST_UART_READ_ERROR.store(code as u8, Ordering::Relaxed);
 }
@@ -2799,6 +2861,16 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         uart_rx_bytes: UART_RX_BYTES.load(Ordering::Relaxed),
         uart_rx_packets: UART_RX_PACKETS.load(Ordering::Relaxed),
         last_uart_packet_len: LAST_UART_PACKET_LEN.load(Ordering::Relaxed),
+        uart_tx_bytes: UART_TX_BYTES.load(Ordering::Relaxed),
+        last_uart_rx_byte: LAST_UART_RX_BYTE.load(Ordering::Relaxed),
+        last_uart_tx_byte: LAST_UART_TX_BYTE.load(Ordering::Relaxed),
+        last_uart_rx_timestamp_ms: LAST_UART_RX_TIMESTAMP_MS.load(Ordering::Relaxed),
+        last_uart_tx_timestamp_ms: LAST_UART_TX_TIMESTAMP_MS.load(Ordering::Relaxed),
+        uart_rx_overruns: UART_RX_OVERRUNS.load(Ordering::Relaxed),
+        uart_rx_breaks: UART_RX_BREAKS.load(Ordering::Relaxed),
+        uart_rx_parity_errors: UART_RX_PARITY_ERRORS.load(Ordering::Relaxed),
+        uart_rx_framing_errors: UART_RX_FRAMING_ERRORS.load(Ordering::Relaxed),
+        uart_rx_other_errors: UART_RX_OTHER_ERRORS.load(Ordering::Relaxed),
         wake_probe_response_bytes: WAKE_PROBE_RESPONSE_BYTES.load(Ordering::Relaxed),
         wake_probe_expected_bytes: WAKE_PROBE_EXPECTED_BYTES.load(Ordering::Relaxed),
         current_command: CURRENT_COMMAND.load(Ordering::Relaxed),
@@ -2922,6 +2994,16 @@ struct StatusJson {
     uart_rx_bytes: u32,
     uart_rx_packets: u32,
     last_uart_packet_len: u32,
+    uart_tx_bytes: u32,
+    last_uart_rx_byte: u8,
+    last_uart_tx_byte: u8,
+    last_uart_rx_timestamp_ms: u32,
+    last_uart_tx_timestamp_ms: u32,
+    uart_rx_overruns: u32,
+    uart_rx_breaks: u32,
+    uart_rx_parity_errors: u32,
+    uart_rx_framing_errors: u32,
+    uart_rx_other_errors: u32,
     wake_probe_response_bytes: u32,
     wake_probe_expected_bytes: u32,
     current_command: &'static str,
@@ -3059,6 +3141,16 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         uart_rx_bytes: snapshot.uart_rx_bytes,
         uart_rx_packets: snapshot.uart_rx_packets,
         last_uart_packet_len: snapshot.last_uart_packet_len,
+        uart_tx_bytes: snapshot.uart_tx_bytes,
+        last_uart_rx_byte: snapshot.last_uart_rx_byte,
+        last_uart_tx_byte: snapshot.last_uart_tx_byte,
+        last_uart_rx_timestamp_ms: snapshot.last_uart_rx_timestamp_ms,
+        last_uart_tx_timestamp_ms: snapshot.last_uart_tx_timestamp_ms,
+        uart_rx_overruns: snapshot.uart_rx_overruns,
+        uart_rx_breaks: snapshot.uart_rx_breaks,
+        uart_rx_parity_errors: snapshot.uart_rx_parity_errors,
+        uart_rx_framing_errors: snapshot.uart_rx_framing_errors,
+        uart_rx_other_errors: snapshot.uart_rx_other_errors,
         wake_probe_response_bytes: snapshot.wake_probe_response_bytes,
         wake_probe_expected_bytes: snapshot.wake_probe_expected_bytes,
         current_command: command_text(snapshot.current_command),

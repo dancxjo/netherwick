@@ -5752,6 +5752,7 @@ dependencies = [
 name = "pete-cockpit"
 version = "0.1.0"
 dependencies = [
+ "dotenvy",
  "pete-cockpit-protocol",
  "serde",
  "serde_json",

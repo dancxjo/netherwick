@@ -52,10 +52,10 @@ Motherbrain                   Brainstem
     |-------- HELLO ------------>|
     |                            | validate identity/version
     |                            | stop and invalidate old motion
-    |                            | revoke leases; remain disarmed
+    |                            | revoke leases; stop motion; retain Full-mode supervision
     |<------- WELCOME -----------|
     |                            |
-    |  validated, disarmed,      |
+    |  validated, stopped,       |
     |  no motion/control lease   |
 ```
 
@@ -63,7 +63,8 @@ A session ID is derived from both device IDs, both boot IDs, the hello nonce,
 and a brainstem session serial. Duplicate identical hellos are idempotent, but
 a reconnect or failover uses a new nonce and session. Before returning WELCOME,
 the brainstem synchronously stops prior motion, clears queued motion and
-heartbeat state, disarms, installs the session, and retains E-stop/fault state.
+heartbeat state, installs the session, and retains E-stop/fault state. Create
+OI acquisition and Full-mode maintenance remain brainstem-owned throughout.
 Handshake success is not motion authorization and does not authorize BOOTSEL,
 flashing, service actions, or Raspberry Pi power control.
 
@@ -134,14 +135,14 @@ implement every scoped operation before it compiles.
 
 Same device and boot means a transport interruption; a new session is still
 required. Same device with a new boot means brainstem reboot: rebuild the live
-contract, reset event assumptions, and remain disarmed. A different device is
+contract, reset event assumptions, and remain stopped. A different device is
 replacement hardware and requires explicit caller acceptance.
 
 ```text
 Motherbrain          USB          Brainstem          Wi-Fi
     |--- command ---->|               |                |
     |   USB fails     X               |                |
-    | best-effort stop/disarm         |                |
+    | best-effort stop                |                |
     |--------------------------------- HELLO ---------->|
     |<-------------------------------- WELCOME ---------|
     | compare device/boot; install fresh session        |
@@ -175,7 +176,9 @@ lease or registration and duplicates replace one unambiguous record.
 
 Motherbrain startup discovers USB, handshakes, verifies the brainstem device,
 builds the live contract, inspects/joins Wi-Fi, registers its leased endpoint,
-verifies DNS, starts session heartbeat/supervision, and remains disarmed. It
+verifies DNS, and starts session heartbeat/supervision. The brainstem already
+owns Create OI startup and continuous Full-mode maintenance; acquiring a
+control lease grants full command authority without a separate arm or mode step. It
 logs both brainstem device identity and hostname because they answer different
 questions. DNS failure never disables USB control.
 

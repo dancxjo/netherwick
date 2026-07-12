@@ -105,8 +105,6 @@ ping
 status
 get_capabilities
 get_events
-arm
-disarm
 stop
 estop
 clear_estop
@@ -140,8 +138,6 @@ power_state
 calibrate_turn
 reset_odometry
 dock
-set_lights
-set_mode
 ```
 
 `get_capabilities` reports the current body contract using the clean names above: body kind, drive type, supported verbs, sensors, outputs, safety features, limits, feedback/song slots, and supported sensor packet range. The facts come from the selected body descriptor, not from the generic renderer. HTTP/WebSocket return JSON; UDP and forebrain UART return a compact single-line representation.
@@ -194,7 +190,12 @@ Smart controller verbs are one-shot/TTL step primitives. `face_bearing`, `track_
 
 Odometry is currently a lightweight accumulator over decoded Create distance/angle deltas. Only packet `0`, `19`, and `20` update odometry: packet `0` carries both distance and angle deltas, packet `19` carries distance, and packet `20` carries angle. Other decoded sensor packets update status and events but do not integrate into odometry. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
 
-Create OI power, BRC, Open Interface start, Safe mode, watchdog stop, and recovery remain owned by the brainstem runtime and Create body driver. Hardware watchdog support is plumbed through the `BrainstemHardware::feed_watchdog` hook and called from the runtime safety lane. The current RP2040/Pico W backends still no-op that hook until the hardware watchdog is deliberately enabled.
+Create OI power, BRC, Open Interface start, continuous Full mode, status-light
+animation, watchdog stop, and recovery remain owned by the brainstem runtime
+and Create body driver. Hardware watchdog support is plumbed through the
+`BrainstemHardware::feed_watchdog` hook and called from the runtime safety lane.
+The current RP2040/Pico W backends still no-op that hook until the hardware
+watchdog is deliberately enabled.
 
 ## Current Boundaries
 
@@ -208,7 +209,7 @@ Create-specific by design:
 
 - The Create OI body/driver path owns opcodes, packet ids, BRC, Create UART behavior, OI modes, songs, LEDs, dock seeking, and Create sensor decoding.
 - `/status.json` still exposes some Create diagnostic fields because they are useful during bring-up.
-- `set_mode`, `power_state`, `song_define`, `song_play`, and `set_lights` are generic-ish surface names backed by Create-specific implementation details today.
+- `power_state`, `song_define`, and `song_play` are generic-ish surface names backed by Create-specific implementation details today.
 
 Known remaining TODOs:
 
@@ -226,7 +227,7 @@ Start without robot hardware and climb only when the previous rung is boring:
 2. Local simulator smoke loop: `cargo run -p pete-cockpit --example sim_servo_loop`.
 3. UDP smoke test against a powered brainstem: `GET_CAPABILITIES`, `GET_EVENTS`, then a low-TTL `CMD_VEL`.
 4. UART smoke test over the forebrain link with the same compact protocol.
-5. Robot attached, wheels off floor: arm, heartbeat, short low-speed motion, stop, event cursor check.
+5. Robot attached, wheels off floor: request control, heartbeat, short low-speed motion, stop, event cursor check.
 6. Robot attached, low-speed motion on the floor with clear space and an operator stop path.
 7. Motherbrain/forebrain integration later, after the brainstem contract and safety events remain stable under the local tests.
 
@@ -321,6 +322,7 @@ DHCP: offers 192.168.4.2-192.168.4.9/24 with router/DNS set to 192.168.4.1
 The interface exposes the body-neutral brainstem surface:
 
 - `http://192.168.4.1/` serves the operator interface.
+- `http://192.168.4.1/events` streams status and outward events as server-sent events (SSE).
 - `http://192.168.4.1/status.json` serves firmware/body/runtime/Create/UART status.
 - `POST http://192.168.4.1/command` accepts one low-level command atom.
 - `POST http://192.168.4.1/command` with `{"kind":"get_capabilities"}` returns the body capability contract.
@@ -413,7 +415,7 @@ cargo run -p pete-cockpit --example contract_check -- http 192.168.4.1:80
 cargo run -p pete-cockpit --example contract_check -- ws ws://192.168.4.1:81/control
 ```
 
-The embedded Pico W browser cockpit is a static implementation of this same logical contract. It fetches capabilities at startup, disables unsupported motion/safety/lights/music/dock/primitives/sensor-streaming controls, polls `get_events`, and stops or warns on missed event history and safety events. LLMs and motherbrain code should use `pete-cockpit` directly, usually over simulator or UART first; transport choice is a deployment detail, not a different pilot API.
+The embedded Pico W browser cockpit is a static implementation of this same logical contract. It fetches capabilities at startup, disables unsupported motion/safety/lights/music/dock/primitives/sensor-streaming controls, and consumes status plus outward events from the `/events` SSE stream. The stream carries event cursor IDs so browser reconnects resume without polling; the cockpit stops or warns on missed event history and safety events. LLMs and motherbrain code should use `pete-cockpit` directly, usually over simulator or UART first; transport choice is a deployment detail, not a different pilot API.
 
 The Rust trait exposes the complete firmware public verb set through both named helper methods and the `CockpitRequest` enum:
 
@@ -423,8 +425,6 @@ bootsel() // service/debug, not advertised as a normal body capability
 get_status()
 get_capabilities()
 get_events_since(since_seq)
-arm()
-disarm()
 stop()
 estop()
 clear_estop()
@@ -459,14 +459,10 @@ power_state(request)
 calibrate_turn(angular_mrad_s, duration_ms)
 reset_odometry()
 dock()
-set_lights(led_bits, color, intensity)
-set_mode(mode)
 ```
 
-`set_lights` is deliberately mechanical: `led_bits` is the low four binary LED channels,
-`color` is the Create power-LED value from green (`0`) through amber (`128`) to red (`255`),
-and `intensity` is the raw `0..255` brightness value. Higher layers may assign meaning to
-those outputs; the brainstem contract does not.
+Create OI mode and robot-light control are deliberately absent from the public
+control surface. They belong to the brainstem supervisor.
 
 Generic outward events are represented by `CockpitEventKind`, matching the public event names from `get_events`: `SafetyTripped`, `HeartbeatExpired`, `EStopLatched`, `MotionRequested`, `SensorFrameDecoded`, command lifecycle events, and the rest of the body-neutral vocabulary.
 
@@ -489,7 +485,6 @@ The UART example also accepts `PETE_BRAINSTEM_UART` and `PETE_BRAINSTEM_BAUD`; b
 The example does:
 
 ```text
-arm
 stream_sensors true 0 250
 loop:
   heartbeat_stop 900
@@ -585,7 +580,7 @@ timeout 1 cat /dev/ttyUSB0
 Expected replies are single lines beginning with `OK 1 CAPABILITIES` and `OK 2 EVENTS`. For a movement smoke test, only run this with the robot lifted or safely staged:
 
 ```bash
-printf 'ARM 3\nHEARTBEAT_STOP 4 900\nCMD_VEL 5 80 0 250\nSTOP 6\nGET_EVENTS 7 0\n' > /dev/ttyUSB0
+printf 'HEARTBEAT_STOP 4 900\nCMD_VEL 5 80 0 250\nSTOP 6\nGET_EVENTS 7 0\n' > /dev/ttyUSB0
 timeout 1 cat /dev/ttyUSB0
 ```
 
@@ -604,11 +599,39 @@ The Pico W onboard LED normally emits a one-blink heartbeat every 15 seconds. Ev
 
 Wi-Fi/AP/DHCP/HTTP/mDNS failure does not prevent motor stop, UART timeout handling, power safety, or the error blink pattern. The Wi-Fi lane is not allowed to call robot drivers directly; future operator commands must enter through a bounded command queue consumed by the runtime lane.
 
-## Startup and Arming
+## Startup and supervision
 
-On boot, the firmware blinks the onboard Pico LED as soon as RP2040 GPIO is initialized, starts its safety and command lanes, and remains idle. It does not wake or move the Create automatically.
+On boot, the firmware blinks the onboard Pico LED as soon as RP2040 GPIO is
+initialized, starts its safety and command lanes,
+starts Open Interface, and requests `Full` mode. Receive-side UART health is
+evidence, not a prerequisite for those writes: while RX is missing or the
+reported mode is uncertain, the supervisor reasserts `Start` followed by
+`Full`; otherwise it refreshes `Full` once per second. Motion remains disabled
+until the Create has returned a valid OI-mode response (sensor packet 35).
+Transmitting `Full` does not itself change the reported mode. The assertion
+pauses when fresh battery telemetry says the battery is at or below 20% and is
+actively charging.
 
-An explicit `arm` command wakes the Create, confirms it is responsive, pulses BRC when enabled, starts Open Interface, and enters `Safe` mode. Once that sequence succeeds, the brainstem plays the `armed` feedback cue. Its default notes are F-G-B: *fasolsi*, Solresol for “prepare / make ready.” `define_chirp` can replace the cue.
+For a non-motion electrical/UART diagnosis, run:
+
+```bash
+cargo run -p pete-cockpit --example create_link_debug
+```
+
+The probe records raw Create-side TX/RX bytes, last-byte timestamps, validated
+packets, and break/parity/framing/overrun counts while testing checksummed OI
+stream frames for mode packet 35 at 19200, 57600, and 115200 baud. It restores
+57600 afterward. Add `-- --wake`
+only when the Create is visibly off; this performs one explicit power-toggle
+attempt before the scan. Automatic startup never blindly toggles the Create's
+power button.
+
+Once acquisition succeeds, the brainstem plays F-G-B, *fasolsi*, for “prepare /
+make ready.” A control-lease transition gets its own short Solresol-style
+acknowledgement; runtime errors get a descending warning phrase. The three
+available Create lights continuously bounce power → LED 2 → LED 3 → LED 2 while
+healthy. A safety latch holds all three red, and runtime error alternates all
+three red/off. These lights are brainstem-owned rather than caller-controlled.
 
 Motor movement remains safety-gated. Timeout, UART framing error, or invalid response sends Stop and enters the repeating three-blink error pattern. All drive commands carry a duration; the tick-driven runtime treats that duration as a deadline and sends Stop when it expires, before power-cycle, before idle, and on errors.
 
