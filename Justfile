@@ -100,10 +100,20 @@ setup-user:
     done
     echo "User setup complete. Please reboot or log out and back in for group changes to take effect."
 
-# Install Rust with rustup if cargo is missing.
+# Install Rust with rustup plus embedded firmware build tools.
 setup-rust:
-    if ! command -v cargo >/dev/null 2>&1; then \
-        curl https://sh.rustup.rs -sSf | sh -s -- -y; \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v cargo >/dev/null 2>&1; then
+        curl https://sh.rustup.rs -sSf | sh -s -- -y
+    fi
+    if [ -f "$HOME/.cargo/env" ]; then
+        # Make a freshly installed cargo/rustup visible to the rest of this recipe.
+        source "$HOME/.cargo/env"
+    fi
+    rustup target add thumbv6m-none-eabi
+    if ! command -v elf2uf2-rs >/dev/null 2>&1; then
+        cargo install elf2uf2-rs
     fi
 
 # Fetch and build Piper's self-contained Rust ONNX package.
