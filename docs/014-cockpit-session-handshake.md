@@ -94,12 +94,41 @@ WELCOME <json-object> LF
 REJECT <json-object> LF
 ```
 
-The JSON object is exactly the shared logical object. The maximum encoded
-handshake line is 4096 bytes; oversized, non-UTF-8, and malformed JSON are rejected
+The JSON object is exactly the shared logical object. Firmware accepts at most
+1024 bytes for a compact request line and reserves 4096 bytes for the larger
+WELCOME/capability response; the hosted decoder independently caps either
+direction at 4096 bytes. Oversized, non-UTF-8, and malformed JSON are rejected
 without changing session state. Stream readers accumulate partial input and
 extract every complete line; UDP treats one line as one datagram. The nonce
 makes delayed/reordered replies stale. Commands append `session_id=<token>` in
 compact form and use a `session_id` JSON property.
+
+The RP2040 buffers are fixed and live in Embassy task futures/static executor
+storage, not on an unbounded heap. USB owns a 1024-byte line and 4096-byte
+response plus 768 bytes of descriptors and packets. UDP owns 1024-byte request
+and 4096-byte response buffers plus 2560 bytes of socket storage. WebSocket
+owns 1024-byte payload, 4096-byte response, 3072 bytes of TCP storage, and a
+512-byte upgrade request. Each of the three HTTP task instances owns a
+1024-byte request, 4096-byte JSON response, and 3072 bytes of TCP storage
+(about 8 KiB per instance). Hardware UART owns one 1024-byte line; its
+4096-byte handshake response exists only while processing HELLO. Overflow
+clears the partial frame, emits `line_too_long` where a reply is possible, and
+never mutates session state. The release-link audit currently reports roughly
+92 KiB of static RAM for the complete firmware.
+
+Compact v1 deliberately uses bounded JSON after the `HELLO` token so every
+transport shares one field model. It does not serialize Rust memory layouts.
+If request growth approaches 1024 bytes, a future protocol minor must define a
+smaller field grammar rather than silently increasing firmware buffers.
+
+The hosted conformance harness runs the same vertical slice against the real
+`UartCockpit` (and therefore USB CDC byte-stream connector), `UdpCockpit`,
+`HttpCockpit`, and `WebSocketCockpit` implementations using protocol peers:
+HELLO/WELCOME, unscoped-motion rejection, session-only motion rejection,
+session-derived network registration, control-lease acquisition, leased
+motion, and rejection of BOOTSEL under an ordinary control lease. Because the
+trait no longer provides handshake or session fallbacks, a new connector must
+implement every scoped operation before it compiles.
 
 ## Reconnect and failover
 
@@ -134,9 +163,10 @@ services are `_pete-brainstem._tcp`, `_pete-control._udp`,
 must still be verified by HELLO/WELCOME.
 
 After a successful USB handshake, the motherbrain may send the session-bound
-`REGISTER_NETWORK_ENDPOINT` with its role/device ID, interface, address,
-hostname, DHCP client identity, and TTL. The brainstem verifies all of these
-against the active motherbrain session and a current lease, then returns
+`REGISTER_NETWORK_ENDPOINT` with its interface, address, hostname, DHCP client
+identity, and TTL. Role, device ID, and boot ID come exclusively from the
+active session record; they are not repeated as caller-controlled registration
+fields. The brainstem verifies that session against a current lease, then returns
 `NETWORK_ENDPOINT_REGISTERED` with FQDN, address, bounded TTL, and generation.
 Only this operation may publish the reserved `motherbrain` name. Reserved names
 are `pete`, `brainstem`, `motherbrain`, `forebrain`, `gateway`, and `control`;
@@ -156,3 +186,11 @@ commands. Forebrain failure triggers process/service recovery first; only loss
 of the motherbrain host reaches later brainstem host-recovery policy. This
 phase establishes freshness and identity continuity, not cryptographic
 authentication; future challenge/signature/key fields remain separate.
+
+Session and lease tokens in protocol v1 use compact FNV-derived 32-bit hashes
+plus monotonic generations. They are collision-prone bookkeeping identifiers,
+not authenticators or secrets. Possessing a session or motion lease never
+authorizes maintenance. BOOTSEL and component restart requests require a
+separate service lease; firmware grants such a lease only in an explicitly
+compiled service mode over direct USB according to role policy. BOOTSEL itself
+remains disabled in this milestone even after service authorization.

@@ -140,7 +140,13 @@ static DIAGNOSTIC_SESSION_HASH: [AtomicU32; DIAGNOSTIC_SESSION_CAPACITY] =
     [const { AtomicU32::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
 static DIAGNOSTIC_PEER_HASH: [AtomicU32; DIAGNOSTIC_SESSION_CAPACITY] =
     [const { AtomicU32::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
+static DIAGNOSTIC_PEER_BOOT_HASH: [AtomicU32; DIAGNOSTIC_SESSION_CAPACITY] =
+    [const { AtomicU32::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
 static DIAGNOSTIC_ROLE: [AtomicU8; DIAGNOSTIC_SESSION_CAPACITY] =
+    [const { AtomicU8::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
+static DIAGNOSTIC_PURPOSE: [AtomicU8; DIAGNOSTIC_SESSION_CAPACITY] =
+    [const { AtomicU8::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
+static DIAGNOSTIC_TRANSPORT: [AtomicU8; DIAGNOSTIC_SESSION_CAPACITY] =
     [const { AtomicU8::new(0) }; DIAGNOSTIC_SESSION_CAPACITY];
 static ACTIVE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SESSION_GENERATION: AtomicU32 = AtomicU32::new(0);
@@ -153,6 +159,9 @@ static PENDING_LEASE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_LEASE_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_LEASE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_LEASE_EXPIRES_MS: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_SERVICE_LEASE_HASH: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_SERVICE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_SERVICE_LEASE_EXPIRES_MS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -716,6 +725,7 @@ pub fn acknowledge_session_replace(generation: u32, session_hash: u32) {
     ACTIVE_LEASE_HASH.store(0, Ordering::Release);
     ACTIVE_LEASE_SESSION_HASH.store(0, Ordering::Release);
     ACTIVE_LEASE_EXPIRES_MS.store(0, Ordering::Release);
+    revoke_service_authority();
     record_public_event(
         if previous == 0 {
             PublicEventKind::SessionOpened
@@ -764,7 +774,14 @@ pub fn session_peer_matches(session_hash: u32, peer_hash: u32) -> bool {
         .is_some_and(|slot| DIAGNOSTIC_PEER_HASH[slot].load(Ordering::Acquire) == peer_hash)
 }
 
-pub fn register_diagnostic_session(session_hash: u32, peer_hash: u32, role: u8) {
+pub fn register_diagnostic_session(
+    session_hash: u32,
+    peer_hash: u32,
+    peer_boot_hash: u32,
+    role: u8,
+    purpose: u8,
+    transport: u8,
+) {
     let slot = DIAGNOSTIC_SESSION_HASH
         .iter()
         .position(|entry| entry.load(Ordering::Acquire) == session_hash)
@@ -775,7 +792,10 @@ pub fn register_diagnostic_session(session_hash: u32, peer_hash: u32, role: u8) 
         })
         .unwrap_or((session_hash as usize) % DIAGNOSTIC_SESSION_CAPACITY);
     DIAGNOSTIC_PEER_HASH[slot].store(peer_hash, Ordering::Release);
+    DIAGNOSTIC_PEER_BOOT_HASH[slot].store(peer_boot_hash, Ordering::Release);
     DIAGNOSTIC_ROLE[slot].store(role, Ordering::Release);
+    DIAGNOSTIC_PURPOSE[slot].store(purpose, Ordering::Release);
+    DIAGNOSTIC_TRANSPORT[slot].store(transport, Ordering::Release);
     DIAGNOSTIC_SESSION_HASH[slot].store(session_hash, Ordering::Release);
     record_public_event(
         PublicEventKind::SessionOpened,
@@ -783,6 +803,37 @@ pub fn register_diagnostic_session(session_hash: u32, peer_hash: u32, role: u8) 
         peer_hash,
         session_hash,
     );
+}
+
+#[derive(Clone, Copy)]
+pub struct SessionIdentity {
+    pub peer_device_hash: u32,
+    pub peer_boot_hash: u32,
+    pub role: u8,
+    pub purpose: u8,
+    pub transport: u8,
+}
+
+pub fn session_identity(session_hash: u32) -> Option<SessionIdentity> {
+    if ACTIVE_SESSION_HASH.load(Ordering::Acquire) == session_hash {
+        return Some(SessionIdentity {
+            peer_device_hash: ACTIVE_PEER_DEVICE_HASH.load(Ordering::Acquire),
+            peer_boot_hash: ACTIVE_PEER_BOOT_HASH.load(Ordering::Acquire),
+            role: 1,
+            purpose: 1,
+            transport: ACTIVE_TRANSPORT.load(Ordering::Acquire),
+        });
+    }
+    DIAGNOSTIC_SESSION_HASH
+        .iter()
+        .position(|entry| entry.load(Ordering::Acquire) == session_hash)
+        .map(|slot| SessionIdentity {
+            peer_device_hash: DIAGNOSTIC_PEER_HASH[slot].load(Ordering::Acquire),
+            peer_boot_hash: DIAGNOSTIC_PEER_BOOT_HASH[slot].load(Ordering::Acquire),
+            role: DIAGNOSTIC_ROLE[slot].load(Ordering::Acquire),
+            purpose: DIAGNOSTIC_PURPOSE[slot].load(Ordering::Acquire),
+            transport: DIAGNOSTIC_TRANSPORT[slot].load(Ordering::Acquire),
+        })
 }
 
 pub fn session_role(session_hash: u32) -> Option<u8> {
@@ -823,6 +874,7 @@ pub fn pending_authority_transition() -> Option<u32> {
     (request != 0 && request != AUTHORITY_ACK.load(Ordering::Acquire)).then_some(request)
 }
 pub fn acknowledge_authority_transition(generation: u32) {
+    revoke_service_authority();
     ACTIVE_LEASE_HASH.store(
         PENDING_LEASE_HASH.load(Ordering::Acquire),
         Ordering::Release,
@@ -838,6 +890,23 @@ pub fn acknowledge_authority_transition(generation: u32) {
         ACTIVE_LEASE_SESSION_HASH.load(Ordering::Acquire),
         ACTIVE_LEASE_HASH.load(Ordering::Acquire),
     );
+}
+pub fn install_service_authority(session_hash: u32, lease_hash: u32, expires_ms: u32) {
+    ACTIVE_SERVICE_SESSION_HASH.store(session_hash, Ordering::Release);
+    ACTIVE_SERVICE_LEASE_HASH.store(lease_hash, Ordering::Release);
+    ACTIVE_SERVICE_LEASE_EXPIRES_MS.store(expires_ms, Ordering::Release);
+}
+pub fn active_service_authority_matches(session_hash: u32, lease_hash: u32, now_ms: u32) -> bool {
+    let deadline = ACTIVE_SERVICE_LEASE_EXPIRES_MS.load(Ordering::Acquire);
+    deadline != 0
+        && now_ms.wrapping_sub(deadline) >= u32::MAX / 2
+        && ACTIVE_SERVICE_SESSION_HASH.load(Ordering::Acquire) == session_hash
+        && ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire) == lease_hash
+}
+pub fn revoke_service_authority() {
+    ACTIVE_SERVICE_LEASE_HASH.store(0, Ordering::Release);
+    ACTIVE_SERVICE_SESSION_HASH.store(0, Ordering::Release);
+    ACTIVE_SERVICE_LEASE_EXPIRES_MS.store(0, Ordering::Release);
 }
 pub fn authority_transition_acked(generation: u32) -> bool {
     AUTHORITY_ACK.load(Ordering::Acquire) == generation
@@ -895,6 +964,7 @@ pub struct SessionDiagnostics {
     pub diagnostic_sessions: u8,
     pub authority_generation: u32,
     pub authority_active: bool,
+    pub service_authority_active: bool,
 }
 
 pub fn session_diagnostics(now_ms: u32) -> SessionDiagnostics {
@@ -906,6 +976,12 @@ pub fn session_diagnostics(now_ms: u32) -> SessionDiagnostics {
             .count() as u8,
         authority_generation: AUTHORITY_ACK.load(Ordering::Acquire),
         authority_active: !authority_expired(now_ms),
+        service_authority_active: ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire) != 0
+            && active_service_authority_matches(
+                ACTIVE_SERVICE_SESSION_HASH.load(Ordering::Acquire),
+                ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire),
+                now_ms,
+            ),
     }
 }
 pub fn mark_transport_changed(transport: u8) {

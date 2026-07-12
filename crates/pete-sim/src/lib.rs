@@ -436,6 +436,35 @@ impl Cockpit for SimCockpit {
         self.execute(request)
     }
 
+    fn execute_with_lease(
+        &mut self,
+        session: &pete_cockpit::CockpitSession,
+        lease: &pete_cockpit::ControlLease,
+        request: CockpitRequest,
+    ) -> pete_cockpit::Result<CockpitResponse> {
+        let protocol_response = self
+            .protocol
+            .lock()
+            .expect("sim protocol mutex poisoned")
+            .execute_with_lease(session, lease, request.clone())?;
+        match request {
+            CockpitRequest::CmdVel { .. } | CockpitRequest::Stop => self.execute(request),
+            _ => Ok(protocol_response),
+        }
+    }
+
+    fn execute_with_service_lease(
+        &mut self,
+        session: &pete_cockpit::CockpitSession,
+        lease: &pete_cockpit::ServiceLease,
+        request: CockpitRequest,
+    ) -> pete_cockpit::Result<CockpitResponse> {
+        self.protocol
+            .lock()
+            .expect("sim protocol mutex poisoned")
+            .execute_with_service_lease(session, lease, request)
+    }
+
     fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
         let body = self
             .state

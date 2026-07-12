@@ -20,19 +20,32 @@ requirement, not something routing software can synthesize.
 
 ## Authority layers
 
-Communication has four separate layers:
+Communication has five separate layers:
 
 1. A transport locates and carries bytes.
 2. HELLO/WELCOME identifies a device boot and creates a fresh session.
 3. A role policy may grant one expiring control lease.
 4. Arming and motion remain explicit operations under that lease.
+5. Maintenance requires a distinct, expiring service lease and never inherits
+   control authority.
+
+Every request has one explicit authorization class: read-only, emergency,
+session, control lease, or service lease. The control matrix is deliberately
+narrow: a control-purpose motherbrain session may request motherbrain
+authority; a control-purpose forebrain session may request recovery authority
+only after takeover conditions; and a control-purpose operator session may
+request debug authority only when policy enables it. Diagnostic sessions and
+service tools cannot acquire motion authority. Service leases are limited to
+direct USB and an explicitly compiled `service-mode`; acquiring one first
+stops motion and revokes the control lease.
 
 Motherbrain replacement, operator debug, and forebrain recovery all execute
 `STOP -> clear queue -> revoke heartbeat/lease -> install new lease -> remain
 disarmed`. Diagnostic operator sessions occupy bounded read-only slots and do
 not disturb the motherbrain. E-stop and STOP remain recovery-safe without a
-lease. BOOTSEL and host power operations require a future service authorization
-and are rejected by ordinary control sessions.
+lease. BOOTSEL and component restart operations require service authorization
+and are rejected by ordinary control sessions. BOOTSEL remains operationally
+disabled in this milestone even when a service lease exists.
 
 Forebrain recovery is allowed only after the active lease has expired. A
 returning motherbrain does not automatically preempt recovery authority; an

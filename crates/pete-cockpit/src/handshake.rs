@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 pub use pete_cockpit_protocol::{
-    ControlAuthority, EndpointRole, HandshakeRejectReason, SessionPurpose, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR_MAX, PROTOCOL_MINOR_MIN,
+    AuthorizationClass, ControlAuthority, EndpointRole, HandshakeRejectReason, ServiceScope,
+    SessionPurpose, PROTOCOL_MAJOR, PROTOCOL_MINOR_MAX, PROTOCOL_MINOR_MIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -244,6 +244,8 @@ pub struct CockpitSession {
     pub local_device_id: String,
     pub local_boot_id: String,
     pub local_role: EndpointRole,
+    #[serde(default)]
+    pub local_purpose: SessionPurpose,
     pub protocol_major: u16,
     pub protocol_minor: u16,
     pub negotiated_features: Vec<HandshakeFeature>,
@@ -256,6 +258,16 @@ pub struct ControlLease {
     pub session_id: String,
     pub owner_role: EndpointRole,
     pub authority: ControlAuthority,
+    pub ttl_ms: u32,
+    pub generation: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServiceLease {
+    pub lease_id: String,
+    pub session_id: String,
+    pub owner_role: EndpointRole,
+    pub scope: ServiceScope,
     pub ttl_ms: u32,
     pub generation: u32,
 }
@@ -318,6 +330,7 @@ impl HandshakeOutcome {
             local_device_id: hello.device_id.clone(),
             local_boot_id: hello.boot_id.clone(),
             local_role: hello.role,
+            local_purpose: hello.session_purpose,
             protocol_major: welcome.protocol_major,
             protocol_minor: welcome.protocol_minor,
             negotiated_features: welcome

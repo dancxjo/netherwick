@@ -20,12 +20,9 @@ fn main() -> pete_cockpit::Result<()> {
         std::env::var("PETE_BRAINSTEM_WIFI_IPV4"),
         std::env::var("PETE_DHCP_CLIENT_ID_HEX"),
     ) {
-        let local_device_id = ready.session().local_device_id.clone();
         let registered = bootstrap.register_network(
             &mut ready,
             RegisterNetworkEndpoint {
-                role: pete_cockpit::EndpointRole::Motherbrain,
-                device_id: local_device_id,
                 interface_id: std::env::var("PETE_BRAINSTEM_INTERFACE")
                     .unwrap_or_else(|_| "wlan1".into()),
                 address_family: AddressFamily::Ipv4,

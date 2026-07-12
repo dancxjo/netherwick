@@ -8229,6 +8229,43 @@ mod tests {
             }
         }
 
+        fn handshake(
+            &mut self,
+            _hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            Err(pete_cockpit::CockpitError::Policy(
+                "test cockpit has no handshake peer".into(),
+            ))
+        }
+
+        fn execute_in_session(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ServiceLease,
+            _request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            Err(pete_cockpit::CockpitError::Policy(
+                "test cockpit has no service mode".into(),
+            ))
+        }
+
         fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
             Ok(CockpitStatus {
                 raw: serde_json::json!({

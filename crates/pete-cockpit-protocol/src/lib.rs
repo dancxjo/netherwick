@@ -45,6 +45,58 @@ pub enum ControlAuthority {
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "snake_case")
 )]
+pub enum AuthorizationClass {
+    ReadOnly,
+    Emergency,
+    Session,
+    ControlLease,
+    ServiceLease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum ServiceScope {
+    BrainstemMaintenance,
+}
+
+pub const fn role_can_request_control(
+    role: EndpointRole,
+    purpose: SessionPurpose,
+    authority: ControlAuthority,
+) -> bool {
+    if !matches!(purpose, SessionPurpose::Control) {
+        return false;
+    }
+    matches!(
+        (role, authority),
+        (EndpointRole::Motherbrain, ControlAuthority::Motherbrain)
+            | (EndpointRole::Forebrain, ControlAuthority::ForebrainRecovery)
+            | (EndpointRole::Operator, ControlAuthority::OperatorDebug)
+    )
+}
+
+pub const fn role_can_request_service(
+    role: EndpointRole,
+    purpose: SessionPurpose,
+    transport: TransportKind,
+) -> bool {
+    matches!(transport, TransportKind::UsbCdc)
+        && (matches!(
+            (role, purpose),
+            (EndpointRole::Motherbrain, SessionPurpose::Control)
+        ) || matches!(role, EndpointRole::ServiceTool))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum HandshakeRejectReason {
     WrongRole,
     ProtocolMajorMismatch,
@@ -152,5 +204,25 @@ mod tests {
         assert!(brainstem_accepts_client_role(EndpointRole::Motherbrain));
         assert!(valid_identity_token(b"motherbrain-primary", 64));
         assert!(!valid_identity_token(b"motherbrain primary", 64));
+        assert!(role_can_request_control(
+            EndpointRole::Motherbrain,
+            SessionPurpose::Control,
+            ControlAuthority::Motherbrain
+        ));
+        assert!(!role_can_request_control(
+            EndpointRole::Motherbrain,
+            SessionPurpose::Diagnostic,
+            ControlAuthority::Motherbrain
+        ));
+        assert!(role_can_request_service(
+            EndpointRole::ServiceTool,
+            SessionPurpose::Diagnostic,
+            TransportKind::UsbCdc
+        ));
+        assert!(!role_can_request_service(
+            EndpointRole::ServiceTool,
+            SessionPurpose::Diagnostic,
+            TransportKind::Http
+        ));
     }
 }

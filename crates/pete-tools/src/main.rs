@@ -4138,7 +4138,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         if args.mock || create_port.as_deref() == Some("mock") {
             device_availability["create"] =
                 serde_json::json!({"present": true, "source": "sim-cockpit"});
-            Box::new(LocalSimCockpit::new())
+            Box::new(LocalSimCockpit::new().with_unscoped_bench_mode())
         } else if let Some(create_port) = &create_port {
             match UartCockpit::connect(create_port) {
                 Ok(cockpit) => {
@@ -4159,7 +4159,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
             .push("cockpit UART device not found; using simulated cockpit status".to_string());
         device_availability["create"] =
             serde_json::json!({"present": false, "reason": "no cockpit serial candidate"});
-        Box::new(LocalSimCockpit::new())
+        Box::new(LocalSimCockpit::new().with_unscoped_bench_mode())
     };
 
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
@@ -5409,7 +5409,11 @@ fn open_robot_cockpit_or_fallback(
             );
             robot_mode = RobotMode::ReadOnly;
         }
-        return Ok((Box::new(LocalSimCockpit::new()), robot_mode, true));
+        return Ok((
+            Box::new(LocalSimCockpit::new().with_unscoped_bench_mode()),
+            robot_mode,
+            true,
+        ));
     }
 
     let Some(create_port) = create_port else {
@@ -5421,7 +5425,11 @@ fn open_robot_cockpit_or_fallback(
         } else {
             println!("warning: no cockpit UART device found; falling back to simulated cockpit");
         }
-        return Ok((Box::new(LocalSimCockpit::new()), robot_mode, true));
+        return Ok((
+            Box::new(LocalSimCockpit::new().with_unscoped_bench_mode()),
+            robot_mode,
+            true,
+        ));
     };
 
     match UartCockpit::connect(create_port) {
@@ -5437,7 +5445,11 @@ fn open_robot_cockpit_or_fallback(
                     "warning: failed to open cockpit UART device {create_port}: {error}; falling back to simulated cockpit"
                 );
             }
-            Ok((Box::new(LocalSimCockpit::new()), robot_mode, true))
+            Ok((
+                Box::new(LocalSimCockpit::new().with_unscoped_bench_mode()),
+                robot_mode,
+                true,
+            ))
         }
     }
 }

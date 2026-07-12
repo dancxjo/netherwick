@@ -86,6 +86,7 @@ static IMU_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 static BRAINSTEM_INSTANCE_ID: AtomicU32 = AtomicU32::new(0);
 static BRAINSTEM_BOOT_ID: AtomicU32 = AtomicU32::new(0);
 static AUTHORITY_GENERATION: AtomicU32 = AtomicU32::new(0);
+static SERVICE_GENERATION: AtomicU32 = AtomicU32::new(0);
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
@@ -1463,12 +1464,24 @@ fn handle_handshake_json<'a>(body: &str, buffer: &'a mut [u8], transport: u8) ->
         status::mark_transport_changed(transport);
     } else {
         let role = match hello.role {
+            session::EndpointRole::Motherbrain => 1,
             session::EndpointRole::Forebrain => 2,
             session::EndpointRole::Operator => 3,
             session::EndpointRole::ServiceTool => 4,
             _ => 0,
         };
-        status::register_diagnostic_session(session_hash, peer_hash, role);
+        let purpose = match hello.session_purpose {
+            session::SessionPurpose::Control => 1,
+            session::SessionPurpose::Diagnostic => 2,
+        };
+        status::register_diagnostic_session(
+            session_hash,
+            peer_hash,
+            session::token_hash(hello.boot_id.as_str()),
+            role,
+            purpose,
+            transport,
+        );
     }
     render_handshake_welcome(
         buffer,
@@ -1557,7 +1570,7 @@ fn render_network_diagnostics(buffer: &mut [u8], now_ms: u32) -> Option<&str> {
 fn render_session_diagnostics(buffer: &mut [u8], now_ms: u32) -> Option<&str> {
     let diagnostics = status::session_diagnostics(now_ms);
     let mut response = heapless::String::<256>::new();
-    write!(response, "{{\"primary_session_generation\":{},\"diagnostic_sessions\":{},\"authority_generation\":{},\"authority_active\":{}}}", diagnostics.primary_session_generation, diagnostics.diagnostic_sessions, diagnostics.authority_generation, diagnostics.authority_active).ok()?;
+    write!(response, "{{\"primary_session_generation\":{},\"diagnostic_sessions\":{},\"authority_generation\":{},\"authority_active\":{},\"service_authority_active\":{}}}", diagnostics.primary_session_generation, diagnostics.diagnostic_sessions, diagnostics.authority_generation, diagnostics.authority_active, diagnostics.service_authority_active).ok()?;
     copy_response(buffer, response.as_str())
 }
 
@@ -1572,6 +1585,9 @@ fn handle_command_request<'a>(
     }
     if json_str(body, "kind") == Some("acquire_control_lease") {
         return handle_authority_json(body, buffer).ok_or(CommandParseError::BadRequest);
+    }
+    if json_str(body, "kind") == Some("acquire_service_lease") {
+        return handle_service_authority_json(body, buffer).ok_or(CommandParseError::BadRequest);
     }
     let command = parse_command(command_id, body).ok_or(CommandParseError::BadRequest)?;
     if matches!(command, BrainstemCommand::Status) {
@@ -1589,7 +1605,7 @@ fn handle_command_request<'a>(
         return render_command_response(buffer, true, command_id, "pong")
             .ok_or(CommandParseError::BadRequest);
     }
-    if matches!(command, BrainstemCommand::Bootsel) {
+    if matches!(command, BrainstemCommand::Bootsel) && !json_service_authority_valid(body) {
         return render_command_response(
             buffer,
             false,
@@ -1604,6 +1620,14 @@ fn handle_command_request<'a>(
     }
     if command_requires_authority(command) && !json_authority_valid(body) {
         return render_command_response(buffer, false, command_id, "invalid_control_lease")
+            .ok_or(CommandParseError::BadRequest);
+    }
+    if command_requires_service_authority(command) && !json_service_authority_valid(body) {
+        return render_command_response(buffer, false, command_id, "invalid_service_lease")
+            .ok_or(CommandParseError::BadRequest);
+    }
+    if matches!(command, BrainstemCommand::Bootsel) {
+        return render_command_response(buffer, false, command_id, "service_operation_disabled")
             .ok_or(CommandParseError::BadRequest);
     }
     if !status::submit_control_command(command_id, command) {
@@ -1622,6 +1646,9 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     }
     if json_str(body, "kind") == Some("acquire_control_lease") {
         return handle_authority_json(body, buffer);
+    }
+    if json_str(body, "kind") == Some("acquire_service_lease") {
+        return handle_service_authority_json(body, buffer);
     }
     if json_str(body, "kind") == Some("status") {
         let snapshot = status::snapshot(Instant::now().as_millis() as u32);
@@ -1643,7 +1670,7 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     if json_bool(body, "ack") == Some(false) {
         let command_id = json_u32(body, "command_id")?;
         let command = parse_command(command_id, body)?;
-        if matches!(command, BrainstemCommand::Bootsel) {
+        if matches!(command, BrainstemCommand::Bootsel) && !json_service_authority_valid(body) {
             return render_command_response(
                 buffer,
                 false,
@@ -1656,6 +1683,17 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
         }
         if command_requires_authority(command) && !json_authority_valid(body) {
             return render_command_response(buffer, false, command_id, "invalid_control_lease");
+        }
+        if command_requires_service_authority(command) && !json_service_authority_valid(body) {
+            return render_command_response(buffer, false, command_id, "invalid_service_lease");
+        }
+        if matches!(command, BrainstemCommand::Bootsel) {
+            return render_command_response(
+                buffer,
+                false,
+                command_id,
+                "service_operation_disabled",
+            );
         }
         let accepted = status::submit_control_command(command_id, command);
         if accepted {
@@ -1672,7 +1710,7 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
 fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
     let command_id = json_u32(body, "command_id")?;
     let command = parse_command(command_id, body)?;
-    if matches!(command, BrainstemCommand::Bootsel) {
+    if matches!(command, BrainstemCommand::Bootsel) && !json_service_authority_valid(body) {
         return render_command_response(
             buffer,
             false,
@@ -1685,6 +1723,12 @@ fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     }
     if command_requires_authority(command) && !json_authority_valid(body) {
         return render_command_response(buffer, false, command_id, "invalid_control_lease");
+    }
+    if command_requires_service_authority(command) && !json_service_authority_valid(body) {
+        return render_command_response(buffer, false, command_id, "invalid_service_lease");
+    }
+    if matches!(command, BrainstemCommand::Bootsel) {
+        return render_command_response(buffer, false, command_id, "service_operation_disabled");
     }
     if !status::submit_control_command(command_id, command) {
         return render_command_response(buffer, false, command_id, "busy");
@@ -1759,8 +1803,14 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
         write_forebrain_uart_line(uart, response.as_bytes());
         return;
     }
+    if line.starts_with("ACQUIRE_SERVICE_LEASE ") {
+        let mut response = heapless::String::<512>::new();
+        handle_service_authority_compact(line, &mut response);
+        write_forebrain_uart_line(uart, response.as_bytes());
+        return;
+    }
 
-    let (command_line, session_id, lease_id) = compact_envelope(line);
+    let (command_line, session_id, lease_id, service_lease_id) = compact_envelope(line);
     let (seq, command) = match parse_forebrain_uart_command(command_line) {
         Ok(parsed) => parsed,
         Err(seq) => {
@@ -1773,7 +1823,11 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
 
     status::mark_forebrain_uart_command(seq, Instant::now().as_millis() as u32);
     if matches!(command, BrainstemCommand::Bootsel) {
-        write_forebrain_uart_error(uart, seq, "service_authorization_required");
+        if !compact_service_authority_valid(session_id, service_lease_id) {
+            write_forebrain_uart_error(uart, seq, "service_authorization_required");
+            return;
+        }
+        write_forebrain_uart_error(uart, seq, "service_operation_disabled");
         return;
     }
     if matches!(command, BrainstemCommand::GetCapabilities) {
@@ -1792,6 +1846,12 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
         && !compact_authority_valid(command, session_id, lease_id)
     {
         write_forebrain_uart_error(uart, seq, "invalid_control_lease");
+        return;
+    }
+    if command_requires_service_authority(command)
+        && !compact_service_authority_valid(session_id, service_lease_id)
+    {
+        write_forebrain_uart_error(uart, seq, "invalid_service_lease");
         return;
     }
 
@@ -2095,7 +2155,11 @@ fn handle_compact_control_line<const N: usize>(
         handle_authority_compact(line, response);
         return Some(false);
     }
-    let (command_line, session_id, lease_id) = compact_envelope(line);
+    if line.starts_with("ACQUIRE_SERVICE_LEASE ") {
+        handle_service_authority_compact(line, response);
+        return Some(false);
+    }
+    let (command_line, session_id, lease_id, service_lease_id) = compact_envelope(line);
     let (seq, command) = match parse_forebrain_uart_command(command_line) {
         Ok(parsed) => parsed,
         Err(seq) => {
@@ -2119,7 +2183,12 @@ fn handle_compact_control_line<const N: usize>(
             Some(false)
         }
         BrainstemCommand::Bootsel => {
-            let _ = writeln!(response, "ERR {seq} service_authorization_required");
+            let reason = if compact_service_authority_valid(session_id, service_lease_id) {
+                "service_operation_disabled"
+            } else {
+                "service_authorization_required"
+            };
+            let _ = writeln!(response, "ERR {seq} {reason}");
             Some(false)
         }
         command => {
@@ -2131,6 +2200,12 @@ fn handle_compact_control_line<const N: usize>(
                 && !compact_authority_valid(command, session_id, lease_id)
             {
                 let _ = writeln!(response, "ERR {seq} invalid_control_lease");
+                return Some(false);
+            }
+            if command_requires_service_authority(command)
+                && !compact_service_authority_valid(session_id, service_lease_id)
+            {
+                let _ = writeln!(response, "ERR {seq} invalid_service_lease");
                 return Some(false);
             }
             if status::submit_control_command(seq, command) {
@@ -2155,7 +2230,15 @@ fn command_requires_session(command: BrainstemCommand) -> bool {
     )
 }
 fn command_requires_authority(command: BrainstemCommand) -> bool {
-    command_requires_session(command) && !matches!(command, BrainstemCommand::Disarm)
+    command_requires_session(command)
+        && !matches!(command, BrainstemCommand::Disarm)
+        && !command_requires_service_authority(command)
+}
+fn command_requires_service_authority(command: BrainstemCommand) -> bool {
+    matches!(
+        command,
+        BrainstemCommand::Bootsel | BrainstemCommand::RestartMpu | BrainstemCommand::RestartCreate
+    )
 }
 
 fn json_session_valid(body: &str) -> bool {
@@ -2182,6 +2265,19 @@ fn json_authority_valid(body: &str) -> bool {
         status::active_authority_matches(session_hash, lease_hash, now)
     }
 }
+fn json_service_authority_valid(body: &str) -> bool {
+    let Some(session_id) = json_str(body, "session_id") else {
+        return false;
+    };
+    let Some(lease_id) = json_str(body, "service_lease_id") else {
+        return false;
+    };
+    status::active_service_authority_matches(
+        session::token_hash(session_id),
+        session::token_hash(lease_id),
+        Instant::now().as_millis() as u32,
+    )
+}
 fn compact_authority_valid(
     command: BrainstemCommand,
     session_id: Option<&str>,
@@ -2207,31 +2303,44 @@ fn compact_session_valid(session_id: &str) -> bool {
 }
 
 fn compact_session(line: &str) -> (&str, Option<&str>) {
-    let (command, session, _) = compact_envelope(line);
+    let (command, session, _, _) = compact_envelope(line);
     (command, session)
 }
-fn compact_envelope(line: &str) -> (&str, Option<&str>, Option<&str>) {
-    let (without_lease, lease) = match line.rsplit_once(" lease_id=") {
+fn compact_envelope(line: &str) -> (&str, Option<&str>, Option<&str>, Option<&str>) {
+    let (without_service, service_lease) = match line.rsplit_once(" service_lease_id=") {
+        Some((command, lease)) if !lease.contains(' ') => (command, Some(lease)),
+        _ => (line, None),
+    };
+    let (without_lease, lease) = match without_service.rsplit_once(" lease_id=") {
         Some((command, lease)) if !lease.contains(' ') => (command, Some(lease)),
         _ => (line, None),
     };
     match without_lease.rsplit_once(" session_id=") {
         Some((command, session_id)) if !session_id.contains(' ') => {
-            (command, Some(session_id), lease)
+            (command, Some(session_id), lease, service_lease)
         }
-        _ => (without_lease, None, lease),
+        _ => (without_lease, None, lease, service_lease),
+    }
+}
+
+fn compact_service_authority_valid(session_id: Option<&str>, lease_id: Option<&str>) -> bool {
+    match (session_id, lease_id) {
+        (Some(session_id), Some(lease_id)) => status::active_service_authority_matches(
+            session::token_hash(session_id),
+            session::token_hash(lease_id),
+            Instant::now().as_millis() as u32,
+        ),
+        _ => false,
     }
 }
 
 fn handle_network_registration_json<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
     let session_id = json_str(body, "session_id")?;
-    let device_id = json_str(body, "device_id")?;
     let session_hash = session::token_hash(session_id);
-    let device_hash = session::token_hash(device_id);
+    let identity = status::session_identity(session_hash)?;
     if !compact_session_valid(session_id)
-        || status::session_role(session_hash) != Some(1)
-        || !status::session_peer_matches(session_hash, device_hash)
-        || json_str(body, "role") != Some("motherbrain")
+        || identity.role != 1
+        || identity.purpose != 1
         || json_str(body, "hostname") != Some("motherbrain")
     {
         return render_registration_reject(buffer, "invalid_session_or_identity");
@@ -2244,6 +2353,8 @@ fn handle_network_registration_json<'a>(body: &str, buffer: &'a mut [u8]) -> Opt
     let Some((ttl, generation)) = network_registry::register_motherbrain(
         lease_identity.as_bytes(),
         address,
+        identity.peer_device_hash,
+        identity.peer_boot_hash,
         ttl,
         Instant::now().as_millis() as u32,
     ) else {
@@ -2272,8 +2383,6 @@ fn handle_network_registration_compact<const N: usize>(
         .next()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
-    let role = fields.next();
-    let device_id = fields.next();
     let _interface_id = fields.next();
     let address_text = fields.next();
     let hostname = fields.next();
@@ -2286,23 +2395,21 @@ fn handle_network_registration_compact<const N: usize>(
         let _ = writeln!(response, "ERR {seq} malformed_registration");
         return;
     };
-    if !valid
-        || role != Some("motherbrain")
-        || hostname != Some("motherbrain")
-        || !session_id.is_some_and(compact_session_valid)
-        || !device_id.is_some_and(|id| {
-            let session_hash = session::token_hash(session_id.unwrap_or(""));
-            status::session_role(session_hash) == Some(1)
-                && status::session_peer_matches(session_hash, session::token_hash(id))
-        })
-    {
+    if !valid || hostname != Some("motherbrain") || !session_id.is_some_and(compact_session_valid) {
         let _ = writeln!(response, "ERR {seq} invalid_session_or_identity");
         return;
     }
-    let Some((ttl, generation)) = lease_identity.and_then(|identity| {
+    let session_identity = status::session_identity(session::token_hash(session_id.unwrap_or("")));
+    let Some((ttl, generation)) = lease_identity.and_then(|lease_identity| {
+        let peer = session_identity?;
+        if peer.role != 1 || peer.purpose != 1 {
+            return None;
+        }
         network_registry::register_motherbrain(
-            identity.as_bytes(),
+            lease_identity.as_bytes(),
             address,
+            peer.peer_device_hash,
+            peer.peer_boot_hash,
             ttl,
             Instant::now().as_millis() as u32,
         )
@@ -2339,6 +2446,114 @@ fn handle_authority_json<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str
     copy_response(buffer, response.as_str())
 }
 
+fn handle_service_authority_json<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    let session_id = json_str(body, "session_id")?;
+    let scope = json_str(body, "scope")?;
+    let ttl_ms = json_u32(body, "ttl_ms").unwrap_or(2_000).clamp(250, 30_000);
+    let session_hash = session::token_hash(session_id);
+    if scope != "brainstem_maintenance" || !service_policy_allows(session_hash) {
+        return render_registration_reject(buffer, "service_policy_rejected");
+    }
+    let (lease_id, generation) = install_service_authority(session_hash, ttl_ms)?;
+    let mut response = heapless::String::<512>::new();
+    write!(response, "{{\"accepted\":true,\"type\":\"service_lease_granted\",\"lease_id\":\"{lease_id}\",\"session_id\":\"{session_id}\",\"owner_role\":\"{}\",\"scope\":\"brainstem_maintenance\",\"ttl_ms\":{ttl_ms},\"generation\":{generation}}}", role_name(status::session_role(session_hash)?)).ok()?;
+    copy_response(buffer, response.as_str())
+}
+
+fn handle_service_authority_compact<const N: usize>(
+    line: &str,
+    response: &mut heapless::String<N>,
+) {
+    response.clear();
+    let (command, session_id) = compact_session(line);
+    let mut fields = command.split_ascii_whitespace();
+    let valid = fields.next() == Some("ACQUIRE_SERVICE_LEASE");
+    let seq = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let scope = fields.next().unwrap_or("");
+    let ttl_ms = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(2_000)
+        .clamp(250, 30_000);
+    let Some(session_id) = session_id else {
+        let _ = writeln!(response, "ERR {seq} invalid_session");
+        return;
+    };
+    let session_hash = session::token_hash(session_id);
+    if !valid || scope != "brainstem_maintenance" || !service_policy_allows(session_hash) {
+        let _ = writeln!(response, "ERR {seq} service_policy_rejected");
+        return;
+    }
+    let Some((lease_id, generation)) = install_service_authority(session_hash, ttl_ms) else {
+        let _ = writeln!(response, "ERR {seq} authority_transition_timeout");
+        return;
+    };
+    let _ = writeln!(response, "OK {seq} SERVICE_LEASE_GRANTED lease_id={lease_id} session_id={session_id} owner_role={} scope=brainstem_maintenance ttl_ms={ttl_ms} generation={generation}", role_name(status::session_role(session_hash).unwrap_or(0)));
+}
+
+fn service_policy_allows(session_hash: u32) -> bool {
+    if !cfg!(feature = "service-mode") {
+        return false;
+    }
+    let Some(identity) = status::session_identity(session_hash) else {
+        return false;
+    };
+    let Some(role) = endpoint_role(identity.role) else {
+        return false;
+    };
+    let purpose = if identity.purpose == 1 {
+        session::SessionPurpose::Control
+    } else {
+        session::SessionPurpose::Diagnostic
+    };
+    let transport = match identity.transport {
+        value if value == TransportKind::UsbCdc as u8 => TransportKind::UsbCdc,
+        value if value == TransportKind::HardwareUart as u8 => TransportKind::HardwareUart,
+        value if value == TransportKind::Http as u8 => TransportKind::Http,
+        value if value == TransportKind::WebSocket as u8 => TransportKind::WebSocket,
+        value if value == TransportKind::Udp as u8 => TransportKind::Udp,
+        _ => return false,
+    };
+    pete_cockpit_protocol::role_can_request_service(role, purpose, transport)
+}
+
+fn install_service_authority(
+    session_hash: u32,
+    ttl_ms: u32,
+) -> Option<(heapless::String<40>, u32)> {
+    // Entering service authority uses the same synchronous stop/revoke barrier
+    // as a controller transition, but installs a separate non-motion lease.
+    let barrier_generation = AUTHORITY_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1);
+    status::request_authority_transition(barrier_generation, 0, 0, 0);
+    for _ in 0..250 {
+        if status::authority_transition_acked(barrier_generation) {
+            break;
+        }
+        embassy_time::block_for(Duration::from_millis(1));
+    }
+    if !status::authority_transition_acked(barrier_generation) {
+        return None;
+    }
+    let generation = SERVICE_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1);
+    let mut lease_id = heapless::String::<40>::new();
+    write!(lease_id, "service-{generation:08x}-{session_hash:08x}").ok()?;
+    status::install_service_authority(
+        session_hash,
+        session::token_hash(lease_id.as_str()),
+        (Instant::now().as_millis() as u32).wrapping_add(ttl_ms),
+    );
+    Some((lease_id, generation))
+}
+
 fn handle_authority_compact<const N: usize>(line: &str, response: &mut heapless::String<N>) {
     response.clear();
     let (command, session_id) = compact_session(line);
@@ -2373,16 +2588,45 @@ fn handle_authority_compact<const N: usize>(line: &str, response: &mut heapless:
 }
 
 fn authority_policy_allows(session_hash: u32, authority: &str, now_ms: u32) -> bool {
-    match (status::session_role(session_hash), authority) {
-        (Some(1), "motherbrain") => true,
-        (Some(3), "operator_debug") => cfg!(feature = "operator-debug"),
-        (Some(2), "forebrain_recovery") => {
+    let Some(identity) = status::session_identity(session_hash) else {
+        return false;
+    };
+    let Some(role) = endpoint_role(identity.role) else {
+        return false;
+    };
+    let purpose = if identity.purpose == 1 {
+        session::SessionPurpose::Control
+    } else {
+        session::SessionPurpose::Diagnostic
+    };
+    let requested = match authority {
+        "motherbrain" => pete_cockpit_protocol::ControlAuthority::Motherbrain,
+        "operator_debug" => pete_cockpit_protocol::ControlAuthority::OperatorDebug,
+        "forebrain_recovery" => pete_cockpit_protocol::ControlAuthority::ForebrainRecovery,
+        _ => return false,
+    };
+    if !pete_cockpit_protocol::role_can_request_control(role, purpose, requested) {
+        return false;
+    }
+    match requested {
+        pete_cockpit_protocol::ControlAuthority::Motherbrain => true,
+        pete_cockpit_protocol::ControlAuthority::OperatorDebug => cfg!(feature = "operator-debug"),
+        pete_cockpit_protocol::ControlAuthority::ForebrainRecovery => {
             status::authority_expired(now_ms)
                 && option_env!("PETE_RECOVERY_FOREBRAIN_ID").is_some_and(|device_id| {
                     status::session_peer_matches(session_hash, session::token_hash(device_id))
                 })
         }
-        _ => false,
+    }
+}
+
+fn endpoint_role(role: u8) -> Option<session::EndpointRole> {
+    match role {
+        1 => Some(session::EndpointRole::Motherbrain),
+        2 => Some(session::EndpointRole::Forebrain),
+        3 => Some(session::EndpointRole::Operator),
+        4 => Some(session::EndpointRole::ServiceTool),
+        _ => None,
     }
 }
 

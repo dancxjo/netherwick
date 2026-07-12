@@ -51,6 +51,7 @@ pico-w = [
     "dep:rp-pac",
 ]
 operator-debug = []
+service-mode = []
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
