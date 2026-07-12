@@ -6,7 +6,11 @@ use crate::commands::{
     SafetyAction, SafetyPolicy, SongTone, ACQUIRE_CREATE_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
     RESTART_CREATE_SCRIPT,
 };
-use crate::drivers::{create_uart::CreateUart, leds::Leds, timers::Timers};
+use crate::drivers::{
+    create_uart::{CreateUart, CREATE_BUTTON_LED_MASK, CREATE_LED_ADVANCE, CREATE_LED_PLAY},
+    leds::Leds,
+    timers::Timers,
+};
 use crate::events::{BrainstemError, BrainstemEvent};
 use crate::hardware::BrainstemHardware;
 use crate::network_registry;
@@ -326,19 +330,19 @@ where
         let (led_bits, color, intensity, period_ms) = if self.mode == RuntimeMode::Error {
             let on = self.supervision_light_phase & 1 == 0;
             (
-                if on { 0x03 } else { 0 },
+                if on { CREATE_BUTTON_LED_MASK } else { 0 },
                 255,
                 if on { 255 } else { 0 },
                 300,
             )
         } else if self.estop_latched || self.safety_latched {
-            (0x03, 255, 255, 500)
+            (CREATE_BUTTON_LED_MASK, 255, 255, 500)
         } else {
-            // Three-light bounce: power -> binary 1 -> binary 2 -> binary 1.
+            // Three-light bounce: power -> play -> advance -> play.
             match self.supervision_light_phase & 3 {
                 0 => (0, 0, 220, SUPERVISION_LIGHT_PERIOD_MS),
-                1 | 3 => (0x01, 0, 0, SUPERVISION_LIGHT_PERIOD_MS),
-                _ => (0x02, 0, 0, SUPERVISION_LIGHT_PERIOD_MS),
+                1 | 3 => (CREATE_LED_PLAY, 0, 0, SUPERVISION_LIGHT_PERIOD_MS),
+                _ => (CREATE_LED_ADVANCE, 0, 0, SUPERVISION_LIGHT_PERIOD_MS),
             }
         };
         self.create_uart

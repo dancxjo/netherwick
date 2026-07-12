@@ -32,6 +32,7 @@ verbs = [
   "get_capabilities",
   "get_events",
   "stop",
+  "disarm",
   "estop",
   "clear_estop",
   "clear_motion_queue",

@@ -218,6 +218,13 @@ pub trait Cockpit {
         None
     }
 
+    /// Sequence immediately preceding the live event head established by a
+    /// validated handshake. Consumers use this to avoid replaying unavailable
+    /// history from boot.
+    fn event_cursor_hint(&self) -> Option<u32> {
+        None
+    }
+
     /// Surrender motherbrain possession. The brainstem wire operation remains
     /// DISARM, but that implementation detail is not the motherbrain lifecycle
     /// vocabulary.
@@ -592,6 +599,9 @@ pub trait Cockpit {
 impl<T: Cockpit + ?Sized> Cockpit for Box<T> {
     fn possession_snapshot(&self) -> Option<PossessionSnapshot> {
         (**self).possession_snapshot()
+    }
+    fn event_cursor_hint(&self) -> Option<u32> {
+        (**self).event_cursor_hint()
     }
 
     fn exorcize(&mut self) -> Result<()> {
@@ -2385,9 +2395,12 @@ impl<C: Cockpit> SafeCockpit<C> {
     }
 
     pub fn with_policy(client: C, policy: AgentPolicy) -> Self {
+        let cursor = EventCursor {
+            next_seq: client.event_cursor_hint().unwrap_or(0),
+        };
         Self {
             client,
-            cursor: EventCursor::new(),
+            cursor,
             policy,
             contract: None,
         }
@@ -2398,13 +2411,21 @@ impl<C: Cockpit> SafeCockpit<C> {
     }
 
     pub fn replace_client(&mut self, client: C) {
+        self.cursor = EventCursor {
+            next_seq: client.event_cursor_hint().unwrap_or(0),
+        };
         self.client = client;
-        self.cursor = EventCursor::new();
         self.contract = None;
     }
 
     pub fn refresh_status(&mut self) -> Result<StatusSummary> {
-        Ok(self.client.get_status()?.summary())
+        let status = self.client.get_status()?.summary();
+        if self.cursor.next_seq == 0 {
+            if let Some(event_next_seq) = status.event_next_seq {
+                self.cursor = EventCursor::from_event_next_seq(event_next_seq);
+            }
+        }
+        Ok(status)
     }
 
     pub fn refresh_contract(&mut self) -> Result<&CockpitContract> {
@@ -3778,9 +3799,6 @@ impl<C: Cockpit> MotherbrainPossession<C> {
         // otherwise expose Create OI modes from the motherbrain.
         expect_accepted(session.execute(CockpitRequest::Stop)?)?;
         let heartbeat_timeout_ms = 750;
-        expect_accepted(session.execute(CockpitRequest::HeartbeatStop {
-            timeout_ms: heartbeat_timeout_ms,
-        })?)?;
         Ok(Self {
             session,
             lease_acquired_at: Instant::now(),
@@ -3882,12 +3900,42 @@ impl<C: Cockpit> MotherbrainPossession<C> {
             .session
             .execute(CockpitRequest::Stop)
             .and_then(expect_accepted);
-        let disarm = self
+        if let Err(error) = stop {
+            self.close_gate("possession exorcized".into());
+            return Err(error);
+        }
+        // Mandatory wire-level surrender. Early production firmware implements
+        // DISARM but omitted it from the advertised verbs. Use only the current
+        // validated session and lease; this is never an unscoped fallback.
+        let session = self.session.session().clone();
+        let lease = self
             .session
-            .execute(CockpitRequest::Disarm)
-            .and_then(expect_accepted);
+            .control_lease
+            .clone()
+            .ok_or_else(|| CockpitError::Policy("exorcize requires the current lease".into()))?;
+        let mut disarm = None;
+        for _ in 0..25 {
+            match self.session.connector_mut().execute_with_lease(
+                &session,
+                &lease,
+                CockpitRequest::Disarm,
+            ) {
+                Err(error) if error.to_string().contains("busy") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    disarm = Some(result.and_then(expect_accepted));
+                    break;
+                }
+            }
+        }
+        let disarm = disarm.unwrap_or_else(|| {
+            Err(CockpitError::Policy(
+                "exorcize DISARM remained busy after STOP".into(),
+            ))
+        });
         self.close_gate("possession exorcized".into());
-        stop.and(disarm)
+        disarm
     }
 
     fn execute_scoped(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
@@ -3970,6 +4018,10 @@ impl<C: Cockpit> Drop for MotherbrainPossession<C> {
 impl<C: Cockpit> Cockpit for MotherbrainPossession<C> {
     fn possession_snapshot(&self) -> Option<PossessionSnapshot> {
         Some(self.snapshot())
+    }
+
+    fn event_cursor_hint(&self) -> Option<u32> {
+        Some(self.session.cursor.next_seq())
     }
 
     fn exorcize(&mut self) -> Result<()> {
@@ -5799,6 +5851,57 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::thread;
+
+    struct StopRejectingCockpit {
+        inner: SimCockpit,
+        reject_stop: bool,
+        disarm_requests: usize,
+    }
+
+    impl Cockpit for StopRejectingCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+            self.inner.execute(request)
+        }
+
+        fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+            self.inner.handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &CockpitSession,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            if matches!(&request, CockpitRequest::Stop) && self.reject_stop {
+                return Ok(CockpitResponse::Rejected {
+                    message: "stop not acknowledged".into(),
+                });
+            }
+            if matches!(&request, CockpitRequest::Disarm) {
+                self.disarm_requests += 1;
+            }
+            self.inner.execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &CockpitSession,
+            lease: &ControlLease,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            self.inner.execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &CockpitSession,
+            lease: &ServiceLease,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            self.inner
+                .execute_with_service_lease(session, lease, request)
+        }
+    }
 
     fn hello() -> HandshakeHello {
         HandshakeHello::motherbrain("pete-motherbrain-test")
@@ -7668,6 +7771,22 @@ mod tests {
         assert!(renewed.possessed);
         assert!(renewed.lease_generation > first.lease_generation);
         assert_ne!(renewed.lease_id, first.lease_id);
+    }
+
+    #[test]
+    fn exorcize_does_not_disarm_until_stop_is_acknowledged() {
+        let cockpit = StopRejectingCockpit {
+            inner: SimCockpit::new(),
+            reject_stop: false,
+            disarm_requests: 0,
+        };
+        let ready = establish_session(cockpit, hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 1_000).unwrap();
+        possession.session.connector_mut().reject_stop = true;
+
+        assert!(possession.exorcize().is_err());
+        assert!(!possession.snapshot().possessed);
+        assert_eq!(possession.session.connector_mut().disarm_requests, 0);
     }
 
     #[test]

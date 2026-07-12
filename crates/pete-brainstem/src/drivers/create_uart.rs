@@ -18,6 +18,9 @@ const OI_STREAM: u8 = 148;
 const OI_PAUSE_RESUME_STREAM: u8 = 150;
 const OI_STREAM_HEADER: u8 = 19;
 const UART_DRAIN_LIMIT: usize = 128;
+pub(crate) const CREATE_LED_PLAY: u8 = 1 << 1;
+pub(crate) const CREATE_LED_ADVANCE: u8 = 1 << 3;
+pub(crate) const CREATE_BUTTON_LED_MASK: u8 = CREATE_LED_PLAY | CREATE_LED_ADVANCE;
 
 #[derive(Clone, Copy)]
 enum StreamState {
@@ -301,7 +304,10 @@ impl CreateUart {
     where
         H: BrainstemHardware,
     {
-        self.send_bytes(hardware, &[OI_LEDS, led_bits & 0x03, color, intensity])
+        self.send_bytes(
+            hardware,
+            &[OI_LEDS, led_bits & CREATE_BUTTON_LED_MASK, color, intensity],
+        )
     }
 
     fn drive<H>(
@@ -778,6 +784,23 @@ mod tests {
             .is_ok());
 
         assert_eq!(hardware.tx, [OI_LEDS, 0b0101, 128, 64]);
+    }
+
+    #[test]
+    fn supervision_lights_use_create_play_and_advance_bits() {
+        let mut uart = CreateUart::new();
+        let mut hardware = TestHardware::new();
+
+        assert!(uart
+            .set_supervision_lights(
+                &mut hardware,
+                CREATE_LED_PLAY | CREATE_LED_ADVANCE | 0x05,
+                128,
+                64,
+            )
+            .is_ok());
+
+        assert_eq!(hardware.tx, [OI_LEDS, 0x0a, 128, 64]);
     }
 
     #[test]

@@ -398,11 +398,14 @@ possess *args:
     echo "limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
     PETE_ROBOT_MODE=possession-slow \
     PETE_ROBOT_LEDGER="${PETE_POSSESSION_LEDGER:-data/ledger/real/possession}" \
+    CAMERA_DEVICE="" MIC_DEVICE="" IMU_DEVICE="" GPS_SERIAL_PORT="" PETE_KINECT_DEPTH=0 \
     just robot \
         --brainstem-device-id "$PETE_BRAINSTEM_DEVICE_ID" \
         --brainstem-boot-id "$PETE_BRAINSTEM_BOOT_ID" \
         --max-linear-mm-s 50 \
         --max-angular-mrad-s 500 \
+        --imu none --gps none \
+        --llm-provider disabled \
         --capture "${PETE_POSSESSION_CAPTURE:-data/captures/real/possession}" {{args}}
 
 # Launch the virtual dream world with HTTPS live view.

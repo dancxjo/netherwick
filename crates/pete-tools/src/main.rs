@@ -4903,11 +4903,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         None => None,
     };
 
-    enqueue_default_bringup_outputs(
-        &mouth,
-        runner.cockpit.client_mut().as_mut(),
-        &initialization,
-    );
+    if robot_mode != RobotMode::Slow {
+        enqueue_default_bringup_outputs(
+            &mouth,
+            runner.cockpit.client_mut().as_mut(),
+            &initialization,
+        );
+    }
 
     let max_steps = args.steps.or_else(|| {
         args.duration_seconds
@@ -4945,13 +4947,15 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
-        play_event_script_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &tick);
-        play_reign_audio_action(
-            &mouth,
-            runner.cockpit.client_mut().as_mut(),
-            &tick,
-            &mut played_reign_audio,
-        );
+        if robot_mode != RobotMode::Slow {
+            play_event_script_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &tick);
+            play_reign_audio_action(
+                &mouth,
+                runner.cockpit.client_mut().as_mut(),
+                &tick,
+                &mut played_reign_audio,
+            );
+        }
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
             live_state.update_embodied_context(tick.frame.embodied_context());
