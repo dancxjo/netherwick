@@ -4028,7 +4028,9 @@ impl MotherbrainBootstrap {
         }
         let mut errors = Vec::new();
         for path in paths {
-            let connector = match UartCockpit::connect(&path) {
+            let connector = match UartCockpit::connect_with_config(
+                UartCockpitConfig::new(&path).with_data_terminal_ready(true),
+            ) {
                 Ok(connector) => connector,
                 Err(error) => {
                     errors.push(CandidateFailure {
@@ -4617,6 +4619,9 @@ pub struct UartCockpitConfig {
     pub baud_rate: u32,
     pub timeout: Duration,
     pub max_response_len: usize,
+    /// Assert DTR after opening. USB CDC firmware commonly uses DTR as its
+    /// indication that a host is ready; hardware UART adapters need not.
+    pub data_terminal_ready: bool,
 }
 
 impl UartCockpitConfig {
@@ -4626,6 +4631,7 @@ impl UartCockpitConfig {
             baud_rate: DEFAULT_UART_BAUD_RATE,
             timeout: DEFAULT_UART_TIMEOUT,
             max_response_len: DEFAULT_UART_MAX_RESPONSE_LEN,
+            data_terminal_ready: false,
         }
     }
 
@@ -4641,6 +4647,11 @@ impl UartCockpitConfig {
 
     pub fn with_max_response_len(mut self, max_response_len: usize) -> Self {
         self.max_response_len = max_response_len;
+        self
+    }
+
+    pub fn with_data_terminal_ready(mut self, ready: bool) -> Self {
+        self.data_terminal_ready = ready;
         self
     }
 }
@@ -4659,9 +4670,12 @@ impl UartCockpit {
     }
 
     pub fn connect_with_config(config: UartCockpitConfig) -> Result<Self> {
-        let port = serialport::new(config.path.to_string_lossy(), config.baud_rate)
+        let mut port = serialport::new(config.path.to_string_lossy(), config.baud_rate)
             .timeout(config.timeout)
             .open()?;
+        if config.data_terminal_ready {
+            port.write_data_terminal_ready(true)?;
+        }
         Ok(Self {
             port,
             next_seq: 1,

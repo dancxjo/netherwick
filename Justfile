@@ -190,7 +190,7 @@ brainstem-fetch-cyw43:
 
 # Build the Brainstem Pico W firmware with AP/status support.
 brainstem-pico-w-build: brainstem-fetch-cyw43
-    cd crates/pete-brainstem && cargo build --release --no-default-features --features pico-w,service-mode
+    cd crates/pete-brainstem && cargo build --release --no-default-features --features pico-w,service-mode,operator-debug
 
 # Convert the Brainstem Pico W firmware ELF to UF2.
 brainstem-pico-w-uf2: brainstem-pico-w-build
