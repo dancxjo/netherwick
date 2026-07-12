@@ -377,13 +377,19 @@ _robot-cockpit-backend:
         exit 0
     fi
 
-    SSID=""
+    PETE_SSID=""
     if command -v nmcli >/dev/null 2>&1; then
-        SSID="$(nmcli -t -f active,ssid dev wifi 2>/dev/null | sed -n 's/^yes://p' | head -n 1)"
+        PETE_SSID="$(
+            nmcli -t -f active,ssid dev wifi 2>/dev/null \
+                | sed -n 's/^yes://p' \
+                | awk 'tolower($0) ~ /^pete-/ { print; exit }' \
+                || true
+        )"
     elif command -v iwgetid >/dev/null 2>&1; then
         SSID="$(iwgetid -r 2>/dev/null || true)"
+        if [[ "${SSID,,}" == pete-* ]]; then PETE_SSID="$SSID"; fi
     fi
-    if [[ "${SSID,,}" == pete-* ]] \
+    if [ -n "$PETE_SSID" ] \
         && command -v curl >/dev/null 2>&1 \
         && curl -fsS --connect-timeout 1 --max-time 2 \
             "http://${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}/status.json" >/dev/null; then
