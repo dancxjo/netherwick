@@ -102,6 +102,7 @@ struct Pins {
     leds: LedPins,
     create_device_detect: OptionalGpioPin,
     estop: OptionalGpioPin,
+    motherbrain_reset: OptionalGpioPin,
 }
 
 #[allow(dead_code)]
@@ -176,7 +177,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", body_path.display());
     println!("cargo:rerun-if-changed={}", board_path.display());
 
-    let body: BodyToml = toml::from_str(&fs::read_to_string(&body_path).unwrap()).unwrap();
+    let mut body: BodyToml = toml::from_str(&fs::read_to_string(&body_path).unwrap()).unwrap();
     let board: BoardToml = toml::from_str(&fs::read_to_string(&board_path).unwrap()).unwrap();
     assert_eq!(body.body.kind, "create_oi");
     assert_eq!(body.body.drive, "differential");
@@ -184,6 +185,20 @@ fn main() {
     assert_eq!(body.create_oi.stop_bits, 1);
     assert_eq!(board.board.arch, "rp2040");
     assert_eq!(board.imu.i2c_bus, "primary");
+    let motherbrain_reset_enabled = board.pins.motherbrain_reset.enabled
+        && env::var_os("CARGO_FEATURE_MOTHERBRAIN_RESET").is_some();
+    if motherbrain_reset_enabled {
+        body.capabilities.verbs.push("reset_motherbrain".into());
+        body.capabilities.outputs.push("motherbrain_reset".into());
+        for event in [
+            "motherbrain_reset_requested",
+            "motherbrain_reset_asserted",
+            "motherbrain_reset_completed",
+            "motherbrain_reset_refused",
+        ] {
+            body.capabilities.events.push(event.into());
+        }
+    }
 
     let default_mode = match body.create_oi.default_mode.as_str() {
         "passive" => "CreateOiMode::Passive",
@@ -250,6 +265,7 @@ pub const CREATE_DEVICE_DETECT_GPIO: u8 = {create_device_detect_gpio};
 pub const ESTOP_ENABLED: bool = {estop_enabled};
 pub const ESTOP_PIN: &str = {estop_pin:?};
 pub const ESTOP_GPIO: u8 = {estop_gpio};
+pub const MOTHERBRAIN_RESET_ENABLED: bool = {motherbrain_reset_enabled};
 
 pub const I2C_PRIMARY_SDA_PIN: &str = {i2c_sda_pin:?};
 pub const I2C_PRIMARY_SDA_GPIO: u8 = {i2c_sda_gpio};
@@ -312,6 +328,7 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         estop_enabled = board.pins.estop.enabled,
         estop_pin = board.pins.estop.pin,
         estop_gpio = board.pins.estop.gpio,
+        motherbrain_reset_enabled = motherbrain_reset_enabled,
         i2c_sda_pin = board.i2c.primary.sda,
         i2c_sda_gpio = board.i2c.primary.sda_gpio,
         i2c_sda_physical_pin = board.i2c.primary.sda_physical_pin,

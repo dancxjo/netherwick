@@ -1,0 +1,14 @@
+[package]
+name = "pete-ups"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+i2cdev = "0.6"
+gpio-cdev = "0.6"
+

@@ -25,6 +25,7 @@ members = [
     "crates/pete-ui",
     "crates/pete-cockpit",
     "crates/pete-cockpit-protocol",
+    "crates/pete-ups",
     "crates/pete-tools",
     "xtask",
 ]

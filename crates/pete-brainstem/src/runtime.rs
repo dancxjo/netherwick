@@ -31,6 +31,8 @@ const BUMP_ESCAPE_BACKOFF_MS: u32 = 450;
 const BUMP_ESCAPE_TURN_MS: u32 = 650;
 const FEEDBACK_SLOT_BASE: u8 = 10;
 const FEEDBACK_KIND_COUNT: usize = 6;
+const MOTHERBRAIN_RESET_PULSE_MS: u32 = 100;
+const MOTHERBRAIN_RESET_COOLDOWN_MS: u32 = 30_000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -135,6 +137,12 @@ where
     last_bump: bool,
     last_cliff: bool,
     last_wheel_drop: bool,
+    motherbrain_reset_release_at_ms: Option<u32>,
+    motherbrain_reset_cooldown_until_ms: u32,
+    last_motherbrain_reset_command_id: u32,
+    motherbrain_reset_hardware_enabled: bool,
+    motherbrain_reset_session_hash: u32,
+    motherbrain_reset_lease_hash: u32,
 }
 
 impl<H> Runtime<H>
@@ -178,6 +186,12 @@ where
             last_bump: false,
             last_cliff: false,
             last_wheel_drop: false,
+            motherbrain_reset_release_at_ms: None,
+            motherbrain_reset_cooldown_until_ms: 0,
+            last_motherbrain_reset_command_id: 0,
+            motherbrain_reset_hardware_enabled: body::MOTHERBRAIN_RESET_ENABLED,
+            motherbrain_reset_session_hash: 0,
+            motherbrain_reset_lease_hash: 0,
         }
     }
 
@@ -208,6 +222,7 @@ where
     pub fn tick(&mut self) {
         status::set_runtime_action(self.active_action_code());
         self.poll();
+        self.poll_motherbrain_reset();
         self.hardware.feed_watchdog();
         self.poll_imu();
         if let Err(error) = self.poll_sensor_stream() {
@@ -441,6 +456,9 @@ where
                 self.mode = RuntimeMode::Running;
                 status::set_runtime_state(RuntimeState::Running);
             }
+            BrainstemCommand::ResetMotherbrain => {
+                self.request_motherbrain_reset(command_id);
+            }
             BrainstemCommand::CmdVel { .. } => {
                 if let Some(command) = runtime_command_from_forebrain(command) {
                     self.enqueue_latest_velocity(command_id, command);
@@ -462,6 +480,60 @@ where
                     status::set_runtime_state(RuntimeState::Running);
                 }
             }
+        }
+    }
+
+    fn request_motherbrain_reset(&mut self, command_id: u32) {
+        let now_ms = self.now_ms();
+        let (session_hash, lease_hash) = status::active_service_identity();
+        status::mark_motherbrain_reset_requested(command_id, session_hash, lease_hash);
+
+        let refusal = if !self.motherbrain_reset_hardware_enabled {
+            Some(status::MotherbrainResetRefusal::HardwareDisabled)
+        } else if command_id == self.last_motherbrain_reset_command_id {
+            Some(status::MotherbrainResetRefusal::Duplicate)
+        } else if self.motherbrain_reset_release_at_ms.is_some()
+            || !time_reached(now_ms, self.motherbrain_reset_cooldown_until_ms)
+        {
+            Some(status::MotherbrainResetRefusal::Cooldown)
+        } else {
+            let snapshot = status::snapshot(now_ms);
+            let stopped = snapshot.body_state == BodyState::Idle as u8
+                && self.active == ActiveAction::None
+                && self.commands.is_empty()
+                && self.heartbeat_stop_at_ms.is_none();
+            let disarmed = snapshot.oi_mode == 1;
+            (!stopped || !disarmed).then_some(status::MotherbrainResetRefusal::UnsafeState)
+        };
+
+        self.last_motherbrain_reset_command_id = command_id;
+        if let Some(reason) = refusal {
+            status::mark_motherbrain_reset_refused(reason, session_hash, lease_hash);
+            return;
+        }
+
+        self.hardware.set_motherbrain_reset(true);
+        self.motherbrain_reset_release_at_ms =
+            Some(now_ms.wrapping_add(MOTHERBRAIN_RESET_PULSE_MS));
+        self.motherbrain_reset_cooldown_until_ms =
+            now_ms.wrapping_add(MOTHERBRAIN_RESET_COOLDOWN_MS);
+        self.motherbrain_reset_session_hash = session_hash;
+        self.motherbrain_reset_lease_hash = lease_hash;
+        status::mark_motherbrain_reset_asserted(command_id, session_hash, lease_hash);
+    }
+
+    fn poll_motherbrain_reset(&mut self) {
+        let Some(release_at_ms) = self.motherbrain_reset_release_at_ms else {
+            return;
+        };
+        if time_reached(self.now_ms(), release_at_ms) {
+            self.hardware.set_motherbrain_reset(false);
+            self.motherbrain_reset_release_at_ms = None;
+            status::mark_motherbrain_reset_completed(
+                self.last_motherbrain_reset_command_id,
+                self.motherbrain_reset_session_hash,
+                self.motherbrain_reset_lease_hash,
+            );
         }
     }
 
@@ -1662,6 +1734,7 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         | BrainstemCommand::Arm
         | BrainstemCommand::Disarm
         | BrainstemCommand::RestartCreate => None,
+        BrainstemCommand::ResetMotherbrain => None,
         BrainstemCommand::Stop => Some(RuntimeCommand::Stop),
         BrainstemCommand::EStop => Some(RuntimeCommand::EStop),
         BrainstemCommand::ClearEStop => Some(RuntimeCommand::ClearEStop),
@@ -2008,6 +2081,7 @@ fn default_feedback_tones(kind: FeedbackKind) -> ([SongTone; MAX_SONG_TONES], u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::CreateOiMode;
     use crate::drivers::imu::ImuSample;
     use crate::hardware::SerialRead;
 
@@ -2016,6 +2090,7 @@ mod tests {
         writes: heapless::Vec<u8, 32>,
         imu_sample: Option<ImuSample>,
         imu_health: Option<crate::drivers::imu::ImuHealth>,
+        reset_levels: heapless::Vec<bool, 8>,
     }
 
     impl FakeHardware {
@@ -2025,6 +2100,7 @@ mod tests {
                 writes: heapless::Vec::new(),
                 imu_sample: None,
                 imu_health: None,
+                reset_levels: heapless::Vec::new(),
             }
         }
 
@@ -2034,6 +2110,7 @@ mod tests {
                 writes: heapless::Vec::new(),
                 imu_sample: Some(imu_sample),
                 imu_health: None,
+                reset_levels: heapless::Vec::new(),
             }
         }
     }
@@ -2056,6 +2133,10 @@ mod tests {
         fn set_indicators(&mut self, _on: bool) {}
 
         fn set_primary_indicator(&mut self, _on: bool) {}
+
+        fn set_motherbrain_reset(&mut self, asserted: bool) {
+            let _ = self.reset_levels.push(asserted);
+        }
 
         fn write_byte(&mut self, byte: u8) -> Result<(), ()> {
             let _ = self.writes.push(byte);
@@ -2264,5 +2345,50 @@ mod tests {
             .iter()
             .any(|event| matches!(event, BrainstemEvent::DriveStopped)));
         assert!(!runtime.hardware.writes.is_empty());
+    }
+
+    #[test]
+    fn motherbrain_reset_is_nonblocking_timed_and_deduplicated() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.motherbrain_reset_hardware_enabled = true;
+        status::set_body_state(BodyState::Idle);
+        status::set_oi_mode(CreateOiMode::Passive);
+
+        runtime.request_motherbrain_reset(42);
+        assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true]);
+        assert!(runtime.motherbrain_reset_release_at_ms.is_some());
+
+        runtime.hardware.now_us += 99_000;
+        runtime.poll_motherbrain_reset();
+        assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true]);
+        runtime.hardware.now_us += 1_000;
+        runtime.poll_motherbrain_reset();
+        assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true, false]);
+
+        runtime.request_motherbrain_reset(42);
+        assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true, false]);
+    }
+
+    #[test]
+    fn motherbrain_reset_refuses_motion_and_cooldown() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.motherbrain_reset_hardware_enabled = true;
+        status::set_oi_mode(CreateOiMode::Full);
+        status::set_body_state(BodyState::Moving);
+        runtime.active = ActiveAction::Driving { stop_at_ms: 2_000 };
+        runtime.request_motherbrain_reset(1);
+        assert!(runtime.hardware.reset_levels.is_empty());
+
+        runtime.active = ActiveAction::None;
+        status::set_oi_mode(CreateOiMode::Passive);
+        status::set_body_state(BodyState::Idle);
+        runtime.request_motherbrain_reset(2);
+        assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true]);
+        runtime.hardware.now_us += 100_000;
+        runtime.poll_motherbrain_reset();
+        runtime.request_motherbrain_reset(3);
+        assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true, false]);
     }
 }

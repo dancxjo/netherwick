@@ -425,6 +425,19 @@ pub enum PublicEventKind {
     DhcpLeaseChanged = 42,
     DnsRegistrationChanged = 43,
     AuthorityChanged = 44,
+    MotherbrainResetRequested = 45,
+    MotherbrainResetAsserted = 46,
+    MotherbrainResetCompleted = 47,
+    MotherbrainResetRefused = 48,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum MotherbrainResetRefusal {
+    HardwareDisabled = 1,
+    UnsafeState = 2,
+    Cooldown = 3,
+    Duplicate = 4,
 }
 
 #[derive(Clone, Copy)]
@@ -524,6 +537,7 @@ enum ControlCommandCode {
     ClearImuOrientation = 44,
     RestartMpu = 45,
     RestartCreate = 46,
+    ResetMotherbrain = 47,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -956,11 +970,7 @@ pub fn active_authority_matches(session_hash: u32, lease_hash: u32, now_ms: u32)
         && ACTIVE_LEASE_HASH.load(Ordering::Acquire) == lease_hash
         && ACTIVE_LEASE_SESSION_HASH.load(Ordering::Acquire) == session_hash
 }
-pub fn authority_heartbeat_valid(
-    session_hash: u32,
-    lease_hash: u32,
-    now_ms: u32,
-) -> bool {
+pub fn authority_heartbeat_valid(session_hash: u32, lease_hash: u32, now_ms: u32) -> bool {
     // HEARTBEAT_STOP has its own runtime deadline. It must validate the
     // negotiated authority, but must not shorten (or extend) the control
     // lease to the motion heartbeat timeout.
@@ -1418,6 +1428,9 @@ fn encode_control_command(
         BrainstemCommand::RestartMpu => Some((ControlCommandCode::RestartMpu, 0, 0, 0, 0, None)),
         BrainstemCommand::RestartCreate => {
             Some((ControlCommandCode::RestartCreate, 0, 0, 0, 0, None))
+        }
+        BrainstemCommand::ResetMotherbrain => {
+            Some((ControlCommandCode::ResetMotherbrain, 0, 0, 0, 0, None))
         }
         BrainstemCommand::GetCapabilities => {
             Some((ControlCommandCode::GetCapabilities, 0, 0, 0, 0, None))
@@ -2265,6 +2278,53 @@ pub fn mark_estop_latched() {
 
 pub fn mark_estop_cleared() {
     record_public_event(PublicEventKind::EStopCleared, 0, 0, 0);
+}
+
+pub fn active_service_identity() -> (u32, u32) {
+    (
+        ACTIVE_SERVICE_SESSION_HASH.load(Ordering::Acquire),
+        ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire),
+    )
+}
+
+pub fn mark_motherbrain_reset_requested(command_id: u32, session_hash: u32, lease_hash: u32) {
+    record_public_event(
+        PublicEventKind::MotherbrainResetRequested,
+        command_id,
+        session_hash,
+        lease_hash,
+    );
+}
+
+pub fn mark_motherbrain_reset_asserted(command_id: u32, session_hash: u32, lease_hash: u32) {
+    record_public_event(
+        PublicEventKind::MotherbrainResetAsserted,
+        command_id,
+        session_hash,
+        lease_hash,
+    );
+}
+
+pub fn mark_motherbrain_reset_completed(command_id: u32, session_hash: u32, lease_hash: u32) {
+    record_public_event(
+        PublicEventKind::MotherbrainResetCompleted,
+        command_id,
+        session_hash,
+        lease_hash,
+    );
+}
+
+pub fn mark_motherbrain_reset_refused(
+    reason: MotherbrainResetRefusal,
+    session_hash: u32,
+    lease_hash: u32,
+) {
+    record_public_event(
+        PublicEventKind::MotherbrainResetRefused,
+        reason as u32,
+        session_hash,
+        lease_hash,
+    );
 }
 
 pub fn mark_uart_rx_error() {
@@ -3313,6 +3373,10 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
         x if x == PublicEventKind::DhcpLeaseChanged as u8 => "dhcp_lease_changed",
         x if x == PublicEventKind::DnsRegistrationChanged as u8 => "dns_registration_changed",
         x if x == PublicEventKind::AuthorityChanged as u8 => "authority_changed",
+        x if x == PublicEventKind::MotherbrainResetRequested as u8 => "motherbrain_reset_requested",
+        x if x == PublicEventKind::MotherbrainResetAsserted as u8 => "motherbrain_reset_asserted",
+        x if x == PublicEventKind::MotherbrainResetCompleted as u8 => "motherbrain_reset_completed",
+        x if x == PublicEventKind::MotherbrainResetRefused as u8 => "motherbrain_reset_refused",
         x if x == PublicEventKind::Error as u8 => "error",
         _ => "none",
     }

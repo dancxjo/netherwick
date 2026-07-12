@@ -28,6 +28,10 @@ pub trait BrainstemHardware {
     #[allow(dead_code)]
     fn set_primary_indicator(&mut self, on: bool);
 
+    /// Drives the external open-drain stage connected across the Pi 5 RUN
+    /// header. `true` asserts reset; the Pico must never drive RUN high.
+    fn set_motherbrain_reset(&mut self, _asserted: bool) {}
+
     fn write_byte(&mut self, byte: u8) -> Result<(), ()>;
     fn flush_uart(&mut self) -> Result<(), ()>;
     fn read_byte(&mut self) -> SerialRead;

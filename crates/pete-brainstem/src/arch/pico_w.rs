@@ -106,6 +106,8 @@ pub struct PicoWBrainstem {
     power_toggle: Output<'static>,
     brc: Output<'static>,
     status_led: Output<'static>,
+    #[cfg(feature = "motherbrain-reset")]
+    motherbrain_reset: Output<'static>,
 }
 
 impl PicoWBrainstem {
@@ -117,6 +119,10 @@ impl PicoWBrainstem {
         power_toggle: Peri<'static, PIN_18>,
         brc: Peri<'static, PIN_19>,
         status_led: Peri<'static, PIN_20>,
+        #[cfg(feature = "motherbrain-reset")] motherbrain_reset: Peri<
+            'static,
+            embassy_rp::peripherals::PIN_21,
+        >,
     ) -> Self {
         let mut uart_config = UartConfig::default();
         uart_config.baudrate = body::CREATE_UART_BAUD;
@@ -136,6 +142,10 @@ impl PicoWBrainstem {
             power_toggle: Output::new(power_toggle, Level::Low),
             brc: Output::new(brc, Level::High),
             status_led: Output::new(status_led, Level::Low),
+            // The gate/base has an external pull-down. Construct it inactive
+            // before any command transport starts.
+            #[cfg(feature = "motherbrain-reset")]
+            motherbrain_reset: Output::new(motherbrain_reset, Level::Low),
         }
     }
 }
@@ -168,6 +178,13 @@ impl BrainstemHardware for PicoWBrainstem {
 
     fn set_primary_indicator(&mut self, on: bool) {
         self.status_led.set_level(level(on));
+    }
+
+    fn set_motherbrain_reset(&mut self, asserted: bool) {
+        #[cfg(feature = "motherbrain-reset")]
+        self.motherbrain_reset.set_level(level(asserted));
+        #[cfg(not(feature = "motherbrain-reset"))]
+        let _ = asserted;
     }
 
     fn write_byte(&mut self, byte: u8) -> Result<(), ()> {
@@ -220,7 +237,16 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
         instance.rotate_left(11) ^ boot_entropy().max(1),
         Ordering::Release,
     );
-    let hardware = PicoWBrainstem::new(p.UART0, p.PIN_0, p.PIN_1, p.PIN_18, p.PIN_19, p.PIN_20);
+    let hardware = PicoWBrainstem::new(
+        p.UART0,
+        p.PIN_0,
+        p.PIN_1,
+        p.PIN_18,
+        p.PIN_19,
+        p.PIN_20,
+        #[cfg(feature = "motherbrain-reset")]
+        p.PIN_21,
+    );
 
     spawn_core1(
         p.CORE1,
@@ -2006,6 +2032,7 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
     let command = match kind {
         "PING" => BrainstemCommand::Ping,
         "BOOTSEL" => BrainstemCommand::Bootsel,
+        "RESET_MOTHERBRAIN" => BrainstemCommand::ResetMotherbrain,
         "ARM" => BrainstemCommand::Arm,
         "DISARM" => BrainstemCommand::Disarm,
         "SET_MODE" => {
@@ -2369,7 +2396,10 @@ fn command_requires_authority(command: BrainstemCommand) -> bool {
 fn command_requires_service_authority(command: BrainstemCommand) -> bool {
     matches!(
         command,
-        BrainstemCommand::Bootsel | BrainstemCommand::RestartMpu | BrainstemCommand::RestartCreate
+        BrainstemCommand::Bootsel
+            | BrainstemCommand::RestartMpu
+            | BrainstemCommand::RestartCreate
+            | BrainstemCommand::ResetMotherbrain
     )
 }
 
@@ -2807,6 +2837,7 @@ fn service_scope_code(scope: &str) -> Option<u8> {
         "bootsel" => Some(1),
         "restart_mpu" => Some(2),
         "restart_create" => Some(3),
+        "reset_motherbrain" => Some(4),
         _ => None,
     }
 }
@@ -3129,6 +3160,7 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
         }),
         "restart_mpu" => Some(BrainstemCommand::RestartMpu),
         "restart_create" => Some(BrainstemCommand::RestartCreate),
+        "reset_motherbrain" => Some(BrainstemCommand::ResetMotherbrain),
         "get_capabilities" => Some(BrainstemCommand::GetCapabilities),
         "get_events" => Some(BrainstemCommand::GetEvents {
             since_seq: json_u32(body, "since_seq").unwrap_or(0),

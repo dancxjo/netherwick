@@ -183,6 +183,7 @@ pub enum BrainstemCommand {
     },
     RestartMpu,
     RestartCreate,
+    ResetMotherbrain,
     GetCapabilities,
     GetEvents {
         since_seq: u32,

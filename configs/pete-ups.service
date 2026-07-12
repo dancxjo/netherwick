@@ -1,0 +1,13 @@
+[Unit]
+Description=Pete motherbrain Geekworm X1202 monitor
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pete-ups monitor --interval-seconds 2 --critical-percent 10 --critical-samples 5
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=pete
+
+[Install]
+WantedBy=multi-user.target

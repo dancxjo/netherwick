@@ -63,6 +63,7 @@ pub enum ServiceScope {
     Bootsel,
     RestartMpu,
     RestartCreate,
+    ResetMotherbrain,
 }
 
 pub const fn role_can_request_control(

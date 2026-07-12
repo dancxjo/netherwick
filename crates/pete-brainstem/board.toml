@@ -36,6 +36,14 @@ enabled = false
 pin = "GP21"
 gpio = 21
 
+[pins.motherbrain_reset]
+enabled = false # enable only after the installed transistor/RUN circuit is continuity-tested
+pin = "GP21"
+gpio = 21
+physical_pin = 27
+active = "high_into_open_drain_stage"
+target = "raspberry_pi_5_run_header"
+
 [pins.estop]
 enabled = false
 pin = "GP22"

@@ -1432,6 +1432,7 @@ pub enum CockpitRequest {
     Bootsel,
     RestartMpu,
     RestartCreate,
+    ResetMotherbrain,
     GetStatus,
     GetCapabilities,
     GetEvents {
@@ -1603,6 +1604,7 @@ impl CockpitRequest {
             Self::Bootsel => Some(ServiceScope::Bootsel),
             Self::RestartMpu => Some(ServiceScope::RestartMpu),
             Self::RestartCreate => Some(ServiceScope::RestartCreate),
+            Self::ResetMotherbrain => Some(ServiceScope::ResetMotherbrain),
             _ => None,
         }
     }
@@ -1617,7 +1619,7 @@ impl CockpitRequest {
             | Self::AcquireControlLease { .. }
             | Self::AcquireServiceLease { .. }
             | Self::Disarm => AuthorizationClass::Session,
-            Self::Bootsel | Self::RestartMpu | Self::RestartCreate => {
+            Self::Bootsel | Self::RestartMpu | Self::RestartCreate | Self::ResetMotherbrain => {
                 AuthorizationClass::ServiceLease
             }
             _ => AuthorizationClass::ControlLease,
@@ -1641,6 +1643,7 @@ impl CockpitRequest {
             Self::Bootsel => "bootsel",
             Self::RestartMpu => "restart_mpu",
             Self::RestartCreate => "restart_create",
+            Self::ResetMotherbrain => "reset_motherbrain",
             Self::GetStatus => "status",
             Self::GetCapabilities => "get_capabilities",
             Self::GetEvents { .. } => "get_events",
@@ -1732,7 +1735,9 @@ impl CockpitRequest {
         match self {
             Self::Ping => client.ping().map(|()| CockpitResponse::Accepted),
             Self::Bootsel => client.bootsel().map(|()| CockpitResponse::Accepted),
-            Self::RestartMpu | Self::RestartCreate => client.execute(self.clone()),
+            Self::RestartMpu | Self::RestartCreate | Self::ResetMotherbrain => {
+                client.execute(self.clone())
+            }
             Self::GetStatus => Ok(CockpitResponse::Status(client.get_status()?)),
             Self::GetCapabilities => Ok(CockpitResponse::Capabilities(client.get_capabilities()?)),
             Self::GetEvents { since_seq } => Ok(CockpitResponse::Events(
@@ -2035,6 +2040,7 @@ impl CockpitRequest {
                 | Self::Bootsel
                 | Self::RestartMpu
                 | Self::RestartCreate
+                | Self::ResetMotherbrain
                 | Self::GetStatus
                 | Self::GetCapabilities
                 | Self::GetEvents { .. }
@@ -2056,6 +2062,7 @@ impl CockpitRequest {
             Self::Bootsel => format!("BOOTSEL {seq}\n"),
             Self::RestartMpu => format!("RESTART_MPU {seq}\n"),
             Self::RestartCreate => format!("RESTART_CREATE {seq}\n"),
+            Self::ResetMotherbrain => format!("RESET_MOTHERBRAIN {seq}\n"),
             Self::GetStatus => format!("STATUS {seq}\n"),
             Self::GetCapabilities => format!("GET_CAPABILITIES {seq}\n"),
             Self::GetEvents { since_seq } => format!("GET_EVENTS {seq} {since_seq}\n"),
@@ -2077,6 +2084,7 @@ impl CockpitRequest {
                     ServiceScope::Bootsel => "bootsel",
                     ServiceScope::RestartMpu => "restart_mpu",
                     ServiceScope::RestartCreate => "restart_create",
+                    ServiceScope::ResetMotherbrain => "reset_motherbrain",
                 }
             ),
             Self::Arm => format!("ARM {seq}\n"),
@@ -2283,6 +2291,7 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "get_events",
         "restart_mpu",
         "restart_create",
+        "reset_motherbrain",
         "arm",
         "disarm",
         "stop",
@@ -2327,7 +2336,7 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
 }
 
 fn optional_cockpit_verbs() -> Vec<&'static str> {
-    Vec::new()
+    vec!["reset_motherbrain"]
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -2569,6 +2578,10 @@ pub enum CockpitEventKind {
     DhcpLeaseChanged,
     DnsRegistrationChanged,
     AuthorityChanged,
+    MotherbrainResetRequested,
+    MotherbrainResetAsserted,
+    MotherbrainResetCompleted,
+    MotherbrainResetRefused,
     Error,
     Unknown(String),
 }
@@ -2620,6 +2633,10 @@ impl From<&str> for CockpitEventKind {
             "dhcp_lease_changed" => Self::DhcpLeaseChanged,
             "dns_registration_changed" => Self::DnsRegistrationChanged,
             "authority_changed" => Self::AuthorityChanged,
+            "motherbrain_reset_requested" => Self::MotherbrainResetRequested,
+            "motherbrain_reset_asserted" => Self::MotherbrainResetAsserted,
+            "motherbrain_reset_completed" => Self::MotherbrainResetCompleted,
+            "motherbrain_reset_refused" => Self::MotherbrainResetRefused,
             "error" => Self::Error,
             other => Self::Unknown(other.to_owned()),
         }
@@ -2673,6 +2690,10 @@ impl CockpitEventKind {
             Self::DhcpLeaseChanged => "dhcp_lease_changed",
             Self::DnsRegistrationChanged => "dns_registration_changed",
             Self::AuthorityChanged => "authority_changed",
+            Self::MotherbrainResetRequested => "motherbrain_reset_requested",
+            Self::MotherbrainResetAsserted => "motherbrain_reset_asserted",
+            Self::MotherbrainResetCompleted => "motherbrain_reset_completed",
+            Self::MotherbrainResetRefused => "motherbrain_reset_refused",
             Self::Error => "error",
             Self::Unknown(kind) => kind.as_str(),
         }
@@ -4295,6 +4316,10 @@ impl<C: Cockpit> ServiceCockpit<'_, C> {
 
     pub fn restart_create(&mut self) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::RestartCreate)?)
+    }
+
+    pub fn reset_motherbrain(&mut self) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::ResetMotherbrain)?)
     }
 
     pub fn bootsel(&mut self) -> Result<()> {
@@ -6670,6 +6695,7 @@ mod tests {
             CockpitRequest::Bootsel,
             CockpitRequest::RestartMpu,
             CockpitRequest::RestartCreate,
+            CockpitRequest::ResetMotherbrain,
         ] {
             assert_eq!(
                 request.authorization_class(),
@@ -7683,6 +7709,7 @@ mod tests {
             "bootsel" => CockpitRequest::Bootsel,
             "restart_mpu" => CockpitRequest::RestartMpu,
             "restart_create" => CockpitRequest::RestartCreate,
+            "reset_motherbrain" => CockpitRequest::ResetMotherbrain,
             "status" => CockpitRequest::GetStatus,
             "get_capabilities" => CockpitRequest::GetCapabilities,
             "get_events" => CockpitRequest::GetEvents { since_seq: 3 },
