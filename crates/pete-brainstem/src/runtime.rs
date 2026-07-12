@@ -33,6 +33,8 @@ const FEEDBACK_SLOT_BASE: u8 = 10;
 const FEEDBACK_KIND_COUNT: usize = 6;
 const MOTHERBRAIN_RESET_PULSE_MS: u32 = 100;
 const MOTHERBRAIN_RESET_COOLDOWN_MS: u32 = 30_000;
+const MOTHERBRAIN_RESET_HISTORY_CAPACITY: usize = 16;
+const MOTHERBRAIN_RESET_SERVICE_SCOPE: u8 = 4;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -103,6 +105,32 @@ struct QueuedCommand {
     command: RuntimeCommand,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct MotherbrainResetIdentity {
+    session_hash: u32,
+    lease_hash: u32,
+    command_id: u32,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MotherbrainResetOutcome {
+    Refused(status::MotherbrainResetRefusal),
+    Asserted,
+    Completed,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct MotherbrainResetRecord {
+    identity: MotherbrainResetIdentity,
+    outcome: MotherbrainResetOutcome,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ActiveMotherbrainReset {
+    identity: MotherbrainResetIdentity,
+    release_at_ms: u32,
+}
+
 pub struct Runtime<H>
 where
     H: BrainstemHardware,
@@ -137,12 +165,11 @@ where
     last_bump: bool,
     last_cliff: bool,
     last_wheel_drop: bool,
-    motherbrain_reset_release_at_ms: Option<u32>,
+    active_motherbrain_reset: Option<ActiveMotherbrainReset>,
     motherbrain_reset_cooldown_until_ms: u32,
-    last_motherbrain_reset_command_id: u32,
     motherbrain_reset_hardware_enabled: bool,
-    motherbrain_reset_session_hash: u32,
-    motherbrain_reset_lease_hash: u32,
+    motherbrain_reset_history: [Option<MotherbrainResetRecord>; MOTHERBRAIN_RESET_HISTORY_CAPACITY],
+    motherbrain_reset_history_next: usize,
 }
 
 impl<H> Runtime<H>
@@ -186,12 +213,11 @@ where
             last_bump: false,
             last_cliff: false,
             last_wheel_drop: false,
-            motherbrain_reset_release_at_ms: None,
+            active_motherbrain_reset: None,
             motherbrain_reset_cooldown_until_ms: 0,
-            last_motherbrain_reset_command_id: 0,
             motherbrain_reset_hardware_enabled: body::MOTHERBRAIN_RESET_ENABLED,
-            motherbrain_reset_session_hash: 0,
-            motherbrain_reset_lease_hash: 0,
+            motherbrain_reset_history: [None; MOTHERBRAIN_RESET_HISTORY_CAPACITY],
+            motherbrain_reset_history_next: 0,
         }
     }
 
@@ -404,6 +430,7 @@ where
             return;
         };
         let command_id = status::last_dispatched_command_id();
+        let (service_session_hash, service_lease_hash) = status::last_dispatched_service_identity();
 
         match command {
             BrainstemCommand::Stop | BrainstemCommand::EStop => {
@@ -457,7 +484,11 @@ where
                 status::set_runtime_state(RuntimeState::Running);
             }
             BrainstemCommand::ResetMotherbrain => {
-                self.request_motherbrain_reset(command_id);
+                self.request_motherbrain_reset(MotherbrainResetIdentity {
+                    session_hash: service_session_hash,
+                    lease_hash: service_lease_hash,
+                    command_id,
+                });
             }
             BrainstemCommand::CmdVel { .. } => {
                 if let Some(command) = runtime_command_from_forebrain(command) {
@@ -483,16 +514,37 @@ where
         }
     }
 
-    fn request_motherbrain_reset(&mut self, command_id: u32) {
+    fn request_motherbrain_reset(&mut self, identity: MotherbrainResetIdentity) {
         let now_ms = self.now_ms();
-        let (session_hash, lease_hash) = status::active_service_identity();
-        status::mark_motherbrain_reset_requested(command_id, session_hash, lease_hash);
+        status::mark_motherbrain_reset_requested(
+            identity.command_id,
+            identity.session_hash,
+            identity.lease_hash,
+        );
 
-        let refusal = if !self.motherbrain_reset_hardware_enabled {
+        if let Some(record) = self
+            .motherbrain_reset_history
+            .iter()
+            .flatten()
+            .find(|record| record.identity == identity)
+            .copied()
+        {
+            Self::replay_motherbrain_reset_outcome(record);
+            return;
+        }
+
+        let refusal = if identity.command_id == 0 {
+            Some(status::MotherbrainResetRefusal::InvalidCommandId)
+        } else if !self.motherbrain_reset_hardware_enabled {
             Some(status::MotherbrainResetRefusal::HardwareDisabled)
-        } else if command_id == self.last_motherbrain_reset_command_id {
-            Some(status::MotherbrainResetRefusal::Duplicate)
-        } else if self.motherbrain_reset_release_at_ms.is_some()
+        } else if !status::active_service_authority_matches(
+            identity.session_hash,
+            identity.lease_hash,
+            now_ms,
+            MOTHERBRAIN_RESET_SERVICE_SCOPE,
+        ) {
+            Some(status::MotherbrainResetRefusal::InvalidServiceAuthority)
+        } else if self.active_motherbrain_reset.is_some()
             || !time_reached(now_ms, self.motherbrain_reset_cooldown_until_ms)
         {
             Some(status::MotherbrainResetRefusal::Cooldown)
@@ -506,34 +558,80 @@ where
             (!stopped || !disarmed).then_some(status::MotherbrainResetRefusal::UnsafeState)
         };
 
-        self.last_motherbrain_reset_command_id = command_id;
         if let Some(reason) = refusal {
-            status::mark_motherbrain_reset_refused(reason, session_hash, lease_hash);
+            let record = MotherbrainResetRecord {
+                identity,
+                outcome: MotherbrainResetOutcome::Refused(reason),
+            };
+            self.remember_motherbrain_reset(record);
+            Self::replay_motherbrain_reset_outcome(record);
             return;
         }
 
         self.hardware.set_motherbrain_reset(true);
-        self.motherbrain_reset_release_at_ms =
-            Some(now_ms.wrapping_add(MOTHERBRAIN_RESET_PULSE_MS));
+        self.active_motherbrain_reset = Some(ActiveMotherbrainReset {
+            identity,
+            release_at_ms: now_ms.wrapping_add(MOTHERBRAIN_RESET_PULSE_MS),
+        });
         self.motherbrain_reset_cooldown_until_ms =
             now_ms.wrapping_add(MOTHERBRAIN_RESET_COOLDOWN_MS);
-        self.motherbrain_reset_session_hash = session_hash;
-        self.motherbrain_reset_lease_hash = lease_hash;
-        status::mark_motherbrain_reset_asserted(command_id, session_hash, lease_hash);
+        let record = MotherbrainResetRecord {
+            identity,
+            outcome: MotherbrainResetOutcome::Asserted,
+        };
+        self.remember_motherbrain_reset(record);
+        Self::replay_motherbrain_reset_outcome(record);
     }
 
     fn poll_motherbrain_reset(&mut self) {
-        let Some(release_at_ms) = self.motherbrain_reset_release_at_ms else {
+        let Some(active) = self.active_motherbrain_reset else {
             return;
         };
-        if time_reached(self.now_ms(), release_at_ms) {
+        if time_reached(self.now_ms(), active.release_at_ms) {
             self.hardware.set_motherbrain_reset(false);
-            self.motherbrain_reset_release_at_ms = None;
-            status::mark_motherbrain_reset_completed(
-                self.last_motherbrain_reset_command_id,
-                self.motherbrain_reset_session_hash,
-                self.motherbrain_reset_lease_hash,
-            );
+            self.active_motherbrain_reset = None;
+            let record = MotherbrainResetRecord {
+                identity: active.identity,
+                outcome: MotherbrainResetOutcome::Completed,
+            };
+            self.remember_motherbrain_reset(record);
+            Self::replay_motherbrain_reset_outcome(record);
+        }
+    }
+
+    fn remember_motherbrain_reset(&mut self, record: MotherbrainResetRecord) {
+        if let Some(existing) = self
+            .motherbrain_reset_history
+            .iter_mut()
+            .flatten()
+            .find(|existing| existing.identity == record.identity)
+        {
+            *existing = record;
+            return;
+        }
+        self.motherbrain_reset_history[self.motherbrain_reset_history_next] = Some(record);
+        self.motherbrain_reset_history_next =
+            (self.motherbrain_reset_history_next + 1) % MOTHERBRAIN_RESET_HISTORY_CAPACITY;
+    }
+
+    fn replay_motherbrain_reset_outcome(record: MotherbrainResetRecord) {
+        let identity = record.identity;
+        match record.outcome {
+            MotherbrainResetOutcome::Refused(reason) => status::mark_motherbrain_reset_refused(
+                reason,
+                identity.session_hash,
+                identity.lease_hash,
+            ),
+            MotherbrainResetOutcome::Asserted => status::mark_motherbrain_reset_asserted(
+                identity.command_id,
+                identity.session_hash,
+                identity.lease_hash,
+            ),
+            MotherbrainResetOutcome::Completed => status::mark_motherbrain_reset_completed(
+                identity.command_id,
+                identity.session_hash,
+                identity.lease_hash,
+            ),
         }
     }
 
@@ -2085,6 +2183,16 @@ mod tests {
     use crate::drivers::imu::ImuSample;
     use crate::hardware::SerialRead;
 
+    struct ResetStatusCleanup;
+
+    impl Drop for ResetStatusCleanup {
+        fn drop(&mut self) {
+            status::set_oi_mode_unknown();
+            status::set_body_state(BodyState::NotStarted);
+            status::revoke_service_authority();
+        }
+    }
+
     struct FakeHardware {
         now_us: u32,
         writes: heapless::Vec<u8, 32>,
@@ -2350,14 +2458,21 @@ mod tests {
     #[test]
     fn motherbrain_reset_is_nonblocking_timed_and_deduplicated() {
         let _guard = status::status_test_guard();
+        let _cleanup = ResetStatusCleanup;
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.motherbrain_reset_hardware_enabled = true;
+        status::install_service_authority(11, 22, 61_000, MOTHERBRAIN_RESET_SERVICE_SCOPE);
         status::set_body_state(BodyState::Idle);
         status::set_oi_mode(CreateOiMode::Passive);
+        let identity = MotherbrainResetIdentity {
+            session_hash: 11,
+            lease_hash: 22,
+            command_id: 42,
+        };
 
-        runtime.request_motherbrain_reset(42);
+        runtime.request_motherbrain_reset(identity);
         assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true]);
-        assert!(runtime.motherbrain_reset_release_at_ms.is_some());
+        assert!(runtime.active_motherbrain_reset.is_some());
 
         runtime.hardware.now_us += 99_000;
         runtime.poll_motherbrain_reset();
@@ -2366,29 +2481,157 @@ mod tests {
         runtime.poll_motherbrain_reset();
         assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true, false]);
 
-        runtime.request_motherbrain_reset(42);
+        runtime.request_motherbrain_reset(identity);
         assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true, false]);
+        assert!(runtime
+            .motherbrain_reset_history
+            .iter()
+            .flatten()
+            .any(|record| {
+                record.identity == identity && record.outcome == MotherbrainResetOutcome::Completed
+            }));
     }
 
     #[test]
     fn motherbrain_reset_refuses_motion_and_cooldown() {
         let _guard = status::status_test_guard();
+        let _cleanup = ResetStatusCleanup;
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.motherbrain_reset_hardware_enabled = true;
+        status::install_service_authority(11, 22, 61_000, MOTHERBRAIN_RESET_SERVICE_SCOPE);
         status::set_oi_mode(CreateOiMode::Full);
         status::set_body_state(BodyState::Moving);
         runtime.active = ActiveAction::Driving { stop_at_ms: 2_000 };
-        runtime.request_motherbrain_reset(1);
+        runtime.request_motherbrain_reset(MotherbrainResetIdentity {
+            session_hash: 11,
+            lease_hash: 22,
+            command_id: 1,
+        });
         assert!(runtime.hardware.reset_levels.is_empty());
 
         runtime.active = ActiveAction::None;
         status::set_oi_mode(CreateOiMode::Passive);
         status::set_body_state(BodyState::Idle);
-        runtime.request_motherbrain_reset(2);
+        runtime.request_motherbrain_reset(MotherbrainResetIdentity {
+            session_hash: 11,
+            lease_hash: 22,
+            command_id: 2,
+        });
         assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true]);
         runtime.hardware.now_us += 100_000;
         runtime.poll_motherbrain_reset();
-        runtime.request_motherbrain_reset(3);
+        runtime.request_motherbrain_reset(MotherbrainResetIdentity {
+            session_hash: 11,
+            lease_hash: 22,
+            command_id: 3,
+        });
         assert_eq!(runtime.hardware.reset_levels.as_slice(), &[true, false]);
+    }
+
+    #[test]
+    fn reset_replay_preserves_refusal_after_state_changes() {
+        let _guard = status::status_test_guard();
+        let _cleanup = ResetStatusCleanup;
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.motherbrain_reset_hardware_enabled = true;
+        status::install_service_authority(31, 32, 61_000, MOTHERBRAIN_RESET_SERVICE_SCOPE);
+        status::set_oi_mode(CreateOiMode::Full);
+        status::set_body_state(BodyState::Moving);
+        runtime.active = ActiveAction::Driving { stop_at_ms: 2_000 };
+        let identity = MotherbrainResetIdentity {
+            session_hash: 31,
+            lease_hash: 32,
+            command_id: 7,
+        };
+
+        runtime.request_motherbrain_reset(identity);
+        runtime.active = ActiveAction::None;
+        status::set_oi_mode(CreateOiMode::Passive);
+        status::set_body_state(BodyState::Idle);
+        runtime.request_motherbrain_reset(identity);
+
+        assert!(runtime.hardware.reset_levels.is_empty());
+        assert!(runtime
+            .motherbrain_reset_history
+            .iter()
+            .flatten()
+            .any(|record| {
+                record.identity == identity
+                    && record.outcome
+                        == MotherbrainResetOutcome::Refused(
+                            status::MotherbrainResetRefusal::UnsafeState,
+                        )
+            }));
+    }
+
+    #[test]
+    fn reset_identity_includes_service_lease_and_active_pulse_is_immutable() {
+        let _guard = status::status_test_guard();
+        let _cleanup = ResetStatusCleanup;
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.motherbrain_reset_hardware_enabled = true;
+        status::set_oi_mode(CreateOiMode::Passive);
+        status::set_body_state(BodyState::Idle);
+        status::install_service_authority(41, 42, 61_000, MOTHERBRAIN_RESET_SERVICE_SCOPE);
+        let first = MotherbrainResetIdentity {
+            session_hash: 41,
+            lease_hash: 42,
+            command_id: 9,
+        };
+        let refused_during_pulse = MotherbrainResetIdentity {
+            session_hash: 41,
+            lease_hash: 42,
+            command_id: 10,
+        };
+
+        runtime.request_motherbrain_reset(first);
+        runtime.request_motherbrain_reset(refused_during_pulse);
+        runtime.hardware.now_us += 100_000;
+        runtime.poll_motherbrain_reset();
+
+        assert!(runtime
+            .motherbrain_reset_history
+            .iter()
+            .flatten()
+            .any(|record| {
+                record.identity == first && record.outcome == MotherbrainResetOutcome::Completed
+            }));
+        assert!(runtime
+            .motherbrain_reset_history
+            .iter()
+            .flatten()
+            .any(|record| {
+                record.identity == refused_during_pulse
+                    && record.outcome
+                        == MotherbrainResetOutcome::Refused(
+                            status::MotherbrainResetRefusal::Cooldown,
+                        )
+            }));
+
+        runtime.hardware.now_us += MOTHERBRAIN_RESET_COOLDOWN_MS * 1_000;
+        status::install_service_authority(51, 52, 91_000, MOTHERBRAIN_RESET_SERVICE_SCOPE);
+        runtime.request_motherbrain_reset(MotherbrainResetIdentity {
+            session_hash: 51,
+            lease_hash: 52,
+            command_id: 9,
+        });
+        assert_eq!(
+            runtime.hardware.reset_levels.as_slice(),
+            &[true, false, true]
+        );
+    }
+
+    #[test]
+    fn reset_command_id_zero_is_never_executed() {
+        let _guard = status::status_test_guard();
+        let _cleanup = ResetStatusCleanup;
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.motherbrain_reset_hardware_enabled = true;
+        runtime.request_motherbrain_reset(MotherbrainResetIdentity {
+            session_hash: 1,
+            lease_hash: 2,
+            command_id: 0,
+        });
+        assert!(runtime.hardware.reset_levels.is_empty());
     }
 }

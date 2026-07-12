@@ -20,6 +20,9 @@ struct BoardToml {
     pins: Pins,
     i2c: I2c,
     imu: Imu,
+    spi: Spi,
+    pwm: Pwm,
+    adc: Adc,
 }
 
 #[allow(dead_code)]
@@ -113,6 +116,37 @@ struct I2c {
 
 #[allow(dead_code)]
 #[derive(Deserialize)]
+struct Spi {
+    primary: SpiPins,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct SpiPins {
+    mosi: String,
+    mosi_gpio: u8,
+    miso: String,
+    miso_gpio: u8,
+    sck: String,
+    sck_gpio: u8,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct Pwm {
+    aux0: String,
+    aux0_gpio: u8,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct Adc {
+    battery: String,
+    battery_gpio: u8,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
 struct I2cPins {
     sda: String,
     sda_gpio: u8,
@@ -185,9 +219,12 @@ fn main() {
     assert_eq!(body.create_oi.stop_bits, 1);
     assert_eq!(board.board.arch, "rp2040");
     assert_eq!(board.imu.i2c_bus, "primary");
+    validate_board_gpio_assignments(&board);
+    println!("cargo:rustc-check-cfg=cfg(motherbrain_reset_hardware)");
     let motherbrain_reset_enabled = board.pins.motherbrain_reset.enabled
         && env::var_os("CARGO_FEATURE_MOTHERBRAIN_RESET").is_some();
     if motherbrain_reset_enabled {
+        println!("cargo:rustc-cfg=motherbrain_reset_hardware");
         body.capabilities.verbs.push("reset_motherbrain".into());
         body.capabilities.outputs.push("motherbrain_reset".into());
         for event in [
@@ -362,4 +399,41 @@ fn string_slice_literal(values: &[String]) -> String {
     }
     literal.push(']');
     literal
+}
+
+fn validate_board_gpio_assignments(board: &BoardToml) {
+    let mut used = Vec::<(u8, &'static str)>::new();
+    let mut claim = |gpio: u8, function: &'static str| {
+        if let Some((_, previous)) = used.iter().find(|(used_gpio, _)| *used_gpio == gpio) {
+            panic!(
+                "board.toml GPIO collision: GP{gpio} is enabled for both {previous} and {function}"
+            );
+        }
+        used.push((gpio, function));
+    };
+
+    claim(board.pins.create_uart.tx_gpio, "create_uart.tx");
+    claim(board.pins.create_uart.rx_gpio, "create_uart.rx");
+    claim(board.pins.power_toggle.gpio, "power_toggle");
+    claim(board.pins.leds.onboard_gpio, "leds.onboard");
+    claim(board.pins.leds.status_gpio, "leds.status");
+    if board.pins.create_brc.enabled {
+        claim(board.pins.create_brc.gpio, "create_brc");
+    }
+    if board.pins.create_device_detect.enabled {
+        claim(board.pins.create_device_detect.gpio, "create_device_detect");
+    }
+    if board.pins.estop.enabled {
+        claim(board.pins.estop.gpio, "estop");
+    }
+    if board.pins.motherbrain_reset.enabled {
+        claim(board.pins.motherbrain_reset.gpio, "motherbrain_reset");
+    }
+    claim(board.i2c.primary.sda_gpio, "i2c.primary.sda");
+    claim(board.i2c.primary.scl_gpio, "i2c.primary.scl");
+    claim(board.spi.primary.mosi_gpio, "spi.primary.mosi");
+    claim(board.spi.primary.miso_gpio, "spi.primary.miso");
+    claim(board.spi.primary.sck_gpio, "spi.primary.sck");
+    claim(board.pwm.aux0_gpio, "pwm.aux0");
+    claim(board.adc.battery_gpio, "adc.battery");
 }

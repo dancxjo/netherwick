@@ -1,0 +1,19 @@
+node_id = "forebrain-sim"
+workspace = "fore/workspace"
+bundles = "fore/experience"
+datasets = "fore/datasets"
+jobs = "fore/jobs"
+candidates = "fore/candidates"
+logs = "logs"
+temporary = "fore/tmp"
+poll_interval_seconds = 1
+
+[data_plane]
+allowed_interfaces = []
+brainstem_interfaces = ["wlan1"]
+allow_brainstem_interface = false
+preferred_kinds = ["ethernet", "wifi", "other"]
+discovery_multicast = "239.255.78.87:8788"
+discovery_seeds = []
+service_port = 22
+advertise = false

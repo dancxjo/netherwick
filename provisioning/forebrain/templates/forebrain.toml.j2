@@ -1,0 +1,19 @@
+node_id = "{{ netherwick_node_id }}"
+workspace = "{{ netherwick_state }}/workspace"
+bundles = "{{ netherwick_state }}/experience"
+datasets = "{{ netherwick_state }}/datasets"
+jobs = "{{ netherwick_state }}/jobs"
+candidates = "{{ netherwick_state }}/candidates"
+logs = "/var/log/netherwick"
+temporary = "{{ netherwick_state }}/tmp"
+poll_interval_seconds = 5
+
+[data_plane]
+allowed_interfaces = {{ netherwick_data_interfaces | default([]) | to_json }}
+brainstem_interfaces = {{ netherwick_brainstem_interfaces | default(['wlan1']) | to_json }}
+allow_brainstem_interface = {{ netherwick_allow_brainstem_interface | default(false) | lower }}
+preferred_kinds = ["ethernet", "wifi", "other"]
+discovery_multicast = "{{ netherwick_discovery_multicast | default('239.255.78.87:8788') }}"
+discovery_seeds = {{ netherwick_discovery_seeds | default([]) | to_json }}
+service_port = {{ netherwick_service_port | default(22) }}
+advertise = true

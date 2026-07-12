@@ -1,0 +1,175 @@
+---
+- name: Provision Netherwick forebrain
+  hosts: forebrains
+  become: true
+  vars:
+    netherwick_service_user: netherwick-forebrain
+    netherwick_service_group: netherwick-forebrain
+    netherwick_source: /opt/netherwick/source
+    netherwick_repo_url: https://github.com/dancxjo/netherwick.git
+    netherwick_version: main
+    netherwick_node_id: "{{ inventory_hostname }}"
+    netherwick_forebrain_authorized_keys: []
+    netherwick_state: /var/lib/netherwick/forebrain
+  tasks:
+    - name: Install auditable build, transfer, and diagnostic packages
+      ansible.builtin.apt:
+        name:
+          - build-essential
+          - cargo
+          - git
+          - iproute2
+          - jq
+          - openssh-server
+          - pkg-config
+          - rsync
+          - rustc
+        state: present
+        update_cache: true
+
+    - name: Create dedicated forebrain group
+      ansible.builtin.group:
+        name: "{{ netherwick_service_group }}"
+        system: true
+
+    - name: Create dedicated forebrain account
+      ansible.builtin.user:
+        name: "{{ netherwick_service_user }}"
+        group: "{{ netherwick_service_group }}"
+        home: "{{ netherwick_state }}"
+        create_home: false
+        shell: /bin/bash
+        password_lock: true
+        system: true
+
+    - name: Create explicit forebrain directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner | default(netherwick_service_user) }}"
+        group: "{{ item.group | default(netherwick_service_group) }}"
+        mode: "{{ item.mode | default('0750') }}"
+      loop:
+        - { path: /etc/netherwick, owner: root, group: "{{ netherwick_service_group }}", mode: "0750" }
+        - { path: /opt/netherwick, owner: root, group: root, mode: "0755" }
+        - { path: "{{ netherwick_state }}" }
+        - { path: "{{ netherwick_state }}/experience" }
+        - { path: "{{ netherwick_state }}/datasets" }
+        - { path: "{{ netherwick_state }}/jobs" }
+        - { path: "{{ netherwick_state }}/jobs/incoming" }
+        - { path: "{{ netherwick_state }}/candidates" }
+        - { path: "{{ netherwick_state }}/workspace" }
+        - { path: "{{ netherwick_state }}/tmp" }
+        - { path: "{{ netherwick_state }}/.ssh", mode: "0700" }
+        - { path: /var/log/netherwick }
+
+    - name: Check out the selected Netherwick revision
+      ansible.builtin.git:
+        repo: "{{ netherwick_repo_url }}"
+        dest: "{{ netherwick_source }}"
+        version: "{{ netherwick_version }}"
+        force: false
+      notify: Build and install forebrain
+
+    - name: Install forebrain configuration without replacing operator changes
+      ansible.builtin.template:
+        src: templates/forebrain.toml.j2
+        dest: /etc/netherwick/forebrain.toml
+        owner: root
+        group: "{{ netherwick_service_group }}"
+        mode: "0640"
+        force: false
+      notify: Restart forebrain services
+
+    - name: Install restricted SFTP authorized key file
+      ansible.builtin.file:
+        path: "{{ netherwick_state }}/.ssh/authorized_keys"
+        state: touch
+        owner: "{{ netherwick_service_user }}"
+        group: "{{ netherwick_service_group }}"
+        mode: "0600"
+        modification_time: preserve
+        access_time: preserve
+
+    - name: Enroll restricted noninteractive transfer keys
+      ansible.builtin.lineinfile:
+        path: "{{ netherwick_state }}/.ssh/authorized_keys"
+        line: 'restrict,command="internal-sftp -d {{ netherwick_state }}" {{ item }}'
+        state: present
+      loop: "{{ netherwick_forebrain_authorized_keys }}"
+      no_log: true
+
+    - name: Enable the OpenSSH transport
+      ansible.builtin.systemd_service:
+        name: ssh
+        enabled: true
+        state: started
+      when: not ansible_check_mode
+
+    - name: Install systemd units
+      ansible.builtin.template:
+        src: "templates/{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - netherwick-forebrain-worker.service
+        - netherwick-forebrain-discovery.service
+      notify:
+        - Reload systemd
+        - Restart forebrain services
+
+    - name: Build immediately on first install
+      ansible.builtin.command:
+        cmd: cargo build --locked --release -p pete-higher-brain
+        chdir: "{{ netherwick_source }}"
+        creates: "{{ netherwick_source }}/target/release/pete-higher-brain"
+      when: not ansible_check_mode
+      notify: Install built forebrain binary
+
+    - name: Flush installation handlers before enabling services
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable forebrain services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - netherwick-forebrain-worker.service
+        - netherwick-forebrain-discovery.service
+      when: not ansible_check_mode
+
+  handlers:
+    - name: Build and install forebrain
+      ansible.builtin.command:
+        cmd: cargo build --locked --release -p pete-higher-brain
+        chdir: "{{ netherwick_source }}"
+      when: not ansible_check_mode
+      notify: Install built forebrain binary
+
+    - name: Install built forebrain binary
+      ansible.builtin.copy:
+        src: "{{ netherwick_source }}/target/release/pete-higher-brain"
+        dest: /usr/local/bin/pete-higher-brain
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when: not ansible_check_mode
+      notify: Restart forebrain services
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Restart forebrain services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - netherwick-forebrain-worker.service
+        - netherwick-forebrain-discovery.service
+      when: not ansible_check_mode

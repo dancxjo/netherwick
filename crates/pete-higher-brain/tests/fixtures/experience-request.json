@@ -1,0 +1,20 @@
+{
+  "pete_id": "pete",
+  "source_node_id": "motherbrain-sim",
+  "begin_timestamp_ms": 100,
+  "end_timestamp_ms": 100,
+  "event_range": {
+    "first_cursor": "fixture-1",
+    "last_cursor": "fixture-1"
+  },
+  "source_checkpoints": {
+    "ledger": "fixture-checkpoint-1"
+  },
+  "software_identity": "fixture-build-1",
+  "schema_versions": {
+    "ledger": "1"
+  },
+  "active_model_versions": {},
+  "configuration_identity": "fixture-config-1",
+  "calibration_identity": "fixture-calibration-1"
+}

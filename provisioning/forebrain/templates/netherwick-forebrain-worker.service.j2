@@ -1,0 +1,19 @@
+[Unit]
+Description=Netherwick durable forebrain worker
+After=local-fs.target
+
+[Service]
+Type=simple
+User={{ netherwick_service_user }}
+Group={{ netherwick_service_group }}
+ExecStart=/usr/local/bin/pete-higher-brain worker --config /etc/netherwick/forebrain.toml
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ netherwick_state }} /var/log/netherwick
+
+[Install]
+WantedBy=multi-user.target

@@ -61,6 +61,8 @@ static PENDING_COMMAND_C: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_D: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_DURATION_MS: AtomicU32 = AtomicU32::new(0);
 static PENDING_COMMAND_SEQ: AtomicU32 = AtomicU32::new(0);
+static PENDING_COMMAND_SERVICE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
+static PENDING_COMMAND_SERVICE_LEASE_HASH: AtomicU32 = AtomicU32::new(0);
 static PENDING_VELOCITY_KIND: AtomicU8 = AtomicU8::new(ControlCommandCode::None as u8);
 static PENDING_VELOCITY_ID: AtomicU32 = AtomicU32::new(0);
 static PENDING_VELOCITY_A: AtomicU32 = AtomicU32::new(0);
@@ -74,6 +76,8 @@ static LAST_COMPLETED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static LAST_INTERRUPTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static LAST_TIMED_OUT_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static LAST_DISPATCHED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_DISPATCHED_SERVICE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
+static LAST_DISPATCHED_SERVICE_LEASE_HASH: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_RX_BYTES: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_RX_LINES: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_LAST_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -431,13 +435,15 @@ pub enum PublicEventKind {
     MotherbrainResetRefused = 48,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u32)]
 pub enum MotherbrainResetRefusal {
     HardwareDisabled = 1,
     UnsafeState = 2,
     Cooldown = 3,
     Duplicate = 4,
+    InvalidServiceAuthority = 5,
+    InvalidCommandId = 6,
 }
 
 #[derive(Clone, Copy)]
@@ -607,6 +613,13 @@ pub fn last_dispatched_command_id() -> u32 {
     LAST_DISPATCHED_COMMAND_ID.load(Ordering::Relaxed)
 }
 
+pub fn last_dispatched_service_identity() -> (u32, u32) {
+    (
+        LAST_DISPATCHED_SERVICE_SESSION_HASH.load(Ordering::Relaxed),
+        LAST_DISPATCHED_SERVICE_LEASE_HASH.load(Ordering::Relaxed),
+    )
+}
+
 pub fn mark_command_started(command_id: u32, command_code: u8) {
     LAST_STARTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
     record_public_event(
@@ -619,6 +632,26 @@ pub fn mark_command_started(command_id: u32, command_code: u8) {
 
 #[cfg(feature = "pico-w")]
 pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> bool {
+    submit_control_command_with_service_identity(command_id, command, 0, 0)
+}
+
+#[cfg(feature = "pico-w")]
+pub fn submit_service_control_command(
+    command_id: u32,
+    command: BrainstemCommand,
+    session_hash: u32,
+    lease_hash: u32,
+) -> bool {
+    submit_control_command_with_service_identity(command_id, command, session_hash, lease_hash)
+}
+
+#[cfg(feature = "pico-w")]
+fn submit_control_command_with_service_identity(
+    command_id: u32,
+    command: BrainstemCommand,
+    service_session_hash: u32,
+    service_lease_hash: u32,
+) -> bool {
     if matches!(
         command,
         BrainstemCommand::Status | BrainstemCommand::Ping | BrainstemCommand::GetEvents { .. }
@@ -673,6 +706,8 @@ pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> boo
     PENDING_COMMAND_D.store(d, Ordering::Relaxed);
     PENDING_COMMAND_DURATION_MS.store(duration_ms.unwrap_or(0), Ordering::Relaxed);
     PENDING_COMMAND_SEQ.store(command_seq(command), Ordering::Relaxed);
+    PENDING_COMMAND_SERVICE_SESSION_HASH.store(service_session_hash, Ordering::Relaxed);
+    PENDING_COMMAND_SERVICE_LEASE_HASH.store(service_lease_hash, Ordering::Relaxed);
     PENDING_COMMAND_KIND.store(kind as u8, Ordering::Relaxed);
     LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
     record_public_event(
@@ -697,8 +732,12 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
         };
         let seq = PENDING_COMMAND_SEQ.load(Ordering::Relaxed);
         let command_id = PENDING_COMMAND_ID.load(Ordering::Relaxed);
+        let service_session_hash = PENDING_COMMAND_SERVICE_SESSION_HASH.load(Ordering::Relaxed);
+        let service_lease_hash = PENDING_COMMAND_SERVICE_LEASE_HASH.load(Ordering::Relaxed);
         PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
         LAST_DISPATCHED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        LAST_DISPATCHED_SERVICE_SESSION_HASH.store(service_session_hash, Ordering::Relaxed);
+        LAST_DISPATCHED_SERVICE_LEASE_HASH.store(service_lease_hash, Ordering::Relaxed);
 
         return decode_control_command(kind, a, b, c, d, duration, seq);
     }
@@ -715,6 +754,8 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
     let command_id = PENDING_VELOCITY_ID.load(Ordering::Relaxed);
     PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
     LAST_DISPATCHED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+    LAST_DISPATCHED_SERVICE_SESSION_HASH.store(0, Ordering::Relaxed);
+    LAST_DISPATCHED_SERVICE_LEASE_HASH.store(0, Ordering::Relaxed);
 
     Some(BrainstemCommand::CmdVel {
         linear_mm_s: decode_i16(a),

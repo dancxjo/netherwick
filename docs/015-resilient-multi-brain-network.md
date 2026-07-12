@@ -1,13 +1,18 @@
 # Resilient multi-brain communications
 
 Pete uses routed failure domains, not one implicit LAN. The Pico W brainstem
-owns physical safety and the `192.168.4.0/24` management network. The Pi 5
-motherbrain connects to that network on `wlan1`, to infrastructure on `wlan0`,
-and to the independent `10.42.0.0/24` interbrain Ethernet backbone on `eth0`.
-The network configuration is in `configs/network`. No interface is bridged.
+owns physical safety and its management network. The checked-in networkd files
+under `configs/network` remain one concrete deployment profile (`wlan1`,
+`wlan0`, `eth0`, and `10.42.0.0/24`), not protocol requirements. Higher-brain
+services use `DataPlaneConfig` to enumerate working interfaces, prefer
+Ethernet, fall back to ordinary LAN or Wi-Fi, and explicitly exclude configured
+brainstem interfaces. No interface is bridged.
 
-The interbrain network survives Pico reboot, body power loss, and either Wi-Fi
-failure. The motherbrain routes it with a default-deny firewall. Forebrains may
+The higher-brain network can be a direct Ethernet link, an isolated switch, a
+normal LAN, or a dedicated Wi-Fi association; local operation needs neither a
+household router nor internet access. It survives Pico reboot and body-network
+loss. A dedicated routed installation may use the included default-deny
+firewall profile. Forebrains may
 reach discovery, diagnostics, handshake, and recovery-policy endpoints, but
 network reachability never grants a session or control lease.
 
@@ -61,6 +66,14 @@ session identity in addition to lease expiry. These continuity checks are not
 a substitute for the future signature-based authentication layer.
 
 ## Discovery and diagnostics
+
+Higher-brain discovery is the advisory, versioned
+`netherwick-higher-brain/1` UDP advertisement described in
+[higher-brain framework](018-higher-brain-framework.md). It advertises role,
+stable node identity, per-boot identity, capabilities, readiness, and every
+eligible service endpoint. Multicast and a configurable ordered list of
+unicast seeds are both supported. Discovery never authorizes transfer, jobs,
+or activation.
 
 The brainstem is authoritative for `pete.internal`. `pete`, `brainstem`, and
 `gateway` resolve to the AP address. `motherbrain.pete.internal` exists only

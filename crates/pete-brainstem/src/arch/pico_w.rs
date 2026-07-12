@@ -106,7 +106,7 @@ pub struct PicoWBrainstem {
     power_toggle: Output<'static>,
     brc: Output<'static>,
     status_led: Output<'static>,
-    #[cfg(feature = "motherbrain-reset")]
+    #[cfg(motherbrain_reset_hardware)]
     motherbrain_reset: Output<'static>,
 }
 
@@ -119,7 +119,7 @@ impl PicoWBrainstem {
         power_toggle: Peri<'static, PIN_18>,
         brc: Peri<'static, PIN_19>,
         status_led: Peri<'static, PIN_20>,
-        #[cfg(feature = "motherbrain-reset")] motherbrain_reset: Peri<
+        #[cfg(motherbrain_reset_hardware)] motherbrain_reset: Peri<
             'static,
             embassy_rp::peripherals::PIN_21,
         >,
@@ -144,7 +144,7 @@ impl PicoWBrainstem {
             status_led: Output::new(status_led, Level::Low),
             // The gate/base has an external pull-down. Construct it inactive
             // before any command transport starts.
-            #[cfg(feature = "motherbrain-reset")]
+            #[cfg(motherbrain_reset_hardware)]
             motherbrain_reset: Output::new(motherbrain_reset, Level::Low),
         }
     }
@@ -181,9 +181,9 @@ impl BrainstemHardware for PicoWBrainstem {
     }
 
     fn set_motherbrain_reset(&mut self, asserted: bool) {
-        #[cfg(feature = "motherbrain-reset")]
+        #[cfg(motherbrain_reset_hardware)]
         self.motherbrain_reset.set_level(level(asserted));
-        #[cfg(not(feature = "motherbrain-reset"))]
+        #[cfg(not(motherbrain_reset_hardware))]
         let _ = asserted;
     }
 
@@ -244,7 +244,7 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
         p.PIN_18,
         p.PIN_19,
         p.PIN_20,
-        #[cfg(feature = "motherbrain-reset")]
+        #[cfg(motherbrain_reset_hardware)]
         p.PIN_21,
     );
 
@@ -1732,6 +1732,10 @@ fn handle_command_request<'a>(
         return handle_service_authority_json(body, buffer).ok_or(CommandParseError::BadRequest);
     }
     let command = parse_command(command_id, body).ok_or(CommandParseError::BadRequest)?;
+    if command_id == 0 {
+        return render_command_response(buffer, false, command_id, "invalid_command_id")
+            .ok_or(CommandParseError::BadRequest);
+    }
     if matches!(command, BrainstemCommand::Status) {
         let snapshot = status::snapshot(Instant::now().as_millis() as u32);
         return status::render_json(snapshot, buffer).map_err(|_| CommandParseError::BadRequest);
@@ -1781,7 +1785,7 @@ fn handle_command_request<'a>(
         )
         .ok_or(CommandParseError::BadRequest);
     }
-    if !status::submit_control_command(command_id, command) {
+    if !submit_json_control_command(command_id, command, body) {
         return Err(CommandParseError::Busy(command_id));
     }
     render_command_response(buffer, true, command_id, "accepted")
@@ -1821,6 +1825,9 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     if json_bool(body, "ack") == Some(false) {
         let command_id = json_u32(body, "command_id")?;
         let command = parse_command(command_id, body)?;
+        if command_id == 0 {
+            return render_command_response(buffer, false, command_id, "invalid_command_id");
+        }
         if matches!(command, BrainstemCommand::Bootsel) && !json_service_authority_valid(body) {
             return render_command_response(
                 buffer,
@@ -1846,7 +1853,7 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
                 "service_operation_disabled",
             );
         }
-        let accepted = status::submit_control_command(command_id, command);
+        let accepted = submit_json_control_command(command_id, command, body);
         if accepted {
             None
         } else {
@@ -1861,6 +1868,9 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
 fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
     let command_id = json_u32(body, "command_id")?;
     let command = parse_command(command_id, body)?;
+    if command_id == 0 {
+        return render_command_response(buffer, false, command_id, "invalid_command_id");
+    }
     if matches!(command, BrainstemCommand::Bootsel) && !json_service_authority_valid(body) {
         return render_command_response(
             buffer,
@@ -1881,7 +1891,7 @@ fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
     if matches!(command, BrainstemCommand::Bootsel) {
         return render_command_response(buffer, false, command_id, "service_operation_disabled");
     }
-    if !status::submit_control_command(command_id, command) {
+    if !submit_json_control_command(command_id, command, body) {
         return render_command_response(buffer, false, command_id, "busy");
     }
     render_command_response(buffer, true, command_id, "accepted")
@@ -2006,7 +2016,7 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
         return;
     }
 
-    if !status::submit_control_command(seq, command) {
+    if !submit_compact_control_command(seq, command, session_id, service_lease_id) {
         status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Busy);
         if matches!(command, BrainstemCommand::CmdVel { .. }) {
             submit_forebrain_stop();
@@ -2028,6 +2038,9 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
         return Err(0);
     };
     let seq = parse_u32(parts.next()).ok_or(0u32)?;
+    if seq == 0 {
+        return Err(0);
+    }
 
     let command = match kind {
         "PING" => BrainstemCommand::Ping,
@@ -2367,7 +2380,7 @@ fn handle_compact_control_line<const N: usize>(
                 let _ = writeln!(response, "ERR {seq} invalid_service_lease");
                 return Some(false);
             }
-            if status::submit_control_command(seq, command) {
+            if submit_compact_control_command(seq, command, session_id, service_lease_id) {
                 let _ = writeln!(response, "OK {seq}");
             } else {
                 let _ = writeln!(response, "ERR {seq} busy");
@@ -2403,6 +2416,45 @@ fn command_requires_service_authority(command: BrainstemCommand) -> bool {
     )
 }
 
+fn submit_json_control_command(command_id: u32, command: BrainstemCommand, body: &str) -> bool {
+    if command_requires_service_authority(command) {
+        let Some((session_hash, lease_hash)) = json_service_identity(body) else {
+            return false;
+        };
+        status::submit_service_control_command(command_id, command, session_hash, lease_hash)
+    } else {
+        status::submit_control_command(command_id, command)
+    }
+}
+
+fn submit_compact_control_command(
+    command_id: u32,
+    command: BrainstemCommand,
+    session_id: Option<&str>,
+    service_lease_id: Option<&str>,
+) -> bool {
+    if command_requires_service_authority(command) {
+        let (Some(session_id), Some(lease_id)) = (session_id, service_lease_id) else {
+            return false;
+        };
+        status::submit_service_control_command(
+            command_id,
+            command,
+            session::token_hash(session_id),
+            session::token_hash(lease_id),
+        )
+    } else {
+        status::submit_control_command(command_id, command)
+    }
+}
+
+fn json_service_identity(body: &str) -> Option<(u32, u32)> {
+    Some((
+        session::token_hash(json_str(body, "session_id")?),
+        session::token_hash(json_str(body, "service_lease_id")?),
+    ))
+}
+
 fn json_session_valid(body: &str) -> bool {
     json_str(body, "session_id").is_some_and(compact_session_valid)
 }
@@ -2423,15 +2475,12 @@ fn json_authority_valid(body: &str) -> bool {
     }
 }
 fn json_service_authority_valid(body: &str) -> bool {
-    let Some(session_id) = json_str(body, "session_id") else {
-        return false;
-    };
-    let Some(lease_id) = json_str(body, "service_lease_id") else {
+    let Some((session_hash, lease_hash)) = json_service_identity(body) else {
         return false;
     };
     status::active_service_authority_matches(
-        session::token_hash(session_id),
-        session::token_hash(lease_id),
+        session_hash,
+        lease_hash,
         Instant::now().as_millis() as u32,
         json_str(body, "kind")
             .and_then(service_scope_code)
@@ -2492,6 +2541,7 @@ fn compact_service_authority_valid(
         BrainstemCommand::Bootsel => 1,
         BrainstemCommand::RestartMpu => 2,
         BrainstemCommand::RestartCreate => 3,
+        BrainstemCommand::ResetMotherbrain => 4,
         _ => 0,
     };
     match (session_id, lease_id) {

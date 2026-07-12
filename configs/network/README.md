@@ -1,8 +1,10 @@
 # Motherbrain routed network
 
-These files describe Pete's three routed failure domains. Interface names are
-deployment defaults and should be overridden with udev/systemd `.link` files
-when adapter MACs are known.
+These files are an optional fixed-interface profile for Pete's three routed
+failure domains. They preserve the original direct-Ethernet installation but
+are not required by the higher-brain protocol. Portable service selection is
+configured in `configs/higher-brain/*.toml` and excludes the brainstem
+interface by default.
 
 - `wlan0`: external infrastructure; never an identity source.
 - `wlan1`: Pico W management subnet, DHCP client.

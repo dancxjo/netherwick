@@ -1,0 +1,43 @@
+---
+- name: Remove Netherwick forebrain services
+  hosts: forebrains
+  become: true
+  vars:
+    netherwick_purge_data: false
+  tasks:
+    - name: Stop and disable services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: false
+        state: stopped
+      failed_when: false
+      loop:
+        - netherwick-forebrain-worker.service
+        - netherwick-forebrain-discovery.service
+
+    - name: Remove units, binary, source, and configuration
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/netherwick-forebrain-worker.service
+        - /etc/systemd/system/netherwick-forebrain-discovery.service
+        - /usr/local/bin/pete-higher-brain
+        - /opt/netherwick/source
+        - /etc/netherwick/forebrain.toml
+
+    - name: Preserve or purge received data explicitly
+      ansible.builtin.file:
+        path: /var/lib/netherwick/forebrain
+        state: absent
+      when: netherwick_purge_data | bool
+
+    - name: Remove service account only when data is purged
+      ansible.builtin.user:
+        name: netherwick-forebrain
+        state: absent
+      when: netherwick_purge_data | bool
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true

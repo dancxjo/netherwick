@@ -1,0 +1,25 @@
+# Copy to /etc/netherwick/forebrain.toml and choose a stable enrolled identity.
+node_id = "forebrain-example-01"
+workspace = "/var/lib/netherwick/forebrain/workspace"
+bundles = "/var/lib/netherwick/forebrain/experience"
+datasets = "/var/lib/netherwick/forebrain/datasets"
+jobs = "/var/lib/netherwick/forebrain/jobs"
+candidates = "/var/lib/netherwick/forebrain/candidates"
+logs = "/var/log/netherwick"
+temporary = "/var/lib/netherwick/forebrain/tmp"
+poll_interval_seconds = 5
+
+[data_plane]
+# Empty means any eligible interface. Name interfaces here when a host needs a
+# tighter policy; these are examples, not assumptions about adapter names.
+allowed_interfaces = []
+brainstem_interfaces = ["wlan1"]
+allow_brainstem_interface = false
+preferred_kinds = ["ethernet", "wifi", "other"]
+discovery_multicast = "239.255.78.87:8788"
+# Unicast seeds make discovery work where multicast is filtered. Multiple
+# addresses are attempted; no household router or internet path is required.
+discovery_seeds = []
+# Restricted OpenSSH/SFTP transport by default.
+service_port = 22
+advertise = true

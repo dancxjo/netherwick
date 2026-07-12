@@ -1,0 +1,12 @@
+# Geekworm X1202/MAX17040G profile for Pete's Raspberry Pi 5 motherbrain.
+# gpiochip enumeration and offsets MUST be verified with `gpioinfo` on the
+# installed kernel and overlays before enabling pete-ups.service.
+name = "geekworm-x1202-max17040g-r1"
+i2c_device = "/dev/i2c-1"
+i2c_address = 0x36
+gpiochip = "/dev/gpiochip0"
+external_power_offset = 6
+external_power_active_high = true
+charge_enable_offset = 16
+charge_enable_active_low = true
+charging_enabled_on_start = true

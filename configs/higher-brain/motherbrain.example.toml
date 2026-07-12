@@ -1,0 +1,29 @@
+[data_plane]
+allowed_interfaces = []
+brainstem_interfaces = ["wlan1"]
+allow_brainstem_interface = false
+preferred_kinds = ["ethernet", "wifi", "other"]
+discovery_multicast = "239.255.78.87:8788"
+discovery_seeds = []
+service_port = 22
+advertise = false
+
+[live_learning]
+enabled_classes = [
+  "replay_accumulation",
+  "embedding_insert",
+  "graph_mutation",
+  "centroid_update",
+  "calibration",
+  "novelty_statistics",
+  "small_classifier_head",
+  "short_horizon_adaptation",
+]
+max_cpu_percent = 20
+max_memory_bytes = 268435456
+max_step_millis = 25
+pause_during_persistence_pressure = true
+pause_during_network_pressure = true
+
+[activation]
+policy = "operator_approval"

@@ -1,0 +1,14 @@
+all:
+  children:
+    forebrains:
+      hosts:
+        forebrain-example:
+          ansible_host: 192.0.2.10
+          ansible_user: operator
+  vars:
+    # Pin a reviewed commit/tag for reproducible production installs.
+    netherwick_version: main
+    netherwick_node_id: forebrain-example-01
+    # Add PUBLIC keys only in an untracked local inventory or --extra-vars file.
+    # Each key is forced into the forebrain SFTP root and cannot open a shell.
+    netherwick_forebrain_authorized_keys: []

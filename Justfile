@@ -30,6 +30,26 @@ setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-ort se
     @echo "pete Linux setup complete"
     @echo "next: cargo check && just sim"
 
+# Build the portable forebrain worker and operator CLI.
+forebrain-build:
+    cargo build --locked --release -p pete-higher-brain
+
+# Validate a provisioned forebrain without requiring a GPU.
+forebrain-validate config="/etc/netherwick/forebrain.toml":
+    cargo run -q -p pete-higher-brain -- validate-node --config "{{config}}"
+
+# Provision the hosts in a local, untracked Ansible inventory.
+forebrain-provision inventory:
+    ansible-playbook -i "{{inventory}}" provisioning/forebrain/site.yml
+
+# Show the idempotent provisioning changes without applying them.
+forebrain-provision-check inventory:
+    ansible-playbook --check --diff -i "{{inventory}}" provisioning/forebrain/site.yml
+
+# Remove services and code while preserving received data by default.
+forebrain-remove inventory:
+    ansible-playbook -i "{{inventory}}" provisioning/forebrain/remove.yml
+
 # Install required system packages via apt.
 setup-system:
     sudo apt-get update

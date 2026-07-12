@@ -14,6 +14,12 @@ Every hard-coded behavior is replaceable. It can run directly, shadow-train a mo
 
 Pete is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.
 
+Pete's higher-brain split now has a reproducible forebrain, a strictly separate
+bulk-data plane, immutable experience bundles, durable training jobs, and
+atomic candidate activation/rollback. See
+[docs/018-higher-brain-framework.md](docs/018-higher-brain-framework.md) for the
+architecture, provisioning, enrollment, and simulated end-to-end workflow.
+
 ## Current milestone
 
 The live perception stack has matured from loose point clouds and transient hypotheses into an inspectable 3D voxel world:
