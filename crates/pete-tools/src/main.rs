@@ -5566,6 +5566,11 @@ fn requested_robot_sensor_count(args: &RobotArgs) -> usize {
         + usize::from(args.gps.is_some())
 }
 
+// Ownership may span comparatively expensive perception/runtime ticks. Wheel
+// motion remains independently bounded by the 300 ms command TTL and 750 ms
+// heartbeat stop, so use the firmware's maximum lease and renew it proactively.
+const POSSESSION_CONTROL_LEASE_TTL_MS: u32 = 60_000;
+
 fn open_robot_cockpit_or_fallback(
     backend: CockpitBackendArg,
     create_port: Option<&str>,
@@ -5579,8 +5584,9 @@ fn open_robot_cockpit_or_fallback(
         if robot_mode == RobotMode::Slow {
             let connector: Box<dyn Cockpit + Send> = Box::new(LocalSimCockpit::new());
             let ready = establish_session(connector, HandshakeHello::default_motherbrain(), None)?;
-            let possession = MotherbrainPossession::acquire(ready, 5_000)?
-                .with_limits(max_linear_mm_s, max_angular_mrad_s);
+            let possession =
+                MotherbrainPossession::acquire(ready, POSSESSION_CONTROL_LEASE_TTL_MS)?
+                    .with_limits(max_linear_mm_s, max_angular_mrad_s);
             return Ok((Box::new(possession), robot_mode, true));
         }
         return Ok((
@@ -5638,8 +5644,9 @@ fn open_robot_cockpit_or_fallback(
                     ready.session().peer_boot_id
                 );
             }
-            let possession = MotherbrainPossession::acquire(ready, 5_000)?
-                .with_limits(max_linear_mm_s, max_angular_mrad_s);
+            let possession =
+                MotherbrainPossession::acquire(ready, POSSESSION_CONTROL_LEASE_TTL_MS)?
+                    .with_limits(max_linear_mm_s, max_angular_mrad_s);
             Ok((Box::new(possession), robot_mode, false))
         }
         Ok(cockpit) => Ok((cockpit, robot_mode, false)),
@@ -11922,6 +11929,7 @@ mod tests {
         )
         .unwrap();
         let first_snapshot = first.possession_snapshot().unwrap();
+        assert!(first_snapshot.lease_remaining_ms > 59_000);
         first
             .cmd_vel(50, 0, 30_000)
             .expect("first lease applies bounded motion");
