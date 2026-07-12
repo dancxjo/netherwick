@@ -3,12 +3,14 @@ use std::thread;
 use std::time::Duration;
 
 use pete_cockpit::{
-    AddressFamily, CockpitRequest, ControlAuthority, MotherbrainBootstrap, RegisterNetworkEndpoint,
+    AddressFamily, Cockpit, CockpitRequest, ControlAuthority, MotherbrainBootstrap,
+    RegisterNetworkEndpoint,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let smoke = args.iter().any(|arg| arg == "--possess-smoke");
+    let lease_expiry_smoke = args.iter().any(|arg| arg == "--lease-expiry-smoke");
     let wheels_off_floor = args.iter().any(|arg| arg == "--wheels-off-floor");
     if smoke && !wheels_off_floor {
         return Err("--possess-smoke requires --wheels-off-floor".into());
@@ -60,13 +62,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let lease = ready
-        .acquire_control(ControlAuthority::Motherbrain, 5_000)?
+        .acquire_control(
+            ControlAuthority::Motherbrain,
+            if lease_expiry_smoke { 300 } else { 5_000 },
+        )?
         .clone();
     eprintln!(
         "control lease: {} generation={} ttl_ms={}",
         lease.lease_id, lease.generation, lease.ttl_ms
     );
-    if smoke {
+    if lease_expiry_smoke {
+        let session = ready.session().clone();
+        thread::sleep(Duration::from_millis(500));
+        let expired = ready.connector_mut().execute_with_lease(
+            &session,
+            &lease,
+            CockpitRequest::HeartbeatStop { timeout_ms: 500 },
+        );
+        if expired.is_ok() {
+            return Err("expired control lease was unexpectedly accepted".into());
+        }
+        eprintln!("expired lease: rejected");
+
+        let fresh = ready
+            .acquire_control(ControlAuthority::Motherbrain, 2_000)?
+            .clone();
+        if fresh.generation <= lease.generation || fresh.lease_id == lease.lease_id {
+            return Err("fresh control lease did not advance identity and generation".into());
+        }
+        eprintln!(
+            "fresh control lease: {} generation={} ttl_ms={}",
+            fresh.lease_id, fresh.generation, fresh.ttl_ms
+        );
+        let stale = ready.connector_mut().execute_with_lease(
+            &session,
+            &lease,
+            CockpitRequest::HeartbeatStop { timeout_ms: 500 },
+        );
+        if stale.is_ok() {
+            return Err("superseded control lease was unexpectedly accepted".into());
+        }
+        eprintln!("superseded lease: rejected");
+        ready.execute(CockpitRequest::HeartbeatStop { timeout_ms: 500 })?;
+        eprintln!("fresh lease-bound heartbeat stop: accepted");
+        thread::sleep(Duration::from_millis(600));
+        ready.execute(CockpitRequest::Stop)?;
+        let status = ready.execute(CockpitRequest::GetStatus)?;
+        let pete_cockpit::CockpitResponse::Status(status) = status else {
+            return Err("final status response was malformed".into());
+        };
+        let summary = status.summary();
+        if summary.armed == Some(true) || summary.active_motion == Some(true) {
+            return Err("lease expiry smoke did not finish stopped and disarmed".into());
+        }
+        eprintln!("lease expiry smoke complete: stopped, disarmed");
+    } else if smoke {
         ready.execute(CockpitRequest::Arm)?;
         ready.execute(CockpitRequest::CmdVel {
             linear_mm_s: 50,

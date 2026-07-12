@@ -20,6 +20,16 @@ symlink and never assumes `/dev/ttyACM0`.
 6. Lift the wheels, then run the same command with
    `-- --possess-smoke --wheels-off-floor` for the 50 mm/s, 125 ms TTL motion.
 
+The non-motion authorization check is safe to run with the robot on the floor:
+
+```sh
+cargo run -p pete-cockpit --example motherbrain_bootstrap -- --lease-expiry-smoke
+```
+
+It proves that an expired lease and a superseded lease fail closed, a newly
+issued lease advances identity and generation, and only the fresh lease can
+send a lease-bound heartbeat stop. It finishes with STOP and DISARM.
+
 Useful diagnostics:
 
 ```sh
