@@ -78,7 +78,8 @@ setup-system:
         libssl-dev \
         libudev-dev \
         libusb-1.0-0-dev \
-        libv4l-dev
+        libv4l-dev \
+        udisks2
 
 # Install Docker and Docker Compose.
 setup-docker:
@@ -276,9 +277,38 @@ flash: brainstem-pico-w-uf2
         return 1
     }
 
+    find_rpi_rp2_block() {
+        if command -v lsblk >/dev/null 2>&1; then
+            lsblk -rnpo LABEL,PATH,FSTYPE,MOUNTPOINT | awk '$1 == "RPI-RP2" && $3 == "vfat" && $4 == "" { print $2; exit }'
+        fi
+    }
+
+    mount_rpi_rp2() {
+        local block mount_dir
+        block="$(find_rpi_rp2_block)"
+        if [ -z "$block" ]; then
+            return 1
+        fi
+
+        echo "Mounting RPI-RP2 from $block" >&2
+        if command -v udisksctl >/dev/null 2>&1 && udisksctl mount -b "$block" >/dev/null 2>&1; then
+            find_rpi_rp2_mount
+            return 0
+        fi
+
+        mount_dir="/media/$USER/RPI-RP2"
+        sudo mkdir -p "$mount_dir"
+        if ! mountpoint -q "$mount_dir"; then
+            sudo mount -t vfat -o "uid=$(id -u),gid=$(id -g),umask=022" "$block" "$mount_dir"
+        fi
+        find_rpi_rp2_mount
+    }
+
     mount_path=""
     if mount_path="$(find_rpi_rp2_mount)"; then
         echo "RPI-RP2 already mounted at $mount_path; skipping BOOTSEL request"
+    elif mount_path="$(mount_rpi_rp2)"; then
+        echo "RPI-RP2 mounted at $mount_path; skipping BOOTSEL request"
     else
         echo "Requesting authorized BOOTSEL via $bootsel_url"
         host="${bootsel_url#http://}"
@@ -302,6 +332,9 @@ flash: brainstem-pico-w-uf2
         deadline=$((SECONDS + timeout_secs))
         while [ "$SECONDS" -lt "$deadline" ]; do
             if mount_path="$(find_rpi_rp2_mount)"; then
+                break
+            fi
+            if mount_path="$(mount_rpi_rp2)"; then
                 break
             fi
             sleep 1
