@@ -15,7 +15,7 @@ use pete_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use pete_body::{BodySense, BodySong, BodyTone};
 use pete_cockpit::{
     establish_session, Cockpit, CockpitError, HandshakeHello, HttpCockpit, MotherbrainPossession,
-    SimCockpit as LocalSimCockpit, SongTone, UartCockpit,
+    SafeCockpit, SimCockpit as LocalSimCockpit, SongTone, UartCockpit,
 };
 use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
 use pete_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter};
@@ -5088,6 +5088,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 if robot_mode == RobotMode::Slow && is_reconnectable_cockpit_error(&error) =>
             {
                 eprintln!("possession transport/session lost; motor gate closed: {error}");
+                disconnect_possession_cockpit_for_reconnect(&mut runner.cockpit);
                 let replacement =
                     reconnect_possession_cockpit(create_port.as_deref(), &args).await?;
                 runner.cockpit.replace_client(replacement);
@@ -5239,6 +5240,12 @@ async fn reconnect_possession_cockpit(
     }
 }
 
+fn disconnect_possession_cockpit_for_reconnect(cockpit: &mut SafeCockpit<Box<dyn Cockpit + Send>>) {
+    cockpit.replace_client(Box::new(ClosedCockpit::new(
+        "possession reconnect in progress",
+    )));
+}
+
 fn next_reconnect_backoff_ms(current_ms: u64, maximum_ms: u64) -> u64 {
     current_ms.saturating_mul(2).min(maximum_ms.max(1))
 }
@@ -5246,6 +5253,64 @@ fn next_reconnect_backoff_ms(current_ms: u64, maximum_ms: u64) -> u64 {
 fn is_identity_acceptance_error(error: &AnyhowError) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("identity mismatch") || message.contains("requires --brainstem")
+}
+
+struct ClosedCockpit {
+    reason: String,
+}
+
+impl ClosedCockpit {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    fn error(&self) -> CockpitError {
+        CockpitError::Policy(self.reason.clone())
+    }
+}
+
+impl Cockpit for ClosedCockpit {
+    fn execute(
+        &mut self,
+        _request: pete_cockpit::CockpitRequest,
+    ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+        Err(self.error())
+    }
+
+    fn handshake(
+        &mut self,
+        _hello: HandshakeHello,
+    ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+        Err(self.error())
+    }
+
+    fn execute_in_session(
+        &mut self,
+        _session: &pete_cockpit::CockpitSession,
+        _request: pete_cockpit::CockpitRequest,
+    ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+        Err(self.error())
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        _session: &pete_cockpit::CockpitSession,
+        _lease: &pete_cockpit::ControlLease,
+        _request: pete_cockpit::CockpitRequest,
+    ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+        Err(self.error())
+    }
+
+    fn execute_with_service_lease(
+        &mut self,
+        _session: &pete_cockpit::CockpitSession,
+        _lease: &pete_cockpit::ServiceLease,
+        _request: pete_cockpit::CockpitRequest,
+    ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+        Err(self.error())
+    }
 }
 
 fn run_mouth(args: MouthArgs) -> Result<()> {
@@ -11016,6 +11081,8 @@ mod tests {
     use pete_now::{ExtensionSense, Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION};
     use pete_sensors::World;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(prefix: &str) -> std::path::PathBuf {
@@ -12166,6 +12233,73 @@ mod tests {
         assert_eq!(next_reconnect_backoff_ms(250, 5_000), 500);
         assert_eq!(next_reconnect_backoff_ms(4_000, 5_000), 5_000);
         assert_eq!(next_reconnect_backoff_ms(5_000, 5_000), 5_000);
+    }
+
+    struct DropTrackedCockpit {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropTrackedCockpit {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Cockpit for DropTrackedCockpit {
+        fn execute(
+            &mut self,
+            _request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            Err(CockpitError::Policy("test cockpit is closed".into()))
+        }
+
+        fn handshake(
+            &mut self,
+            _hello: HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            Err(CockpitError::Policy("test cockpit is closed".into()))
+        }
+
+        fn execute_in_session(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            Err(CockpitError::Policy("test cockpit is closed".into()))
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ControlLease,
+            _request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            Err(CockpitError::Policy("test cockpit is closed".into()))
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ServiceLease,
+            _request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            Err(CockpitError::Policy("test cockpit is closed".into()))
+        }
+    }
+
+    #[test]
+    fn possession_reconnect_drops_existing_cockpit_before_opening_replacement() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let cockpit: Box<dyn Cockpit + Send> = Box::new(DropTrackedCockpit {
+            drops: Arc::clone(&drops),
+        });
+        let mut safe = SafeCockpit::new(cockpit);
+
+        disconnect_possession_cockpit_for_reconnect(&mut safe);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let error = safe.client_mut().stop().unwrap_err();
+        assert!(error.to_string().contains("reconnect in progress"));
     }
 
     #[test]

@@ -35,6 +35,8 @@ const MOTHERBRAIN_RESET_PULSE_MS: u32 = 100;
 const MOTHERBRAIN_RESET_COOLDOWN_MS: u32 = 30_000;
 const MOTHERBRAIN_RESET_HISTORY_CAPACITY: usize = 16;
 const MOTHERBRAIN_RESET_SERVICE_SCOPE: u8 = 4;
+const CONNECTED_POWER_LED_COLOR: u8 = 128;
+const CONNECTED_POWER_LED_INTENSITY: u8 = 255;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -44,19 +46,17 @@ enum RuntimeMode {
 }
 
 fn healthy_supervision_lights(phase: u8) -> (u8, u8, u8, u32) {
-    let breath_phase = phase & 31;
-    let breath_level = if breath_phase < 16 {
-        breath_phase
-    } else {
-        31 - breath_phase
-    };
-    let power_intensity = 40 + breath_level * 12;
     let led_bits = if (phase / 8) & 1 == 0 {
         CREATE_LED_PLAY
     } else {
         CREATE_LED_ADVANCE
     };
-    (led_bits, 0, power_intensity, HEALTHY_LIGHT_STEP_MS)
+    (
+        led_bits,
+        CONNECTED_POWER_LED_COLOR,
+        CONNECTED_POWER_LED_INTENSITY,
+        HEALTHY_LIGHT_STEP_MS,
+    )
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -395,7 +395,7 @@ where
         } else if self.estop_latched || self.safety_latched {
             (CREATE_BUTTON_LED_MASK, 255, 255, 500)
         } else {
-            // Breathe POWER while PLAY and ADVANCE alternate more quickly.
+            // Keep POWER stable while PLAY and ADVANCE alternate more quickly.
             healthy_supervision_lights(self.supervision_light_phase)
         };
         self.create_uart
@@ -2271,22 +2271,42 @@ mod tests {
     }
 
     #[test]
-    fn healthy_supervision_lights_breathe_power_and_alternate_buttons() {
+    fn healthy_supervision_lights_keep_power_amber_and_alternate_buttons() {
         assert_eq!(
             healthy_supervision_lights(0),
-            (CREATE_LED_PLAY, 0, 40, HEALTHY_LIGHT_STEP_MS)
+            (
+                CREATE_LED_PLAY,
+                CONNECTED_POWER_LED_COLOR,
+                CONNECTED_POWER_LED_INTENSITY,
+                HEALTHY_LIGHT_STEP_MS
+            )
         );
         assert_eq!(
             healthy_supervision_lights(8),
-            (CREATE_LED_ADVANCE, 0, 136, HEALTHY_LIGHT_STEP_MS)
+            (
+                CREATE_LED_ADVANCE,
+                CONNECTED_POWER_LED_COLOR,
+                CONNECTED_POWER_LED_INTENSITY,
+                HEALTHY_LIGHT_STEP_MS
+            )
         );
         assert_eq!(
             healthy_supervision_lights(15),
-            (CREATE_LED_ADVANCE, 0, 220, HEALTHY_LIGHT_STEP_MS)
+            (
+                CREATE_LED_ADVANCE,
+                CONNECTED_POWER_LED_COLOR,
+                CONNECTED_POWER_LED_INTENSITY,
+                HEALTHY_LIGHT_STEP_MS
+            )
         );
         assert_eq!(
             healthy_supervision_lights(16),
-            (CREATE_LED_PLAY, 0, 220, HEALTHY_LIGHT_STEP_MS)
+            (
+                CREATE_LED_PLAY,
+                CONNECTED_POWER_LED_COLOR,
+                CONNECTED_POWER_LED_INTENSITY,
+                HEALTHY_LIGHT_STEP_MS
+            )
         );
         assert_eq!(
             healthy_supervision_lights(32),
