@@ -10,14 +10,14 @@ use embassy_net::{
     Config as NetConfig, HardwareAddress, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Stack,
     StackResources,
 };
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::i2c::{
     Async as I2cAsync, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler,
 };
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
 use embassy_rp::peripherals::{
-    DMA_CH0, I2C1, PIN_0, PIN_1, PIN_18, PIN_19, PIN_2, PIN_20, PIN_23, PIN_24, PIN_25, PIN_29,
-    PIN_3, PIN_4, PIN_5, PIO0, UART0, UART1, USB,
+    DMA_CH0, I2C1, PIN_0, PIN_1, PIN_17, PIN_18, PIN_19, PIN_2, PIN_20, PIN_23, PIN_24, PIN_25,
+    PIN_29, PIN_3, PIN_4, PIN_5, PIO0, UART0, UART1, USB,
 };
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::rom_data::reset_to_usb_boot;
@@ -106,6 +106,7 @@ pub struct PicoWBrainstem {
     power_toggle: Output<'static>,
     brc: Output<'static>,
     status_led: Output<'static>,
+    charging_indicator: Input<'static>,
     #[cfg(motherbrain_reset_hardware)]
     motherbrain_reset: Output<'static>,
 }
@@ -119,6 +120,7 @@ impl PicoWBrainstem {
         power_toggle: Peri<'static, PIN_18>,
         brc: Peri<'static, PIN_19>,
         status_led: Peri<'static, PIN_20>,
+        charging_indicator: Peri<'static, PIN_17>,
         #[cfg(motherbrain_reset_hardware)] motherbrain_reset: Peri<
             'static,
             embassy_rp::peripherals::PIN_21,
@@ -142,6 +144,14 @@ impl PicoWBrainstem {
             power_toggle: Output::new(power_toggle, Level::Low),
             brc: Output::new(brc, Level::High),
             status_led: Output::new(status_led, Level::Low),
+            charging_indicator: Input::new(
+                charging_indicator,
+                if body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH {
+                    Pull::Down
+                } else {
+                    Pull::Up
+                },
+            ),
             // The gate/base has an external pull-down. Construct it inactive
             // before any command transport starts.
             #[cfg(motherbrain_reset_hardware)]
@@ -215,6 +225,14 @@ impl BrainstemHardware for PicoWBrainstem {
         IMU_RESTART_REQUESTED.store(true, Ordering::Relaxed);
         Ok(())
     }
+
+    fn charging_indicator_active(&mut self) -> Option<bool> {
+        if body::CREATE_CHARGING_INDICATOR_ENABLED {
+            Some(self.charging_indicator.is_high() == body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH)
+        } else {
+            None
+        }
+    }
 }
 
 fn map_uart_error(error: UartError) -> UartReadError {
@@ -244,6 +262,7 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
         p.PIN_18,
         p.PIN_19,
         p.PIN_20,
+        p.PIN_17,
         #[cfg(motherbrain_reset_hardware)]
         p.PIN_21,
     );
@@ -786,9 +805,8 @@ async fn http_task(stack: Stack<'static>) -> ! {
                     Ok(body) => {
                         write_response(&mut socket, "application/json", body.as_bytes()).await
                     }
-                    Err(CommandParseError::Busy(command_id)) => {
-                        let body =
-                            render_command_response(json.as_mut(), false, command_id, "busy");
+                    Err(CommandParseError::Busy(command_id, reason)) => {
+                        let body = render_command_response(json.as_mut(), false, command_id, reason);
                         match body {
                             Some(body) => {
                                 write_response(&mut socket, "application/json", body.as_bytes())
@@ -1472,7 +1490,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 </div>
 </div>
 <script>
-let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,sse=null,sseOpen=false,driveKind='',lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,caps=null,sessionId='',controlLeaseId='';
+let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,sse=null,sseOpen=false,driveKind='',lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,caps=null,sessionId='',controlLeaseId='',sensorStreamRequested=false;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
 const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','calibrate_turn','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
 const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',heartbeat:'heartbeat_stop'};
@@ -1481,14 +1499,15 @@ function pill(el,text,state){el.textContent=text;el.className='pill '+(state||''
 function addLog(text){let t=new Date().toLocaleTimeString();log.textContent=(t+'  '+text+'\n'+(log.textContent==='No commands yet'?'':log.textContent)).slice(0,900)}
 function hasVerb(v){return !!(caps&&caps.verbs&&caps.verbs.indexOf(v)>=0)}
 function setDisabled(ids,verb){ids.forEach(x=>{let e=$(x);if(e)e.disabled=!hasVerb(verb)})}
+function ensureSensorStream(){if(sensorStreamRequested||!sessionId||!hasVerb('stream_sensors'))return;sensorStreamRequested=true;sendCockpit({kind:'stream_sensors',enabled:true,packet_id:0,period_ms:250},false).then(j=>{if(j&&j.accepted===false)sensorStreamRequested=false})}
 function token(prefix){let a=new Uint32Array(2);crypto.getRandomValues(a);return prefix+'-'+a[0].toString(16)+'-'+a[1].toString(16)}
-function establishBrowserSession(){controlLeaseId='';let boot=sessionStorage.getItem('pete-browser-boot');if(!boot){boot=token('browserboot');sessionStorage.setItem('pete-browser-boot',boot)}let nonce=token('hello'),hello={role:'operator',session_purpose:'control',device_id:token('browser'),boot_id:boot,handshake_nonce:nonce,protocol_major:1,protocol_minor_min:0,protocol_minor_max:0,supported_features:['session_ids','event_cursor','heartbeat','transport_failover'],required_features:['session_ids'],preferred_heartbeat_ms:500};pill($('session'),'handshaking','warn');return fetch('/handshake',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(hello)}).then(r=>r.json()).then(j=>{if(j.kind!=='welcome'||j.echoed_handshake_nonce!==nonce)throw new Error(j.reason_code||'invalid welcome');sessionId=j.session_id;eventCursor=Math.max(0,(j.current_event_next_seq||1)-1);pill($('session'),'session '+sessionId.slice(-8),'ok');pill(net,'session HTTP','ok');addLog('session opened '+sessionId);requestCaps();connectSse();return j}).catch(e=>{sessionId='';pill($('session'),'session failed','bad');addLog('handshake failed '+e.message);throw e})}
+function establishBrowserSession(){controlLeaseId='';sensorStreamRequested=false;let boot=sessionStorage.getItem('pete-browser-boot');if(!boot){boot=token('browserboot');sessionStorage.setItem('pete-browser-boot',boot)}let nonce=token('hello'),hello={role:'operator',session_purpose:'control',device_id:token('browser'),boot_id:boot,handshake_nonce:nonce,protocol_major:1,protocol_minor_min:0,protocol_minor_max:0,supported_features:['session_ids','event_cursor','heartbeat','transport_failover'],required_features:['session_ids'],preferred_heartbeat_ms:500};pill($('session'),'handshaking','warn');return fetch('/handshake',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(hello)}).then(r=>r.json()).then(j=>{if(j.kind!=='welcome'||j.echoed_handshake_nonce!==nonce)throw new Error(j.reason_code||'invalid welcome');sessionId=j.session_id;eventCursor=Math.max(0,(j.current_event_next_seq||1)-1);pill($('session'),'session '+sessionId.slice(-8),'ok');pill(net,'session HTTP','ok');addLog('session opened '+sessionId);requestCaps();connectSse();return j}).catch(e=>{sessionId='';sensorStreamRequested=false;pill($('session'),'session failed','bad');addLog('handshake failed '+e.message);throw e})}
 function acquireBrowserControl(){if(!sessionId){addLog('open a session first');return}let body={kind:'acquire_control_lease',command_id:id++,session_id:sessionId,authority:'operator_debug',ttl_ms:60000};fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(j=>{if(j.accepted&&j.type==='control_lease_granted'){controlLeaseId=j.lease_id;pill($('session'),'operator control','ok');addLog('control lease '+j.lease_id+' (60 seconds)')}else{controlLeaseId='';handleReply(j)}}).catch(e=>addLog('control request failed '+e.message))}
 function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;pill(net,'control ws','ok');requestCaps()};ws.onclose=()=>{wsOpen=false;pill(net,'reconnecting','warn');setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false;pill(net,'ws error','warn')};ws.onmessage=e=>{try{handleReply(JSON.parse(e.data))}catch(_){}}}catch(_){wsOpen=false}}
 function connectSse(){if(sse)sse.close();sseOpen=false;sse=new EventSource('/events?since='+eventCursor);sse.onopen=()=>{sseOpen=true;pill(net,'telemetry sse','ok')};sse.addEventListener('status',e=>{try{showStatus(JSON.parse(e.data))}catch(_){}});sse.addEventListener('events',e=>{try{handleEvents(JSON.parse(e.data))}catch(_){}});sse.onerror=()=>{sseOpen=false;pill(net,'sse reconnecting','warn')}}
-function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='events'){handleEvents(j);return}if(j.verbs){caps=j;applyCaps();pill(net,'capabilities','ok');return}let ok=j.accepted!==false,reason=j.message||j.reason||'';if(!ok&&(reason==='invalid_control_lease'||reason==='control_lease_required')){controlLeaseId='';pill($('session'),'session; control expired','warn');addLog('control authority expired; press Request control')}if(!ok&&(reason==='invalid_session'||reason==='session_required')){sessionId='';controlLeaseId='';pill($('session'),'session expired','bad');addLog('session expired; press New session')}pill(net,ok?'accepted':'rejected',ok?'ok':'warn');if(!ok)addLog('rejected '+(reason||j.command_id||''));else if(j.message)addLog(j.message+' '+(j.command_id||''))}
+function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='events'){handleEvents(j);return}if(j.verbs){caps=j;applyCaps();pill(net,'capabilities','ok');ensureSensorStream();return}let ok=j.accepted!==false,reason=j.message||j.reason||'';if(!ok&&(reason==='invalid_control_lease'||reason==='control_lease_required')){controlLeaseId='';pill($('session'),'session; control expired','warn');addLog('control authority expired; press Request control')}if(!ok&&(reason==='invalid_session'||reason==='session_required')){sessionId='';controlLeaseId='';sensorStreamRequested=false;pill($('session'),'session expired','bad');addLog('session expired; press New session')}pill(net,ok?'accepted':'rejected',ok?'ok':'warn');if(!ok)addLog('rejected '+(reason||j.command_id||''));else if(j.message)addLog(j.message+' '+(j.command_id||''))}
 function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(sessionId)o.session_id=sessionId;if(controlLeaseId)o.lease_id=controlLeaseId;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
-function requestCaps(){sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps()}})}
+function requestCaps(){return sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps();ensureSensorStream()}})}
 function applyCaps(){setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');setDisabled(['imuzero'],'zero_imu_orientation');setDisabled(['imuclear'],'clear_imu_orientation');setDisabled(['mpurestart'],'restart_mpu');setDisabled(['createrestart'],'restart_create');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});['dock','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
 function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('[data-drive].active').forEach(b=>b.classList.remove('active'));sendCockpit({kind:'stop'})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
@@ -1532,7 +1551,7 @@ function num(v,d=0){return typeof v==='number'&&isFinite(v)?v.toFixed(d):'--'}
 function pctBar(id,value,max,badAt,warnAt){let e=$(id),i=e&&e.querySelector('i');if(!e||!i)return;let p=Math.max(0,Math.min(100,(value||0)*100/max));i.style.width=p+'%';e.className='bar '+((value||0)>=badAt?'bad':(value||0)>=warnAt?'warn':'')}
 function imuClass(imu){let h=imu.health||'unknown',age=imu.sample_age_ms||0;if(h==='fault'||(h==='ok'&&age>2000))return'badtext';if(h!=='ok'||age>500)return'muted';return'oktext'}
 function showImu(imu){imu=imu||{};let present=imu.present||'unknown',health=imu.health||'unknown',age=imu.sample_age_ms||0,poll=imu.poll_period_ms||0,yaw=(imu.yaw_mrad||0)/1000,rate=(imu.yaw_rate_mrad_s||0)/1000,acc=(imu.accel_magnitude_mm_s2||0)/1000,tilt=(imu.tilt_magnitude_mrad||0)/1000,rough=(imu.roughness_mm_s2||0)/1000,impact=(imu.impact_score_mm_s2||0)/1000;let cls=imuClass(imu);$('imuhealth').textContent=title(health)+' / '+title(present)+' / age '+age+' ms / '+poll+' ms poll';$('imuhealth').className=cls;$('imuyaw').textContent=num(yaw,2)+' rad / '+num(yaw*57.2958,1)+' deg';$('imuyaw').className=cls;$('imuaccel').textContent=num(acc,2)+' m/s\u00B2';$('imuaccel').className=acc>16?'badtext':acc>12?'muted':cls;$('imutilt').textContent=num(tilt,2)+' rad / '+num(tilt*57.2958,1)+' deg';$('imutilt').className=tilt>.65?'badtext':tilt>.35?'muted':cls;$('imurates').textContent='yaw '+num(rate,2)+' rad/s / xyz '+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.x||0)/1000,2)+','+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.y||0)/1000,2)+','+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.z||0)/1000,2);$('imurates').className=cls;$('imurough').textContent=num(rough,2)+' m/s\u00B2';$('imurough').className=rough>8?'badtext':rough>3?'muted':cls;$('imuimpact').textContent=num(impact,2)+' m/s\u00B2';$('imuimpact').className=impact>18?'badtext':impact>8?'muted':cls;$('imumotion').textContent=title(imu.motion_consistency||'unknown')+' / '+title(imu.calibration||'uncalibrated');$('imumotion').className=(imu.motion_consistency==='inconsistent'||imu.calibration==='uncalibrated')?'muted':cls;pctBar('imuaccelbar',imu.accel_magnitude_mm_s2||0,22000,18000,13000);pctBar('imutiltbar',imu.tilt_magnitude_mrad||0,1000,650,350);pctBar('imuroughbar',imu.roughness_mm_s2||0,12000,8000,3000);pctBar('imuimpactbar',imu.impact_score_mm_s2||0,22000,18000,8000)}
-function showStatus(s){let cs=s.create_sensors||{},od=s.odometry||{},imu=s.imu||{},music=s.create_songs||{},fatal=s.current_runtime_state==='error'||(s.last_error&&s.last_error!=='none'),contact=cs.bump_left||cs.bump_right||cs.wall||cs.virtual_wall,imuOk=imu.health==='ok',imuDanger=imu.health==='fault'||(imuOk&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safetyStop=cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,pct=battPct(cs),flags=flagList(cs);if(imuOk&&(imu.tilt_magnitude_mrad||0)>=650)flags.push('tilt');if(imuOk&&(imu.impact_score_mm_s2||0)>=18000)flags.push('impact');if(imuOk&&imu.motion_consistency==='inconsistent')flags.push('motion mismatch');pill(net,wsOpen?'control ws':sseOpen?'telemetry sse':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),fatal?'fatal/error':safetyStop?'safety stop':contact?'contact':'clear',fatal||safetyStop?'bad':contact?'warn':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health)+' / IMU '+title(imu.health||'unknown');$('runtime').textContent=title(s.current_runtime_state)+' / body '+title(s.body_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=flags.join(', ')||'clear';$('safetyread').className=fatal||safetyStop?'badtext':contact?'muted':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / IR '+(cs.ir_byte||0)+' / buttons '+(cs.buttons||0)+' / cliff sig '+(cs.cliff_left_signal||0)+','+(cs.cliff_front_left_signal||0)+','+(cs.cliff_front_right_signal||0)+','+(cs.cliff_right_signal||0);$('battery').textContent=(pct===null?'--':pct+'%')+' / '+(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh / charge state '+(cs.charging_state||0);$('battery').className=pct!==null&&pct<=20?'badtext':'muted';$('odom').textContent='delta '+(cs.distance_mm||0)+' mm / '+(cs.angle_mrad||0)+' mrad / total '+(od.distance_mm||0)+' mm / '+(od.heading_mrad||0)+' mrad / resets '+(od.reset_count||0);showImu(imu);$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=fatal?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=fatal?'badtext':'muted'}
+function showStatus(s){let cs=s.create_sensors||{},od=s.odometry||{},imu=s.imu||{},music=s.create_songs||{},fatal=s.current_runtime_state==='error'||(s.last_error&&s.last_error!=='none'),contact=cs.bump_left||cs.bump_right||cs.wall||cs.virtual_wall,imuOk=imu.health==='ok',imuDanger=imu.health==='fault'||(imuOk&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safetyStop=cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,pct=battPct(cs),flags=flagList(cs);if(imuOk&&(imu.tilt_magnitude_mrad||0)>=650)flags.push('tilt');if(imuOk&&(imu.impact_score_mm_s2||0)>=18000)flags.push('impact');if(imuOk&&imu.motion_consistency==='inconsistent')flags.push('motion mismatch');pill(net,wsOpen?'control ws':sseOpen?'telemetry sse':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),fatal?'fatal/error':safetyStop?'safety stop':contact?'contact':'clear',fatal||safetyStop?'bad':contact?'warn':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health)+' / IMU '+title(imu.health||'unknown');$('runtime').textContent=title(s.current_runtime_state)+' / body '+title(s.body_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=flags.join(', ')||'clear';$('safetyread').className=fatal||safetyStop?'badtext':contact?'muted':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / IR '+(cs.ir_byte||0)+' / buttons '+(cs.buttons||0)+' / cliff sig '+(cs.cliff_left_signal||0)+','+(cs.cliff_front_left_signal||0)+','+(cs.cliff_front_right_signal||0)+','+(cs.cliff_right_signal||0);$('battery').textContent=(pct===null?'--':pct+'%')+' / '+(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh / charge state '+(cs.charging_state||0)+' / charge pin '+title(cs.charging_indicator);$('battery').className=pct!==null&&pct<=20?'badtext':'muted';$('odom').textContent='delta '+(cs.distance_mm||0)+' mm / '+(cs.angle_mrad||0)+' mrad / total '+(od.distance_mm||0)+' mm / '+(od.heading_mrad||0)+' mrad / resets '+(od.reset_count||0);showImu(imu);$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=fatal?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=fatal?'badtext':'muted'}
 function handleEvents(batch){let stopNeeded=false;eventCursor=Math.max(0,(batch.next_seq||1)-1);if(batch.dropped_before_seq){$('events').textContent='recovered after '+batch.dropped_before_seq;pill($('safety'),'event history recovered','warn');addLog('recovered event history after '+batch.dropped_before_seq);stopNeeded=true}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched','wheel_drop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k+' '+(e.a||0));stopNeeded=true}else if(['bump_changed','wall_changed','virtual_wall_changed','buttons_changed','ir_changed','charging_state_changed','battery_low','cliff_changed','wheel_drop_cleared','safety_cleared'].indexOf(k)>=0){addLog(k+' '+(e.a||0))}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0))}else if(k==='motion_stopped'){addLog('motion stopped')}else if(k==='error'){pill($('safety'),'fatal/error','bad');addLog('error '+(e.a||0));stopNeeded=true}});if(stopNeeded)stop()}
 applyCaps();establishBrowserSession().catch(connectSse);
 </script>
@@ -1543,7 +1562,7 @@ applyCaps();establishBrowserSession().catch(connectSse);
 
 enum CommandParseError {
     BadRequest,
-    Busy(u32),
+    Busy(u32, &'static str),
 }
 
 fn handle_handshake_json<'a>(body: &str, buffer: &'a mut [u8], transport: u8) -> Option<&'a str> {
@@ -1786,7 +1805,7 @@ fn handle_command_request<'a>(
         .ok_or(CommandParseError::BadRequest);
     }
     if !submit_json_control_command(command_id, command, body) {
-        return Err(CommandParseError::Busy(command_id));
+        return Err(CommandParseError::Busy(command_id, control_busy_reason()));
     }
     render_command_response(buffer, true, command_id, "accepted")
         .ok_or(CommandParseError::BadRequest)
@@ -1857,7 +1876,7 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
         if accepted {
             None
         } else {
-            render_command_response(buffer, false, command_id, "busy")
+            render_command_response(buffer, false, command_id, control_busy_reason())
         }
     } else {
         handle_websocket_command(body, buffer)
@@ -1892,7 +1911,7 @@ fn handle_websocket_command<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
         return render_command_response(buffer, false, command_id, "service_operation_disabled");
     }
     if !submit_json_control_command(command_id, command, body) {
-        return render_command_response(buffer, false, command_id, "busy");
+        return render_command_response(buffer, false, command_id, control_busy_reason());
     }
     render_command_response(buffer, true, command_id, "accepted")
 }
@@ -2383,10 +2402,21 @@ fn handle_compact_control_line<const N: usize>(
             if submit_compact_control_command(seq, command, session_id, service_lease_id) {
                 let _ = writeln!(response, "OK {seq}");
             } else {
-                let _ = writeln!(response, "ERR {seq} busy");
+                let _ = writeln!(response, "ERR {seq} {}", control_busy_reason());
             }
             Some(false)
         }
+    }
+}
+
+fn control_busy_reason() -> &'static str {
+    let snapshot = status::snapshot(Instant::now().as_millis() as u32);
+    if snapshot.create_charging_indicator_state == 2
+        || matches!(snapshot.create_sensor_charging_state, 1..=3)
+    {
+        "charging_busy"
+    } else {
+        "busy"
     }
 }
 
@@ -2404,6 +2434,10 @@ fn command_requires_session(command: BrainstemCommand) -> bool {
 fn command_requires_authority(command: BrainstemCommand) -> bool {
     command_requires_session(command)
         && !matches!(command, BrainstemCommand::Disarm)
+        && !matches!(
+            command,
+            BrainstemCommand::RequestSensors { .. } | BrainstemCommand::StreamSensors { .. }
+        )
         && !command_requires_service_authority(command)
 }
 fn command_requires_service_authority(command: BrainstemCommand) -> bool {

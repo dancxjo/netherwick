@@ -104,6 +104,7 @@ struct Pins {
     create_brc: OptionalGpioPin,
     leds: LedPins,
     create_device_detect: OptionalGpioPin,
+    create_charging_indicator: OptionalInputPin,
     estop: OptionalGpioPin,
     motherbrain_reset: OptionalGpioPin,
 }
@@ -192,6 +193,16 @@ struct OptionalGpioPin {
     pin: String,
     gpio: u8,
     physical_pin: Option<u8>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct OptionalInputPin {
+    enabled: bool,
+    pin: String,
+    gpio: u8,
+    physical_pin: Option<u8>,
+    active: String,
 }
 
 #[allow(dead_code)]
@@ -299,6 +310,11 @@ pub const EXTERNAL_LED_PIN: &str = {external_led_pin:?};
 pub const CREATE_DEVICE_DETECT_ENABLED: bool = {create_device_detect_enabled};
 pub const CREATE_DEVICE_DETECT_PIN: &str = {create_device_detect_pin:?};
 pub const CREATE_DEVICE_DETECT_GPIO: u8 = {create_device_detect_gpio};
+pub const CREATE_CHARGING_INDICATOR_ENABLED: bool = {create_charging_indicator_enabled};
+pub const CREATE_CHARGING_INDICATOR_PIN: &str = {create_charging_indicator_pin:?};
+pub const CREATE_CHARGING_INDICATOR_GPIO: u8 = {create_charging_indicator_gpio};
+pub const CREATE_CHARGING_INDICATOR_PHYSICAL_PIN: u8 = {create_charging_indicator_physical_pin};
+pub const CREATE_CHARGING_INDICATOR_ACTIVE_HIGH: bool = {create_charging_indicator_active_high};
 pub const ESTOP_ENABLED: bool = {estop_enabled};
 pub const ESTOP_PIN: &str = {estop_pin:?};
 pub const ESTOP_GPIO: u8 = {estop_gpio};
@@ -362,6 +378,24 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         create_device_detect_enabled = board.pins.create_device_detect.enabled,
         create_device_detect_pin = board.pins.create_device_detect.pin,
         create_device_detect_gpio = board.pins.create_device_detect.gpio,
+        create_charging_indicator_enabled = board.pins.create_charging_indicator.enabled,
+        create_charging_indicator_pin = board.pins.create_charging_indicator.pin,
+        create_charging_indicator_gpio = board.pins.create_charging_indicator.gpio,
+        create_charging_indicator_physical_pin = board
+            .pins
+            .create_charging_indicator
+            .physical_pin
+            .unwrap_or(0),
+        create_charging_indicator_active_high = match board
+            .pins
+            .create_charging_indicator
+            .active
+            .as_str()
+        {
+            "high" => true,
+            "low" => false,
+            other => panic!("unsupported create_charging_indicator.active: {other}"),
+        },
         estop_enabled = board.pins.estop.enabled,
         estop_pin = board.pins.estop.pin,
         estop_gpio = board.pins.estop.gpio,
@@ -422,6 +456,12 @@ fn validate_board_gpio_assignments(board: &BoardToml) {
     }
     if board.pins.create_device_detect.enabled {
         claim(board.pins.create_device_detect.gpio, "create_device_detect");
+    }
+    if board.pins.create_charging_indicator.enabled {
+        claim(
+            board.pins.create_charging_indicator.gpio,
+            "create_charging_indicator",
+        );
     }
     if board.pins.estop.enabled {
         claim(board.pins.estop.gpio, "estop");

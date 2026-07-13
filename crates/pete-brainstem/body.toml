@@ -85,6 +85,7 @@ sensors = [
   "ir",
   "buttons",
   "battery",
+  "charging_indicator",
   "odometry_delta",
   "imu",
 ]

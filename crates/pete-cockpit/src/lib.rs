@@ -1280,6 +1280,7 @@ pub struct BatterySummary {
     pub capacity_mah: Option<u32>,
     pub percent: Option<u8>,
     pub charging_state: Option<u8>,
+    pub charging_indicator: Option<bool>,
     pub low: Option<bool>,
 }
 
@@ -1295,6 +1296,7 @@ impl BatterySummary {
             capacity_mah,
             percent,
             charging_state: number_for(raw, "charging_state").map(|value| value as u8),
+            charging_indicator: bool_for(raw, "charging_indicator"),
             low: percent.map(|value| value <= 20),
         }
     }
@@ -1313,6 +1315,7 @@ impl BatterySummary {
             capacity_mah,
             percent,
             charging_state: json_u32_value(sensors, "charging_state").map(|value| value as u8),
+            charging_indicator: json_tri_state_value(sensors, "charging_indicator"),
             low: percent.map(|value| value <= 20),
         }
     }
@@ -5375,10 +5378,35 @@ fn expect_ok(seq: u32, response: &str) -> Result<()> {
     match (
         parts.next(),
         parts.next().and_then(|value| value.parse::<u32>().ok()),
+        parts.next(),
     ) {
-        (Some("OK"), Some(response_seq)) if response_seq == seq => Ok(()),
+        (Some("OK"), Some(response_seq), _) if response_seq == seq => Ok(()),
+        (Some("ERR"), Some(response_seq), Some(reason))
+            if response_seq == seq && is_compact_rejection_reason(reason) =>
+        {
+            Err(CockpitError::Rejected {
+                command_id: seq,
+                reason: reason.to_owned(),
+            })
+        }
         _ => Err(CockpitError::BadResponse(response.to_owned())),
     }
+}
+
+fn is_compact_rejection_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "busy"
+            | "charging_busy"
+            | "unsupported"
+            | "invalid_session"
+            | "session_required"
+            | "invalid_control_lease"
+            | "control_lease_required"
+            | "invalid_service_lease"
+            | "service_authorization_required"
+            | "service_operation_disabled"
+    )
 }
 
 fn parse_capabilities(seq: u32, response: &str) -> Result<CockpitCapabilities> {
@@ -5811,6 +5839,18 @@ fn json_str_value<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str
 
 fn json_bool_value(value: &serde_json::Value, key: &str) -> Option<bool> {
     value.get(key)?.as_bool()
+}
+
+fn json_tri_state_value(value: &serde_json::Value, key: &str) -> Option<bool> {
+    match value.get(key)? {
+        serde_json::Value::Bool(value) => Some(*value),
+        serde_json::Value::String(value) => match value.as_str() {
+            "true" | "1" | "on" | "yes" => Some(true),
+            "false" | "0" | "off" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn json_u32_value(value: &serde_json::Value, key: &str) -> Option<u32> {
@@ -7016,7 +7056,7 @@ mod tests {
         let status = parse_json_cockpit_response(
             1,
             &CockpitRequest::GetStatus,
-            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","event_next_seq":8}"#,
+            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","event_next_seq":8,"create_sensors":{"charging_indicator":"on"}}"#,
         )
         .unwrap();
         let CockpitResponse::Status(status) = status else {
@@ -7026,6 +7066,7 @@ mod tests {
         assert_eq!(summary.runtime_state.as_deref(), Some("idle"));
         assert_eq!(summary.armed, Some(true));
         assert_eq!(summary.event_next_seq, Some(8));
+        assert_eq!(summary.battery.charging_indicator, Some(true));
 
         let caps = parse_json_cockpit_response(
             2,
@@ -7294,8 +7335,11 @@ mod tests {
     fn parses_ok_and_err_responses() {
         assert!(expect_ok(2, "OK 2").is_ok());
         assert!(matches!(
-            expect_ok(2, "ERR 2 parse"),
-            Err(CockpitError::BadResponse(_))
+            expect_ok(2, "ERR 2 busy"),
+            Err(CockpitError::Rejected {
+                command_id: 2,
+                reason
+            }) if reason == "busy"
         ));
     }
 

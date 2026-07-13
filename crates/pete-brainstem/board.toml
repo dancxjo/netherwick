@@ -36,6 +36,13 @@ enabled = false
 pin = "GP21"
 gpio = 21
 
+[pins.create_charging_indicator]
+enabled = true
+pin = "GP17"
+gpio = 17
+physical_pin = 22
+active = "high"
+
 [pins.motherbrain_reset]
 enabled = false # enable only after the installed transistor/RUN circuit is continuity-tested
 pin = "GP21"

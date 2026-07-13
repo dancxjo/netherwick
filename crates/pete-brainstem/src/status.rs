@@ -91,6 +91,7 @@ static CREATE_SENSOR_ANGLE_MRAD: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_IR_BYTE: AtomicU8 = AtomicU8::new(0);
 static CREATE_SENSOR_BUTTONS: AtomicU8 = AtomicU8::new(0);
 static CREATE_SENSOR_CHARGING_STATE: AtomicU8 = AtomicU8::new(0);
+static CREATE_CHARGING_INDICATOR_STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
 static CREATE_SENSOR_VOLTAGE_MV: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CURRENT_MA: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_TEMPERATURE_C: AtomicU32 = AtomicU32::new(0);
@@ -241,6 +242,7 @@ pub struct BrainstemStatus {
     pub create_sensor_ir_byte: u8,
     pub create_sensor_buttons: u8,
     pub create_sensor_charging_state: u8,
+    pub create_charging_indicator_state: u8,
     pub create_sensor_voltage_mv: u16,
     pub create_sensor_current_ma: i16,
     pub create_sensor_temperature_c: i8,
@@ -1919,6 +1921,17 @@ pub fn set_create_power_unknown() {
     CREATE_POWER_STATE.store(UNKNOWN, Ordering::Relaxed);
 }
 
+pub fn mark_create_charging_indicator(active: Option<bool>) {
+    CREATE_CHARGING_INDICATOR_STATE.store(
+        match active {
+            Some(false) => OFF,
+            Some(true) => ON,
+            None => UNKNOWN,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 pub fn set_oi_mode(mode: CreateOiMode) {
     let code = match mode {
         CreateOiMode::Passive => 1,
@@ -3017,6 +3030,7 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         create_sensor_ir_byte: CREATE_SENSOR_IR_BYTE.load(Ordering::Relaxed),
         create_sensor_buttons: CREATE_SENSOR_BUTTONS.load(Ordering::Relaxed),
         create_sensor_charging_state: CREATE_SENSOR_CHARGING_STATE.load(Ordering::Relaxed),
+        create_charging_indicator_state: CREATE_CHARGING_INDICATOR_STATE.load(Ordering::Relaxed),
         create_sensor_voltage_mv: CREATE_SENSOR_VOLTAGE_MV.load(Ordering::Relaxed) as u16,
         create_sensor_current_ma: decode_signed_i16(
             CREATE_SENSOR_CURRENT_MA.load(Ordering::Relaxed),
@@ -3202,6 +3216,9 @@ struct CreateSensorStatusJson {
     ir_byte: u8,
     buttons: u8,
     charging_state: u8,
+    charging_indicator: &'static str,
+    charging_indicator_pin: &'static str,
+    charging_indicator_physical_pin: u8,
     voltage_mv: u16,
     current_ma: i16,
     temperature_c: i8,
@@ -3348,6 +3365,9 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
         ir_byte: snapshot.create_sensor_ir_byte,
         buttons: snapshot.create_sensor_buttons,
         charging_state: snapshot.create_sensor_charging_state,
+        charging_indicator: tri_state_text(snapshot.create_charging_indicator_state),
+        charging_indicator_pin: body::CREATE_CHARGING_INDICATOR_PIN,
+        charging_indicator_physical_pin: body::CREATE_CHARGING_INDICATOR_PHYSICAL_PIN,
         voltage_mv: snapshot.create_sensor_voltage_mv,
         current_ma: snapshot.create_sensor_current_ma,
         temperature_c: snapshot.create_sensor_temperature_c,

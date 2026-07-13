@@ -250,6 +250,7 @@ where
         self.poll();
         self.poll_motherbrain_reset();
         self.hardware.feed_watchdog();
+        self.poll_charging_indicator();
         self.poll_imu();
         if let Err(error) = self.poll_sensor_stream() {
             self.enter_error(error);
@@ -1482,6 +1483,15 @@ where
             Ok(None) => {}
             Err(health) => status::mark_imu_health(health),
         }
+    }
+
+    fn poll_charging_indicator(&mut self) {
+        let active = if body::CREATE_CHARGING_INDICATOR_ENABLED {
+            self.hardware.charging_indicator_active()
+        } else {
+            None
+        };
+        status::mark_create_charging_indicator(active);
     }
 
     fn enforce_safety_policy(&mut self) -> Result<(), BrainstemError> {

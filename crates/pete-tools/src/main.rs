@@ -5104,6 +5104,12 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 eprintln!("possession reconnected with fresh session and lease; stopped=true");
                 continue;
             }
+            Err(error) if robot_mode == RobotMode::Slow && is_charging_busy_error(&error) => {
+                eprintln!(
+                    "possession motor gate closed: brainstem reports charging_busy; Create charging indicator is wired to Pico GP17 physical pin 22"
+                );
+                return Err(error);
+            }
             Err(error) if robot_mode == RobotMode::ReadOnly => {
                 if is_transient_robot_timeout(&error) {
                     eprintln!("read-only tick timed out; continuing");
@@ -7232,6 +7238,14 @@ async fn inspect_ledger(args: InspectLedgerArgs) -> Result<()> {
 
 fn is_transient_readonly_timeout(error: &AnyhowError) -> bool {
     is_transient_robot_timeout(error)
+}
+
+fn is_charging_busy_error(error: &AnyhowError) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<CockpitError>()
+            .is_some_and(|cockpit| matches!(cockpit, CockpitError::Rejected { reason, .. } if reason == "charging_busy"))
+    })
 }
 
 fn is_reconnectable_cockpit_error(error: &AnyhowError) -> bool {

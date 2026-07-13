@@ -44,6 +44,10 @@ pub trait BrainstemHardware {
         Ok(None)
     }
 
+    fn charging_indicator_active(&mut self) -> Option<bool> {
+        None
+    }
+
     fn restart_imu(&mut self) -> Result<(), ImuHealth> {
         Err(ImuHealth::Absent)
     }
