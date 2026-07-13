@@ -363,6 +363,45 @@ compose-build:
 servers:
     docker compose up -d neo4j qdrant
 
+# Ensure shared graph and vector memory services are reachable.
+_ensure-memory-servers:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    neo4j_url="${PETE_NEO4J_HTTP_URL:-http://127.0.0.1:${PETE_NEO4J_HTTP_PORT:-7474}}"
+    qdrant_url="${PETE_QDRANT_URL:-http://127.0.0.1:${PETE_QDRANT_HTTP_PORT:-6333}}"
+    neo4j_url="${neo4j_url%/}"
+    qdrant_url="${qdrant_url%/}"
+
+    neo4j_ready() {
+        curl -fsS --max-time 2 "$neo4j_url/" >/dev/null 2>&1
+    }
+
+    qdrant_ready() {
+        curl -fsS --max-time 2 "$qdrant_url/readyz" >/dev/null 2>&1 \
+            || curl -fsS --max-time 2 "$qdrant_url/collections" >/dev/null 2>&1
+    }
+
+    if neo4j_ready && qdrant_ready; then
+        exit 0
+    fi
+
+    echo "Graph/vector memory services are not reachable; starting local Neo4j and Qdrant with just servers."
+    just servers
+
+    deadline=$((SECONDS + ${PETE_MEMORY_SERVER_WAIT_SECS:-90}))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if neo4j_ready && qdrant_ready; then
+            echo "Graph/vector memory services are ready."
+            exit 0
+        fi
+        sleep 2
+    done
+
+    echo "Timed out waiting for Neo4j at $neo4j_url and Qdrant at $qdrant_url." >&2
+    echo "Check 'docker compose ps neo4j qdrant' and 'just server-logs neo4j' / 'just server-logs qdrant'." >&2
+    exit 1
+
 # Start backing services plus the pete-live container.
 live-server:
     docker compose --profile pete up -d neo4j qdrant pete-live
@@ -452,6 +491,7 @@ _robot-cockpit-backend:
 robot *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    just --quiet _ensure-memory-servers
     CAMERA_ARGS=()
     MIC_ARGS=()
     IMU_ARGS=()
