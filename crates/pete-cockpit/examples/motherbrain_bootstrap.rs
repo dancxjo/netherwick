@@ -18,7 +18,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--possess-smoke requires --wheels-off-floor".into());
     }
     let mut bootstrap = MotherbrainBootstrap::from_host();
-    bootstrap.expected_brainstem_device_id = std::env::var("PETE_BRAINSTEM_DEVICE_ID").ok();
+    bootstrap.expected_brainstem_device_id = std::env::var("PETE_BRAINSTEM_DEVICE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let mut ready = bootstrap.connect_usb()?;
     eprintln!(
         "brainstem identity: {}\nbrainstem boot: {}\nprotocol: {}.{}\nsession: {}",

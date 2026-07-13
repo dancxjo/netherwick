@@ -23,20 +23,31 @@ firmware deliberately requires one wired identity establishment after a
 brainstem cold boot because its AP is open and the current identity continuity
 mechanism is not cryptographic authentication. When the pinned USB brainstem is
 connected, `just possess` performs that wired identity bootstrap automatically.
+If `.env` points at a stale `/dev/serial/by-id` symlink and exactly one Pete
+brainstem is connected, `just possess` reports the detected replacement. Accept
+it only while the intended brainstem is wired over USB:
+
+```sh
+PETE_ACCEPT_BRAINSTEM_REPLACEMENT=1 just possess
+```
 
 ## Bring-up
 
 1. Build service-mode firmware: `just brainstem-pico-w-uf2`.
-2. Flash it with `just flash`. The recipe performs an HTTP handshake, acquires
+2. Install the BOOTSEL automount once on the motherbrain: `just setup-pico-bootsel`.
+   When a Pico/Pico W appears as the `RPI-RP2` BOOTSEL volume, udev starts a
+   systemd helper that mounts it at `/media/$USER/RPI-RP2` with write
+   permissions for the operator user.
+3. Flash it with `just flash`. The recipe performs an HTTP handshake, acquires
    a five-second `bootsel` service lease, requests BOOTSEL, waits for `RPI-RP2`,
    and copies the UF2. If a writable `RPI-RP2` volume is already mounted after
    manual BOOTSEL, it skips the network BOOTSEL request. It never silently uses
    the legacy endpoint.
-3. Connect Pico USB to the motherbrain and run `ls -l /dev/serial/by-id`.
-4. Run `cargo run -p pete-cockpit --example motherbrain_bootstrap`.
-5. Configure `PETE_BRAINSTEM_WIFI_IPV4`, `PETE_DHCP_CLIENT_ID_HEX`, and optionally
+4. Connect Pico USB to the motherbrain and run `ls -l /dev/serial/by-id`.
+5. Run `cargo run -p pete-cockpit --example motherbrain_bootstrap`.
+6. Configure `PETE_BRAINSTEM_WIFI_IPV4`, `PETE_DHCP_CLIENT_ID_HEX`, and optionally
    `PETE_BRAINSTEM_INTERFACE` to exercise registration and DNS verification.
-6. Lift the wheels, then run the same command with
+7. Lift the wheels, then run the same command with
    `-- --possess-smoke --wheels-off-floor` for the 50 mm/s, 125 ms TTL motion.
 
 The non-motion authorization check is safe to run with the robot on the floor:

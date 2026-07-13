@@ -32,8 +32,8 @@ pico_w_mount_timeout_secs := env_var_or_default("PICO_W_MOUNT_TIMEOUT_SECS", "30
 default *args:
     just robot {{args}}
 
-# Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, and local models.
-setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-ort setup-tts setup-whisper
+# Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, Pico BOOTSEL automount, and local models.
+setup: setup-system setup-docker setup-user setup-pico-bootsel setup-rust setup-kinect setup-ort setup-tts setup-whisper
     @echo "pete Linux setup complete"
     @echo "next: cargo check && just sim"
 
@@ -100,6 +100,23 @@ setup-user:
         fi
     done
     echo "User setup complete. Please reboot or log out and back in for group changes to take effect."
+
+# Install udev/systemd integration that mounts Pico/Pico W BOOTSEL at /media/$USER/RPI-RP2.
+setup-pico-bootsel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    user="${SUDO_USER:-$(whoami)}"
+    group="$(id -gn "$user")"
+    sudo install -d -m 0755 /usr/local/lib/netherwick
+    sudo install -m 0755 scripts/pico-bootsel-mount.sh /usr/local/lib/netherwick/pico-bootsel-mount
+    sudo install -m 0644 configs/systemd/netherwick-pico-bootsel-mount@.service /etc/systemd/system/netherwick-pico-bootsel-mount@.service
+    sudo install -m 0644 configs/udev/99-netherwick-pico-bootsel.rules /etc/udev/rules.d/99-netherwick-pico-bootsel.rules
+    printf 'PICO_BOOTSEL_USER=%s\nPICO_BOOTSEL_GROUP=%s\nPICO_BOOTSEL_MOUNT_BASE=/media\n' "$user" "$group" \
+        | sudo tee /etc/default/netherwick-pico-bootsel >/dev/null
+    sudo systemctl daemon-reload
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=block --property-match=ID_FS_LABEL=RPI-RP2 || true
+    echo "Pico BOOTSEL automount installed for $user:$group at /media/$user/RPI-RP2"
 
 # Install Rust with rustup plus embedded firmware build tools.
 setup-rust:
@@ -283,9 +300,18 @@ flash: brainstem-pico-w-uf2
         fi
     }
 
+    find_rpi_rp2_block_any() {
+        if command -v lsblk >/dev/null 2>&1; then
+            lsblk -rnpo LABEL,PATH,FSTYPE | awk '$1 == "RPI-RP2" && $3 == "vfat" { print $2; exit }'
+        fi
+    }
+
     mount_rpi_rp2() {
-        local block mount_dir
+        local block existing_mount mount_dir
         block="$(find_rpi_rp2_block)"
+        if [ -z "$block" ]; then
+            block="$(find_rpi_rp2_block_any)"
+        fi
         if [ -z "$block" ]; then
             return 1
         fi
@@ -298,6 +324,13 @@ flash: brainstem-pico-w-uf2
 
         mount_dir="/media/$USER/RPI-RP2"
         sudo mkdir -p "$mount_dir"
+        existing_mount="$(lsblk -rnpo PATH,MOUNTPOINT "$block" | awk '$1 == "'"$block"'" { print $2; exit }')"
+        if [ -n "$existing_mount" ] && [ "$existing_mount" != "$mount_dir" ]; then
+            sudo umount "$existing_mount"
+        fi
+        if mountpoint -q "$mount_dir" && [ ! -w "$mount_dir" ]; then
+            sudo umount "$mount_dir"
+        fi
         if ! mountpoint -q "$mount_dir"; then
             sudo mount -t vfat -o "uid=$(id -u),gid=$(id -g),umask=022" "$block" "$mount_dir"
         fi
@@ -572,6 +605,72 @@ possess *args:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${PETE_BRAINSTEM_DEVICE_ID:?set PETE_BRAINSTEM_DEVICE_ID in .env}"
+
+    set_env_var() {
+        local key="$1" value="$2" escaped
+        escaped="$(printf '%s' "$value" | sed 's/[\&/]/\\&/g')"
+        if [ -f .env ] && grep -q "^${key}=" .env; then
+            sed -i "s/^${key}=.*/${key}=${escaped}/" .env
+        else
+            printf '\n%s=%s\n' "$key" "$value" >> .env
+        fi
+    }
+
+    detect_single_brainstem_port() {
+        shopt -s nullglob
+        local candidates=(/dev/serial/by-id/*Pete_Brainstem*)
+        shopt -u nullglob
+        if [ "${#candidates[@]}" -eq 1 ]; then
+            printf '%s\n' "${candidates[0]}"
+        fi
+    }
+
+    refresh_brainstem_pin_from_usb() {
+        local detected_port bootstrap_log live_device_id live_boot_id
+        detected_port="$(detect_single_brainstem_port || true)"
+        if [ -z "$detected_port" ]; then
+            return 1
+        fi
+        bootstrap_log="$(mktemp)"
+        if ! PETE_BRAINSTEM_DEVICE_ID= cargo run -q -p pete-cockpit --example motherbrain_bootstrap -- --identity-only >"$bootstrap_log" 2>&1; then
+            cat "$bootstrap_log" >&2
+            rm -f "$bootstrap_log"
+            return 1
+        fi
+        live_device_id="$(sed -n 's/^brainstem identity: //p' "$bootstrap_log" | tail -n 1)"
+        live_boot_id="$(sed -n 's/^brainstem boot: //p' "$bootstrap_log" | tail -n 1)"
+        cat "$bootstrap_log"
+        rm -f "$bootstrap_log"
+        if [ -z "$live_device_id" ] || [ -z "$live_boot_id" ]; then
+            echo "USB bootstrap did not report a usable brainstem identity." >&2
+            return 1
+        fi
+        if [ "$live_device_id" != "$PETE_BRAINSTEM_DEVICE_ID" ] \
+            && [ "${PETE_ACCEPT_BRAINSTEM_REPLACEMENT:-0}" != "1" ]; then
+            echo "Detected brainstem $live_device_id at $detected_port, but .env pins $PETE_BRAINSTEM_DEVICE_ID." >&2
+            echo "To accept this replacement over the wired USB link, rerun:" >&2
+            echo "  PETE_ACCEPT_BRAINSTEM_REPLACEMENT=1 just possess" >&2
+            return 1
+        fi
+        set_env_var PETE_BRAINSTEM_DEVICE_ID "$live_device_id"
+        set_env_var PETE_BRAINSTEM_BOOT_ID "$live_boot_id"
+        set_env_var PETE_COCKPIT_PORT "$detected_port"
+        export PETE_BRAINSTEM_DEVICE_ID="$live_device_id"
+        export PETE_BRAINSTEM_BOOT_ID="$live_boot_id"
+        export PETE_COCKPIT_PORT="$detected_port"
+        BOOT_ID="$live_boot_id"
+        echo "Updated .env brainstem pin from wired USB: device=$live_device_id boot=$live_boot_id port=$detected_port"
+    }
+
+    if [ -n "${PETE_COCKPIT_PORT:-}" ] && [ "${PETE_COCKPIT_PORT:-}" != auto ] && [ ! -e "$PETE_COCKPIT_PORT" ]; then
+        DETECTED_PORT="$(detect_single_brainstem_port || true)"
+        if [ -n "$DETECTED_PORT" ]; then
+            echo "Configured PETE_COCKPIT_PORT is missing: $PETE_COCKPIT_PORT"
+            echo "Detected one wired brainstem candidate: $DETECTED_PORT"
+            refresh_brainstem_pin_from_usb
+        fi
+    fi
+
     BACKEND_WAS_EXPLICIT=0
     if [ -n "${PETE_COCKPIT_BACKEND:-}" ]; then BACKEND_WAS_EXPLICIT=1; fi
     COCKPIT_BACKEND="$(just --quiet _robot-cockpit-backend)"
@@ -634,12 +733,7 @@ possess *args:
     LIVE_BOOT_ID="$(sed -n 's/^Error: brainstem boot identity mismatch: expected .* received \([^[:space:]]*\)$/\1/p' "$LOG" | tail -n 1)"
     if [ -z "$LIVE_BOOT_ID" ]; then exit "$STATUS"; fi
 
-    if [ -f .env ] && grep -q '^PETE_BRAINSTEM_BOOT_ID=' .env; then
-        ESCAPED_BOOT_ID="$(printf '%s' "$LIVE_BOOT_ID" | sed 's/[\&/]/\\&/g')"
-        sed -i "s/^PETE_BRAINSTEM_BOOT_ID=.*/PETE_BRAINSTEM_BOOT_ID=$ESCAPED_BOOT_ID/" .env
-    else
-        printf '\nPETE_BRAINSTEM_BOOT_ID=%s\n' "$LIVE_BOOT_ID" >> .env
-    fi
+    set_env_var PETE_BRAINSTEM_BOOT_ID "$LIVE_BOOT_ID"
     BOOT_ID="$LIVE_BOOT_ID"
     export PETE_BRAINSTEM_BOOT_ID="$BOOT_ID"
     echo "Accepted current boot identity for pinned device $PETE_BRAINSTEM_DEVICE_ID; updated .env and retrying."

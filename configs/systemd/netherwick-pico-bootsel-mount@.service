@@ -1,0 +1,12 @@
+[Unit]
+Description=Mount Raspberry Pi Pico BOOTSEL volume %I for Netherwick flashing
+Documentation=man:mount(8)
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/netherwick-pico-bootsel
+ExecStart=/usr/local/lib/netherwick/pico-bootsel-mount %I
+ExecStop=/usr/local/lib/netherwick/pico-bootsel-mount --umount %I

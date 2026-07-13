@@ -1,0 +1,3 @@
+# Mount Raspberry Pi Pico/Pico W BOOTSEL storage where the flash recipe can use it.
+# The RP2040 boot ROM exposes a VFAT volume labelled RPI-RP2.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="RPI-RP2", ENV{ID_FS_TYPE}=="vfat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="netherwick-pico-bootsel-mount@%k.service"

@@ -300,13 +300,21 @@ crates/pete-brainstem/target/thumbv6m-none-eabi/release/pete-brainstem-pico-w.uf
 
 To flash, hold the Pico BOOTSEL button while plugging it into USB, then copy the UF2 file to the mounted `RPI-RP2` drive.
 
+On Linux motherbrain hosts, install the repo's BOOTSEL automount once:
+
+```bash
+just setup-pico-bootsel
+```
+
+After that, a Pico/Pico W in BOOTSEL mounts at `/media/$USER/RPI-RP2` with write permission for the operator user.
+
 For an already-running Pico W on its `pete-xxxx` AP, the repo root also has a one-command Wi-Fi BOOTSEL flash path:
 
 ```bash
 just flash
 ```
 
-It builds `brainstem-pico-w-uf2`, posts the BOOTSEL command to `http://192.168.4.1/command`, waits for the `RPI-RP2` drive, then copies the UF2. Override `PICO_W_BOOTSEL_URL`, `PICO_W_MOUNT`, or `PICO_W_MOUNT_TIMEOUT_SECS` when needed.
+It builds `brainstem-pico-w-uf2`, posts the BOOTSEL command to `http://192.168.4.1/command`, waits for the `RPI-RP2` drive, mounts it if needed, then copies the UF2. Override `PICO_W_BOOTSEL_URL`, `PICO_W_MOUNT`, or `PICO_W_MOUNT_TIMEOUT_SECS` when needed.
 
 ## Pico W Operator Interface
 
