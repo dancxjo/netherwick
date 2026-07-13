@@ -4664,7 +4664,18 @@ where
         }
 
         let pre_body_t_ms = wall_time_ms();
-        let brainstem_events = self.cockpit.poll_events()?;
+        let brainstem_events = if self.tick_count == 0 {
+            let events = self.cockpit.poll_events_allowing_history_gap()?;
+            if events.dropped_before_seq > 0 {
+                eprintln!(
+                    "slow possession recovered from pre-loop event history gap before sequence {}",
+                    events.dropped_before_seq
+                );
+            }
+            events
+        } else {
+            self.cockpit.poll_events()?
+        };
         if let Some(input) = self.runtime.reign_sense(pre_body_t_ms)?.latest {
             if reign_input_outputs_real_slow_directly(&input) {
                 let body_before = pete_body::BodySense {

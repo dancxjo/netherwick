@@ -2436,6 +2436,20 @@ impl<C: Cockpit> SafeCockpit<C> {
         Ok(status)
     }
 
+    pub fn resync_event_cursor_from_status(&mut self) -> Result<StatusSummary> {
+        let status = self.client.get_status()?.summary();
+        if let Some(event_next_seq) = status.event_next_seq {
+            self.cursor = EventCursor::from_event_next_seq(event_next_seq);
+        }
+        Ok(status)
+    }
+
+    pub fn poll_events_allowing_history_gap(&mut self) -> Result<EventBatch> {
+        let batch = self.client.get_events_since(self.cursor.next_seq)?;
+        self.cursor = EventCursor::from_event_next_seq(batch.next_seq);
+        Ok(batch)
+    }
+
     /// Consume the next cursor-bounded batch from the brainstem interface.
     /// A reported history gap is an error; callers never silently skip body
     /// events and pretend their view is continuous.

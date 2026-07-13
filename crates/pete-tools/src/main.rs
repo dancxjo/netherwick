@@ -5000,9 +5000,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             None
         }
     };
-    if let Some(mouth_ref) = &mouth {
-        if !speak_robot_mouth_text_before_status(mouth_ref, "Hello. My name is Pete.") {
-            mouth = None;
+    if robot_mode != RobotMode::Slow {
+        if let Some(mouth_ref) = &mouth {
+            if !speak_robot_mouth_text_before_status(mouth_ref, "Hello. My name is Pete.") {
+                mouth = None;
+            }
         }
     }
 
@@ -5056,6 +5058,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             runner.cockpit.client_mut().as_mut(),
             &initialization,
         );
+    } else {
+        let status = runner.cockpit.resync_event_cursor_from_status()?;
+        if let Some(event_next_seq) = status.event_next_seq {
+            println!(
+                "possession event cursor resynced before control loop: next_seq={event_next_seq}"
+            );
+        }
     }
 
     let max_steps = args.steps.or_else(|| {
