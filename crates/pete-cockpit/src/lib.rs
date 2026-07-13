@@ -1127,8 +1127,6 @@ pub enum SafeStopReason {
     SafetyTripped,
     HeartbeatExpired,
     EStopLatched,
-    CommandRejected,
-    CommandInterrupted,
 }
 
 impl SafeStopReason {
@@ -1137,8 +1135,6 @@ impl SafeStopReason {
             CockpitEventKind::SafetyTripped => Some(Self::SafetyTripped),
             CockpitEventKind::HeartbeatExpired => Some(Self::HeartbeatExpired),
             CockpitEventKind::EStopLatched => Some(Self::EStopLatched),
-            CockpitEventKind::CommandRejected => Some(Self::CommandRejected),
-            CockpitEventKind::CommandInterrupted => Some(Self::CommandInterrupted),
             _ => None,
         }
     }
@@ -7201,6 +7197,19 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == CockpitEventKind::HeartbeatExpired));
+    }
+
+    #[test]
+    fn simulator_command_rejection_alone_is_not_stop_reason() {
+        let mut sim = SimCockpit::new().with_unscoped_bench_mode();
+        sim.push_event(CockpitEventKind::CommandRejected, 7, 0, 0);
+        let batch = sim.get_events_since(0).unwrap();
+
+        assert!(!batch.has_stop_reason());
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::CommandRejected));
     }
 
     #[test]
