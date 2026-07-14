@@ -3,7 +3,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Error as AnyhowError, Result};
 use chrono::Utc;
@@ -14,9 +14,9 @@ use pete_autonomic::SimpleSafety;
 use pete_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use pete_body::{BodySense, BodySong, BodyTone};
 use pete_cockpit::{
-    establish_diagnostic_session, establish_session, Cockpit, CockpitError, HandshakeHello,
-    HttpCockpit, MotherbrainPossession, SafeCockpit, SimCockpit as LocalSimCockpit, SongTone,
-    UartCockpit,
+    establish_diagnostic_session, establish_session, Cockpit, CockpitError, CockpitEventKind,
+    HandshakeHello, HttpCockpit, MotherbrainPossession, SafeCockpit, SimCockpit as LocalSimCockpit,
+    SongTone, UartCockpit,
 };
 use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
 use pete_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter};
@@ -39,9 +39,9 @@ use pete_now::{
     EarSense, ExtensionSense, KinectSense, Now, RangeExtrinsics, RangeSense, SurpriseSense,
 };
 use pete_runtime::{
-    ActionSelectionDecision, ActionSelectorMode, InlineLearningBehaviors, InlineLearningConfig,
-    InlineLearningMode, MinimalRuntime, NudgePolicy, RealRobotRunner, ReignQueue, RobotMode,
-    RuntimeLoop, RuntimeModelStack, RuntimeTick, SimRunner,
+    body_sense_from_cockpit_status, ActionSelectionDecision, ActionSelectorMode,
+    InlineLearningBehaviors, InlineLearningConfig, InlineLearningMode, MinimalRuntime, NudgePolicy,
+    RealRobotRunner, ReignQueue, RobotMode, RuntimeLoop, RuntimeModelStack, RuntimeTick, SimRunner,
 };
 use pete_sensors::{
     AsrToolConfig, CameraSenseProvider, DepthRangeProjectionConfig, EyeFrame, EyeFrameFormat,
@@ -540,6 +540,12 @@ struct RobotArgs {
     /// Permit executive-selected actions to drive physical wheels in possession-slow mode.
     #[arg(long)]
     autonomous_motion: bool,
+    /// Run the guarded physical bump-to-recovery possession smoke test and exit.
+    #[arg(long)]
+    recovery_smoke: bool,
+    /// Confirm that physical drive wheels are clear of the floor for a motion smoke test.
+    #[arg(long, requires = "recovery_smoke")]
+    wheels_off_floor: bool,
     #[arg(long, default_value_t = 250)]
     reconnect_initial_backoff_ms: u64,
     #[arg(long, default_value_t = 5_000)]
@@ -4728,6 +4734,18 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         .get_capabilities()
         .context("failed to read the brainstem capability contract")?;
     establish_create_sensor_stream(cockpit.as_mut())?;
+    if args.recovery_smoke {
+        if robot_mode != RobotMode::Slow {
+            anyhow::bail!("--recovery-smoke requires --mode possession-slow");
+        }
+        if is_mock_body || args.cockpit == CockpitBackendArg::Sim {
+            anyhow::bail!("--recovery-smoke requires a physical brainstem");
+        }
+        if !args.wheels_off_floor {
+            anyhow::bail!("--recovery-smoke requires --wheels-off-floor");
+        }
+        return run_physical_possession_recovery_smoke(cockpit).await;
+    }
 
     let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
     let live_state = args.dashboard.map(|_| {
@@ -5767,6 +5785,169 @@ fn establish_create_sensor_stream(cockpit: &mut dyn Cockpit) -> Result<()> {
 // Ownership may span comparatively expensive perception/runtime ticks. Wheel
 // motion remains independently bounded by the 300 ms command TTL and 750 ms
 // heartbeat stop, so use the firmware's maximum lease and renew it proactively.
+async fn run_physical_possession_recovery_smoke(cockpit: Box<dyn Cockpit + Send>) -> Result<()> {
+    let mut cockpit = SafeCockpit::new(cockpit);
+    let result = run_physical_possession_recovery_smoke_inner(&mut cockpit).await;
+    let stop_result = cockpit
+        .client_mut()
+        .stop()
+        .context("recovery smoke final STOP was not acknowledged");
+    let exorcize_result = cockpit
+        .client_mut()
+        .exorcize()
+        .context("recovery smoke could not surrender possession");
+    result?;
+    stop_result?;
+    exorcize_result?;
+    println!("physical possession recovery smoke complete: stopped and exorcized");
+    Ok(())
+}
+
+async fn run_physical_possession_recovery_smoke_inner(
+    cockpit: &mut SafeCockpit<Box<dyn Cockpit + Send>>,
+) -> Result<()> {
+    cockpit.client_mut().stop()?;
+    cockpit.resync_event_cursor_from_status()?;
+    println!(
+        "recovery smoke armed: wheels must remain off the floor; press and hold either bumper until contact is acknowledged"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_motion_at = Instant::now();
+    let mut saw_safety_trip = false;
+    let mut saw_motion_stop = false;
+    let contacted_body = loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "recovery smoke timed out waiting for live bump telemetry and safety-stop events"
+            );
+        }
+        let status = cockpit.refresh_status()?;
+        let body =
+            body_sense_from_cockpit_status(status, Utc::now().timestamp_millis().max(0) as u64);
+        let events = cockpit.poll_events()?;
+        saw_safety_trip |= events
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::SafetyTripped);
+        saw_motion_stop |= events
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::MotionStopped);
+        if body.flags.bump_left || body.flags.bump_right {
+            if saw_safety_trip && saw_motion_stop {
+                break body;
+            }
+        } else if Instant::now() >= next_motion_at {
+            // Keep a bounded motion active so the observed bump proves that
+            // firmware interruption, not mere stationary telemetry, occurred.
+            cockpit.client_mut().cmd_vel(25, 0, 300)?;
+            next_motion_at = Instant::now() + Duration::from_millis(150);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    let expected_turn = if contacted_body.flags.bump_left {
+        TurnDir::Right
+    } else {
+        TurnDir::Left
+    };
+    let mut conductor = SimpleConductor::default();
+    let first = conductor.choose(recovery_smoke_input(contacted_body))?;
+    if !matches!(
+        first,
+        ActionPrimitive::Go {
+            intensity,
+            duration_ms: 300
+        } if intensity < 0.0
+    ) {
+        anyhow::bail!("contact did not enter conductor reverse recovery: {first:?}");
+    }
+    println!("contact observed; brainstem stopped motion; release the bumper");
+
+    let clear_deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_safety_clear = false;
+    loop {
+        if Instant::now() >= clear_deadline {
+            anyhow::bail!("recovery smoke timed out waiting for bumper and safety latch to clear");
+        }
+        let status = cockpit.refresh_status()?;
+        let body =
+            body_sense_from_cockpit_status(status, Utc::now().timestamp_millis().max(0) as u64);
+        let events = cockpit.poll_events()?;
+        saw_safety_clear |= events
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::SafetyCleared);
+        if !body.flags.bump_left && !body.flags.bump_right && saw_safety_clear {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let mut saw_reverse = false;
+    let mut saw_turn = false;
+    let mut saw_probe = false;
+    let mut saw_inspect = false;
+    for _ in 0..20 {
+        let status = cockpit.refresh_status()?;
+        let body =
+            body_sense_from_cockpit_status(status, Utc::now().timestamp_millis().max(0) as u64);
+        let action = conductor.choose(recovery_smoke_input(body))?;
+        match &action {
+            ActionPrimitive::Go { intensity, .. } if *intensity < 0.0 => saw_reverse = true,
+            ActionPrimitive::Turn { direction, .. } => {
+                if *direction != expected_turn {
+                    anyhow::bail!(
+                        "conductor turned {direction:?} after contact; expected {expected_turn:?}"
+                    );
+                }
+                saw_turn = true;
+            }
+            ActionPrimitive::Go { intensity, .. } if *intensity > 0.0 => saw_probe = true,
+            ActionPrimitive::Inspect { .. } => {
+                saw_inspect = true;
+                cockpit.client_mut().stop()?;
+                break;
+            }
+            other => anyhow::bail!("unexpected recovery action during physical smoke: {other:?}"),
+        }
+        let motor = pete_actions::action_to_motor_command(Some(&action));
+        cockpit.pulse_motion(
+            pete_cockpit::meters_per_second_to_mm_s(motor.forward),
+            pete_cockpit::radians_per_second_to_mrad_s(motor.turn),
+        )?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !(saw_reverse && saw_turn && saw_probe && saw_inspect) {
+        anyhow::bail!(
+            "incomplete physical recovery sequence: reverse={saw_reverse} turn={saw_turn} probe={saw_probe} inspect={saw_inspect}"
+        );
+    }
+    println!(
+        "verified live sequence: contact -> stop -> clear -> reverse -> turn -> probe -> inspect"
+    );
+    Ok(())
+}
+
+fn recovery_smoke_input(body: BodySense) -> ConductorInput {
+    ConductorInput {
+        latent: Default::default(),
+        drives: Default::default(),
+        memory: Default::default(),
+        predictions: Default::default(),
+        surprise: Default::default(),
+        llm: Default::default(),
+        safety: Default::default(),
+        reign: Default::default(),
+        range: Default::default(),
+        body,
+        charger_near_score: 0.0,
+        charger_visible_score: 0.0,
+        proposals: Vec::new(),
+    }
+}
+
 const POSSESSION_CONTROL_LEASE_TTL_MS: u32 = 60_000;
 
 fn open_robot_cockpit_or_fallback(

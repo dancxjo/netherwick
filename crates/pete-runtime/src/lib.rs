@@ -5099,7 +5099,7 @@ fn apply_safe_cockpit_motion<C: Cockpit>(
     apply_safe_cockpit_motor(cockpit, motion.to_motor_command())
 }
 
-fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
+pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
     BodySense {
         battery_level: status
             .battery
@@ -6582,10 +6582,7 @@ fn hard_safety_action(now: &Now) -> Option<ActionPrimitive> {
         || now.body.flags.cliff_front_right
         || now.body.flags.cliff_right
     {
-        return Some(ActionPrimitive::Go {
-            intensity: -0.12,
-            duration_ms: 750,
-        });
+        return Some(ActionPrimitive::Stop);
     }
     if now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall {
         let direction = if now.body.flags.bump_left && !now.body.flags.bump_right {
@@ -7594,7 +7591,8 @@ mod tests {
     use pete_autonomic::SimpleSafety;
     use pete_body::BodySense;
     use pete_cockpit::{
-        CockpitCapabilities, CockpitRequest, CockpitResponse, CockpitStatus, EventBatch,
+        establish_session, CockpitCapabilities, CockpitRequest, CockpitResponse, CockpitStatus,
+        EventBatch, HandshakeHello, MotherbrainPossession, SimCockpit,
     };
     use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
     use pete_experience::{
@@ -8345,6 +8343,127 @@ mod tests {
                 inline_learning: InlineLearningTickStatus::default(),
             })
         }
+    }
+
+    #[derive(Clone)]
+    struct SharedSimCockpit(Arc<Mutex<SimCockpit>>);
+
+    impl Cockpit for SharedSimCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            self.0.lock().unwrap().execute(request)
+        }
+
+        fn handshake(
+            &mut self,
+            hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            self.0.lock().unwrap().handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.0.lock().unwrap().execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.0
+                .lock()
+                .unwrap()
+                .execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ServiceLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.0
+                .lock()
+                .unwrap()
+                .execute_with_service_lease(session, lease, request)
+        }
+    }
+
+    #[test]
+    fn production_possession_composes_bump_stop_and_conductor_recovery() {
+        let sim = Arc::new(Mutex::new(SimCockpit::new()));
+        let session = establish_session(
+            SharedSimCockpit(Arc::clone(&sim)),
+            HandshakeHello::motherbrain("pete-runtime-recovery-test"),
+            None,
+        )
+        .unwrap();
+        let possession = MotherbrainPossession::acquire(session, 5_000).unwrap();
+        let mut cockpit = SafeCockpit::new(possession);
+
+        cockpit.pulse_motion(40, 0).unwrap();
+        sim.lock().unwrap().set_bump(true, false);
+
+        let stop_events = cockpit.poll_events().unwrap();
+        assert!(stop_events.has_stop_reason());
+        let status = cockpit.refresh_status().unwrap();
+        let body = body_sense_from_cockpit_status(status, 1_000);
+        assert!(body.flags.bump_left);
+
+        let mut conductor = SimpleConductor::default();
+        let mut input = test_conductor_input(ActionPrimitive::Stop);
+        input.body = body;
+        let first_recovery = conductor.choose(input).unwrap();
+        assert!(matches!(
+            first_recovery,
+            ActionPrimitive::Go {
+                intensity,
+                duration_ms: 300
+            } if intensity < 0.0
+        ));
+
+        sim.lock().unwrap().set_bump(false, false);
+        let clear_events = cockpit.poll_events().unwrap();
+        assert!(clear_events
+            .events
+            .iter()
+            .any(|event| event.kind == pete_cockpit::CockpitEventKind::SafetyCleared));
+        let cleared_body = body_sense_from_cockpit_status(cockpit.refresh_status().unwrap(), 1_100);
+        assert!(!cleared_body.flags.bump_left);
+
+        let mut cleared_input = test_conductor_input(ActionPrimitive::Stop);
+        cleared_input.body = cleared_body.clone();
+        let reverse = conductor.choose(cleared_input.clone()).unwrap();
+        let reverse_motor = action_to_motor_command(Some(&reverse));
+        assert!(reverse_motor.forward < 0.0);
+        apply_slow_possession_motor(&mut cockpit, reverse_motor).unwrap();
+
+        let turn = conductor.choose(cleared_input).unwrap();
+        assert!(matches!(
+            turn,
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                ..
+            }
+        ));
+        let turn_motor = action_to_motor_command(Some(&turn));
+        assert!(turn_motor.turn.abs() > 0.0);
+        apply_slow_possession_motor(&mut cockpit, turn_motor).unwrap();
+
+        assert!(cockpit.client_mut().snapshot().possessed);
+        let events = sim.lock().unwrap().get_events_since(0).unwrap();
+        let stop_index = events
+            .events
+            .iter()
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::MotionStopped)
+            .unwrap();
+        assert!(events.events[stop_index + 1..]
+            .iter()
+            .any(|event| event.kind == pete_cockpit::CockpitEventKind::MotionRequested));
     }
 
     struct CountingCockpit {
@@ -10133,7 +10252,7 @@ mod tests {
             2_000,
         ));
         let mut body = BodySense::default();
-        body.flags.cliff_left = true;
+        body.flags.cliff_front_left = true;
         body.last_update_ms = 100;
         let now = Now::blank(100, body);
 
@@ -10160,6 +10279,12 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("Safety vetoed")));
+        let motor_gate = tick.frame.now.extensions.get("motor_gate").unwrap();
+        assert_eq!(
+            serde_json::from_value::<MotorCommand>(motor_gate["final_motor"].clone()).unwrap(),
+            MotorCommand::stop()
+        );
+        assert_eq!(motor_gate["safety_reason"], "cliff");
     }
 
     #[tokio::test]
@@ -11832,6 +11957,32 @@ mod tests {
                 duration_ms: 1_200
             })
         );
+    }
+
+    #[test]
+    fn every_cliff_sensor_selects_stop_before_hardware_gate() {
+        for sensor in ["left", "front_left", "front_right", "right"] {
+            let mut body = test_body(1.0, 1.0, 1.0, 100);
+            match sensor {
+                "left" => body.flags.cliff_left = true,
+                "front_left" => body.flags.cliff_front_left = true,
+                "front_right" => body.flags.cliff_front_right = true,
+                "right" => body.flags.cliff_right = true,
+                _ => unreachable!(),
+            }
+            let now = Now::blank(100, body.clone());
+
+            assert_eq!(
+                hard_safety_action(&now),
+                Some(ActionPrimitive::Stop),
+                "{sensor}"
+            );
+            assert_eq!(
+                real_slow_body_block_reason(&body).as_deref(),
+                Some("cliff sensor active"),
+                "{sensor}"
+            );
+        }
     }
 
     fn test_ledger_root(name: &str) -> PathBuf {

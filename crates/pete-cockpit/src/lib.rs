@@ -3163,9 +3163,21 @@ impl SimCockpit {
         if self.bump_left == left && self.bump_right == right {
             return;
         }
+        let was_active = self.bump_left || self.bump_right;
+        let active = left || right;
         self.bump_left = left;
         self.bump_right = right;
-        self.push_event(CockpitEventKind::BumpChanged, (left || right) as u32, 0, 0);
+        self.push_event(CockpitEventKind::BumpChanged, active as u32, 0, 0);
+        if active && !was_active {
+            // Match the firmware's default bump policy: stop the current
+            // motion, but keep the possession lease usable for a bounded
+            // motherbrain recovery once contact clears.
+            self.interrupt_active_motion();
+            self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
+            self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
+        } else if was_active && !active {
+            self.push_event(CockpitEventKind::SafetyCleared, 1, 0, 0);
+        }
     }
 
     pub fn set_cliff(&mut self, active: bool) {
