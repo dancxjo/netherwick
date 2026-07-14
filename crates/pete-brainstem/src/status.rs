@@ -1931,10 +1931,14 @@ pub fn set_runtime_action(action: RuntimeActionCode) {
 
 pub fn set_create_power_on(on: bool) {
     CREATE_POWER_STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
+    if !on {
+        clear_create_sensor_snapshot();
+    }
 }
 
 pub fn set_create_power_unknown() {
     CREATE_POWER_STATE.store(UNKNOWN, Ordering::Relaxed);
+    clear_create_sensor_snapshot();
 }
 
 pub fn mark_create_charging_indicator(active: Option<bool>) {
@@ -1989,6 +1993,27 @@ pub fn set_oi_mode(mode: CreateOiMode) {
 
 pub fn set_oi_mode_unknown() {
     OI_MODE.store(UNKNOWN, Ordering::Relaxed);
+}
+
+pub fn clear_create_sensor_snapshot() {
+    CREATE_SENSOR_LAST_PACKET_ID.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_COMPLETE_PACKET_COUNT.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_FLAGS.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_DISTANCE_MM.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_ANGLE_MRAD.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_IR_BYTE.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_BUTTONS.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CHARGING_STATE.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_VOLTAGE_MV.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CURRENT_MA.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_TEMPERATURE_C.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CHARGE_MAH.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CAPACITY_MAH.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_LEFT_SIGNAL.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(0, Ordering::Relaxed);
 }
 
 pub fn mark_uart_rx_byte(byte: u8, timestamp_ms: u32) {

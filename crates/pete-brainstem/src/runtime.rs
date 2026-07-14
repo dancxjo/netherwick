@@ -355,9 +355,10 @@ where
     fn maintain_full_mode(&mut self) -> Result<(), BrainstemError> {
         let now_ms = self.now_ms();
         let snapshot = status::snapshot(now_ms);
-        if !time_reached(now_ms, self.next_full_mode_refresh_ms)
-            || low_battery_and_charging(&snapshot)
-        {
+        if !time_reached(now_ms, self.next_full_mode_refresh_ms) {
+            return Ok(());
+        }
+        if low_battery_and_charging(&snapshot) && snapshot.oi_mode == 3 {
             return Ok(());
         }
 
@@ -2462,11 +2463,15 @@ mod tests {
                 ..crate::events::CreateSensorPacket::default()
             },
         );
+        status::set_oi_mode(crate::commands::CreateOiMode::Full);
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
 
         assert!(runtime.maintain_full_mode().is_ok());
 
         assert!(runtime.hardware.writes.is_empty());
+        status::set_oi_mode_unknown();
+        assert!(runtime.maintain_full_mode().is_ok());
+        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 35]);
         status::mark_create_sensor_packet(
             0,
             crate::events::CreateSensorPacket {
