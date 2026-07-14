@@ -1152,6 +1152,9 @@ pub struct StatusSummary {
     pub safety_tripped: Option<bool>,
     pub active_motion: Option<bool>,
     pub event_next_seq: Option<u32>,
+    pub body_packet_count: Option<u32>,
+    pub body_packet_age_ms: Option<u32>,
+    pub body_packet_complete: Option<bool>,
     pub contact: ContactSummary,
     pub battery: BatterySummary,
     pub odometry: OdometrySummary,
@@ -1159,10 +1162,28 @@ pub struct StatusSummary {
 }
 
 impl StatusSummary {
+    pub fn has_fresh_complete_body_packet(&self, max_age_ms: u32) -> bool {
+        self.body_packet_complete == Some(true)
+            && self
+                .body_packet_age_ms
+                .is_some_and(|age_ms| age_ms <= max_age_ms)
+    }
+
     pub fn from_raw(raw: &str) -> Self {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
             return Self::from_json(raw, &value);
         }
+        let packet_count = number_for(raw, "create_body_packets");
+        let packet_age_ms = match (
+            number_for(raw, "uptime_ms"),
+            number_for(raw, "create_last_body_packet_ms"),
+            packet_count,
+        ) {
+            (Some(uptime_ms), Some(packet_ms), Some(count)) if count > 0 => {
+                Some(uptime_ms.wrapping_sub(packet_ms))
+            }
+            _ => None,
+        };
         Self {
             raw: raw.to_owned(),
             runtime_state: value_for(raw, "runtime").map(ToOwned::to_owned),
@@ -1171,6 +1192,9 @@ impl StatusSummary {
             safety_tripped: bool_for(raw, "safety_tripped"),
             active_motion: bool_for(raw, "active_cmd_vel"),
             event_next_seq: number_for(raw, "event_next_seq"),
+            body_packet_count: packet_count,
+            body_packet_age_ms: packet_age_ms,
+            body_packet_complete: Some(packet_count.unwrap_or(0) > 0),
             contact: ContactSummary::from_raw(raw),
             battery: BatterySummary::from_raw(raw),
             odometry: OdometrySummary::from_raw(raw),
@@ -1180,6 +1204,19 @@ impl StatusSummary {
 
     fn from_json(raw: &str, value: &serde_json::Value) -> Self {
         let sensors = value.get("create_sensors");
+        let packet_count =
+            sensors.and_then(|sensors| json_u32_value(sensors, "complete_packet_count"));
+        let packet_age_ms = match (
+            json_u32_value(value, "uptime_ms"),
+            sensors
+                .and_then(|sensors| json_u32_value(sensors, "last_complete_packet_timestamp_ms")),
+            packet_count,
+        ) {
+            (Some(uptime_ms), Some(packet_ms), Some(count)) if count > 0 => {
+                Some(uptime_ms.wrapping_sub(packet_ms))
+            }
+            _ => None,
+        };
         let safety_tripped = sensors.map(|sensors| {
             json_bool_value(sensors, "wheel_drop").unwrap_or(false)
                 || json_bool_value(sensors, "cliff_left").unwrap_or(false)
@@ -1198,6 +1235,9 @@ impl StatusSummary {
             active_motion: json_str_value(value, "current_command")
                 .map(|command| command == "drive"),
             event_next_seq: json_u32_value(value, "event_next_seq"),
+            body_packet_count: packet_count,
+            body_packet_age_ms: packet_age_ms,
+            body_packet_complete: Some(packet_count.unwrap_or(0) > 0),
             contact: ContactSummary::from_json(sensors),
             battery: BatterySummary::from_json(sensors),
             odometry: OdometrySummary::from_json(value.get("odometry")),
@@ -3593,7 +3633,9 @@ impl Cockpit for SimCockpit {
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
-                "OK 0 STATUS sim=true now_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_yaw_rate_mrad_s=0 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={}",
+                "OK 0 STATUS sim=true now_ms={} uptime_ms={} create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_yaw_rate_mrad_s=0 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={}",
+                self.now_ms,
+                self.now_ms,
                 self.now_ms,
                 self.armed,
                 self.estop_latched,
@@ -7241,6 +7283,42 @@ mod tests {
         assert_eq!(events.since_seq, 6);
         assert_eq!(events.next_seq, 9);
         assert!(events.has_stop_reason());
+    }
+
+    #[test]
+    fn status_summary_reports_complete_body_packet_age() {
+        let summary = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 2_000,
+                "current_runtime_state": "idle",
+                "create_sensors": {
+                    "last_packet_id": 0,
+                    "complete_packet_count": 7,
+                    "last_complete_packet_timestamp_ms": 1_650,
+                    "bump_left": false
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        assert_eq!(summary.body_packet_count, Some(7));
+        assert_eq!(summary.body_packet_age_ms, Some(350));
+        assert_eq!(summary.body_packet_complete, Some(true));
+        assert!(summary.has_fresh_complete_body_packet(500));
+        assert!(!summary.has_fresh_complete_body_packet(250));
+    }
+
+    #[test]
+    fn compact_status_requires_a_complete_body_packet() {
+        let summary = CockpitStatus {
+            raw: "OK 1 STATUS uptime_ms=2000 create_rx_packets=7 create_last_packet_ms=1900 create_sensor_packet_id=35 create_body_packets=0 create_last_body_packet_ms=0 bump_left=false".into(),
+        }
+        .summary();
+
+        assert_eq!(summary.body_packet_age_ms, None);
+        assert_eq!(summary.body_packet_complete, Some(false));
+        assert!(!summary.has_fresh_complete_body_packet(500));
     }
 
     #[test]

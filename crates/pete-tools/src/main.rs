@@ -76,6 +76,8 @@ const DEFAULT_MPU6050_IMU_DEVICE: &str = "/dev/i2c-1";
 const DEFAULT_WHISPER_MODEL_FILENAME: &str = "ggml-tiny.en.bin";
 const CREATE_SENSOR_STREAM_PACKET_ID: u8 = 0;
 const CREATE_SENSOR_STREAM_PERIOD_MS: u32 = 250;
+const CREATE_SENSOR_FRESHNESS_MAX_AGE_MS: u32 = 500;
+const CREATE_SENSOR_READY_TIMEOUT_MS: u64 = 3_000;
 
 #[derive(Parser)]
 #[command(name = "pete")]
@@ -4733,7 +4735,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let brainstem_capabilities = cockpit
         .get_capabilities()
         .context("failed to read the brainstem capability contract")?;
-    establish_create_sensor_stream(cockpit.as_mut())?;
+    establish_create_sensor_stream(cockpit.as_mut(), !is_mock_body)?;
     if args.recovery_smoke {
         if robot_mode != RobotMode::Slow {
             anyhow::bail!("--recovery-smoke requires --mode possession-slow");
@@ -5123,9 +5125,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 let replacement =
                     reconnect_possession_cockpit(create_port.as_deref(), &args).await?;
                 let mut replacement = replacement;
-                establish_create_sensor_stream(replacement.as_mut())?;
+                establish_create_sensor_stream(replacement.as_mut(), true)?;
                 runner.cockpit.replace_client(replacement);
-                eprintln!("possession reconnected with fresh session and lease; stopped=true");
+                eprintln!(
+                    "possession reconnected with fresh session, lease, and complete body packet; stopped=true"
+                );
                 continue;
             }
             Err(error) if robot_mode == RobotMode::Slow && is_charging_busy_error(&error) => {
@@ -5772,14 +5776,56 @@ fn requested_robot_sensor_count(args: &RobotArgs) -> usize {
         + usize::from(args.gps.is_some())
 }
 
-fn establish_create_sensor_stream(cockpit: &mut dyn Cockpit) -> Result<()> {
+fn establish_create_sensor_stream(
+    cockpit: &mut dyn Cockpit,
+    require_new_complete_packet: bool,
+) -> Result<()> {
+    cockpit
+        .stop()
+        .context("failed to establish stopped state before Create sensor streaming")?;
+    let baseline_count = cockpit
+        .get_status()
+        .context("failed to read pre-stream Create packet counter")?
+        .summary()
+        .body_packet_count;
     cockpit
         .stream_sensors(
             true,
             CREATE_SENSOR_STREAM_PACKET_ID,
             CREATE_SENSOR_STREAM_PERIOD_MS,
         )
-        .context("failed to establish the production Create sensor stream")
+        .context("failed to establish the production Create sensor stream")?;
+    if !require_new_complete_packet {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(CREATE_SENSOR_READY_TIMEOUT_MS);
+    loop {
+        let status = cockpit
+            .get_status()
+            .context("failed while waiting for fresh Create body telemetry")?
+            .summary();
+        let count_advanced = match (baseline_count, status.body_packet_count) {
+            (Some(before), Some(after)) => after != before,
+            (None, Some(after)) => after > 0,
+            _ => false,
+        };
+        if count_advanced
+            && status.has_fresh_complete_body_packet(CREATE_SENSOR_FRESHNESS_MAX_AGE_MS)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "Create sensor stream did not produce a new complete packet within {} ms (before={baseline_count:?}, after={:?}, age_ms={:?}, complete={:?})",
+                CREATE_SENSOR_READY_TIMEOUT_MS,
+                status.body_packet_count,
+                status.body_packet_age_ms,
+                status.body_packet_complete,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 // Ownership may span comparatively expensive perception/runtime ticks. Wheel
@@ -12457,6 +12503,105 @@ mod tests {
         assert_eq!(next_reconnect_backoff_ms(250, 5_000), 500);
         assert_eq!(next_reconnect_backoff_ms(4_000, 5_000), 5_000);
         assert_eq!(next_reconnect_backoff_ms(5_000, 5_000), 5_000);
+    }
+
+    struct FreshPacketCockpit {
+        status_reads: usize,
+        stopped: bool,
+        stream_requested: bool,
+    }
+
+    impl Cockpit for FreshPacketCockpit {
+        fn execute(
+            &mut self,
+            request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            match request {
+                pete_cockpit::CockpitRequest::Stop => {
+                    self.stopped = true;
+                    Ok(pete_cockpit::CockpitResponse::Accepted)
+                }
+                pete_cockpit::CockpitRequest::StreamSensors {
+                    enabled: true,
+                    packet_id: 0,
+                    ..
+                } => {
+                    assert!(self.stopped, "stream requested before STOP");
+                    self.stream_requested = true;
+                    Ok(pete_cockpit::CockpitResponse::Accepted)
+                }
+                pete_cockpit::CockpitRequest::GetStatus => {
+                    self.status_reads += 1;
+                    let fresh = self.stream_requested && self.status_reads >= 3;
+                    let count = if fresh { 2 } else { 1 };
+                    let packet_ms = if fresh { 995 } else { 100 };
+                    Ok(pete_cockpit::CockpitResponse::Status(
+                        pete_cockpit::CockpitStatus {
+                            raw: serde_json::json!({
+                                "uptime_ms": 1_000,
+                                "current_runtime_state": "idle",
+                                "current_command": "stop",
+                                "create_sensors": {
+                                    "last_packet_id": 0,
+                                    "complete_packet_count": count,
+                                    "last_complete_packet_timestamp_ms": packet_ms
+                                }
+                            })
+                            .to_string(),
+                        },
+                    ))
+                }
+                other => panic!("unexpected readiness request: {other:?}"),
+            }
+        }
+
+        fn handshake(
+            &mut self,
+            _hello: HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            Err(CockpitError::Policy("not used by readiness test".into()))
+        }
+
+        fn execute_in_session(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ControlLease,
+            request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ServiceLease,
+            _request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            Err(CockpitError::Policy("service mode unavailable".into()))
+        }
+    }
+
+    #[test]
+    fn reconnect_readiness_requires_stop_and_new_complete_packet() {
+        let mut cockpit = FreshPacketCockpit {
+            status_reads: 0,
+            stopped: false,
+            stream_requested: false,
+        };
+
+        establish_create_sensor_stream(&mut cockpit, true).unwrap();
+
+        assert!(cockpit.stopped);
+        assert!(cockpit.stream_requested);
+        assert!(cockpit.status_reads >= 3);
     }
 
     struct DropTrackedCockpit {

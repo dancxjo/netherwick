@@ -1,12 +1,19 @@
 # Current Pete State
 
-This note records the current working shape of Pete after the first convincing real-world voxel milestone.
+This note records the current working shape of Pete after physical motherbrain possession became operational. Behavior validation is the active milestone.
 
 ## What works now
 
 Pete can render aligned, colored 3D voxels from real sensor data. The output is blocky and Minecraft-like, but the important feature is not visual polish. The important feature is correspondence: colored voxel structures line up with real things in the room.
 
 This means the perception stack has crossed from raw capture and loose point cloud experiments into an inspectable spatial model.
+
+Pete can also take guarded physical possession through `just possess`. The
+motherbrain lease is possession; bounded commands reach the brainstem, body
+telemetry reaches `BodySense`, and orderly shutdown performs acknowledged STOP
+and exorcize. Body freshness is tied to complete Create packet age rather than
+to the time at which cached status was read. Reconnect begins stopped and does
+not reopen the motor path until a newly received packet-0 body frame is fresh.
 
 The LLM loop is also doing real work now. It is predicting counterfactual outcomes, critiquing training data, and suggesting motion intents. Some of those critiques are weird, but they are useful: they expose suspicious examples, unstable hypotheses, and tests the robot could run to become more certain.
 
@@ -48,26 +55,32 @@ Debug order:
 4. Replay a known capture and compare voxel output against map output.
 5. Save the failure as a regression fixture.
 
-### Movement
+### Behavior validation
 
-Movement appears to have broken somewhere in the command-to-base path. The LLM is suggesting motion intents, but the body is not responding downstream yet. The likely explanations are:
+The command-to-base path is working. The active task is validating that normal
+behavior, autonomic policy, the final hardware gate, brainstem reflexes, and
+recorded experience agree under real disturbances. Automated coverage includes
+normal random walk → bump stop → bounded conductor recovery. The remaining
+physical cases are:
 
-- safety veto,
-- wrong robot mode,
-- stale or missing base connection,
-- command path regression,
-- controller path regression,
-- body state that correctly refuses movement, such as docked, cliff, bumper, or fault state.
+- charging interlock,
+- bumper recovery,
+- left, front-left, front-right, and right cliff sensors,
+- wheel drop,
+- heartbeat loss,
+- transport loss and stopped reconnect with fresh body telemetry.
 
-Debug order:
+Validation order:
 
-1. Log the generated movement intent.
-2. Log the controller receipt.
-3. Log the safety decision with reason codes.
-4. Log the outbound base command.
-5. Log the robot's reported mode and body state.
+1. Record the generated action and autonomic decision.
+2. Record the final real-slow gate and outbound bounded command.
+3. Record brainstem safety and motion events.
+4. Record complete-packet age and the resulting `BodySense`.
+5. Confirm the observed body outcome and stopped shutdown state.
 
-The desired fix is not to bypass safety. The desired fix is a legible refusal path, so Pete can say why he will not move.
+The goal is not merely wheel motion. The goal is agreement between intent,
+refusal or execution, physical outcome, and the experience used for later
+behavior training.
 
 ## Capture target
 
@@ -96,6 +109,8 @@ Pete should be considered healthy when:
 - the 2D map agrees with the voxel/world frame,
 - recurrent cross-modal constellations can be saved and matched again,
 - the LLM can critique candidates and suggest useful tests,
+- possession and reconnect fail closed on stale or incomplete body telemetry,
 - movement commands either execute or produce explicit safety/mode refusal reasons,
+- the pending physical safety checklist has captured evidence for every case,
 - captures can be replayed without the robot present,
 - the WebXR view can be used as an inspection surface rather than a novelty.

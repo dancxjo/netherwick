@@ -2,13 +2,13 @@
 
 `pete` is a Rust workspace for Pete, an embodied self-training robot architecture.
 
-Pete now has a working real-world perception path: Kinect RGB and depth data can be fused into aligned, Minecrafty but properly colored 3D voxels that correspond to real objects in real space. The current milestone is important because Pete is no longer only passing sensor packets around. It is beginning to hold a visible world model that a human can inspect, debug, and eventually enter through the WebXR viewer.
+Pete now has working real-world perception and guarded physical possession. Kinect RGB and depth data can be fused into aligned, Minecrafty but properly colored 3D voxels, while `just possess` establishes the motherbrain lease, streams body telemetry, and drives through bounded safety gates. The active milestone is behavior validation: proving that normal runs compose perception, action selection, autonomic vetoes, brainstem reflexes, recovery, and learning traces consistently.
 
 The project still keeps the larger PETE architecture in view. Pete gathers raw sensors, memory recalls, internal drives, model predictions, surprise, and LLM guidance into `Now`. `Now` is compressed into an `ExperienceLatent`, used to imagine futures, choose actions, and train from consequences.
 
 Pete acts through high-level action primitives. A hard-coded autonomic layer keeps the body safe. The LLM may command, reflect, critique, and teach, but cannot bypass safety.
 
-The LLM loop is now active as a trainer, critic, and planner. It predicts counterfactual outcomes, critiques training data, and suggests motion intents. Movement itself is still not responding downstream, so the current debugging target is the command-to-base path: safety vetoes, robot mode, stale base connection, controller regression, or body-state refusal.
+The LLM loop is active as a trainer, critic, and planner. It predicts counterfactual outcomes, critiques training data, and suggests motion intents. Physical motion now reaches the body through possession; the remaining work is to validate behavior and safety outcomes under real contact, charging, cliff, wheel-drop, heartbeat-loss, and transport-loss conditions.
 
 Every hard-coded behavior is replaceable. It can run directly, shadow-train a model, compare with a model, promote a model, or fall back to safe hand-written logic.
 
@@ -20,16 +20,19 @@ atomic candidate activation/rollback. See
 [docs/018-higher-brain-framework.md](docs/018-higher-brain-framework.md) for the
 architecture, provisioning, enrollment, and simulated end-to-end workflow.
 
-## Current milestone
+## Current milestone: behavior validation
 
-The live perception stack has matured from loose point clouds and transient hypotheses into an inspectable 3D voxel world:
+Possession and the live perception stack are operational. The current milestone is to validate complete behavior episodes and preserve their evidence:
 
 - Kinect depth and RGB are being aligned into colored voxels.
 - The voxel output is coarse, blocky, and intentionally debuggable.
 - Visible structures in the voxel scene correspond to real things in the room.
 - The 3D/WebXR viewer is the main inspection surface for the current world model.
 - The 2D map path needs restoration after drifting out of alignment and then failing.
-- Movement is temporarily under investigation: commands may be blocked by a safety veto, dropped by a controller path, or blocked by robot mode/state.
+- `just possess` acquires and maintains the motherbrain lease with bounded motion and explicit STOP/exorcize shutdown.
+- Normal-run tests cover random walk, bump stop, and conductor recovery.
+- Create packet age and completeness now drive body freshness; reconnect cannot reopen motion on cached telemetry.
+- The next physical work is the safety checklist below, not restoration of the command-to-base path.
 
 The next good artifact is a capture set: screenshots, video capture, and a short golden run containing RGB, depth, IMU, odometry, command traces, safety decisions, and map/voxel outputs from the same session.
 
@@ -92,9 +95,9 @@ The 2D map previously drifted out of alignment and then stopped working. Treat i
 3. Check whether the map renderer is alive but receiving empty or invalid data.
 4. Compare a known-good capture against the current map path.
 
-### Movement restoration
+### Behavior validation
 
-Movement is expected to remain conservative. Debug it from command intent outward:
+Movement is deliberately conservative and now operational under possession. Validate each behavior from command intent outward:
 
 1. Did a movement intent get generated?
 2. Did the controller receive it?
@@ -102,7 +105,7 @@ Movement is expected to remain conservative. Debug it from command intent outwar
 4. Is the base in the correct mode to accept motion?
 5. Did the robot report a fault, dock state, cliff signal, bumper signal, or stale serial/body connection?
 
-Do not bypass safety just to make the wheels turn. The goal is to make the vetoes inspectable so the system can explain why the body refuses to move.
+Do not bypass safety to make a scenario pass. Preserve the chosen action, autonomic decision, final hardware gate, brainstem event sequence, and observed body outcome so discrepancies become regression tests.
 
 ## Setup
 
@@ -180,6 +183,26 @@ exorcize and final stopped/unpossessed status. Exorcize releases motherbrain
 control without disarming Create OI; the brainstem keeps supervising it in Full
 mode. Serial loss is handled by the short
 command, heartbeat, and lease deadlines; no power toggle is attempted.
+
+The guarded physical bumper-recovery smoke test uses the same possession path:
+
+```bash
+just possess --recovery-smoke --wheels-off-floor
+```
+
+It requires a physical brainstem and explicit wheels-off-floor acknowledgement,
+then waits for an operator-held bumper and verifies contact → stop → clear →
+reverse → turn → probe → inspect before STOP and exorcize. This command is
+documented but has not been run as part of this software-only readiness pass.
+
+Physical validation still pending:
+
+- [ ] charging interlock,
+- [ ] bumper recovery,
+- [ ] all four cliff sensors,
+- [ ] wheel drop,
+- [ ] heartbeat loss,
+- [ ] transport loss and stopped reconnect with fresh packet-0 telemetry.
 
 See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions, device expectations, success criteria, and failure behavior.
 

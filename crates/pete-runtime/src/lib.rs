@@ -5100,6 +5100,11 @@ fn apply_safe_cockpit_motion<C: Cockpit>(
 }
 
 pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
+    let packet_update_ms = status
+        .body_packet_age_ms
+        .filter(|_| status.body_packet_complete == Some(true))
+        .map(|age_ms| last_update_ms.saturating_sub(u64::from(age_ms)))
+        .unwrap_or(0);
     BodySense {
         battery_level: status
             .battery
@@ -5124,7 +5129,7 @@ pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: Tim
             y_m: 0.0,
             heading_rad: status.odometry.heading_mrad.unwrap_or(0) as f32 / 1000.0,
         },
-        last_update_ms,
+        last_update_ms: packet_update_ms,
         ..BodySense::default()
     }
 }
@@ -7652,9 +7657,13 @@ mod tests {
     fn physical_charging_indicator_populates_body_charging_without_oi_state() {
         let status = CockpitStatus {
             raw: serde_json::json!({
+                "uptime_ms": 1_000,
                 "current_runtime_state": "idle",
                 "oi_mode": "safe",
                 "create_sensors": {
+                    "last_packet_id": 0,
+                    "complete_packet_count": 1,
+                    "last_complete_packet_timestamp_ms": 1_000,
                     "charging_state": 0,
                     "charging_indicator": "on"
                 }
@@ -7667,6 +7676,61 @@ mod tests {
 
         assert!(body.charging);
         assert_eq!(body.last_update_ms, 123);
+    }
+
+    #[test]
+    fn body_timestamp_tracks_complete_create_packet_age() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 2_000,
+                "current_runtime_state": "idle",
+                "oi_mode": "safe",
+                "create_sensors": {
+                    "last_packet_id": 0,
+                    "complete_packet_count": 4,
+                    "last_complete_packet_timestamp_ms": 1_250,
+                    "bump_left": false
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        let body = body_sense_from_cockpit_status(status, 10_000);
+
+        assert_eq!(body.last_update_ms, 9_250);
+        let decision = SimpleSafety::default().filter(
+            &Now::blank(10_000, body),
+            MotorCommand {
+                forward: 0.2,
+                turn: 0.0,
+            },
+        );
+        assert_eq!(decision.reason, Some(SafetyReason::StaleSensors));
+        assert_eq!(decision.command, MotorCommand::stop());
+    }
+
+    #[test]
+    fn incomplete_create_packet_never_refreshes_body_timestamp() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 2_000,
+                "last_uart_packet_timestamp_ms": 1_990,
+                "uart_rx_packets": 4,
+                "current_runtime_state": "idle",
+                "create_sensors": {
+                    "last_packet_id": 35,
+                    "complete_packet_count": 0
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        assert_eq!(
+            body_sense_from_cockpit_status(status, 10_000).last_update_ms,
+            0
+        );
     }
 
     #[test]
@@ -8398,7 +8462,7 @@ mod tests {
 
     #[test]
     fn production_possession_composes_bump_stop_and_conductor_recovery() {
-        let sim = Arc::new(Mutex::new(SimCockpit::new()));
+        let sim = Arc::new(Mutex::new(SimCockpit::new().with_event_capacity(256)));
         let session = establish_session(
             SharedSimCockpit(Arc::clone(&sim)),
             HandshakeHello::motherbrain("pete-runtime-recovery-test"),
@@ -8467,6 +8531,80 @@ mod tests {
         assert!(events.events[stop_index + 1..]
             .iter()
             .any(|event| event.kind == pete_cockpit::CockpitEventKind::MotionRequested));
+    }
+
+    #[tokio::test]
+    async fn normal_possession_run_random_walk_bump_stop_and_recovery() {
+        let sim = Arc::new(Mutex::new(SimCockpit::new().with_event_capacity(256)));
+        let session = establish_session(
+            SharedSimCockpit(Arc::clone(&sim)),
+            HandshakeHello::motherbrain("pete-runtime-normal-bump-test"),
+            None,
+        )
+        .unwrap();
+        let possession = MotherbrainPossession::acquire(session, 5_000).unwrap();
+        let ledger_root = test_ledger_root("normal-possession-bump-recovery");
+        let ledger = JsonlLedger::new(&ledger_root);
+        let memory = InMemoryExperienceStore::new();
+        let runtime = MinimalRuntime::new(
+            ledger,
+            memory.clone(),
+            memory,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            pete_llm::NoopLlmAgent,
+        );
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, possession, Vec::new(), runtime)
+            .with_autonomous_motion(true);
+        runner.cockpit.resync_event_cursor_from_status().unwrap();
+
+        let (_first_snapshot, first_tick) = runner.tick_slow_manual().await.unwrap();
+        assert!(matches!(
+            first_tick.chosen_action,
+            Some(ActionPrimitive::Explore {
+                style: ExploreStyle::RandomWalk,
+                ..
+            })
+        ));
+
+        sim.lock().unwrap().set_bump(true, false);
+        let (_bump_snapshot, bump_tick) = runner.tick_slow_manual().await.unwrap();
+        assert!(bump_tick.frame.now.body.flags.bump_left);
+        assert!(matches!(
+            bump_tick.chosen_action,
+            Some(ActionPrimitive::Go { intensity, .. }) if intensity < 0.0
+        ));
+
+        sim.lock().unwrap().set_bump(false, false);
+        let _ = runner.tick_slow_manual().await.unwrap();
+        let (_turn_snapshot, turn_tick) = runner.tick_slow_manual().await.unwrap();
+        assert!(matches!(
+            turn_tick.chosen_action,
+            Some(ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                ..
+            })
+        ));
+
+        let events = sim.lock().unwrap().get_events_since(0).unwrap();
+        let bump_index = events
+            .events
+            .iter()
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::BumpChanged)
+            .unwrap();
+        let stop_index = events.events[bump_index..]
+            .iter()
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::MotionStopped)
+            .map(|index| bump_index + index)
+            .unwrap();
+        let recovery_index = events.events[stop_index + 1..]
+            .iter()
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::MotionRequested)
+            .map(|index| stop_index + 1 + index)
+            .unwrap();
+        assert!(bump_index < stop_index && stop_index < recovery_index);
+        assert!(runner.cockpit.client_mut().snapshot().possessed);
+        let _ = fs::remove_dir_all(ledger_root);
     }
 
     struct CountingCockpit {
@@ -8547,10 +8685,14 @@ mod tests {
         fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
             Ok(CockpitStatus {
                 raw: serde_json::json!({
+                    "uptime_ms": 1_000,
                     "current_runtime_state": "test",
                     "oi_mode": "safe",
                     "current_command": "stop",
                     "create_sensors": {
+                        "last_packet_id": 0,
+                        "complete_packet_count": 1,
+                        "last_complete_packet_timestamp_ms": 1_000,
                         "bump_left": self.body.flags.bump_left,
                         "bump_right": self.body.flags.bump_right,
                         "wheel_drop": self.body.flags.wheel_drop,

@@ -85,6 +85,8 @@ static FOREBRAIN_UART_LAST_ERROR: AtomicU8 = AtomicU8::new(ForebrainUartErrorCod
 static FOREBRAIN_UART_LAST_RX_MS: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_LAST_COMMAND_MS: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_LAST_PACKET_ID: AtomicU8 = AtomicU8::new(0);
+static CREATE_SENSOR_COMPLETE_PACKET_COUNT: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_FLAGS: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_DISTANCE_MM: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_ANGLE_MRAD: AtomicU32 = AtomicU32::new(0);
@@ -236,6 +238,8 @@ pub struct BrainstemStatus {
     pub forebrain_uart_link_alive_ms: u32,
     pub forebrain_uart_last_command_age_ms: u32,
     pub create_sensor_last_packet_id: u8,
+    pub create_sensor_complete_packet_count: u32,
+    pub create_sensor_last_complete_packet_timestamp_ms: u32,
     pub create_sensor_flags: u32,
     pub create_sensor_distance_mm: i16,
     pub create_sensor_angle_mrad: i16,
@@ -2011,6 +2015,13 @@ pub fn mark_uart_packet(len: usize) {
 }
 
 pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
+    if packet_id == 0 {
+        increment(&CREATE_SENSOR_COMPLETE_PACKET_COUNT);
+        CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS.store(
+            LAST_UART_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
     let old_flags = CREATE_SENSOR_FLAGS.load(Ordering::Relaxed);
     let new_flags =
         merge_create_sensor_flags(packet_id, old_flags, create_sensor_flags_bits(sensors));
@@ -3062,6 +3073,10 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
             FOREBRAIN_UART_LAST_COMMAND_MS.load(Ordering::Relaxed),
         ),
         create_sensor_last_packet_id: CREATE_SENSOR_LAST_PACKET_ID.load(Ordering::Relaxed),
+        create_sensor_complete_packet_count: CREATE_SENSOR_COMPLETE_PACKET_COUNT
+            .load(Ordering::Relaxed),
+        create_sensor_last_complete_packet_timestamp_ms:
+            CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
         create_sensor_flags: CREATE_SENSOR_FLAGS.load(Ordering::Relaxed),
         create_sensor_distance_mm: decode_signed_i16(
             CREATE_SENSOR_DISTANCE_MM.load(Ordering::Relaxed),
@@ -3243,6 +3258,8 @@ struct Axis3I16Json {
 #[derive(serde::Serialize)]
 struct CreateSensorStatusJson {
     last_packet_id: u8,
+    complete_packet_count: u32,
+    last_complete_packet_timestamp_ms: u32,
     bump_left: bool,
     bump_right: bool,
     wheel_drop: bool,
@@ -3392,6 +3409,9 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
     let flags = snapshot.create_sensor_flags;
     CreateSensorStatusJson {
         last_packet_id: snapshot.create_sensor_last_packet_id,
+        complete_packet_count: snapshot.create_sensor_complete_packet_count,
+        last_complete_packet_timestamp_ms: snapshot
+            .create_sensor_last_complete_packet_timestamp_ms,
         bump_left: flags & (1 << 0) != 0,
         bump_right: flags & (1 << 1) != 0,
         wheel_drop: flags & (1 << 2) != 0,
