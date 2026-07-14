@@ -5224,6 +5224,9 @@ fn reign_input_outputs_real_slow_directly(input: &ReignInput) -> bool {
 }
 
 fn real_slow_body_block_reason(body: &pete_body::BodySense) -> Option<String> {
+    if body.charging {
+        return Some("charging active".to_string());
+    }
     if body.flags.wheel_drop {
         return Some("wheel drop active".to_string());
     }
@@ -9202,6 +9205,56 @@ mod tests {
                 .and_then(|value| value.get("runtime_bypassed"))
                 .and_then(|value| value.as_bool()),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_direct_webremote_stops_locally_while_charging() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingCockpit {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                charging: true,
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        queue.lock().unwrap().push(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: wall_time_ms().saturating_add(500),
+            source: ReignSource::WebRemote,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Go {
+                intensity: 0.50,
+                duration_ms: 300,
+            },
+            priority: 1.0,
+            note: None,
+        });
+        let tick_attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = QueueOnlyRuntime {
+            queue,
+            tick_attempts: Arc::clone(&tick_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), runtime);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(motors.lock().unwrap().as_slice(), &[MotorCommand::stop()]);
+        assert_eq!(
+            tick.frame
+                .now
+                .extensions
+                .get("action.motion_bridge")
+                .and_then(|value| value.get("why_not_moving"))
+                .and_then(|value| value.as_str()),
+            Some("charging active")
         );
     }
 
