@@ -707,15 +707,20 @@ async fn usb_cdc_task(mut class: CdcAcmClass<'static, UsbDriver>) -> ! {
                     b'\r' => {}
                     b'\n' => {
                         if let Ok(command) = core::str::from_utf8(&line) {
-                            let _ = handle_compact_control_line(
+                            let boot_to_usb = handle_compact_control_line(
                                 command,
                                 &mut response,
                                 TransportKind::UsbCdc as u8,
-                            );
+                            )
+                            .unwrap_or(false);
                             for chunk in response.as_bytes().chunks(64) {
                                 if class.write_packet(chunk).await.is_err() {
                                     break;
                                 }
+                            }
+                            if boot_to_usb {
+                                Timer::after_millis(100).await;
+                                reset_to_usb_boot(0, 0);
                             }
                         }
                         line.clear();

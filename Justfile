@@ -337,23 +337,57 @@ flash: brainstem-pico-w-uf2
         find_rpi_rp2_mount
     }
 
+    connected_to_brainstem_wifi() {
+        local ssid=""
+        if command -v nmcli >/dev/null 2>&1; then
+            ssid="$(
+                nmcli -t -f active,ssid dev wifi 2>/dev/null \
+                    | sed -n 's/^yes://p' \
+                    | awk 'tolower($0) ~ /^pete-/ { print; exit }' \
+                    || true
+            )"
+        elif command -v iwgetid >/dev/null 2>&1; then
+            ssid="$(iwgetid -r 2>/dev/null || true)"
+            if [[ "${ssid,,}" != pete-* ]]; then
+                ssid=""
+            fi
+        fi
+        [ -n "$ssid" ] \
+            && command -v curl >/dev/null 2>&1 \
+            && curl -fsS --connect-timeout 1 --max-time 2 \
+                "http://$host/status.json" >/dev/null
+    }
+
     mount_path=""
+    host="${bootsel_url#http://}"
+    host="${host%%/*}"
+    if [[ "$host" != *:* ]]; then
+        host="$host:80"
+    fi
     if mount_path="$(find_rpi_rp2_mount)"; then
         echo "RPI-RP2 already mounted at $mount_path; skipping BOOTSEL request"
     elif mount_path="$(mount_rpi_rp2)"; then
         echo "RPI-RP2 mounted at $mount_path; skipping BOOTSEL request"
     else
-        echo "Requesting authorized BOOTSEL via $bootsel_url"
-        host="${bootsel_url#http://}"
-        host="${host%%/*}"
-        if [[ "$host" != *:* ]]; then
-            host="$host:80"
+        echo "Requesting authorized BOOTSEL via USB CDC"
+        if ! PETE_BOOTSEL_USB=1 cargo run -q -p pete-cockpit --example service_bootsel; then
+            if connected_to_brainstem_wifi; then
+                echo "USB BOOTSEL failed; requesting authorized BOOTSEL via $bootsel_url"
+                PETE_BRAINSTEM_HTTP_HOST="$host" cargo run -q -p pete-cockpit --example service_bootsel \
+                    || bootsel_failed=1
+            else
+                echo "USB BOOTSEL failed and this host is not connected to a Pete brainstem Wi-Fi AP." >&2
+                bootsel_failed=1
+            fi
         fi
-        if ! PETE_BRAINSTEM_HTTP_HOST="$host" cargo run -q -p pete-cockpit --example service_bootsel \
-            && ! PETE_BOOTSEL_USB=1 cargo run -q -p pete-cockpit --example service_bootsel; then
+        if [ "${bootsel_failed:-0}" = 1 ]; then
             if [ "${PETE_ALLOW_LEGACY_BOOTSEL:-0}" != "1" ]; then
                 echo "Authorized BOOTSEL failed; legacy fallback is disabled." >&2
                 echo "Set PETE_ALLOW_LEGACY_BOOTSEL=1 only for explicit development recovery." >&2
+                exit 1
+            fi
+            if ! connected_to_brainstem_wifi; then
+                echo "Legacy HTTP BOOTSEL fallback requires an active Pete brainstem Wi-Fi connection." >&2
                 exit 1
             fi
             echo "WARNING: USING UNAUDITED LEGACY BOOTSEL DEVELOPMENT FALLBACK" >&2
