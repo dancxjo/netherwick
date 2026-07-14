@@ -3,8 +3,8 @@ use heapless::Deque;
 use crate::body;
 use crate::commands::{
     BrainstemCommand, EscapeDirection, FeedbackKind, PowerStateRequest, RuntimeCommand,
-    SafetyAction, SafetyPolicy, SongTone, ACQUIRE_CREATE_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
-    RESTART_CREATE_SCRIPT,
+    SafetyAction, SafetyLatchKind, SafetyPolicy, SongTone, ACQUIRE_CREATE_SCRIPT, DISARM_SCRIPT,
+    MAX_SONG_TONES, RESTART_CREATE_SCRIPT,
 };
 use crate::drivers::{
     create_uart::{CreateUart, CREATE_BUTTON_LED_MASK, CREATE_LED_ADVANCE, CREATE_LED_PLAY},
@@ -103,6 +103,25 @@ struct SensorStream {
 struct QueuedCommand {
     command_id: u32,
     command: RuntimeCommand,
+    safety_recovery: bool,
+}
+
+impl QueuedCommand {
+    fn new(command_id: u32, command: RuntimeCommand) -> Self {
+        Self {
+            command_id,
+            command,
+            safety_recovery: false,
+        }
+    }
+
+    fn safety_recovery(command_id: u32, command: RuntimeCommand) -> Self {
+        Self {
+            command_id,
+            command,
+            safety_recovery: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -172,6 +191,8 @@ where
     motherbrain_reset_hardware_enabled: bool,
     motherbrain_reset_history: [Option<MotherbrainResetRecord>; MOTHERBRAIN_RESET_HISTORY_CAPACITY],
     motherbrain_reset_history_next: usize,
+    safety_recovery_motion: bool,
+    create_no_response_restart_queued: bool,
 }
 
 impl<H> Runtime<H>
@@ -222,6 +243,8 @@ where
             motherbrain_reset_hardware_enabled: body::MOTHERBRAIN_RESET_ENABLED,
             motherbrain_reset_history: [None; MOTHERBRAIN_RESET_HISTORY_CAPACITY],
             motherbrain_reset_history_next: 0,
+            safety_recovery_motion: false,
+            create_no_response_restart_queued: false,
         }
     }
 
@@ -242,10 +265,7 @@ where
     #[allow(dead_code)]
     pub fn enqueue_command(&mut self, command: RuntimeCommand) -> Result<(), RuntimeCommand> {
         self.commands
-            .push_back(QueuedCommand {
-                command_id: 0,
-                command,
-            })
+            .push_back(QueuedCommand::new(0, command))
             .map_err(|queued| queued.command)
     }
 
@@ -312,6 +332,7 @@ where
         let snapshot = status::snapshot(self.now_ms());
         if matches!(snapshot.oi_mode, 1..=3) {
             self.create_responsive = true;
+            self.create_no_response_restart_queued = false;
             status::set_create_power_on(true);
         }
         self.poll_control_command();
@@ -334,20 +355,31 @@ where
         status::set_runtime_state(RuntimeState::Idle);
         status::set_body_state(BodyState::Idle);
         status::acknowledge_authority_transition(generation);
-        let _ = self.commands.push_back(QueuedCommand {
-            command_id: 0,
-            command: RuntimeCommand::PlayFeedback {
+        let _ = self.commands.push_back(QueuedCommand::new(
+            0,
+            RuntimeCommand::PlayFeedback {
                 kind: FeedbackKind::Ok,
             },
-        });
+        ));
     }
 
     fn queue_create_acquisition(&mut self, command_id: u32) {
         for command in ACQUIRE_CREATE_SCRIPT {
-            let _ = self.commands.push_back(QueuedCommand {
-                command_id,
-                command: *command,
-            });
+            let _ = self
+                .commands
+                .push_back(QueuedCommand::new(command_id, *command));
+        }
+        self.mode = RuntimeMode::Running;
+    }
+
+    fn queue_create_restart_front(&mut self, command_id: u32) {
+        while self.commands.len() + RESTART_CREATE_SCRIPT.len() > COMMAND_QUEUE_CAPACITY {
+            let _ = self.commands.pop_back();
+        }
+        for command in RESTART_CREATE_SCRIPT.iter().rev() {
+            let _ = self
+                .commands
+                .push_front(QueuedCommand::new(command_id, *command));
         }
         self.mode = RuntimeMode::Running;
     }
@@ -449,10 +481,9 @@ where
                     BrainstemCommand::EStop => RuntimeCommand::EStop,
                     _ => unreachable!(),
                 };
-                let _ = self.commands.push_front(QueuedCommand {
-                    command_id,
-                    command,
-                });
+                let _ = self
+                    .commands
+                    .push_front(QueuedCommand::new(command_id, command));
                 self.mode = RuntimeMode::Running;
             }
             BrainstemCommand::Arm => {
@@ -468,10 +499,9 @@ where
                 self.active = ActiveAction::None;
                 self.heartbeat_stop_at_ms = None;
                 for command in DISARM_SCRIPT.iter().rev() {
-                    let _ = self.commands.push_front(QueuedCommand {
-                        command_id,
-                        command: *command,
-                    });
+                    let _ = self
+                        .commands
+                        .push_front(QueuedCommand::new(command_id, *command));
                 }
                 self.mode = RuntimeMode::Running;
             }
@@ -481,10 +511,9 @@ where
                 self.active = ActiveAction::None;
                 self.heartbeat_stop_at_ms = None;
                 for command in RESTART_CREATE_SCRIPT.iter().rev() {
-                    let _ = self.commands.push_front(QueuedCommand {
-                        command_id,
-                        command: *command,
-                    });
+                    let _ = self
+                        .commands
+                        .push_front(QueuedCommand::new(command_id, *command));
                 }
                 self.mode = RuntimeMode::Running;
                 status::set_runtime_state(RuntimeState::Running);
@@ -507,10 +536,9 @@ where
             }
             _ => {
                 if let Some(command) = runtime_command_from_forebrain(command) {
-                    let _ = self.commands.push_back(QueuedCommand {
-                        command_id,
-                        command,
-                    });
+                    let _ = self
+                        .commands
+                        .push_back(QueuedCommand::new(command_id, command));
                 }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
@@ -655,15 +683,13 @@ where
         if matches!(self.active, ActiveAction::Driving { .. }) {
             self.interrupt_active_command();
             self.active = ActiveAction::None;
-            let _ = self.commands.push_front(QueuedCommand {
-                command_id,
-                command,
-            });
+            let _ = self
+                .commands
+                .push_front(QueuedCommand::new(command_id, command));
         } else {
-            let _ = self.commands.push_back(QueuedCommand {
-                command_id,
-                command,
-            });
+            let _ = self
+                .commands
+                .push_back(QueuedCommand::new(command_id, command));
         }
     }
 
@@ -675,6 +701,7 @@ where
         let command = queued.command;
         let command_code = status::set_command(Some(command));
         self.active_command_id = Some(queued.command_id);
+        self.safety_recovery_motion = queued.safety_recovery;
         status::mark_command_started(queued.command_id, command_code);
 
         let now_ms = self.now_ms();
@@ -697,15 +724,25 @@ where
             }
             RuntimeCommand::WakeCreate => {
                 self.create_responsive = false;
-                status::set_create_power_unknown();
                 status::set_oi_mode_unknown();
                 status::set_body_state(BodyState::WaitingForCreate);
-                self.active = ActiveAction::WaitForCreate {
-                    deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
-                    next_probe_ms: now_ms,
-                    response_bytes: 0,
-                    oi_started: false,
-                    power_toggled: false,
+                if status::create_power_state_is_off(status::snapshot(now_ms).create_power_state) {
+                    self.push_event(BrainstemEvent::CreatePowerOnRequested);
+                    self.hardware.set_power_toggle(true);
+                    self.active = ActiveAction::PowerPulse {
+                        release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
+                        wake_wait_until_ms: Some(now_ms.wrapping_add(body::CREATE_WAKE_WAIT_MS)),
+                        power_on: true,
+                    };
+                } else {
+                    status::set_create_power_unknown();
+                    self.active = ActiveAction::WaitForCreate {
+                        deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
+                        next_probe_ms: now_ms,
+                        response_bytes: 0,
+                        oi_started: false,
+                        power_toggled: false,
+                    };
                 };
             }
             RuntimeCommand::SleepCreate => {
@@ -914,6 +951,9 @@ where
                     self.stop_drive()?;
                 }
             }
+            RuntimeCommand::ClearSafetyLatch { kind } => {
+                self.clear_safety_latch(Some(safety_latch_kind_to_event(kind)));
+            }
             RuntimeCommand::HeartbeatStop { timeout_ms } => {
                 self.heartbeat_stop_at_ms = Some(now_ms.wrapping_add(timeout_ms));
             }
@@ -943,7 +983,6 @@ where
             }
             RuntimeCommand::SetSafetyPolicy { policy } => {
                 self.safety_policy = policy;
-                self.clear_safety_latch(None);
             }
             RuntimeCommand::ClearMotionQueue => {
                 self.clear_motion_queue()?;
@@ -999,10 +1038,6 @@ where
             RuntimeCommand::ClearImuOrientation => {
                 status::clear_imu_orientation_calibration();
             }
-            RuntimeCommand::RestartMpu => match self.hardware.restart_imu() {
-                Ok(()) => status::mark_imu_health(crate::drivers::imu::ImuHealth::Unknown),
-                Err(health) => status::mark_imu_health(health),
-            },
             RuntimeCommand::SongPlay { id } => {
                 self.ensure_create_responsive()?;
                 self.create_uart
@@ -1131,6 +1166,7 @@ where
 
                 if response_bytes >= WAKE_PROBE_RESPONSE_BYTES_REQUIRED {
                     self.create_responsive = true;
+                    self.create_no_response_restart_queued = false;
                     status::set_create_power_on(true);
                     self.active = ActiveAction::None;
                     self.complete_active_command();
@@ -1154,6 +1190,10 @@ where
                     status::set_create_power_unknown();
                     status::set_oi_mode_unknown();
                     status::mark_uart_rx_error();
+                    if response_bytes == 0 && !self.create_no_response_restart_queued {
+                        self.create_no_response_restart_queued = true;
+                        self.queue_create_restart_front(self.active_command_id.unwrap_or(0));
+                    }
                     // Do not strand supervision in Error because RX failed.
                     // The queued START/FULL commands and periodic assertion
                     // still have value when the receive side is broken.
@@ -1366,7 +1406,7 @@ where
         backoff_mm_s: i16,
         turn_angular_mrad_s: i16,
     ) -> Result<(), BrainstemError> {
-        self.ensure_motion_allowed()?;
+        self.ensure_recovery_motion_allowed()?;
         let backoff = -abs_i32(backoff_mm_s as i32);
         let turn_abs = abs_i32(turn_angular_mrad_s as i32);
         let turn = match direction {
@@ -1374,22 +1414,22 @@ where
             EscapeDirection::Right => -turn_abs,
             EscapeDirection::Either => turn_abs,
         };
-        let _ = self.commands.push_front(QueuedCommand {
+        let _ = self.commands.push_front(QueuedCommand::safety_recovery(
             command_id,
-            command: RuntimeCommand::CmdVel {
+            RuntimeCommand::CmdVel {
                 linear_mm_s: 0,
                 angular_mrad_s: clamp_i16(turn),
                 duration_ms: Some(BUMP_ESCAPE_TURN_MS),
             },
-        });
-        let _ = self.commands.push_front(QueuedCommand {
+        ));
+        let _ = self.commands.push_front(QueuedCommand::safety_recovery(
             command_id,
-            command: RuntimeCommand::CmdVel {
+            RuntimeCommand::CmdVel {
                 linear_mm_s: clamp_i16(backoff),
                 angular_mrad_s: 0,
                 duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
             },
-        });
+        ));
         self.active = ActiveAction::None;
         Ok(())
     }
@@ -1430,14 +1470,14 @@ where
         let cycles = cycles.min(6);
         for cycle in (0..cycles).rev() {
             let sign = if cycle % 2 == 0 { 1 } else { -1 };
-            let _ = self.commands.push_front(QueuedCommand {
-                command_id: self.active_command_id.unwrap_or(0),
-                command: RuntimeCommand::TurnBy {
+            let _ = self.commands.push_front(QueuedCommand::new(
+                self.active_command_id.unwrap_or(0),
+                RuntimeCommand::TurnBy {
                     angle_mrad: clamp_i16(amplitude_mrad as i32 * sign),
                     angular_mrad_s,
                     timeout_ms: 800,
                 },
-            });
+            ));
         }
         self.active = ActiveAction::None;
         Ok(())
@@ -1523,18 +1563,9 @@ where
             }
             return Ok(());
         }
-        if self.charging_interlock_latched {
-            status::mark_safety_cleared(status::SafetyEventKind::Charging);
-            self.charging_interlock_latched = false;
-        }
 
         if !bump && !cliff && !wheel_drop && !tilt && !impact && !charging {
             self.update_safety_edges(bump, cliff, wheel_drop);
-            let keep_wheel_drop_latched = self.safety_policy.wheel_drop_latch
-                && self.safety_latch_kind == Some(status::SafetyEventKind::WheelDrop);
-            if !keep_wheel_drop_latched {
-                self.clear_safety_latch(None);
-            }
             return Ok(());
         }
         self.update_safety_edges(bump, cliff, wheel_drop);
@@ -1600,14 +1631,14 @@ where
                 self.interrupt_active_command();
                 self.commands.clear();
                 self.active = ActiveAction::None;
-                let _ = self.commands.push_front(QueuedCommand {
+                let _ = self.commands.push_front(QueuedCommand::safety_recovery(
                     command_id,
-                    command: RuntimeCommand::CmdVel {
+                    RuntimeCommand::CmdVel {
                         linear_mm_s: -80,
                         angular_mrad_s: 0,
                         duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
                     },
-                });
+                ));
                 Ok(())
             }
             SafetyAction::BumpEscape => {
@@ -1627,6 +1658,12 @@ where
     }
 
     fn clear_safety_latch(&mut self, expected: Option<status::SafetyEventKind>) {
+        if expected == Some(status::SafetyEventKind::Charging) && self.charging_interlock_latched {
+            status::mark_safety_cleared(status::SafetyEventKind::Charging);
+            self.charging_interlock_latched = false;
+            return;
+        }
+
         let Some(kind) = self.safety_latch_kind else {
             self.safety_latched = false;
             return;
@@ -1727,12 +1764,31 @@ where
     }
 
     fn ensure_motion_allowed(&mut self) -> Result<(), BrainstemError> {
-        if self.estop_latched {
+        if self.estop_latched
+            || self.charging_interlock_latched
+            || (self.safety_latched && !self.safety_recovery_latch_allows_motion())
+        {
             self.stop_drive()?;
             return Err(BrainstemError::CreateNoResponse);
         }
         self.ensure_create_responsive()?;
         Ok(())
+    }
+
+    fn ensure_recovery_motion_allowed(&mut self) -> Result<(), BrainstemError> {
+        if self.estop_latched
+            || self.charging_interlock_latched
+            || (self.safety_latched && !recoverable_safety_latch(self.safety_latch_kind))
+        {
+            self.stop_drive()?;
+            return Err(BrainstemError::CreateNoResponse);
+        }
+        self.ensure_create_responsive()?;
+        Ok(())
+    }
+
+    fn safety_recovery_latch_allows_motion(&self) -> bool {
+        self.safety_recovery_motion && recoverable_safety_latch(self.safety_latch_kind)
     }
 
     fn enforce_heartbeat_stop(&mut self) -> Result<(), BrainstemError> {
@@ -1831,18 +1887,21 @@ where
     }
 
     fn complete_active_command(&mut self) {
+        self.safety_recovery_motion = false;
         if let Some(command_id) = self.active_command_id.take() {
             status::mark_command_completed(command_id);
         }
     }
 
     fn interrupt_active_command(&mut self) {
+        self.safety_recovery_motion = false;
         if let Some(command_id) = self.active_command_id.take() {
             status::mark_command_interrupted(command_id);
         }
     }
 
     fn fail_active_command(&mut self, error: BrainstemError) {
+        self.safety_recovery_motion = false;
         let Some(command_id) = self.active_command_id.take() else {
             return;
         };
@@ -2094,6 +2153,9 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             turn_angular_mrad_s,
         }),
         BrainstemCommand::CliffGuard { clear, .. } => Some(RuntimeCommand::CliffGuard { clear }),
+        BrainstemCommand::ClearSafetyLatch { kind, .. } => {
+            Some(RuntimeCommand::ClearSafetyLatch { kind })
+        }
         BrainstemCommand::HeartbeatStop { timeout_ms, .. } => {
             Some(RuntimeCommand::HeartbeatStop { timeout_ms })
         }
@@ -2145,7 +2207,6 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         BrainstemCommand::ResetOdometry { .. } => Some(RuntimeCommand::ResetOdometry),
         BrainstemCommand::ZeroImuOrientation { .. } => Some(RuntimeCommand::ZeroImuOrientation),
         BrainstemCommand::ClearImuOrientation { .. } => Some(RuntimeCommand::ClearImuOrientation),
-        BrainstemCommand::RestartMpu => Some(RuntimeCommand::RestartMpu),
         BrainstemCommand::SongPlay { id } => Some(RuntimeCommand::SongPlay { id }),
         BrainstemCommand::SongDefine {
             id,
@@ -2208,6 +2269,25 @@ fn is_motion_command(command: RuntimeCommand) -> bool {
     )
 }
 
+fn recoverable_safety_latch(kind: Option<status::SafetyEventKind>) -> bool {
+    matches!(
+        kind,
+        Some(status::SafetyEventKind::Bump | status::SafetyEventKind::Cliff)
+    )
+}
+
+fn safety_latch_kind_to_event(kind: SafetyLatchKind) -> status::SafetyEventKind {
+    match kind {
+        SafetyLatchKind::Bump => status::SafetyEventKind::Bump,
+        SafetyLatchKind::Cliff => status::SafetyEventKind::Cliff,
+        SafetyLatchKind::WheelDrop => status::SafetyEventKind::WheelDrop,
+        SafetyLatchKind::Heartbeat => status::SafetyEventKind::Heartbeat,
+        SafetyLatchKind::Tilt => status::SafetyEventKind::Tilt,
+        SafetyLatchKind::Impact => status::SafetyEventKind::Impact,
+        SafetyLatchKind::Charging => status::SafetyEventKind::Charging,
+    }
+}
+
 fn feedback_index(kind: FeedbackKind) -> usize {
     match kind {
         FeedbackKind::Ok => 0,
@@ -2266,6 +2346,7 @@ mod tests {
         imu_sample: Option<ImuSample>,
         imu_health: Option<crate::drivers::imu::ImuHealth>,
         reset_levels: heapless::Vec<bool, 8>,
+        power_toggle_levels: heapless::Vec<bool, 8>,
         charging_indicator: Option<bool>,
     }
 
@@ -2277,6 +2358,7 @@ mod tests {
                 imu_sample: None,
                 imu_health: None,
                 reset_levels: heapless::Vec::new(),
+                power_toggle_levels: heapless::Vec::new(),
                 charging_indicator: None,
             }
         }
@@ -2288,6 +2370,7 @@ mod tests {
                 imu_sample: Some(imu_sample),
                 imu_health: None,
                 reset_levels: heapless::Vec::new(),
+                power_toggle_levels: heapless::Vec::new(),
                 charging_indicator: None,
             }
         }
@@ -2304,7 +2387,9 @@ mod tests {
 
         fn feed_watchdog(&mut self) {}
 
-        fn set_power_toggle(&mut self, _high: bool) {}
+        fn set_power_toggle(&mut self, high: bool) {
+            let _ = self.power_toggle_levels.push(high);
+        }
 
         fn set_brc(&mut self, _high: bool) {}
 
@@ -2396,6 +2481,10 @@ mod tests {
         runtime.start();
 
         assert_eq!(runtime.commands.len(), ACQUIRE_CREATE_SCRIPT.len());
+        assert!(runtime
+            .commands
+            .iter()
+            .any(|queued| matches!(queued.command, RuntimeCommand::WakeCreate)));
         assert!(runtime.commands.iter().any(|queued| matches!(
             queued.command,
             RuntimeCommand::SetMode(crate::commands::CreateOiMode::Full)
@@ -2405,6 +2494,99 @@ mod tests {
             status::snapshot(0).current_runtime_state,
             RuntimeState::Running as u8
         );
+    }
+
+    #[test]
+    fn wake_create_pulses_power_once_when_create_is_known_off() {
+        let _guard = status::status_test_guard();
+        status::set_create_power_on(false);
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+
+        assert!(runtime.enqueue_command(RuntimeCommand::WakeCreate).is_ok());
+        assert!(runtime.start_next_command().is_ok());
+
+        assert_eq!(runtime.hardware.power_toggle_levels.as_slice(), &[true]);
+        assert!(matches!(
+            runtime.active,
+            ActiveAction::PowerPulse {
+                power_on: true,
+                wake_wait_until_ms: Some(_),
+                ..
+            }
+        ));
+
+        runtime.hardware.delay_ms(body::POWER_TOGGLE_PULSE_MS);
+        assert!(runtime.advance_active_action().is_ok());
+
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[true, false]
+        );
+        assert_eq!(
+            runtime
+                .events
+                .iter()
+                .filter(|event| matches!(event, BrainstemEvent::CreatePowerOnRequested))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn zero_byte_wake_timeout_queues_create_restart_once() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.active_command_id = Some(77);
+        runtime.active = ActiveAction::WaitForCreate {
+            deadline_ms: 1_000,
+            next_probe_ms: 2_000,
+            response_bytes: 0,
+            oi_started: true,
+            power_toggled: true,
+        };
+
+        assert!(runtime.advance_active_action().is_ok());
+
+        assert_eq!(runtime.commands.len(), RESTART_CREATE_SCRIPT.len());
+        for (queued, expected) in runtime.commands.iter().zip(RESTART_CREATE_SCRIPT.iter()) {
+            assert_eq!(queued.command_id, 77);
+            assert!(queued.command == *expected);
+        }
+        assert!(runtime.create_no_response_restart_queued);
+
+        runtime.commands.clear();
+        runtime.active_command_id = Some(78);
+        runtime.active = ActiveAction::WaitForCreate {
+            deadline_ms: 1_000,
+            next_probe_ms: 2_000,
+            response_bytes: 0,
+            oi_started: true,
+            power_toggled: true,
+        };
+
+        assert!(runtime.advance_active_action().is_ok());
+        assert!(runtime.commands.is_empty());
+
+        let mut bytes = heapless::Vec::<u8, 32>::new();
+        assert!(bytes.push(1).is_ok());
+        assert!(runtime
+            .events
+            .push_back(BrainstemEvent::CreatePacketReceived {
+                packet_id: 35,
+                bytes
+            })
+            .is_ok());
+        runtime.active = ActiveAction::WaitForCreate {
+            deadline_ms: 1_010,
+            next_probe_ms: 2_000,
+            response_bytes: 0,
+            oi_started: true,
+            power_toggled: true,
+        };
+
+        assert!(runtime.advance_active_action().is_ok());
+        assert!(!runtime.create_no_response_restart_queued);
+        assert!(runtime.create_responsive);
     }
 
     #[test]
@@ -2493,14 +2675,14 @@ mod tests {
         runtime.create_responsive = true;
         runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
         runtime.active_command_id = Some(77);
-        let _ = runtime.commands.push_back(QueuedCommand {
-            command_id: 78,
-            command: RuntimeCommand::CmdVel {
+        let _ = runtime.commands.push_back(QueuedCommand::new(
+            78,
+            RuntimeCommand::CmdVel {
                 linear_mm_s: 100,
                 angular_mrad_s: 0,
                 duration_ms: Some(500),
             },
-        });
+        ));
 
         runtime.tick();
 
@@ -2517,6 +2699,14 @@ mod tests {
 
         runtime.hardware.charging_indicator = Some(false);
         runtime.tick();
+        assert!(runtime.charging_interlock_latched);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::ClearSafetyLatch {
+                kind: SafetyLatchKind::Charging,
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
         assert!(!runtime.charging_interlock_latched);
     }
 
@@ -2620,7 +2810,7 @@ mod tests {
     }
 
     #[test]
-    fn bump_stop_clears_after_contact_and_allows_recovery_motion() {
+    fn bump_stop_stays_latched_after_contact_until_explicit_clear() {
         let _guard = status::status_test_guard();
         status::mark_create_sensor_packet(
             0,
@@ -2645,8 +2835,12 @@ mod tests {
 
         status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
         assert!(runtime.enforce_safety_policy().is_ok());
-        assert!(!runtime.safety_latched);
-        assert!(runtime.safety_latch_kind.is_none());
+        assert!(runtime.safety_latched);
+        assert_eq!(status::snapshot(1_000).create_sensor_flags & 0b11, 0);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Bump)
+        ));
 
         assert!(runtime
             .enqueue_command(RuntimeCommand::CmdVel {
@@ -2655,8 +2849,67 @@ mod tests {
                 duration_ms: Some(300),
             })
             .is_ok());
+        assert!(runtime.start_next_command().is_err());
+        assert!(runtime.safety_latched);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::ClearSafetyLatch {
+                kind: SafetyLatchKind::Bump,
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(!runtime.safety_latched);
+        assert!(runtime.safety_latch_kind.is_none());
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_right: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Bump)
+        ));
+    }
+
+    #[test]
+    fn bump_escape_runs_while_bump_latched() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.latch_safety(status::SafetyEventKind::Bump);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::BumpEscape {
+                direction: EscapeDirection::Either,
+                backoff_mm_s: 80,
+                turn_angular_mrad_s: 900,
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(runtime.safety_latched);
+        assert_eq!(runtime.commands.len(), 2);
+
         assert!(runtime.start_next_command().is_ok());
         assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert!(runtime.safety_latched);
     }
 
     #[test]
@@ -2712,6 +2965,91 @@ mod tests {
             runtime.safety_latch_kind,
             Some(status::SafetyEventKind::WheelDrop)
         ));
+    }
+
+    #[test]
+    fn cliff_latch_preserves_sensor_state_and_retrips_after_clear() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    cliff_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Cliff)
+        ));
+
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.safety_latched);
+        assert_eq!(status::snapshot(1_000).create_sensor_flags & 0b1111_0000, 0);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::ClearSafetyLatch {
+                kind: SafetyLatchKind::Cliff,
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(!runtime.safety_latched);
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    cliff_front_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Cliff)
+        ));
+    }
+
+    #[test]
+    fn imu_zeroing_runs_while_safety_latched_but_motion_stays_blocked() {
+        let _guard = status::status_test_guard();
+        status::clear_imu_orientation_calibration();
+        status::mark_imu_sample(ImuSample::stationary(1_000));
+
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.latch_safety(status::SafetyEventKind::Cliff);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::ZeroImuOrientation)
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert_eq!(
+            status::snapshot(1_000).imu_calibration_state,
+            status::ImuCalibrationCode::Ready as u8
+        );
+        assert!(runtime.safety_latched);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::CmdVel {
+                linear_mm_s: 80,
+                angular_mrad_s: 0,
+                duration_ms: Some(300),
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_err());
+        assert!(runtime.safety_latched);
     }
 
     #[test]

@@ -23,7 +23,10 @@ pub trait BrainstemHardware {
     fn feed_watchdog(&mut self);
 
     fn set_power_toggle(&mut self, high: bool);
-    fn set_brc(&mut self, high: bool);
+    /// Create 1 BRC/DD is a 0-5V input to the robot. `false` asserts it by
+    /// pulling low; `true` releases the line so the robot/external pull-up can
+    /// read high. Implementations must not drive this signal high push-pull.
+    fn set_brc(&mut self, released: bool);
     fn set_indicators(&mut self, on: bool);
     #[allow(dead_code)]
     fn set_primary_indicator(&mut self, on: bool);
@@ -46,10 +49,6 @@ pub trait BrainstemHardware {
 
     fn charging_indicator_active(&mut self) -> Option<bool> {
         None
-    }
-
-    fn restart_imu(&mut self) -> Result<(), ImuHealth> {
-        Err(ImuHealth::Absent)
     }
 
     fn drain_uart_rx(&mut self) {

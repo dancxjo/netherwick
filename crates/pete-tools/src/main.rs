@@ -15,8 +15,8 @@ use pete_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use pete_body::{BodySense, BodySong, BodyTone};
 use pete_cockpit::{
     establish_diagnostic_session, establish_session, Cockpit, CockpitError, CockpitEventKind,
-    HandshakeHello, HttpCockpit, MotherbrainPossession, SafeCockpit, SimCockpit as LocalSimCockpit,
-    SongTone, UartCockpit,
+    HandshakeHello, HttpCockpit, MotherbrainPossession, SafeCockpit, SafetyLatchKind,
+    SimCockpit as LocalSimCockpit, SongTone, UartCockpit,
 };
 use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
 use pete_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter};
@@ -5920,13 +5920,19 @@ async fn run_physical_possession_recovery_smoke_inner(
         let status = cockpit.refresh_status()?;
         let body =
             body_sense_from_cockpit_status(status, Utc::now().timestamp_millis().max(0) as u64);
-        let events = cockpit.poll_events()?;
-        saw_safety_clear |= events
-            .events
-            .iter()
-            .any(|event| event.kind == CockpitEventKind::SafetyCleared);
-        if !body.flags.bump_left && !body.flags.bump_right && saw_safety_clear {
-            break;
+        cockpit.poll_events()?;
+        if !body.flags.bump_left && !body.flags.bump_right {
+            cockpit
+                .client_mut()
+                .clear_safety_latch(SafetyLatchKind::Bump)?;
+            let clear_events = cockpit.poll_events()?;
+            saw_safety_clear |= clear_events
+                .events
+                .iter()
+                .any(|event| event.kind == CockpitEventKind::SafetyCleared);
+            if saw_safety_clear {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

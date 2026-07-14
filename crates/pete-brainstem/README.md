@@ -29,7 +29,8 @@ arch = "rp2040"
 
 `board.toml` owns physical pin assignments for the RP2040 backend and reserves logical roles for later capabilities such as I2C, SPI, PWM, ADC, device detect, and emergency stop. This keeps robot-body capabilities separate from the board used to host the brainstem.
 
-BRC is optional and disabled by default for 57600 baud bring-up:
+BRC is optional and disabled by default for 57600 baud bring-up. On Create 1,
+this is the same robot-side Mini-DIN signal as Device Detect / Baud Rate Change:
 
 ```toml
 [pins.create_brc]
@@ -45,7 +46,7 @@ gpio = 19
 | Create OI UART TX | GP0 | 1 | Pico TX to Create RX |
 | Create OI UART RX | GP1 | 2 | Create TX to Pico RX |
 | Create Power Toggle | GP18 | 24 | Pico output to external power-toggle interface |
-| Create BRC | GP19 | 25 | Pico output to Create BRC, optional |
+| Create BRC/DD | GP19 | 25 | Pico open-drain output to Create BRC / Device Detect, optional |
 | External status LED | GP20 | 26 | Pico output, optional |
 | Onboard LED | GP25 | onboard | Pico output |
 | IMU I2C SDA | GP2 | 4 | Pico I2C1 SDA to MPU-6050 SDA |
@@ -57,7 +58,7 @@ The IMU path is short-horizon inertial telemetry plus local tilt/impact reflex s
 
 Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external level shifting or a divider is present on the Create TX to Pico GP1 line.
 
-The Power Toggle and BRC outputs assume external wiring that is electrically safe for both the Pico and the Create. Review polarity and isolation before connecting a real robot.
+The Power Toggle output assumes external wiring that is electrically safe for both the Pico and the Create. The firmware treats BRC/DD as open-drain: asserted pulls low, released does not drive high. Use an external pull-up or level interface appropriate for the Create's 0-5V input, and do not connect any 5V Create output directly to an RP2040 pin.
 
 For initial 57600 baud Open Interface bring-up, wire Power Toggle, UART TX/RX, and GND first. Leave BRC disabled unless the board configuration explicitly enables it.
 

@@ -6,7 +6,7 @@ use core::{
 use crate::body;
 use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, PowerStateRequest,
-    RuntimeCommand, SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
+    RuntimeCommand, SafetyAction, SafetyLatchKind, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
 use crate::drivers::imu::{
     derive_sample, derive_sample_with_gravity_calibration, ImuGravityCalibration, ImuHealth,
@@ -426,19 +426,20 @@ pub enum PublicEventKind {
     TiltChanged = 33,
     MotionInconsistencyDetected = 34,
     ImpactDetected = 35,
-    Error = 36,
-    SessionOpened = 37,
-    SessionReplaced = 38,
-    SessionRejected = 39,
-    TransportChanged = 40,
-    PeerRebootDetected = 41,
-    DhcpLeaseChanged = 42,
-    DnsRegistrationChanged = 43,
-    AuthorityChanged = 44,
-    MotherbrainResetRequested = 45,
-    MotherbrainResetAsserted = 46,
-    MotherbrainResetCompleted = 47,
-    MotherbrainResetRefused = 48,
+    ImuCalibrationChanged = 36,
+    Error = 37,
+    SessionOpened = 38,
+    SessionReplaced = 39,
+    SessionRejected = 40,
+    TransportChanged = 41,
+    PeerRebootDetected = 42,
+    DhcpLeaseChanged = 43,
+    DnsRegistrationChanged = 44,
+    AuthorityChanged = 45,
+    MotherbrainResetRequested = 46,
+    MotherbrainResetAsserted = 47,
+    MotherbrainResetCompleted = 48,
+    MotherbrainResetRefused = 49,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -548,9 +549,9 @@ enum ControlCommandCode {
     GetEvents = 42,
     ZeroImuOrientation = 43,
     ClearImuOrientation = 44,
-    RestartMpu = 45,
     RestartCreate = 46,
     ResetMotherbrain = 47,
+    ClearSafetyLatch = 48,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -590,6 +591,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::WiggleAlign { .. })
         | Some(RuntimeCommand::Unstick { .. })
         | Some(RuntimeCommand::CliffGuard { .. })
+        | Some(RuntimeCommand::ClearSafetyLatch { .. })
         | Some(RuntimeCommand::HeartbeatStop { .. }) => CommandCode::Behavior,
         Some(RuntimeCommand::PulseBrc) => CommandCode::PulseBrc,
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
@@ -605,7 +607,6 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::ResetOdometry)
         | Some(RuntimeCommand::ZeroImuOrientation)
         | Some(RuntimeCommand::ClearImuOrientation)
-        | Some(RuntimeCommand::RestartMpu)
         | Some(RuntimeCommand::SetCreateBaud(_))
         | Some(RuntimeCommand::SongDefine { .. })
         | Some(RuntimeCommand::SongPlay { .. })
@@ -1398,6 +1399,14 @@ fn encode_control_command(
         BrainstemCommand::CliffGuard { clear, .. } => {
             Some((ControlCommandCode::CliffGuard, clear as u32, 0, 0, 0, None))
         }
+        BrainstemCommand::ClearSafetyLatch { kind, .. } => Some((
+            ControlCommandCode::ClearSafetyLatch,
+            encode_safety_latch_kind(kind) as u32,
+            0,
+            0,
+            0,
+            None,
+        )),
         BrainstemCommand::RequestSensors { packet_id, .. } => Some((
             ControlCommandCode::RequestSensors,
             packet_id as u32,
@@ -1484,7 +1493,6 @@ fn encode_control_command(
         BrainstemCommand::ClearImuOrientation { .. } => {
             Some((ControlCommandCode::ClearImuOrientation, 0, 0, 0, 0, None))
         }
-        BrainstemCommand::RestartMpu => Some((ControlCommandCode::RestartMpu, 0, 0, 0, 0, None)),
         BrainstemCommand::RestartCreate => {
             Some((ControlCommandCode::RestartCreate, 0, 0, 0, 0, None))
         }
@@ -1670,6 +1678,12 @@ fn decode_control_command(
         x if x == ControlCommandCode::CliffGuard as u8 => {
             Some(BrainstemCommand::CliffGuard { clear: a != 0, seq })
         }
+        x if x == ControlCommandCode::ClearSafetyLatch as u8 => {
+            Some(BrainstemCommand::ClearSafetyLatch {
+                kind: decode_safety_latch_kind(a as u8)?,
+                seq,
+            })
+        }
         x if x == ControlCommandCode::RequestSensors as u8 => {
             Some(BrainstemCommand::RequestSensors {
                 packet_id: a as u8,
@@ -1730,7 +1744,6 @@ fn decode_control_command(
         x if x == ControlCommandCode::ClearImuOrientation as u8 => {
             Some(BrainstemCommand::ClearImuOrientation { seq })
         }
-        x if x == ControlCommandCode::RestartMpu as u8 => Some(BrainstemCommand::RestartMpu),
         x if x == ControlCommandCode::RestartCreate as u8 => Some(BrainstemCommand::RestartCreate),
         x if x == ControlCommandCode::GetCapabilities as u8 => {
             Some(BrainstemCommand::GetCapabilities)
@@ -1763,6 +1776,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::WiggleAlign { seq, .. }
         | BrainstemCommand::Unstick { seq, .. }
         | BrainstemCommand::CliffGuard { seq, .. }
+        | BrainstemCommand::ClearSafetyLatch { seq, .. }
         | BrainstemCommand::SongDefine { seq, .. }
         | BrainstemCommand::RequestSensors { seq, .. }
         | BrainstemCommand::StreamSensors { seq, .. }
@@ -1837,6 +1851,32 @@ fn decode_safety_action(value: u8) -> Option<SafetyAction> {
         1 => Some(SafetyAction::Stop),
         2 => Some(SafetyAction::Backoff),
         3 => Some(SafetyAction::BumpEscape),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn encode_safety_latch_kind(kind: SafetyLatchKind) -> u8 {
+    match kind {
+        SafetyLatchKind::Bump => 1,
+        SafetyLatchKind::Cliff => 2,
+        SafetyLatchKind::WheelDrop => 3,
+        SafetyLatchKind::Heartbeat => 5,
+        SafetyLatchKind::Tilt => 6,
+        SafetyLatchKind::Impact => 7,
+        SafetyLatchKind::Charging => 8,
+    }
+}
+
+fn decode_safety_latch_kind(value: u8) -> Option<SafetyLatchKind> {
+    match value {
+        1 => Some(SafetyLatchKind::Bump),
+        2 => Some(SafetyLatchKind::Cliff),
+        3 => Some(SafetyLatchKind::WheelDrop),
+        5 => Some(SafetyLatchKind::Heartbeat),
+        6 => Some(SafetyLatchKind::Tilt),
+        7 => Some(SafetyLatchKind::Impact),
+        8 => Some(SafetyLatchKind::Charging),
         _ => None,
     }
 }
@@ -1939,6 +1979,10 @@ pub fn set_create_power_on(on: bool) {
 pub fn set_create_power_unknown() {
     CREATE_POWER_STATE.store(UNKNOWN, Ordering::Relaxed);
     clear_create_sensor_snapshot();
+}
+
+pub fn create_power_state_is_off(state: u8) -> bool {
+    state == OFF
 }
 
 pub fn mark_create_charging_indicator(active: Option<bool>) {
@@ -2271,6 +2315,12 @@ pub fn zero_imu_orientation_from_gravity() -> bool {
     IMU_TILT_MAGNITUDE_MRAD.store(0, Ordering::Relaxed);
     IMU_TILT_ACTIVE.store(0, Ordering::Relaxed);
     IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Ready as u8, Ordering::Relaxed);
+    record_public_event(
+        PublicEventKind::ImuCalibrationChanged,
+        ImuCalibrationCode::Ready as u32,
+        calibration.reference_magnitude_mm_s2 as u32,
+        sample_count,
+    );
     true
 }
 
@@ -2281,6 +2331,12 @@ pub fn clear_imu_orientation_calibration() {
     IMU_GRAVITY_REF_Z_MM_S2.store(0, Ordering::Relaxed);
     IMU_GRAVITY_REF_MAGNITUDE_MM_S2.store(0, Ordering::Relaxed);
     IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Uncalibrated as u8, Ordering::Relaxed);
+    record_public_event(
+        PublicEventKind::ImuCalibrationChanged,
+        ImuCalibrationCode::Uncalibrated as u32,
+        0,
+        IMU_SAMPLE_COUNT.load(Ordering::Relaxed),
+    );
 }
 
 pub fn imu_calibrated_down() -> Option<ImuVector> {
@@ -3435,8 +3491,7 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
     CreateSensorStatusJson {
         last_packet_id: snapshot.create_sensor_last_packet_id,
         complete_packet_count: snapshot.create_sensor_complete_packet_count,
-        last_complete_packet_timestamp_ms: snapshot
-            .create_sensor_last_complete_packet_timestamp_ms,
+        last_complete_packet_timestamp_ms: snapshot.create_sensor_last_complete_packet_timestamp_ms,
         bump_left: flags & (1 << 0) != 0,
         bump_right: flags & (1 << 1) != 0,
         wheel_drop: flags & (1 << 2) != 0,
@@ -3509,6 +3564,7 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
         x if x == PublicEventKind::ImuFrameReceived as u8 => "imu_frame_received",
         x if x == PublicEventKind::ImuFault as u8 => "imu_fault",
         x if x == PublicEventKind::TiltChanged as u8 => "tilt_changed",
+        x if x == PublicEventKind::ImuCalibrationChanged as u8 => "imu_calibration_changed",
         x if x == PublicEventKind::MotionInconsistencyDetected as u8 => {
             "motion_inconsistency_detected"
         }
@@ -3708,6 +3764,7 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::WiggleAlign as u8 => "wiggle_align",
         x if x == ControlCommandCode::Unstick as u8 => "unstick",
         x if x == ControlCommandCode::CliffGuard as u8 => "cliff_guard",
+        x if x == ControlCommandCode::ClearSafetyLatch as u8 => "clear_safety_latch",
         x if x == ControlCommandCode::SongDefine as u8 => "song_define",
         x if x == ControlCommandCode::DriveDirect as u8 => "drive_direct",
         x if x == ControlCommandCode::DriveArc as u8 => "drive_arc",
@@ -3722,7 +3779,6 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::ResetOdometry as u8 => "reset_odometry",
         x if x == ControlCommandCode::ZeroImuOrientation as u8 => "zero_imu_orientation",
         x if x == ControlCommandCode::ClearImuOrientation as u8 => "clear_imu_orientation",
-        x if x == ControlCommandCode::RestartMpu as u8 => "restart_mpu",
         x if x == ControlCommandCode::RestartCreate as u8 => "restart_create",
         x if x == ControlCommandCode::GetCapabilities as u8 => "get_capabilities",
         _ => "none",

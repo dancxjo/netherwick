@@ -61,7 +61,6 @@ pub enum AuthorizationClass {
 )]
 pub enum ServiceScope {
     Bootsel,
-    RestartMpu,
     RestartCreate,
     ResetMotherbrain,
 }

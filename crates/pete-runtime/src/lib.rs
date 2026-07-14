@@ -14,7 +14,10 @@ use pete_behaviors::{
     ReplaceableBehavior, TargetExtractor, TrainingSample, TrainingSource,
 };
 use pete_body::{BodyFlags, BodySense};
-use pete_cockpit::{Cockpit, MotionCommand, MotorCommand, SafeCockpit, StatusSummary};
+use pete_cockpit::{
+    Cockpit, CockpitEventKind, EscapeDirection, MotionCommand, MotorCommand, SafeCockpit,
+    SafetyLatchKind, StatusSummary,
+};
 use pete_conductor::{Conductor, ConductorInput, NavigationIntent, SimpleConductor};
 use pete_core::{Pose2, Provenance, Reward, TimeMs};
 use pete_events::{default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response};
@@ -4533,6 +4536,38 @@ pub struct RealRobotRunner<R, C> {
     live_image_enricher: Option<LiveImageEnricher>,
     robot_initialization: Option<serde_json::Value>,
     brainstem_interface: Option<serde_json::Value>,
+    possession_recovery: PossessionRecoveryState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PossessionRecoveryPhase {
+    Idle,
+    WaitingForSensorClear,
+    Escaping,
+}
+
+#[derive(Clone, Debug)]
+struct PossessionRecoveryState {
+    latch: Option<SafetyLatchKind>,
+    phase: PossessionRecoveryPhase,
+    turn_direction: TurnDir,
+}
+
+impl Default for PossessionRecoveryState {
+    fn default() -> Self {
+        Self {
+            latch: None,
+            phase: PossessionRecoveryPhase::Idle,
+            turn_direction: TurnDir::Left,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PossessionRecoveryDecision {
+    block_reason: Option<String>,
+    command_sent: bool,
+    debug: serde_json::Value,
 }
 
 impl<R, C> RealRobotRunner<R, C>
@@ -4559,6 +4594,7 @@ where
             live_image_enricher: None,
             robot_initialization: None,
             brainstem_interface: None,
+            possession_recovery: PossessionRecoveryState::default(),
         }
     }
 
@@ -4708,8 +4744,10 @@ where
             }
         }
 
-        let body_before =
-            body_sense_from_cockpit_status(self.cockpit.refresh_status()?, wall_time_ms());
+        let status_before = self.cockpit.refresh_status()?;
+        let body_before = body_sense_from_cockpit_status(status_before.clone(), wall_time_ms());
+        let recovery_decision =
+            self.apply_possession_recovery(&body_before, &brainstem_events, &status_before)?;
         let mut packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
@@ -4747,13 +4785,18 @@ where
             if reign_input_drives_real_slow(&input) {
                 let desired_motor =
                     action_to_motor_command(input.command.to_action().as_ref()).clamped(0.05, 0.5);
-                let block_reason = real_slow_body_block_reason(&body_before);
+                let block_reason = recovery_decision
+                    .block_reason
+                    .clone()
+                    .or_else(|| real_slow_body_block_reason(&body_before));
                 let final_motor = if block_reason.is_none() {
                     desired_motor
                 } else {
                     MotorCommand::stop()
                 };
-                apply_slow_possession_motor(&mut self.cockpit, final_motor)?;
+                if !recovery_decision.command_sent {
+                    apply_slow_possession_motor(&mut self.cockpit, final_motor)?;
+                }
                 let tick = synthetic_slow_manual_tick(
                     now,
                     input,
@@ -4783,14 +4826,17 @@ where
             .as_ref()
             .map(reign_input_drives_real_slow)
             .unwrap_or(false);
-        let block_reason =
-            real_slow_motor_block_reason(&body_before, &tick, manual_drive, self.autonomous_motion);
+        let block_reason = recovery_decision.block_reason.clone().or_else(|| {
+            real_slow_motor_block_reason(&body_before, &tick, manual_drive, self.autonomous_motion)
+        });
         let final_motor = if block_reason.is_none() {
             chosen_motor
         } else {
             MotorCommand::stop()
         };
-        apply_slow_possession_motor(&mut self.cockpit, final_motor)?;
+        if !recovery_decision.command_sent {
+            apply_slow_possession_motor(&mut self.cockpit, final_motor)?;
+        }
 
         let mut snapshot = self.now_builder.snapshot();
         snapshot.eye = tick.frame.now.eye.clone();
@@ -4832,6 +4878,10 @@ where
             object.insert(
                 "autonomous_hardware_gate".to_string(),
                 serde_json::json!(self.autonomous_motion),
+            );
+            object.insert(
+                "possession_recovery".to_string(),
+                recovery_decision.debug.clone(),
             );
             object.insert(
                 "why_not_moving".to_string(),
@@ -4883,6 +4933,128 @@ where
             }
         }
         Ok(events)
+    }
+
+    fn apply_possession_recovery(
+        &mut self,
+        body: &BodySense,
+        events: &pete_cockpit::EventBatch,
+        status: &StatusSummary,
+    ) -> Result<PossessionRecoveryDecision> {
+        for event in &events.events {
+            match event.kind {
+                CockpitEventKind::SafetyTripped => {
+                    if let Some(kind) = safety_latch_kind_from_event_code(event.a) {
+                        self.possession_recovery.latch = Some(kind);
+                        self.possession_recovery.phase =
+                            PossessionRecoveryPhase::WaitingForSensorClear;
+                        self.possession_recovery.turn_direction =
+                            recovery_turn_direction_for_latch(kind, body);
+                    }
+                }
+                CockpitEventKind::SafetyCleared => {
+                    if self.possession_recovery.latch == safety_latch_kind_from_event_code(event.a)
+                    {
+                        self.possession_recovery = PossessionRecoveryState::default();
+                    }
+                }
+                CockpitEventKind::EStopLatched => {
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+                _ => {}
+            }
+        }
+
+        if self.possession_recovery.latch.is_none()
+            && status.safety_tripped == Some(true)
+            && status.estop_latched != Some(true)
+        {
+            if let Some(kind) = infer_safety_latch_from_sensors(body) {
+                self.possession_recovery.latch = Some(kind);
+                self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+                self.possession_recovery.turn_direction =
+                    recovery_turn_direction_for_latch(kind, body);
+            }
+        }
+
+        let Some(latch) = self.possession_recovery.latch else {
+            return Ok(PossessionRecoveryDecision {
+                block_reason: None,
+                command_sent: false,
+                debug: possession_recovery_debug(&self.possession_recovery, None, false),
+            });
+        };
+
+        let command_sent = true;
+        let reason = format!("recovering {latch:?} safety latch");
+        match latch {
+            SafetyLatchKind::Bump => {
+                if bump_active(body) {
+                    self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+                    self.possession_recovery.turn_direction =
+                        recovery_turn_direction_for_latch(latch, body);
+                    self.cockpit.client_mut().bump_escape(
+                        escape_direction(self.possession_recovery.turn_direction.clone()),
+                        80,
+                        900,
+                    )?;
+                } else {
+                    self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+            }
+            SafetyLatchKind::Cliff => {
+                if cliff_active(body) {
+                    self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+                    self.possession_recovery.turn_direction =
+                        recovery_turn_direction_for_latch(latch, body);
+                    self.cockpit.client_mut().bump_escape(
+                        escape_direction(self.possession_recovery.turn_direction.clone()),
+                        100,
+                        900,
+                    )?;
+                } else {
+                    self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+            }
+            SafetyLatchKind::WheelDrop => {
+                if body.flags.wheel_drop {
+                    self.cockpit.client_mut().stop()?;
+                } else {
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+            }
+            SafetyLatchKind::Charging => {
+                if body.charging {
+                    self.cockpit.client_mut().stop()?;
+                } else {
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+            }
+            SafetyLatchKind::Heartbeat => {
+                self.cockpit.client_mut().clear_safety_latch(latch)?;
+                self.possession_recovery = PossessionRecoveryState::default();
+            }
+            SafetyLatchKind::Tilt | SafetyLatchKind::Impact => {
+                if imu_recovery_clear(status, latch) {
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                } else {
+                    self.cockpit.client_mut().stop()?;
+                }
+            }
+        }
+
+        Ok(PossessionRecoveryDecision {
+            block_reason: Some(reason),
+            command_sent,
+            debug: possession_recovery_debug(&self.possession_recovery, Some(latch), command_sent),
+        })
     }
 
     fn insert_brainstem_interface(&self, now: &mut Now, events: &pete_cockpit::EventBatch) {
@@ -5133,6 +5305,102 @@ pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: Tim
         last_update_ms: packet_update_ms,
         ..BodySense::default()
     }
+}
+
+fn safety_latch_kind_from_event_code(code: u32) -> Option<SafetyLatchKind> {
+    match code {
+        1 => Some(SafetyLatchKind::Bump),
+        2 => Some(SafetyLatchKind::Cliff),
+        3 => Some(SafetyLatchKind::WheelDrop),
+        5 => Some(SafetyLatchKind::Heartbeat),
+        6 => Some(SafetyLatchKind::Tilt),
+        7 => Some(SafetyLatchKind::Impact),
+        8 => Some(SafetyLatchKind::Charging),
+        _ => None,
+    }
+}
+
+fn infer_safety_latch_from_sensors(body: &BodySense) -> Option<SafetyLatchKind> {
+    if bump_active(body) {
+        Some(SafetyLatchKind::Bump)
+    } else if cliff_active(body) {
+        Some(SafetyLatchKind::Cliff)
+    } else if body.flags.wheel_drop {
+        Some(SafetyLatchKind::WheelDrop)
+    } else if body.charging {
+        Some(SafetyLatchKind::Charging)
+    } else {
+        None
+    }
+}
+
+fn bump_active(body: &BodySense) -> bool {
+    body.flags.bump_left || body.flags.bump_right
+}
+
+fn cliff_active(body: &BodySense) -> bool {
+    body.flags.cliff_left
+        || body.flags.cliff_front_left
+        || body.flags.cliff_front_right
+        || body.flags.cliff_right
+}
+
+fn recovery_turn_direction_for_latch(kind: SafetyLatchKind, body: &BodySense) -> TurnDir {
+    match kind {
+        SafetyLatchKind::Bump => contact_turn_direction(body),
+        SafetyLatchKind::Cliff => {
+            if body.flags.cliff_left || body.flags.cliff_front_left {
+                TurnDir::Right
+            } else if body.flags.cliff_right || body.flags.cliff_front_right {
+                TurnDir::Left
+            } else {
+                TurnDir::Left
+            }
+        }
+        _ => TurnDir::Left,
+    }
+}
+
+fn contact_turn_direction(body: &BodySense) -> TurnDir {
+    match (body.flags.bump_left, body.flags.bump_right) {
+        (true, false) => TurnDir::Right,
+        (false, true) => TurnDir::Left,
+        _ => TurnDir::Left,
+    }
+}
+
+fn escape_direction(direction: TurnDir) -> EscapeDirection {
+    match direction {
+        TurnDir::Left => EscapeDirection::Left,
+        TurnDir::Right => EscapeDirection::Right,
+    }
+}
+
+fn imu_recovery_clear(status: &StatusSummary, latch: SafetyLatchKind) -> bool {
+    match latch {
+        SafetyLatchKind::Tilt => status
+            .imu
+            .tilt_magnitude_mrad
+            .is_none_or(|value| value < 650),
+        SafetyLatchKind::Impact => status
+            .imu
+            .impact_score_mm_s2
+            .is_none_or(|value| value < 18_000),
+        _ => false,
+    }
+}
+
+fn possession_recovery_debug(
+    state: &PossessionRecoveryState,
+    active_latch: Option<SafetyLatchKind>,
+    command_sent: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "latched": active_latch.or(state.latch).map(|latch| format!("{latch:?}")),
+        "phase": format!("{:?}", state.phase),
+        "turn_direction": format!("{:?}", state.turn_direction),
+        "command_sent": command_sent,
+    })
 }
 
 fn synthetic_slow_manual_tick(
@@ -8495,6 +8763,10 @@ mod tests {
         ));
 
         sim.lock().unwrap().set_bump(false, false);
+        cockpit
+            .client_mut()
+            .clear_safety_latch(SafetyLatchKind::Bump)
+            .unwrap();
         let clear_events = cockpit.poll_events().unwrap();
         assert!(clear_events
             .events

@@ -10,7 +10,7 @@ use embassy_net::{
     Config as NetConfig, HardwareAddress, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Stack,
     StackResources,
 };
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{Input, Level, Output, OutputOpenDrain, Pull};
 use embassy_rp::i2c::{
     Async as I2cAsync, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler,
 };
@@ -31,14 +31,14 @@ use embassy_usb::UsbDevice;
 use embedded_hal_nb::serial::Read as _;
 use embedded_io_async::Write;
 use pete_cockpit_protocol::TransportKind;
-use portable_atomic::{AtomicBool, AtomicU32, Ordering};
+use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use crate::body;
 use crate::capabilities;
 use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, PowerStateRequest, SafetyAction,
-    SafetyPolicy, SongTone, MAX_SONG_TONES,
+    SafetyLatchKind, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
 use crate::dhcp::{DhcpClient, DhcpGrant, DhcpLeaseState, DhcpRequest, DHCP_LEASE_SECONDS};
 use crate::drivers::imu::{decode_mpu6050_sample, ImuHealth};
@@ -85,7 +85,6 @@ const MPU6050_ACCEL_CONFIG: u8 = 0x1c;
 const MPU6050_ACCEL_XOUT_H: u8 = 0x3b;
 
 static mut CORE1_STACK: CoreStack<8192> = CoreStack::new();
-static IMU_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 static BRAINSTEM_INSTANCE_ID: AtomicU32 = AtomicU32::new(0);
 static BRAINSTEM_BOOT_ID: AtomicU32 = AtomicU32::new(0);
 static AUTHORITY_GENERATION: AtomicU32 = AtomicU32::new(0);
@@ -104,7 +103,7 @@ bind_interrupts!(struct Irqs {
 pub struct PicoWBrainstem {
     uart: Uart<'static, Blocking>,
     power_toggle: Output<'static>,
-    brc: Output<'static>,
+    brc: OutputOpenDrain<'static>,
     status_led: Output<'static>,
     charging_indicator: Input<'static>,
     #[cfg(motherbrain_reset_hardware)]
@@ -142,7 +141,11 @@ impl PicoWBrainstem {
         Self {
             uart,
             power_toggle: Output::new(power_toggle, Level::Low),
-            brc: Output::new(brc, Level::High),
+            brc: {
+                let mut brc = OutputOpenDrain::new(brc, Level::High);
+                brc.set_pullup(false);
+                brc
+            },
             status_led: Output::new(status_led, Level::Low),
             charging_indicator: Input::new(
                 charging_indicator,
@@ -178,8 +181,8 @@ impl BrainstemHardware for PicoWBrainstem {
         self.power_toggle.set_level(level(high));
     }
 
-    fn set_brc(&mut self, high: bool) {
-        self.brc.set_level(level(high));
+    fn set_brc(&mut self, released: bool) {
+        self.brc.set_level(level(released));
     }
 
     fn set_indicators(&mut self, on: bool) {
@@ -215,14 +218,6 @@ impl BrainstemHardware for PicoWBrainstem {
 
     fn set_create_uart_baud(&mut self, baud: u32) -> Result<(), ()> {
         self.uart.set_baudrate(baud);
-        Ok(())
-    }
-
-    fn restart_imu(&mut self) -> Result<(), ImuHealth> {
-        if !body::IMU_ENABLED {
-            return Err(ImuHealth::Absent);
-        }
-        IMU_RESTART_REQUESTED.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -483,16 +478,6 @@ async fn imu_task(
     let mut address = None;
 
     loop {
-        if IMU_RESTART_REQUESTED.swap(false, Ordering::Relaxed) {
-            if let Some(active_address) = address {
-                let _ =
-                    imu_write_with_timeout(&mut i2c, active_address, [MPU6050_PWR_MGMT_1, 0x80])
-                        .await;
-                Timer::after_millis(100).await;
-            }
-            address = None;
-        }
-
         let active_address = match address {
             Some(address) => address,
             None => match initialize_imu(&mut i2c).await {
@@ -1411,39 +1396,42 @@ fn index_html() -> &'static [u8] {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pete Brainstem</title>
 <style>
-:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#202522;background:#f2f4f1;accent-color:#1f6f78}
-*{box-sizing:border-box}body{margin:0}.wrap{max-width:1180px;margin:auto;padding:14px}
-header{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:12px}
-h1{font-size:22px;line-height:1.1;margin:0}h2{font-size:12px;margin:0 0 9px;color:#59625d;text-transform:uppercase;font-weight:800}
-.sub{font-size:13px;color:#626c66;margin-top:4px}.top{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}
-.pill{font-size:12px;border:1px solid #c8cfca;border-radius:999px;padding:5px 9px;background:#fff;color:#303934;white-space:nowrap}
-.pill.ok{border-color:#63ad7d;background:#edf9f1}.pill.warn{border-color:#d4aa40;background:#fff7dc}.pill.bad{border-color:#d67171;background:#fff0f0}
-.layout{display:grid;gap:10px}.panel{background:#fff;border:1px solid #d7ddd9;border-radius:8px;padding:12px;box-shadow:0 1px 2px #1a241e12}
-.motion{display:grid;gap:12px}.joy{min-height:300px;display:grid;place-items:center;touch-action:none;user-select:none;background:#f7f9f7;border:1px solid #e1e7e3;border-radius:8px}
-.base{width:min(72vw,286px);height:min(72vw,286px);border-radius:50%;background:#e5ebe7;border:2px solid #c3ccc6;position:relative;box-shadow:inset 0 0 0 28px #f0f4f1}
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#1f2728;background:#eef1ed;accent-color:#1d7580}
+*{box-sizing:border-box}body{margin:0}.wrap{max-width:1280px;margin:auto;padding:14px}
+header{display:grid;grid-template-columns:minmax(210px,1fr) auto;gap:12px;align-items:start;margin-bottom:12px}
+h1{font-size:23px;line-height:1.05;margin:0;color:#121817}h2{font-size:12px;margin:0;color:#596361;text-transform:uppercase;font-weight:850}
+.sub{font-size:13px;color:#697370;margin-top:5px}.top{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end;align-items:center}
+.pill{font-size:12px;border:1px solid #c5cdc8;border-radius:999px;padding:5px 9px;background:#fff;color:#303936;white-space:nowrap}
+.pill.ok{border-color:#5ca77a;background:#edf8f1}.pill.warn{border-color:#d4aa40;background:#fff7dc}.pill.bad{border-color:#cf6868;background:#fff0f0}
+.check{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:750;color:#44504a;white-space:nowrap}.check input{width:16px;min-height:16px;margin:0}.lock{font-size:12px;border:1px solid #c5cdc8;border-radius:999px;padding:5px 9px;background:#fff;color:#68736c;font-weight:850;white-space:nowrap}.lock.ok{border-color:#5ca77a;background:#edf8f1;color:#287142}.lock.warn{border-color:#d4aa40;background:#fff7dc;color:#6d5510}
+.layout{display:grid;grid-template-columns:minmax(340px,.95fr) minmax(0,1.45fr);gap:10px;align-items:start}
+.side{display:grid;gap:10px}.station{background:#fff;border:1px solid #d7ded9;border-radius:8px;padding:11px;box-shadow:0 1px 2px #17241c10;display:grid;gap:10px}
+.station-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.station-head .pill{padding:4px 8px}.motion{position:sticky;top:10px}
+.zone{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(180px,.85fr);gap:10px;align-items:start}.zone.slim{grid-template-columns:minmax(0,1fr) minmax(150px,.55fr)}
+.controls{display:grid;gap:8px}.joy{min-height:326px;display:grid;place-items:center;touch-action:none;user-select:none;background:#f7f9f7;border:1px solid #e1e7e3;border-radius:8px}
+.base{width:min(68vw,296px);height:min(68vw,296px);border-radius:50%;background:#e5ebe7;border:2px solid #c3ccc6;position:relative;box-shadow:inset 0 0 0 28px #f0f4f1}
 .base:before,.base:after{content:"";position:absolute;background:#c8d1cb}.base:before{width:2px;height:82%;left:50%;top:9%}.base:after{height:2px;width:82%;left:9%;top:50%}
-.nub{width:84px;height:84px;border-radius:50%;background:#1f6f78;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);box-shadow:0 8px 18px #13251c33;border:4px solid #fbfdfb}
-.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 auto}.stack{display:grid;gap:8px}.cluster{display:grid;gap:8px;margin-top:12px}.split{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-button{min-height:42px;border:1px solid #b9c2bd;border-radius:7px;background:#fff;color:#202722;font-weight:750;font-size:14px;letter-spacing:0}
-button:active,.active{transform:translateY(1px);background:#eef2ef}button:disabled{opacity:.55}.primary{background:#dceee6;border-color:#8eb99f}.stop{background:#202522;color:#fff;border-color:#202522}.danger{background:#9d2830;color:#fff;border-color:#842029}.warnbtn{background:#fff3d6;border-color:#d8b24a}.blue{background:#e7f0fb;border-color:#9bbbe0}
+.nub{width:84px;height:84px;border-radius:50%;background:#1d7580;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);box-shadow:0 8px 18px #13251c33;border:4px solid #fbfdfb}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 auto}.split{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{min-height:40px;border:1px solid #b9c2bd;border-radius:7px;background:#fff;color:#202722;font-weight:750;font-size:14px;letter-spacing:0;cursor:pointer}
+button:active,.active{transform:translateY(1px);background:#eef2ef}button:disabled{opacity:.48;cursor:not-allowed}.primary{background:#dceee6;border-color:#8eb99f}.stop{background:#202522;color:#fff;border-color:#202522}.danger{background:#9d2830;color:#fff;border-color:#842029}.warnbtn{background:#fff3d6;border-color:#d8b24a}.blue{background:#e7f0fb;border-color:#9bbbe0}
 .pad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.pad button{min-height:48px}.pad .center{grid-column:2}
-.seg{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.seg button{min-height:38px;font-size:12px}
+.seg{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.seg.three{grid-template-columns:repeat(3,minmax(0,1fr))}.seg button{min-height:38px;font-size:12px}
 label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;gap:6px}.slider input{width:100%}input,select{width:100%;min-height:40px;border:1px solid #cbd3ce;border-radius:7px;padding:8px;font:inherit;background:#fff}
-.readout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;font-size:13px}.tile{background:#f6f8f6;border:1px solid #e1e6e2;border-radius:7px;padding:8px;min-height:50px}
+.readout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;font-size:13px}.readout.compact{grid-template-columns:1fr}.tile{background:#f6f8f6;border:1px solid #e1e6e2;border-radius:7px;padding:8px;min-height:50px}
 .tile b{display:block;color:#4e5852;font-size:11px;text-transform:uppercase;margin-bottom:3px}.tile span,.tile div{overflow-wrap:anywhere}.wide{grid-column:1/-1}.muted{color:#68736c}.badtext{color:#a1262f}.oktext{color:#287142}
-.imu{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.imu .tile{min-height:58px}.bar{height:7px;border-radius:999px;background:#dfe6e2;overflow:hidden;margin-top:6px}.bar i{display:block;height:100%;width:0;background:#1f6f78}.bar.warn i{background:#d49832}.bar.bad i{background:#b12c37}
-.log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45;max-height:110px;overflow:auto;white-space:pre-wrap}
-@media(min-width:800px){.layout{grid-template-columns:minmax(320px,.9fr) minmax(380px,1.1fr)}.telemetry{grid-column:1/-1}.joy{min-height:382px}.controlgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.cluster{margin-top:0}}
-@media(max-width:720px){.imu{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:520px){.wrap{padding:10px}header{display:grid}.readout,.split,.imu{grid-template-columns:1fr}.seg{grid-template-columns:repeat(2,1fr)}}
+.imu{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.imu .tile{min-height:58px}.bar{height:7px;border-radius:999px;background:#dfe6e2;overflow:hidden;margin-top:6px}.bar i{display:block;height:100%;width:0;background:#1d7580}.bar.warn i{background:#d49832}.bar.bad i{background:#b12c37}
+.log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45;max-height:132px;overflow:auto;white-space:pre-wrap}
+@media(max-width:980px){.layout{grid-template-columns:1fr}.motion{position:static}.zone,.zone.slim{grid-template-columns:1fr}.imu{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.wrap{padding:10px}header{grid-template-columns:1fr}.top{justify-content:flex-start}.readout,.split,.imu{grid-template-columns:1fr}.seg,.seg.three{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<header><div><h1>Pete Brainstem</h1><div class="sub" id="headline">Waiting for status</div></div><div class="top"><span id="session" class="pill">no session</span><button id="sessionnew">New session</button><button id="controllease">Request control</button><span id="net" class="pill">connecting</span><span id="mode" class="pill">mode unknown</span><span id="safety" class="pill">safety unknown</span></div></header>
+<header><div><h1>Pete Brainstem</h1><div class="sub" id="headline">Waiting for status</div></div><div class="top"><span id="session" class="pill">no session</span><button id="sessionnew">New session</button><button id="controllease">Request control</button><span id="controlstate" class="lock">unlocked</span><label class="check"><input id="controlrefresh" type="checkbox">Keep control</label><span id="net" class="pill">connecting</span><span id="mode" class="pill">mode unknown</span><span id="safety" class="pill">safety unknown</span></div></header>
 <div class="layout">
-<section class="panel motion">
-<h2>Motion</h2>
+<section class="station motion">
+<div class="station-head"><h2>Drive</h2><span id="cmd" class="pill">command unknown</span></div>
 <div class="joy"><div id="base" class="base"><div id="nub" class="nub"></div></div></div>
 <div class="split"><div class="slider"><label for="speed">Speed <span id="speedv">120</span> mm/s</label><input id="speed" type="range" min="40" max="260" value="120"></div><div class="slider"><label for="turn">Turn <span id="turnv">1200</span> mrad/s</label><input id="turn" type="range" min="300" max="2000" value="1200"></div></div>
 <div class="pad">
@@ -1452,30 +1440,44 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <button data-drive="back" class="center">BACK</button>
 <button data-drive="spinl">SPIN L</button><button data-drive="slow">SLOW</button><button data-drive="spinr">SPIN R</button>
 </div>
-<div class="row"><button class="stop" id="stop">STOP</button><button class="danger" id="estop">E-STOP</button><button id="clear">Clear E-Stop</button></div>
+<div class="row"><button class="stop" id="stop">STOP</button><button data-action="drive_for">Drive 300</button><button data-action="turn_left">Turn L</button><button data-action="turn_right">Turn R</button></div>
+<div class="row"><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div>
 </section>
-<section class="panel controls">
-<div class="controlgrid">
-<div class="cluster"><h2>Robot</h2><p class="muted">Brainstem continuously supervises the Create in Full mode.</p><div class="seg"><button id="dock">Dock</button><button id="ping">Ping</button></div></div>
-<div class="cluster"><h2>Primitives</h2><div class="seg"><button data-action="drive_for">Drive 300</button><button data-action="turn_left">Turn L</button><button data-action="turn_right">Turn R</button><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div></div>
-<div class="cluster"><h2>Reflexes</h2><div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button class="blue" data-action="heartbeat">Heartbeat</button><button id="imuzero">Zero IMU</button><button id="imuclear">Clear IMU</button><button id="mpurestart" class="warnbtn">Restart MPU</button><button id="createrestart" class="warnbtn">Restart Create</button><button id="stream">Stream Sensors</button><button id="refresh">Refresh</button><button id="bootsel">BOOTSEL</button></div></div>
-<div class="cluster wide"><h2>Music</h2><div class="split"><div class="field"><label for="songid">Slot</label><input id="songid" inputmode="numeric" value="0"></div><div class="field"><label for="tones">Tones</label><input id="tones" value="72:8,76:8,79:16"></div></div><div class="row"><button id="songdef" class="primary">Define</button><button id="songplay">Play</button><button id="song">Chirp</button></div></div>
+<div class="side">
+<section class="station">
+<div class="station-head"><h2>Safety and Reflexes</h2><span class="pill">reflex guard</span></div>
+<div class="zone slim">
+<div class="readout">
+<div class="tile wide"><b>Safety</b><span id="safetyread" class="muted">...</span></div>
+<div class="tile"><b>Last error</b><span id="err" class="muted">...</span></div>
+<div class="tile"><b>Events</b><span id="events" class="muted">...</span></div>
+</div>
+<div class="controls">
+<div class="seg"><button class="danger" id="estop">E-STOP</button><button id="clear">Clear E-Stop</button></div>
+<div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button data-action="cliff_clear">Clear Cliff</button></div>
+<button class="blue" data-action="heartbeat">Heartbeat</button>
+</div>
 </div>
 </section>
-<section class="panel telemetry">
-<h2>Telemetry</h2>
+<section class="station">
+<div class="station-head"><h2>Create Body</h2><span id="create" class="pill">create unknown</span></div>
+<div class="zone">
 <div class="readout">
-<div class="tile"><b>Runtime</b><span id="runtime" class="muted">...</span></div>
-<div class="tile"><b>Uptime</b><span id="uptime" class="muted">...</span></div>
-<div class="tile"><b>Create</b><span id="create" class="muted">...</span></div>
-<div class="tile"><b>Safety</b><span id="safetyread" class="muted">...</span></div>
-<div class="tile"><b>UART</b><span id="uart" class="muted">...</span></div>
-<div class="tile"><b>Command</b><span id="cmd" class="muted">...</span></div>
-<div class="tile"><b>Forebrain</b><span id="forebrain" class="muted">...</span></div>
-<div class="tile"><b>Web</b><span id="web" class="muted">...</span></div>
-<div class="tile"><b>Sensors</b><span id="sensors" class="muted">...</span></div>
 <div class="tile"><b>Battery</b><span id="battery" class="muted">...</span></div>
 <div class="tile"><b>Odometry</b><span id="odom" class="muted">...</span></div>
+<div class="tile wide"><b>Sensors</b><span id="sensors" class="muted">...</span></div>
+</div>
+<div class="controls">
+<div class="seg"><button id="dock">Dock</button><button id="ping">Ping</button></div>
+<div class="seg"><button id="stream">Stream Sensors</button><button id="createon" class="blue">Create On</button></div>
+<div class="seg"><button id="createoi">Start OI</button><button id="createbrc">Pulse BRC</button></div>
+<div class="seg"><button id="createoff" class="warnbtn">Create Off</button><button id="createrestart" class="warnbtn">Restart Create</button></div>
+</div>
+</div>
+</section>
+<section class="station">
+<div class="station-head"><h2>IMU</h2><span class="pill">orientation</span></div>
+<div class="zone">
 <div class="imu">
 <div class="tile"><b>IMU health</b><span id="imuhealth" class="muted">...</span></div>
 <div class="tile"><b>Yaw</b><span id="imuyaw" class="muted">...</span></div>
@@ -1486,36 +1488,74 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <div class="tile"><b>Impact</b><span id="imuimpact" class="muted">...</span><div id="imuimpactbar" class="bar"><i></i></div></div>
 <div class="tile"><b>Motion</b><span id="imumotion" class="muted">...</span></div>
 </div>
-<div class="tile"><b>Music</b><span id="music" class="muted">...</span></div>
-<div class="tile"><b>Firmware</b><span id="firmware" class="muted">...</span></div>
-<div class="tile wide"><b>Events</b><span id="events" class="muted">...</span></div>
-<div class="tile wide"><b>Last error</b><span id="err" class="muted">...</span></div>
-<div class="tile wide"><b>Activity</b><div id="log" class="log muted">No commands yet</div></div>
+<div class="controls">
+<button id="imuzero" class="primary">Zero IMU</button>
+<button id="imuclear">Clear IMU</button>
 </div>
+</div>
+</section>
+<section class="station">
+<div class="station-head"><h2>Session and Link</h2><button id="refresh">Refresh</button></div>
+<div class="zone slim">
+<div class="readout">
+<div class="tile"><b>Runtime</b><span id="runtime" class="muted">...</span></div>
+<div class="tile"><b>Uptime</b><span id="uptime" class="muted">...</span></div>
+<div class="tile"><b>UART</b><span id="uart" class="muted">...</span></div>
+<div class="tile"><b>Forebrain</b><span id="forebrain" class="muted">...</span></div>
+<div class="tile"><b>Web</b><span id="web" class="muted">...</span></div>
+<div class="tile"><b>Firmware</b><span id="firmware" class="muted">...</span></div>
+</div>
+<div class="controls"><div class="seg"><button id="mbreset" class="danger">Reset Motherbrain</button><button id="bootsel" class="danger">BOOTSEL</button></div></div>
+</div>
+</section>
+<section class="station">
+<div class="station-head"><h2>Music</h2><span id="music" class="pill">music unknown</span></div>
+<div class="zone slim">
+<div class="split"><div class="field"><label for="songid">Slot</label><input id="songid" inputmode="numeric" value="0"></div><div class="field"><label for="tones">Tones</label><input id="tones" value="72:8,76:8,79:16"></div></div>
+<div class="controls"><div class="seg three"><button id="songdef" class="primary">Define</button><button id="songplay">Play</button><button id="song">Chirp</button></div></div>
+</div>
+</section>
+<section class="station">
+<div class="station-head"><h2>Activity</h2></div>
+<div id="log" class="log muted">No commands yet</div>
 </section>
 </div>
 </div>
+</div>
 <script>
-let id=1,active=false,timer=0,last={x:0,y:0},ws=null,wsOpen=false,sse=null,sseOpen=false,driveKind='',lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,caps=null,sessionId='',controlLeaseId='',sensorStreamRequested=false;
+let id=1,active=false,timer=0,controlRefreshTimer=0,last={x:0,y:0},ws=null,wsOpen=false,sse=null,sseOpen=false,driveKind='',lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,caps=null,lastStatus=null,sessionId='',controlLeaseId='',serviceLeaseId='',sensorStreamRequested=false;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
-const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','calibrate_turn','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
-const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',heartbeat:'heartbeat_stop'};
+const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','create_power_on','create_power_off','calibrate_turn','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
+const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',cliff_clear:'cliff_guard',heartbeat:'heartbeat_stop'};
 function title(s){return (s||'unknown').replaceAll('_',' ')}
 function pill(el,text,state){el.textContent=text;el.className='pill '+(state||'')}
 function addLog(text){let t=new Date().toLocaleTimeString();log.textContent=(t+'  '+text+'\n'+(log.textContent==='No commands yet'?'':log.textContent)).slice(0,900)}
 function hasVerb(v){return !!(caps&&caps.verbs&&caps.verbs.indexOf(v)>=0)}
-function setDisabled(ids,verb){ids.forEach(x=>{let e=$(x);if(e)e.disabled=!hasVerb(verb)})}
+function setEnabled(id,on){let e=$(id);if(e)e.disabled=!on}
+function setEnabledAll(selector,on){document.querySelectorAll(selector).forEach(e=>e.disabled=!on)}
+function statusBlocksMotion(){let s=lastStatus||{},cs=s.create_sensors||{},imu=s.imu||{},imuDanger=imu.health==='fault'||(imu.health==='ok'&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safety=cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,charging=cs.charging_indicator==='on'||(cs.charging_state>=1&&cs.charging_state<=3);return !!(safety||charging)}
+function canSession(verb){return hasVerb(verb)&&!!sessionId}
+function canControl(verb){return hasVerb(verb)&&!!sessionId&&!!controlLeaseId}
+function canMotion(verb){return canControl(verb)&&!statusBlocksMotion()}
+function canService(verb){return hasVerb(verb)&&!!sessionId&&!!serviceLeaseId}
 function ensureSensorStream(){if(sensorStreamRequested||!sessionId||!hasVerb('stream_sensors'))return;sensorStreamRequested=true;sendCockpit({kind:'stream_sensors',enabled:true,packet_id:0,period_ms:250},false).then(j=>{if(j&&j.accepted===false)sensorStreamRequested=false})}
 function token(prefix){let a=new Uint32Array(2);crypto.getRandomValues(a);return prefix+'-'+a[0].toString(16)+'-'+a[1].toString(16)}
-function establishBrowserSession(){controlLeaseId='';sensorStreamRequested=false;let boot=sessionStorage.getItem('pete-browser-boot');if(!boot){boot=token('browserboot');sessionStorage.setItem('pete-browser-boot',boot)}let nonce=token('hello'),hello={role:'operator',session_purpose:'control',device_id:token('browser'),boot_id:boot,handshake_nonce:nonce,protocol_major:1,protocol_minor_min:0,protocol_minor_max:0,supported_features:['session_ids','event_cursor','heartbeat','transport_failover'],required_features:['session_ids'],preferred_heartbeat_ms:500};pill($('session'),'handshaking','warn');return fetch('/handshake',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(hello)}).then(r=>r.json()).then(j=>{if(j.kind!=='welcome'||j.echoed_handshake_nonce!==nonce)throw new Error(j.reason_code||'invalid welcome');sessionId=j.session_id;eventCursor=Math.max(0,(j.current_event_next_seq||1)-1);pill($('session'),'session '+sessionId.slice(-8),'ok');pill(net,'session HTTP','ok');addLog('session opened '+sessionId);requestCaps();connectSse();return j}).catch(e=>{sessionId='';sensorStreamRequested=false;pill($('session'),'session failed','bad');addLog('handshake failed '+e.message);throw e})}
-function acquireBrowserControl(){if(!sessionId){addLog('open a session first');return}let body={kind:'acquire_control_lease',command_id:id++,session_id:sessionId,authority:'operator_debug',ttl_ms:60000};fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(j=>{if(j.accepted&&j.type==='control_lease_granted'){controlLeaseId=j.lease_id;pill($('session'),'operator control','ok');addLog('control lease '+j.lease_id+' (60 seconds)')}else{controlLeaseId='';handleReply(j)}}).catch(e=>addLog('control request failed '+e.message))}
+function controlLock(text,state){let e=$('controlstate');e.textContent=text;e.className='lock '+(state||'')}
+function refreshControlLock(){controlLock(controlLeaseId?'locked':'unlocked',controlLeaseId?'ok':($('controlrefresh').checked?'warn':''))}
+function establishBrowserSession(){controlLeaseId='';serviceLeaseId='';sensorStreamRequested=false;applyCaps();let boot=sessionStorage.getItem('pete-browser-boot');if(!boot){boot=token('browserboot');sessionStorage.setItem('pete-browser-boot',boot)}let nonce=token('hello'),hello={role:'operator',session_purpose:'control',device_id:token('browser'),boot_id:boot,handshake_nonce:nonce,protocol_major:1,protocol_minor_min:0,protocol_minor_max:0,supported_features:['session_ids','event_cursor','heartbeat','transport_failover'],required_features:['session_ids'],preferred_heartbeat_ms:500};pill($('session'),'handshaking','warn');return fetch('/handshake',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(hello)}).then(r=>r.json()).then(j=>{if(j.kind!=='welcome'||j.echoed_handshake_nonce!==nonce)throw new Error(j.reason_code||'invalid welcome');sessionId=j.session_id;eventCursor=Math.max(0,(j.current_event_next_seq||1)-1);pill($('session'),'session '+sessionId.slice(-8),'ok');pill(net,'session HTTP','ok');addLog('session opened '+sessionId);applyCaps();requestCaps();connectSse();if($('controlrefresh').checked)acquireBrowserControl();return j}).catch(e=>{sessionId='';controlLeaseId='';serviceLeaseId='';sensorStreamRequested=false;applyCaps();pill($('session'),'session failed','bad');addLog('handshake failed '+e.message);throw e})}
+function acquireBrowserControl(){if(!sessionId){addLog('open a session first');return Promise.resolve(null)}let body={kind:'acquire_control_lease',command_id:id++,session_id:sessionId,authority:'operator_debug',ttl_ms:60000};controlLock('refreshing','warn');return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(j=>{if(j.accepted&&j.type==='control_lease_granted'){controlLeaseId=j.lease_id;serviceLeaseId='';pill($('session'),'operator control','ok');addLog('control lease '+j.lease_id+' (60 seconds)');applyCaps()}else{controlLeaseId='';handleReply(j);applyCaps()}refreshControlLock();return j}).catch(e=>{controlLeaseId='';refreshControlLock();addLog('control request failed '+e.message);return null})}
+function syncControlRefresh(){clearInterval(controlRefreshTimer);controlRefreshTimer=0;refreshControlLock();if($('controlrefresh').checked){if(sessionId)acquireBrowserControl();controlRefreshTimer=setInterval(()=>{if(!sessionId)establishBrowserSession().catch(()=>{});else acquireBrowserControl()},45000)}}
+function acquireService(scope){if(!sessionId){addLog('open a session first');return Promise.resolve(null)}let body={kind:'acquire_service_lease',command_id:id++,session_id:sessionId,scope,ttl_ms:5000};return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(j=>{if(j.accepted&&j.type==='service_lease_granted'){serviceLeaseId=j.lease_id;controlLeaseId='';pill($('session'),'service '+scope,'warn');addLog('service lease '+scope);applyCaps()}else{serviceLeaseId='';handleReply(j);applyCaps()}refreshControlLock();return j}).catch(e=>{serviceLeaseId='';addLog('service request failed '+e.message);applyCaps();return null})}
+function serviceCommand(scope,cmd){return acquireService(scope).then(j=>{if(!(j&&j.accepted))return j;return sendCockpit(cmd).then(r=>{serviceLeaseId='';applyCaps();if($('controlrefresh').checked&&scope!=='bootsel'&&scope!=='reset_motherbrain')acquireBrowserControl();return r})})}
 function connectWs(){try{ws=new WebSocket('ws://'+location.hostname+':81/control');ws.onopen=()=>{wsOpen=true;pill(net,'control ws','ok');requestCaps()};ws.onclose=()=>{wsOpen=false;pill(net,'reconnecting','warn');setTimeout(connectWs,1000)};ws.onerror=()=>{wsOpen=false;pill(net,'ws error','warn')};ws.onmessage=e=>{try{handleReply(JSON.parse(e.data))}catch(_){}}}catch(_){wsOpen=false}}
 function connectSse(){if(sse)sse.close();sseOpen=false;sse=new EventSource('/events?since='+eventCursor);sse.onopen=()=>{sseOpen=true;pill(net,'telemetry sse','ok')};sse.addEventListener('status',e=>{try{showStatus(JSON.parse(e.data))}catch(_){}});sse.addEventListener('events',e=>{try{handleEvents(JSON.parse(e.data))}catch(_){}});sse.onerror=()=>{sseOpen=false;pill(net,'sse reconnecting','warn')}}
-function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='events'){handleEvents(j);return}if(j.verbs){caps=j;applyCaps();pill(net,'capabilities','ok');ensureSensorStream();return}let ok=j.accepted!==false,reason=j.message||j.reason||'';if(!ok&&(reason==='invalid_control_lease'||reason==='control_lease_required')){controlLeaseId='';pill($('session'),'session; control expired','warn');addLog('control authority expired; press Request control')}if(!ok&&(reason==='invalid_session'||reason==='session_required')){sessionId='';controlLeaseId='';sensorStreamRequested=false;pill($('session'),'session expired','bad');addLog('session expired; press New session')}pill(net,ok?'accepted':'rejected',ok?'ok':'warn');if(!ok)addLog('rejected '+(reason||j.command_id||''));else if(j.message)addLog(j.message+' '+(j.command_id||''))}
-function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(sessionId)o.session_id=sessionId;if(controlLeaseId)o.lease_id=controlLeaseId;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
+function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='events'){handleEvents(j);return}if(j.verbs){caps=j;applyCaps();pill(net,'capabilities','ok');ensureSensorStream();return}let ok=j.accepted!==false,reason=j.message||j.reason||'';if(!ok&&(reason==='invalid_control_lease'||reason==='control_lease_required')){controlLeaseId='';pill($('session'),'session; control expired','warn');addLog('control authority expired; press Request control')}if(!ok&&(reason==='invalid_service_lease'||reason==='service_authorization_required'||reason==='service_operation_disabled')){serviceLeaseId=''}if(!ok&&(reason==='invalid_session'||reason==='session_required')){sessionId='';controlLeaseId='';serviceLeaseId='';sensorStreamRequested=false;pill($('session'),'session expired','bad');addLog('session expired; press New session')}applyCaps();refreshControlLock();pill(net,ok?'accepted':'rejected',ok?'ok':'warn');if(!ok)addLog('rejected '+(reason||j.command_id||''));else if(j.message)addLog(j.message+' '+(j.command_id||''))}
+function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(sessionId)o.session_id=sessionId;if(controlLeaseId)o.lease_id=controlLeaseId;if(serviceLeaseId)o.service_lease_id=serviceLeaseId;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
+function requestStatus(){return sendCockpit({kind:'status'},false)}
 function requestCaps(){return sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps();ensureSensorStream()}})}
-function applyCaps(){setDisabled(['stop','padstop'],'stop');setDisabled(['estop'],'estop');setDisabled(['clear'],'clear_estop');setDisabled(['stream'],'stream_sensors');setDisabled(['imuzero'],'zero_imu_orientation');setDisabled(['imuclear'],'clear_imu_orientation');setDisabled(['mpurestart'],'restart_mpu');setDisabled(['createrestart'],'restart_create');document.querySelectorAll('[data-drive]').forEach(b=>b.disabled=!hasVerb('cmd_vel'));base.style.pointerEvents=hasVerb('cmd_vel')?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];if(v)b.disabled=!hasVerb(v)});['dock','songdef','songplay','song'].forEach(x=>{let v=x==='dock'?'dock':x==='songplay'?'song_play':'song_define';$(x).disabled=!hasVerb(v)});$('ping').disabled=!hasVerb('ping');if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
-function stop(){clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('[data-drive].active').forEach(b=>b.classList.remove('active'));sendCockpit({kind:'stop'})}
+function applyCaps(){let drive=canMotion('cmd_vel'),svc=!!sessionId;setEnabled('controllease',!!sessionId);setEnabled('stop',hasVerb('stop'));setEnabled('padstop',hasVerb('stop'));setEnabled('estop',hasVerb('estop'));setEnabled('clear',canSession('clear_estop'));setEnabled('stream',canSession('stream_sensors'));setEnabled('imuzero',canControl('zero_imu_orientation'));setEnabled('imuclear',canControl('clear_imu_orientation'));setEnabled('createrestart',svc&&hasVerb('restart_create'));setEnabled('mbreset',svc&&hasVerb('reset_motherbrain'));setEnabled('bootsel',svc&&hasVerb('bootsel'));setEnabled('createon',canControl('create_power_on'));setEnabled('createoff',canControl('create_power_off'));setEnabled('createbrc',canControl('power_state'));setEnabled('createoi',canControl('power_state'));setEnabledAll('[data-drive]',drive);setEnabled('speed',drive);setEnabled('turn',drive);base.style.pointerEvents=drive?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action],motion=['drive_for','turn_left','turn_right','creep','scan','wiggle','bump_escape','unstick'].indexOf(b.dataset.action)>=0;b.disabled=!(v&&(motion?canMotion(v):canControl(v)))});setEnabled('dock',canMotion('dock'));setEnabled('songdef',canControl('song_define'));setEnabled('songplay',canControl('song_play'));setEnabled('song',canControl('song_define')&&canControl('song_play'));setEnabled('songid',canControl('song_define')||canControl('song_play'));setEnabled('tones',canControl('song_define'));setEnabled('ping',hasVerb('ping'));setEnabled('refresh',true);refreshControlLock();if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
+function releaseDriveUi(){let wasDriving=active||timer||driveKind;clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('[data-drive].active').forEach(b=>b.classList.remove('active'));return wasDriving}
+function stop(){releaseDriveUi();sendCockpit({kind:'stop'})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
 function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
 function refreshHeartbeat(){if(!hasVerb('heartbeat_stop'))return;let now=Date.now();if(now-lastHeartbeatAt>550){lastHeartbeatAt=now;sendCockpit({kind:'heartbeat_stop',timeout_ms:900},false)}}
@@ -1524,7 +1564,7 @@ function sendJoy(){paceDrive(()=>{let m=joyMax(),lin=Math.round(-last.y*m.lin),a
 function sendDrive(){paceDrive(()=>{let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=m.ang;if(driveKind==='right')ang=-m.ang;if(driveKind==='spinl')ang=m.ang,lin=0;if(driveKind==='spinr')ang=-m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);pulseCmdVel(lin,ang)})}
 function songSlot(){let n=parseInt($('songid').value,10);return Number.isFinite(n)?Math.max(0,Math.min(15,n)):0}
 function defineSong(){return sendCockpit({kind:'song_define',id:songSlot(),tones:$('tones').value})}
-function behavior(k){let v=actionVerb[k];if(v&&!hasVerb(v)){addLog('unsupported '+v);return}let m=joyMax();if(k==='drive_for')sendCockpit({kind:'drive_for',distance_mm:300,velocity_mm_s:m.lin,timeout_ms:3500});if(k==='turn_left')sendCockpit({kind:'turn_by',angle_mrad:1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='turn_right')sendCockpit({kind:'turn_by',angle_mrad:-1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='creep')sendCockpit({kind:'creep_until',velocity_mm_s:45,timeout_ms:1200});if(k==='scan')sendCockpit({kind:'scan_arc',angle_mrad:3140,angular_mrad_s:700,timeout_ms:6000});if(k==='wiggle')sendCockpit({kind:'wiggle_align',amplitude_mrad:240,angular_mrad_s:700,cycles:4});if(k==='bump_escape')sendCockpit({kind:'bump_escape',direction:'either'});if(k==='unstick')sendCockpit({kind:'unstick',direction:'either'});if(k==='cliff_trip')sendCockpit({kind:'cliff_guard',clear:false});if(k==='heartbeat')sendCockpit({kind:'heartbeat_stop',timeout_ms:1200})}
+function behavior(k){let v=actionVerb[k];if(v&&!hasVerb(v)){addLog('unsupported '+v);return}let m=joyMax();if(k==='drive_for')sendCockpit({kind:'drive_for',distance_mm:300,velocity_mm_s:m.lin,timeout_ms:3500});if(k==='turn_left')sendCockpit({kind:'turn_by',angle_mrad:1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='turn_right')sendCockpit({kind:'turn_by',angle_mrad:-1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='creep')sendCockpit({kind:'creep_until',velocity_mm_s:45,timeout_ms:1200});if(k==='scan')sendCockpit({kind:'scan_arc',angle_mrad:3140,angular_mrad_s:700,timeout_ms:6000});if(k==='wiggle')sendCockpit({kind:'wiggle_align',amplitude_mrad:240,angular_mrad_s:700,cycles:4});if(k==='bump_escape')sendCockpit({kind:'bump_escape',direction:'either'});if(k==='unstick')sendCockpit({kind:'unstick',direction:'either'});if(k==='cliff_trip')sendCockpit({kind:'cliff_guard',clear:false});if(k==='cliff_clear')sendCockpit({kind:'cliff_guard',clear:true});if(k==='heartbeat')sendCockpit({kind:'heartbeat_stop',timeout_ms:1200})}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
 base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
 base.onpointermove=e=>{if(active)move(e)}
@@ -1532,19 +1572,24 @@ base.onpointerup=base.onpointercancel=stop
 $('stop').onclick=stop;$('padstop').onclick=stop
 $('sessionnew').onclick=establishBrowserSession
 $('controllease').onclick=acquireBrowserControl
+$('controlrefresh').onchange=syncControlRefresh
 $('estop').onclick=()=>sendCockpit({kind:'estop'})
 $('clear').onclick=()=>sendCockpit({kind:'clear_estop'})
 $('dock').onclick=()=>sendCockpit({kind:'dock'})
 $('ping').onclick=()=>sendCockpit({kind:'ping'})
-$('imuzero').onclick=()=>sendCockpit({kind:'zero_imu_orientation'})
-$('imuclear').onclick=()=>sendCockpit({kind:'clear_imu_orientation'})
-$('mpurestart').onclick=()=>sendCockpit({kind:'restart_mpu'})
-$('createrestart').onclick=()=>sendCockpit({kind:'restart_create'})
+$('imuzero').onclick=()=>sendCockpit({kind:'zero_imu_orientation'}).then(requestStatus)
+$('imuclear').onclick=()=>sendCockpit({kind:'clear_imu_orientation'}).then(requestStatus)
+$('createrestart').onclick=()=>serviceCommand('restart_create',{kind:'restart_create'})
+$('mbreset').onclick=()=>serviceCommand('reset_motherbrain',{kind:'reset_motherbrain'})
+$('createon').onclick=()=>sendCockpit({kind:'create_power_on'})
+$('createoff').onclick=()=>sendCockpit({kind:'create_power_off'})
+$('createbrc').onclick=()=>sendCockpit({kind:'power_state',request:'pulse_brc'})
+$('createoi').onclick=()=>sendCockpit({kind:'power_state',request:'start_oi'})
 $('songdef').onclick=defineSong
 $('songplay').onclick=()=>sendCockpit({kind:'song_play',id:songSlot()})
 $('song').onclick=()=>defineSong().then(()=>sendCockpit({kind:'song_play',id:songSlot()}))
 $('stream').onclick=()=>sendCockpit({kind:'stream_sensors',enabled:true,packet_id:0,period_ms:250})
-$('bootsel').onclick=()=>sendCockpit({kind:'bootsel'})
+$('bootsel').onclick=()=>serviceCommand('bootsel',{kind:'bootsel'})
 $('refresh').onclick=connectSse
 document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>behavior(b.dataset.action))
 document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveKind=b.dataset.drive;b.classList.add('active');sendDrive();timer=setInterval(sendDrive,190);b.setPointerCapture(e.pointerId)};b.onpointerup=b.onpointercancel=stop})
@@ -1556,9 +1601,9 @@ function battPct(cs){return cs.capacity_mah?Math.min(100,Math.round((cs.charge_m
 function num(v,d=0){return typeof v==='number'&&isFinite(v)?v.toFixed(d):'--'}
 function pctBar(id,value,max,badAt,warnAt){let e=$(id),i=e&&e.querySelector('i');if(!e||!i)return;let p=Math.max(0,Math.min(100,(value||0)*100/max));i.style.width=p+'%';e.className='bar '+((value||0)>=badAt?'bad':(value||0)>=warnAt?'warn':'')}
 function imuClass(imu){let h=imu.health||'unknown',age=imu.sample_age_ms||0;if(h==='fault'||(h==='ok'&&age>2000))return'badtext';if(h!=='ok'||age>500)return'muted';return'oktext'}
-function showImu(imu){imu=imu||{};let present=imu.present||'unknown',health=imu.health||'unknown',age=imu.sample_age_ms||0,poll=imu.poll_period_ms||0,yaw=(imu.yaw_mrad||0)/1000,rate=(imu.yaw_rate_mrad_s||0)/1000,acc=(imu.accel_magnitude_mm_s2||0)/1000,tilt=(imu.tilt_magnitude_mrad||0)/1000,rough=(imu.roughness_mm_s2||0)/1000,impact=(imu.impact_score_mm_s2||0)/1000;let cls=imuClass(imu);$('imuhealth').textContent=title(health)+' / '+title(present)+' / age '+age+' ms / '+poll+' ms poll';$('imuhealth').className=cls;$('imuyaw').textContent=num(yaw,2)+' rad / '+num(yaw*57.2958,1)+' deg';$('imuyaw').className=cls;$('imuaccel').textContent=num(acc,2)+' m/s\u00B2';$('imuaccel').className=acc>16?'badtext':acc>12?'muted':cls;$('imutilt').textContent=num(tilt,2)+' rad / '+num(tilt*57.2958,1)+' deg';$('imutilt').className=tilt>.65?'badtext':tilt>.35?'muted':cls;$('imurates').textContent='yaw '+num(rate,2)+' rad/s / xyz '+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.x||0)/1000,2)+','+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.y||0)/1000,2)+','+num((imu.angular_velocity_mrad_s&&imu.angular_velocity_mrad_s.z||0)/1000,2);$('imurates').className=cls;$('imurough').textContent=num(rough,2)+' m/s\u00B2';$('imurough').className=rough>8?'badtext':rough>3?'muted':cls;$('imuimpact').textContent=num(impact,2)+' m/s\u00B2';$('imuimpact').className=impact>18?'badtext':impact>8?'muted':cls;$('imumotion').textContent=title(imu.motion_consistency||'unknown')+' / '+title(imu.calibration||'uncalibrated');$('imumotion').className=(imu.motion_consistency==='inconsistent'||imu.calibration==='uncalibrated')?'muted':cls;pctBar('imuaccelbar',imu.accel_magnitude_mm_s2||0,22000,18000,13000);pctBar('imutiltbar',imu.tilt_magnitude_mrad||0,1000,650,350);pctBar('imuroughbar',imu.roughness_mm_s2||0,12000,8000,3000);pctBar('imuimpactbar',imu.impact_score_mm_s2||0,22000,18000,8000)}
-function showStatus(s){let cs=s.create_sensors||{},od=s.odometry||{},imu=s.imu||{},music=s.create_songs||{},fatal=s.current_runtime_state==='error'||(s.last_error&&s.last_error!=='none'),contact=cs.bump_left||cs.bump_right||cs.wall||cs.virtual_wall,imuOk=imu.health==='ok',imuDanger=imu.health==='fault'||(imuOk&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safetyStop=cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,pct=battPct(cs),flags=flagList(cs);if(imuOk&&(imu.tilt_magnitude_mrad||0)>=650)flags.push('tilt');if(imuOk&&(imu.impact_score_mm_s2||0)>=18000)flags.push('impact');if(imuOk&&imu.motion_consistency==='inconsistent')flags.push('motion mismatch');pill(net,wsOpen?'control ws':sseOpen?'telemetry sse':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),fatal?'fatal/error':safetyStop?'safety stop':contact?'contact':'clear',fatal||safetyStop?'bad':contact?'warn':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health)+' / IMU '+title(imu.health||'unknown');$('runtime').textContent=title(s.current_runtime_state)+' / body '+title(s.body_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=flags.join(', ')||'clear';$('safetyread').className=fatal||safetyStop?'badtext':contact?'muted':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / IR '+(cs.ir_byte||0)+' / buttons '+(cs.buttons||0)+' / cliff sig '+(cs.cliff_left_signal||0)+','+(cs.cliff_front_left_signal||0)+','+(cs.cliff_front_right_signal||0)+','+(cs.cliff_right_signal||0);$('battery').textContent=(pct===null?'--':pct+'%')+' / '+(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh / charge state '+(cs.charging_state||0)+' / charge pin '+title(cs.charging_indicator);$('battery').className=pct!==null&&pct<=20?'badtext':'muted';$('odom').textContent='delta '+(cs.distance_mm||0)+' mm / '+(cs.angle_mrad||0)+' mrad / total '+(od.distance_mm||0)+' mm / '+(od.heading_mrad||0)+' mrad / resets '+(od.reset_count||0);showImu(imu);$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=fatal?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=fatal?'badtext':'muted'}
-function handleEvents(batch){let stopNeeded=false;eventCursor=Math.max(0,(batch.next_seq||1)-1);if(batch.dropped_before_seq){$('events').textContent='recovered after '+batch.dropped_before_seq;pill($('safety'),'event history recovered','warn');addLog('recovered event history after '+batch.dropped_before_seq);stopNeeded=true}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched','wheel_drop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k+' '+(e.a||0));stopNeeded=true}else if(['bump_changed','wall_changed','virtual_wall_changed','buttons_changed','ir_changed','charging_state_changed','battery_low','cliff_changed','wheel_drop_cleared','safety_cleared'].indexOf(k)>=0){addLog(k+' '+(e.a||0))}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0))}else if(k==='motion_stopped'){addLog('motion stopped')}else if(k==='error'){pill($('safety'),'fatal/error','bad');addLog('error '+(e.a||0));stopNeeded=true}});if(stopNeeded)stop()}
+function showImu(imu){imu=imu||{};let present=imu.present||'unknown',health=imu.health||'unknown',age=imu.sample_age_ms||0,poll=imu.poll_period_ms||0,yaw=(imu.yaw_mrad||0)/1000,pitch=(imu.pitch_mrad||0)/1000,roll=(imu.roll_mrad||0)/1000,rate=(imu.yaw_rate_mrad_s||0)/1000,acc=(imu.accel_magnitude_mm_s2||0)/1000,tilt=(imu.tilt_magnitude_mrad||0)/1000,rough=(imu.roughness_mm_s2||0)/1000,impact=(imu.impact_score_mm_s2||0)/1000,av=imu.angular_velocity_mrad_s||{},la=imu.linear_acceleration_mm_s2||{};let cls=imuClass(imu);$('imuhealth').textContent=title(health)+' / '+title(present)+' / samples '+(imu.sample_count||0)+' / age '+age+' ms / '+poll+' ms poll';$('imuhealth').className=cls;$('imuyaw').textContent='yaw '+num(yaw,2)+' / pitch '+num(pitch,2)+' / roll '+num(roll,2)+' rad';$('imuyaw').className=cls;$('imuaccel').textContent=num(acc,2)+' m/s\u00B2 / xyz '+num((la.x||0)/1000,2)+','+num((la.y||0)/1000,2)+','+num((la.z||0)/1000,2);$('imuaccel').className=acc>16?'badtext':acc>12?'muted':cls;$('imutilt').textContent=num(tilt,2)+' rad / '+num(tilt*57.2958,1)+' deg';$('imutilt').className=tilt>.65?'badtext':tilt>.35?'muted':cls;$('imurates').textContent='yaw '+num(rate,2)+' rad/s / xyz '+num((av.x||0)/1000,2)+','+num((av.y||0)/1000,2)+','+num((av.z||0)/1000,2);$('imurates').className=cls;$('imurough').textContent=num(rough,2)+' m/s\u00B2';$('imurough').className=rough>8?'badtext':rough>3?'muted':cls;$('imuimpact').textContent=num(impact,2)+' m/s\u00B2';$('imuimpact').className=impact>18?'badtext':impact>8?'muted':cls;$('imumotion').textContent=title(imu.motion_consistency||'unknown')+' / '+title(imu.calibration||'uncalibrated');$('imumotion').className=(imu.motion_consistency==='inconsistent'||imu.calibration==='uncalibrated')?'muted':cls;pctBar('imuaccelbar',imu.accel_magnitude_mm_s2||0,22000,18000,13000);pctBar('imutiltbar',imu.tilt_magnitude_mrad||0,1000,650,350);pctBar('imuroughbar',imu.roughness_mm_s2||0,12000,8000,3000);pctBar('imuimpactbar',imu.impact_score_mm_s2||0,22000,18000,8000)}
+function showStatus(s){lastStatus=s;let cs=s.create_sensors||{},od=s.odometry||{},imu=s.imu||{},music=s.create_songs||{},fatal=s.current_runtime_state==='error'||(s.last_error&&s.last_error!=='none'),contact=cs.bump_left||cs.bump_right||cs.wall||cs.virtual_wall,imuOk=imu.health==='ok',imuDanger=imu.health==='fault'||(imuOk&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safetyStop=cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,pct=battPct(cs),flags=flagList(cs);if(imuOk&&(imu.tilt_magnitude_mrad||0)>=650)flags.push('tilt');if(imuOk&&(imu.impact_score_mm_s2||0)>=18000)flags.push('impact');if(imuOk&&imu.motion_consistency==='inconsistent')flags.push('motion mismatch');let safetyText=flags.join(', ')||'clear';pill(net,wsOpen?'control ws':sseOpen?'telemetry sse':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),safetyStop?'safety stop':contact?'contact':'clear',safetyStop?'bad':contact?'warn':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health)+' / IMU '+title(imu.health||'unknown');$('runtime').textContent=title(s.current_runtime_state)+' / body '+title(s.body_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=safetyText;$('safetyread').className=safetyStop?'badtext':contact?'muted':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / IR '+(cs.ir_byte||0)+' / buttons '+(cs.buttons||0)+' / cliff sig '+(cs.cliff_left_signal||0)+','+(cs.cliff_front_left_signal||0)+','+(cs.cliff_front_right_signal||0)+','+(cs.cliff_right_signal||0);$('battery').textContent=(pct===null?'--':pct+'%')+' / '+(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh / charge state '+(cs.charging_state||0)+' / charge pin '+title(cs.charging_indicator);$('battery').className=pct!==null&&pct<=20?'badtext':'muted';$('odom').textContent='delta '+(cs.distance_mm||0)+' mm / '+(cs.angle_mrad||0)+' mrad / total '+(od.distance_mm||0)+' mm / '+(od.heading_mrad||0)+' mrad / resets '+(od.reset_count||0);showImu(imu);$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=fatal?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=fatal?'badtext':'muted';applyCaps()}
+function handleEvents(batch){let stopNeeded=false,refreshNeeded=false;eventCursor=Math.max(0,(batch.next_seq||1)-1);if(batch.dropped_before_seq){$('events').textContent='recovered after '+batch.dropped_before_seq;pill($('safety'),'event history recovered','warn');addLog('recovered event history after '+batch.dropped_before_seq);stopNeeded=true}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched','wheel_drop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k+' '+(e.a||0));stopNeeded=true;refreshNeeded=true}else if(k==='safety_cleared'){pill($('safety'),'clear','ok');$('safetyread').textContent='clear';$('safetyread').className='oktext';addLog(k+' '+(e.a||0));refreshNeeded=true}else if(['imu_frame_received','imu_fault','tilt_changed','impact_detected','imu_calibration_changed'].indexOf(k)>=0){addLog(k+' '+(e.a||0));refreshNeeded=true}else if(['bump_changed','wall_changed','virtual_wall_changed','buttons_changed','ir_changed','charging_state_changed','battery_low','cliff_changed','wheel_drop_cleared'].indexOf(k)>=0){addLog(k+' '+(e.a||0));refreshNeeded=true}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0));refreshNeeded=true}else if(k==='motion_stopped'){addLog('motion stopped')}else if(k==='error'){pill($('safety'),'fatal/error','bad');addLog('error '+(e.a||0));stopNeeded=true;refreshNeeded=true}});if(refreshNeeded)requestStatus();if(stopNeeded&&releaseDriveUi())sendCockpit({kind:'stop'})}
 applyCaps();establishBrowserSession().catch(connectSse);
 </script>
 </body>
@@ -2195,6 +2240,10 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             seq,
             clear: parse_bool(parts.next()).ok_or(seq)?,
         },
+        "CLEAR_SAFETY_LATCH" => BrainstemCommand::ClearSafetyLatch {
+            seq,
+            kind: parse_safety_latch_kind(parts.next().ok_or(seq)?).ok_or(seq)?,
+        },
         "HEARTBEAT_STOP" => BrainstemCommand::HeartbeatStop {
             seq,
             timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
@@ -2250,6 +2299,14 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
         "POWER_STATE" => BrainstemCommand::PowerState {
             seq,
             request: parse_power_request(parts.next().ok_or(seq)?).ok_or(seq)?,
+        },
+        "CREATE_POWER_ON" => BrainstemCommand::PowerState {
+            seq,
+            request: PowerStateRequest::Wake,
+        },
+        "CREATE_POWER_OFF" => BrainstemCommand::PowerState {
+            seq,
+            request: PowerStateRequest::Sleep,
         },
         "CALIBRATE_TURN" => BrainstemCommand::CalibrateTurn {
             seq,
@@ -2453,7 +2510,6 @@ fn command_requires_service_authority(command: BrainstemCommand) -> bool {
     matches!(
         command,
         BrainstemCommand::Bootsel
-            | BrainstemCommand::RestartMpu
             | BrainstemCommand::RestartCreate
             | BrainstemCommand::ResetMotherbrain
     )
@@ -2621,7 +2677,6 @@ fn compact_service_authority_valid(
 ) -> bool {
     let scope = match command {
         BrainstemCommand::Bootsel => 1,
-        BrainstemCommand::RestartMpu => 2,
         BrainstemCommand::RestartCreate => 3,
         BrainstemCommand::ResetMotherbrain => 4,
         _ => 0,
@@ -2967,7 +3022,6 @@ fn install_authority(session_hash: u32, ttl_ms: u32) -> Option<(heapless::String
 fn service_scope_code(scope: &str) -> Option<u8> {
     match scope {
         "bootsel" => Some(1),
-        "restart_mpu" => Some(2),
         "restart_create" => Some(3),
         "reset_motherbrain" => Some(4),
         _ => None,
@@ -3047,7 +3101,7 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
     let snapshot = status::snapshot(Instant::now().as_millis() as u32);
     let _ = writeln!(
         response,
-        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_yaw_rate_mrad_s={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={}",
+        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={}",
         snapshot.uptime_ms,
         snapshot.current_runtime_state,
         snapshot.body_state,
@@ -3083,10 +3137,19 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.forebrain_uart_rx_lines,
         snapshot.imu_present,
         snapshot.imu_health,
+        snapshot.imu_sample_count,
         snapshot.imu_sample_age_ms,
         snapshot.imu_poll_period_ms,
         snapshot.imu_yaw_mrad,
+        snapshot.imu_pitch_mrad,
+        snapshot.imu_roll_mrad,
         snapshot.imu_yaw_rate_mrad_s,
+        snapshot.imu_gyro_x_mrad_s,
+        snapshot.imu_gyro_y_mrad_s,
+        snapshot.imu_gyro_z_mrad_s,
+        snapshot.imu_accel_x_mm_s2,
+        snapshot.imu_accel_y_mm_s2,
+        snapshot.imu_accel_z_mm_s2,
         snapshot.imu_accel_magnitude_mm_s2,
         snapshot.imu_tilt_magnitude_mrad,
         snapshot.imu_roughness_mm_s2,
@@ -3238,6 +3301,10 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             clear: json_bool(body, "clear").unwrap_or(false),
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
+        "clear_safety_latch" => Some(BrainstemCommand::ClearSafetyLatch {
+            kind: parse_safety_latch_kind(json_str(body, "latch")?)?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
         "heartbeat_stop" => Some(BrainstemCommand::HeartbeatStop {
             timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "ttl_ms"))?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
@@ -3281,6 +3348,14 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             request: parse_power_request(json_str(body, "request")?)?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
+        "create_power_on" => Some(BrainstemCommand::PowerState {
+            request: PowerStateRequest::Wake,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "create_power_off" => Some(BrainstemCommand::PowerState {
+            request: PowerStateRequest::Sleep,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
         "calibrate_turn" => Some(BrainstemCommand::CalibrateTurn {
             angular_mrad_s: json_i16(body, "angular_mrad_s")?,
             duration_ms: json_u32(body, "duration_ms")?,
@@ -3295,7 +3370,6 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
         "clear_imu_orientation" => Some(BrainstemCommand::ClearImuOrientation {
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
-        "restart_mpu" => Some(BrainstemCommand::RestartMpu),
         "restart_create" => Some(BrainstemCommand::RestartCreate),
         "reset_motherbrain" => Some(BrainstemCommand::ResetMotherbrain),
         "get_capabilities" => Some(BrainstemCommand::GetCapabilities),
@@ -3348,6 +3422,19 @@ fn parse_safety_action(action: &str) -> Option<SafetyAction> {
         "stop" | "STOP" => Some(SafetyAction::Stop),
         "backoff" | "BACKOFF" => Some(SafetyAction::Backoff),
         "bump_escape" | "BUMP_ESCAPE" | "escape" | "ESCAPE" => Some(SafetyAction::BumpEscape),
+        _ => None,
+    }
+}
+
+fn parse_safety_latch_kind(kind: &str) -> Option<SafetyLatchKind> {
+    match kind {
+        "bump" | "BUMP" => Some(SafetyLatchKind::Bump),
+        "cliff" | "CLIFF" => Some(SafetyLatchKind::Cliff),
+        "wheel_drop" | "WHEEL_DROP" => Some(SafetyLatchKind::WheelDrop),
+        "heartbeat" | "HEARTBEAT" => Some(SafetyLatchKind::Heartbeat),
+        "tilt" | "TILT" => Some(SafetyLatchKind::Tilt),
+        "impact" | "IMPACT" => Some(SafetyLatchKind::Impact),
+        "charging" | "CHARGING" => Some(SafetyLatchKind::Charging),
         _ => None,
     }
 }

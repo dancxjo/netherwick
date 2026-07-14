@@ -247,6 +247,11 @@ fn main() {
             body.capabilities.events.push(event.into());
         }
     }
+    if env::var_os("CARGO_FEATURE_SERVICE_MODE").is_some()
+        && !body.capabilities.verbs.iter().any(|verb| verb == "bootsel")
+    {
+        body.capabilities.verbs.push("bootsel".into());
+    }
 
     let default_mode = match body.create_oi.default_mode.as_str() {
         "passive" => "CreateOiMode::Passive",
@@ -386,16 +391,12 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
             .create_charging_indicator
             .physical_pin
             .unwrap_or(0),
-        create_charging_indicator_active_high = match board
-            .pins
-            .create_charging_indicator
-            .active
-            .as_str()
-        {
-            "high" => true,
-            "low" => false,
-            other => panic!("unsupported create_charging_indicator.active: {other}"),
-        },
+        create_charging_indicator_active_high =
+            match board.pins.create_charging_indicator.active.as_str() {
+                "high" => true,
+                "low" => false,
+                other => panic!("unsupported create_charging_indicator.active: {other}"),
+            },
         estop_enabled = board.pins.estop.enabled,
         estop_pin = board.pins.estop.pin,
         estop_gpio = board.pins.estop.gpio,

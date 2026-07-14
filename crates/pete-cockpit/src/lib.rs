@@ -311,6 +311,10 @@ pub trait Cockpit {
         expect_accepted(self.execute(CockpitRequest::ClearEStop)?)
     }
 
+    fn clear_safety_latch(&mut self, kind: SafetyLatchKind) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::ClearSafetyLatch { latch: kind })?)
+    }
+
     fn cmd_vel(&mut self, linear_mm_s: i16, angular_mrad_s: i16, ttl_ms: u32) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::CmdVel {
             linear_mm_s,
@@ -671,6 +675,18 @@ pub enum SafetyAction {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyLatchKind {
+    Bump,
+    Cliff,
+    WheelDrop,
+    Heartbeat,
+    Tilt,
+    Impact,
+    Charging,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SafetyPolicy {
     pub bump: SafetyAction,
     pub cliff: SafetyAction,
@@ -745,6 +761,32 @@ impl SafetyAction {
             Self::Backoff => "backoff",
             Self::BumpEscape => "bump_escape",
         }
+    }
+}
+
+impl SafetyLatchKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bump => "bump",
+            Self::Cliff => "cliff",
+            Self::WheelDrop => "wheel_drop",
+            Self::Heartbeat => "heartbeat",
+            Self::Tilt => "tilt",
+            Self::Impact => "impact",
+            Self::Charging => "charging",
+        }
+    }
+}
+
+fn safety_latch_kind_code(kind: SafetyLatchKind) -> u32 {
+    match kind {
+        SafetyLatchKind::Bump => 1,
+        SafetyLatchKind::Cliff => 2,
+        SafetyLatchKind::WheelDrop => 3,
+        SafetyLatchKind::Heartbeat => 5,
+        SafetyLatchKind::Tilt => 6,
+        SafetyLatchKind::Impact => 7,
+        SafetyLatchKind::Charging => 8,
     }
 }
 
@@ -1392,10 +1434,15 @@ impl OdometrySummary {
 pub struct ImuSummary {
     pub present: Option<String>,
     pub health: Option<String>,
+    pub sample_count: Option<u32>,
     pub sample_age_ms: Option<u32>,
     pub poll_period_ms: Option<u32>,
     pub yaw_mrad: Option<i32>,
+    pub pitch_mrad: Option<i32>,
+    pub roll_mrad: Option<i32>,
     pub yaw_rate_mrad_s: Option<i32>,
+    pub angular_velocity_mrad_s: Axis3Summary,
+    pub linear_acceleration_mm_s2: Axis3Summary,
     pub accel_magnitude_mm_s2: Option<u32>,
     pub tilt_magnitude_mrad: Option<u32>,
     pub roughness_mm_s2: Option<u32>,
@@ -1409,10 +1456,24 @@ impl ImuSummary {
         Self {
             present: value_for(raw, "imu_present").map(ToOwned::to_owned),
             health: value_for(raw, "imu_health").map(ToOwned::to_owned),
+            sample_count: number_for(raw, "imu_samples")
+                .or_else(|| number_for(raw, "imu_sample_count")),
             sample_age_ms: number_for(raw, "imu_age_ms"),
             poll_period_ms: number_for(raw, "imu_poll_ms"),
             yaw_mrad: signed_number_for(raw, "imu_yaw_mrad"),
+            pitch_mrad: signed_number_for(raw, "imu_pitch_mrad"),
+            roll_mrad: signed_number_for(raw, "imu_roll_mrad"),
             yaw_rate_mrad_s: signed_number_for(raw, "imu_yaw_rate_mrad_s"),
+            angular_velocity_mrad_s: Axis3Summary {
+                x: signed_number_for(raw, "imu_gyro_x_mrad_s"),
+                y: signed_number_for(raw, "imu_gyro_y_mrad_s"),
+                z: signed_number_for(raw, "imu_gyro_z_mrad_s"),
+            },
+            linear_acceleration_mm_s2: Axis3Summary {
+                x: signed_number_for(raw, "imu_accel_x_mm_s2"),
+                y: signed_number_for(raw, "imu_accel_y_mm_s2"),
+                z: signed_number_for(raw, "imu_accel_z_mm_s2"),
+            },
             accel_magnitude_mm_s2: number_for(raw, "imu_accel_mag_mm_s2"),
             tilt_magnitude_mrad: number_for(raw, "imu_tilt_mrad"),
             roughness_mm_s2: number_for(raw, "imu_roughness_mm_s2"),
@@ -1429,16 +1490,43 @@ impl ImuSummary {
         Self {
             present: json_str_value(imu, "present").map(ToOwned::to_owned),
             health: json_str_value(imu, "health").map(ToOwned::to_owned),
+            sample_count: json_u32_value(imu, "sample_count"),
             sample_age_ms: json_u32_value(imu, "sample_age_ms"),
             poll_period_ms: json_u32_value(imu, "poll_period_ms"),
             yaw_mrad: json_i32_value(imu, "yaw_mrad"),
+            pitch_mrad: json_i32_value(imu, "pitch_mrad"),
+            roll_mrad: json_i32_value(imu, "roll_mrad"),
             yaw_rate_mrad_s: json_i32_value(imu, "yaw_rate_mrad_s"),
+            angular_velocity_mrad_s: Axis3Summary::from_json(imu.get("angular_velocity_mrad_s")),
+            linear_acceleration_mm_s2: Axis3Summary::from_json(
+                imu.get("linear_acceleration_mm_s2"),
+            ),
             accel_magnitude_mm_s2: json_u32_value(imu, "accel_magnitude_mm_s2"),
             tilt_magnitude_mrad: json_u32_value(imu, "tilt_magnitude_mrad"),
             roughness_mm_s2: json_u32_value(imu, "roughness_mm_s2"),
             impact_score_mm_s2: json_u32_value(imu, "impact_score_mm_s2"),
             motion_consistency: json_str_value(imu, "motion_consistency").map(ToOwned::to_owned),
             calibration: json_str_value(imu, "calibration").map(ToOwned::to_owned),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Axis3Summary {
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub z: Option<i32>,
+}
+
+impl Axis3Summary {
+    fn from_json(value: Option<&serde_json::Value>) -> Self {
+        let Some(value) = value else {
+            return Self::default();
+        };
+        Self {
+            x: json_i32_value(value, "x"),
+            y: json_i32_value(value, "y"),
+            z: json_i32_value(value, "z"),
         }
     }
 }
@@ -1471,7 +1559,6 @@ fn battery_percent(charge_mah: Option<u32>, capacity_mah: Option<u32>) -> Option
 pub enum CockpitRequest {
     Ping,
     Bootsel,
-    RestartMpu,
     RestartCreate,
     ResetMotherbrain,
     GetStatus,
@@ -1493,6 +1580,9 @@ pub enum CockpitRequest {
     Stop,
     EStop,
     ClearEStop,
+    ClearSafetyLatch {
+        latch: SafetyLatchKind,
+    },
     CmdVel {
         linear_mm_s: i16,
         angular_mrad_s: i16,
@@ -1616,6 +1706,8 @@ pub enum CockpitRequest {
     PowerState {
         request: PowerStateRequest,
     },
+    CreatePowerOn,
+    CreatePowerOff,
     CalibrateTurn {
         angular_mrad_s: i16,
         duration_ms: u32,
@@ -1643,7 +1735,6 @@ impl CockpitRequest {
     fn required_service_scope(&self) -> Option<ServiceScope> {
         match self {
             Self::Bootsel => Some(ServiceScope::Bootsel),
-            Self::RestartMpu => Some(ServiceScope::RestartMpu),
             Self::RestartCreate => Some(ServiceScope::RestartCreate),
             Self::ResetMotherbrain => Some(ServiceScope::ResetMotherbrain),
             _ => None,
@@ -1662,7 +1753,7 @@ impl CockpitRequest {
             | Self::RequestSensors { .. }
             | Self::StreamSensors { .. }
             | Self::Disarm => AuthorizationClass::Session,
-            Self::Bootsel | Self::RestartMpu | Self::RestartCreate | Self::ResetMotherbrain => {
+            Self::Bootsel | Self::RestartCreate | Self::ResetMotherbrain => {
                 AuthorizationClass::ServiceLease
             }
             _ => AuthorizationClass::ControlLease,
@@ -1680,11 +1771,25 @@ impl CockpitRequest {
         self.authorization_class() == AuthorizationClass::ControlLease
     }
 
+    fn bypasses_closed_motor_gate(&self) -> bool {
+        matches!(
+            self,
+            Self::Stop
+                | Self::EStop
+                | Self::ClearEStop
+                | Self::ClearSafetyLatch { .. }
+                | Self::BumpEscape { .. }
+                | Self::Unstick { .. }
+                | Self::CliffGuard { .. }
+                | Self::ZeroImuOrientation
+                | Self::ClearImuOrientation
+        )
+    }
+
     pub fn verb(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
             Self::Bootsel => "bootsel",
-            Self::RestartMpu => "restart_mpu",
             Self::RestartCreate => "restart_create",
             Self::ResetMotherbrain => "reset_motherbrain",
             Self::GetStatus => "status",
@@ -1698,6 +1803,7 @@ impl CockpitRequest {
             Self::Stop => "stop",
             Self::EStop => "estop",
             Self::ClearEStop => "clear_estop",
+            Self::ClearSafetyLatch { .. } => "clear_safety_latch",
             Self::CmdVel { .. } => "cmd_vel",
             Self::DriveDirect { .. } => "drive_direct",
             Self::DriveArc { .. } => "drive_arc",
@@ -1724,6 +1830,8 @@ impl CockpitRequest {
             Self::DefineChirp { .. } => "define_chirp",
             Self::PlayFeedback { .. } => "play_feedback",
             Self::PowerState { .. } => "power_state",
+            Self::CreatePowerOn => "create_power_on",
+            Self::CreatePowerOff => "create_power_off",
             Self::CalibrateTurn { .. } => "calibrate_turn",
             Self::ResetOdometry => "reset_odometry",
             Self::ZeroImuOrientation => "zero_imu_orientation",
@@ -1778,9 +1886,7 @@ impl CockpitRequest {
         match self {
             Self::Ping => client.ping().map(|()| CockpitResponse::Accepted),
             Self::Bootsel => client.bootsel().map(|()| CockpitResponse::Accepted),
-            Self::RestartMpu | Self::RestartCreate | Self::ResetMotherbrain => {
-                client.execute(self.clone())
-            }
+            Self::RestartCreate | Self::ResetMotherbrain => client.execute(self.clone()),
             Self::GetStatus => Ok(CockpitResponse::Status(client.get_status()?)),
             Self::GetCapabilities => Ok(CockpitResponse::Capabilities(client.get_capabilities()?)),
             Self::GetEvents { since_seq } => Ok(CockpitResponse::Events(
@@ -1794,6 +1900,9 @@ impl CockpitRequest {
             Self::Stop => client.stop().map(|()| CockpitResponse::Accepted),
             Self::EStop => client.estop().map(|()| CockpitResponse::Accepted),
             Self::ClearEStop => client.clear_estop().map(|()| CockpitResponse::Accepted),
+            Self::ClearSafetyLatch { latch } => client
+                .clear_safety_latch(*latch)
+                .map(|()| CockpitResponse::Accepted),
             Self::CmdVel {
                 linear_mm_s,
                 angular_mrad_s,
@@ -1990,6 +2099,12 @@ impl CockpitRequest {
             Self::PowerState { request } => client
                 .power_state(*request)
                 .map(|()| CockpitResponse::Accepted),
+            Self::CreatePowerOn => client
+                .power_state(PowerStateRequest::Wake)
+                .map(|()| CockpitResponse::Accepted),
+            Self::CreatePowerOff => client
+                .power_state(PowerStateRequest::Sleep)
+                .map(|()| CockpitResponse::Accepted),
             Self::CalibrateTurn {
                 angular_mrad_s,
                 duration_ms,
@@ -2081,7 +2196,6 @@ impl CockpitRequest {
             self,
             Self::Ping
                 | Self::Bootsel
-                | Self::RestartMpu
                 | Self::RestartCreate
                 | Self::ResetMotherbrain
                 | Self::GetStatus
@@ -2092,6 +2206,7 @@ impl CockpitRequest {
                 | Self::Stop
                 | Self::EStop
                 | Self::ClearEStop
+                | Self::ClearSafetyLatch { .. }
                 | Self::SetMode { .. }
                 | Self::SongPlay { .. }
                 | Self::Dock
@@ -2103,7 +2218,6 @@ impl CockpitRequest {
         match self {
             Self::Ping => format!("PING {seq}\n"),
             Self::Bootsel => format!("BOOTSEL {seq}\n"),
-            Self::RestartMpu => format!("RESTART_MPU {seq}\n"),
             Self::RestartCreate => format!("RESTART_CREATE {seq}\n"),
             Self::ResetMotherbrain => format!("RESET_MOTHERBRAIN {seq}\n"),
             Self::GetStatus => format!("STATUS {seq}\n"),
@@ -2125,7 +2239,6 @@ impl CockpitRequest {
                 "ACQUIRE_SERVICE_LEASE {seq} {} {ttl_ms}\n",
                 match scope {
                     ServiceScope::Bootsel => "bootsel",
-                    ServiceScope::RestartMpu => "restart_mpu",
                     ServiceScope::RestartCreate => "restart_create",
                     ServiceScope::ResetMotherbrain => "reset_motherbrain",
                 }
@@ -2135,6 +2248,9 @@ impl CockpitRequest {
             Self::Stop => format!("STOP {seq}\n"),
             Self::EStop => format!("ESTOP {seq}\n"),
             Self::ClearEStop => format!("CLEAR_ESTOP {seq}\n"),
+            Self::ClearSafetyLatch { latch } => {
+                format!("CLEAR_SAFETY_LATCH {seq} {}\n", latch.as_str())
+            }
             Self::CmdVel {
                 linear_mm_s,
                 angular_mrad_s,
@@ -2268,6 +2384,8 @@ impl CockpitRequest {
             }
             Self::PlayFeedback { feedback } => format!("PLAY_FEEDBACK {seq} {}\n", feedback.as_str()),
             Self::PowerState { request } => format!("POWER_STATE {seq} {}\n", request.as_str()),
+            Self::CreatePowerOn => format!("CREATE_POWER_ON {seq}\n"),
+            Self::CreatePowerOff => format!("CREATE_POWER_OFF {seq}\n"),
             Self::CalibrateTurn {
                 angular_mrad_s,
                 duration_ms,
@@ -2332,7 +2450,6 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "status",
         "get_capabilities",
         "get_events",
-        "restart_mpu",
         "restart_create",
         "reset_motherbrain",
         "arm",
@@ -2340,6 +2457,7 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "stop",
         "estop",
         "clear_estop",
+        "clear_safety_latch",
         "clear_motion_queue",
         "cmd_vel",
         "drive_direct",
@@ -2368,6 +2486,8 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "define_chirp",
         "play_feedback",
         "power_state",
+        "create_power_on",
+        "create_power_off",
         "calibrate_turn",
         "reset_odometry",
         "zero_imu_orientation",
@@ -2624,6 +2744,7 @@ pub enum CockpitEventKind {
     ImuFrameReceived,
     ImuFault,
     TiltChanged,
+    ImuCalibrationChanged,
     MotionInconsistencyDetected,
     ImpactDetected,
     SessionOpened,
@@ -2679,6 +2800,7 @@ impl From<&str> for CockpitEventKind {
             "imu_frame_received" => Self::ImuFrameReceived,
             "imu_fault" => Self::ImuFault,
             "tilt_changed" => Self::TiltChanged,
+            "imu_calibration_changed" => Self::ImuCalibrationChanged,
             "motion_inconsistency_detected" => Self::MotionInconsistencyDetected,
             "impact_detected" => Self::ImpactDetected,
             "session_opened" => Self::SessionOpened,
@@ -2736,6 +2858,7 @@ impl CockpitEventKind {
             Self::ImuFrameReceived => "imu_frame_received",
             Self::ImuFault => "imu_fault",
             Self::TiltChanged => "tilt_changed",
+            Self::ImuCalibrationChanged => "imu_calibration_changed",
             Self::MotionInconsistencyDetected => "motion_inconsistency_detected",
             Self::ImpactDetected => "impact_detected",
             Self::SessionOpened => "session_opened",
@@ -2878,6 +3001,7 @@ impl SimCockpit {
                     "imu_frame_received",
                     "imu_fault",
                     "tilt_changed",
+                    "imu_calibration_changed",
                     "motion_inconsistency_detected",
                     "impact_detected",
                 ]
@@ -3212,11 +3336,10 @@ impl SimCockpit {
             // Match the firmware's default bump policy: stop the current
             // motion, but keep the possession lease usable for a bounded
             // motherbrain recovery once contact clears.
+            self.safety_tripped = true;
             self.interrupt_active_motion();
             self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
             self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
-        } else if was_active && !active {
-            self.push_event(CockpitEventKind::SafetyCleared, 1, 0, 0);
         }
     }
 
@@ -3226,6 +3349,12 @@ impl SimCockpit {
         }
         self.cliff = active;
         self.push_event(CockpitEventKind::CliffChanged, active as u32, 0, 0);
+        if active {
+            self.safety_tripped = true;
+            self.interrupt_active_motion();
+            self.push_event(CockpitEventKind::SafetyTripped, 2, 0, 0);
+            self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
+        }
     }
 
     pub fn set_wheel_drop(&mut self, active: bool) {
@@ -3239,10 +3368,6 @@ impl SimCockpit {
             self.push_event(CockpitEventKind::WheelDropLatched, 1, 0, 0);
             self.push_event(CockpitEventKind::SafetyTripped, 3, 0, 0);
             self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
-        } else {
-            self.safety_tripped = self.estop_latched || self.cliff;
-            self.push_event(CockpitEventKind::WheelDropCleared, 0, 0, 0);
-            self.push_event(CockpitEventKind::SafetyCleared, 3, 0, 0);
         }
     }
 
@@ -3423,6 +3548,9 @@ impl Cockpit for SimCockpit {
             CockpitRequest::Stop => self.stop().map(|()| CockpitResponse::Accepted),
             CockpitRequest::EStop => self.estop().map(|()| CockpitResponse::Accepted),
             CockpitRequest::ClearEStop => self.clear_estop().map(|()| CockpitResponse::Accepted),
+            CockpitRequest::ClearSafetyLatch { latch } => self
+                .clear_safety_latch(latch)
+                .map(|()| CockpitResponse::Accepted),
             CockpitRequest::CmdVel {
                 linear_mm_s,
                 angular_mrad_s,
@@ -3633,7 +3761,7 @@ impl Cockpit for SimCockpit {
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
-                "OK 0 STATUS sim=true now_ms={} uptime_ms={} create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_yaw_rate_mrad_s=0 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={}",
+                "OK 0 STATUS sim=true now_ms={} uptime_ms={} create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_samples=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_pitch_mrad=0 imu_roll_mrad=0 imu_yaw_rate_mrad_s=0 imu_gyro_x_mrad_s=0 imu_gyro_y_mrad_s=0 imu_gyro_z_mrad_s=0 imu_accel_x_mm_s2=0 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=9807 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={}",
                 self.now_ms,
                 self.now_ms,
                 self.now_ms,
@@ -3740,6 +3868,23 @@ impl Cockpit for SimCockpit {
         Ok(())
     }
 
+    fn clear_safety_latch(&mut self, kind: SafetyLatchKind) -> Result<()> {
+        self.require_scoped_dispatch()?;
+        let id = self.accept_command();
+        self.safety_tripped = false;
+        if kind == SafetyLatchKind::WheelDrop {
+            self.push_event(CockpitEventKind::WheelDropCleared, 0, 0, 0);
+        }
+        self.push_event(
+            CockpitEventKind::SafetyCleared,
+            safety_latch_kind_code(kind),
+            0,
+            0,
+        );
+        self.complete_command(id);
+        Ok(())
+    }
+
     fn cmd_vel(&mut self, linear_mm_s: i16, angular_mrad_s: i16, ttl_ms: u32) -> Result<()> {
         self.require_scoped_dispatch()?;
         let id = self.accept_command();
@@ -3790,6 +3935,7 @@ impl Cockpit for SimCockpit {
         self.require_scoped_dispatch()?;
         let id = self.accept_command();
         self.imu_calibration = 3;
+        self.push_event(CockpitEventKind::ImuCalibrationChanged, 3, 9807, 1);
         self.complete_command(id);
         Ok(())
     }
@@ -3798,6 +3944,7 @@ impl Cockpit for SimCockpit {
         self.require_scoped_dispatch()?;
         let id = self.accept_command();
         self.imu_calibration = 0;
+        self.push_event(CockpitEventKind::ImuCalibrationChanged, 0, 0, 1);
         self.complete_command(id);
         Ok(())
     }
@@ -4037,7 +4184,7 @@ impl<C: Cockpit> MotherbrainPossession<C> {
     }
 
     fn execute_scoped(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
-        if request.authorization_class() != AuthorizationClass::Emergency {
+        if !request.bypasses_closed_motor_gate() {
             self.maintain()?;
         }
         if matches!(request, CockpitRequest::SetMode { .. }) {
@@ -4150,7 +4297,7 @@ impl<C: Cockpit> Cockpit for MotherbrainPossession<C> {
                 if let CockpitResponse::Status(status) = &response {
                     let summary = status.summary();
                     self.last_status = Some(summary.clone());
-                    if summary.estop_latched == Some(true) || summary.safety_tripped == Some(true) {
+                    if summary.estop_latched == Some(true) {
                         self.close_gate("brainstem safety refusal".into());
                     }
                 }
@@ -4424,10 +4571,6 @@ impl<C: Cockpit> ServiceCockpit<'_, C> {
             ));
         }
         self.session.execute(request)
-    }
-
-    pub fn restart_mpu(&mut self) -> Result<()> {
-        expect_accepted(self.execute(CockpitRequest::RestartMpu)?)
     }
 
     pub fn restart_create(&mut self) -> Result<()> {
@@ -6906,7 +7049,6 @@ mod tests {
         );
         for request in [
             CockpitRequest::Bootsel,
-            CockpitRequest::RestartMpu,
             CockpitRequest::RestartCreate,
             CockpitRequest::ResetMotherbrain,
         ] {
@@ -7516,6 +7658,7 @@ mod tests {
         sim.cmd_vel(70, 0, 1_000).unwrap();
         sim.set_wheel_drop(true);
         sim.set_wheel_drop(false);
+        sim.clear_safety_latch(SafetyLatchKind::WheelDrop).unwrap();
 
         let batch = sim.get_events_since(0).unwrap();
         assert!(batch.has_stop_reason());
@@ -7827,7 +7970,6 @@ mod tests {
         vec![
             ("ping", "ping", "PING"),
             ("bootsel", "bootsel", "BOOTSEL"),
-            ("restart_mpu", "restart_mpu", "RESTART_MPU"),
             ("restart_create", "restart_create", "RESTART_CREATE"),
             ("status", "status", "STATUS"),
             ("get_capabilities", "get_capabilities", "GET_CAPABILITIES"),
@@ -7837,6 +7979,11 @@ mod tests {
             ("stop", "stop", "STOP"),
             ("estop", "estop", "ESTOP"),
             ("clear_estop", "clear_estop", "CLEAR_ESTOP"),
+            (
+                "clear_safety_latch",
+                "clear_safety_latch",
+                "CLEAR_SAFETY_LATCH",
+            ),
             (
                 "clear_motion_queue",
                 "clear_motion_queue",
@@ -7873,6 +8020,8 @@ mod tests {
             ("define_chirp", "define_chirp", "DEFINE_CHIRP"),
             ("play_feedback", "play_feedback", "PLAY_FEEDBACK"),
             ("power_state", "power_state", "POWER_STATE"),
+            ("create_power_on", "create_power_on", "CREATE_POWER_ON"),
+            ("create_power_off", "create_power_off", "CREATE_POWER_OFF"),
             ("calibrate_turn", "calibrate_turn", "CALIBRATE_TURN"),
             ("reset_odometry", "reset_odometry", "RESET_ODOMETRY"),
             (
@@ -7983,7 +8132,6 @@ mod tests {
         match verb {
             "ping" => CockpitRequest::Ping,
             "bootsel" => CockpitRequest::Bootsel,
-            "restart_mpu" => CockpitRequest::RestartMpu,
             "restart_create" => CockpitRequest::RestartCreate,
             "reset_motherbrain" => CockpitRequest::ResetMotherbrain,
             "status" => CockpitRequest::GetStatus,
@@ -7994,6 +8142,9 @@ mod tests {
             "stop" => CockpitRequest::Stop,
             "estop" => CockpitRequest::EStop,
             "clear_estop" => CockpitRequest::ClearEStop,
+            "clear_safety_latch" => CockpitRequest::ClearSafetyLatch {
+                latch: SafetyLatchKind::Bump,
+            },
             "clear_motion_queue" => CockpitRequest::ClearMotionQueue,
             "cmd_vel" => CockpitRequest::CmdVel {
                 linear_mm_s: 10,
@@ -8120,6 +8271,8 @@ mod tests {
             "power_state" => CockpitRequest::PowerState {
                 request: PowerStateRequest::Wake,
             },
+            "create_power_on" => CockpitRequest::CreatePowerOn,
+            "create_power_off" => CockpitRequest::CreatePowerOff,
             "calibrate_turn" => CockpitRequest::CalibrateTurn {
                 angular_mrad_s: 500,
                 duration_ms: 1_000,
@@ -8222,6 +8375,55 @@ mod tests {
         assert!(renewed.possessed);
         assert!(renewed.lease_generation > first.lease_generation);
         assert_ne!(renewed.lease_id, first.lease_id);
+    }
+
+    #[test]
+    fn closed_possession_motor_gate_allows_estop_reset_and_imu_zeroing() {
+        let ready = establish_session(SimCockpit::new(), hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 60_000).unwrap();
+
+        expect_accepted(possession.execute(CockpitRequest::EStop).unwrap()).unwrap();
+        let status = match possession.execute(CockpitRequest::GetStatus).unwrap() {
+            CockpitResponse::Status(status) => status.summary(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(status.estop_latched, Some(true));
+        assert!(!possession.snapshot().possessed);
+
+        assert!(matches!(
+            possession.execute(CockpitRequest::CmdVel {
+                linear_mm_s: 10,
+                angular_mrad_s: 0,
+                ttl_ms: 100,
+            }),
+            Err(CockpitError::Policy(_))
+        ));
+
+        expect_accepted(
+            possession
+                .execute(CockpitRequest::ZeroImuOrientation)
+                .unwrap(),
+        )
+        .unwrap();
+        let status = match possession.execute(CockpitRequest::GetStatus).unwrap() {
+            CockpitResponse::Status(status) => status.summary(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(status.imu.calibration.as_deref(), Some("3"));
+
+        expect_accepted(
+            possession
+                .execute(CockpitRequest::ClearImuOrientation)
+                .unwrap(),
+        )
+        .unwrap();
+        expect_accepted(possession.execute(CockpitRequest::ClearEStop).unwrap()).unwrap();
+        let status = match possession.execute(CockpitRequest::GetStatus).unwrap() {
+            CockpitResponse::Status(status) => status.summary(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(status.imu.calibration.as_deref(), Some("0"));
+        assert_eq!(status.estop_latched, Some(false));
     }
 
     #[test]

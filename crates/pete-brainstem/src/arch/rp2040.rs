@@ -9,7 +9,10 @@ use rp2040_hal as hal;
 
 use hal::clocks::{init_clocks_and_plls, Clock};
 use hal::gpio::bank0::{Gpio0, Gpio1, Gpio18, Gpio19, Gpio2, Gpio20, Gpio25, Gpio3};
-use hal::gpio::{FunctionI2c, FunctionSioOutput, FunctionUart, Pin, PullDown, PullUp};
+use hal::gpio::{
+    FunctionI2c, FunctionNull, FunctionSioOutput, FunctionUart, InOutPin, Pin, PullDown, PullNone,
+    PullUp,
+};
 use hal::i2c::I2C;
 use hal::pac;
 use hal::sio::Sio;
@@ -31,7 +34,7 @@ const CREATE_UART_STOP_BITS: StopBits = StopBits::One;
 // - body.toml maps GP0/Pico physical pin 1 to Create RX.
 // - body.toml maps GP1/Pico physical pin 2 from Create TX through external 5V-to-3.3V level shifting.
 // - body.toml maps GP18 to the external Create Power Toggle interface with the correct polarity and isolation.
-// - body.toml maps GP19 to Create BRC; BRC is released high by this firmware.
+// - body.toml maps GP19 to Create BRC/DD; firmware only pulls this line low or releases it.
 // - body.toml maps GP20 as an optional external LED output; leave unconnected if unused.
 
 type CreateUart = UartPeripheral<
@@ -44,6 +47,7 @@ type CreateUart = UartPeripheral<
 >;
 
 type Output<P> = Pin<P, FunctionSioOutput, PullDown>;
+type Brc = InOutPin<Pin<Gpio19, FunctionNull, PullNone>>;
 type ImuBus = I2C<
     pac::I2C1,
     (
@@ -57,7 +61,7 @@ pub struct Rp2040Brainstem {
     uart: CreateUart,
     imu: Option<Mpu6050<ImuBus>>,
     power_toggle: Output<Gpio18>,
-    brc: Output<Gpio19>,
+    brc: Brc,
     external_led: Output<Gpio20>,
     onboard_led: Output<Gpio25>,
 }
@@ -126,7 +130,7 @@ impl Rp2040Brainstem {
             uart,
             imu,
             power_toggle: pins.gpio18.into_push_pull_output(),
-            brc: pins.gpio19.into_push_pull_output(),
+            brc: InOutPin::new(pins.gpio19.into_floating_disabled()),
             external_led: pins.gpio20.into_push_pull_output(),
             onboard_led,
         }
@@ -150,8 +154,12 @@ impl BrainstemHardware for Rp2040Brainstem {
         set_pin(&mut self.power_toggle, high);
     }
 
-    fn set_brc(&mut self, high: bool) {
-        set_pin(&mut self.brc, high);
+    fn set_brc(&mut self, released: bool) {
+        if released {
+            let _ = self.brc.set_high();
+        } else {
+            let _ = self.brc.set_low();
+        }
     }
 
     fn set_indicators(&mut self, on: bool) {
