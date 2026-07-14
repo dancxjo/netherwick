@@ -806,7 +806,8 @@ async fn http_task(stack: Stack<'static>) -> ! {
                         write_response(&mut socket, "application/json", body.as_bytes()).await
                     }
                     Err(CommandParseError::Busy(command_id, reason)) => {
-                        let body = render_command_response(json.as_mut(), false, command_id, reason);
+                        let body =
+                            render_command_response(json.as_mut(), false, command_id, reason);
                         match body {
                             Some(body) => {
                                 write_response(&mut socket, "application/json", body.as_bytes())
@@ -2418,6 +2419,11 @@ fn control_busy_reason() -> &'static str {
     }
 }
 
+fn create_charging_active(snapshot: &status::BrainstemStatus) -> bool {
+    snapshot.create_charging_indicator_state == 2
+        || matches!(snapshot.create_sensor_charging_state, 1..=3)
+}
+
 fn command_requires_session(command: BrainstemCommand) -> bool {
     !matches!(
         command,
@@ -2449,6 +2455,9 @@ fn command_requires_service_authority(command: BrainstemCommand) -> bool {
 }
 
 fn submit_json_control_command(command_id: u32, command: BrainstemCommand, body: &str) -> bool {
+    if command_blocked_while_charging(command) {
+        return false;
+    }
     if command_requires_service_authority(command) {
         let Some((session_hash, lease_hash)) = json_service_identity(body) else {
             return false;
@@ -2465,6 +2474,9 @@ fn submit_compact_control_command(
     session_id: Option<&str>,
     service_lease_id: Option<&str>,
 ) -> bool {
+    if command_blocked_while_charging(command) {
+        return false;
+    }
     if command_requires_service_authority(command) {
         let (Some(session_id), Some(lease_id)) = (session_id, service_lease_id) else {
             return false;
@@ -2478,6 +2490,39 @@ fn submit_compact_control_command(
     } else {
         status::submit_control_command(command_id, command)
     }
+}
+
+fn command_blocked_while_charging(command: BrainstemCommand) -> bool {
+    if !command_moves_body(command) {
+        return false;
+    }
+    let snapshot = status::snapshot(Instant::now().as_millis() as u32);
+    create_charging_active(&snapshot)
+}
+
+fn command_moves_body(command: BrainstemCommand) -> bool {
+    matches!(
+        command,
+        BrainstemCommand::CmdVel { .. }
+            | BrainstemCommand::DriveDirect { .. }
+            | BrainstemCommand::DriveArc { .. }
+            | BrainstemCommand::FaceBearing { .. }
+            | BrainstemCommand::TrackBearing { .. }
+            | BrainstemCommand::TurnBy { .. }
+            | BrainstemCommand::DriveFor { .. }
+            | BrainstemCommand::BumpEscape { .. }
+            | BrainstemCommand::HoldHeading { .. }
+            | BrainstemCommand::TurnToHeading { .. }
+            | BrainstemCommand::ArcFor { .. }
+            | BrainstemCommand::CreepUntil { .. }
+            | BrainstemCommand::ScanArc { .. }
+            | BrainstemCommand::DockAlign { .. }
+            | BrainstemCommand::WallFollow { .. }
+            | BrainstemCommand::WiggleAlign { .. }
+            | BrainstemCommand::Unstick { .. }
+            | BrainstemCommand::CalibrateTurn { .. }
+            | BrainstemCommand::Dock
+    )
 }
 
 fn json_service_identity(body: &str) -> Option<(u32, u32)> {

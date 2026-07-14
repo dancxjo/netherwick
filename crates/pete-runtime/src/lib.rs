@@ -5100,19 +5100,20 @@ fn apply_safe_cockpit_motion<C: Cockpit>(
 }
 
 pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
+    let charging = status.battery.charging_state.unwrap_or(0) != 0
+        || status.battery.charging_indicator.unwrap_or(false);
     let packet_update_ms = status
         .body_packet_age_ms
         .filter(|_| status.body_packet_complete == Some(true))
         .map(|age_ms| last_update_ms.saturating_sub(u64::from(age_ms)))
-        .unwrap_or(0);
+        .unwrap_or(if charging { last_update_ms } else { 0 });
     BodySense {
         battery_level: status
             .battery
             .percent
             .map(|percent| percent as f32 / 100.0)
             .unwrap_or(1.0),
-        charging: status.battery.charging_indicator == Some(true)
-            || status.battery.charging_state.unwrap_or(0) != 0,
+        charging,
         flags: BodyFlags {
             bump_left: status.contact.bump_left.unwrap_or(false),
             bump_right: status.contact.bump_right.unwrap_or(false),
@@ -9697,6 +9698,30 @@ mod tests {
 
         assert!(!body_text.contains("floor feels like it falls away near me"));
         assert!(body_text.contains("cliff IR signal is uncertain"));
+    }
+
+    #[test]
+    fn cockpit_charging_indicator_sets_body_charging() {
+        let status = StatusSummary::from_raw(
+            r#"{"create_sensors":{"charging_state":0,"charging_indicator":"on","charge_mah":1300,"capacity_mah":2600}}"#,
+        );
+
+        let body = body_sense_from_cockpit_status(status, 42);
+
+        assert!(body.charging);
+        assert_eq!(body.battery_level, 0.5);
+        assert_eq!(body.last_update_ms, 42);
+    }
+
+    #[test]
+    fn real_slow_blocks_charging_body() {
+        let mut body = BodySense::default();
+        body.charging = true;
+
+        assert_eq!(
+            real_slow_body_block_reason(&body).as_deref(),
+            Some("charging active")
+        );
     }
 
     #[test]

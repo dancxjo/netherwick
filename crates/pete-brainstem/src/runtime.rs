@@ -397,10 +397,7 @@ where
                 if on { 255 } else { 0 },
                 300,
             )
-        } else if self.estop_latched
-            || self.safety_latched
-            || self.charging_interlock_latched
-        {
+        } else if self.estop_latched || self.safety_latched || self.charging_interlock_latched {
             (CREATE_BUTTON_LED_MASK, 255, 255, 500)
         } else {
             // Keep POWER stable while PLAY and ADVANCE alternate more quickly.
@@ -1530,7 +1527,7 @@ where
             self.charging_interlock_latched = false;
         }
 
-        if !bump && !cliff && !wheel_drop && !tilt && !impact {
+        if !bump && !cliff && !wheel_drop && !tilt && !impact && !charging {
             self.update_safety_edges(bump, cliff, wheel_drop);
             let keep_wheel_drop_latched = self.safety_policy.wheel_drop_latch
                 && self.safety_latch_kind == Some(status::SafetyEventKind::WheelDrop);
@@ -1881,11 +1878,15 @@ fn time_reached(now_ms: u32, deadline_ms: u32) -> bool {
 }
 
 fn low_battery_and_charging(snapshot: &status::BrainstemStatus) -> bool {
-    let actively_charging = matches!(snapshot.create_sensor_charging_state, 1..=3);
-    actively_charging
+    create_charging_active(snapshot)
         && snapshot.create_sensor_capacity_mah > 0
         && u32::from(snapshot.create_sensor_charge_mah) * 100
             <= u32::from(snapshot.create_sensor_capacity_mah) * LOW_BATTERY_PERCENT
+}
+
+fn create_charging_active(snapshot: &status::BrainstemStatus) -> bool {
+    snapshot.create_charging_indicator_state == 2
+        || matches!(snapshot.create_sensor_charging_state, 1..=3)
 }
 
 fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCommand> {

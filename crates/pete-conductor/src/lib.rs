@@ -125,6 +125,15 @@ impl SimpleConductor {
                 "wheel drop safety signal requires stopping",
             ));
         }
+        if input.body.charging {
+            self.recovery = RecoveryState::default();
+            return Ok(navigation_goal(
+                NavigationIntent::RemainCharging,
+                ActionPrimitive::Stop,
+                1.0,
+                "charging is already established; remain stationary",
+            ));
+        }
         let charge_context = charge_context(&input);
         if charge_context.charging_established {
             self.recovery = RecoveryState::default();
