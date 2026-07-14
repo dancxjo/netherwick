@@ -1619,6 +1619,8 @@ impl CockpitRequest {
             Self::RegisterNetworkEndpoint(_)
             | Self::AcquireControlLease { .. }
             | Self::AcquireServiceLease { .. }
+            | Self::RequestSensors { .. }
+            | Self::StreamSensors { .. }
             | Self::Disarm => AuthorizationClass::Session,
             Self::Bootsel | Self::RestartMpu | Self::RestartCreate | Self::ResetMotherbrain => {
                 AuthorizationClass::ServiceLease
@@ -4260,6 +4262,55 @@ impl<C: Cockpit> SessionCockpit<C> {
     }
 }
 
+impl<C: Cockpit> Cockpit for SessionCockpit<C> {
+    fn event_cursor_hint(&self) -> Option<u32> {
+        Some(self.cursor.next_seq())
+    }
+
+    fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+        SessionCockpit::execute(self, request)
+    }
+
+    fn handshake(&mut self, _hello: HandshakeHello) -> Result<HandshakeOutcome> {
+        Err(CockpitError::Policy(
+            "cockpit session is already established".into(),
+        ))
+    }
+
+    fn execute_in_session(
+        &mut self,
+        session: &CockpitSession,
+        request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        if session.session_id != self.session().session_id {
+            return Err(CockpitError::Policy("session replacement detected".into()));
+        }
+        SessionCockpit::execute(self, request)
+    }
+
+    fn execute_with_lease(
+        &mut self,
+        _session: &CockpitSession,
+        _lease: &ControlLease,
+        _request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        Err(CockpitError::Policy(
+            "nested control authority is not available".into(),
+        ))
+    }
+
+    fn execute_with_service_lease(
+        &mut self,
+        _session: &CockpitSession,
+        _lease: &ServiceLease,
+        _request: CockpitRequest,
+    ) -> Result<CockpitResponse> {
+        Err(CockpitError::Policy(
+            "nested service authority is not available".into(),
+        ))
+    }
+}
+
 /// Narrow handle exposing commands authorized by an installed control lease.
 pub struct ControlCockpit<'a, C> {
     session: &'a mut SessionCockpit<C>,
@@ -6790,6 +6841,15 @@ mod tests {
             CockpitRequest::Arm.authorization_class(),
             AuthorizationClass::ControlLease
         );
+        assert_eq!(
+            CockpitRequest::StreamSensors {
+                enabled: true,
+                packet_id: 0,
+                period_ms: 250,
+            }
+            .authorization_class(),
+            AuthorizationClass::Session
+        );
         for request in [
             CockpitRequest::Bootsel,
             CockpitRequest::RestartMpu,
@@ -7399,6 +7459,16 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == CockpitEventKind::ChargingStateChanged && event.a == 2));
+    }
+
+    #[test]
+    fn diagnostic_session_can_establish_sensor_stream_through_cockpit_trait() {
+        let connector = SimCockpit::new();
+        let mut cockpit =
+            establish_diagnostic_session(connector, HandshakeHello::default_motherbrain(), None)
+                .unwrap();
+
+        Cockpit::stream_sensors(&mut cockpit, true, 0, 250).unwrap();
     }
 
     #[test]

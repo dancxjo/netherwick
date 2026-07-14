@@ -14,8 +14,9 @@ use pete_autonomic::SimpleSafety;
 use pete_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
 use pete_body::{BodySense, BodySong, BodyTone};
 use pete_cockpit::{
-    establish_session, Cockpit, CockpitError, HandshakeHello, HttpCockpit, MotherbrainPossession,
-    SafeCockpit, SimCockpit as LocalSimCockpit, SongTone, UartCockpit,
+    establish_diagnostic_session, establish_session, Cockpit, CockpitError, HandshakeHello,
+    HttpCockpit, MotherbrainPossession, SafeCockpit, SimCockpit as LocalSimCockpit, SongTone,
+    UartCockpit,
 };
 use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
 use pete_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter};
@@ -73,6 +74,8 @@ use serde_json::Value;
 const DEFAULT_LIVE_LLM_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MPU6050_IMU_DEVICE: &str = "/dev/i2c-1";
 const DEFAULT_WHISPER_MODEL_FILENAME: &str = "ggml-tiny.en.bin";
+const CREATE_SENSOR_STREAM_PACKET_ID: u8 = 0;
+const CREATE_SENSOR_STREAM_PERIOD_MS: u32 = 250;
 
 #[derive(Parser)]
 #[command(name = "pete")]
@@ -4724,6 +4727,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let brainstem_capabilities = cockpit
         .get_capabilities()
         .context("failed to read the brainstem capability contract")?;
+    establish_create_sensor_stream(cockpit.as_mut())?;
 
     let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
     let live_state = args.dashboard.map(|_| {
@@ -5100,6 +5104,8 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 disconnect_possession_cockpit_for_reconnect(&mut runner.cockpit);
                 let replacement =
                     reconnect_possession_cockpit(create_port.as_deref(), &args).await?;
+                let mut replacement = replacement;
+                establish_create_sensor_stream(replacement.as_mut())?;
                 runner.cockpit.replace_client(replacement);
                 eprintln!("possession reconnected with fresh session and lease; stopped=true");
                 continue;
@@ -5748,6 +5754,16 @@ fn requested_robot_sensor_count(args: &RobotArgs) -> usize {
         + usize::from(args.gps.is_some())
 }
 
+fn establish_create_sensor_stream(cockpit: &mut dyn Cockpit) -> Result<()> {
+    cockpit
+        .stream_sensors(
+            true,
+            CREATE_SENSOR_STREAM_PACKET_ID,
+            CREATE_SENSOR_STREAM_PERIOD_MS,
+        )
+        .context("failed to establish the production Create sensor stream")
+}
+
 // Ownership may span comparatively expensive perception/runtime ticks. Wheel
 // motion remains independently bounded by the 300 ms command TTL and 750 ms
 // heartbeat stop, so use the firmware's maximum lease and renew it proactively.
@@ -5831,7 +5847,11 @@ fn open_robot_cockpit_or_fallback(
                     .with_limits(max_linear_mm_s, max_angular_mrad_s);
             Ok((Box::new(possession), robot_mode, false))
         }
-        Ok(cockpit) => Ok((cockpit, robot_mode, false)),
+        Ok(cockpit) => {
+            let session =
+                establish_diagnostic_session(cockpit, HandshakeHello::default_motherbrain(), None)?;
+            Ok((Box::new(session), robot_mode, false))
+        }
         Err(error) => {
             if robot_mode == RobotMode::Slow {
                 anyhow::bail!("failed to open possession brainstem {create_port}: {error}");

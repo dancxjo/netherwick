@@ -448,7 +448,7 @@ pub enum MotherbrainResetRefusal {
     InvalidCommandId = 6,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 pub enum SafetyEventKind {
     Bump = 1,
@@ -458,6 +458,7 @@ pub enum SafetyEventKind {
     Heartbeat = 5,
     Tilt = 6,
     Impact = 7,
+    Charging = 8,
 }
 
 #[derive(Clone, Copy)]
@@ -666,6 +667,17 @@ fn submit_control_command_with_service_identity(
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, 0, 0);
         return true;
+    }
+
+    if charging_interlock_active(&snapshot(0)) && is_motion_control_command(command) {
+        LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+        record_public_event(
+            PublicEventKind::CommandRejected,
+            command_id,
+            command_seq(command),
+            0,
+        );
+        return false;
     }
 
     let Some((kind, a, b, c, d, duration_ms)) = encode_control_command(command) else {
@@ -1930,6 +1942,36 @@ pub fn mark_create_charging_indicator(active: Option<bool>) {
         },
         Ordering::Relaxed,
     );
+}
+
+pub fn charging_interlock_active(snapshot: &BrainstemStatus) -> bool {
+    snapshot.create_charging_indicator_state == ON
+        || matches!(snapshot.create_sensor_charging_state, 1..=3)
+}
+
+fn is_motion_control_command(command: BrainstemCommand) -> bool {
+    matches!(
+        command,
+        BrainstemCommand::CmdVel { .. }
+            | BrainstemCommand::DriveDirect { .. }
+            | BrainstemCommand::DriveArc { .. }
+            | BrainstemCommand::FaceBearing { .. }
+            | BrainstemCommand::TrackBearing { .. }
+            | BrainstemCommand::TurnBy { .. }
+            | BrainstemCommand::DriveFor { .. }
+            | BrainstemCommand::BumpEscape { .. }
+            | BrainstemCommand::HoldHeading { .. }
+            | BrainstemCommand::TurnToHeading { .. }
+            | BrainstemCommand::ArcFor { .. }
+            | BrainstemCommand::CreepUntil { .. }
+            | BrainstemCommand::ScanArc { .. }
+            | BrainstemCommand::DockAlign { .. }
+            | BrainstemCommand::WallFollow { .. }
+            | BrainstemCommand::WiggleAlign { .. }
+            | BrainstemCommand::Unstick { .. }
+            | BrainstemCommand::CalibrateTurn { .. }
+            | BrainstemCommand::Dock
+    )
 }
 
 pub fn set_oi_mode(mode: CreateOiMode) {
@@ -3824,6 +3866,35 @@ mod tests {
         );
         assert_eq!(records[1].a, SafetyEventKind::EStop as u32);
         assert_eq!(records[3].a, SafetyEventKind::EStop as u32);
+    }
+
+    #[test]
+    fn charging_interlock_covers_both_charge_sources_and_motion_commands() {
+        let _guard = status_test_guard();
+        mark_create_sensor_packet(0, CreateSensorPacket::default());
+        mark_create_charging_indicator(Some(true));
+        assert!(charging_interlock_active(&snapshot(0)));
+
+        mark_create_charging_indicator(Some(false));
+        mark_create_sensor_packet(
+            0,
+            CreateSensorPacket {
+                charging_state: 3,
+                ..CreateSensorPacket::default()
+            },
+        );
+        assert!(charging_interlock_active(&snapshot(0)));
+        assert!(is_motion_control_command(BrainstemCommand::CmdVel {
+            linear_mm_s: 100,
+            angular_mrad_s: 0,
+            ttl_ms: 500,
+            seq: 1,
+        }));
+        assert!(is_motion_control_command(BrainstemCommand::Dock));
+        assert!(!is_motion_control_command(BrainstemCommand::Stop));
+
+        mark_create_sensor_packet(0, CreateSensorPacket::default());
+        assert!(!charging_interlock_active(&snapshot(0)));
     }
 
     #[test]

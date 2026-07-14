@@ -153,6 +153,8 @@ where
     supervision_light_phase: u8,
     safety_policy: SafetyPolicy,
     safety_latched: bool,
+    safety_latch_kind: Option<status::SafetyEventKind>,
+    charging_interlock_latched: bool,
     chirps: [[SongTone; MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
     chirp_counts: [u8; FEEDBACK_KIND_COUNT],
     error_blink_next_ms: u32,
@@ -201,6 +203,8 @@ where
             supervision_light_phase: 0,
             safety_policy: SafetyPolicy::default(),
             safety_latched: false,
+            safety_latch_kind: None,
+            charging_interlock_latched: false,
             chirps: [[SongTone::default(); MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
             chirp_counts: [0; FEEDBACK_KIND_COUNT],
             error_blink_next_ms: 0,
@@ -393,7 +397,10 @@ where
                 if on { 255 } else { 0 },
                 300,
             )
-        } else if self.estop_latched || self.safety_latched {
+        } else if self.estop_latched
+            || self.safety_latched
+            || self.charging_interlock_latched
+        {
             (CREATE_BUTTON_LED_MASK, 255, 255, 500)
         } else {
             // Keep POWER stable while PLAY and ADVANCE alternate more quickly.
@@ -901,7 +908,11 @@ where
                 turn_angular_mrad_s,
             )?,
             RuntimeCommand::CliffGuard { clear } => {
-                if !clear {
+                if clear {
+                    self.clear_safety_latch(Some(status::SafetyEventKind::Cliff));
+                } else {
+                    status::mark_safety_tripped(status::SafetyEventKind::Cliff);
+                    self.latch_safety(status::SafetyEventKind::Cliff);
                     self.stop_drive()?;
                 }
             }
@@ -934,7 +945,7 @@ where
             }
             RuntimeCommand::SetSafetyPolicy { policy } => {
                 self.safety_policy = policy;
-                self.safety_latched = false;
+                self.clear_safety_latch(None);
             }
             RuntimeCommand::ClearMotionQueue => {
                 self.clear_motion_queue()?;
@@ -1503,60 +1514,82 @@ where
         let imu_ok = body::IMU_ENABLED && snapshot.imu_health == status::ImuHealthCode::Ok as u8;
         let tilt = imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
         let impact = imu_ok && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
+        let charging = status::charging_interlock_active(&snapshot);
+
+        if charging {
+            if !self.charging_interlock_latched {
+                status::mark_safety_tripped(status::SafetyEventKind::Charging);
+                self.clear_motion_queue()?;
+                self.stop_drive()?;
+                self.charging_interlock_latched = true;
+            }
+            return Ok(());
+        }
+        if self.charging_interlock_latched {
+            status::mark_safety_cleared(status::SafetyEventKind::Charging);
+            self.charging_interlock_latched = false;
+        }
 
         if !bump && !cliff && !wheel_drop && !tilt && !impact {
             self.update_safety_edges(bump, cliff, wheel_drop);
-            if !self.safety_policy.wheel_drop_latch {
-                if self.safety_latched {
-                    status::mark_safety_cleared(status::SafetyEventKind::WheelDrop);
-                    status::mark_wheel_drop_cleared();
-                }
-                self.safety_latched = false;
+            let keep_wheel_drop_latched = self.safety_policy.wheel_drop_latch
+                && self.safety_latch_kind == Some(status::SafetyEventKind::WheelDrop);
+            if !keep_wheel_drop_latched {
+                self.clear_safety_latch(None);
             }
             return Ok(());
         }
         self.update_safety_edges(bump, cliff, wheel_drop);
+
+        if wheel_drop && self.safety_policy.wheel_drop_latch {
+            if self.safety_latch_kind != Some(status::SafetyEventKind::WheelDrop) {
+                status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
+                status::mark_wheel_drop_latched();
+                self.latch_safety(status::SafetyEventKind::WheelDrop);
+                self.interrupt_active_command();
+                self.commands.clear();
+                self.stop_drive()?;
+                self.active = ActiveAction::None;
+                let _ = self.play_feedback_now(FeedbackKind::Danger);
+            }
+            return Ok(());
+        }
         if self.safety_latched {
             return Ok(());
         }
 
-        if wheel_drop && self.safety_policy.wheel_drop_latch {
-            status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
-            status::mark_wheel_drop_latched();
-            self.safety_latched = true;
-            self.interrupt_active_command();
-            self.commands.clear();
-            self.stop_drive()?;
-            self.active = ActiveAction::None;
-            let _ = self.play_feedback_now(FeedbackKind::Danger);
-            return Ok(());
-        }
-
-        let action = if tilt {
+        let (kind, action) = if tilt {
             status::mark_safety_tripped(status::SafetyEventKind::Tilt);
-            SafetyAction::Stop
+            (status::SafetyEventKind::Tilt, SafetyAction::Stop)
         } else if impact {
             status::mark_safety_tripped(status::SafetyEventKind::Impact);
-            SafetyAction::Stop
+            (status::SafetyEventKind::Impact, SafetyAction::Stop)
         } else if cliff {
             status::mark_safety_tripped(status::SafetyEventKind::Cliff);
-            self.safety_policy.cliff
+            (status::SafetyEventKind::Cliff, self.safety_policy.cliff)
         } else if bump {
             status::mark_safety_tripped(status::SafetyEventKind::Bump);
-            self.safety_policy.bump
+            (status::SafetyEventKind::Bump, self.safety_policy.bump)
+        } else if wheel_drop {
+            status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
+            (status::SafetyEventKind::WheelDrop, SafetyAction::Stop)
         } else {
-            SafetyAction::Stop
+            (status::SafetyEventKind::Bump, SafetyAction::Stop)
         };
-        self.apply_safety_action(action)?;
+        self.apply_safety_action(kind, action)?;
         let _ = self.play_feedback_now(FeedbackKind::Danger);
         Ok(())
     }
 
-    fn apply_safety_action(&mut self, action: SafetyAction) -> Result<(), BrainstemError> {
+    fn apply_safety_action(
+        &mut self,
+        kind: status::SafetyEventKind,
+        action: SafetyAction,
+    ) -> Result<(), BrainstemError> {
         match action {
             SafetyAction::None => Ok(()),
             SafetyAction::Stop => {
-                self.safety_latched = true;
+                self.latch_safety(kind);
                 self.interrupt_active_command();
                 self.commands.clear();
                 self.stop_drive()?;
@@ -1564,7 +1597,7 @@ where
                 Ok(())
             }
             SafetyAction::Backoff => {
-                self.safety_latched = true;
+                self.latch_safety(kind);
                 let command_id = self.active_command_id.unwrap_or(0);
                 self.interrupt_active_command();
                 self.commands.clear();
@@ -1580,7 +1613,7 @@ where
                 Ok(())
             }
             SafetyAction::BumpEscape => {
-                self.safety_latched = true;
+                self.latch_safety(kind);
                 let command_id = self.active_command_id.unwrap_or(0);
                 self.interrupt_active_command();
                 self.commands.clear();
@@ -1588,6 +1621,27 @@ where
                 self.queue_bump_escape(command_id, EscapeDirection::Either, 80, 900)
             }
         }
+    }
+
+    fn latch_safety(&mut self, kind: status::SafetyEventKind) {
+        self.safety_latched = true;
+        self.safety_latch_kind = Some(kind);
+    }
+
+    fn clear_safety_latch(&mut self, expected: Option<status::SafetyEventKind>) {
+        let Some(kind) = self.safety_latch_kind else {
+            self.safety_latched = false;
+            return;
+        };
+        if expected.is_some_and(|expected| expected != kind) {
+            return;
+        }
+        status::mark_safety_cleared(kind);
+        if kind == status::SafetyEventKind::WheelDrop {
+            status::mark_wheel_drop_cleared();
+        }
+        self.safety_latched = false;
+        self.safety_latch_kind = None;
     }
 
     fn feedback_tones(&self, kind: FeedbackKind) -> ([SongTone; MAX_SONG_TONES], u8) {
@@ -2148,6 +2202,7 @@ fn is_motion_command(command: RuntimeCommand) -> bool {
             | RuntimeCommand::Unstick { .. }
             | RuntimeCommand::CliffGuard { .. }
             | RuntimeCommand::CalibrateTurn { .. }
+            | RuntimeCommand::Dock
     )
 }
 
@@ -2209,6 +2264,7 @@ mod tests {
         imu_sample: Option<ImuSample>,
         imu_health: Option<crate::drivers::imu::ImuHealth>,
         reset_levels: heapless::Vec<bool, 8>,
+        charging_indicator: Option<bool>,
     }
 
     impl FakeHardware {
@@ -2219,6 +2275,7 @@ mod tests {
                 imu_sample: None,
                 imu_health: None,
                 reset_levels: heapless::Vec::new(),
+                charging_indicator: None,
             }
         }
 
@@ -2229,6 +2286,7 @@ mod tests {
                 imu_sample: Some(imu_sample),
                 imu_health: None,
                 reset_levels: heapless::Vec::new(),
+                charging_indicator: None,
             }
         }
     }
@@ -2277,6 +2335,10 @@ mod tests {
                 return Err(health);
             }
             Ok(self.imu_sample.take())
+        }
+
+        fn charging_indicator_active(&mut self) -> Option<bool> {
+            self.charging_indicator
         }
     }
 
@@ -2378,12 +2440,13 @@ mod tests {
     #[test]
     fn unresponsive_create_still_gets_start_and_full() {
         let _guard = status::status_test_guard();
+        status::set_oi_mode_unknown();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
 
         assert!(runtime.maintain_full_mode().is_ok());
 
-        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132]);
-        assert_eq!(status::snapshot(1_000).oi_mode, 3);
+        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 35]);
+        assert_eq!(status::snapshot(1_000).oi_mode, 0);
     }
 
     #[test]
@@ -2412,6 +2475,65 @@ mod tests {
                 ..crate::events::CreateSensorPacket::default()
             },
         );
+    }
+
+    #[test]
+    fn charging_indicator_stops_active_motion_and_clears_motion_queue() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        let mut hardware = FakeHardware::new(1_000);
+        hardware.charging_indicator = Some(true);
+        let mut runtime = Runtime::new(hardware);
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(77);
+        let _ = runtime.commands.push_back(QueuedCommand {
+            command_id: 78,
+            command: RuntimeCommand::CmdVel {
+                linear_mm_s: 100,
+                angular_mrad_s: 0,
+                duration_ms: Some(500),
+            },
+        });
+
+        runtime.tick();
+
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert!(runtime.charging_interlock_latched);
+        assert!(!runtime
+            .commands
+            .iter()
+            .any(|queued| is_motion_command(queued.command)));
+        assert!(runtime
+            .events
+            .iter()
+            .any(|event| matches!(event, BrainstemEvent::DriveStopped)));
+
+        runtime.hardware.charging_indicator = Some(false);
+        runtime.tick();
+        assert!(!runtime.charging_interlock_latched);
+    }
+
+    #[test]
+    fn oi_charging_state_stops_active_motion_without_charge_pin() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charging_state: 2,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+
+        runtime.tick();
+
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert!(runtime.charging_interlock_latched);
+
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
     }
 
     #[test]
@@ -2489,6 +2611,101 @@ mod tests {
             .iter()
             .any(|event| matches!(event, BrainstemEvent::DriveStopped)));
         assert!(!runtime.hardware.writes.is_empty());
+    }
+
+    #[test]
+    fn bump_stop_clears_after_contact_and_allows_recovery_motion() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Bump)
+        ));
+
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(!runtime.safety_latched);
+        assert!(runtime.safety_latch_kind.is_none());
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::CmdVel {
+                linear_mm_s: -80,
+                angular_mrad_s: 0,
+                duration_ms: Some(300),
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+    }
+
+    #[test]
+    fn wheel_drop_latch_survives_sensor_clear_with_default_policy() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    wheel_drop: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+
+        assert!(runtime.enforce_safety_policy().is_ok());
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        assert!(runtime.enforce_safety_policy().is_ok());
+
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::WheelDrop)
+        ));
+    }
+
+    #[test]
+    fn cliff_guard_clear_releases_only_a_cliff_latch() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.latch_safety(status::SafetyEventKind::Cliff);
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::CliffGuard { clear: true })
+            .is_ok());
+
+        assert!(runtime.start_next_command().is_ok());
+
+        assert!(!runtime.safety_latched);
+        assert!(runtime.safety_latch_kind.is_none());
+
+        runtime.latch_safety(status::SafetyEventKind::WheelDrop);
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::CliffGuard { clear: true })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::WheelDrop)
+        ));
     }
 
     #[test]

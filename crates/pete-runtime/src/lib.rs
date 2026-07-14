@@ -5106,7 +5106,8 @@ fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs)
             .percent
             .map(|percent| percent as f32 / 100.0)
             .unwrap_or(1.0),
-        charging: status.battery.charging_state.unwrap_or(0) != 0,
+        charging: status.battery.charging_indicator == Some(true)
+            || status.battery.charging_state.unwrap_or(0) != 0,
         flags: BodyFlags {
             bump_left: status.contact.bump_left.unwrap_or(false),
             bump_right: status.contact.bump_right.unwrap_or(false),
@@ -7572,6 +7573,7 @@ fn set_drive(drives: &mut DriveSense, name: &DriveName, value: f32) {
 
 fn describe_safety_reason(reason: Option<SafetyReason>) -> &'static str {
     match reason {
+        Some(SafetyReason::Charging) => "charging",
         Some(SafetyReason::WheelDrop) => "wheel drop",
         Some(SafetyReason::Cliff) => "cliff",
         Some(SafetyReason::BatteryCritical) => "critical battery",
@@ -7643,6 +7645,27 @@ mod tests {
                 }
             }),
         );
+    }
+
+    #[test]
+    fn physical_charging_indicator_populates_body_charging_without_oi_state() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "current_runtime_state": "idle",
+                "oi_mode": "safe",
+                "create_sensors": {
+                    "charging_state": 0,
+                    "charging_indicator": "on"
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        let body = body_sense_from_cockpit_status(status, 123);
+
+        assert!(body.charging);
+        assert_eq!(body.last_update_ms, 123);
     }
 
     #[test]

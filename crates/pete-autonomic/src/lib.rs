@@ -8,6 +8,7 @@ pub trait SafetyLayer {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SafetyReason {
+    Charging,
     WheelDrop,
     Cliff,
     BatteryCritical,
@@ -78,7 +79,12 @@ impl SafetyLayer for SimpleSafety {
             reason = Some(SafetyReason::MotorOutOfRange);
         }
 
-        if now.body.flags.wheel_drop {
+        if now.body.charging {
+            command = MotorCommand::stop();
+            events.extend([AutonomicEvent::Stop, AutonomicEvent::Veto]);
+            reason = Some(SafetyReason::Charging);
+            vetoed = true;
+        } else if now.body.flags.wheel_drop {
             command = MotorCommand::stop();
             events.extend([AutonomicEvent::Stop, AutonomicEvent::Veto]);
             reason = Some(SafetyReason::WheelDrop);
@@ -141,5 +147,53 @@ mod tests {
         assert!(decision.vetoed);
         assert_eq!(decision.command, MotorCommand::stop());
         assert_eq!(decision.reason, Some(SafetyReason::WheelDrop));
+    }
+
+    #[test]
+    fn charging_vetoes_motion_and_overrides_cliff_escape() {
+        let mut safety = SimpleSafety::default();
+        let mut body = BodySense::default();
+        body.charging = true;
+        body.flags.cliff_left = true;
+        body.last_update_ms = 10;
+        let now = Now::blank(10, body);
+
+        let decision = safety.filter(
+            &now,
+            MotorCommand {
+                forward: 0.4,
+                turn: 0.3,
+            },
+        );
+
+        assert!(decision.vetoed);
+        assert_eq!(decision.command, MotorCommand::stop());
+        assert_eq!(decision.reason, Some(SafetyReason::Charging));
+        assert_eq!(
+            decision.events,
+            vec![AutonomicEvent::Stop, AutonomicEvent::Veto]
+        );
+    }
+
+    #[test]
+    fn charging_transition_stops_previously_allowed_motion() {
+        let mut safety = SimpleSafety::default();
+        let mut body = BodySense::default();
+        body.last_update_ms = 10;
+        let desired = MotorCommand {
+            forward: 0.4,
+            turn: 0.0,
+        };
+
+        let moving = safety.filter(&Now::blank(10, body.clone()), desired);
+        assert!(!moving.vetoed);
+        assert_eq!(moving.command, desired);
+
+        body.charging = true;
+        body.last_update_ms = 20;
+        let stopped = safety.filter(&Now::blank(20, body), desired);
+        assert!(stopped.vetoed);
+        assert_eq!(stopped.command, MotorCommand::stop());
+        assert_eq!(stopped.reason, Some(SafetyReason::Charging));
     }
 }

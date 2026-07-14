@@ -2040,7 +2040,7 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
         if matches!(command, BrainstemCommand::CmdVel { .. }) {
             submit_forebrain_stop();
         }
-        write_forebrain_uart_error(uart, seq, "busy");
+        write_forebrain_uart_error(uart, seq, control_busy_reason());
         return;
     }
 
@@ -2411,9 +2411,7 @@ fn handle_compact_control_line<const N: usize>(
 
 fn control_busy_reason() -> &'static str {
     let snapshot = status::snapshot(Instant::now().as_millis() as u32);
-    if snapshot.create_charging_indicator_state == 2
-        || matches!(snapshot.create_sensor_charging_state, 1..=3)
-    {
+    if status::charging_interlock_active(&snapshot) {
         "charging_busy"
     } else {
         "busy"
