@@ -677,7 +677,14 @@ possess *args:
     export PETE_COCKPIT_BACKEND="$COCKPIT_BACKEND"
     BOOT_ID="${PETE_BRAINSTEM_BOOT_ID:-unknown}"
     run_possession() {
-        echo "Taking brainstem possession over ${PETE_COCKPIT_BACKEND:-wifi} at ${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}"
+        if [ "${PETE_COCKPIT_BACKEND:-}" = "wifi" ]; then
+            COCKPIT_ENDPOINT="${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}"
+        elif [ "${PETE_COCKPIT_BACKEND:-}" = "uart" ]; then
+            COCKPIT_ENDPOINT="${PETE_COCKPIT_PORT:-{{cockpit_port}}}"
+        else
+            COCKPIT_ENDPOINT="${PETE_COCKPIT_BACKEND:-unknown}"
+        fi
+        echo "Taking brainstem possession over ${PETE_COCKPIT_BACKEND:-unknown} at ${COCKPIT_ENDPOINT}"
         echo "device=$PETE_BRAINSTEM_DEVICE_ID boot=$BOOT_ID"
         echo "limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
         PETE_ROBOT_MODE=possession-slow \

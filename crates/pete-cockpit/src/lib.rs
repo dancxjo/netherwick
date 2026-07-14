@@ -15,6 +15,9 @@ pub use handshake::*;
 
 pub type Result<T> = std::result::Result<T, CockpitError>;
 const DEFAULT_SIM_EVENT_CAPACITY: usize = 32;
+const POSSESSION_LEASE_RENEW_INTERVAL_MS: u32 = 1_000;
+const POSSESSION_BUSY_RETRY_ATTEMPTS: usize = 300;
+const POSSESSION_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MotorCommand {
@@ -3915,10 +3918,17 @@ impl<C: Cockpit> MotherbrainPossession<C> {
                     .unwrap_or_else(|| "not possessed".into()),
             ));
         }
-        let renew_at = self.lease_ttl_ms.saturating_sub(self.renew_margin_ms);
+        let renew_at = self
+            .lease_ttl_ms
+            .saturating_sub(self.renew_margin_ms)
+            .min(POSSESSION_LEASE_RENEW_INTERVAL_MS);
         if self.lease_acquired_at.elapsed() < Duration::from_millis(u64::from(renew_at)) {
             return Ok(());
         }
+        self.renew_control_lease()
+    }
+
+    fn renew_control_lease(&mut self) -> Result<()> {
         if let Err(error) = self
             .session
             .acquire_control(ControlAuthority::Motherbrain, self.lease_ttl_ms)
@@ -3936,10 +3946,21 @@ impl<C: Cockpit> MotherbrainPossession<C> {
     }
 
     fn execute_with_busy_retry(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
-        for attempt in 0..25 {
+        let mut retried_after_lease_renewal = false;
+        for attempt in 0..POSSESSION_BUSY_RETRY_ATTEMPTS {
             match self.session.execute(request.clone()) {
-                Err(CockpitError::Rejected { reason, .. }) if reason == "busy" && attempt < 24 => {
-                    std::thread::sleep(Duration::from_millis(10));
+                Err(CockpitError::Rejected { reason, .. })
+                    if reason == "busy" && attempt + 1 < POSSESSION_BUSY_RETRY_ATTEMPTS =>
+                {
+                    std::thread::sleep(POSSESSION_BUSY_RETRY_DELAY);
+                }
+                Err(error)
+                    if request.authorization_class() == AuthorizationClass::ControlLease
+                        && !retried_after_lease_renewal
+                        && is_control_lease_rejection(&error) =>
+                {
+                    self.renew_control_lease()?;
+                    retried_after_lease_renewal = true;
                 }
                 result => return result,
             }
@@ -3949,8 +3970,7 @@ impl<C: Cockpit> MotherbrainPossession<C> {
 
     pub fn exorcize(&mut self) -> Result<()> {
         let stop = self
-            .session
-            .execute(CockpitRequest::Stop)
+            .execute_with_busy_retry(CockpitRequest::Stop)
             .and_then(expect_accepted);
         if let Err(error) = stop {
             self.close_gate("possession exorcized".into());
@@ -4030,9 +4050,18 @@ impl<C: Cockpit> MotherbrainPossession<C> {
     }
 }
 
+fn is_control_lease_rejection(error: &CockpitError) -> bool {
+    matches!(
+        error,
+        CockpitError::Rejected { reason, .. }
+            if reason.contains("invalid_control_lease")
+                || reason.contains("control_lease_required")
+    )
+}
+
 impl<C: Cockpit> Drop for MotherbrainPossession<C> {
     fn drop(&mut self) {
-        let _ = self.session.execute(CockpitRequest::Stop);
+        let _ = self.execute_with_busy_retry(CockpitRequest::Stop);
     }
 }
 
@@ -5939,6 +5968,12 @@ mod tests {
         attempts: usize,
     }
 
+    struct StaleLeaseOnceCockpit {
+        inner: SimCockpit,
+        invalid_remaining: usize,
+        attempts: usize,
+    }
+
     impl Cockpit for BusyOnceCockpit {
         fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
             self.inner.execute(request)
@@ -5968,6 +6003,51 @@ mod tests {
                 return Err(CockpitError::Rejected {
                     command_id: self.attempts as u32,
                     reason: "busy".into(),
+                });
+            }
+            self.inner.execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &CockpitSession,
+            lease: &ServiceLease,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            self.inner
+                .execute_with_service_lease(session, lease, request)
+        }
+    }
+
+    impl Cockpit for StaleLeaseOnceCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+            self.inner.execute(request)
+        }
+
+        fn handshake(&mut self, hello: HandshakeHello) -> Result<HandshakeOutcome> {
+            self.inner.handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &CockpitSession,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            self.inner.execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &CockpitSession,
+            lease: &ControlLease,
+            request: CockpitRequest,
+        ) -> Result<CockpitResponse> {
+            self.attempts += 1;
+            if self.invalid_remaining > 0 {
+                self.invalid_remaining -= 1;
+                return Err(CockpitError::Rejected {
+                    command_id: self.attempts as u32,
+                    reason: "invalid_control_lease".into(),
                 });
             }
             self.inner.execute_with_lease(session, lease, request)
@@ -7919,6 +7999,22 @@ mod tests {
     }
 
     #[test]
+    fn production_possession_renews_long_lease_on_short_cadence() {
+        let ready = establish_session(SimCockpit::new(), hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 60_000).unwrap();
+        let first = possession.snapshot();
+        possession.lease_acquired_at =
+            Instant::now() - Duration::from_millis(POSSESSION_LEASE_RENEW_INTERVAL_MS as u64 + 1);
+
+        possession.maintain().unwrap();
+
+        let renewed = possession.snapshot();
+        assert!(renewed.possessed);
+        assert!(renewed.lease_generation > first.lease_generation);
+        assert_ne!(renewed.lease_id, first.lease_id);
+    }
+
+    #[test]
     fn production_possession_retries_transient_busy_commands() {
         let cockpit = BusyOnceCockpit {
             inner: SimCockpit::new(),
@@ -7941,6 +8037,31 @@ mod tests {
             attempts_before + 2
         );
         assert!(possession.snapshot().possessed);
+    }
+
+    #[test]
+    fn production_possession_renews_and_retries_stale_control_lease() {
+        let cockpit = StaleLeaseOnceCockpit {
+            inner: SimCockpit::new(),
+            invalid_remaining: 0,
+            attempts: 0,
+        };
+        let ready = establish_session(cockpit, hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 60_000).unwrap();
+        possession.session.connector_mut().invalid_remaining = 1;
+        let first = possession.snapshot();
+
+        possession
+            .execute(CockpitRequest::PlayFeedback {
+                feedback: FeedbackKind::Ok,
+            })
+            .unwrap();
+
+        let renewed = possession.snapshot();
+        assert_eq!(possession.session.connector_mut().attempts, 2);
+        assert!(renewed.possessed);
+        assert!(renewed.lease_generation > first.lease_generation);
+        assert_ne!(renewed.lease_id, first.lease_id);
     }
 
     #[test]

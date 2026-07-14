@@ -4664,18 +4664,7 @@ where
         }
 
         let pre_body_t_ms = wall_time_ms();
-        let brainstem_events = if self.tick_count == 0 {
-            let events = self.cockpit.poll_events_allowing_history_gap()?;
-            if events.dropped_before_seq > 0 {
-                eprintln!(
-                    "slow possession recovered from pre-loop event history gap before sequence {}",
-                    events.dropped_before_seq
-                );
-            }
-            events
-        } else {
-            self.cockpit.poll_events()?
-        };
+        let brainstem_events = self.poll_slow_possession_events()?;
         if let Some(input) = self.runtime.reign_sense(pre_body_t_ms)?.latest {
             if reign_input_outputs_real_slow_directly(&input) {
                 let body_before = pete_body::BodySense {
@@ -4764,7 +4753,7 @@ where
                 } else {
                     MotorCommand::stop()
                 };
-                apply_safe_cockpit_motor(&mut self.cockpit, final_motor)?;
+                apply_slow_possession_motor(&mut self.cockpit, final_motor)?;
                 let tick = synthetic_slow_manual_tick(
                     now,
                     input,
@@ -4801,7 +4790,7 @@ where
         } else {
             MotorCommand::stop()
         };
-        apply_safe_cockpit_motor(&mut self.cockpit, final_motor)?;
+        apply_slow_possession_motor(&mut self.cockpit, final_motor)?;
 
         let mut snapshot = self.now_builder.snapshot();
         snapshot.eye = tick.frame.now.eye.clone();
@@ -4875,6 +4864,25 @@ where
                 }),
             );
         }
+    }
+
+    fn poll_slow_possession_events(&mut self) -> Result<pete_cockpit::EventBatch> {
+        let events = self.cockpit.poll_events_allowing_history_gap()?;
+        if events.dropped_before_seq > 0 {
+            if self.tick_count == 0 {
+                eprintln!(
+                    "slow possession recovered from pre-loop event history gap before sequence {}",
+                    events.dropped_before_seq
+                );
+            } else {
+                eprintln!(
+                    "slow possession recovered from event history gap before sequence {}; stopping before continuing",
+                    events.dropped_before_seq
+                );
+                self.cockpit.client_mut().stop()?;
+            }
+        }
+        Ok(events)
     }
 
     fn insert_brainstem_interface(&self, now: &mut Now, events: &pete_cockpit::EventBatch) {
@@ -5029,6 +5037,59 @@ fn apply_safe_cockpit_motor<C: Cockpit>(
             )
             .map_err(anyhow::Error::from)
     }
+}
+
+fn apply_slow_possession_motor<C: Cockpit>(
+    cockpit: &mut SafeCockpit<C>,
+    motor: MotorCommand,
+) -> Result<()> {
+    if is_near_zero_motor(motor) {
+        return cockpit.client_mut().stop().map_err(anyhow::Error::from);
+    }
+    match cockpit
+        .pulse_motion(
+            pete_cockpit::meters_per_second_to_mm_s(motor.forward),
+            pete_cockpit::radians_per_second_to_mrad_s(motor.turn),
+        )
+        .map_err(anyhow::Error::from)
+    {
+        Ok(()) => Ok(()),
+        Err(error) if is_missed_events_error(&error) => {
+            eprintln!(
+                "slow possession recovered from event history gap during motion safety poll; stopping before continuing"
+            );
+            cockpit.client_mut().stop().map_err(anyhow::Error::from)
+        }
+        Err(error) if is_motion_stopped_policy_error(&error) => {
+            eprintln!("{error}; slow possession stopping before continuing");
+            cockpit.client_mut().stop().map_err(anyhow::Error::from)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_missed_events_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<pete_cockpit::CockpitError>()
+            .is_some_and(|cockpit| {
+                matches!(cockpit, pete_cockpit::CockpitError::MissedEvents { .. })
+            })
+    })
+}
+
+fn is_motion_stopped_policy_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<pete_cockpit::CockpitError>()
+            .is_some_and(|cockpit| {
+                matches!(
+                    cockpit,
+                    pete_cockpit::CockpitError::Policy(reason)
+                        if reason.starts_with("motion stopped by ")
+                )
+            })
+    })
 }
 
 fn apply_safe_cockpit_motion<C: Cockpit>(
@@ -8407,6 +8468,164 @@ mod tests {
         }
     }
 
+    struct HistoryGapCockpit {
+        inner: CountingCockpit,
+        event_polls: Arc<AtomicUsize>,
+        gap_poll: usize,
+    }
+
+    impl Cockpit for HistoryGapCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute(request)
+        }
+
+        fn handshake(
+            &mut self,
+            hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            self.inner.handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ServiceLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner
+                .execute_with_service_lease(session, lease, request)
+        }
+
+        fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
+            self.inner.get_status()
+        }
+
+        fn get_capabilities(&mut self) -> pete_cockpit::Result<CockpitCapabilities> {
+            self.inner.get_capabilities()
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
+            let poll = self.event_polls.fetch_add(1, Ordering::SeqCst);
+            let inject_gap = poll == self.gap_poll;
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: if inject_gap {
+                    since_seq.saturating_add(2)
+                } else {
+                    1
+                },
+                next_seq: since_seq.saturating_add(2),
+                dropped_before_seq: if inject_gap {
+                    since_seq.saturating_add(2)
+                } else {
+                    0
+                },
+                events: Vec::new(),
+            })
+        }
+    }
+
+    struct MotionStopEventsCockpit {
+        inner: CountingCockpit,
+        event_polls: Arc<AtomicUsize>,
+    }
+
+    impl Cockpit for MotionStopEventsCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute(request)
+        }
+
+        fn handshake(
+            &mut self,
+            hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            self.inner.handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ServiceLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner
+                .execute_with_service_lease(session, lease, request)
+        }
+
+        fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
+            self.inner.get_status()
+        }
+
+        fn get_capabilities(&mut self) -> pete_cockpit::Result<CockpitCapabilities> {
+            self.inner.get_capabilities()
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
+            let poll = self.event_polls.fetch_add(1, Ordering::SeqCst);
+            let events = if poll == 1 {
+                vec![
+                    pete_cockpit::CockpitEvent {
+                        seq: since_seq.saturating_add(1),
+                        kind: pete_cockpit::CockpitEventKind::HeartbeatExpired,
+                        a: 0,
+                        b: 0,
+                        c: 0,
+                    },
+                    pete_cockpit::CockpitEvent {
+                        seq: since_seq.saturating_add(2),
+                        kind: pete_cockpit::CockpitEventKind::SafetyTripped,
+                        a: 1,
+                        b: 0,
+                        c: 0,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: 1,
+                next_seq: since_seq.saturating_add(events.len() as u32 + 1),
+                dropped_before_seq: 0,
+                events,
+            })
+        }
+    }
+
     struct FailingSensor;
 
     #[async_trait::async_trait]
@@ -8573,6 +8792,107 @@ mod tests {
         );
         assert!(first_tick.frame.notes.is_empty());
         assert!(second_tick.frame.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_recovers_history_gap_by_stopping() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let event_polls = Arc::new(AtomicUsize::new(0));
+        let body = HistoryGapCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            event_polls: Arc::clone(&event_polls),
+            gap_poll: 1,
+        };
+        let runtime = SlowRuntime {
+            tick_attempts: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), runtime);
+
+        runner.tick_slow_manual().await.unwrap();
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(event_polls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            tick.frame.now.extensions["brainstem.events"]["dropped_before_seq"],
+            serde_json::json!(3)
+        );
+        assert!(motor_attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(motors.lock().unwrap().last(), Some(&MotorCommand::stop()));
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_recovers_motion_safety_poll_history_gap_by_stopping() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let event_polls = Arc::new(AtomicUsize::new(0));
+        let body = HistoryGapCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            event_polls: Arc::clone(&event_polls),
+            gap_poll: 1,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 100,
+            })
+        );
+        assert_eq!(event_polls.load(Ordering::SeqCst), 2);
+        assert!(motor_attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(motors.lock().unwrap().last(), Some(&MotorCommand::stop()));
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_recovers_motion_stop_events_by_stopping() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let event_polls = Arc::new(AtomicUsize::new(0));
+        let body = MotionStopEventsCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            event_polls: Arc::clone(&event_polls),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 100,
+            })
+        );
+        assert_eq!(event_polls.load(Ordering::SeqCst), 2);
+        assert!(motor_attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(motors.lock().unwrap().last(), Some(&MotorCommand::stop()));
     }
 
     struct ManualRuntime;
