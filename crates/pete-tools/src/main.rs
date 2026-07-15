@@ -38,8 +38,8 @@ use pete_mouth::QueuedPiperCpalMouth;
 use pete_neat::{
     CandidateEvaluation, CurriculumStage, EpisodeMetrics as NeatEpisodeMetrics, FitnessTraits,
     Genome, GenomeState, LocomotionCheckpoint, LocomotionOutput, LocomotionTracker, NeatConfig,
-    NoveltyArchive, Population, QualityDiversityDescriptor, QualityDiversityEntry,
-    SelectionSummary,
+    NicheQualificationEvidence, NoveltyArchive, Population, QualityDiversityDescriptor,
+    QualityDiversityEntry, SelectionSummary,
 };
 use pete_now::{
     EarSense, ExtensionSense, KinectSense, Now, RangeExtrinsics, RangeSense, SurpriseSense,
@@ -289,6 +289,15 @@ struct NeatTrainArgs {
     /// Held-out audit seed root. These seeds are never used for selection.
     #[arg(long, default_value_t = 9_000_001)]
     heldout_seed: u64,
+    /// Validation seed root. Validation worlds never participate in selection.
+    #[arg(long, default_value_t = 8_000_001)]
+    validation_seed: u64,
+    /// Validate the current champion every N generations.
+    #[arg(long, default_value_t = 4)]
+    validation_every: usize,
+    /// Consecutive validation passes required before advancing a stage.
+    #[arg(long, default_value_t = 2)]
+    validation_passes: usize,
     #[arg(long, default_value_t = 2.2)]
     compatibility_threshold: f32,
     #[arg(long, default_value_t = 4)]
@@ -299,6 +308,21 @@ struct NeatTrainArgs {
     checkpoint: String,
     #[arg(long, default_value = "data/reports/neat/locomotion")]
     report_dir: String,
+    /// Atomic full evolutionary-state checkpoint.
+    #[arg(
+        long,
+        default_value = "data/reports/neat/locomotion/trainer-state.json"
+    )]
+    state_checkpoint: String,
+    /// Resume a full evolutionary-state checkpoint.
+    #[arg(long)]
+    resume: Option<String>,
+    /// Reconstruct a founder population from a completed legacy report.
+    #[arg(long)]
+    founders_report: Option<String>,
+    /// First stage for a reconstructed founder population.
+    #[arg(long)]
+    start_stage: Option<String>,
     #[arg(long, default_value = "data/captures/neat/locomotion")]
     capture_root: String,
     #[arg(long, default_value = "configs/models.toml")]
@@ -324,6 +348,12 @@ struct NeatTrainArgs {
     /// Fraction of each generation's episodes mutated from archived hard worlds.
     #[arg(long, default_value_t = 0.25)]
     world_mutation_ratio: f32,
+    /// Fraction of late-stage training worlds drawn from earlier curriculum stages.
+    #[arg(long, default_value_t = 0.20)]
+    rehearsal_ratio: f32,
+    /// Paired held-out episodes used to qualify specialist archive labels.
+    #[arg(long, default_value_t = 16)]
+    niche_audit_episodes: usize,
     /// Leave the trained candidate as a report artifact instead of promoting winners.
     #[arg(long)]
     no_promote: bool,
@@ -1882,15 +1912,23 @@ struct NeatNicheArchiveEntry {
     base_selection_fitness: f32,
     novelty_score: f32,
     diagnostic_fitness: f32,
+    #[serde(default)]
+    qualification_evidence: Option<NicheQualificationEvidence>,
     genome: Genome,
     evaluation: NeatPolicyEvaluation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct NeatEnvironmentChallenge {
     stage: CurriculumStage,
     kind: ScenarioKind,
     seed: u64,
+    #[serde(default)]
+    arena_override_m: Option<(f32, f32)>,
+    #[serde(default)]
+    initial_battery: Option<f32>,
+    #[serde(default)]
+    disable_chargers: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1902,10 +1940,89 @@ struct NeatWorldArchiveEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct NeatStageValidationReport {
+    stage: CurriculumStage,
+    validation_round: u64,
+    seeded_episodes: usize,
+    success_rate: f32,
+    collision_rate: f32,
+    safety_invariant_violations: u32,
+    passed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NeatTrainerState {
+    schema_version: u32,
+    behavior: String,
+    seed: u64,
+    validation_seed: u64,
+    heldout_seed: u64,
+    steps: usize,
+    episodes_per_genome: usize,
+    settings: NeatTrainerSettings,
+    population: Population,
+    stage_index: usize,
+    generation_in_stage: usize,
+    validation_round: u64,
+    qualification_streak: usize,
+    stage_qualified: bool,
+    validations: Vec<NeatStageValidationReport>,
+    generation_reports: Vec<NeatGenerationReport>,
+    stage_best: Option<(f32, Genome, NeatPolicyEvaluation)>,
+    stage_archive: Vec<NeatNicheArchiveEntry>,
+    stage_reports: Vec<NeatStageReport>,
+    repertoire: Vec<NeatNicheArchiveEntry>,
+    novelty_archive: NoveltyArchive,
+    world_archive: Vec<NeatWorldArchiveEntry>,
+    transfer_genome: Genome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct NeatTrainerSettings {
+    initial_compatibility_threshold: f32,
+    target_species_min: usize,
+    target_species_max: usize,
+    novelty_weight: f32,
+    novelty_neighbors: usize,
+    novelty_archive_limit: usize,
+    world_archive_limit: usize,
+    world_replay_ratio: f32,
+    world_mutation_ratio: f32,
+    rehearsal_ratio: f32,
+    validation_every: usize,
+    validation_passes: usize,
+    niche_audit_episodes: usize,
+}
+
+impl From<&NeatTrainArgs> for NeatTrainerSettings {
+    fn from(args: &NeatTrainArgs) -> Self {
+        Self {
+            initial_compatibility_threshold: args.compatibility_threshold,
+            target_species_min: args.target_species_min,
+            target_species_max: args.target_species_max,
+            novelty_weight: args.novelty_weight,
+            novelty_neighbors: args.novelty_neighbors,
+            novelty_archive_limit: args.novelty_archive_limit,
+            world_archive_limit: args.world_archive_limit,
+            world_replay_ratio: args.world_replay_ratio,
+            world_mutation_ratio: args.world_mutation_ratio,
+            rehearsal_ratio: args.rehearsal_ratio,
+            validation_every: args.validation_every,
+            validation_passes: args.validation_passes,
+            niche_audit_episodes: args.niche_audit_episodes,
+        }
+    }
+}
+
+const NEAT_TRAINER_STATE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct NeatTrainingReport {
     behavior: String,
     seed: u64,
     heldout_seed_root: u64,
+    #[serde(default)]
+    validation_seed_root: u64,
     checkpoint: String,
     novelty_weight: f32,
     novelty_neighbors: usize,
@@ -1916,6 +2033,10 @@ struct NeatTrainingReport {
     stages: Vec<NeatStageReport>,
     repertoire: Vec<NeatNicheArchiveEntry>,
     world_archive: Vec<NeatWorldArchiveEntry>,
+    #[serde(default)]
+    validations: Vec<NeatStageValidationReport>,
+    #[serde(default)]
+    trainer_state: Option<String>,
     transfer_candidate: CandidateEvaluation,
     transfer_eligible: bool,
     transfer_criteria: pete_neat::PromotionCriteria,
@@ -1940,6 +2061,255 @@ struct NeatPromotionReport {
     models_config: String,
 }
 
+fn load_or_initialize_neat_trainer_state(
+    args: &NeatTrainArgs,
+    config: NeatConfig,
+) -> Result<NeatTrainerState> {
+    if let Some(path) = args.resume.as_deref() {
+        let state: NeatTrainerState = serde_json::from_slice(
+            &fs::read(path).with_context(|| format!("reading NEAT trainer state {path}"))?,
+        )
+        .with_context(|| format!("parsing NEAT trainer state {path}"))?;
+        if state.schema_version != NEAT_TRAINER_STATE_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported NEAT trainer state schema {}; expected {}",
+                state.schema_version,
+                NEAT_TRAINER_STATE_SCHEMA_VERSION
+            );
+        }
+        if state.behavior != args.behavior
+            || state.seed != args.seed
+            || state.validation_seed != args.validation_seed
+            || state.heldout_seed != args.heldout_seed
+            || state.steps != args.steps
+            || state.episodes_per_genome != args.episodes_per_genome
+            || state.population.config.population_size != args.population
+            || state.settings != NeatTrainerSettings::from(args)
+        {
+            anyhow::bail!(
+                "resume configuration differs from {}; behavior, seeds, steps, episodes, and population must match",
+                path
+            );
+        }
+        println!(
+            "resuming trainer state {} at stage={} generation={}",
+            path, state.stage_index, state.generation_in_stage
+        );
+        return Ok(state);
+    }
+
+    let default_start = if args.founders_report.is_some() {
+        CurriculumStage::ExploreWithoutLooping
+    } else {
+        CurriculumStage::BackAwayReliably
+    };
+    let start_stage = args
+        .start_stage
+        .as_deref()
+        .map(parse_neat_stage)
+        .transpose()?
+        .unwrap_or(default_start);
+    let evolving_stages = CurriculumStage::ORDER
+        .into_iter()
+        .filter(|stage| stage.evolves_population())
+        .collect::<Vec<_>>();
+    let stage_index = evolving_stages
+        .iter()
+        .position(|stage| *stage == start_stage)
+        .context("transfer audit cannot be used as an evolutionary start stage")?;
+    let mut rng = StdRng::seed_from_u64(args.seed ^ 0xF0_0D_E2);
+
+    let (population, stage_reports, repertoire, world_archive, mut novelty_archive) =
+        if let Some(report_path) = args.founders_report.as_deref() {
+            let legacy: NeatTrainingReport = serde_json::from_slice(
+                &fs::read(report_path)
+                    .with_context(|| format!("reading founder report {report_path}"))?,
+            )
+            .with_context(|| format!("parsing founder report {report_path}"))?;
+            let founders = legacy_founder_genomes(&legacy, args)?;
+            let population = Population::from_founders(config, &founders, &mut rng)?;
+            let mut novelty = NoveltyArchive::new(args.novelty_archive_limit);
+            let traits = legacy
+                .repertoire
+                .iter()
+                .map(|entry| entry.evaluation.traits)
+                .collect::<Vec<_>>();
+            let metrics = legacy
+                .repertoire
+                .iter()
+                .map(|entry| entry.evaluation.metrics)
+                .collect::<Vec<_>>();
+            novelty.observe(&pete_neat::behavioral_descriptors(
+                &traits,
+                &metrics,
+                args.episodes_per_genome,
+                args.steps,
+            ));
+            println!(
+                "reconstructed {}-member population from {} imported founders",
+                population.genomes.len(),
+                founders.len()
+            );
+            (
+                population,
+                legacy.stages.into_iter().take(stage_index).collect(),
+                legacy.repertoire,
+                legacy.world_archive,
+                novelty,
+            )
+        } else {
+            (
+                Population::seeded(config, &mut rng),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                NoveltyArchive::new(args.novelty_archive_limit),
+            )
+        };
+    novelty_archive.observe(&[]);
+    let transfer_genome = population.genomes[0].clone();
+    Ok(NeatTrainerState {
+        schema_version: NEAT_TRAINER_STATE_SCHEMA_VERSION,
+        behavior: args.behavior.clone(),
+        seed: args.seed,
+        validation_seed: args.validation_seed,
+        heldout_seed: args.heldout_seed,
+        steps: args.steps,
+        episodes_per_genome: args.episodes_per_genome,
+        settings: NeatTrainerSettings::from(args),
+        population,
+        stage_index,
+        generation_in_stage: 0,
+        validation_round: 0,
+        qualification_streak: 0,
+        stage_qualified: false,
+        validations: Vec::new(),
+        generation_reports: Vec::new(),
+        stage_best: None,
+        stage_archive: Vec::new(),
+        stage_reports,
+        repertoire,
+        novelty_archive,
+        world_archive,
+        transfer_genome,
+    })
+}
+
+fn parse_neat_stage(value: &str) -> Result<CurriculumStage> {
+    CurriculumStage::ORDER
+        .into_iter()
+        .find(|stage| {
+            neat_stage_slug(*stage) == value || format!("{stage:?}").eq_ignore_ascii_case(value)
+        })
+        .with_context(|| format!("unknown NEAT curriculum stage {value:?}"))
+}
+
+fn legacy_founder_genomes(
+    report: &NeatTrainingReport,
+    args: &NeatTrainArgs,
+) -> Result<Vec<Genome>> {
+    let mut founders = Vec::<Genome>::new();
+    let add_unique = |founders: &mut Vec<Genome>, genome: Genome| {
+        if !founders.contains(&genome) {
+            founders.push(genome);
+        }
+    };
+    for stage in &report.stages {
+        if let Some(entry) = stage
+            .niche_archive
+            .iter()
+            .max_by(|left, right| left.selection_fitness.total_cmp(&right.selection_fitness))
+        {
+            add_unique(&mut founders, entry.genome.clone());
+        }
+    }
+    if let Some(active_path) = active_locomotion_model_checkpoint(Path::new(&args.models_config))? {
+        if let Ok(checkpoint) = LocomotionCheckpoint::load(active_path) {
+            add_unique(&mut founders, checkpoint.genome);
+        }
+    }
+    if let Some(candidate_path) = report.promotion.candidate_artifact.as_deref() {
+        if let Ok(checkpoint) = LocomotionCheckpoint::load(candidate_path) {
+            add_unique(&mut founders, checkpoint.genome);
+        }
+    }
+
+    let mut seen_cells = HashSet::new();
+    let mut candidates = report.repertoire.iter().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.selection_fitness.total_cmp(&left.selection_fitness));
+    for entry in candidates {
+        if founders.len() >= 16 {
+            break;
+        }
+        if seen_cells.insert((neat_stage_slug(entry.stage), entry.niche, entry.descriptor)) {
+            add_unique(&mut founders, entry.genome.clone());
+        }
+    }
+    if founders.is_empty() {
+        anyhow::bail!("founder report contains no recoverable genomes");
+    }
+    founders.truncate(16);
+    Ok(founders)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_neat_trainer_state(
+    path: &Path,
+    args: &NeatTrainArgs,
+    population: &Population,
+    stage_index: usize,
+    generation_in_stage: usize,
+    validation_round: u64,
+    qualification_streak: usize,
+    stage_qualified: bool,
+    validations: &[NeatStageValidationReport],
+    generation_reports: &[NeatGenerationReport],
+    stage_best: &Option<(f32, Genome, NeatPolicyEvaluation)>,
+    stage_archive: &[NeatNicheArchiveEntry],
+    stage_reports: &[NeatStageReport],
+    repertoire: &[NeatNicheArchiveEntry],
+    novelty_archive: &NoveltyArchive,
+    world_archive: &[NeatWorldArchiveEntry],
+    transfer_genome: &Genome,
+) -> Result<()> {
+    let state = NeatTrainerState {
+        schema_version: NEAT_TRAINER_STATE_SCHEMA_VERSION,
+        behavior: args.behavior.clone(),
+        seed: args.seed,
+        validation_seed: args.validation_seed,
+        heldout_seed: args.heldout_seed,
+        steps: args.steps,
+        episodes_per_genome: args.episodes_per_genome,
+        settings: NeatTrainerSettings::from(args),
+        population: population.clone(),
+        stage_index,
+        generation_in_stage,
+        validation_round,
+        qualification_streak,
+        stage_qualified,
+        validations: validations.to_vec(),
+        generation_reports: generation_reports.to_vec(),
+        stage_best: stage_best.clone(),
+        stage_archive: stage_archive.to_vec(),
+        stage_reports: stage_reports.to_vec(),
+        repertoire: repertoire.to_vec(),
+        novelty_archive: novelty_archive.clone(),
+        world_archive: world_archive.to_vec(),
+        transfer_genome: transfer_genome.clone(),
+    };
+    write_json_report_atomic(path, &state)
+}
+
+fn write_json_report_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(value)?)
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+}
+
 async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
     if args.behavior != "locomotion" {
         anyhow::bail!(
@@ -1952,21 +2322,46 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             "population, generations-per-stage, and episodes-per-genome must be positive"
         );
     }
+    if args.validation_every == 0 || args.validation_passes == 0 {
+        anyhow::bail!("validation-every and validation-passes must be positive");
+    }
+    if args.world_replay_ratio + args.world_mutation_ratio + args.rehearsal_ratio > 1.0 {
+        anyhow::bail!("world replay, mutation, and rehearsal ratios must sum to at most 1.0");
+    }
+    if args.resume.is_some() && (args.founders_report.is_some() || args.start_stage.is_some()) {
+        anyhow::bail!("--resume cannot be combined with --founders-report or --start-stage");
+    }
+    if let Some(founders_report) = args.founders_report.as_deref() {
+        if Path::new(founders_report).parent() == Some(Path::new(&args.report_dir)) {
+            anyhow::bail!(
+                "founder report must be outside the new report directory so historical artifacts cannot be overwritten"
+            );
+        }
+    }
 
     fs::create_dir_all(&args.report_dir)?;
     fs::create_dir_all(&args.capture_root)?;
-    let mut rng = StdRng::seed_from_u64(args.seed);
     let config = NeatConfig {
         population_size: args.population,
         compatibility_threshold: args.compatibility_threshold,
         ..NeatConfig::default()
     };
-    let mut population = Population::seeded(config, &mut rng);
-    let mut stage_reports = Vec::new();
-    let mut repertoire = Vec::new();
-    let mut novelty_archive = NoveltyArchive::new(args.novelty_archive_limit);
-    let mut world_archive = Vec::<NeatWorldArchiveEntry>::new();
-    let mut transfer_genome = population.genomes[0].clone();
+    let initial_state = load_or_initialize_neat_trainer_state(&args, config)?;
+    let resume_stage_index = initial_state.stage_index;
+    let resume_generation_in_stage = initial_state.generation_in_stage;
+    let mut validation_round = initial_state.validation_round;
+    let mut qualification_streak = initial_state.qualification_streak;
+    let resume_stage_qualified = initial_state.stage_qualified;
+    let mut validations = initial_state.validations;
+    let mut resumed_generation_reports = Some(initial_state.generation_reports);
+    let mut resumed_stage_best = Some(initial_state.stage_best);
+    let mut resumed_stage_archive = Some(initial_state.stage_archive);
+    let mut population = initial_state.population;
+    let mut stage_reports = initial_state.stage_reports;
+    let mut repertoire = initial_state.repertoire;
+    let mut novelty_archive = initial_state.novelty_archive;
+    let mut world_archive = initial_state.world_archive;
+    let mut transfer_genome = initial_state.transfer_genome;
     let evolving_stages = CurriculumStage::ORDER
         .into_iter()
         .filter(|stage| stage.evolves_population())
@@ -2003,17 +2398,47 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
     }
 
     for (stage_index, stage) in evolving_stages.iter().copied().enumerate() {
+        if stage_index < resume_stage_index {
+            continue;
+        }
         println!(
             "\n=== stage {}/{}: {} ===",
             stage_index + 1,
             evolving_stages.len(),
             neat_stage_slug(stage)
         );
-        let mut generation_reports = Vec::new();
-        let mut stage_best: Option<(f32, Genome, NeatPolicyEvaluation)> = None;
-        let mut stage_archive = Vec::<NeatNicheArchiveEntry>::new();
+        let resuming_stage = stage_index == resume_stage_index;
+        let start_generation = if resuming_stage {
+            resume_generation_in_stage
+        } else {
+            0
+        };
+        let mut generation_reports = if resuming_stage {
+            resumed_generation_reports.take().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut stage_best = if resuming_stage {
+            resumed_stage_best.take().flatten()
+        } else {
+            None
+        };
+        let mut stage_archive = if resuming_stage {
+            resumed_stage_archive.take().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !resuming_stage {
+            qualification_streak = 0;
+        }
+        let mut stage_qualified = resuming_stage && resume_stage_qualified;
 
-        for generation_in_stage in 0..args.generations_per_stage {
+        let generation_range_start = if stage_qualified {
+            args.generations_per_stage
+        } else {
+            start_generation
+        };
+        for generation_in_stage in generation_range_start..args.generations_per_stage {
             let mut evaluations = Vec::with_capacity(population.genomes.len());
             let challenge_plan = neat_generation_challenges(
                 stage,
@@ -2024,6 +2449,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 &world_archive,
                 args.world_replay_ratio,
                 args.world_mutation_ratio,
+                args.rehearsal_ratio,
             );
             for (genome_index, genome) in population.genomes.iter().enumerate() {
                 let evaluation = evaluate_neat_locomotion(
@@ -2195,7 +2621,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 report.champion_collision_rate,
             );
             println!(
-                "  components area={} clear_distance={:.2} escapes={} boundary={} mouth_progress={:.2} collisions={} repeats={} wheel_motion={:.2} angular={:.2} stalled={} vetoes={} lifetime mean={:.2} q25={:.2} min={:.2} qualify={:.1}%",
+                "  components area={} clear_distance={:.2} escapes={} boundary={} mouth_progress={:.2} collisions={} repeats={} wheel_motion={:.2} angular={:.2} stalled={} vetoes={} invariants={} lifetime mean={:.2} q25={:.2} min={:.2} qualify={:.1}%",
                 report.champion_metrics.new_area_cells,
                 report.champion_metrics.distance_without_collision_m,
                 report.champion_metrics.successful_escapes,
@@ -2207,6 +2633,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 report.champion_metrics.angular_motion_rad,
                 report.champion_metrics.stalled_steps,
                 report.champion_metrics.safety_vetoes,
+                report.champion_metrics.safety_invariant_violations,
                 report.champion_lifetime_selection.mean_score,
                 report.champion_lifetime_selection.lower_quartile_score,
                 report.champion_lifetime_selection.worst_score,
@@ -2223,6 +2650,8 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                     champion_evaluation.clone(),
                 ));
             }
+            let validation_genome = champion.clone();
+            let validation_evaluation = champion_evaluation.clone();
             generation_reports.push(report.clone());
             write_json_report(
                 Path::new(&args.report_dir).join(format!(
@@ -2250,13 +2679,97 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 .await?;
                 println!("  worldlab capture: {}", path.display());
             }
-            population.evolve(&selection_fitness, &mut rng)?;
+            let mut evolution_rng = StdRng::seed_from_u64(
+                args.seed
+                    ^ population.generation.rotate_left(17)
+                    ^ (stage_index as u64).rotate_left(33),
+            );
+            population.evolve(&selection_fitness, &mut evolution_rng)?;
             tune_compatibility_threshold(
                 &mut population,
                 report.species,
                 args.target_species_min,
                 args.target_species_max,
             );
+
+            let validation_due = (generation_in_stage + 1) % args.validation_every.max(1) == 0
+                || generation_in_stage + 1 == args.generations_per_stage;
+            if validation_due {
+                let validation_reports = validate_neat_curriculum(
+                    &validation_genome,
+                    stage_index,
+                    &evolving_stages,
+                    args.steps,
+                    args.validation_seed,
+                    validation_round,
+                )
+                .await?;
+                validation_round = validation_round.saturating_add(1);
+                let validation_passed = validation_reports.iter().all(|report| report.passed);
+                for validation in &validation_reports {
+                    println!(
+                        "  validation {} success={:.1}% collision={:.4} invariants={} {}",
+                        neat_stage_slug(validation.stage),
+                        validation.success_rate * 100.0,
+                        validation.collision_rate,
+                        validation.safety_invariant_violations,
+                        if validation.passed { "PASS" } else { "FAIL" }
+                    );
+                }
+                validations.extend(validation_reports);
+                if validation_passed {
+                    qualification_streak = qualification_streak.saturating_add(1);
+                } else {
+                    qualification_streak = 0;
+                }
+                println!(
+                    "  qualification streak={}/{}",
+                    qualification_streak,
+                    args.validation_passes.max(1)
+                );
+                if qualification_streak >= args.validation_passes.max(1) {
+                    stage_qualified = true;
+                    transfer_genome = validation_genome.clone();
+                    stage_best = Some((
+                        best_selection,
+                        validation_genome.clone(),
+                        validation_evaluation,
+                    ));
+                }
+            }
+
+            write_neat_trainer_state(
+                Path::new(&args.state_checkpoint),
+                &args,
+                &population,
+                stage_index,
+                generation_in_stage + 1,
+                validation_round,
+                qualification_streak,
+                stage_qualified,
+                &validations,
+                &generation_reports,
+                &stage_best,
+                &stage_archive,
+                &stage_reports,
+                &repertoire,
+                &novelty_archive,
+                &world_archive,
+                &transfer_genome,
+            )?;
+            if stage_qualified {
+                break;
+            }
+        }
+
+        if !stage_qualified {
+            println!(
+                "stage {} did not qualify within {} generations; state saved at {}",
+                neat_stage_slug(stage),
+                args.generations_per_stage,
+                args.state_checkpoint
+            );
+            return Ok(());
         }
 
         let (best_fitness, best_genome, best_evaluation) =
@@ -2280,6 +2793,15 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             best_fitness,
             stage_capture.display()
         );
+        qualify_neat_stage_archive(
+            &mut stage_archive,
+            args.niche_audit_episodes,
+            args.steps,
+            args.validation_seed
+                .saturating_add(0x004E_4943_4845)
+                .saturating_add((stage_index as u64) << 32),
+        )
+        .await?;
         write_stage_niche_checkpoints(
             &stage_archive,
             population.generation,
@@ -2294,8 +2816,35 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             generations: generation_reports,
             capture: stage_capture.to_string_lossy().to_string(),
         });
+        qualification_streak = 0;
+        write_neat_trainer_state(
+            Path::new(&args.state_checkpoint),
+            &args,
+            &population,
+            stage_index + 1,
+            0,
+            validation_round,
+            qualification_streak,
+            false,
+            &validations,
+            &[],
+            &None,
+            &[],
+            &stage_reports,
+            &repertoire,
+            &novelty_archive,
+            &world_archive,
+            &transfer_genome,
+        )?;
     }
 
+    transfer_genome = select_neat_transfer_candidate(
+        &transfer_genome,
+        &repertoire,
+        args.steps,
+        args.validation_seed.saturating_add(0x7A4E_5FE2),
+    )
+    .await?;
     let checkpoint = LocomotionCheckpoint::new(
         population.generation,
         stage_reports
@@ -2390,26 +2939,23 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         } else {
             None
         };
-    let baseline_traits = active_model_evaluation
-        .as_ref()
-        .map(|(_, active)| active.traits)
-        .unwrap_or(hardcoded.traits);
-    let transfer_summaries = pete_neat::selection_summaries(
-        &[candidate.traits, hardcoded.traits, baseline_traits],
-        transfer_stage.selection_constraints(),
-    );
-    let candidate_selection = transfer_summaries[0].fitness;
-    let hardcoded_selection = transfer_summaries[1].fitness;
-    let baseline_selection = transfer_summaries[2].fitness;
-    let (baseline_kind, baseline_checkpoint, baseline_fitness) =
-        if let Some((checkpoint_path, _)) = active_model_evaluation.as_ref() {
+    let candidate_selection = transfer_ordering_score(&candidate);
+    let hardcoded_selection = transfer_ordering_score(&hardcoded);
+    let (baseline_kind, baseline_checkpoint, baseline_fitness, beats_baseline) =
+        if let Some((checkpoint_path, active)) = active_model_evaluation.as_ref() {
             (
                 "active_model".to_string(),
                 Some(checkpoint_path.clone()),
-                baseline_selection,
+                transfer_ordering_score(active),
+                transfer_evaluation_better(&candidate, active),
             )
         } else {
-            ("hardcoded".to_string(), None, baseline_selection)
+            (
+                "hardcoded".to_string(),
+                None,
+                hardcoded_selection,
+                transfer_evaluation_better(&candidate, &hardcoded),
+            )
         };
     println!(
         "  selection candidate={:.3} hardcoded={:.3} baseline={:.3}",
@@ -2431,11 +2977,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         false,
     )
     .await?;
-    let noisy_selection = pete_neat::selection_summaries(
-        &[candidate.traits, noisy.traits],
-        transfer_stage.selection_constraints(),
-    )[1]
-    .fitness;
+    let noisy_selection = transfer_ordering_score(&noisy);
     println!(
         "  noisy selection={:.3} diagnostic_fitness={:.3}",
         noisy_selection, noisy.fitness
@@ -2458,25 +3000,19 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         false,
     )
     .await?;
-    let mismatch_selection = pete_neat::selection_summaries(
-        &[candidate.traits, mismatch.traits],
-        transfer_stage.selection_constraints(),
-    )[1]
-    .fitness;
+    let mismatch_selection = transfer_ordering_score(&mismatch);
     println!(
         "  motor-mismatch selection={:.3} diagnostic_fitness={:.3}",
         mismatch_selection, mismatch.fitness
     );
-    let robust_enough =
-        |perturbed: f32| perturbed >= candidate_selection - candidate_selection.abs() * 0.25 - 1.0;
     let candidate_evaluation = CandidateEvaluation {
         seeded_episodes: args.transfer_episodes as u32,
         success_rate: candidate.success_rate(),
         collision_rate: candidate.collision_rate,
-        safety_invariant_violations: 0,
-        beats_hardcoded: candidate_selection > hardcoded_selection,
-        noise_robust: robust_enough(noisy_selection),
-        motor_mismatch_robust: robust_enough(mismatch_selection),
+        safety_invariant_violations: candidate.metrics.safety_invariant_violations,
+        beats_hardcoded: transfer_evaluation_better(&candidate, &hardcoded),
+        noise_robust: transfer_perturbation_robust(&candidate, &noisy),
+        motor_mismatch_robust: transfer_perturbation_robust(&candidate, &mismatch),
         fallback_verified: true,
     };
     let criteria = transfer_stage.promotion_criteria();
@@ -2486,13 +3022,15 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         candidate_selection, hardcoded_selection, noisy_selection, mismatch_selection
     );
     println!(
-        "transfer episodes={} success={:.1}% collision={:.4} beats_hardcoded={} noise_robust={} motor_robust={} safety_violations=0 fallback_verified=true",
+        "transfer episodes={} success={:.1}% collision={:.4} beats_hardcoded={} noise_robust={} motor_robust={} safety_invariant_violations={} safety_vetoes={} fallback_verified=true",
         args.transfer_episodes,
         candidate.success_rate() * 100.0,
         candidate.collision_rate,
         candidate_evaluation.beats_hardcoded,
         candidate_evaluation.noise_robust,
         candidate_evaluation.motor_mismatch_robust,
+        candidate_evaluation.safety_invariant_violations,
+        candidate.metrics.safety_vetoes,
     );
     println!(
         "PETE transfer eligibility: {}",
@@ -2517,14 +3055,14 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             promoted_regime: None,
             models_config: args.models_config.clone(),
         }
-    } else if candidate_selection > baseline_fitness {
+    } else if eligible && beats_baseline {
         checkpoint.save(&args.checkpoint)?;
         promote_locomotion_model_config(
             Path::new(&args.models_config),
             Path::new(&args.checkpoint),
         )?;
         println!(
-            "\npromoted locomotion.neat.v0: candidate selection {:.3} beat {} selection {:.3}",
+            "\npromoted locomotion.neat.v0: eligible candidate score {:.3} beat {} score {:.3}",
             candidate_selection, baseline_kind, baseline_fitness
         );
         println!(
@@ -2535,7 +3073,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             enabled: true,
             promoted: true,
             reason: format!(
-                "candidate selection {:.3} beat {} selection {:.3}",
+                "eligible candidate score {:.3} beat {} score {:.3}",
                 candidate_selection, baseline_kind, baseline_fitness
             ),
             baseline_kind,
@@ -2548,10 +3086,13 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         }
     } else {
         checkpoint.save(&rejected_candidate_path)?;
-        println!(
-            "\nnot promoting locomotion.neat.v0: candidate selection {:.3} did not beat {} selection {:.3}",
-            candidate_selection, baseline_kind, baseline_fitness
+        let reason = transfer_rejection_reason(
+            candidate_evaluation,
+            criteria,
+            beats_baseline,
+            &baseline_kind,
         );
+        println!("\nnot promoting locomotion.neat.v0: {reason}");
         println!(
             "candidate artifact kept for inspection: {}",
             rejected_candidate_path.display()
@@ -2559,10 +3100,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         NeatPromotionReport {
             enabled: true,
             promoted: false,
-            reason: format!(
-                "candidate selection {:.3} did not beat {} selection {:.3}",
-                candidate_selection, baseline_kind, baseline_fitness
-            ),
+            reason,
             baseline_kind,
             baseline_checkpoint,
             baseline_fitness,
@@ -2577,6 +3115,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         behavior: args.behavior,
         seed: args.seed,
         heldout_seed_root: args.heldout_seed,
+        validation_seed_root: args.validation_seed,
         checkpoint: args.checkpoint,
         novelty_weight: args.novelty_weight,
         novelty_neighbors: args.novelty_neighbors,
@@ -2587,6 +3126,8 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         stages: stage_reports,
         repertoire,
         world_archive,
+        validations,
+        trainer_state: Some(args.state_checkpoint.clone()),
         transfer_candidate: candidate_evaluation,
         transfer_eligible: eligible,
         transfer_criteria: criteria,
@@ -2750,7 +3291,26 @@ async fn evaluate_neat_locomotion(
         let kind = challenge
             .map(|challenge| challenge.kind)
             .unwrap_or_else(|| neat_stage_scenario(stage, episode_seed));
-        let scenario = build_scenario(ScenarioConfig::new(kind, episode_seed));
+        let mut scenario_config = ScenarioConfig::new(kind, episode_seed);
+        if let Some((width_m, height_m)) =
+            challenge.and_then(|challenge| challenge.arena_override_m)
+        {
+            scenario_config.arena = pete_sim::ArenaConfig {
+                width_m: width_m.max(2.0),
+                height_m: height_m.max(2.0),
+            };
+        }
+        if challenge.is_some_and(|challenge| challenge.disable_chargers) {
+            scenario_config.object_count = scenario_config
+                .object_count
+                .saturating_sub(scenario_config.charger_count);
+            scenario_config.charger_count = 0;
+        }
+        let mut scenario = build_scenario(scenario_config);
+        if let Some(initial_battery) = challenge.and_then(|challenge| challenge.initial_battery) {
+            scenario.metadata.body.battery_level = initial_battery.clamp(0.0, 1.0);
+            scenario.world.set_body(scenario.metadata.body.clone());
+        }
         if capture && episode == 0 {
             captured_scenario = Some(scenario.metadata.clone());
         }
@@ -2918,6 +3478,10 @@ async fn evaluate_neat_locomotion(
             if decision.vetoed {
                 metrics.safety_vetoes = metrics.safety_vetoes.saturating_add(1);
             }
+            if neat_safety_invariant_violated(&decision) {
+                metrics.safety_invariant_violations =
+                    metrics.safety_invariant_violations.saturating_add(1);
+            }
             tracker.observe_command(LocomotionOutput {
                 forward_velocity_m_s: decision.command.forward,
                 angular_velocity_rad_s: decision.command.turn,
@@ -3060,6 +3624,195 @@ fn lifetime_selection_adjustment(selection: NeatLifetimeSelection) -> f32 {
     selection.robustness_score + selection.qualification_probability * 10.0
 }
 
+fn transfer_ordering_score(evaluation: &NeatPolicyEvaluation) -> f32 {
+    if evaluation.metrics.safety_invariant_violations > 0 {
+        return -10_000.0 - evaluation.metrics.safety_invariant_violations as f32;
+    }
+    evaluation.success_rate() * 1_000.0 - evaluation.collision_rate * 100.0
+        + (evaluation.fitness / 1_000.0).tanh() * 10.0
+}
+
+fn transfer_evaluation_better(
+    candidate: &NeatPolicyEvaluation,
+    baseline: &NeatPolicyEvaluation,
+) -> bool {
+    candidate
+        .metrics
+        .safety_invariant_violations
+        .cmp(&baseline.metrics.safety_invariant_violations)
+        .reverse()
+        .then_with(|| candidate.success_rate().total_cmp(&baseline.success_rate()))
+        .then_with(|| baseline.collision_rate.total_cmp(&candidate.collision_rate))
+        .then_with(|| candidate.fitness.total_cmp(&baseline.fitness))
+        .is_gt()
+}
+
+fn transfer_perturbation_robust(
+    nominal: &NeatPolicyEvaluation,
+    perturbed: &NeatPolicyEvaluation,
+) -> bool {
+    let retained_success = if nominal.success_rate() <= f32::EPSILON {
+        perturbed.success_rate() >= nominal.success_rate()
+    } else {
+        perturbed.success_rate() >= nominal.success_rate() * 0.75
+    };
+    perturbed.metrics.safety_invariant_violations == 0
+        && retained_success
+        && perturbed.collision_rate <= nominal.collision_rate + 0.02
+}
+
+fn transfer_rejection_reason(
+    evaluation: CandidateEvaluation,
+    criteria: pete_neat::PromotionCriteria,
+    beats_baseline: bool,
+    baseline_kind: &str,
+) -> String {
+    let mut failures = Vec::new();
+    if evaluation.seeded_episodes < criteria.minimum_seeded_episodes {
+        failures.push(format!(
+            "episodes {} < {}",
+            evaluation.seeded_episodes, criteria.minimum_seeded_episodes
+        ));
+    }
+    if evaluation.success_rate < criteria.minimum_success_rate {
+        failures.push(format!(
+            "success {:.1}% < {:.1}%",
+            evaluation.success_rate * 100.0,
+            criteria.minimum_success_rate * 100.0
+        ));
+    }
+    if evaluation.collision_rate > criteria.maximum_collision_rate {
+        failures.push(format!(
+            "collision {:.4} > {:.4}",
+            evaluation.collision_rate, criteria.maximum_collision_rate
+        ));
+    }
+    if evaluation.safety_invariant_violations > criteria.maximum_safety_invariant_violations {
+        failures.push(format!(
+            "safety invariant violations {} > {}",
+            evaluation.safety_invariant_violations, criteria.maximum_safety_invariant_violations
+        ));
+    }
+    if !evaluation.beats_hardcoded {
+        failures.push("did not beat hardcoded".to_string());
+    }
+    if !evaluation.noise_robust {
+        failures.push("sensor perturbation retention failed".to_string());
+    }
+    if !evaluation.motor_mismatch_robust {
+        failures.push("motor perturbation retention failed".to_string());
+    }
+    if !evaluation.fallback_verified {
+        failures.push("fallback verification failed".to_string());
+    }
+    if !beats_baseline {
+        failures.push(format!("did not beat {baseline_kind}"));
+    }
+    if failures.is_empty() {
+        "candidate did not satisfy promotion policy".to_string()
+    } else {
+        failures.join("; ")
+    }
+}
+
+async fn validate_neat_curriculum(
+    genome: &Genome,
+    current_stage_index: usize,
+    evolving_stages: &[CurriculumStage],
+    steps: usize,
+    validation_seed: u64,
+    validation_round: u64,
+) -> Result<Vec<NeatStageValidationReport>> {
+    let mut reports = Vec::with_capacity(current_stage_index + 1);
+    for (stage_index, stage) in evolving_stages
+        .iter()
+        .copied()
+        .enumerate()
+        .take(current_stage_index + 1)
+    {
+        let criteria = stage.promotion_criteria();
+        let episodes = criteria.minimum_seeded_episodes as usize;
+        let seed = validation_seed
+            .saturating_add(validation_round << 32)
+            .saturating_add((stage_index as u64) << 20);
+        let evaluation = evaluate_neat_locomotion(
+            Some(genome),
+            stage,
+            episodes,
+            steps,
+            seed,
+            NeatPerturbation::default(),
+            None,
+            false,
+        )
+        .await?;
+        let passed = evaluation.success_rate() >= criteria.minimum_success_rate
+            && evaluation.collision_rate <= criteria.maximum_collision_rate
+            && evaluation.metrics.safety_invariant_violations
+                <= criteria.maximum_safety_invariant_violations;
+        reports.push(NeatStageValidationReport {
+            stage,
+            validation_round,
+            seeded_episodes: episodes,
+            success_rate: evaluation.success_rate(),
+            collision_rate: evaluation.collision_rate,
+            safety_invariant_violations: evaluation.metrics.safety_invariant_violations,
+            passed,
+        });
+    }
+    Ok(reports)
+}
+
+async fn select_neat_transfer_candidate(
+    stage_champion: &Genome,
+    repertoire: &[NeatNicheArchiveEntry],
+    steps: usize,
+    seed: u64,
+) -> Result<Genome> {
+    let mut candidates = vec![stage_champion.clone()];
+    let mut ranked = repertoire.iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.selection_fitness.total_cmp(&left.selection_fitness));
+    for entry in ranked {
+        if candidates.len() >= 8 {
+            break;
+        }
+        if !candidates.contains(&entry.genome) {
+            candidates.push(entry.genome.clone());
+        }
+    }
+    let candidate_count = candidates.len();
+    let mut best: Option<(Genome, NeatPolicyEvaluation)> = None;
+    for (index, genome) in candidates.into_iter().enumerate() {
+        let evaluation = evaluate_neat_locomotion(
+            Some(&genome),
+            CurriculumStage::TransferCandidatesToPete,
+            64,
+            steps,
+            seed,
+            NeatPerturbation::default(),
+            None,
+            false,
+        )
+        .await?;
+        println!(
+            "transfer shortlist {}/{} success={:.1}% collision={:.4} invariants={}",
+            index + 1,
+            candidate_count,
+            evaluation.success_rate() * 100.0,
+            evaluation.collision_rate,
+            evaluation.metrics.safety_invariant_violations
+        );
+        if best
+            .as_ref()
+            .is_none_or(|(_, current)| transfer_evaluation_better(&evaluation, current))
+        {
+            best = Some((genome, evaluation));
+        }
+    }
+    best.map(|(genome, _)| genome)
+        .context("empty transfer candidate shortlist")
+}
+
 async fn capture_neat_champion(
     genome: &Genome,
     stage: CurriculumStage,
@@ -3171,6 +3924,16 @@ fn neat_plasticity_reward(step_distance: f32, collision: bool, safety_vetoed: bo
     reward.clamp(-1.0, 1.0)
 }
 
+fn neat_safety_invariant_violated(decision: &pete_autonomic::SafetyDecision) -> bool {
+    let command = decision.command;
+    let finite = command.forward.is_finite() && command.turn.is_finite();
+    let bounded =
+        command.forward.abs() <= 0.6 + f32::EPSILON && command.turn.abs() <= 1.0 + f32::EPSILON;
+    let stopped_when_vetoed = !decision.vetoed
+        || (command.forward.abs() <= f32::EPSILON && command.turn.abs() <= f32::EPSILON);
+    !finite || !bounded || !stopped_when_vetoed
+}
+
 fn neat_sensor_energy_cost(range: &RangeSense) -> f32 {
     0.00025 + range.beams.len() as f32 * 0.000002
 }
@@ -3186,10 +3949,19 @@ fn neat_generation_challenges(
     archive: &[NeatWorldArchiveEntry],
     replay_ratio: f32,
     mutation_ratio: f32,
+    rehearsal_ratio: f32,
 ) -> Vec<NeatEnvironmentChallenge> {
     let mut rng = StdRng::seed_from_u64(seed ^ 0xA11CE_5757);
     let replay_count = ((episodes as f32) * replay_ratio.clamp(0.0, 1.0)).round() as usize;
     let mutation_count = ((episodes as f32) * mutation_ratio.clamp(0.0, 1.0)).round() as usize;
+    let rehearsal_count = if matches!(
+        stage,
+        CurriculumStage::ExploreWithoutLooping | CurriculumStage::NavigateVariedRooms
+    ) {
+        ((episodes as f32) * rehearsal_ratio.clamp(0.0, 1.0)).round() as usize
+    } else {
+        0
+    };
     let mut ranked_archive = archive.iter().collect::<Vec<_>>();
     ranked_archive.sort_by(|left, right| {
         right
@@ -3209,6 +3981,28 @@ fn neat_generation_challenges(
     {
         challenges.push(mutate_neat_environment(entry.challenge, &mut rng));
     }
+    let current_stage_index = CurriculumStage::ORDER
+        .iter()
+        .position(|candidate| *candidate == stage)
+        .unwrap_or_default();
+    for rehearsal_index in 0..rehearsal_count.min(episodes.saturating_sub(challenges.len())) {
+        let prior_stages = &CurriculumStage::ORDER[..current_stage_index];
+        if prior_stages.is_empty() {
+            break;
+        }
+        let rehearsal_stage = prior_stages[rehearsal_index % prior_stages.len()];
+        let episode_seed = seed
+            .saturating_add((challenges.len() as u64) << 8)
+            .saturating_add(rng.gen_range(0..=u16::MAX) as u64);
+        challenges.push(NeatEnvironmentChallenge {
+            stage: rehearsal_stage,
+            kind: neat_stage_scenario(rehearsal_stage, episode_seed),
+            seed: episode_seed,
+            arena_override_m: None,
+            initial_battery: None,
+            disable_chargers: false,
+        });
+    }
     while challenges.len() < episodes {
         let episode_seed = seed
             .saturating_add((challenges.len() as u64) << 8)
@@ -3217,6 +4011,9 @@ fn neat_generation_challenges(
             stage,
             kind: neat_stage_scenario(stage, episode_seed),
             seed: episode_seed,
+            arena_override_m: None,
+            initial_battery: None,
+            disable_chargers: false,
         });
     }
     challenges
@@ -3254,6 +4051,9 @@ fn mutate_neat_environment<R: Rng + ?Sized>(
         stage: challenge.stage,
         kind: kinds.choose(rng).copied().unwrap_or(challenge.kind),
         seed: challenge.seed.wrapping_add(rng.gen_range(1..=10_000)) ^ rng.gen::<u64>(),
+        arena_override_m: challenge.arena_override_m,
+        initial_battery: challenge.initial_battery,
+        disable_chargers: challenge.disable_chargers,
     }
 }
 
@@ -3343,11 +4143,183 @@ fn update_neat_niche_archive(
             base_selection_fitness: evaluation.base_selection_fitness,
             novelty_score: evaluation.novelty_score,
             diagnostic_fitness: evaluation.fitness,
+            qualification_evidence: None,
             genome: genome.clone(),
             evaluation: evaluation.clone(),
         };
         upsert_niche_archive_entry(archive, candidate);
     }
+}
+
+async fn qualify_neat_stage_archive(
+    archive: &mut [NeatNicheArchiveEntry],
+    episodes: usize,
+    steps: usize,
+    seed: u64,
+) -> Result<()> {
+    if archive.is_empty() || episodes == 0 {
+        return Ok(());
+    }
+    let mut indices = (0..archive.len()).collect::<Vec<_>>();
+    indices.sort_by(|left, right| {
+        archive[*right]
+            .selection_fitness
+            .total_cmp(&archive[*left].selection_fitness)
+    });
+    indices.truncate(16);
+    let trap_challenges = niche_challenges(
+        CurriculumStage::EscapeCorners,
+        ScenarioKind::ConcaveTrap,
+        episodes,
+        seed ^ 0x7A_A9,
+        None,
+        None,
+        false,
+    );
+    let low_battery_challenges = niche_challenges(
+        CurriculumStage::NavigateVariedRooms,
+        ScenarioKind::MixedRoom,
+        episodes,
+        seed ^ 0xBA77,
+        None,
+        Some(0.18),
+        true,
+    );
+    let corridor_challenges = niche_challenges(
+        CurriculumStage::NavigateVariedRooms,
+        ScenarioKind::EmptyRoom,
+        episodes,
+        seed ^ 0x0C07_71D0,
+        Some((12.0, 3.5)),
+        None,
+        false,
+    );
+
+    for index in indices {
+        let genome = archive[index].genome.clone();
+        let nominal = evaluate_neat_locomotion(
+            Some(&genome),
+            CurriculumStage::TransferCandidatesToPete,
+            episodes,
+            steps,
+            seed.saturating_add(index as u64 * 0x1000),
+            NeatPerturbation::default(),
+            None,
+            false,
+        )
+        .await?;
+        let degraded = evaluate_neat_locomotion(
+            Some(&genome),
+            CurriculumStage::TransferCandidatesToPete,
+            episodes,
+            steps,
+            seed.saturating_add(index as u64 * 0x1000),
+            NeatPerturbation {
+                sensor_noise: 0.08,
+                latency_steps: 1,
+                ..NeatPerturbation::default()
+            },
+            None,
+            false,
+        )
+        .await?;
+        let mismatch = evaluate_neat_locomotion(
+            Some(&genome),
+            CurriculumStage::TransferCandidatesToPete,
+            episodes,
+            steps,
+            seed.saturating_add(index as u64 * 0x1000),
+            NeatPerturbation {
+                left_motor_scale: 0.82,
+                right_motor_scale: 1.0,
+                wheel_gain_jitter: 0.12,
+                deadband_m_s: 0.015,
+                ..NeatPerturbation::default()
+            },
+            None,
+            false,
+        )
+        .await?;
+        let traps = evaluate_neat_locomotion(
+            Some(&genome),
+            CurriculumStage::EscapeCorners,
+            episodes,
+            steps,
+            seed ^ 0x7A_A9,
+            NeatPerturbation::default(),
+            Some(&trap_challenges),
+            false,
+        )
+        .await?;
+        let low_battery = evaluate_neat_locomotion(
+            Some(&genome),
+            CurriculumStage::NavigateVariedRooms,
+            episodes,
+            steps,
+            seed ^ 0xBA77,
+            NeatPerturbation::default(),
+            Some(&low_battery_challenges),
+            false,
+        )
+        .await?;
+        let corridor = evaluate_neat_locomotion(
+            Some(&genome),
+            CurriculumStage::NavigateVariedRooms,
+            episodes,
+            steps,
+            seed ^ 0x0C07_71D0,
+            NeatPerturbation::default(),
+            Some(&corridor_challenges),
+            false,
+        )
+        .await?;
+        let low_battery_progress = if low_battery.metrics.battery_depleted == 0 {
+            low_battery.metrics.distance_without_collision_m / episodes as f32
+        } else {
+            0.0
+        };
+        let evidence = NicheQualificationEvidence {
+            degraded_sensor_retention: success_retention(&nominal, &degraded),
+            motor_mismatch_retention: success_retention(&nominal, &mismatch),
+            heldout_trap_success_rate: traps.success_rate(),
+            low_battery_progress_m: low_battery_progress,
+            corridor_success_rate: corridor.success_rate(),
+        };
+        archive[index].niche = archive[index]
+            .descriptor
+            .evidence_based_niche_label(archive[index].evaluation.traits, evidence);
+        archive[index].qualification_evidence = Some(evidence);
+    }
+    Ok(())
+}
+
+fn success_retention(nominal: &NeatPolicyEvaluation, perturbed: &NeatPolicyEvaluation) -> f32 {
+    if nominal.success_rate() <= f32::EPSILON {
+        0.0
+    } else {
+        (perturbed.success_rate() / nominal.success_rate()).clamp(0.0, 1.0)
+    }
+}
+
+fn niche_challenges(
+    stage: CurriculumStage,
+    kind: ScenarioKind,
+    episodes: usize,
+    seed: u64,
+    arena_override_m: Option<(f32, f32)>,
+    initial_battery: Option<f32>,
+    disable_chargers: bool,
+) -> Vec<NeatEnvironmentChallenge> {
+    (0..episodes)
+        .map(|episode| NeatEnvironmentChallenge {
+            stage,
+            kind,
+            seed: seed.saturating_add(episode as u64),
+            arena_override_m,
+            initial_battery,
+            disable_chargers,
+        })
+        .collect()
 }
 
 fn update_global_repertoire(
@@ -3432,6 +4404,9 @@ fn add_neat_metrics(total: &mut NeatEpisodeMetrics, episode: NeatEpisodeMetrics)
     total.recovery_activation_sum += episode.recovery_activation_sum;
     total.stalled_steps = total.stalled_steps.saturating_add(episode.stalled_steps);
     total.safety_vetoes = total.safety_vetoes.saturating_add(episode.safety_vetoes);
+    total.safety_invariant_violations = total
+        .safety_invariant_violations
+        .saturating_add(episode.safety_invariant_violations);
     total.resource_energy_used += episode.resource_energy_used;
     total.sensor_energy_cost += episode.sensor_energy_cost;
     total.computation_energy_cost += episode.computation_energy_cost;
@@ -13329,6 +14304,51 @@ mod tests {
         assert_eq!(summary.qualification_probability, 0.75);
         assert_eq!(summary.robustness_score, 1.25);
         assert_eq!(lifetime_selection_adjustment(summary), 8.75);
+    }
+
+    #[test]
+    fn safety_veto_is_not_an_invariant_violation_when_it_stops_motion() {
+        let stopped = pete_autonomic::SafetyDecision {
+            command: pete_cockpit::MotorCommand::stop(),
+            vetoed: true,
+            reason: Some(pete_autonomic::SafetyReason::Cliff),
+            events: Vec::new(),
+        };
+        let moving = pete_autonomic::SafetyDecision {
+            command: pete_cockpit::MotorCommand {
+                forward: 0.1,
+                turn: 0.0,
+            },
+            ..stopped.clone()
+        };
+
+        assert!(!neat_safety_invariant_violated(&stopped));
+        assert!(neat_safety_invariant_violated(&moving));
+    }
+
+    #[test]
+    fn transfer_robustness_uses_success_collision_and_invariants() {
+        let nominal = NeatPolicyEvaluation {
+            successful_episodes: 80,
+            episodes: 100,
+            collision_rate: 0.01,
+            ..NeatPolicyEvaluation::default()
+        };
+        let retained = NeatPolicyEvaluation {
+            successful_episodes: 60,
+            episodes: 100,
+            collision_rate: 0.03,
+            ..NeatPolicyEvaluation::default()
+        };
+        let regressed = NeatPolicyEvaluation {
+            successful_episodes: 59,
+            episodes: 100,
+            collision_rate: 0.01,
+            ..NeatPolicyEvaluation::default()
+        };
+
+        assert!(transfer_perturbation_robust(&nominal, &retained));
+        assert!(!transfer_perturbation_robust(&nominal, &regressed));
     }
 
     #[test]

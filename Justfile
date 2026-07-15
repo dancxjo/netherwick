@@ -880,23 +880,74 @@ train *args:
             exit 2
         fi
         behavior="$2"
+        report_dir="${PETE_NEAT_REPORT_DIR:-data/reports/neat/locomotion-v2}"
+        state_checkpoint="${PETE_NEAT_STATE_CHECKPOINT:-${report_dir}/trainer-state.json}"
+        capture_root="${PETE_NEAT_CAPTURE_ROOT:-data/captures/neat/locomotion-v2}"
+        resume="${PETE_NEAT_RESUME:-}"
+        founders="${PETE_NEAT_FOUNDERS_REPORT:-}"
+        start_stage="${PETE_NEAT_START_STAGE:-}"
+        extra_args=()
+        if [ -n "$resume" ] && [ -n "$founders" ]; then
+            echo "PETE_NEAT_RESUME and PETE_NEAT_FOUNDERS_REPORT are mutually exclusive"
+            exit 2
+        elif [ -n "$resume" ]; then
+            extra_args+=(--resume "$resume")
+            continuation="$resume"
+            echo "NEAT continuation: resuming $resume"
+        elif [ -n "$founders" ]; then
+            extra_args+=(--founders-report "$founders")
+            extra_args+=(--start-stage "${start_stage:-explore-without-looping}")
+            continuation=""
+            echo "NEAT continuation: reconstructing founders from $founders"
+        elif [ -z "${PETE_NEAT_FRESH:-}" ] && [ -f "$state_checkpoint" ]; then
+            extra_args+=(--resume "$state_checkpoint")
+            continuation="$state_checkpoint"
+            echo "NEAT continuation: resuming $state_checkpoint"
+        elif [ -z "${PETE_NEAT_FRESH:-}" ] && [ -f data/reports/neat/locomotion/training-report.json ]; then
+            extra_args+=(--founders-report data/reports/neat/locomotion/training-report.json)
+            extra_args+=(--start-stage "${start_stage:-explore-without-looping}")
+            continuation=""
+            echo "NEAT continuation: reconstructing founders from data/reports/neat/locomotion/training-report.json"
+        else
+            continuation=""
+            if [ -n "$start_stage" ]; then
+                extra_args+=(--start-stage "$start_stage")
+            fi
+            echo "NEAT continuation: starting a fresh competence-gated run"
+        fi
+        generations_per_stage="${PETE_NEAT_GENERATIONS_PER_STAGE:-120}"
+        if [ -z "${PETE_NEAT_GENERATIONS_PER_STAGE:-}" ] && [ -n "$continuation" ]; then
+            if command -v jq >/dev/null 2>&1; then
+                completed_generations="$(jq -er '.generation_in_stage' "$continuation" 2>/dev/null || true)"
+                if [[ "$completed_generations" =~ ^[0-9]+$ ]]; then
+                    generations_per_stage="$((completed_generations + 120))"
+                fi
+            fi
+        fi
         cargo run -p pete-tools -- neat-train "$behavior" \
-            --generations-per-stage "${PETE_NEAT_GENERATIONS_PER_STAGE:-6}" \
-            --population "${PETE_NEAT_POPULATION:-32}" \
-            --episodes-per-genome "${PETE_NEAT_EPISODES_PER_GENOME:-3}" \
-            --steps "${PETE_NEAT_STEPS:-220}" \
+            --generations-per-stage "$generations_per_stage" \
+            --population "${PETE_NEAT_POPULATION:-64}" \
+            --episodes-per-genome "${PETE_NEAT_EPISODES_PER_GENOME:-8}" \
+            --steps "${PETE_NEAT_STEPS:-300}" \
             --transfer-episodes "${PETE_NEAT_TRANSFER_EPISODES:-500}" \
             --seed "${PETE_NEAT_SEED:-7}" \
             --heldout-seed "${PETE_NEAT_HELDOUT_SEED:-9000001}" \
+            --validation-seed "${PETE_NEAT_VALIDATION_SEED:-8000001}" \
+            --validation-every "${PETE_NEAT_VALIDATION_EVERY:-4}" \
+            --validation-passes "${PETE_NEAT_VALIDATION_PASSES:-2}" \
             --compatibility-threshold "${PETE_NEAT_COMPATIBILITY_THRESHOLD:-2.2}" \
             --target-species-min "${PETE_NEAT_TARGET_SPECIES_MIN:-4}" \
             --target-species-max "${PETE_NEAT_TARGET_SPECIES_MAX:-9}" \
             --checkpoint "${PETE_NEAT_CHECKPOINT:-data/models/locomotion_neat_v0}" \
-            --report-dir "${PETE_NEAT_REPORT_DIR:-data/reports/neat/locomotion}" \
-            --capture-root "${PETE_NEAT_CAPTURE_ROOT:-data/captures/neat/locomotion}" \
+            --report-dir "$report_dir" \
+            --state-checkpoint "$state_checkpoint" \
+            --capture-root "$capture_root" \
             --capture-every "${PETE_NEAT_CAPTURE_EVERY:-2}" \
+            --rehearsal-ratio "${PETE_NEAT_REHEARSAL_RATIO:-0.20}" \
+            --niche-audit-episodes "${PETE_NEAT_NICHE_AUDIT_EPISODES:-16}" \
             --models-config "${PETE_NEAT_MODELS_CONFIG:-configs/models.toml}" \
-            ${PETE_NEAT_NO_PROMOTE:+--no-promote}
+            ${PETE_NEAT_NO_PROMOTE:+--no-promote} \
+            "${extra_args[@]}"
         exit 0
     fi
     if [ "${1:-virtual}" != "virtual" ] || [ "$#" -gt 1 ]; then

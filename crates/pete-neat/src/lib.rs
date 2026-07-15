@@ -390,7 +390,7 @@ impl Genome {
             for index in 0..output_count as u32 {
                 let to = bias_id + 1 + index;
                 connections.push(ConnectionGene {
-                    innovation: innovations.connection(from, to),
+                    innovation: innovations.connection(from, to, false),
                     from,
                     to,
                     weight: rng.gen_range(-1.0..1.0),
@@ -627,7 +627,7 @@ impl Genome {
         }
         if let Some(&(from, to)) = candidates.choose(rng) {
             self.connections.push(ConnectionGene {
-                innovation: innovations.connection(from, to),
+                innovation: innovations.connection(from, to, false),
                 from,
                 to,
                 weight: rng.gen_range(-1.0..1.0),
@@ -660,7 +660,7 @@ impl Genome {
         }
         if let Some(&(from, to)) = candidates.choose(rng) {
             self.connections.push(ConnectionGene {
-                innovation: innovations.connection(from, to),
+                innovation: innovations.connection(from, to, true),
                 from,
                 to,
                 weight: rng.gen_range(-1.0..1.0),
@@ -710,7 +710,7 @@ impl Genome {
             });
         }
         for (from, to, weight) in [(old.from, node_id, 1.0), (node_id, old.to, old.weight)] {
-            let innovation = innovations.connection(from, to);
+            let innovation = innovations.connection(from, to, false);
             if let Some(existing) = self
                 .connections
                 .iter_mut()
@@ -826,8 +826,44 @@ impl Default for NeatConfig {
 pub struct InnovationTracker {
     next_innovation: u64,
     next_node_id: u32,
-    connections: HashMap<(u32, u32), u64>,
+    #[serde(with = "connection_innovation_map")]
+    connections: ConnectionInnovationMap,
     split_nodes: HashMap<u64, u32>,
+}
+
+type ConnectionInnovationKey = (u32, u32, bool);
+type ConnectionInnovationMap = HashMap<ConnectionInnovationKey, u64>;
+
+mod connection_innovation_map {
+    use super::*;
+
+    pub fn serialize<S>(
+        value: &ConnectionInnovationMap,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut entries = value
+            .iter()
+            .map(|(&(from, to, recurrent), &innovation)| (from, to, recurrent, innovation))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<ConnectionInnovationMap, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let entries = Vec::<(u32, u32, bool, u64)>::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .map(|(from, to, recurrent, innovation)| ((from, to, recurrent), innovation))
+            .collect())
+    }
 }
 
 impl InnovationTracker {
@@ -840,13 +876,13 @@ impl InnovationTracker {
         }
     }
 
-    fn connection(&mut self, from: u32, to: u32) -> u64 {
-        if let Some(innovation) = self.connections.get(&(from, to)) {
+    fn connection(&mut self, from: u32, to: u32, recurrent: bool) -> u64 {
+        if let Some(innovation) = self.connections.get(&(from, to, recurrent)) {
             return *innovation;
         }
         let innovation = self.next_innovation;
         self.next_innovation += 1;
-        self.connections.insert((from, to), innovation);
+        self.connections.insert((from, to, recurrent), innovation);
         innovation
     }
 
@@ -866,8 +902,23 @@ pub struct SpeciesRecord {
     pub id: u64,
     pub representative: Genome,
     pub age: u64,
+    #[serde(
+        default = "negative_infinity",
+        deserialize_with = "deserialize_best_fitness"
+    )]
     pub best_fitness: f32,
     pub generations_without_improvement: u64,
+}
+
+fn negative_infinity() -> f32 {
+    f32::NEG_INFINITY
+}
+
+fn deserialize_best_fitness<'de, D>(deserializer: D) -> std::result::Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f32>::deserialize(deserializer)?.unwrap_or(f32::NEG_INFINITY))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -924,6 +975,86 @@ impl Population {
         };
         population.assign_species_members();
         population
+    }
+
+    pub fn from_founders<R: Rng + ?Sized>(
+        config: NeatConfig,
+        founders: &[Genome],
+        rng: &mut R,
+    ) -> Result<Self> {
+        if founders.is_empty() {
+            bail!("cannot reconstruct a population without founders");
+        }
+        let founder_count = founders.len().min(config.population_size);
+        let mut canonical_founders = founders[..founder_count].to_vec();
+        let mut next_innovation = canonical_founders
+            .iter()
+            .flat_map(|genome| genome.connections.iter())
+            .map(|connection| connection.innovation.saturating_add(1))
+            .max()
+            .unwrap_or_default();
+        let mut key_innovations = HashMap::<(u32, u32, bool), u64>::new();
+        let mut innovation_keys = HashMap::<u64, (u32, u32, bool)>::new();
+        for genome in &mut canonical_founders {
+            for connection in &mut genome.connections {
+                let key = (connection.from, connection.to, connection.recurrent);
+                let innovation = if let Some(existing) = key_innovations.get(&key) {
+                    *existing
+                } else if innovation_keys
+                    .get(&connection.innovation)
+                    .is_none_or(|existing| *existing == key)
+                {
+                    connection.innovation
+                } else {
+                    let fresh = next_innovation;
+                    next_innovation = next_innovation.saturating_add(1);
+                    fresh
+                };
+                connection.innovation = innovation;
+                key_innovations.insert(key, innovation);
+                innovation_keys.insert(innovation, key);
+            }
+        }
+        let mut innovations = InnovationTracker::default();
+        for genome in &canonical_founders {
+            innovations.next_node_id = innovations.next_node_id.max(
+                genome
+                    .nodes
+                    .iter()
+                    .map(|node| node.id.saturating_add(1))
+                    .max()
+                    .unwrap_or_default(),
+            );
+            for connection in &genome.connections {
+                innovations.next_innovation = innovations
+                    .next_innovation
+                    .max(connection.innovation.saturating_add(1));
+                innovations
+                    .connections
+                    .entry((connection.from, connection.to, connection.recurrent))
+                    .or_insert(connection.innovation);
+            }
+        }
+
+        let mut genomes = canonical_founders;
+        let mut descendant = 0usize;
+        while genomes.len() < config.population_size {
+            let mut genome = genomes[descendant % founder_count].clone();
+            genome.mutate(config, &mut innovations, rng);
+            genomes.push(genome);
+            descendant += 1;
+        }
+        let mut population = Self {
+            generation: 0,
+            genomes,
+            config,
+            innovations,
+            species_records: Vec::new(),
+            genome_species: Vec::new(),
+            next_species_id: 0,
+        };
+        population.assign_species_members();
+        Ok(population)
     }
 
     pub fn species(&self) -> Vec<SpeciesSnapshot> {
@@ -1247,6 +1378,7 @@ pub struct NeatLocomotionBehavior {
     pub max_forward_m_s: f32,
     pub max_turn_rad_s: f32,
     state: GenomeState,
+    last_input: Option<LocomotionInput>,
 }
 
 impl NeatLocomotionBehavior {
@@ -1256,7 +1388,30 @@ impl NeatLocomotionBehavior {
             max_forward_m_s: 0.6,
             max_turn_rad_s: 1.0,
             state: GenomeState::default(),
+            last_input: None,
         })
+    }
+
+    pub fn infer_with_reward(
+        &mut self,
+        input: &LocomotionInput,
+        reward: f32,
+    ) -> Result<LocomotionOutput> {
+        self.checkpoint
+            .genome
+            .apply_plasticity(&mut self.state, reward);
+        let values = self
+            .checkpoint
+            .genome
+            .activate_stateful(&input.features(), &mut self.state)?;
+        self.last_input = Some(input.clone());
+        Ok(LocomotionOutput {
+            forward_velocity_m_s: values[0] * self.max_forward_m_s,
+            angular_velocity_rad_s: values[1] * self.max_turn_rad_s,
+            recovery_activation: (values[2] + 1.0) * 0.5,
+        }
+        .bounded(self.max_forward_m_s, self.max_turn_rad_s)
+        .with_recovery_intent(0.5))
     }
 }
 
@@ -1266,21 +1421,27 @@ impl FunctionBehavior<LocomotionInput, LocomotionOutput> for NeatLocomotionBehav
     }
 
     fn infer(&mut self, input: &LocomotionInput) -> Result<LocomotionOutput> {
-        let values = self
-            .checkpoint
-            .genome
-            .activate_stateful(&input.features(), &mut self.state)?;
-        self.checkpoint
-            .genome
-            .apply_plasticity(&mut self.state, 0.0);
-        Ok(LocomotionOutput {
-            forward_velocity_m_s: values[0] * self.max_forward_m_s,
-            angular_velocity_rad_s: values[1] * self.max_turn_rad_s,
-            recovery_activation: (values[2] + 1.0) * 0.5,
-        }
-        .bounded(self.max_forward_m_s, self.max_turn_rad_s)
-        .with_recovery_intent(0.5))
+        let reward = self
+            .last_input
+            .as_ref()
+            .map(|previous| runtime_locomotion_reward(previous, input))
+            .unwrap_or(0.0);
+        self.infer_with_reward(input, reward)
     }
+}
+
+fn runtime_locomotion_reward(previous: &LocomotionInput, current: &LocomotionInput) -> f32 {
+    let left_delta = current.left_wheel_travel_m - previous.left_wheel_travel_m;
+    let right_delta = current.right_wheel_travel_m - previous.right_wheel_travel_m;
+    let travel = ((left_delta + right_delta) * 0.5).abs();
+    let mut reward = (travel * 5.0).clamp(0.0, 0.5);
+    if current.collision_active() && !previous.collision_active() {
+        reward -= 0.5;
+    }
+    let collision_rate_delta =
+        (current.recent_collision_rate - previous.recent_collision_rate).max(0.0);
+    reward -= collision_rate_delta.clamp(0.0, 0.5);
+    reward.clamp(-1.0, 1.0)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1297,6 +1458,8 @@ pub struct EpisodeMetrics {
     pub recovery_activation_sum: f32,
     pub stalled_steps: u32,
     pub safety_vetoes: u32,
+    #[serde(default)]
+    pub safety_invariant_violations: u32,
     pub resource_energy_used: f32,
     pub sensor_energy_cost: f32,
     pub computation_energy_cost: f32,
@@ -1318,7 +1481,10 @@ pub struct FitnessTraits {
     pub forward_progress: f32,
     pub repetition_rate: f32,
     pub worst_environment_score: f32,
-    pub safety_violations: u32,
+    #[serde(default)]
+    pub safety_veto_rate: f32,
+    #[serde(default)]
+    pub safety_invariant_violations: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1367,43 +1533,77 @@ impl QualityDiversityDescriptor {
     }
 
     pub fn niche_label(self, traits: FitnessTraits) -> NicheLabel {
+        self.evidence_based_niche_label(traits, NicheQualificationEvidence::default())
+    }
+
+    pub fn evidence_based_niche_label(
+        self,
+        traits: FitnessTraits,
+        evidence: NicheQualificationEvidence,
+    ) -> NicheLabel {
+        if let Some(niche) = evidence.label_for_descriptor(self, traits) {
+            return niche;
+        }
         if self.area_coverage_bin >= 3
             && self.collision_frequency_bin <= 1
             && self.energy_consumption_bin <= 2
         {
             NicheLabel::OpenRoomExplorer
-        } else if self.turning_intensity_bin >= 2
-            && self.collision_frequency_bin <= 1
-            && self.area_coverage_bin >= 1
-        {
-            NicheLabel::NarrowCorridorNavigator
-        } else if self.recovery_aggressiveness_bin >= 2
-            && traits.escape_rate >= 0.7
-            && traits.worst_environment_score.is_sign_positive()
-        {
-            NicheLabel::ConcaveTrapEscapeSpecialist
         } else if self.collision_frequency_bin >= 2
             && self.recovery_aggressiveness_bin >= 1
             && traits.escape_rate >= 0.6
         {
             NicheLabel::ClutterSpecialist
-        } else if self.energy_consumption_bin == 0
-            && self.collision_frequency_bin <= 1
-            && traits.forward_progress > 0.0
-        {
-            NicheLabel::LowBatteryConservativeMover
-        } else if traits.repetition_rate <= 0.20
-            && self.collision_frequency_bin <= 1
-            && traits.worst_environment_score > 0.0
-        {
-            NicheLabel::DegradedSensorNavigator
-        } else if self.turning_intensity_bin >= 1
-            && self.energy_consumption_bin >= 1
-            && self.collision_frequency_bin <= 1
-        {
-            NicheLabel::AsymmetricMotorCompensator
         } else {
             NicheLabel::Generalist
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NicheQualificationEvidence {
+    pub degraded_sensor_retention: f32,
+    pub motor_mismatch_retention: f32,
+    pub heldout_trap_success_rate: f32,
+    pub low_battery_progress_m: f32,
+    pub corridor_success_rate: f32,
+}
+
+impl NicheQualificationEvidence {
+    pub fn from_selection_retention(degraded_sensor: f32, motor_mismatch: f32) -> Self {
+        Self {
+            degraded_sensor_retention: finite_or_zero(degraded_sensor).clamp(0.0, 1.0),
+            motor_mismatch_retention: finite_or_zero(motor_mismatch).clamp(0.0, 1.0),
+            ..Self::default()
+        }
+    }
+
+    fn label_for_descriptor(
+        self,
+        descriptor: QualityDiversityDescriptor,
+        traits: FitnessTraits,
+    ) -> Option<NicheLabel> {
+        if self.heldout_trap_success_rate >= 0.80 && descriptor.recovery_aggressiveness_bin >= 2 {
+            Some(NicheLabel::ConcaveTrapEscapeSpecialist)
+        } else if self.low_battery_progress_m > 0.5
+            && descriptor.energy_consumption_bin <= 1
+            && descriptor.collision_frequency_bin <= 1
+        {
+            Some(NicheLabel::LowBatteryConservativeMover)
+        } else if self.corridor_success_rate >= 0.80
+            && descriptor.turning_intensity_bin >= 2
+            && descriptor.collision_frequency_bin <= 1
+        {
+            Some(NicheLabel::NarrowCorridorNavigator)
+        } else if self.degraded_sensor_retention >= 0.75
+            && descriptor.collision_frequency_bin <= 1
+            && traits.worst_environment_score > 0.0
+        {
+            Some(NicheLabel::DegradedSensorNavigator)
+        } else if self.motor_mismatch_retention >= 0.75 && descriptor.collision_frequency_bin <= 1 {
+            Some(NicheLabel::AsymmetricMotorCompensator)
+        } else {
+            None
         }
     }
 }
@@ -1577,6 +1777,24 @@ pub fn quality_diversity_archive(
     episodes: usize,
     steps: usize,
 ) -> Vec<QualityDiversityEntry> {
+    quality_diversity_archive_with_evidence(
+        traits,
+        metrics,
+        selection_fitness,
+        &[],
+        episodes,
+        steps,
+    )
+}
+
+pub fn quality_diversity_archive_with_evidence(
+    traits: &[FitnessTraits],
+    metrics: &[EpisodeMetrics],
+    selection_fitness: &[f32],
+    evidence: &[NicheQualificationEvidence],
+    episodes: usize,
+    steps: usize,
+) -> Vec<QualityDiversityEntry> {
     let mut archive = BTreeMap::<QualityDiversityDescriptor, QualityDiversityEntry>::new();
     for index in 0..traits.len().min(metrics.len()).min(selection_fitness.len()) {
         let descriptor = QualityDiversityDescriptor::from_traits_and_metrics(
@@ -1585,12 +1803,16 @@ pub fn quality_diversity_archive(
             episodes,
             steps,
         );
+        let niche = evidence
+            .get(index)
+            .and_then(|evidence| evidence.label_for_descriptor(descriptor, traits[index]))
+            .unwrap_or_else(|| descriptor.niche_label(traits[index]));
         let entry = QualityDiversityEntry {
             genome_index: index,
             selection_fitness: selection_fitness[index],
             traits: traits[index],
             descriptor,
-            niche: descriptor.niche_label(traits[index]),
+            niche,
         };
         archive
             .entry(descriptor)
@@ -1630,7 +1852,8 @@ impl FitnessTraits {
             forward_progress,
             repetition_rate: metrics.repeated_state_steps as f32 / step_count,
             worst_environment_score: finite_or_zero(worst_environment_score),
-            safety_violations: metrics.safety_vetoes,
+            safety_veto_rate: metrics.safety_vetoes as f32 / step_count,
+            safety_invariant_violations: metrics.safety_invariant_violations,
         }
     }
 
@@ -1646,6 +1869,7 @@ impl FitnessTraits {
             SelectionObjective::CollisionAvoidance => -self.collision_rate,
             SelectionObjective::LowEnergy => -self.energy_use,
             SelectionObjective::LowRepetition => -self.repetition_rate,
+            SelectionObjective::LowSafetyVeto => -self.safety_veto_rate,
         }
     }
 }
@@ -1660,26 +1884,27 @@ impl Default for FitnessTraits {
             forward_progress: 0.0,
             repetition_rate: 1.0,
             worst_environment_score: f32::NEG_INFINITY,
-            safety_violations: u32::MAX,
+            safety_veto_rate: 1.0,
+            safety_invariant_violations: u32::MAX,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SelectionConstraints {
-    pub maximum_safety_violations: u32,
+    pub maximum_safety_invariant_violations: u32,
     pub maximum_collision_rate: f32,
     pub minimum_escape_rate: f32,
 }
 
 impl SelectionConstraints {
     pub const fn new(
-        maximum_safety_violations: u32,
+        maximum_safety_invariant_violations: u32,
         maximum_collision_rate: f32,
         minimum_escape_rate: f32,
     ) -> Self {
         Self {
-            maximum_safety_violations,
+            maximum_safety_invariant_violations,
             maximum_collision_rate,
             minimum_escape_rate,
         }
@@ -1702,9 +1927,10 @@ enum SelectionObjective {
     CollisionAvoidance,
     LowEnergy,
     LowRepetition,
+    LowSafetyVeto,
 }
 
-const SELECTION_OBJECTIVES: [SelectionObjective; 8] = [
+const SELECTION_OBJECTIVES: [SelectionObjective; 9] = [
     SelectionObjective::EscapeRate,
     SelectionObjective::Exploration,
     SelectionObjective::Efficiency,
@@ -1713,6 +1939,7 @@ const SELECTION_OBJECTIVES: [SelectionObjective; 8] = [
     SelectionObjective::CollisionAvoidance,
     SelectionObjective::LowEnergy,
     SelectionObjective::LowRepetition,
+    SelectionObjective::LowSafetyVeto,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -1720,7 +1947,15 @@ pub struct SelectionSummary {
     pub fitness: f32,
     pub constraint_violations: u32,
     pub pareto_front: u32,
+    #[serde(default, deserialize_with = "deserialize_optional_f32")]
     pub crowding_distance: f32,
+}
+
+fn deserialize_optional_f32<'de, D>(deserializer: D) -> std::result::Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f32>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 pub fn rank_fitness(traits: &[FitnessTraits], constraints: SelectionConstraints) -> Vec<f32> {
@@ -1761,7 +1996,7 @@ pub fn selection_summaries(
     for (index, violation) in violations.iter().copied().enumerate() {
         if violation > 0.0 {
             summaries[index] = SelectionSummary {
-                fitness: -violation,
+                fitness: -violation + infeasible_tiebreak(traits[index]),
                 constraint_violations: violation.ceil() as u32,
                 pareto_front: u32::MAX,
                 crowding_distance: 0.0,
@@ -1774,15 +2009,11 @@ pub fn selection_summaries(
         let crowding = crowding_distances(traits, front);
         for (member_offset, genome_index) in front.iter().copied().enumerate() {
             let crowding_distance = crowding[member_offset];
-            let finite_crowding = if crowding_distance.is_finite() {
-                crowding_distance
-            } else {
-                1.0e6
-            };
+            let crowding_bonus = normalized_crowding_bonus(crowding_distance);
             summaries[genome_index] = SelectionSummary {
                 fitness: 1_000.0
                     + (front_count - front_index as f32) * 100.0
-                    + finite_crowding.min(1.0e6),
+                    + crowding_bonus * 50.0,
                 constraint_violations: 0,
                 pareto_front: front_index as u32,
                 crowding_distance,
@@ -1947,7 +2178,7 @@ impl CurriculumStage {
         SelectionConstraints::new(
             criteria.maximum_safety_invariant_violations,
             criteria.maximum_collision_rate,
-            criteria.minimum_success_rate,
+            0.0,
         )
     }
 
@@ -2167,20 +2398,34 @@ fn select_parent_from_indices<R: Rng + ?Sized>(
 
 fn constraint_violation_score(traits: FitnessTraits, constraints: SelectionConstraints) -> f32 {
     let safety_excess = traits
-        .safety_violations
-        .saturating_sub(constraints.maximum_safety_violations) as f32;
+        .safety_invariant_violations
+        .saturating_sub(constraints.maximum_safety_invariant_violations)
+        as f32;
     if safety_excess > 0.0 {
-        return 1_000_000.0 + safety_excess;
+        return 10_000.0 + safety_excess;
     }
     let collision_excess = (traits.collision_rate - constraints.maximum_collision_rate).max(0.0);
     if collision_excess > 0.0 {
-        return 100_000.0 + collision_excess * 10_000.0;
+        return 1_000.0 + collision_excess * 1_000.0;
     }
     let escape_deficit = (constraints.minimum_escape_rate - traits.escape_rate).max(0.0);
     if escape_deficit > 0.0 {
-        return 10_000.0 + escape_deficit * 1_000.0;
+        return 100.0 + escape_deficit * 100.0;
     }
     0.0
+}
+
+fn infeasible_tiebreak(traits: FitnessTraits) -> f32 {
+    let exploration = (traits.exploration / 28.0).clamp(0.0, 1.0);
+    let progress = (traits.forward_progress / 20.0).clamp(0.0, 1.0);
+    let low_repetition = (1.0 - traits.repetition_rate).clamp(0.0, 1.0);
+    let low_veto = (1.0 - traits.safety_veto_rate).clamp(0.0, 1.0);
+    (0.40 * traits.escape_rate.clamp(0.0, 1.0)
+        + 0.20 * exploration
+        + 0.15 * progress
+        + 0.15 * low_repetition
+        + 0.10 * low_veto)
+        .clamp(0.0, 0.99)
 }
 
 fn pareto_fronts(traits: &[FitnessTraits], candidates: &[usize]) -> Vec<Vec<usize>> {
@@ -2256,6 +2501,14 @@ fn crowding_distances(traits: &[FitnessTraits], front: &[usize]) -> Vec<f32> {
     }
 
     distances
+}
+
+fn normalized_crowding_bonus(crowding_distance: f32) -> f32 {
+    if crowding_distance.is_finite() {
+        crowding_distance.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 fn checkpoint_path(path: &Path) -> std::path::PathBuf {
@@ -2375,7 +2628,7 @@ mod tests {
             edge.enabled = false;
         }
         genome.connections.push(ConnectionGene {
-            innovation: innovations.connection(output_id, output_id),
+            innovation: innovations.connection(output_id, output_id, true),
             from: output_id,
             to: output_id,
             weight: 1.0,
@@ -2385,7 +2638,7 @@ mod tests {
             plasticity_rate: 0.0,
         });
         genome.connections.push(ConnectionGene {
-            innovation: innovations.connection(0, output_id),
+            innovation: innovations.connection(0, output_id, false),
             from: 0,
             to: output_id,
             weight: 1.0,
@@ -2419,7 +2672,7 @@ mod tests {
             &mut rng,
         );
         let output_id = LOCOMOTION_INPUT_COUNT as u32 + 1;
-        let innovation = innovations.connection(0, output_id);
+        let innovation = innovations.connection(0, output_id, false);
         genome.connections.clear();
         genome.connections.push(ConnectionGene {
             innovation,
@@ -2444,6 +2697,168 @@ mod tests {
         assert!(learned_weight > 0.5);
         assert_eq!(genome.connections[0].weight, 0.5);
         assert!((before - after_reset).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn reward_modulated_locomotion_learns_from_runtime_motion_reward() {
+        let mut rng = StdRng::seed_from_u64(14);
+        let mut innovations =
+            InnovationTracker::new((LOCOMOTION_INPUT_COUNT + LOCOMOTION_OUTPUT_COUNT + 1) as u32);
+        let mut genome = Genome::minimal(
+            LOCOMOTION_INPUT_COUNT,
+            LOCOMOTION_OUTPUT_COUNT,
+            &mut innovations,
+            &mut rng,
+        );
+        let output_id = LOCOMOTION_INPUT_COUNT as u32 + 1;
+        let innovation = innovations.connection(0, output_id, false);
+        genome.connections.clear();
+        genome.connections.push(ConnectionGene {
+            innovation,
+            from: 0,
+            to: output_id,
+            weight: 0.5,
+            enabled: true,
+            recurrent: false,
+            plasticity: PlasticityMode::RewardModulated,
+            plasticity_rate: 0.05,
+        });
+        let mut behavior = NeatLocomotionBehavior {
+            checkpoint: LocomotionCheckpoint::new(0, 0.0, genome),
+            max_forward_m_s: 0.6,
+            max_turn_rad_s: 1.0,
+            state: GenomeState::default(),
+            last_input: None,
+        };
+        let first = LocomotionInput {
+            bump_left: 1.0,
+            ..LocomotionInput::default()
+        };
+        behavior.infer(&first).unwrap();
+        let mut second = first.clone();
+        second.left_wheel_travel_m = 0.2;
+        second.right_wheel_travel_m = 0.2;
+        behavior.infer(&second).unwrap();
+
+        assert!(behavior.state.effective_weights[&innovation] > 0.5);
+    }
+
+    #[test]
+    fn recurrent_and_feed_forward_connections_get_distinct_innovations() {
+        let mut innovations = InnovationTracker::new(100);
+        let feed_forward = innovations.connection(1, 2, false);
+        let recurrent = innovations.connection(1, 2, true);
+
+        assert_ne!(feed_forward, recurrent);
+        assert_eq!(feed_forward, innovations.connection(1, 2, false));
+        assert_eq!(recurrent, innovations.connection(1, 2, true));
+    }
+
+    #[test]
+    fn safety_vetoes_are_costs_not_invariant_violations() {
+        let metrics = EpisodeMetrics {
+            safety_vetoes: 40,
+            safety_invariant_violations: 0,
+            ..EpisodeMetrics::default()
+        };
+        let traits = FitnessTraits::from_metrics(metrics, 2, 100, 0, 0.0);
+        let summary = selection_summaries(&[traits], SelectionConstraints::new(0, 0.05, 0.0))[0];
+
+        assert_eq!(traits.safety_veto_rate, 0.2);
+        assert_eq!(summary.constraint_violations, 0);
+        assert!(summary.fitness > 0.0);
+    }
+
+    #[test]
+    fn founder_population_round_trips_complete_innovation_state() {
+        let mut rng = StdRng::seed_from_u64(22);
+        let mut innovations =
+            InnovationTracker::new((LOCOMOTION_INPUT_COUNT + LOCOMOTION_OUTPUT_COUNT + 1) as u32);
+        let first = Genome::minimal(
+            LOCOMOTION_INPUT_COUNT,
+            LOCOMOTION_OUTPUT_COUNT,
+            &mut innovations,
+            &mut rng,
+        );
+        let mut second = first.clone();
+        second.mutate(NeatConfig::default(), &mut innovations, &mut rng);
+        let config = NeatConfig {
+            population_size: 8,
+            ..NeatConfig::default()
+        };
+        let population =
+            Population::from_founders(config, &[first.clone(), second.clone()], &mut rng).unwrap();
+
+        assert_eq!(population.genomes.len(), 8);
+        assert_eq!(population.genomes[0], first);
+        assert_eq!(population.genomes[1], second);
+        let encoded = serde_json::to_vec(&population).unwrap();
+        let decoded: Population = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.genomes, population.genomes);
+        assert_eq!(
+            decoded.innovations.connections,
+            population.innovations.connections
+        );
+    }
+
+    #[test]
+    fn serialized_population_resumes_deterministically() {
+        let config = NeatConfig {
+            population_size: 8,
+            ..NeatConfig::default()
+        };
+        let mut seed_rng = StdRng::seed_from_u64(31);
+        let population = Population::seeded(config, &mut seed_rng);
+        let encoded = serde_json::to_vec(&population).unwrap();
+        let mut uninterrupted = population;
+        let mut resumed: Population = serde_json::from_slice(&encoded).unwrap();
+        let fitness = (0..config.population_size)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        let mut left_rng = StdRng::seed_from_u64(32);
+        let mut right_rng = StdRng::seed_from_u64(32);
+
+        uninterrupted.evolve(&fitness, &mut left_rng).unwrap();
+        resumed.evolve(&fitness, &mut right_rng).unwrap();
+
+        assert_eq!(uninterrupted.generation, resumed.generation);
+        assert_eq!(uninterrupted.genomes, resumed.genomes);
+        assert_eq!(uninterrupted.genome_species, resumed.genome_species);
+        assert_eq!(uninterrupted.species_records, resumed.species_records);
+        assert_eq!(
+            uninterrupted.innovations.connections,
+            resumed.innovations.connections
+        );
+    }
+
+    #[test]
+    fn founder_reconstruction_repairs_legacy_recurrent_innovation_collisions() {
+        let mut rng = StdRng::seed_from_u64(40);
+        let mut innovations =
+            InnovationTracker::new((LOCOMOTION_INPUT_COUNT + LOCOMOTION_OUTPUT_COUNT + 1) as u32);
+        let first = Genome::minimal(
+            LOCOMOTION_INPUT_COUNT,
+            LOCOMOTION_OUTPUT_COUNT,
+            &mut innovations,
+            &mut rng,
+        );
+        let mut second = first.clone();
+        second.connections[0].recurrent = true;
+        second.connections[0].innovation = first.connections[0].innovation;
+        let population = Population::from_founders(
+            NeatConfig {
+                population_size: 2,
+                ..NeatConfig::default()
+            },
+            &[first, second],
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_ne!(
+            population.genomes[0].connections[0].innovation,
+            population.genomes[1].connections[0].innovation
+        );
     }
 
     #[test]
@@ -2569,7 +2984,8 @@ mod tests {
             forward_progress: 50.0,
             repetition_rate: 0.0,
             worst_environment_score: 10.0,
-            safety_violations: 0,
+            safety_veto_rate: 0.0,
+            safety_invariant_violations: 0,
         };
         let competent = FitnessTraits {
             exploration: 10.0,
@@ -2579,7 +2995,8 @@ mod tests {
             forward_progress: 5.0,
             repetition_rate: 0.1,
             worst_environment_score: 5.0,
-            safety_violations: 0,
+            safety_veto_rate: 0.0,
+            safety_invariant_violations: 0,
         };
         let scores = rank_fitness(
             &[reckless, competent],
@@ -2599,7 +3016,8 @@ mod tests {
             forward_progress: 15.0,
             repetition_rate: 0.2,
             worst_environment_score: 7.0,
-            safety_violations: 0,
+            safety_veto_rate: 0.0,
+            safety_invariant_violations: 0,
         };
         let efficient = FitnessTraits {
             exploration: 15.0,
@@ -2609,7 +3027,8 @@ mod tests {
             forward_progress: 8.0,
             repetition_rate: 0.02,
             worst_environment_score: 7.0,
-            safety_violations: 0,
+            safety_veto_rate: 0.0,
+            safety_invariant_violations: 0,
         };
         let dominated = FitnessTraits {
             exploration: 10.0,
@@ -2619,7 +3038,8 @@ mod tests {
             forward_progress: 4.0,
             repetition_rate: 0.3,
             worst_environment_score: 2.0,
-            safety_violations: 0,
+            safety_veto_rate: 0.0,
+            safety_invariant_violations: 0,
         };
         let summaries = selection_summaries(
             &[explorer, efficient, dominated],
@@ -2641,7 +3061,8 @@ mod tests {
                 forward_progress: 15.0,
                 repetition_rate: 0.02,
                 worst_environment_score: 10.0,
-                safety_violations: 0,
+                safety_veto_rate: 0.0,
+                safety_invariant_violations: 0,
             },
             FitnessTraits {
                 exploration: 8.0,
@@ -2651,7 +3072,8 @@ mod tests {
                 forward_progress: 3.0,
                 repetition_rate: 0.1,
                 worst_environment_score: 5.0,
-                safety_violations: 0,
+                safety_veto_rate: 0.0,
+                safety_invariant_violations: 0,
             },
             FitnessTraits {
                 exploration: 40.0,
@@ -2661,7 +3083,8 @@ mod tests {
                 forward_progress: 15.0,
                 repetition_rate: 0.02,
                 worst_environment_score: 10.0,
-                safety_violations: 0,
+                safety_veto_rate: 0.0,
+                safety_invariant_violations: 0,
             },
         ];
         let metrics = [
@@ -2691,6 +3114,51 @@ mod tests {
         assert_eq!(archive.len(), 2);
         assert!(archive.iter().any(|entry| entry.genome_index == 1));
         assert!(archive.iter().any(|entry| entry.genome_index == 2));
+    }
+
+    #[test]
+    fn specialist_niches_require_explicit_qualification_evidence() {
+        let traits = [FitnessTraits {
+            exploration: 12.0,
+            escape_rate: 0.9,
+            collision_rate: 0.002,
+            energy_use: 4.0,
+            forward_progress: 8.0,
+            repetition_rate: 0.02,
+            worst_environment_score: 10.0,
+            safety_veto_rate: 0.0,
+            safety_invariant_violations: 0,
+        }];
+        let metrics = [EpisodeMetrics {
+            new_area_cells: 24,
+            angular_motion_rad: 30.0,
+            wheel_motion_m: 8.0,
+            recovery_activation_sum: 1.0,
+            ..EpisodeMetrics::default()
+        }];
+        let descriptor =
+            QualityDiversityDescriptor::from_traits_and_metrics(traits[0], metrics[0], 2, 100);
+
+        assert_eq!(descriptor.niche_label(traits[0]), NicheLabel::Generalist);
+
+        let archive = quality_diversity_archive_with_evidence(
+            &traits,
+            &metrics,
+            &[10.0],
+            &[NicheQualificationEvidence::from_selection_retention(
+                0.0, 0.9,
+            )],
+            2,
+            100,
+        );
+        assert_eq!(archive[0].niche, NicheLabel::AsymmetricMotorCompensator);
+    }
+
+    #[test]
+    fn pareto_boundary_bonus_is_bounded() {
+        assert_eq!(normalized_crowding_bonus(f32::INFINITY), 1.0);
+        assert_eq!(normalized_crowding_bonus(5.0), 1.0);
+        assert_eq!(normalized_crowding_bonus(0.25), 0.25);
     }
 
     #[test]

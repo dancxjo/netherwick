@@ -15,6 +15,20 @@ safety layers.
 just train --neat locomotion
 ```
 
+The bare command uses the first continuation source it finds:
+
+1. `data/reports/neat/locomotion-v2/trainer-state.json`, resuming the complete
+   population and its archives;
+2. `data/reports/neat/locomotion/training-report.json`, reconstructing founders
+   at `explore-without-looping` from the historical run;
+3. a fresh competence-gated population.
+
+The production defaults are 64 genomes, 8 episodes per genome, 300 steps per
+episode, and 120 more generations at the current stage when resuming. Set
+`PETE_NEAT_FRESH=1` to bypass automatic continuation. Explicit
+`PETE_NEAT_RESUME`, `PETE_NEAT_FOUNDERS_REPORT`, and `PETE_NEAT_START_STAGE`
+values override automatic discovery.
+
 The command evolves a candidate, writes progress reports and WorldLab captures,
 then performs a transfer audit. If the candidate's transfer fitness beats the
 currently active locomotion model, or the hardcoded baseline when no model is
@@ -24,10 +38,7 @@ through the downstream safety layers. Defaults can be changed without changing
 the command contract:
 
 ```bash
-PETE_NEAT_POPULATION=64 \
 PETE_NEAT_GENERATIONS_PER_STAGE=20 \
-PETE_NEAT_EPISODES_PER_GENOME=8 \
-PETE_NEAT_STEPS=260 \
 PETE_NEAT_SEED=41 \
 PETE_NEAT_HELDOUT_SEED=9000001 \
 just train --neat locomotion
@@ -37,12 +48,36 @@ Set `PETE_NEAT_NO_PROMOTE=1` to keep the old candidate-only behavior.
 Use `PETE_NEAT_COMPATIBILITY_THRESHOLD`, `PETE_NEAT_TARGET_SPECIES_MIN`, and
 `PETE_NEAT_TARGET_SPECIES_MAX` to tune speciation pressure.
 
+`PETE_NEAT_GENERATIONS_PER_STAGE` is a maximum, not a fixed schedule. Every
+fourth generation by default, the current champion is evaluated on rotating
+validation seeds and retested on all earlier stages. A stage advances only
+after two consecutive complete passes. If the maximum is reached first,
+training stops with an atomic `trainer-state.json` instead of advancing an
+unqualified population.
+
+Resume a nonstandard checkpoint, including species, innovations, novelty, and
+world archives, with:
+
+```bash
+PETE_NEAT_RESUME=/path/to/trainer-state.json \
+just train --neat locomotion
+```
+
+To explicitly reconstruct a different historical run from its stage and niche
+genomes:
+
+```bash
+PETE_NEAT_FOUNDERS_REPORT=/path/to/training-report.json \
+PETE_NEAT_START_STAGE=explore-without-looping \
+just train --neat locomotion
+```
+
 The standard artifacts are:
 
 - promoted checkpoint: `data/models/locomotion_neat_v0/locomotion-neat.json`;
-- non-promoted candidate checkpoint: `data/reports/neat/locomotion/candidate-locomotion-neat.json`;
-- generation and final reports: `data/reports/neat/locomotion/`;
-- replayable champion captures: `data/captures/neat/locomotion/`.
+- non-promoted candidate checkpoint: `data/reports/neat/locomotion-v2/candidate-locomotion-neat.json`;
+- resumable trainer state and reports: `data/reports/neat/locomotion-v2/`;
+- replayable champion captures: `data/captures/neat/locomotion-v2/`.
 
 ## Curriculum
 
@@ -67,11 +102,21 @@ without collision, successful escapes, trap escape-boundary crossings, progress
 away from the trap mouth, collisions, repeated states, wheel motion, angular
 motion, stalls, and safety vetoes.
 
+Safety vetoes are ordinary behavioral costs: they mean the protective layer
+worked. Only a broken post-filter contract is a categorical safety-invariant
+violation. Collisions remain a separate constrained trait.
+
 The escape and transfer stages include seeded concave traps in multiple
 orientations, corner traps, and column traps. Normal training episodes include
 small randomized left/right wheel gain and motor deadband perturbations. The
 transfer audit uses `PETE_NEAT_HELDOUT_SEED`; those held-out seeds are not used
 for population selection.
+
+Specialist repertoire labels are assigned only after paired held-out evidence.
+The archive records sensor and motor performance retention, concave-trap and
+narrow-corridor success, and progress under a fixed low-battery budget with
+chargers disabled. Descriptor-only entries remain generalist, open-room, or
+clutter labels.
 
 ## Nervous System
 
@@ -124,6 +169,9 @@ The transfer report compares the candidate with the ancestral hardcoded policy
 on identical seeds, then repeats evaluation with sensor noise/latency and motor
 asymmetry. `transfer_eligible=false` is a normal, useful result; the report
 contains the evidence needed to decide what to evolve next.
+Promotion also requires full transfer eligibility; beating a baseline score
+alone cannot promote an ineligible controller. Transfer comparisons are ordered
+by invariant violations, success, collision rate, and diagnostic robustness.
 
 ## Runtime Promotion
 
