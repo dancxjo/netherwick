@@ -36,8 +36,10 @@ use pete_memory::{
 use pete_models::MODEL_REGISTRY;
 use pete_mouth::QueuedPiperCpalMouth;
 use pete_neat::{
-    CandidateEvaluation, CurriculumStage, EpisodeMetrics as NeatEpisodeMetrics, Genome,
-    LocomotionCheckpoint, LocomotionOutput, LocomotionTracker, NeatConfig, Population,
+    CandidateEvaluation, CurriculumStage, EpisodeMetrics as NeatEpisodeMetrics, FitnessTraits,
+    Genome, GenomeState, LocomotionCheckpoint, LocomotionOutput, LocomotionTracker, NeatConfig,
+    NoveltyArchive, Population, QualityDiversityDescriptor, QualityDiversityEntry,
+    SelectionSummary,
 };
 use pete_now::{
     EarSense, ExtensionSense, KinectSense, Now, RangeExtrinsics, RangeSense, SurpriseSense,
@@ -71,7 +73,7 @@ use pete_worldlab::{
     export_pointcloud_for_frame, export_snapshot_assets, rewrite_frames, update_manifest,
     CaptureReader, CaptureReplayRunner, CaptureSource, CaptureStreams, CaptureWriter,
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{prelude::SliceRandom, rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -304,6 +306,24 @@ struct NeatTrainArgs {
     /// Capture every Nth generation champion; stage champions are always captured.
     #[arg(long, default_value_t = 2)]
     capture_every: usize,
+    /// Selection bonus multiplier for population-level behavioral novelty.
+    #[arg(long, default_value_t = 25.0)]
+    novelty_weight: f32,
+    /// Number of nearest behavior descriptors used to score novelty.
+    #[arg(long, default_value_t = 10)]
+    novelty_neighbors: usize,
+    /// Maximum historical behavior descriptors retained for novelty search.
+    #[arg(long, default_value_t = 512)]
+    novelty_archive_limit: usize,
+    /// Maximum historically difficult procedural worlds retained for replay/mutation.
+    #[arg(long, default_value_t = 128)]
+    world_archive_limit: usize,
+    /// Fraction of each generation's episodes reserved for old hard-world replay.
+    #[arg(long, default_value_t = 0.25)]
+    world_replay_ratio: f32,
+    /// Fraction of each generation's episodes mutated from archived hard worlds.
+    #[arg(long, default_value_t = 0.25)]
+    world_mutation_ratio: f32,
     /// Leave the trained candidate as a report artifact instead of promoting winners.
     #[arg(long)]
     no_promote: bool,
@@ -1778,10 +1798,17 @@ impl Default for NeatPerturbation {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct NeatPolicyEvaluation {
     fitness: f32,
+    selection_fitness: f32,
+    base_selection_fitness: f32,
+    novelty_score: f32,
+    lifetime_selection: NeatLifetimeSelection,
+    traits: FitnessTraits,
+    selection_summary: Option<SelectionSummary>,
     metrics: NeatEpisodeMetrics,
     successful_episodes: usize,
     episodes: usize,
     collision_rate: f32,
+    environment_scores: Vec<f32>,
     #[serde(skip)]
     snapshots: Vec<WorldSnapshot>,
     #[serde(skip)]
@@ -1798,6 +1825,15 @@ impl NeatPolicyEvaluation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct NeatLifetimeSelection {
+    mean_score: f32,
+    lower_quartile_score: f32,
+    worst_score: f32,
+    qualification_probability: f32,
+    robustness_score: f32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NeatGenerationReport {
     stage: CurriculumStage,
@@ -1807,11 +1843,24 @@ struct NeatGenerationReport {
     best_fitness: f32,
     mean_fitness: f32,
     worst_fitness: f32,
+    best_selection_fitness: f32,
+    mean_selection_fitness: f32,
+    worst_selection_fitness: f32,
+    best_novelty: f32,
+    mean_novelty: f32,
+    champion_novelty: f32,
+    champion_selection_summary: SelectionSummary,
+    champion_lifetime_selection: NeatLifetimeSelection,
+    champion_traits: FitnessTraits,
     champion_nodes: usize,
     champion_connections: usize,
     champion_metrics: NeatEpisodeMetrics,
     champion_success_rate: f32,
     champion_collision_rate: f32,
+    archive_cells: usize,
+    world_archive_size: usize,
+    replayed_worlds: usize,
+    retained_worlds: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1819,8 +1868,37 @@ struct NeatStageReport {
     stage: CurriculumStage,
     best_fitness: f32,
     best_evaluation: NeatPolicyEvaluation,
+    niche_archive: Vec<NeatNicheArchiveEntry>,
     generations: Vec<NeatGenerationReport>,
     capture: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NeatNicheArchiveEntry {
+    stage: CurriculumStage,
+    niche: pete_neat::NicheLabel,
+    descriptor: QualityDiversityDescriptor,
+    selection_fitness: f32,
+    base_selection_fitness: f32,
+    novelty_score: f32,
+    diagnostic_fitness: f32,
+    genome: Genome,
+    evaluation: NeatPolicyEvaluation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct NeatEnvironmentChallenge {
+    stage: CurriculumStage,
+    kind: ScenarioKind,
+    seed: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NeatWorldArchiveEntry {
+    challenge: NeatEnvironmentChallenge,
+    difficulty: f32,
+    distinction: f32,
+    retained_generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1829,7 +1907,15 @@ struct NeatTrainingReport {
     seed: u64,
     heldout_seed_root: u64,
     checkpoint: String,
+    novelty_weight: f32,
+    novelty_neighbors: usize,
+    novelty_archive_limit: usize,
+    world_archive_limit: usize,
+    world_replay_ratio: f32,
+    world_mutation_ratio: f32,
     stages: Vec<NeatStageReport>,
+    repertoire: Vec<NeatNicheArchiveEntry>,
+    world_archive: Vec<NeatWorldArchiveEntry>,
     transfer_candidate: CandidateEvaluation,
     transfer_eligible: bool,
     transfer_criteria: pete_neat::PromotionCriteria,
@@ -1877,6 +1963,9 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
     };
     let mut population = Population::seeded(config, &mut rng);
     let mut stage_reports = Vec::new();
+    let mut repertoire = Vec::new();
+    let mut novelty_archive = NoveltyArchive::new(args.novelty_archive_limit);
+    let mut world_archive = Vec::<NeatWorldArchiveEntry>::new();
     let mut transfer_genome = population.genomes[0].clone();
     let evolving_stages = CurriculumStage::ORDER
         .into_iter()
@@ -1922,9 +2011,20 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         );
         let mut generation_reports = Vec::new();
         let mut stage_best: Option<(f32, Genome, NeatPolicyEvaluation)> = None;
+        let mut stage_archive = Vec::<NeatNicheArchiveEntry>::new();
 
         for generation_in_stage in 0..args.generations_per_stage {
             let mut evaluations = Vec::with_capacity(population.genomes.len());
+            let challenge_plan = neat_generation_challenges(
+                stage,
+                args.episodes_per_genome,
+                args.seed
+                    .saturating_add((stage_index as u64) << 32)
+                    .saturating_add((generation_in_stage as u64) << 20),
+                &world_archive,
+                args.world_replay_ratio,
+                args.world_mutation_ratio,
+            );
             for (genome_index, genome) in population.genomes.iter().enumerate() {
                 let evaluation = evaluate_neat_locomotion(
                     Some(genome),
@@ -1936,6 +2036,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                         .saturating_add((generation_in_stage as u64) << 20)
                         .saturating_add((genome_index as u64) << 8),
                     NeatPerturbation::default(),
+                    Some(&challenge_plan),
                     false,
                 )
                 .await?;
@@ -1945,7 +2046,85 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 .iter()
                 .map(|evaluation| evaluation.fitness)
                 .collect::<Vec<_>>();
-            let best_index = fitness
+            let traits = evaluations
+                .iter()
+                .map(|evaluation| evaluation.traits)
+                .collect::<Vec<_>>();
+            let metrics = evaluations
+                .iter()
+                .map(|evaluation| evaluation.metrics)
+                .collect::<Vec<_>>();
+            let selection_summaries =
+                pete_neat::selection_summaries(&traits, stage.selection_constraints());
+            let base_selection_fitness = selection_summaries
+                .iter()
+                .zip(evaluations.iter())
+                .map(|(summary, evaluation)| {
+                    summary.fitness + lifetime_selection_adjustment(evaluation.lifetime_selection)
+                })
+                .collect::<Vec<_>>();
+            let behavioral_descriptors = pete_neat::behavioral_descriptors(
+                &traits,
+                &metrics,
+                args.episodes_per_genome,
+                args.steps,
+            );
+            let novelty_scores = pete_neat::novelty_scores(
+                &behavioral_descriptors,
+                novelty_archive.descriptors(),
+                args.novelty_neighbors,
+            );
+            let novelty_summaries = pete_neat::apply_novelty_pressure(
+                &base_selection_fitness,
+                &novelty_scores,
+                args.novelty_weight,
+            );
+            let selection_fitness = novelty_summaries
+                .iter()
+                .map(|summary| summary.selection_fitness)
+                .collect::<Vec<_>>();
+            for ((evaluation, summary), novelty) in evaluations
+                .iter_mut()
+                .zip(selection_summaries.iter())
+                .zip(novelty_summaries.iter())
+            {
+                evaluation.base_selection_fitness =
+                    summary.fitness + lifetime_selection_adjustment(evaluation.lifetime_selection);
+                evaluation.selection_fitness = novelty.selection_fitness;
+                evaluation.novelty_score = novelty.novelty;
+                evaluation.selection_summary = Some(*summary);
+            }
+            novelty_archive.observe(&behavioral_descriptors);
+            let generation_archive = pete_neat::quality_diversity_archive(
+                &traits,
+                &metrics,
+                &selection_fitness,
+                args.episodes_per_genome,
+                args.steps,
+            );
+            update_neat_niche_archive(
+                &mut stage_archive,
+                stage,
+                &generation_archive,
+                &population.genomes,
+                &evaluations,
+            );
+            let replayed_worlds = challenge_plan
+                .iter()
+                .filter(|challenge| {
+                    world_archive
+                        .iter()
+                        .any(|entry| entry.challenge == **challenge)
+                })
+                .count();
+            let retained_worlds = update_neat_world_archive(
+                &mut world_archive,
+                &challenge_plan,
+                &evaluations,
+                population.generation,
+                args.world_archive_limit,
+            );
+            let best_index = selection_fitness
                 .iter()
                 .enumerate()
                 .max_by(|left, right| left.1.total_cmp(right.1))
@@ -1954,6 +2133,19 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             let best = fitness[best_index];
             let mean = fitness.iter().sum::<f32>() / fitness.len() as f32;
             let worst = fitness.iter().copied().fold(f32::INFINITY, f32::min);
+            let best_selection = selection_fitness[best_index];
+            let mean_selection =
+                selection_fitness.iter().sum::<f32>() / selection_fitness.len() as f32;
+            let worst_selection = selection_fitness
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min);
+            let best_novelty = novelty_scores.iter().copied().fold(0.0, f32::max);
+            let mean_novelty = if novelty_scores.is_empty() {
+                0.0
+            } else {
+                novelty_scores.iter().sum::<f32>() / novelty_scores.len() as f32
+            };
             let champion = &population.genomes[best_index];
             let champion_evaluation = &evaluations[best_index];
             let report = NeatGenerationReport {
@@ -1964,27 +2156,46 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 best_fitness: best,
                 mean_fitness: mean,
                 worst_fitness: worst,
+                best_selection_fitness: best_selection,
+                mean_selection_fitness: mean_selection,
+                worst_selection_fitness: worst_selection,
+                best_novelty,
+                mean_novelty,
+                champion_novelty: champion_evaluation.novelty_score,
+                champion_selection_summary: selection_summaries[best_index],
+                champion_lifetime_selection: champion_evaluation.lifetime_selection,
+                champion_traits: champion_evaluation.traits,
                 champion_nodes: champion.nodes.len(),
                 champion_connections: champion.connections.len(),
                 champion_metrics: champion_evaluation.metrics,
                 champion_success_rate: champion_evaluation.success_rate(),
                 champion_collision_rate: champion_evaluation.collision_rate,
+                archive_cells: stage_archive.len(),
+                world_archive_size: world_archive.len(),
+                replayed_worlds,
+                retained_worlds,
             };
             println!(
-                "gen {:03} global={:03} species={} fitness best={:8.3} mean={:8.3} worst={:8.3} topology={}/{} success={:5.1}% collision={:6.3}",
+                "gen {:03} global={:03} species={} archive_cells={} world_archive={} retained_worlds={} selection best={:8.3} mean={:8.3} worst={:8.3} novelty best={:5.3} mean={:5.3} diagnostic_fitness={:8.3} topology={}/{} success={:5.1}% collision={:6.3}",
                 generation_in_stage + 1,
                 population.generation,
                 report.species,
+                report.archive_cells,
+                report.world_archive_size,
+                report.retained_worlds,
+                best_selection,
+                mean_selection,
+                worst_selection,
+                best_novelty,
+                mean_novelty,
                 best,
-                mean,
-                worst,
                 report.champion_nodes,
                 report.champion_connections,
                 report.champion_success_rate * 100.0,
                 report.champion_collision_rate,
             );
             println!(
-                "  components area={} clear_distance={:.2} escapes={} boundary={} mouth_progress={:.2} collisions={} repeats={} wheel_motion={:.2} angular={:.2} stalled={} vetoes={}",
+                "  components area={} clear_distance={:.2} escapes={} boundary={} mouth_progress={:.2} collisions={} repeats={} wheel_motion={:.2} angular={:.2} stalled={} vetoes={} lifetime mean={:.2} q25={:.2} min={:.2} qualify={:.1}%",
                 report.champion_metrics.new_area_cells,
                 report.champion_metrics.distance_without_collision_m,
                 report.champion_metrics.successful_escapes,
@@ -1996,13 +2207,21 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 report.champion_metrics.angular_motion_rad,
                 report.champion_metrics.stalled_steps,
                 report.champion_metrics.safety_vetoes,
+                report.champion_lifetime_selection.mean_score,
+                report.champion_lifetime_selection.lower_quartile_score,
+                report.champion_lifetime_selection.worst_score,
+                report.champion_lifetime_selection.qualification_probability * 100.0,
             );
 
             if stage_best
                 .as_ref()
-                .is_none_or(|(fitness, _, _)| best > *fitness)
+                .is_none_or(|(fitness, _, _)| best_selection > *fitness)
             {
-                stage_best = Some((best, champion.clone(), champion_evaluation.clone()));
+                stage_best = Some((
+                    best_selection,
+                    champion.clone(),
+                    champion_evaluation.clone(),
+                ));
             }
             generation_reports.push(report.clone());
             write_json_report(
@@ -2026,12 +2245,12 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                     args.steps,
                     args.seed.saturating_add(population.generation),
                     &path,
-                    best,
+                    best_selection,
                 )
                 .await?;
                 println!("  worldlab capture: {}", path.display());
             }
-            population.evolve(&fitness, &mut rng)?;
+            population.evolve(&selection_fitness, &mut rng)?;
             tune_compatibility_threshold(
                 &mut population,
                 report.species,
@@ -2057,14 +2276,21 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         )
         .await?;
         println!(
-            "stage champion fitness={:.3} capture={}",
+            "stage champion selection={:.3} capture={}",
             best_fitness,
             stage_capture.display()
         );
+        write_stage_niche_checkpoints(
+            &stage_archive,
+            population.generation,
+            Path::new(&args.report_dir),
+        )?;
+        update_global_repertoire(&mut repertoire, &stage_archive);
         stage_reports.push(NeatStageReport {
             stage,
             best_fitness,
             best_evaluation,
+            niche_archive: stage_archive,
             generations: generation_reports,
             capture: stage_capture.to_string_lossy().to_string(),
         });
@@ -2098,11 +2324,12 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         args.steps,
         audit_seed,
         NeatPerturbation::default(),
+        None,
         false,
     )
     .await?;
     println!(
-        "  candidate fitness={:.3} success={:.1}% collision={:.4}",
+        "  candidate diagnostic_fitness={:.3} success={:.1}% collision={:.4}",
         candidate.fitness,
         candidate.success_rate() * 100.0,
         candidate.collision_rate
@@ -2115,11 +2342,12 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         args.steps,
         audit_seed,
         NeatPerturbation::default(),
+        None,
         false,
     )
     .await?;
     println!(
-        "  hardcoded fitness={:.3} success={:.1}% collision={:.4}",
+        "  hardcoded diagnostic_fitness={:.3} success={:.1}% collision={:.4}",
         hardcoded.fitness,
         hardcoded.success_rate() * 100.0,
         hardcoded.collision_rate
@@ -2138,7 +2366,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 }
             })
     };
-    let (baseline_kind, baseline_checkpoint, baseline_fitness) =
+    let active_model_evaluation =
         if let Some((checkpoint_path, active_checkpoint)) = active_model_baseline.as_ref() {
             println!("promotion baseline: active model {}", checkpoint_path);
             let active = evaluate_neat_locomotion(
@@ -2148,23 +2376,45 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 args.steps,
                 audit_seed,
                 NeatPerturbation::default(),
+                None,
                 false,
             )
             .await?;
             println!(
-                "  active-model fitness={:.3} success={:.1}% collision={:.4}",
+                "  active-model diagnostic_fitness={:.3} success={:.1}% collision={:.4}",
                 active.fitness,
                 active.success_rate() * 100.0,
                 active.collision_rate
             );
+            Some((checkpoint_path.clone(), active))
+        } else {
+            None
+        };
+    let baseline_traits = active_model_evaluation
+        .as_ref()
+        .map(|(_, active)| active.traits)
+        .unwrap_or(hardcoded.traits);
+    let transfer_summaries = pete_neat::selection_summaries(
+        &[candidate.traits, hardcoded.traits, baseline_traits],
+        transfer_stage.selection_constraints(),
+    );
+    let candidate_selection = transfer_summaries[0].fitness;
+    let hardcoded_selection = transfer_summaries[1].fitness;
+    let baseline_selection = transfer_summaries[2].fitness;
+    let (baseline_kind, baseline_checkpoint, baseline_fitness) =
+        if let Some((checkpoint_path, _)) = active_model_evaluation.as_ref() {
             (
                 "active_model".to_string(),
                 Some(checkpoint_path.clone()),
-                active.fitness,
+                baseline_selection,
             )
         } else {
-            ("hardcoded".to_string(), None, hardcoded.fitness)
+            ("hardcoded".to_string(), None, baseline_selection)
         };
+    println!(
+        "  selection candidate={:.3} hardcoded={:.3} baseline={:.3}",
+        candidate_selection, hardcoded_selection, baseline_fitness
+    );
     println!("audit 3/4 sensor noise plus one-tick latency");
     let noisy = evaluate_neat_locomotion(
         Some(&transfer_genome),
@@ -2177,10 +2427,19 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             latency_steps: 1,
             ..NeatPerturbation::default()
         },
+        None,
         false,
     )
     .await?;
-    println!("  noisy fitness={:.3}", noisy.fitness);
+    let noisy_selection = pete_neat::selection_summaries(
+        &[candidate.traits, noisy.traits],
+        transfer_stage.selection_constraints(),
+    )[1]
+    .fitness;
+    println!(
+        "  noisy selection={:.3} diagnostic_fitness={:.3}",
+        noisy_selection, noisy.fitness
+    );
     println!("audit 4/4 left/right motor mismatch");
     let mismatch = evaluate_neat_locomotion(
         Some(&transfer_genome),
@@ -2195,27 +2454,36 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             deadband_m_s: 0.015,
             ..NeatPerturbation::default()
         },
+        None,
         false,
     )
     .await?;
-    println!("  motor-mismatch fitness={:.3}", mismatch.fitness);
+    let mismatch_selection = pete_neat::selection_summaries(
+        &[candidate.traits, mismatch.traits],
+        transfer_stage.selection_constraints(),
+    )[1]
+    .fitness;
+    println!(
+        "  motor-mismatch selection={:.3} diagnostic_fitness={:.3}",
+        mismatch_selection, mismatch.fitness
+    );
     let robust_enough =
-        |perturbed: f32| perturbed >= candidate.fitness - candidate.fitness.abs() * 0.25 - 1.0;
+        |perturbed: f32| perturbed >= candidate_selection - candidate_selection.abs() * 0.25 - 1.0;
     let candidate_evaluation = CandidateEvaluation {
         seeded_episodes: args.transfer_episodes as u32,
         success_rate: candidate.success_rate(),
         collision_rate: candidate.collision_rate,
         safety_invariant_violations: 0,
-        beats_hardcoded: candidate.fitness > hardcoded.fitness,
-        noise_robust: robust_enough(noisy.fitness),
-        motor_mismatch_robust: robust_enough(mismatch.fitness),
+        beats_hardcoded: candidate_selection > hardcoded_selection,
+        noise_robust: robust_enough(noisy_selection),
+        motor_mismatch_robust: robust_enough(mismatch_selection),
         fallback_verified: true,
     };
     let criteria = transfer_stage.promotion_criteria();
     let eligible = criteria.accepts(candidate_evaluation);
     println!(
-        "candidate fitness={:.3} hardcoded={:.3} noisy={:.3} motor-mismatch={:.3}",
-        candidate.fitness, hardcoded.fitness, noisy.fitness, mismatch.fitness
+        "candidate selection={:.3} hardcoded={:.3} noisy={:.3} motor-mismatch={:.3}",
+        candidate_selection, hardcoded_selection, noisy_selection, mismatch_selection
     );
     println!(
         "transfer episodes={} success={:.1}% collision={:.4} beats_hardcoded={} noise_robust={} motor_robust={} safety_violations=0 fallback_verified=true",
@@ -2249,15 +2517,15 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             promoted_regime: None,
             models_config: args.models_config.clone(),
         }
-    } else if candidate.fitness > baseline_fitness {
+    } else if candidate_selection > baseline_fitness {
         checkpoint.save(&args.checkpoint)?;
         promote_locomotion_model_config(
             Path::new(&args.models_config),
             Path::new(&args.checkpoint),
         )?;
         println!(
-            "\npromoted locomotion.neat.v0: candidate fitness {:.3} beat {} fitness {:.3}",
-            candidate.fitness, baseline_kind, baseline_fitness
+            "\npromoted locomotion.neat.v0: candidate selection {:.3} beat {} selection {:.3}",
+            candidate_selection, baseline_kind, baseline_fitness
         );
         println!(
             "active checkpoint: {}; config: {} regime=model_infer",
@@ -2267,8 +2535,8 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             enabled: true,
             promoted: true,
             reason: format!(
-                "candidate fitness {:.3} beat {} fitness {:.3}",
-                candidate.fitness, baseline_kind, baseline_fitness
+                "candidate selection {:.3} beat {} selection {:.3}",
+                candidate_selection, baseline_kind, baseline_fitness
             ),
             baseline_kind,
             baseline_checkpoint,
@@ -2281,8 +2549,8 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
     } else {
         checkpoint.save(&rejected_candidate_path)?;
         println!(
-            "\nnot promoting locomotion.neat.v0: candidate fitness {:.3} did not beat {} fitness {:.3}",
-            candidate.fitness, baseline_kind, baseline_fitness
+            "\nnot promoting locomotion.neat.v0: candidate selection {:.3} did not beat {} selection {:.3}",
+            candidate_selection, baseline_kind, baseline_fitness
         );
         println!(
             "candidate artifact kept for inspection: {}",
@@ -2292,8 +2560,8 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             enabled: true,
             promoted: false,
             reason: format!(
-                "candidate fitness {:.3} did not beat {} fitness {:.3}",
-                candidate.fitness, baseline_kind, baseline_fitness
+                "candidate selection {:.3} did not beat {} selection {:.3}",
+                candidate_selection, baseline_kind, baseline_fitness
             ),
             baseline_kind,
             baseline_checkpoint,
@@ -2310,14 +2578,22 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         seed: args.seed,
         heldout_seed_root: args.heldout_seed,
         checkpoint: args.checkpoint,
+        novelty_weight: args.novelty_weight,
+        novelty_neighbors: args.novelty_neighbors,
+        novelty_archive_limit: args.novelty_archive_limit,
+        world_archive_limit: args.world_archive_limit,
+        world_replay_ratio: args.world_replay_ratio,
+        world_mutation_ratio: args.world_mutation_ratio,
         stages: stage_reports,
+        repertoire,
+        world_archive,
         transfer_candidate: candidate_evaluation,
         transfer_eligible: eligible,
         transfer_criteria: criteria,
-        hardcoded_transfer_fitness: hardcoded.fitness,
-        candidate_transfer_fitness: candidate.fitness,
-        noisy_transfer_fitness: noisy.fitness,
-        motor_mismatch_transfer_fitness: mismatch.fitness,
+        hardcoded_transfer_fitness: hardcoded_selection,
+        candidate_transfer_fitness: candidate_selection,
+        noisy_transfer_fitness: noisy_selection,
+        motor_mismatch_transfer_fitness: mismatch_selection,
         promotion,
     };
     let report_path = Path::new(&args.report_dir).join("training-report.json");
@@ -2452,18 +2728,28 @@ async fn evaluate_neat_locomotion(
     steps: usize,
     seed: u64,
     perturbation: NeatPerturbation,
+    challenges: Option<&[NeatEnvironmentChallenge]>,
     capture: bool,
 ) -> Result<NeatPolicyEvaluation> {
     let mut total = NeatEpisodeMetrics::default();
     let mut fitness = 0.0;
     let mut successful_episodes = 0usize;
+    let mut worst_environment_score = f32::INFINITY;
+    let mut environment_scores = Vec::with_capacity(episodes);
     let mut captured_snapshots = Vec::new();
     let mut captured_scenario = None;
     let weights = stage.weights();
 
     for episode in 0..episodes {
-        let episode_seed = seed.saturating_add(episode as u64);
-        let kind = neat_stage_scenario(stage, episode_seed);
+        let challenge = challenges
+            .and_then(|challenges| challenges.get(episode))
+            .copied();
+        let episode_seed = challenge
+            .map(|challenge| challenge.seed)
+            .unwrap_or_else(|| seed.saturating_add(episode as u64));
+        let kind = challenge
+            .map(|challenge| challenge.kind)
+            .unwrap_or_else(|| neat_stage_scenario(stage, episode_seed));
         let scenario = build_scenario(ScenarioConfig::new(kind, episode_seed));
         if capture && episode == 0 {
             captured_scenario = Some(scenario.metadata.clone());
@@ -2479,6 +2765,14 @@ async fn evaluate_neat_locomotion(
         let mut collision_active = false;
         let mut escape_anchor: Option<(f32, f32)> = None;
         let mut delayed_commands = VecDeque::new();
+        let mut genome_state = GenomeState::default();
+        let mut resource_battery = scenario.metadata.body.battery_level.clamp(0.10, 1.0);
+        let mut resource_health = 1.0f32;
+        metrics.minimum_resource_battery = resource_battery;
+        metrics.final_resource_battery = resource_battery;
+        metrics.minimum_resource_health = resource_health;
+        metrics.final_resource_health = resource_health;
+        let topology_cost_per_tick = genome.map(neat_topology_metabolic_cost).unwrap_or(0.0);
         let escape_target = trap_escape_target(kind, &scenario.metadata);
         let mut best_escape_progress = 0.0f32;
         let mut crossed_escape_boundary = false;
@@ -2513,8 +2807,15 @@ async fn evaluate_neat_locomotion(
                 .map(|last| distance_between(last, position))
                 .unwrap_or(0.0);
             let collision = body.flags.bump_left || body.flags.bump_right || body.flags.wall;
+            let impact_energy = if collision && !collision_active {
+                0.03
+            } else {
+                0.0
+            };
             if collision && !collision_active {
                 metrics.collisions = metrics.collisions.saturating_add(1);
+                metrics.collision_energy_cost += impact_energy;
+                resource_health = (resource_health - 0.15).max(0.0);
                 escape_anchor = Some(position);
             }
             if !collision {
@@ -2565,7 +2866,7 @@ async fn evaluate_neat_locomotion(
                         .clamp(-1.0, 1.0);
                     }
                 }
-                let raw = genome.activate(&features)?;
+                let raw = genome.activate_stateful(&features, &mut genome_state)?;
                 LocomotionOutput {
                     forward_velocity_m_s: raw[0] * 0.6,
                     angular_velocity_rad_s: raw[1],
@@ -2605,6 +2906,7 @@ async fn evaluate_neat_locomotion(
             } else {
                 LocomotionOutput::default()
             };
+            metrics.recovery_activation_sum += applied.recovery_activation;
             let now = snapshot.to_now(body.last_update_ms);
             let decision = safety.filter(
                 &now,
@@ -2626,6 +2928,34 @@ async fn evaluate_neat_locomotion(
             if decision.command.forward.abs() > 0.02 && step_distance < 0.002 {
                 metrics.stalled_steps = metrics.stalled_steps.saturating_add(1);
             }
+            let motor_energy = (mismatched_left.abs() + mismatched_right.abs()) * 0.5 * 0.003;
+            let sensor_energy = neat_sensor_energy_cost(&snapshot.range);
+            metrics.sensor_energy_cost += sensor_energy;
+            metrics.computation_energy_cost += topology_cost_per_tick;
+            let tick_energy = motor_energy + sensor_energy + topology_cost_per_tick + impact_energy;
+            metrics.resource_energy_used += tick_energy;
+            resource_battery = (resource_battery - tick_energy).max(0.0);
+            if body.charging {
+                resource_battery = (resource_battery + 0.02).min(1.0);
+            }
+            metrics.minimum_resource_battery =
+                metrics.minimum_resource_battery.min(resource_battery);
+            metrics.minimum_resource_health = metrics.minimum_resource_health.min(resource_health);
+            metrics.final_resource_battery = resource_battery;
+            metrics.final_resource_health = resource_health;
+            if resource_battery <= f32::EPSILON {
+                metrics.battery_depleted = metrics.battery_depleted.saturating_add(1);
+                break;
+            }
+            if resource_health <= f32::EPSILON {
+                metrics.health_depleted = metrics.health_depleted.saturating_add(1);
+                break;
+            }
+            if let Some(genome) = genome {
+                let plasticity_reward =
+                    neat_plasticity_reward(step_distance, collision, decision.vetoed);
+                genome.apply_plasticity(&mut genome_state, plasticity_reward);
+            }
             motors.apply_motion(MotionCommand::Drive {
                 forward_m_s: decision.command.forward,
                 turn_rad_s: decision.command.turn,
@@ -2633,36 +2963,101 @@ async fn evaluate_neat_locomotion(
             last_position = Some(position);
         }
 
-        let succeeded = match stage {
-            CurriculumStage::BackAwayReliably
-            | CurriculumStage::ChooseUsefulTurn
-            | CurriculumStage::EscapeCorners => {
-                metrics.successful_escapes > 0 || metrics.escape_boundary_crossings > 0
-            }
-            CurriculumStage::ExploreWithoutLooping => {
-                metrics.new_area_cells >= 8 && metrics.repeated_state_steps < steps as u32 / 2
-            }
-            CurriculumStage::NavigateVariedRooms | CurriculumStage::TransferCandidatesToPete => {
-                metrics.new_area_cells >= 10
-                    && metrics.collisions <= 3
-                    && (escape_target.is_none() || metrics.escape_boundary_crossings > 0)
-            }
-        };
+        let functional = metrics.battery_depleted == 0
+            && metrics.health_depleted == 0
+            && metrics.final_resource_battery > f32::EPSILON
+            && metrics.final_resource_health > f32::EPSILON;
+        let succeeded = functional
+            && match stage {
+                CurriculumStage::BackAwayReliably
+                | CurriculumStage::ChooseUsefulTurn
+                | CurriculumStage::EscapeCorners => {
+                    metrics.successful_escapes > 0 || metrics.escape_boundary_crossings > 0
+                }
+                CurriculumStage::ExploreWithoutLooping => {
+                    metrics.new_area_cells >= 8 && metrics.repeated_state_steps < steps as u32 / 2
+                }
+                CurriculumStage::NavigateVariedRooms
+                | CurriculumStage::TransferCandidatesToPete => {
+                    metrics.new_area_cells >= 10
+                        && metrics.collisions <= 3
+                        && (escape_target.is_none() || metrics.escape_boundary_crossings > 0)
+                }
+            };
+        let episode_score = constrained_episode_score(metrics, succeeded, steps);
+        environment_scores.push(episode_score);
+        worst_environment_score = worst_environment_score.min(episode_score);
         successful_episodes += succeeded as usize;
         fitness += weights.score(metrics);
         add_neat_metrics(&mut total, metrics);
     }
 
     let episode_count = episodes.max(1) as f32;
+    let traits = FitnessTraits::from_metrics(
+        total,
+        episodes,
+        steps,
+        successful_episodes,
+        worst_environment_score,
+    );
+    let lifetime_selection =
+        lifetime_selection_summary(&environment_scores, successful_episodes, episodes);
     Ok(NeatPolicyEvaluation {
         fitness: fitness / episode_count,
+        selection_fitness: 0.0,
+        base_selection_fitness: 0.0,
+        novelty_score: 0.0,
+        lifetime_selection,
+        traits,
+        selection_summary: None,
         metrics: total,
         successful_episodes,
         episodes,
         collision_rate: total.collisions as f32 / (episodes.max(1) * steps.max(1)) as f32,
+        environment_scores,
         snapshots: captured_snapshots,
         scenario: captured_scenario,
     })
+}
+
+fn lifetime_selection_summary(
+    episode_scores: &[f32],
+    successful_episodes: usize,
+    episodes: usize,
+) -> NeatLifetimeSelection {
+    let mut scores = episode_scores
+        .iter()
+        .copied()
+        .filter(|score| score.is_finite())
+        .collect::<Vec<_>>();
+    let qualification_probability = if episodes == 0 {
+        0.0
+    } else {
+        successful_episodes as f32 / episodes as f32
+    };
+    if scores.is_empty() {
+        return NeatLifetimeSelection {
+            qualification_probability,
+            ..NeatLifetimeSelection::default()
+        };
+    }
+    scores.sort_by(|left, right| left.total_cmp(right));
+    let mean_score = scores.iter().sum::<f32>() / scores.len() as f32;
+    let lower_quartile_index = ((scores.len() - 1) as f32 * 0.25).floor() as usize;
+    let lower_quartile_score = scores[lower_quartile_index];
+    let worst_score = scores[0];
+    let robustness_score = 0.5 * mean_score + 0.3 * lower_quartile_score + 0.2 * worst_score;
+    NeatLifetimeSelection {
+        mean_score,
+        lower_quartile_score,
+        worst_score,
+        qualification_probability,
+        robustness_score,
+    }
+}
+
+fn lifetime_selection_adjustment(selection: NeatLifetimeSelection) -> f32 {
+    selection.robustness_score + selection.qualification_probability * 10.0
 }
 
 async fn capture_neat_champion(
@@ -2680,13 +3075,14 @@ async fn capture_neat_champion(
         steps,
         seed,
         NeatPerturbation::default(),
+        None,
         true,
     )
     .await?;
     let mut writer = CaptureWriter::create(path, CaptureSource::Sim, Some(100)).await?;
     writer.manifest_mut().scenario = evaluation.scenario;
     writer.manifest_mut().notes.push(format!(
-        "NEAT locomotion champion stage={} fitness={fitness:.4} nodes={} connections={}",
+        "NEAT locomotion champion stage={} selection={fitness:.4} nodes={} connections={}",
         neat_stage_slug(stage),
         genome.nodes.len(),
         genome.connections.len()
@@ -2745,6 +3141,278 @@ fn neat_stage_slug(stage: CurriculumStage) -> &'static str {
     }
 }
 
+fn constrained_episode_score(metrics: NeatEpisodeMetrics, succeeded: bool, steps: usize) -> f32 {
+    let step_count = steps.max(1) as f32;
+    let collision_rate = metrics.collisions as f32 / step_count;
+    let repetition_rate = metrics.repeated_state_steps as f32 / step_count;
+    let efficiency = (metrics.new_area_cells as f32 + metrics.distance_without_collision_m)
+        / (1.0 + metrics.wheel_motion_m);
+    (succeeded as u8 as f32) * 20.0
+        + metrics.escape_boundary_crossings as f32 * 8.0
+        + metrics.successful_escapes as f32 * 6.0
+        + efficiency
+        + metrics.trap_mouth_progress_m
+        - collision_rate * 20.0
+        - repetition_rate * 5.0
+        - metrics.safety_vetoes as f32 * 100.0
+        - metrics.resource_energy_used * 4.0
+        - metrics.battery_depleted as f32 * 50.0
+        - metrics.health_depleted as f32 * 75.0
+}
+
+fn neat_plasticity_reward(step_distance: f32, collision: bool, safety_vetoed: bool) -> f32 {
+    let mut reward = (step_distance * 5.0).clamp(0.0, 0.5);
+    if collision {
+        reward -= 0.5;
+    }
+    if safety_vetoed {
+        reward -= 0.5;
+    }
+    reward.clamp(-1.0, 1.0)
+}
+
+fn neat_sensor_energy_cost(range: &RangeSense) -> f32 {
+    0.00025 + range.beams.len() as f32 * 0.000002
+}
+
+fn neat_topology_metabolic_cost(genome: &Genome) -> f32 {
+    (genome.nodes.len() as f32 * 0.000015 + genome.connections.len() as f32 * 0.000008).min(0.01)
+}
+
+fn neat_generation_challenges(
+    stage: CurriculumStage,
+    episodes: usize,
+    seed: u64,
+    archive: &[NeatWorldArchiveEntry],
+    replay_ratio: f32,
+    mutation_ratio: f32,
+) -> Vec<NeatEnvironmentChallenge> {
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xA11CE_5757);
+    let replay_count = ((episodes as f32) * replay_ratio.clamp(0.0, 1.0)).round() as usize;
+    let mutation_count = ((episodes as f32) * mutation_ratio.clamp(0.0, 1.0)).round() as usize;
+    let mut ranked_archive = archive.iter().collect::<Vec<_>>();
+    ranked_archive.sort_by(|left, right| {
+        right
+            .distinction
+            .total_cmp(&left.distinction)
+            .then_with(|| right.difficulty.total_cmp(&left.difficulty))
+    });
+
+    let mut challenges = Vec::with_capacity(episodes);
+    for entry in ranked_archive.iter().take(replay_count.min(episodes)) {
+        challenges.push(entry.challenge);
+    }
+    for entry in ranked_archive
+        .iter()
+        .cycle()
+        .take(mutation_count.min(episodes.saturating_sub(challenges.len())))
+    {
+        challenges.push(mutate_neat_environment(entry.challenge, &mut rng));
+    }
+    while challenges.len() < episodes {
+        let episode_seed = seed
+            .saturating_add((challenges.len() as u64) << 8)
+            .saturating_add(rng.gen_range(0..=u16::MAX) as u64);
+        challenges.push(NeatEnvironmentChallenge {
+            stage,
+            kind: neat_stage_scenario(stage, episode_seed),
+            seed: episode_seed,
+        });
+    }
+    challenges
+}
+
+fn mutate_neat_environment<R: Rng + ?Sized>(
+    challenge: NeatEnvironmentChallenge,
+    rng: &mut R,
+) -> NeatEnvironmentChallenge {
+    let kinds = match challenge.stage {
+        CurriculumStage::BackAwayReliably => &[ScenarioKind::ObstacleAvoidance][..],
+        CurriculumStage::ChooseUsefulTurn => &[
+            ScenarioKind::ObstacleAvoidance,
+            ScenarioKind::ColumnTrap,
+            ScenarioKind::ConcaveTrap,
+        ],
+        CurriculumStage::EscapeCorners => &[
+            ScenarioKind::CornerTrap,
+            ScenarioKind::ColumnTrap,
+            ScenarioKind::ConcaveTrap,
+        ],
+        CurriculumStage::ExploreWithoutLooping => {
+            &[ScenarioKind::MixedRoom, ScenarioKind::ConcaveTrap]
+        }
+        CurriculumStage::NavigateVariedRooms | CurriculumStage::TransferCandidatesToPete => &[
+            ScenarioKind::EmptyRoom,
+            ScenarioKind::ObstacleAvoidance,
+            ScenarioKind::CornerTrap,
+            ScenarioKind::ColumnTrap,
+            ScenarioKind::ConcaveTrap,
+            ScenarioKind::Dream,
+        ],
+    };
+    NeatEnvironmentChallenge {
+        stage: challenge.stage,
+        kind: kinds.choose(rng).copied().unwrap_or(challenge.kind),
+        seed: challenge.seed.wrapping_add(rng.gen_range(1..=10_000)) ^ rng.gen::<u64>(),
+    }
+}
+
+fn update_neat_world_archive(
+    archive: &mut Vec<NeatWorldArchiveEntry>,
+    challenges: &[NeatEnvironmentChallenge],
+    evaluations: &[NeatPolicyEvaluation],
+    generation: u64,
+    archive_limit: usize,
+) -> usize {
+    let mut retained = 0usize;
+    for (episode_index, challenge) in challenges.iter().copied().enumerate() {
+        let scores = evaluations
+            .iter()
+            .filter_map(|evaluation| evaluation.environment_scores.get(episode_index).copied())
+            .filter(|score| score.is_finite())
+            .collect::<Vec<_>>();
+        if scores.len() < 2 {
+            continue;
+        }
+        let mean = scores.iter().sum::<f32>() / scores.len() as f32;
+        let variance = scores
+            .iter()
+            .map(|score| {
+                let delta = score - mean;
+                delta * delta
+            })
+            .sum::<f32>()
+            / scores.len() as f32;
+        let distinction = variance.sqrt();
+        let difficulty = (1.0 - ((mean + 20.0) / 80.0)).clamp(0.0, 1.0);
+        let discriminates = distinction >= 0.25 && (0.10..=0.90).contains(&difficulty);
+        if !discriminates {
+            continue;
+        }
+        let candidate = NeatWorldArchiveEntry {
+            challenge,
+            difficulty,
+            distinction,
+            retained_generation: generation,
+        };
+        if let Some(existing) = archive
+            .iter_mut()
+            .find(|entry| entry.challenge == candidate.challenge)
+        {
+            if candidate.distinction > existing.distinction {
+                *existing = candidate;
+                retained = retained.saturating_add(1);
+            }
+        } else {
+            archive.push(candidate);
+            retained = retained.saturating_add(1);
+        }
+    }
+    archive.sort_by(|left, right| {
+        let left_score = left.distinction * (1.0 - (left.difficulty - 0.5).abs());
+        let right_score = right.distinction * (1.0 - (right.difficulty - 0.5).abs());
+        right_score
+            .total_cmp(&left_score)
+            .then_with(|| right.retained_generation.cmp(&left.retained_generation))
+    });
+    if archive.len() > archive_limit {
+        archive.truncate(archive_limit);
+    }
+    retained
+}
+
+fn update_neat_niche_archive(
+    archive: &mut Vec<NeatNicheArchiveEntry>,
+    stage: CurriculumStage,
+    generation_archive: &[QualityDiversityEntry],
+    genomes: &[Genome],
+    evaluations: &[NeatPolicyEvaluation],
+) {
+    for entry in generation_archive {
+        let Some(genome) = genomes.get(entry.genome_index) else {
+            continue;
+        };
+        let Some(evaluation) = evaluations.get(entry.genome_index) else {
+            continue;
+        };
+        let candidate = NeatNicheArchiveEntry {
+            stage,
+            niche: entry.niche,
+            descriptor: entry.descriptor,
+            selection_fitness: entry.selection_fitness,
+            base_selection_fitness: evaluation.base_selection_fitness,
+            novelty_score: evaluation.novelty_score,
+            diagnostic_fitness: evaluation.fitness,
+            genome: genome.clone(),
+            evaluation: evaluation.clone(),
+        };
+        upsert_niche_archive_entry(archive, candidate);
+    }
+}
+
+fn update_global_repertoire(
+    repertoire: &mut Vec<NeatNicheArchiveEntry>,
+    stage_archive: &[NeatNicheArchiveEntry],
+) {
+    for entry in stage_archive {
+        upsert_niche_archive_entry(repertoire, entry.clone());
+    }
+}
+
+fn upsert_niche_archive_entry(
+    archive: &mut Vec<NeatNicheArchiveEntry>,
+    candidate: NeatNicheArchiveEntry,
+) {
+    if let Some(existing) = archive
+        .iter_mut()
+        .find(|entry| entry.descriptor == candidate.descriptor)
+    {
+        if candidate.selection_fitness > existing.selection_fitness {
+            *existing = candidate;
+        }
+    } else {
+        archive.push(candidate);
+    }
+}
+
+fn write_stage_niche_checkpoints(
+    archive: &[NeatNicheArchiveEntry],
+    generation: u64,
+    report_dir: &Path,
+) -> Result<()> {
+    let archive_dir = report_dir.join("niche-archive");
+    fs::create_dir_all(&archive_dir)?;
+    for entry in archive {
+        let file_name = format!(
+            "{}-{}-c{}-t{}-a{}-e{}-r{}.json",
+            neat_stage_slug(entry.stage),
+            niche_slug(entry.niche),
+            entry.descriptor.collision_frequency_bin,
+            entry.descriptor.turning_intensity_bin,
+            entry.descriptor.area_coverage_bin,
+            entry.descriptor.energy_consumption_bin,
+            entry.descriptor.recovery_aggressiveness_bin
+        );
+        let checkpoint =
+            LocomotionCheckpoint::new(generation, entry.selection_fitness, entry.genome.clone());
+        checkpoint.save(archive_dir.join(file_name))?;
+    }
+    Ok(())
+}
+
+fn niche_slug(niche: pete_neat::NicheLabel) -> &'static str {
+    match niche {
+        pete_neat::NicheLabel::OpenRoomExplorer => "open-room-explorer",
+        pete_neat::NicheLabel::NarrowCorridorNavigator => "narrow-corridor-navigator",
+        pete_neat::NicheLabel::ConcaveTrapEscapeSpecialist => "concave-trap-escape-specialist",
+        pete_neat::NicheLabel::ClutterSpecialist => "clutter-specialist",
+        pete_neat::NicheLabel::LowBatteryConservativeMover => "low-battery-conservative-mover",
+        pete_neat::NicheLabel::DegradedSensorNavigator => "degraded-sensor-navigator",
+        pete_neat::NicheLabel::AsymmetricMotorCompensator => "asymmetric-motor-compensator",
+        pete_neat::NicheLabel::Generalist => "generalist",
+    }
+}
+
 fn add_neat_metrics(total: &mut NeatEpisodeMetrics, episode: NeatEpisodeMetrics) {
     total.new_area_cells = total.new_area_cells.saturating_add(episode.new_area_cells);
     total.distance_without_collision_m += episode.distance_without_collision_m;
@@ -2761,8 +3429,35 @@ fn add_neat_metrics(total: &mut NeatEpisodeMetrics, episode: NeatEpisodeMetrics)
         .saturating_add(episode.repeated_state_steps);
     total.wheel_motion_m += episode.wheel_motion_m;
     total.angular_motion_rad += episode.angular_motion_rad;
+    total.recovery_activation_sum += episode.recovery_activation_sum;
     total.stalled_steps = total.stalled_steps.saturating_add(episode.stalled_steps);
     total.safety_vetoes = total.safety_vetoes.saturating_add(episode.safety_vetoes);
+    total.resource_energy_used += episode.resource_energy_used;
+    total.sensor_energy_cost += episode.sensor_energy_cost;
+    total.computation_energy_cost += episode.computation_energy_cost;
+    total.collision_energy_cost += episode.collision_energy_cost;
+    total.minimum_resource_battery = if total.minimum_resource_battery == 0.0 {
+        episode.minimum_resource_battery
+    } else {
+        total
+            .minimum_resource_battery
+            .min(episode.minimum_resource_battery)
+    };
+    total.final_resource_battery += episode.final_resource_battery;
+    total.minimum_resource_health = if total.minimum_resource_health == 0.0 {
+        episode.minimum_resource_health
+    } else {
+        total
+            .minimum_resource_health
+            .min(episode.minimum_resource_health)
+    };
+    total.final_resource_health += episode.final_resource_health;
+    total.battery_depleted = total
+        .battery_depleted
+        .saturating_add(episode.battery_depleted);
+    total.health_depleted = total
+        .health_depleted
+        .saturating_add(episode.health_depleted);
 }
 
 fn write_json_report(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
@@ -12623,6 +13318,17 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn lifetime_selection_uses_mean_lower_quartile_and_worst_episode() {
+        let summary = lifetime_selection_summary(&[10.0, 20.0, -10.0, 30.0], 3, 4);
+        assert_eq!(summary.mean_score, 12.5);
+        assert_eq!(summary.lower_quartile_score, -10.0);
+        assert_eq!(summary.worst_score, -10.0);
+        assert_eq!(summary.qualification_probability, 0.75);
+        assert_eq!(summary.robustness_score, 1.25);
+        assert_eq!(lifetime_selection_adjustment(summary), 8.75);
     }
 
     #[test]
