@@ -1,6 +1,11 @@
 # 001 Architecture
 
-The main flow is sensors → Features → `Now` → Sensations → teacher vectors → `ExperienceInstant` → latent encoding → imagined futures → conductor choice → autonomic safety → body actuation → next `Now` → reward/surprise → ledger → training.
+The main flow is sensors → Features → `Now` → persistent blackboard world model → homeostatic drives → goal interpretation → immutable goal evaluations → commitment-aware arbitration → goal-owned behavior → typed action primitive → autonomic safety → body actuation → next `Now` → reward/surprise → ledger → training.
+
+The legacy `SimpleConductor` remains available for comparison. `goal-shadow`
+maintains the complete blackboard and goal state while executing the legacy
+choice; `goal` executes the selected goal behavior. See
+[019-goal-architecture.md](019-goal-architecture.md).
 
 The canonical moment representation is [ExperienceInstant](instant.md), not a separate Sensorium layer.
 

@@ -225,7 +225,11 @@ fn spawn_body(config: &ScenarioConfig, rng: &mut StdRng) -> BodySense {
             body.odometry.heading_rad = 0.0;
         }
         ScenarioKind::ChargerSeeking => {
-            body.battery_level = 0.18;
+            // Keep the task energy-constrained but physically reachable. With
+            // simulator drain proportional to motor effort, 0.18 stores only
+            // about 3.6 m of straight-line travel while held-out chargers can
+            // begin more than 4 m away.
+            body.battery_level = 0.35;
             body.odometry.x_m = rng.gen_range(0.8..config.arena.width_m * 0.35);
             body.odometry.y_m = rng.gen_range(0.8..config.arena.height_m - 0.8);
             body.odometry.heading_rad = rng.gen_range(-0.7..0.7);

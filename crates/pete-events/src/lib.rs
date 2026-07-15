@@ -193,7 +193,7 @@ pub enum Response {
     AddExperience(Experience),
     AddMemoryNote(String),
     ProposeAction(ActionPrimitive),
-    SetDrive { name: DriveName, value: f32 },
+    AddDriveImpulse { name: DriveName, value: f32 },
     SetMemorySense(MemorySense),
     Teach(LlmTeaching),
     Emit(Event),
@@ -745,7 +745,7 @@ pub mod responders {
                     json!({ "kind": "battery_low" }),
                 )),
                 Response::AddMemoryNote("Battery low here.".to_string()),
-                Response::SetDrive {
+                Response::AddDriveImpulse {
                     name: DriveName::BatteryHunger,
                     value: 1.0,
                 },
@@ -783,7 +783,7 @@ pub mod responders {
                     event.t_ms,
                     event.t_ms,
                 )),
-                Response::SetDrive {
+                Response::AddDriveImpulse {
                     name: DriveName::BatteryHunger,
                     value: 0.0,
                 },
@@ -821,7 +821,7 @@ pub mod responders {
                     json!({ "side": side }),
                 )),
                 Response::AddMemoryNote("Danger here.".to_string()),
-                Response::SetDrive {
+                Response::AddDriveImpulse {
                     name: DriveName::DangerAvoidance,
                     value: 1.0,
                 },
@@ -893,7 +893,7 @@ pub mod responders {
                     json!({ "kind": "surprise_high" }),
                 )),
                 Response::AddMemoryNote("This moment was surprisingly important.".to_string()),
-                Response::SetDrive {
+                Response::AddDriveImpulse {
                     name: DriveName::Curiosity,
                     value: 0.8,
                 },

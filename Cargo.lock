@@ -5706,6 +5706,7 @@ dependencies = [
 name = "pete-autonomic"
 version = "0.1.0"
 dependencies = [
+ "pete-actions",
  "pete-body",
  "pete-cockpit",
  "pete-now",

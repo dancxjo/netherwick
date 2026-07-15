@@ -9,6 +9,7 @@ publish = false
 serde.workspace = true
 pete-cockpit = { path = "../pete-cockpit" }
 pete-now = { path = "../pete-now" }
+pete-actions = { path = "../pete-actions" }
 
 [dev-dependencies]
 pete-body = { path = "../pete-body" }

@@ -454,6 +454,8 @@ enum CliActionSelectorMode {
     Random,
     ModelAssisted,
     Scripted,
+    GoalShadow,
+    Goal,
 }
 
 impl From<CliActionSelectorMode> for ActionSelectorMode {
@@ -463,6 +465,8 @@ impl From<CliActionSelectorMode> for ActionSelectorMode {
             CliActionSelectorMode::Random => ActionSelectorMode::Random,
             CliActionSelectorMode::ModelAssisted => ActionSelectorMode::ModelAssisted,
             CliActionSelectorMode::Scripted => ActionSelectorMode::Scripted,
+            CliActionSelectorMode::GoalShadow => ActionSelectorMode::GoalShadow,
+            CliActionSelectorMode::Goal => ActionSelectorMode::Goal,
         }
     }
 }
@@ -5368,6 +5372,18 @@ struct ScenarioEvaluationSummary {
     low_confidence_navigation_fallbacks: usize,
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
+    #[serde(default)]
+    goal_switches: usize,
+    #[serde(default)]
+    goal_commitment_retained_ticks: usize,
+    #[serde(default)]
+    goal_behavior_transitions: usize,
+    #[serde(default)]
+    mean_goal_dwell_ms: Option<f32>,
+    #[serde(default)]
+    goal_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    goal_behavior_histogram: HashMap<String, usize>,
     mean_chosen_score: Option<f32>,
     mean_candidate_score: Option<f32>,
 }
@@ -5439,6 +5455,18 @@ struct ScenarioEpisodeReport {
     model_fallbacks: usize,
     model_assisted_decisions: usize,
     action_selector_safety_overrides: usize,
+    #[serde(default)]
+    goal_switches: usize,
+    #[serde(default)]
+    goal_commitment_retained_ticks: usize,
+    #[serde(default)]
+    goal_behavior_transitions: usize,
+    #[serde(default)]
+    mean_goal_dwell_ms: Option<f32>,
+    #[serde(default)]
+    goal_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    goal_behavior_histogram: HashMap<String, usize>,
     action_selector_fallbacks: usize,
     #[serde(default)]
     action_selector_guard_yields: usize,
@@ -5572,6 +5600,16 @@ struct EpisodeMetricBuilder {
     action_selector_safety_overrides: usize,
     action_selector_fallbacks: usize,
     action_selector_guard_yields: usize,
+    goal_switches: usize,
+    goal_commitment_retained_ticks: usize,
+    goal_behavior_transitions: usize,
+    goal_dwell_ticks_sum: usize,
+    goal_dwell_count: usize,
+    current_goal: Option<String>,
+    current_goal_ticks: usize,
+    current_goal_behavior: Option<String>,
+    goal_histogram: HashMap<String, usize>,
+    goal_behavior_histogram: HashMap<String, usize>,
     map_memory_decisions: usize,
     danger_memory_decisions: usize,
     charge_memory_decisions: usize,
@@ -5656,6 +5694,16 @@ impl EpisodeMetricBuilder {
             action_selector_safety_overrides: 0,
             action_selector_fallbacks: 0,
             action_selector_guard_yields: 0,
+            goal_switches: 0,
+            goal_commitment_retained_ticks: 0,
+            goal_behavior_transitions: 0,
+            goal_dwell_ticks_sum: 0,
+            goal_dwell_count: 0,
+            current_goal: None,
+            current_goal_ticks: 0,
+            current_goal_behavior: None,
+            goal_histogram: HashMap::new(),
+            goal_behavior_histogram: HashMap::new(),
             map_memory_decisions: 0,
             danger_memory_decisions: 0,
             charge_memory_decisions: 0,
@@ -5882,6 +5930,55 @@ impl EpisodeMetricBuilder {
             self.action_selector_safety_overrides =
                 self.action_selector_safety_overrides.saturating_add(1);
         }
+        if decision.goal_switched {
+            self.goal_switches = self.goal_switches.saturating_add(1);
+        }
+        if decision.goal_retained_by_commitment {
+            self.goal_commitment_retained_ticks =
+                self.goal_commitment_retained_ticks.saturating_add(1);
+        }
+        let observed_goal = decision
+            .selected_goal
+            .clone()
+            .or(decision.shadow_selected_goal.clone());
+        let observed_behavior = decision.selected_behavior.clone().or_else(|| {
+            tick.frame
+                .now
+                .extensions
+                .get("goal_system")
+                .and_then(|value| value.get("behavior"))
+                .and_then(|value| value.get("behavior_id"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+        if let Some(goal) = observed_goal {
+            *self.goal_histogram.entry(goal.clone()).or_default() += 1;
+            if self.current_goal.as_deref() == Some(goal.as_str()) {
+                self.current_goal_ticks = self.current_goal_ticks.saturating_add(1);
+            } else {
+                if self.current_goal.is_some() {
+                    self.goal_dwell_ticks_sum = self
+                        .goal_dwell_ticks_sum
+                        .saturating_add(self.current_goal_ticks);
+                    self.goal_dwell_count = self.goal_dwell_count.saturating_add(1);
+                }
+                self.current_goal = Some(goal);
+                self.current_goal_ticks = 1;
+                self.current_goal_behavior = None;
+            }
+        }
+        if let Some(behavior) = observed_behavior {
+            *self
+                .goal_behavior_histogram
+                .entry(behavior.clone())
+                .or_default() += 1;
+            if self.current_goal_behavior.is_some()
+                && self.current_goal_behavior.as_deref() != Some(behavior.as_str())
+            {
+                self.goal_behavior_transitions = self.goal_behavior_transitions.saturating_add(1);
+            }
+            self.current_goal_behavior = Some(behavior);
+        }
         if decision
             .candidates
             .iter()
@@ -6081,6 +6178,20 @@ impl EpisodeMetricBuilder {
             model_fallbacks: self.model_fallbacks,
             model_assisted_decisions: self.model_assisted_decisions,
             action_selector_safety_overrides: self.action_selector_safety_overrides,
+            goal_switches: self.goal_switches,
+            goal_commitment_retained_ticks: self.goal_commitment_retained_ticks,
+            goal_behavior_transitions: self.goal_behavior_transitions,
+            mean_goal_dwell_ms: {
+                let dwell_sum = self
+                    .goal_dwell_ticks_sum
+                    .saturating_add(self.current_goal_ticks);
+                let dwell_count = self
+                    .goal_dwell_count
+                    .saturating_add(usize::from(self.current_goal.is_some()));
+                (dwell_count > 0).then_some(dwell_sum as f32 * 100.0 / dwell_count as f32)
+            },
+            goal_histogram: self.goal_histogram,
+            goal_behavior_histogram: self.goal_behavior_histogram,
             action_selector_fallbacks: self.action_selector_fallbacks,
             action_selector_guard_yields: self.action_selector_guard_yields,
             map_memory_decisions: self.map_memory_decisions,
@@ -6465,7 +6576,9 @@ fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool 
                 && episode.distance_traveled_m > 0.25
                 && episode.collisions <= (episode.ticks / 20).max(1)
         }
-        ScenarioKind::ChargerSeeking => episode.charging_ticks > 0 || episode.battery_delta > 0.03,
+        ScenarioKind::ChargerSeeking => {
+            episode.charging_ticks > 0 && episode.dead_battery_tick.is_none()
+        }
         ScenarioKind::PersonAndSpeaker => {
             episode.ticks > 0
                 && episode.collisions == 0
@@ -6645,6 +6758,28 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
             .iter()
             .map(|episode| episode.action_selector_safety_overrides)
             .sum(),
+        goal_switches: episodes.iter().map(|episode| episode.goal_switches).sum(),
+        goal_commitment_retained_ticks: episodes
+            .iter()
+            .map(|episode| episode.goal_commitment_retained_ticks)
+            .sum(),
+        goal_behavior_transitions: episodes
+            .iter()
+            .map(|episode| episode.goal_behavior_transitions)
+            .sum(),
+        mean_goal_dwell_ms: mean_optional(
+            episodes
+                .iter()
+                .filter_map(|episode| episode.mean_goal_dwell_ms),
+        ),
+        goal_histogram: summarize_string_histogram(
+            episodes.iter().map(|episode| &episode.goal_histogram),
+        ),
+        goal_behavior_histogram: summarize_string_histogram(
+            episodes
+                .iter()
+                .map(|episode| &episode.goal_behavior_histogram),
+        ),
         mean_chosen_score: mean_optional(
             episodes
                 .iter()
@@ -6666,6 +6801,18 @@ fn summarize_action_histogram(episodes: &[ScenarioEpisodeReport]) -> HashMap<Str
         }
     }
     histogram
+}
+
+fn summarize_string_histogram<'a>(
+    histograms: impl IntoIterator<Item = &'a HashMap<String, usize>>,
+) -> HashMap<String, usize> {
+    let mut combined = HashMap::new();
+    for histogram in histograms {
+        for (key, count) in histogram {
+            *combined.entry(key.clone()).or_default() += count;
+        }
+    }
+    combined
 }
 
 fn summarize_memory_navigation_intents(
@@ -16005,6 +16152,7 @@ mod tests {
                 selected_score: Some(-0.5),
                 safety_overrode: true,
                 fallback_warnings: vec!["action selector used hardcoded score".to_string()],
+                ..Default::default()
             })
             .unwrap(),
         );
@@ -16055,6 +16203,7 @@ mod tests {
                 fallback_warnings: vec![
                     "model-assisted selector yielded to baseline trap recovery".to_string(),
                 ],
+                ..Default::default()
             })
             .unwrap(),
         );

@@ -1,9 +1,21 @@
+use pete_actions::ActionPrimitive;
 use pete_cockpit::MotorCommand;
 use pete_now::Now;
 use serde::{Deserialize, Serialize};
 
 pub trait SafetyLayer {
     fn filter(&mut self, now: &Now, desired: MotorCommand) -> SafetyDecision;
+
+    fn filter_action(
+        &mut self,
+        now: &Now,
+        goal_id: Option<&str>,
+        action: &ActionPrimitive,
+        desired: MotorCommand,
+    ) -> SafetyDecision {
+        let _ = (goal_id, action);
+        self.filter(now, desired)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +30,7 @@ pub enum SafetyReason {
     HighDanger,
     RawLlmMotorRejected,
     ReadOnlyMode,
+    Contact,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +82,28 @@ pub struct SimpleSafety {
 
 impl SafetyLayer for SimpleSafety {
     fn filter(&mut self, now: &Now, desired: MotorCommand) -> SafetyDecision {
+        self.filter_with_context(now, None, None, desired)
+    }
+
+    fn filter_action(
+        &mut self,
+        now: &Now,
+        goal_id: Option<&str>,
+        action: &ActionPrimitive,
+        desired: MotorCommand,
+    ) -> SafetyDecision {
+        self.filter_with_context(now, goal_id, Some(action), desired)
+    }
+}
+
+impl SimpleSafety {
+    fn filter_with_context(
+        &mut self,
+        now: &Now,
+        goal_id: Option<&str>,
+        action: Option<&ActionPrimitive>,
+        desired: MotorCommand,
+    ) -> SafetyDecision {
         let mut command = desired.clamped(self.config.max_forward, self.config.max_turn);
         let mut events = Vec::new();
         let mut reason = None;
@@ -98,7 +133,17 @@ impl SafetyLayer for SimpleSafety {
             events.extend([AutonomicEvent::Stop, AutonomicEvent::Veto]);
             reason = Some(SafetyReason::Cliff);
             vetoed = true;
-        } else if now.body.battery_level <= self.config.critical_battery && desired.forward > 0.0 {
+        } else if (now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall)
+            && desired.forward > 0.0
+        {
+            command = MotorCommand::stop();
+            events.extend([AutonomicEvent::Stop, AutonomicEvent::Veto]);
+            reason = Some(SafetyReason::Contact);
+            vetoed = true;
+        } else if now.body.battery_level <= self.config.critical_battery
+            && desired.forward > 0.0
+            && !charge_seeking_intent(goal_id, action)
+        {
             command = MotorCommand::stop();
             events.extend([AutonomicEvent::Stop, AutonomicEvent::Veto]);
             reason = Some(SafetyReason::BatteryCritical);
@@ -119,9 +164,15 @@ impl SafetyLayer for SimpleSafety {
     }
 }
 
+fn charge_seeking_intent(goal_id: Option<&str>, action: Option<&ActionPrimitive>) -> bool {
+    let _ = action;
+    goal_id == Some("seek_charger")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pete_actions::{ActionPrimitive, ApproachTarget, ExploreStyle};
     use pete_body::BodySense;
     use pete_now::Now;
 
@@ -223,5 +274,70 @@ mod tests {
                 "{sensor}"
             );
         }
+    }
+
+    #[test]
+    fn critical_battery_allows_typed_charger_approach_only() {
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        body.last_update_ms = 10;
+        let now = Now::blank(10, body);
+        let desired = MotorCommand {
+            forward: 0.2,
+            turn: 0.0,
+        };
+        let approach = ActionPrimitive::Approach {
+            target: ApproachTarget::Charger,
+        };
+        let allowed =
+            SimpleSafety::default().filter_action(&now, Some("seek_charger"), &approach, desired);
+        assert!(!allowed.vetoed);
+        assert_eq!(allowed.command, desired);
+
+        let explore = ActionPrimitive::Explore {
+            style: ExploreStyle::Wander,
+            duration_ms: 1_000,
+        };
+        let stopped =
+            SimpleSafety::default().filter_action(&now, Some("explore"), &explore, desired);
+        assert!(stopped.vetoed);
+        assert_eq!(stopped.reason, Some(SafetyReason::BatteryCritical));
+    }
+
+    #[test]
+    fn contact_blocks_forward_but_preserves_reverse_escape() {
+        let mut body = BodySense::default();
+        body.flags.bump_left = true;
+        body.last_update_ms = 10;
+        let now = Now::blank(10, body);
+        let action = ActionPrimitive::Go {
+            intensity: 0.2,
+            duration_ms: 300,
+        };
+        let blocked = SimpleSafety::default().filter_action(
+            &now,
+            Some("escape_danger"),
+            &action,
+            MotorCommand {
+                forward: 0.2,
+                turn: 0.0,
+            },
+        );
+        assert_eq!(blocked.reason, Some(SafetyReason::Contact));
+
+        let reverse = ActionPrimitive::Go {
+            intensity: -0.2,
+            duration_ms: 300,
+        };
+        let allowed = SimpleSafety::default().filter_action(
+            &now,
+            Some("escape_danger"),
+            &reverse,
+            MotorCommand {
+                forward: -0.2,
+                turn: 0.0,
+            },
+        );
+        assert!(!allowed.vetoed);
     }
 }

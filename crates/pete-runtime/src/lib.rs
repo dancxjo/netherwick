@@ -19,7 +19,7 @@ use pete_cockpit::{
     MotorCommand, SafeCockpit, SafeStopReason, SafetyLatchKind, StatusSummary,
     BUMP_ESCAPE_BACKOFF_DURATION_MS,
 };
-use pete_conductor::{Conductor, ConductorInput, NavigationIntent, SimpleConductor};
+use pete_conductor::{Conductor, ConductorInput, GoalSystem, NavigationIntent, SimpleConductor};
 use pete_core::{Pose2, Provenance, Reward, TimeMs};
 use pete_events::{default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response};
 use pete_experience::{
@@ -103,6 +103,7 @@ where
     locomotion_tracker: LocomotionTracker,
     chirp_events: ChirpEventState,
     nudge: NudgeController,
+    goal_system: GoalSystem,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -207,6 +208,8 @@ pub enum ActionSelectorMode {
     Random,
     ModelAssisted,
     Scripted,
+    GoalShadow,
+    Goal,
 }
 
 impl ActionSelectorMode {
@@ -216,6 +219,8 @@ impl ActionSelectorMode {
             Self::Random => "random",
             Self::ModelAssisted => "model-assisted",
             Self::Scripted => "scripted",
+            Self::GoalShadow => "goal-shadow",
+            Self::Goal => "goal",
         }
     }
 }
@@ -687,6 +692,18 @@ pub struct ActionSelectionDecision {
     pub selected_score: Option<f32>,
     pub safety_overrode: bool,
     pub fallback_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_behavior: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_selected_goal: Option<String>,
+    #[serde(default)]
+    pub goal_switched: bool,
+    #[serde(default)]
+    pub goal_retained_by_commitment: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_selection_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2811,12 +2828,15 @@ impl ReignQueue {
     }
 }
 
-fn mechanical_reign_action(input: &Option<ReignInput>) -> Option<ActionPrimitive> {
+fn mechanical_reign_action(
+    input: &Option<ReignInput>,
+    selector_mode: ActionSelectorMode,
+) -> Option<ActionPrimitive> {
     let input = input.as_ref()?;
-    if !matches!(
-        input.mode,
-        pete_actions::ReignMode::Direct | pete_actions::ReignMode::Assist
-    ) {
+    let goal_mode = selector_mode == ActionSelectorMode::Goal;
+    let mechanical = matches!(input.mode, pete_actions::ReignMode::Direct)
+        || (!goal_mode && matches!(input.mode, pete_actions::ReignMode::Assist));
+    if !mechanical {
         return None;
     }
     input.command.to_action()
@@ -2871,6 +2891,7 @@ where
             locomotion_tracker: LocomotionTracker::default(),
             chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
+            goal_system: GoalSystem::default(),
         }
     }
 
@@ -2908,6 +2929,7 @@ where
             locomotion_tracker: LocomotionTracker::default(),
             chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
+            goal_system: GoalSystem::default(),
         }
     }
 
@@ -2982,7 +3004,8 @@ where
         let reign_action = reign_input
             .as_ref()
             .and_then(|input| input.command.to_action());
-        let mechanical_reign_action = mechanical_reign_action(&reign_input);
+        let mechanical_reign_action =
+            mechanical_reign_action(&reign_input, self.action_selector_mode);
 
         let mut behavior_runs: Vec<ErasedBehaviorRunRecord> = Vec::new();
         let experience_input = ExperienceBehaviorInput::from_now(&now);
@@ -3334,10 +3357,36 @@ where
         }
 
         let mut proposals = proposed_actions.clone();
+        if self.action_selector_mode == ActionSelectorMode::Goal {
+            if let Some(reign_action) = now
+                .reign
+                .latest
+                .as_ref()
+                .filter(|input| matches!(input.mode, ReignMode::Assist | ReignMode::Suggest))
+                .and_then(|input| input.command.to_action())
+            {
+                // In goal mode Assist/Suggest is consumed as an affordance-matched
+                // bias by GoalSystem, not reintroduced as a generic task proposal.
+                proposals.retain(|proposal| proposal != &reign_action);
+            }
+        }
         if let Some(action) = llm_command_action.clone() {
             notes.push(format!("LlmActionProposal: proposed {:?}", action));
             proposals.push(action);
         }
+        if let Some(action) = event_script_forced_action.clone() {
+            push_unique_action(&mut proposals, action);
+        }
+        let goal_cycle = self.goal_system.tick(&now, &proposals)?;
+        now.drives = goal_cycle.drives.legacy_sense();
+        let goal_action = goal_cycle
+            .behavior
+            .as_ref()
+            .map(|behavior| behavior.action.clone());
+        now.extensions.insert(
+            "goal_system".to_string(),
+            serde_json::to_value(&goal_cycle)?,
+        );
         let mut action_value_candidates =
             action_value_candidate_actions(&proposals, reign_action.as_ref(), &llm_tick);
 
@@ -3356,7 +3405,7 @@ where
             body: now.body.clone(),
             charger_near_score: sim_world_extension_score(&now, 3),
             charger_visible_score: sim_world_extension_score(&now, 4),
-            proposals,
+            proposals: proposals.clone(),
         })?;
         if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
             baseline_action = action.clone();
@@ -3478,14 +3527,44 @@ where
             baseline_action.clone(),
             candidate_scores,
         );
+        action_selection.shadow_selected_goal = goal_cycle
+            .selection
+            .selected_goal
+            .as_ref()
+            .map(|goal| goal.as_str().to_string());
+        action_selection.goal_switched = goal_cycle.selection.switched;
+        action_selection.goal_retained_by_commitment = goal_cycle.selection.retained_by_commitment;
+        action_selection.goal_selection_reason = Some(goal_cycle.selection.reason.clone());
+        if self.action_selector_mode == ActionSelectorMode::Goal {
+            action_selection.selected_goal = action_selection.shadow_selected_goal.clone();
+            action_selection.selected_behavior = goal_cycle
+                .behavior
+                .as_ref()
+                .map(|behavior| behavior.behavior_id.clone());
+            action_selection.selected_action = goal_action.clone();
+            action_selection.selected_score = goal_cycle
+                .selection
+                .selected_goal
+                .as_ref()
+                .and_then(|selected| {
+                    goal_cycle
+                        .evaluations
+                        .iter()
+                        .find(|evaluation| &evaluation.goal_id == selected)
+                })
+                .map(|evaluation| evaluation.motivation.activation);
+            action_selection.safety_overrode = false;
+        }
         if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
             action_selection.selected_action = Some(action.clone());
             action_selection.selected_score = None;
             action_selection.safety_overrode = false;
-        } else if let Some(action) = event_script_forced_action.as_ref() {
-            action_selection.selected_action = Some(action.clone());
-            action_selection.selected_score = None;
-            action_selection.safety_overrode = false;
+        } else if self.action_selector_mode != ActionSelectorMode::Goal {
+            if let Some(action) = event_script_forced_action.as_ref() {
+                action_selection.selected_action = Some(action.clone());
+                action_selection.selected_score = None;
+                action_selection.safety_overrode = false;
+            }
         }
         for warning in &action_selection.fallback_warnings {
             notes.push(warning.clone());
@@ -3529,7 +3608,7 @@ where
         let conductor_controls = matches!(
             self.models.behaviors.conductor.regime,
             BehaviorRegime::ModelInfer | BehaviorRegime::ModelTrainAndInfer
-        );
+        ) && self.action_selector_mode != ActionSelectorMode::Goal;
         let conductor_selected_action = if conductor_controls {
             conductor_run.chosen
         } else {
@@ -3543,7 +3622,11 @@ where
         }
         let mut chosen_action = mechanical_reign_action_for_selection
             .clone()
-            .or_else(|| event_script_forced_action.clone())
+            .or_else(|| {
+                (self.action_selector_mode != ActionSelectorMode::Goal)
+                    .then(|| event_script_forced_action.clone())
+                    .flatten()
+            })
             .unwrap_or(conductor_selected_action);
         let locomotion_input = self
             .locomotion_tracker
@@ -3555,7 +3638,8 @@ where
             .infer_with_disagreement(&locomotion_input, now.t_ms)?;
         let locomotion_output = locomotion_run.chosen.bounded(0.6, 1.0);
         let locomotion_applied = mechanical_reign_action_for_selection.is_none()
-            && event_script_forced_action.is_none()
+            && (event_script_forced_action.is_none()
+                || self.action_selector_mode == ActionSelectorMode::Goal)
             && matches!(&chosen_action, ActionPrimitive::Explore { .. });
         if locomotion_applied {
             let duration_ms = match &chosen_action {
@@ -3697,9 +3781,21 @@ where
         }
         behavior_runs.push(ear_next_record.erase());
 
-        let safety = self
-            .safety
-            .filter(&now, action_to_motor_command(Some(&chosen_action)));
+        let selected_goal_for_safety = (self.action_selector_mode == ActionSelectorMode::Goal)
+            .then(|| goal_cycle.selection.selected_goal.as_ref())
+            .flatten()
+            .map(|goal| goal.as_str());
+        let safety = self.safety.filter_action(
+            &now,
+            selected_goal_for_safety,
+            &chosen_action,
+            action_to_motor_command(Some(&chosen_action)),
+        );
+        action_selection.safety_overrode = safety.vetoed;
+        now.extensions.insert(
+            "action_selector".to_string(),
+            serde_json::to_value(&action_selection)?,
+        );
         self.locomotion_tracker.observe_command(LocomotionOutput {
             forward_velocity_m_s: safety.command.forward,
             angular_velocity_rad_s: safety.command.turn,
@@ -7248,6 +7344,7 @@ fn select_action_from_scores(
                 selected_score: None,
                 safety_overrode: true,
                 fallback_warnings: fallback_warnings_for_mode(mode),
+                ..ActionSelectionDecision::default()
             };
         }
     }
@@ -7287,6 +7384,13 @@ fn select_action_from_scores(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .cloned(),
+        ActionSelectorMode::GoalShadow | ActionSelectorMode::Goal => {
+            Some(ActionSelectionCandidateScore {
+                action: baseline_action.clone(),
+                score: 0.0,
+                ..ActionSelectionCandidateScore::default()
+            })
+        }
     };
     let fallback_warnings = if candidates.iter().any(|candidate| candidate.fallback_used) {
         fallback_warnings_for_mode(mode)
@@ -7304,6 +7408,7 @@ fn select_action_from_scores(
         baseline_action: Some(baseline_action),
         safety_overrode: false,
         fallback_warnings,
+        ..ActionSelectionDecision::default()
     }
 }
 
@@ -7573,7 +7678,9 @@ fn apply_responses(
             Response::AddImpression(impression) => impressions.push(impression),
             Response::AddExperience(experience) => experiences.push(experience),
             Response::ProposeAction(action) => proposed_actions.push(action),
-            Response::SetDrive { name, value } => set_drive(&mut now.drives, &name, value),
+            Response::AddDriveImpulse { name, value } => {
+                add_drive_impulse(&mut now.drives, &name, value)
+            }
             Response::SetMemorySense(memory) => now.memory = memory,
             Response::Teach(teaching) => teachings.push(teaching),
             Response::AddMemoryNote(note) => notes.push(note),
@@ -8332,14 +8439,22 @@ fn derive_direct_experiences(
     )]
 }
 
-fn set_drive(drives: &mut DriveSense, name: &DriveName, value: f32) {
+fn add_drive_impulse(drives: &mut DriveSense, name: &DriveName, value: f32) {
     match name {
-        DriveName::BatteryHunger => drives.battery_hunger = value,
-        DriveName::DangerAvoidance => drives.danger_avoidance = value,
-        DriveName::Curiosity => drives.curiosity = value,
-        DriveName::SocialInterest => drives.social_interest = value,
-        DriveName::Fatigue => drives.fatigue = value,
-        DriveName::UncertaintyPressure => drives.uncertainty_pressure = value,
+        DriveName::BatteryHunger => {
+            drives.battery_hunger = (drives.battery_hunger + value).clamp(0.0, 1.0)
+        }
+        DriveName::DangerAvoidance => {
+            drives.danger_avoidance = (drives.danger_avoidance + value).clamp(0.0, 1.0)
+        }
+        DriveName::Curiosity => drives.curiosity = (drives.curiosity + value).clamp(0.0, 1.0),
+        DriveName::SocialInterest => {
+            drives.social_interest = (drives.social_interest + value).clamp(0.0, 1.0)
+        }
+        DriveName::Fatigue => drives.fatigue = (drives.fatigue + value).clamp(0.0, 1.0),
+        DriveName::UncertaintyPressure => {
+            drives.uncertainty_pressure = (drives.uncertainty_pressure + value).clamp(0.0, 1.0)
+        }
     }
 }
 
@@ -8355,6 +8470,7 @@ fn describe_safety_reason(reason: Option<SafetyReason>) -> &'static str {
         Some(SafetyReason::HighDanger) => "high danger",
         Some(SafetyReason::RawLlmMotorRejected) => "raw llm motor rejected",
         Some(SafetyReason::ReadOnlyMode) => "read-only mode",
+        Some(SafetyReason::Contact) => "contact",
         None => "unknown reason",
     }
 }
@@ -11711,6 +11827,111 @@ mod tests {
         assert_eq!(decision.mode, ActionSelectorMode::ModelAssisted);
         assert!(!decision.candidates.is_empty());
         assert!(decision.selected_action.is_some());
+    }
+
+    #[tokio::test]
+    async fn goal_shadow_records_evaluation_without_replacing_baseline() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-goal-shadow-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            FixedConductor::new(ActionPrimitive::Stop),
+            SimpleSafety::default(),
+            pete_llm::NoopLlmAgent,
+        )
+        .with_action_selector_mode(ActionSelectorMode::GoalShadow);
+        let tick = runtime
+            .tick(idle_now(100), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        let decision = serde_json::from_value::<ActionSelectionDecision>(
+            tick.frame.now.extensions["action_selector"].clone(),
+        )
+        .unwrap();
+        assert_eq!(decision.mode, ActionSelectorMode::GoalShadow);
+        assert!(decision.selected_goal.is_none());
+        assert!(decision.shadow_selected_goal.is_some());
+        assert!(tick.frame.now.extensions.contains_key("goal_system"));
+    }
+
+    #[tokio::test]
+    async fn goal_mode_executes_goal_behavior_and_publishes_homeostatic_drives() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-goal-mode-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            FixedConductor::new(ActionPrimitive::Stop),
+            SimpleSafety::default(),
+            pete_llm::NoopLlmAgent,
+        )
+        .with_action_selector_mode(ActionSelectorMode::Goal);
+        let mut now = idle_now(100);
+        now.body.battery_level = 0.05;
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        let decision = serde_json::from_value::<ActionSelectionDecision>(
+            tick.frame.now.extensions["action_selector"].clone(),
+        )
+        .unwrap();
+        assert_eq!(decision.selected_goal.as_deref(), Some("seek_charger"));
+        assert!(matches!(
+            decision.selected_behavior.as_deref(),
+            Some("inspect_for_charger" | "systematic_charger_search")
+        ));
+        assert_ne!(tick.chosen_action, Some(ActionPrimitive::Dock));
+        assert!(tick.frame.now.drives.battery_hunger > 0.5);
+    }
+
+    #[tokio::test]
+    async fn goal_mode_assist_is_only_an_affordance_bias_but_direct_still_overrides() {
+        let build_runtime = |path: &'static str| {
+            let ledger = JsonlLedger::new(path);
+            let memory = InMemoryExperienceStore::new();
+            let recall = memory.clone();
+            MinimalRuntime::new(
+                ledger,
+                memory,
+                recall,
+                FixedConductor::new(ActionPrimitive::Stop),
+                SimpleSafety::default(),
+                pete_llm::NoopLlmAgent,
+            )
+            .with_action_selector_mode(ActionSelectorMode::Goal)
+        };
+        let mut assisted = build_runtime("/tmp/pete-runtime-goal-assist-test");
+        assisted.reign_queue.lock().unwrap().push(test_reign_input(
+            100,
+            ReignMode::Assist,
+            ReignCommand::Dock,
+            2_000,
+        ));
+        let assisted_tick = assisted
+            .tick(idle_now(100), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        assert_ne!(assisted_tick.chosen_action, Some(ActionPrimitive::Dock));
+
+        let mut direct = build_runtime("/tmp/pete-runtime-goal-direct-test");
+        direct.reign_queue.lock().unwrap().push(test_reign_input(
+            100,
+            ReignMode::Direct,
+            ReignCommand::Dock,
+            2_000,
+        ));
+        let direct_tick = direct
+            .tick(idle_now(100), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(direct_tick.chosen_action, Some(ActionPrimitive::Dock));
     }
 
     #[test]
