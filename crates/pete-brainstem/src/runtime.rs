@@ -469,6 +469,7 @@ where
             self.estop_latched,
             self.safety_latched,
             self.charging_interlock_latched,
+            self.safety_latch_kind,
         );
     }
 

@@ -168,6 +168,7 @@ static DIAGNOSTIC_TRANSPORT: [AtomicU8; DIAGNOSTIC_SESSION_CAPACITY] =
 static ACTIVE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SESSION_GENERATION: AtomicU32 = AtomicU32::new(0);
 static SESSION_SAFETY_FLAGS: AtomicU32 = AtomicU32::new(0);
+static SESSION_SAFETY_LATCH_KIND: AtomicU8 = AtomicU8::new(0);
 static ACTIVE_TRANSPORT: AtomicU8 = AtomicU8::new(0);
 static AUTHORITY_REQUEST: AtomicU32 = AtomicU32::new(0);
 static AUTHORITY_ACK: AtomicU32 = AtomicU32::new(0);
@@ -464,6 +465,20 @@ pub enum SafetyEventKind {
     Tilt = 6,
     Impact = 7,
     Charging = 8,
+}
+
+fn safety_event_kind(code: u8) -> Option<SafetyEventKind> {
+    match code {
+        x if x == SafetyEventKind::Bump as u8 => Some(SafetyEventKind::Bump),
+        x if x == SafetyEventKind::Cliff as u8 => Some(SafetyEventKind::Cliff),
+        x if x == SafetyEventKind::WheelDrop as u8 => Some(SafetyEventKind::WheelDrop),
+        x if x == SafetyEventKind::EStop as u8 => Some(SafetyEventKind::EStop),
+        x if x == SafetyEventKind::Heartbeat as u8 => Some(SafetyEventKind::Heartbeat),
+        x if x == SafetyEventKind::Tilt as u8 => Some(SafetyEventKind::Tilt),
+        x if x == SafetyEventKind::Impact as u8 => Some(SafetyEventKind::Impact),
+        x if x == SafetyEventKind::Charging as u8 => Some(SafetyEventKind::Charging),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -946,6 +961,7 @@ pub fn set_session_safety_snapshot(
     estop_latched: bool,
     safety_tripped: bool,
     motion_interlock_latched: bool,
+    safety_latch_kind: Option<SafetyEventKind>,
 ) {
     SESSION_SAFETY_FLAGS.store(
         (estop_latched as u32)
@@ -953,11 +969,20 @@ pub fn set_session_safety_snapshot(
             | ((motion_interlock_latched as u32) << 2),
         Ordering::Release,
     );
+    SESSION_SAFETY_LATCH_KIND.store(
+        safety_latch_kind.map_or(0, |kind| kind as u8),
+        Ordering::Release,
+    );
 }
 
-pub fn session_safety_snapshot() -> (bool, bool, bool) {
+pub fn session_safety_snapshot() -> (bool, bool, bool, Option<SafetyEventKind>) {
     let flags = SESSION_SAFETY_FLAGS.load(Ordering::Acquire);
-    (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0)
+    (
+        flags & 1 != 0,
+        flags & 2 != 0,
+        flags & 4 != 0,
+        safety_event_kind(SESSION_SAFETY_LATCH_KIND.load(Ordering::Acquire)),
+    )
 }
 
 pub fn request_authority_transition(
@@ -3275,6 +3300,7 @@ struct StatusJson {
     body_state: &'static str,
     estop_latched: bool,
     safety_tripped: bool,
+    safety_latch_kind: &'static str,
     motion_interlock_latched: bool,
     wifi_state: &'static str,
     https_state: &'static str,
@@ -3392,7 +3418,8 @@ struct ForebrainUartStatusJson {
 
 #[cfg(feature = "pico-w")]
 pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Result<&'a str, ()> {
-    let (estop_latched, safety_tripped, motion_interlock_latched) = session_safety_snapshot();
+    let (estop_latched, safety_tripped, motion_interlock_latched, safety_latch_kind) =
+        session_safety_snapshot();
     let status = StatusJson {
         firmware_name: snapshot.firmware_name,
         firmware_version: snapshot.firmware_version,
@@ -3431,6 +3458,7 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         body_state: body_state_text(snapshot.body_state),
         estop_latched,
         safety_tripped,
+        safety_latch_kind: safety_event_kind_text(safety_latch_kind),
         motion_interlock_latched,
         wifi_state: wifi_state_text(snapshot.wifi_state),
         https_state: https_state_text(snapshot.https_state),
@@ -3532,6 +3560,20 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
         cliff_front_left_signal: snapshot.create_sensor_cliff_front_left_signal,
         cliff_front_right_signal: snapshot.create_sensor_cliff_front_right_signal,
         cliff_right_signal: snapshot.create_sensor_cliff_right_signal,
+    }
+}
+
+fn safety_event_kind_text(kind: Option<SafetyEventKind>) -> &'static str {
+    match kind {
+        Some(SafetyEventKind::Bump) => "bump",
+        Some(SafetyEventKind::Cliff) => "cliff",
+        Some(SafetyEventKind::WheelDrop) => "wheel_drop",
+        Some(SafetyEventKind::EStop) => "estop",
+        Some(SafetyEventKind::Heartbeat) => "heartbeat",
+        Some(SafetyEventKind::Tilt) => "tilt",
+        Some(SafetyEventKind::Impact) => "impact",
+        Some(SafetyEventKind::Charging) => "charging",
+        None => "none",
     }
 }
 
