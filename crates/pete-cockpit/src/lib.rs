@@ -1083,11 +1083,17 @@ impl CockpitContract {
             .map(ToOwned::to_owned)
             .collect();
         let optional_verbs = optional_cockpit_verbs();
+        let tolerated_advertised_verbs = tolerated_advertised_verbs();
         let missing_verbs = self
             .capabilities
             .verbs
             .iter()
-            .filter(|verb| !modeled_verbs.iter().any(|modeled| modeled == *verb))
+            .filter(|verb| {
+                !modeled_verbs.iter().any(|modeled| modeled == *verb)
+                    && !tolerated_advertised_verbs
+                        .iter()
+                        .any(|tolerated| tolerated == &verb.as_str())
+            })
             .cloned()
             .collect();
         let extra_verbs = modeled_verbs
@@ -2450,6 +2456,7 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "status",
         "get_capabilities",
         "get_events",
+        "bootsel",
         "restart_create",
         "reset_motherbrain",
         "arm",
@@ -2499,7 +2506,11 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
 }
 
 fn optional_cockpit_verbs() -> Vec<&'static str> {
-    vec!["reset_motherbrain"]
+    vec!["bootsel", "reset_motherbrain"]
+}
+
+fn tolerated_advertised_verbs() -> Vec<&'static str> {
+    vec!["restart_mpu"]
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -7299,6 +7310,21 @@ mod tests {
             report.missing_verbs,
             report.extra_verbs,
             report.unknown_events
+        );
+    }
+
+    #[test]
+    fn live_service_verbs_do_not_block_maintenance_handshake() {
+        let mut capabilities = body_toml_capabilities();
+        capabilities.verbs.push("bootsel".to_owned());
+        capabilities.verbs.push("restart_mpu".to_owned());
+        let contract = CockpitContract::new(capabilities);
+        let report = contract.validate_local_model();
+
+        assert!(
+            report.missing_verbs.is_empty(),
+            "missing={:?}",
+            report.missing_verbs
         );
     }
 

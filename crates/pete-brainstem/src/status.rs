@@ -942,16 +942,22 @@ pub fn session_role(session_hash: u32) -> Option<u8> {
         .map(|slot| DIAGNOSTIC_ROLE[slot].load(Ordering::Acquire))
 }
 
-pub fn set_session_safety_snapshot(estop_latched: bool, safety_tripped: bool) {
+pub fn set_session_safety_snapshot(
+    estop_latched: bool,
+    safety_tripped: bool,
+    motion_interlock_latched: bool,
+) {
     SESSION_SAFETY_FLAGS.store(
-        (estop_latched as u32) | ((safety_tripped as u32) << 1),
+        (estop_latched as u32)
+            | ((safety_tripped as u32) << 1)
+            | ((motion_interlock_latched as u32) << 2),
         Ordering::Release,
     );
 }
 
-pub fn session_safety_snapshot() -> (bool, bool) {
+pub fn session_safety_snapshot() -> (bool, bool, bool) {
     let flags = SESSION_SAFETY_FLAGS.load(Ordering::Acquire);
-    (flags & 1 != 0, flags & 2 != 0)
+    (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0)
 }
 
 pub fn request_authority_transition(
@@ -3267,6 +3273,9 @@ struct StatusJson {
     last_error_action: &'static str,
     last_error_hint: &'static str,
     body_state: &'static str,
+    estop_latched: bool,
+    safety_tripped: bool,
+    motion_interlock_latched: bool,
     wifi_state: &'static str,
     https_state: &'static str,
     http_requests: u32,
@@ -3383,6 +3392,7 @@ struct ForebrainUartStatusJson {
 
 #[cfg(feature = "pico-w")]
 pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Result<&'a str, ()> {
+    let (estop_latched, safety_tripped, motion_interlock_latched) = session_safety_snapshot();
     let status = StatusJson {
         firmware_name: snapshot.firmware_name,
         firmware_version: snapshot.firmware_version,
@@ -3419,6 +3429,9 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         last_error_action: runtime_action_text(snapshot.last_error_action),
         last_error_hint: error_hint_text(snapshot),
         body_state: body_state_text(snapshot.body_state),
+        estop_latched,
+        safety_tripped,
+        motion_interlock_latched,
         wifi_state: wifi_state_text(snapshot.wifi_state),
         https_state: https_state_text(snapshot.https_state),
         http_requests: snapshot.http_requests,

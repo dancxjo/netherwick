@@ -288,6 +288,7 @@ where
             self.enter_error(error);
             return;
         }
+        self.publish_safety_snapshot();
         if let Err(error) = self.maintain_full_mode() {
             self.enter_error(error);
             return;
@@ -457,10 +458,18 @@ where
         status::set_command(None);
         status::set_runtime_state(RuntimeState::Idle);
         status::set_body_state(BodyState::Idle);
-        status::set_session_safety_snapshot(self.estop_latched, self.safety_latched);
+        self.publish_safety_snapshot();
         // The session module supplies the pending hash before requesting the
         // barrier. Until it is wired, generation itself is a fail-closed token.
         status::acknowledge_session_replace(generation, status::pending_session_hash());
+    }
+
+    fn publish_safety_snapshot(&self) {
+        status::set_session_safety_snapshot(
+            self.estop_latched,
+            self.safety_latched,
+            self.charging_interlock_latched,
+        );
     }
 
     fn poll_control_command(&mut self) {
