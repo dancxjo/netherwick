@@ -8,6 +8,7 @@ RUN apt-get update \
         ca-certificates \
         clang \
         cmake \
+        lld \
         libasound2-dev \
         libssl-dev \
         libudev-dev \

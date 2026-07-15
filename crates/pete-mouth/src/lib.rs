@@ -99,7 +99,7 @@ impl QueuedPiperCpalMouth {
                     }
                 };
                 println!("robot mouth Piper voice ready");
-                for item in rx {
+                while let Ok(item) = rx.recv() {
                     match mouth.speak(&item.text) {
                         Ok(outcome) => {
                             println!(
@@ -113,11 +113,20 @@ impl QueuedPiperCpalMouth {
                         }
                         Err(error) => {
                             let message = error.to_string();
-                            println!("robot mouth failed: {message}; text {:?}", item.text);
+                            println!(
+                                "robot mouth failed: {message}; disabling mouth worker; text {:?}",
+                                item.text
+                            );
                             tracing::warn!(error = %message, text = %item.text, "queued Piper mouth failed");
                             if let Some(outcome_tx) = item.outcome_tx {
-                                let _ = outcome_tx.send(Err(message));
+                                let _ = outcome_tx.send(Err(message.clone()));
                             }
+                            for pending in rx.try_iter() {
+                                if let Some(outcome_tx) = pending.outcome_tx {
+                                    let _ = outcome_tx.send(Err(message.clone()));
+                                }
+                            }
+                            break;
                         }
                     }
                 }
@@ -189,11 +198,10 @@ impl Drop for QueuedPiperCpalMouth {
     fn drop(&mut self) {
         drop(self.tx.take());
         if let Some(worker) = self.worker.take() {
-            if worker.is_finished() {
-                let _ = worker.join();
-            } else {
-                println!("robot mouth worker still running at shutdown; detaching");
+            if !worker.is_finished() {
+                println!("robot mouth worker still running at shutdown; waiting for it to stop");
             }
+            let _ = worker.join();
         }
     }
 }

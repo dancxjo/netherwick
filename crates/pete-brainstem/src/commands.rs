@@ -10,6 +10,18 @@ pub enum CreateOiMode {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(dead_code)]
+pub enum SafetyLatchKind {
+    Bump,
+    Cliff,
+    WheelDrop,
+    Tilt,
+    Impact,
+    Charging,
+    Heartbeat,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum BrainstemCommand {
     Ping,
     Arm,
@@ -132,6 +144,10 @@ pub enum BrainstemCommand {
         clear: bool,
         seq: u32,
     },
+    ClearSafetyLatch {
+        kind: SafetyLatchKind,
+        seq: u32,
+    },
     HeartbeatStop {
         timeout_ms: u32,
         seq: u32,
@@ -172,6 +188,11 @@ pub enum BrainstemCommand {
         duration_ms: u32,
         seq: u32,
     },
+    OrientationProbe {
+        angular_mrad_s: i16,
+        duration_ms: u32,
+        seq: u32,
+    },
     ResetOdometry {
         seq: u32,
     },
@@ -181,7 +202,6 @@ pub enum BrainstemCommand {
     ClearImuOrientation {
         seq: u32,
     },
-    RestartMpu,
     RestartCreate,
     ResetMotherbrain,
     GetCapabilities,
@@ -369,6 +389,9 @@ pub(crate) enum RuntimeCommand {
     CliffGuard {
         clear: bool,
     },
+    ClearSafetyLatch {
+        kind: SafetyLatchKind,
+    },
     HeartbeatStop {
         timeout_ms: u32,
     },
@@ -401,10 +424,13 @@ pub(crate) enum RuntimeCommand {
         angular_mrad_s: i16,
         duration_ms: u32,
     },
+    OrientationProbe {
+        angular_mrad_s: i16,
+        duration_ms: u32,
+    },
     ResetOdometry,
     ZeroImuOrientation,
     ClearImuOrientation,
-    RestartMpu,
     PulseBrc,
     StartOi,
     SetCreateBaud(u32),
@@ -432,6 +458,7 @@ pub(crate) enum RuntimeCommand {
 }
 
 pub(crate) const ACQUIRE_CREATE_SCRIPT: &[RuntimeCommand] = &[
+    RuntimeCommand::WakeCreate,
     RuntimeCommand::PulseBrc,
     RuntimeCommand::StartOi,
     RuntimeCommand::SetMode(CreateOiMode::Full),

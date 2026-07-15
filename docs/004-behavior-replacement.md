@@ -37,3 +37,12 @@ For event and robot-output behaviors, model replacement must preserve the output
 This keeps cute/status behaviors learnable without letting a generated script or model bypass the robot safety, mouth, and body-audio gates.
 
 Randomness belongs inside the teacher behavior input/output record, not outside the behavior system. If a TypeScript teacher uses randomness, the selected output is still recorded as the teacher sample. Shadow models learn from the emitted `EventScriptOutput`, and model inference remains constrained to the same typed output shape.
+
+## Locomotion NEAT
+
+The `locomotion` behavior is the first evolved motion-decision layer. Its
+hardcoded implementation preserves the existing wander motor mapping and its
+NEAT implementation consumes a small, versioned sensor/history vector. Only
+autonomous `Explore` actions are lowered through this behavior; Reign and
+event-forced actions keep priority. Both implementations still feed the same
+autonomic and brainstem safety path. See [neat-locomotion.md](neat-locomotion.md).

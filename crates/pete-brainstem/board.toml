@@ -33,8 +33,18 @@ status_physical_pin = 26
 
 [pins.create_device_detect]
 enabled = false
-pin = "GP21"
-gpio = 21
+# Create 1 BRC and Device Detect are the same robot-side Mini-DIN pin.
+# Keep this placeholder disabled; the active firmware role is create_brc.
+pin = "GP19"
+gpio = 19
+physical_pin = 25
+
+[pins.create_charging_indicator]
+enabled = true
+pin = "GP17"
+gpio = 17
+physical_pin = 22
+active = "high"
 
 [pins.motherbrain_reset]
 enabled = false # enable only after the installed transistor/RUN circuit is continuity-tested

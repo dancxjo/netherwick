@@ -54,6 +54,7 @@ impl Default for ConductorConfig {
 #[serde(rename_all = "snake_case")]
 pub enum NavigationIntent {
     GoTowardKnownCharger,
+    RemainCharging,
     AvoidKnownDangerCell,
     InspectSafeNovelFrontier,
     ReturnToFamiliarSafeCell,
@@ -124,7 +125,25 @@ impl SimpleConductor {
                 "wheel drop safety signal requires stopping",
             ));
         }
+        if input.body.charging {
+            self.recovery = RecoveryState::default();
+            return Ok(navigation_goal(
+                NavigationIntent::RemainCharging,
+                ActionPrimitive::Stop,
+                1.0,
+                "charging is already established; remain stationary",
+            ));
+        }
         let charge_context = charge_context(&input);
+        if charge_context.charging_established {
+            self.recovery = RecoveryState::default();
+            return Ok(navigation_goal(
+                NavigationIntent::RemainCharging,
+                ActionPrimitive::Stop,
+                1.0,
+                "charging is already established; remain stationary",
+            ));
+        }
         if input.body.battery_level <= self.config.critical_battery {
             self.recovery = RecoveryState::default();
             let decision = critical_battery_charge_goal(&input, charge_context);
@@ -197,7 +216,7 @@ impl SimpleConductor {
                     NavigationIntent::GoTowardKnownCharger,
                     ActionPrimitive::Dock,
                     0.95,
-                    "charger contact is plausible from near/charging signal",
+                    "charger contact is plausible from proximity and dock prediction",
                 ));
             }
             if charge_context.should_approach {
@@ -441,6 +460,7 @@ fn charge_alignment_turn(bearing_rad: f32) -> Option<TurnDir> {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ChargeContext {
+    charging_established: bool,
     dock_plausible: bool,
     should_approach: bool,
     should_search: bool,
@@ -457,14 +477,17 @@ fn charge_context(input: &ConductorInput) -> ChargeContext {
         .unwrap_or_default();
     let prediction_probability = prediction.charge_probability.clamp(0.0, 1.0);
     let dock_likelihood = prediction.dock_likelihood.clamp(0.0, 1.0);
-    let dock_plausible =
-        input.body.charging || near >= 0.92 || (near >= 0.80 && dock_likelihood >= 0.85);
-    let should_approach = !dock_plausible
+    let charging_established = input.body.charging;
+    let dock_plausible = near >= 0.92 || (near >= 0.80 && dock_likelihood >= 0.85);
+    let should_approach = !charging_established
+        && !dock_plausible
         && (visible >= 0.20 || near >= 0.25 || memory > 0.5 || prediction_probability >= 0.70);
-    let should_search = !dock_plausible
+    let should_search = !charging_established
+        && !dock_plausible
         && !should_approach
         && (input.body.battery_level <= 0.20 || memory >= 0.25 || prediction_probability >= 0.35);
     ChargeContext {
+        charging_established,
         dock_plausible,
         should_approach,
         should_search,
@@ -638,6 +661,36 @@ mod tests {
         input.charger_near_score = 0.95;
 
         assert_eq!(conductor.choose(input).unwrap(), ActionPrimitive::Dock);
+    }
+
+    #[test]
+    fn critical_battery_remains_stopped_when_already_charging() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        body.charging = true;
+        let mut input = input_with_body(body);
+        input.charger_near_score = 0.95;
+
+        let decision = conductor.choose_with_navigation_goal(input).unwrap();
+
+        assert_eq!(decision.intent, NavigationIntent::RemainCharging);
+        assert_eq!(decision.action, ActionPrimitive::Stop);
+        assert!(decision.reason.contains("already established"));
+    }
+
+    #[test]
+    fn low_battery_remains_stopped_when_already_charging() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.15;
+        body.charging = true;
+        let input = input_with_body(body);
+
+        let decision = conductor.choose_with_navigation_goal(input).unwrap();
+
+        assert_eq!(decision.intent, NavigationIntent::RemainCharging);
+        assert_eq!(decision.action, ActionPrimitive::Stop);
     }
 
     #[test]

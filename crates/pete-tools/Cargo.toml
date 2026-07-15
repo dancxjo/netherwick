@@ -41,6 +41,7 @@ pete-ledger = { path = "../pete-ledger" }
 pete-llm = { path = "../pete-llm" }
 pete-map = { path = "../pete-map" }
 pete-memory = { path = "../pete-memory" }
+pete-neat = { path = "../pete-neat" }
 pete-models = { path = "../pete-models" }
 pete-mouth = { path = "../pete-mouth" }
 pete-now = { path = "../pete-now" }

@@ -10,6 +10,7 @@ members = [
     "crates/pete-autonomic",
     "crates/pete-actions",
     "crates/pete-behaviors",
+    "crates/pete-neat",
     "crates/pete-models",
     "crates/pete-training",
     "crates/pete-experience",

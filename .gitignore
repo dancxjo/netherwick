@@ -6,6 +6,7 @@
 /data/ledger/**
 /data/models/**
 /data/recordings/**
+/data/reports/neat/**
 /data/snapshots/**
 
 !/data/ledger/.gitkeep

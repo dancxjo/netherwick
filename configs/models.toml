@@ -1,22 +1,8 @@
-[behavior.eye_next]
+[behavior.action_value]
 regime = "shadow_train"
-hardcoded = "eye.copy_current"
-model = "eye.burn.next_v0"
-checkpoint = "data/models/eye_next_v0"
-fallback = "use_hardcoded"
-
-[behavior.ear_next]
-regime = "hardcoded"
-hardcoded = "ear.copy_current"
-model = "ear.burn.next_v0"
-checkpoint = "data/models/ear_next_v0"
-fallback = "use_hardcoded"
-
-[behavior.danger]
-regime = "shadow_train"
-hardcoded = "danger.range_bumper"
-model = "danger.burn.v0"
-checkpoint = "data/models/danger_v0"
+hardcoded = "action_value.handcoded"
+model = "action_value.burn.v0"
+checkpoint = "data/models/action_value_v0"
 fallback = "use_hardcoded"
 
 [behavior.charge]
@@ -26,20 +12,6 @@ model = "charge.burn.v0"
 checkpoint = "data/models/charge_v0"
 fallback = "use_hardcoded"
 
-[behavior.future]
-regime = "hardcoded"
-hardcoded = "future.stasis"
-model = "future.burn.v0"
-checkpoint = "data/models/future_v0"
-fallback = "use_hardcoded"
-
-[behavior.action_value]
-regime = "shadow_train"
-hardcoded = "action_value.handcoded"
-model = "action_value.burn.v0"
-checkpoint = "data/models/action_value_v0"
-fallback = "use_hardcoded"
-
 [behavior.conductor]
 regime = "hardcoded"
 hardcoded = "conductor.simple_v0"
@@ -47,12 +19,19 @@ model = "conductor.burn.v0"
 checkpoint = "data/models/conductor_v0"
 fallback = "return_error"
 
-[behavior.experience]
+[behavior.danger]
 regime = "shadow_train"
-hardcoded = "experience.no_latent_yet"
-model = "experience.autoencoder.v0"
-checkpoint = "data/models/experience_v0"
-fallback = "return_error"
+hardcoded = "danger.range_bumper"
+model = "danger.burn.v0"
+checkpoint = "data/models/danger_v0"
+fallback = "use_hardcoded"
+
+[behavior.ear_next]
+regime = "hardcoded"
+hardcoded = "ear.copy_current"
+model = "ear.burn.next_v0"
+checkpoint = "data/models/ear_next_v0"
+fallback = "use_hardcoded"
 
 [behavior.event_bump]
 regime = "shadow_train"
@@ -68,74 +47,30 @@ model = "event.face_detected.shadow.v0"
 checkpoint = "data/models/event_face_detected_v0"
 fallback = "use_hardcoded"
 
-[vectorizer.vision_image]
-enabled = true
-model = "pete.image.frame_stats.v1"
-model_label = "Pete deterministic image frame statistics"
-purpose = "scene_similarity"
-collection = "scene_vectors"
-fallback = "placeholder"
+[behavior.experience]
+regime = "shadow_train"
+hardcoded = "experience.no_latent_yet"
+model = "experience.autoencoder.v0"
+checkpoint = "data/models/experience_v0"
+fallback = "return_error"
 
-[vectorizer.vision_crop]
-enabled = true
-model = "pete.image.frame_stats.v1"
-model_label = "Pete deterministic image crop statistics"
-purpose = "face_identity"
-collection = "faces"
-fallback = "placeholder"
+[behavior.eye_next]
+regime = "shadow_train"
+hardcoded = "eye.copy_current"
+model = "eye.burn.next_v0"
+checkpoint = "data/models/eye_next_v0"
+fallback = "use_hardcoded"
 
-[vectorizer.vision_features]
-enabled = true
-model = "pete.image.feature_artifact.v1"
-model_label = "Upstream image/scene vector artifact"
-purpose = "visual_similarity"
-collection = "images"
-fallback = "placeholder"
+[behavior.future]
+regime = "hardcoded"
+hardcoded = "future.stasis"
+model = "future.burn.v0"
+checkpoint = "data/models/future_v0"
+fallback = "use_hardcoded"
 
-[vectorizer.audio_pcm]
-enabled = true
-model = "pete.audio.window_stats.v1"
-model_label = "Pete deterministic audio window statistics"
-purpose = "voice_identity"
-collection = "voices"
-fallback = "placeholder"
-
-[vectorizer.audio_voice]
-enabled = true
-model = "pete.audio.window_stats.v1"
-model_label = "Pete deterministic voice window statistics"
-purpose = "voice_identity"
-collection = "voices"
-fallback = "placeholder"
-
-[vectorizer.audio_speech]
-enabled = true
-model = "pete.text.hashing.v1"
-model_label = "Pete deterministic speech hash embedding"
-purpose = "transcript_semantic"
-collection = "transcripts"
-fallback = "placeholder"
-
-[vectorizer.audio_transcript]
-enabled = true
-model = "pete.text.hashing.v1"
-model_label = "Pete deterministic transcript hash embedding"
-purpose = "transcript_semantic"
-collection = "transcripts"
-fallback = "placeholder"
-
-[vectorizer.audio_phoneme]
-enabled = true
-model = "pete.text.hashing.v1"
-model_label = "Pete deterministic phoneme hash embedding"
-purpose = "transcript_semantic"
-collection = "transcripts"
-fallback = "placeholder"
-
-[vectorizer.depth_scene]
-enabled = true
-model = "pete.depth.scene_stats.v1"
-model_label = "Pete deterministic depth scene statistics"
-purpose = "scene_similarity"
-collection = "scene_vectors"
-fallback = "placeholder"
+[behavior.locomotion]
+regime = "model_infer"
+hardcoded = "locomotion.hardcoded_wander.v0"
+model = "locomotion.neat.v0"
+checkpoint = "data/models/locomotion_neat_v0"
+fallback = "use_hardcoded"

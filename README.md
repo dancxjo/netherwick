@@ -140,6 +140,46 @@ Pete now has deliberately separate bodily control and bulk-data planes.
 See [docs/018-higher-brain-framework.md](docs/018-higher-brain-framework.md) for
 the protocol, provisioning, authorization, transfer, jobs, candidate lifecycle,
 and simulated end-to-end exercise.
+`pete` is a Rust workspace for Pete, an embodied self-training robot architecture.
+
+Pete now has working real-world perception and guarded physical possession. Kinect RGB and depth data can be fused into aligned, Minecrafty but properly colored 3D voxels, while `just possess` establishes the motherbrain lease, streams body telemetry, and drives through bounded safety gates. The active milestone is behavior validation: proving that normal runs compose perception, action selection, autonomic vetoes, brainstem reflexes, recovery, and learning traces consistently.
+
+The project still keeps the larger PETE architecture in view. Pete gathers raw sensors, memory recalls, internal drives, model predictions, surprise, and LLM guidance into `Now`. `Now` is compressed into an `ExperienceLatent`, used to imagine futures, choose actions, and train from consequences.
+
+Pete acts through high-level action primitives. A hard-coded autonomic layer keeps the body safe. The LLM may command, reflect, critique, and teach, but cannot bypass safety.
+
+The LLM loop is active as a trainer, critic, and planner. It predicts counterfactual outcomes, critiques training data, and suggests motion intents. Physical motion now reaches the body through possession; the remaining work is to validate behavior and safety outcomes under real contact, charging, cliff, wheel-drop, heartbeat-loss, and transport-loss conditions.
+
+Every hard-coded behavior is replaceable. It can run directly, shadow-train a model, compare with a model, promote a model, or fall back to safe hand-written logic.
+
+The first small evolved nervous system is the replaceable `locomotion` behavior.
+Run `just train --neat locomotion` to evolve it through a staged, WorldLab-visible
+curriculum and promote it when the transfer audit beats the active baseline. See
+[docs/neat-locomotion.md](docs/neat-locomotion.md).
+
+Pete is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.
+
+Pete's higher-brain split now has a reproducible forebrain, a strictly separate
+bulk-data plane, immutable experience bundles, durable training jobs, and
+atomic candidate activation/rollback. See
+[docs/018-higher-brain-framework.md](docs/018-higher-brain-framework.md) for the
+architecture, provisioning, enrollment, and simulated end-to-end workflow.
+
+## Current milestone: behavior validation
+
+Possession and the live perception stack are operational. The current milestone is to validate complete behavior episodes and preserve their evidence:
+
+- Kinect depth and RGB are being aligned into colored voxels.
+- The voxel output is coarse, blocky, and intentionally debuggable.
+- Visible structures in the voxel scene correspond to real things in the room.
+- The 3D/WebXR viewer is the main inspection surface for the current world model.
+- The 2D map path needs restoration after drifting out of alignment and then failing.
+- `just possess` acquires and maintains the motherbrain lease with bounded motion and explicit STOP/exorcize shutdown.
+- Normal-run tests cover random walk, bump stop, and conductor recovery.
+- Create packet age and completeness now drive body freshness; reconnect cannot reopen motion on cached telemetry.
+- The next physical work is the safety checklist below, not restoration of the command-to-base path.
+
+The next good artifact is a capture set: screenshots, video capture, and a short golden run containing RGB, depth, IMU, odometry, command traces, safety decisions, and map/voxel outputs from the same session.
 
 ## Architecture sketch
 
@@ -189,6 +229,61 @@ architectural restart:
    deliberately non-mobile second body or safe low-voltage fixture.
 9. Exercise higher-brain transfer interruption, candidate return, activation,
    and rollback across the actual Pi and forebrain links.
+The present engineering emphasis is not beauty. It is spatial trust. A crude voxel world that stays aligned is more useful than a polished render that cannot be believed.
+
+See [docs/013-feature-registry.md](docs/013-feature-registry.md) for the universal observation layer: everything Pete observes should become a Feature before new learning systems consume it.
+
+## Constellations
+
+A **constellation** is a repeatable pattern of experience, not merely a visual cluster. The first obvious constellations come from nearby colored voxels, planes, corners, and depth edges, but the abstraction should generalize across all modalities:
+
+- geometry: points, voxels, surfaces, occupancy, relative position,
+- color and image evidence,
+- motion and odometry,
+- robot body state,
+- audio and speech events,
+- text labels and image descriptions,
+- memory recalls,
+- prediction error and surprise,
+- LLM counterfactuals, critiques, and suggested actions.
+
+The search target is not yet "chair" or "kitchen." The search target is "I have seen this arrangement before." Once a constellation survives time, viewpoint changes, lighting changes, motion, and critique, it can be promoted into an object, place, affordance, or training specimen.
+
+See [docs/constellations.md](docs/constellations.md) for the generalized pattern-search model.
+
+## Active debugging tracks
+
+### 3D voxel world
+
+The voxel path is currently the strongest signal. Keep it capture-first and regression-friendly:
+
+```bash
+just live-server
+# open the 3D/WebXR view printed by the server, or visit /view/3d
+```
+
+When the world looks right, save screenshots and a short video. When it looks wrong, preserve the input capture rather than only the rendered failure.
+
+### 2D map restoration
+
+The 2D map previously drifted out of alignment and then stopped working. Treat it as a derived product of the same spatial truth used by the voxel view:
+
+1. Verify that the coordinate frame used for voxel projection is the same frame the 2D map consumes.
+2. Confirm that map updates are still being emitted.
+3. Check whether the map renderer is alive but receiving empty or invalid data.
+4. Compare a known-good capture against the current map path.
+
+### Behavior validation
+
+Movement is deliberately conservative and now operational under possession. Validate each behavior from command intent outward:
+
+1. Did a movement intent get generated?
+2. Did the controller receive it?
+3. Did the safety layer veto it?
+4. Is the base in the correct mode to accept motion?
+5. Did the robot report a fault, dock state, cliff signal, bumper signal, or stale serial/body connection?
+
+Do not bypass safety to make a scenario pass. Preserve the chosen action, autonomic decision, final hardware gate, brainstem event sequence, and observed body outcome so discrepancies become regression tests.
 
 ## Setup
 
@@ -280,6 +375,27 @@ is attempted.
 
 See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions,
 device expectations, success criteria, and failure behavior.
+The guarded physical bumper-recovery smoke test uses the same possession path:
+
+```bash
+just possess --recovery-smoke --wheels-off-floor
+```
+
+It requires a physical brainstem and explicit wheels-off-floor acknowledgement,
+then waits for an operator-held bumper and verifies contact → stop → clear →
+reverse → turn → probe → inspect before STOP and exorcize. This command is
+documented but has not been run as part of this software-only readiness pass.
+
+Physical validation still pending:
+
+- [ ] charging interlock,
+- [ ] bumper recovery,
+- [ ] all four cliff sensors,
+- [ ] wheel drop,
+- [ ] heartbeat loss,
+- [ ] transport loss and stopped reconnect with fresh packet-0 telemetry.
+
+See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions, device expectations, success criteria, and failure behavior.
 
 ## Docker services
 

@@ -14,7 +14,11 @@ use pete_behaviors::{
     ReplaceableBehavior, TargetExtractor, TrainingSample, TrainingSource,
 };
 use pete_body::{BodyFlags, BodySense};
-use pete_cockpit::{Cockpit, MotionCommand, MotorCommand, SafeCockpit, StatusSummary};
+use pete_cockpit::{
+    bump_escape_duration_ms, Cockpit, CockpitEventKind, EscapeDirection, MotionCommand,
+    MotorCommand, SafeCockpit, SafeStopReason, SafetyLatchKind, StatusSummary,
+    BUMP_ESCAPE_BACKOFF_DURATION_MS,
+};
 use pete_conductor::{Conductor, ConductorInput, NavigationIntent, SimpleConductor};
 use pete_core::{Pose2, Provenance, Reward, TimeMs};
 use pete_events::{default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response};
@@ -47,6 +51,10 @@ use pete_models::{
     DangerNetTrainer, EarNextNetTrainer, ExperienceAutoencoderTrainer, EyeNextNetTrainer,
     FutureNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
     HardcodedDangerPredictor,
+};
+use pete_neat::{
+    HardcodedLocomotionBehavior, LocomotionInput, LocomotionOutput, LocomotionTracker,
+    NeatLocomotionBehavior,
 };
 use pete_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
@@ -92,6 +100,7 @@ where
     pub nudge_policy: NudgePolicy,
     pub local_map: LocalMap,
     pub last_behavior_runs: Vec<ErasedBehaviorRunRecord>,
+    locomotion_tracker: LocomotionTracker,
     chirp_events: ChirpEventState,
     nudge: NudgeController,
 }
@@ -1015,6 +1024,13 @@ impl RuntimeModelStack {
 
     pub fn from_behavior_config(config: &BehaviorRegistryConfig) -> Result<Self> {
         let mut stack = Self::default();
+        if let Some(behavior) = config.behavior.get("locomotion") {
+            stack.behaviors.locomotion = locomotion_behavior(
+                behavior.regime,
+                load_locomotion_behavior(behavior)?,
+                behavior.fallback,
+            );
+        }
         if let Some(behavior) = config.behavior.get("danger") {
             stack.behaviors.danger = danger_behavior(
                 behavior.regime,
@@ -1105,6 +1121,21 @@ impl RuntimeModelStack {
                 .cloned()
         };
         vec![
+            behavior_node_state(
+                "Locomotion",
+                "locomotion",
+                "Locomotion",
+                self.behaviors.locomotion.regime,
+                self.behaviors.locomotion.hardcoded_id(),
+                self.behaviors.locomotion.model_id(),
+                self.behaviors.locomotion.fallback,
+                vec![impl_id(
+                    "locomotion.hardcoded_wander.v0",
+                    "Hardcoded wander/reflex",
+                )],
+                vec![impl_id("locomotion.neat.v0", "NEAT locomotion v0")],
+                last("locomotion"),
+            ),
             behavior_node_state(
                 "Experience",
                 "experience",
@@ -1291,6 +1322,7 @@ impl RuntimeModelStack {
             }};
         }
         match id.as_str() {
+            "locomotion" => update_behavior!(locomotion),
             "experience" => update_behavior!(experience),
             "danger" => update_behavior!(danger),
             "charge" => update_behavior!(charge),
@@ -1384,6 +1416,7 @@ fn effective_training_regime(
 }
 
 pub struct BehaviorRegistry {
+    pub locomotion: ReplaceableBehavior<LocomotionInput, LocomotionOutput>,
     pub experience: ReplaceableBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput>,
     pub danger: ReplaceableBehavior<SituatedDangerInput, DangerOutput>,
     pub charge: ReplaceableBehavior<SituatedChargeInput, ChargeOutput>,
@@ -1400,6 +1433,11 @@ pub struct BehaviorRegistry {
 impl Default for BehaviorRegistry {
     fn default() -> Self {
         Self {
+            locomotion: locomotion_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
             experience: experience_behavior(
                 BehaviorRegime::Hardcoded,
                 None,
@@ -2036,6 +2074,20 @@ impl FunctionBehavior<FutureInput, FuturePrediction> for FutureModelBehavior {
     }
 }
 
+fn locomotion_behavior(
+    regime: BehaviorRegime,
+    model: Option<NeatLocomotionBehavior>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<LocomotionInput, LocomotionOutput> {
+    ReplaceableBehavior::new(
+        "locomotion",
+        regime,
+        Box::new(HardcodedLocomotionBehavior::default()),
+        model.map(|model| Box::new(model) as Box<_>),
+        fallback,
+    )
+}
+
 fn danger_behavior(
     regime: BehaviorRegime,
     trainer: Option<DangerNetTrainer>,
@@ -2416,6 +2468,22 @@ fn ear_next_behavior(
         trainer.map(|trainer| Box::new(EarNextModelBehavior { trainer }) as Box<_>),
         fallback,
     )
+}
+
+fn load_locomotion_behavior(behavior: &BehaviorConfig) -> Result<Option<NeatLocomotionBehavior>> {
+    let Some(checkpoint) = behavior.checkpoint.as_deref() else {
+        return Ok(None);
+    };
+    let checkpoint_path = Path::new(checkpoint);
+    let artifact = if checkpoint_path.extension().is_some() {
+        checkpoint_path.to_path_buf()
+    } else {
+        checkpoint_path.join("locomotion-neat.json")
+    };
+    if !artifact.exists() {
+        return Ok(None);
+    }
+    Ok(Some(NeatLocomotionBehavior::load(checkpoint)?))
 }
 
 fn load_danger_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<DangerNetTrainer>> {
@@ -2800,6 +2868,7 @@ where
             nudge_policy: NudgePolicy::default(),
             local_map: LocalMap::default(),
             last_behavior_runs: Vec::new(),
+            locomotion_tracker: LocomotionTracker::default(),
             chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
         }
@@ -2836,6 +2905,7 @@ where
             nudge_policy: NudgePolicy::default(),
             local_map: LocalMap::default(),
             last_behavior_runs: Vec::new(),
+            locomotion_tracker: LocomotionTracker::default(),
             chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
         }
@@ -3471,10 +3541,44 @@ where
         {
             conductor_record.selected_output = mechanical_reign_action_for_selection.clone();
         }
-        let chosen_action = mechanical_reign_action_for_selection
+        let mut chosen_action = mechanical_reign_action_for_selection
             .clone()
             .or_else(|| event_script_forced_action.clone())
             .unwrap_or(conductor_selected_action);
+        let locomotion_input = self
+            .locomotion_tracker
+            .observe(now.t_ms, &now.body, &now.range);
+        let locomotion_run = self
+            .models
+            .behaviors
+            .locomotion
+            .infer_with_disagreement(&locomotion_input, now.t_ms)?;
+        let locomotion_output = locomotion_run.chosen.bounded(0.6, 1.0);
+        let locomotion_applied = mechanical_reign_action_for_selection.is_none()
+            && event_script_forced_action.is_none()
+            && matches!(&chosen_action, ActionPrimitive::Explore { .. });
+        if locomotion_applied {
+            let duration_ms = match &chosen_action {
+                ActionPrimitive::Explore { duration_ms, .. } => *duration_ms,
+                _ => 1_000,
+            };
+            chosen_action = ActionPrimitive::Drive {
+                forward: locomotion_output.forward_velocity_m_s,
+                turn: locomotion_output.angular_velocity_rad_s,
+                duration_ms,
+            };
+        }
+        now.extensions.insert(
+            "locomotion.nervous_system".to_string(),
+            serde_json::json!({
+                "schema_version": pete_neat::LOCOMOTION_SCHEMA_VERSION,
+                "input": locomotion_input,
+                "output": locomotion_output,
+                "applied": locomotion_applied,
+                "safety_authority": false,
+            }),
+        );
+        behavior_runs.push(locomotion_run.record.erase());
         self.chirp_events
             .emit_post_selection_chirps(&mut now, &mut notes, &chosen_action)?;
         let mut map_memory_decision = map_memory_decision_debug(
@@ -3596,6 +3700,11 @@ where
         let safety = self
             .safety
             .filter(&now, action_to_motor_command(Some(&chosen_action)));
+        self.locomotion_tracker.observe_command(LocomotionOutput {
+            forward_velocity_m_s: safety.command.forward,
+            angular_velocity_rad_s: safety.command.turn,
+            recovery_activation: locomotion_output.recovery_activation,
+        });
         map_memory_decision.safety_overrode = safety.vetoed;
         self.nudge.observe_motor(safety.command);
         now.extensions.insert(
@@ -4533,6 +4642,76 @@ pub struct RealRobotRunner<R, C> {
     live_image_enricher: Option<LiveImageEnricher>,
     robot_initialization: Option<serde_json::Value>,
     brainstem_interface: Option<serde_json::Value>,
+    possession_recovery: PossessionRecoveryState,
+    motion_rejection: MotionRejectionState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PossessionRecoveryPhase {
+    Idle,
+    WaitingForSensorClear,
+    Escaping,
+    Stuck,
+}
+
+#[derive(Clone, Debug)]
+struct PossessionRecoveryState {
+    latch: Option<SafetyLatchKind>,
+    phase: PossessionRecoveryPhase,
+    turn_direction: TurnDir,
+    active_since_ms: TimeMs,
+    last_command_ms: TimeMs,
+    command_attempts: u32,
+    stuck_stop_sent: bool,
+}
+
+impl Default for PossessionRecoveryState {
+    fn default() -> Self {
+        Self {
+            latch: None,
+            phase: PossessionRecoveryPhase::Idle,
+            turn_direction: TurnDir::Left,
+            active_since_ms: 0,
+            last_command_ms: 0,
+            command_attempts: 0,
+            stuck_stop_sent: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MotionRejectionState {
+    first_ms: TimeMs,
+    last_ms: TimeMs,
+    blocked_until_ms: TimeMs,
+    latest_command_id: u32,
+    latest_reason: Option<String>,
+    count: u32,
+    stuck: bool,
+    stuck_stop_sent: bool,
+}
+
+const POSSESSION_RECOVERY_COMMAND_COOLDOWN_MS: TimeMs = 1_000;
+const POSSESSION_RECOVERY_STUCK_AFTER_MS: TimeMs = 15_000;
+const POSSESSION_RECOVERY_MAX_ATTEMPTS: u32 = 3;
+const POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S: i16 = 50;
+const POSSESSION_BUMP_ESCAPE_TURN_MRAD_S: i16 = 500;
+const POSSESSION_BUMP_ESCAPE_SETTLE_MS: TimeMs = 250;
+const POSSESSION_BUMP_ESCAPE_DURATION_MS: TimeMs =
+    bump_escape_duration_ms(POSSESSION_BUMP_ESCAPE_TURN_MRAD_S) as TimeMs
+        + POSSESSION_BUMP_ESCAPE_SETTLE_MS;
+const MOTION_REJECTION_WINDOW_MS: TimeMs = 5_000;
+const MOTION_REJECTION_BASE_BACKOFF_MS: TimeMs = 1_000;
+const MOTION_REJECTION_MAX_BACKOFF_MS: TimeMs = 5_000;
+const MOTION_REJECTION_STUCK_AFTER: u32 = 3;
+
+#[derive(Clone, Debug)]
+struct PossessionRecoveryDecision {
+    block_reason: Option<String>,
+    command_sent: bool,
+    action: Option<ActionPrimitive>,
+    motor: Option<MotorCommand>,
+    debug: serde_json::Value,
 }
 
 impl<R, C> RealRobotRunner<R, C>
@@ -4559,6 +4738,8 @@ where
             live_image_enricher: None,
             robot_initialization: None,
             brainstem_interface: None,
+            possession_recovery: PossessionRecoveryState::default(),
+            motion_rejection: MotionRejectionState::default(),
         }
     }
 
@@ -4664,7 +4845,7 @@ where
         }
 
         let pre_body_t_ms = wall_time_ms();
-        let brainstem_events = self.cockpit.poll_events()?;
+        let brainstem_events = self.poll_slow_possession_events()?;
         if let Some(input) = self.runtime.reign_sense(pre_body_t_ms)?.latest {
             if reign_input_outputs_real_slow_directly(&input) {
                 let body_before = pete_body::BodySense {
@@ -4708,8 +4889,10 @@ where
             }
         }
 
-        let body_before =
-            body_sense_from_cockpit_status(self.cockpit.refresh_status()?, wall_time_ms());
+        let status_before = self.cockpit.refresh_status()?;
+        let body_before = body_sense_from_cockpit_status(status_before.clone(), wall_time_ms());
+        let recovery_decision =
+            self.apply_possession_recovery(&body_before, &brainstem_events, &status_before)?;
         let mut packets = poll_sensors_lossy(&mut self.sensors).await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
@@ -4747,13 +4930,35 @@ where
             if reign_input_drives_real_slow(&input) {
                 let desired_motor =
                     action_to_motor_command(input.command.to_action().as_ref()).clamped(0.05, 0.5);
-                let block_reason = real_slow_body_block_reason(&body_before);
-                let final_motor = if block_reason.is_none() {
+                let mut block_reason = recovery_decision
+                    .block_reason
+                    .clone()
+                    .or_else(|| self.motion_rejection_block_reason(wall_time_ms()))
+                    .or_else(|| real_slow_body_block_reason(&body_before));
+                let mut final_motor = if block_reason.is_none() {
                     desired_motor
                 } else {
                     MotorCommand::stop()
                 };
-                apply_safe_cockpit_motor(&mut self.cockpit, final_motor)?;
+                if !recovery_decision.command_sent {
+                    if let Some(block) =
+                        apply_slow_possession_motor(&mut self.cockpit, final_motor)?
+                    {
+                        match block {
+                            SlowPossessionMotionBlock::SafetyLatch(latch) => {
+                                self.start_possession_recovery(latch, &body_before);
+                                block_reason = Some(format!("recovering {latch:?} safety latch"));
+                            }
+                            SlowPossessionMotionBlock::CommandRejected { command_id, reason } => {
+                                block_reason =
+                                    Some(self.record_motion_rejection(command_id, &reason));
+                            }
+                        }
+                        final_motor = MotorCommand::stop();
+                    } else if !is_near_zero_motor(final_motor) {
+                        self.motion_rejection = MotionRejectionState::default();
+                    }
+                }
                 let tick = synthetic_slow_manual_tick(
                     now,
                     input,
@@ -4772,10 +4977,11 @@ where
 
         enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
 
-        let tick = self
+        let mut tick = self
             .runtime
             .tick(now.clone(), ExperienceLatent::default(), Vec::new())
             .await?;
+        let original_chosen_action = tick.chosen_action.clone();
         let chosen_motor = final_motor_from_tick(&tick).clamped(0.05, 0.5);
         let manual_drive = tick
             .frame
@@ -4783,14 +4989,50 @@ where
             .as_ref()
             .map(reign_input_drives_real_slow)
             .unwrap_or(false);
-        let block_reason =
-            real_slow_motor_block_reason(&body_before, &tick, manual_drive, self.autonomous_motion);
-        let final_motor = if block_reason.is_none() {
+        let mut block_reason = recovery_decision
+            .block_reason
+            .clone()
+            .or_else(|| self.motion_rejection_block_reason(wall_time_ms()))
+            .or_else(|| {
+                real_slow_motor_block_reason(
+                    &body_before,
+                    &tick,
+                    manual_drive,
+                    self.autonomous_motion,
+                )
+            });
+        let mut final_motor = if block_reason.is_none() {
             chosen_motor
         } else {
             MotorCommand::stop()
         };
-        apply_safe_cockpit_motor(&mut self.cockpit, final_motor)?;
+        if !recovery_decision.command_sent {
+            if let Some(block) = apply_slow_possession_motor(&mut self.cockpit, final_motor)? {
+                match block {
+                    SlowPossessionMotionBlock::SafetyLatch(latch) => {
+                        self.start_possession_recovery(latch, &body_before);
+                        block_reason = Some(format!("recovering {latch:?} safety latch"));
+                    }
+                    SlowPossessionMotionBlock::CommandRejected { command_id, reason } => {
+                        block_reason = Some(self.record_motion_rejection(command_id, &reason));
+                    }
+                }
+                final_motor = MotorCommand::stop();
+            } else if !is_near_zero_motor(final_motor) {
+                self.motion_rejection = MotionRejectionState::default();
+            }
+        }
+        if self.motion_rejection_block_reason(wall_time_ms()).is_some() {
+            tick.chosen_action = Some(ActionPrimitive::Stop);
+            tick.frame.chosen_action = Some(ActionPrimitive::Stop);
+            if self.motion_rejection.stuck && !self.motion_rejection.stuck_stop_sent {
+                self.cockpit.client_mut().stop()?;
+                self.motion_rejection.stuck_stop_sent = true;
+            }
+        } else if let Some(recovery_action) = recovery_decision.action.clone() {
+            tick.chosen_action = Some(recovery_action.clone());
+            tick.frame.chosen_action = Some(recovery_action);
+        }
 
         let mut snapshot = self.now_builder.snapshot();
         snapshot.eye = tick.frame.now.eye.clone();
@@ -4815,7 +5057,9 @@ where
             );
             object.insert(
                 "motion_sent_to_robot".to_string(),
-                serde_json::to_value(motor_command_to_motion(final_motor))?,
+                serde_json::to_value(motor_command_to_motion(
+                    recovery_decision.motor.unwrap_or(final_motor),
+                ))?,
             );
             object.insert(
                 "motion_sent_to_sim".to_string(),
@@ -4823,7 +5067,26 @@ where
             );
             object.insert(
                 "motor_applied".to_string(),
-                serde_json::json!(!is_near_zero_motor(final_motor)),
+                serde_json::json!(recovery_decision
+                    .motor
+                    .map(|motor| !is_near_zero_motor(motor))
+                    .unwrap_or(!is_near_zero_motor(final_motor))),
+            );
+            object.insert(
+                "runtime_chosen_action".to_string(),
+                serde_json::to_value(original_chosen_action)?,
+            );
+            object.insert(
+                "recovery_action".to_string(),
+                serde_json::to_value(recovery_decision.action.clone())?,
+            );
+            object.insert(
+                "recovery_motor".to_string(),
+                recovery_decision
+                    .motor
+                    .map(serde_json::to_value)
+                    .transpose()?
+                    .unwrap_or(serde_json::Value::Null),
             );
             object.insert(
                 "manual_hardware_gate".to_string(),
@@ -4832,6 +5095,14 @@ where
             object.insert(
                 "autonomous_hardware_gate".to_string(),
                 serde_json::json!(self.autonomous_motion),
+            );
+            object.insert(
+                "possession_recovery".to_string(),
+                recovery_decision.debug.clone(),
+            );
+            object.insert(
+                "motion_rejection".to_string(),
+                motion_rejection_debug(&self.motion_rejection),
             );
             object.insert(
                 "why_not_moving".to_string(),
@@ -4863,6 +5134,340 @@ where
                     serde_json::json!({"possessed": false, "refusal_reason": error.to_string()})
                 }),
             );
+        }
+    }
+
+    fn poll_slow_possession_events(&mut self) -> Result<pete_cockpit::EventBatch> {
+        let events = self.cockpit.poll_events_allowing_history_gap()?;
+        if events.dropped_before_seq > 0 {
+            if self.tick_count == 0 {
+                eprintln!(
+                    "slow possession recovered from pre-loop event history gap before sequence {}",
+                    events.dropped_before_seq
+                );
+            } else {
+                eprintln!(
+                    "slow possession recovered from event history gap before sequence {}; stopping before continuing",
+                    events.dropped_before_seq
+                );
+                self.cockpit.client_mut().stop()?;
+            }
+        }
+        Ok(events)
+    }
+
+    fn apply_possession_recovery(
+        &mut self,
+        body: &BodySense,
+        events: &pete_cockpit::EventBatch,
+        status: &StatusSummary,
+    ) -> Result<PossessionRecoveryDecision> {
+        for event in &events.events {
+            match event.kind {
+                CockpitEventKind::SafetyTripped => {
+                    if let Some(kind) = safety_latch_kind_from_event_code(event.a) {
+                        self.start_possession_recovery(kind, body);
+                    }
+                }
+                CockpitEventKind::SafetyCleared => {
+                    if self.possession_recovery.latch == safety_latch_kind_from_event_code(event.a)
+                    {
+                        self.possession_recovery = PossessionRecoveryState::default();
+                    }
+                }
+                CockpitEventKind::EStopLatched => {
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+                _ => {}
+            }
+        }
+
+        if self.possession_recovery.latch.is_none()
+            && status.safety_tripped == Some(true)
+            && status.estop_latched != Some(true)
+        {
+            if let Some(kind) = status
+                .safety_latch_kind
+                .or_else(|| infer_safety_latch_from_sensors(body))
+            {
+                self.start_possession_recovery(kind, body);
+            }
+        }
+
+        let Some(latch) = self.possession_recovery.latch else {
+            return Ok(PossessionRecoveryDecision {
+                block_reason: None,
+                command_sent: false,
+                action: None,
+                motor: None,
+                debug: possession_recovery_debug(&self.possession_recovery, None, false),
+            });
+        };
+
+        let mut command_sent = true;
+        let mut action = None;
+        let mut motor = None;
+        let now_ms = wall_time_ms();
+        let recovery_age_ms = recovery_age_ms(&self.possession_recovery, now_ms);
+        let mut reason = format!("recovering {latch:?} safety latch");
+        match latch {
+            SafetyLatchKind::Bump => {
+                let escape_elapsed_ms =
+                    now_ms.saturating_sub(self.possession_recovery.last_command_ms);
+                if self.possession_recovery.phase == PossessionRecoveryPhase::Escaping
+                    && escape_elapsed_ms < POSSESSION_BUMP_ESCAPE_DURATION_MS
+                {
+                    command_sent = true;
+                    if escape_elapsed_ms < BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs {
+                        action = Some(ActionPrimitive::Go {
+                            intensity: -0.2,
+                            duration_ms: BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs,
+                        });
+                        motor = Some(MotorCommand {
+                            forward: -0.05,
+                            turn: 0.0,
+                        });
+                        reason = format!(
+                            "recovering {latch:?} safety latch; reversing for escape attempt {}",
+                            self.possession_recovery.command_attempts
+                        );
+                    } else {
+                        action = Some(ActionPrimitive::Turn {
+                            direction: TurnDir::Right,
+                            intensity: 0.5,
+                            duration_ms: POSSESSION_BUMP_ESCAPE_DURATION_MS
+                                .saturating_sub(BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs),
+                        });
+                        motor = Some(MotorCommand {
+                            forward: 0.0,
+                            turn: -0.5,
+                        });
+                        reason = format!(
+                            "recovering {latch:?} safety latch; turning clockwise 90 degrees for escape attempt {}",
+                            self.possession_recovery.command_attempts
+                        );
+                    }
+                } else if self.possession_recovery.phase == PossessionRecoveryPhase::Escaping
+                    && !bump_active(body)
+                {
+                    self.cockpit.client_mut().stop()?;
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                    action = Some(ActionPrimitive::Stop);
+                    motor = Some(MotorCommand::stop());
+                    reason = format!(
+                        "recovered {latch:?} safety latch after reverse and clockwise 90 degree turn"
+                    );
+                } else {
+                    self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+                    action = Some(ActionPrimitive::Go {
+                        intensity: -0.2,
+                        duration_ms: BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs,
+                    });
+                    motor = Some(MotorCommand {
+                        forward: -0.05,
+                        turn: 0.0,
+                    });
+                    if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
+                        self.possession_recovery.phase = PossessionRecoveryPhase::Stuck;
+                        action = Some(ActionPrimitive::Stop);
+                        motor = Some(MotorCommand::stop());
+                        reason = format!(
+                            "{latch:?} recovery stuck after reverse and clockwise turns; bumper still active after {} ms and {} escape attempts; operator intervention needed",
+                            recovery_age_ms, self.possession_recovery.command_attempts
+                        );
+                        if !self.possession_recovery.stuck_stop_sent {
+                            self.cockpit.client_mut().stop()?;
+                            self.possession_recovery.stuck_stop_sent = true;
+                        }
+                    } else if possession_recovery_command_due(&self.possession_recovery, now_ms) {
+                        self.possession_recovery.command_attempts =
+                            self.possession_recovery.command_attempts.saturating_add(1);
+                        self.possession_recovery.last_command_ms = now_ms;
+                        self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+                        reason = format!(
+                            "recovering {latch:?} safety latch; escape attempt {}: reverse then turn clockwise 90 degrees",
+                            self.possession_recovery.command_attempts
+                        );
+                        self.cockpit.client_mut().bump_escape(
+                            EscapeDirection::Right,
+                            POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S,
+                            POSSESSION_BUMP_ESCAPE_TURN_MRAD_S,
+                        )?;
+                    } else {
+                        reason = format!(
+                            "recovering {latch:?} safety latch; escape in progress for {} ms",
+                            now_ms.saturating_sub(self.possession_recovery.last_command_ms)
+                        );
+                    }
+                }
+            }
+            SafetyLatchKind::Cliff => {
+                if cliff_active(body) {
+                    self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+                    self.possession_recovery.turn_direction =
+                        recovery_turn_direction_for_latch(latch, body);
+                    action = Some(ActionPrimitive::Go {
+                        intensity: -0.25,
+                        duration_ms: 900,
+                    });
+                    motor = Some(MotorCommand {
+                        forward: -0.10,
+                        turn: 0.0,
+                    });
+                    if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
+                        self.possession_recovery.phase = PossessionRecoveryPhase::Stuck;
+                        action = Some(ActionPrimitive::Stop);
+                        motor = Some(MotorCommand::stop());
+                        reason = format!(
+                            "{latch:?} recovery stuck; cliff still active after {} ms and {} escape attempts; operator intervention needed",
+                            recovery_age_ms, self.possession_recovery.command_attempts
+                        );
+                        if !self.possession_recovery.stuck_stop_sent {
+                            self.cockpit.client_mut().stop()?;
+                            self.possession_recovery.stuck_stop_sent = true;
+                        }
+                    } else if possession_recovery_command_due(&self.possession_recovery, now_ms) {
+                        self.possession_recovery.command_attempts =
+                            self.possession_recovery.command_attempts.saturating_add(1);
+                        self.possession_recovery.last_command_ms = now_ms;
+                        reason = format!(
+                            "recovering {latch:?} safety latch; escape attempt {}",
+                            self.possession_recovery.command_attempts
+                        );
+                        self.cockpit.client_mut().bump_escape(
+                            escape_direction(self.possession_recovery.turn_direction.clone()),
+                            100,
+                            900,
+                        )?;
+                    } else {
+                        reason = format!(
+                            "recovering {latch:?} safety latch; escape in progress for {} ms",
+                            now_ms.saturating_sub(self.possession_recovery.last_command_ms)
+                        );
+                    }
+                } else {
+                    self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+            }
+            SafetyLatchKind::WheelDrop => {
+                if body.flags.wheel_drop {
+                    action = Some(ActionPrimitive::Stop);
+                    motor = Some(MotorCommand::stop());
+                    self.cockpit.client_mut().stop()?;
+                } else {
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+            }
+            SafetyLatchKind::Charging => {
+                if body.charging {
+                    action = Some(ActionPrimitive::Stop);
+                    motor = Some(MotorCommand::stop());
+                    self.cockpit.client_mut().stop()?;
+                } else {
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                }
+            }
+            SafetyLatchKind::Heartbeat => {
+                self.cockpit.client_mut().clear_safety_latch(latch)?;
+                self.possession_recovery = PossessionRecoveryState::default();
+                command_sent = false;
+            }
+            SafetyLatchKind::Tilt | SafetyLatchKind::Impact => {
+                if imu_recovery_clear(status, latch) {
+                    self.cockpit.client_mut().clear_safety_latch(latch)?;
+                    self.possession_recovery = PossessionRecoveryState::default();
+                    command_sent = false;
+                } else {
+                    action = Some(ActionPrimitive::Stop);
+                    motor = Some(MotorCommand::stop());
+                    self.cockpit.client_mut().stop()?;
+                }
+            }
+        }
+
+        Ok(PossessionRecoveryDecision {
+            block_reason: Some(reason),
+            command_sent,
+            action,
+            motor,
+            debug: possession_recovery_debug(&self.possession_recovery, Some(latch), command_sent),
+        })
+    }
+
+    fn start_possession_recovery(&mut self, latch: SafetyLatchKind, body: &BodySense) {
+        let now_ms = wall_time_ms();
+        let latch_changed = self.possession_recovery.latch != Some(latch);
+        self.possession_recovery.latch = Some(latch);
+        self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+        self.possession_recovery.turn_direction = recovery_turn_direction_for_latch(latch, body);
+        if latch_changed || self.possession_recovery.active_since_ms == 0 {
+            self.possession_recovery.active_since_ms = now_ms;
+            self.possession_recovery.last_command_ms = 0;
+            self.possession_recovery.command_attempts = 0;
+            self.possession_recovery.stuck_stop_sent = false;
+        }
+    }
+
+    fn motion_rejection_block_reason(&self, now_ms: TimeMs) -> Option<String> {
+        let reason = self
+            .motion_rejection
+            .latest_reason
+            .as_deref()
+            .unwrap_or("unknown rejection");
+        if self.motion_rejection.stuck {
+            return Some(format!(
+                "brainstem repeatedly rejected motion; latest command #{}: {}; operator intervention needed",
+                self.motion_rejection.latest_command_id, reason
+            ));
+        }
+        if self.motion_rejection.blocked_until_ms > now_ms {
+            return Some(format!(
+                "brainstem rejected motion command #{}: {}; pausing motion retries for {} ms",
+                self.motion_rejection.latest_command_id,
+                reason,
+                self.motion_rejection
+                    .blocked_until_ms
+                    .saturating_sub(now_ms)
+            ));
+        }
+        None
+    }
+
+    fn record_motion_rejection(&mut self, command_id: u32, reason: &str) -> String {
+        let now_ms = wall_time_ms();
+        if self.motion_rejection.first_ms == 0
+            || now_ms.saturating_sub(self.motion_rejection.first_ms) > MOTION_REJECTION_WINDOW_MS
+        {
+            self.motion_rejection = MotionRejectionState {
+                first_ms: now_ms,
+                ..MotionRejectionState::default()
+            };
+        }
+        self.motion_rejection.last_ms = now_ms;
+        self.motion_rejection.latest_command_id = command_id;
+        self.motion_rejection.latest_reason = Some(reason.to_string());
+        self.motion_rejection.count = self.motion_rejection.count.saturating_add(1);
+        let backoff = MOTION_REJECTION_BASE_BACKOFF_MS
+            .saturating_mul(u64::from(self.motion_rejection.count))
+            .min(MOTION_REJECTION_MAX_BACKOFF_MS);
+        self.motion_rejection.blocked_until_ms = now_ms.saturating_add(backoff);
+        if self.motion_rejection.count >= MOTION_REJECTION_STUCK_AFTER {
+            self.motion_rejection.stuck = true;
+        }
+
+        if self.motion_rejection.stuck {
+            format!(
+                "brainstem repeatedly rejected motion; latest command #{command_id}: {reason}; operator intervention needed"
+            )
+        } else {
+            format!(
+                "brainstem rejected motion command #{command_id}: {reason}; pausing motion retries for {backoff} ms"
+            )
         }
     }
 
@@ -5020,6 +5625,108 @@ fn apply_safe_cockpit_motor<C: Cockpit>(
     }
 }
 
+fn apply_slow_possession_motor<C: Cockpit>(
+    cockpit: &mut SafeCockpit<C>,
+    motor: MotorCommand,
+) -> Result<Option<SlowPossessionMotionBlock>> {
+    if is_near_zero_motor(motor) {
+        cockpit.client_mut().stop().map_err(anyhow::Error::from)?;
+        return Ok(None);
+    }
+    match cockpit
+        .pulse_motion(
+            pete_cockpit::meters_per_second_to_mm_s(motor.forward),
+            pete_cockpit::radians_per_second_to_mrad_s(motor.turn),
+        )
+        .map_err(anyhow::Error::from)
+    {
+        Ok(()) => Ok(None),
+        Err(error) if is_missed_events_error(&error) => {
+            eprintln!(
+                "slow possession recovered from event history gap during motion safety poll; stopping before continuing"
+            );
+            cockpit.client_mut().stop().map_err(anyhow::Error::from)?;
+            Ok(None)
+        }
+        Err(error) if motion_stopped_latch(&error).is_some() => {
+            let latch = motion_stopped_latch(&error);
+            eprintln!("{error}; slow possession stopping before continuing");
+            cockpit.client_mut().stop().map_err(anyhow::Error::from)?;
+            Ok(latch.map(SlowPossessionMotionBlock::SafetyLatch))
+        }
+        Err(error) if command_rejection(&error).is_some() => {
+            let (command_id, reason) = command_rejection(&error).expect("rejection was present");
+            eprintln!("{error}; slow possession stopping before continuing");
+            cockpit.client_mut().stop().map_err(anyhow::Error::from)?;
+            Ok(Some(SlowPossessionMotionBlock::CommandRejected {
+                command_id,
+                reason,
+            }))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SlowPossessionMotionBlock {
+    SafetyLatch(SafetyLatchKind),
+    CommandRejected { command_id: u32, reason: String },
+}
+
+fn is_missed_events_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<pete_cockpit::CockpitError>()
+            .is_some_and(|cockpit| {
+                matches!(cockpit, pete_cockpit::CockpitError::MissedEvents { .. })
+            })
+    })
+}
+
+fn motion_stopped_latch(error: &anyhow::Error) -> Option<SafetyLatchKind> {
+    error.chain().find_map(|cause| {
+        let cockpit = cause.downcast_ref::<pete_cockpit::CockpitError>()?;
+        match cockpit {
+            pete_cockpit::CockpitError::MotionStopped { reasons } => {
+                latch_from_stop_reasons(reasons)
+            }
+            pete_cockpit::CockpitError::Policy(reason)
+                if reason.starts_with("motion stopped by ") =>
+            {
+                Some(SafetyLatchKind::Heartbeat)
+            }
+            _ => None,
+        }
+    })
+}
+
+fn command_rejection(error: &anyhow::Error) -> Option<(u32, String)> {
+    error.chain().find_map(|cause| {
+        let cockpit = cause.downcast_ref::<pete_cockpit::CockpitError>()?;
+        match cockpit {
+            pete_cockpit::CockpitError::Rejected { command_id, reason } => {
+                Some((*command_id, reason.clone()))
+            }
+            _ => None,
+        }
+    })
+}
+
+fn latch_from_stop_reasons(reasons: &[SafeStopReason]) -> Option<SafetyLatchKind> {
+    reasons
+        .iter()
+        .find_map(|reason| match reason {
+            SafeStopReason::SafetyTripped { latch } => *latch,
+            _ => None,
+        })
+        .or_else(|| {
+            reasons.iter().find_map(|reason| match reason {
+                SafeStopReason::HeartbeatExpired => Some(SafetyLatchKind::Heartbeat),
+                _ => None,
+            })
+        })
+}
+
 fn apply_safe_cockpit_motion<C: Cockpit>(
     cockpit: &mut SafeCockpit<C>,
     motion: &MotionCommand,
@@ -5027,14 +5734,21 @@ fn apply_safe_cockpit_motion<C: Cockpit>(
     apply_safe_cockpit_motor(cockpit, motion.to_motor_command())
 }
 
-fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
+pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
+    let charging = status.battery.charging_state.unwrap_or(0) != 0
+        || status.battery.charging_indicator.unwrap_or(false);
+    let packet_update_ms = status
+        .body_packet_age_ms
+        .filter(|_| status.body_packet_complete == Some(true))
+        .map(|age_ms| last_update_ms.saturating_sub(u64::from(age_ms)))
+        .unwrap_or(if charging { last_update_ms } else { 0 });
     BodySense {
         battery_level: status
             .battery
             .percent
             .map(|percent| percent as f32 / 100.0)
             .unwrap_or(1.0),
-        charging: status.battery.charging_state.unwrap_or(0) != 0,
+        charging,
         flags: BodyFlags {
             bump_left: status.contact.bump_left.unwrap_or(false),
             bump_right: status.contact.bump_right.unwrap_or(false),
@@ -5051,9 +5765,140 @@ fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs)
             y_m: 0.0,
             heading_rad: status.odometry.heading_mrad.unwrap_or(0) as f32 / 1000.0,
         },
-        last_update_ms,
+        last_update_ms: packet_update_ms,
         ..BodySense::default()
     }
+}
+
+fn safety_latch_kind_from_event_code(code: u32) -> Option<SafetyLatchKind> {
+    match code {
+        1 => Some(SafetyLatchKind::Bump),
+        2 => Some(SafetyLatchKind::Cliff),
+        3 => Some(SafetyLatchKind::WheelDrop),
+        5 => Some(SafetyLatchKind::Heartbeat),
+        6 => Some(SafetyLatchKind::Tilt),
+        7 => Some(SafetyLatchKind::Impact),
+        8 => Some(SafetyLatchKind::Charging),
+        _ => None,
+    }
+}
+
+fn infer_safety_latch_from_sensors(body: &BodySense) -> Option<SafetyLatchKind> {
+    if bump_active(body) {
+        Some(SafetyLatchKind::Bump)
+    } else if cliff_active(body) {
+        Some(SafetyLatchKind::Cliff)
+    } else if body.flags.wheel_drop {
+        Some(SafetyLatchKind::WheelDrop)
+    } else if body.charging {
+        Some(SafetyLatchKind::Charging)
+    } else {
+        None
+    }
+}
+
+fn bump_active(body: &BodySense) -> bool {
+    body.flags.bump_left || body.flags.bump_right
+}
+
+fn cliff_active(body: &BodySense) -> bool {
+    body.flags.cliff_left
+        || body.flags.cliff_front_left
+        || body.flags.cliff_front_right
+        || body.flags.cliff_right
+}
+
+fn recovery_turn_direction_for_latch(kind: SafetyLatchKind, body: &BodySense) -> TurnDir {
+    match kind {
+        SafetyLatchKind::Bump => contact_turn_direction(body),
+        SafetyLatchKind::Cliff => {
+            if body.flags.cliff_left || body.flags.cliff_front_left {
+                TurnDir::Right
+            } else if body.flags.cliff_right || body.flags.cliff_front_right {
+                TurnDir::Left
+            } else {
+                TurnDir::Left
+            }
+        }
+        _ => TurnDir::Left,
+    }
+}
+
+fn contact_turn_direction(body: &BodySense) -> TurnDir {
+    match (body.flags.bump_left, body.flags.bump_right) {
+        (true, false) => TurnDir::Right,
+        (false, true) => TurnDir::Left,
+        _ => TurnDir::Left,
+    }
+}
+
+fn escape_direction(direction: TurnDir) -> EscapeDirection {
+    match direction {
+        TurnDir::Left => EscapeDirection::Left,
+        TurnDir::Right => EscapeDirection::Right,
+    }
+}
+
+fn imu_recovery_clear(status: &StatusSummary, latch: SafetyLatchKind) -> bool {
+    match latch {
+        SafetyLatchKind::Tilt => status
+            .imu
+            .tilt_magnitude_mrad
+            .is_none_or(|value| value < 650),
+        SafetyLatchKind::Impact => status
+            .imu
+            .impact_score_mm_s2
+            .is_none_or(|value| value < 18_000),
+        _ => false,
+    }
+}
+
+fn recovery_age_ms(state: &PossessionRecoveryState, now_ms: TimeMs) -> TimeMs {
+    if state.active_since_ms == 0 {
+        0
+    } else {
+        now_ms.saturating_sub(state.active_since_ms)
+    }
+}
+
+fn possession_recovery_command_due(state: &PossessionRecoveryState, now_ms: TimeMs) -> bool {
+    state.last_command_ms == 0
+        || now_ms.saturating_sub(state.last_command_ms) >= POSSESSION_RECOVERY_COMMAND_COOLDOWN_MS
+}
+
+fn possession_recovery_is_stuck(state: &PossessionRecoveryState, now_ms: TimeMs) -> bool {
+    recovery_age_ms(state, now_ms) >= POSSESSION_RECOVERY_STUCK_AFTER_MS
+        || state.command_attempts >= POSSESSION_RECOVERY_MAX_ATTEMPTS
+}
+
+fn possession_recovery_debug(
+    state: &PossessionRecoveryState,
+    active_latch: Option<SafetyLatchKind>,
+    command_sent: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "latched": active_latch.or(state.latch).map(|latch| format!("{latch:?}")),
+        "phase": format!("{:?}", state.phase),
+        "turn_direction": format!("{:?}", state.turn_direction),
+        "active_since_ms": state.active_since_ms,
+        "last_command_ms": state.last_command_ms,
+        "command_attempts": state.command_attempts,
+        "stuck_stop_sent": state.stuck_stop_sent,
+        "command_sent": command_sent,
+    })
+}
+
+fn motion_rejection_debug(state: &MotionRejectionState) -> serde_json::Value {
+    serde_json::json!({
+        "first_ms": state.first_ms,
+        "last_ms": state.last_ms,
+        "blocked_until_ms": state.blocked_until_ms,
+        "latest_command_id": state.latest_command_id,
+        "latest_reason": state.latest_reason,
+        "count": state.count,
+        "stuck": state.stuck,
+        "stuck_stop_sent": state.stuck_stop_sent,
+    })
 }
 
 fn synthetic_slow_manual_tick(
@@ -5151,6 +5996,9 @@ fn reign_input_outputs_real_slow_directly(input: &ReignInput) -> bool {
 }
 
 fn real_slow_body_block_reason(body: &pete_body::BodySense) -> Option<String> {
+    if body.charging {
+        return Some("charging active".to_string());
+    }
     if body.flags.wheel_drop {
         return Some("wheel drop active".to_string());
     }
@@ -6509,10 +7357,7 @@ fn hard_safety_action(now: &Now) -> Option<ActionPrimitive> {
         || now.body.flags.cliff_front_right
         || now.body.flags.cliff_right
     {
-        return Some(ActionPrimitive::Go {
-            intensity: -0.12,
-            duration_ms: 750,
-        });
+        return Some(ActionPrimitive::Stop);
     }
     if now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall {
         let direction = if now.body.flags.bump_left && !now.body.flags.bump_right {
@@ -7500,6 +8345,7 @@ fn set_drive(drives: &mut DriveSense, name: &DriveName, value: f32) {
 
 fn describe_safety_reason(reason: Option<SafetyReason>) -> &'static str {
     match reason {
+        Some(SafetyReason::Charging) => "charging",
         Some(SafetyReason::WheelDrop) => "wheel drop",
         Some(SafetyReason::Cliff) => "cliff",
         Some(SafetyReason::BatteryCritical) => "critical battery",
@@ -7520,7 +8366,8 @@ mod tests {
     use pete_autonomic::SimpleSafety;
     use pete_body::BodySense;
     use pete_cockpit::{
-        CockpitCapabilities, CockpitRequest, CockpitResponse, CockpitStatus, EventBatch,
+        establish_session, CockpitCapabilities, CockpitRequest, CockpitResponse, CockpitStatus,
+        EventBatch, HandshakeHello, MotherbrainPossession, SimCockpit,
     };
     use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
     use pete_experience::{
@@ -7570,6 +8417,86 @@ mod tests {
                     "submaps": 1
                 }
             }),
+        );
+    }
+
+    #[test]
+    fn physical_charging_indicator_populates_body_charging_without_oi_state() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 1_000,
+                "current_runtime_state": "idle",
+                "oi_mode": "safe",
+                "create_sensors": {
+                    "last_packet_id": 0,
+                    "complete_packet_count": 1,
+                    "last_complete_packet_timestamp_ms": 1_000,
+                    "charging_state": 0,
+                    "charging_indicator": "on"
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        let body = body_sense_from_cockpit_status(status, 123);
+
+        assert!(body.charging);
+        assert_eq!(body.last_update_ms, 123);
+    }
+
+    #[test]
+    fn body_timestamp_tracks_complete_create_packet_age() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 2_000,
+                "current_runtime_state": "idle",
+                "oi_mode": "safe",
+                "create_sensors": {
+                    "last_packet_id": 0,
+                    "complete_packet_count": 4,
+                    "last_complete_packet_timestamp_ms": 1_250,
+                    "bump_left": false
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        let body = body_sense_from_cockpit_status(status, 10_000);
+
+        assert_eq!(body.last_update_ms, 9_250);
+        let decision = SimpleSafety::default().filter(
+            &Now::blank(10_000, body),
+            MotorCommand {
+                forward: 0.2,
+                turn: 0.0,
+            },
+        );
+        assert_eq!(decision.reason, Some(SafetyReason::StaleSensors));
+        assert_eq!(decision.command, MotorCommand::stop());
+    }
+
+    #[test]
+    fn incomplete_create_packet_never_refreshes_body_timestamp() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 2_000,
+                "last_uart_packet_timestamp_ms": 1_990,
+                "uart_rx_packets": 4,
+                "current_runtime_state": "idle",
+                "create_sensors": {
+                    "last_packet_id": 35,
+                    "complete_packet_count": 0
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        assert_eq!(
+            body_sense_from_cockpit_status(status, 10_000).last_update_ms,
+            0
         );
     }
 
@@ -8252,6 +9179,204 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct SharedSimCockpit(Arc<Mutex<SimCockpit>>);
+
+    impl Cockpit for SharedSimCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            self.0.lock().unwrap().execute(request)
+        }
+
+        fn handshake(
+            &mut self,
+            hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            self.0.lock().unwrap().handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.0.lock().unwrap().execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.0
+                .lock()
+                .unwrap()
+                .execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ServiceLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.0
+                .lock()
+                .unwrap()
+                .execute_with_service_lease(session, lease, request)
+        }
+    }
+
+    #[test]
+    fn production_possession_composes_bump_stop_and_conductor_recovery() {
+        let sim = Arc::new(Mutex::new(SimCockpit::new().with_event_capacity(256)));
+        let session = establish_session(
+            SharedSimCockpit(Arc::clone(&sim)),
+            HandshakeHello::motherbrain("pete-runtime-recovery-test"),
+            None,
+        )
+        .unwrap();
+        let possession = MotherbrainPossession::acquire(session, 5_000).unwrap();
+        let mut cockpit = SafeCockpit::new(possession);
+
+        cockpit.pulse_motion(40, 0).unwrap();
+        sim.lock().unwrap().set_bump(true, false);
+
+        let stop_events = cockpit.poll_events().unwrap();
+        assert!(stop_events.has_stop_reason());
+        let status = cockpit.refresh_status().unwrap();
+        let body = body_sense_from_cockpit_status(status, 1_000);
+        assert!(body.flags.bump_left);
+
+        let mut conductor = SimpleConductor::default();
+        let mut input = test_conductor_input(ActionPrimitive::Stop);
+        input.body = body;
+        let first_recovery = conductor.choose(input).unwrap();
+        assert!(matches!(
+            first_recovery,
+            ActionPrimitive::Go {
+                intensity,
+                duration_ms: 300
+            } if intensity < 0.0
+        ));
+
+        sim.lock().unwrap().set_bump(false, false);
+        cockpit
+            .client_mut()
+            .clear_safety_latch(SafetyLatchKind::Bump)
+            .unwrap();
+        let clear_events = cockpit.poll_events().unwrap();
+        assert!(clear_events
+            .events
+            .iter()
+            .any(|event| event.kind == pete_cockpit::CockpitEventKind::SafetyCleared));
+        let cleared_body = body_sense_from_cockpit_status(cockpit.refresh_status().unwrap(), 1_100);
+        assert!(!cleared_body.flags.bump_left);
+
+        let mut cleared_input = test_conductor_input(ActionPrimitive::Stop);
+        cleared_input.body = cleared_body.clone();
+        let reverse = conductor.choose(cleared_input.clone()).unwrap();
+        let reverse_motor = action_to_motor_command(Some(&reverse));
+        assert!(reverse_motor.forward < 0.0);
+        apply_slow_possession_motor(&mut cockpit, reverse_motor).unwrap();
+
+        let turn = conductor.choose(cleared_input).unwrap();
+        assert!(matches!(
+            turn,
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                ..
+            }
+        ));
+        let turn_motor = action_to_motor_command(Some(&turn));
+        assert!(turn_motor.turn.abs() > 0.0);
+        apply_slow_possession_motor(&mut cockpit, turn_motor).unwrap();
+
+        assert!(cockpit.client_mut().snapshot().possessed);
+        let events = sim.lock().unwrap().get_events_since(0).unwrap();
+        let stop_index = events
+            .events
+            .iter()
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::MotionStopped)
+            .unwrap();
+        assert!(events.events[stop_index + 1..]
+            .iter()
+            .any(|event| event.kind == pete_cockpit::CockpitEventKind::MotionRequested));
+    }
+
+    #[tokio::test]
+    async fn normal_possession_run_random_walk_bump_stop_and_recovery() {
+        let sim = Arc::new(Mutex::new(SimCockpit::new().with_event_capacity(256)));
+        let session = establish_session(
+            SharedSimCockpit(Arc::clone(&sim)),
+            HandshakeHello::motherbrain("pete-runtime-normal-bump-test"),
+            None,
+        )
+        .unwrap();
+        let possession = MotherbrainPossession::acquire(session, 5_000).unwrap();
+        let ledger_root = test_ledger_root("normal-possession-bump-recovery");
+        let ledger = JsonlLedger::new(&ledger_root);
+        let memory = InMemoryExperienceStore::new();
+        let runtime = MinimalRuntime::new(
+            ledger,
+            memory.clone(),
+            memory,
+            SimpleConductor::default(),
+            SimpleSafety::default(),
+            pete_llm::NoopLlmAgent,
+        );
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, possession, Vec::new(), runtime)
+            .with_autonomous_motion(true);
+        runner.cockpit.resync_event_cursor_from_status().unwrap();
+
+        let (_first_snapshot, first_tick) = runner.tick_slow_manual().await.unwrap();
+        assert!(matches!(
+            first_tick.chosen_action,
+            Some(ActionPrimitive::Drive { forward, turn, .. })
+                if (forward - 0.2).abs() < 0.001 && (turn - 0.1).abs() < 0.001
+        ));
+
+        sim.lock().unwrap().set_bump(true, false);
+        let (_bump_snapshot, bump_tick) = runner.tick_slow_manual().await.unwrap();
+        assert!(bump_tick.frame.now.body.flags.bump_left);
+        assert!(matches!(
+            bump_tick.chosen_action,
+            Some(ActionPrimitive::Go { intensity, .. }) if intensity < 0.0
+        ));
+
+        sim.lock().unwrap().set_bump(false, false);
+        runner.possession_recovery.last_command_ms =
+            wall_time_ms().saturating_sub(BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs + 1);
+        let (_turn_snapshot, turn_tick) = runner.tick_slow_manual().await.unwrap();
+        assert!(matches!(
+            turn_tick.chosen_action,
+            Some(ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                ..
+            })
+        ));
+
+        let events = sim.lock().unwrap().get_events_since(0).unwrap();
+        let bump_index = events
+            .events
+            .iter()
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::BumpChanged)
+            .unwrap();
+        let stop_index = events.events[bump_index..]
+            .iter()
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::MotionStopped)
+            .map(|index| bump_index + index)
+            .unwrap();
+        let safety_index = events.events[bump_index..]
+            .iter()
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::SafetyTripped)
+            .map(|index| bump_index + index)
+            .unwrap();
+        assert!(bump_index < safety_index && safety_index < stop_index);
+        assert!(runner.cockpit.client_mut().snapshot().possessed);
+        let _ = fs::remove_dir_all(ledger_root);
+    }
+
     struct CountingCockpit {
         motor_attempts: Arc<AtomicUsize>,
         motors: Arc<Mutex<Vec<MotorCommand>>>,
@@ -8330,10 +9455,14 @@ mod tests {
         fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
             Ok(CockpitStatus {
                 raw: serde_json::json!({
+                    "uptime_ms": 1_000,
                     "current_runtime_state": "test",
                     "oi_mode": "safe",
                     "current_command": "stop",
                     "create_sensors": {
+                        "last_packet_id": 0,
+                        "complete_packet_count": 1,
+                        "last_complete_packet_timestamp_ms": 1_000,
                         "bump_left": self.body.flags.bump_left,
                         "bump_right": self.body.flags.bump_right,
                         "wheel_drop": self.body.flags.wheel_drop,
@@ -8383,6 +9512,515 @@ mod tests {
                     max_ttl_ms: 60_000,
                 },
             })
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: 1,
+                next_seq: since_seq.saturating_add(1),
+                dropped_before_seq: 0,
+                events: Vec::new(),
+            })
+        }
+    }
+
+    struct LatchedStatusCockpit {
+        clear_attempts: Arc<Mutex<Vec<SafetyLatchKind>>>,
+        latch: SafetyLatchKind,
+        safety_tripped: bool,
+    }
+
+    impl Cockpit for LatchedStatusCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            match request {
+                CockpitRequest::GetStatus => Ok(CockpitResponse::Status(self.get_status()?)),
+                CockpitRequest::GetCapabilities => {
+                    Ok(CockpitResponse::Capabilities(self.get_capabilities()?))
+                }
+                CockpitRequest::GetEvents { since_seq } => {
+                    Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
+                }
+                CockpitRequest::ClearSafetyLatch { latch } => {
+                    self.clear_attempts.lock().unwrap().push(latch);
+                    self.safety_tripped = false;
+                    Ok(CockpitResponse::Accepted)
+                }
+                CockpitRequest::Stop | CockpitRequest::HeartbeatStop { .. } => {
+                    Ok(CockpitResponse::Accepted)
+                }
+                _ => Ok(CockpitResponse::Accepted),
+            }
+        }
+
+        fn handshake(
+            &mut self,
+            _hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            Err(pete_cockpit::CockpitError::Policy(
+                "test cockpit has no handshake peer".into(),
+            ))
+        }
+
+        fn execute_in_session(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ServiceLease,
+            _request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            Err(pete_cockpit::CockpitError::Policy(
+                "test cockpit has no service mode".into(),
+            ))
+        }
+
+        fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
+            Ok(CockpitStatus {
+                raw: serde_json::json!({
+                    "uptime_ms": 1_000,
+                    "current_runtime_state": "idle",
+                    "oi_mode": "safe",
+                    "current_command": "stop",
+                    "estop_latched": false,
+                    "safety_tripped": self.safety_tripped,
+                    "safety_latch_kind": self.latch,
+                    "create_sensors": {
+                        "last_packet_id": 0,
+                        "complete_packet_count": 1,
+                        "last_complete_packet_timestamp_ms": 1_000,
+                        "charging_state": 0,
+                    },
+                    "imu": {
+                        "health": "ok",
+                        "tilt_magnitude_mrad": 0,
+                        "impact_score_mm_s2": 0,
+                    }
+                })
+                .to_string(),
+            })
+        }
+
+        fn get_capabilities(&mut self) -> pete_cockpit::Result<CockpitCapabilities> {
+            Ok(CockpitCapabilities {
+                body_kind: "test".to_string(),
+                drive: "differential".to_string(),
+                verbs: [
+                    "status",
+                    "get_capabilities",
+                    "get_events",
+                    "stop",
+                    "cmd_vel",
+                    "heartbeat_stop",
+                    "clear_safety_latch",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                sensors: Vec::new(),
+                outputs: Vec::new(),
+                safety: Vec::new(),
+                events: Vec::new(),
+                limits: pete_cockpit::CockpitLimits {
+                    max_linear_mm_s: 500,
+                    max_angular_mrad_s: 4_000,
+                    min_ttl_ms: 1,
+                    max_ttl_ms: 60_000,
+                },
+            })
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: 1,
+                next_seq: since_seq.saturating_add(1),
+                dropped_before_seq: 0,
+                events: Vec::new(),
+            })
+        }
+    }
+
+    struct ActiveBumpRecoveryCockpit {
+        bump_escape_attempts: Arc<AtomicUsize>,
+        bump_escape_commands: Arc<Mutex<Vec<(EscapeDirection, i16, i16)>>>,
+        stop_attempts: Arc<AtomicUsize>,
+        clear_attempts: Arc<AtomicUsize>,
+        bump_active: bool,
+    }
+
+    impl Cockpit for ActiveBumpRecoveryCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            match request {
+                CockpitRequest::GetStatus => Ok(CockpitResponse::Status(self.get_status()?)),
+                CockpitRequest::GetCapabilities => {
+                    Ok(CockpitResponse::Capabilities(self.get_capabilities()?))
+                }
+                CockpitRequest::GetEvents { since_seq } => {
+                    Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
+                }
+                CockpitRequest::BumpEscape {
+                    direction,
+                    backoff_mm_s,
+                    turn_angular_mrad_s,
+                } => {
+                    self.bump_escape_attempts.fetch_add(1, Ordering::SeqCst);
+                    self.bump_escape_commands.lock().unwrap().push((
+                        direction,
+                        backoff_mm_s,
+                        turn_angular_mrad_s,
+                    ));
+                    Ok(CockpitResponse::Accepted)
+                }
+                CockpitRequest::Stop => {
+                    self.stop_attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(CockpitResponse::Accepted)
+                }
+                CockpitRequest::ClearSafetyLatch {
+                    latch: SafetyLatchKind::Bump,
+                } => {
+                    self.clear_attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(CockpitResponse::Accepted)
+                }
+                CockpitRequest::HeartbeatStop { .. } => Ok(CockpitResponse::Accepted),
+                _ => Ok(CockpitResponse::Accepted),
+            }
+        }
+
+        fn handshake(
+            &mut self,
+            _hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            Err(pete_cockpit::CockpitError::Policy(
+                "test cockpit has no handshake peer".into(),
+            ))
+        }
+
+        fn execute_in_session(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ServiceLease,
+            _request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            Err(pete_cockpit::CockpitError::Policy(
+                "test cockpit has no service mode".into(),
+            ))
+        }
+
+        fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
+            Ok(CockpitStatus {
+                raw: serde_json::json!({
+                    "uptime_ms": 1_000,
+                    "current_runtime_state": "idle",
+                    "oi_mode": "safe",
+                    "current_command": "stop",
+                    "estop_latched": false,
+                    "safety_tripped": true,
+                    "safety_latch_kind": "bump",
+                    "create_sensors": {
+                        "last_packet_id": 0,
+                        "complete_packet_count": 1,
+                        "last_complete_packet_timestamp_ms": 1_000,
+                        "bump_left": self.bump_active,
+                        "bump_right": false,
+                        "charging_state": 0,
+                    },
+                    "imu": {
+                        "health": "ok",
+                        "tilt_magnitude_mrad": 0,
+                        "impact_score_mm_s2": 0,
+                    }
+                })
+                .to_string(),
+            })
+        }
+
+        fn get_capabilities(&mut self) -> pete_cockpit::Result<CockpitCapabilities> {
+            Ok(CockpitCapabilities {
+                body_kind: "test".to_string(),
+                drive: "differential".to_string(),
+                verbs: [
+                    "status",
+                    "get_capabilities",
+                    "get_events",
+                    "stop",
+                    "bump_escape",
+                    "heartbeat_stop",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                sensors: Vec::new(),
+                outputs: Vec::new(),
+                safety: Vec::new(),
+                events: Vec::new(),
+                limits: pete_cockpit::CockpitLimits {
+                    max_linear_mm_s: 500,
+                    max_angular_mrad_s: 4_000,
+                    min_ttl_ms: 1,
+                    max_ttl_ms: 60_000,
+                },
+            })
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: 1,
+                next_seq: since_seq.saturating_add(1),
+                dropped_before_seq: 0,
+                events: Vec::new(),
+            })
+        }
+    }
+
+    struct HistoryGapCockpit {
+        inner: CountingCockpit,
+        event_polls: Arc<AtomicUsize>,
+        gap_poll: usize,
+    }
+
+    impl Cockpit for HistoryGapCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute(request)
+        }
+
+        fn handshake(
+            &mut self,
+            hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            self.inner.handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ServiceLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner
+                .execute_with_service_lease(session, lease, request)
+        }
+
+        fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
+            self.inner.get_status()
+        }
+
+        fn get_capabilities(&mut self) -> pete_cockpit::Result<CockpitCapabilities> {
+            self.inner.get_capabilities()
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
+            let poll = self.event_polls.fetch_add(1, Ordering::SeqCst);
+            let inject_gap = poll == self.gap_poll;
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: if inject_gap {
+                    since_seq.saturating_add(2)
+                } else {
+                    1
+                },
+                next_seq: since_seq.saturating_add(2),
+                dropped_before_seq: if inject_gap {
+                    since_seq.saturating_add(2)
+                } else {
+                    0
+                },
+                events: Vec::new(),
+            })
+        }
+    }
+
+    struct MotionStopEventsCockpit {
+        inner: CountingCockpit,
+        event_polls: Arc<AtomicUsize>,
+    }
+
+    impl Cockpit for MotionStopEventsCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute(request)
+        }
+
+        fn handshake(
+            &mut self,
+            hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            self.inner.handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ServiceLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner
+                .execute_with_service_lease(session, lease, request)
+        }
+
+        fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
+            self.inner.get_status()
+        }
+
+        fn get_capabilities(&mut self) -> pete_cockpit::Result<CockpitCapabilities> {
+            self.inner.get_capabilities()
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
+            let poll = self.event_polls.fetch_add(1, Ordering::SeqCst);
+            let events = if poll == 1 {
+                vec![
+                    pete_cockpit::CockpitEvent {
+                        seq: since_seq.saturating_add(1),
+                        kind: pete_cockpit::CockpitEventKind::HeartbeatExpired,
+                        a: 0,
+                        b: 0,
+                        c: 0,
+                    },
+                    pete_cockpit::CockpitEvent {
+                        seq: since_seq.saturating_add(2),
+                        kind: pete_cockpit::CockpitEventKind::SafetyTripped,
+                        a: 1,
+                        b: 0,
+                        c: 0,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: 1,
+                next_seq: since_seq.saturating_add(events.len() as u32 + 1),
+                dropped_before_seq: 0,
+                events,
+            })
+        }
+    }
+
+    struct RejectingMotionCockpit {
+        inner: CountingCockpit,
+        rejection_attempts: Arc<AtomicUsize>,
+    }
+
+    impl Cockpit for RejectingMotionCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            if matches!(&request, CockpitRequest::CmdVel { .. }) {
+                self.rejection_attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(pete_cockpit::CockpitError::Rejected {
+                    command_id: 42,
+                    reason: "stale_sequence".to_string(),
+                });
+            }
+            self.inner.execute(request)
+        }
+
+        fn handshake(
+            &mut self,
+            hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            self.inner.handshake(hello)
+        }
+
+        fn execute_in_session(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_in_session(session, request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner.execute_with_lease(session, lease, request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            session: &pete_cockpit::CockpitSession,
+            lease: &pete_cockpit::ServiceLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.inner
+                .execute_with_service_lease(session, lease, request)
+        }
+
+        fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
+            self.inner.get_status()
+        }
+
+        fn get_capabilities(&mut self) -> pete_cockpit::Result<CockpitCapabilities> {
+            self.inner.get_capabilities()
         }
 
         fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
@@ -8480,6 +10118,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_robot_slow_runner_clears_latch_reported_by_status() {
+        let clear_attempts = Arc::new(Mutex::new(Vec::new()));
+        let body = LatchedStatusCockpit {
+            clear_attempts: Arc::clone(&clear_attempts),
+            latch: SafetyLatchKind::Tilt,
+            safety_tripped: true,
+        };
+        let mut runner =
+            RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), StubRuntime)
+                .with_autonomous_motion(true);
+
+        let (snapshot, _tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(
+            clear_attempts.lock().unwrap().as_slice(),
+            &[SafetyLatchKind::Tilt]
+        );
+        assert_eq!(
+            snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("possession_recovery"))
+                .and_then(|debug| debug.get("latched")),
+            Some(&serde_json::json!("Tilt"))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_reports_active_bump_recovery_as_chosen_action() {
+        let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
+        let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let body = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            bump_escape_commands: Arc::clone(&bump_escape_commands),
+            stop_attempts,
+            clear_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_active: true,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bump_escape_commands.lock().unwrap().as_slice(),
+            &[(EscapeDirection::Right, 50, 500)]
+        );
+        assert_eq!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: -0.2,
+                duration_ms: BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs,
+            })
+        );
+        let debug = snapshot.action_debug.as_ref().unwrap();
+        assert_eq!(
+            debug.get("runtime_chosen_action"),
+            Some(
+                &serde_json::to_value(ActionPrimitive::Go {
+                    intensity: 0.2,
+                    duration_ms: 100,
+                })
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            debug.get("motion_sent_to_robot"),
+            Some(
+                &serde_json::to_value(motor_command_to_motion(MotorCommand {
+                    forward: -0.05,
+                    turn: 0.0,
+                }))
+                .unwrap()
+            )
+        );
+        assert_eq!(debug.get("motor_applied"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            debug
+                .get("possession_recovery")
+                .and_then(|debug| debug.get("latched")),
+            Some(&serde_json::json!("Bump"))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_does_not_spam_bump_escape_during_recovery_cooldown() {
+        let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
+        let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let body = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            bump_escape_commands,
+            stop_attempts,
+            clear_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_active: true,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (_first_snapshot, _first_tick) = runner.tick_slow_manual().await.unwrap();
+        let (second_snapshot, second_tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second_tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: -0.2,
+                duration_ms: BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs,
+            })
+        );
+        assert!(second_snapshot
+            .action_debug
+            .as_ref()
+            .and_then(|debug| debug.get("why_not_moving"))
+            .and_then(|reason| reason.as_str())
+            .is_some_and(|reason| reason.contains("reversing")));
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_reports_stuck_bump_recovery_after_repeated_attempts() {
+        let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
+        let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let body = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            bump_escape_commands,
+            stop_attempts: Arc::clone(&stop_attempts),
+            clear_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_active: true,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+        runner.possession_recovery.latch = Some(SafetyLatchKind::Bump);
+        runner.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+        runner.possession_recovery.active_since_ms =
+            wall_time_ms().saturating_sub(POSSESSION_RECOVERY_STUCK_AFTER_MS + 1);
+        runner.possession_recovery.command_attempts = POSSESSION_RECOVERY_MAX_ATTEMPTS;
+
+        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        let debug = snapshot.action_debug.as_ref().unwrap();
+        assert!(debug
+            .get("why_not_moving")
+            .and_then(|reason| reason.as_str())
+            .is_some_and(|reason| reason.contains("operator intervention needed")));
+        assert_eq!(
+            debug
+                .get("possession_recovery")
+                .and_then(|debug| debug.get("phase")),
+            Some(&serde_json::json!("Stuck"))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_escapes_even_if_momentary_bump_already_cleared() {
+        let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
+        let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
+        let body = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            bump_escape_commands: Arc::clone(&bump_escape_commands),
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            clear_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_active: false,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bump_escape_commands.lock().unwrap().as_slice(),
+            &[(EscapeDirection::Right, 50, 500)]
+        );
+        assert!(matches!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_reports_clockwise_turn_phase_without_resubmitting() {
+        let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
+        let body = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            bump_escape_commands: Arc::new(Mutex::new(Vec::new())),
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            clear_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_active: true,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+        runner.possession_recovery.latch = Some(SafetyLatchKind::Bump);
+        runner.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+        runner.possession_recovery.command_attempts = 1;
+        runner.possession_recovery.last_command_ms =
+            wall_time_ms().saturating_sub(BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs + 1);
+
+        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                ..
+            })
+        ));
+        assert!(snapshot
+            .action_debug
+            .as_ref()
+            .and_then(|debug| debug.get("why_not_moving"))
+            .and_then(|reason| reason.as_str())
+            .is_some_and(|reason| reason.contains("clockwise 90 degrees")));
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_clears_bump_only_after_escape_finishes() {
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let clear_attempts = Arc::new(AtomicUsize::new(0));
+        let body = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_escape_commands: Arc::new(Mutex::new(Vec::new())),
+            stop_attempts: Arc::clone(&stop_attempts),
+            clear_attempts: Arc::clone(&clear_attempts),
+            bump_active: false,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+        runner.possession_recovery.latch = Some(SafetyLatchKind::Bump);
+        runner.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+        runner.possession_recovery.command_attempts = 1;
+        runner.possession_recovery.last_command_ms =
+            wall_time_ms().saturating_sub(POSSESSION_BUMP_ESCAPE_DURATION_MS + 1);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(clear_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.possession_recovery.latch, None);
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+    }
+
+    #[tokio::test]
     async fn real_robot_slow_runner_applies_executive_motion_when_explicitly_authorized() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
@@ -8562,6 +10449,250 @@ mod tests {
         );
         assert!(first_tick.frame.notes.is_empty());
         assert!(second_tick.frame.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_recovers_history_gap_by_stopping() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let event_polls = Arc::new(AtomicUsize::new(0));
+        let body = HistoryGapCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            event_polls: Arc::clone(&event_polls),
+            gap_poll: 1,
+        };
+        let runtime = SlowRuntime {
+            tick_attempts: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), runtime);
+
+        runner.tick_slow_manual().await.unwrap();
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(event_polls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            tick.frame.now.extensions["brainstem.events"]["dropped_before_seq"],
+            serde_json::json!(3)
+        );
+        assert!(motor_attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(motors.lock().unwrap().last(), Some(&MotorCommand::stop()));
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_recovers_motion_safety_poll_history_gap_by_stopping() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let event_polls = Arc::new(AtomicUsize::new(0));
+        let body = HistoryGapCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            event_polls: Arc::clone(&event_polls),
+            gap_poll: 1,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 100,
+            })
+        );
+        assert_eq!(event_polls.load(Ordering::SeqCst), 2);
+        assert!(motor_attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(motors.lock().unwrap().last(), Some(&MotorCommand::stop()));
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_recovers_motion_stop_events_by_stopping() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let event_polls = Arc::new(AtomicUsize::new(0));
+        let body = MotionStopEventsCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            event_polls: Arc::clone(&event_polls),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: 0.2,
+                duration_ms: 100,
+            })
+        );
+        assert_eq!(event_polls.load(Ordering::SeqCst), 2);
+        assert!(motor_attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(motors.lock().unwrap().last(), Some(&MotorCommand::stop()));
+
+        let (recovery_snapshot, _recovery_tick) = runner.tick_slow_manual().await.unwrap();
+        assert_eq!(
+            recovery_snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("possession_recovery"))
+                .and_then(|debug| debug.get("latched")),
+            Some(&serde_json::json!("Bump"))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_treats_command_rejected_as_motion_feedback() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let rejection_attempts = Arc::new(AtomicUsize::new(0));
+        let body = RejectingMotionCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            rejection_attempts: Arc::clone(&rejection_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert_eq!(rejection_attempts.load(Ordering::SeqCst), 1);
+        let motors = motors.lock().unwrap();
+        assert_eq!(motors.last(), Some(&MotorCommand::stop()));
+        assert_eq!(
+            snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("why_not_moving"))
+                .and_then(|reason| reason.as_str()),
+            Some(
+                "brainstem rejected motion command #42: stale_sequence; pausing motion retries for 1000 ms"
+            )
+        );
+        assert_eq!(
+            snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("motor_applied"))
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_pauses_motion_after_command_rejection() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let rejection_attempts = Arc::new(AtomicUsize::new(0));
+        let body = RejectingMotionCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            rejection_attempts: Arc::clone(&rejection_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+
+        let (_first_snapshot, _first_tick) = runner.tick_slow_manual().await.unwrap();
+        let (second_snapshot, second_tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(second_tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert_eq!(rejection_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(motors.lock().unwrap().last(), Some(&MotorCommand::stop()));
+        assert!(second_snapshot
+            .action_debug
+            .as_ref()
+            .and_then(|debug| debug.get("why_not_moving"))
+            .and_then(|reason| reason.as_str())
+            .is_some_and(|reason| reason.contains("pausing motion retries")));
+        assert_eq!(
+            second_snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("motion_rejection"))
+                .and_then(|debug| debug.get("count")),
+            Some(&serde_json::json!(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_latches_stuck_after_repeated_command_rejections() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let rejection_attempts = Arc::new(AtomicUsize::new(0));
+        let body = RejectingMotionCockpit {
+            inner: CountingCockpit {
+                motor_attempts: Arc::clone(&motor_attempts),
+                motors: Arc::clone(&motors),
+                body: BodySense {
+                    last_update_ms: 100,
+                    ..BodySense::default()
+                },
+            },
+            rejection_attempts: Arc::clone(&rejection_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+        let now_ms = wall_time_ms();
+        runner.motion_rejection = MotionRejectionState {
+            first_ms: now_ms,
+            last_ms: now_ms,
+            latest_command_id: 41,
+            latest_reason: Some("busy".to_string()),
+            count: MOTION_REJECTION_STUCK_AFTER - 1,
+            ..MotionRejectionState::default()
+        };
+
+        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert!(snapshot
+            .action_debug
+            .as_ref()
+            .and_then(|debug| debug.get("why_not_moving"))
+            .and_then(|reason| reason.as_str())
+            .is_some_and(|reason| reason.contains("operator intervention needed")));
+        assert_eq!(
+            snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("motion_rejection"))
+                .and_then(|debug| debug.get("stuck")),
+            Some(&serde_json::json!(true))
+        );
     }
 
     struct ManualRuntime;
@@ -8729,6 +10860,56 @@ mod tests {
                 .and_then(|value| value.get("runtime_bypassed"))
                 .and_then(|value| value.as_bool()),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_direct_webremote_stops_locally_while_charging() {
+        let motor_attempts = Arc::new(AtomicUsize::new(0));
+        let motors = Arc::new(Mutex::new(Vec::new()));
+        let body = CountingCockpit {
+            motor_attempts: Arc::clone(&motor_attempts),
+            motors: Arc::clone(&motors),
+            body: BodySense {
+                charging: true,
+                last_update_ms: 100,
+                ..BodySense::default()
+            },
+        };
+        let queue = Arc::new(Mutex::new(ReignQueue::default()));
+        queue.lock().unwrap().push(ReignInput {
+            id: Uuid::new_v4(),
+            issued_at_ms: 100,
+            expires_at_ms: wall_time_ms().saturating_add(500),
+            source: ReignSource::WebRemote,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Go {
+                intensity: 0.50,
+                duration_ms: 300,
+            },
+            priority: 1.0,
+            note: None,
+        });
+        let tick_attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = QueueOnlyRuntime {
+            queue,
+            tick_attempts: Arc::clone(&tick_attempts),
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), runtime);
+
+        let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(tick_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(motor_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(motors.lock().unwrap().as_slice(), &[MotorCommand::stop()]);
+        assert_eq!(
+            tick.frame
+                .now
+                .extensions
+                .get("action.motion_bridge")
+                .and_then(|value| value.get("why_not_moving"))
+                .and_then(|value| value.as_str()),
+            Some("charging active")
         );
     }
 
@@ -9029,6 +11210,30 @@ mod tests {
 
         assert!(!body_text.contains("floor feels like it falls away near me"));
         assert!(body_text.contains("cliff IR signal is uncertain"));
+    }
+
+    #[test]
+    fn cockpit_charging_indicator_sets_body_charging() {
+        let status = StatusSummary::from_raw(
+            r#"{"create_sensors":{"charging_state":0,"charging_indicator":"on","charge_mah":1300,"capacity_mah":2600}}"#,
+        );
+
+        let body = body_sense_from_cockpit_status(status, 42);
+
+        assert!(body.charging);
+        assert_eq!(body.battery_level, 0.5);
+        assert_eq!(body.last_update_ms, 42);
+    }
+
+    #[test]
+    fn real_slow_blocks_charging_body() {
+        let mut body = BodySense::default();
+        body.charging = true;
+
+        assert_eq!(
+            real_slow_body_block_reason(&body).as_deref(),
+            Some("charging active")
+        );
     }
 
     #[test]
@@ -9779,7 +11984,7 @@ mod tests {
             2_000,
         ));
         let mut body = BodySense::default();
-        body.flags.cliff_left = true;
+        body.flags.cliff_front_left = true;
         body.last_update_ms = 100;
         let now = Now::blank(100, body);
 
@@ -9806,6 +12011,12 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("Safety vetoed")));
+        let motor_gate = tick.frame.now.extensions.get("motor_gate").unwrap();
+        assert_eq!(
+            serde_json::from_value::<MotorCommand>(motor_gate["final_motor"].clone()).unwrap(),
+            MotorCommand::stop()
+        );
+        assert_eq!(motor_gate["safety_reason"], "cliff");
     }
 
     #[tokio::test]
@@ -10057,6 +12268,10 @@ mod tests {
         };
         let action = ActionPrimitive::Dock;
 
+        let locomotion = registry
+            .locomotion
+            .infer(&LocomotionInput::default(), 100)
+            .unwrap();
         let danger = registry
             .danger
             .infer(&danger_behavior_input(&now, &latent, Some(&action)), 100)
@@ -10102,6 +12317,7 @@ mod tests {
             .infer(&ExperienceBehaviorInput::from_now(&now), 100)
             .unwrap();
 
+        assert_eq!(locomotion.record.behavior_id, "locomotion");
         assert_eq!(experience.record.behavior_id, "experience");
         assert_eq!(danger.record.behavior_id, "danger");
         assert_eq!(charge.record.behavior_id, "charge");
@@ -10109,6 +12325,7 @@ mod tests {
         assert_eq!(action_value.record.behavior_id, "action_value");
         assert_eq!(eye_next.record.behavior_id, "eye_next");
         assert_eq!(ear_next.record.behavior_id, "ear_next");
+        assert!(locomotion.record.hardcoded_output.is_some());
         assert!(experience.record.hardcoded_output.is_some());
         assert!(danger.record.hardcoded_output.is_some());
         assert!(charge.record.hardcoded_output.is_some());
@@ -10252,6 +12469,14 @@ mod tests {
             let mut runner = SimRunner::new(runtime, world, motors);
             let start = runner.world.body();
             let mut saw_non_zero_final_motor = false;
+            let expected_selected_action = match &action {
+                ActionPrimitive::Explore { duration_ms, .. } => ActionPrimitive::Drive {
+                    forward: 0.2,
+                    turn: 0.1,
+                    duration_ms: *duration_ms,
+                },
+                _ => action.clone(),
+            };
 
             runner
                 .run_steps_observing_ticks(5, |snapshot, tick| {
@@ -10259,7 +12484,10 @@ mod tests {
                     if !is_near_zero_motor(final_motor) {
                         saw_non_zero_final_motor = true;
                     }
-                    assert_eq!(snapshot.final_selected_action, Some(action.clone()));
+                    assert_eq!(
+                        snapshot.final_selected_action,
+                        Some(expected_selected_action.clone())
+                    );
                 })
                 .await
                 .unwrap();
@@ -11478,6 +13706,32 @@ mod tests {
                 duration_ms: 1_200
             })
         );
+    }
+
+    #[test]
+    fn every_cliff_sensor_selects_stop_before_hardware_gate() {
+        for sensor in ["left", "front_left", "front_right", "right"] {
+            let mut body = test_body(1.0, 1.0, 1.0, 100);
+            match sensor {
+                "left" => body.flags.cliff_left = true,
+                "front_left" => body.flags.cliff_front_left = true,
+                "front_right" => body.flags.cliff_front_right = true,
+                "right" => body.flags.cliff_right = true,
+                _ => unreachable!(),
+            }
+            let now = Now::blank(100, body.clone());
+
+            assert_eq!(
+                hard_safety_action(&now),
+                Some(ActionPrimitive::Stop),
+                "{sensor}"
+            );
+            assert_eq!(
+                real_slow_body_block_reason(&body).as_deref(),
+                Some("cliff sensor active"),
+                "{sensor}"
+            );
+        }
     }
 
     fn test_ledger_root(name: &str) -> PathBuf {

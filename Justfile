@@ -32,8 +32,8 @@ pico_w_mount_timeout_secs := env_var_or_default("PICO_W_MOUNT_TIMEOUT_SECS", "30
 default *args:
     just robot {{args}}
 
-# Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, and local models.
-setup: setup-system setup-docker setup-user setup-rust setup-kinect setup-ort setup-tts setup-whisper
+# Install Linux dependencies, Rust toolchain, Docker, Kinect prerequisites, Pico BOOTSEL automount, and local models.
+setup: setup-system setup-docker setup-user setup-pico-bootsel setup-rust setup-kinect setup-ort setup-tts setup-whisper
     @echo "pete Linux setup complete"
     @echo "next: cargo check && just sim"
 
@@ -78,7 +78,8 @@ setup-system:
         libssl-dev \
         libudev-dev \
         libusb-1.0-0-dev \
-        libv4l-dev
+        libv4l-dev \
+        udisks2
 
 # Install Docker and Docker Compose.
 setup-docker:
@@ -99,6 +100,23 @@ setup-user:
         fi
     done
     echo "User setup complete. Please reboot or log out and back in for group changes to take effect."
+
+# Install udev/systemd integration that mounts Pico/Pico W BOOTSEL at /media/$USER/RPI-RP2.
+setup-pico-bootsel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    user="${SUDO_USER:-$(whoami)}"
+    group="$(id -gn "$user")"
+    sudo install -d -m 0755 /usr/local/lib/netherwick
+    sudo install -m 0755 scripts/pico-bootsel-mount.sh /usr/local/lib/netherwick/pico-bootsel-mount
+    sudo install -m 0644 configs/systemd/netherwick-pico-bootsel-mount@.service /etc/systemd/system/netherwick-pico-bootsel-mount@.service
+    sudo install -m 0644 configs/udev/99-netherwick-pico-bootsel.rules /etc/udev/rules.d/99-netherwick-pico-bootsel.rules
+    printf 'PICO_BOOTSEL_USER=%s\nPICO_BOOTSEL_GROUP=%s\nPICO_BOOTSEL_MOUNT_BASE=/media\n' "$user" "$group" \
+        | sudo tee /etc/default/netherwick-pico-bootsel >/dev/null
+    sudo systemctl daemon-reload
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=block --property-match=ID_FS_LABEL=RPI-RP2 || true
+    echo "Pico BOOTSEL automount installed for $user:$group at /media/$user/RPI-RP2"
 
 # Install Rust with rustup plus embedded firmware build tools.
 setup-rust:
@@ -276,21 +294,100 @@ flash: brainstem-pico-w-uf2
         return 1
     }
 
+    find_rpi_rp2_block() {
+        if command -v lsblk >/dev/null 2>&1; then
+            lsblk -rnpo LABEL,PATH,FSTYPE,MOUNTPOINT | awk '$1 == "RPI-RP2" && $3 == "vfat" && $4 == "" { print $2; exit }'
+        fi
+    }
+
+    find_rpi_rp2_block_any() {
+        if command -v lsblk >/dev/null 2>&1; then
+            lsblk -rnpo LABEL,PATH,FSTYPE | awk '$1 == "RPI-RP2" && $3 == "vfat" { print $2; exit }'
+        fi
+    }
+
+    mount_rpi_rp2() {
+        local block existing_mount mount_dir
+        block="$(find_rpi_rp2_block)"
+        if [ -z "$block" ]; then
+            block="$(find_rpi_rp2_block_any)"
+        fi
+        if [ -z "$block" ]; then
+            return 1
+        fi
+
+        echo "Mounting RPI-RP2 from $block" >&2
+        if command -v udisksctl >/dev/null 2>&1 && udisksctl mount -b "$block" >/dev/null 2>&1; then
+            find_rpi_rp2_mount
+            return 0
+        fi
+
+        mount_dir="/media/$USER/RPI-RP2"
+        sudo mkdir -p "$mount_dir"
+        existing_mount="$(lsblk -rnpo PATH,MOUNTPOINT "$block" | awk '$1 == "'"$block"'" { print $2; exit }')"
+        if [ -n "$existing_mount" ] && [ "$existing_mount" != "$mount_dir" ]; then
+            sudo umount "$existing_mount"
+        fi
+        if mountpoint -q "$mount_dir" && [ ! -w "$mount_dir" ]; then
+            sudo umount "$mount_dir"
+        fi
+        if ! mountpoint -q "$mount_dir"; then
+            sudo mount -t vfat -o "uid=$(id -u),gid=$(id -g),umask=022" "$block" "$mount_dir"
+        fi
+        find_rpi_rp2_mount
+    }
+
+    connected_to_brainstem_wifi() {
+        local ssid=""
+        if command -v nmcli >/dev/null 2>&1; then
+            ssid="$(
+                nmcli -t -f active,ssid dev wifi 2>/dev/null \
+                    | sed -n 's/^yes://p' \
+                    | awk 'tolower($0) ~ /^pete-/ { print; exit }' \
+                    || true
+            )"
+        elif command -v iwgetid >/dev/null 2>&1; then
+            ssid="$(iwgetid -r 2>/dev/null || true)"
+            if [[ "${ssid,,}" != pete-* ]]; then
+                ssid=""
+            fi
+        fi
+        [ -n "$ssid" ] \
+            && command -v curl >/dev/null 2>&1 \
+            && curl -fsS --connect-timeout 1 --max-time 2 \
+                "http://$host/status.json" >/dev/null
+    }
+
     mount_path=""
+    host="${bootsel_url#http://}"
+    host="${host%%/*}"
+    if [[ "$host" != *:* ]]; then
+        host="$host:80"
+    fi
     if mount_path="$(find_rpi_rp2_mount)"; then
         echo "RPI-RP2 already mounted at $mount_path; skipping BOOTSEL request"
+    elif mount_path="$(mount_rpi_rp2)"; then
+        echo "RPI-RP2 mounted at $mount_path; skipping BOOTSEL request"
     else
-        echo "Requesting authorized BOOTSEL via $bootsel_url"
-        host="${bootsel_url#http://}"
-        host="${host%%/*}"
-        if [[ "$host" != *:* ]]; then
-            host="$host:80"
+        echo "Requesting authorized BOOTSEL via USB CDC"
+        if ! PETE_BOOTSEL_USB=1 cargo run -q -p pete-cockpit --example service_bootsel; then
+            if connected_to_brainstem_wifi; then
+                echo "USB BOOTSEL failed; requesting authorized BOOTSEL via $bootsel_url"
+                PETE_BRAINSTEM_HTTP_HOST="$host" cargo run -q -p pete-cockpit --example service_bootsel \
+                    || bootsel_failed=1
+            else
+                echo "USB BOOTSEL failed and this host is not connected to a Pete brainstem Wi-Fi AP." >&2
+                bootsel_failed=1
+            fi
         fi
-        if ! PETE_BRAINSTEM_HTTP_HOST="$host" cargo run -q -p pete-cockpit --example service_bootsel \
-            && ! PETE_BOOTSEL_USB=1 cargo run -q -p pete-cockpit --example service_bootsel; then
+        if [ "${bootsel_failed:-0}" = 1 ]; then
             if [ "${PETE_ALLOW_LEGACY_BOOTSEL:-0}" != "1" ]; then
                 echo "Authorized BOOTSEL failed; legacy fallback is disabled." >&2
                 echo "Set PETE_ALLOW_LEGACY_BOOTSEL=1 only for explicit development recovery." >&2
+                exit 1
+            fi
+            if ! connected_to_brainstem_wifi; then
+                echo "Legacy HTTP BOOTSEL fallback requires an active Pete brainstem Wi-Fi connection." >&2
                 exit 1
             fi
             echo "WARNING: USING UNAUDITED LEGACY BOOTSEL DEVELOPMENT FALLBACK" >&2
@@ -302,6 +399,9 @@ flash: brainstem-pico-w-uf2
         deadline=$((SECONDS + timeout_secs))
         while [ "$SECONDS" -lt "$deadline" ]; do
             if mount_path="$(find_rpi_rp2_mount)"; then
+                break
+            fi
+            if mount_path="$(mount_rpi_rp2)"; then
                 break
             fi
             sleep 1
@@ -329,6 +429,45 @@ compose-build:
 # Start shared backing services (neo4j and qdrant).
 servers:
     docker compose up -d neo4j qdrant
+
+# Ensure shared graph and vector memory services are reachable.
+_ensure-memory-servers:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    neo4j_url="${PETE_NEO4J_HTTP_URL:-http://127.0.0.1:${PETE_NEO4J_HTTP_PORT:-7474}}"
+    qdrant_url="${PETE_QDRANT_URL:-http://127.0.0.1:${PETE_QDRANT_HTTP_PORT:-6333}}"
+    neo4j_url="${neo4j_url%/}"
+    qdrant_url="${qdrant_url%/}"
+
+    neo4j_ready() {
+        curl -fsS --max-time 2 "$neo4j_url/" >/dev/null 2>&1
+    }
+
+    qdrant_ready() {
+        curl -fsS --max-time 2 "$qdrant_url/readyz" >/dev/null 2>&1 \
+            || curl -fsS --max-time 2 "$qdrant_url/collections" >/dev/null 2>&1
+    }
+
+    if neo4j_ready && qdrant_ready; then
+        exit 0
+    fi
+
+    echo "Graph/vector memory services are not reachable; starting local Neo4j and Qdrant with just servers."
+    just servers
+
+    deadline=$((SECONDS + ${PETE_MEMORY_SERVER_WAIT_SECS:-90}))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if neo4j_ready && qdrant_ready; then
+            echo "Graph/vector memory services are ready."
+            exit 0
+        fi
+        sleep 2
+    done
+
+    echo "Timed out waiting for Neo4j at $neo4j_url and Qdrant at $qdrant_url." >&2
+    echo "Check 'docker compose ps neo4j qdrant' and 'just server-logs neo4j' / 'just server-logs qdrant'." >&2
+    exit 1
 
 # Start backing services plus the pete-live container.
 live-server:
@@ -419,6 +558,7 @@ _robot-cockpit-backend:
 robot *args:
     #!/usr/bin/env bash
     set -euo pipefail
+    just --quiet _ensure-memory-servers
     CAMERA_ARGS=()
     MIC_ARGS=()
     IMU_ARGS=()
@@ -499,13 +639,86 @@ possess *args:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${PETE_BRAINSTEM_DEVICE_ID:?set PETE_BRAINSTEM_DEVICE_ID in .env}"
+
+    set_env_var() {
+        local key="$1" value="$2" escaped
+        escaped="$(printf '%s' "$value" | sed 's/[\&/]/\\&/g')"
+        if [ -f .env ] && grep -q "^${key}=" .env; then
+            sed -i "s/^${key}=.*/${key}=${escaped}/" .env
+        else
+            printf '\n%s=%s\n' "$key" "$value" >> .env
+        fi
+    }
+
+    detect_single_brainstem_port() {
+        shopt -s nullglob
+        local candidates=(/dev/serial/by-id/*Pete_Brainstem*)
+        shopt -u nullglob
+        if [ "${#candidates[@]}" -eq 1 ]; then
+            printf '%s\n' "${candidates[0]}"
+        fi
+    }
+
+    refresh_brainstem_pin_from_usb() {
+        local detected_port bootstrap_log live_device_id live_boot_id
+        detected_port="$(detect_single_brainstem_port || true)"
+        if [ -z "$detected_port" ]; then
+            return 1
+        fi
+        bootstrap_log="$(mktemp)"
+        if ! PETE_BRAINSTEM_DEVICE_ID= cargo run -q -p pete-cockpit --example motherbrain_bootstrap -- --identity-only >"$bootstrap_log" 2>&1; then
+            cat "$bootstrap_log" >&2
+            rm -f "$bootstrap_log"
+            return 1
+        fi
+        live_device_id="$(sed -n 's/^brainstem identity: //p' "$bootstrap_log" | tail -n 1)"
+        live_boot_id="$(sed -n 's/^brainstem boot: //p' "$bootstrap_log" | tail -n 1)"
+        cat "$bootstrap_log"
+        rm -f "$bootstrap_log"
+        if [ -z "$live_device_id" ] || [ -z "$live_boot_id" ]; then
+            echo "USB bootstrap did not report a usable brainstem identity." >&2
+            return 1
+        fi
+        if [ "$live_device_id" != "$PETE_BRAINSTEM_DEVICE_ID" ] \
+            && [ "${PETE_ACCEPT_BRAINSTEM_REPLACEMENT:-0}" != "1" ]; then
+            echo "Detected brainstem $live_device_id at $detected_port, but .env pins $PETE_BRAINSTEM_DEVICE_ID." >&2
+            echo "To accept this replacement over the wired USB link, rerun:" >&2
+            echo "  PETE_ACCEPT_BRAINSTEM_REPLACEMENT=1 just possess" >&2
+            return 1
+        fi
+        set_env_var PETE_BRAINSTEM_DEVICE_ID "$live_device_id"
+        set_env_var PETE_BRAINSTEM_BOOT_ID "$live_boot_id"
+        set_env_var PETE_COCKPIT_PORT "$detected_port"
+        export PETE_BRAINSTEM_DEVICE_ID="$live_device_id"
+        export PETE_BRAINSTEM_BOOT_ID="$live_boot_id"
+        export PETE_COCKPIT_PORT="$detected_port"
+        BOOT_ID="$live_boot_id"
+        echo "Updated .env brainstem pin from wired USB: device=$live_device_id boot=$live_boot_id port=$detected_port"
+    }
+
+    if [ -n "${PETE_COCKPIT_PORT:-}" ] && [ "${PETE_COCKPIT_PORT:-}" != auto ] && [ ! -e "$PETE_COCKPIT_PORT" ]; then
+        DETECTED_PORT="$(detect_single_brainstem_port || true)"
+        if [ -n "$DETECTED_PORT" ]; then
+            echo "Configured PETE_COCKPIT_PORT is missing: $PETE_COCKPIT_PORT"
+            echo "Detected one wired brainstem candidate: $DETECTED_PORT"
+            refresh_brainstem_pin_from_usb
+        fi
+    fi
+
     BACKEND_WAS_EXPLICIT=0
     if [ -n "${PETE_COCKPIT_BACKEND:-}" ]; then BACKEND_WAS_EXPLICIT=1; fi
     COCKPIT_BACKEND="$(just --quiet _robot-cockpit-backend)"
     export PETE_COCKPIT_BACKEND="$COCKPIT_BACKEND"
     BOOT_ID="${PETE_BRAINSTEM_BOOT_ID:-unknown}"
     run_possession() {
-        echo "Taking brainstem possession over ${PETE_COCKPIT_BACKEND:-wifi} at ${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}"
+        if [ "${PETE_COCKPIT_BACKEND:-}" = "wifi" ]; then
+            COCKPIT_ENDPOINT="${PETE_BRAINSTEM_HTTP_HOST:-192.168.4.1:80}"
+        elif [ "${PETE_COCKPIT_BACKEND:-}" = "uart" ]; then
+            COCKPIT_ENDPOINT="${PETE_COCKPIT_PORT:-{{cockpit_port}}}"
+        else
+            COCKPIT_ENDPOINT="${PETE_COCKPIT_BACKEND:-unknown}"
+        fi
+        echo "Taking brainstem possession over ${PETE_COCKPIT_BACKEND:-unknown} at ${COCKPIT_ENDPOINT}"
         echo "device=$PETE_BRAINSTEM_DEVICE_ID boot=$BOOT_ID"
         echo "limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
         PETE_ROBOT_MODE=possession-slow \
@@ -561,12 +774,7 @@ possess *args:
     LIVE_BOOT_ID="$(sed -n 's/^Error: brainstem boot identity mismatch: expected .* received \([^[:space:]]*\)$/\1/p' "$LOG" | tail -n 1)"
     if [ -z "$LIVE_BOOT_ID" ]; then exit "$STATUS"; fi
 
-    if [ -f .env ] && grep -q '^PETE_BRAINSTEM_BOOT_ID=' .env; then
-        ESCAPED_BOOT_ID="$(printf '%s' "$LIVE_BOOT_ID" | sed 's/[\&/]/\\&/g')"
-        sed -i "s/^PETE_BRAINSTEM_BOOT_ID=.*/PETE_BRAINSTEM_BOOT_ID=$ESCAPED_BOOT_ID/" .env
-    else
-        printf '\nPETE_BRAINSTEM_BOOT_ID=%s\n' "$LIVE_BOOT_ID" >> .env
-    fi
+    set_env_var PETE_BRAINSTEM_BOOT_ID "$LIVE_BOOT_ID"
     BOOT_ID="$LIVE_BOOT_ID"
     export PETE_BRAINSTEM_BOOT_ID="$BOOT_ID"
     echo "Accepted current boot identity for pinned device $PETE_BRAINSTEM_DEVICE_ID; updated .env and retrying."
@@ -661,12 +869,87 @@ virtual:
 virtual-https:
     just go virtual
 
-# Train models from virtual ledger data.
-train target="virtual":
+# Train models from virtual ledger data or evolve a named NEAT behavior.
+train *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{target}}" != "virtual" ]; then
-        echo "usage: just train virtual"
+    set -- {{args}}
+    if [ "${1:-virtual}" = "--neat" ]; then
+        if [ "$#" -ne 2 ]; then
+            echo "usage: just train --neat locomotion"
+            exit 2
+        fi
+        behavior="$2"
+        report_dir="${PETE_NEAT_REPORT_DIR:-data/reports/neat/locomotion-v2}"
+        default_state_checkpoint="${report_dir}/trainer-state.json"
+        migrated_state_checkpoint="${report_dir}/trainer-state-schema3-leave-start-region.json"
+        if [ -z "${PETE_NEAT_STATE_CHECKPOINT:-}" ] && [ -f "$migrated_state_checkpoint" ]; then
+            default_state_checkpoint="$migrated_state_checkpoint"
+        fi
+        state_checkpoint="${PETE_NEAT_STATE_CHECKPOINT:-$default_state_checkpoint}"
+        capture_root="${PETE_NEAT_CAPTURE_ROOT:-data/captures/neat/locomotion-v2}"
+        resume="${PETE_NEAT_RESUME:-}"
+        founders="${PETE_NEAT_FOUNDERS_REPORT:-}"
+        start_stage="${PETE_NEAT_START_STAGE:-}"
+        extra_args=()
+        if [ -n "$resume" ] && [ -n "$founders" ]; then
+            echo "PETE_NEAT_RESUME and PETE_NEAT_FOUNDERS_REPORT are mutually exclusive"
+            exit 2
+        elif [ -n "$resume" ]; then
+            extra_args+=(--resume "$resume")
+            continuation="$resume"
+            echo "NEAT continuation: resuming $resume"
+        elif [ -n "$founders" ]; then
+            extra_args+=(--founders-report "$founders")
+            extra_args+=(--start-stage "${start_stage:-leave-start-region}")
+            continuation=""
+            echo "NEAT continuation: reconstructing founders from $founders"
+        elif [ -z "${PETE_NEAT_FRESH:-}" ] && [ -f "$state_checkpoint" ]; then
+            extra_args+=(--resume "$state_checkpoint")
+            continuation="$state_checkpoint"
+            echo "NEAT continuation: resuming $state_checkpoint"
+        elif [ -z "${PETE_NEAT_FRESH:-}" ] && [ -f data/reports/neat/locomotion/training-report.json ]; then
+            extra_args+=(--founders-report data/reports/neat/locomotion/training-report.json)
+            extra_args+=(--start-stage "${start_stage:-leave-start-region}")
+            continuation=""
+            echo "NEAT continuation: reconstructing founders from data/reports/neat/locomotion/training-report.json"
+        else
+            continuation=""
+            if [ -n "$start_stage" ]; then
+                extra_args+=(--start-stage "$start_stage")
+            fi
+            echo "NEAT continuation: starting a fresh competence-gated run"
+        fi
+        generations_per_stage="$(scripts/neat-generation-limit.sh "${continuation:-/nonexistent}" "${PETE_NEAT_GENERATIONS_PER_STAGE:-}" 120 120)"
+        cargo run -p pete-tools -- neat-train "$behavior" \
+            --generations-per-stage "$generations_per_stage" \
+            --population "${PETE_NEAT_POPULATION:-64}" \
+            --episodes-per-genome "${PETE_NEAT_EPISODES_PER_GENOME:-12}" \
+            --steps "${PETE_NEAT_STEPS:-300}" \
+            --transfer-episodes "${PETE_NEAT_TRANSFER_EPISODES:-500}" \
+            --seed "${PETE_NEAT_SEED:-7}" \
+            --heldout-seed "${PETE_NEAT_HELDOUT_SEED:-9000001}" \
+            --validation-seed "${PETE_NEAT_VALIDATION_SEED:-8000001}" \
+            --validation-every "${PETE_NEAT_VALIDATION_EVERY:-4}" \
+            --validation-passes "${PETE_NEAT_VALIDATION_PASSES:-2}" \
+            --compatibility-threshold "${PETE_NEAT_COMPATIBILITY_THRESHOLD:-2.2}" \
+            --compatibility-threshold-floor "${PETE_NEAT_COMPATIBILITY_THRESHOLD_FLOOR:-0.05}" \
+            --target-species-min "${PETE_NEAT_TARGET_SPECIES_MIN:-4}" \
+            --target-species-max "${PETE_NEAT_TARGET_SPECIES_MAX:-9}" \
+            --checkpoint "${PETE_NEAT_CHECKPOINT:-data/models/locomotion_neat_v0}" \
+            --report-dir "$report_dir" \
+            --state-checkpoint "$state_checkpoint" \
+            --capture-root "$capture_root" \
+            --capture-every "${PETE_NEAT_CAPTURE_EVERY:-2}" \
+            --rehearsal-ratio "${PETE_NEAT_REHEARSAL_RATIO:-0.20}" \
+            --niche-audit-episodes "${PETE_NEAT_NICHE_AUDIT_EPISODES:-16}" \
+            --models-config "${PETE_NEAT_MODELS_CONFIG:-configs/models.toml}" \
+            ${PETE_NEAT_NO_PROMOTE:+--no-promote} \
+            "${extra_args[@]}"
+        exit 0
+    fi
+    if [ "${1:-virtual}" != "virtual" ] || [ "$#" -gt 1 ]; then
+        echo "usage: just train virtual | just train --neat locomotion"
         exit 2
     fi
     cargo run -p pete-tools -- train virtual \

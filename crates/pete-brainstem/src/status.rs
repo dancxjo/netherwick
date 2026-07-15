@@ -2,11 +2,12 @@ use core::{
     fmt::Write as _,
     sync::atomic::{AtomicU32, AtomicU8, Ordering},
 };
+pub use pete_cockpit_protocol::CommandRejectReason;
 
 use crate::body;
 use crate::commands::{
     BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, PowerStateRequest,
-    RuntimeCommand, SafetyAction, SafetyPolicy, SongTone, MAX_SONG_TONES,
+    RuntimeCommand, SafetyAction, SafetyLatchKind, SafetyPolicy, SongTone, MAX_SONG_TONES,
 };
 use crate::drivers::imu::{
     derive_sample, derive_sample_with_gravity_calibration, ImuGravityCalibration, ImuHealth,
@@ -85,12 +86,15 @@ static FOREBRAIN_UART_LAST_ERROR: AtomicU8 = AtomicU8::new(ForebrainUartErrorCod
 static FOREBRAIN_UART_LAST_RX_MS: AtomicU32 = AtomicU32::new(0);
 static FOREBRAIN_UART_LAST_COMMAND_MS: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_LAST_PACKET_ID: AtomicU8 = AtomicU8::new(0);
+static CREATE_SENSOR_COMPLETE_PACKET_COUNT: AtomicU32 = AtomicU32::new(0);
+static CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_FLAGS: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_DISTANCE_MM: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_ANGLE_MRAD: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_IR_BYTE: AtomicU8 = AtomicU8::new(0);
 static CREATE_SENSOR_BUTTONS: AtomicU8 = AtomicU8::new(0);
 static CREATE_SENSOR_CHARGING_STATE: AtomicU8 = AtomicU8::new(0);
+static CREATE_CHARGING_INDICATOR_STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
 static CREATE_SENSOR_VOLTAGE_MV: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CURRENT_MA: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_TEMPERATURE_C: AtomicU32 = AtomicU32::new(0);
@@ -165,6 +169,7 @@ static DIAGNOSTIC_TRANSPORT: [AtomicU8; DIAGNOSTIC_SESSION_CAPACITY] =
 static ACTIVE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SESSION_GENERATION: AtomicU32 = AtomicU32::new(0);
 static SESSION_SAFETY_FLAGS: AtomicU32 = AtomicU32::new(0);
+static SESSION_SAFETY_LATCH_KIND: AtomicU8 = AtomicU8::new(0);
 static ACTIVE_TRANSPORT: AtomicU8 = AtomicU8::new(0);
 static AUTHORITY_REQUEST: AtomicU32 = AtomicU32::new(0);
 static AUTHORITY_ACK: AtomicU32 = AtomicU32::new(0);
@@ -235,12 +240,15 @@ pub struct BrainstemStatus {
     pub forebrain_uart_link_alive_ms: u32,
     pub forebrain_uart_last_command_age_ms: u32,
     pub create_sensor_last_packet_id: u8,
+    pub create_sensor_complete_packet_count: u32,
+    pub create_sensor_last_complete_packet_timestamp_ms: u32,
     pub create_sensor_flags: u32,
     pub create_sensor_distance_mm: i16,
     pub create_sensor_angle_mrad: i16,
     pub create_sensor_ir_byte: u8,
     pub create_sensor_buttons: u8,
     pub create_sensor_charging_state: u8,
+    pub create_charging_indicator_state: u8,
     pub create_sensor_voltage_mv: u16,
     pub create_sensor_current_ma: i16,
     pub create_sensor_temperature_c: i8,
@@ -420,19 +428,20 @@ pub enum PublicEventKind {
     TiltChanged = 33,
     MotionInconsistencyDetected = 34,
     ImpactDetected = 35,
-    Error = 36,
-    SessionOpened = 37,
-    SessionReplaced = 38,
-    SessionRejected = 39,
-    TransportChanged = 40,
-    PeerRebootDetected = 41,
-    DhcpLeaseChanged = 42,
-    DnsRegistrationChanged = 43,
-    AuthorityChanged = 44,
-    MotherbrainResetRequested = 45,
-    MotherbrainResetAsserted = 46,
-    MotherbrainResetCompleted = 47,
-    MotherbrainResetRefused = 48,
+    ImuCalibrationChanged = 36,
+    Error = 37,
+    SessionOpened = 38,
+    SessionReplaced = 39,
+    SessionRejected = 40,
+    TransportChanged = 41,
+    PeerRebootDetected = 42,
+    DhcpLeaseChanged = 43,
+    DnsRegistrationChanged = 44,
+    AuthorityChanged = 45,
+    MotherbrainResetRequested = 46,
+    MotherbrainResetAsserted = 47,
+    MotherbrainResetCompleted = 48,
+    MotherbrainResetRefused = 49,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -446,7 +455,7 @@ pub enum MotherbrainResetRefusal {
     InvalidCommandId = 6,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 pub enum SafetyEventKind {
     Bump = 1,
@@ -456,6 +465,21 @@ pub enum SafetyEventKind {
     Heartbeat = 5,
     Tilt = 6,
     Impact = 7,
+    Charging = 8,
+}
+
+fn safety_event_kind(code: u8) -> Option<SafetyEventKind> {
+    match code {
+        x if x == SafetyEventKind::Bump as u8 => Some(SafetyEventKind::Bump),
+        x if x == SafetyEventKind::Cliff as u8 => Some(SafetyEventKind::Cliff),
+        x if x == SafetyEventKind::WheelDrop as u8 => Some(SafetyEventKind::WheelDrop),
+        x if x == SafetyEventKind::EStop as u8 => Some(SafetyEventKind::EStop),
+        x if x == SafetyEventKind::Heartbeat as u8 => Some(SafetyEventKind::Heartbeat),
+        x if x == SafetyEventKind::Tilt as u8 => Some(SafetyEventKind::Tilt),
+        x if x == SafetyEventKind::Impact as u8 => Some(SafetyEventKind::Impact),
+        x if x == SafetyEventKind::Charging as u8 => Some(SafetyEventKind::Charging),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -541,9 +565,10 @@ enum ControlCommandCode {
     GetEvents = 42,
     ZeroImuOrientation = 43,
     ClearImuOrientation = 44,
-    RestartMpu = 45,
+    OrientationProbe = 45,
     RestartCreate = 46,
     ResetMotherbrain = 47,
+    ClearSafetyLatch = 48,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -583,6 +608,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::WiggleAlign { .. })
         | Some(RuntimeCommand::Unstick { .. })
         | Some(RuntimeCommand::CliffGuard { .. })
+        | Some(RuntimeCommand::ClearSafetyLatch { .. })
         | Some(RuntimeCommand::HeartbeatStop { .. }) => CommandCode::Behavior,
         Some(RuntimeCommand::PulseBrc) => CommandCode::PulseBrc,
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
@@ -595,10 +621,10 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::DefineChirp { .. })
         | Some(RuntimeCommand::PlayFeedback { .. })
         | Some(RuntimeCommand::CalibrateTurn { .. })
+        | Some(RuntimeCommand::OrientationProbe { .. })
         | Some(RuntimeCommand::ResetOdometry)
         | Some(RuntimeCommand::ZeroImuOrientation)
         | Some(RuntimeCommand::ClearImuOrientation)
-        | Some(RuntimeCommand::RestartMpu)
         | Some(RuntimeCommand::SetCreateBaud(_))
         | Some(RuntimeCommand::SongDefine { .. })
         | Some(RuntimeCommand::SongPlay { .. })
@@ -631,7 +657,10 @@ pub fn mark_command_started(command_id: u32, command_code: u8) {
 }
 
 #[cfg(feature = "pico-w")]
-pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> bool {
+pub fn submit_control_command(
+    command_id: u32,
+    command: BrainstemCommand,
+) -> Result<(), CommandRejectReason> {
     submit_control_command_with_service_identity(command_id, command, 0, 0)
 }
 
@@ -641,7 +670,7 @@ pub fn submit_service_control_command(
     command: BrainstemCommand,
     session_hash: u32,
     lease_hash: u32,
-) -> bool {
+) -> Result<(), CommandRejectReason> {
     submit_control_command_with_service_identity(command_id, command, session_hash, lease_hash)
 }
 
@@ -651,33 +680,52 @@ fn submit_control_command_with_service_identity(
     command: BrainstemCommand,
     service_session_hash: u32,
     service_lease_hash: u32,
-) -> bool {
+) -> Result<(), CommandRejectReason> {
     if matches!(
         command,
         BrainstemCommand::Status | BrainstemCommand::Ping | BrainstemCommand::GetEvents { .. }
     ) {
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, 0, 0);
-        return true;
+        return Ok(());
     }
     if matches!(command, BrainstemCommand::GetCapabilities) {
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, 0, 0);
-        return true;
+        return Ok(());
     }
 
     let Some((kind, a, b, c, d, duration_ms)) = encode_control_command(command) else {
-        LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-        record_public_event(PublicEventKind::CommandRejected, command_id, 0, 0);
-        return false;
+        return reject_control_command(
+            command_id,
+            command_seq(command),
+            ControlCommandCode::None,
+            CommandRejectReason::Unsupported,
+        );
     };
+
+    if charging_interlock_active(&snapshot(0)) && is_motion_control_command(command) {
+        return reject_control_command(
+            command_id,
+            command_seq(command),
+            kind,
+            CommandRejectReason::Charging,
+        );
+    }
 
     if kind == ControlCommandCode::CmdVel {
         let seq = command_seq(command);
-        if !seq_is_current_or_newer(seq, PENDING_VELOCITY_SEQ.load(Ordering::Relaxed)) {
-            LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-            record_public_event(PublicEventKind::CommandRejected, command_id, seq, 0);
-            return false;
+        let velocity_pending =
+            PENDING_VELOCITY_KIND.load(Ordering::Relaxed) == ControlCommandCode::CmdVel as u8;
+        if velocity_pending
+            && !seq_is_current_or_newer(seq, PENDING_VELOCITY_SEQ.load(Ordering::Relaxed))
+        {
+            return reject_control_command(
+                command_id,
+                seq,
+                kind,
+                CommandRejectReason::StaleSequence,
+            );
         }
 
         PENDING_VELOCITY_ID.store(command_id, Ordering::Relaxed);
@@ -688,15 +736,23 @@ fn submit_control_command_with_service_identity(
         PENDING_VELOCITY_KIND.store(ControlCommandCode::CmdVel as u8, Ordering::Relaxed);
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, seq, 0);
-        return true;
+        return Ok(());
     }
 
     if matches!(kind, ControlCommandCode::Stop | ControlCommandCode::EStop) {
         PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
-    } else if PENDING_COMMAND_KIND.load(Ordering::Relaxed) != ControlCommandCode::None as u8 {
-        LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-        record_public_event(PublicEventKind::CommandRejected, command_id, 0, 0);
-        return false;
+    } else {
+        let pending_kind = PENDING_COMMAND_KIND.load(Ordering::Relaxed);
+        let replaces_pending_heartbeat = kind == ControlCommandCode::HeartbeatStop
+            && pending_kind == ControlCommandCode::HeartbeatStop as u8;
+        if pending_kind != ControlCommandCode::None as u8 && !replaces_pending_heartbeat {
+            return reject_control_command(
+                command_id,
+                command_seq(command),
+                kind,
+                CommandRejectReason::Busy,
+            );
+        }
     }
 
     PENDING_COMMAND_ID.store(command_id, Ordering::Relaxed);
@@ -716,7 +772,25 @@ fn submit_control_command_with_service_identity(
         command_seq(command),
         kind as u32,
     );
-    true
+    Ok(())
+}
+
+#[cfg(feature = "pico-w")]
+fn reject_control_command(
+    command_id: u32,
+    command_seq: u32,
+    command_kind: ControlCommandCode,
+    reason: CommandRejectReason,
+) -> Result<(), CommandRejectReason> {
+    LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+    let detail = ((command_kind as u32) << 8) | reason.code() as u32;
+    record_public_event(
+        PublicEventKind::CommandRejected,
+        command_id,
+        command_seq,
+        detail,
+    );
+    Err(reason)
 }
 
 pub fn take_control_command() -> Option<BrainstemCommand> {
@@ -923,16 +997,32 @@ pub fn session_role(session_hash: u32) -> Option<u8> {
         .map(|slot| DIAGNOSTIC_ROLE[slot].load(Ordering::Acquire))
 }
 
-pub fn set_session_safety_snapshot(estop_latched: bool, safety_tripped: bool) {
+pub fn set_session_safety_snapshot(
+    estop_latched: bool,
+    safety_tripped: bool,
+    motion_interlock_latched: bool,
+    safety_latch_kind: Option<SafetyEventKind>,
+) {
     SESSION_SAFETY_FLAGS.store(
-        (estop_latched as u32) | ((safety_tripped as u32) << 1),
+        (estop_latched as u32)
+            | ((safety_tripped as u32) << 1)
+            | ((motion_interlock_latched as u32) << 2),
+        Ordering::Release,
+    );
+    SESSION_SAFETY_LATCH_KIND.store(
+        safety_latch_kind.map_or(0, |kind| kind as u8),
         Ordering::Release,
     );
 }
 
-pub fn session_safety_snapshot() -> (bool, bool) {
+pub fn session_safety_snapshot() -> (bool, bool, bool, Option<SafetyEventKind>) {
     let flags = SESSION_SAFETY_FLAGS.load(Ordering::Acquire);
-    (flags & 1 != 0, flags & 2 != 0)
+    (
+        flags & 1 != 0,
+        flags & 2 != 0,
+        flags & 4 != 0,
+        safety_event_kind(SESSION_SAFETY_LATCH_KIND.load(Ordering::Acquire)),
+    )
 }
 
 pub fn request_authority_transition(
@@ -1380,6 +1470,14 @@ fn encode_control_command(
         BrainstemCommand::CliffGuard { clear, .. } => {
             Some((ControlCommandCode::CliffGuard, clear as u32, 0, 0, 0, None))
         }
+        BrainstemCommand::ClearSafetyLatch { kind, .. } => Some((
+            ControlCommandCode::ClearSafetyLatch,
+            encode_safety_latch_kind(kind) as u32,
+            0,
+            0,
+            0,
+            None,
+        )),
         BrainstemCommand::RequestSensors { packet_id, .. } => Some((
             ControlCommandCode::RequestSensors,
             packet_id as u32,
@@ -1457,6 +1555,18 @@ fn encode_control_command(
             0,
             Some(duration_ms),
         )),
+        BrainstemCommand::OrientationProbe {
+            angular_mrad_s,
+            duration_ms,
+            ..
+        } => Some((
+            ControlCommandCode::OrientationProbe,
+            encode_i16(angular_mrad_s),
+            0,
+            0,
+            0,
+            Some(duration_ms),
+        )),
         BrainstemCommand::ResetOdometry { .. } => {
             Some((ControlCommandCode::ResetOdometry, 0, 0, 0, 0, None))
         }
@@ -1466,7 +1576,6 @@ fn encode_control_command(
         BrainstemCommand::ClearImuOrientation { .. } => {
             Some((ControlCommandCode::ClearImuOrientation, 0, 0, 0, 0, None))
         }
-        BrainstemCommand::RestartMpu => Some((ControlCommandCode::RestartMpu, 0, 0, 0, 0, None)),
         BrainstemCommand::RestartCreate => {
             Some((ControlCommandCode::RestartCreate, 0, 0, 0, 0, None))
         }
@@ -1652,6 +1761,12 @@ fn decode_control_command(
         x if x == ControlCommandCode::CliffGuard as u8 => {
             Some(BrainstemCommand::CliffGuard { clear: a != 0, seq })
         }
+        x if x == ControlCommandCode::ClearSafetyLatch as u8 => {
+            Some(BrainstemCommand::ClearSafetyLatch {
+                kind: decode_safety_latch_kind(a as u8)?,
+                seq,
+            })
+        }
         x if x == ControlCommandCode::RequestSensors as u8 => {
             Some(BrainstemCommand::RequestSensors {
                 packet_id: a as u8,
@@ -1703,6 +1818,13 @@ fn decode_control_command(
                 seq,
             })
         }
+        x if x == ControlCommandCode::OrientationProbe as u8 => {
+            Some(BrainstemCommand::OrientationProbe {
+                angular_mrad_s: decode_i16(a),
+                duration_ms: duration_ms?,
+                seq,
+            })
+        }
         x if x == ControlCommandCode::ResetOdometry as u8 => {
             Some(BrainstemCommand::ResetOdometry { seq })
         }
@@ -1712,7 +1834,6 @@ fn decode_control_command(
         x if x == ControlCommandCode::ClearImuOrientation as u8 => {
             Some(BrainstemCommand::ClearImuOrientation { seq })
         }
-        x if x == ControlCommandCode::RestartMpu as u8 => Some(BrainstemCommand::RestartMpu),
         x if x == ControlCommandCode::RestartCreate as u8 => Some(BrainstemCommand::RestartCreate),
         x if x == ControlCommandCode::GetCapabilities as u8 => {
             Some(BrainstemCommand::GetCapabilities)
@@ -1745,6 +1866,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::WiggleAlign { seq, .. }
         | BrainstemCommand::Unstick { seq, .. }
         | BrainstemCommand::CliffGuard { seq, .. }
+        | BrainstemCommand::ClearSafetyLatch { seq, .. }
         | BrainstemCommand::SongDefine { seq, .. }
         | BrainstemCommand::RequestSensors { seq, .. }
         | BrainstemCommand::StreamSensors { seq, .. }
@@ -1754,6 +1876,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::PlayFeedback { seq, .. }
         | BrainstemCommand::PowerState { seq, .. }
         | BrainstemCommand::CalibrateTurn { seq, .. }
+        | BrainstemCommand::OrientationProbe { seq, .. }
         | BrainstemCommand::ResetOdometry { seq, .. }
         | BrainstemCommand::ZeroImuOrientation { seq, .. }
         | BrainstemCommand::ClearImuOrientation { seq, .. }
@@ -1819,6 +1942,32 @@ fn decode_safety_action(value: u8) -> Option<SafetyAction> {
         1 => Some(SafetyAction::Stop),
         2 => Some(SafetyAction::Backoff),
         3 => Some(SafetyAction::BumpEscape),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "pico-w")]
+fn encode_safety_latch_kind(kind: SafetyLatchKind) -> u8 {
+    match kind {
+        SafetyLatchKind::Bump => 1,
+        SafetyLatchKind::Cliff => 2,
+        SafetyLatchKind::WheelDrop => 3,
+        SafetyLatchKind::Heartbeat => 5,
+        SafetyLatchKind::Tilt => 6,
+        SafetyLatchKind::Impact => 7,
+        SafetyLatchKind::Charging => 8,
+    }
+}
+
+fn decode_safety_latch_kind(value: u8) -> Option<SafetyLatchKind> {
+    match value {
+        1 => Some(SafetyLatchKind::Bump),
+        2 => Some(SafetyLatchKind::Cliff),
+        3 => Some(SafetyLatchKind::WheelDrop),
+        5 => Some(SafetyLatchKind::Heartbeat),
+        6 => Some(SafetyLatchKind::Tilt),
+        7 => Some(SafetyLatchKind::Impact),
+        8 => Some(SafetyLatchKind::Charging),
         _ => None,
     }
 }
@@ -1913,10 +2062,60 @@ pub fn set_runtime_action(action: RuntimeActionCode) {
 
 pub fn set_create_power_on(on: bool) {
     CREATE_POWER_STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
+    if !on {
+        clear_create_sensor_snapshot();
+    }
 }
 
 pub fn set_create_power_unknown() {
     CREATE_POWER_STATE.store(UNKNOWN, Ordering::Relaxed);
+    clear_create_sensor_snapshot();
+}
+
+pub fn create_power_state_is_off(state: u8) -> bool {
+    state == OFF
+}
+
+pub fn mark_create_charging_indicator(active: Option<bool>) {
+    CREATE_CHARGING_INDICATOR_STATE.store(
+        match active {
+            Some(false) => OFF,
+            Some(true) => ON,
+            None => UNKNOWN,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+pub fn charging_interlock_active(snapshot: &BrainstemStatus) -> bool {
+    snapshot.create_charging_indicator_state == ON
+        || matches!(snapshot.create_sensor_charging_state, 1..=3)
+}
+
+fn is_motion_control_command(command: BrainstemCommand) -> bool {
+    matches!(
+        command,
+        BrainstemCommand::CmdVel { .. }
+            | BrainstemCommand::DriveDirect { .. }
+            | BrainstemCommand::DriveArc { .. }
+            | BrainstemCommand::FaceBearing { .. }
+            | BrainstemCommand::TrackBearing { .. }
+            | BrainstemCommand::TurnBy { .. }
+            | BrainstemCommand::DriveFor { .. }
+            | BrainstemCommand::BumpEscape { .. }
+            | BrainstemCommand::HoldHeading { .. }
+            | BrainstemCommand::TurnToHeading { .. }
+            | BrainstemCommand::ArcFor { .. }
+            | BrainstemCommand::CreepUntil { .. }
+            | BrainstemCommand::ScanArc { .. }
+            | BrainstemCommand::DockAlign { .. }
+            | BrainstemCommand::WallFollow { .. }
+            | BrainstemCommand::WiggleAlign { .. }
+            | BrainstemCommand::Unstick { .. }
+            | BrainstemCommand::CalibrateTurn { .. }
+            | BrainstemCommand::OrientationProbe { .. }
+            | BrainstemCommand::Dock
+    )
 }
 
 pub fn set_oi_mode(mode: CreateOiMode) {
@@ -1930,6 +2129,27 @@ pub fn set_oi_mode(mode: CreateOiMode) {
 
 pub fn set_oi_mode_unknown() {
     OI_MODE.store(UNKNOWN, Ordering::Relaxed);
+}
+
+pub fn clear_create_sensor_snapshot() {
+    CREATE_SENSOR_LAST_PACKET_ID.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_COMPLETE_PACKET_COUNT.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_FLAGS.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_DISTANCE_MM.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_ANGLE_MRAD.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_IR_BYTE.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_BUTTONS.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CHARGING_STATE.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_VOLTAGE_MV.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CURRENT_MA.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_TEMPERATURE_C.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CHARGE_MAH.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CAPACITY_MAH.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_LEFT_SIGNAL.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_FRONT_LEFT_SIGNAL.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_FRONT_RIGHT_SIGNAL.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CLIFF_RIGHT_SIGNAL.store(0, Ordering::Relaxed);
 }
 
 pub fn mark_uart_rx_byte(byte: u8, timestamp_ms: u32) {
@@ -1956,6 +2176,13 @@ pub fn mark_uart_packet(len: usize) {
 }
 
 pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
+    if packet_id == 0 {
+        increment(&CREATE_SENSOR_COMPLETE_PACKET_COUNT);
+        CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS.store(
+            LAST_UART_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
     let old_flags = CREATE_SENSOR_FLAGS.load(Ordering::Relaxed);
     let new_flags =
         merge_create_sensor_flags(packet_id, old_flags, create_sensor_flags_bits(sensors));
@@ -2111,12 +2338,6 @@ pub fn mark_imu_sample(sample: ImuSample) {
     IMU_MOTION_CONSISTENCY.store(MotionConsistencyCode::Consistent as u8, Ordering::Relaxed);
     IMU_TILT_ACTIVE.store(new_tilt as u8, Ordering::Relaxed);
     increment(&IMU_SAMPLE_COUNT);
-    record_public_event(
-        PublicEventKind::ImuFrameReceived,
-        sample.timestamp_ms,
-        derived.yaw_rate_mrad_s as u16 as u32,
-        derived.accel_magnitude_mm_s2 as u32,
-    );
     if old_health != ImuHealthCode::Ok as u8 {
         record_public_event(PublicEventKind::ImuFault, ImuHealthCode::Ok as u32, 0, 0);
     }
@@ -2180,6 +2401,12 @@ pub fn zero_imu_orientation_from_gravity() -> bool {
     IMU_TILT_MAGNITUDE_MRAD.store(0, Ordering::Relaxed);
     IMU_TILT_ACTIVE.store(0, Ordering::Relaxed);
     IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Ready as u8, Ordering::Relaxed);
+    record_public_event(
+        PublicEventKind::ImuCalibrationChanged,
+        ImuCalibrationCode::Ready as u32,
+        calibration.reference_magnitude_mm_s2 as u32,
+        sample_count,
+    );
     true
 }
 
@@ -2190,6 +2417,12 @@ pub fn clear_imu_orientation_calibration() {
     IMU_GRAVITY_REF_Z_MM_S2.store(0, Ordering::Relaxed);
     IMU_GRAVITY_REF_MAGNITUDE_MM_S2.store(0, Ordering::Relaxed);
     IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Uncalibrated as u8, Ordering::Relaxed);
+    record_public_event(
+        PublicEventKind::ImuCalibrationChanged,
+        ImuCalibrationCode::Uncalibrated as u32,
+        0,
+        IMU_SAMPLE_COUNT.load(Ordering::Relaxed),
+    );
 }
 
 pub fn imu_calibrated_down() -> Option<ImuVector> {
@@ -2684,18 +2917,8 @@ fn record_public_event_from_brainstem_event(event: &BrainstemEvent) {
             0,
             0,
         ),
-        BrainstemEvent::CreatePacketReceived { packet_id, bytes } => record_public_event(
-            PublicEventKind::TelemetryReceived,
-            *packet_id as u32,
-            bytes.len() as u32,
-            0,
-        ),
-        BrainstemEvent::CreateSensorPacketDecoded { packet_id, sensors } => record_public_event(
-            PublicEventKind::SensorFrameDecoded,
-            *packet_id as u32,
-            create_sensor_flags_bits(*sensors),
-            pack_i16_pair(sensors.distance_mm, sensors.angle_mrad),
-        ),
+        BrainstemEvent::CreatePacketReceived { .. }
+        | BrainstemEvent::CreateSensorPacketDecoded { .. } => {}
         BrainstemEvent::DriveRequested {
             left_mm_s,
             right_mm_s,
@@ -3007,6 +3230,10 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
             FOREBRAIN_UART_LAST_COMMAND_MS.load(Ordering::Relaxed),
         ),
         create_sensor_last_packet_id: CREATE_SENSOR_LAST_PACKET_ID.load(Ordering::Relaxed),
+        create_sensor_complete_packet_count: CREATE_SENSOR_COMPLETE_PACKET_COUNT
+            .load(Ordering::Relaxed),
+        create_sensor_last_complete_packet_timestamp_ms:
+            CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
         create_sensor_flags: CREATE_SENSOR_FLAGS.load(Ordering::Relaxed),
         create_sensor_distance_mm: decode_signed_i16(
             CREATE_SENSOR_DISTANCE_MM.load(Ordering::Relaxed),
@@ -3017,6 +3244,7 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         create_sensor_ir_byte: CREATE_SENSOR_IR_BYTE.load(Ordering::Relaxed),
         create_sensor_buttons: CREATE_SENSOR_BUTTONS.load(Ordering::Relaxed),
         create_sensor_charging_state: CREATE_SENSOR_CHARGING_STATE.load(Ordering::Relaxed),
+        create_charging_indicator_state: CREATE_CHARGING_INDICATOR_STATE.load(Ordering::Relaxed),
         create_sensor_voltage_mv: CREATE_SENSOR_VOLTAGE_MV.load(Ordering::Relaxed) as u16,
         create_sensor_current_ma: decode_signed_i16(
             CREATE_SENSOR_CURRENT_MA.load(Ordering::Relaxed),
@@ -3115,6 +3343,10 @@ struct StatusJson {
     last_error_action: &'static str,
     last_error_hint: &'static str,
     body_state: &'static str,
+    estop_latched: bool,
+    safety_tripped: bool,
+    safety_latch_kind: &'static str,
+    motion_interlock_latched: bool,
     wifi_state: &'static str,
     https_state: &'static str,
     http_requests: u32,
@@ -3187,6 +3419,8 @@ struct Axis3I16Json {
 #[derive(serde::Serialize)]
 struct CreateSensorStatusJson {
     last_packet_id: u8,
+    complete_packet_count: u32,
+    last_complete_packet_timestamp_ms: u32,
     bump_left: bool,
     bump_right: bool,
     wheel_drop: bool,
@@ -3202,6 +3436,9 @@ struct CreateSensorStatusJson {
     ir_byte: u8,
     buttons: u8,
     charging_state: u8,
+    charging_indicator: &'static str,
+    charging_indicator_pin: &'static str,
+    charging_indicator_physical_pin: u8,
     voltage_mv: u16,
     current_ma: i16,
     temperature_c: i8,
@@ -3226,6 +3463,8 @@ struct ForebrainUartStatusJson {
 
 #[cfg(feature = "pico-w")]
 pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Result<&'a str, ()> {
+    let (estop_latched, safety_tripped, motion_interlock_latched, safety_latch_kind) =
+        session_safety_snapshot();
     let status = StatusJson {
         firmware_name: snapshot.firmware_name,
         firmware_version: snapshot.firmware_version,
@@ -3262,6 +3501,10 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         last_error_action: runtime_action_text(snapshot.last_error_action),
         last_error_hint: error_hint_text(snapshot),
         body_state: body_state_text(snapshot.body_state),
+        estop_latched,
+        safety_tripped,
+        safety_latch_kind: safety_event_kind_text(safety_latch_kind),
+        motion_interlock_latched,
         wifi_state: wifi_state_text(snapshot.wifi_state),
         https_state: https_state_text(snapshot.https_state),
         http_requests: snapshot.http_requests,
@@ -3333,6 +3576,8 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
     let flags = snapshot.create_sensor_flags;
     CreateSensorStatusJson {
         last_packet_id: snapshot.create_sensor_last_packet_id,
+        complete_packet_count: snapshot.create_sensor_complete_packet_count,
+        last_complete_packet_timestamp_ms: snapshot.create_sensor_last_complete_packet_timestamp_ms,
         bump_left: flags & (1 << 0) != 0,
         bump_right: flags & (1 << 1) != 0,
         wheel_drop: flags & (1 << 2) != 0,
@@ -3348,6 +3593,9 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
         ir_byte: snapshot.create_sensor_ir_byte,
         buttons: snapshot.create_sensor_buttons,
         charging_state: snapshot.create_sensor_charging_state,
+        charging_indicator: tri_state_text(snapshot.create_charging_indicator_state),
+        charging_indicator_pin: body::CREATE_CHARGING_INDICATOR_PIN,
+        charging_indicator_physical_pin: body::CREATE_CHARGING_INDICATOR_PHYSICAL_PIN,
         voltage_mv: snapshot.create_sensor_voltage_mv,
         current_ma: snapshot.create_sensor_current_ma,
         temperature_c: snapshot.create_sensor_temperature_c,
@@ -3357,6 +3605,20 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
         cliff_front_left_signal: snapshot.create_sensor_cliff_front_left_signal,
         cliff_front_right_signal: snapshot.create_sensor_cliff_front_right_signal,
         cliff_right_signal: snapshot.create_sensor_cliff_right_signal,
+    }
+}
+
+fn safety_event_kind_text(kind: Option<SafetyEventKind>) -> &'static str {
+    match kind {
+        Some(SafetyEventKind::Bump) => "bump",
+        Some(SafetyEventKind::Cliff) => "cliff",
+        Some(SafetyEventKind::WheelDrop) => "wheel_drop",
+        Some(SafetyEventKind::EStop) => "estop",
+        Some(SafetyEventKind::Heartbeat) => "heartbeat",
+        Some(SafetyEventKind::Tilt) => "tilt",
+        Some(SafetyEventKind::Impact) => "impact",
+        Some(SafetyEventKind::Charging) => "charging",
+        None => "none",
     }
 }
 
@@ -3402,6 +3664,7 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
         x if x == PublicEventKind::ImuFrameReceived as u8 => "imu_frame_received",
         x if x == PublicEventKind::ImuFault as u8 => "imu_fault",
         x if x == PublicEventKind::TiltChanged as u8 => "tilt_changed",
+        x if x == PublicEventKind::ImuCalibrationChanged as u8 => "imu_calibration_changed",
         x if x == PublicEventKind::MotionInconsistencyDetected as u8 => {
             "motion_inconsistency_detected"
         }
@@ -3601,6 +3864,7 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::WiggleAlign as u8 => "wiggle_align",
         x if x == ControlCommandCode::Unstick as u8 => "unstick",
         x if x == ControlCommandCode::CliffGuard as u8 => "cliff_guard",
+        x if x == ControlCommandCode::ClearSafetyLatch as u8 => "clear_safety_latch",
         x if x == ControlCommandCode::SongDefine as u8 => "song_define",
         x if x == ControlCommandCode::DriveDirect as u8 => "drive_direct",
         x if x == ControlCommandCode::DriveArc as u8 => "drive_arc",
@@ -3612,10 +3876,10 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::PlayFeedback as u8 => "play_feedback",
         x if x == ControlCommandCode::PowerState as u8 => "power_state",
         x if x == ControlCommandCode::CalibrateTurn as u8 => "calibrate_turn",
+        x if x == ControlCommandCode::OrientationProbe as u8 => "orientation_probe",
         x if x == ControlCommandCode::ResetOdometry as u8 => "reset_odometry",
         x if x == ControlCommandCode::ZeroImuOrientation as u8 => "zero_imu_orientation",
         x if x == ControlCommandCode::ClearImuOrientation as u8 => "clear_imu_orientation",
-        x if x == ControlCommandCode::RestartMpu as u8 => "restart_mpu",
         x if x == ControlCommandCode::RestartCreate as u8 => "restart_create",
         x if x == ControlCommandCode::GetCapabilities as u8 => "get_capabilities",
         _ => "none",
@@ -3782,6 +4046,97 @@ mod tests {
         assert_eq!(records[1].a, 42);
     }
 
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn new_velocity_after_stop_may_restart_with_lower_sequence() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+        PENDING_VELOCITY_SEQ.store(10_000, Ordering::Relaxed);
+        assert!(submit_control_command(10_001, BrainstemCommand::Stop).is_ok());
+        assert_eq!(
+            PENDING_VELOCITY_KIND.load(Ordering::Relaxed),
+            ControlCommandCode::None as u8
+        );
+
+        assert!(submit_control_command(
+            321,
+            BrainstemCommand::CmdVel {
+                linear_mm_s: 50,
+                angular_mrad_s: 0,
+                ttl_ms: 300,
+                seq: 321
+            }
+        )
+        .is_ok());
+        assert_eq!(
+            PENDING_VELOCITY_KIND.load(Ordering::Relaxed),
+            ControlCommandCode::CmdVel as u8
+        );
+        assert_eq!(PENDING_VELOCITY_SEQ.load(Ordering::Relaxed), 321);
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn pending_heartbeat_refresh_is_coalesced() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+
+        assert!(submit_control_command(
+            10,
+            BrainstemCommand::HeartbeatStop {
+                timeout_ms: 750,
+                seq: 10,
+            },
+        )
+        .is_ok());
+        assert!(submit_control_command(
+            11,
+            BrainstemCommand::HeartbeatStop {
+                timeout_ms: 900,
+                seq: 11,
+            },
+        )
+        .is_ok());
+
+        assert_eq!(PENDING_COMMAND_ID.load(Ordering::Relaxed), 11);
+        assert_eq!(PENDING_COMMAND_SEQ.load(Ordering::Relaxed), 11);
+        assert_eq!(PENDING_COMMAND_DURATION_MS.load(Ordering::Relaxed), 900);
+        let records = collect::<8>(0);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.kind == PublicEventKind::CommandRejected as u8)
+                .count(),
+            0
+        );
+        PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn command_rejection_event_includes_kind_and_reason() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_COMMAND_KIND.store(ControlCommandCode::HeartbeatStop as u8, Ordering::Relaxed);
+
+        assert_eq!(
+            submit_control_command(12, BrainstemCommand::Arm),
+            Err(CommandRejectReason::Busy)
+        );
+
+        let records = collect::<4>(0);
+        let rejected = records
+            .iter()
+            .find(|record| record.kind == PublicEventKind::CommandRejected as u8)
+            .unwrap();
+        assert_eq!(rejected.a, 12);
+        assert_eq!(rejected.b, 0);
+        assert_eq!(rejected.c, ((ControlCommandCode::Arm as u32) << 8) | 1);
+        PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    }
+
     #[test]
     fn safety_event_ordering() {
         let _guard = status_test_guard();
@@ -3807,7 +4162,36 @@ mod tests {
     }
 
     #[test]
-    fn imu_sample_updates_status_and_events() {
+    fn charging_interlock_covers_both_charge_sources_and_motion_commands() {
+        let _guard = status_test_guard();
+        mark_create_sensor_packet(0, CreateSensorPacket::default());
+        mark_create_charging_indicator(Some(true));
+        assert!(charging_interlock_active(&snapshot(0)));
+
+        mark_create_charging_indicator(Some(false));
+        mark_create_sensor_packet(
+            0,
+            CreateSensorPacket {
+                charging_state: 3,
+                ..CreateSensorPacket::default()
+            },
+        );
+        assert!(charging_interlock_active(&snapshot(0)));
+        assert!(is_motion_control_command(BrainstemCommand::CmdVel {
+            linear_mm_s: 100,
+            angular_mrad_s: 0,
+            ttl_ms: 500,
+            seq: 1,
+        }));
+        assert!(is_motion_control_command(BrainstemCommand::Dock));
+        assert!(!is_motion_control_command(BrainstemCommand::Stop));
+
+        mark_create_sensor_packet(0, CreateSensorPacket::default());
+        assert!(!charging_interlock_active(&snapshot(0)));
+    }
+
+    #[test]
+    fn imu_sample_updates_status_without_per_sample_events() {
         let _guard = status_test_guard();
         clear_imu_orientation_calibration();
         reset_event_log_for_test();
@@ -3828,9 +4212,27 @@ mod tests {
         assert_eq!(snapshot.imu_accel_magnitude_mm_s2, 9_807);
 
         let records = collect::<8>(0);
-        assert!(records
+        assert!(!records
             .iter()
             .any(|record| record.kind == PublicEventKind::ImuFrameReceived as u8));
+    }
+
+    #[test]
+    fn imu_samples_do_not_evict_safety_events() {
+        let _guard = status_test_guard();
+        clear_imu_orientation_calibration();
+        reset_event_log_for_test();
+        mark_safety_tripped(SafetyEventKind::Bump);
+
+        for timestamp_ms in 1..=(EVENT_LOG_CAPACITY as u32 * 2) {
+            mark_imu_sample(ImuSample::stationary(timestamp_ms));
+        }
+
+        let records = collect::<EVENT_LOG_CAPACITY>(0);
+        assert!(records.iter().any(|record| {
+            record.kind == PublicEventKind::SafetyTripped as u8
+                && record.a == SafetyEventKind::Bump as u32
+        }));
     }
 
     #[test]

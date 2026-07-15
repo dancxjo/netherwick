@@ -1,5 +1,28 @@
 #![no_std]
 
+pub const BUMP_ESCAPE_BACKOFF_DURATION_MS: u32 = 900;
+pub const BUMP_ESCAPE_TURN_ANGLE_MRAD: u32 = 1_571;
+
+pub const fn bump_escape_turn_duration_ms(turn_angular_mrad_s: i16) -> u32 {
+    let angular_mrad_s = if turn_angular_mrad_s < 0 {
+        -(turn_angular_mrad_s as i32)
+    } else {
+        turn_angular_mrad_s as i32
+    } as u32;
+    if angular_mrad_s == 0 {
+        return 0;
+    }
+    BUMP_ESCAPE_TURN_ANGLE_MRAD
+        .saturating_mul(1_000)
+        .saturating_add(angular_mrad_s - 1)
+        / angular_mrad_s
+}
+
+pub const fn bump_escape_duration_ms(turn_angular_mrad_s: i16) -> u32 {
+    BUMP_ESCAPE_BACKOFF_DURATION_MS
+        .saturating_add(bump_escape_turn_duration_ms(turn_angular_mrad_s))
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(
     feature = "serde",
@@ -61,7 +84,6 @@ pub enum AuthorizationClass {
 )]
 pub enum ServiceScope {
     Bootsel,
-    RestartMpu,
     RestartCreate,
     ResetMotherbrain,
 }
@@ -87,11 +109,14 @@ pub const fn role_can_request_service(
     purpose: SessionPurpose,
     transport: TransportKind,
 ) -> bool {
-    matches!(transport, TransportKind::UsbCdc | TransportKind::Http)
-        && (matches!(
-            (role, purpose),
-            (EndpointRole::Motherbrain, SessionPurpose::Control)
-        ) || matches!(role, EndpointRole::ServiceTool))
+    matches!(
+        (role, purpose, transport),
+        (
+            EndpointRole::Motherbrain,
+            SessionPurpose::Control,
+            TransportKind::UsbCdc | TransportKind::Http,
+        ) | (EndpointRole::ServiceTool, _, TransportKind::UsbCdc,)
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +133,52 @@ pub enum HandshakeRejectReason {
     InvalidIdentity,
     Busy,
     InternalError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum CommandRejectReason {
+    Busy,
+    Charging,
+    StaleSequence,
+    Unsupported,
+    Unknown(u8),
+}
+
+impl CommandRejectReason {
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Busy,
+            2 => Self::Charging,
+            3 => Self::StaleSequence,
+            4 => Self::Unsupported,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Busy => 1,
+            Self::Charging => 2,
+            Self::StaleSequence => 3,
+            Self::Unsupported => 4,
+            Self::Unknown(code) => code,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Charging => "charging_busy",
+            Self::StaleSequence => "stale_sequence",
+            Self::Unsupported => "unsupported",
+            Self::Unknown(_) => "unknown",
+        }
+    }
 }
 
 impl HandshakeRejectReason {
@@ -227,5 +298,29 @@ mod tests {
             SessionPurpose::Diagnostic,
             TransportKind::Http
         ));
+    }
+
+    #[test]
+    fn command_rejection_codes_round_trip() {
+        for reason in [
+            CommandRejectReason::Busy,
+            CommandRejectReason::Charging,
+            CommandRejectReason::StaleSequence,
+            CommandRejectReason::Unsupported,
+        ] {
+            assert_eq!(CommandRejectReason::from_code(reason.code()), reason);
+        }
+        assert_eq!(
+            CommandRejectReason::from_code(99),
+            CommandRejectReason::Unknown(99)
+        );
+    }
+
+    #[test]
+    fn bump_escape_timing_is_reverse_then_quarter_turn() {
+        assert_eq!(bump_escape_turn_duration_ms(500), 3_142);
+        assert_eq!(bump_escape_turn_duration_ms(-500), 3_142);
+        assert_eq!(bump_escape_duration_ms(500), 4_042);
+        assert_eq!(bump_escape_turn_duration_ms(0), 0);
     }
 }

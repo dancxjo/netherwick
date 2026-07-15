@@ -110,6 +110,10 @@ the brainstem's cursor-bounded event stream and publishes it as
 `brainstem.events`; the validated interface contract is published as
 `brainstem.interface`. A missed event-history window is an error rather than a
 silent skip. The underlying Create OI remains private to brainstem firmware.
+The requested sensor stream is not treated as proof of perpetual freshness:
+status reports the decoded packet counter, packet ID, and device-relative age.
+Only complete packet 0 refreshes `BodySense::last_update_ms`; old, missing, or
+partial packets therefore reach the normal stale-sensor STOP policy.
 
 Normal exit, SIGINT, and SIGTERM require acknowledged STOP, acknowledged
 exorcize, and final status. Exorcize releases motherbrain control but leaves
@@ -121,11 +125,37 @@ short command, heartbeat, and lease expiries and never triggers a power toggle.
 After transport loss, the runner closes its local motor gate and retries the
 same stable USB path with exponential backoff (250 ms through 5 seconds by
 default). Every attempt performs a new handshake and acquires a new lease; the
-old session and lease are never reused. The configured device and boot IDs must
-both match. A reboot/boot-ID change stops retrying and requires the operator to
+old session and lease are never reused. A replacement begins with STOP,
+re-requests packet-0 streaming, and remains outside the runner until the packet
+counter advances and a complete body packet is no more than 500 ms old. The
+configured device and boot IDs must both match. A reboot/boot-ID change stops retrying and requires the operator to
 restart with the newly observed `--brainstem-boot-id`, making acceptance
 explicit. Override only the bounded timing with
 `--reconnect-initial-backoff-ms` and `--reconnect-max-backoff-ms`.
+
+## Physical recovery smoke and pending validation
+
+With the drive wheels physically clear of the floor, the live bumper recovery
+path can be exercised through the standard possession entrypoint:
+
+```bash
+just possess --recovery-smoke --wheels-off-floor
+```
+
+The command refuses simulated or read-only operation. It requests fresh Create
+telemetry, keeps bounded motion active, asks the operator to hold either bumper,
+and requires live contact, `SafetyTripped`, `MotionStopped`, bumper release,
+`SafetyCleared`, reverse, turn-away, probe, and inspect before final STOP and
+exorcize. It is intentionally documented here without being run unattended.
+
+Physical evidence still to collect:
+
+- [ ] charging interlock prevents queued, autonomous, and direct motion,
+- [ ] left and right bumper recovery complete normally,
+- [ ] left, front-left, front-right, and right cliff sensors stop motion,
+- [ ] wheel drop remains latched and overrides recovery,
+- [ ] heartbeat loss stops bounded motion,
+- [ ] transport loss stops motion and reconnect waits for fresh packet-0 data.
 
 ## Hardware Notes
 

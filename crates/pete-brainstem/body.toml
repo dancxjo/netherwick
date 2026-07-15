@@ -36,6 +36,7 @@ verbs = [
   "disarm",
   "estop",
   "clear_estop",
+  "clear_safety_latch",
   "clear_motion_queue",
   "cmd_vel",
   "drive_direct",
@@ -66,13 +67,15 @@ verbs = [
   "define_chirp",
   "play_feedback",
   "power_state",
+  "create_power_on",
+  "create_power_off",
   "calibrate_turn",
+  "orientation_probe",
   "reset_odometry",
   "zero_imu_orientation",
   "clear_imu_orientation",
   "set_mode",
   "set_lights",
-  "restart_mpu",
   "restart_create",
   "dock",
 ]
@@ -85,11 +88,12 @@ sensors = [
   "ir",
   "buttons",
   "battery",
+  "charging_indicator",
   "odometry_delta",
   "imu",
 ]
 outputs = ["song", "dock", "power_toggle", "brc"]
-safety = ["bump", "cliff", "wheel_drop", "estop", "heartbeat", "tilt", "impact"]
+safety = ["bump", "cliff", "wheel_drop", "estop", "heartbeat", "tilt", "impact", "charging"]
 feedback = ["ok", "error", "armed", "lost_target", "dock_seen", "danger"]
 events = [
   "boot",
@@ -125,6 +129,7 @@ events = [
   "imu_frame_received",
   "imu_fault",
   "tilt_changed",
+  "imu_calibration_changed",
   "motion_inconsistency_detected",
   "impact_detected",
   "error",

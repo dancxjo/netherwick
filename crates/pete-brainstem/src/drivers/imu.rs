@@ -172,12 +172,6 @@ where
         Ok(())
     }
 
-    pub fn restart(&mut self) -> Result<(), ImuHealth> {
-        self.initialized = false;
-        self.bus
-            .write(self.address, &[Register::PwrMgmt1 as u8, 0x80])
-            .map_err(|_| ImuHealth::Fault)
-    }
 }
 
 impl<B> ImuDriver for Mpu6050<B>
@@ -471,20 +465,6 @@ mod tests {
         let mut imu = Mpu6050::new(MissingBus);
 
         assert!(matches!(imu.poll(0), Err(ImuHealth::Absent)));
-    }
-
-    #[test]
-    fn restart_resets_the_device_and_forces_reinitialization() {
-        let mut imu = Mpu6050::new(RecordingBus::default());
-        imu.initialized = true;
-
-        assert!(imu.restart().is_ok());
-
-        assert!(!imu.initialized);
-        assert_eq!(
-            imu.bus.writes.as_slice(),
-            &[std::vec![Register::PwrMgmt1 as u8, 0x80]]
-        );
     }
 
     #[test]
