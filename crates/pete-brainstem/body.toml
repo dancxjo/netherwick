@@ -70,6 +70,7 @@ verbs = [
   "create_power_on",
   "create_power_off",
   "calibrate_turn",
+  "orientation_probe",
   "reset_odometry",
   "zero_imu_orientation",
   "clear_imu_orientation",

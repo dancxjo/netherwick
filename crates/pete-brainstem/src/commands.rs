@@ -188,6 +188,11 @@ pub enum BrainstemCommand {
         duration_ms: u32,
         seq: u32,
     },
+    OrientationProbe {
+        angular_mrad_s: i16,
+        duration_ms: u32,
+        seq: u32,
+    },
     ResetOdometry {
         seq: u32,
     },
@@ -416,6 +421,10 @@ pub(crate) enum RuntimeCommand {
         kind: FeedbackKind,
     },
     CalibrateTurn {
+        angular_mrad_s: i16,
+        duration_ms: u32,
+    },
+    OrientationProbe {
         angular_mrad_s: i16,
         duration_ms: u32,
     },

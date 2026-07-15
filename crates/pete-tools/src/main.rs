@@ -78,6 +78,8 @@ const CREATE_SENSOR_STREAM_PACKET_ID: u8 = 0;
 const CREATE_SENSOR_STREAM_PERIOD_MS: u32 = 250;
 const CREATE_SENSOR_FRESHNESS_MAX_AGE_MS: u32 = 500;
 const CREATE_SENSOR_READY_TIMEOUT_MS: u64 = 3_000;
+const POSSESSION_SHUTDOWN_BUSY_RETRY_ATTEMPTS: usize = 20;
+const POSSESSION_SHUTDOWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
 #[command(name = "pete")]
@@ -545,6 +547,9 @@ struct RobotArgs {
     /// Run the guarded physical bump-to-recovery possession smoke test and exit.
     #[arg(long)]
     recovery_smoke: bool,
+    /// Calibrate IMU down from gravity, then run a tiny in-place spin probe and exit.
+    #[arg(long)]
+    orientation_probe: bool,
     /// Confirm that physical drive wheels are clear of the floor for a motion smoke test.
     #[arg(long, requires = "recovery_smoke")]
     wheels_off_floor: bool,
@@ -4748,6 +4753,15 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
         return run_physical_possession_recovery_smoke(cockpit).await;
     }
+    if args.orientation_probe {
+        if robot_mode != RobotMode::Slow {
+            anyhow::bail!("--orientation-probe requires --mode possession-slow");
+        }
+        if is_mock_body || args.cockpit == CockpitBackendArg::Sim {
+            anyhow::bail!("--orientation-probe requires a physical brainstem");
+        }
+        return run_physical_orientation_probe(cockpit).await;
+    }
 
     let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
     let live_state = args.dashboard.map(|_| {
@@ -5166,9 +5180,14 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 .append_snapshot(snapshot.body.last_update_ms, snapshot.clone(), Vec::new())
                 .await?;
         }
+        let motion_note = slow_motion_note(&snapshot);
         println!(
-            "robot {:?} tick {}: battery {:.2}, chosen {:?}",
-            robot_mode, runner.tick_count, tick.frame.now.body.battery_level, tick.chosen_action
+            "robot {:?} tick {}: battery {:.2}, chosen {:?}{}",
+            robot_mode,
+            runner.tick_count,
+            tick.frame.now.body.battery_level,
+            tick.chosen_action,
+            motion_note
         );
         tokio::select! {
             signal = &mut shutdown => {
@@ -5183,16 +5202,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         // Preserve acknowledgement semantics: motion must be stopped before
         // surrendering the motherbrain gate. The brainstem continues owning
         // and supervising Create OI in Full mode.
-        runner
-            .cockpit
-            .client_mut()
-            .stop()
-            .context("possession shutdown STOP was not acknowledged")?;
-        runner
-            .cockpit
-            .client_mut()
-            .exorcize()
-            .context("possession exorcize was not acknowledged")?;
+        run_possession_shutdown(runner.cockpit.client_mut().as_mut())?;
         let final_status = runner
             .cockpit
             .client_mut()
@@ -5287,6 +5297,72 @@ fn disconnect_possession_cockpit_for_reconnect(cockpit: &mut SafeCockpit<Box<dyn
     cockpit.replace_client(Box::new(ClosedCockpit::new(
         "possession reconnect in progress",
     )));
+}
+
+fn slow_motion_note(snapshot: &WorldSnapshot) -> String {
+    snapshot
+        .action_debug
+        .as_ref()
+        .and_then(|debug| debug.get("why_not_moving"))
+        .and_then(|reason| reason.as_str())
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| format!(", motion blocked: {reason}"))
+        .unwrap_or_default()
+}
+
+fn run_possession_shutdown(cockpit: &mut dyn Cockpit) -> Result<()> {
+    run_possession_shutdown_with_retry(
+        cockpit,
+        POSSESSION_SHUTDOWN_BUSY_RETRY_ATTEMPTS,
+        POSSESSION_SHUTDOWN_BUSY_RETRY_DELAY,
+    )
+}
+
+fn run_possession_shutdown_with_retry<C: Cockpit + ?Sized>(
+    cockpit: &mut C,
+    attempts: usize,
+    delay: Duration,
+) -> Result<()> {
+    retry_possession_shutdown_command(
+        cockpit,
+        "possession shutdown STOP",
+        attempts,
+        delay,
+        Cockpit::stop,
+    )?;
+    retry_possession_shutdown_command(
+        cockpit,
+        "possession exorcize",
+        attempts,
+        delay,
+        Cockpit::exorcize,
+    )
+}
+
+fn retry_possession_shutdown_command<C, F>(
+    cockpit: &mut C,
+    label: &'static str,
+    attempts: usize,
+    delay: Duration,
+    mut command: F,
+) -> Result<()>
+where
+    C: Cockpit + ?Sized,
+    F: FnMut(&mut C) -> std::result::Result<(), CockpitError>,
+{
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        match command(cockpit) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_plain_busy_cockpit_error(&error) && attempt + 1 < attempts => {
+                std::thread::sleep(delay);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("{label} was not acknowledged"))
+            }
+        }
+    }
+    unreachable!("bounded shutdown retry always returns on its final attempt")
 }
 
 fn next_reconnect_backoff_ms(current_ms: u64, maximum_ms: u64) -> u64 {
@@ -5846,6 +5922,108 @@ async fn run_physical_possession_recovery_smoke(cockpit: Box<dyn Cockpit + Send>
     stop_result?;
     exorcize_result?;
     println!("physical possession recovery smoke complete: stopped and exorcized");
+    Ok(())
+}
+
+async fn run_physical_orientation_probe(cockpit: Box<dyn Cockpit + Send>) -> Result<()> {
+    let mut cockpit = SafeCockpit::new(cockpit);
+    let result = run_physical_orientation_probe_inner(&mut cockpit).await;
+    let stop_result = cockpit
+        .client_mut()
+        .stop()
+        .context("orientation probe final STOP was not acknowledged");
+    let exorcize_result = cockpit
+        .client_mut()
+        .exorcize()
+        .context("orientation probe could not surrender possession");
+    result?;
+    stop_result?;
+    exorcize_result?;
+    println!("orientation probe complete: stopped and exorcized");
+    Ok(())
+}
+
+async fn run_physical_orientation_probe_inner(
+    cockpit: &mut SafeCockpit<Box<dyn Cockpit + Send>>,
+) -> Result<()> {
+    cockpit.client_mut().stop()?;
+    cockpit.resync_event_cursor_from_status()?;
+    let before = cockpit.refresh_status()?;
+    ensure_orientation_probe_safe(&before, "before orientation probe")?;
+    println!(
+        "orientation probe before: tilt={} mrad accel={} mm/s^2 rough={} impact={} odom={} mm heading={} mrad calibration={}",
+        before.imu.tilt_magnitude_mrad.unwrap_or_default(),
+        before.imu.accel_magnitude_mm_s2.unwrap_or_default(),
+        before.imu.roughness_mm_s2.unwrap_or_default(),
+        before.imu.impact_score_mm_s2.unwrap_or_default(),
+        before.odometry.distance_mm.unwrap_or_default(),
+        before.odometry.heading_mrad.unwrap_or_default(),
+        before.imu.calibration.as_deref().unwrap_or("unknown"),
+    );
+
+    cockpit.client_mut().orientation_probe(250, 400)?;
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    cockpit.client_mut().stop()?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let end = cockpit.refresh_status()?;
+    ensure_orientation_probe_safe(&end, "after orientation probe")?;
+
+    let heading_delta = end.odometry.heading_mrad.unwrap_or_default();
+    let yaw_delta = end.imu.yaw_mrad.unwrap_or_default();
+    let distance_delta = end.odometry.distance_mm.unwrap_or_default();
+    println!(
+        "orientation probe firmware spin: heading_delta={} mrad yaw_delta={} mrad distance_delta={} mm yaw_rate={} mrad/s gyro=({},{},{}) mrad/s tilt={} mrad calibration={} motion_consistency={}",
+        heading_delta,
+        yaw_delta,
+        distance_delta,
+        end.imu.yaw_rate_mrad_s.unwrap_or_default(),
+        end.imu.angular_velocity_mrad_s.x.unwrap_or_default(),
+        end.imu.angular_velocity_mrad_s.y.unwrap_or_default(),
+        end.imu.angular_velocity_mrad_s.z.unwrap_or_default(),
+        end.imu.tilt_magnitude_mrad.unwrap_or_default(),
+        end.imu.calibration.as_deref().unwrap_or("unknown"),
+        end.imu.motion_consistency.as_deref().unwrap_or("unknown"),
+    );
+    if heading_delta.abs() < 20 && yaw_delta.abs() < 20 {
+        println!("orientation probe warning: spin pulse produced little or no heading/yaw change; ground contact, wheel slip, or Create drive response is uncertain");
+    }
+    if distance_delta.abs() > 20 {
+        println!("orientation probe warning: spin pulse produced translational odometry; wheel slip or uneven ground is possible");
+    }
+    Ok(())
+}
+
+fn ensure_orientation_probe_safe(status: &pete_cockpit::StatusSummary, phase: &str) -> Result<()> {
+    if !status.has_fresh_complete_body_packet(CREATE_SENSOR_FRESHNESS_MAX_AGE_MS) {
+        anyhow::bail!("{phase}: no fresh complete Create body packet");
+    }
+    if status.battery.charging_state.unwrap_or(0) != 0
+        || status.battery.charging_indicator.unwrap_or(false)
+    {
+        anyhow::bail!("{phase}: charging is active");
+    }
+    if status.contact.wheel_drop.unwrap_or(false) {
+        anyhow::bail!("{phase}: wheel drop is active");
+    }
+    if status.contact.any_safety_stop() == Some(true) {
+        anyhow::bail!("{phase}: cliff or wheel-drop safety sensor is active");
+    }
+    if status.imu.health.as_deref() != Some("1") && status.imu.health.as_deref() != Some("ok") {
+        anyhow::bail!(
+            "{phase}: IMU health is {}",
+            status.imu.health.as_deref().unwrap_or("unknown")
+        );
+    }
+    if status.imu.sample_age_ms.is_some_and(|age| age > 100) {
+        anyhow::bail!("{phase}: IMU sample is stale");
+    }
+    if status
+        .imu
+        .impact_score_mm_s2
+        .is_some_and(|impact| impact >= 18_000)
+    {
+        anyhow::bail!("{phase}: IMU impact score is high");
+    }
     Ok(())
 }
 
@@ -7501,6 +7679,10 @@ fn is_charging_busy_error(error: &AnyhowError) -> bool {
     })
 }
 
+fn is_plain_busy_cockpit_error(error: &CockpitError) -> bool {
+    matches!(error, CockpitError::Rejected { reason, .. } if reason == "busy")
+}
+
 fn is_reconnectable_cockpit_error(error: &AnyhowError) -> bool {
     if is_transient_robot_timeout(error) {
         return true;
@@ -7523,6 +7705,7 @@ fn is_reconnectable_cockpit_error(error: &AnyhowError) -> bool {
                         || reason.contains("control_lease_required")
                 }
                 CockpitError::Policy(_)
+                | CockpitError::MotionStopped { .. }
                 | CockpitError::MissedEvents { .. }
                 | CockpitError::HandshakeRejected(_)
                 | CockpitError::StaleHandshake { .. }
@@ -12675,6 +12858,106 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let error = safe.client_mut().stop().unwrap_err();
         assert!(error.to_string().contains("reconnect in progress"));
+    }
+
+    struct BusyShutdownCockpit {
+        stop_busy_remaining: usize,
+        exorcize_busy_remaining: usize,
+        stop_attempts: usize,
+        exorcize_attempts: usize,
+        stopped: bool,
+        exorcized: bool,
+    }
+
+    impl BusyShutdownCockpit {
+        fn busy(command_id: u32) -> CockpitError {
+            CockpitError::Rejected {
+                command_id,
+                reason: "busy".into(),
+            }
+        }
+    }
+
+    impl Cockpit for BusyShutdownCockpit {
+        fn exorcize(&mut self) -> pete_cockpit::Result<()> {
+            self.exorcize_attempts += 1;
+            if self.exorcize_busy_remaining > 0 {
+                self.exorcize_busy_remaining -= 1;
+                return Err(Self::busy(100 + self.exorcize_attempts as u32));
+            }
+            self.exorcized = true;
+            Ok(())
+        }
+
+        fn execute(
+            &mut self,
+            request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            match request {
+                pete_cockpit::CockpitRequest::Stop => {
+                    self.stop_attempts += 1;
+                    if self.stop_busy_remaining > 0 {
+                        self.stop_busy_remaining -= 1;
+                        return Err(Self::busy(self.stop_attempts as u32));
+                    }
+                    self.stopped = true;
+                    Ok(pete_cockpit::CockpitResponse::Accepted)
+                }
+                other => panic!("unexpected shutdown request: {other:?}"),
+            }
+        }
+
+        fn handshake(
+            &mut self,
+            _hello: HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            Err(CockpitError::Policy("not used by shutdown test".into()))
+        }
+
+        fn execute_in_session(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ControlLease,
+            request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ServiceLease,
+            _request: pete_cockpit::CockpitRequest,
+        ) -> pete_cockpit::Result<pete_cockpit::CockpitResponse> {
+            Err(CockpitError::Policy("service mode unavailable".into()))
+        }
+    }
+
+    #[test]
+    fn possession_shutdown_retries_plain_busy_stop_and_exorcize() {
+        let mut cockpit = BusyShutdownCockpit {
+            stop_busy_remaining: 2,
+            exorcize_busy_remaining: 1,
+            stop_attempts: 0,
+            exorcize_attempts: 0,
+            stopped: false,
+            exorcized: false,
+        };
+
+        run_possession_shutdown_with_retry(&mut cockpit, 5, Duration::ZERO).unwrap();
+
+        assert!(cockpit.stopped);
+        assert!(cockpit.exorcized);
+        assert_eq!(cockpit.stop_attempts, 3);
+        assert_eq!(cockpit.exorcize_attempts, 2);
     }
 
     #[test]

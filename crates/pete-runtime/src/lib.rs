@@ -16,7 +16,7 @@ use pete_behaviors::{
 use pete_body::{BodyFlags, BodySense};
 use pete_cockpit::{
     Cockpit, CockpitEventKind, EscapeDirection, MotionCommand, MotorCommand, SafeCockpit,
-    SafetyLatchKind, StatusSummary,
+    SafeStopReason, SafetyLatchKind, StatusSummary,
 };
 use pete_conductor::{Conductor, ConductorInput, NavigationIntent, SimpleConductor};
 use pete_core::{Pose2, Provenance, Reward, TimeMs};
@@ -4795,7 +4795,11 @@ where
                     MotorCommand::stop()
                 };
                 if !recovery_decision.command_sent {
-                    apply_slow_possession_motor(&mut self.cockpit, final_motor)?;
+                    if let Some(latch) =
+                        apply_slow_possession_motor(&mut self.cockpit, final_motor)?
+                    {
+                        self.start_possession_recovery(latch, &body_before);
+                    }
                 }
                 let tick = synthetic_slow_manual_tick(
                     now,
@@ -4835,7 +4839,9 @@ where
             MotorCommand::stop()
         };
         if !recovery_decision.command_sent {
-            apply_slow_possession_motor(&mut self.cockpit, final_motor)?;
+            if let Some(latch) = apply_slow_possession_motor(&mut self.cockpit, final_motor)? {
+                self.start_possession_recovery(latch, &body_before);
+            }
         }
 
         let mut snapshot = self.now_builder.snapshot();
@@ -4969,7 +4975,10 @@ where
             && status.safety_tripped == Some(true)
             && status.estop_latched != Some(true)
         {
-            if let Some(kind) = infer_safety_latch_from_sensors(body) {
+            if let Some(kind) = status
+                .safety_latch_kind
+                .or_else(|| infer_safety_latch_from_sensors(body))
+            {
                 self.possession_recovery.latch = Some(kind);
                 self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
                 self.possession_recovery.turn_direction =
@@ -5055,6 +5064,12 @@ where
             command_sent,
             debug: possession_recovery_debug(&self.possession_recovery, Some(latch), command_sent),
         })
+    }
+
+    fn start_possession_recovery(&mut self, latch: SafetyLatchKind, body: &BodySense) {
+        self.possession_recovery.latch = Some(latch);
+        self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+        self.possession_recovery.turn_direction = recovery_turn_direction_for_latch(latch, body);
     }
 
     fn insert_brainstem_interface(&self, now: &mut Now, events: &pete_cockpit::EventBatch) {
@@ -5214,9 +5229,10 @@ fn apply_safe_cockpit_motor<C: Cockpit>(
 fn apply_slow_possession_motor<C: Cockpit>(
     cockpit: &mut SafeCockpit<C>,
     motor: MotorCommand,
-) -> Result<()> {
+) -> Result<Option<SafetyLatchKind>> {
     if is_near_zero_motor(motor) {
-        return cockpit.client_mut().stop().map_err(anyhow::Error::from);
+        cockpit.client_mut().stop().map_err(anyhow::Error::from)?;
+        return Ok(None);
     }
     match cockpit
         .pulse_motion(
@@ -5225,16 +5241,19 @@ fn apply_slow_possession_motor<C: Cockpit>(
         )
         .map_err(anyhow::Error::from)
     {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(None),
         Err(error) if is_missed_events_error(&error) => {
             eprintln!(
                 "slow possession recovered from event history gap during motion safety poll; stopping before continuing"
             );
-            cockpit.client_mut().stop().map_err(anyhow::Error::from)
+            cockpit.client_mut().stop().map_err(anyhow::Error::from)?;
+            Ok(None)
         }
-        Err(error) if is_motion_stopped_policy_error(&error) => {
+        Err(error) if motion_stopped_latch(&error).is_some() => {
+            let latch = motion_stopped_latch(&error);
             eprintln!("{error}; slow possession stopping before continuing");
-            cockpit.client_mut().stop().map_err(anyhow::Error::from)
+            cockpit.client_mut().stop().map_err(anyhow::Error::from)?;
+            Ok(latch)
         }
         Err(error) => Err(error),
     }
@@ -5250,18 +5269,36 @@ fn is_missed_events_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn is_motion_stopped_policy_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<pete_cockpit::CockpitError>()
-            .is_some_and(|cockpit| {
-                matches!(
-                    cockpit,
-                    pete_cockpit::CockpitError::Policy(reason)
-                        if reason.starts_with("motion stopped by ")
-                )
-            })
+fn motion_stopped_latch(error: &anyhow::Error) -> Option<SafetyLatchKind> {
+    error.chain().find_map(|cause| {
+        let cockpit = cause.downcast_ref::<pete_cockpit::CockpitError>()?;
+        match cockpit {
+            pete_cockpit::CockpitError::MotionStopped { reasons } => {
+                latch_from_stop_reasons(reasons)
+            }
+            pete_cockpit::CockpitError::Policy(reason)
+                if reason.starts_with("motion stopped by ") =>
+            {
+                Some(SafetyLatchKind::Heartbeat)
+            }
+            _ => None,
+        }
     })
+}
+
+fn latch_from_stop_reasons(reasons: &[SafeStopReason]) -> Option<SafetyLatchKind> {
+    reasons
+        .iter()
+        .find_map(|reason| match reason {
+            SafeStopReason::SafetyTripped { latch } => *latch,
+            _ => None,
+        })
+        .or_else(|| {
+            reasons.iter().find_map(|reason| match reason {
+                SafeStopReason::HeartbeatExpired => Some(SafetyLatchKind::Heartbeat),
+                _ => None,
+            })
+        })
 }
 
 fn apply_safe_cockpit_motion<C: Cockpit>(
@@ -9028,6 +9065,137 @@ mod tests {
         }
     }
 
+    struct LatchedStatusCockpit {
+        clear_attempts: Arc<Mutex<Vec<SafetyLatchKind>>>,
+        latch: SafetyLatchKind,
+        safety_tripped: bool,
+    }
+
+    impl Cockpit for LatchedStatusCockpit {
+        fn execute(&mut self, request: CockpitRequest) -> pete_cockpit::Result<CockpitResponse> {
+            match request {
+                CockpitRequest::GetStatus => Ok(CockpitResponse::Status(self.get_status()?)),
+                CockpitRequest::GetCapabilities => {
+                    Ok(CockpitResponse::Capabilities(self.get_capabilities()?))
+                }
+                CockpitRequest::GetEvents { since_seq } => {
+                    Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
+                }
+                CockpitRequest::ClearSafetyLatch { latch } => {
+                    self.clear_attempts.lock().unwrap().push(latch);
+                    self.safety_tripped = false;
+                    Ok(CockpitResponse::Accepted)
+                }
+                CockpitRequest::Stop | CockpitRequest::HeartbeatStop { .. } => {
+                    Ok(CockpitResponse::Accepted)
+                }
+                _ => Ok(CockpitResponse::Accepted),
+            }
+        }
+
+        fn handshake(
+            &mut self,
+            _hello: pete_cockpit::HandshakeHello,
+        ) -> pete_cockpit::Result<pete_cockpit::HandshakeOutcome> {
+            Err(pete_cockpit::CockpitError::Policy(
+                "test cockpit has no handshake peer".into(),
+            ))
+        }
+
+        fn execute_in_session(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ControlLease,
+            request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            self.execute(request)
+        }
+
+        fn execute_with_service_lease(
+            &mut self,
+            _session: &pete_cockpit::CockpitSession,
+            _lease: &pete_cockpit::ServiceLease,
+            _request: CockpitRequest,
+        ) -> pete_cockpit::Result<CockpitResponse> {
+            Err(pete_cockpit::CockpitError::Policy(
+                "test cockpit has no service mode".into(),
+            ))
+        }
+
+        fn get_status(&mut self) -> pete_cockpit::Result<CockpitStatus> {
+            Ok(CockpitStatus {
+                raw: serde_json::json!({
+                    "uptime_ms": 1_000,
+                    "current_runtime_state": "idle",
+                    "oi_mode": "safe",
+                    "current_command": "stop",
+                    "estop_latched": false,
+                    "safety_tripped": self.safety_tripped,
+                    "safety_latch_kind": self.latch,
+                    "create_sensors": {
+                        "last_packet_id": 0,
+                        "complete_packet_count": 1,
+                        "last_complete_packet_timestamp_ms": 1_000,
+                        "charging_state": 0,
+                    },
+                    "imu": {
+                        "health": "ok",
+                        "tilt_magnitude_mrad": 0,
+                        "impact_score_mm_s2": 0,
+                    }
+                })
+                .to_string(),
+            })
+        }
+
+        fn get_capabilities(&mut self) -> pete_cockpit::Result<CockpitCapabilities> {
+            Ok(CockpitCapabilities {
+                body_kind: "test".to_string(),
+                drive: "differential".to_string(),
+                verbs: [
+                    "status",
+                    "get_capabilities",
+                    "get_events",
+                    "stop",
+                    "cmd_vel",
+                    "heartbeat_stop",
+                    "clear_safety_latch",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                sensors: Vec::new(),
+                outputs: Vec::new(),
+                safety: Vec::new(),
+                events: Vec::new(),
+                limits: pete_cockpit::CockpitLimits {
+                    max_linear_mm_s: 500,
+                    max_angular_mrad_s: 4_000,
+                    min_ttl_ms: 1,
+                    max_ttl_ms: 60_000,
+                },
+            })
+        }
+
+        fn get_events_since(&mut self, since_seq: u32) -> pete_cockpit::Result<EventBatch> {
+            Ok(EventBatch {
+                since_seq,
+                oldest_seq: 1,
+                next_seq: since_seq.saturating_add(1),
+                dropped_before_seq: 0,
+                events: Vec::new(),
+            })
+        }
+    }
+
     struct HistoryGapCockpit {
         inner: CountingCockpit,
         event_polls: Arc<AtomicUsize>,
@@ -9270,6 +9438,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_robot_slow_runner_clears_latch_reported_by_status() {
+        let clear_attempts = Arc::new(Mutex::new(Vec::new()));
+        let body = LatchedStatusCockpit {
+            clear_attempts: Arc::clone(&clear_attempts),
+            latch: SafetyLatchKind::Tilt,
+            safety_tripped: true,
+        };
+        let mut runner =
+            RealRobotRunner::new(RobotMode::Slow, Box::new(body), Vec::new(), StubRuntime)
+                .with_autonomous_motion(true);
+
+        let (snapshot, _tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(
+            clear_attempts.lock().unwrap().as_slice(),
+            &[SafetyLatchKind::Tilt]
+        );
+        assert_eq!(
+            snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("possession_recovery"))
+                .and_then(|debug| debug.get("latched")),
+            Some(&serde_json::json!("Tilt"))
+        );
+    }
+
+    #[tokio::test]
     async fn real_robot_slow_runner_applies_executive_motion_when_explicitly_authorized() {
         let motor_attempts = Arc::new(AtomicUsize::new(0));
         let motors = Arc::new(Mutex::new(Vec::new()));
@@ -9453,6 +9649,16 @@ mod tests {
         assert_eq!(event_polls.load(Ordering::SeqCst), 2);
         assert!(motor_attempts.load(Ordering::SeqCst) >= 2);
         assert_eq!(motors.lock().unwrap().last(), Some(&MotorCommand::stop()));
+
+        let (recovery_snapshot, _recovery_tick) = runner.tick_slow_manual().await.unwrap();
+        assert_eq!(
+            recovery_snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("possession_recovery"))
+                .and_then(|debug| debug.get("latched")),
+            Some(&serde_json::json!("Bump"))
+        );
     }
 
     struct ManualRuntime;

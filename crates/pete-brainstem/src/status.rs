@@ -564,6 +564,7 @@ enum ControlCommandCode {
     GetEvents = 42,
     ZeroImuOrientation = 43,
     ClearImuOrientation = 44,
+    OrientationProbe = 45,
     RestartCreate = 46,
     ResetMotherbrain = 47,
     ClearSafetyLatch = 48,
@@ -619,6 +620,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::DefineChirp { .. })
         | Some(RuntimeCommand::PlayFeedback { .. })
         | Some(RuntimeCommand::CalibrateTurn { .. })
+        | Some(RuntimeCommand::OrientationProbe { .. })
         | Some(RuntimeCommand::ResetOdometry)
         | Some(RuntimeCommand::ZeroImuOrientation)
         | Some(RuntimeCommand::ClearImuOrientation)
@@ -708,7 +710,11 @@ fn submit_control_command_with_service_identity(
 
     if kind == ControlCommandCode::CmdVel {
         let seq = command_seq(command);
-        if !seq_is_current_or_newer(seq, PENDING_VELOCITY_SEQ.load(Ordering::Relaxed)) {
+        let velocity_pending =
+            PENDING_VELOCITY_KIND.load(Ordering::Relaxed) == ControlCommandCode::CmdVel as u8;
+        if velocity_pending
+            && !seq_is_current_or_newer(seq, PENDING_VELOCITY_SEQ.load(Ordering::Relaxed))
+        {
             LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
             record_public_event(PublicEventKind::CommandRejected, command_id, seq, 0);
             return false;
@@ -1515,6 +1521,18 @@ fn encode_control_command(
             0,
             Some(duration_ms),
         )),
+        BrainstemCommand::OrientationProbe {
+            angular_mrad_s,
+            duration_ms,
+            ..
+        } => Some((
+            ControlCommandCode::OrientationProbe,
+            encode_i16(angular_mrad_s),
+            0,
+            0,
+            0,
+            Some(duration_ms),
+        )),
         BrainstemCommand::ResetOdometry { .. } => {
             Some((ControlCommandCode::ResetOdometry, 0, 0, 0, 0, None))
         }
@@ -1766,6 +1784,13 @@ fn decode_control_command(
                 seq,
             })
         }
+        x if x == ControlCommandCode::OrientationProbe as u8 => {
+            Some(BrainstemCommand::OrientationProbe {
+                angular_mrad_s: decode_i16(a),
+                duration_ms: duration_ms?,
+                seq,
+            })
+        }
         x if x == ControlCommandCode::ResetOdometry as u8 => {
             Some(BrainstemCommand::ResetOdometry { seq })
         }
@@ -1817,6 +1842,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::PlayFeedback { seq, .. }
         | BrainstemCommand::PowerState { seq, .. }
         | BrainstemCommand::CalibrateTurn { seq, .. }
+        | BrainstemCommand::OrientationProbe { seq, .. }
         | BrainstemCommand::ResetOdometry { seq, .. }
         | BrainstemCommand::ZeroImuOrientation { seq, .. }
         | BrainstemCommand::ClearImuOrientation { seq, .. }
@@ -2053,6 +2079,7 @@ fn is_motion_control_command(command: BrainstemCommand) -> bool {
             | BrainstemCommand::WiggleAlign { .. }
             | BrainstemCommand::Unstick { .. }
             | BrainstemCommand::CalibrateTurn { .. }
+            | BrainstemCommand::OrientationProbe { .. }
             | BrainstemCommand::Dock
     )
 }
@@ -3831,6 +3858,7 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::PlayFeedback as u8 => "play_feedback",
         x if x == ControlCommandCode::PowerState as u8 => "power_state",
         x if x == ControlCommandCode::CalibrateTurn as u8 => "calibrate_turn",
+        x if x == ControlCommandCode::OrientationProbe as u8 => "orientation_probe",
         x if x == ControlCommandCode::ResetOdometry as u8 => "reset_odometry",
         x if x == ControlCommandCode::ZeroImuOrientation as u8 => "zero_imu_orientation",
         x if x == ControlCommandCode::ClearImuOrientation as u8 => "clear_imu_orientation",
@@ -3998,6 +4026,35 @@ mod tests {
         assert_eq!(records[0].b, ControlCommandCode::CmdVel as u8 as u32);
         assert_eq!(records[1].kind, PublicEventKind::CommandCompleted as u8);
         assert_eq!(records[1].a, 42);
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn new_velocity_after_stop_may_restart_with_lower_sequence() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+        PENDING_VELOCITY_SEQ.store(10_000, Ordering::Relaxed);
+        assert!(submit_control_command(10_001, BrainstemCommand::Stop));
+        assert_eq!(
+            PENDING_VELOCITY_KIND.load(Ordering::Relaxed),
+            ControlCommandCode::None as u8
+        );
+
+        assert!(submit_control_command(
+            321,
+            BrainstemCommand::CmdVel {
+                linear_mm_s: 50,
+                angular_mrad_s: 0,
+                ttl_ms: 300,
+                seq: 321
+            }
+        ));
+        assert_eq!(
+            PENDING_VELOCITY_KIND.load(Ordering::Relaxed),
+            ControlCommandCode::CmdVel as u8
+        );
+        assert_eq!(PENDING_VELOCITY_SEQ.load(Ordering::Relaxed), 321);
     }
 
     #[test]

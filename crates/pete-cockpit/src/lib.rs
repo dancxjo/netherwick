@@ -119,6 +119,8 @@ pub enum CockpitError {
     BadResponse(String),
     #[error("event history missed before sequence {dropped_before_seq}")]
     MissedEvents { dropped_before_seq: u32 },
+    #[error("motion stopped by {reasons:?}")]
+    MotionStopped { reasons: Vec<SafeStopReason> },
     #[error("brainstem rejected command {command_id}: {reason}")]
     Rejected { command_id: u32, reason: String },
     #[error("command rejected by policy: {0}")]
@@ -566,6 +568,13 @@ pub trait Cockpit {
         })?)
     }
 
+    fn orientation_probe(&mut self, angular_mrad_s: i16, duration_ms: u32) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::OrientationProbe {
+            angular_mrad_s,
+            duration_ms,
+        })?)
+    }
+
     fn reset_odometry(&mut self) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::ResetOdometry)?)
     }
@@ -774,6 +783,32 @@ impl SafetyLatchKind {
             Self::Tilt => "tilt",
             Self::Impact => "impact",
             Self::Charging => "charging",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "bump" => Some(Self::Bump),
+            "cliff" => Some(Self::Cliff),
+            "wheel_drop" => Some(Self::WheelDrop),
+            "heartbeat" => Some(Self::Heartbeat),
+            "tilt" => Some(Self::Tilt),
+            "impact" => Some(Self::Impact),
+            "charging" => Some(Self::Charging),
+            _ => None,
+        }
+    }
+
+    fn from_event_code(code: u32) -> Option<Self> {
+        match code {
+            1 => Some(Self::Bump),
+            2 => Some(Self::Cliff),
+            3 => Some(Self::WheelDrop),
+            5 => Some(Self::Heartbeat),
+            6 => Some(Self::Tilt),
+            7 => Some(Self::Impact),
+            8 => Some(Self::Charging),
+            _ => None,
         }
     }
 }
@@ -995,7 +1030,8 @@ impl CockpitContract {
             | CockpitRequest::TurnToHeading { angular_mrad_s, .. }
             | CockpitRequest::ScanArc { angular_mrad_s, .. }
             | CockpitRequest::WiggleAlign { angular_mrad_s, .. }
-            | CockpitRequest::CalibrateTurn { angular_mrad_s, .. } => {
+            | CockpitRequest::CalibrateTurn { angular_mrad_s, .. }
+            | CockpitRequest::OrientationProbe { angular_mrad_s, .. } => {
                 check_angular(*angular_mrad_s, "angular_mrad_s")
             }
             CockpitRequest::BumpEscape {
@@ -1175,7 +1211,7 @@ impl CockpitEvent {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SafeStopReason {
-    SafetyTripped,
+    SafetyTripped { latch: Option<SafetyLatchKind> },
     HeartbeatExpired,
     EStopLatched,
 }
@@ -1183,7 +1219,9 @@ pub enum SafeStopReason {
 impl SafeStopReason {
     pub fn from_event(event: &CockpitEvent) -> Option<Self> {
         match event.kind {
-            CockpitEventKind::SafetyTripped => Some(Self::SafetyTripped),
+            CockpitEventKind::SafetyTripped => Some(Self::SafetyTripped {
+                latch: SafetyLatchKind::from_event_code(event.a),
+            }),
             CockpitEventKind::HeartbeatExpired => Some(Self::HeartbeatExpired),
             CockpitEventKind::EStopLatched => Some(Self::EStopLatched),
             _ => None,
@@ -1198,6 +1236,7 @@ pub struct StatusSummary {
     pub armed: Option<bool>,
     pub estop_latched: Option<bool>,
     pub safety_tripped: Option<bool>,
+    pub safety_latch_kind: Option<SafetyLatchKind>,
     pub active_motion: Option<bool>,
     pub event_next_seq: Option<u32>,
     pub body_packet_count: Option<u32>,
@@ -1222,6 +1261,8 @@ impl StatusSummary {
             return Self::from_json(raw, &value);
         }
         let packet_count = number_for(raw, "create_body_packets");
+        let imu = ImuSummary::from_raw(raw);
+        let inferred_imu_latch = inferred_imu_safety_latch(&imu);
         let packet_age_ms = match (
             number_for(raw, "uptime_ms"),
             number_for(raw, "create_last_body_packet_ms"),
@@ -1237,7 +1278,10 @@ impl StatusSummary {
             runtime_state: value_for(raw, "runtime").map(ToOwned::to_owned),
             armed: bool_for(raw, "armed"),
             estop_latched: bool_for(raw, "estop"),
-            safety_tripped: bool_for(raw, "safety_tripped"),
+            safety_tripped: bool_for(raw, "safety_tripped").or(inferred_imu_latch.map(|_| true)),
+            safety_latch_kind: value_for(raw, "safety_latch_kind")
+                .and_then(SafetyLatchKind::from_str)
+                .or(inferred_imu_latch),
             active_motion: bool_for(raw, "active_cmd_vel"),
             event_next_seq: number_for(raw, "event_next_seq"),
             body_packet_count: packet_count,
@@ -1246,7 +1290,7 @@ impl StatusSummary {
             contact: ContactSummary::from_raw(raw),
             battery: BatterySummary::from_raw(raw),
             odometry: OdometrySummary::from_raw(raw),
-            imu: ImuSummary::from_raw(raw),
+            imu,
         }
     }
 
@@ -1265,7 +1309,7 @@ impl StatusSummary {
             }
             _ => None,
         };
-        let safety_tripped = sensors.map(|sensors| {
+        let sensor_safety_tripped = sensors.map(|sensors| {
             json_bool_value(sensors, "wheel_drop").unwrap_or(false)
                 || json_bool_value(sensors, "cliff_left").unwrap_or(false)
                 || json_bool_value(sensors, "cliff_front_left").unwrap_or(false)
@@ -1278,8 +1322,10 @@ impl StatusSummary {
                 .or_else(|| json_str_value(value, "runtime"))
                 .map(ToOwned::to_owned),
             armed: json_str_value(value, "oi_mode").map(|mode| mode == "safe" || mode == "full"),
-            estop_latched: None,
-            safety_tripped,
+            estop_latched: json_bool_value(value, "estop_latched"),
+            safety_tripped: json_bool_value(value, "safety_tripped").or(sensor_safety_tripped),
+            safety_latch_kind: json_str_value(value, "safety_latch_kind")
+                .and_then(SafetyLatchKind::from_str),
             active_motion: json_str_value(value, "current_command")
                 .map(|command| command == "drive"),
             event_next_seq: json_u32_value(value, "event_next_seq"),
@@ -1517,6 +1563,16 @@ impl ImuSummary {
     }
 }
 
+fn inferred_imu_safety_latch(imu: &ImuSummary) -> Option<SafetyLatchKind> {
+    if imu.tilt_magnitude_mrad.is_some_and(|value| value >= 650) {
+        Some(SafetyLatchKind::Tilt)
+    } else if imu.impact_score_mm_s2.is_some_and(|value| value >= 18_000) {
+        Some(SafetyLatchKind::Impact)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Axis3Summary {
     pub x: Option<i32>,
@@ -1718,6 +1774,10 @@ pub enum CockpitRequest {
         angular_mrad_s: i16,
         duration_ms: u32,
     },
+    OrientationProbe {
+        angular_mrad_s: i16,
+        duration_ms: u32,
+    },
     ResetOdometry,
     ZeroImuOrientation,
     ClearImuOrientation,
@@ -1787,6 +1847,7 @@ impl CockpitRequest {
                 | Self::BumpEscape { .. }
                 | Self::Unstick { .. }
                 | Self::CliffGuard { .. }
+                | Self::OrientationProbe { .. }
                 | Self::ZeroImuOrientation
                 | Self::ClearImuOrientation
         )
@@ -1839,6 +1900,7 @@ impl CockpitRequest {
             Self::CreatePowerOn => "create_power_on",
             Self::CreatePowerOff => "create_power_off",
             Self::CalibrateTurn { .. } => "calibrate_turn",
+            Self::OrientationProbe { .. } => "orientation_probe",
             Self::ResetOdometry => "reset_odometry",
             Self::ZeroImuOrientation => "zero_imu_orientation",
             Self::ClearImuOrientation => "clear_imu_orientation",
@@ -1879,9 +1941,9 @@ impl CockpitRequest {
             | Self::CreepUntil { timeout_ms, .. }
             | Self::ScanArc { timeout_ms, .. }
             | Self::TurnToHeading { timeout_ms, .. } => Some(*timeout_ms),
-            Self::ArcFor { duration_ms, .. } | Self::CalibrateTurn { duration_ms, .. } => {
-                Some(*duration_ms)
-            }
+            Self::ArcFor { duration_ms, .. }
+            | Self::CalibrateTurn { duration_ms, .. }
+            | Self::OrientationProbe { duration_ms, .. } => Some(*duration_ms),
             Self::HeartbeatStop { timeout_ms } => Some(*timeout_ms),
             Self::StreamSensors { period_ms, .. } => Some(*period_ms),
             _ => None,
@@ -2116,6 +2178,12 @@ impl CockpitRequest {
                 duration_ms,
             } => client
                 .calibrate_turn(*angular_mrad_s, *duration_ms)
+                .map(|()| CockpitResponse::Accepted),
+            Self::OrientationProbe {
+                angular_mrad_s,
+                duration_ms,
+            } => client
+                .orientation_probe(*angular_mrad_s, *duration_ms)
                 .map(|()| CockpitResponse::Accepted),
             Self::SetMode { mode } => client.set_mode(*mode).map(|()| CockpitResponse::Accepted),
             Self::SongDefine { id, tones } => client
@@ -2396,6 +2464,10 @@ impl CockpitRequest {
                 angular_mrad_s,
                 duration_ms,
             } => format!("CALIBRATE_TURN {seq} {angular_mrad_s} {duration_ms}\n"),
+            Self::OrientationProbe {
+                angular_mrad_s,
+                duration_ms,
+            } => format!("ORIENTATION_PROBE {seq} {angular_mrad_s} {duration_ms}\n"),
             Self::ResetOdometry => format!("RESET_ODOMETRY {seq}\n"),
             Self::ZeroImuOrientation => format!("ZERO_IMU_ORIENTATION {seq}\n"),
             Self::ClearImuOrientation => format!("CLEAR_IMU_ORIENTATION {seq}\n"),
@@ -2496,6 +2568,7 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "create_power_on",
         "create_power_off",
         "calibrate_turn",
+        "orientation_probe",
         "reset_odometry",
         "zero_imu_orientation",
         "clear_imu_orientation",
@@ -2705,10 +2778,7 @@ impl<C: Cockpit> SafeCockpit<C> {
         let stops = self.poll_safety_events()?;
         if !stops.is_empty() {
             let _ = self.client.stop();
-            return Err(CockpitError::Policy(format!(
-                "motion stopped by {:?}",
-                stops
-            )));
+            return Err(CockpitError::MotionStopped { reasons: stops });
         }
         Ok(())
     }
@@ -4168,6 +4238,9 @@ impl<C: Cockpit> MotherbrainPossession<C> {
                 {
                     std::thread::sleep(POSSESSION_BUSY_RETRY_DELAY);
                 }
+                Err(CockpitError::Rejected { command_id, reason }) if reason == "busy" => {
+                    return Err(self.annotate_busy_rejection(command_id, request.verb()));
+                }
                 Err(error)
                     if request.authorization_class() == AuthorizationClass::ControlLease
                         && !retried_after_lease_renewal
@@ -4180,6 +4253,29 @@ impl<C: Cockpit> MotherbrainPossession<C> {
             }
         }
         unreachable!("bounded busy retry always returns on its final attempt")
+    }
+
+    fn annotate_busy_rejection(&mut self, command_id: u32, request_name: &str) -> CockpitError {
+        let mut reason = format!("busy while submitting {request_name}");
+        if let Ok(CockpitResponse::Status(status)) = self.session.execute(CockpitRequest::GetStatus)
+        {
+            let summary = status.summary();
+            let current = value_for(&summary.raw, "command")
+                .or_else(|| value_for(&summary.raw, "current_command"))
+                .unwrap_or("unknown");
+            let pending = value_for(&summary.raw, "pending")
+                .or_else(|| value_for(&summary.raw, "pending_command"))
+                .unwrap_or("unknown");
+            let pending_id = value_for(&summary.raw, "pending_command_id").unwrap_or("unknown");
+            let runtime = value_for(&summary.raw, "runtime")
+                .or_else(|| value_for(&summary.raw, "current_runtime_state"))
+                .unwrap_or("unknown");
+            let body = value_for(&summary.raw, "body").unwrap_or("unknown");
+            reason = format!(
+                "{reason}; status current={current} pending={pending} pending_id={pending_id} runtime={runtime} body={body}"
+            );
+        }
+        CockpitError::Rejected { command_id, reason }
     }
 
     pub fn exorcize(&mut self) -> Result<()> {
@@ -7414,7 +7510,7 @@ mod tests {
         let status = parse_json_cockpit_response(
             1,
             &CockpitRequest::GetStatus,
-            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","event_next_seq":8,"create_sensors":{"charging_indicator":"on"}}"#,
+            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","estop_latched":false,"safety_tripped":true,"safety_latch_kind":"tilt","event_next_seq":8,"create_sensors":{"charging_indicator":"on"}}"#,
         )
         .unwrap();
         let CockpitResponse::Status(status) = status else {
@@ -7423,6 +7519,9 @@ mod tests {
         let summary = status.summary();
         assert_eq!(summary.runtime_state.as_deref(), Some("idle"));
         assert_eq!(summary.armed, Some(true));
+        assert_eq!(summary.estop_latched, Some(false));
+        assert_eq!(summary.safety_tripped, Some(true));
+        assert_eq!(summary.safety_latch_kind, Some(SafetyLatchKind::Tilt));
         assert_eq!(summary.event_next_seq, Some(8));
         assert_eq!(summary.battery.charging_indicator, Some(true));
 
@@ -7451,6 +7550,17 @@ mod tests {
         assert_eq!(events.since_seq, 6);
         assert_eq!(events.next_seq, 9);
         assert!(events.has_stop_reason());
+    }
+
+    #[test]
+    fn compact_status_infers_imu_tilt_safety_latch() {
+        let summary = StatusSummary::from_raw(
+            "OK 1 STATUS uptime_ms=1000 runtime=3 body=6 command=0 pending=0 power=2 oi=3 create_body_packets=1 create_last_body_packet_ms=900 imu_health=1 imu_tilt_mrad=2269 imu_impact_mm_s2=96",
+        );
+
+        assert_eq!(summary.safety_tripped, Some(true));
+        assert_eq!(summary.safety_latch_kind, Some(SafetyLatchKind::Tilt));
+        assert_eq!(summary.imu.tilt_magnitude_mrad, Some(2269));
     }
 
     #[test]
@@ -8049,6 +8159,11 @@ mod tests {
             ("create_power_on", "create_power_on", "CREATE_POWER_ON"),
             ("create_power_off", "create_power_off", "CREATE_POWER_OFF"),
             ("calibrate_turn", "calibrate_turn", "CALIBRATE_TURN"),
+            (
+                "orientation_probe",
+                "orientation_probe",
+                "ORIENTATION_PROBE",
+            ),
             ("reset_odometry", "reset_odometry", "RESET_ODOMETRY"),
             (
                 "zero_imu_orientation",
@@ -8302,6 +8417,10 @@ mod tests {
             "calibrate_turn" => CockpitRequest::CalibrateTurn {
                 angular_mrad_s: 500,
                 duration_ms: 1_000,
+            },
+            "orientation_probe" => CockpitRequest::OrientationProbe {
+                angular_mrad_s: 250,
+                duration_ms: 400,
             },
             "reset_odometry" => CockpitRequest::ResetOdometry,
             "zero_imu_orientation" => CockpitRequest::ZeroImuOrientation,

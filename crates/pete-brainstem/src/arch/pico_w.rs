@@ -1527,7 +1527,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <script>
 let id=1,active=false,timer=0,controlRefreshTimer=0,last={x:0,y:0},ws=null,wsOpen=false,sse=null,sseOpen=false,driveKind='',lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,caps=null,lastStatus=null,sessionId='',controlLeaseId='',serviceLeaseId='',sensorStreamRequested=false;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
-const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','clear_safety_latch','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','create_power_on','create_power_off','calibrate_turn','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
+const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','clear_safety_latch','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','create_power_on','create_power_off','calibrate_turn','orientation_probe','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
 const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',cliff_clear:'cliff_guard',heartbeat:'heartbeat_stop'};
 function title(s){return (s||'unknown').replaceAll('_',' ')}
 function pill(el,text,state){el.textContent=text;el.className='pill '+(state||'')}
@@ -1559,7 +1559,7 @@ function requestCaps(){return sendCockpit({kind:'get_capabilities'},false).then(
 function applyCaps(){let drive=canMotion('cmd_vel'),svc=!!sessionId,canClearLatch=canControl('clear_safety_latch');setEnabled('controllease',!!sessionId);setEnabled('stop',hasVerb('stop'));setEnabled('padstop',hasVerb('stop'));setEnabled('estop',hasVerb('estop'));setEnabled('clear',canSession('clear_estop'));setEnabled('clearcharge',canClearLatch&&!(lastStatus&&lastStatus.create_sensors&&chargeActive(lastStatus.create_sensors)));['clearbump','clearwheel','clearcliff','cleartilt','clearimpact'].forEach(id=>setEnabled(id,canClearLatch));setEnabled('stream',canSession('stream_sensors'));setEnabled('imuzero',canControl('zero_imu_orientation'));setEnabled('imuclear',canControl('clear_imu_orientation'));setEnabled('createrestart',svc&&hasVerb('restart_create'));setEnabled('mbreset',svc&&hasVerb('reset_motherbrain'));setEnabled('bootsel',svc&&hasVerb('bootsel'));setEnabled('createon',canControl('create_power_on'));setEnabled('createoff',canControl('create_power_off'));setEnabled('createbrc',canControl('power_state'));setEnabled('createoi',canControl('power_state'));setEnabledAll('[data-drive]',drive);setEnabled('speed',drive);setEnabled('turn',drive);base.style.pointerEvents=drive?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action],motion=['drive_for','turn_left','turn_right','creep','scan','wiggle','bump_escape','unstick'].indexOf(b.dataset.action)>=0;b.disabled=!(v&&(motion?canMotion(v):canControl(v)))});setEnabled('dock',canMotion('dock'));setEnabled('songdef',canControl('song_define'));setEnabled('songplay',canControl('song_play'));setEnabled('song',canControl('song_define')&&canControl('song_play'));setEnabled('songid',canControl('song_define')||canControl('song_play'));setEnabled('tones',canControl('song_define'));setEnabled('ping',hasVerb('ping'));setEnabled('refresh',true);refreshControlLock();if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
 function releaseDriveUi(){let wasDriving=active||timer||driveKind;clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('[data-drive].active').forEach(b=>b.classList.remove('active'));return wasDriving}
 function stop(){releaseDriveUi();sendCockpit({kind:'stop'})}
-function clearLatch(kind){return sendCockpit({kind:'clear_safety_latch',latch:kind}).then(requestStatus)}
+function clearLatch(kind,attempt=0){return sendCockpit({kind:'clear_safety_latch',latch:kind}).then(j=>{let reason=j&&(j.message||j.reason);if(j&&j.accepted===false&&reason==='busy'&&attempt<5){addLog('retry clear '+kind);return new Promise(r=>setTimeout(r,180)).then(()=>clearLatch(kind,attempt+1))}return requestStatus()})}
 function joyMax(){return {lin:+$('speed').value,ang:+$('turn').value}}
 function paceDrive(fn){let now=Date.now();if(now-lastDriveAt<120)return;lastDriveAt=now;fn()}
 function refreshHeartbeat(){if(!hasVerb('heartbeat_stop'))return;let now=Date.now();if(now-lastHeartbeatAt>550){lastHeartbeatAt=now;sendCockpit({kind:'heartbeat_stop',timeout_ms:900},false)}}
@@ -2324,6 +2324,11 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
             duration_ms: parse_u32(parts.next()).ok_or(seq)?,
         },
+        "ORIENTATION_PROBE" => BrainstemCommand::OrientationProbe {
+            seq,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            duration_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
         "RESET_ODOMETRY" => BrainstemCommand::ResetOdometry { seq },
         "ZERO_IMU_ORIENTATION" => BrainstemCommand::ZeroImuOrientation { seq },
         "CLEAR_IMU_ORIENTATION" => BrainstemCommand::ClearImuOrientation { seq },
@@ -2593,6 +2598,7 @@ fn command_moves_body(command: BrainstemCommand) -> bool {
             | BrainstemCommand::WiggleAlign { .. }
             | BrainstemCommand::Unstick { .. }
             | BrainstemCommand::CalibrateTurn { .. }
+            | BrainstemCommand::OrientationProbe { .. }
             | BrainstemCommand::Dock
     )
 }
@@ -3370,6 +3376,11 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
         "calibrate_turn" => Some(BrainstemCommand::CalibrateTurn {
             angular_mrad_s: json_i16(body, "angular_mrad_s")?,
             duration_ms: json_u32(body, "duration_ms")?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "orientation_probe" => Some(BrainstemCommand::OrientationProbe {
+            angular_mrad_s: json_i16(body, "angular_mrad_s").unwrap_or(250),
+            duration_ms: json_u32(body, "duration_ms").unwrap_or(400),
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
         "reset_odometry" => Some(BrainstemCommand::ResetOdometry {

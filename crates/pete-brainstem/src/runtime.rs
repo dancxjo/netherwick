@@ -37,6 +37,9 @@ const MOTHERBRAIN_RESET_HISTORY_CAPACITY: usize = 16;
 const MOTHERBRAIN_RESET_SERVICE_SCOPE: u8 = 4;
 const CONNECTED_POWER_LED_COLOR: u8 = 128;
 const CONNECTED_POWER_LED_INTENSITY: u8 = 255;
+const ORIENTATION_PROBE_IMU_MAX_AGE_MS: u32 = body::IMU_POLL_PERIOD_MS * 5;
+const ORIENTATION_PROBE_MIN_ACCEL_MM_S2: u16 = 7_000;
+const ORIENTATION_PROBE_MAX_ACCEL_MM_S2: u16 = 13_000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -1039,11 +1042,19 @@ where
                 angular_mrad_s,
                 duration_ms,
             } => self.start_cmd_vel(0, angular_mrad_s, Some(duration_ms), now_ms)?,
+            RuntimeCommand::OrientationProbe {
+                angular_mrad_s,
+                duration_ms,
+            } => self.start_orientation_probe(angular_mrad_s, duration_ms, now_ms)?,
             RuntimeCommand::ResetOdometry => {
                 status::mark_odometry_reset();
             }
             RuntimeCommand::ZeroImuOrientation => {
-                let _ = status::zero_imu_orientation_from_gravity();
+                if status::zero_imu_orientation_from_gravity()
+                    && self.safety_latch_kind == Some(status::SafetyEventKind::Tilt)
+                {
+                    self.clear_safety_latch(Some(status::SafetyEventKind::Tilt));
+                }
             }
             RuntimeCommand::ClearImuOrientation => {
                 status::clear_imu_orientation_calibration();
@@ -1407,6 +1418,71 @@ where
             .max(1)
             .min(timeout_ms);
         self.start_cmd_vel(clamp_i16(velocity), 0, Some(duration_ms), now_ms)
+    }
+
+    fn start_orientation_probe(
+        &mut self,
+        angular_mrad_s: i16,
+        duration_ms: u32,
+        now_ms: u32,
+    ) -> Result<(), BrainstemError> {
+        let angular_abs = abs_i32(angular_mrad_s as i32);
+        if angular_abs == 0 || duration_ms == 0 {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
+
+        self.ensure_orientation_probe_allowed(now_ms)?;
+        if !status::zero_imu_orientation_from_gravity() {
+            self.stop_drive()?;
+            return Err(BrainstemError::CreateNoResponse);
+        }
+        if self.safety_latch_kind == Some(status::SafetyEventKind::Tilt) {
+            self.clear_safety_latch(Some(status::SafetyEventKind::Tilt));
+        }
+        self.ensure_orientation_probe_allowed(now_ms)?;
+
+        status::mark_odometry_reset();
+        self.start_cmd_vel(0, clamp_i16(angular_abs), Some(duration_ms), now_ms)
+    }
+
+    fn ensure_orientation_probe_allowed(&mut self, now_ms: u32) -> Result<(), BrainstemError> {
+        if self.estop_latched
+            || self.charging_interlock_latched
+            || (self.safety_latched
+                && self.safety_latch_kind != Some(status::SafetyEventKind::Tilt))
+        {
+            self.stop_drive()?;
+            return Err(BrainstemError::CreateNoResponse);
+        }
+        self.ensure_create_responsive()?;
+
+        let snapshot = status::snapshot(now_ms);
+        let flags = snapshot.create_sensor_flags;
+        let wheel_drop = flags & (1 << 2) != 0;
+        let cliff = flags & ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)) != 0;
+        let imu_ready = body::IMU_ENABLED
+            && snapshot.imu_health == status::ImuHealthCode::Ok as u8
+            && snapshot.imu_sample_count > 0
+            && snapshot.imu_sample_age_ms <= ORIENTATION_PROBE_IMU_MAX_AGE_MS
+            && snapshot.imu_accel_magnitude_mm_s2 >= ORIENTATION_PROBE_MIN_ACCEL_MM_S2
+            && snapshot.imu_accel_magnitude_mm_s2 <= ORIENTATION_PROBE_MAX_ACCEL_MM_S2;
+        let imu_still_tilted =
+            snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
+        let imu_impact = snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
+        if wheel_drop
+            || cliff
+            || status::charging_interlock_active(&snapshot)
+            || !imu_ready
+            || imu_impact
+            || (imu_still_tilted
+                && self.safety_latch_kind != Some(status::SafetyEventKind::Tilt))
+        {
+            self.stop_drive()?;
+            return Err(BrainstemError::CreateNoResponse);
+        }
+        Ok(())
     }
 
     fn queue_bump_escape(
@@ -2214,6 +2290,14 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             angular_mrad_s,
             duration_ms,
         }),
+        BrainstemCommand::OrientationProbe {
+            angular_mrad_s,
+            duration_ms,
+            ..
+        } => Some(RuntimeCommand::OrientationProbe {
+            angular_mrad_s,
+            duration_ms,
+        }),
         BrainstemCommand::ResetOdometry { .. } => Some(RuntimeCommand::ResetOdometry),
         BrainstemCommand::ZeroImuOrientation { .. } => Some(RuntimeCommand::ZeroImuOrientation),
         BrainstemCommand::ClearImuOrientation { .. } => Some(RuntimeCommand::ClearImuOrientation),
@@ -2275,6 +2359,7 @@ fn is_motion_command(command: RuntimeCommand) -> bool {
             | RuntimeCommand::Unstick { .. }
             | RuntimeCommand::CliffGuard { .. }
             | RuntimeCommand::CalibrateTurn { .. }
+            | RuntimeCommand::OrientationProbe { .. }
             | RuntimeCommand::Dock
     )
 }
@@ -3032,7 +3117,7 @@ mod tests {
     }
 
     #[test]
-    fn imu_zeroing_runs_while_safety_latched_but_motion_stays_blocked() {
+    fn imu_zeroing_keeps_non_tilt_safety_latches_blocked() {
         let _guard = status::status_test_guard();
         status::clear_imu_orientation_calibration();
         status::mark_imu_sample(ImuSample::stationary(1_000));
@@ -3060,6 +3145,94 @@ mod tests {
             .is_ok());
         assert!(runtime.start_next_command().is_err());
         assert!(runtime.safety_latched);
+    }
+
+    #[test]
+    fn imu_zeroing_clears_tilt_latch_after_gravity_calibration() {
+        let _guard = status::status_test_guard();
+        status::clear_imu_orientation_calibration();
+        status::mark_imu_sample(ImuSample {
+            accel_x_mm_s2: 9_807,
+            accel_y_mm_s2: 0,
+            accel_z_mm_s2: 0,
+            ..ImuSample::stationary(1_000)
+        });
+
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.latch_safety(status::SafetyEventKind::Tilt);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::ZeroImuOrientation)
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+
+        assert_eq!(
+            status::snapshot(1_000).imu_calibration_state,
+            status::ImuCalibrationCode::Ready as u8
+        );
+        assert!(!runtime.safety_latched);
+        assert!(runtime.safety_latch_kind.is_none());
+    }
+
+    #[test]
+    fn orientation_probe_clears_tilt_latch_and_starts_spin() {
+        let _guard = status::status_test_guard();
+        status::clear_imu_orientation_calibration();
+        status::mark_imu_sample(ImuSample {
+            accel_x_mm_s2: 9_807,
+            accel_y_mm_s2: 0,
+            accel_z_mm_s2: 0,
+            ..ImuSample::stationary(1_000)
+        });
+
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.latch_safety(status::SafetyEventKind::Tilt);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::OrientationProbe {
+                angular_mrad_s: 250,
+                duration_ms: 400,
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+
+        assert_eq!(
+            status::snapshot(1_000).imu_calibration_state,
+            status::ImuCalibrationCode::Ready as u8
+        );
+        assert!(!runtime.safety_latched);
+        assert!(runtime.safety_latch_kind.is_none());
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert_eq!(status::snapshot(1_000).odometry_reset_count, 1);
+        assert!(!runtime.hardware.writes.is_empty());
+    }
+
+    #[test]
+    fn orientation_probe_does_not_clear_non_tilt_latches() {
+        let _guard = status::status_test_guard();
+        status::clear_imu_orientation_calibration();
+        status::mark_imu_sample(ImuSample::stationary(1_000));
+
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.latch_safety(status::SafetyEventKind::Cliff);
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::OrientationProbe {
+                angular_mrad_s: 250,
+                duration_ms: 400,
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_err());
+
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Cliff)
+        ));
+        assert!(matches!(runtime.active, ActiveAction::None));
     }
 
     #[test]
