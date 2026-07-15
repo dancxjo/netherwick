@@ -4,7 +4,10 @@ use anyhow::{anyhow, Result};
 use pete_actions::{
     ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, ReignMode, TurnDir,
 };
-use pete_now::{DriveSense, Now, ObjectClass};
+use pete_now::{
+    DriveSense, EntityId, EvidenceRef, GoalStatusBelief, WorldEntity, WorldEntityKind,
+    WorldModelSnapshot, WorldModelUpdateContext,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -18,243 +21,6 @@ impl GoalId {
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct EntityId(pub String);
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorldEntityKind {
-    Charger,
-    Person,
-    Obstacle,
-    SoundSource,
-    Landmark,
-    Door,
-    Region,
-    #[default]
-    Unknown,
-}
-
-impl From<&ObjectClass> for WorldEntityKind {
-    fn from(value: &ObjectClass) -> Self {
-        match value {
-            ObjectClass::Charger => Self::Charger,
-            ObjectClass::Person => Self::Person,
-            ObjectClass::Obstacle => Self::Obstacle,
-            ObjectClass::SoundSource => Self::SoundSource,
-            ObjectClass::Landmark => Self::Landmark,
-            ObjectClass::Unknown => Self::Unknown,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct WorldPose {
-    pub x_m: f32,
-    pub y_m: f32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct ReachabilityEstimate {
-    pub reachable: bool,
-    pub confidence: f32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvidenceRef {
-    pub source: String,
-    pub key: String,
-    pub observed_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct WorldEntity {
-    pub id: EntityId,
-    pub kind: WorldEntityKind,
-    pub label: String,
-    pub last_observed_at_ms: u64,
-    pub confidence: f32,
-    pub pose: Option<WorldPose>,
-    pub bearing_rad: Option<f32>,
-    pub distance_m: Option<f32>,
-    pub reachability: ReachabilityEstimate,
-    pub attributes: BTreeMap<String, f32>,
-    pub provenance: Vec<EvidenceRef>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct GoalStatusSnapshot {
-    pub elapsed_time_ms: u64,
-    pub failed_attempts: u32,
-    pub recent_progress: f32,
-    pub confidence_trend: f32,
-    pub frustration: f32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct SelfModelSnapshot {
-    pub battery_level: f32,
-    pub charging: bool,
-    pub active_goal: Option<GoalId>,
-    pub goal_status: BTreeMap<GoalId, GoalStatusSnapshot>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct WorldModelSnapshot {
-    pub schema_version: u32,
-    pub revision: u64,
-    pub t_ms: u64,
-    pub entities: BTreeMap<EntityId, WorldEntity>,
-    pub self_model: SelfModelSnapshot,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct WorldModelUpdater {
-    revision: u64,
-    entities: BTreeMap<EntityId, WorldEntity>,
-}
-
-impl WorldModelUpdater {
-    pub fn update(
-        &mut self,
-        now: &Now,
-        active_goal: Option<GoalId>,
-        goal_status: BTreeMap<GoalId, GoalStatusSnapshot>,
-    ) -> WorldModelSnapshot {
-        for entity in self.entities.values_mut() {
-            let age_ms = now.t_ms.saturating_sub(entity.last_observed_at_ms);
-            if age_ms > 1_000 {
-                let decay = (age_ms.saturating_sub(1_000) as f32 / 15_000.0).clamp(0.0, 1.0);
-                entity.confidence = (entity.confidence * (1.0 - decay)).clamp(0.0, 1.0);
-                entity.reachability.confidence =
-                    entity.reachability.confidence.min(entity.confidence);
-            }
-        }
-
-        for observation in &now.objects.observations {
-            let kind = WorldEntityKind::from(&observation.class);
-            let id = EntityId(format!(
-                "{}:{}",
-                entity_kind_key(&kind),
-                normalized_label(&observation.label)
-            ));
-            let pose = observation.distance_m.map(|distance| {
-                let heading = now.body.odometry.heading_rad + observation.bearing_rad;
-                WorldPose {
-                    x_m: now.body.odometry.x_m + heading.cos() * distance,
-                    y_m: now.body.odometry.y_m + heading.sin() * distance,
-                }
-            });
-            let range_clear = now.range.nearest_m.unwrap_or(f32::INFINITY) > 0.18;
-            let reachable = observation.distance_m.is_some() && range_clear;
-            let source = format!("object.{:?}", observation.source).to_lowercase();
-            self.entities.insert(
-                id.clone(),
-                WorldEntity {
-                    id,
-                    kind,
-                    label: observation.label.clone(),
-                    last_observed_at_ms: now.t_ms,
-                    confidence: observation.confidence.clamp(0.0, 1.0),
-                    pose,
-                    bearing_rad: Some(observation.bearing_rad),
-                    distance_m: observation.distance_m,
-                    reachability: ReachabilityEstimate {
-                        reachable,
-                        confidence: observation.confidence.clamp(0.0, 1.0),
-                    },
-                    attributes: BTreeMap::new(),
-                    provenance: vec![EvidenceRef {
-                        source,
-                        key: observation.label.clone(),
-                        observed_at_ms: now.t_ms,
-                    }],
-                },
-            );
-        }
-
-        if !now.ear.features.is_empty()
-            || now
-                .ear
-                .transcript
-                .as_deref()
-                .is_some_and(|v| !v.trim().is_empty())
-        {
-            let id = EntityId("sound_source:current".to_string());
-            self.entities.insert(
-                id.clone(),
-                WorldEntity {
-                    id,
-                    kind: WorldEntityKind::SoundSource,
-                    label: now
-                        .ear
-                        .transcript
-                        .clone()
-                        .unwrap_or_else(|| "unidentified sound".to_string()),
-                    last_observed_at_ms: now.t_ms,
-                    confidence: now.ear.asr.confidence.clamp(0.2, 1.0),
-                    reachability: ReachabilityEstimate {
-                        reachable: false,
-                        confidence: 0.2,
-                    },
-                    provenance: vec![EvidenceRef {
-                        source: "ear".to_string(),
-                        key: "sound_source".to_string(),
-                        observed_at_ms: now.t_ms,
-                    }],
-                    ..WorldEntity::default()
-                },
-            );
-        }
-
-        self.entities.retain(|_, entity| {
-            now.t_ms.saturating_sub(entity.last_observed_at_ms) <= 60_000
-                && entity.confidence > 0.01
-        });
-        self.revision = self.revision.saturating_add(1);
-        WorldModelSnapshot {
-            schema_version: 1,
-            revision: self.revision,
-            t_ms: now.t_ms,
-            entities: self.entities.clone(),
-            self_model: SelfModelSnapshot {
-                battery_level: now.body.battery_level,
-                charging: now.body.charging,
-                active_goal,
-                goal_status,
-            },
-        }
-    }
-}
-
-fn entity_kind_key(kind: &WorldEntityKind) -> &'static str {
-    match kind {
-        WorldEntityKind::Charger => "charger",
-        WorldEntityKind::Person => "person",
-        WorldEntityKind::Obstacle => "obstacle",
-        WorldEntityKind::SoundSource => "sound_source",
-        WorldEntityKind::Landmark => "landmark",
-        WorldEntityKind::Door => "door",
-        WorldEntityKind::Region => "region",
-        WorldEntityKind::Unknown => "unknown",
-    }
-}
-
-fn normalized_label(label: &str) -> String {
-    let normalized = label
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect::<String>();
-    if normalized.is_empty() {
-        "unlabeled".to_string()
-    } else {
-        normalized
     }
 }
 
@@ -319,97 +85,126 @@ pub struct DriveDynamics {
     last_t_ms: Option<u64>,
     fatigue: f32,
     snapshot: DriveSnapshot,
+    seeded: bool,
+    pending_impulses: DriveSense,
 }
 
 impl DriveDynamics {
-    pub fn update(&mut self, now: &Now, world: &WorldModelSnapshot) -> DriveSnapshot {
+    pub fn seed_from(&mut self, drives: DriveSense) {
+        if !self.seeded {
+            self.add_impulses(drives);
+            self.seeded = true;
+        }
+    }
+
+    pub fn add_impulses(&mut self, impulses: DriveSense) {
+        self.pending_impulses.battery_hunger =
+            (self.pending_impulses.battery_hunger + impulses.battery_hunger).clamp(0.0, 1.0);
+        self.pending_impulses.danger_avoidance =
+            (self.pending_impulses.danger_avoidance + impulses.danger_avoidance).clamp(0.0, 1.0);
+        self.pending_impulses.curiosity =
+            (self.pending_impulses.curiosity + impulses.curiosity).clamp(0.0, 1.0);
+        self.pending_impulses.social_interest =
+            (self.pending_impulses.social_interest + impulses.social_interest).clamp(0.0, 1.0);
+        self.pending_impulses.fatigue =
+            (self.pending_impulses.fatigue + impulses.fatigue).clamp(0.0, 1.0);
+        self.pending_impulses.uncertainty_pressure = (self.pending_impulses.uncertainty_pressure
+            + impulses.uncertainty_pressure)
+            .clamp(0.0, 1.0);
+    }
+
+    pub fn update(&mut self, world: &WorldModelSnapshot) -> DriveSnapshot {
+        self.seeded = true;
+        let impulses = std::mem::take(&mut self.pending_impulses);
         let dt_s = self
             .last_t_ms
-            .map(|last| now.t_ms.saturating_sub(last) as f32 / 1_000.0)
+            .map(|last| world.t_ms.saturating_sub(last) as f32 / 1_000.0)
             .unwrap_or(0.0)
             .clamp(0.0, 5.0);
-        self.last_t_ms = Some(now.t_ms);
+        self.last_t_ms = Some(world.t_ms);
 
-        let moving =
-            now.body.velocity.forward_m_s.abs() > 0.01 || now.body.velocity.turn_rad_s.abs() > 0.01;
-        let fatigue_delta = if now.body.charging {
+        let fatigue_delta = if world.self_model.charging {
             -0.01 * dt_s
-        } else if moving {
+        } else if world.self_model.moving {
             0.003 * dt_s
         } else {
             0.001 * dt_s
         };
         self.fatigue = (self.fatigue + fatigue_delta).clamp(0.0, 1.0);
 
-        let predicted_energy = (now.body.battery_level
-            + now
-                .predictions
-                .charge_model
-                .or(now.predictions.charge_hardcoded)
-                .map(|p| p.expected_battery_delta)
+        let predicted_energy = (world.self_model.battery_level
+            + world
+                .context
+                .expected_battery_delta
+                .as_ref()
+                .map(|belief| belief.value)
                 .unwrap_or(-0.01))
         .clamp(0.0, 1.0);
         self.snapshot.energy.update(
             0.80,
-            if now.body.charging {
+            if world.self_model.charging {
                 1.0
             } else {
-                now.body.battery_level
+                world.self_model.battery_level
             },
-            if now.body.charging {
+            if world.self_model.charging {
                 1.0
             } else {
                 predicted_energy
             },
             dt_s,
-            now.drives.battery_hunger.clamp(0.0, 1.0) * 0.35,
+            impulses.battery_hunger * 0.35,
         );
 
-        let predicted_danger = now
-            .predictions
-            .danger_model
-            .or(now.predictions.danger_hardcoded)
-            .map(|p| {
-                p.bump_risk
-                    .max(p.cliff_risk)
-                    .max(p.wheel_drop_risk)
-                    .max(p.stuck_risk)
-            })
+        let predicted_danger = world
+            .hazards
+            .predicted_risk
+            .as_ref()
+            .map(|belief| belief.value)
             .unwrap_or(0.0);
-        let contact = if now.body.flags.bump_left
-            || now.body.flags.bump_right
-            || now.body.flags.wall
-            || now.body.flags.wheel_drop
-        {
-            1.0
-        } else {
-            0.0
-        };
-        let range_risk = now
-            .range
-            .nearest_m
-            .map(|distance| ((0.35 - distance) / 0.35).clamp(0.0, 1.0))
+        let contact = if world.self_model.contact { 1.0 } else { 0.0 };
+        let immediate_risk = world
+            .hazards
+            .immediate_risk
+            .as_ref()
+            .map(|belief| belief.value)
+            .unwrap_or(0.0);
+        let remembered_risk = world
+            .hazards
+            .remembered_risk
+            .as_ref()
+            .map(|belief| belief.value)
             .unwrap_or(0.0);
         let risk = predicted_danger
-            .max(now.memory.place_danger)
-            .max(range_risk)
+            .max(remembered_risk)
+            .max(immediate_risk)
             .max(contact);
         self.snapshot.safety.update(
             0.95,
             1.0 - risk,
             1.0 - predicted_danger,
             dt_s,
-            (contact * 0.4).max(now.drives.danger_avoidance.clamp(0.0, 1.0) * 0.4),
+            (contact * 0.4).max(impulses.danger_avoidance * 0.4),
         );
 
-        let novelty = now.memory.place_novelty.clamp(0.0, 1.0);
+        let novelty = world
+            .context
+            .novelty
+            .as_ref()
+            .map(|belief| belief.value)
+            .unwrap_or(0.0);
+        let surprise = world
+            .context
+            .surprise
+            .as_ref()
+            .map(|belief| belief.value)
+            .unwrap_or(0.0);
         self.snapshot.curiosity.update(
             0.60,
             novelty,
-            novelty.max(now.surprise.total),
+            novelty.max(surprise),
             dt_s,
-            (now.surprise.total.clamp(0.0, 1.0) * 0.25)
-                .max(now.drives.curiosity.clamp(0.0, 1.0) * 0.25),
+            (surprise * 0.25).max(impulses.curiosity * 0.25),
         );
 
         let person_confidence = world
@@ -417,27 +212,45 @@ impl DriveDynamics {
             .values()
             .filter(|entity| entity.kind == WorldEntityKind::Person)
             .map(|entity| entity.confidence)
-            .fold(0.0f32, f32::max)
-            .max(now.memory.place_social_value);
-        self.snapshot
-            .social
-            .update(0.50, person_confidence, person_confidence, dt_s, 0.0);
-        self.snapshot
-            .rest
-            .update(0.80, 1.0 - self.fatigue, 1.0 - self.fatigue, dt_s, 0.0);
-        let llm_certainty = if now.llm.command_summary.is_some() || now.llm.critique.is_some() {
-            now.llm.confidence.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        let certainty = (1.0 - now.predictions.uncertainty)
-            .min(llm_certainty)
-            .clamp(0.0, 1.0);
-        self.snapshot
-            .certainty
-            .update(0.85, certainty, certainty, dt_s, 0.0);
+            .fold(0.0f32, f32::max);
+        self.snapshot.social.update(
+            0.50,
+            person_confidence,
+            person_confidence,
+            dt_s,
+            impulses.social_interest * 0.25,
+        );
+        self.snapshot.rest.update(
+            0.80,
+            1.0 - self.fatigue,
+            1.0 - self.fatigue,
+            dt_s,
+            impulses.fatigue * 0.25,
+        );
+        let llm_certainty = world
+            .context
+            .llm_confidence
+            .as_ref()
+            .map(|belief| belief.value)
+            .unwrap_or(1.0);
+        let certainty = (1.0
+            - world
+                .context
+                .prediction_uncertainty
+                .as_ref()
+                .map(|belief| belief.value)
+                .unwrap_or(0.0))
+        .min(llm_certainty)
+        .clamp(0.0, 1.0);
+        self.snapshot.certainty.update(
+            0.85,
+            certainty,
+            certainty,
+            dt_s,
+            impulses.uncertainty_pressure * 0.25,
+        );
         self.snapshot.schema_version = 1;
-        self.snapshot.t_ms = now.t_ms;
+        self.snapshot.t_ms = world.t_ms;
         self.snapshot.clone()
     }
 }
@@ -453,6 +266,7 @@ pub struct Motivation {
 pub struct Affordance {
     pub behavior_id: String,
     pub available: bool,
+    pub rejection_reason: Option<String>,
     pub confidence: f32,
     pub expected_reward: f32,
     pub expected_progress: f32,
@@ -460,8 +274,16 @@ pub struct Affordance {
     pub expected_energy_cost: f32,
     pub expected_duration_ms: u64,
     pub target: Option<EntityId>,
+    pub bearing_rad: Option<f32>,
+    pub skill_request: Option<SkillRequest>,
     pub action: Option<ActionPrimitive>,
     pub provenance: Vec<EvidenceRef>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SkillRequest {
+    pub skill_id: String,
+    pub parameters: BTreeMap<String, String>,
 }
 
 impl Affordance {
@@ -469,6 +291,11 @@ impl Affordance {
         0.25 * self.confidence + 0.25 * self.expected_reward + 0.35 * self.expected_progress
             - 0.25 * self.expected_risk
             - 0.10 * self.expected_energy_cost
+    }
+
+    fn with_bearing(mut self, bearing_rad: Option<f32>) -> Self {
+        self.bearing_rad = bearing_rad;
+        self
     }
 }
 
@@ -489,6 +316,7 @@ pub struct GoalEvaluation {
     pub goal_id: GoalId,
     pub t_ms: u64,
     pub world_revision: u64,
+    pub disposition: GoalDisposition,
     pub motivation: Motivation,
     pub competence: Competence,
     pub contributions: Vec<EvaluationContribution>,
@@ -501,6 +329,7 @@ pub struct GoalInterpretation {
     pub target_confidence: f32,
     pub target_bearing_rad: Option<f32>,
     pub target_distance_m: Option<f32>,
+    pub target_reachable: bool,
     pub danger: f32,
     pub novelty: f32,
     pub social_presence: f32,
@@ -511,6 +340,8 @@ pub struct GoalInterpretation {
 }
 
 pub type GoalInterpretationSnapshot = GoalInterpretation;
+pub type GoalPerceptionSnapshot = GoalInterpretationSnapshot;
+pub type GoalPerceptionContext<'a> = GoalInterpretationContext<'a>;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InterpreterState {
@@ -528,26 +359,35 @@ pub struct EvaluatorState {
 pub struct ExecutorState {
     pub executions: u64,
     pub last_behavior_id: Option<String>,
+    pub committed_turn_direction: Option<TurnDir>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GoalRuntimeState {
+    pub active: bool,
     pub elapsed_time_ms: u64,
     pub failed_attempts: u32,
     pub recent_progress: f32,
     pub confidence_trend: f32,
     pub frustration: f32,
     pub last_confidence: Option<f32>,
+    pub last_exit_reason: Option<GoalExitReason>,
 }
 
 impl GoalRuntimeState {
-    fn snapshot(&self) -> GoalStatusSnapshot {
-        GoalStatusSnapshot {
+    fn snapshot(&self) -> GoalStatusBelief {
+        GoalStatusBelief {
+            meta: Default::default(),
+            active: self.active,
             elapsed_time_ms: self.elapsed_time_ms,
             failed_attempts: self.failed_attempts,
             recent_progress: self.recent_progress,
             confidence_trend: self.confidence_trend,
             frustration: self.frustration,
+            last_exit_reason: self
+                .last_exit_reason
+                .as_ref()
+                .map(|reason| format!("{reason:?}").to_ascii_lowercase()),
         }
     }
 }
@@ -561,15 +401,13 @@ pub struct BehaviorDecision {
 }
 
 pub struct GoalInterpretationContext<'a> {
-    pub now: &'a Now,
     pub world: &'a WorldModelSnapshot,
     pub drives: &'a DriveSnapshot,
     pub runtime: &'a GoalRuntimeState,
-    pub proposals: &'a [ActionPrimitive],
+    pub suggestions: &'a [ActionPrimitive],
 }
 
 pub struct GoalEvaluationContext<'a> {
-    pub now: &'a Now,
     pub world: &'a WorldModelSnapshot,
     pub drives: &'a DriveSnapshot,
     pub runtime: &'a GoalRuntimeState,
@@ -578,6 +416,53 @@ pub struct GoalEvaluationContext<'a> {
 pub struct GoalExecutionContext<'a> {
     pub world: &'a WorldModelSnapshot,
     pub runtime: &'a GoalRuntimeState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalExitReason {
+    Superseded,
+    Satisfied,
+    Completed,
+    Failed,
+    LostSafeAffordances,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalDisposition {
+    #[default]
+    Active,
+    Satisfied,
+    Completed,
+    Failed,
+}
+
+pub trait Goal: Send {
+    fn id(&self) -> &GoalId;
+
+    fn perceive(
+        &mut self,
+        context: &GoalInterpretationContext<'_>,
+    ) -> Result<GoalInterpretationSnapshot>;
+
+    fn evaluate(
+        &mut self,
+        perception: &GoalInterpretationSnapshot,
+        context: &GoalEvaluationContext<'_>,
+    ) -> Result<GoalEvaluation>;
+
+    fn execute(
+        &mut self,
+        context: &GoalExecutionContext<'_>,
+        evaluation: &GoalEvaluation,
+    ) -> Result<BehaviorDecision>;
+
+    fn enter(&mut self, context: &GoalExecutionContext<'_>);
+    fn exit(&mut self, reason: GoalExitReason);
+    fn runtime(&self) -> &GoalRuntimeState;
+    fn runtime_mut(&mut self) -> &mut GoalRuntimeState;
+    fn last_evaluation(&self) -> Option<&GoalEvaluation>;
 }
 
 pub trait GoalInterpreter: Send {
@@ -621,10 +506,24 @@ pub struct GoalModule {
 
 impl GoalModule {
     fn new(id: GoalId) -> Self {
+        Self::from_components(
+            id.clone(),
+            Box::new(RuleGoalInterpreter { id: id.clone() }),
+            Box::new(RuleGoalEvaluator { id: id.clone() }),
+            Box::new(UtilityGoalExecutor { id }),
+        )
+    }
+
+    pub fn from_components(
+        id: GoalId,
+        interpreter: Box<dyn GoalInterpreter>,
+        evaluator: Box<dyn GoalEvaluator>,
+        executor: Box<dyn GoalExecutor>,
+    ) -> Self {
         Self {
-            interpreter: Box::new(RuleGoalInterpreter { id: id.clone() }),
-            evaluator: Box::new(RuleGoalEvaluator { id: id.clone() }),
-            executor: Box::new(UtilityGoalExecutor),
+            interpreter,
+            evaluator,
+            executor,
             id,
             interpreter_state: InterpreterState::default(),
             evaluator_state: EvaluatorState::default(),
@@ -633,6 +532,21 @@ impl GoalModule {
             last_interpretation: None,
             last_evaluation: None,
         }
+    }
+
+    pub fn replace_interpreter(&mut self, interpreter: Box<dyn GoalInterpreter>) {
+        self.interpreter = interpreter;
+        self.interpreter_state = InterpreterState::default();
+    }
+
+    pub fn replace_evaluator(&mut self, evaluator: Box<dyn GoalEvaluator>) {
+        self.evaluator = evaluator;
+        self.evaluator_state = EvaluatorState::default();
+    }
+
+    pub fn replace_executor(&mut self, executor: Box<dyn GoalExecutor>) {
+        self.executor = executor;
+        self.executor_state = ExecutorState::default();
     }
 
     fn interpret(&mut self, context: &GoalInterpretationContext<'_>) -> Result<GoalInterpretation> {
@@ -670,6 +584,70 @@ impl GoalModule {
     }
 }
 
+impl Goal for GoalModule {
+    fn id(&self) -> &GoalId {
+        &self.id
+    }
+
+    fn perceive(
+        &mut self,
+        context: &GoalInterpretationContext<'_>,
+    ) -> Result<GoalInterpretationSnapshot> {
+        self.interpret(context)
+    }
+
+    fn evaluate(
+        &mut self,
+        perception: &GoalInterpretationSnapshot,
+        context: &GoalEvaluationContext<'_>,
+    ) -> Result<GoalEvaluation> {
+        GoalModule::evaluate(self, perception, context)
+    }
+
+    fn execute(
+        &mut self,
+        context: &GoalExecutionContext<'_>,
+        evaluation: &GoalEvaluation,
+    ) -> Result<BehaviorDecision> {
+        GoalModule::execute(self, evaluation, context)
+    }
+
+    fn enter(&mut self, _context: &GoalExecutionContext<'_>) {
+        self.runtime.active = true;
+        self.runtime.elapsed_time_ms = 0;
+        self.runtime.recent_progress = 0.0;
+        self.runtime.last_exit_reason = None;
+        self.executor_state.last_behavior_id = None;
+        self.executor_state.executions = 0;
+        self.executor_state.committed_turn_direction = None;
+    }
+
+    fn exit(&mut self, reason: GoalExitReason) {
+        self.runtime.active = false;
+        self.runtime.elapsed_time_ms = 0;
+        if matches!(
+            reason,
+            GoalExitReason::Satisfied | GoalExitReason::Completed
+        ) {
+            self.runtime.failed_attempts = 0;
+            self.runtime.frustration = 0.0;
+        }
+        self.runtime.last_exit_reason = Some(reason);
+    }
+
+    fn runtime(&self) -> &GoalRuntimeState {
+        &self.runtime
+    }
+
+    fn runtime_mut(&mut self) -> &mut GoalRuntimeState {
+        &mut self.runtime
+    }
+
+    fn last_evaluation(&self) -> Option<&GoalEvaluation> {
+        self.last_evaluation.as_ref()
+    }
+}
+
 struct RuleGoalInterpreter {
     id: GoalId,
 }
@@ -693,16 +671,17 @@ impl GoalInterpreter for RuleGoalInterpreter {
                 .values()
                 .filter(|entity| entity.kind == kind)
                 .max_by(|left, right| {
-                    goal_entity_score(left, context.now)
-                        .total_cmp(&goal_entity_score(right, context.now))
+                    goal_entity_score(left, context.world)
+                        .total_cmp(&goal_entity_score(right, context.world))
                 })
         });
         let target_relative = target.and_then(|entity| {
             entity.pose.map(|pose| {
-                let dx = pose.x_m - context.now.body.odometry.x_m;
-                let dy = pose.y_m - context.now.body.odometry.y_m;
+                let self_pose = context.world.self_model.pose;
+                let dx = pose.x_m - self_pose.x_m;
+                let dy = pose.y_m - self_pose.y_m;
                 let distance = (dx * dx + dy * dy).sqrt();
-                let bearing = normalize_angle(dy.atan2(dx) - context.now.body.odometry.heading_rad);
+                let bearing = normalize_angle(dy.atan2(dx) - self_pose.heading_rad);
                 (bearing, distance)
             })
         });
@@ -717,36 +696,26 @@ impl GoalInterpreter for RuleGoalInterpreter {
         let interpretation = GoalInterpretation {
             goal_id: self.id.clone(),
             target: target.map(|entity| entity.id.clone()),
-            target_confidence: target.map(|entity| entity.confidence).unwrap_or_else(|| {
-                if self.id.as_str() == "seek_charger" {
-                    context
-                        .now
-                        .predictions
-                        .charge_model
-                        .or(context.now.predictions.charge_hardcoded)
-                        .map(|p| p.confidence * p.charge_probability)
-                        .unwrap_or(context.now.memory.place_charge_value)
-                } else {
-                    0.0
-                }
-            }),
+            target_confidence: target.map(|entity| entity.confidence).unwrap_or(0.0),
             target_bearing_rad: target_relative
                 .map(|(bearing, _)| bearing)
-                .or_else(|| target.and_then(|entity| entity.bearing_rad))
-                .or_else(|| {
-                    (self.id.as_str() == "seek_charger")
-                        .then_some(context.now.memory.nearby_best_charge_direction_rad)
-                        .flatten()
-                }),
+                .or_else(|| target.and_then(|entity| entity.bearing_rad)),
             target_distance_m: target_relative
                 .map(|(_, distance)| distance)
                 .or_else(|| target.and_then(|entity| entity.distance_m)),
+            target_reachable: target.is_some_and(|entity| entity.reachability.reachable),
             danger,
-            novelty: context.now.memory.place_novelty,
+            novelty: context
+                .world
+                .context
+                .novelty
+                .as_ref()
+                .map(|belief| belief.value)
+                .unwrap_or(0.0),
             social_presence: context.drives.social.actual,
             uncertainty: context.drives.certainty.activation,
             stalled_goal_frustration,
-            suggestions: context.proposals.to_vec(),
+            suggestions: context.suggestions.to_vec(),
             provenance: target
                 .map(|entity| entity.provenance.clone())
                 .unwrap_or_default(),
@@ -761,17 +730,22 @@ impl GoalInterpreter for RuleGoalInterpreter {
     }
 }
 
-fn goal_entity_score(entity: &WorldEntity, now: &Now) -> f32 {
+fn goal_entity_score(entity: &WorldEntity, world: &WorldModelSnapshot) -> f32 {
     let distance = entity
         .pose
         .map(|pose| {
-            let dx = pose.x_m - now.body.odometry.x_m;
-            let dy = pose.y_m - now.body.odometry.y_m;
+            let dx = pose.x_m - world.self_model.pose.x_m;
+            let dy = pose.y_m - world.self_model.pose.y_m;
             (dx * dx + dy * dy).sqrt()
         })
         .or(entity.distance_m)
         .unwrap_or(10.0);
-    entity.confidence / (1.0 + distance.max(0.0))
+    let reachability = if entity.reachability.reachable {
+        1.0
+    } else {
+        0.10
+    };
+    reachability * entity.confidence / (1.0 + distance.max(0.0))
 }
 
 fn normalize_angle(mut angle: f32) -> f32 {
@@ -807,17 +781,21 @@ impl GoalEvaluator for RuleGoalEvaluator {
                 unknown => return Err(anyhow!("unknown goal {unknown}")),
             };
 
-        if let Some(reign) = context.now.reign.latest.as_ref() {
+        if let Some(reign) = context.world.authority.as_ref().map(|belief| &belief.input) {
             if matches!(reign.mode, ReignMode::Assist | ReignMode::Suggest) {
                 if let Some(action) = reign.command.to_action() {
-                    if affordances
+                    if let Some(matching_confidence) = affordances
                         .iter()
-                        .any(|affordance| affordance.action.as_ref() == Some(&action))
+                        .filter(|affordance| {
+                            affordance.available && affordance.action.as_ref() == Some(&action)
+                        })
+                        .map(|affordance| affordance.confidence)
+                        .max_by(f32::total_cmp)
                     {
                         let scale = if reign.mode == ReignMode::Assist {
                             0.60
                         } else {
-                            0.25
+                            0.25 * matching_confidence.clamp(0.0, 1.0)
                         };
                         contributions.push(EvaluationContribution {
                             source: format!("reign.{:?}", reign.mode).to_lowercase(),
@@ -842,10 +820,35 @@ impl GoalEvaluator for RuleGoalEvaluator {
             .map(|affordance| affordance.confidence)
             .fold(0.0f32, f32::max)
             .clamp(0.0, 1.0);
+        let escaped_with_clearance = self.id.as_str() == "escape_danger"
+            && context.runtime.recent_progress >= 0.01
+            && !context.world.self_model.stuck
+            && !context.world.self_model.contact
+            && context
+                .world
+                .self_model
+                .range_nearest_m
+                .unwrap_or(f32::INFINITY)
+                >= 0.25;
+        let disposition = if self.id.as_str() == "seek_charger" && context.world.self_model.charging
+        {
+            GoalDisposition::Completed
+        } else if escaped_with_clearance {
+            GoalDisposition::Completed
+        } else if self.id.as_str() == "follow_task" && affordances.is_empty() {
+            GoalDisposition::Completed
+        } else if context.runtime.failed_attempts >= 8 && context.runtime.frustration > 0.9 {
+            GoalDisposition::Failed
+        } else if satisfaction >= 0.999 && activation <= 0.05 {
+            GoalDisposition::Satisfied
+        } else {
+            GoalDisposition::Active
+        };
         let evaluation = GoalEvaluation {
             goal_id: self.id.clone(),
-            t_ms: context.now.t_ms,
+            t_ms: context.world.t_ms,
             world_revision: context.world.revision,
+            disposition,
             motivation: Motivation {
                 activation,
                 urgency: urgency.clamp(0.0, 1.0),
@@ -867,7 +870,9 @@ impl GoalEvaluator for RuleGoalEvaluator {
     }
 }
 
-struct UtilityGoalExecutor;
+struct UtilityGoalExecutor {
+    id: GoalId,
+}
 
 impl GoalExecutor for UtilityGoalExecutor {
     fn execute(
@@ -882,7 +887,32 @@ impl GoalExecutor for UtilityGoalExecutor {
             .iter()
             .filter(|affordance| affordance.available && affordance.action.is_some())
             .collect::<Vec<_>>();
-        if context.runtime.frustration > 0.6 {
+        if self.id.as_str() == "escape_danger" {
+            let phase = state.executions % 13;
+            let next = if context.world.self_model.contact && phase <= 1 {
+                "reverse_from_danger"
+            } else {
+                match phase {
+                    0..=8 => "turn_toward_clearance",
+                    9..=11 => "probe_clearance",
+                    _ => "inspect_clearance",
+                }
+            };
+            if let Some(index) = candidates
+                .iter()
+                .position(|affordance| affordance.behavior_id == next)
+            {
+                candidates.swap(0, index);
+            }
+        } else if self.id.as_str() == "seek_charger" {
+            let request_help =
+                evaluation.motivation.urgency > 0.8 && context.runtime.frustration > 0.6;
+            candidates.sort_by(|left, right| {
+                charger_behavior_rank(&left.behavior_id, request_help)
+                    .cmp(&charger_behavior_rank(&right.behavior_id, request_help))
+                    .then_with(|| right.utility().total_cmp(&left.utility()))
+            });
+        } else if context.runtime.frustration > 0.6 {
             candidates.sort_by(|left, right| {
                 let left_repeat =
                     state.last_behavior_id.as_deref() == Some(left.behavior_id.as_str());
@@ -895,7 +925,7 @@ impl GoalExecutor for UtilityGoalExecutor {
         } else {
             candidates.sort_by(|left, right| right.utility().total_cmp(&left.utility()));
         }
-        let affordance = candidates
+        let mut affordance = candidates
             .first()
             .copied()
             .ok_or_else(|| {
@@ -905,10 +935,33 @@ impl GoalExecutor for UtilityGoalExecutor {
                 )
             })?
             .clone();
-        let action = affordance
+        let mut action = affordance
             .action
             .clone()
             .ok_or_else(|| anyhow!("selected affordance has no action"))?;
+        let mut committed_turn_direction = state.committed_turn_direction.clone();
+        if self.id.as_str() == "escape_danger" {
+            if let ActionPrimitive::Turn {
+                direction,
+                intensity,
+                duration_ms,
+            } = &action
+            {
+                let direction = committed_turn_direction
+                    .clone()
+                    .unwrap_or_else(|| direction.clone());
+                committed_turn_direction = Some(direction.clone());
+                action = ActionPrimitive::Turn {
+                    direction,
+                    intensity: *intensity,
+                    duration_ms: *duration_ms,
+                };
+                affordance.action = Some(action.clone());
+            }
+            if (state.executions + 1) % 13 == 0 {
+                committed_turn_direction = None;
+            }
+        }
         let decision = BehaviorDecision {
             goal_id: evaluation.goal_id.clone(),
             behavior_id: affordance.behavior_id.clone(),
@@ -920,8 +973,22 @@ impl GoalExecutor for UtilityGoalExecutor {
             ExecutorState {
                 executions: state.executions.saturating_add(1),
                 last_behavior_id: Some(decision.behavior_id),
+                committed_turn_direction,
             },
         ))
+    }
+}
+
+fn charger_behavior_rank(behavior_id: &str, request_help: bool) -> u8 {
+    match behavior_id {
+        "dock" => 0,
+        "approach_charger" => 1,
+        "turn_toward_charger" => 2,
+        "request_charge_help" if request_help => 3,
+        "systematic_charger_search" => 3,
+        "inspect_for_charger" => 4,
+        "request_charge_help" => 5,
+        _ => 6,
     }
 }
 
@@ -947,6 +1014,7 @@ fn affordance(
     Affordance {
         behavior_id: behavior_id.to_string(),
         available: true,
+        rejection_reason: None,
         confidence: confidence.clamp(0.0, 1.0),
         expected_reward: reward.clamp(-1.0, 1.0),
         expected_progress: progress.clamp(0.0, 1.0),
@@ -954,8 +1022,28 @@ fn affordance(
         expected_energy_cost: energy.clamp(0.0, 1.0),
         expected_duration_ms: duration_ms,
         target,
+        bearing_rad: None,
+        skill_request: None,
         action: Some(action),
         provenance: provenance.to_vec(),
+    }
+}
+
+fn rejected_affordance(
+    behavior_id: &str,
+    reason: impl Into<String>,
+    target: Option<EntityId>,
+    bearing_rad: Option<f32>,
+    provenance: &[EvidenceRef],
+) -> Affordance {
+    Affordance {
+        behavior_id: behavior_id.to_string(),
+        available: false,
+        rejection_reason: Some(reason.into()),
+        target,
+        bearing_rad,
+        provenance: provenance.to_vec(),
+        ..Affordance::default()
     }
 }
 
@@ -966,65 +1054,119 @@ fn evaluate_seek_charger(
     context: &GoalEvaluationContext<'_>,
 ) -> EvaluationParts {
     let energy = context.drives.energy.activation;
-    let urgency = ((0.25 - context.now.body.battery_level) / 0.20).clamp(0.0, 1.0);
+    let urgency = ((0.25 - context.world.self_model.battery_level) / 0.20).clamp(0.0, 1.0);
     let confidence = interpretation.target_confidence;
     let mut affordances = Vec::new();
-    if let Some(distance) = interpretation.target_distance_m {
-        if distance <= 0.35 {
-            affordances.push(affordance(
-                "dock",
-                ActionPrimitive::Dock,
-                confidence,
-                1.0,
-                1.0,
-                0.05,
-                0.02,
-                2_000,
-                interpretation.target.clone(),
-                &interpretation.provenance,
-            ));
+    match interpretation.target_distance_m {
+        Some(distance) if distance <= 0.35 && confidence >= 0.65 => {
+            affordances.push(
+                affordance(
+                    "dock",
+                    ActionPrimitive::Dock,
+                    confidence,
+                    1.0,
+                    1.0,
+                    0.05,
+                    0.02,
+                    2_000,
+                    interpretation.target.clone(),
+                    &interpretation.provenance,
+                )
+                .with_bearing(interpretation.target_bearing_rad),
+            );
         }
+        Some(distance) if distance > 0.35 => affordances.push(rejected_affordance(
+            "dock",
+            "charger is outside docking range",
+            interpretation.target.clone(),
+            interpretation.target_bearing_rad,
+            &interpretation.provenance,
+        )),
+        Some(_) => affordances.push(rejected_affordance(
+            "dock",
+            "charger confidence is too low for docking",
+            interpretation.target.clone(),
+            interpretation.target_bearing_rad,
+            &interpretation.provenance,
+        )),
+        None => affordances.push(rejected_affordance(
+            "dock",
+            "no localized charger target",
+            None,
+            None,
+            &interpretation.provenance,
+        )),
     }
     if let Some(bearing) = interpretation.target_bearing_rad {
-        if bearing.abs() > 0.20 {
-            affordances.push(affordance(
-                "turn_toward_charger",
-                ActionPrimitive::Turn {
-                    direction: if bearing >= 0.0 {
-                        TurnDir::Left
-                    } else {
-                        TurnDir::Right
-                    },
-                    intensity: 0.4,
-                    duration_ms: 700,
-                },
-                confidence,
-                0.65,
-                0.75,
-                interpretation.danger * 0.25,
-                0.05,
-                700,
-                interpretation.target.clone(),
-                &interpretation.provenance,
-            ));
-        } else {
-            affordances.push(affordance(
+        if confidence < 0.35 {
+            affordances.push(rejected_affordance(
                 "approach_charger",
-                ActionPrimitive::Drive {
-                    forward: 0.40,
-                    turn: (bearing * 1.2).clamp(-0.35, 0.35),
-                    duration_ms: 1_000,
-                },
-                confidence,
-                0.8,
-                0.9,
-                interpretation.danger,
-                0.15,
-                1_000,
+                "charger confidence is too low for locomotion",
                 interpretation.target.clone(),
+                Some(bearing),
                 &interpretation.provenance,
             ));
+        } else if !interpretation.target_reachable {
+            affordances.push(rejected_affordance(
+                "approach_charger",
+                "the charger target is not currently reachable",
+                interpretation.target.clone(),
+                Some(bearing),
+                &interpretation.provenance,
+            ));
+        } else if bearing.abs() > 0.20 {
+            affordances.push(
+                affordance(
+                    "turn_toward_charger",
+                    ActionPrimitive::Turn {
+                        direction: if bearing >= 0.0 {
+                            TurnDir::Left
+                        } else {
+                            TurnDir::Right
+                        },
+                        intensity: 0.4,
+                        duration_ms: 700,
+                    },
+                    confidence,
+                    0.65,
+                    0.75,
+                    interpretation.danger * 0.25,
+                    0.05,
+                    700,
+                    interpretation.target.clone(),
+                    &interpretation.provenance,
+                )
+                .with_bearing(Some(bearing)),
+            );
+        } else {
+            affordances.push(
+                affordance(
+                    "approach_charger",
+                    ActionPrimitive::Drive {
+                        forward: 0.40,
+                        turn: (bearing * 1.2).clamp(-0.35, 0.35),
+                        duration_ms: 1_000,
+                    },
+                    confidence,
+                    0.8,
+                    0.9,
+                    interpretation.danger,
+                    0.15,
+                    1_000,
+                    interpretation.target.clone(),
+                    &interpretation.provenance,
+                )
+                .with_bearing(Some(bearing)),
+            );
         }
+    } else {
+        affordances.push(rejected_affordance(
+            "approach_charger",
+            "charger bearing is unknown",
+            interpretation.target.clone(),
+            None,
+            &interpretation.provenance,
+        ));
     }
     affordances.push(affordance(
         "inspect_for_charger",
@@ -1071,6 +1213,17 @@ fn evaluate_seek_charger(
             &[],
         ));
     }
+    let dock_available = affordances
+        .iter()
+        .any(|affordance| affordance.behavior_id == "dock" && affordance.available);
+    if context.world.self_model.contact && !dock_available {
+        for affordance in &mut affordances {
+            affordance.available = false;
+            affordance.rejection_reason = Some(
+                "immediate contact must be cleared before charger seeking resumes".to_string(),
+            );
+        }
+    }
     (
         (0.85 * energy + 0.15 * confidence).clamp(0.0, 1.0),
         urgency,
@@ -1088,32 +1241,61 @@ fn evaluate_escape(
     context: &GoalEvaluationContext<'_>,
 ) -> EvaluationParts {
     let danger = interpretation.danger;
-    let contact = context.now.body.flags.bump_left
-        || context.now.body.flags.bump_right
-        || context.now.body.flags.wall;
-    let confidence = context.now.memory.map_confidence.max(0.5);
-    let direction = context
-        .now
-        .memory
-        .nearby_best_safe_direction_rad
-        .map(|bearing| {
-            if bearing >= 0.0 {
-                TurnDir::Left
-            } else {
-                TurnDir::Right
-            }
-        })
-        .unwrap_or_else(|| {
-            if context.now.body.flags.bump_left {
-                TurnDir::Right
-            } else {
-                TurnDir::Left
-            }
-        });
+    let contact = context.world.self_model.contact;
+    let stuck = context.world.self_model.stuck;
+    let corner_trap = context
+        .world
+        .self_model
+        .stuck_trap_kind
+        .as_ref()
+        .is_some_and(|belief| belief.value == pete_now::StuckTrapKind::Corner);
+    let confidence = context
+        .world
+        .context
+        .map_confidence
+        .as_ref()
+        .map(|belief| belief.value)
+        .unwrap_or(0.0)
+        .max(0.5);
+    let direction = if context.world.self_model.bump_left {
+        TurnDir::Right
+    } else if context.world.self_model.contact {
+        TurnDir::Left
+    } else if context
+        .world
+        .local_geometry
+        .right_clearance_m
+        .as_ref()
+        .map(|belief| belief.value)
+        .unwrap_or(0.0)
+        > context
+            .world
+            .local_geometry
+            .left_clearance_m
+            .as_ref()
+            .map(|belief| belief.value)
+            .unwrap_or(0.0)
+    {
+        TurnDir::Right
+    } else if let Some(bearing) = context
+        .world
+        .context
+        .safe_bearing_rad
+        .as_ref()
+        .map(|belief| belief.value)
+    {
+        if bearing >= 0.0 {
+            TurnDir::Left
+        } else {
+            TurnDir::Right
+        }
+    } else {
+        TurnDir::Left
+    };
     let mut affordances = Vec::new();
-    if contact {
+    if contact || (stuck && !corner_trap) {
         affordances.push(affordance(
-            "reverse_from_contact",
+            "reverse_from_danger",
             ActionPrimitive::Go {
                 intensity: -0.18,
                 duration_ms: 300,
@@ -1122,7 +1304,7 @@ fn evaluate_escape(
             0.7,
             0.8,
             0.1,
-            0.05,
+            0.08,
             300,
             None,
             &[],
@@ -1131,16 +1313,61 @@ fn evaluate_escape(
     affordances.push(affordance(
         "turn_toward_clearance",
         ActionPrimitive::Turn {
-            direction,
-            intensity: 0.55,
-            duration_ms: 800,
+            direction: direction.clone(),
+            intensity: 0.75,
+            duration_ms: 500,
         },
         confidence,
         0.65,
         0.7,
         0.15,
         0.08,
-        800,
+        500,
+        None,
+        &[],
+    ));
+    let center_clearance = context
+        .world
+        .local_geometry
+        .center_clearance_m
+        .as_ref()
+        .map(|belief| belief.value);
+    if center_clearance.is_some_and(|clearance| clearance >= 0.30) || (corner_trap && !contact) {
+        affordances.push(affordance(
+            "probe_clearance",
+            ActionPrimitive::Go {
+                intensity: 0.14,
+                duration_ms: 300,
+            },
+            confidence,
+            0.55,
+            0.65,
+            0.15,
+            0.05,
+            300,
+            None,
+            &[],
+        ));
+    } else {
+        affordances.push(rejected_affordance(
+            "probe_clearance",
+            "center clearance is below 0.30 m or unknown",
+            None,
+            None,
+            &[],
+        ));
+    }
+    affordances.push(affordance(
+        "inspect_clearance",
+        ActionPrimitive::Inspect {
+            target: InspectTarget::Novelty,
+        },
+        confidence * (1.0 - interpretation.danger * 0.5),
+        0.5,
+        0.35,
+        0.0,
+        0.01,
+        500,
         None,
         &[],
     ));
@@ -1164,7 +1391,13 @@ fn evaluate_explore(
         - 0.50 * drives.rest.activation
         - 0.25 * drives.certainty.activation)
         .clamp(0.0, 1.0);
-    let action = if let Some(bearing) = context.now.memory.nearby_frontier_direction_rad {
+    let action = if let Some(bearing) = context
+        .world
+        .context
+        .frontier_bearing_rad
+        .as_ref()
+        .map(|belief| belief.value)
+    {
         ActionPrimitive::Turn {
             direction: if bearing >= 0.0 {
                 TurnDir::Left
@@ -1254,7 +1487,7 @@ fn evaluate_rest(
     let rest = context.drives.rest.activation;
     (
         rest,
-        if context.now.body.charging {
+        if context.world.self_model.charging {
             0.8
         } else {
             rest * 0.5
@@ -1292,7 +1525,16 @@ fn evaluate_investigate(
         }
     };
     (
-        (0.65 * uncertainty + 0.25 * context.now.surprise.total + 0.35 * frustration
+        (0.65 * uncertainty
+            + 0.25
+                * context
+                    .world
+                    .context
+                    .surprise
+                    .as_ref()
+                    .map(|belief| belief.value)
+                    .unwrap_or(0.0)
+            + 0.35 * frustration
             - 0.50 * interpretation.danger)
             .clamp(0.0, 1.0),
         (0.25 + frustration * 0.5).clamp(0.0, 1.0),
@@ -1329,7 +1571,14 @@ fn evaluate_follow_task(
             affordance(
                 &format!("task_proposal_{index}"),
                 action,
-                context.now.llm.confidence.max(0.5),
+                context
+                    .world
+                    .context
+                    .llm_confidence
+                    .as_ref()
+                    .map(|belief| belief.value)
+                    .unwrap_or(0.5)
+                    .max(0.5),
                 0.5,
                 0.5,
                 interpretation.danger,
@@ -1380,9 +1629,15 @@ pub struct GoalCommitment {
 pub struct GoalSelection {
     pub selected_goal: Option<GoalId>,
     pub incumbent_goal: Option<GoalId>,
+    pub challenger_goal: Option<GoalId>,
     pub switched: bool,
     pub retained_by_commitment: bool,
     pub reason: String,
+    pub exit_reason: Option<GoalExitReason>,
+    pub commitment_age_ms: u64,
+    pub incumbent_activation: Option<f32>,
+    pub challenger_activation: Option<f32>,
+    pub required_activation: Option<f32>,
     pub effective_switching_cost: f32,
     pub effective_minimum_dwell_ms: u64,
 }
@@ -1402,8 +1657,7 @@ impl GoalArbiter {
         let eligible = evaluations
             .iter()
             .filter(|evaluation| {
-                (evaluation.motivation.satisfaction < 0.999
-                    || evaluation.motivation.activation > 0.05)
+                evaluation.disposition == GoalDisposition::Active
                     && evaluation
                         .competence
                         .affordances
@@ -1418,6 +1672,11 @@ impl GoalArbiter {
                 .then_with(|| right.goal_id.cmp(&left.goal_id))
         });
         let incumbent_id = self.current_goal().cloned();
+        let incumbent_evaluation = incumbent_id.as_ref().and_then(|id| {
+            evaluations
+                .iter()
+                .find(|evaluation| &evaluation.goal_id == id)
+        });
         let incumbent = incumbent_id.as_ref().and_then(|id| {
             eligible
                 .iter()
@@ -1426,9 +1685,12 @@ impl GoalArbiter {
         });
 
         let Some(challenger) = challenger else {
+            let released = incumbent_id.is_some();
             self.commitment = None;
             return GoalSelection {
                 incumbent_goal: incumbent_id,
+                switched: released,
+                exit_reason: incumbent_evaluation.map(goal_exit_reason),
                 reason: "no eligible goal evaluation".to_string(),
                 ..GoalSelection::default()
             };
@@ -1441,8 +1703,10 @@ impl GoalArbiter {
             });
             return GoalSelection {
                 selected_goal: Some(challenger.goal_id.clone()),
+                challenger_goal: Some(challenger.goal_id.clone()),
                 switched: true,
                 reason: "selected initial goal".to_string(),
+                challenger_activation: Some(challenger.motivation.activation),
                 ..GoalSelection::default()
             };
         };
@@ -1456,8 +1720,13 @@ impl GoalArbiter {
             return GoalSelection {
                 selected_goal: Some(challenger.goal_id.clone()),
                 incumbent_goal: Some(old),
+                challenger_goal: Some(challenger.goal_id.clone()),
                 switched: true,
                 reason: "incumbent completed, failed, or lost all affordances".to_string(),
+                exit_reason: incumbent_evaluation.map(goal_exit_reason),
+                incumbent_activation: incumbent_evaluation
+                    .map(|evaluation| evaluation.motivation.activation),
+                challenger_activation: Some(challenger.motivation.activation),
                 ..GoalSelection::default()
             };
         };
@@ -1466,7 +1735,11 @@ impl GoalArbiter {
             return GoalSelection {
                 selected_goal: Some(incumbent.goal_id.clone()),
                 incumbent_goal: Some(incumbent.goal_id.clone()),
+                challenger_goal: Some(challenger.goal_id.clone()),
                 reason: "incumbent remains most active".to_string(),
+                commitment_age_ms: now_ms.saturating_sub(commitment.entered_at_ms),
+                incumbent_activation: Some(incumbent.motivation.activation),
+                challenger_activation: Some(challenger.motivation.activation),
                 ..GoalSelection::default()
             };
         }
@@ -1490,8 +1763,14 @@ impl GoalArbiter {
             GoalSelection {
                 selected_goal: Some(challenger.goal_id.clone()),
                 incumbent_goal: Some(old),
+                challenger_goal: Some(challenger.goal_id.clone()),
                 switched: true,
                 reason: "challenger overcame persistence and switching cost".to_string(),
+                exit_reason: Some(GoalExitReason::Superseded),
+                commitment_age_ms: dwell_ms,
+                incumbent_activation: Some(incumbent.motivation.activation),
+                challenger_activation: Some(challenger.motivation.activation),
+                required_activation: Some(required_activation),
                 effective_switching_cost,
                 effective_minimum_dwell_ms,
                 ..GoalSelection::default()
@@ -1500,17 +1779,31 @@ impl GoalArbiter {
             GoalSelection {
                 selected_goal: Some(incumbent.goal_id.clone()),
                 incumbent_goal: Some(incumbent.goal_id.clone()),
+                challenger_goal: Some(challenger.goal_id.clone()),
                 retained_by_commitment: true,
                 reason: if dwell_ms < effective_minimum_dwell_ms {
                     "incumbent retained during commitment dwell".to_string()
                 } else {
                     "challenger did not overcome persistence and switching cost".to_string()
                 },
+                commitment_age_ms: dwell_ms,
+                incumbent_activation: Some(incumbent.motivation.activation),
+                challenger_activation: Some(challenger.motivation.activation),
+                required_activation: Some(required_activation),
                 effective_switching_cost,
                 effective_minimum_dwell_ms,
                 ..GoalSelection::default()
             }
         }
+    }
+}
+
+fn goal_exit_reason(evaluation: &GoalEvaluation) -> GoalExitReason {
+    match evaluation.disposition {
+        GoalDisposition::Satisfied => GoalExitReason::Satisfied,
+        GoalDisposition::Completed => GoalExitReason::Completed,
+        GoalDisposition::Failed => GoalExitReason::Failed,
+        GoalDisposition::Active => GoalExitReason::LostSafeAffordances,
     }
 }
 
@@ -1538,9 +1831,8 @@ struct PendingOutcome {
 }
 
 pub struct GoalSystem {
-    world: WorldModelUpdater,
     drives: DriveDynamics,
-    goals: Vec<GoalModule>,
+    goals: Vec<Box<dyn Goal>>,
     arbiter: GoalArbiter,
     pending: Option<PendingOutcome>,
     last_tick_ms: Option<u64>,
@@ -1558,10 +1850,9 @@ impl Default for GoalSystem {
             "follow_task",
         ]
         .into_iter()
-        .map(|id| GoalModule::new(GoalId::new(id)))
+        .map(|id| Box::new(GoalModule::new(GoalId::new(id))) as Box<dyn Goal>)
         .collect();
         Self {
-            world: WorldModelUpdater::default(),
             drives: DriveDynamics::default(),
             goals,
             arbiter: GoalArbiter::default(),
@@ -1572,32 +1863,71 @@ impl Default for GoalSystem {
 }
 
 impl GoalSystem {
-    pub fn tick(&mut self, now: &Now, proposals: &[ActionPrimitive]) -> Result<GoalCycle> {
-        let goal_status = self
+    pub fn with_goals(goals: Vec<Box<dyn Goal>>) -> Self {
+        Self {
+            goals,
+            drives: DriveDynamics::default(),
+            arbiter: GoalArbiter::default(),
+            pending: None,
+            last_tick_ms: None,
+        }
+    }
+
+    pub fn register_goal(&mut self, goal: Box<dyn Goal>) -> Result<()> {
+        if self
             .goals
             .iter()
-            .map(|goal| (goal.id.clone(), goal.runtime.snapshot()))
-            .collect();
-        let world = self
-            .world
-            .update(now, self.arbiter.current_goal().cloned(), goal_status);
-        self.observe_pending_outcome(now, &world);
-        let drives = self.drives.update(now, &world);
+            .any(|registered| registered.id() == goal.id())
+        {
+            return Err(anyhow!("goal {} is already registered", goal.id().as_str()));
+        }
+        self.goals.push(goal);
+        Ok(())
+    }
+
+    pub fn add_drive_impulses(&mut self, impulses: DriveSense) {
+        self.drives.add_impulses(impulses);
+    }
+
+    pub fn seed_drives(&mut self, drives: DriveSense) {
+        self.drives.seed_from(drives);
+    }
+
+    pub fn world_model_update_context(&self) -> WorldModelUpdateContext {
+        WorldModelUpdateContext {
+            active_goal: self
+                .arbiter
+                .current_goal()
+                .map(|goal| goal.as_str().to_string()),
+            goal_status: self
+                .goals
+                .iter()
+                .map(|goal| (goal.id().as_str().to_string(), goal.runtime().snapshot()))
+                .collect(),
+        }
+    }
+
+    pub fn tick(
+        &mut self,
+        world: &WorldModelSnapshot,
+        proposals: &[ActionPrimitive],
+    ) -> Result<GoalCycle> {
+        let world = world.clone();
+        self.observe_pending_outcome(&world);
+        let drives = self.drives.update(&world);
         let mut interpretations = Vec::with_capacity(self.goals.len());
         let mut evaluations = Vec::with_capacity(self.goals.len());
         for goal in &mut self.goals {
-            let runtime = goal.runtime.clone();
-            let interpretation = goal.interpret(&GoalInterpretationContext {
-                now,
+            let runtime = goal.runtime().clone();
+            let interpretation = goal.perceive(&GoalInterpretationContext {
                 world: &world,
                 drives: &drives,
                 runtime: &runtime,
-                proposals,
+                suggestions: proposals,
             })?;
             let evaluation = goal.evaluate(
                 &interpretation,
                 &GoalEvaluationContext {
-                    now,
                     world: &world,
                     drives: &drives,
                     runtime: &runtime,
@@ -1608,40 +1938,55 @@ impl GoalSystem {
         }
 
         let previous_goal = self.arbiter.current_goal().cloned();
-        let selection = self.arbiter.select(now.t_ms, &evaluations);
+        let selection = self.arbiter.select(world.t_ms, &evaluations);
         if selection.switched {
             if let Some(previous) = previous_goal {
-                if let Some(goal) = self.goals.iter_mut().find(|goal| goal.id == previous) {
-                    goal.runtime.elapsed_time_ms = 0;
+                if let Some(goal) = self.goals.iter_mut().find(|goal| goal.id() == &previous) {
+                    goal.exit(
+                        selection
+                            .exit_reason
+                            .clone()
+                            .unwrap_or(GoalExitReason::Superseded),
+                    );
+                }
+            }
+            if let Some(selected) = selection.selected_goal.as_ref() {
+                if let Some(goal) = self.goals.iter_mut().find(|goal| goal.id() == selected) {
+                    let runtime = goal.runtime().clone();
+                    goal.enter(&GoalExecutionContext {
+                        world: &world,
+                        runtime: &runtime,
+                    });
                 }
             }
         }
         let dt_ms = self
             .last_tick_ms
-            .map(|last| now.t_ms.saturating_sub(last))
+            .map(|last| world.t_ms.saturating_sub(last))
             .unwrap_or(0);
-        self.last_tick_ms = Some(now.t_ms);
+        self.last_tick_ms = Some(world.t_ms);
         let behavior = if let Some(goal_id) = selection.selected_goal.as_ref() {
             let index = self
                 .goals
                 .iter()
-                .position(|goal| &goal.id == goal_id)
+                .position(|goal| goal.id() == goal_id)
                 .ok_or_else(|| anyhow!("selected goal is not registered"))?;
-            self.goals[index].runtime.elapsed_time_ms = self.goals[index]
-                .runtime
+            let elapsed = self.goals[index]
+                .runtime()
                 .elapsed_time_ms
                 .saturating_add(dt_ms);
+            self.goals[index].runtime_mut().elapsed_time_ms = elapsed;
             let evaluation = evaluations
                 .iter()
                 .find(|evaluation| &evaluation.goal_id == goal_id)
                 .ok_or_else(|| anyhow!("selected goal has no immutable evaluation"))?;
-            let runtime = self.goals[index].runtime.clone();
+            let runtime = self.goals[index].runtime().clone();
             let decision = self.goals[index].execute(
-                evaluation,
                 &GoalExecutionContext {
                     world: &world,
                     runtime: &runtime,
                 },
+                evaluation,
             )?;
             let begins_new_attempt = self
                 .pending
@@ -1655,10 +2000,10 @@ impl GoalSystem {
                 self.pending = Some(PendingOutcome {
                     goal_id: decision.goal_id.clone(),
                     behavior_id: decision.behavior_id.clone(),
-                    started_at_ms: now.t_ms,
+                    started_at_ms: world.t_ms,
                     expected_progress: decision.affordance.expected_progress,
                     expected_duration_ms: decision.affordance.expected_duration_ms,
-                    start_pose: (now.body.odometry.x_m, now.body.odometry.y_m),
+                    start_pose: (world.self_model.pose.x_m, world.self_model.pose.y_m),
                     start_target_distance_m: decision
                         .affordance
                         .target
@@ -1683,13 +2028,13 @@ impl GoalSystem {
         })
     }
 
-    fn observe_pending_outcome(&mut self, now: &Now, world: &WorldModelSnapshot) {
+    fn observe_pending_outcome(&mut self, world: &WorldModelSnapshot) {
         let Some(pending) = self.pending.clone() else {
             return;
         };
-        let elapsed = now.t_ms.saturating_sub(pending.started_at_ms);
-        let dx = now.body.odometry.x_m - pending.start_pose.0;
-        let dy = now.body.odometry.y_m - pending.start_pose.1;
+        let elapsed = world.t_ms.saturating_sub(pending.started_at_ms);
+        let dx = world.self_model.pose.x_m - pending.start_pose.0;
+        let dy = world.self_model.pose.y_m - pending.start_pose.1;
         let movement_progress = ((dx * dx + dy * dy).sqrt() / 0.5).clamp(0.0, 1.0);
         let target_progress = pending
             .target
@@ -1698,44 +2043,48 @@ impl GoalSystem {
             .and_then(|entity| entity.distance_m)
             .zip(pending.start_target_distance_m)
             .map(|(current, start)| ((start - current) / start.max(0.1)).clamp(0.0, 1.0));
-        let observed = if pending.behavior_id == "dock" && now.body.charging {
+        let observed = if pending.behavior_id == "dock" && world.self_model.charging {
             1.0
         } else {
             target_progress.unwrap_or(movement_progress)
         };
         let attempt_finished = elapsed >= pending.expected_duration_ms
-            || (pending.behavior_id == "dock" && now.body.charging);
+            || (pending.behavior_id == "dock" && world.self_model.charging);
         if let Some(goal) = self
             .goals
             .iter_mut()
-            .find(|goal| goal.id == pending.goal_id)
+            .find(|goal| goal.id() == &pending.goal_id)
         {
-            goal.runtime.recent_progress =
-                (0.7 * goal.runtime.recent_progress + 0.3 * observed).clamp(0.0, 1.0);
-            if let Some(evaluation) = goal.last_evaluation.as_ref() {
-                let trend = evaluation.competence.confidence
-                    - goal
-                        .runtime
-                        .last_confidence
-                        .unwrap_or(evaluation.competence.confidence);
-                goal.runtime.confidence_trend =
-                    (0.8 * goal.runtime.confidence_trend + 0.2 * trend).clamp(-1.0, 1.0);
-                goal.runtime.last_confidence = Some(evaluation.competence.confidence);
+            let recent_progress =
+                (0.7 * goal.runtime().recent_progress + 0.3 * observed).clamp(0.0, 1.0);
+            goal.runtime_mut().recent_progress = recent_progress;
+            if let Some(confidence) = goal
+                .last_evaluation()
+                .map(|evaluation| evaluation.competence.confidence)
+            {
+                let trend = confidence - goal.runtime().last_confidence.unwrap_or(confidence);
+                let confidence_trend =
+                    (0.8 * goal.runtime().confidence_trend + 0.2 * trend).clamp(-1.0, 1.0);
+                goal.runtime_mut().confidence_trend = confidence_trend;
+                goal.runtime_mut().last_confidence = Some(confidence);
             }
             if attempt_finished && observed + 0.1 < pending.expected_progress {
-                goal.runtime.failed_attempts = goal.runtime.failed_attempts.saturating_add(1);
+                goal.runtime_mut().failed_attempts =
+                    goal.runtime().failed_attempts.saturating_add(1);
             }
             let progress_deficit = (pending.expected_progress - observed).max(0.0);
-            let failed = (goal.runtime.failed_attempts as f32 / 5.0).clamp(0.0, 1.0);
-            let falling_confidence = (-goal.runtime.confidence_trend).max(0.0);
+            let failed = (goal.runtime().failed_attempts as f32 / 5.0).clamp(0.0, 1.0);
+            let falling_confidence = (-goal.runtime().confidence_trend).max(0.0);
             let target_frustration =
                 (0.5 * progress_deficit + 0.3 * failed + 0.2 * falling_confidence).clamp(0.0, 1.0);
-            let alpha = if target_frustration > goal.runtime.frustration {
+            let alpha = if target_frustration > goal.runtime().frustration {
                 0.20
             } else {
                 0.07
             };
-            goal.runtime.frustration += (target_frustration - goal.runtime.frustration) * alpha;
+            let frustration = goal.runtime().frustration
+                + (target_frustration - goal.runtime().frustration) * alpha;
+            goal.runtime_mut().frustration = frustration;
         }
         if attempt_finished {
             self.pending = None;
@@ -1747,7 +2096,9 @@ impl GoalSystem {
 mod tests {
     use super::*;
     use pete_body::BodySense;
-    use pete_now::{ObjectObservation, ObjectObservationSource};
+    use pete_now::{
+        Now, ObjectClass, ObjectObservation, ObjectObservationSource, WorldModelUpdater,
+    };
 
     fn evaluation(id: &str, activation: f32, urgency: f32) -> GoalEvaluation {
         GoalEvaluation {
@@ -1776,6 +2127,15 @@ mod tests {
         }
     }
 
+    fn tick_with_canonical_world(
+        system: &mut GoalSystem,
+        updater: &mut WorldModelUpdater,
+        now: Now,
+    ) -> GoalCycle {
+        let now = updater.update(now, system.world_model_update_context());
+        system.tick(&now.world, &[]).unwrap()
+    }
+
     #[test]
     fn world_model_keeps_entity_identity_across_occlusion() {
         let mut updater = WorldModelUpdater::default();
@@ -1788,10 +2148,14 @@ mod tests {
             confidence: 0.9,
             source: ObjectObservationSource::Sim,
         });
-        let first = updater.update(&now, None, BTreeMap::new());
+        let first = updater
+            .update(now.clone(), WorldModelUpdateContext::default())
+            .world;
         now.t_ms = 500;
         now.objects.observations.clear();
-        let second = updater.update(&now, None, BTreeMap::new());
+        let second = updater
+            .update(now, WorldModelUpdateContext::default())
+            .world;
         assert_eq!(
             first.entities.keys().collect::<Vec<_>>(),
             second.entities.keys().collect::<Vec<_>>()
@@ -1802,6 +2166,7 @@ mod tests {
     #[test]
     fn goal_interpretation_recomputes_relative_bearing_from_world_pose() {
         let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
         let mut now = Now::blank(100, BodySense::default());
         now.body.battery_level = 0.2;
         now.objects.observations.push(ObjectObservation {
@@ -1812,12 +2177,12 @@ mod tests {
             confidence: 0.9,
             source: ObjectObservationSource::Sim,
         });
-        system.tick(&now, &[]).unwrap();
+        tick_with_canonical_world(&mut system, &mut updater, now.clone());
 
         now.t_ms = 200;
         now.objects.observations.clear();
         now.body.odometry.heading_rad = std::f32::consts::FRAC_PI_2;
-        let cycle = system.tick(&now, &[]).unwrap();
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
         let charge = cycle
             .interpretations
             .iter()
@@ -1849,6 +2214,75 @@ mod tests {
     }
 
     #[test]
+    fn arbitration_is_deterministic_and_does_not_modify_evaluations() {
+        let mut alpha = evaluation("alpha", 0.5, 0.0);
+        alpha.contributions.push(EvaluationContribution {
+            source: "direct_observation".to_string(),
+            value: 100.0,
+        });
+        alpha.competence.affordances[0]
+            .provenance
+            .push(EvidenceRef {
+                id: "sensor:a".to_string(),
+                ..EvidenceRef::default()
+            });
+        let mut beta = evaluation("beta", 0.5, 0.0);
+        beta.contributions.push(EvaluationContribution {
+            source: "memory_recall".to_string(),
+            value: -100.0,
+        });
+        let evaluations = vec![alpha.clone(), beta.clone()];
+        let original = evaluations.clone();
+        let first = GoalArbiter::default().select(0, &evaluations);
+        assert_eq!(evaluations, original);
+
+        let reversed = vec![beta, alpha];
+        let second = GoalArbiter::default().select(0, &reversed);
+        assert_eq!(first.selected_goal, second.selected_goal);
+    }
+
+    #[test]
+    fn goal_components_are_independently_replaceable() {
+        let id = GoalId::new("rest");
+        let mut goal = GoalModule::new(id.clone());
+        goal.interpreter_state.updates = 3;
+        goal.evaluator_state.evaluations = 4;
+        goal.executor_state.executions = 5;
+
+        goal.replace_interpreter(Box::new(RuleGoalInterpreter { id: id.clone() }));
+        assert_eq!(goal.interpreter_state, InterpreterState::default());
+        assert_eq!(goal.evaluator_state.evaluations, 4);
+        assert_eq!(goal.executor_state.executions, 5);
+
+        goal.replace_evaluator(Box::new(RuleGoalEvaluator { id: id.clone() }));
+        assert_eq!(goal.evaluator_state, EvaluatorState::default());
+        assert_eq!(goal.executor_state.executions, 5);
+
+        goal.replace_executor(Box::new(UtilityGoalExecutor { id }));
+        assert_eq!(goal.executor_state, ExecutorState::default());
+    }
+
+    #[test]
+    fn adding_a_registered_goal_does_not_change_the_arbiter() {
+        let mut system =
+            GoalSystem::with_goals(vec![Box::new(GoalModule::new(GoalId::new("rest")))]);
+        system
+            .register_goal(Box::new(GoalModule::new(GoalId::new("explore"))))
+            .unwrap();
+        let mut updater = WorldModelUpdater::default();
+        let cycle = tick_with_canonical_world(
+            &mut system,
+            &mut updater,
+            Now::blank(0, BodySense::default()),
+        );
+        assert_eq!(cycle.evaluations.len(), 2);
+        assert!(cycle
+            .evaluations
+            .iter()
+            .any(|evaluation| evaluation.goal_id == GoalId::new("explore")));
+    }
+
+    #[test]
     fn urgency_reduces_commitment_cost_without_becoming_activation() {
         let mut arbiter = GoalArbiter::default();
         arbiter.select(0, &[evaluation("explore", 0.4, 0.0)]);
@@ -1865,12 +2299,45 @@ mod tests {
     }
 
     #[test]
+    fn completed_goal_releases_commitment_immediately() {
+        let mut arbiter = GoalArbiter::default();
+        arbiter.select(0, &[evaluation("charge", 0.9, 0.0)]);
+        let mut completed = evaluation("charge", 0.9, 0.0);
+        completed.disposition = GoalDisposition::Completed;
+        let selection = arbiter.select(10, &[completed, evaluation("explore", 0.2, 0.0)]);
+        assert_eq!(selection.selected_goal, Some(GoalId::new("explore")));
+        assert_eq!(selection.exit_reason, Some(GoalExitReason::Completed));
+        assert!(selection.switched);
+    }
+
+    #[test]
+    fn transient_drive_impulse_decays_and_ordinary_frames_do_not_reset_it() {
+        let mut dynamics = DriveDynamics::default();
+        let mut world = WorldModelSnapshot::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.8;
+        world.self_model.battery_level = body.battery_level;
+        dynamics.update(&world);
+        dynamics.add_impulses(DriveSense {
+            battery_hunger: 1.0,
+            ..DriveSense::default()
+        });
+        world.t_ms = 100;
+        let pulsed = dynamics.update(&world).energy.activation;
+        world.t_ms = 200;
+        let recovered = dynamics.update(&world).energy.activation;
+        assert!(pulsed > 0.05);
+        assert!(recovered < pulsed);
+    }
+
+    #[test]
     fn low_confidence_urgent_charge_searches_instead_of_docking() {
         let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
         let mut body = BodySense::default();
         body.battery_level = 0.05;
         let now = Now::blank(1_000, body);
-        let cycle = system.tick(&now, &[]).unwrap();
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
         let behavior = cycle.behavior.unwrap();
         assert_eq!(behavior.goal_id, GoalId::new("seek_charger"));
         assert_eq!(behavior.behavior_id, "systematic_charger_search");
@@ -1878,8 +2345,155 @@ mod tests {
     }
 
     #[test]
+    fn low_confidence_localized_charger_rejects_direct_locomotion() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        let mut now = Now::blank(1_000, body);
+        now.objects.observations.push(ObjectObservation {
+            label: "uncertain dock".to_string(),
+            class: ObjectClass::Charger,
+            bearing_rad: 0.0,
+            distance_m: Some(0.2),
+            confidence: 0.1,
+            source: ObjectObservationSource::Sim,
+        });
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
+        assert_eq!(
+            cycle.behavior.as_ref().unwrap().behavior_id,
+            "systematic_charger_search"
+        );
+        let evaluation = cycle
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("seek_charger"))
+            .unwrap();
+        let dock = evaluation
+            .competence
+            .affordances
+            .iter()
+            .find(|affordance| affordance.behavior_id == "dock")
+            .unwrap();
+        assert!(!dock.available);
+        assert!(dock.rejection_reason.is_some());
+    }
+
+    #[test]
+    fn occluded_charger_selects_search_instead_of_direct_approach() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        let mut now = Now::blank(1_000, body);
+        now.range.nearest_m = Some(0.5);
+        now.objects.observations.extend([
+            ObjectObservation {
+                label: "blocking obstacle".to_string(),
+                class: ObjectClass::Obstacle,
+                bearing_rad: 0.02,
+                distance_m: Some(0.5),
+                confidence: 0.95,
+                source: ObjectObservationSource::Sim,
+            },
+            ObjectObservation {
+                label: "dock".to_string(),
+                class: ObjectClass::Charger,
+                bearing_rad: 0.0,
+                distance_m: Some(2.0),
+                confidence: 0.95,
+                source: ObjectObservationSource::Sim,
+            },
+        ]);
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
+        assert_eq!(
+            cycle.behavior.as_ref().unwrap().behavior_id,
+            "systematic_charger_search"
+        );
+        let charge = cycle
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("seek_charger"))
+            .unwrap();
+        let approach = charge
+            .competence
+            .affordances
+            .iter()
+            .find(|affordance| affordance.behavior_id == "approach_charger")
+            .unwrap();
+        assert!(!approach.available);
+        assert!(approach
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not currently reachable")));
+    }
+
+    #[test]
+    fn obstacle_contact_releases_charge_commitment_to_escape() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        body.flags.bump_right = true;
+        let mut now = Now::blank(1_000, body);
+        now.objects.observations.push(ObjectObservation {
+            label: "dock".to_string(),
+            class: ObjectClass::Charger,
+            bearing_rad: 0.0,
+            distance_m: Some(1.5),
+            confidence: 0.9,
+            source: ObjectObservationSource::Sim,
+        });
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
+        assert_eq!(
+            cycle.selection.selected_goal,
+            Some(GoalId::new("escape_danger"))
+        );
+        let charge = cycle
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("seek_charger"))
+            .unwrap();
+        assert!(charge
+            .competence
+            .affordances
+            .iter()
+            .all(|affordance| !affordance.available));
+    }
+
+    #[test]
+    fn escape_goal_sequences_behaviors_without_resetting_goal_commitment() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 1.0;
+        let mut now = Now::blank(0, body);
+        now.memory.place_danger = 1.0;
+        now.memory.map_confidence = 1.0;
+        now.range.beams = vec![1.0; 9];
+        let mut behaviors = Vec::new();
+        for tick in 0..13 {
+            now.t_ms = tick * 100;
+            let cycle = tick_with_canonical_world(&mut system, &mut updater, now.clone());
+            assert_eq!(
+                cycle.selection.selected_goal,
+                Some(GoalId::new("escape_danger"))
+            );
+            behaviors.push(cycle.behavior.unwrap().behavior_id);
+        }
+        assert!(behaviors[..9]
+            .iter()
+            .all(|behavior| behavior == "turn_toward_clearance"));
+        assert!(behaviors[9..12]
+            .iter()
+            .all(|behavior| behavior == "probe_clearance"));
+        assert_eq!(behaviors[12], "inspect_clearance");
+    }
+
+    #[test]
     fn high_confidence_nearby_charger_affords_docking() {
         let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
         let mut body = BodySense::default();
         body.battery_level = 0.05;
         let mut now = Now::blank(1_000, body);
@@ -1891,7 +2505,7 @@ mod tests {
             confidence: 0.98,
             source: ObjectObservationSource::Sim,
         });
-        let cycle = system.tick(&now, &[]).unwrap();
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
         let behavior = cycle.behavior.unwrap();
         assert_eq!(behavior.goal_id, GoalId::new("seek_charger"));
         assert_eq!(behavior.behavior_id, "dock");
@@ -1901,6 +2515,7 @@ mod tests {
     #[test]
     fn urgent_aligned_charger_approach_uses_bounded_fast_drive() {
         let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
         let mut body = BodySense::default();
         body.battery_level = 0.05;
         let mut now = Now::blank(1_000, body);
@@ -1912,7 +2527,7 @@ mod tests {
             confidence: 0.98,
             source: ObjectObservationSource::Sim,
         });
-        let cycle = system.tick(&now, &[]).unwrap();
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
         let behavior = cycle.behavior.unwrap();
         assert_eq!(behavior.behavior_id, "approach_charger");
         assert!(matches!(
@@ -1925,27 +2540,29 @@ mod tests {
     #[test]
     fn failed_expected_progress_builds_runtime_frustration() {
         let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
         let mut body = BodySense::default();
         body.battery_level = 0.05;
         let first = Now::blank(1_000, body.clone());
-        system.tick(&first, &[]).unwrap();
+        tick_with_canonical_world(&mut system, &mut updater, first);
         let second = Now::blank(2_100, body);
-        system.tick(&second, &[]).unwrap();
+        tick_with_canonical_world(&mut system, &mut updater, second);
         let charge = system
             .goals
             .iter()
-            .find(|goal| goal.id == GoalId::new("seek_charger"))
+            .find(|goal| goal.id() == &GoalId::new("seek_charger"))
             .unwrap();
-        assert_eq!(charge.runtime.failed_attempts, 1);
-        assert!(charge.runtime.frustration > 0.0);
+        assert_eq!(charge.runtime().failed_attempts, 1);
+        assert!(charge.runtime().frustration > 0.0);
     }
 
     #[test]
     fn absent_llm_opinion_does_not_create_uncertainty_pressure() {
         let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
         let mut body = BodySense::default();
         body.battery_level = 0.35;
-        let cycle = system.tick(&Now::blank(1_000, body), &[]).unwrap();
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_000, body));
         assert_eq!(cycle.drives.certainty.activation, 0.0);
         assert_eq!(
             cycle.selection.selected_goal,

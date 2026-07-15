@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+pub mod beliefs;
+
+pub use beliefs::{
+    AuthorityBelief, Belief, BeliefMeta, BeliefSourceKind, BeliefUpdateTrace, ContextBeliefs,
+    EntityId, EvidenceRef, Freshness, GoalStatusBelief, HazardBeliefs, LocalGeometrySnapshot,
+    ReachabilityEstimate, SelfModelSnapshot, StuckTrapKind, WorldEntity, WorldEntityKind,
+    WorldModelSnapshot, WorldModelUpdateContext, WorldModelUpdater, WorldPose,
+};
+
 pub type ExtensionMap = BTreeMap<String, Value>;
 
 pub const MEMORY_VECTOR_COLLECTION: &str = "memories";
@@ -832,6 +841,8 @@ pub struct Now {
     pub t_ms: u64,
     pub body: BodySense,
     #[serde(default)]
+    pub world: WorldModelSnapshot,
+    #[serde(default)]
     pub eye: EyeSense,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eye_frame: Option<EyeFrame>,
@@ -874,6 +885,11 @@ impl Now {
         Self {
             t_ms,
             body,
+            world: WorldModelSnapshot {
+                schema_version: 1,
+                t_ms,
+                ..WorldModelSnapshot::default()
+            },
             eye: EyeSense {
                 schema_version: 1,
                 ..EyeSense::default()

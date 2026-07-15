@@ -1,0 +1,1185 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use pete_actions::ReignInput;
+use pete_core::{FrameId, Pose2};
+use serde::{Deserialize, Serialize};
+
+use crate::{Now, ObjectClass, ObjectObservationSource};
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EntityId(pub String);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeliefSourceKind {
+    DirectObservation,
+    DerivedPerception,
+    MemoryRecall,
+    LearnedPrediction,
+    Map,
+    ActionOutcome,
+    HumanClaim,
+    LlmClaim,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Freshness {
+    Current,
+    Aging,
+    Stale,
+    Invalidated,
+    #[default]
+    Missing,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceRef {
+    pub id: String,
+    pub source: String,
+    pub key: String,
+    pub observed_at_ms: u64,
+    #[serde(default)]
+    pub transformation_lineage: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BeliefMeta {
+    pub confidence: f32,
+    pub observed_at_ms: u64,
+    pub valid_at_ms: u64,
+    pub freshness: Freshness,
+    #[serde(default)]
+    pub provenance: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub contradiction_refs: Vec<EvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate_frame: Option<FrameId>,
+    pub source_kind: BeliefSourceKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Belief<T> {
+    pub value: T,
+    pub meta: BeliefMeta,
+}
+
+impl<T: Default> Default for Belief<T> {
+    fn default() -> Self {
+        Self {
+            value: T::default(),
+            meta: BeliefMeta::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldEntityKind {
+    Charger,
+    Person,
+    Obstacle,
+    SoundSource,
+    Landmark,
+    Door,
+    Region,
+    #[default]
+    Unknown,
+}
+
+impl From<&ObjectClass> for WorldEntityKind {
+    fn from(value: &ObjectClass) -> Self {
+        match value {
+            ObjectClass::Charger => Self::Charger,
+            ObjectClass::Person => Self::Person,
+            ObjectClass::Obstacle => Self::Obstacle,
+            ObjectClass::SoundSource => Self::SoundSource,
+            ObjectClass::Landmark => Self::Landmark,
+            ObjectClass::Unknown => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorldPose {
+    pub x_m: f32,
+    pub y_m: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReachabilityEstimate {
+    pub reachable: bool,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorldEntity {
+    pub id: EntityId,
+    pub kind: WorldEntityKind,
+    pub label: String,
+    pub last_observed_at_ms: u64,
+    pub confidence: f32,
+    pub meta: BeliefMeta,
+    pub pose: Option<WorldPose>,
+    pub bearing_rad: Option<f32>,
+    pub bearing_meta: Option<BeliefMeta>,
+    pub distance_m: Option<f32>,
+    pub distance_meta: Option<BeliefMeta>,
+    pub reachability: ReachabilityEstimate,
+    pub reachability_meta: Option<BeliefMeta>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, f32>,
+    #[serde(default)]
+    pub provenance: Vec<EvidenceRef>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GoalStatusBelief {
+    pub meta: BeliefMeta,
+    pub active: bool,
+    pub elapsed_time_ms: u64,
+    pub failed_attempts: u32,
+    pub recent_progress: f32,
+    pub confidence_trend: f32,
+    pub frustration: f32,
+    pub last_exit_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StuckTrapKind {
+    Wall,
+    Corner,
+    Column,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SelfModelSnapshot {
+    pub battery_level: f32,
+    pub battery_meta: BeliefMeta,
+    pub charging: bool,
+    pub charging_meta: BeliefMeta,
+    pub stuck: bool,
+    pub stuck_meta: BeliefMeta,
+    pub stuck_trap_kind: Option<Belief<StuckTrapKind>>,
+    pub pose: Pose2,
+    pub pose_meta: BeliefMeta,
+    pub contact: bool,
+    pub bump_left: bool,
+    pub moving: bool,
+    pub range_nearest_m: Option<f32>,
+    pub active_goal: Option<String>,
+    #[serde(default)]
+    pub goal_status: BTreeMap<String, GoalStatusBelief>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalGeometrySnapshot {
+    pub nearest_m: Option<Belief<f32>>,
+    pub left_clearance_m: Option<Belief<f32>>,
+    pub center_clearance_m: Option<Belief<f32>>,
+    pub right_clearance_m: Option<Belief<f32>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextBeliefs {
+    pub novelty: Option<Belief<f32>>,
+    pub surprise: Option<Belief<f32>>,
+    pub prediction_uncertainty: Option<Belief<f32>>,
+    pub map_confidence: Option<Belief<f32>>,
+    pub safe_bearing_rad: Option<Belief<f32>>,
+    pub frontier_bearing_rad: Option<Belief<f32>>,
+    pub llm_confidence: Option<Belief<f32>>,
+    pub expected_battery_delta: Option<Belief<f32>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthorityBelief {
+    pub input: ReignInput,
+    pub meta: BeliefMeta,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HazardBeliefs {
+    pub immediate_risk: Option<Belief<f32>>,
+    pub remembered_risk: Option<Belief<f32>>,
+    pub predicted_risk: Option<Belief<f32>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BeliefUpdateTrace {
+    #[serde(default)]
+    pub input_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub updated: Vec<String>,
+    #[serde(default)]
+    pub removed: Vec<String>,
+    #[serde(default)]
+    pub freshness_changes: Vec<String>,
+    #[serde(default)]
+    pub confidence_changes: Vec<String>,
+    #[serde(default)]
+    pub contradiction_resolutions: Vec<String>,
+    pub builder_implementation: String,
+    pub builder_version: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorldModelSnapshot {
+    pub schema_version: u32,
+    pub revision: u64,
+    pub t_ms: u64,
+    #[serde(default)]
+    pub entities: BTreeMap<EntityId, WorldEntity>,
+    pub self_model: SelfModelSnapshot,
+    pub local_geometry: LocalGeometrySnapshot,
+    pub hazards: HazardBeliefs,
+    pub context: ContextBeliefs,
+    pub authority: Option<AuthorityBelief>,
+    pub update_trace: BeliefUpdateTrace,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorldModelUpdateContext {
+    pub active_goal: Option<String>,
+    #[serde(default)]
+    pub goal_status: BTreeMap<String, GoalStatusBelief>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorldModelUpdater {
+    revision: u64,
+    entities: BTreeMap<EntityId, WorldEntity>,
+}
+
+impl WorldModelUpdater {
+    pub fn update(&mut self, mut now: Now, context: WorldModelUpdateContext) -> Now {
+        let previous = self.entities.clone();
+        let mut trace = BeliefUpdateTrace {
+            builder_implementation: "pete_now::WorldModelUpdater".to_string(),
+            builder_version: "1".to_string(),
+            ..BeliefUpdateTrace::default()
+        };
+        self.age_entities(now.t_ms, &mut trace);
+        self.integrate_objects(&now, &mut trace);
+        self.integrate_sound(&now, &mut trace);
+        self.integrate_memory(&now, &mut trace);
+        self.mark_contradictions(&mut trace);
+        self.remove_expired(now.t_ms, &mut trace);
+
+        for id in self.entities.keys() {
+            if previous.contains_key(id) {
+                if previous.get(id) != self.entities.get(id) {
+                    trace.updated.push(id.0.clone());
+                }
+            } else {
+                trace.added.push(id.0.clone());
+            }
+        }
+        let self_model = self.self_model(&now, context);
+        let local_geometry = local_geometry(&now);
+        let hazards = hazard_beliefs(&now);
+        let context = context_beliefs(&now);
+        let authority = authority_belief(&now);
+        record_meta_evidence(&mut trace, &self_model.battery_meta);
+        record_meta_evidence(&mut trace, &self_model.charging_meta);
+        record_meta_evidence(&mut trace, &self_model.stuck_meta);
+        record_meta_evidence(&mut trace, &self_model.pose_meta);
+        if let Some(trap_kind) = &self_model.stuck_trap_kind {
+            record_meta_evidence(&mut trace, &trap_kind.meta);
+        }
+        for status in self_model.goal_status.values() {
+            record_meta_evidence(&mut trace, &status.meta);
+        }
+        for belief in [
+            local_geometry.nearest_m.as_ref(),
+            local_geometry.left_clearance_m.as_ref(),
+            local_geometry.center_clearance_m.as_ref(),
+            local_geometry.right_clearance_m.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            record_meta_evidence(&mut trace, &belief.meta);
+        }
+        for belief in [
+            hazards.immediate_risk.as_ref(),
+            hazards.remembered_risk.as_ref(),
+            hazards.predicted_risk.as_ref(),
+            context.novelty.as_ref(),
+            context.surprise.as_ref(),
+            context.prediction_uncertainty.as_ref(),
+            context.map_confidence.as_ref(),
+            context.safe_bearing_rad.as_ref(),
+            context.frontier_bearing_rad.as_ref(),
+            context.llm_confidence.as_ref(),
+            context.expected_battery_delta.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            record_meta_evidence(&mut trace, &belief.meta);
+        }
+        if let Some(authority) = &authority {
+            record_meta_evidence(&mut trace, &authority.meta);
+        }
+        trace.input_evidence_ids.sort();
+        trace.input_evidence_ids.dedup();
+        trace.added.sort();
+        trace.updated.sort();
+        trace.removed.sort();
+        trace.freshness_changes.sort();
+        trace.confidence_changes.sort();
+        trace.contradiction_resolutions.sort();
+
+        self.revision = self.revision.saturating_add(1);
+        now.world = WorldModelSnapshot {
+            schema_version: 1,
+            revision: self.revision,
+            t_ms: now.t_ms,
+            entities: self.entities.clone(),
+            self_model,
+            local_geometry,
+            hazards,
+            context,
+            authority,
+            update_trace: trace,
+        };
+        now
+    }
+
+    fn age_entities(&mut self, now_ms: u64, trace: &mut BeliefUpdateTrace) {
+        for entity in self.entities.values_mut() {
+            let age_ms = now_ms.saturating_sub(entity.last_observed_at_ms);
+            let previous = entity.meta.freshness.clone();
+            let previous_confidence = entity.confidence;
+            entity.meta.freshness = freshness(age_ms, identity_policy(&entity.kind));
+            entity.meta.valid_at_ms = now_ms;
+            let base_confidence = entity
+                .attributes
+                .get("observed_confidence")
+                .copied()
+                .unwrap_or(entity.confidence);
+            entity.confidence =
+                decayed_confidence(base_confidence, age_ms, identity_policy(&entity.kind));
+            entity.meta.confidence = entity.confidence;
+            if (entity.confidence - previous_confidence).abs() > f32::EPSILON {
+                trace.confidence_changes.push(format!(
+                    "{}:{previous_confidence:.6}->{:.6}",
+                    entity.id.0, entity.confidence
+                ));
+            }
+            if previous != entity.meta.freshness {
+                trace.freshness_changes.push(format!(
+                    "{}:identity:{previous:?}->{:?}",
+                    entity.id.0, entity.meta.freshness
+                ));
+            }
+            if age_ms > bearing_policy(&entity.kind).aging_after_ms {
+                if entity.bearing_rad.take().is_some() {
+                    trace
+                        .freshness_changes
+                        .push(format!("{}:bearing:stale", entity.id.0));
+                }
+                entity.bearing_meta = None;
+            }
+            if age_ms > distance_policy(&entity.kind).aging_after_ms {
+                entity.distance_m = None;
+                entity.distance_meta = None;
+                entity.reachability = ReachabilityEstimate::default();
+                entity.reachability_meta = None;
+            }
+        }
+    }
+
+    fn integrate_objects(&mut self, now: &Now, trace: &mut BeliefUpdateTrace) {
+        for (index, observation) in now.objects.observations.iter().enumerate() {
+            let kind = WorldEntityKind::from(&observation.class);
+            let id = EntityId(format!(
+                "{}:{}",
+                entity_kind_key(&kind),
+                normalized_label(&observation.label)
+            ));
+            let source_kind = match observation.source {
+                ObjectObservationSource::Sim => BeliefSourceKind::DirectObservation,
+                ObjectObservationSource::HumanLabel => BeliefSourceKind::HumanClaim,
+                ObjectObservationSource::Kinect | ObjectObservationSource::Captioner => {
+                    BeliefSourceKind::DerivedPerception
+                }
+                ObjectObservationSource::Unknown => BeliefSourceKind::Unknown,
+            };
+            let evidence = evidence_ref(
+                &format!("object.{:?}", observation.source).to_lowercase(),
+                &format!("{}:{index}", observation.label),
+                now.t_ms,
+                "object-observation-v1",
+            );
+            trace.input_evidence_ids.push(evidence.id.clone());
+            let meta = belief_meta(
+                observation.confidence,
+                now.t_ms,
+                source_kind,
+                evidence.clone(),
+                Some("base_link".to_string()),
+            );
+            let pose = observation.distance_m.map(|distance| {
+                let heading = now.body.odometry.heading_rad + observation.bearing_rad;
+                WorldPose {
+                    x_m: now.body.odometry.x_m + heading.cos() * distance,
+                    y_m: now.body.odometry.y_m + heading.sin() * distance,
+                }
+            });
+            let occluded = observation.distance_m.is_some_and(|target_distance| {
+                now.objects.observations.iter().any(|other| {
+                    other.class == ObjectClass::Obstacle
+                        && other.distance_m.is_some_and(|obstacle_distance| {
+                            obstacle_distance + 0.10 < target_distance
+                                && normalize_angle(other.bearing_rad - observation.bearing_rad)
+                                    .abs()
+                                    < 0.28
+                        })
+                })
+            });
+            let reachable = observation.distance_m.is_some() && !occluded;
+            self.entities.insert(
+                id.clone(),
+                WorldEntity {
+                    id,
+                    kind,
+                    label: observation.label.clone(),
+                    last_observed_at_ms: now.t_ms,
+                    confidence: observation.confidence.clamp(0.0, 1.0),
+                    meta: meta.clone(),
+                    pose,
+                    bearing_rad: Some(observation.bearing_rad),
+                    bearing_meta: Some(meta.clone()),
+                    distance_m: observation.distance_m,
+                    distance_meta: observation.distance_m.map(|_| meta.clone()),
+                    reachability: ReachabilityEstimate {
+                        reachable,
+                        confidence: observation.confidence.clamp(0.0, 1.0),
+                    },
+                    reachability_meta: Some(meta.clone()),
+                    attributes: BTreeMap::from([(
+                        "observed_confidence".to_string(),
+                        observation.confidence.clamp(0.0, 1.0),
+                    )]),
+                    provenance: vec![evidence],
+                },
+            );
+        }
+    }
+
+    fn integrate_sound(&mut self, now: &Now, trace: &mut BeliefUpdateTrace) {
+        let Some(label) = now
+            .ear
+            .transcript
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| (!now.ear.features.is_empty()).then(|| "unidentified sound".to_string()))
+        else {
+            return;
+        };
+        let evidence = evidence_ref("ear", "sound_source", now.t_ms, "sound-hypothesis-v1");
+        trace.input_evidence_ids.push(evidence.id.clone());
+        let confidence = now.ear.asr.confidence.clamp(0.2, 1.0);
+        let meta = belief_meta(
+            confidence,
+            now.t_ms,
+            BeliefSourceKind::DerivedPerception,
+            evidence.clone(),
+            Some("base_link".to_string()),
+        );
+        let id = EntityId("sound_source:current".to_string());
+        self.entities.insert(
+            id.clone(),
+            WorldEntity {
+                id,
+                kind: WorldEntityKind::SoundSource,
+                label,
+                last_observed_at_ms: now.t_ms,
+                confidence,
+                meta,
+                provenance: vec![evidence],
+                ..WorldEntity::default()
+            },
+        );
+    }
+
+    fn integrate_memory(&mut self, now: &Now, trace: &mut BeliefUpdateTrace) {
+        let Some(bearing) = now.memory.nearby_best_charge_direction_rad else {
+            return;
+        };
+        let confidence =
+            (now.memory.place_charge_value * now.memory.map_confidence).clamp(0.0, 1.0);
+        if confidence <= 0.01 {
+            return;
+        }
+        let evidence = evidence_ref(
+            "memory.recall",
+            "charger_direction",
+            now.t_ms,
+            "memory-belief-v1",
+        );
+        trace.input_evidence_ids.push(evidence.id.clone());
+        let meta = belief_meta(
+            confidence,
+            now.t_ms,
+            BeliefSourceKind::MemoryRecall,
+            evidence.clone(),
+            Some("base_link".to_string()),
+        );
+        let id = EntityId("charger:remembered_home".to_string());
+        self.entities.insert(
+            id.clone(),
+            WorldEntity {
+                id,
+                kind: WorldEntityKind::Charger,
+                label: "remembered charger".to_string(),
+                last_observed_at_ms: now.t_ms,
+                confidence,
+                meta: meta.clone(),
+                bearing_rad: Some(bearing),
+                bearing_meta: Some(meta.clone()),
+                reachability: ReachabilityEstimate {
+                    reachable: false,
+                    confidence,
+                },
+                reachability_meta: Some(meta),
+                attributes: BTreeMap::from([("observed_confidence".to_string(), confidence)]),
+                provenance: vec![evidence],
+                ..WorldEntity::default()
+            },
+        );
+    }
+
+    fn mark_contradictions(&mut self, trace: &mut BeliefUpdateTrace) {
+        let mut by_label: BTreeMap<String, Vec<EntityId>> = BTreeMap::new();
+        for entity in self.entities.values() {
+            by_label
+                .entry(normalized_label(&entity.label))
+                .or_default()
+                .push(entity.id.clone());
+        }
+        for ids in by_label.values().filter(|ids| ids.len() > 1) {
+            let kinds = ids
+                .iter()
+                .filter_map(|id| self.entities.get(id))
+                .map(|entity| entity.kind.clone())
+                .collect::<BTreeSet<_>>();
+            if kinds.len() <= 1 {
+                continue;
+            }
+            for id in ids {
+                let contradictions = ids
+                    .iter()
+                    .filter(|other| *other != id)
+                    .filter_map(|other| self.entities.get(other))
+                    .flat_map(|entity| entity.provenance.clone())
+                    .collect::<Vec<_>>();
+                if let Some(entity) = self.entities.get_mut(id) {
+                    entity.meta.contradiction_refs = contradictions;
+                }
+            }
+            trace.contradiction_resolutions.push(format!(
+                "preserved:{}",
+                ids.iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    }
+
+    fn remove_expired(&mut self, now_ms: u64, trace: &mut BeliefUpdateTrace) {
+        self.entities.retain(|id, entity| {
+            let keep = now_ms.saturating_sub(entity.last_observed_at_ms)
+                <= identity_policy(&entity.kind).invalidate_after_ms
+                && entity.confidence > 0.01;
+            if !keep {
+                trace.removed.push(id.0.clone());
+            }
+            keep
+        });
+    }
+
+    fn self_model(&self, now: &Now, context: WorldModelUpdateContext) -> SelfModelSnapshot {
+        let body_evidence = evidence_ref("body", "state", now.t_ms, "body-belief-v1");
+        let body_meta = belief_meta(
+            1.0,
+            now.t_ms,
+            BeliefSourceKind::DirectObservation,
+            body_evidence,
+            Some("base_link".to_string()),
+        );
+        let stuck = now
+            .extensions
+            .get("sim.stuck")
+            .and_then(|value| value.get("values"))
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_f64())
+            .is_some_and(|active| active > 0.0);
+        let stuck_trap_kind = stuck.then(|| {
+            let value = now
+                .extensions
+                .get("sim.stuck")
+                .and_then(|value| value.get("values"))
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.get(10))
+                .and_then(|value| value.as_f64())
+                .map(|code| match code.round() as i32 {
+                    1 => StuckTrapKind::Wall,
+                    2 => StuckTrapKind::Corner,
+                    3 => StuckTrapKind::Column,
+                    _ => StuckTrapKind::Unknown,
+                })
+                .unwrap_or_default();
+            Belief {
+                value,
+                meta: simple_meta(
+                    now.t_ms,
+                    BeliefSourceKind::DerivedPerception,
+                    "recovery.trap_kind",
+                ),
+            }
+        });
+        let mut goal_status = context.goal_status;
+        for (goal_id, status) in &mut goal_status {
+            status.meta = simple_meta(
+                now.t_ms,
+                BeliefSourceKind::ActionOutcome,
+                &format!("goal_outcome.{goal_id}"),
+            );
+        }
+        SelfModelSnapshot {
+            battery_level: now.body.battery_level,
+            battery_meta: body_meta.clone(),
+            charging: now.body.charging,
+            charging_meta: body_meta.clone(),
+            stuck,
+            stuck_meta: body_meta,
+            stuck_trap_kind,
+            pose: now.body.odometry,
+            pose_meta: belief_meta(
+                1.0,
+                now.t_ms,
+                BeliefSourceKind::DirectObservation,
+                evidence_ref("body", "odometry", now.t_ms, "body-belief-v1"),
+                Some("map".to_string()),
+            ),
+            contact: now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall,
+            bump_left: now.body.flags.bump_left,
+            moving: now.body.velocity.forward_m_s.abs() > 0.01
+                || now.body.velocity.turn_rad_s.abs() > 0.01,
+            range_nearest_m: now.range.nearest_m,
+            active_goal: context.active_goal,
+            goal_status,
+        }
+    }
+}
+
+fn record_meta_evidence(trace: &mut BeliefUpdateTrace, meta: &BeliefMeta) {
+    trace
+        .input_evidence_ids
+        .extend(meta.provenance.iter().map(|evidence| evidence.id.clone()));
+    trace.input_evidence_ids.extend(
+        meta.contradiction_refs
+            .iter()
+            .map(|evidence| evidence.id.clone()),
+    );
+}
+
+fn context_beliefs(now: &Now) -> ContextBeliefs {
+    let memory_present = now.memory.map_confidence > 0.0
+        || now.memory.places_visited > 0
+        || !now.memory.remembered_entities.is_empty();
+    let predictions_present = !now.predictions.expected_events.is_empty()
+        || now.predictions.danger_model.is_some()
+        || now.predictions.danger_hardcoded.is_some()
+        || now.predictions.charge_model.is_some()
+        || now.predictions.charge_hardcoded.is_some();
+    ContextBeliefs {
+        novelty: memory_present.then(|| Belief {
+            value: now.memory.place_novelty.clamp(0.0, 1.0),
+            meta: simple_meta(now.t_ms, BeliefSourceKind::MemoryRecall, "memory.novelty"),
+        }),
+        surprise: Some(Belief {
+            value: now.surprise.total.clamp(0.0, 1.0),
+            meta: simple_meta(
+                now.t_ms,
+                BeliefSourceKind::DerivedPerception,
+                "surprise.total",
+            ),
+        }),
+        prediction_uncertainty: predictions_present.then(|| Belief {
+            value: now.predictions.uncertainty.clamp(0.0, 1.0),
+            meta: simple_meta(
+                now.t_ms,
+                BeliefSourceKind::LearnedPrediction,
+                "prediction.uncertainty",
+            ),
+        }),
+        map_confidence: memory_present.then(|| Belief {
+            value: now.memory.map_confidence.clamp(0.0, 1.0),
+            meta: simple_meta(now.t_ms, BeliefSourceKind::Map, "memory.map_confidence"),
+        }),
+        safe_bearing_rad: now
+            .memory
+            .nearby_best_safe_direction_rad
+            .map(|value| Belief {
+                value,
+                meta: simple_meta(
+                    now.t_ms,
+                    BeliefSourceKind::MemoryRecall,
+                    "memory.safe_bearing",
+                ),
+            }),
+        frontier_bearing_rad: now
+            .memory
+            .nearby_frontier_direction_rad
+            .map(|value| Belief {
+                value,
+                meta: simple_meta(
+                    now.t_ms,
+                    BeliefSourceKind::MemoryRecall,
+                    "memory.frontier_bearing",
+                ),
+            }),
+        llm_confidence: (now.llm.command_summary.is_some() || now.llm.critique.is_some()).then(
+            || Belief {
+                value: now.llm.confidence.clamp(0.0, 1.0),
+                meta: simple_meta(now.t_ms, BeliefSourceKind::LlmClaim, "llm.confidence"),
+            },
+        ),
+        expected_battery_delta: now
+            .predictions
+            .charge_model
+            .or(now.predictions.charge_hardcoded)
+            .map(|prediction| Belief {
+                value: prediction.expected_battery_delta,
+                meta: simple_meta(
+                    now.t_ms,
+                    BeliefSourceKind::LearnedPrediction,
+                    "prediction.expected_battery_delta",
+                ),
+            }),
+    }
+}
+
+fn local_geometry(now: &Now) -> LocalGeometrySnapshot {
+    let range_belief = |key: &str, value: f32| Belief {
+        value,
+        meta: simple_meta(
+            now.t_ms,
+            BeliefSourceKind::DirectObservation,
+            &format!("range.{key}"),
+        ),
+    };
+    let (left, center, right) = clearance_buckets(&now.range.beams);
+    LocalGeometrySnapshot {
+        nearest_m: now
+            .range
+            .nearest_m
+            .map(|value| range_belief("nearest", value)),
+        left_clearance_m: left.map(|value| range_belief("left_clearance", value)),
+        center_clearance_m: center.map(|value| range_belief("center_clearance", value)),
+        right_clearance_m: right.map(|value| range_belief("right_clearance", value)),
+    }
+}
+
+fn clearance_buckets(beams: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>) {
+    if beams.is_empty() {
+        return (None, None, None);
+    }
+    let third = (beams.len() / 3).max(1);
+    let left_end = third.min(beams.len());
+    let right_start = beams.len().saturating_sub(third);
+    let center_start = left_end.saturating_sub(1).min(beams.len());
+    let center_end = (right_start + 1).min(beams.len()).max(center_start + 1);
+    let nearest = |slice: &[f32]| slice.iter().copied().reduce(f32::min);
+    (
+        nearest(&beams[..left_end]),
+        nearest(&beams[center_start..center_end]),
+        nearest(&beams[right_start..]),
+    )
+}
+
+fn authority_belief(now: &Now) -> Option<AuthorityBelief> {
+    now.reign.latest.clone().map(|input| AuthorityBelief {
+        meta: simple_meta(now.t_ms, BeliefSourceKind::HumanClaim, "authority.reign"),
+        input,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct FreshnessPolicy {
+    current_for_ms: u64,
+    aging_after_ms: u64,
+    invalidate_after_ms: u64,
+}
+
+fn identity_policy(kind: &WorldEntityKind) -> FreshnessPolicy {
+    match kind {
+        WorldEntityKind::Person | WorldEntityKind::SoundSource => FreshnessPolicy {
+            current_for_ms: 1_000,
+            aging_after_ms: 5_000,
+            invalidate_after_ms: 15_000,
+        },
+        _ => FreshnessPolicy {
+            current_for_ms: 2_000,
+            aging_after_ms: 15_000,
+            invalidate_after_ms: 60_000,
+        },
+    }
+}
+
+fn bearing_policy(_kind: &WorldEntityKind) -> FreshnessPolicy {
+    FreshnessPolicy {
+        current_for_ms: 500,
+        aging_after_ms: 2_000,
+        invalidate_after_ms: 3_000,
+    }
+}
+
+fn distance_policy(_kind: &WorldEntityKind) -> FreshnessPolicy {
+    FreshnessPolicy {
+        current_for_ms: 500,
+        aging_after_ms: 2_000,
+        invalidate_after_ms: 3_000,
+    }
+}
+
+fn freshness(age_ms: u64, policy: FreshnessPolicy) -> Freshness {
+    if age_ms <= policy.current_for_ms {
+        Freshness::Current
+    } else if age_ms <= policy.aging_after_ms {
+        Freshness::Aging
+    } else if age_ms <= policy.invalidate_after_ms {
+        Freshness::Stale
+    } else {
+        Freshness::Invalidated
+    }
+}
+
+fn decayed_confidence(base: f32, age_ms: u64, policy: FreshnessPolicy) -> f32 {
+    if age_ms <= policy.current_for_ms {
+        base.clamp(0.0, 1.0)
+    } else {
+        let span = policy
+            .invalidate_after_ms
+            .saturating_sub(policy.current_for_ms)
+            .max(1);
+        let elapsed = age_ms.saturating_sub(policy.current_for_ms);
+        (base * (1.0 - elapsed as f32 / span as f32)).clamp(0.0, 1.0)
+    }
+}
+
+fn hazard_beliefs(now: &Now) -> HazardBeliefs {
+    let contact = now.body.flags.bump_left
+        || now.body.flags.bump_right
+        || now.body.flags.wall
+        || now.body.flags.wheel_drop;
+    let range_risk = now
+        .range
+        .nearest_m
+        .map(|distance| ((0.35 - distance) / 0.35).clamp(0.0, 1.0));
+    let immediate = if contact { Some(1.0) } else { range_risk };
+    let predicted = now
+        .predictions
+        .danger_model
+        .or(now.predictions.danger_hardcoded)
+        .map(|prediction| {
+            prediction
+                .bump_risk
+                .max(prediction.cliff_risk)
+                .max(prediction.wheel_drop_risk)
+                .max(prediction.stuck_risk)
+        });
+    HazardBeliefs {
+        immediate_risk: immediate.map(|value| Belief {
+            value,
+            meta: simple_meta(now.t_ms, BeliefSourceKind::DirectObservation, "range/body"),
+        }),
+        remembered_risk: (now.memory.map_confidence > 0.0).then(|| Belief {
+            value: now.memory.place_danger.clamp(0.0, 1.0),
+            meta: simple_meta(
+                now.t_ms,
+                BeliefSourceKind::MemoryRecall,
+                "memory.place_danger",
+            ),
+        }),
+        predicted_risk: predicted.map(|value| Belief {
+            value,
+            meta: simple_meta(
+                now.t_ms,
+                BeliefSourceKind::LearnedPrediction,
+                "prediction.danger",
+            ),
+        }),
+    }
+}
+
+fn simple_meta(now_ms: u64, source_kind: BeliefSourceKind, key: &str) -> BeliefMeta {
+    let evidence = evidence_ref(key, key, now_ms, "world-model-v1");
+    belief_meta(1.0, now_ms, source_kind, evidence, None)
+}
+
+fn belief_meta(
+    confidence: f32,
+    now_ms: u64,
+    source_kind: BeliefSourceKind,
+    evidence: EvidenceRef,
+    coordinate_frame: Option<FrameId>,
+) -> BeliefMeta {
+    BeliefMeta {
+        confidence: confidence.clamp(0.0, 1.0),
+        observed_at_ms: now_ms,
+        valid_at_ms: now_ms,
+        freshness: Freshness::Current,
+        provenance: vec![evidence],
+        contradiction_refs: Vec::new(),
+        coordinate_frame,
+        source_kind,
+    }
+}
+
+fn evidence_ref(source: &str, key: &str, now_ms: u64, implementation: &str) -> EvidenceRef {
+    EvidenceRef {
+        id: format!("{source}:{key}:{now_ms}"),
+        source: source.to_string(),
+        key: key.to_string(),
+        observed_at_ms: now_ms,
+        transformation_lineage: vec![implementation.to_string()],
+        implementation_version: Some("1".to_string()),
+    }
+}
+
+fn entity_kind_key(kind: &WorldEntityKind) -> &'static str {
+    match kind {
+        WorldEntityKind::Charger => "charger",
+        WorldEntityKind::Person => "person",
+        WorldEntityKind::Obstacle => "obstacle",
+        WorldEntityKind::SoundSource => "sound_source",
+        WorldEntityKind::Landmark => "landmark",
+        WorldEntityKind::Door => "door",
+        WorldEntityKind::Region => "region",
+        WorldEntityKind::Unknown => "unknown",
+    }
+}
+
+fn normalized_label(label: &str) -> String {
+    let normalized = label
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>();
+    if normalized.is_empty() {
+        "unlabeled".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_angle(mut angle: f32) -> f32 {
+    while angle > std::f32::consts::PI {
+        angle -= std::f32::consts::TAU;
+    }
+    while angle < -std::f32::consts::PI {
+        angle += std::f32::consts::TAU;
+    }
+    angle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ObjectObservation, ObjectSense};
+    use pete_body::BodySense;
+
+    fn observed_now(t_ms: u64, class: ObjectClass, label: &str) -> Now {
+        let mut now = Now::blank(t_ms, BodySense::default());
+        now.objects = ObjectSense {
+            schema_version: 1,
+            observations: vec![ObjectObservation {
+                label: label.to_string(),
+                class,
+                bearing_rad: 0.2,
+                distance_m: Some(1.0),
+                confidence: 0.9,
+                source: ObjectObservationSource::Sim,
+            }],
+            ..ObjectSense::default()
+        };
+        now
+    }
+
+    #[test]
+    fn stale_target_loses_bearing_without_erasing_identity() {
+        let mut updater = WorldModelUpdater::default();
+        let first = updater.update(
+            observed_now(0, ObjectClass::Charger, "dock"),
+            WorldModelUpdateContext::default(),
+        );
+        let id = first.world.entities.keys().next().unwrap().clone();
+        let stale = updater.update(
+            Now::blank(2_100, BodySense::default()),
+            WorldModelUpdateContext::default(),
+        );
+        assert!(stale.world.entities.contains_key(&id));
+        assert!(stale.world.entities[&id].bearing_rad.is_none());
+    }
+
+    #[test]
+    fn contradictory_claims_coexist_and_are_explicit() {
+        let mut updater = WorldModelUpdater::default();
+        updater.update(
+            observed_now(0, ObjectClass::Person, "Alex"),
+            WorldModelUpdateContext::default(),
+        );
+        let next = updater.update(
+            observed_now(1, ObjectClass::Charger, "Alex"),
+            WorldModelUpdateContext::default(),
+        );
+        assert_eq!(next.world.entities.len(), 2);
+        assert!(next
+            .world
+            .entities
+            .values()
+            .all(|entity| !entity.meta.contradiction_refs.is_empty()));
+    }
+
+    #[test]
+    fn fixed_evidence_sequence_is_deterministic() {
+        let sequence = || {
+            let mut updater = WorldModelUpdater::default();
+            updater
+                .update(
+                    observed_now(10, ObjectClass::Charger, "dock"),
+                    WorldModelUpdateContext::default(),
+                )
+                .world
+        };
+        assert_eq!(sequence(), sequence());
+    }
+
+    #[test]
+    fn memory_and_direct_observation_remain_distinguishable() {
+        let mut updater = WorldModelUpdater::default();
+        let mut now = observed_now(10, ObjectClass::Charger, "dock");
+        now.memory.nearby_best_charge_direction_rad = Some(-0.4);
+        now.memory.place_charge_value = 0.8;
+        now.memory.map_confidence = 0.7;
+        let snapshot = updater
+            .update(now, WorldModelUpdateContext::default())
+            .world;
+        let sources = snapshot
+            .entities
+            .values()
+            .map(|entity| entity.meta.source_kind.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(sources.contains(&BeliefSourceKind::DirectObservation));
+        assert!(sources.contains(&BeliefSourceKind::MemoryRecall));
+    }
+
+    #[test]
+    fn missing_modalities_remain_missing_beliefs() {
+        let mut updater = WorldModelUpdater::default();
+        let snapshot = updater
+            .update(
+                Now::blank(10, BodySense::default()),
+                WorldModelUpdateContext::default(),
+            )
+            .world;
+        assert!(snapshot.entities.is_empty());
+        assert!(snapshot.context.prediction_uncertainty.is_none());
+        assert!(snapshot.context.llm_confidence.is_none());
+        assert!(snapshot.local_geometry.nearest_m.is_none());
+        assert!(snapshot.local_geometry.center_clearance_m.is_none());
+    }
+
+    #[test]
+    fn entity_belief_is_traceable_to_input_evidence() {
+        let mut updater = WorldModelUpdater::default();
+        let snapshot = updater
+            .update(
+                observed_now(10, ObjectClass::Charger, "dock"),
+                WorldModelUpdateContext::default(),
+            )
+            .world;
+        let charger = snapshot.entities.values().next().unwrap();
+        let evidence_id = &charger.meta.provenance[0].id;
+        assert!(snapshot
+            .update_trace
+            .input_evidence_ids
+            .contains(evidence_id));
+        assert!(charger.meta.provenance[0]
+            .transformation_lineage
+            .contains(&"object-observation-v1".to_string()));
+    }
+
+    #[test]
+    fn learned_latent_extension_cannot_erase_contact_belief() {
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.flags.bump_left = true;
+        let mut now = Now::blank(10, body);
+        now.extensions.insert(
+            "experience.latent".to_string(),
+            serde_json::json!({"danger": 0.0, "contact": false}),
+        );
+        let snapshot = updater
+            .update(now, WorldModelUpdateContext::default())
+            .world;
+        assert!(snapshot.self_model.contact);
+        assert_eq!(
+            snapshot
+                .hazards
+                .immediate_risk
+                .as_ref()
+                .map(|belief| belief.value),
+            Some(1.0)
+        );
+        assert_eq!(
+            snapshot.self_model.battery_meta.source_kind,
+            BeliefSourceKind::DirectObservation
+        );
+    }
+
+    #[test]
+    fn local_geometry_is_typed_derived_belief() {
+        let mut updater = WorldModelUpdater::default();
+        let mut now = Now::blank(10, BodySense::default());
+        now.range.nearest_m = Some(0.2);
+        now.range.beams = vec![0.9, 0.8, 0.7, 0.5, 0.4, 0.6, 0.3, 0.2, 0.1];
+        let snapshot = updater
+            .update(now, WorldModelUpdateContext::default())
+            .world;
+        assert_eq!(
+            snapshot
+                .local_geometry
+                .center_clearance_m
+                .as_ref()
+                .map(|belief| belief.value),
+            Some(0.3)
+        );
+        assert_eq!(
+            snapshot
+                .local_geometry
+                .center_clearance_m
+                .as_ref()
+                .map(|belief| &belief.meta.source_kind),
+            Some(&BeliefSourceKind::DirectObservation)
+        );
+    }
+}

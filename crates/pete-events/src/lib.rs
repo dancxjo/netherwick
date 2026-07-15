@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use anyhow::Result;
-use pete_actions::{ActionPrimitive, ApproachTarget, InspectTarget, ReignInput, TurnDir};
+use pete_actions::{ActionPrimitive, ReignInput};
 use pete_autonomic::{SafetyDecision, SafetyReason};
 use pete_core::{Provenance, TimeMs};
 use pete_experience::{Experience, ExperienceLatent, FuturePrediction, Impression, Sensation};
@@ -192,20 +192,10 @@ pub enum Response {
     AddImpression(Impression),
     AddExperience(Experience),
     AddMemoryNote(String),
-    ProposeAction(ActionPrimitive),
     AddDriveImpulse { name: DriveName, value: f32 },
     SetMemorySense(MemorySense),
     Teach(LlmTeaching),
     Emit(Event),
-}
-
-impl Response {
-    pub fn as_action(&self) -> Option<&ActionPrimitive> {
-        match self {
-            Self::ProposeAction(action) => Some(action),
-            _ => None,
-        }
-    }
 }
 
 pub struct EventContext<'a> {
@@ -736,7 +726,6 @@ pub mod responders {
 
         fn respond(&mut self, _ctx: &EventContext, event: &Event) -> Result<Vec<Response>> {
             Ok(vec![
-                Response::ProposeAction(ActionPrimitive::Dock),
                 Response::AddSensation(event_sensation(
                     event,
                     "drive.battery_hunger",
@@ -808,10 +797,6 @@ pub mod responders {
                 EventPayload::Bump { side } => side.as_str(),
                 _ => "unknown",
             };
-            let direction = match side {
-                "left" => TurnDir::Right,
-                _ => TurnDir::Left,
-            };
             Ok(vec![
                 Response::AddSensation(event_sensation(
                     event,
@@ -825,11 +810,6 @@ pub mod responders {
                     name: DriveName::DangerAvoidance,
                     value: 1.0,
                 },
-                Response::ProposeAction(ActionPrimitive::Turn {
-                    direction,
-                    intensity: 0.5,
-                    duration_ms: 1_000,
-                }),
             ])
         }
     }
@@ -897,9 +877,6 @@ pub mod responders {
                     name: DriveName::Curiosity,
                     value: 0.8,
                 },
-                Response::ProposeAction(ActionPrimitive::Inspect {
-                    target: InspectTarget::Novelty,
-                }),
             ])
         }
     }
@@ -1044,25 +1021,13 @@ pub mod responders {
                 EventPayload::ReignCommanded { input } => input,
                 _ => return Ok(Vec::new()),
             };
-            let Some(action) = input.command.to_action() else {
-                return Ok(vec![Response::AddSensation(event_sensation(
-                    event,
-                    "reign.mode",
-                    "human",
-                    "I received a remote reign mode command.",
-                    json!({ "input": input }),
-                ))]);
-            };
-            Ok(vec![
-                Response::AddSensation(event_sensation(
-                    event,
-                    "reign.command",
-                    "human",
-                    "I received a remote reign command.",
-                    json!({ "input": input }),
-                )),
-                Response::ProposeAction(action),
-            ])
+            Ok(vec![Response::AddSensation(event_sensation(
+                event,
+                "reign.command",
+                "human",
+                "I received a remote reign command.",
+                json!({ "input": input }),
+            ))])
         }
     }
 
@@ -1085,29 +1050,13 @@ pub mod responders {
                 .map(|hit| hit.summary.clone())
                 .filter(|summary| !summary.trim().is_empty())
                 .unwrap_or_else(|| "someone familiar".to_string());
-            let action = if ctx.now.drives.danger_avoidance >= 0.7 {
-                ActionPrimitive::Inspect {
-                    target: InspectTarget::Person,
-                }
-            } else if ctx.now.drives.social_interest >= 0.7 {
-                ActionPrimitive::Speak {
-                    text: "Hello again.".to_string(),
-                }
-            } else {
-                ActionPrimitive::Approach {
-                    target: ApproachTarget::Person,
-                }
-            };
-            Ok(vec![
-                Response::AddSensation(event_sensation(
-                    event,
-                    "face.recognized",
-                    "vision",
-                    format!("I recognize {name}."),
-                    json!({ "name": name }),
-                )),
-                Response::ProposeAction(action),
-            ])
+            Ok(vec![Response::AddSensation(event_sensation(
+                event,
+                "face.recognized",
+                "vision",
+                format!("I recognize {name}."),
+                json!({ "name": name }),
+            ))])
         }
     }
 }
@@ -1154,6 +1103,7 @@ fn region_id(now: &Now, region_size_m: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pete_actions::TurnDir;
     use pete_body::BodySense;
     use pete_memory::RecallBundle;
     use pete_now::{ObjectObservation, ObjectObservationSource, ObjectSense};
@@ -1233,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn battery_low_responder_proposes_dock() {
+    fn battery_low_responder_publishes_drive_impulse_without_action() {
         let mut bus = EventBus::new();
         bus.on(responders::BatteryLowResponder);
         let mut body = BodySense::default();
@@ -1252,9 +1202,13 @@ mod tests {
 
         let output = bus.dispatch(&ctx, &event).unwrap();
 
-        assert!(output
-            .iter()
-            .any(|response| matches!(response, Response::ProposeAction(ActionPrimitive::Dock))));
+        assert!(output.iter().any(|response| matches!(
+            response,
+            Response::AddDriveImpulse {
+                name: DriveName::BatteryHunger,
+                value: 1.0,
+            }
+        )));
     }
 
     #[test]
@@ -1384,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn bump_responder_marks_danger_and_escape() {
+    fn bump_responder_marks_danger_without_selecting_an_action() {
         let mut bus = EventBus::new();
         bus.on(responders::BumpResponder);
         let now = Now::blank(9, BodySense::default());
@@ -1408,10 +1362,10 @@ mod tests {
         }));
         assert!(output.iter().any(|response| matches!(
             response,
-            Response::ProposeAction(ActionPrimitive::Turn {
-                direction: TurnDir::Right,
-                ..
-            })
+            Response::AddDriveImpulse {
+                name: DriveName::DangerAvoidance,
+                value: 1.0,
+            }
         )));
     }
 
@@ -1489,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn reign_responder_maps_turn_to_action() {
+    fn reign_responder_publishes_human_evidence_without_selecting_action() {
         let mut bus = EventBus::new();
         bus.on(responders::ReignResponder);
         let now = Now::blank(10, BodySense::default());
@@ -1520,15 +1474,9 @@ mod tests {
 
         let output = bus.dispatch(&ctx, &event).unwrap();
 
-        assert!(output.iter().any(|response| {
-            matches!(
-                response,
-                Response::ProposeAction(ActionPrimitive::Turn {
-                    direction: TurnDir::Left,
-                    intensity: 0.5,
-                    duration_ms: 500,
-                })
-            )
+        assert!(output.iter().any(|response| match response {
+            Response::AddSensation(sensation) => sensation.kind == "reign.command",
+            _ => false,
         }));
     }
 

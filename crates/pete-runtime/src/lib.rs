@@ -59,7 +59,7 @@ use pete_neat::{
 use pete_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
     ExtensionSense, EyePrediction, MemorySense, Now, ObjectClass, ReignSense, SafetySense,
-    SurpriseSense,
+    SurpriseSense, WorldModelUpdater,
 };
 use pete_sensors::{
     anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
@@ -104,6 +104,7 @@ where
     chirp_events: ChirpEventState,
     nudge: NudgeController,
     goal_system: GoalSystem,
+    world_model: WorldModelUpdater,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -698,6 +699,12 @@ pub struct ActionSelectionDecision {
     pub selected_behavior: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_selected_goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_selected_behavior: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_goal_action: Option<ActionPrimitive>,
+    #[serde(default)]
+    pub shadow_diverged_from_baseline: bool,
     #[serde(default)]
     pub goal_switched: bool,
     #[serde(default)]
@@ -2892,6 +2899,7 @@ where
             chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
             goal_system: GoalSystem::default(),
+            world_model: WorldModelUpdater::default(),
         }
     }
 
@@ -2930,6 +2938,7 @@ where
             chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
             goal_system: GoalSystem::default(),
+            world_model: WorldModelUpdater::default(),
         }
     }
 
@@ -3143,6 +3152,7 @@ where
         }
         let mut teachings = Vec::new();
         let mut notes = Vec::new();
+        let mut drive_impulses = DriveSense::default();
         if let Some(stuck_values) = now
             .extensions
             .get("sim.stuck")
@@ -3254,7 +3264,7 @@ where
             &mut experiences,
             &mut teachings,
             &mut notes,
-            &mut proposed_actions,
+            &mut drive_impulses,
         );
         let (event_script_forced_action, event_script_records) =
             self.run_event_scripts(&mut now, &recall, &mut notes, &mut proposed_actions)?;
@@ -3337,8 +3347,11 @@ where
             ..LlmActionProposal::default()
         };
         let llm_has_safety_reason = crate::llm_explicit_safety_reason(&llm_tick);
+        let direct_reign_active = reign_input
+            .as_ref()
+            .is_some_and(|input| input.mode == pete_actions::ReignMode::Direct);
         let mechanical_reign_action_for_selection =
-            if mechanical_reign_action.is_some() && llm_has_safety_reason {
+            if mechanical_reign_action.is_some() && llm_has_safety_reason && !direct_reign_active {
                 notes.push(
                     "LlmActionProposal: explicit safety reason allowed competition with Reign"
                         .to_string(),
@@ -3377,7 +3390,13 @@ where
         if let Some(action) = event_script_forced_action.clone() {
             push_unique_action(&mut proposals, action);
         }
-        let goal_cycle = self.goal_system.tick(&now, &proposals)?;
+        self.goal_system
+            .add_drive_impulses(std::mem::take(&mut drive_impulses));
+        self.goal_system.seed_drives(now.drives.clone());
+        now = self
+            .world_model
+            .update(now, self.goal_system.world_model_update_context());
+        let goal_cycle = self.goal_system.tick(&now.world, &proposals)?;
         now.drives = goal_cycle.drives.legacy_sense();
         let goal_action = goal_cycle
             .behavior
@@ -3532,6 +3551,14 @@ where
             .selected_goal
             .as_ref()
             .map(|goal| goal.as_str().to_string());
+        action_selection.shadow_selected_behavior = goal_cycle
+            .behavior
+            .as_ref()
+            .map(|behavior| behavior.behavior_id.clone());
+        action_selection.shadow_goal_action = goal_action.clone();
+        action_selection.shadow_diverged_from_baseline = goal_action
+            .as_ref()
+            .is_some_and(|action| action != &baseline_action);
         action_selection.goal_switched = goal_cycle.selection.switched;
         action_selection.goal_retained_by_commitment = goal_cycle.selection.retained_by_commitment;
         action_selection.goal_selection_reason = Some(goal_cycle.selection.reason.clone());
@@ -3781,10 +3808,11 @@ where
         }
         behavior_runs.push(ear_next_record.erase());
 
-        let selected_goal_for_safety = (self.action_selector_mode == ActionSelectorMode::Goal)
-            .then(|| goal_cycle.selection.selected_goal.as_ref())
-            .flatten()
-            .map(|goal| goal.as_str());
+        let selected_goal_for_safety = (self.action_selector_mode == ActionSelectorMode::Goal
+            && mechanical_reign_action_for_selection.is_none())
+        .then(|| goal_cycle.selection.selected_goal.as_ref())
+        .flatten()
+        .map(|goal| goal.as_str());
         let safety = self.safety.filter_action(
             &now,
             selected_goal_for_safety,
@@ -3795,6 +3823,25 @@ where
         now.extensions.insert(
             "action_selector".to_string(),
             serde_json::to_value(&action_selection)?,
+        );
+        now.extensions.insert(
+            "goal_system.outcome".to_string(),
+            serde_json::json!({
+                "schema_version": 1,
+                "world_revision": goal_cycle.world.revision,
+                "selected_goal": goal_cycle.selection.selected_goal.clone(),
+                "selected_behavior": goal_cycle.behavior.as_ref().map(|behavior| &behavior.behavior_id),
+                "selected_primitive": chosen_action.clone(),
+                "safety": {
+                    "vetoed": safety.vetoed,
+                    "reason": safety
+                        .reason
+                        .clone()
+                        .map(|reason| describe_safety_reason(Some(reason))),
+                    "final_motor": safety.command,
+                },
+                "shadow_diverged_from_baseline": action_selection.shadow_diverged_from_baseline,
+            }),
         );
         self.locomotion_tracker.observe_command(LocomotionOutput {
             forward_velocity_m_s: safety.command.forward,
@@ -3891,8 +3938,10 @@ where
                 &mut experiences,
                 &mut teachings,
                 &mut notes,
-                &mut proposed_actions,
+                &mut drive_impulses,
             );
+            self.goal_system
+                .add_drive_impulses(std::mem::take(&mut drive_impulses));
             notes.push(format!(
                 "Safety vetoed {:?}: {}",
                 chosen_action,
@@ -7669,7 +7718,7 @@ fn apply_responses(
     experiences: &mut Vec<Experience>,
     teachings: &mut Vec<pete_llm::LlmTeaching>,
     notes: &mut Vec<String>,
-    proposed_actions: &mut Vec<ActionPrimitive>,
+    drive_impulses: &mut DriveSense,
 ) {
     for response in responses {
         match response {
@@ -7677,9 +7726,8 @@ fn apply_responses(
             Response::AddSensation(sensation) => sensations.push(sensation),
             Response::AddImpression(impression) => impressions.push(impression),
             Response::AddExperience(experience) => experiences.push(experience),
-            Response::ProposeAction(action) => proposed_actions.push(action),
             Response::AddDriveImpulse { name, value } => {
-                add_drive_impulse(&mut now.drives, &name, value)
+                add_drive_impulse(drive_impulses, &name, value)
             }
             Response::SetMemorySense(memory) => now.memory = memory,
             Response::Teach(teaching) => teachings.push(teaching),

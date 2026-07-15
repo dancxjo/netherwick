@@ -1,9 +1,9 @@
-# 019 Blackboard and Goal Architecture
+# 019 Goal Architecture
 
 PETE's executive is deliberately small:
 
 ```text
-update blackboard
+build the next canonical Now.world snapshot
 update drives
 interpret the world for each goal
 produce immutable goal evaluations
@@ -14,17 +14,20 @@ actuate
 observe progress
 ```
 
-## Shared blackboard
+## Shared canonical world model
 
-The runtime blackboard is a revisioned `WorldModelSnapshot`. It fuses object,
-range, memory, and prediction evidence into persistent typed entities. A
+The runtime blackboard is the revisioned `WorldModelSnapshot` inside `Now`. The
+`WorldModelUpdater` fuses object, range, memory, authority, action-outcome, and
+prediction evidence into persistent typed beliefs. A
 charger, person, obstacle, landmark, or sound source keeps one identity across
 temporary occlusion. Entity bearings are recomputed from persistent world poses
 rather than reusing stale camera-relative bearings.
 
-Goals receive the same immutable snapshot. They do not maintain competing
-copies of charger or person location. Evidence provenance remains attached for
-replay and later training.
+The public goal tick receives only the same immutable `WorldModelSnapshot` plus
+typed suggestions. Goal interpretation/evaluation contexts expose neither
+`Now`'s raw evidence fields nor sensor-provider types. Goals do not maintain
+competing canonical copies of charger or person location. Evidence provenance
+and the builder update trace remain attached for replay and later training.
 
 ## Homeostatic drives
 
@@ -92,3 +95,5 @@ Use `--action-selector goal-shadow` to compare without changing execution, or
 
 Scenario reports aggregate goal switches, commitment-retained ticks, behavior
 transitions, mean goal dwell, and goal/behavior histograms.
+
+The complete belief contract is [020-now-world-model.md](020-now-world-model.md).

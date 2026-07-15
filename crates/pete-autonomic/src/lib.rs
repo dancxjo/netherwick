@@ -165,8 +165,25 @@ impl SimpleSafety {
 }
 
 fn charge_seeking_intent(goal_id: Option<&str>, action: Option<&ActionPrimitive>) -> bool {
-    let _ = action;
-    goal_id == Some("seek_charger")
+    if goal_id != Some("seek_charger") {
+        return false;
+    }
+    matches!(
+        action,
+        Some(ActionPrimitive::Approach {
+            target: pete_actions::ApproachTarget::Charger,
+        }) | Some(ActionPrimitive::Dock)
+    ) || matches!(
+        action,
+        Some(ActionPrimitive::Drive {
+            forward,
+            turn,
+            duration_ms,
+        }) if *forward >= 0.0
+            && *forward <= 0.4
+            && turn.abs() <= 0.5
+            && *duration_ms <= 1_500
+    )
 }
 
 #[cfg(test)]
@@ -300,6 +317,19 @@ mod tests {
         };
         let stopped =
             SimpleSafety::default().filter_action(&now, Some("explore"), &explore, desired);
+        assert!(stopped.vetoed);
+        assert_eq!(stopped.reason, Some(SafetyReason::BatteryCritical));
+
+        let unrelated_go = ActionPrimitive::Go {
+            intensity: 0.2,
+            duration_ms: 500,
+        };
+        let stopped = SimpleSafety::default().filter_action(
+            &now,
+            Some("seek_charger"),
+            &unrelated_go,
+            desired,
+        );
         assert!(stopped.vetoed);
         assert_eq!(stopped.reason, Some(SafetyReason::BatteryCritical));
     }

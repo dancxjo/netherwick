@@ -5379,6 +5379,8 @@ struct ScenarioEvaluationSummary {
     #[serde(default)]
     goal_behavior_transitions: usize,
     #[serde(default)]
+    goal_shadow_divergences: usize,
+    #[serde(default)]
     mean_goal_dwell_ms: Option<f32>,
     #[serde(default)]
     goal_histogram: HashMap<String, usize>,
@@ -5461,6 +5463,8 @@ struct ScenarioEpisodeReport {
     goal_commitment_retained_ticks: usize,
     #[serde(default)]
     goal_behavior_transitions: usize,
+    #[serde(default)]
+    goal_shadow_divergences: usize,
     #[serde(default)]
     mean_goal_dwell_ms: Option<f32>,
     #[serde(default)]
@@ -5603,6 +5607,7 @@ struct EpisodeMetricBuilder {
     goal_switches: usize,
     goal_commitment_retained_ticks: usize,
     goal_behavior_transitions: usize,
+    goal_shadow_divergences: usize,
     goal_dwell_ticks_sum: usize,
     goal_dwell_count: usize,
     current_goal: Option<String>,
@@ -5697,6 +5702,7 @@ impl EpisodeMetricBuilder {
             goal_switches: 0,
             goal_commitment_retained_ticks: 0,
             goal_behavior_transitions: 0,
+            goal_shadow_divergences: 0,
             goal_dwell_ticks_sum: 0,
             goal_dwell_count: 0,
             current_goal: None,
@@ -5936,6 +5942,9 @@ impl EpisodeMetricBuilder {
         if decision.goal_retained_by_commitment {
             self.goal_commitment_retained_ticks =
                 self.goal_commitment_retained_ticks.saturating_add(1);
+        }
+        if decision.shadow_diverged_from_baseline {
+            self.goal_shadow_divergences = self.goal_shadow_divergences.saturating_add(1);
         }
         let observed_goal = decision
             .selected_goal
@@ -6181,6 +6190,7 @@ impl EpisodeMetricBuilder {
             goal_switches: self.goal_switches,
             goal_commitment_retained_ticks: self.goal_commitment_retained_ticks,
             goal_behavior_transitions: self.goal_behavior_transitions,
+            goal_shadow_divergences: self.goal_shadow_divergences,
             mean_goal_dwell_ms: {
                 let dwell_sum = self
                     .goal_dwell_ticks_sum
@@ -6766,6 +6776,10 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
         goal_behavior_transitions: episodes
             .iter()
             .map(|episode| episode.goal_behavior_transitions)
+            .sum(),
+        goal_shadow_divergences: episodes
+            .iter()
+            .map(|episode| episode.goal_shadow_divergences)
             .sum(),
         mean_goal_dwell_ms: mean_optional(
             episodes

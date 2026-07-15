@@ -11,10 +11,14 @@ use serde::{Deserialize, Serialize};
 pub mod goal_architecture;
 
 pub use goal_architecture::{
-    Affordance, BehaviorDecision, Competence, DriveDynamics, DriveSnapshot, EvidenceRef,
-    GoalArbiter, GoalArbiterConfig, GoalCycle, GoalEvaluation, GoalId, GoalRuntimeState,
-    GoalSystem, Motivation, WorldEntity, WorldEntityKind, WorldModelSnapshot,
+    Affordance, BehaviorDecision, Competence, DriveDynamics, DriveSnapshot, Goal, GoalArbiter,
+    GoalArbiterConfig, GoalCycle, GoalDisposition, GoalEvaluation, GoalEvaluationContext,
+    GoalEvaluator, GoalExecutionContext, GoalExecutor, GoalExitReason, GoalId,
+    GoalInterpretationContext, GoalInterpretationSnapshot, GoalInterpreter, GoalModule,
+    GoalPerceptionContext, GoalPerceptionSnapshot, GoalRuntimeState, GoalSystem, Motivation,
+    SkillRequest,
 };
+pub use pete_now::{EvidenceRef, WorldEntity, WorldEntityKind, WorldModelSnapshot};
 
 pub trait Conductor {
     fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive>;
