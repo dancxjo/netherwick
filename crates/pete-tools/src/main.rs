@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pete_actions::ActionPrimitive;
 use pete_actions::{ApproachTarget, ExploreStyle, TurnDir};
 use pete_autonomic::{SafetyLayer, SimpleSafety};
-use pete_behaviors::{BehaviorRegime, ErasedBehaviorRunRecord};
+use pete_behaviors::{BehaviorConfig, BehaviorRegime, ErasedBehaviorRunRecord, FallbackPolicy};
 use pete_body::{BodySense, BodySong, BodyTone};
 use pete_cockpit::{
     establish_diagnostic_session, establish_session, Cockpit, CockpitError, CockpitEventKind,
@@ -63,9 +63,9 @@ use pete_training::dream_policy::{
 };
 use pete_training::{
     evaluate_behavior, load_models_config, promote_behavior_config, train_behavior,
-    train_latent_round_trip, train_unified_experience, EvaluateBehaviorRequest,
-    TrainBehaviorRequest, TrainLatentRoundTripRequest, TrainUnifiedExperienceRequest,
-    TrainableBehavior,
+    train_latent_round_trip, train_unified_experience, write_models_config,
+    EvaluateBehaviorRequest, TrainBehaviorRequest, TrainLatentRoundTripRequest,
+    TrainUnifiedExperienceRequest, TrainableBehavior,
 };
 use pete_worldlab::{
     export_pointcloud_for_frame, export_snapshot_assets, rewrite_frames, update_manifest,
@@ -278,21 +278,35 @@ struct NeatTrainArgs {
     population: usize,
     #[arg(long, default_value_t = 3)]
     episodes_per_genome: usize,
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 220)]
     steps: usize,
     #[arg(long, default_value_t = 500)]
     transfer_episodes: usize,
     #[arg(long, default_value_t = 7)]
     seed: u64,
+    /// Held-out audit seed root. These seeds are never used for selection.
+    #[arg(long, default_value_t = 9_000_001)]
+    heldout_seed: u64,
+    #[arg(long, default_value_t = 2.2)]
+    compatibility_threshold: f32,
+    #[arg(long, default_value_t = 4)]
+    target_species_min: usize,
+    #[arg(long, default_value_t = 9)]
+    target_species_max: usize,
     #[arg(long, default_value = "data/models/locomotion_neat_v0")]
     checkpoint: String,
     #[arg(long, default_value = "data/reports/neat/locomotion")]
     report_dir: String,
     #[arg(long, default_value = "data/captures/neat/locomotion")]
     capture_root: String,
+    #[arg(long, default_value = "configs/models.toml")]
+    models_config: String,
     /// Capture every Nth generation champion; stage champions are always captured.
     #[arg(long, default_value_t = 2)]
     capture_every: usize,
+    /// Leave the trained candidate as a report artifact instead of promoting winners.
+    #[arg(long)]
+    no_promote: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -443,6 +457,7 @@ enum ScenarioArg {
     EmptyRoom,
     ObstacleAvoidance,
     CornerTrap,
+    ConcaveTrap,
     ColumnTrap,
     ChargerSeeking,
     PersonSpeakerRoom,
@@ -456,6 +471,7 @@ impl From<ScenarioArg> for ScenarioKind {
             ScenarioArg::EmptyRoom => ScenarioKind::EmptyRoom,
             ScenarioArg::ObstacleAvoidance => ScenarioKind::ObstacleAvoidance,
             ScenarioArg::CornerTrap => ScenarioKind::CornerTrap,
+            ScenarioArg::ConcaveTrap => ScenarioKind::ConcaveTrap,
             ScenarioArg::ColumnTrap => ScenarioKind::ColumnTrap,
             ScenarioArg::ChargerSeeking => ScenarioKind::ChargerSeeking,
             ScenarioArg::PersonSpeakerRoom => ScenarioKind::PersonAndSpeaker,
@@ -1736,12 +1752,27 @@ async fn run_sim_curriculum(args: SimCurriculumArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct NeatPerturbation {
     sensor_noise: f32,
     left_motor_scale: f32,
     right_motor_scale: f32,
+    wheel_gain_jitter: f32,
+    deadband_m_s: f32,
     latency_steps: usize,
+}
+
+impl Default for NeatPerturbation {
+    fn default() -> Self {
+        Self {
+            sensor_noise: 0.0,
+            left_motor_scale: 1.0,
+            right_motor_scale: 1.0,
+            wheel_gain_jitter: 0.08,
+            deadband_m_s: 0.01,
+            latency_steps: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1796,6 +1827,7 @@ struct NeatStageReport {
 struct NeatTrainingReport {
     behavior: String,
     seed: u64,
+    heldout_seed_root: u64,
     checkpoint: String,
     stages: Vec<NeatStageReport>,
     transfer_candidate: CandidateEvaluation,
@@ -1805,6 +1837,21 @@ struct NeatTrainingReport {
     candidate_transfer_fitness: f32,
     noisy_transfer_fitness: f32,
     motor_mismatch_transfer_fitness: f32,
+    promotion: NeatPromotionReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NeatPromotionReport {
+    enabled: bool,
+    promoted: bool,
+    reason: String,
+    baseline_kind: String,
+    baseline_checkpoint: Option<String>,
+    baseline_fitness: f32,
+    candidate_checkpoint: String,
+    candidate_artifact: Option<String>,
+    promoted_regime: Option<BehaviorRegime>,
+    models_config: String,
 }
 
 async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
@@ -1825,6 +1872,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
     let mut rng = StdRng::seed_from_u64(args.seed);
     let config = NeatConfig {
         population_size: args.population,
+        compatibility_threshold: args.compatibility_threshold,
         ..NeatConfig::default()
     };
     let mut population = Population::seeded(config, &mut rng);
@@ -1837,12 +1885,17 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
 
     println!("NEAT behavior: locomotion (locomotion.neat.v0)");
     println!(
-        "population={} generations/stage={} episodes/genome={} steps/episode={} seed={}",
+        "population={} generations/stage={} episodes/genome={} steps/episode={} seed={} heldout_seed={}",
         args.population,
         args.generations_per_stage,
         args.episodes_per_genome,
         args.steps,
-        args.seed
+        args.seed,
+        args.heldout_seed,
+    );
+    println!(
+        "species target={}..{} compatibility_threshold={:.3}",
+        args.target_species_min, args.target_species_max, population.config.compatibility_threshold
     );
     println!(
         "curriculum: {}",
@@ -1852,7 +1905,13 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(" -> ")
     );
-    println!("physical authority: disabled; checkpoints remain candidates");
+    if args.no_promote {
+        println!("promotion: disabled; checkpoint remains a candidate artifact");
+    } else {
+        println!(
+            "promotion: enabled; winning checkpoint may set locomotion to model_infer with hardcoded fallback"
+        );
+    }
 
     for (stage_index, stage) in evolving_stages.iter().copied().enumerate() {
         println!(
@@ -1925,10 +1984,12 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 report.champion_collision_rate,
             );
             println!(
-                "  components area={} clear_distance={:.2} escapes={} collisions={} repeats={} wheel_motion={:.2} angular={:.2} stalled={} vetoes={}",
+                "  components area={} clear_distance={:.2} escapes={} boundary={} mouth_progress={:.2} collisions={} repeats={} wheel_motion={:.2} angular={:.2} stalled={} vetoes={}",
                 report.champion_metrics.new_area_cells,
                 report.champion_metrics.distance_without_collision_m,
                 report.champion_metrics.successful_escapes,
+                report.champion_metrics.escape_boundary_crossings,
+                report.champion_metrics.trap_mouth_progress_m,
                 report.champion_metrics.collisions,
                 report.champion_metrics.repeated_state_steps,
                 report.champion_metrics.wheel_motion_m,
@@ -1971,6 +2032,12 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 println!("  worldlab capture: {}", path.display());
             }
             population.evolve(&fitness, &mut rng)?;
+            tune_compatibility_threshold(
+                &mut population,
+                report.species,
+                args.target_species_min,
+                args.target_species_max,
+            );
         }
 
         let (best_fitness, best_genome, best_evaluation) =
@@ -2011,8 +2078,8 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             .unwrap_or_default(),
         transfer_genome.clone(),
     );
-    checkpoint.save(&args.checkpoint)?;
-    println!("\ncheckpoint candidate written: {}", args.checkpoint);
+    let rejected_candidate_path =
+        Path::new(&args.report_dir).join("candidate-locomotion-neat.json");
 
     let transfer_stage = CurriculumStage::TransferCandidatesToPete;
     println!(
@@ -2023,12 +2090,13 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         "audit 1/4 candidate: {} seeded varied-room episodes",
         args.transfer_episodes
     );
+    let audit_seed = args.heldout_seed.saturating_add(0xF1A1);
     let candidate = evaluate_neat_locomotion(
         Some(&transfer_genome),
         transfer_stage,
         args.transfer_episodes,
         args.steps,
-        args.seed.saturating_add(0xF1A1),
+        audit_seed,
         NeatPerturbation::default(),
         false,
     )
@@ -2045,7 +2113,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         transfer_stage,
         args.transfer_episodes,
         args.steps,
-        args.seed.saturating_add(0xF1A1),
+        audit_seed,
         NeatPerturbation::default(),
         false,
     )
@@ -2056,13 +2124,54 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         hardcoded.success_rate() * 100.0,
         hardcoded.collision_rate
     );
+    let active_model_baseline = if args.no_promote {
+        None
+    } else {
+        active_locomotion_model_checkpoint(Path::new(&args.models_config))?
+            .and_then(|checkpoint_path| match LocomotionCheckpoint::load(&checkpoint_path) {
+                Ok(checkpoint) => Some((checkpoint_path, checkpoint)),
+                Err(error) => {
+                    eprintln!(
+                        "warning: could not load active locomotion checkpoint for promotion comparison: {error:#}"
+                    );
+                    None
+                }
+            })
+    };
+    let (baseline_kind, baseline_checkpoint, baseline_fitness) =
+        if let Some((checkpoint_path, active_checkpoint)) = active_model_baseline.as_ref() {
+            println!("promotion baseline: active model {}", checkpoint_path);
+            let active = evaluate_neat_locomotion(
+                Some(&active_checkpoint.genome),
+                transfer_stage,
+                args.transfer_episodes,
+                args.steps,
+                audit_seed,
+                NeatPerturbation::default(),
+                false,
+            )
+            .await?;
+            println!(
+                "  active-model fitness={:.3} success={:.1}% collision={:.4}",
+                active.fitness,
+                active.success_rate() * 100.0,
+                active.collision_rate
+            );
+            (
+                "active_model".to_string(),
+                Some(checkpoint_path.clone()),
+                active.fitness,
+            )
+        } else {
+            ("hardcoded".to_string(), None, hardcoded.fitness)
+        };
     println!("audit 3/4 sensor noise plus one-tick latency");
     let noisy = evaluate_neat_locomotion(
         Some(&transfer_genome),
         transfer_stage,
         args.transfer_episodes,
         args.steps,
-        args.seed.saturating_add(0xF1A1),
+        audit_seed,
         NeatPerturbation {
             sensor_noise: 0.08,
             latency_steps: 1,
@@ -2078,10 +2187,12 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         transfer_stage,
         args.transfer_episodes,
         args.steps,
-        args.seed.saturating_add(0xF1A1),
+        audit_seed,
         NeatPerturbation {
             left_motor_scale: 0.82,
             right_motor_scale: 1.0,
+            wheel_gain_jitter: 0.12,
+            deadband_m_s: 0.015,
             ..NeatPerturbation::default()
         },
         false,
@@ -2123,10 +2234,81 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             "NOT ELIGIBLE"
         }
     );
+    let promotion = if args.no_promote {
+        checkpoint.save(&args.checkpoint)?;
+        println!("\ncheckpoint candidate written: {}", args.checkpoint);
+        NeatPromotionReport {
+            enabled: false,
+            promoted: false,
+            reason: "automatic promotion disabled by --no-promote".to_string(),
+            baseline_kind,
+            baseline_checkpoint,
+            baseline_fitness,
+            candidate_checkpoint: args.checkpoint.clone(),
+            candidate_artifact: None,
+            promoted_regime: None,
+            models_config: args.models_config.clone(),
+        }
+    } else if candidate.fitness > baseline_fitness {
+        checkpoint.save(&args.checkpoint)?;
+        promote_locomotion_model_config(
+            Path::new(&args.models_config),
+            Path::new(&args.checkpoint),
+        )?;
+        println!(
+            "\npromoted locomotion.neat.v0: candidate fitness {:.3} beat {} fitness {:.3}",
+            candidate.fitness, baseline_kind, baseline_fitness
+        );
+        println!(
+            "active checkpoint: {}; config: {} regime=model_infer",
+            args.checkpoint, args.models_config
+        );
+        NeatPromotionReport {
+            enabled: true,
+            promoted: true,
+            reason: format!(
+                "candidate fitness {:.3} beat {} fitness {:.3}",
+                candidate.fitness, baseline_kind, baseline_fitness
+            ),
+            baseline_kind,
+            baseline_checkpoint,
+            baseline_fitness,
+            candidate_checkpoint: args.checkpoint.clone(),
+            candidate_artifact: None,
+            promoted_regime: Some(BehaviorRegime::ModelInfer),
+            models_config: args.models_config.clone(),
+        }
+    } else {
+        checkpoint.save(&rejected_candidate_path)?;
+        println!(
+            "\nnot promoting locomotion.neat.v0: candidate fitness {:.3} did not beat {} fitness {:.3}",
+            candidate.fitness, baseline_kind, baseline_fitness
+        );
+        println!(
+            "candidate artifact kept for inspection: {}",
+            rejected_candidate_path.display()
+        );
+        NeatPromotionReport {
+            enabled: true,
+            promoted: false,
+            reason: format!(
+                "candidate fitness {:.3} did not beat {} fitness {:.3}",
+                candidate.fitness, baseline_kind, baseline_fitness
+            ),
+            baseline_kind,
+            baseline_checkpoint,
+            baseline_fitness,
+            candidate_checkpoint: args.checkpoint.clone(),
+            candidate_artifact: Some(rejected_candidate_path.to_string_lossy().to_string()),
+            promoted_regime: None,
+            models_config: args.models_config.clone(),
+        }
+    };
 
     let report = NeatTrainingReport {
         behavior: args.behavior,
         seed: args.seed,
+        heldout_seed_root: args.heldout_seed,
         checkpoint: args.checkpoint,
         stages: stage_reports,
         transfer_candidate: candidate_evaluation,
@@ -2136,11 +2318,131 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         candidate_transfer_fitness: candidate.fitness,
         noisy_transfer_fitness: noisy.fitness,
         motor_mismatch_transfer_fitness: mismatch.fitness,
+        promotion,
     };
     let report_path = Path::new(&args.report_dir).join("training-report.json");
     write_json_report(&report_path, &report)?;
     println!("training report: {}", report_path.display());
     Ok(())
+}
+
+fn active_locomotion_model_checkpoint(config_path: &Path) -> Result<Option<String>> {
+    let config = load_models_config(config_path)?;
+    let Some(entry) = config.behavior.get("locomotion") else {
+        return Ok(None);
+    };
+    if matches!(
+        entry.regime,
+        BehaviorRegime::ModelInfer | BehaviorRegime::ModelTrainAndInfer
+    ) {
+        Ok(entry.checkpoint.clone())
+    } else {
+        Ok(None)
+    }
+}
+
+fn promote_locomotion_model_config(config_path: &Path, checkpoint: &Path) -> Result<()> {
+    let mut config = load_models_config(config_path)?;
+    let entry = config
+        .behavior
+        .entry("locomotion".to_string())
+        .or_insert_with(|| BehaviorConfig {
+            regime: BehaviorRegime::Hardcoded,
+            hardcoded: "locomotion.hardcoded_wander.v0".to_string(),
+            model: Some("locomotion.neat.v0".to_string()),
+            checkpoint: None,
+            fallback: FallbackPolicy::UseHardcoded,
+        });
+    if entry.hardcoded.is_empty() {
+        entry.hardcoded = "locomotion.hardcoded_wander.v0".to_string();
+    }
+    if entry.model.is_none() {
+        entry.model = Some("locomotion.neat.v0".to_string());
+    }
+    entry.regime = BehaviorRegime::ModelInfer;
+    entry.checkpoint = Some(checkpoint.to_string_lossy().to_string());
+    entry.fallback = FallbackPolicy::UseHardcoded;
+    write_models_config(config_path, &config)
+}
+
+fn tune_compatibility_threshold(
+    population: &mut Population,
+    species_count: usize,
+    target_min: usize,
+    target_max: usize,
+) {
+    if target_min == 0 || target_max < target_min {
+        return;
+    }
+    let before = population.config.compatibility_threshold;
+    if species_count < target_min {
+        population.config.compatibility_threshold =
+            (population.config.compatibility_threshold * 0.92).max(0.35);
+    } else if species_count > target_max {
+        population.config.compatibility_threshold =
+            (population.config.compatibility_threshold * 1.08).min(8.0);
+    }
+    if (population.config.compatibility_threshold - before).abs() > f32::EPSILON {
+        println!(
+            "  compatibility threshold adjusted {:.3} -> {:.3} for species target {}..{}",
+            before, population.config.compatibility_threshold, target_min, target_max
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrapEscapeTarget {
+    mouth: (f32, f32),
+    initial_distance_m: f32,
+    boundary_distance_m: f32,
+}
+
+fn trap_escape_target(
+    kind: ScenarioKind,
+    metadata: &pete_sim::ScenarioMetadata,
+) -> Option<TrapEscapeTarget> {
+    let start = (metadata.body.odometry.x_m, metadata.body.odometry.y_m);
+    let mouth = match kind {
+        ScenarioKind::CornerTrap => (1.35, 1.35),
+        ScenarioKind::ColumnTrap => (start.0 + 0.85, start.1),
+        ScenarioKind::ConcaveTrap => {
+            let obstacle_center = obstacle_centroid(&metadata.objects)?;
+            let dx = start.0 - obstacle_center.0;
+            let dy = start.1 - obstacle_center.1;
+            let length = dx.hypot(dy).max(0.001);
+            (start.0 + dx / length * 0.85, start.1 + dy / length * 0.85)
+        }
+        _ => return None,
+    };
+    let initial_distance_m = distance_between(start, mouth);
+    Some(TrapEscapeTarget {
+        mouth,
+        initial_distance_m,
+        boundary_distance_m: initial_distance_m + 0.75,
+    })
+}
+
+fn obstacle_centroid(objects: &[pete_sim::SimObject]) -> Option<(f32, f32)> {
+    let mut count = 0usize;
+    let mut x = 0.0f32;
+    let mut y = 0.0f32;
+    for object in objects
+        .iter()
+        .filter(|object| matches!(object.kind, SimObjectKind::Obstacle))
+    {
+        count += 1;
+        x += object.x_m;
+        y += object.y_m;
+    }
+    (count > 0).then_some((x / count as f32, y / count as f32))
+}
+
+fn apply_deadband(value: f32, deadband: f32) -> f32 {
+    if value.abs() < deadband {
+        0.0
+    } else {
+        value
+    }
 }
 
 async fn evaluate_neat_locomotion(
@@ -2177,6 +2479,28 @@ async fn evaluate_neat_locomotion(
         let mut collision_active = false;
         let mut escape_anchor: Option<(f32, f32)> = None;
         let mut delayed_commands = VecDeque::new();
+        let escape_target = trap_escape_target(kind, &scenario.metadata);
+        let mut best_escape_progress = 0.0f32;
+        let mut crossed_escape_boundary = false;
+        let episode_left_gain = if perturbation.wheel_gain_jitter > 0.0 {
+            rng.gen_range(
+                1.0 - perturbation.wheel_gain_jitter..1.0 + perturbation.wheel_gain_jitter,
+            )
+        } else {
+            1.0
+        };
+        let episode_right_gain = if perturbation.wheel_gain_jitter > 0.0 {
+            rng.gen_range(
+                1.0 - perturbation.wheel_gain_jitter..1.0 + perturbation.wheel_gain_jitter,
+            )
+        } else {
+            1.0
+        };
+        let episode_deadband = if perturbation.deadband_m_s > 0.0 {
+            rng.gen_range(0.0..perturbation.deadband_m_s)
+        } else {
+            0.0
+        };
 
         for _ in 0..steps {
             let snapshot = world.snapshot().await?;
@@ -2200,6 +2524,21 @@ async fn evaluate_neat_locomotion(
                 if !collision && distance_between(anchor, position) >= 0.35 {
                     metrics.successful_escapes = metrics.successful_escapes.saturating_add(1);
                     escape_anchor = None;
+                }
+            }
+            if let Some(target) = escape_target {
+                let distance_from_mouth = distance_between(position, target.mouth);
+                best_escape_progress = best_escape_progress.max(distance_from_mouth);
+                metrics.trap_mouth_progress_m = metrics
+                    .trap_mouth_progress_m
+                    .max((best_escape_progress - target.initial_distance_m).max(0.0));
+                if !crossed_escape_boundary
+                    && !collision
+                    && distance_from_mouth >= target.boundary_distance_m
+                {
+                    crossed_escape_boundary = true;
+                    metrics.escape_boundary_crossings =
+                        metrics.escape_boundary_crossings.saturating_add(1);
                 }
             }
             collision_active = collision;
@@ -2246,16 +2585,16 @@ async fn evaluate_neat_locomotion(
                 1.0
             } else {
                 perturbation.left_motor_scale
-            };
+            } * episode_left_gain;
             let right_scale = if perturbation.right_motor_scale == 0.0 {
                 1.0
             } else {
                 perturbation.right_motor_scale
-            };
+            } * episode_right_gain;
             let left = output.forward_velocity_m_s - output.angular_velocity_rad_s * 0.235 * 0.5;
             let right = output.forward_velocity_m_s + output.angular_velocity_rad_s * 0.235 * 0.5;
-            let mismatched_left = left * left_scale;
-            let mismatched_right = right * right_scale;
+            let mismatched_left = apply_deadband(left * left_scale, episode_deadband);
+            let mismatched_right = apply_deadband(right * right_scale, episode_deadband);
             output.forward_velocity_m_s = (mismatched_left + mismatched_right) * 0.5;
             output.angular_velocity_rad_s = (mismatched_right - mismatched_left) / 0.235;
             output = output.bounded(0.6, 1.0);
@@ -2297,12 +2636,16 @@ async fn evaluate_neat_locomotion(
         let succeeded = match stage {
             CurriculumStage::BackAwayReliably
             | CurriculumStage::ChooseUsefulTurn
-            | CurriculumStage::EscapeCorners => metrics.successful_escapes > 0,
+            | CurriculumStage::EscapeCorners => {
+                metrics.successful_escapes > 0 || metrics.escape_boundary_crossings > 0
+            }
             CurriculumStage::ExploreWithoutLooping => {
                 metrics.new_area_cells >= 8 && metrics.repeated_state_steps < steps as u32 / 2
             }
             CurriculumStage::NavigateVariedRooms | CurriculumStage::TransferCandidatesToPete => {
-                metrics.new_area_cells >= 10 && metrics.collisions <= 3
+                metrics.new_area_cells >= 10
+                    && metrics.collisions <= 3
+                    && (escape_target.is_none() || metrics.escape_boundary_crossings > 0)
             }
         };
         successful_episodes += succeeded as usize;
@@ -2361,27 +2704,30 @@ async fn capture_neat_champion(
 fn neat_stage_scenario(stage: CurriculumStage, seed: u64) -> ScenarioKind {
     match stage {
         CurriculumStage::BackAwayReliably => ScenarioKind::ObstacleAvoidance,
-        CurriculumStage::ChooseUsefulTurn => {
-            if seed % 2 == 0 {
-                ScenarioKind::ObstacleAvoidance
+        CurriculumStage::ChooseUsefulTurn => match seed % 3 {
+            0 => ScenarioKind::ObstacleAvoidance,
+            1 => ScenarioKind::ColumnTrap,
+            _ => ScenarioKind::ConcaveTrap,
+        },
+        CurriculumStage::EscapeCorners => match seed % 3 {
+            0 => ScenarioKind::CornerTrap,
+            1 => ScenarioKind::ColumnTrap,
+            _ => ScenarioKind::ConcaveTrap,
+        },
+        CurriculumStage::ExploreWithoutLooping => {
+            if seed % 4 == 0 {
+                ScenarioKind::ConcaveTrap
             } else {
-                ScenarioKind::ColumnTrap
+                ScenarioKind::MixedRoom
             }
         }
-        CurriculumStage::EscapeCorners => {
-            if seed % 2 == 0 {
-                ScenarioKind::CornerTrap
-            } else {
-                ScenarioKind::ColumnTrap
-            }
-        }
-        CurriculumStage::ExploreWithoutLooping => ScenarioKind::MixedRoom,
         CurriculumStage::NavigateVariedRooms | CurriculumStage::TransferCandidatesToPete => {
-            match seed % 5 {
+            match seed % 6 {
                 0 => ScenarioKind::EmptyRoom,
                 1 => ScenarioKind::ObstacleAvoidance,
                 2 => ScenarioKind::CornerTrap,
                 3 => ScenarioKind::ColumnTrap,
+                4 => ScenarioKind::ConcaveTrap,
                 _ => ScenarioKind::Dream,
             }
         }
@@ -2405,6 +2751,10 @@ fn add_neat_metrics(total: &mut NeatEpisodeMetrics, episode: NeatEpisodeMetrics)
     total.successful_escapes = total
         .successful_escapes
         .saturating_add(episode.successful_escapes);
+    total.escape_boundary_crossings = total
+        .escape_boundary_crossings
+        .saturating_add(episode.escape_boundary_crossings);
+    total.trap_mouth_progress_m += episode.trap_mouth_progress_m;
     total.collisions = total.collisions.saturating_add(episode.collisions);
     total.repeated_state_steps = total
         .repeated_state_steps
@@ -3651,7 +4001,7 @@ fn episode_success(kind: ScenarioKind, episode: &ScenarioEpisodeReport) -> bool 
                 && episode.stuck_ticks < episode.ticks / 2
                 && episode.distance_traveled_m > 0.05
         }
-        ScenarioKind::CornerTrap => {
+        ScenarioKind::CornerTrap | ScenarioKind::ConcaveTrap => {
             episode.stuck_count > 0
                 && episode.recovery_success_rate.unwrap_or(0.0) > 0.0
                 && episode.distance_traveled_m > 0.10
@@ -3948,10 +4298,12 @@ fn escape_progress_score(
     ticks: usize,
 ) -> f32 {
     let progress = match kind {
-        ScenarioKind::ColumnTrap | ScenarioKind::CornerTrap => distance_at_last_recovery_m
-            .map(|distance| (distance_traveled_m - distance).max(0.0))
-            .filter(|distance| *distance >= 0.08)
-            .unwrap_or(distance_traveled_m),
+        ScenarioKind::ColumnTrap | ScenarioKind::CornerTrap | ScenarioKind::ConcaveTrap => {
+            distance_at_last_recovery_m
+                .map(|distance| (distance_traveled_m - distance).max(0.0))
+                .filter(|distance| *distance >= 0.08)
+                .unwrap_or(distance_traveled_m)
+        }
         _ => distance_traveled_m,
     };
     let collision_penalty = collisions as f32 * 0.05;

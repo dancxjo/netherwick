@@ -14,7 +14,7 @@ Every hard-coded behavior is replaceable. It can run directly, shadow-train a mo
 
 The first small evolved nervous system is the replaceable `locomotion` behavior.
 Run `just train --neat locomotion` to evolve it through a staged, WorldLab-visible
-curriculum without granting it physical authority. See
+curriculum and promote it when the transfer audit beats the active baseline. See
 [docs/neat-locomotion.md](docs/neat-locomotion.md).
 
 Pete is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.

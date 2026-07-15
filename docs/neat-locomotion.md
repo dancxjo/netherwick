@@ -16,20 +16,31 @@ just train --neat locomotion
 ```
 
 The command evolves a candidate, writes progress reports and WorldLab captures,
-then performs a transfer audit. It never activates the checkpoint on physical
-PETE. Defaults can be changed without changing the command contract:
+then performs a transfer audit. If the candidate's transfer fitness beats the
+currently active locomotion model, or the hardcoded baseline when no model is
+active, the command writes the checkpoint and promotes `locomotion` to
+`model_infer` in `configs/models.toml`. The selected `Drive` still passes
+through the downstream safety layers. Defaults can be changed without changing
+the command contract:
 
 ```bash
 PETE_NEAT_POPULATION=64 \
 PETE_NEAT_GENERATIONS_PER_STAGE=20 \
 PETE_NEAT_EPISODES_PER_GENOME=8 \
+PETE_NEAT_STEPS=260 \
 PETE_NEAT_SEED=41 \
+PETE_NEAT_HELDOUT_SEED=9000001 \
 just train --neat locomotion
 ```
 
+Set `PETE_NEAT_NO_PROMOTE=1` to keep the old candidate-only behavior.
+Use `PETE_NEAT_COMPATIBILITY_THRESHOLD`, `PETE_NEAT_TARGET_SPECIES_MIN`, and
+`PETE_NEAT_TARGET_SPECIES_MAX` to tune speciation pressure.
+
 The standard artifacts are:
 
-- candidate checkpoint: `data/models/locomotion_neat_v0/locomotion-neat.json`;
+- promoted checkpoint: `data/models/locomotion_neat_v0/locomotion-neat.json`;
+- non-promoted candidate checkpoint: `data/reports/neat/locomotion/candidate-locomotion-neat.json`;
 - generation and final reports: `data/reports/neat/locomotion/`;
 - replayable champion captures: `data/captures/neat/locomotion/`.
 
@@ -52,8 +63,15 @@ fallback.
 
 Fitness is stage-specific. The command intentionally does not optimize one
 grand score from the beginning. Its reported components are new area, distance
-without collision, successful escapes, collisions, repeated states, wheel
-motion, angular motion, stalls, and safety vetoes.
+without collision, successful escapes, trap escape-boundary crossings, progress
+away from the trap mouth, collisions, repeated states, wheel motion, angular
+motion, stalls, and safety vetoes.
+
+The escape and transfer stages include seeded concave traps in multiple
+orientations, corner traps, and column traps. Normal training episodes include
+small randomized left/right wheel gain and motor deadband perturbations. The
+transfer audit uses `PETE_NEAT_HELDOUT_SEED`; those held-out seeds are not used
+for population selection.
 
 ## Nervous System
 
@@ -94,6 +112,8 @@ Every generation prints:
 - champion node and connection counts;
 - success and collision rates;
 - every decomposed fitness component.
+- compatibility-threshold adjustments when species collapse or fragment outside
+  the target species range.
 
 Each generation gets a JSON report. Every configured Nth generation and every
 stage champion gets a WorldLab capture with scenario metadata, topology size,
@@ -108,9 +128,10 @@ contains the evidence needed to decide what to evolve next.
 ## Runtime Promotion
 
 `configs/models.toml` starts locomotion in `hardcoded` regime with
-`use_hardcoded` fallback. A candidate should first run in `shadow_infer`, where
-both outputs are recorded but hardcode remains selected. `model_infer` is a
-separate, explicit promotion after evaluation and physical-trial authorization.
+`use_hardcoded` fallback. The NEAT trainer may promote a candidate to
+`model_infer` when it beats the current active baseline in the transfer audit.
+Set `PETE_NEAT_NO_PROMOTE=1` when you want to collect candidates without
+changing runtime selection.
 
 Even in `model_infer`, autonomous `Explore` is the only action currently lowered
 through this behavior. Human Reign commands and event-forced actions outrank it,

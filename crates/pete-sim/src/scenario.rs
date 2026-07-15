@@ -11,6 +11,7 @@ pub enum ScenarioKind {
     EmptyRoom,
     ObstacleAvoidance,
     CornerTrap,
+    ConcaveTrap,
     ColumnTrap,
     ChargerSeeking,
     PersonAndSpeaker,
@@ -24,6 +25,7 @@ impl ScenarioKind {
             Self::EmptyRoom => "empty-room",
             Self::ObstacleAvoidance => "obstacle-avoidance",
             Self::CornerTrap => "corner-trap",
+            Self::ConcaveTrap => "concave-trap",
             Self::ColumnTrap => "column-trap",
             Self::ChargerSeeking => "charger-seeking",
             Self::PersonAndSpeaker => "person-speaker-room",
@@ -110,6 +112,10 @@ impl ScenarioConfig {
             ScenarioKind::CornerTrap => {
                 config.charger_count = 1;
                 config.obstacle_count = 3;
+            }
+            ScenarioKind::ConcaveTrap => {
+                config.charger_count = 1;
+                config.obstacle_count = 5;
             }
             ScenarioKind::ColumnTrap => {
                 config.charger_count = 1;
@@ -207,6 +213,12 @@ fn spawn_body(config: &ScenarioConfig, rng: &mut StdRng) -> BodySense {
             body.odometry.y_m = 0.42;
             body.odometry.heading_rad = -2.35;
         }
+        ScenarioKind::ConcaveTrap => {
+            let layout = concave_trap_layout(config);
+            body.odometry.x_m = layout.spawn_x_m;
+            body.odometry.y_m = layout.spawn_y_m;
+            body.odometry.heading_rad = layout.spawn_heading_rad;
+        }
         ScenarioKind::ColumnTrap => {
             body.odometry.x_m = 1.0;
             body.odometry.y_m = config.arena.height_m * 0.5;
@@ -253,6 +265,13 @@ fn add_kind_objects(
                 1 => (1.02, 0.42),
                 _ => (0.92, 0.92),
             }
+        } else if config.kind == ScenarioKind::ConcaveTrap {
+            let layout = concave_trap_layout(config);
+            layout
+                .obstacles
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| random_free_position(config.arena, rng, body, objects, 0.35))
         } else {
             random_free_position(config.arena, rng, body, objects, 0.35)
         };
@@ -261,10 +280,10 @@ fn add_kind_objects(
             format!("obstacle {index}"),
             x_m,
             y_m,
-            if config.kind == ScenarioKind::ColumnTrap {
-                0.28
-            } else {
-                rng.gen_range(0.22..0.42)
+            match config.kind {
+                ScenarioKind::ColumnTrap => 0.28,
+                ScenarioKind::ConcaveTrap => 0.30,
+                _ => rng.gen_range(0.22..0.42),
             },
         ));
     }
@@ -330,6 +349,58 @@ fn add_kind_objects(
             spoken_text: Some(dream_voice_phrase(index).to_string()),
             charge_rate: 0.0,
         });
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConcaveTrapLayout {
+    spawn_x_m: f32,
+    spawn_y_m: f32,
+    spawn_heading_rad: f32,
+    obstacles: Vec<(f32, f32)>,
+}
+
+fn concave_trap_layout(config: &ScenarioConfig) -> ConcaveTrapLayout {
+    let orientation = config.seed % 4;
+    let center = (
+        config.arena.width_m * 0.5 + ((config.seed >> 4) as f32 % 7.0 - 3.0) * 0.08,
+        config.arena.height_m * 0.5 + ((config.seed >> 8) as f32 % 7.0 - 3.0) * 0.08,
+    );
+    let depth = 0.82 + ((config.seed >> 12) as f32 % 5.0) * 0.05;
+    let half_width = 0.58 + ((config.seed >> 16) as f32 % 5.0) * 0.04;
+    let spacing = 0.46;
+    let local_obstacles = [
+        (-half_width, -depth),
+        (0.0, -depth),
+        (half_width, -depth),
+        (-half_width, -depth + spacing),
+        (half_width, -depth + spacing),
+    ];
+    let local_spawn = (0.0, -depth + spacing * 0.55);
+    let local_heading = match orientation {
+        0 => std::f32::consts::FRAC_PI_2,
+        1 => -std::f32::consts::FRAC_PI_2,
+        2 => 0.0,
+        _ => std::f32::consts::PI,
+    };
+    let transform = |local: (f32, f32)| -> (f32, f32) {
+        let (x, y) = match orientation {
+            0 => local,
+            1 => (-local.0, -local.1),
+            2 => (local.1, -local.0),
+            _ => (-local.1, local.0),
+        };
+        (
+            (center.0 + x).clamp(0.55, config.arena.width_m - 0.55),
+            (center.1 + y).clamp(0.55, config.arena.height_m - 0.55),
+        )
+    };
+    let (spawn_x_m, spawn_y_m) = transform(local_spawn);
+    ConcaveTrapLayout {
+        spawn_x_m,
+        spawn_y_m,
+        spawn_heading_rad: local_heading,
+        obstacles: local_obstacles.into_iter().map(transform).collect(),
     }
 }
 
@@ -1028,6 +1099,7 @@ mod tests {
             ScenarioKind::EmptyRoom,
             ScenarioKind::ObstacleAvoidance,
             ScenarioKind::CornerTrap,
+            ScenarioKind::ConcaveTrap,
             ScenarioKind::ColumnTrap,
             ScenarioKind::PersonAndSpeaker,
             ScenarioKind::MixedRoom,
@@ -1059,6 +1131,23 @@ mod tests {
         let snapshot = scenario.world.snapshot().await.unwrap();
 
         assert!(snapshot.range.nearest_m.unwrap_or(10.0) < 0.35);
+    }
+
+    #[tokio::test]
+    async fn concave_trap_scenario_starts_constrained() {
+        let mut scenario = build_scenario(ScenarioConfig::new(ScenarioKind::ConcaveTrap, 7));
+        let snapshot = scenario.world.snapshot().await.unwrap();
+
+        assert!(snapshot.range.nearest_m.unwrap_or(10.0) < 0.7);
+        assert_eq!(
+            scenario
+                .metadata
+                .objects
+                .iter()
+                .filter(|object| matches!(object.kind, SimObjectKind::Obstacle))
+                .count(),
+            5
+        );
     }
 
     #[tokio::test]

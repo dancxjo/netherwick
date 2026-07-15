@@ -909,6 +909,8 @@ pub struct EpisodeMetrics {
     pub new_area_cells: u32,
     pub distance_without_collision_m: f32,
     pub successful_escapes: u32,
+    pub escape_boundary_crossings: u32,
+    pub trap_mouth_progress_m: f32,
     pub collisions: u32,
     pub repeated_state_steps: u32,
     pub wheel_motion_m: f32,
@@ -922,6 +924,8 @@ pub struct FitnessWeights {
     pub new_area: f32,
     pub collision_free_distance: f32,
     pub successful_escape: f32,
+    pub escape_boundary: f32,
+    pub trap_mouth_progress: f32,
     pub collision: f32,
     pub repeated_state: f32,
     pub energy: f32,
@@ -936,6 +940,8 @@ impl FitnessWeights {
             new_area: 0.2,
             collision_free_distance: 1.0,
             successful_escape: 8.0,
+            escape_boundary: 12.0,
+            trap_mouth_progress: 4.0,
             collision: 3.0,
             repeated_state: 0.1,
             energy: 0.05,
@@ -950,6 +956,8 @@ impl FitnessWeights {
             new_area: 2.0,
             collision_free_distance: 1.5,
             successful_escape: 3.0,
+            escape_boundary: 6.0,
+            trap_mouth_progress: 2.0,
             collision: 5.0,
             repeated_state: 0.3,
             energy: 0.15,
@@ -963,6 +971,8 @@ impl FitnessWeights {
         self.new_area * metrics.new_area_cells as f32
             + self.collision_free_distance * metrics.distance_without_collision_m
             + self.successful_escape * metrics.successful_escapes as f32
+            + self.escape_boundary * metrics.escape_boundary_crossings as f32
+            + self.trap_mouth_progress * metrics.trap_mouth_progress_m
             - self.collision * metrics.collisions as f32
             - self.repeated_state * metrics.repeated_state_steps as f32
             - self.energy * metrics.wheel_motion_m
@@ -1019,15 +1029,26 @@ impl CurriculumStage {
                 repeated_state: 0.2,
                 ..FitnessWeights::collision_recovery()
             },
-            Self::EscapeCorners => FitnessWeights::collision_recovery(),
+            Self::EscapeCorners => FitnessWeights {
+                successful_escape: 14.0,
+                escape_boundary: 18.0,
+                trap_mouth_progress: 8.0,
+                collision: 5.0,
+                repeated_state: 0.25,
+                ..FitnessWeights::collision_recovery()
+            },
             Self::ExploreWithoutLooping => FitnessWeights::efficient_wandering(),
             Self::NavigateVariedRooms => FitnessWeights {
                 new_area: 2.5,
+                escape_boundary: 8.0,
+                trap_mouth_progress: 3.0,
                 collision: 6.0,
                 safety_veto: 4.0,
                 ..FitnessWeights::efficient_wandering()
             },
             Self::TransferCandidatesToPete => FitnessWeights {
+                escape_boundary: 10.0,
+                trap_mouth_progress: 4.0,
                 safety_veto: 20.0,
                 collision: 8.0,
                 ..FitnessWeights::efficient_wandering()

@@ -884,13 +884,19 @@ train *args:
             --generations-per-stage "${PETE_NEAT_GENERATIONS_PER_STAGE:-6}" \
             --population "${PETE_NEAT_POPULATION:-32}" \
             --episodes-per-genome "${PETE_NEAT_EPISODES_PER_GENOME:-3}" \
-            --steps "${PETE_NEAT_STEPS:-120}" \
+            --steps "${PETE_NEAT_STEPS:-220}" \
             --transfer-episodes "${PETE_NEAT_TRANSFER_EPISODES:-500}" \
             --seed "${PETE_NEAT_SEED:-7}" \
+            --heldout-seed "${PETE_NEAT_HELDOUT_SEED:-9000001}" \
+            --compatibility-threshold "${PETE_NEAT_COMPATIBILITY_THRESHOLD:-2.2}" \
+            --target-species-min "${PETE_NEAT_TARGET_SPECIES_MIN:-4}" \
+            --target-species-max "${PETE_NEAT_TARGET_SPECIES_MAX:-9}" \
             --checkpoint "${PETE_NEAT_CHECKPOINT:-data/models/locomotion_neat_v0}" \
             --report-dir "${PETE_NEAT_REPORT_DIR:-data/reports/neat/locomotion}" \
             --capture-root "${PETE_NEAT_CAPTURE_ROOT:-data/captures/neat/locomotion}" \
-            --capture-every "${PETE_NEAT_CAPTURE_EVERY:-2}"
+            --capture-every "${PETE_NEAT_CAPTURE_EVERY:-2}" \
+            --models-config "${PETE_NEAT_MODELS_CONFIG:-configs/models.toml}" \
+            ${PETE_NEAT_NO_PROMOTE:+--no-promote}
         exit 0
     fi
     if [ "${1:-virtual}" != "virtual" ] || [ "$#" -gt 1 ]; then
