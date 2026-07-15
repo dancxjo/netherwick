@@ -1,3 +1,10 @@
+[behavior.locomotion]
+regime = "hardcoded"
+hardcoded = "locomotion.hardcoded_wander.v0"
+model = "locomotion.neat.v0"
+checkpoint = "data/models/locomotion_neat_v0"
+fallback = "use_hardcoded"
+
 [behavior.eye_next]
 regime = "shadow_train"
 hardcoded = "eye.copy_current"

@@ -52,6 +52,10 @@ use pete_models::{
     FutureNetTrainer, HardcodedActionValuePredictor, HardcodedChargePredictor,
     HardcodedDangerPredictor,
 };
+use pete_neat::{
+    HardcodedLocomotionBehavior, LocomotionInput, LocomotionOutput, LocomotionTracker,
+    NeatLocomotionBehavior,
+};
 use pete_now::{
     ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
     ExtensionSense, EyePrediction, MemorySense, Now, ObjectClass, ReignSense, SafetySense,
@@ -96,6 +100,7 @@ where
     pub nudge_policy: NudgePolicy,
     pub local_map: LocalMap,
     pub last_behavior_runs: Vec<ErasedBehaviorRunRecord>,
+    locomotion_tracker: LocomotionTracker,
     chirp_events: ChirpEventState,
     nudge: NudgeController,
 }
@@ -1019,6 +1024,13 @@ impl RuntimeModelStack {
 
     pub fn from_behavior_config(config: &BehaviorRegistryConfig) -> Result<Self> {
         let mut stack = Self::default();
+        if let Some(behavior) = config.behavior.get("locomotion") {
+            stack.behaviors.locomotion = locomotion_behavior(
+                behavior.regime,
+                load_locomotion_behavior(behavior)?,
+                behavior.fallback,
+            );
+        }
         if let Some(behavior) = config.behavior.get("danger") {
             stack.behaviors.danger = danger_behavior(
                 behavior.regime,
@@ -1109,6 +1121,21 @@ impl RuntimeModelStack {
                 .cloned()
         };
         vec![
+            behavior_node_state(
+                "Locomotion",
+                "locomotion",
+                "Locomotion",
+                self.behaviors.locomotion.regime,
+                self.behaviors.locomotion.hardcoded_id(),
+                self.behaviors.locomotion.model_id(),
+                self.behaviors.locomotion.fallback,
+                vec![impl_id(
+                    "locomotion.hardcoded_wander.v0",
+                    "Hardcoded wander/reflex",
+                )],
+                vec![impl_id("locomotion.neat.v0", "NEAT locomotion v0")],
+                last("locomotion"),
+            ),
             behavior_node_state(
                 "Experience",
                 "experience",
@@ -1295,6 +1322,7 @@ impl RuntimeModelStack {
             }};
         }
         match id.as_str() {
+            "locomotion" => update_behavior!(locomotion),
             "experience" => update_behavior!(experience),
             "danger" => update_behavior!(danger),
             "charge" => update_behavior!(charge),
@@ -1388,6 +1416,7 @@ fn effective_training_regime(
 }
 
 pub struct BehaviorRegistry {
+    pub locomotion: ReplaceableBehavior<LocomotionInput, LocomotionOutput>,
     pub experience: ReplaceableBehavior<ExperienceBehaviorInput, ExperienceBehaviorOutput>,
     pub danger: ReplaceableBehavior<SituatedDangerInput, DangerOutput>,
     pub charge: ReplaceableBehavior<SituatedChargeInput, ChargeOutput>,
@@ -1404,6 +1433,11 @@ pub struct BehaviorRegistry {
 impl Default for BehaviorRegistry {
     fn default() -> Self {
         Self {
+            locomotion: locomotion_behavior(
+                BehaviorRegime::Hardcoded,
+                None,
+                FallbackPolicy::UseHardcoded,
+            ),
             experience: experience_behavior(
                 BehaviorRegime::Hardcoded,
                 None,
@@ -2040,6 +2074,20 @@ impl FunctionBehavior<FutureInput, FuturePrediction> for FutureModelBehavior {
     }
 }
 
+fn locomotion_behavior(
+    regime: BehaviorRegime,
+    model: Option<NeatLocomotionBehavior>,
+    fallback: FallbackPolicy,
+) -> ReplaceableBehavior<LocomotionInput, LocomotionOutput> {
+    ReplaceableBehavior::new(
+        "locomotion",
+        regime,
+        Box::new(HardcodedLocomotionBehavior::default()),
+        model.map(|model| Box::new(model) as Box<_>),
+        fallback,
+    )
+}
+
 fn danger_behavior(
     regime: BehaviorRegime,
     trainer: Option<DangerNetTrainer>,
@@ -2420,6 +2468,22 @@ fn ear_next_behavior(
         trainer.map(|trainer| Box::new(EarNextModelBehavior { trainer }) as Box<_>),
         fallback,
     )
+}
+
+fn load_locomotion_behavior(behavior: &BehaviorConfig) -> Result<Option<NeatLocomotionBehavior>> {
+    let Some(checkpoint) = behavior.checkpoint.as_deref() else {
+        return Ok(None);
+    };
+    let checkpoint_path = Path::new(checkpoint);
+    let artifact = if checkpoint_path.extension().is_some() {
+        checkpoint_path.to_path_buf()
+    } else {
+        checkpoint_path.join("locomotion-neat.json")
+    };
+    if !artifact.exists() {
+        return Ok(None);
+    }
+    Ok(Some(NeatLocomotionBehavior::load(checkpoint)?))
 }
 
 fn load_danger_behavior_trainer(behavior: &BehaviorConfig) -> Result<Option<DangerNetTrainer>> {
@@ -2804,6 +2868,7 @@ where
             nudge_policy: NudgePolicy::default(),
             local_map: LocalMap::default(),
             last_behavior_runs: Vec::new(),
+            locomotion_tracker: LocomotionTracker::default(),
             chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
         }
@@ -2840,6 +2905,7 @@ where
             nudge_policy: NudgePolicy::default(),
             local_map: LocalMap::default(),
             last_behavior_runs: Vec::new(),
+            locomotion_tracker: LocomotionTracker::default(),
             chirp_events: ChirpEventState::default(),
             nudge: NudgeController::default(),
         }
@@ -3475,10 +3541,44 @@ where
         {
             conductor_record.selected_output = mechanical_reign_action_for_selection.clone();
         }
-        let chosen_action = mechanical_reign_action_for_selection
+        let mut chosen_action = mechanical_reign_action_for_selection
             .clone()
             .or_else(|| event_script_forced_action.clone())
             .unwrap_or(conductor_selected_action);
+        let locomotion_input = self
+            .locomotion_tracker
+            .observe(now.t_ms, &now.body, &now.range);
+        let locomotion_run = self
+            .models
+            .behaviors
+            .locomotion
+            .infer_with_disagreement(&locomotion_input, now.t_ms)?;
+        let locomotion_output = locomotion_run.chosen.bounded(0.6, 1.0);
+        let locomotion_applied = mechanical_reign_action_for_selection.is_none()
+            && event_script_forced_action.is_none()
+            && matches!(&chosen_action, ActionPrimitive::Explore { .. });
+        if locomotion_applied {
+            let duration_ms = match &chosen_action {
+                ActionPrimitive::Explore { duration_ms, .. } => *duration_ms,
+                _ => 1_000,
+            };
+            chosen_action = ActionPrimitive::Drive {
+                forward: locomotion_output.forward_velocity_m_s,
+                turn: locomotion_output.angular_velocity_rad_s,
+                duration_ms,
+            };
+        }
+        now.extensions.insert(
+            "locomotion.nervous_system".to_string(),
+            serde_json::json!({
+                "schema_version": pete_neat::LOCOMOTION_SCHEMA_VERSION,
+                "input": locomotion_input,
+                "output": locomotion_output,
+                "applied": locomotion_applied,
+                "safety_authority": false,
+            }),
+        );
+        behavior_runs.push(locomotion_run.record.erase());
         self.chirp_events
             .emit_post_selection_chirps(&mut now, &mut notes, &chosen_action)?;
         let mut map_memory_decision = map_memory_decision_debug(
@@ -3600,6 +3700,11 @@ where
         let safety = self
             .safety
             .filter(&now, action_to_motor_command(Some(&chosen_action)));
+        self.locomotion_tracker.observe_command(LocomotionOutput {
+            forward_velocity_m_s: safety.command.forward,
+            angular_velocity_rad_s: safety.command.turn,
+            recovery_activation: locomotion_output.recovery_activation,
+        });
         map_memory_decision.safety_overrode = safety.vetoed;
         self.nudge.observe_motor(safety.command);
         now.extensions.insert(
@@ -9227,10 +9332,8 @@ mod tests {
         let (_first_snapshot, first_tick) = runner.tick_slow_manual().await.unwrap();
         assert!(matches!(
             first_tick.chosen_action,
-            Some(ActionPrimitive::Explore {
-                style: ExploreStyle::RandomWalk,
-                ..
-            })
+            Some(ActionPrimitive::Drive { forward, turn, .. })
+                if (forward - 0.2).abs() < 0.001 && (turn - 0.1).abs() < 0.001
         ));
 
         sim.lock().unwrap().set_bump(true, false);
@@ -9242,7 +9345,8 @@ mod tests {
         ));
 
         sim.lock().unwrap().set_bump(false, false);
-        let _ = runner.tick_slow_manual().await.unwrap();
+        runner.possession_recovery.last_command_ms =
+            wall_time_ms().saturating_sub(BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs + 1);
         let (_turn_snapshot, turn_tick) = runner.tick_slow_manual().await.unwrap();
         assert!(matches!(
             turn_tick.chosen_action,
@@ -9263,12 +9367,12 @@ mod tests {
             .position(|event| event.kind == pete_cockpit::CockpitEventKind::MotionStopped)
             .map(|index| bump_index + index)
             .unwrap();
-        let recovery_index = events.events[stop_index + 1..]
+        let safety_index = events.events[bump_index..]
             .iter()
-            .position(|event| event.kind == pete_cockpit::CockpitEventKind::MotionRequested)
-            .map(|index| stop_index + 1 + index)
+            .position(|event| event.kind == pete_cockpit::CockpitEventKind::SafetyTripped)
+            .map(|index| bump_index + index)
             .unwrap();
-        assert!(bump_index < stop_index && stop_index < recovery_index);
+        assert!(bump_index < safety_index && safety_index < stop_index);
         assert!(runner.cockpit.client_mut().snapshot().possessed);
         let _ = fs::remove_dir_all(ledger_root);
     }
@@ -12164,6 +12268,10 @@ mod tests {
         };
         let action = ActionPrimitive::Dock;
 
+        let locomotion = registry
+            .locomotion
+            .infer(&LocomotionInput::default(), 100)
+            .unwrap();
         let danger = registry
             .danger
             .infer(&danger_behavior_input(&now, &latent, Some(&action)), 100)
@@ -12209,6 +12317,7 @@ mod tests {
             .infer(&ExperienceBehaviorInput::from_now(&now), 100)
             .unwrap();
 
+        assert_eq!(locomotion.record.behavior_id, "locomotion");
         assert_eq!(experience.record.behavior_id, "experience");
         assert_eq!(danger.record.behavior_id, "danger");
         assert_eq!(charge.record.behavior_id, "charge");
@@ -12216,6 +12325,7 @@ mod tests {
         assert_eq!(action_value.record.behavior_id, "action_value");
         assert_eq!(eye_next.record.behavior_id, "eye_next");
         assert_eq!(ear_next.record.behavior_id, "ear_next");
+        assert!(locomotion.record.hardcoded_output.is_some());
         assert!(experience.record.hardcoded_output.is_some());
         assert!(danger.record.hardcoded_output.is_some());
         assert!(charge.record.hardcoded_output.is_some());
@@ -12359,6 +12469,14 @@ mod tests {
             let mut runner = SimRunner::new(runtime, world, motors);
             let start = runner.world.body();
             let mut saw_non_zero_final_motor = false;
+            let expected_selected_action = match &action {
+                ActionPrimitive::Explore { duration_ms, .. } => ActionPrimitive::Drive {
+                    forward: 0.2,
+                    turn: 0.1,
+                    duration_ms: *duration_ms,
+                },
+                _ => action.clone(),
+            };
 
             runner
                 .run_steps_observing_ticks(5, |snapshot, tick| {
@@ -12366,7 +12484,10 @@ mod tests {
                     if !is_near_zero_motor(final_motor) {
                         saw_non_zero_final_motor = true;
                     }
-                    assert_eq!(snapshot.final_selected_action, Some(action.clone()));
+                    assert_eq!(
+                        snapshot.final_selected_action,
+                        Some(expected_selected_action.clone())
+                    );
                 })
                 .await
                 .unwrap();

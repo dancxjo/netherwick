@@ -12,6 +12,11 @@ The LLM loop is active as a trainer, critic, and planner. It predicts counterfac
 
 Every hard-coded behavior is replaceable. It can run directly, shadow-train a model, compare with a model, promote a model, or fall back to safe hand-written logic.
 
+The first small evolved nervous system is the replaceable `locomotion` behavior.
+Run `just train --neat locomotion` to evolve it through a staged, WorldLab-visible
+curriculum without granting it physical authority. See
+[docs/neat-locomotion.md](docs/neat-locomotion.md).
+
 Pete is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.
 
 Pete's higher-brain split now has a reproducible forebrain, a strictly separate

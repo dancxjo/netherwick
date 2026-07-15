@@ -5979,6 +5979,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pete-neat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pete-behaviors",
+ "pete-body",
+ "pete-core",
+ "pete-now",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pete-now"
 version = "0.1.0"
 dependencies = [
@@ -6021,6 +6036,7 @@ dependencies = [
  "pete-map",
  "pete-memory",
  "pete-models",
+ "pete-neat",
  "pete-now",
  "pete-sensors",
  "pete-sim",
@@ -6131,6 +6147,7 @@ dependencies = [
  "pete-memory",
  "pete-models",
  "pete-mouth",
+ "pete-neat",
  "pete-now",
  "pete-runtime",
  "pete-sensors",

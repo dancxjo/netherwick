@@ -869,12 +869,32 @@ virtual:
 virtual-https:
     just go virtual
 
-# Train models from virtual ledger data.
-train target="virtual":
+# Train models from virtual ledger data or evolve a named NEAT behavior.
+train *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{target}}" != "virtual" ]; then
-        echo "usage: just train virtual"
+    set -- {{args}}
+    if [ "${1:-virtual}" = "--neat" ]; then
+        if [ "$#" -ne 2 ]; then
+            echo "usage: just train --neat locomotion"
+            exit 2
+        fi
+        behavior="$2"
+        cargo run -p pete-tools -- neat-train "$behavior" \
+            --generations-per-stage "${PETE_NEAT_GENERATIONS_PER_STAGE:-6}" \
+            --population "${PETE_NEAT_POPULATION:-32}" \
+            --episodes-per-genome "${PETE_NEAT_EPISODES_PER_GENOME:-3}" \
+            --steps "${PETE_NEAT_STEPS:-120}" \
+            --transfer-episodes "${PETE_NEAT_TRANSFER_EPISODES:-500}" \
+            --seed "${PETE_NEAT_SEED:-7}" \
+            --checkpoint "${PETE_NEAT_CHECKPOINT:-data/models/locomotion_neat_v0}" \
+            --report-dir "${PETE_NEAT_REPORT_DIR:-data/reports/neat/locomotion}" \
+            --capture-root "${PETE_NEAT_CAPTURE_ROOT:-data/captures/neat/locomotion}" \
+            --capture-every "${PETE_NEAT_CAPTURE_EVERY:-2}"
+        exit 0
+    fi
+    if [ "${1:-virtual}" != "virtual" ] || [ "$#" -gt 1 ]; then
+        echo "usage: just train virtual | just train --neat locomotion"
         exit 2
     fi
     cargo run -p pete-tools -- train virtual \

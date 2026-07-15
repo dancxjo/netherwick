@@ -1,0 +1,19 @@
+[package]
+name = "pete-neat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+pete-behaviors = { path = "../pete-behaviors" }
+pete-body = { path = "../pete-body" }
+pete-core = { path = "../pete-core" }
+pete-now = { path = "../pete-now" }
+
+[dev-dependencies]
+tempfile = "3"
