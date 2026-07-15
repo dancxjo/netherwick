@@ -1979,6 +1979,12 @@ pub struct SelectionConstraints {
     pub maximum_safety_invariant_violations: u32,
     pub maximum_collision_rate: f32,
     pub minimum_escape_rate: f32,
+    #[serde(default = "default_maximum_safety_veto_rate")]
+    pub maximum_safety_veto_rate: f32,
+}
+
+fn default_maximum_safety_veto_rate() -> f32 {
+    1.0
 }
 
 impl SelectionConstraints {
@@ -1991,7 +1997,13 @@ impl SelectionConstraints {
             maximum_safety_invariant_violations,
             maximum_collision_rate,
             minimum_escape_rate,
+            maximum_safety_veto_rate: 1.0,
         }
+    }
+
+    pub const fn with_maximum_safety_veto_rate(mut self, maximum_rate: f32) -> Self {
+        self.maximum_safety_veto_rate = maximum_rate;
+        self
     }
 }
 
@@ -2312,6 +2324,14 @@ impl CurriculumStage {
             criteria.maximum_collision_rate,
             0.0,
         )
+        .with_maximum_safety_veto_rate(self.maximum_safety_veto_rate())
+    }
+
+    pub const fn maximum_safety_veto_rate(self) -> f32 {
+        // A few isolated interventions remain a cost, while policies that ask
+        // the downstream safety layer to suppress more than one command in
+        // twenty are not considered reproductively feasible or promotable.
+        0.05
     }
 
     pub fn promotion_criteria(self) -> PromotionCriteria {
@@ -2334,8 +2354,14 @@ pub struct PromotionCriteria {
     pub minimum_seeded_episodes: u32,
     pub minimum_success_rate: f32,
     pub maximum_collision_rate: f32,
+    #[serde(default = "default_promotion_maximum_safety_veto_rate")]
+    pub maximum_safety_veto_rate: f32,
     pub must_beat_hardcoded: bool,
     pub maximum_safety_invariant_violations: u32,
+}
+
+fn default_promotion_maximum_safety_veto_rate() -> f32 {
+    0.05
 }
 
 impl PromotionCriteria {
@@ -2349,6 +2375,7 @@ impl PromotionCriteria {
             minimum_seeded_episodes,
             minimum_success_rate,
             maximum_collision_rate,
+            maximum_safety_veto_rate: 0.05,
             must_beat_hardcoded,
             maximum_safety_invariant_violations: 0,
         }
@@ -2358,6 +2385,7 @@ impl PromotionCriteria {
         evaluation.seeded_episodes >= self.minimum_seeded_episodes
             && evaluation.success_rate >= self.minimum_success_rate
             && evaluation.collision_rate <= self.maximum_collision_rate
+            && evaluation.safety_veto_rate <= self.maximum_safety_veto_rate
             && evaluation.safety_invariant_violations <= self.maximum_safety_invariant_violations
             && (!self.must_beat_hardcoded || evaluation.beats_hardcoded)
             && evaluation.noise_robust
@@ -2371,6 +2399,8 @@ pub struct CandidateEvaluation {
     pub seeded_episodes: u32,
     pub success_rate: f32,
     pub collision_rate: f32,
+    #[serde(default)]
+    pub safety_veto_rate: f32,
     pub safety_invariant_violations: u32,
     pub beats_hardcoded: bool,
     pub noise_robust: bool,
@@ -2538,6 +2568,10 @@ fn constraint_violation_score(traits: FitnessTraits, constraints: SelectionConst
         as f32;
     if safety_excess > 0.0 {
         return 10_000.0 + safety_excess;
+    }
+    let veto_excess = (traits.safety_veto_rate - constraints.maximum_safety_veto_rate).max(0.0);
+    if veto_excess > 0.0 {
+        return 5_000.0 + veto_excess * 1_000.0;
     }
     let collision_excess = (traits.collision_rate - constraints.maximum_collision_rate).max(0.0);
     if collision_excess > 0.0 {
@@ -3187,6 +3221,32 @@ mod tests {
     }
 
     #[test]
+    fn excessive_safety_veto_reliance_is_reproductively_infeasible() {
+        let high_success_veto_dependent = FitnessTraits {
+            exploration: 20.0,
+            escape_rate: 1.0,
+            collision_rate: 0.0,
+            energy_use: 2.0,
+            forward_progress: 8.0,
+            repetition_rate: 0.0,
+            worst_environment_score: 10.0,
+            safety_veto_rate: 0.23,
+            safety_invariant_violations: 0,
+        };
+        let clean_partial_success = FitnessTraits {
+            escape_rate: 0.75,
+            safety_veto_rate: 0.0,
+            ..high_success_veto_dependent
+        };
+        let scores = rank_fitness(
+            &[high_success_veto_dependent, clean_partial_success],
+            SelectionConstraints::new(0, 0.10, 0.0).with_maximum_safety_veto_rate(0.05),
+        );
+        assert!(scores[0] < 0.0);
+        assert!(scores[1] > scores[0]);
+    }
+
+    #[test]
     fn pareto_ranking_preserves_distinct_feasible_strategies() {
         let explorer = FitnessTraits {
             exploration: 40.0,
@@ -3392,6 +3452,7 @@ mod tests {
             seeded_episodes: 500,
             success_rate: 0.95,
             collision_rate: 0.02,
+            safety_veto_rate: 0.01,
             safety_invariant_violations: 0,
             beats_hardcoded: true,
             noise_robust: true,
@@ -3401,6 +3462,10 @@ mod tests {
         assert!(criteria.accepts(passing));
         assert!(!criteria.accepts(CandidateEvaluation {
             safety_invariant_violations: 1,
+            ..passing
+        }));
+        assert!(!criteria.accepts(CandidateEvaluation {
+            safety_veto_rate: 0.25,
             ..passing
         }));
         assert!(!criteria.accepts(CandidateEvaluation {

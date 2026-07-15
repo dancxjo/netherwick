@@ -1974,6 +1974,8 @@ struct NeatStageValidationReport {
     seeded_episodes: usize,
     success_rate: f32,
     collision_rate: f32,
+    #[serde(default)]
+    safety_veto_rate: f32,
     safety_invariant_violations: u32,
     passed: bool,
 }
@@ -2728,7 +2730,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 retained_worlds,
             };
             println!(
-                "gen {:03} global={:03} species={} archive_cells={} world_archive={} retained_worlds={} selection best={:8.3} mean={:8.3} worst={:8.3} novelty best={:5.3} mean={:5.3} diagnostic_fitness={:8.3} topology={}/{} success={:5.1}% collision={:6.3}",
+                "gen {:03} global={:03} species={} archive_cells={} world_archive={} retained_worlds={} selection best={:8.3} mean={:8.3} worst={:8.3} novelty best={:5.3} mean={:5.3} diagnostic_fitness={:8.3} topology={}/{} success={:5.1}% collision={:6.3} veto_rate={:5.1}%",
                 generation_in_stage + 1,
                 population.generation,
                 report.species,
@@ -2745,7 +2747,15 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 report.champion_connections,
                 report.champion_success_rate * 100.0,
                 report.champion_collision_rate,
+                report.champion_traits.safety_veto_rate * 100.0,
             );
+            if report.champion_traits.safety_veto_rate > stage.maximum_safety_veto_rate() {
+                println!(
+                    "  safety reliance warning: veto_rate={:.1}% exceeds {:.1}% reproductive limit",
+                    report.champion_traits.safety_veto_rate * 100.0,
+                    stage.maximum_safety_veto_rate() * 100.0
+                );
+            }
             println!(
                 "  components area={} clear_distance={:.2} escapes={} boundary={} mouth_progress={:.2} collisions={} repeats={} wheel_motion={:.2} angular={:.2} stalled={} vetoes={} invariants={} lifetime mean={:.2} q25={:.2} min={:.2} qualify={:.1}%",
                 report.champion_metrics.new_area_cells,
@@ -2890,11 +2900,12 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                             .sum::<f32>();
                     for validation in &candidate_reports {
                         println!(
-                            "  validation [{}] {} success={:.1}% collision={:.4} invariants={} {}",
+                            "  validation [{}] {} success={:.1}% collision={:.4} veto_rate={:.1}% invariants={} {}",
                             candidate_kind,
                             neat_stage_slug(validation.stage),
                             validation.success_rate * 100.0,
                             validation.collision_rate,
+                            validation.safety_veto_rate * 100.0,
                             validation.safety_invariant_violations,
                             if validation.passed { "PASS" } else { "FAIL" }
                         );
@@ -3206,6 +3217,7 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         seeded_episodes: args.transfer_episodes as u32,
         success_rate: candidate.success_rate(),
         collision_rate: candidate.collision_rate,
+        safety_veto_rate: candidate.traits.safety_veto_rate,
         safety_invariant_violations: candidate.metrics.safety_invariant_violations,
         beats_hardcoded: transfer_evaluation_better(&candidate, &hardcoded),
         noise_robust: transfer_perturbation_robust(&candidate, &noisy),
@@ -3219,10 +3231,11 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         candidate_selection, hardcoded_selection, noisy_selection, mismatch_selection
     );
     println!(
-        "transfer episodes={} success={:.1}% collision={:.4} beats_hardcoded={} noise_robust={} motor_robust={} safety_invariant_violations={} safety_vetoes={} fallback_verified=true",
+        "transfer episodes={} success={:.1}% collision={:.4} veto_rate={:.1}% beats_hardcoded={} noise_robust={} motor_robust={} safety_invariant_violations={} safety_vetoes={} fallback_verified=true",
         args.transfer_episodes,
         candidate.success_rate() * 100.0,
         candidate.collision_rate,
+        candidate.traits.safety_veto_rate * 100.0,
         candidate_evaluation.beats_hardcoded,
         candidate_evaluation.noise_robust,
         candidate_evaluation.motor_mismatch_robust,
@@ -3413,12 +3426,21 @@ fn protected_generation_elites(
     generation_archive: &[QualityDiversityEntry],
 ) -> Vec<Genome> {
     let mut indices = Vec::<usize>::new();
+    let feasible = evaluations
+        .iter()
+        .enumerate()
+        .filter(|(_, evaluation)| {
+            evaluation
+                .selection_summary
+                .is_some_and(|summary| summary.constraint_violations == 0)
+        })
+        .collect::<Vec<_>>();
     let mut add = |index: usize| {
         if index < genomes.len() && !indices.contains(&index) {
             indices.push(index);
         }
     };
-    if let Some((index, _)) = evaluations.iter().enumerate().max_by(|left, right| {
+    if let Some((index, _)) = feasible.iter().copied().max_by(|left, right| {
         left.1
             .selection_summary
             .map(|summary| summary.stage_success_rate)
@@ -3433,7 +3455,7 @@ fn protected_generation_elites(
     }) {
         add(index);
     }
-    if let Some((index, _)) = evaluations.iter().enumerate().max_by(|left, right| {
+    if let Some((index, _)) = feasible.iter().copied().max_by(|left, right| {
         left.1
             .selection_summary
             .map(|summary| summary.stage_score)
@@ -3448,7 +3470,7 @@ fn protected_generation_elites(
     }) {
         add(index);
     }
-    if let Some((index, _)) = evaluations.iter().enumerate().max_by(|left, right| {
+    if let Some((index, _)) = feasible.iter().copied().max_by(|left, right| {
         left.1
             .selection_summary
             .map(|summary| summary.prerequisite_floor)
@@ -3463,9 +3485,9 @@ fn protected_generation_elites(
     }) {
         add(index);
     }
-    if let Some((index, _)) = evaluations
+    if let Some((index, _)) = feasible
         .iter()
-        .enumerate()
+        .copied()
         .filter(|(_, evaluation)| {
             evaluation
                 .selection_summary
@@ -3477,7 +3499,15 @@ fn protected_generation_elites(
     }
     let mut niches = HashSet::new();
     for entry in generation_archive {
-        if niches.insert(entry.niche) {
+        if evaluations
+            .get(entry.genome_index)
+            .is_some_and(|evaluation| {
+                evaluation
+                    .selection_summary
+                    .is_some_and(|summary| summary.constraint_violations == 0)
+            })
+            && niches.insert(entry.niche)
+        {
             add(entry.genome_index);
         }
     }
@@ -3495,6 +3525,7 @@ fn archive_recovery_founders(
     let mut entries = stage_archive
         .iter()
         .chain(repertoire.iter())
+        .filter(|entry| archived_evaluation_is_safe(entry))
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
         right
@@ -3516,6 +3547,13 @@ fn archive_recovery_founders(
         }
     }
     founders
+}
+
+fn archived_evaluation_is_safe(entry: &NeatNicheArchiveEntry) -> bool {
+    entry.evaluation.metrics.safety_invariant_violations == 0
+        && entry.evaluation.traits.safety_veto_rate <= entry.stage.maximum_safety_veto_rate()
+        && entry.evaluation.collision_rate
+            <= entry.stage.promotion_criteria().maximum_collision_rate
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4155,7 +4193,8 @@ fn stable_selection_summary(
 ) -> SelectionSummary {
     let criteria = stage.promotion_criteria();
     let constraint_violations = evaluation.metrics.safety_invariant_violations
-        + (evaluation.collision_rate > criteria.maximum_collision_rate) as u32;
+        + (evaluation.collision_rate > criteria.maximum_collision_rate) as u32
+        + (evaluation.traits.safety_veto_rate > stage.maximum_safety_veto_rate()) as u32;
     structured_selection_summaries(
         stage,
         std::slice::from_ref(evaluation),
@@ -4208,6 +4247,7 @@ fn transfer_perturbation_robust(
     perturbed.metrics.safety_invariant_violations == 0
         && retained_success
         && perturbed.collision_rate <= nominal.collision_rate + 0.02
+        && perturbed.traits.safety_veto_rate <= 0.05
 }
 
 fn transfer_rejection_reason(
@@ -4234,6 +4274,13 @@ fn transfer_rejection_reason(
         failures.push(format!(
             "collision {:.4} > {:.4}",
             evaluation.collision_rate, criteria.maximum_collision_rate
+        ));
+    }
+    if evaluation.safety_veto_rate > criteria.maximum_safety_veto_rate {
+        failures.push(format!(
+            "safety veto rate {:.1}% > {:.1}%",
+            evaluation.safety_veto_rate * 100.0,
+            criteria.maximum_safety_veto_rate * 100.0
         ));
     }
     if evaluation.safety_invariant_violations > criteria.maximum_safety_invariant_violations {
@@ -4297,6 +4344,7 @@ async fn validate_neat_curriculum(
         .await?;
         let passed = evaluation.success_rate() >= criteria.minimum_success_rate
             && evaluation.collision_rate <= criteria.maximum_collision_rate
+            && evaluation.traits.safety_veto_rate <= stage.maximum_safety_veto_rate()
             && evaluation.metrics.safety_invariant_violations
                 <= criteria.maximum_safety_invariant_violations;
         reports.push(NeatStageValidationReport {
@@ -4306,6 +4354,7 @@ async fn validate_neat_curriculum(
             seeded_episodes: episodes,
             success_rate: evaluation.success_rate(),
             collision_rate: evaluation.collision_rate,
+            safety_veto_rate: evaluation.traits.safety_veto_rate,
             safety_invariant_violations: evaluation.metrics.safety_invariant_violations,
             passed,
         });
@@ -4325,7 +4374,10 @@ fn validation_candidates(
         current_genome.clone(),
         current_evaluation.clone(),
     )];
-    if let Some((_, genome, evaluation)) = stage_best {
+    if let Some((_, genome, evaluation)) = stage_best.as_ref().filter(|(_, _, evaluation)| {
+        evaluation.metrics.safety_invariant_violations == 0
+            && evaluation.traits.safety_veto_rate <= 0.05
+    }) {
         candidates.push((
             "structured-stage-best".to_string(),
             genome.clone(),
@@ -4335,7 +4387,9 @@ fn validation_candidates(
     if let Some(entry) = stage_archive
         .iter()
         .chain(repertoire.iter())
-        .filter(|entry| entry.niche == pete_neat::NicheLabel::Generalist)
+        .filter(|entry| {
+            entry.niche == pete_neat::NicheLabel::Generalist && archived_evaluation_is_safe(entry)
+        })
         .max_by(|left, right| {
             left.evaluation
                 .success_rate()
@@ -4349,12 +4403,16 @@ fn validation_candidates(
             entry.evaluation.clone(),
         ));
     }
-    if let Some(entry) = stage_archive.iter().max_by(|left, right| {
-        left.evaluation
-            .success_rate()
-            .total_cmp(&right.evaluation.success_rate())
-            .then_with(|| left.evaluation.fitness.total_cmp(&right.evaluation.fitness))
-    }) {
+    if let Some(entry) = stage_archive
+        .iter()
+        .filter(|entry| archived_evaluation_is_safe(entry))
+        .max_by(|left, right| {
+            left.evaluation
+                .success_rate()
+                .total_cmp(&right.evaluation.success_rate())
+                .then_with(|| left.evaluation.fitness.total_cmp(&right.evaluation.fitness))
+        })
+    {
         candidates.push((
             "current-stage-specialist".to_string(),
             entry.genome.clone(),
@@ -15026,6 +15084,17 @@ mod tests {
         weighted_score: f32,
     ) -> NeatPolicyEvaluation {
         let mut evaluation = NeatPolicyEvaluation::default();
+        evaluation.traits = FitnessTraits {
+            exploration: 0.0,
+            escape_rate: 0.0,
+            collision_rate: 0.0,
+            energy_use: 0.0,
+            forward_progress: 0.0,
+            repetition_rate: 0.0,
+            worst_environment_score: 0.0,
+            safety_veto_rate: 0.0,
+            safety_invariant_violations: 0,
+        };
         evaluation.stage_competence.insert(
             stage,
             StageCompetence {
@@ -15065,6 +15134,24 @@ mod tests {
         );
         assert!(summaries[0].fitness > summaries[1].fitness);
         assert_eq!(summaries[1].stage_success_rate, 0.0);
+    }
+
+    #[test]
+    fn excessive_veto_reliance_cannot_dominate_through_stage_success() {
+        let stage = CurriculumStage::LeaveStartRegion;
+        let mut veto_dependent = evaluation_with_competence(stage, 4, 4, 100.0);
+        veto_dependent.traits.safety_veto_rate = 0.23;
+        let clean = evaluation_with_competence(stage, 4, 3, 10.0);
+        let evaluations = [veto_dependent, clean];
+        let traits = evaluations
+            .iter()
+            .map(|evaluation| evaluation.traits)
+            .collect::<Vec<_>>();
+        let pareto = pete_neat::selection_summaries(&traits, stage.selection_constraints());
+        let summaries =
+            structured_selection_summaries(stage, &evaluations, &pareto, &[100.0, 0.0], 25.0);
+        assert!(summaries[0].constraint_violations > 0);
+        assert!(summaries[1].fitness > summaries[0].fitness);
     }
 
     #[tokio::test]
@@ -15179,7 +15266,7 @@ mod tests {
             diagnostic_fitness: 1.0,
             qualification_evidence: None,
             genome: population.genomes[1].clone(),
-            evaluation: NeatPolicyEvaluation::default(),
+            evaluation: evaluation_with_competence(CurriculumStage::EscapeCorners, 1, 1, 1.0),
         };
         let candidates = validation_candidates(
             &population.genomes[0],
@@ -15221,6 +15308,13 @@ mod tests {
             qualification_evidence: None,
             genome: discovery.clone(),
             evaluation: NeatPolicyEvaluation {
+                traits: evaluation_with_competence(
+                    CurriculumStage::ExploreWithoutLooping,
+                    1,
+                    1,
+                    1.0,
+                )
+                .traits,
                 metrics: NeatEpisodeMetrics {
                     new_area_cells: 113,
                     distance_without_collision_m: 90.34,
@@ -15267,27 +15361,40 @@ mod tests {
 
     #[test]
     fn transfer_robustness_uses_success_collision_and_invariants() {
+        let safe_traits =
+            evaluation_with_competence(CurriculumStage::TransferCandidatesToPete, 1, 1, 0.0).traits;
         let nominal = NeatPolicyEvaluation {
             successful_episodes: 80,
             episodes: 100,
             collision_rate: 0.01,
+            traits: safe_traits,
             ..NeatPolicyEvaluation::default()
         };
         let retained = NeatPolicyEvaluation {
             successful_episodes: 60,
             episodes: 100,
             collision_rate: 0.03,
+            traits: safe_traits,
             ..NeatPolicyEvaluation::default()
         };
         let regressed = NeatPolicyEvaluation {
             successful_episodes: 59,
             episodes: 100,
             collision_rate: 0.01,
+            traits: safe_traits,
             ..NeatPolicyEvaluation::default()
+        };
+        let veto_dependent = NeatPolicyEvaluation {
+            traits: FitnessTraits {
+                safety_veto_rate: 0.25,
+                ..safe_traits
+            },
+            ..retained.clone()
         };
 
         assert!(transfer_perturbation_robust(&nominal, &retained));
         assert!(!transfer_perturbation_robust(&nominal, &regressed));
+        assert!(!transfer_perturbation_robust(&nominal, &veto_dependent));
     }
 
     #[test]
