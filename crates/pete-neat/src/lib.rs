@@ -1207,6 +1207,78 @@ impl Population {
         Ok(())
     }
 
+    /// Evolves normally, then carries the supplied protected repertoire into the
+    /// next population without mutation. Protected genomes replace descendants
+    /// at the tail, never the newly selected global champion at index zero.
+    pub fn evolve_with_elites<R: Rng + ?Sized>(
+        &mut self,
+        fitness: &[f32],
+        protected: &[Genome],
+        rng: &mut R,
+    ) -> Result<()> {
+        let protected = protected
+            .iter()
+            .filter(|genome| self.genomes.iter().any(|candidate| candidate == *genome))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.evolve(fitness, rng)?;
+        let mut replacement = self.genomes.len();
+        for elite in protected {
+            if self.genomes.iter().any(|genome| genome == &elite) {
+                continue;
+            }
+            if replacement <= 1 {
+                break;
+            }
+            replacement -= 1;
+            self.genomes[replacement] = elite;
+        }
+        self.assign_species_members();
+        Ok(())
+    }
+
+    /// Replaces low-priority descendants with mutated archive founders. This is
+    /// intended for bounded diversity recovery, not wholesale reseeding.
+    pub fn inject_archive_descendants<R: Rng + ?Sized>(
+        &mut self,
+        founders: &[Genome],
+        count: usize,
+        rng: &mut R,
+    ) -> usize {
+        if founders.is_empty() || self.genomes.len() <= 1 {
+            return 0;
+        }
+        let count = count.min(self.genomes.len() - 1);
+        for offset in 0..count {
+            let mut descendant = founders[offset % founders.len()].clone();
+            // Two mutations give recovery founders room to clear a collapsed
+            // compatibility basin while retaining their archived behavior.
+            descendant.mutate(self.config, &mut self.innovations, rng);
+            descendant.mutate(self.config, &mut self.innovations, rng);
+            let index = 1 + offset;
+            self.genomes[index] = descendant;
+        }
+        self.assign_species_members();
+        count
+    }
+
+    pub fn compatibility_distance_distribution(&self) -> (f32, f32, f32) {
+        let mut distances = Vec::new();
+        for left in 0..self.genomes.len() {
+            for right in left + 1..self.genomes.len() {
+                distances.push(
+                    self.genomes[left].compatibility_distance(&self.genomes[right], self.config),
+                );
+            }
+        }
+        if distances.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        distances.sort_by(|left, right| left.total_cmp(right));
+        let mean = distances.iter().sum::<f32>() / distances.len() as f32;
+        (distances[0], mean, distances[distances.len() - 1])
+    }
+
     pub fn evolve_ranked<R: Rng + ?Sized>(
         &mut self,
         traits: &[FitnessTraits],
@@ -1453,6 +1525,18 @@ pub struct EpisodeMetrics {
     pub trap_mouth_progress_m: f32,
     pub collisions: u32,
     pub repeated_state_steps: u32,
+    #[serde(default)]
+    pub short_cycle_count: u32,
+    #[serde(default)]
+    pub short_cycle_steps: u32,
+    #[serde(default)]
+    pub recent_repetition_steps: u32,
+    #[serde(default)]
+    pub maximum_displacement_m: f32,
+    #[serde(default)]
+    pub radius_bands_reached: u32,
+    #[serde(default)]
+    pub arena_sectors_visited: u32,
     pub wheel_motion_m: f32,
     pub angular_motion_rad: f32,
     pub recovery_activation_sum: f32,
@@ -1946,6 +2030,12 @@ const SELECTION_OBJECTIVES: [SelectionObjective; 9] = [
 pub struct SelectionSummary {
     pub fitness: f32,
     pub constraint_violations: u32,
+    #[serde(default)]
+    pub stage_success_rate: f32,
+    #[serde(default)]
+    pub prerequisite_floor: f32,
+    #[serde(default)]
+    pub stage_score: f32,
     pub pareto_front: u32,
     #[serde(default, deserialize_with = "deserialize_optional_f32")]
     pub crowding_distance: f32,
@@ -1987,6 +2077,9 @@ pub fn selection_summaries(
         SelectionSummary {
             fitness: 0.0,
             constraint_violations: 0,
+            stage_success_rate: 0.0,
+            prerequisite_floor: 0.0,
+            stage_score: 0.0,
             pareto_front: u32::MAX,
             crowding_distance: 0.0,
         };
@@ -1998,6 +2091,9 @@ pub fn selection_summaries(
             summaries[index] = SelectionSummary {
                 fitness: -violation + infeasible_tiebreak(traits[index]),
                 constraint_violations: violation.ceil() as u32,
+                stage_success_rate: 0.0,
+                prerequisite_floor: 0.0,
+                stage_score: 0.0,
                 pareto_front: u32::MAX,
                 crowding_distance: 0.0,
             };
@@ -2015,6 +2111,9 @@ pub fn selection_summaries(
                     + (front_count - front_index as f32) * 100.0
                     + crowding_bonus * 50.0,
                 constraint_violations: 0,
+                stage_success_rate: 0.0,
+                prerequisite_floor: 0.0,
+                stage_score: 0.0,
                 pareto_front: front_index as u32,
                 crowding_distance,
             };
@@ -2099,22 +2198,28 @@ impl FitnessWeights {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CurriculumStage {
     BackAwayReliably,
     ChooseUsefulTurn,
     EscapeCorners,
+    LeaveStartRegion,
+    ExpandLocalCoverage,
+    BreakShortCycles,
     ExploreWithoutLooping,
     NavigateVariedRooms,
     TransferCandidatesToPete,
 }
 
 impl CurriculumStage {
-    pub const ORDER: [Self; 6] = [
+    pub const ORDER: [Self; 9] = [
         Self::BackAwayReliably,
         Self::ChooseUsefulTurn,
         Self::EscapeCorners,
+        Self::LeaveStartRegion,
+        Self::ExpandLocalCoverage,
+        Self::BreakShortCycles,
         Self::ExploreWithoutLooping,
         Self::NavigateVariedRooms,
         Self::TransferCandidatesToPete,
@@ -2154,6 +2259,33 @@ impl CurriculumStage {
                 repeated_state: 0.25,
                 ..FitnessWeights::collision_recovery()
             },
+            Self::LeaveStartRegion => FitnessWeights {
+                new_area: 3.0,
+                collision_free_distance: 2.0,
+                collision: 7.0,
+                repeated_state: 0.5,
+                angular_motion: 0.15,
+                stalled: 0.5,
+                ..FitnessWeights::efficient_wandering()
+            },
+            Self::ExpandLocalCoverage => FitnessWeights {
+                new_area: 4.0,
+                collision_free_distance: 2.0,
+                collision: 7.0,
+                repeated_state: 0.7,
+                angular_motion: 0.12,
+                stalled: 0.5,
+                ..FitnessWeights::efficient_wandering()
+            },
+            Self::BreakShortCycles => FitnessWeights {
+                new_area: 4.0,
+                collision_free_distance: 2.0,
+                collision: 7.0,
+                repeated_state: 1.5,
+                angular_motion: 0.2,
+                stalled: 0.5,
+                ..FitnessWeights::efficient_wandering()
+            },
             Self::ExploreWithoutLooping => FitnessWeights::efficient_wandering(),
             Self::NavigateVariedRooms => FitnessWeights {
                 new_area: 2.5,
@@ -2187,6 +2319,9 @@ impl CurriculumStage {
             Self::BackAwayReliably => PromotionCriteria::new(40, 0.90, 0.20, false),
             Self::ChooseUsefulTurn => PromotionCriteria::new(60, 0.85, 0.18, false),
             Self::EscapeCorners => PromotionCriteria::new(100, 0.80, 0.15, false),
+            Self::LeaveStartRegion => PromotionCriteria::new(120, 0.80, 0.10, false),
+            Self::ExpandLocalCoverage => PromotionCriteria::new(120, 0.80, 0.10, false),
+            Self::BreakShortCycles => PromotionCriteria::new(150, 0.80, 0.10, false),
             Self::ExploreWithoutLooping => PromotionCriteria::new(150, 0.80, 0.10, true),
             Self::NavigateVariedRooms => PromotionCriteria::new(300, 0.85, 0.08, true),
             Self::TransferCandidatesToPete => PromotionCriteria::new(500, 0.90, 0.05, true),
@@ -2886,6 +3021,51 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(species_ids.contains(&10));
         assert!(species_ids.contains(&20));
+    }
+
+    #[test]
+    fn evolve_with_elites_preserves_a_low_fitness_protected_genome() {
+        let mut rng = StdRng::seed_from_u64(1701);
+        let mut population = Population::seeded(
+            NeatConfig {
+                population_size: 8,
+                compatibility_threshold: 100.0,
+                ..NeatConfig::default()
+            },
+            &mut rng,
+        );
+        let protected = population.genomes[7].clone();
+        population
+            .evolve_with_elites(
+                &[8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, -100.0],
+                &[protected.clone()],
+                &mut rng,
+            )
+            .unwrap();
+        assert!(population.genomes.contains(&protected));
+    }
+
+    #[test]
+    fn archive_injection_recovers_multiple_species_from_a_collapsed_population() {
+        let mut rng = StdRng::seed_from_u64(1702);
+        let mut population = Population::seeded(
+            NeatConfig {
+                population_size: 12,
+                compatibility_threshold: 0.000_001,
+                add_connection_rate: 1.0,
+                add_node_rate: 1.0,
+                weight_mutation_rate: 1.0,
+                ..NeatConfig::default()
+            },
+            &mut rng,
+        );
+        let collapsed = population.genomes[0].clone();
+        population.genomes.fill(collapsed.clone());
+        population.assign_species_members();
+        assert_eq!(population.species().len(), 1);
+        let injected = population.inject_archive_descendants(&[collapsed], 8, &mut rng);
+        assert_eq!(injected, 8);
+        assert!(population.species().len() > 1);
     }
 
     #[test]

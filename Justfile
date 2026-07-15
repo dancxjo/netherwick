@@ -881,7 +881,12 @@ train *args:
         fi
         behavior="$2"
         report_dir="${PETE_NEAT_REPORT_DIR:-data/reports/neat/locomotion-v2}"
-        state_checkpoint="${PETE_NEAT_STATE_CHECKPOINT:-${report_dir}/trainer-state.json}"
+        default_state_checkpoint="${report_dir}/trainer-state.json"
+        migrated_state_checkpoint="${report_dir}/trainer-state-schema3-leave-start-region.json"
+        if [ -z "${PETE_NEAT_STATE_CHECKPOINT:-}" ] && [ -f "$migrated_state_checkpoint" ]; then
+            default_state_checkpoint="$migrated_state_checkpoint"
+        fi
+        state_checkpoint="${PETE_NEAT_STATE_CHECKPOINT:-$default_state_checkpoint}"
         capture_root="${PETE_NEAT_CAPTURE_ROOT:-data/captures/neat/locomotion-v2}"
         resume="${PETE_NEAT_RESUME:-}"
         founders="${PETE_NEAT_FOUNDERS_REPORT:-}"
@@ -896,7 +901,7 @@ train *args:
             echo "NEAT continuation: resuming $resume"
         elif [ -n "$founders" ]; then
             extra_args+=(--founders-report "$founders")
-            extra_args+=(--start-stage "${start_stage:-explore-without-looping}")
+            extra_args+=(--start-stage "${start_stage:-leave-start-region}")
             continuation=""
             echo "NEAT continuation: reconstructing founders from $founders"
         elif [ -z "${PETE_NEAT_FRESH:-}" ] && [ -f "$state_checkpoint" ]; then
@@ -905,7 +910,7 @@ train *args:
             echo "NEAT continuation: resuming $state_checkpoint"
         elif [ -z "${PETE_NEAT_FRESH:-}" ] && [ -f data/reports/neat/locomotion/training-report.json ]; then
             extra_args+=(--founders-report data/reports/neat/locomotion/training-report.json)
-            extra_args+=(--start-stage "${start_stage:-explore-without-looping}")
+            extra_args+=(--start-stage "${start_stage:-leave-start-region}")
             continuation=""
             echo "NEAT continuation: reconstructing founders from data/reports/neat/locomotion/training-report.json"
         else
@@ -915,19 +920,11 @@ train *args:
             fi
             echo "NEAT continuation: starting a fresh competence-gated run"
         fi
-        generations_per_stage="${PETE_NEAT_GENERATIONS_PER_STAGE:-120}"
-        if [ -z "${PETE_NEAT_GENERATIONS_PER_STAGE:-}" ] && [ -n "$continuation" ]; then
-            if command -v jq >/dev/null 2>&1; then
-                completed_generations="$(jq -er '.generation_in_stage' "$continuation" 2>/dev/null || true)"
-                if [[ "$completed_generations" =~ ^[0-9]+$ ]]; then
-                    generations_per_stage="$((completed_generations + 120))"
-                fi
-            fi
-        fi
+        generations_per_stage="$(scripts/neat-generation-limit.sh "${continuation:-/nonexistent}" "${PETE_NEAT_GENERATIONS_PER_STAGE:-}" 120 120)"
         cargo run -p pete-tools -- neat-train "$behavior" \
             --generations-per-stage "$generations_per_stage" \
             --population "${PETE_NEAT_POPULATION:-64}" \
-            --episodes-per-genome "${PETE_NEAT_EPISODES_PER_GENOME:-8}" \
+            --episodes-per-genome "${PETE_NEAT_EPISODES_PER_GENOME:-12}" \
             --steps "${PETE_NEAT_STEPS:-300}" \
             --transfer-episodes "${PETE_NEAT_TRANSFER_EPISODES:-500}" \
             --seed "${PETE_NEAT_SEED:-7}" \
@@ -936,6 +933,7 @@ train *args:
             --validation-every "${PETE_NEAT_VALIDATION_EVERY:-4}" \
             --validation-passes "${PETE_NEAT_VALIDATION_PASSES:-2}" \
             --compatibility-threshold "${PETE_NEAT_COMPATIBILITY_THRESHOLD:-2.2}" \
+            --compatibility-threshold-floor "${PETE_NEAT_COMPATIBILITY_THRESHOLD_FLOOR:-0.05}" \
             --target-species-min "${PETE_NEAT_TARGET_SPECIES_MIN:-4}" \
             --target-species-max "${PETE_NEAT_TARGET_SPECIES_MAX:-9}" \
             --checkpoint "${PETE_NEAT_CHECKPOINT:-data/models/locomotion_neat_v0}" \
