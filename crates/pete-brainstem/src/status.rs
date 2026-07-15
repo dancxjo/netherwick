@@ -2,6 +2,7 @@ use core::{
     fmt::Write as _,
     sync::atomic::{AtomicU32, AtomicU8, Ordering},
 };
+pub use pete_cockpit_protocol::CommandRejectReason;
 
 use crate::body;
 use crate::commands::{
@@ -656,7 +657,10 @@ pub fn mark_command_started(command_id: u32, command_code: u8) {
 }
 
 #[cfg(feature = "pico-w")]
-pub fn submit_control_command(command_id: u32, command: BrainstemCommand) -> bool {
+pub fn submit_control_command(
+    command_id: u32,
+    command: BrainstemCommand,
+) -> Result<(), CommandRejectReason> {
     submit_control_command_with_service_identity(command_id, command, 0, 0)
 }
 
@@ -666,7 +670,7 @@ pub fn submit_service_control_command(
     command: BrainstemCommand,
     session_hash: u32,
     lease_hash: u32,
-) -> bool {
+) -> Result<(), CommandRejectReason> {
     submit_control_command_with_service_identity(command_id, command, session_hash, lease_hash)
 }
 
@@ -676,37 +680,38 @@ fn submit_control_command_with_service_identity(
     command: BrainstemCommand,
     service_session_hash: u32,
     service_lease_hash: u32,
-) -> bool {
+) -> Result<(), CommandRejectReason> {
     if matches!(
         command,
         BrainstemCommand::Status | BrainstemCommand::Ping | BrainstemCommand::GetEvents { .. }
     ) {
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, 0, 0);
-        return true;
+        return Ok(());
     }
     if matches!(command, BrainstemCommand::GetCapabilities) {
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, 0, 0);
-        return true;
-    }
-
-    if charging_interlock_active(&snapshot(0)) && is_motion_control_command(command) {
-        LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-        record_public_event(
-            PublicEventKind::CommandRejected,
-            command_id,
-            command_seq(command),
-            0,
-        );
-        return false;
+        return Ok(());
     }
 
     let Some((kind, a, b, c, d, duration_ms)) = encode_control_command(command) else {
-        LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-        record_public_event(PublicEventKind::CommandRejected, command_id, 0, 0);
-        return false;
+        return reject_control_command(
+            command_id,
+            command_seq(command),
+            ControlCommandCode::None,
+            CommandRejectReason::Unsupported,
+        );
     };
+
+    if charging_interlock_active(&snapshot(0)) && is_motion_control_command(command) {
+        return reject_control_command(
+            command_id,
+            command_seq(command),
+            kind,
+            CommandRejectReason::Charging,
+        );
+    }
 
     if kind == ControlCommandCode::CmdVel {
         let seq = command_seq(command);
@@ -715,9 +720,12 @@ fn submit_control_command_with_service_identity(
         if velocity_pending
             && !seq_is_current_or_newer(seq, PENDING_VELOCITY_SEQ.load(Ordering::Relaxed))
         {
-            LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-            record_public_event(PublicEventKind::CommandRejected, command_id, seq, 0);
-            return false;
+            return reject_control_command(
+                command_id,
+                seq,
+                kind,
+                CommandRejectReason::StaleSequence,
+            );
         }
 
         PENDING_VELOCITY_ID.store(command_id, Ordering::Relaxed);
@@ -728,15 +736,23 @@ fn submit_control_command_with_service_identity(
         PENDING_VELOCITY_KIND.store(ControlCommandCode::CmdVel as u8, Ordering::Relaxed);
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, seq, 0);
-        return true;
+        return Ok(());
     }
 
     if matches!(kind, ControlCommandCode::Stop | ControlCommandCode::EStop) {
         PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
-    } else if PENDING_COMMAND_KIND.load(Ordering::Relaxed) != ControlCommandCode::None as u8 {
-        LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-        record_public_event(PublicEventKind::CommandRejected, command_id, 0, 0);
-        return false;
+    } else {
+        let pending_kind = PENDING_COMMAND_KIND.load(Ordering::Relaxed);
+        let replaces_pending_heartbeat = kind == ControlCommandCode::HeartbeatStop
+            && pending_kind == ControlCommandCode::HeartbeatStop as u8;
+        if pending_kind != ControlCommandCode::None as u8 && !replaces_pending_heartbeat {
+            return reject_control_command(
+                command_id,
+                command_seq(command),
+                kind,
+                CommandRejectReason::Busy,
+            );
+        }
     }
 
     PENDING_COMMAND_ID.store(command_id, Ordering::Relaxed);
@@ -756,7 +772,25 @@ fn submit_control_command_with_service_identity(
         command_seq(command),
         kind as u32,
     );
-    true
+    Ok(())
+}
+
+#[cfg(feature = "pico-w")]
+fn reject_control_command(
+    command_id: u32,
+    command_seq: u32,
+    command_kind: ControlCommandCode,
+    reason: CommandRejectReason,
+) -> Result<(), CommandRejectReason> {
+    LAST_REJECTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
+    let detail = ((command_kind as u32) << 8) | reason.code() as u32;
+    record_public_event(
+        PublicEventKind::CommandRejected,
+        command_id,
+        command_seq,
+        detail,
+    );
+    Err(reason)
 }
 
 pub fn take_control_command() -> Option<BrainstemCommand> {
@@ -2304,12 +2338,6 @@ pub fn mark_imu_sample(sample: ImuSample) {
     IMU_MOTION_CONSISTENCY.store(MotionConsistencyCode::Consistent as u8, Ordering::Relaxed);
     IMU_TILT_ACTIVE.store(new_tilt as u8, Ordering::Relaxed);
     increment(&IMU_SAMPLE_COUNT);
-    record_public_event(
-        PublicEventKind::ImuFrameReceived,
-        sample.timestamp_ms,
-        derived.yaw_rate_mrad_s as u16 as u32,
-        derived.accel_magnitude_mm_s2 as u32,
-    );
     if old_health != ImuHealthCode::Ok as u8 {
         record_public_event(PublicEventKind::ImuFault, ImuHealthCode::Ok as u32, 0, 0);
     }
@@ -2889,18 +2917,8 @@ fn record_public_event_from_brainstem_event(event: &BrainstemEvent) {
             0,
             0,
         ),
-        BrainstemEvent::CreatePacketReceived { packet_id, bytes } => record_public_event(
-            PublicEventKind::TelemetryReceived,
-            *packet_id as u32,
-            bytes.len() as u32,
-            0,
-        ),
-        BrainstemEvent::CreateSensorPacketDecoded { packet_id, sensors } => record_public_event(
-            PublicEventKind::SensorFrameDecoded,
-            *packet_id as u32,
-            create_sensor_flags_bits(*sensors),
-            pack_i16_pair(sensors.distance_mm, sensors.angle_mrad),
-        ),
+        BrainstemEvent::CreatePacketReceived { .. }
+        | BrainstemEvent::CreateSensorPacketDecoded { .. } => {}
         BrainstemEvent::DriveRequested {
             left_mm_s,
             right_mm_s,
@@ -4035,7 +4053,7 @@ mod tests {
         reset_event_log_for_test();
         PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
         PENDING_VELOCITY_SEQ.store(10_000, Ordering::Relaxed);
-        assert!(submit_control_command(10_001, BrainstemCommand::Stop));
+        assert!(submit_control_command(10_001, BrainstemCommand::Stop).is_ok());
         assert_eq!(
             PENDING_VELOCITY_KIND.load(Ordering::Relaxed),
             ControlCommandCode::None as u8
@@ -4049,12 +4067,74 @@ mod tests {
                 ttl_ms: 300,
                 seq: 321
             }
-        ));
+        )
+        .is_ok());
         assert_eq!(
             PENDING_VELOCITY_KIND.load(Ordering::Relaxed),
             ControlCommandCode::CmdVel as u8
         );
         assert_eq!(PENDING_VELOCITY_SEQ.load(Ordering::Relaxed), 321);
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn pending_heartbeat_refresh_is_coalesced() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+
+        assert!(submit_control_command(
+            10,
+            BrainstemCommand::HeartbeatStop {
+                timeout_ms: 750,
+                seq: 10,
+            },
+        )
+        .is_ok());
+        assert!(submit_control_command(
+            11,
+            BrainstemCommand::HeartbeatStop {
+                timeout_ms: 900,
+                seq: 11,
+            },
+        )
+        .is_ok());
+
+        assert_eq!(PENDING_COMMAND_ID.load(Ordering::Relaxed), 11);
+        assert_eq!(PENDING_COMMAND_SEQ.load(Ordering::Relaxed), 11);
+        assert_eq!(PENDING_COMMAND_DURATION_MS.load(Ordering::Relaxed), 900);
+        let records = collect::<8>(0);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.kind == PublicEventKind::CommandRejected as u8)
+                .count(),
+            0
+        );
+        PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn command_rejection_event_includes_kind_and_reason() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_COMMAND_KIND.store(ControlCommandCode::HeartbeatStop as u8, Ordering::Relaxed);
+
+        assert_eq!(
+            submit_control_command(12, BrainstemCommand::Arm),
+            Err(CommandRejectReason::Busy)
+        );
+
+        let records = collect::<4>(0);
+        let rejected = records
+            .iter()
+            .find(|record| record.kind == PublicEventKind::CommandRejected as u8)
+            .unwrap();
+        assert_eq!(rejected.a, 12);
+        assert_eq!(rejected.b, 0);
+        assert_eq!(rejected.c, ((ControlCommandCode::Arm as u32) << 8) | 1);
+        PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
     }
 
     #[test]
@@ -4111,7 +4191,7 @@ mod tests {
     }
 
     #[test]
-    fn imu_sample_updates_status_and_events() {
+    fn imu_sample_updates_status_without_per_sample_events() {
         let _guard = status_test_guard();
         clear_imu_orientation_calibration();
         reset_event_log_for_test();
@@ -4132,9 +4212,27 @@ mod tests {
         assert_eq!(snapshot.imu_accel_magnitude_mm_s2, 9_807);
 
         let records = collect::<8>(0);
-        assert!(records
+        assert!(!records
             .iter()
             .any(|record| record.kind == PublicEventKind::ImuFrameReceived as u8));
+    }
+
+    #[test]
+    fn imu_samples_do_not_evict_safety_events() {
+        let _guard = status_test_guard();
+        clear_imu_orientation_calibration();
+        reset_event_log_for_test();
+        mark_safety_tripped(SafetyEventKind::Bump);
+
+        for timestamp_ms in 1..=(EVENT_LOG_CAPACITY as u32 * 2) {
+            mark_imu_sample(ImuSample::stationary(timestamp_ms));
+        }
+
+        let records = collect::<EVENT_LOG_CAPACITY>(0);
+        assert!(records.iter().any(|record| {
+            record.kind == PublicEventKind::SafetyTripped as u8
+                && record.a == SafetyEventKind::Bump as u32
+        }));
     }
 
     #[test]

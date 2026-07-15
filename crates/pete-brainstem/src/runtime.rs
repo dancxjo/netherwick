@@ -1,4 +1,7 @@
 use heapless::Deque;
+use pete_cockpit_protocol::{
+    bump_escape_turn_duration_ms, BUMP_ESCAPE_BACKOFF_DURATION_MS,
+};
 
 use crate::body;
 use crate::commands::{
@@ -27,8 +30,6 @@ const WAKE_PROBE_RESPONSE_BYTES_REQUIRED: u8 = 1;
 const CREATE_AXLE_TRACK_MM: i32 = 258;
 const BEARING_SLOWDOWN_MRAD: i32 = 1_000;
 const MIN_TRACK_SPEED_MM_S: i32 = 35;
-const BUMP_ESCAPE_BACKOFF_MS: u32 = 450;
-const BUMP_ESCAPE_TURN_MS: u32 = 650;
 const FEEDBACK_SLOT_BASE: u8 = 10;
 const FEEDBACK_KIND_COUNT: usize = 6;
 const MOTHERBRAIN_RESET_PULSE_MS: u32 = 100;
@@ -1495,17 +1496,21 @@ where
         self.ensure_recovery_motion_allowed()?;
         let backoff = -abs_i32(backoff_mm_s as i32);
         let turn_abs = abs_i32(turn_angular_mrad_s as i32);
+        if backoff == 0 || turn_abs == 0 {
+            return Err(BrainstemError::Timeout);
+        }
         let turn = match direction {
             EscapeDirection::Left => turn_abs,
             EscapeDirection::Right => -turn_abs,
-            EscapeDirection::Either => turn_abs,
+            EscapeDirection::Either => -turn_abs,
         };
+        let turn_duration_ms = bump_escape_turn_duration_ms(clamp_i16(turn_abs));
         let _ = self.commands.push_front(QueuedCommand::safety_recovery(
             command_id,
             RuntimeCommand::CmdVel {
                 linear_mm_s: 0,
                 angular_mrad_s: clamp_i16(turn),
-                duration_ms: Some(BUMP_ESCAPE_TURN_MS),
+                duration_ms: Some(turn_duration_ms),
             },
         ));
         let _ = self.commands.push_front(QueuedCommand::safety_recovery(
@@ -1513,7 +1518,7 @@ where
             RuntimeCommand::CmdVel {
                 linear_mm_s: clamp_i16(backoff),
                 angular_mrad_s: 0,
-                duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
+                duration_ms: Some(BUMP_ESCAPE_BACKOFF_DURATION_MS),
             },
         ));
         self.active = ActiveAction::None;
@@ -1722,7 +1727,7 @@ where
                     RuntimeCommand::CmdVel {
                         linear_mm_s: -80,
                         angular_mrad_s: 0,
-                        duration_ms: Some(BUMP_ESCAPE_BACKOFF_MS),
+                        duration_ms: Some(BUMP_ESCAPE_BACKOFF_DURATION_MS),
                     },
                 ));
                 Ok(())
@@ -3001,6 +3006,22 @@ mod tests {
         assert!(runtime.start_next_command().is_ok());
         assert!(runtime.safety_latched);
         assert_eq!(runtime.commands.len(), 2);
+        assert!(matches!(
+            runtime.commands.front().map(|queued| queued.command),
+            Some(RuntimeCommand::CmdVel {
+                linear_mm_s: -80,
+                angular_mrad_s: 0,
+                duration_ms: Some(BUMP_ESCAPE_BACKOFF_DURATION_MS),
+            })
+        ));
+        assert!(matches!(
+            runtime.commands.back().map(|queued| queued.command),
+            Some(RuntimeCommand::CmdVel {
+                linear_mm_s: 0,
+                angular_mrad_s: -900,
+                duration_ms: Some(1_746),
+            })
+        ));
 
         assert!(runtime.start_next_command().is_ok());
         assert!(matches!(runtime.active, ActiveAction::Driving { .. }));

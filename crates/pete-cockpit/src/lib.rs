@@ -12,9 +12,14 @@ use tungstenite::{connect, Message, WebSocket};
 
 mod handshake;
 pub use handshake::*;
+pub use pete_cockpit_protocol::{
+    bump_escape_duration_ms, bump_escape_turn_duration_ms, CommandRejectReason,
+    BUMP_ESCAPE_BACKOFF_DURATION_MS, BUMP_ESCAPE_TURN_ANGLE_MRAD,
+};
 
 pub type Result<T> = std::result::Result<T, CockpitError>;
 const DEFAULT_SIM_EVENT_CAPACITY: usize = 32;
+const POSSESSION_BUMP_ESCAPE_HEARTBEAT_MARGIN_MS: u32 = 1_000;
 const POSSESSION_LEASE_RENEW_INTERVAL_MS: u32 = 1_000;
 const POSSESSION_BUSY_RETRY_ATTEMPTS: usize = 300;
 const POSSESSION_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -228,6 +233,12 @@ pub trait Cockpit {
     /// history from boot.
     fn event_cursor_hint(&self) -> Option<u32> {
         None
+    }
+
+    /// Whether this cockpit already refreshes the motion heartbeat before
+    /// forwarding velocity commands.
+    fn manages_motion_heartbeat(&self) -> bool {
+        false
     }
 
     /// Surrender motherbrain possession after stopping motion. This does not
@@ -617,6 +628,10 @@ impl<T: Cockpit + ?Sized> Cockpit for Box<T> {
     }
     fn event_cursor_hint(&self) -> Option<u32> {
         (**self).event_cursor_hint()
+    }
+
+    fn manages_motion_heartbeat(&self) -> bool {
+        (**self).manages_motion_heartbeat()
     }
 
     fn exorcize(&mut self) -> Result<()> {
@@ -1206,6 +1221,26 @@ impl CockpitEvent {
     pub fn is_stop_reason(&self) -> bool {
         SafeStopReason::from_event(self).is_some()
     }
+
+    pub fn command_rejection(&self) -> Option<CommandRejection> {
+        if self.kind != CockpitEventKind::CommandRejected {
+            return None;
+        }
+        Some(CommandRejection {
+            command_id: self.a,
+            command_seq: self.b,
+            command_code: (self.c >> 8) as u8,
+            reason: CommandRejectReason::from_code(self.c as u8),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandRejection {
+    pub command_id: u32,
+    pub command_seq: u32,
+    pub command_code: u8,
+    pub reason: CommandRejectReason,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -2738,13 +2773,14 @@ impl<C: Cockpit> SafeCockpit<C> {
         }
         let heartbeat_timeout_ms = self.policy.heartbeat_timeout_ms;
         let motion_ttl_ms = self.policy.motion_ttl_ms;
+        let heartbeat_managed = self.client.manages_motion_heartbeat();
         let contract = self.ensure_contract()?;
         if !contract.supports("cmd_vel") {
             return Err(CockpitError::Policy(
                 "refusing motion because cmd_vel is unsupported".to_owned(),
             ));
         }
-        if heartbeat_timeout_ms > 0 && !contract.supports("heartbeat_stop") {
+        if heartbeat_timeout_ms > 0 && !heartbeat_managed && !contract.supports("heartbeat_stop") {
             return Err(CockpitError::Policy(
                 "heartbeat policy requires heartbeat_stop capability".to_owned(),
             ));
@@ -2756,7 +2792,7 @@ impl<C: Cockpit> SafeCockpit<C> {
         };
         let request = contract.clamp_motion_request(&request);
         contract.validate_request(&request)?;
-        if heartbeat_timeout_ms > 0 {
+        if heartbeat_timeout_ms > 0 && !heartbeat_managed {
             let heartbeat = CockpitRequest::HeartbeatStop {
                 timeout_ms: heartbeat_timeout_ms,
             };
@@ -4314,19 +4350,40 @@ impl<C: Cockpit> MotherbrainPossession<C> {
                 linear_mm_s,
                 angular_mrad_s,
                 ..
-            } => {
-                expect_accepted(self.execute_with_busy_retry(CockpitRequest::HeartbeatStop {
-                    timeout_ms: self.heartbeat_timeout_ms,
-                })?)?;
-                CockpitRequest::CmdVel {
-                    linear_mm_s: linear_mm_s.clamp(-self.max_linear_mm_s, self.max_linear_mm_s),
-                    angular_mrad_s: angular_mrad_s
-                        .clamp(-self.max_angular_mrad_s, self.max_angular_mrad_s),
-                    ttl_ms: self.motion_ttl_ms,
-                }
-            }
+            } => CockpitRequest::CmdVel {
+                linear_mm_s: linear_mm_s.clamp(-self.max_linear_mm_s, self.max_linear_mm_s),
+                angular_mrad_s: angular_mrad_s
+                    .clamp(-self.max_angular_mrad_s, self.max_angular_mrad_s),
+                ttl_ms: self.motion_ttl_ms,
+            },
+            CockpitRequest::BumpEscape {
+                direction,
+                backoff_mm_s,
+                turn_angular_mrad_s,
+            } => CockpitRequest::BumpEscape {
+                direction,
+                backoff_mm_s: backoff_mm_s.clamp(0, self.max_linear_mm_s),
+                turn_angular_mrad_s: turn_angular_mrad_s.clamp(0, self.max_angular_mrad_s),
+            },
             other => other,
         };
+        let heartbeat_timeout_ms = match &request {
+            CockpitRequest::CmdVel { .. } => Some(self.heartbeat_timeout_ms),
+            CockpitRequest::BumpEscape {
+                turn_angular_mrad_s,
+                ..
+            } => Some(
+                bump_escape_duration_ms(*turn_angular_mrad_s)
+                    .saturating_add(POSSESSION_BUMP_ESCAPE_HEARTBEAT_MARGIN_MS)
+                    .max(self.heartbeat_timeout_ms),
+            ),
+            _ => None,
+        };
+        if let Some(timeout_ms) = heartbeat_timeout_ms {
+            expect_accepted(
+                self.execute_with_busy_retry(CockpitRequest::HeartbeatStop { timeout_ms })?,
+            )?;
+        }
         let response = self.execute_with_busy_retry(request.clone());
         match response {
             Ok(response) => {
@@ -4382,6 +4439,10 @@ impl<C: Cockpit> Cockpit for MotherbrainPossession<C> {
 
     fn event_cursor_hint(&self) -> Option<u32> {
         Some(self.session.cursor.next_seq())
+    }
+
+    fn manages_motion_heartbeat(&self) -> bool {
+        true
     }
 
     fn exorcize(&mut self) -> Result<()> {
@@ -5778,6 +5839,7 @@ fn is_compact_rejection_reason(reason: &str) -> bool {
         reason,
         "busy"
             | "charging_busy"
+            | "stale_sequence"
             | "unsupported"
             | "invalid_session"
             | "session_required"
@@ -6321,6 +6383,10 @@ mod tests {
         inner: SimCockpit,
         busy_remaining: usize,
         attempts: usize,
+        heartbeat_attempts: usize,
+        cmd_vel_attempts: usize,
+        last_heartbeat_timeout_ms: Option<u32>,
+        last_bump_escape: Option<(EscapeDirection, i16, i16)>,
     }
 
     struct StaleLeaseOnceCockpit {
@@ -6353,6 +6419,21 @@ mod tests {
             request: CockpitRequest,
         ) -> Result<CockpitResponse> {
             self.attempts += 1;
+            match &request {
+                CockpitRequest::HeartbeatStop { timeout_ms } => {
+                    self.heartbeat_attempts += 1;
+                    self.last_heartbeat_timeout_ms = Some(*timeout_ms);
+                }
+                CockpitRequest::CmdVel { .. } => self.cmd_vel_attempts += 1,
+                CockpitRequest::BumpEscape {
+                    direction,
+                    backoff_mm_s,
+                    turn_angular_mrad_s,
+                } => {
+                    self.last_bump_escape = Some((*direction, *backoff_mm_s, *turn_angular_mrad_s));
+                }
+                _ => {}
+            }
             if self.busy_remaining > 0 {
                 self.busy_remaining -= 1;
                 return Err(CockpitError::Rejected {
@@ -7708,16 +7789,26 @@ mod tests {
     }
 
     #[test]
-    fn simulator_command_rejection_alone_is_not_stop_reason() {
+    fn simulator_command_rejection_alone_is_diagnostic() {
         let mut sim = SimCockpit::new().with_unscoped_bench_mode();
-        sim.push_event(CockpitEventKind::CommandRejected, 7, 0, 0);
+        sim.push_event(CockpitEventKind::CommandRejected, 7, 11, (6 << 8) | 1);
         let batch = sim.get_events_since(0).unwrap();
 
         assert!(!batch.has_stop_reason());
-        assert!(batch
+        let rejected = batch
             .events
             .iter()
-            .any(|event| event.kind == CockpitEventKind::CommandRejected));
+            .find(|event| event.kind == CockpitEventKind::CommandRejected)
+            .unwrap();
+        assert_eq!(
+            rejected.command_rejection(),
+            Some(CommandRejection {
+                command_id: 7,
+                command_seq: 11,
+                command_code: 6,
+                reason: CommandRejectReason::Busy,
+            })
+        );
     }
 
     #[test]
@@ -8073,6 +8164,21 @@ mod tests {
                 heartbeat_timeout_ms: 0,
             },
         );
+        safe.pulse_motion(20, 0).unwrap();
+    }
+
+    #[test]
+    fn safe_cockpit_does_not_treat_historical_command_rejection_as_motion_stop() {
+        let mut sim = SimCockpit::new().with_unscoped_bench_mode();
+        sim.push_event(CockpitEventKind::CommandRejected, 7, 0, 0);
+        let mut safe = SafeCockpit::with_policy(
+            sim,
+            AgentPolicy {
+                motion_ttl_ms: 100,
+                heartbeat_timeout_ms: 0,
+            },
+        );
+
         safe.pulse_motion(20, 0).unwrap();
     }
 
@@ -8478,6 +8584,10 @@ mod tests {
             inner: SimCockpit::new(),
             busy_remaining: 0,
             attempts: 0,
+            heartbeat_attempts: 0,
+            cmd_vel_attempts: 0,
+            last_heartbeat_timeout_ms: None,
+            last_bump_escape: None,
         };
         let ready = establish_session(cockpit, hello(), None).unwrap();
         let mut possession = MotherbrainPossession::acquire(ready, 1_000).unwrap();
@@ -8495,6 +8605,60 @@ mod tests {
             attempts_before + 2
         );
         assert!(possession.snapshot().possessed);
+    }
+
+    #[test]
+    fn safe_cockpit_uses_possessions_single_motion_heartbeat() {
+        let cockpit = BusyOnceCockpit {
+            inner: SimCockpit::new(),
+            busy_remaining: 0,
+            attempts: 0,
+            heartbeat_attempts: 0,
+            cmd_vel_attempts: 0,
+            last_heartbeat_timeout_ms: None,
+            last_bump_escape: None,
+        };
+        let ready = establish_session(cockpit, hello(), None).unwrap();
+        let possession = MotherbrainPossession::acquire(ready, 60_000).unwrap();
+        let mut safe = SafeCockpit::new(possession);
+
+        safe.pulse_motion(20, 0).unwrap();
+
+        let connector = safe.client_mut().session.connector_mut();
+        assert_eq!(connector.heartbeat_attempts, 1);
+        assert_eq!(connector.cmd_vel_attempts, 1);
+    }
+
+    #[test]
+    fn production_possession_gives_clockwise_bump_escape_time_to_finish() {
+        let cockpit = BusyOnceCockpit {
+            inner: SimCockpit::new(),
+            busy_remaining: 0,
+            attempts: 0,
+            heartbeat_attempts: 0,
+            cmd_vel_attempts: 0,
+            last_heartbeat_timeout_ms: None,
+            last_bump_escape: None,
+        };
+        let ready = establish_session(cockpit, hello(), None).unwrap();
+        let mut possession = MotherbrainPossession::acquire(ready, 60_000)
+            .unwrap()
+            .with_limits(50, 500);
+
+        possession
+            .bump_escape(EscapeDirection::Right, 80, 900)
+            .unwrap();
+
+        let connector = possession.session.connector_mut();
+        assert_eq!(connector.heartbeat_attempts, 1);
+        assert_eq!(
+            connector.last_heartbeat_timeout_ms,
+            Some(bump_escape_duration_ms(500) + POSSESSION_BUMP_ESCAPE_HEARTBEAT_MARGIN_MS)
+        );
+        assert_eq!(
+            connector.last_bump_escape,
+            Some((EscapeDirection::Right, 50, 500))
+        );
     }
 
     #[test]
