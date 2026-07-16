@@ -45,6 +45,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Consume sleep inputs per successfully completed work kind, keeping deferred,
+  failed, and cancelled training inputs eligible when resources return, and
+  declare canonical world-model schema 3 in sleep provenance.
 - Credit semantic action outcomes only when the autonomous goal primitive was
   actually executed unchanged through safety, and measure progress against the
   same canonical world-model target identity rather than raw observations.

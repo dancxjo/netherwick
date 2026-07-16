@@ -54,13 +54,16 @@ promotion policy. The initial deterministic plan:
 4. optionally produces a versioned candidate;
 5. evaluates it against a fixed teacher baseline.
 
-Deferred maintenance is keyed by stable episode and failure references, not a
-recomputed count. A successfully finalized session records those references as
-consumed in a bounded controller history; the same charging snapshot therefore
-cannot immediately start the same plan again. A higher failure count or a new
-episode id is new work. Fatigue-triggered entry uses hysteresis and is re-armed
-only after activation falls below 0.65. Operator sleep requests are
-edge-triggered, so a held request cannot create a sleep/reawaken loop.
+Deferred maintenance is keyed by stable episode, failure, and semantic
+references, not a recomputed count. Consumption is recorded per input and work
+kind only after that work completes successfully. A deferred, failed, or
+cancelled training item therefore leaves its inputs pending for a later session,
+while already completed local work is not repeated for those inputs. Fully
+consumed references cannot immediately start the same plan again. A higher
+failure count or a new episode id is new work. Fatigue-triggered entry uses
+hysteresis and is re-armed only after activation falls below 0.65. Operator
+sleep requests are edge-triggered, so a held request cannot create a
+sleep/reawaken loop.
 
 Local work remains useful without an accelerator. Accelerator-preferred work
 is deferred with an explicit reason. Replay artifacts cannot enter live `Now`
@@ -80,7 +83,7 @@ work executes.
 Every tick serializes the normalized lifecycle snapshot under the `sleep`
 extension of the durable `ExperienceFrame`. Completed reports identify work,
 artifacts, deferrals/failures, wake reason, and the fresh-world/no-stale-skill
-invariants.
+invariants. Work provenance declares canonical world-model schema version 3.
 
 ## Grounded semantic graph
 

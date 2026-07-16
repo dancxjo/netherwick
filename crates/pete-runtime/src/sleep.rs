@@ -281,6 +281,12 @@ pub struct SleepWorkResult {
     pub candidate: Option<CandidateArtifact>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SleepInputConsumption {
+    pub input_ref: String,
+    pub work_kind: SleepWorkKind,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SleepSessionId(pub String);
@@ -302,6 +308,8 @@ pub struct SleepSession {
     pub provenance: Vec<EvidenceRef>,
     #[serde(default)]
     pub claimed_input_refs: Vec<String>,
+    #[serde(default)]
+    pub claimed_inputs: Vec<SleepInputConsumption>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -334,6 +342,8 @@ pub struct SleepReport {
     pub stale_skill_resumed: bool,
     #[serde(default)]
     pub consumed_input_refs: Vec<String>,
+    #[serde(default)]
+    pub consumed_inputs: Vec<SleepInputConsumption>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -375,7 +385,7 @@ pub struct SleepController {
     sequence: u64,
     session: Option<SleepSession>,
     last_report: Option<SleepReport>,
-    consumed_input_refs: VecDeque<String>,
+    consumed_inputs: VecDeque<SleepInputConsumption>,
     fatigue_entry_armed: bool,
     operator_sleep_request_active: bool,
 }
@@ -386,7 +396,7 @@ impl Default for SleepController {
             sequence: 0,
             session: None,
             last_report: None,
-            consumed_input_refs: VecDeque::new(),
+            consumed_inputs: VecDeque::new(),
             fatigue_entry_armed: true,
             operator_sleep_request_active: false,
         }
@@ -499,6 +509,8 @@ impl SleepController {
         }
         let id = SleepSessionId(format!("sleep:{}:{}", input.now_ms, self.sequence));
         let claimed_input_refs = sleep_input_refs(input);
+        let claimed_inputs = sleep_input_requirements(input);
+        let work_plan = deterministic_work_plan(&id, input, &self.consumed_inputs);
         self.session = Some(SleepSession {
             id: id.clone(),
             started_at_ms: input.now_ms,
@@ -506,7 +518,7 @@ impl SleepController {
             trigger,
             started_on_external_power: input.charging,
             resource_budget: SleepResourceBudget::default(),
-            work_plan: deterministic_work_plan(&id, input),
+            work_plan,
             completed: Vec::new(),
             interrupted_by: None,
             provenance: vec![EvidenceRef {
@@ -522,6 +534,7 @@ impl SleepController {
                 implementation_version: Some("1".to_string()),
             }],
             claimed_input_refs,
+            claimed_inputs,
         });
     }
 
@@ -576,14 +589,37 @@ impl SleepController {
             .filter(|result| result.status == SleepWorkStatus::Deferred)
             .map(|result| result.work_item_id.clone())
             .collect();
-        let consumed_input_refs = if session.interrupted_by.is_none() {
-            session.claimed_input_refs.clone()
-        } else {
-            Vec::new()
-        };
-        for input_ref in &consumed_input_refs {
-            self.mark_consumed(input_ref.clone());
+        let consumed_inputs = completed
+            .iter()
+            .filter(|result| result.status == SleepWorkStatus::Completed)
+            .flat_map(|result| {
+                session
+                    .work_plan
+                    .iter()
+                    .find(|item| item.id == result.work_item_id)
+                    .into_iter()
+                    .flat_map(|item| item.input_artifact_refs.iter())
+                    .map(|input_ref| SleepInputConsumption {
+                        input_ref: input_ref.clone(),
+                        work_kind: result.kind,
+                    })
+            })
+            .collect::<Vec<_>>();
+        for consumption in &consumed_inputs {
+            self.mark_consumed(consumption.clone());
         }
+        let consumed_input_refs = session
+            .claimed_input_refs
+            .iter()
+            .filter(|input_ref| {
+                session
+                    .claimed_inputs
+                    .iter()
+                    .filter(|requirement| requirement.input_ref.as_str() == input_ref.as_str())
+                    .all(|requirement| self.is_consumed(requirement))
+            })
+            .cloned()
+            .collect();
         self.last_report = Some(SleepReport {
             schema_version: 1,
             session_id: session.id,
@@ -599,30 +635,63 @@ impl SleepController {
             fresh_world_model_required: true,
             stale_skill_resumed: false,
             consumed_input_refs,
+            consumed_inputs,
         });
     }
 
     fn pending_input(&self, input: &SleepTickInput) -> SleepTickInput {
         let mut pending = input.clone();
-        pending
-            .completed_episode_refs
-            .retain(|input_ref| !self.consumed_input_refs.contains(input_ref));
-        pending
-            .failed_behavior_refs
-            .retain(|input_ref| !self.consumed_input_refs.contains(input_ref));
-        pending
-            .semantic_relation_refs
-            .retain(|input_ref| !self.consumed_input_refs.contains(input_ref));
+        pending.completed_episode_refs.retain(|input_ref| {
+            self.has_pending_work(
+                input_ref,
+                &[
+                    SleepWorkKind::ConsolidateEpisodes,
+                    SleepWorkKind::ReplayRecentFailures,
+                    SleepWorkKind::TrainCandidate,
+                ],
+            )
+        });
+        pending.failed_behavior_refs.retain(|input_ref| {
+            self.has_pending_work(
+                input_ref,
+                &[
+                    SleepWorkKind::ReplayRecentFailures,
+                    SleepWorkKind::TrainCandidate,
+                ],
+            )
+        });
+        pending.semantic_relation_refs.retain(|input_ref| {
+            self.has_pending_work(
+                input_ref,
+                &[
+                    SleepWorkKind::ConsolidateEpisodes,
+                    SleepWorkKind::TrainCandidate,
+                ],
+            )
+        });
         pending
     }
 
-    fn mark_consumed(&mut self, input_ref: String) {
-        if self.consumed_input_refs.contains(&input_ref) {
+    fn has_pending_work(&self, input_ref: &str, kinds: &[SleepWorkKind]) -> bool {
+        kinds.iter().any(|kind| {
+            !self.is_consumed(&SleepInputConsumption {
+                input_ref: input_ref.to_string(),
+                work_kind: *kind,
+            })
+        })
+    }
+
+    fn is_consumed(&self, consumption: &SleepInputConsumption) -> bool {
+        self.consumed_inputs.contains(consumption)
+    }
+
+    fn mark_consumed(&mut self, consumption: SleepInputConsumption) {
+        if self.is_consumed(&consumption) {
             return;
         }
-        self.consumed_input_refs.push_back(input_ref);
-        while self.consumed_input_refs.len() > MAX_CONSUMED_SLEEP_INPUT_REFS {
-            self.consumed_input_refs.pop_front();
+        self.consumed_inputs.push_back(consumption);
+        while self.consumed_inputs.len() > MAX_CONSUMED_SLEEP_INPUT_REFS {
+            self.consumed_inputs.pop_front();
         }
     }
 }
@@ -676,7 +745,9 @@ fn sleep_eligibility_with_arms(
 }
 
 fn has_deferred_work(input: &SleepTickInput) -> bool {
-    !input.completed_episode_refs.is_empty() || !input.failed_behavior_refs.is_empty()
+    !input.completed_episode_refs.is_empty()
+        || !input.failed_behavior_refs.is_empty()
+        || !input.semantic_relation_refs.is_empty()
 }
 
 fn sleep_input_refs(input: &SleepTickInput) -> Vec<String> {
@@ -689,6 +760,58 @@ fn sleep_input_refs(input: &SleepTickInput) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn sleep_input_requirements(input: &SleepTickInput) -> Vec<SleepInputConsumption> {
+    let mut requirements = Vec::new();
+    for input_ref in sleep_input_refs(input) {
+        for work_kind in [
+            SleepWorkKind::ConsolidateEpisodes,
+            SleepWorkKind::ReplayRecentFailures,
+            SleepWorkKind::TrainCandidate,
+        ] {
+            if input_ref_is_used_by(input, &input_ref, work_kind) {
+                requirements.push(SleepInputConsumption {
+                    input_ref: input_ref.clone(),
+                    work_kind,
+                });
+            }
+        }
+    }
+    requirements
+}
+
+fn input_ref_is_used_by(input: &SleepTickInput, input_ref: &str, kind: SleepWorkKind) -> bool {
+    match kind {
+        SleepWorkKind::ConsolidateEpisodes => {
+            input
+                .completed_episode_refs
+                .iter()
+                .any(|value| value == input_ref)
+                || input
+                    .semantic_relation_refs
+                    .iter()
+                    .any(|value| value == input_ref)
+        }
+        SleepWorkKind::ReplayRecentFailures => {
+            input
+                .completed_episode_refs
+                .iter()
+                .any(|value| value == input_ref)
+                || input
+                    .failed_behavior_refs
+                    .iter()
+                    .any(|value| value == input_ref)
+        }
+        SleepWorkKind::TrainCandidate => sleep_input_refs(input)
+            .iter()
+            .any(|value| value == input_ref),
+        SleepWorkKind::FlushDurableState
+        | SleepWorkKind::EvaluateCandidate
+        | SleepWorkKind::RebuildIndexes
+        | SleepWorkKind::DryRunPruning
+        | SleepWorkKind::SummarizeChanges => false,
+    }
 }
 
 fn wake_reason(input: &SleepTickInput, max_thermal_fraction: f32) -> Option<WakeReason> {
@@ -717,9 +840,13 @@ fn wake_reason(input: &SleepTickInput, max_thermal_fraction: f32) -> Option<Wake
     reasons.into_iter().max_by_key(WakeReason::priority)
 }
 
-fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<SleepWorkItem> {
+fn deterministic_work_plan(
+    id: &SleepSessionId,
+    input: &SleepTickInput,
+    consumed_inputs: &VecDeque<SleepInputConsumption>,
+) -> Vec<SleepWorkItem> {
     let item = |suffix: &str,
-                kind,
+                kind: SleepWorkKind,
                 dependencies: Vec<String>,
                 estimate,
                 locality,
@@ -728,16 +855,19 @@ fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<S
                 promotion_policy| SleepWorkItem {
         id: format!("{}:{suffix}", id.0),
         kind,
-        input_artifact_refs: input
-            .completed_episode_refs
-            .iter()
-            .chain(input.failed_behavior_refs.iter())
-            .chain(input.semantic_relation_refs.iter())
-            .cloned()
+        input_artifact_refs: sleep_input_refs(input)
+            .into_iter()
+            .filter(|input_ref| input_ref_is_used_by(input, input_ref, kind))
+            .filter(|input_ref| {
+                !consumed_inputs.contains(&SleepInputConsumption {
+                    input_ref: input_ref.clone(),
+                    work_kind: kind,
+                })
+            })
             .collect(),
         input_schema_versions: BTreeMap::from([
             ("experience_frame".to_string(), 1),
-            ("world_model".to_string(), 2),
+            ("world_model".to_string(), 3),
         ]),
         dependencies,
         estimate,
@@ -1060,6 +1190,62 @@ mod tests {
             result.kind == SleepWorkKind::TrainCandidate
                 && result.status == SleepWorkStatus::Deferred
         }));
+        assert!(report.consumed_input_refs.is_empty());
+        assert!(report.consumed_inputs.iter().any(|consumption| {
+            consumption.input_ref == "episode:charging:1"
+                && consumption.work_kind == SleepWorkKind::ConsolidateEpisodes
+        }));
+        assert!(!report
+            .consumed_inputs
+            .iter()
+            .any(|consumption| consumption.work_kind == SleepWorkKind::TrainCandidate));
+    }
+
+    #[test]
+    fn deferred_training_inputs_are_readmitted_when_acceleration_returns() {
+        let mut controller = SleepController::default();
+        run_to_wake(&mut controller, 100, false);
+
+        let mut retry = safe_input(108);
+        retry.fatigue_activation = 0.0;
+        retry.accelerator_available = true;
+        let restarted = controller.tick(retry);
+        assert_eq!(restarted.phase, SleepPhase::Preparing);
+        assert_eq!(
+            restarted.session.as_ref().map(|session| session.trigger),
+            Some(SleepTrigger::DeferredWork)
+        );
+        let plan = &restarted.session.as_ref().unwrap().work_plan;
+        let training_inputs = &plan
+            .iter()
+            .find(|item| item.kind == SleepWorkKind::TrainCandidate)
+            .unwrap()
+            .input_artifact_refs;
+        assert!(training_inputs.contains(&"episode:charging:1".to_string()));
+        assert!(training_inputs.contains(&"behavior:approach_charger:failed:1".to_string()));
+        assert!(plan
+            .iter()
+            .find(|item| item.kind == SleepWorkKind::ConsolidateEpisodes)
+            .unwrap()
+            .input_artifact_refs
+            .is_empty());
+
+        for now_ms in 109..=115 {
+            let mut input = safe_input(now_ms);
+            input.fatigue_activation = 0.0;
+            controller.tick(input);
+        }
+        let report = controller.last_report.as_ref().unwrap();
+        assert!(report.completed.iter().any(|result| {
+            result.kind == SleepWorkKind::TrainCandidate
+                && result.status == SleepWorkStatus::Completed
+        }));
+        assert!(report
+            .consumed_input_refs
+            .contains(&"episode:charging:1".to_string()));
+        assert!(report
+            .consumed_input_refs
+            .contains(&"behavior:approach_charger:failed:1".to_string()));
     }
 
     #[test]
@@ -1133,6 +1319,10 @@ mod tests {
                 .find(|item| item.kind == kind)
                 .is_some_and(|item| item.requires_external_power));
         }
+        assert!(session
+            .work_plan
+            .iter()
+            .all(|item| { item.input_schema_versions.get("world_model") == Some(&3) }));
     }
 
     #[test]
