@@ -2978,6 +2978,146 @@ mod tests {
     }
 
     #[test]
+    fn reusable_skills_are_claimed_by_multiple_goals() {
+        let mut updater = WorldModelUpdater::default();
+
+        let mut charger_now = Now::blank(1_000, BodySense::default());
+        charger_now.body.battery_level = 0.05;
+        charger_now.objects.observations.push(ObjectObservation {
+            label: "dock".to_string(),
+            class: ObjectClass::Charger,
+            bearing_rad: 0.8,
+            distance_m: Some(2.0),
+            confidence: 0.95,
+            source: ObjectObservationSource::Sim,
+        });
+        let mut charger_system = GoalSystem::default();
+        let charger = tick_with_canonical_world(&mut charger_system, &mut updater, charger_now);
+        let mut aligned_now = Now::blank(3_500, BodySense::default());
+        aligned_now.body.battery_level = 0.05;
+        aligned_now.objects.observations.push(ObjectObservation {
+            label: "aligned dock".to_string(),
+            class: ObjectClass::Charger,
+            bearing_rad: 0.1,
+            distance_m: Some(2.0),
+            confidence: 0.95,
+            source: ObjectObservationSource::Sim,
+        });
+        let mut aligned_system = GoalSystem::default();
+        let aligned = tick_with_canonical_world(&mut aligned_system, &mut updater, aligned_now);
+        assert!(charger
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("seek_charger"))
+            .unwrap()
+            .competence
+            .affordances
+            .iter()
+            .any(|affordance| affordance
+                .skill_request
+                .as_ref()
+                .map(|request| request.skill_id)
+                == Some(SkillId::TurnTowardTarget)));
+
+        let mut escape_now = Now::blank(2_000, BodySense::default());
+        escape_now.body.flags.bump_left = true;
+        escape_now.memory.place_danger = 1.0;
+        escape_now.memory.map_confidence = 1.0;
+        let mut escape_system = GoalSystem::default();
+        let escape = tick_with_canonical_world(&mut escape_system, &mut updater, escape_now);
+        assert!(escape
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("escape_danger"))
+            .unwrap()
+            .competence
+            .affordances
+            .iter()
+            .any(|affordance| affordance
+                .skill_request
+                .as_ref()
+                .map(|request| request.skill_id)
+                == Some(SkillId::TurnTowardTarget)));
+
+        let mut person_now = Now::blank(3_000, BodySense::default());
+        person_now.objects.observations.push(ObjectObservation {
+            label: "person".to_string(),
+            class: ObjectClass::Person,
+            bearing_rad: 0.1,
+            distance_m: Some(2.0),
+            confidence: 0.9,
+            source: ObjectObservationSource::Sim,
+        });
+        let mut social_system = GoalSystem::default();
+        let social = tick_with_canonical_world(&mut social_system, &mut updater, person_now);
+        assert!(social
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("socialize"))
+            .unwrap()
+            .competence
+            .affordances
+            .iter()
+            .any(|affordance| affordance
+                .skill_request
+                .as_ref()
+                .map(|request| request.skill_id)
+                == Some(SkillId::ApproachTarget)));
+        assert!(aligned
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("seek_charger"))
+            .unwrap()
+            .competence
+            .affordances
+            .iter()
+            .any(|affordance| affordance
+                .skill_request
+                .as_ref()
+                .map(|request| request.skill_id)
+                == Some(SkillId::ApproachTarget)));
+
+        let task_now = Now::blank(4_000, BodySense::default());
+        let task_world = updater.update(task_now, WorldModelUpdateContext::default());
+        let mut task_system = GoalSystem::default();
+        let task = task_system
+            .tick(
+                &task_world.world,
+                &[ActionPrimitive::Go {
+                    intensity: -0.2,
+                    duration_ms: 300,
+                }],
+            )
+            .unwrap();
+        assert!(task
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("follow_task"))
+            .unwrap()
+            .competence
+            .affordances
+            .iter()
+            .any(|affordance| affordance
+                .skill_request
+                .as_ref()
+                .map(|request| request.skill_id)
+                == Some(SkillId::BackAway)));
+        assert!(escape
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("escape_danger"))
+            .unwrap()
+            .competence
+            .affordances
+            .iter()
+            .any(|affordance| affordance
+                .skill_request
+                .as_ref()
+                .map(|request| request.skill_id)
+                == Some(SkillId::BackAway)));
+    }
+
+    #[test]
     fn absent_llm_opinion_does_not_create_uncertainty_pressure() {
         let mut system = GoalSystem::default();
         let mut updater = WorldModelUpdater::default();
