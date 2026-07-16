@@ -192,10 +192,11 @@ a higher process.
 
 Examples include stopping for a cliff, cutting power to an overheating coil,
 disabling an oven heater after a probe fault, or ending kettle heat when boil is
-detected. The brainstem may also expose one-shot controller primitives that use
-a fresh error or range sample supplied by the host. Those primitives remain
-bounded. Continuous closed-loop behavior requires the host to keep sending
-fresh observations or targets.
+detected. Brainstem motion primitives are limited to TTL-bounded velocity,
+direct-wheel, and arc output plus immediate stop. Bearing tracking, timed
+motion, scanning, wall following, docking alignment, and escape sequencing are
+motherbrain skills that repeatedly emit those primitives while their inputs
+and authority remain fresh.
 
 This preserves a useful division:
 
@@ -206,10 +207,23 @@ This preserves a useful division:
 - the higher brain owns interpretation, adaptation, and long-horizon control.
 
 For contact, the brainstem's only autonomous motion is a bounded straight
-withdrawal followed by stop. A turn, probe, search, or route change is a
+withdrawal following a fresh contact edge during unsafe forward output,
+followed by stop. A level already asserted at boot or while stationary is
+evidence only. A turn, probe, search, or route change is a
 possessor skill. Calling both mechanisms “recovery” does not make them the same
 authority layer: the reflex supersedes the skill and reports a typed
 safety-preempted outcome upstream.
+
+Safety recipes are not host policy. Production hosts cannot select `none`,
+`backoff`, or compound escape behavior for bump/cliff/wheel-drop protections,
+and a safety latch clears only after the matching fresh physical condition has
+cleared. The canonical per-verb ownership/authority/bounds/event inventory is
+`crates/pete-brainstem/verb-classification.toml`.
+
+This boundary is the implementation correction tracked by GitHub issues #63,
+#64, #74, and #78: mature local programs remain an explicitly reviewed
+exception, while the contact-withdrawal reflex is the canonical privileged
+body-local behavior.
 
 ## Ordered events are the physical transcript
 

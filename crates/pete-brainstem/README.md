@@ -130,47 +130,32 @@ failure matrix are documented in `docs/026-brainstem-transit-failover.md`.
 
 The public brainstem surface is body-neutral. The forebrain/motherbrain asks for motion, safety, feedback, telemetry, capabilities, and events; the active body driver maps those requests to Create OI opcodes, packet ids, BRC, songs, LEDs, dock seeking, UART behavior, and sensor decoding.
 
-Current public verbs:
+The checked source of truth is `verb-classification.toml`; `build.rs` fails if
+an advertised verb lacks an exposed classification. The production vocabulary
+contains only telemetry, bounded actuator primitives, body-native operations,
+explicit services, immutable stop/latch operations, and the final Create dock
+opcode. Its actuator surface is:
 
 ```text
 ping
 status
 get_capabilities
 get_events
-stop
-estop
-clear_estop
-clear_motion_queue
 cmd_vel
 drive_direct
 drive_arc
-drive_for
-turn_by
-arc_for
-creep_until
-scan_arc
-face_bearing
-track_bearing
-hold_heading
-turn_to_heading
-dock_align
-wall_follow
-wiggle_align
-bump_escape
-unstick
-cliff_guard
-request_sensors
-stream_sensors
-set_safety_policy
-song_define
-song_play
-define_chirp
-play_feedback
-power_state
-calibrate_turn
-reset_odometry
+stop
 dock
 ```
+
+Navigation, alignment, timed-motion, scanning, wall-follow, wiggle, and escape
+procedures are deterministic motherbrain skills. In particular,
+`face_bearing`, `track_bearing`, `hold_heading`, `turn_to_heading`, `turn_by`,
+`drive_for`, `arc_for`, `creep_until`, `scan_arc`, `dock_align`, `wall_follow`,
+`wiggle_align`, `bump_escape`, and `unstick` are not Brainstem capabilities.
+All transports reject those legacy wire verbs as `unsupported`; the simulator
+uses the same contract. `set_safety_policy` and `cliff_guard` are likewise
+unsupported because a host cannot weaken or manufacture physical safety.
 
 `get_capabilities` reports the current body contract using the clean names above: body kind, drive type, supported verbs, sensors, outputs, safety features, limits, feedback/song slots, and supported sensor packet range. The facts come from the selected body descriptor, not from the generic renderer. HTTP/WebSocket return JSON; UDP and forebrain UART return a compact single-line representation.
 
@@ -215,13 +200,16 @@ The JSON response includes `oldest_seq`, `next_seq`, and `dropped_before_seq`. T
 
 The numeric fields are intentionally small and transport-neutral. Command lifecycle events use `a` for command id. `command_started` is emitted when the runtime actually pops a queued runtime command and begins executing it. `command_completed` is emitted when that runtime step finishes normally, including normal TTL expiry for motion. `command_interrupted` is emitted when Stop/E-stop/new velocity/safety/reflex logic clears an active or accepted pending command. `command_timed_out` is reserved for actual failure/deadline paths such as Create wake response timeout, not ordinary motion TTL completion. An identical `cmd_vel` refresh renews the original streaming command without restarting the motor or transferring lifecycle ownership; `command_renewed` is the refresh command's terminal record, with the refresh id in `a`, owning stream command id in `b`, and refresh sequence in `c`.
 
-Motion events pack wheel speeds or duration, sensor-frame events carry the body packet/frame id plus flags and odometry delta, and error events carry a small error code. Compound verbs such as `bump_escape` and `wiggle_align` currently expand into runtime substeps that share the external command id; a future event schema should add a child-step field.
+Motion events pack wheel speeds or duration, sensor-frame events carry the body packet/frame id plus flags and odometry delta, and error events carry a small error code.
 
 Contact withdrawal is not a `bump_escape` skill. A rising bumper edge invokes a
 brainstem-local straight reverse of 80 mm/s for at most 300 ms, after first
-stopping the preempted command. It runs without a possession lease and survives
-host/session loss. Cliff, wheel-drop, charging, disarm, stop, and e-stop remain
-stronger and end it stopped. `contact_withdrawal_started` records contact side,
+stopping the preempted command. Only a fresh contact edge during positive
+linear output can trigger it: a held-at-boot bumper, stationary press, docked
+contact, or restored level sample cannot cause motion. It runs without a
+possession lease and survives host/session loss. Cliff, wheel-drop, charging,
+tilt/impact, disarm, stop, and e-stop remain stronger and end it stopped.
+`contact_withdrawal_started` records contact side,
 repeat count, preempted command id, and the reverse bounds;
 `contact_withdrawal_completed` records outcome, any dominating safety condition,
 observed odometry displacement, elapsed time, and final stopped state. The
@@ -230,7 +218,11 @@ skill; it does not schedule or claim ownership of the reflex.
 
 The current internal Rust enums still include Create-specific variants such as `CreateOiMode`, `CreatePacketReceived`, and `CreateSensorPacketDecoded`. Those are driver/runtime implementation details, not the clean public vocabulary. Public capability and event renderers translate them into body-neutral names.
 
-Smart controller verbs are one-shot/TTL step primitives. `face_bearing`, `track_bearing`, `hold_heading`, `turn_to_heading`, `dock_align`, `wall_follow`, and `creep_until` consume the supplied current error/range and emit a short motion pulse or stop. The host must repeatedly send fresh target error/range samples if it wants closed-loop behavior across time.
+Motherbrain skills consume canonical fresh target/body state and renew 250 ms
+`cmd_vel` primitives on a 100 ms cadence. If progress inputs, authority, the
+transport, or the skill loop go stale, renewal stops and the Brainstem zeros
+the motors. Brainstem reflex and invariant events terminate the owning skill as
+`safety-preempted`, never as success.
 
 Odometry is currently a lightweight accumulator over decoded Create distance/angle deltas. Packets `0`, `19`, and `20` update odometry: complete packet `0` carries both distance and angle deltas, packet `19` carries distance, and packet `20` carries angle. Other decoded sensor packets update status and events but do not integrate into odometry. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
 
@@ -505,25 +497,9 @@ clear_motion_queue()
 cmd_vel(linear_mm_s, angular_mrad_s, ttl_ms)
 drive_direct(left_mm_s, right_mm_s, ttl_ms)
 drive_arc(velocity_mm_s, radius_mm, ttl_ms)
-drive_for(distance_mm, velocity_mm_s, timeout_ms)
-turn_by(angle_mrad, angular_mrad_s, timeout_ms)
-arc_for(velocity_mm_s, radius_mm, duration_ms)
-creep_until(velocity_mm_s, angular_mrad_s, timeout_ms)
-scan_arc(angle_mrad, angular_mrad_s, timeout_ms)
-face_bearing(bearing_mrad, max_angular_mrad_s, tolerance_mrad, ttl_ms)
-track_bearing(bearing_mrad, range_mm, max_linear_mm_s, max_angular_mrad_s, stop_range_mm, ttl_ms)
-hold_heading(heading_error_mrad, velocity_mm_s, max_angular_mrad_s, ttl_ms)
-turn_to_heading(heading_error_mrad, angular_mrad_s, tolerance_mrad, timeout_ms)
-dock_align(bearing_mrad, range_mm, max_linear_mm_s, max_angular_mrad_s, stop_range_mm, ttl_ms)
-wall_follow(distance_error_mm, velocity_mm_s, max_angular_mrad_s, ttl_ms)
-wiggle_align(amplitude_mrad, angular_mrad_s, cycles)
-bump_escape(direction, backoff_mm_s, turn_angular_mrad_s)
-unstick(direction, backoff_mm_s, turn_angular_mrad_s)
-cliff_guard(clear)
 heartbeat_stop(timeout_ms)
 request_sensors(packet_id)
 stream_sensors(enabled, packet_id, period_ms)
-set_safety_policy(policy)
 song_define(id, tones)
 song_play(id)
 define_chirp(kind, tones)
@@ -601,25 +577,9 @@ CLEAR_ESTOP seq
 CMD_VEL seq linear_mm_s angular_mrad_s ttl_ms
 DRIVE_DIRECT seq left_mm_s right_mm_s ttl_ms
 DRIVE_ARC seq velocity_mm_s radius_mm ttl_ms
-FACE_BEARING seq bearing_mrad max_angular_mrad_s tolerance_mrad ttl_ms
-TRACK_BEARING seq bearing_mrad range_mm max_linear_mm_s max_angular_mrad_s stop_range_mm ttl_ms
-TURN_BY seq angle_mrad angular_mrad_s timeout_ms
-DRIVE_FOR seq distance_mm velocity_mm_s timeout_ms
-BUMP_ESCAPE seq left|right|either backoff_mm_s turn_angular_mrad_s
-HOLD_HEADING seq heading_error_mrad velocity_mm_s max_angular_mrad_s ttl_ms
-TURN_TO_HEADING seq heading_error_mrad angular_mrad_s tolerance_mrad timeout_ms
-ARC_FOR seq velocity_mm_s radius_mm duration_ms
-CREEP_UNTIL seq velocity_mm_s angular_mrad_s timeout_ms
-SCAN_ARC seq angle_mrad angular_mrad_s timeout_ms
-DOCK_ALIGN seq bearing_mrad range_mm max_linear_mm_s max_angular_mrad_s stop_range_mm ttl_ms
-WALL_FOLLOW seq distance_error_mm velocity_mm_s max_angular_mrad_s ttl_ms
-WIGGLE_ALIGN seq amplitude_mrad angular_mrad_s cycles
-UNSTICK seq left|right|either backoff_mm_s turn_angular_mrad_s
-CLIFF_GUARD seq true|false
 HEARTBEAT_STOP seq timeout_ms
 REQUEST_SENSORS seq packet_id
 STREAM_SENSORS seq true|false packet_id period_ms
-SET_SAFETY_POLICY seq none|stop|backoff|bump_escape none|stop|backoff|bump_escape wheel_drop_latch
 CLEAR_MOTION_QUEUE seq
 DEFINE_CHIRP seq ok|error|armed|lost_target|dock_seen|danger note duration_64ths...
 PLAY_FEEDBACK seq ok|error|armed|lost_target|dock_seen|danger

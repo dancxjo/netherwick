@@ -477,6 +477,32 @@ fn validate_verb_classifications(
 ) {
     let mut classified = BTreeMap::new();
     for group in &classifications.verbs {
+        assert!(
+            matches!(
+                group.category.as_str(),
+                "primitive"
+                    | "body-native"
+                    | "telemetry"
+                    | "service"
+                    | "reflex"
+                    | "deprecated/moved skill"
+            ),
+            "invalid Brainstem verb category: {}",
+            group.category
+        );
+        for (field, value) in [
+            ("authority", group.authority.as_str()),
+            ("sensors", group.sensors.as_str()),
+            ("bounds", group.bounds.as_str()),
+            ("preempted_by", group.preempted_by.as_str()),
+            ("owner", group.owner.as_str()),
+            ("lifecycle", group.lifecycle.as_str()),
+        ] {
+            assert!(
+                !value.trim().is_empty(),
+                "Brainstem verb classification has an empty {field} field"
+            );
+        }
         for name in &group.names {
             assert!(
                 classified.insert(name.as_str(), group.exposed).is_none(),
