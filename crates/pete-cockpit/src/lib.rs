@@ -2661,8 +2661,35 @@ fn optional_cockpit_verbs() -> Vec<&'static str> {
     vec!["bootsel", "reset_motherbrain"]
 }
 
+// Older brainstems advertised these convenience commands directly. Current
+// firmware implements the primitives underneath them instead, but the host
+// must continue accepting the old vocabulary so it can establish the service
+// session needed to put pre-upgrade firmware into BOOTSEL.
+fn legacy_brainstem_convenience_verbs() -> Vec<&'static str> {
+    vec![
+        "drive_for",
+        "turn_by",
+        "arc_for",
+        "creep_until",
+        "scan_arc",
+        "face_bearing",
+        "track_bearing",
+        "hold_heading",
+        "turn_to_heading",
+        "dock_align",
+        "wall_follow",
+        "wiggle_align",
+        "bump_escape",
+        "unstick",
+        "cliff_guard",
+        "set_safety_policy",
+    ]
+}
+
 fn tolerated_advertised_verbs() -> Vec<&'static str> {
-    vec!["restart_mpu"]
+    let mut verbs = vec!["restart_mpu"];
+    verbs.extend(legacy_brainstem_convenience_verbs());
+    verbs
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -7730,6 +7757,22 @@ mod tests {
             "missing={:?}",
             report.missing_verbs
         );
+    }
+
+    #[test]
+    fn previous_brainstem_contract_does_not_block_bootsel_handshake() {
+        let mut capabilities = body_toml_capabilities();
+        capabilities.verbs.extend(
+            legacy_brainstem_convenience_verbs()
+                .into_iter()
+                .map(ToOwned::to_owned),
+        );
+        establish_session(
+            SimCockpit::new().with_capabilities(capabilities),
+            HandshakeHello::default_motherbrain(),
+            None,
+        )
+        .expect("older firmware must remain flashable");
     }
 
     #[test]

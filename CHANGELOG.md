@@ -70,6 +70,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Keep authorized `just flash` BOOTSEL negotiation compatible with older
+  brainstems that advertise retired convenience verbs, while preserving the
+  primitive-only contract for newly built firmware.
 - Make contact withdrawal an immutable brainstem safety reflex: only a fresh
   bumper edge during forward output can start the bounded reverse, held or
   stationary contact cannot initiate motion, active physical hazards cannot be

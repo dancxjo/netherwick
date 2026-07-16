@@ -8,3 +8,8 @@
   checks when they help; do not run the full test suite before every commit.
 - End the task with `just sup` so staged work, unstaged work, and the Unreleased
   changelog are reconciled before handoff.
+- Keep `just flash` and its authorized BOOTSEL handshake backwards compatible
+  with previously flashed brainstem firmware. Capability-vocabulary, handshake,
+  and service-authorization changes are migrations: retain host acceptance for
+  older advertised contracts, add a regression test for the prior contract, and
+  validate against attached pre-upgrade firmware before flashing when available.
