@@ -12,6 +12,7 @@ All notable changes are grouped by date.
 
 - Make a bump-triggered contact withdrawal a bounded brainstem-local reflex: it continues across authority changes, records start and terminal safety events, and remains preemptible by stronger safety conditions.
 - Expose the contact-withdrawal lifecycle through typed cockpit events and mirror its bounded, authority-independent behavior in the simulator.
+- Route selected goal affordances through typed, bounded possessor skills, with target-based turn, approach, docking, search, and retreat requests that report completion, timeout, unavailable-target, authority-loss, and safety-preemption outcomes.
 
 ### Ongoing
 

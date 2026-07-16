@@ -280,10 +280,64 @@ pub struct Affordance {
     pub provenance: Vec<EvidenceRef>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillId {
+    #[default]
+    StopAndStabilize,
+    TurnTowardTarget,
+    FollowBearing,
+    ApproachTarget,
+    BackAway,
+    InspectTarget,
+    WallFollow,
+    AlignWithDock,
+    SystematicSearch,
+    HoldHeading,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SkillRequest {
-    pub skill_id: String,
-    pub parameters: BTreeMap<String, String>,
+    pub skill_id: SkillId,
+    pub target: Option<EntityId>,
+    pub bearing_rad: Option<f32>,
+    pub range_m: Option<f32>,
+    pub stop_range_m: Option<f32>,
+    pub maximum_duration_ms: u64,
+    pub expected_progress: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPhase {
+    #[default]
+    Requested,
+    Running,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillOutcome {
+    Completed,
+    Failed,
+    TimedOut,
+    SafetyPreempted,
+    AuthorityLost,
+    TargetStale,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SkillStatus {
+    pub request: SkillRequest,
+    pub phase: SkillPhase,
+    pub outcome: Option<SkillOutcome>,
+    pub progress: Option<f32>,
+    pub attempts: u32,
+    pub started_at_ms: Option<u64>,
+    pub updated_at_ms: u64,
+    pub reason: Option<String>,
 }
 
 impl Affordance {
@@ -295,6 +349,26 @@ impl Affordance {
 
     fn with_bearing(mut self, bearing_rad: Option<f32>) -> Self {
         self.bearing_rad = bearing_rad;
+        self
+    }
+
+    fn with_skill(mut self, skill_id: SkillId, stop_range_m: Option<f32>) -> Self {
+        self.skill_request = Some(SkillRequest {
+            skill_id,
+            target: self.target.clone(),
+            bearing_rad: self.bearing_rad,
+            range_m: None,
+            stop_range_m,
+            maximum_duration_ms: self.expected_duration_ms,
+            expected_progress: self.expected_progress,
+        });
+        self
+    }
+
+    fn with_skill_range(mut self, range_m: Option<f32>) -> Self {
+        if let Some(request) = &mut self.skill_request {
+            request.range_m = range_m;
+        }
         self
     }
 }
@@ -1135,7 +1209,9 @@ fn evaluate_seek_charger(
                     interpretation.target.clone(),
                     &interpretation.provenance,
                 )
-                .with_bearing(interpretation.target_bearing_rad),
+                .with_bearing(interpretation.target_bearing_rad)
+                .with_skill(SkillId::AlignWithDock, Some(0.20))
+                .with_skill_range(interpretation.target_distance_m),
             );
         }
         Some(distance) if distance > 0.35 => affordances.push(rejected_affordance(
@@ -1199,16 +1275,16 @@ fn evaluate_seek_charger(
                     interpretation.target.clone(),
                     &interpretation.provenance,
                 )
-                .with_bearing(Some(bearing)),
+                .with_bearing(Some(bearing))
+                .with_skill(SkillId::TurnTowardTarget, None)
+                .with_skill_range(interpretation.target_distance_m),
             );
         } else {
             affordances.push(
                 affordance(
                     "approach_charger",
-                    ActionPrimitive::Drive {
-                        forward: 0.40,
-                        turn: (bearing * 1.2).clamp(-0.35, 0.35),
-                        duration_ms: 1_000,
+                    ActionPrimitive::Approach {
+                        target: ApproachTarget::Charger,
                     },
                     confidence,
                     0.8,
@@ -1219,7 +1295,9 @@ fn evaluate_seek_charger(
                     interpretation.target.clone(),
                     &interpretation.provenance,
                 )
-                .with_bearing(Some(bearing)),
+                .with_bearing(Some(bearing))
+                .with_skill(SkillId::ApproachTarget, Some(0.30))
+                .with_skill_range(interpretation.target_distance_m),
             );
         }
     } else {
@@ -1245,21 +1323,24 @@ fn evaluate_seek_charger(
         interpretation.target.clone(),
         &interpretation.provenance,
     ));
-    affordances.push(affordance(
-        "systematic_charger_search",
-        ActionPrimitive::Explore {
-            style: ExploreStyle::WallFollow,
-            duration_ms: 1_000,
-        },
-        (1.0 - confidence).max(0.25),
-        0.8,
-        0.20,
-        interpretation.danger,
-        0.2,
-        1_000,
-        None,
-        &interpretation.provenance,
-    ));
+    affordances.push(
+        affordance(
+            "systematic_charger_search",
+            ActionPrimitive::Explore {
+                style: ExploreStyle::WallFollow,
+                duration_ms: 1_000,
+            },
+            (1.0 - confidence).max(0.25),
+            0.8,
+            0.20,
+            interpretation.danger,
+            0.2,
+            1_000,
+            None,
+            &interpretation.provenance,
+        )
+        .with_skill(SkillId::SystematicSearch, None),
+    );
     if urgency > 0.8 && confidence < 0.2 && context.runtime.frustration > 0.6 {
         affordances.push(affordance(
             "request_charge_help",
@@ -1358,38 +1439,49 @@ fn evaluate_escape(
     };
     let mut affordances = Vec::new();
     if contact || (stuck && !corner_trap) {
-        affordances.push(affordance(
-            "reverse_from_danger",
-            ActionPrimitive::Go {
-                intensity: -0.18,
-                duration_ms: 300,
+        affordances.push(
+            affordance(
+                "reverse_from_danger",
+                ActionPrimitive::Go {
+                    intensity: -0.18,
+                    duration_ms: 300,
+                },
+                0.95,
+                0.7,
+                0.8,
+                0.1,
+                0.08,
+                300,
+                None,
+                &[],
+            )
+            .with_skill(SkillId::BackAway, None),
+        );
+    }
+    let clearance_bearing = Some(match &direction {
+        TurnDir::Left => 0.75,
+        TurnDir::Right => -0.75,
+    });
+    affordances.push(
+        affordance(
+            "turn_toward_clearance",
+            ActionPrimitive::Turn {
+                direction: direction.clone(),
+                intensity: 0.75,
+                duration_ms: 500,
             },
-            0.95,
+            confidence,
+            0.65,
             0.7,
-            0.8,
-            0.1,
+            0.15,
             0.08,
-            300,
+            500,
             None,
             &[],
-        ));
-    }
-    affordances.push(affordance(
-        "turn_toward_clearance",
-        ActionPrimitive::Turn {
-            direction: direction.clone(),
-            intensity: 0.75,
-            duration_ms: 500,
-        },
-        confidence,
-        0.65,
-        0.7,
-        0.15,
-        0.08,
-        500,
-        None,
-        &[],
-    ));
+        )
+        .with_bearing(clearance_bearing)
+        .with_skill(SkillId::TurnTowardTarget, None),
+    );
     let center_clearance = context
         .world
         .local_geometry
@@ -1518,6 +1610,24 @@ fn evaluate_socialize(
             target: InspectTarget::Person,
         },
     };
+    let mut engagement = affordance(
+        "social_engagement",
+        action.clone(),
+        confidence.max(0.25),
+        0.55,
+        0.55,
+        interpretation.danger,
+        0.1,
+        1_000,
+        interpretation.target.clone(),
+        &interpretation.provenance,
+    )
+    .with_bearing(interpretation.target_bearing_rad);
+    if matches!(action, ActionPrimitive::Approach { .. }) {
+        engagement = engagement
+            .with_skill(SkillId::ApproachTarget, Some(0.75))
+            .with_skill_range(interpretation.target_distance_m);
+    }
     (
         (0.70 * social + 0.30 * confidence
             - 0.60 * interpretation.danger
@@ -1525,18 +1635,7 @@ fn evaluate_socialize(
             .clamp(0.0, 1.0),
         0.2,
         context.drives.social.satisfaction,
-        vec![affordance(
-            "social_engagement",
-            action,
-            confidence.max(0.25),
-            0.55,
-            0.55,
-            interpretation.danger,
-            0.1,
-            1_000,
-            interpretation.target.clone(),
-            &interpretation.provenance,
-        )],
+        vec![engagement],
         vec![
             contribution("drive.social", social),
             contribution("world.person_confidence", confidence),
@@ -1632,9 +1731,9 @@ fn evaluate_follow_task(
         .cloned()
         .enumerate()
         .map(|(index, action)| {
-            affordance(
+            let mut task_affordance = affordance(
                 &format!("task_proposal_{index}"),
-                action,
+                action.clone(),
                 context
                     .world
                     .context
@@ -1650,7 +1749,11 @@ fn evaluate_follow_task(
                 1_000,
                 None,
                 &[],
-            )
+            );
+            if matches!(action, ActionPrimitive::Go { intensity, .. } if intensity < 0.0) {
+                task_affordance = task_affordance.with_skill(SkillId::BackAway, None);
+            }
+            task_affordance
         })
         .collect::<Vec<_>>();
     let activation = if affordances.is_empty() { 0.0 } else { 0.45 };
@@ -2684,10 +2787,14 @@ mod tests {
         assert_eq!(behavior.goal_id, GoalId::new("seek_charger"));
         assert_eq!(behavior.behavior_id, "dock");
         assert_eq!(behavior.action, ActionPrimitive::Dock);
+        assert_eq!(
+            behavior.affordance.skill_request.as_ref().map(|request| request.skill_id),
+            Some(SkillId::AlignWithDock)
+        );
     }
 
     #[test]
-    fn urgent_aligned_charger_approach_uses_bounded_fast_drive() {
+    fn urgent_aligned_charger_approach_requests_possessor_skill() {
         let mut system = GoalSystem::default();
         let mut updater = WorldModelUpdater::default();
         let mut body = BodySense::default();
@@ -2704,11 +2811,16 @@ mod tests {
         let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
         let behavior = cycle.behavior.unwrap();
         assert_eq!(behavior.behavior_id, "approach_charger");
-        assert!(matches!(
+        assert_eq!(
             behavior.action,
-            ActionPrimitive::Drive { forward, turn, .. }
-                if forward == 0.40 && turn.abs() <= 0.35
-        ));
+            ActionPrimitive::Approach {
+                target: ApproachTarget::Charger
+            }
+        );
+        let skill = behavior.affordance.skill_request.unwrap();
+        assert_eq!(skill.skill_id, SkillId::ApproachTarget);
+        assert_eq!(skill.range_m, Some(2.0));
+        assert_eq!(skill.stop_range_m, Some(0.30));
     }
 
     #[test]

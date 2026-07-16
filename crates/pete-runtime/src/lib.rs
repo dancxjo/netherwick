@@ -19,7 +19,10 @@ use pete_cockpit::{
     ContactWithdrawalOutcome, EscapeDirection, MotionCommand, MotorCommand, SafeCockpit,
     SafeStopReason, SafetyLatchKind, StatusSummary, BUMP_ESCAPE_BACKOFF_DURATION_MS,
 };
-use pete_conductor::{Conductor, ConductorInput, GoalSystem, NavigationIntent, SimpleConductor};
+use pete_conductor::{
+    Conductor, ConductorInput, GoalSystem, NavigationIntent, SimpleConductor, SkillId,
+    SkillOutcome, SkillPhase, SkillRequest, SkillStatus,
+};
 use pete_core::{Pose2, Provenance, Reward, TimeMs};
 use pete_events::{default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response};
 use pete_experience::{
@@ -3451,6 +3454,10 @@ where
             .behavior
             .as_ref()
             .map(|behavior| behavior.action.clone());
+        let goal_skill_request = goal_cycle
+            .behavior
+            .as_ref()
+            .and_then(|behavior| behavior.affordance.skill_request.clone());
         now.extensions.insert(
             "goal_system".to_string(),
             serde_json::to_value(&goal_cycle)?,
@@ -4176,6 +4183,11 @@ where
                 )
             }),
             chosen_action: Some(chosen_action),
+            skill_request: (self.action_selector_mode == ActionSelectorMode::Goal
+                && mechanical_reign_action_for_selection.is_none())
+            .then_some(goal_skill_request)
+            .flatten(),
+            skill_status: None,
             recall,
             llm: llm_tick,
             combobulation,
@@ -4804,6 +4816,8 @@ pub struct RuntimeTick {
     pub frame: ExperienceFrame,
     pub experience: Experience,
     pub chosen_action: Option<ActionPrimitive>,
+    pub skill_request: Option<SkillRequest>,
+    pub skill_status: Option<SkillStatus>,
     pub recall: RecallBundle,
     pub llm: LlmTickResult,
     pub combobulation: Option<Combobulation>,
@@ -4877,6 +4891,206 @@ pub struct RealRobotRunner<R, C> {
     brainstem_interface: Option<serde_json::Value>,
     possession_recovery: PossessionRecoveryState,
     motion_rejection: MotionRejectionState,
+    possessor_skills: PossessorSkillRuntime,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PossessorSkillRuntime {
+    status: Option<SkillStatus>,
+    initial_metric: Option<f32>,
+    last_dispatch_ms: TimeMs,
+}
+
+impl PossessorSkillRuntime {
+    fn step<C: Cockpit>(
+        &mut self,
+        cockpit: &mut C,
+        request: &SkillRequest,
+        events: &pete_cockpit::EventBatch,
+        now_ms: TimeMs,
+    ) -> (SkillStatus, bool) {
+        let same_intention = self.status.as_ref().is_some_and(|status| {
+            status.request.skill_id == request.skill_id && status.request.target == request.target
+        });
+        if !same_intention {
+            self.status = Some(SkillStatus {
+                request: request.clone(),
+                phase: SkillPhase::Requested,
+                started_at_ms: Some(now_ms),
+                updated_at_ms: now_ms,
+                ..SkillStatus::default()
+            });
+            self.initial_metric = skill_metric(request);
+            self.last_dispatch_ms = 0;
+        }
+
+        let mut status = self.status.clone().unwrap_or_default();
+        status.request = request.clone();
+        status.updated_at_ms = now_ms;
+
+        if status.phase == SkillPhase::Terminal {
+            self.status = Some(status.clone());
+            return (status, false);
+        }
+        if events.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                CockpitEventKind::SafetyTripped
+                    | CockpitEventKind::EStopLatched
+                    | CockpitEventKind::ContactWithdrawalStarted
+            )
+        }) {
+            status.phase = SkillPhase::Terminal;
+            status.outcome = Some(SkillOutcome::SafetyPreempted);
+            status.reason = Some("brainstem safety or reflex preempted the skill".to_string());
+            self.status = Some(status.clone());
+            return (status, false);
+        }
+        if events.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                CockpitEventKind::SessionReplaced | CockpitEventKind::AuthorityChanged
+            )
+        }) {
+            status.phase = SkillPhase::Terminal;
+            status.outcome = Some(SkillOutcome::AuthorityLost);
+            status.reason = Some("possession authority changed while the skill was active".into());
+            self.status = Some(status.clone());
+            return (status, false);
+        }
+
+        status.progress = skill_progress(self.initial_metric, skill_metric(request));
+        if skill_completed(request) {
+            let _ = cockpit.stop();
+            status.phase = SkillPhase::Terminal;
+            status.outcome = Some(SkillOutcome::Completed);
+            status.progress = Some(1.0);
+            self.status = Some(status.clone());
+            return (status, true);
+        }
+        let started_at = status.started_at_ms.unwrap_or(now_ms);
+        if request.maximum_duration_ms > 0
+            && now_ms.saturating_sub(started_at) >= request.maximum_duration_ms
+        {
+            let _ = cockpit.stop();
+            status.phase = SkillPhase::Terminal;
+            status.outcome = Some(SkillOutcome::TimedOut);
+            status.reason = Some("skill exceeded its bounded duration".into());
+            self.status = Some(status.clone());
+            return (status, true);
+        }
+        if skill_requires_bearing(request.skill_id) && request.bearing_rad.is_none() {
+            status.phase = SkillPhase::Terminal;
+            status.outcome = Some(SkillOutcome::TargetStale);
+            status.reason = Some("the skill target has no current bearing".into());
+            self.status = Some(status.clone());
+            return (status, false);
+        }
+
+        status.phase = SkillPhase::Running;
+        let dispatch_due =
+            self.last_dispatch_ms == 0 || now_ms.saturating_sub(self.last_dispatch_ms) >= 100;
+        let mut command_sent = false;
+        if dispatch_due {
+            status.attempts = status.attempts.saturating_add(1);
+            match dispatch_possessor_skill(cockpit, request) {
+                Ok(()) => {
+                    self.last_dispatch_ms = now_ms;
+                    command_sent = true;
+                }
+                Err(error) => {
+                    status.phase = SkillPhase::Terminal;
+                    status.outcome = Some(SkillOutcome::Unavailable);
+                    status.reason = Some(error.to_string());
+                }
+            }
+        }
+        self.status = Some(status.clone());
+        (status, command_sent)
+    }
+}
+
+fn skill_requires_bearing(skill_id: SkillId) -> bool {
+    matches!(
+        skill_id,
+        SkillId::TurnTowardTarget
+            | SkillId::FollowBearing
+            | SkillId::ApproachTarget
+            | SkillId::AlignWithDock
+            | SkillId::HoldHeading
+    )
+}
+
+fn skill_metric(request: &SkillRequest) -> Option<f32> {
+    match request.skill_id {
+        SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => {
+            request.bearing_rad.map(f32::abs)
+        }
+        SkillId::ApproachTarget | SkillId::AlignWithDock => request.range_m,
+        _ => None,
+    }
+}
+
+fn skill_progress(initial: Option<f32>, current: Option<f32>) -> Option<f32> {
+    match (initial, current) {
+        (Some(initial), Some(current)) if initial > f32::EPSILON => {
+            Some(((initial - current) / initial).clamp(0.0, 1.0))
+        }
+        _ => None,
+    }
+}
+
+fn skill_completed(request: &SkillRequest) -> bool {
+    match request.skill_id {
+        SkillId::StopAndStabilize => true,
+        SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => request
+            .bearing_rad
+            .is_some_and(|bearing| bearing.abs() <= 0.10),
+        SkillId::ApproachTarget | SkillId::AlignWithDock => request
+            .range_m
+            .zip(request.stop_range_m)
+            .is_some_and(|(range, stop)| range <= stop),
+        _ => false,
+    }
+}
+
+fn dispatch_possessor_skill<C: Cockpit>(
+    cockpit: &mut C,
+    request: &SkillRequest,
+) -> pete_cockpit::Result<()> {
+    let duration_ms = request.maximum_duration_ms.clamp(100, 5_000) as u32;
+    let bearing_mrad = request
+        .bearing_rad
+        .map(|bearing| {
+            (bearing * 1_000.0)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16
+        })
+        .unwrap_or(0);
+    let range_mm = request
+        .range_m
+        .map(|range| (range.max(0.0) * 1_000.0).round().min(u16::MAX as f32) as u16)
+        .unwrap_or(0);
+    let stop_range_mm = request
+        .stop_range_m
+        .map(|range| (range.max(0.0) * 1_000.0).round().min(u16::MAX as f32) as u16)
+        .unwrap_or(250);
+    match request.skill_id {
+        SkillId::StopAndStabilize => cockpit.stop(),
+        SkillId::TurnTowardTarget => cockpit.face_bearing(bearing_mrad, 500, 100, duration_ms),
+        SkillId::FollowBearing => cockpit.hold_heading(bearing_mrad, 45, 500, duration_ms),
+        SkillId::ApproachTarget => {
+            cockpit.track_bearing(bearing_mrad, range_mm, 50, 500, stop_range_mm, duration_ms)
+        }
+        SkillId::BackAway => cockpit.drive_for(-120, 40, duration_ms),
+        SkillId::InspectTarget => cockpit.scan_arc(800, 300, duration_ms),
+        SkillId::WallFollow => cockpit.wall_follow(0, 45, 400, duration_ms),
+        SkillId::AlignWithDock => {
+            cockpit.dock_align(bearing_mrad, range_mm, 35, 400, stop_range_mm, duration_ms)
+        }
+        SkillId::SystematicSearch => cockpit.scan_arc(1_571, 300, duration_ms),
+        SkillId::HoldHeading => cockpit.hold_heading(bearing_mrad, 0, 400, duration_ms),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4978,6 +5192,7 @@ where
             brainstem_interface: None,
             possession_recovery: PossessionRecoveryState::default(),
             motion_rejection: MotionRejectionState::default(),
+            possessor_skills: PossessorSkillRuntime::default(),
         }
     }
 
@@ -5244,7 +5459,20 @@ where
         } else {
             MotorCommand::stop()
         };
-        if !recovery_decision.command_sent {
+        let possessor_skill_owns_motion = tick.skill_request.is_some();
+        if let Some(request) = tick.skill_request.clone() {
+            final_motor = MotorCommand::stop();
+            if block_reason.is_none() && !recovery_decision.command_sent {
+                let (status, _command_sent) = self.possessor_skills.step(
+                    self.cockpit.client_mut(),
+                    &request,
+                    &brainstem_events,
+                    t_ms,
+                );
+                tick.skill_status = Some(status);
+            }
+        }
+        if !recovery_decision.command_sent && !possessor_skill_owns_motion {
             if let Some(block) = apply_slow_possession_motor(&mut self.cockpit, final_motor)? {
                 match block {
                     SlowPossessionMotionBlock::SafetyLatch(latch) => {
@@ -5337,6 +5565,14 @@ where
             object.insert(
                 "possession_recovery".to_string(),
                 recovery_decision.debug.clone(),
+            );
+            object.insert(
+                "possessor_skill_request".to_string(),
+                serde_json::to_value(&tick.skill_request)?,
+            );
+            object.insert(
+                "possessor_skill_status".to_string(),
+                serde_json::to_value(&tick.skill_status)?,
             );
             object.insert(
                 "motion_rejection".to_string(),
@@ -6259,6 +6495,8 @@ fn synthetic_slow_manual_tick(
         },
         experience,
         chosen_action: action,
+        skill_request: None,
+        skill_status: None,
         recall: RecallBundle::default(),
         llm: LlmTickResult::default(),
         combobulation: None,
@@ -9431,6 +9669,63 @@ mod tests {
         assert!(inspect.curiosity > 0.0);
     }
 
+    #[test]
+    fn possessor_skill_runtime_turns_and_completes_from_updated_target_error() {
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let events = cockpit.get_events_since(0).unwrap();
+        let mut runtime = PossessorSkillRuntime::default();
+        let request = SkillRequest {
+            skill_id: SkillId::TurnTowardTarget,
+            target: Some(pete_now::EntityId("charger:17".to_string())),
+            bearing_rad: Some(0.5),
+            maximum_duration_ms: 1_000,
+            expected_progress: 0.8,
+            ..SkillRequest::default()
+        };
+
+        let (running, command_sent) = runtime.step(&mut cockpit, &request, &events, 1);
+        assert!(command_sent);
+        assert_eq!(running.phase, SkillPhase::Running);
+        assert_eq!(running.attempts, 1);
+
+        let aligned = SkillRequest {
+            bearing_rad: Some(0.05),
+            ..request
+        };
+        let (completed, stop_sent) = runtime.step(&mut cockpit, &aligned, &events, 100);
+        assert!(stop_sent);
+        assert_eq!(completed.phase, SkillPhase::Terminal);
+        assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
+        assert_eq!(completed.progress, Some(1.0));
+    }
+
+    #[test]
+    fn brainstem_contact_reflex_safety_preempts_a_possessor_skill() {
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let initial_events = cockpit.get_events_since(0).unwrap();
+        let mut runtime = PossessorSkillRuntime::default();
+        let request = SkillRequest {
+            skill_id: SkillId::ApproachTarget,
+            target: Some(pete_now::EntityId("charger:17".to_string())),
+            bearing_rad: Some(0.0),
+            range_m: Some(2.0),
+            stop_range_m: Some(0.3),
+            maximum_duration_ms: 2_000,
+            expected_progress: 0.9,
+        };
+        let (_, command_sent) = runtime.step(&mut cockpit, &request, &initial_events, 1);
+        assert!(command_sent);
+
+        let cursor = initial_events.next_seq.saturating_sub(1);
+        cockpit.set_bump(true, false);
+        let reflex_events = cockpit.get_events_since(cursor).unwrap();
+        let (preempted, command_sent) = runtime.step(&mut cockpit, &request, &reflex_events, 100);
+
+        assert!(!command_sent);
+        assert_eq!(preempted.phase, SkillPhase::Terminal);
+        assert_eq!(preempted.outcome, Some(SkillOutcome::SafetyPreempted));
+    }
+
     struct StubRuntime;
 
     #[async_trait::async_trait]
@@ -9474,6 +9769,8 @@ mod tests {
                 },
                 experience,
                 chosen_action: Some(action),
+                skill_request: None,
+                skill_status: None,
                 recall: RecallBundle::default(),
                 llm: LlmTickResult::default(),
                 combobulation: None,
@@ -9524,6 +9821,8 @@ mod tests {
                 },
                 experience,
                 chosen_action: Some(ActionPrimitive::Stop),
+                skill_request: None,
+                skill_status: None,
                 recall: RecallBundle::default(),
                 llm: LlmTickResult::default(),
                 combobulation: None,
@@ -11101,6 +11400,8 @@ mod tests {
                 },
                 experience,
                 chosen_action: Some(action),
+                skill_request: None,
+                skill_status: None,
                 recall: RecallBundle::default(),
                 llm: LlmTickResult::default(),
                 combobulation: None,
