@@ -12992,6 +12992,16 @@ mod tests {
             .graph_relationships
             .iter()
             .any(|relationship| { relationship.relationship == "HAS_TEMPORAL_EPISODE" }));
+        assert!(record
+            .graph_entities
+            .iter()
+            .any(|entity| entity.id == "concept:charger" && entity.has_label("SemanticNode")));
+        assert!(record.graph_relationships.iter().any(|relationship| {
+            relationship.from == "concept:charger"
+                && relationship.to == "drive:energy"
+                && relationship.relationship == "SEMANTIC_RESTORES"
+                && relationship.payload.get("supporting_evidence").is_some()
+        }));
     }
 
     fn test_cluster(

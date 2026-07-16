@@ -227,6 +227,17 @@ pub struct ReplayArtifact {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConsolidationArtifact {
+    pub artifact_id: String,
+    #[serde(default)]
+    pub source_episode_refs: Vec<String>,
+    #[serde(default)]
+    pub semantic_relation_refs: Vec<String>,
+    pub source_history_preserved: bool,
+    pub deterministic_index_entries: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CandidateArtifact {
     pub artifact_id: String,
     pub role: String,
@@ -260,6 +271,7 @@ pub struct SleepWorkResult {
     pub output_artifact_refs: Vec<String>,
     pub summary: String,
     pub replay: Option<ReplayArtifact>,
+    pub consolidation: Option<ConsolidationArtifact>,
     pub candidate: Option<CandidateArtifact>,
 }
 
@@ -758,10 +770,21 @@ fn execute_work_item(
     result.output_artifact_refs.push(artifact_id.clone());
     result.summary = match item.kind {
         SleepWorkKind::FlushDurableState => "verified pending durable state".to_string(),
-        SleepWorkKind::ConsolidateEpisodes => format!(
-            "indexed {} episode refs without replacing source history",
-            input.completed_episode_refs.len()
-        ),
+        SleepWorkKind::ConsolidateEpisodes => {
+            result.consolidation = Some(ConsolidationArtifact {
+                artifact_id,
+                source_episode_refs: input.completed_episode_refs.clone(),
+                semantic_relation_refs: input.semantic_relation_refs.clone(),
+                source_history_preserved: true,
+                deterministic_index_entries: input.completed_episode_refs.len()
+                    + input.semantic_relation_refs.len(),
+            });
+            format!(
+                "indexed {} episode refs and {} semantic refs without replacing source history",
+                input.completed_episode_refs.len(),
+                input.semantic_relation_refs.len()
+            )
+        }
         SleepWorkKind::ReplayRecentFailures => {
             result.replay = Some(ReplayArtifact {
                 artifact_id,
@@ -898,6 +921,10 @@ mod tests {
         assert!(report.completed.iter().any(|result| {
             result.kind == SleepWorkKind::ConsolidateEpisodes
                 && result.status == SleepWorkStatus::Completed
+                && result
+                    .consolidation
+                    .as_ref()
+                    .is_some_and(|artifact| artifact.source_history_preserved)
         }));
         assert!(report.completed.iter().any(|result| {
             result.kind == SleepWorkKind::TrainCandidate

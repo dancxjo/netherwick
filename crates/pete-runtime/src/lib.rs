@@ -1,3 +1,7 @@
+mod sleep;
+
+pub use sleep::*;
+
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -62,8 +66,10 @@ use pete_neat::{
 use pete_now::{
     ActionValuePrediction, ActiveControlSummary, BeliefMeta, BeliefSourceKind, ChargePrediction,
     CognitiveServiceBelief, ControlProvenance, DangerPrediction, DriveSense, EarPrediction,
-    ExtensionSense, EyePrediction, Freshness, MemorySense, Now, ObjectClass, ReignSense,
-    SafetySense, SurpriseSense, WorldModelUpdater,
+    EvidenceRef, ExtensionSense, EyePrediction, Freshness, MemorySense, Now, ObjectClass,
+    ReignSense, SafetySense, SemanticBehaviorId, SemanticEvidenceObservation,
+    SemanticGroundingKind, SemanticNodeRef, SemanticOutcomeId, SemanticPredicate, SurpriseSense,
+    WorldModelUpdater,
 };
 use pete_sensors::{
     anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
@@ -109,7 +115,208 @@ where
     nudge: NudgeController,
     goal_system: GoalSystem,
     world_model: WorldModelUpdater,
+    sleep_controller: SleepController,
+    semantic_outcomes: SemanticOutcomeTracker,
     last_active_control: Option<ActiveControlSummary>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SemanticOutcomeTracker {
+    previous: Option<SemanticActionState>,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticActionState {
+    t_ms: u64,
+    behavior_id: Option<String>,
+    charger_distance_m: Option<f32>,
+    clearance_m: Option<f32>,
+    charging: bool,
+}
+
+impl SemanticOutcomeTracker {
+    fn observations(&self, now: &Now) -> Vec<SemanticEvidenceObservation> {
+        let Some(previous) = self.previous.as_ref() else {
+            return Vec::new();
+        };
+        let mut observations = Vec::new();
+        let current_charger_distance = closest_observed_charger_distance(now);
+        let progress_evidence = |key: &str| EvidenceRef {
+            id: format!("semantic:action-outcome:{key}:{}:{}", previous.t_ms, now.t_ms),
+            source: "runtime.action_outcome".to_string(),
+            key: key.to_string(),
+            observed_at_ms: now.t_ms,
+            transformation_lineage: vec!["pete_runtime::SemanticOutcomeTracker".to_string()],
+            implementation_version: Some("1".to_string()),
+        };
+        if previous.behavior_id.as_deref() == Some("approach_charger")
+            && previous
+                .charger_distance_m
+                .zip(current_charger_distance)
+                .is_some_and(|(before, after)| after + 0.02 < before)
+        {
+            observations.push(SemanticEvidenceObservation::supported(
+                SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string())),
+                SemanticPredicate::Predicts,
+                SemanticNodeRef::Outcome(SemanticOutcomeId(
+                    "target_distance_decreases".to_string(),
+                )),
+                0.85,
+                SemanticGroundingKind::ActionOutcome,
+                progress_evidence("approach_reduced_charger_distance"),
+            ));
+        }
+        if previous.behavior_id.as_deref() == Some("dock")
+            && !previous.charging
+            && now.body.charging
+        {
+            observations.push(SemanticEvidenceObservation::supported(
+                SemanticNodeRef::Behavior(SemanticBehaviorId("dock".to_string())),
+                SemanticPredicate::Predicts,
+                SemanticNodeRef::Outcome(SemanticOutcomeId("charging_started".to_string())),
+                0.95,
+                SemanticGroundingKind::ActionOutcome,
+                progress_evidence("dock_started_charging"),
+            ));
+        }
+        if previous.behavior_id.as_deref() == Some("back_away")
+            && previous
+                .clearance_m
+                .zip(now.range.nearest_m)
+                .is_some_and(|(before, after)| after > before + 0.02)
+        {
+            observations.push(SemanticEvidenceObservation::supported(
+                SemanticNodeRef::Behavior(SemanticBehaviorId("back_away".to_string())),
+                SemanticPredicate::Predicts,
+                SemanticNodeRef::Outcome(SemanticOutcomeId("clearance_increases".to_string())),
+                0.85,
+                SemanticGroundingKind::ActionOutcome,
+                progress_evidence("back_away_increased_clearance"),
+            ));
+        }
+        observations
+    }
+
+    fn remember(&mut self, now: &Now, behavior_id: Option<String>) {
+        self.previous = Some(SemanticActionState {
+            t_ms: now.t_ms,
+            behavior_id,
+            charger_distance_m: closest_observed_charger_distance(now),
+            clearance_m: now.range.nearest_m,
+            charging: now.body.charging,
+        });
+    }
+}
+
+fn closest_observed_charger_distance(now: &Now) -> Option<f32> {
+    now.objects
+        .observations
+        .iter()
+        .filter(|object| object.class == ObjectClass::Charger)
+        .filter_map(|object| object.distance_m)
+        .min_by(f32::total_cmp)
+}
+
+fn runtime_sleep_input(
+    now: &Now,
+    expected_external_power: bool,
+    accelerator_available: bool,
+) -> SleepTickInput {
+    let flags = &now.body.flags;
+    let safety_event = if flags.wheel_drop {
+        Some("wheel_drop".to_string())
+    } else if flags.cliff_left
+        || flags.cliff_front_left
+        || flags.cliff_front_right
+        || flags.cliff_right
+    {
+        Some("cliff".to_string())
+    } else if flags.bump_left || flags.bump_right {
+        Some("contact".to_string())
+    } else {
+        None
+    };
+    let extension_bool = |key: &str| {
+        now.extensions
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let fatigue_activation = now
+        .world
+        .self_model
+        .motivation
+        .drives
+        .get("rest")
+        .map(|drive| drive.activation)
+        .unwrap_or(now.drives.fatigue)
+        .max(now.drives.fatigue);
+    let direct_reign_active = now.reign.active
+        && (now.reign.mode == Some(ReignMode::Direct)
+            || now
+                .reign
+                .latest
+                .as_ref()
+                .is_some_and(|input| input.mode == ReignMode::Direct));
+    let stopped = now.body.velocity.forward_m_s.abs() <= 0.01
+        && now.body.velocity.turn_rad_s.abs() <= 0.01;
+    let body_communication_stable = now.body.last_update_ms == 0
+        || now.t_ms.saturating_sub(now.body.last_update_ms) <= 2_000;
+    let critical_battery = now.body.battery_level <= 0.08;
+    let unresolved_urgent_need = safety_event.is_some()
+        || (now.body.battery_level <= 0.15 && !now.body.charging)
+        || now.drives.danger_avoidance >= 0.80;
+    let completed_episode_refs = now
+        .world
+        .temporal
+        .recently_completed
+        .iter()
+        .map(|episode| episode.episode_id.0.clone())
+        .collect::<Vec<_>>();
+    let failed_behavior_refs = now
+        .world
+        .self_model
+        .goal_status
+        .iter()
+        .filter(|(_, status)| status.failed_attempts > 0)
+        .map(|(goal_id, status)| format!("goal:{goal_id}:failures:{}", status.failed_attempts))
+        .collect::<Vec<_>>();
+    let semantic_relation_refs = now
+        .world
+        .semantic
+        .relations
+        .keys()
+        .take(128)
+        .map(|relation_id| relation_id.0.clone())
+        .collect::<Vec<_>>();
+    let deferred_work_count = completed_episode_refs.len() + failed_behavior_refs.len();
+    SleepTickInput {
+        now_ms: now.t_ms,
+        fatigue_activation,
+        charging: now.body.charging,
+        docked: now.body.charging,
+        stopped,
+        direct_reign_active,
+        unresolved_urgent_need,
+        body_communication_stable,
+        active_skill_interruptible: true,
+        critical_battery,
+        external_power_lost: expected_external_power && !now.body.charging,
+        safety_event,
+        important_social_cue: extension_bool("sleep.important_social_cue"),
+        operator_sleep_request: extension_bool("sleep.request"),
+        operator_wake_request: extension_bool("wake.request"),
+        accelerator_available,
+        thermal_fraction: now
+            .extensions
+            .get("body.thermal_fraction")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        deferred_work_count,
+        completed_episode_refs,
+        failed_behavior_refs,
+        semantic_relation_refs,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2905,6 +3112,8 @@ where
             nudge: NudgeController::default(),
             goal_system: GoalSystem::default(),
             world_model: WorldModelUpdater::default(),
+            sleep_controller: SleepController::default(),
+            semantic_outcomes: SemanticOutcomeTracker::default(),
             last_active_control: None,
         }
     }
@@ -2945,6 +3154,8 @@ where
             nudge: NudgeController::default(),
             goal_system: GoalSystem::default(),
             world_model: WorldModelUpdater::default(),
+            sleep_controller: SleepController::default(),
+            semantic_outcomes: SemanticOutcomeTracker::default(),
             last_active_control: None,
         }
     }
@@ -3420,6 +3631,7 @@ where
                 .extend(previous_control.veto_reasons.iter().cloned());
         }
         world_context.active_control = self.last_active_control.clone();
+        world_context.semantic_observations = self.semantic_outcomes.observations(&now);
         let enhanced_cognition_available = self.llm.enhanced_cognition_available();
         world_context.cognitive_services.insert(
             "rich_language".to_string(),
@@ -3460,7 +3672,26 @@ where
             "epistemic_state".to_string(),
             serde_json::to_value(&now.world.epistemic)?,
         );
-        let goal_cycle = self.goal_system.tick(&now.world, &proposals)?;
+        now.extensions.insert(
+            "semantic_graph".to_string(),
+            serde_json::to_value(&now.world.semantic)?,
+        );
+        let sleep_input = runtime_sleep_input(
+            &now,
+            self.sleep_controller.expects_external_power(),
+            enhanced_cognition_available,
+        );
+        let sleep_snapshot = self.sleep_controller.tick(sleep_input);
+        let sleeping = self.sleep_controller.requires_quiescence();
+        now.extensions.insert(
+            "sleep".to_string(),
+            serde_json::to_value(&sleep_snapshot)?,
+        );
+        let goal_cycle = if sleeping {
+            self.goal_system.suspend_for_sleep(&now.world)
+        } else {
+            self.goal_system.tick(&now.world, &proposals)?
+        };
         now.drives = goal_cycle.drives.legacy_sense();
         let goal_action = goal_cycle
             .behavior
@@ -3723,6 +3954,9 @@ where
                     .flatten()
             })
             .unwrap_or(conductor_selected_action);
+        if sleeping && mechanical_reign_action_for_selection.is_none() {
+            chosen_action = ActionPrimitive::Stop;
+        }
         let locomotion_input = self
             .locomotion_tracker
             .observe(now.t_ms, &now.body, &now.range);
@@ -4182,6 +4416,13 @@ where
         }
         self.memory_store.store(&frame).await?;
 
+        self.semantic_outcomes.remember(
+            &now,
+            goal_cycle
+                .behavior
+                .as_ref()
+                .map(|behavior| behavior.behavior_id.clone()),
+        );
         Ok(RuntimeTick {
             frame,
             experience: experiences.last().cloned().unwrap_or_else(|| {
@@ -4196,7 +4437,8 @@ where
             }),
             chosen_action: Some(chosen_action),
             skill_request: (self.action_selector_mode == ActionSelectorMode::Goal
-                && mechanical_reign_action_for_selection.is_none())
+                && mechanical_reign_action_for_selection.is_none()
+                && !sleeping)
             .then_some(goal_skill_request)
             .flatten(),
             skill_status: None,
@@ -12494,6 +12736,103 @@ mod tests {
         ));
         assert_ne!(tick.chosen_action, Some(ActionPrimitive::Dock));
         assert!(tick.frame.now.drives.battery_hunger > 0.5);
+    }
+
+    #[tokio::test]
+    async fn sleep_quiesces_possessor_goals_and_emits_a_durable_snapshot() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-sleep-quiescence-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            FixedConductor::new(ActionPrimitive::Explore {
+                style: ExploreStyle::Wander,
+                duration_ms: 1_000,
+            }),
+            SimpleSafety::default(),
+            pete_llm::NoopLlmAgent,
+        )
+        .with_action_selector_mode(ActionSelectorMode::Goal);
+        let mut now = idle_now(100);
+        now.body.charging = true;
+        now.extensions
+            .insert("sleep.request".to_string(), serde_json::Value::Bool(true));
+
+        let tick = runtime
+            .tick(now, ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert!(tick.skill_request.is_none());
+        let sleep: SleepSnapshot =
+            serde_json::from_value(tick.frame.now.extensions["sleep"].clone()).unwrap();
+        assert_eq!(sleep.phase, SleepPhase::Preparing);
+        let goals: pete_conductor::GoalCycle =
+            serde_json::from_value(tick.frame.now.extensions["goal_system"].clone()).unwrap();
+        assert!(goals.selection.selected_goal.is_none());
+        assert_eq!(goals.selection.reason, "deliberative goals quiesced for sleep");
+    }
+
+    #[tokio::test]
+    async fn semantic_action_outcome_strengthens_approach_progress_without_selecting_it() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-semantic-outcome-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            FixedConductor::new(ActionPrimitive::Stop),
+            SimpleSafety::default(),
+            pete_llm::NoopLlmAgent,
+        )
+        .with_action_selector_mode(ActionSelectorMode::Goal);
+        let charger_now = |t_ms: u64, distance_m: f32| {
+            let mut now = idle_now(t_ms);
+            now.body.battery_level = 0.12;
+            now.objects.observations.push(pete_now::ObjectObservation {
+                label: "dock".to_string(),
+                class: ObjectClass::Charger,
+                bearing_rad: 0.0,
+                distance_m: Some(distance_m),
+                confidence: 0.95,
+                source: pete_now::ObjectObservationSource::Sim,
+            });
+            now
+        };
+        let first = runtime
+            .tick(charger_now(100, 1.0), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            first.frame.now.extensions["action_selector"]["selected_behavior"],
+            serde_json::Value::String("approach_charger".to_string())
+        );
+        let second = runtime
+            .tick(charger_now(200, 0.7), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        assert!(second
+            .frame
+            .now
+            .world
+            .semantic
+            .relations
+            .values()
+            .any(|relation| {
+                relation.subject
+                    == SemanticNodeRef::Behavior(SemanticBehaviorId(
+                        "approach_charger".to_string(),
+                    ))
+                    && relation.predicate == SemanticPredicate::Predicts
+                    && relation
+                        .supporting_evidence
+                        .iter()
+                        .any(|evidence| evidence.source == "runtime.action_outcome")
+            }));
     }
 
     #[tokio::test]

@@ -408,6 +408,7 @@ impl Affordance {
         self.expected_uncertainty_after = Some(affordance.expected_uncertainty_after);
         self
     }
+
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -558,6 +559,7 @@ pub struct GoalExecutionContext<'a> {
 #[serde(rename_all = "snake_case")]
 pub enum GoalExitReason {
     Superseded,
+    Sleep,
     Satisfied,
     Completed,
     Failed,
@@ -1221,6 +1223,7 @@ fn affordance(
         skill_request: None,
         action: Some(action),
         provenance: provenance.to_vec(),
+        semantic_relation_ids: Vec::new(),
     }
 }
 
@@ -2177,6 +2180,10 @@ impl GoalArbiter {
         self.commitment.as_ref().map(|value| &value.goal_id)
     }
 
+    fn release(&mut self) -> Option<GoalId> {
+        self.commitment.take().map(|commitment| commitment.goal_id)
+    }
+
     pub fn select(&mut self, now_ms: u64, evaluations: &[GoalEvaluation]) -> GoalSelection {
         let eligible = evaluations
             .iter()
@@ -2726,6 +2733,29 @@ impl GoalSystem {
             selection,
             behavior,
         })
+    }
+
+    /// Quiesce deliberative control for sleep without pausing homeostatic dynamics.
+    /// Any possessor-layer skill request becomes stale and must be rebuilt from a
+    /// fresh world model after waking.
+    pub fn suspend_for_sleep(&mut self, world: &WorldModelSnapshot) -> GoalCycle {
+        if let Some(goal_id) = self.arbiter.release() {
+            if let Some(goal) = self.goals.iter_mut().find(|goal| goal.id() == &goal_id) {
+                goal.exit(GoalExitReason::Sleep);
+            }
+        }
+        self.pending = None;
+        self.last_tick_ms = Some(world.t_ms);
+        GoalCycle {
+            schema_version: 1,
+            world: world.clone(),
+            drives: self.drives.update(world),
+            selection: GoalSelection {
+                reason: "deliberative goals quiesced for sleep".to_string(),
+                ..GoalSelection::default()
+            },
+            ..GoalCycle::default()
+        }
     }
 
     fn observe_pending_outcome(&mut self, world: &WorldModelSnapshot) {

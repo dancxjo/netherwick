@@ -25,6 +25,12 @@ All notable changes are grouped by date.
   energy-meaning confidence in goal evaluations and affordances.
 - Project canonical semantic relations into durable graph-memory entities and
   edges, preserving grounding metadata and confidence for recall.
+- Ground charger approach, docking, and withdrawal predictions in observed
+  runtime action outcomes, retaining their evidence provenance across ticks.
+- Add a safety-gated sleep lifecycle that quiesces deliberative control, plans
+  bounded consolidation, replay, training, and evaluation work, defers
+  unavailable accelerator work, and wakes for operator, safety, power, or
+  body-link events without automatically promoting candidates.
 
 ### Changed
 
