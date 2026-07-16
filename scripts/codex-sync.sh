@@ -10,7 +10,7 @@ if [[ ! -d .git ]]; then
   exit 1
 fi
 
-codex --ask-for-approval never exec --cd "$(pwd)" --sandbox danger-full-access --ephemeral <<'EOF'
+RUST_LOG=error codex --ask-for-approval never exec --cd "$(pwd)" --sandbox danger-full-access --ephemeral <<'EOF'
 You are continuing the workflow in this repository. Do exactly this:
 
 1) Inspect repository state and current changes with `git diff` and `git status`.
