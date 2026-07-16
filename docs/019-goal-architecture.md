@@ -86,6 +86,14 @@ Skill-local progress and goal progress remain distinct: for example, charger
 search can expose frontier coverage to the skill while the owning goal measures
 whether charger uncertainty actually falls.
 
+Each possessor `SkillStatus` identifies one execution with a stable
+`execution_id`. `attempts` advances only when that intention begins a new
+execution; the 100 ms command renewals used within an execution accumulate in
+`dispatch_count` instead. A terminal execution is admitted to goal progress
+exactly once, then the possessor may start a genuine retry with a new execution
+id. Cached terminal observations therefore cannot manufacture failures or
+prevent retry.
+
 `SeekCharger` escalates repeated low-confidence search failure to a help
 request, then abandons only at the bounded failure limit. `Explore` publishes
 independent random-walk, wall-follow, frontier-follow, and novelty-inspection

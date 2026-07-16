@@ -399,10 +399,18 @@ pub enum SkillOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SkillStatus {
     pub request: SkillRequest,
+    /// Stable identifier for one possessor execution. Retries receive a new id.
+    #[serde(default)]
+    pub execution_id: u64,
     pub phase: SkillPhase,
     pub outcome: Option<SkillOutcome>,
     pub progress: Option<f32>,
+    /// Number of executions of this intention, not motor refreshes.
+    #[serde(default)]
     pub attempts: u32,
+    /// Motor/command refreshes sent during this execution.
+    #[serde(default)]
+    pub dispatch_count: u32,
     pub started_at_ms: Option<u64>,
     pub updated_at_ms: u64,
     pub reason: Option<String>,
@@ -2531,6 +2539,7 @@ pub struct GoalSystem {
     arbiter: GoalArbiter,
     pending: Option<PendingOutcome>,
     last_tick_ms: Option<u64>,
+    processed_terminal_skill_executions: BTreeMap<GoalId, u64>,
 }
 
 impl Default for GoalSystem {
@@ -2553,6 +2562,7 @@ impl Default for GoalSystem {
             arbiter: GoalArbiter::default(),
             pending: None,
             last_tick_ms: None,
+            processed_terminal_skill_executions: BTreeMap::new(),
         }
     }
 }
@@ -2565,6 +2575,7 @@ impl GoalSystem {
             arbiter: GoalArbiter::default(),
             pending: None,
             last_tick_ms: None,
+            processed_terminal_skill_executions: BTreeMap::new(),
         }
     }
 
@@ -2592,6 +2603,15 @@ impl GoalSystem {
         let Some(goal_id) = status.request.goal_id.as_ref() else {
             return;
         };
+        if status.phase == SkillPhase::Terminal
+            && status.execution_id != 0
+            && self
+                .processed_terminal_skill_executions
+                .get(goal_id)
+                .is_some_and(|processed| *processed == status.execution_id)
+        {
+            return;
+        }
         let Some(goal) = self.goals.iter_mut().find(|goal| goal.id() == goal_id) else {
             return;
         };
@@ -2627,6 +2647,10 @@ impl GoalSystem {
             }
         }
         if status.phase == SkillPhase::Terminal {
+            if status.execution_id != 0 {
+                self.processed_terminal_skill_executions
+                    .insert(goal_id.clone(), status.execution_id);
+            }
             goal.runtime_mut().last_skill_outcome = status.outcome;
             if matches!(
                 status.outcome,
@@ -3724,7 +3748,7 @@ mod tests {
     }
 
     #[test]
-    fn possessor_skill_failure_updates_goal_progress_without_switching_goal() {
+    fn possessor_terminal_failure_is_processed_once_per_execution() {
         let mut system = GoalSystem::default();
         let mut updater = WorldModelUpdater::default();
         let mut body = BodySense::default();
@@ -3741,16 +3765,20 @@ mod tests {
         let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
         let request = cycle.behavior.unwrap().affordance.skill_request.unwrap();
 
-        system.observe_skill_status(&SkillStatus {
+        let failure = SkillStatus {
             request,
+            execution_id: 7,
             phase: SkillPhase::Terminal,
             outcome: Some(SkillOutcome::TimedOut),
             progress: None,
-            attempts: 2,
+            attempts: 1,
+            dispatch_count: 20,
             started_at_ms: Some(1_000),
             updated_at_ms: 2_000,
             reason: Some("no target progress".to_string()),
-        });
+        };
+        system.observe_skill_status(&failure);
+        system.observe_skill_status(&failure);
 
         let charge = system
             .goals
@@ -3758,6 +3786,7 @@ mod tests {
             .find(|goal| goal.id() == &GoalId::new("seek_charger"))
             .unwrap();
         assert_eq!(charge.runtime().failed_attempts, 1);
+        assert_eq!(charge.runtime().attempts, 1);
         assert_eq!(
             charge.runtime().last_skill_outcome,
             Some(SkillOutcome::TimedOut)
@@ -3780,10 +3809,12 @@ mod tests {
 
         system.observe_skill_status(&SkillStatus {
             request,
+            execution_id: 8,
             phase: SkillPhase::Terminal,
             outcome: Some(SkillOutcome::SafetyPreempted),
             progress: Some(1.0),
             attempts: 1,
+            dispatch_count: 1,
             started_at_ms: Some(1_000),
             updated_at_ms: 1_100,
             reason: Some("contact withdrawal preempted possessor control".to_string()),
@@ -3844,10 +3875,12 @@ mod tests {
         for attempt in 1..=4 {
             system.observe_skill_status(&SkillStatus {
                 request: request.clone(),
+                execution_id: attempt as u64,
                 phase: SkillPhase::Terminal,
                 outcome: Some(SkillOutcome::TimedOut),
                 progress: Some(0.0),
                 attempts: attempt,
+                dispatch_count: 10,
                 started_at_ms: Some(1_000),
                 updated_at_ms: 1_000 + attempt as u64 * 25,
                 reason: Some("charger search produced no evidence".to_string()),
@@ -3906,10 +3939,12 @@ mod tests {
         for attempt in 5..=8 {
             system.observe_skill_status(&SkillStatus {
                 request: request.clone(),
+                execution_id: attempt as u64,
                 phase: SkillPhase::Terminal,
                 outcome: Some(SkillOutcome::TimedOut),
                 progress: Some(0.0),
                 attempts: attempt,
+                dispatch_count: 10,
                 started_at_ms: Some(1_000),
                 updated_at_ms: 1_200 + attempt as u64 * 25,
                 reason: Some("bounded charger retry failed".to_string()),
@@ -3952,10 +3987,12 @@ mod tests {
         for attempt in 1..=4 {
             system.observe_skill_status(&SkillStatus {
                 request: request.clone(),
+                execution_id: attempt as u64,
                 phase: SkillPhase::Terminal,
                 outcome: Some(SkillOutcome::TimedOut),
                 progress: Some(0.0),
                 attempts: attempt,
+                dispatch_count: 10,
                 started_at_ms: Some(1_000),
                 updated_at_ms: 1_000 + attempt as u64 * 25,
                 reason: Some("frontier coverage did not increase".to_string()),

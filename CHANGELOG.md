@@ -60,6 +60,9 @@ All notable changes are grouped by date.
   deduplication and Neo4j persistence by carrying `SemanticRelationId` as the
   stable edge identity instead of collapsing edges by triple alone, and
   migrate away legacy `RELATED` projections that lack the new identity.
+- Give each possessor skill execution a stable id, count attempts once per
+  execution rather than per motor refresh, expose dispatches separately, and
+  consume each terminal failure only once before retrying.
 - Preserve lifecycle telemetry when velocity and heartbeat commands coalesce:
   identical velocity refreshes renew one streaming command without restarting
   the motor or transferring lifecycle ownership, and every replaced accepted

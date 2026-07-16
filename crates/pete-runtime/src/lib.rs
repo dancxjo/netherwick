@@ -5194,6 +5194,8 @@ struct PossessorSkillRuntime {
     status: Option<SkillStatus>,
     initial_metric: Option<f32>,
     last_dispatch_ms: TimeMs,
+    intention_attempts: u32,
+    next_execution_id: u64,
 }
 
 impl PossessorSkillRuntime {
@@ -5205,12 +5207,28 @@ impl PossessorSkillRuntime {
         now_ms: TimeMs,
     ) -> (SkillStatus, bool) {
         let same_intention = self.status.as_ref().is_some_and(|status| {
-            status.request.skill_id == request.skill_id && status.request.target == request.target
+            status.request.skill_id == request.skill_id
+                && status.request.goal_id == request.goal_id
+                && status.request.behavior_id == request.behavior_id
+                && status.request.target == request.target
         });
-        if !same_intention {
+        let terminal_consumed = same_intention
+            && self
+                .status
+                .as_ref()
+                .is_some_and(|status| status.phase == SkillPhase::Terminal);
+        if !same_intention || terminal_consumed {
+            if !same_intention {
+                self.intention_attempts = 0;
+            }
+            self.intention_attempts = self.intention_attempts.saturating_add(1);
+            let execution_id = self.next_execution_id.max(1);
+            self.next_execution_id = execution_id.saturating_add(1);
             self.status = Some(SkillStatus {
                 request: request.clone(),
+                execution_id,
                 phase: SkillPhase::Requested,
+                attempts: self.intention_attempts,
                 started_at_ms: Some(now_ms),
                 updated_at_ms: now_ms,
                 ..SkillStatus::default()
@@ -5223,10 +5241,6 @@ impl PossessorSkillRuntime {
         status.request = request.clone();
         status.updated_at_ms = now_ms;
 
-        if status.phase == SkillPhase::Terminal {
-            self.status = Some(status.clone());
-            return (status, false);
-        }
         if events.events.iter().any(|event| {
             matches!(
                 event.kind,
@@ -5287,7 +5301,7 @@ impl PossessorSkillRuntime {
             self.last_dispatch_ms == 0 || now_ms.saturating_sub(self.last_dispatch_ms) >= 100;
         let mut command_sent = false;
         if dispatch_due {
-            status.attempts = status.attempts.saturating_add(1);
+            status.dispatch_count = status.dispatch_count.saturating_add(1);
             match dispatch_possessor_skill(cockpit, request) {
                 Ok(()) => {
                     self.last_dispatch_ms = now_ms;
@@ -10007,6 +10021,8 @@ mod tests {
         assert!(command_sent);
         assert_eq!(running.phase, SkillPhase::Running);
         assert_eq!(running.attempts, 1);
+        assert_eq!(running.dispatch_count, 1);
+        assert_ne!(running.execution_id, 0);
 
         let aligned = SkillRequest {
             bearing_rad: Some(0.05),
@@ -10017,6 +10033,67 @@ mod tests {
         assert_eq!(completed.phase, SkillPhase::Terminal);
         assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
         assert_eq!(completed.progress, Some(1.0));
+        assert_eq!(completed.execution_id, running.execution_id);
+        assert_eq!(completed.attempts, 1);
+    }
+
+    #[test]
+    fn possessor_terminal_status_is_consumed_once_before_a_real_retry() {
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let events = cockpit.get_events_since(0).unwrap();
+        let mut runtime = PossessorSkillRuntime::default();
+        let request = SkillRequest {
+            skill_id: SkillId::ApproachTarget,
+            goal_id: Some(pete_conductor::GoalId::new("seek_charger")),
+            behavior_id: Some("approach_charger".to_string()),
+            target: Some(pete_now::EntityId("charger:17".to_string())),
+            bearing_rad: Some(0.0),
+            range_m: Some(2.0),
+            stop_range_m: Some(0.3),
+            maximum_duration_ms: 100,
+            ..SkillRequest::default()
+        };
+
+        let (running, first_dispatch) = runtime.step(&mut cockpit, &request, &events, 1);
+        assert!(first_dispatch);
+        assert_eq!(running.attempts, 1);
+        assert_eq!(running.dispatch_count, 1);
+
+        let (timed_out, stop_sent) = runtime.step(&mut cockpit, &request, &events, 101);
+        assert!(stop_sent);
+        assert_eq!(timed_out.phase, SkillPhase::Terminal);
+        assert_eq!(timed_out.outcome, Some(SkillOutcome::TimedOut));
+        assert_eq!(timed_out.execution_id, running.execution_id);
+        assert_eq!(timed_out.attempts, 1);
+
+        let (retry, retry_dispatched) = runtime.step(&mut cockpit, &request, &events, 102);
+        assert!(retry_dispatched);
+        assert_eq!(retry.phase, SkillPhase::Running);
+        assert_ne!(retry.execution_id, timed_out.execution_id);
+        assert_eq!(retry.attempts, 2);
+        assert_eq!(retry.dispatch_count, 1);
+    }
+
+    #[test]
+    fn possessor_motor_refreshes_do_not_increment_attempts() {
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let events = cockpit.get_events_since(0).unwrap();
+        let mut runtime = PossessorSkillRuntime::default();
+        let request = SkillRequest {
+            skill_id: SkillId::FollowBearing,
+            bearing_rad: Some(0.5),
+            maximum_duration_ms: 5_000,
+            ..SkillRequest::default()
+        };
+
+        let (first, _) = runtime.step(&mut cockpit, &request, &events, 1);
+        let (second, _) = runtime.step(&mut cockpit, &request, &events, 101);
+        let (third, _) = runtime.step(&mut cockpit, &request, &events, 201);
+
+        assert_eq!(first.execution_id, second.execution_id);
+        assert_eq!(second.execution_id, third.execution_id);
+        assert_eq!(third.attempts, 1);
+        assert_eq!(third.dispatch_count, 3);
     }
 
     #[test]
