@@ -1528,11 +1528,17 @@ pub struct BatterySummary {
     pub capacity_mah: Option<u32>,
     pub percent: Option<u8>,
     pub charging_state: Option<u8>,
+    pub charging_sources: Option<u8>,
     pub charging_indicator: Option<bool>,
     pub low: Option<bool>,
 }
 
 impl BatterySummary {
+    pub fn home_base(&self) -> bool {
+        self.charging_sources
+            .is_some_and(|sources| sources & 0b10 != 0)
+    }
+
     fn from_raw(raw: &str) -> Self {
         let charge_mah = number_for(raw, "charge_mah");
         let capacity_mah = number_for(raw, "capacity_mah");
@@ -1544,6 +1550,7 @@ impl BatterySummary {
             capacity_mah,
             percent,
             charging_state: number_for(raw, "charging_state").map(|value| value as u8),
+            charging_sources: number_for(raw, "charging_sources").map(|value| value as u8),
             charging_indicator: bool_for(raw, "charging_indicator"),
             low: percent.map(|value| value <= 20),
         }
@@ -1563,6 +1570,7 @@ impl BatterySummary {
             capacity_mah,
             percent,
             charging_state: json_u32_value(sensors, "charging_state").map(|value| value as u8),
+            charging_sources: json_u32_value(sensors, "charging_sources").map(|value| value as u8),
             charging_indicator: json_tri_state_value(sensors, "charging_indicator"),
             low: percent.map(|value| value <= 20),
         }
@@ -7881,7 +7889,7 @@ mod tests {
         let status = parse_json_cockpit_response(
             1,
             &CockpitRequest::GetStatus,
-            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","estop_latched":false,"safety_tripped":true,"safety_latch_kind":"tilt","event_next_seq":8,"create_sensors":{"charging_indicator":"on"}}"#,
+            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","estop_latched":false,"safety_tripped":true,"safety_latch_kind":"tilt","event_next_seq":8,"create_sensors":{"charging_sources":2,"charging_indicator":"on"}}"#,
         )
         .unwrap();
         let CockpitResponse::Status(status) = status else {
@@ -7895,6 +7903,7 @@ mod tests {
         assert_eq!(summary.safety_latch_kind, Some(SafetyLatchKind::Tilt));
         assert_eq!(summary.event_next_seq, Some(8));
         assert_eq!(summary.battery.charging_indicator, Some(true));
+        assert!(summary.battery.home_base());
 
         let caps = parse_json_cockpit_response(
             2,
@@ -7926,12 +7935,13 @@ mod tests {
     #[test]
     fn compact_status_infers_imu_tilt_safety_latch() {
         let summary = StatusSummary::from_raw(
-            "OK 1 STATUS uptime_ms=1000 runtime=3 body=6 command=0 pending=0 power=2 oi=3 create_body_packets=1 create_last_body_packet_ms=900 imu_health=1 imu_tilt_mrad=2269 imu_impact_mm_s2=96",
+            "OK 1 STATUS uptime_ms=1000 runtime=3 body=6 command=0 pending=0 power=2 oi=3 create_body_packets=1 create_last_body_packet_ms=900 charging_sources=2 imu_health=1 imu_tilt_mrad=2269 imu_impact_mm_s2=96",
         );
 
         assert_eq!(summary.safety_tripped, Some(true));
         assert_eq!(summary.safety_latch_kind, Some(SafetyLatchKind::Tilt));
         assert_eq!(summary.imu.tilt_magnitude_mrad, Some(2269));
+        assert!(summary.battery.home_base());
     }
 
     #[test]

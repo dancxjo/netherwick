@@ -6593,6 +6593,7 @@ fn apply_safe_cockpit_motion<C: Cockpit>(
 pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
     let charging = status.battery.charging_state.unwrap_or(0) != 0
         || status.battery.charging_indicator.unwrap_or(false);
+    let home_base = status.battery.home_base();
     let packet_update_ms = status
         .body_packet_age_ms
         .filter(|_| status.body_packet_complete == Some(true))
@@ -6606,12 +6607,16 @@ pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: Tim
             .unwrap_or(1.0),
         charging,
         flags: BodyFlags {
-            bump_left: status.contact.bump_left.unwrap_or(false),
-            bump_right: status.contact.bump_right.unwrap_or(false),
-            cliff_left: status.contact.cliff_left.unwrap_or(false),
-            cliff_front_left: status.contact.cliff_front_left.unwrap_or(false),
-            cliff_front_right: status.contact.cliff_front_right.unwrap_or(false),
-            cliff_right: status.contact.cliff_right.unwrap_or(false),
+            // Create 1 can report its dock contacts as both bumpers plus all
+            // four cliff bits. Packet 34 is the authoritative Home Base
+            // discriminator. Keep those raw bits in Cockpit status, but do
+            // not promote dock geometry into upstream collision evidence.
+            bump_left: !home_base && status.contact.bump_left.unwrap_or(false),
+            bump_right: !home_base && status.contact.bump_right.unwrap_or(false),
+            cliff_left: !home_base && status.contact.cliff_left.unwrap_or(false),
+            cliff_front_left: !home_base && status.contact.cliff_front_left.unwrap_or(false),
+            cliff_front_right: !home_base && status.contact.cliff_front_right.unwrap_or(false),
+            cliff_right: !home_base && status.contact.cliff_right.unwrap_or(false),
             wheel_drop: status.contact.wheel_drop.unwrap_or(false),
             wall: status.contact.wall.unwrap_or(false),
             virtual_wall: status.contact.virtual_wall.unwrap_or(false),
@@ -9352,6 +9357,66 @@ mod tests {
 
         assert!(body.charging);
         assert_eq!(body.last_update_ms, 123);
+    }
+
+    #[test]
+    fn home_base_contacts_do_not_become_upstream_collision_evidence() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 1_000,
+                "current_runtime_state": "idle",
+                "create_sensors": {
+                    "last_packet_id": 0,
+                    "complete_packet_count": 1,
+                    "last_complete_packet_timestamp_ms": 1_000,
+                    "charging_sources": 2,
+                    "bump_left": true,
+                    "bump_right": true,
+                    "cliff_left": true,
+                    "cliff_front_left": true,
+                    "cliff_front_right": true,
+                    "cliff_right": true,
+                    "wheel_drop": true
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        let body = body_sense_from_cockpit_status(status, 123);
+
+        assert!(!body.flags.bump_left);
+        assert!(!body.flags.bump_right);
+        assert!(!body.flags.cliff_left);
+        assert!(!body.flags.cliff_front_left);
+        assert!(!body.flags.cliff_front_right);
+        assert!(!body.flags.cliff_right);
+        assert!(body.flags.wheel_drop);
+    }
+
+    #[test]
+    fn identical_contacts_off_home_base_remain_collision_evidence() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 1_000,
+                "current_runtime_state": "idle",
+                "create_sensors": {
+                    "last_packet_id": 0,
+                    "complete_packet_count": 1,
+                    "last_complete_packet_timestamp_ms": 1_000,
+                    "charging_sources": 0,
+                    "bump_left": true,
+                    "cliff_front_left": true
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        let body = body_sense_from_cockpit_status(status, 123);
+
+        assert!(body.flags.bump_left);
+        assert!(body.flags.cliff_front_left);
     }
 
     #[test]
