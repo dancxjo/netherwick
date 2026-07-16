@@ -1567,7 +1567,7 @@ fn render_self_model_context(now: &Now) -> String {
                 capability.availability,
                 pete_now::CapabilityAvailability::Available
                     | pete_now::CapabilityAvailability::Degraded
-            )
+            ) && capability.authorized
         })
         .map(|capability| capability.id.0.as_str())
         .collect::<Vec<_>>();
@@ -1580,7 +1580,7 @@ fn render_self_model_context(now: &Now) -> String {
                 capability.availability,
                 pete_now::CapabilityAvailability::Unavailable
                     | pete_now::CapabilityAvailability::Unknown
-            )
+            ) || !capability.authorized
         })
         .map(|capability| {
             format!(
@@ -1589,6 +1589,7 @@ fn render_self_model_context(now: &Now) -> String {
                 capability
                     .unavailable_reason
                     .as_deref()
+                    .or(capability.authority_reason.as_deref())
                     .unwrap_or("availability is unknown")
             )
         })

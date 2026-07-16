@@ -209,6 +209,8 @@ pub struct CapabilityBelief {
     pub availability: CapabilityAvailability,
     pub confidence: f32,
     pub unavailable_reason: Option<String>,
+    pub authorized: bool,
+    pub authority_reason: Option<String>,
     #[serde(default)]
     pub dependencies: Vec<CapabilityId>,
     pub performance_summary: Option<String>,
@@ -237,6 +239,23 @@ impl CapabilitySelfModel {
         self.capabilities
             .get(&CapabilityId(id.to_string()))
             .and_then(|capability| capability.unavailable_reason.as_deref())
+    }
+
+    pub fn is_authorized(&self, id: &str) -> bool {
+        self.capabilities
+            .get(&CapabilityId(id.to_string()))
+            .is_some_and(|capability| capability.authorized)
+    }
+
+    pub fn execution_block_reason(&self, id: &str) -> Option<&str> {
+        self.capabilities
+            .get(&CapabilityId(id.to_string()))
+            .and_then(|capability| {
+                capability
+                    .unavailable_reason
+                    .as_deref()
+                    .or(capability.authority_reason.as_deref())
+            })
     }
 }
 
@@ -533,6 +552,19 @@ impl WorldModelUpdater {
         record_meta_evidence(&mut trace, &self_model.pose_meta);
         if let Some(trap_kind) = &self_model.stuck_trap_kind {
             record_meta_evidence(&mut trace, &trap_kind.meta);
+        }
+        record_meta_evidence(&mut trace, &self_model.organism_id.meta);
+        record_meta_evidence(&mut trace, &self_model.body.body_id.meta);
+        record_meta_evidence(&mut trace, &self_model.body.pose.meta);
+        record_meta_evidence(&mut trace, &self_model.body.energy.meta);
+        record_meta_evidence(&mut trace, &self_model.body.charging.meta);
+        record_meta_evidence(&mut trace, &self_model.body.health.meta);
+        record_meta_evidence(&mut trace, &self_model.agency.meta);
+        for capability in self_model.capabilities.capabilities.values() {
+            record_meta_evidence(&mut trace, &capability.meta);
+        }
+        for service in self_model.service_state.services.values() {
+            record_meta_evidence(&mut trace, &service.meta);
         }
         for status in self_model.goal_status.values() {
             record_meta_evidence(&mut trace, &status.meta);
@@ -1062,6 +1094,22 @@ impl WorldModelUpdater {
                 .capabilities
                 .insert(capability.id.clone(), capability.clone());
         }
+        let hardware_authority_available = possession.is_none() || (possessed && armed);
+        for capability in capabilities.capabilities.values_mut() {
+            if matches!(
+                capability.kind,
+                CapabilityKind::Actuator | CapabilityKind::Behavior | CapabilityKind::Skill
+            ) {
+                capability.authorized = capability.authorized && hardware_authority_available;
+                if !capability.authorized && capability.authority_reason.is_none() {
+                    capability.authority_reason = Some(if boot_changed {
+                        "brainstem reboot invalidated the control lease".to_string()
+                    } else {
+                        "no current actuation authority".to_string()
+                    });
+                }
+            }
+        }
         let mut service_state = CognitiveServiceSummary {
             services: context.cognitive_services.clone(),
         };
@@ -1109,6 +1157,9 @@ impl WorldModelUpdater {
             meta: body_meta.clone(),
         })
         .collect::<Vec<_>>();
+        let tilt_known = now.imu.orientation.len() >= 2;
+        let tilted = tilt_known
+            .then(|| now.imu.orientation[0].abs() > 0.35 || now.imu.orientation[1].abs() > 0.35);
         let body = SelfBodyBelief {
             body_id: Belief {
                 value: BodyId("pete.primary_body".to_string()),
@@ -1154,13 +1205,26 @@ impl WorldModelUpdater {
                 meta: body_meta.clone(),
             },
             faults,
-            being_moved: None,
-            tilted: None,
+            being_moved: Some(Belief {
+                value: moving && context.active_behavior.is_none() && reign.is_none(),
+                meta: body_meta.clone(),
+            }),
+            tilted: tilted.map(|value| Belief {
+                value,
+                meta: simple_meta(
+                    now.t_ms,
+                    BeliefSourceKind::DirectObservation,
+                    "body.imu.tilt",
+                ),
+            }),
             blocked: Some(Belief {
                 value: stuck || now.body.flags.bump_left || now.body.flags.bump_right,
                 meta: body_meta.clone(),
             }),
-            carried: None,
+            carried: now.body.flags.wheel_drop.then(|| Belief {
+                value: true,
+                meta: body_meta.clone(),
+            }),
         };
         let motivation = MotivationSummary {
             drives: context.drive_summaries.clone(),
@@ -1171,7 +1235,29 @@ impl WorldModelUpdater {
             uncertainty: context.uncertainty,
             strategy_failure_pressure: context.strategy_failure_pressure,
         };
-        let active_control = context
+        let mut continuity = context.continuity.clone();
+        continuity.session_id = continuity.session_id.or_else(|| session_id.clone());
+        continuity.important_relationship_refs.extend(
+            self.entities
+                .values()
+                .filter(|entity| entity.kind == WorldEntityKind::Person)
+                .map(|entity| entity.id.clone()),
+        );
+        for entity in &now.memory.remembered_entities {
+            if entity.has_label("Person") || entity.has_label("person") {
+                continuity
+                    .important_relationship_refs
+                    .push(EntityId(entity.id.clone()));
+            }
+            if entity.has_label("Place") || entity.has_label("place") {
+                continuity.important_place_refs.push(entity.id.clone());
+            }
+        }
+        continuity.important_relationship_refs.sort();
+        continuity.important_relationship_refs.dedup();
+        continuity.important_place_refs.sort();
+        continuity.important_place_refs.dedup();
+        let mut active_control = context
             .active_control
             .unwrap_or_else(|| ActiveControlSummary {
                 goal_id: context.active_goal.clone(),
@@ -1182,6 +1268,9 @@ impl WorldModelUpdater {
                     .then_some("drive capability is unavailable".to_string()),
                 ..ActiveControlSummary::default()
             });
+        if reign.is_some_and(|input| input.mode == pete_actions::ReignMode::Direct) {
+            active_control.provenance = ControlProvenance::HumanDirect;
+        }
         SelfModelSnapshot {
             organism_id: Belief {
                 value: OrganismId("pete".to_string()),
@@ -1222,7 +1311,7 @@ impl WorldModelUpdater {
             },
             motivation,
             active_control,
-            continuity: context.continuity,
+            continuity,
             service_state,
             meta: body_meta.clone(),
             battery_level: now.body.battery_level,
@@ -1265,6 +1354,7 @@ fn insert_capability(
             },
             confidence: 1.0,
             unavailable_reason: unavailable_reason.map(ToOwned::to_owned),
+            authorized: available,
             meta: simple_meta(now_ms, BeliefSourceKind::Map, "self.capability.registry"),
             ..CapabilityBelief::default()
         },

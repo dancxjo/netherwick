@@ -3398,6 +3398,24 @@ where
             .add_drive_impulses(std::mem::take(&mut drive_impulses));
         self.goal_system.seed_drives(now.drives.clone());
         let mut world_context = self.goal_system.world_model_update_context();
+        if let Some(experience_id) = runtime_instant.experience_id.as_ref() {
+            world_context
+                .continuity
+                .recent_experience_refs
+                .push(format!("{experience_id:?}"));
+        }
+        if let Some(previous_control) = self.last_active_control.as_ref() {
+            if let Some(action) = previous_control.action_kind.as_ref() {
+                world_context
+                    .continuity
+                    .recent_self_action_refs
+                    .push(action.clone());
+            }
+            world_context
+                .continuity
+                .recent_outcome_refs
+                .extend(previous_control.veto_reasons.iter().cloned());
+        }
         world_context.active_control = self.last_active_control.clone();
         let enhanced_cognition_available = self.llm.enhanced_cognition_available();
         world_context.cognitive_services.insert(
@@ -3423,6 +3441,10 @@ where
             },
         );
         now = self.world_model.update(now, world_context);
+        now.extensions.insert(
+            "self_model".to_string(),
+            serde_json::to_value(&now.world.self_model)?,
+        );
         let goal_cycle = self.goal_system.tick(&now.world, &proposals)?;
         now.drives = goal_cycle.drives.legacy_sense();
         let goal_action = goal_cycle

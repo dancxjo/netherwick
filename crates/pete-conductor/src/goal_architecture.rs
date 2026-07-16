@@ -819,6 +819,11 @@ impl GoalEvaluator for RuleGoalEvaluator {
                     .self_model
                     .capabilities
                     .is_available(capability)
+                    || !context
+                        .world
+                        .self_model
+                        .capabilities
+                        .is_authorized(capability)
                 {
                     affordance.available = false;
                     affordance.rejection_reason = Some(
@@ -826,7 +831,7 @@ impl GoalEvaluator for RuleGoalEvaluator {
                             .world
                             .self_model
                             .capabilities
-                            .unavailable_reason(capability)
+                            .execution_block_reason(capability)
                             .unwrap_or("required capability is unavailable")
                             .to_string(),
                     );
