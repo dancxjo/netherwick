@@ -82,6 +82,9 @@ All notable changes are grouped by date.
 - Keep Home Base contact normalized throughout the bounded dock-departure
   reverse, instead of letting alternating packet-0 and packet-34 observations
   repeatedly trip and clear the dock's cliff bits while stopping motion.
+- Prevent the browser's 900 ms motion heartbeat from cancelling the fixed
+  1.25-second body-local dock departure, and expose an explicit Undock control
+  that requests that bounded transition without requiring a held drive button.
 - Keep authorized `just flash` BOOTSEL negotiation compatible with older
   brainstems that advertise retired convenience verbs, while preserving the
   primitive-only contract for newly built firmware.
