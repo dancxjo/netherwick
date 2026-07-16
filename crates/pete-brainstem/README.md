@@ -651,7 +651,7 @@ charging, and leaving the Home Base requires reversing away from its contacts.
 The brainstem polls charging-sources packet 34 independently of caller-requested
 sensor streams. When its Home Base bit is present, the first nonzero,
 non-docking motion request is held while the body driver backs straight away
-from the dock at 80 mm/s for 1.25 seconds. The original body-neutral request
+from the dock at 80 mm/s for 2.5 seconds. The original body-neutral request
 starts afterward. This dock departure is an internal body-driver action rather
 than a charging safety latch that callers must clear. Stop, e-stop, authority
 loss, heartbeat expiry, and local safety reflexes still preempt it.

@@ -38,7 +38,7 @@ const ORIENTATION_PROBE_MIN_ACCEL_MM_S2: u16 = 7_000;
 const ORIENTATION_PROBE_MAX_ACCEL_MM_S2: u16 = 13_000;
 const CONTACT_REPEAT_WINDOW_MS: u32 = 2_000;
 const DOCK_DEPARTURE_SPEED_MM_S: i16 = -80;
-const DOCK_DEPARTURE_DURATION_MS: u32 = 1_250;
+const DOCK_DEPARTURE_DURATION_MS: u32 = 2_500;
 const CREATE_CHARGING_SOURCES_PACKET: u8 = 34;
 const CREATE_CHARGING_SOURCES_POLL_PERIOD_MS: u32 = 250;
 
@@ -1285,7 +1285,7 @@ where
     fn start_dock_departure(&mut self, now_ms: u32) -> Result<(), BrainstemError> {
         self.ensure_create_responsive()?;
         self.dock_departure_pending = false;
-        // Dock departure is a fixed, body-local 1.25 second operation. A
+        // Dock departure is a fixed, body-local 2.5 second operation. A
         // browser motion heartbeat is shorter (900 ms) and supervises the
         // caller's primitive, not this bounded transition. Clear its deadline
         // before starting so the watchdog cannot cancel the reviewed undock.
@@ -2891,6 +2891,10 @@ mod tests {
         runtime.dock_departure_pending = true;
         assert!(runtime.start_dock_departure(1_000).is_ok());
         assert!(runtime.heartbeat_stop_at_ms.is_none());
+        assert!(matches!(
+            runtime.active,
+            ActiveAction::DockDeparture { stop_at_ms: 3_500 }
+        ));
 
         let mut departure_events = heapless::Vec::<status::PublicEventRecord, 8>::new();
         status::collect_events_since(departure_cursor, &mut departure_events);
