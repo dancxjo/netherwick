@@ -85,8 +85,9 @@ All notable changes are grouped by date.
 - Prevent the browser's 900 ms motion heartbeat from cancelling the fixed
   body-local dock departure, give its 200 mm/s by 1.5-second envelope enough
   breakaway torque and travel to clear the Home Base, prevent periodic OI Full
-  supervision from zeroing active motor output, and expose an Undock control
-  without requiring a held drive button.
+  supervision from zeroing active motor output, expose wheel-overcurrent in
+  browser and compact diagnostics, and provide an Undock control without
+  requiring a held drive button.
 - Keep authorized `just flash` BOOTSEL negotiation compatible with older
   brainstems that advertise retired convenience verbs, while preserving the
   primitive-only contract for newly built firmware.

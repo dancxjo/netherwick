@@ -1719,7 +1719,7 @@ document.querySelectorAll('[data-drive]').forEach(b=>{b.onpointerdown=e=>{driveK
 $('speed').oninput=()=>$('speedv').textContent=$('speed').value
 $('turn').oninput=()=>$('turnv').textContent=$('turn').value
 function time(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60),h=Math.floor(m/60);return h+'h '+(m%60)+'m '+(s%60)+'s'}
-function flagList(cs){let f=[],dock=homeBaseContact(cs);if(dock)f.push('Home Base contact');if(!dock&&cs.bump_left)f.push('bump L');if(!dock&&cs.bump_right)f.push('bump R');if(cs.wall)f.push('wall');if(cs.virtual_wall)f.push('virtual wall');if(cs.wheel_drop)f.push('wheel drop');if(!dock&&cs.cliff_left)f.push('cliff L');if(!dock&&cs.cliff_front_left)f.push('cliff FL');if(!dock&&cs.cliff_front_right)f.push('cliff FR');if(!dock&&cs.cliff_right)f.push('cliff R');return f}
+function flagList(cs){let f=[],dock=homeBaseContact(cs);if(dock)f.push('Home Base contact');if(!dock&&cs.bump_left)f.push('bump L');if(!dock&&cs.bump_right)f.push('bump R');if(cs.wall)f.push('wall');if(cs.virtual_wall)f.push('virtual wall');if(cs.wheel_drop)f.push('wheel drop');if(cs.overcurrent)f.push('wheel overcurrent');if(!dock&&cs.cliff_left)f.push('cliff L');if(!dock&&cs.cliff_front_left)f.push('cliff FL');if(!dock&&cs.cliff_front_right)f.push('cliff FR');if(!dock&&cs.cliff_right)f.push('cliff R');return f}
 function battPct(cs){return cs.capacity_mah?Math.min(100,Math.round((cs.charge_mah||0)*100/cs.capacity_mah)):null}
 function num(v,d=0){return typeof v==='number'&&isFinite(v)?v.toFixed(d):'--'}
 function pctBar(id,value,max,badAt,warnAt){let e=$(id),i=e&&e.querySelector('i');if(!e||!i)return;let p=Math.max(0,Math.min(100,(value||0)*100/max));i.style.width=p+'%';e.className='bar '+((value||0)>=badAt?'bad':(value||0)>=warnAt?'warn':'')}
@@ -3086,7 +3086,7 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
     let snapshot = status::snapshot(Instant::now().as_millis() as u32);
     let _ = writeln!(
         response,
-        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={}",
+        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={}",
         snapshot.uptime_ms,
         snapshot.current_runtime_state,
         snapshot.body_state,
@@ -3107,6 +3107,7 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.create_sensor_last_complete_packet_timestamp_ms,
         snapshot.last_uart_packet_len,
         snapshot.create_sensor_charging_sources,
+        snapshot.create_sensor_flags,
         snapshot.uart_tx_bytes,
         snapshot.last_uart_rx_byte,
         snapshot.last_uart_tx_byte,
