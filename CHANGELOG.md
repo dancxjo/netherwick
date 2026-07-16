@@ -15,6 +15,10 @@ All notable changes are grouped by date.
 
 ### Ready
 
+- Add typed temporal clock domains, timed predictions, and deterministic charging, conversation, recovery, exploration, and task episodes to the canonical world model.
+- Add persistent uncertain people, relationship, presence, identity, and interaction beliefs shared by goals and durable memory without granting social trust any motor authority.
+- Add explicit epistemic questions and information-gathering affordances whose progress is measured by actual uncertainty reduction, including charger-seeking inquiry that preserves goal commitment.
+- Persist temporal, social, and epistemic snapshots in memory and expose social and episode structure as queryable durable graph records.
 - Make a bump-triggered contact withdrawal a bounded brainstem-local reflex: it continues across authority changes, records start and terminal safety events, and remains preemptible by stronger safety conditions.
 - Expose the contact-withdrawal lifecycle through typed cockpit events and mirror its bounded, authority-independent behavior in the simulator.
 - Route selected goal affordances through typed, bounded possessor skills, with target-based turn, approach, docking, search, and retreat requests that report completion, timeout, unavailable-target, authority-loss, and safety-preemption outcomes.
