@@ -64,6 +64,10 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Make contact withdrawal an immutable brainstem safety reflex: only a fresh
+  bumper edge during forward output can start the bounded reverse, held or
+  stationary contact cannot initiate motion, active physical hazards cannot be
+  cleared, and diagnostic safety-policy commands cannot weaken firmware rules.
 - Accept checksum-valid Create group-0 sensor frames even when battery
   telemetry is unusual, preserving their independently validated safety data
   instead of repeatedly surfacing opaque `error 4` messages; spell out
