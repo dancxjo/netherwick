@@ -391,11 +391,7 @@ impl Default for SleepController {
 }
 
 impl SleepController {
-    pub fn snapshot(
-        &self,
-        now_ms: u64,
-        eligibility: SleepEligibility,
-    ) -> SleepSnapshot {
+    pub fn snapshot(&self, now_ms: u64, eligibility: SleepEligibility) -> SleepSnapshot {
         SleepSnapshot {
             schema_version: 1,
             t_ms: now_ms,
@@ -1034,6 +1030,101 @@ mod tests {
             result.kind == SleepWorkKind::TrainCandidate
                 && result.status == SleepWorkStatus::Deferred
         }));
+    }
+
+    #[test]
+    fn completed_session_consumes_deferred_refs_and_does_not_reenter() {
+        let mut controller = SleepController::default();
+        run_to_wake(&mut controller, 100, true);
+
+        let mut same_work = safe_input(108);
+        same_work.fatigue_activation = 0.0;
+        let snapshot = controller.tick(same_work);
+
+        assert_eq!(snapshot.phase, SleepPhase::Awake);
+        assert!(snapshot.session.is_none());
+        assert!(!snapshot.eligibility.eligible);
+        assert_eq!(controller.sequence, 1);
+        let consumed = &snapshot.last_report.unwrap().consumed_input_refs;
+        assert!(consumed.contains(&"episode:charging:1".to_string()));
+        assert!(consumed.contains(&"behavior:approach_charger:failed:1".to_string()));
+    }
+
+    #[test]
+    fn persistent_high_fatigue_must_recover_before_it_can_trigger_again() {
+        let mut controller = SleepController::default();
+        for offset in 0..8 {
+            controller.tick(safe_input(100 + offset));
+        }
+
+        let still_fatigued = controller.tick(safe_input(108));
+        assert_eq!(still_fatigued.phase, SleepPhase::Awake);
+        assert!(!still_fatigued.eligibility.eligible);
+        assert_eq!(controller.sequence, 1);
+
+        let mut recovered = safe_input(109);
+        recovered.fatigue_activation = 0.0;
+        let recovered = controller.tick(recovered);
+        assert_eq!(recovered.phase, SleepPhase::Awake);
+
+        let fatigued_again = controller.tick(safe_input(110));
+        assert_eq!(fatigued_again.phase, SleepPhase::Preparing);
+        assert_eq!(
+            fatigued_again.session.unwrap().trigger,
+            SleepTrigger::HighFatigue
+        );
+        assert_eq!(controller.sequence, 2);
+    }
+
+    #[test]
+    fn increased_failure_count_is_new_deferred_work() {
+        let mut controller = SleepController::default();
+        run_to_wake(&mut controller, 100, true);
+
+        let mut new_failure = safe_input(108);
+        new_failure.fatigue_activation = 0.0;
+        new_failure.failed_behavior_refs = vec!["behavior:approach_charger:failed:2".to_string()];
+        let snapshot = controller.tick(new_failure);
+
+        assert_eq!(snapshot.phase, SleepPhase::Preparing);
+        assert_eq!(
+            snapshot.session.unwrap().trigger,
+            SleepTrigger::DeferredWork
+        );
+        assert_eq!(controller.sequence, 2);
+    }
+
+    #[test]
+    fn persistent_operator_request_is_edge_triggered() {
+        let mut controller = SleepController::default();
+        for offset in 0..8 {
+            let mut input = safe_input(100 + offset);
+            input.fatigue_activation = 0.0;
+            input.operator_sleep_request = true;
+            controller.tick(input);
+        }
+
+        let mut held_request = safe_input(108);
+        held_request.fatigue_activation = 0.0;
+        held_request.operator_sleep_request = true;
+        let held = controller.tick(held_request);
+        assert_eq!(held.phase, SleepPhase::Awake);
+        assert!(!held.eligibility.eligible);
+
+        let mut released = safe_input(109);
+        released.fatigue_activation = 0.0;
+        released.operator_sleep_request = false;
+        controller.tick(released);
+
+        let mut pressed_again = safe_input(110);
+        pressed_again.fatigue_activation = 0.0;
+        pressed_again.operator_sleep_request = true;
+        let restarted = controller.tick(pressed_again);
+        assert_eq!(restarted.phase, SleepPhase::Preparing);
+        assert_eq!(
+            restarted.session.unwrap().trigger,
+            SleepTrigger::OperatorRequest
+        );
     }
 
     #[test]
