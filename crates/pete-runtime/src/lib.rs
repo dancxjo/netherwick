@@ -4836,6 +4836,8 @@ pub trait RuntimeLoop {
     fn reign_sense(&self, _now_ms: TimeMs) -> Result<ReignSense> {
         Ok(ReignSense::default())
     }
+
+    fn observe_skill_status(&mut self, _status: &SkillStatus) {}
 }
 
 #[async_trait::async_trait]
@@ -4855,6 +4857,10 @@ where
             .map_err(|_| anyhow::anyhow!("reign queue lock poisoned"))?;
         reign_queue.drain_expired(now_ms);
         Ok(reign_queue.sense(now_ms))
+    }
+
+    fn observe_skill_status(&mut self, status: &SkillStatus) {
+        self.goal_system.observe_skill_status(status);
     }
 
     async fn tick(
@@ -5469,6 +5475,7 @@ where
                     &brainstem_events,
                     t_ms,
                 );
+                self.runtime.observe_skill_status(&status);
                 tick.skill_status = Some(status);
             }
         }
@@ -9706,6 +9713,8 @@ mod tests {
         let mut runtime = PossessorSkillRuntime::default();
         let request = SkillRequest {
             skill_id: SkillId::ApproachTarget,
+            goal_id: None,
+            behavior_id: None,
             target: Some(pete_now::EntityId("charger:17".to_string())),
             bearing_rad: Some(0.0),
             range_m: Some(2.0),
@@ -9957,7 +9966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_possession_run_random_walk_bump_stop_and_recovery() {
+    async fn normal_possession_observes_brainstem_reflex_without_host_escape() {
         let sim = Arc::new(Mutex::new(SimCockpit::new().with_event_capacity(256)));
         let session = establish_session(
             SharedSimCockpit(Arc::clone(&sim)),
@@ -9981,32 +9990,24 @@ mod tests {
             .with_autonomous_motion(true);
         runner.cockpit.resync_event_cursor_from_status().unwrap();
 
-        let (_first_snapshot, first_tick) = runner.tick_slow_manual().await.unwrap();
-        assert!(matches!(
-            first_tick.chosen_action,
-            Some(ActionPrimitive::Drive { forward, turn, .. })
-                if (forward - 0.2).abs() < 0.001 && (turn - 0.1).abs() < 0.001
-        ));
+        let (_first_snapshot, _first_tick) = runner.tick_slow_manual().await.unwrap();
 
         sim.lock().unwrap().set_bump(true, false);
-        let (_bump_snapshot, bump_tick) = runner.tick_slow_manual().await.unwrap();
+        let (bump_snapshot, bump_tick) = runner.tick_slow_manual().await.unwrap();
         assert!(bump_tick.frame.now.body.flags.bump_left);
-        assert!(matches!(
-            bump_tick.chosen_action,
-            Some(ActionPrimitive::Go { intensity, .. }) if intensity < 0.0
-        ));
+        assert_eq!(
+            bump_snapshot
+                .action_debug
+                .as_ref()
+                .and_then(|debug| debug.get("possession_recovery"))
+                .and_then(|debug| debug.get("phase")),
+            Some(&serde_json::json!("BrainstemReflex"))
+        );
 
         sim.lock().unwrap().set_bump(false, false);
-        runner.possession_recovery.last_command_ms =
-            wall_time_ms().saturating_sub(BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs + 1);
-        let (_turn_snapshot, turn_tick) = runner.tick_slow_manual().await.unwrap();
-        assert!(matches!(
-            turn_tick.chosen_action,
-            Some(ActionPrimitive::Turn {
-                direction: TurnDir::Right,
-                ..
-            })
-        ));
+        sim.lock().unwrap().advance_ms(300);
+        let (_completed_snapshot, _completed_tick) = runner.tick_slow_manual().await.unwrap();
+        assert!(runner.possession_recovery.latch.is_none());
 
         let events = sim.lock().unwrap().get_events_since(0).unwrap();
         let bump_index = events
@@ -10025,6 +10026,17 @@ mod tests {
             .map(|index| bump_index + index)
             .unwrap();
         assert!(bump_index < safety_index && safety_index < stop_index);
+        let reflex_start = events
+            .events
+            .iter()
+            .position(|event| event.kind == CockpitEventKind::ContactWithdrawalStarted)
+            .unwrap();
+        let reflex_complete = events
+            .events
+            .iter()
+            .position(|event| event.kind == CockpitEventKind::ContactWithdrawalCompleted)
+            .unwrap();
+        assert!(stop_index < reflex_start && reflex_start < reflex_complete);
         assert!(runner.cockpit.client_mut().snapshot().possessed);
         let _ = fs::remove_dir_all(ledger_root);
     }

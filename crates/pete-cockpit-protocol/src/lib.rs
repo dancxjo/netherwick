@@ -2,6 +2,8 @@
 
 pub const BUMP_ESCAPE_BACKOFF_DURATION_MS: u32 = 900;
 pub const BUMP_ESCAPE_TURN_ANGLE_MRAD: u32 = 1_571;
+pub const CONTACT_WITHDRAWAL_DURATION_MS: u32 = 300;
+pub const CONTACT_WITHDRAWAL_SPEED_MM_S: i16 = 80;
 
 pub const fn bump_escape_turn_duration_ms(turn_angular_mrad_s: i16) -> u32 {
     let angular_mrad_s = if turn_angular_mrad_s < 0 {

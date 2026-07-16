@@ -193,8 +193,16 @@ fresh observations or targets.
 This preserves a useful division:
 
 - the brainstem owns immediate consequences and invariants;
-- the higher brain owns interpretation, goals, adaptation, and long-horizon
-  control.
+- the motherbrain possessor owns reusable skills, local sequencing, progress,
+  retries, and bounded strategy failure handling;
+- goals own motivation and select skill requests, not wheel mechanics;
+- the higher brain owns interpretation, adaptation, and long-horizon control.
+
+For contact, the brainstem's only autonomous motion is a bounded straight
+withdrawal followed by stop. A turn, probe, search, or route change is a
+possessor skill. Calling both mechanisms “recovery” does not make them the same
+authority layer: the reflex supersedes the skill and reports a typed
+safety-preempted outcome upstream.
 
 ## Ordered events are the physical transcript
 

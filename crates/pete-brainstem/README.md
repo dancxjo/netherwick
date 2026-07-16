@@ -185,6 +185,17 @@ The numeric fields are intentionally small and transport-neutral. Command lifecy
 
 Motion events pack wheel speeds or duration, sensor-frame events carry the body packet/frame id plus flags and odometry delta, and error events carry a small error code. Compound verbs such as `bump_escape` and `wiggle_align` currently expand into runtime substeps that share the external command id; a future event schema should add a child-step field.
 
+Contact withdrawal is not a `bump_escape` skill. A rising bumper edge invokes a
+brainstem-local straight reverse of 80 mm/s for at most 300 ms, after first
+stopping the preempted command. It runs without a possession lease and survives
+host/session loss. Cliff, wheel-drop, charging, disarm, stop, and e-stop remain
+stronger and end it stopped. `contact_withdrawal_started` records contact side,
+repeat count, preempted command id, and the reverse bounds;
+`contact_withdrawal_completed` records outcome, any dominating safety condition,
+observed odometry displacement, elapsed time, and final stopped state. The
+motherbrain possessor consumes those events as a safety preemption of its active
+skill; it does not schedule or claim ownership of the reflex.
+
 The current internal Rust enums still include Create-specific variants such as `CreateOiMode`, `CreatePacketReceived`, and `CreateSensorPacketDecoded`. Those are driver/runtime implementation details, not the clean public vocabulary. Public capability and event renderers translate them into body-neutral names.
 
 Smart controller verbs are one-shot/TTL step primitives. `face_bearing`, `track_bearing`, `hold_heading`, `turn_to_heading`, `dock_align`, `wall_follow`, and `creep_until` consume the supplied current error/range and emit a short motion pulse or stop. The host must repeatedly send fresh target error/range samples if it wants closed-loop behavior across time.
@@ -231,6 +242,18 @@ Start without robot hardware and climb only when the previous rung is boring:
 5. Robot attached, wheels off floor: request control, heartbeat, short low-speed motion, stop, event cursor check.
 6. Robot attached, low-speed motion on the floor with clear space and an operator stop path.
 7. Motherbrain/forebrain integration later, after the brainstem contract and safety events remain stable under the local tests.
+
+Phase-B contact-reflex promotion additionally requires recorded HIL evidence.
+With wheels initially off the floor, command a low forward velocity, press each
+bumper independently, and verify from the ordered event cursor that
+`command_interrupted` precedes `contact_withdrawal_started`, the wheels reverse
+within one 10 ms runtime cycle, and `contact_withdrawal_completed` reports a
+stopped body within 300 ms. Repeat while expiring the control lease; withdrawal
+must finish. Then repeat with a cliff or wheel-drop signal introduced during
+withdrawal; the stronger safety event must terminate the reverse and the typed
+outcome must name that preemption. Floor testing should measure displacement
+and run repeated contacts before promotion. Unit/simulator success is not HIL
+evidence and is not sufficient to close the reflex issue.
 
 ## Build
 

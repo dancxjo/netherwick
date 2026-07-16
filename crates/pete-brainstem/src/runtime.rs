@@ -1,5 +1,8 @@
 use heapless::Deque;
-use pete_cockpit_protocol::{bump_escape_turn_duration_ms, BUMP_ESCAPE_BACKOFF_DURATION_MS};
+use pete_cockpit_protocol::{
+    bump_escape_turn_duration_ms, BUMP_ESCAPE_BACKOFF_DURATION_MS, CONTACT_WITHDRAWAL_DURATION_MS,
+    CONTACT_WITHDRAWAL_SPEED_MM_S,
+};
 
 use crate::body;
 use crate::commands::{
@@ -39,7 +42,6 @@ const CONNECTED_POWER_LED_INTENSITY: u8 = 255;
 const ORIENTATION_PROBE_IMU_MAX_AGE_MS: u32 = body::IMU_POLL_PERIOD_MS * 5;
 const ORIENTATION_PROBE_MIN_ACCEL_MM_S2: u16 = 7_000;
 const ORIENTATION_PROBE_MAX_ACCEL_MM_S2: u16 = 13_000;
-const CONTACT_WITHDRAWAL_SPEED_MM_S: i16 = 80;
 const CONTACT_REPEAT_WINDOW_MS: u32 = 2_000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1807,7 +1809,7 @@ where
                     RuntimeCommand::CmdVel {
                         linear_mm_s: -CONTACT_WITHDRAWAL_SPEED_MM_S,
                         angular_mrad_s: 0,
-                        duration_ms: Some(BUMP_ESCAPE_BACKOFF_DURATION_MS),
+                        duration_ms: Some(CONTACT_WITHDRAWAL_DURATION_MS),
                     },
                 ));
                 Ok(())
@@ -2112,7 +2114,7 @@ where
             self.repeated_contact_count,
             preempted_command_id,
             CONTACT_WITHDRAWAL_SPEED_MM_S.unsigned_abs(),
-            BUMP_ESCAPE_BACKOFF_DURATION_MS.min(u32::from(u16::MAX)) as u16,
+            CONTACT_WITHDRAWAL_DURATION_MS.min(u32::from(u16::MAX)) as u16,
         );
     }
 
@@ -3078,7 +3080,7 @@ mod tests {
         assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
         assert!(runtime.active_contact_withdrawal.is_some());
 
-        runtime.hardware.now_us += BUMP_ESCAPE_BACKOFF_DURATION_MS * 1_000;
+        runtime.hardware.now_us += CONTACT_WITHDRAWAL_DURATION_MS * 1_000;
         assert!(runtime.advance_active_action().is_ok());
         assert!(runtime.active_contact_withdrawal.is_none());
         assert!(matches!(runtime.active, ActiveAction::None));
@@ -3127,6 +3129,45 @@ mod tests {
             runtime.safety_latch_kind,
             Some(status::SafetyEventKind::Bump)
         ));
+    }
+
+    #[test]
+    fn contact_edge_preempts_forward_and_starts_reverse_in_one_runtime_tick() {
+        let _guard = status::status_test_guard();
+        let since_seq = status::event_next_seq().saturating_sub(1);
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_right: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(71);
+
+        runtime.tick();
+
+        assert!(runtime.active_contact_withdrawal.is_some());
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert!(runtime.safety_recovery_motion);
+        let mut events = heapless::Vec::<status::PublicEventRecord, 64>::new();
+        status::collect_events_since(since_seq, &mut events);
+        let interrupted = events
+            .iter()
+            .position(|event| {
+                event.kind == status::PublicEventKind::CommandInterrupted as u8 && event.a == 71
+            })
+            .unwrap();
+        let reflex = events
+            .iter()
+            .position(|event| event.kind == status::PublicEventKind::ContactWithdrawalStarted as u8)
+            .unwrap();
+        assert!(interrupted < reflex);
     }
 
     #[test]

@@ -14,7 +14,8 @@ mod handshake;
 pub use handshake::*;
 pub use pete_cockpit_protocol::{
     bump_escape_duration_ms, bump_escape_turn_duration_ms, CommandRejectReason,
-    BUMP_ESCAPE_BACKOFF_DURATION_MS, BUMP_ESCAPE_TURN_ANGLE_MRAD,
+    BUMP_ESCAPE_BACKOFF_DURATION_MS, BUMP_ESCAPE_TURN_ANGLE_MRAD, CONTACT_WITHDRAWAL_DURATION_MS,
+    CONTACT_WITHDRAWAL_SPEED_MM_S,
 };
 
 pub type Result<T> = std::result::Result<T, CockpitError>;
@@ -3556,11 +3557,12 @@ impl SimCockpit {
                     | (u32::from(right) << 1)
                     | (u32::from(self.repeated_contact_count) << 8),
                 preempted_command_id,
-                80 | (300 << 16),
+                u32::from(CONTACT_WITHDRAWAL_SPEED_MM_S.unsigned_abs())
+                    | (CONTACT_WITHDRAWAL_DURATION_MS << 16),
             );
             self.active_contact_withdrawal = Some(SimContactWithdrawal {
                 started_at_ms: self.now_ms,
-                complete_at_ms: self.now_ms.wrapping_add(300),
+                complete_at_ms: self.now_ms.wrapping_add(CONTACT_WITHDRAWAL_DURATION_MS),
                 baseline_odometry_mm: self.odometry_distance_mm,
             });
         }
@@ -3716,9 +3718,12 @@ impl SimCockpit {
             return;
         }
         self.active_contact_withdrawal = None;
-        // 80 mm/s for 300 ms, kept explicit so the simulator reports the
-        // same bounded displacement as the firmware contract.
-        self.odometry_distance_mm = self.odometry_distance_mm.saturating_sub(24);
+        // Shared bounds keep simulator and firmware transcripts on the same
+        // bounded displacement contract.
+        let displacement_mm = i32::from(CONTACT_WITHDRAWAL_SPEED_MM_S)
+            * CONTACT_WITHDRAWAL_DURATION_MS as i32
+            / 1_000;
+        self.odometry_distance_mm = self.odometry_distance_mm.saturating_sub(displacement_mm);
         self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
         self.push_event(
             CockpitEventKind::ContactWithdrawalCompleted,

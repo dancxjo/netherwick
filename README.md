@@ -126,7 +126,9 @@ See:
 Pete now has deliberately separate bodily control and bulk-data planes.
 
 - The Pico W brainstem exclusively owns bodily safety, possession, bounded
-  commands, reflexes, and recovery authority.
+  commands, and immediate reflex authority. The motherbrain possessor owns
+  reusable skills and higher-level recovery sequencing; every such command is
+  still subordinate to brainstem safety and reflex preemption.
 - The Pi 5 motherbrain remains canonical for Pete's live experience, graph,
   vector stores, inference state, and bounded online learning.
 - Forebrains are enrolled compute nodes that receive immutable exports and run
