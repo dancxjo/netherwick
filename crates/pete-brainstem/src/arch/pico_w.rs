@@ -1652,7 +1652,7 @@ function hasVerb(v){return !!(caps&&caps.verbs&&caps.verbs.indexOf(v)>=0)}
 function setEnabled(id,on){let e=$(id);if(e)e.disabled=!on}
 function setEnabledAll(selector,on){document.querySelectorAll(selector).forEach(e=>e.disabled=!on)}
 function chargeActive(cs){return cs.charging_indicator==='on'||(cs.charging_state>=1&&cs.charging_state<=3)}
-function statusBlocksMotion(){let s=lastStatus||{},cs=s.create_sensors||{},imu=s.imu||{},imuDanger=imu.health==='fault'||(imu.health==='ok'&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safety=s.estop_latched||s.safety_tripped||s.motion_interlock_latched||cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,charging=chargeActive(cs);return !!(safety||charging)}
+function statusBlocksMotion(){let s=lastStatus||{},cs=s.create_sensors||{},imu=s.imu||{},imuDanger=imu.health==='fault'||(imu.health==='ok'&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safety=s.estop_latched||s.safety_tripped||s.motion_interlock_latched||cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger;return !!safety}
 function canSession(verb){return hasVerb(verb)&&!!sessionId}
 function canControl(verb){return hasVerb(verb)&&!!sessionId&&!!controlLeaseId}
 function canMotion(verb){return canControl(verb)&&!statusBlocksMotion()}

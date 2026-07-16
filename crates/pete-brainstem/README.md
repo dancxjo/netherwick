@@ -687,6 +687,16 @@ confirms Full, so supervision traffic cannot consume the lifecycle event ring;
 it pauses when fresh battery telemetry says the battery is at or below 20% and
 is actively charging.
 
+Create 1 has no separate Open Interface undock command. Full mode terminates
+charging, and leaving the Home Base requires reversing away from its contacts.
+The brainstem remembers that charging stopped motion; when charging has ended,
+the first nonzero, non-docking motion request is held while the body driver
+backs straight away from the Home Base at 80 mm/s for 1.25 seconds. The
+original body-neutral request starts afterward. This dock departure is an
+internal body-driver action rather than a charging safety latch that callers
+must clear. Stop, e-stop, authority loss, heartbeat expiry, and local safety
+reflexes still preempt it.
+
 For a non-motion electrical/UART diagnosis, run:
 
 ```bash

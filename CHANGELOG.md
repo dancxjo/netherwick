@@ -64,6 +64,10 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Keep Create 1 dock departure inside the brainstem: after Full mode ends
+  charging, hold the first nonzero motion request, perform a bounded reverse
+  off the Home Base, then execute the original request without exposing a
+  charging latch that callers must clear.
 - Consume sleep inputs per successfully completed work kind, keeping deferred,
   failed, and cancelled training inputs eligible when resources return, and
   declare canonical world-model schema 3 in sleep provenance.

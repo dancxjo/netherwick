@@ -43,6 +43,8 @@ const ORIENTATION_PROBE_IMU_MAX_AGE_MS: u32 = body::IMU_POLL_PERIOD_MS * 5;
 const ORIENTATION_PROBE_MIN_ACCEL_MM_S2: u16 = 7_000;
 const ORIENTATION_PROBE_MAX_ACCEL_MM_S2: u16 = 13_000;
 const CONTACT_REPEAT_WINDOW_MS: u32 = 2_000;
+const DOCK_DEPARTURE_SPEED_MM_S: i16 = -80;
+const DOCK_DEPARTURE_DURATION_MS: u32 = 1_250;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -94,6 +96,9 @@ enum ActiveAction {
         until_ms: u32,
     },
     Driving {
+        stop_at_ms: u32,
+    },
+    DockDeparture {
         stop_at_ms: u32,
     },
 }
@@ -467,7 +472,7 @@ where
                 if on { 255 } else { 0 },
                 300,
             )
-        } else if self.estop_latched || self.safety_latched || self.charging_interlock_latched {
+        } else if self.estop_latched || self.safety_latched {
             (CREATE_BUTTON_LED_MASK, 255, 255, 500)
         } else {
             // Keep POWER stable while PLAY and ADVANCE alternate more quickly.
@@ -506,7 +511,7 @@ where
         status::set_session_safety_snapshot(
             self.estop_latched,
             self.safety_latched,
-            self.charging_interlock_latched,
+            false,
             self.safety_latch_kind,
         );
     }
@@ -817,12 +822,24 @@ where
             return Ok(());
         };
         let command = queued.command;
+        let now_ms = self.now_ms();
+        if self.charging_interlock_latched && requires_dock_departure(command) {
+            // Full mode terminates Create 1 charging.  Once the charge signal
+            // drops, back off the Home Base before starting the caller's
+            // body-neutral motion command.  Keep that command queued and do
+            // not give the internal departure its lifecycle identity.
+            if status::charging_interlock_active(&status::snapshot(now_ms)) {
+                let _ = self.commands.push_front(queued);
+                return Ok(());
+            }
+            let _ = self.commands.push_front(queued);
+            self.start_dock_departure(now_ms)?;
+            return Ok(());
+        }
         let command_code = status::set_command(Some(command));
         self.active_command_id = Some(queued.command_id);
         self.safety_recovery_motion = queued.safety_recovery;
         status::mark_command_started(queued.command_id, command_code);
-
-        let now_ms = self.now_ms();
         match command {
             RuntimeCommand::Stop | RuntimeCommand::StopDrive => {
                 self.stop_drive()?;
@@ -929,7 +946,13 @@ where
                 duration_ms,
             } => {
                 self.start_cmd_vel(linear_mm_s, angular_mrad_s, duration_ms, now_ms)?;
-                status::mark_velocity_stream_active(queued.command_id, linear_mm_s, angular_mrad_s);
+                if linear_mm_s != 0 || angular_mrad_s != 0 {
+                    status::mark_velocity_stream_active(
+                        queued.command_id,
+                        linear_mm_s,
+                        angular_mrad_s,
+                    );
+                }
             }
             RuntimeCommand::FaceBearing {
                 bearing_mrad,
@@ -1384,7 +1407,34 @@ where
                 }
                 Ok(())
             }
+            ActiveAction::DockDeparture { stop_at_ms } => {
+                if time_reached(now_ms, stop_at_ms) {
+                    self.stop_drive()?;
+                    self.active = ActiveAction::None;
+                    status::set_body_state(BodyState::Idle);
+                }
+                Ok(())
+            }
         }
+    }
+
+    fn start_dock_departure(&mut self, now_ms: u32) -> Result<(), BrainstemError> {
+        self.ensure_create_responsive()?;
+        self.charging_interlock_latched = false;
+        self.active_velocity = None;
+        status::set_body_state(BodyState::Moving);
+        self.stop_sent = false;
+        self.create_uart.drive_direct(
+            &mut self.hardware,
+            &mut self.events,
+            DOCK_DEPARTURE_SPEED_MM_S,
+            DOCK_DEPARTURE_SPEED_MM_S,
+            DOCK_DEPARTURE_DURATION_MS,
+        )?;
+        self.active = ActiveAction::DockDeparture {
+            stop_at_ms: now_ms.wrapping_add(DOCK_DEPARTURE_DURATION_MS),
+        };
+        Ok(())
     }
 
     fn stop_drive(&mut self) -> Result<(), BrainstemError> {
@@ -1408,6 +1458,11 @@ where
         duration_ms: Option<u32>,
         now_ms: u32,
     ) -> Result<(), BrainstemError> {
+        if linear_mm_s == 0 && angular_mrad_s == 0 {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
         let half_delta = angular_mrad_s as i32 * CREATE_AXLE_TRACK_MM / 2_000;
         let left = clamp_i16(linear_mm_s as i32 - half_delta);
         let right = clamp_i16(linear_mm_s as i32 + half_delta);
@@ -1699,7 +1754,10 @@ where
                 let _ = self.commands.push_back(command);
             }
         }
-        if matches!(self.active, ActiveAction::Driving { .. }) {
+        if matches!(
+            self.active,
+            ActiveAction::Driving { .. } | ActiveAction::DockDeparture { .. }
+        ) {
             self.interrupt_active_command();
             self.stop_drive()?;
             self.active = ActiveAction::None;
@@ -1762,7 +1820,6 @@ where
 
         if charging {
             if !self.charging_interlock_latched {
-                status::mark_safety_tripped(status::SafetyEventKind::Charging);
                 self.clear_motion_queue()?;
                 self.stop_drive()?;
                 self.finish_contact_withdrawal(
@@ -1895,7 +1952,6 @@ where
 
     fn clear_safety_latch(&mut self, expected: Option<status::SafetyEventKind>) {
         if expected == Some(status::SafetyEventKind::Charging) && self.charging_interlock_latched {
-            status::mark_safety_cleared(status::SafetyEventKind::Charging);
             self.charging_interlock_latched = false;
             return;
         }
@@ -1948,6 +2004,11 @@ where
             self.stop_drive()?;
             return Err(BrainstemError::Timeout);
         };
+        if left_mm_s == 0 && right_mm_s == 0 {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
         self.ensure_motion_allowed()?;
         self.active_velocity = None;
 
@@ -1977,6 +2038,11 @@ where
             self.stop_drive()?;
             return Err(BrainstemError::Timeout);
         };
+        if velocity_mm_s == 0 {
+            self.stop_drive()?;
+            self.active = ActiveAction::None;
+            return Ok(());
+        }
         self.ensure_motion_allowed()?;
 
         status::set_body_state(BodyState::Moving);
@@ -2117,7 +2183,9 @@ where
             ActiveAction::WakeSettle { .. } => RuntimeActionCode::WakeSettle,
             ActiveAction::WaitForCreate { .. } => RuntimeActionCode::WaitForCreate,
             ActiveAction::Settle { .. } => RuntimeActionCode::Settle,
-            ActiveAction::Driving { .. } => RuntimeActionCode::Driving,
+            ActiveAction::Driving { .. } | ActiveAction::DockDeparture { .. } => {
+                RuntimeActionCode::Driving
+            }
         }
     }
 
@@ -2569,6 +2637,42 @@ fn is_motion_command(command: RuntimeCommand) -> bool {
             | RuntimeCommand::OrientationProbe { .. }
             | RuntimeCommand::Dock
     )
+}
+
+fn requires_dock_departure(command: RuntimeCommand) -> bool {
+    match command {
+        RuntimeCommand::CmdVel {
+            linear_mm_s,
+            angular_mrad_s,
+            ..
+        } => linear_mm_s != 0 || angular_mrad_s != 0,
+        RuntimeCommand::Drive {
+            left_mm_s,
+            right_mm_s,
+            ..
+        }
+        | RuntimeCommand::DriveDirect {
+            left_mm_s,
+            right_mm_s,
+            ..
+        } => left_mm_s != 0 || right_mm_s != 0,
+        RuntimeCommand::DriveArc { velocity_mm_s, .. } => velocity_mm_s != 0,
+        RuntimeCommand::DriveFor {
+            distance_mm,
+            velocity_mm_s,
+            ..
+        } => distance_mm != 0 && velocity_mm_s != 0,
+        RuntimeCommand::TurnBy {
+            angle_mrad,
+            angular_mrad_s,
+            ..
+        } => angle_mrad != 0 && angular_mrad_s != 0,
+        RuntimeCommand::ArcFor { velocity_mm_s, .. } => velocity_mm_s != 0,
+        RuntimeCommand::Dock | RuntimeCommand::DockAlign { .. } | RuntimeCommand::StopDrive => {
+            false
+        }
+        _ => is_motion_command(command),
+    }
 }
 
 fn recoverable_safety_latch(kind: Option<status::SafetyEventKind>) -> bool {
@@ -3067,7 +3171,7 @@ mod tests {
     }
 
     #[test]
-    fn charging_indicator_stops_active_motion_and_clears_motion_queue() {
+    fn charging_indicator_stops_motion_then_departure_precedes_next_command() {
         let _guard = status::status_test_guard();
         status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
         let mut hardware = FakeHardware::new(1_000);
@@ -3101,14 +3205,110 @@ mod tests {
         runtime.hardware.charging_indicator = Some(false);
         runtime.tick();
         assert!(runtime.charging_interlock_latched);
+        assert!(!status::session_safety_snapshot().2);
 
+        let event_cursor = status::snapshot(1_000).event_next_seq;
         assert!(runtime
-            .enqueue_command(RuntimeCommand::ClearSafetyLatch {
-                kind: SafetyLatchKind::Charging,
-            })
+            .commands
+            .push_back(QueuedCommand::new(
+                79,
+                RuntimeCommand::CmdVel {
+                    linear_mm_s: 100,
+                    angular_mrad_s: 0,
+                    duration_ms: Some(500),
+                },
+            ))
             .is_ok());
         assert!(runtime.start_next_command().is_ok());
+        assert!(matches!(
+            runtime.active,
+            ActiveAction::DockDeparture { .. }
+        ));
         assert!(!runtime.charging_interlock_latched);
+        assert_eq!(
+            &runtime.hardware.writes.as_slice()[runtime.hardware.writes.len() - 5..],
+            &[145, 0xff, 0xb0, 0xff, 0xb0]
+        );
+        assert_eq!(runtime.commands.len(), 1);
+
+        let mut lifecycle = heapless::Vec::<status::PublicEventRecord, 8>::new();
+        status::collect_events_since(event_cursor, &mut lifecycle);
+        assert!(!lifecycle.iter().any(|event| {
+            event.kind == status::PublicEventKind::CommandStarted as u8 && event.a == 79
+        }));
+
+        runtime.hardware.delay_ms(DOCK_DEPARTURE_DURATION_MS);
+        assert!(runtime.advance_active_action().is_ok());
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert_eq!(runtime.commands.len(), 1);
+
+        assert!(runtime.start_next_command().is_ok());
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert_eq!(runtime.active_command_id, Some(79));
+        assert!(runtime.events.iter().any(|event| {
+            matches!(
+                event,
+                BrainstemEvent::DriveRequested {
+                    left_mm_s: 100,
+                    right_mm_s: 100,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn dock_departure_only_wraps_nonzero_nondocking_motion() {
+        assert!(!requires_dock_departure(RuntimeCommand::CmdVel {
+            linear_mm_s: 0,
+            angular_mrad_s: 0,
+            duration_ms: Some(300),
+        }));
+        assert!(requires_dock_departure(RuntimeCommand::CmdVel {
+            linear_mm_s: 50,
+            angular_mrad_s: 0,
+            duration_ms: Some(300),
+        }));
+        assert!(!requires_dock_departure(RuntimeCommand::Dock));
+        assert!(!requires_dock_departure(RuntimeCommand::DockAlign {
+            bearing_mrad: 0,
+            range_mm: 100,
+            max_linear_mm_s: 50,
+            max_angular_mrad_s: 100,
+            stop_range_mm: 120,
+            duration_ms: 300,
+        }));
+    }
+
+    #[test]
+    fn zero_velocity_stops_without_consuming_pending_dock_departure() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.charging_interlock_latched = true;
+        assert!(runtime
+            .commands
+            .push_back(QueuedCommand::new(
+                80,
+                RuntimeCommand::CmdVel {
+                    linear_mm_s: 0,
+                    angular_mrad_s: 0,
+                    duration_ms: Some(300),
+                },
+            ))
+            .is_ok());
+
+        assert!(runtime.start_next_command().is_ok());
+
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert!(runtime.charging_interlock_latched);
+        assert!(runtime.active_velocity.is_none());
+        assert!(runtime
+            .hardware
+            .writes
+            .windows(5)
+            .any(|bytes| bytes == [137, 0, 0, 0, 0]));
     }
 
     #[test]

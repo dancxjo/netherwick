@@ -778,15 +778,6 @@ fn submit_control_command_with_service_identity(
         );
     };
 
-    if charging_interlock_active(&snapshot(0)) && is_motion_control_command(command) {
-        return reject_control_command(
-            command_id,
-            command_seq(command),
-            kind,
-            CommandRejectReason::Charging,
-        );
-    }
-
     if kind == ControlCommandCode::CmdVel {
         let seq = command_seq(command);
         let renewed_stream_id = matching_velocity_stream(a, b);
@@ -2221,32 +2212,6 @@ pub fn mark_create_charging_indicator(active: Option<bool>) {
 pub fn charging_interlock_active(snapshot: &BrainstemStatus) -> bool {
     snapshot.create_charging_indicator_state == ON
         || matches!(snapshot.create_sensor_charging_state, 1..=3)
-}
-
-fn is_motion_control_command(command: BrainstemCommand) -> bool {
-    matches!(
-        command,
-        BrainstemCommand::CmdVel { .. }
-            | BrainstemCommand::DriveDirect { .. }
-            | BrainstemCommand::DriveArc { .. }
-            | BrainstemCommand::FaceBearing { .. }
-            | BrainstemCommand::TrackBearing { .. }
-            | BrainstemCommand::TurnBy { .. }
-            | BrainstemCommand::DriveFor { .. }
-            | BrainstemCommand::BumpEscape { .. }
-            | BrainstemCommand::HoldHeading { .. }
-            | BrainstemCommand::TurnToHeading { .. }
-            | BrainstemCommand::ArcFor { .. }
-            | BrainstemCommand::CreepUntil { .. }
-            | BrainstemCommand::ScanArc { .. }
-            | BrainstemCommand::DockAlign { .. }
-            | BrainstemCommand::WallFollow { .. }
-            | BrainstemCommand::WiggleAlign { .. }
-            | BrainstemCommand::Unstick { .. }
-            | BrainstemCommand::CalibrateTurn { .. }
-            | BrainstemCommand::OrientationProbe { .. }
-            | BrainstemCommand::Dock
-    )
 }
 
 pub fn set_oi_mode(mode: CreateOiMode) {
@@ -4615,7 +4580,7 @@ mod tests {
     }
 
     #[test]
-    fn charging_interlock_covers_both_charge_sources_and_motion_commands() {
+    fn charging_interlock_covers_both_charge_sources() {
         let _guard = status_test_guard();
         mark_create_sensor_packet(0, CreateSensorPacket::default());
         mark_create_charging_indicator(Some(true));
@@ -4630,17 +4595,33 @@ mod tests {
             },
         );
         assert!(charging_interlock_active(&snapshot(0)));
-        assert!(is_motion_control_command(BrainstemCommand::CmdVel {
-            linear_mm_s: 100,
-            angular_mrad_s: 0,
-            ttl_ms: 500,
-            seq: 1,
-        }));
-        assert!(is_motion_control_command(BrainstemCommand::Dock));
-        assert!(!is_motion_control_command(BrainstemCommand::Stop));
-
         mark_create_sensor_packet(0, CreateSensorPacket::default());
         assert!(!charging_interlock_active(&snapshot(0)));
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn charging_motion_reaches_runtime_for_internal_dock_departure() {
+        let _guard = status_test_guard();
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+        mark_create_charging_indicator(Some(true));
+
+        assert!(submit_control_command(
+            41,
+            BrainstemCommand::CmdVel {
+                linear_mm_s: 50,
+                angular_mrad_s: 0,
+                ttl_ms: 300,
+                seq: 41,
+            },
+        )
+        .is_ok());
+        assert!(matches!(
+            take_control_command(),
+            Some(BrainstemCommand::CmdVel { seq: 41, .. })
+        ));
+
+        mark_create_charging_indicator(Some(false));
     }
 
     #[test]
