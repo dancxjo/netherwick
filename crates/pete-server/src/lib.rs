@@ -9409,7 +9409,6 @@ const defaults = {
 let cal = { ...defaults };
 let calibrationLoadedFromStorage = false;
 const CALIBRATION_KEY = 'pete-sensor-calibration-v2';
-const LEGACY_CALIBRATION_KEY = 'pete-sensor-calibration';
 
 const depthScaleEl = document.getElementById('cal-depth-scale');
 const pointYEl = document.getElementById('cal-point-y');
@@ -9442,18 +9441,7 @@ const valColorX = document.getElementById('val-color-x');
 const valColorY = document.getElementById('val-color-y');
 
 function loadCalibration() {
-  let stored = localStorage.getItem(CALIBRATION_KEY);
-  if(!stored){
-    const legacy = localStorage.getItem(LEGACY_CALIBRATION_KEY);
-    if(legacy){
-      try{
-        const parsed = JSON.parse(legacy);
-        if(Math.abs((Number(parsed.pointY) || 0) - 0.18) > 0.01){
-          stored = legacy;
-        }
-      }catch(_e){}
-    }
-  }
+  const stored = localStorage.getItem(CALIBRATION_KEY);
   if (stored) {
     try {
       cal = { ...defaults, ...JSON.parse(stored) };
