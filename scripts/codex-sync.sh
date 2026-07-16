@@ -10,26 +10,65 @@ if [[ ! -d .git ]]; then
   exit 1
 fi
 
-if [[ -z "$(git status --porcelain)" ]]; then
+STATUS_BRIEF="$(git status --short --branch)"
+DIRTY="$(git status --porcelain)"
+
+if [[ -z "${DIRTY}" ]]; then
   echo "No repository changes to process."
-  git status -sb
+  echo "${STATUS_BRIEF}"
+  echo "Syncing branch with origin..."
+  git pull --ff-only
+  if echo "${STATUS_BRIEF}" | grep -qE '\\[ahead [0-9]+\\]'; then
+    git push
+  fi
   exit 0
 fi
 
-RUST_LOG=error codex --ask-for-approval never exec --cd "$(pwd)" --sandbox danger-full-access --ephemeral <<'EOF'
-You are continuing the workflow in this repository. Do exactly this:
+TMP_ALL="$(mktemp)"
+TMP_SUMMARY="$(mktemp)"
+trap 'rm -f "$TMP_ALL" "$TMP_SUMMARY"' EXIT
 
-1) Inspect repository state and current changes with `git diff` and `git status`.
-2) Split unstaged/staged edits into a small number of semantically coherent commit groups.
-3) Stage and commit each group with a distinct, imperative commit message that you generate.
-4) Run `git pull --ff-only`.
-5) If `git pull --ff-only` fails, resolve any merge conflicts in a conservative way (preserve local intended changes while honoring upstream changes) and continue.
-6) Push the result with `git push`.
+RUST_LOG=error codex --ask-for-approval never exec --cd "$(pwd)" --sandbox danger-full-access --ephemeral --output-last-message "$TMP_SUMMARY" <<'EOF' >"$TMP_ALL" 2>&1
+You are the repo-sync assistant for this workspace.
+
+Do exactly this workflow:
+
+1) Inspect working state with:
+   - `git status --short --branch`
+   - `git diff --name-status`
+   - `git diff --cached --name-status`
+   - `git diff`
+   - `git diff --cached`
+
+2) Produce a concise summary (4-10 bullet points) of what changed.
+
+3) Update CHANGELOG.md under `## Unreleased`:
+   - If this section contains only the existing placeholder line, replace it with your new summary.
+   - If `## Unreleased` already has content, add a new heading `### Auto-sync (YYYY-MM-DD)` using today’s date and append your summary bullets.
+   - Do not remove prior release entries.
+
+4) Stage and commit all edits into minimal semantic commit groups with imperative messages you generate.
+   (Include changelog edits in the same commit group as the code changes they describe.)
+
+5) Run `git pull --ff-only`.
+   If pull fails, resolve merge conflicts conservatively (preserve local intended changes + upstream changes), then continue.
+
+6) Run `git push`.
+
+7) Final response: short final summary including
+   - what was summarized,
+   - changelog update made,
+   - commits pushed,
+   - pull/push result.
 
 Rules:
-- Keep commits minimal and focused.
-- Do not include unrelated files in a group.
-- If no changes are present, report that clearly and stop.
-- Keep running commands limited to the workflow above.
-- Show a brief final summary of commits and any conflict resolutions.
+- No CI/build/test commands.
+- No extra files.
+- Keep commands strictly within this workflow.
 EOF
+
+if [[ -s "${TMP_SUMMARY}" ]]; then
+  cat "${TMP_SUMMARY}"
+else
+  cat "${TMP_ALL}"
+fi

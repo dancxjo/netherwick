@@ -4,7 +4,12 @@ All notable changes are grouped by date.
 
 ## Unreleased
 
-- Keep this section for post-merge notes before the next release boundary.
+- Added a `sup` target in `Justfile` as a short alias for `./scripts/codex-sync.sh`.
+- Refactored `scripts/codex-sync.sh` to cache both short and porcelain git status once per run.
+- In clean-sync mode, `codex-sync.sh` now prints branch/status context and syncs from origin with `git pull --ff-only`.
+- In clean-sync mode, local ahead status now triggers an automatic `git push` after successful pull.
+- Added temporary-file based output capture in `codex-sync.sh` for robust summary propagation from nested `codex` execution.
+- Updated the embedded codex instructions in `scripts/codex-sync.sh` to enforce an expanded repo-sync workflow (status inspection, changelog update, conflict-aware pull/push, and final summary format).
 
 ## 2026-07-15
 

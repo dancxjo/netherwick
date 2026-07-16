@@ -1298,3 +1298,7 @@ clean:
 # Run the Codex autonomous diff -> commit -> pull -> push workflow.
 codex-sync:
     ./scripts/codex-sync.sh
+
+# Run the Codex autonomous sync workflow (read, summarize, changelog, pull/push).
+sup:
+    ./scripts/codex-sync.sh
