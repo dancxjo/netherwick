@@ -5131,6 +5131,7 @@ struct PossessionRecoveryState {
     stuck_stop_sent: bool,
     brainstem_reflex_observed: bool,
     last_reflex_outcome: Option<ContactWithdrawalOutcome>,
+    estop_observed_during_bump_recovery: bool,
 }
 
 impl Default for PossessionRecoveryState {
@@ -5145,6 +5146,7 @@ impl Default for PossessionRecoveryState {
             stuck_stop_sent: false,
             brainstem_reflex_observed: false,
             last_reflex_outcome: None,
+            estop_observed_during_bump_recovery: false,
         }
     }
 }
@@ -5688,7 +5690,20 @@ where
                     }
                 }
                 CockpitEventKind::EStopLatched => {
-                    self.possession_recovery = PossessionRecoveryState::default();
+                    if self.possession_recovery.latch == Some(SafetyLatchKind::Bump) {
+                        // This e-stop interrupted the local contact withdrawal.
+                        // Clear only the e-stop now: the retained bump latch
+                        // still permits the bounded BumpEscape needed to
+                        // unload a sustained bumper contact.
+                        self.cockpit.client_mut().clear_estop()?;
+                        self.possession_recovery.estop_observed_during_bump_recovery = true;
+                        self.possession_recovery.brainstem_reflex_observed = false;
+                        self.possession_recovery.phase =
+                            PossessionRecoveryPhase::WaitingForSensorClear;
+                        self.possession_recovery.last_command_ms = 0;
+                    } else {
+                        self.possession_recovery = PossessionRecoveryState::default();
+                    }
                 }
                 _ => {}
             }
@@ -5732,10 +5747,15 @@ where
                         reason = "brainstem contact-withdrawal reflex owns motion; possessor is observing"
                             .to_string();
                     } else if !bump_active(body) {
-                        self.cockpit.client_mut().clear_safety_latch(latch)?;
+                        let cleared_estop = self.clear_completed_bump_recovery_latches(status)?;
                         reason = format!(
-                            "brainstem contact withdrawal ended with {:?}; contact cleared",
-                            self.possession_recovery.last_reflex_outcome
+                            "brainstem contact withdrawal ended with {:?}; contact cleared{}",
+                            self.possession_recovery.last_reflex_outcome,
+                            if cleared_estop {
+                                "; cleared paired e-stop"
+                            } else {
+                                ""
+                            },
                         );
                         self.possession_recovery = PossessionRecoveryState::default();
                     } else if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
@@ -5792,13 +5812,14 @@ where
                         && !bump_active(body)
                     {
                         self.cockpit.client_mut().stop()?;
-                        self.cockpit.client_mut().clear_safety_latch(latch)?;
+                        let cleared_estop = self.clear_completed_bump_recovery_latches(status)?;
                         self.possession_recovery = PossessionRecoveryState::default();
                         action = Some(ActionPrimitive::Stop);
                         motor = Some(MotorCommand::stop());
                         reason = format!(
-                        "recovered {latch:?} safety latch after reverse and clockwise 90 degree turn"
-                    );
+                            "recovered {latch:?} safety latch after reverse and clockwise 90 degree turn{}",
+                            if cleared_estop { "; cleared paired e-stop" } else { "" },
+                        );
                     } else {
                         self.possession_recovery.phase =
                             PossessionRecoveryPhase::WaitingForSensorClear;
@@ -5943,6 +5964,18 @@ where
         })
     }
 
+    fn clear_completed_bump_recovery_latches(&mut self, status: &StatusSummary) -> Result<bool> {
+        let clear_estop = self.possession_recovery.estop_observed_during_bump_recovery
+            && status.estop_latched == Some(true);
+        if clear_estop {
+            self.cockpit.client_mut().clear_estop()?;
+        }
+        self.cockpit
+            .client_mut()
+            .clear_safety_latch(SafetyLatchKind::Bump)?;
+        Ok(clear_estop)
+    }
+
     fn start_possession_recovery(&mut self, latch: SafetyLatchKind, body: &BodySense) {
         let now_ms = wall_time_ms();
         let latch_changed = self.possession_recovery.latch != Some(latch);
@@ -5954,6 +5987,7 @@ where
             self.possession_recovery.last_command_ms = 0;
             self.possession_recovery.command_attempts = 0;
             self.possession_recovery.stuck_stop_sent = false;
+            self.possession_recovery.estop_observed_during_bump_recovery = false;
         }
     }
 
@@ -9978,7 +10012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_possession_observes_brainstem_reflex_without_host_escape() {
+    async fn normal_possession_restarts_bump_escape_after_paired_estop() {
         let sim = Arc::new(Mutex::new(SimCockpit::new().with_event_capacity(256)));
         let session = establish_session(
             SharedSimCockpit(Arc::clone(&sim)),
@@ -10005,6 +10039,10 @@ mod tests {
         let (_first_snapshot, _first_tick) = runner.tick_slow_manual().await.unwrap();
 
         sim.lock().unwrap().set_bump(true, false);
+        // The paired e-stop interrupts the local reflex. The runner clears
+        // that e-stop but keeps the bump latch so it can restart the bounded
+        // BumpEscape needed to unload a sustained bumper contact.
+        runner.cockpit.client_mut().estop().unwrap();
         let (bump_snapshot, bump_tick) = runner.tick_slow_manual().await.unwrap();
         assert!(bump_tick.frame.now.body.flags.bump_left);
         assert_eq!(
@@ -10013,13 +10051,18 @@ mod tests {
                 .as_ref()
                 .and_then(|debug| debug.get("possession_recovery"))
                 .and_then(|debug| debug.get("phase")),
-            Some(&serde_json::json!("BrainstemReflex"))
+            Some(&serde_json::json!("Escaping"))
         );
 
         sim.lock().unwrap().set_bump(false, false);
-        sim.lock().unwrap().advance_ms(300);
+        sim.lock()
+            .unwrap()
+            .advance_ms(POSSESSION_BUMP_ESCAPE_DURATION_MS as u32);
         let (_completed_snapshot, _completed_tick) = runner.tick_slow_manual().await.unwrap();
         assert!(runner.possession_recovery.latch.is_none());
+        let status = runner.cockpit.refresh_status().unwrap();
+        assert_eq!(status.estop_latched, Some(false));
+        assert_eq!(status.safety_tripped, Some(false));
 
         let events = sim.lock().unwrap().get_events_since(0).unwrap();
         let bump_index = events

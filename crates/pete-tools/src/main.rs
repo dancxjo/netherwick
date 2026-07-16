@@ -9717,7 +9717,8 @@ async fn run_physical_possession_recovery_smoke_inner(
     cockpit: &mut SafeCockpit<Box<dyn Cockpit + Send>>,
 ) -> Result<()> {
     cockpit.client_mut().stop()?;
-    cockpit.resync_event_cursor_from_status()?;
+    let initial_status = cockpit.resync_event_cursor_from_status()?;
+    ensure_recovery_smoke_ready(&initial_status)?;
     println!(
         "recovery smoke armed: wheels must remain off the floor; press and hold either bumper until contact is acknowledged"
     );
@@ -9726,6 +9727,7 @@ async fn run_physical_possession_recovery_smoke_inner(
     let mut next_motion_at = Instant::now();
     let mut saw_safety_trip = false;
     let mut saw_motion_stop = false;
+    let mut saw_recovery_estop = false;
     let contacted_body = loop {
         if Instant::now() >= deadline {
             anyhow::bail!(
@@ -9744,6 +9746,10 @@ async fn run_physical_possession_recovery_smoke_inner(
             .events
             .iter()
             .any(|event| event.kind == CockpitEventKind::MotionStopped);
+        saw_recovery_estop |= events
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::EStopLatched);
         if body.flags.bump_left || body.flags.bump_right {
             if saw_safety_trip && saw_motion_stop {
                 break body;
@@ -9776,7 +9782,6 @@ async fn run_physical_possession_recovery_smoke_inner(
     println!("contact observed; brainstem stopped motion; release the bumper");
 
     let clear_deadline = Instant::now() + Duration::from_secs(10);
-    let mut saw_safety_clear = false;
     loop {
         if Instant::now() >= clear_deadline {
             anyhow::bail!("recovery smoke timed out waiting for bumper and safety latch to clear");
@@ -9784,19 +9789,14 @@ async fn run_physical_possession_recovery_smoke_inner(
         let status = cockpit.refresh_status()?;
         let body =
             body_sense_from_cockpit_status(status, Utc::now().timestamp_millis().max(0) as u64);
-        cockpit.poll_events()?;
+        let events = cockpit.poll_events()?;
+        saw_recovery_estop |= events
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::EStopLatched);
         if !body.flags.bump_left && !body.flags.bump_right {
-            cockpit
-                .client_mut()
-                .clear_safety_latch(SafetyLatchKind::Bump)?;
-            let clear_events = cockpit.poll_events()?;
-            saw_safety_clear |= clear_events
-                .events
-                .iter()
-                .any(|event| event.kind == CockpitEventKind::SafetyCleared);
-            if saw_safety_clear {
-                break;
-            }
+            clear_bump_recovery_latches(cockpit, saw_recovery_estop)?;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -9843,6 +9843,81 @@ async fn run_physical_possession_recovery_smoke_inner(
     println!(
         "verified live sequence: contact -> stop -> clear -> reverse -> turn -> probe -> inspect"
     );
+    Ok(())
+}
+
+fn ensure_recovery_smoke_ready(status: &pete_cockpit::StatusSummary) -> Result<()> {
+    if status.estop_latched == Some(true) || status.safety_tripped == Some(true) {
+        anyhow::bail!("recovery smoke requires an initially clear e-stop and safety latch");
+    }
+    if status.contact.any_contact() == Some(true) {
+        anyhow::bail!(
+            "recovery smoke requires the bumper and contact sensors to be clear initially"
+        );
+    }
+    if status.contact.any_safety_stop() == Some(true) {
+        anyhow::bail!("recovery smoke cannot run while a cliff or wheel-drop sensor is active");
+    }
+    if status.battery.charging_state.unwrap_or(0) != 0
+        || status.battery.charging_indicator.unwrap_or(false)
+    {
+        anyhow::bail!("recovery smoke cannot run while charging is active");
+    }
+    Ok(())
+}
+
+/// Clear only the latches created by this explicitly guarded bump smoke after
+/// telemetry proves contact is gone. An e-stop that predates the smoke is left
+/// for an operator rather than being treated as a recoverable bump side effect.
+fn clear_bump_recovery_latches<C: Cockpit>(
+    cockpit: &mut SafeCockpit<C>,
+    saw_recovery_estop: bool,
+) -> Result<()> {
+    let status = cockpit.refresh_status()?;
+    if status.contact.bump_left == Some(true) || status.contact.bump_right == Some(true) {
+        anyhow::bail!("refusing to clear recovery latches while a bumper is still pressed");
+    }
+    if status.contact.any_safety_stop() == Some(true) {
+        anyhow::bail!(
+            "refusing to clear recovery latches while a cliff or wheel-drop sensor is active"
+        );
+    }
+    if status.battery.charging_state.unwrap_or(0) != 0
+        || status.battery.charging_indicator.unwrap_or(false)
+    {
+        anyhow::bail!("refusing to clear recovery latches while charging is active");
+    }
+    if let Some(kind) = status.safety_latch_kind {
+        if kind != SafetyLatchKind::Bump {
+            anyhow::bail!("refusing to clear non-bump safety latch during recovery: {kind:?}");
+        }
+    }
+    if status.estop_latched == Some(true) {
+        if !saw_recovery_estop {
+            anyhow::bail!(
+                "e-stop was already latched before bump recovery; leave it latched for operator clearance"
+            );
+        }
+        cockpit
+            .client_mut()
+            .clear_estop()
+            .context("recovery bump e-stop could not be cleared after contact release")?;
+    }
+
+    let status = cockpit.refresh_status()?;
+    if status.safety_tripped == Some(true)
+        || status.safety_latch_kind == Some(SafetyLatchKind::Bump)
+    {
+        cockpit
+            .client_mut()
+            .clear_safety_latch(SafetyLatchKind::Bump)
+            .context("recovery bump safety latch could not be cleared after contact release")?;
+    }
+
+    let status = cockpit.refresh_status()?;
+    if status.estop_latched == Some(true) || status.safety_tripped == Some(true) {
+        anyhow::bail!("recovery latches remain set after bumper release");
+    }
     Ok(())
 }
 
@@ -15236,6 +15311,43 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn bump_recovery_cleanup_clears_the_bump_latch_after_contact_releases() {
+        let mut cockpit = SafeCockpit::new(LocalSimCockpit::new().with_unscoped_bench_mode());
+        cockpit.client_mut().set_bump(true, false);
+        cockpit.client_mut().set_bump(false, false);
+
+        clear_bump_recovery_latches(&mut cockpit, false).unwrap();
+
+        let status = cockpit.refresh_status().unwrap();
+        assert_eq!(status.safety_tripped, Some(false));
+        assert_eq!(status.estop_latched, Some(false));
+    }
+
+    #[test]
+    fn bump_recovery_cleanup_clears_an_estop_observed_during_the_bump_incident() {
+        let mut cockpit = SafeCockpit::new(LocalSimCockpit::new().with_unscoped_bench_mode());
+        cockpit.client_mut().set_bump(true, false);
+        cockpit.client_mut().estop().unwrap();
+        cockpit.client_mut().set_bump(false, false);
+
+        clear_bump_recovery_latches(&mut cockpit, true).unwrap();
+
+        let status = cockpit.refresh_status().unwrap();
+        assert_eq!(status.estop_latched, Some(false));
+        assert_eq!(status.safety_tripped, Some(false));
+    }
+
+    #[test]
+    fn bump_recovery_cleanup_preserves_an_unrelated_estop() {
+        let mut cockpit = SafeCockpit::new(LocalSimCockpit::new().with_unscoped_bench_mode());
+        cockpit.client_mut().estop().unwrap();
+
+        let error = clear_bump_recovery_latches(&mut cockpit, false).unwrap_err();
+        assert!(error.to_string().contains("already latched"));
+        assert_eq!(cockpit.refresh_status().unwrap().estop_latched, Some(true));
     }
 
     #[test]

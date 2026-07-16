@@ -136,7 +136,10 @@ explicit. Override only the bounded timing with
 ## Physical recovery smoke and pending validation
 
 With the drive wheels physically clear of the floor, the live bumper recovery
-path can be exercised through the standard possession entrypoint:
+path can be exercised through the standard possession entrypoint. Once bumper
+telemetry has cleared, the smoke releases the bump latch and any e-stop it
+observed from that same bump incident; it deliberately leaves a pre-existing
+e-stop latched for the operator:
 
 ```bash
 just possess --recovery-smoke --wheels-off-floor

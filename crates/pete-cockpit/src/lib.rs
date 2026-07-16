@@ -4417,6 +4417,33 @@ impl<C: Cockpit> MotherbrainPossession<C> {
         self.refusal_reason = Some(reason);
     }
 
+    /// A safety clear is an explicit request to resume only after the
+    /// brainstem confirms that no e-stop or safety latch remains. Refresh the
+    /// control lease before reopening the local motor gate so a recovery never
+    /// revives stale authority.
+    fn reopen_gate_if_safety_clear(&mut self) -> Result<()> {
+        let status = match self.session.execute(CockpitRequest::GetStatus) {
+            Ok(CockpitResponse::Status(status)) => status.summary(),
+            Ok(other) => return Err(CockpitError::BadResponse(format!("{other:?}"))),
+            Err(error) => return Err(error),
+        };
+        self.last_status = Some(status.clone());
+        if status.estop_latched == Some(true) || status.safety_tripped == Some(true) {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .session
+            .acquire_control(ControlAuthority::Motherbrain, self.lease_ttl_ms)
+        {
+            self.close_gate(format!("control lease recovery failed: {error}"));
+            return Err(error);
+        }
+        self.lease_acquired_at = Instant::now();
+        self.motor_gate_open = true;
+        self.refusal_reason = None;
+        Ok(())
+    }
+
     fn execute_with_busy_retry(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
         let mut retried_after_lease_renewal = false;
         for attempt in 0..POSSESSION_BUSY_RETRY_ATTEMPTS {
@@ -4625,7 +4652,17 @@ impl<C: Cockpit> Cockpit for MotherbrainPossession<C> {
             }
             AuthorizationClass::Emergency
             | AuthorizationClass::Session
-            | AuthorizationClass::ControlLease => self.execute_scoped(request),
+            | AuthorizationClass::ControlLease => {
+                let reopen_after_clear = matches!(
+                    request,
+                    CockpitRequest::ClearEStop | CockpitRequest::ClearSafetyLatch { .. }
+                );
+                let response = self.execute_scoped(request)?;
+                if reopen_after_clear {
+                    self.reopen_gate_if_safety_clear()?;
+                }
+                Ok(response)
+            }
             AuthorizationClass::ServiceLease => Err(CockpitError::Policy(
                 "service operations are outside motherbrain possession".into(),
             )),
@@ -8921,6 +8958,7 @@ mod tests {
         };
         assert_eq!(status.imu.calibration.as_deref(), Some("0"));
         assert_eq!(status.estop_latched, Some(false));
+        assert!(possession.snapshot().possessed);
     }
 
     #[test]

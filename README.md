@@ -385,7 +385,9 @@ just possess --recovery-smoke --wheels-off-floor
 
 It requires a physical brainstem and explicit wheels-off-floor acknowledgement,
 then waits for an operator-held bumper and verifies contact → stop → clear →
-reverse → turn → probe → inspect before STOP and exorcize. This command is
+reverse → turn → probe → inspect before STOP and exorcize. After the bumper is
+released, the smoke clears its bump latch and any e-stop it observed during that
+same incident; a pre-existing e-stop remains latched for the operator. This command is
 documented but has not been run as part of this software-only readiness pass.
 
 Physical validation still pending:

@@ -10,6 +10,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- When an e-stop interrupts bump recovery, clear the paired e-stop so bounded
+  reverse/turn recovery can unload the bumper, then clear the bump latch and
+  restore possession only after the safety status is clear.
 - Use `portable-atomic` for brainstem registry and session counters in the default RP2040 build as well as Pico-W builds.
 - Pin the Pico-W firmware's `fixed` dependency to the Rust-1.92-compatible 1.30 release so the documented embedded build remains reproducible.
 
