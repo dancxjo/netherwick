@@ -7,8 +7,9 @@ use pete_actions::{
 use pete_now::{
     ClockDomain, DriveSelfSummary, DriveSense, EntityId, EpistemicActionKind, EpistemicAffordance,
     EpistemicAttempt, EpistemicQuestionFamily, EvidenceRef, GoalStatusBelief,
-    PendingTemporalExpectation, QuestionId, TimeInterval, WorldEntity, WorldEntityKind,
-    WorldModelSnapshot, WorldModelUpdateContext,
+    PendingTemporalExpectation, QuestionId, SemanticBehaviorId, SemanticConceptId,
+    SemanticExplanation, SemanticNodeRef, SemanticPredicate, SemanticRelationId, TimeInterval,
+    WorldEntity, WorldEntityKind, WorldModelSnapshot, WorldModelUpdateContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -298,6 +299,8 @@ pub struct Affordance {
     pub skill_request: Option<SkillRequest>,
     pub action: Option<ActionPrimitive>,
     pub provenance: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub semantic_relation_ids: Vec<SemanticRelationId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -428,6 +431,8 @@ pub struct GoalEvaluation {
     pub motivation: Motivation,
     pub competence: Competence,
     pub contributions: Vec<EvaluationContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_explanation: Option<SemanticExplanation>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1038,6 +1043,10 @@ impl GoalEvaluator for RuleGoalEvaluator {
                 affordances,
             },
             contributions,
+            semantic_explanation: (self.id.as_str() == "seek_charger")
+                .then(|| interpretation.target.as_ref())
+                .flatten()
+                .map(|target| context.world.semantic.charger_explanation(target)),
         };
         Ok((
             evaluation,
@@ -1504,6 +1513,28 @@ fn evaluate_seek_charger(
             );
         }
     }
+    for goal_affordance in &mut affordances {
+        goal_affordance.semantic_relation_ids = charger_affordance_semantics(
+            context.world,
+            interpretation.target.as_ref(),
+            &goal_affordance.behavior_id,
+        );
+    }
+    let semantic_confidence = context
+        .world
+        .semantic
+        .relations
+        .values()
+        .filter(|relation| {
+            relation.subject
+                == SemanticNodeRef::Concept(SemanticConceptId("charger".to_string()))
+                && matches!(
+                    relation.predicate,
+                    SemanticPredicate::Restores | SemanticPredicate::SatisfiesDrive
+                )
+        })
+        .map(|relation| relation.confidence)
+        .fold(0.0f32, f32::max);
     (
         (0.85 * energy + 0.15 * confidence).clamp(0.0, 1.0),
         urgency,
@@ -1512,8 +1543,50 @@ fn evaluate_seek_charger(
         vec![
             contribution("drive.energy", energy),
             contribution("world.charger_confidence", confidence),
+            contribution("semantic.charger_energy_meaning", semantic_confidence),
         ],
     )
+}
+
+fn charger_affordance_semantics(
+    world: &WorldModelSnapshot,
+    target: Option<&EntityId>,
+    behavior_id: &str,
+) -> Vec<SemanticRelationId> {
+    let charger = SemanticNodeRef::Concept(SemanticConceptId("charger".to_string()));
+    let semantic_behavior = match behavior_id {
+        "dock" => Some("dock"),
+        "approach_charger" | "turn_toward_charger" => Some("approach_charger"),
+        _ => None,
+    };
+    world
+        .semantic
+        .relations
+        .values()
+        .filter(|relation| {
+            (relation.subject == charger
+                && matches!(
+                    relation.predicate,
+                    SemanticPredicate::Restores
+                        | SemanticPredicate::SatisfiesDrive
+                        | SemanticPredicate::HelpsGoal
+                ))
+                || semantic_behavior.is_some_and(|behavior| {
+                    relation.subject == charger
+                        && relation.predicate == SemanticPredicate::Affords
+                        && relation.object
+                            == SemanticNodeRef::Behavior(SemanticBehaviorId(behavior.to_string()))
+                })
+                || target.is_some_and(|target| {
+                    (relation.subject == SemanticNodeRef::Entity(target.clone())
+                        && relation.predicate == SemanticPredicate::IsA
+                        && relation.object == charger)
+                        || (relation.predicate == SemanticPredicate::Blocks
+                            && relation.object == SemanticNodeRef::Entity(target.clone()))
+                })
+        })
+        .map(|relation| relation.id.clone())
+        .collect()
 }
 
 fn evaluate_escape(
