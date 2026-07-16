@@ -107,6 +107,7 @@ impl<'de> Deserialize<'de> for HandshakeFeature {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SoftwareInfo {
     pub software_name: String,
+    #[serde(default)]
     pub software_version: String,
     pub build_id: String,
 }
@@ -534,4 +535,21 @@ fn fresh_id(prefix: &str) -> String {
 fn process_boot_id() -> String {
     static BOOT_ID: OnceLock<String> = OnceLock::new();
     BOOT_ID.get_or_init(|| fresh_id("mbboot")).clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SoftwareInfo;
+
+    #[test]
+    fn legacy_software_info_without_version_still_decodes() {
+        let software: SoftwareInfo = serde_json::from_str(
+            r#"{"software_name":"pete-brainstem","build_id":"legacy-build"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(software.software_name, "pete-brainstem");
+        assert_eq!(software.software_version, "");
+        assert_eq!(software.build_id, "legacy-build");
+    }
 }

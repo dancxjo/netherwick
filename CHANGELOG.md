@@ -64,6 +64,8 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Accept older brainstem handshake frames that predate the nested software
+  version field so an authorized USB BOOTSEL upgrade can still proceed.
 - Keep Create 1 dock departure inside the brainstem: after Full mode ends
   charging, hold the first nonzero motion request, perform a bounded reverse
   off the Home Base, then execute the original request without exposing a
