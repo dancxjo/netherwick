@@ -2393,7 +2393,7 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
         _ => return Err(seq),
     };
 
-    if parts.next().is_some() {
+    if !matches!(command, BrainstemCommand::Unsupported { .. }) && parts.next().is_some() {
         return Err(seq);
     }
 
@@ -4046,5 +4046,17 @@ mod tests {
             Err(103)
         );
         assert_eq!(parse_forebrain_uart_command("GET_EVENTS 103"), Err(103));
+    }
+
+    #[test]
+    fn retired_compact_commands_ignore_legacy_arguments_and_reach_typed_rejection() {
+        assert!(matches!(
+            parse_forebrain_uart_command("DRIVE_FOR 104 100 50 1000"),
+            Ok((104, BrainstemCommand::Unsupported { seq: 104 }))
+        ));
+        assert!(matches!(
+            parse_forebrain_uart_command("SET_SAFETY_POLICY 105 none none false"),
+            Ok((105, BrainstemCommand::Unsupported { seq: 105 }))
+        ));
     }
 }
