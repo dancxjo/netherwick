@@ -1915,7 +1915,7 @@ mod tests {
 
     #[test]
     fn brainstem_reboot_invalidates_authority_but_not_identity() {
-        let with_boot = |t_ms, boot: &str| {
+        let with_boot = |t_ms, boot: &str, lease: &str| {
             let mut now = Now::blank(t_ms, BodySense::default());
             now.extensions.insert(
                 "brainstem.possession".to_string(),
@@ -1923,7 +1923,7 @@ mod tests {
                     "brainstem_device_id": "device-7",
                     "brainstem_boot_id": boot,
                     "session_id": "session-1",
-                    "lease_id": "lease-1",
+                    "lease_id": lease,
                     "possessed": true,
                     "brainstem_armed": true
                 }),
@@ -1931,8 +1931,14 @@ mod tests {
             now
         };
         let mut updater = WorldModelUpdater::default();
-        let first = updater.update(with_boot(10, "boot-a"), WorldModelUpdateContext::default());
-        let rebooted = updater.update(with_boot(20, "boot-b"), WorldModelUpdateContext::default());
+        let first = updater.update(
+            with_boot(10, "boot-a", "lease-1"),
+            WorldModelUpdateContext::default(),
+        );
+        let rebooted = updater.update(
+            with_boot(20, "boot-b", "lease-1"),
+            WorldModelUpdateContext::default(),
+        );
         assert_eq!(
             first.world.self_model.organism_id.value,
             rebooted.world.self_model.organism_id.value
@@ -1943,9 +1949,29 @@ mod tests {
         assert!(!rebooted
             .world
             .self_model
+            .capabilities
+            .is_authorized("actuator:drive"));
+        assert!(!rebooted
+            .world
+            .self_model
             .agency
             .authority_conflicts
             .is_empty());
+        let still_invalid = updater.update(
+            with_boot(30, "boot-b", "lease-1"),
+            WorldModelUpdateContext::default(),
+        );
+        assert!(!still_invalid.world.self_model.agency.possessed.value);
+        let reacquired = updater.update(
+            with_boot(40, "boot-b", "lease-2"),
+            WorldModelUpdateContext::default(),
+        );
+        assert!(reacquired.world.self_model.agency.possessed.value);
+        assert!(reacquired
+            .world
+            .self_model
+            .capabilities
+            .is_authorized("actuator:drive"));
     }
 
     #[test]
@@ -1967,6 +1993,10 @@ mod tests {
             .world;
         assert_eq!(
             snapshot.self_model.agency.controller,
+            ControlProvenance::HumanDirect
+        );
+        assert_eq!(
+            snapshot.self_model.active_control.provenance,
             ControlProvenance::HumanDirect
         );
         assert!(snapshot.self_model.agency.pending_direct_override);
