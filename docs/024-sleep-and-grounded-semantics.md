@@ -127,7 +127,11 @@ Goal evaluations expose a bounded semantic explanation and affordances expose
 the exact relation ids they used. The arbiter remains semantic-agnostic: it
 still consumes immutable evaluations only. Memory projects semantic nodes and
 relations into durable graph records with the complete typed relation in the
-edge payload.
+edge payload. Neo4j uses that stable relation id as `RELATED.edge_id`. On the
+first graph write after upgrading, the store runs an idempotent migration that
+deletes only legacy `RELATED` projections lacking `edge_id`; their former
+kind-only identity cannot safely recover context that may already have been
+collapsed. Canonical memory records then rebuild the current projections.
 
 ## Replacement boundary and second passes
 

@@ -8295,6 +8295,7 @@ impl Neo4jConfig {
 pub struct Neo4jGraphStore {
     client: reqwest::Client,
     config: Neo4jConfig,
+    legacy_related_migration: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl Neo4jGraphStore {
@@ -8302,11 +8303,22 @@ impl Neo4jGraphStore {
         Self {
             client: reqwest::Client::new(),
             config,
+            legacy_related_migration: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
     pub fn from_env() -> Option<Self> {
         Neo4jConfig::from_env().map(Self::new)
+    }
+
+    async fn migrate_legacy_related_edges(&self) -> Result<()> {
+        self.legacy_related_migration
+            .get_or_try_init(|| async {
+                self.run_cypher(NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER, json!({}))
+                    .await
+            })
+            .await?;
+        Ok(())
     }
 
     async fn run_cypher(&self, statement: &str, parameters: serde_json::Value) -> Result<()> {
@@ -8400,6 +8412,13 @@ impl Neo4jGraphStore {
 #[async_trait]
 impl GraphStore for Neo4jGraphStore {
     async fn upsert_graph(&self, record: &MemoryRecord) -> Result<()> {
+        // Releases before stable edge ids merged RELATED edges by kind. Those
+        // relationships cannot be upgraded safely because context-distinct
+        // relations may already have overwritten one another. Remove only the
+        // identity-less legacy projection once, then rebuild current edges
+        // from canonical memory records below.
+        self.migrate_legacy_related_edges().await?;
+
         let entities = neo4j_entity_params(record);
         let relationships = neo4j_relationship_params(record);
 
@@ -8413,6 +8432,12 @@ impl GraphStore for Neo4jGraphStore {
         .await
     }
 }
+
+const NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER: &str = r#"
+MATCH ()-[legacy:RELATED]->()
+WHERE legacy.edge_id IS NULL
+DELETE legacy
+"#;
 
 const NEO4J_GRAPH_UPSERT_CYPHER: &str = r#"
 UNWIND $entities AS entity
@@ -13104,6 +13129,9 @@ mod tests {
             ])
         );
         assert!(NEO4J_GRAPH_UPSERT_CYPHER.contains("{edge_id: relationship.edge_id}"));
+        assert!(NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER
+            .contains("WHERE legacy.edge_id IS NULL"));
+        assert!(NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER.contains("DELETE legacy"));
     }
 
     fn test_cluster(
