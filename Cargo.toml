@@ -27,6 +27,7 @@ members = [
     "crates/pete-cockpit",
     "crates/pete-cockpit-protocol",
     "crates/pete-ups",
+    "crates/pete-cognition",
     "crates/pete-higher-brain",
     "crates/pete-tools",
     "xtask",

@@ -20,6 +20,7 @@ image.workspace = true
 pete-actions = { path = "../pete-actions" }
 pete-experience = { path = "../pete-experience" }
 pete-now = { path = "../pete-now" }
+pete-cognition = { path = "../pete-cognition" }
 uuid.workspace = true
 
 [dev-dependencies]

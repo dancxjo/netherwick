@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pete_actions::ReignInput;
+use pete_cognition::{ProviderRegistrySnapshot, ProviderHealthState};
 use pete_core::{FrameId, Pose2};
 use serde::{Deserialize, Serialize};
 
@@ -370,11 +371,20 @@ pub struct ContinuitySummary {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CognitiveServiceBelief {
+    pub provider_id: Option<String>,
+    pub role: Option<String>,
+    pub capability: Option<String>,
+    pub capability_version: Option<String>,
     pub available: bool,
     pub confidence: f32,
     pub unavailable_reason: Option<String>,
     pub host_id: Option<HostId>,
     pub process_id: Option<ProcessId>,
+    pub implementation: Option<String>,
+    pub implementation_version: Option<String>,
+    pub model_version: Option<String>,
+    pub locality: Option<String>,
+    pub resource_class: Option<String>,
     pub meta: BeliefMeta,
 }
 
@@ -1132,6 +1142,7 @@ impl WorldModelUpdater {
         let mut service_state = CognitiveServiceSummary {
             services: context.cognitive_services.clone(),
         };
+        integrate_cognitive_registry(now, &mut service_state);
         service_state
             .services
             .entry("local_language".to_string())

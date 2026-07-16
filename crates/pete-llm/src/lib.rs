@@ -7,6 +7,14 @@ use image::ImageEncoder;
 use pete_actions::{
     ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle, InspectTarget, TurnDir,
 };
+use pete_cognition::{
+    BoundedImageInput, BoundedInputRef, CallerRole, CapabilityDescriptor,
+    CognitiveCapability, CognitiveProvider, CognitiveProviderDescriptor, CognitiveRequest,
+    CognitiveRequestPayload, CognitiveResponse, CognitiveResponsePayload, CognitiveResponseStatus,
+    CognitiveRole, CognitiveRouter, HostId, LatencyEstimate, Locality, PrivacyPolicy, ProcessId,
+    ProviderHealth, ProviderHealthState, ProviderId, ProviderRegistrySnapshot, RequestProvenance,
+    ResourceClass, ResourceCost, ResponseDisposition, RoutedResponse, SnapshotRef, TrustPolicy,
+};
 use pete_experience::{EmbodiedContext, ExperienceLatent, FuturePrediction, Impression};
 use pete_now::{
     EyeFrame, EyeFrameFormat, LlmSense, Now, ReignSense, VectorArtifact,
@@ -25,6 +33,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 pub const IMAGE_CAPTION_PROMPT: &str = "Describe only what you see from your viewpoint. Start from the fact that this is your own vision looking out, so the first person should mean phrases like \"I see...\" or \"in front of me,\" not that visible people, faces, hands, eyes, or bodies are yours. You may use more than one sentence when the visible scene needs fuller description, but stay grounded in visible evidence and do not speculate beyond what can be seen. Do not interpret this as an image; interpret it as the machine's own live view. When looking out, one does not see oneself: anyone you see is most likely someone you're looking at, not yourself, unless you're clearly looking in a mirror or reflection. Describe visible people in third person, as someone in front of you.";
@@ -476,6 +485,205 @@ pub struct LiveImageEnrichment {
     pub scene_vector: VectorArtifact,
 }
 
+const OLLAMA_SCENE_PROVIDER_ID: &str = "ollama.scene_description";
+
+pub struct LiveImageCognition {
+    router: Option<CognitiveRouter>,
+    pending: Option<JoinHandle<(CognitiveRouter, RoutedResponse)>>,
+    last_frame_key: Option<LiveImageFrameKey>,
+    last_registry: ProviderRegistrySnapshot,
+    request_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LiveImageCognitionTick {
+    pub registry: ProviderRegistrySnapshot,
+    pub enrichment: Option<LiveImageEnrichment>,
+    pub response: Option<RoutedResponse>,
+}
+
+impl LiveImageCognition {
+    pub fn new(enricher: Option<LiveImageEnricher>) -> Self {
+        let request_timeout_ms = enricher
+            .as_ref()
+            .map(|provider| provider.config.timeout_ms)
+            .unwrap_or(1_000)
+            .max(1);
+        let mut router = CognitiveRouter::default();
+        if let Some(enricher) = enricher {
+            router.register(Box::new(enricher));
+        }
+        let last_registry = router.registry_snapshot(wall_now_ms());
+        Self {
+            router: Some(router),
+            pending: None,
+            last_frame_key: None,
+            last_registry,
+            request_timeout_ms,
+        }
+    }
+
+    pub fn registry_snapshot(&self) -> &ProviderRegistrySnapshot {
+        &self.last_registry
+    }
+
+    /// Poll a completed request and enqueue at most one new frame. This never
+    /// waits for provider I/O: unfinished work remains in the background while
+    /// the organism tick proceeds with local structured beliefs.
+    pub async fn poll_and_submit(
+        &mut self,
+        frame: Option<&EyeFrame>,
+        world_revision: u64,
+        now_ms: u64,
+    ) -> LiveImageCognitionTick {
+        let mut tick = LiveImageCognitionTick::default();
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            let handle = self.pending.take().expect("finished handle exists");
+            match handle.await {
+                Ok((router, response)) => {
+                    self.router = Some(router);
+                    if response.disposition == ResponseDisposition::Accepted {
+                        tick.enrichment = enrichment_from_response(&response.response);
+                    }
+                    tick.response = Some(response);
+                }
+                Err(error) => {
+                    tick.response = None;
+                    self.router = Some(CognitiveRouter::default());
+                    self.last_registry = ProviderRegistrySnapshot {
+                        schema_version: 1,
+                        observed_at_ms: now_ms,
+                        ..ProviderRegistrySnapshot::default()
+                    };
+                    let _ = error;
+                }
+            }
+        }
+
+        if self.pending.is_none() {
+            if let (Some(frame), Some(mut router)) = (frame, self.router.take()) {
+                let key = LiveImageFrameKey::from(frame);
+                if self.last_frame_key.as_ref() != Some(&key) {
+                    self.last_frame_key = Some(key);
+                    let provider_id = ProviderId(OLLAMA_SCENE_PROVIDER_ID.to_string());
+                    router.update_health(
+                        &provider_id,
+                        ProviderHealth {
+                            state: ProviderHealthState::Available,
+                            confidence: 0.8,
+                            observed_at_ms: now_ms,
+                            valid_until_ms: now_ms.saturating_add(self.request_timeout_ms),
+                            reason: None,
+                        },
+                    );
+                    match scene_request(frame, world_revision, now_ms, self.request_timeout_ms) {
+                        Ok(request) => {
+                            self.last_registry = router.registry_snapshot(now_ms);
+                            self.pending = Some(tokio::spawn(async move {
+                                let response = router.dispatch(request, now_ms).await;
+                                (router, response)
+                            }));
+                        }
+                        Err(_) => self.router = Some(router),
+                    }
+                } else {
+                    self.router = Some(router);
+                }
+            }
+        }
+        if let Some(router) = self.router.as_ref() {
+            self.last_registry = router.registry_snapshot(now_ms);
+        }
+        tick.registry = self.last_registry.clone();
+        tick
+    }
+}
+
+fn scene_request(
+    frame: &EyeFrame,
+    world_revision: u64,
+    now_ms: u64,
+    timeout_ms: u64,
+) -> Result<CognitiveRequest> {
+    let png = encode_eye_frame_png(frame)?;
+    let source_frame_id = live_image_source_frame_id(frame);
+    let reference = BoundedInputRef {
+        id: source_frame_id.clone(),
+        kind: "eye_frame_png".to_string(),
+        byte_len: png.len(),
+        content_hash: None,
+    };
+    let mut request = CognitiveRequest::new(
+        SnapshotRef {
+            snapshot_id: source_frame_id.clone(),
+            schema_version: 1,
+            revision: world_revision,
+            captured_at_ms: frame.captured_at_ms,
+        },
+        now_ms,
+        now_ms.saturating_add(timeout_ms),
+        PrivacyPolicy {
+            maximum_locality: Locality::LocalNetwork,
+            allow_raw_image: true,
+            allow_persistence: false,
+        },
+        RequestProvenance {
+            caller: CallerRole::OrganismRuntime,
+            caller_id: "live_vision".to_string(),
+            evidence_refs: vec![source_frame_id],
+        },
+        CognitiveRequestPayload::DescribeScene(BoundedImageInput {
+            reference: reference.clone(),
+            content_type: "image/png".to_string(),
+            width: frame.width,
+            height: frame.height,
+            captured_at_ms: frame.captured_at_ms,
+            bytes: png,
+        }),
+    );
+    request.input_refs.push(reference);
+    Ok(request)
+}
+
+fn enrichment_from_response(response: &CognitiveResponse) -> Option<LiveImageEnrichment> {
+    let CognitiveResponsePayload::SceneDescription { text, embedding } = &response.payload else {
+        return None;
+    };
+    let source_frame_id = response.input_snapshot.snapshot_id.clone();
+    let embedding_model = response
+        .model_version
+        .clone()
+        .unwrap_or_else(|| response.implementation_version.clone());
+    let point_id = stable_uuid_for_text(&format!(
+        "{}:{}:{}",
+        source_frame_id, response.provider_id.0, text
+    ))
+    .to_string();
+    let image_description_vector = VectorArtifact::new(
+        IMAGE_DESCRIPTION_VECTOR_COLLECTION,
+        point_id.clone(),
+        embedding.clone(),
+    )
+    .with_model(embedding_model.clone())
+    .with_source_id(format!("image-description:{source_frame_id}"))
+    .with_source_frame_id(source_frame_id.clone())
+    .with_occurred_at_ms(response.input_snapshot.captured_at_ms);
+    let scene_vector = VectorArtifact::new(SCENE_VECTOR_COLLECTION, point_id, embedding.clone())
+        .with_model(embedding_model)
+        .with_source_id(format!("image-description:{source_frame_id}"))
+        .with_source_frame_id(source_frame_id)
+        .with_occurred_at_ms(response.input_snapshot.captured_at_ms);
+    Some(LiveImageEnrichment {
+        description: text.clone(),
+        image_description_vector,
+        scene_vector,
+    })
+}
+
 impl LiveImageEnricher {
     pub fn new(config: LlmConfig) -> Result<Option<Self>> {
         if config.provider != LlmProvider::Ollama || !config.enrich_live_images {
@@ -605,6 +813,95 @@ impl LiveImageEnricher {
     }
 }
 
+#[async_trait]
+impl CognitiveProvider for LiveImageEnricher {
+    fn descriptor(&self) -> CognitiveProviderDescriptor {
+        CognitiveProviderDescriptor {
+            provider_id: ProviderId(OLLAMA_SCENE_PROVIDER_ID.to_string()),
+            role: CognitiveRole::CognitiveAccelerator,
+            host_id: None::<HostId>,
+            process_id: None::<ProcessId>,
+            implementation: "ollama".to_string(),
+            implementation_version: "api-v1".to_string(),
+            model_version: self.config.vision_model.clone(),
+            capabilities: vec![CapabilityDescriptor {
+                capability: CognitiveCapability::DescribeScene,
+                version: "1".to_string(),
+                supports_partial: false,
+                performance_confidence: 0.8,
+            }],
+            health: ProviderHealth {
+                state: ProviderHealthState::Available,
+                confidence: 0.5,
+                observed_at_ms: wall_now_ms(),
+                valid_until_ms: u64::MAX,
+                reason: None,
+            },
+            latency: LatencyEstimate {
+                expected_ms: self.config.timeout_ms.min(2_000),
+                p95_ms: self.config.timeout_ms,
+            },
+            resource_class: ResourceClass::Accelerated,
+            locality: Locality::LocalNetwork,
+            trust: TrustPolicy::TrustedProvider,
+            energy_cost: 0.2,
+            network_cost: 0.2,
+        }
+    }
+
+    async fn execute(&mut self, request: &CognitiveRequest) -> Result<CognitiveResponse> {
+        let CognitiveRequestPayload::DescribeScene(image) = &request.payload else {
+            anyhow::bail!("ollama scene provider received incompatible request payload");
+        };
+        let started = std::time::Instant::now();
+        let vision_model = self
+            .config
+            .vision_model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .context("scene description requires vision_model")?;
+        let embedding_model = self
+            .config
+            .embedding_model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .context("scene description requires embedding_model")?;
+        let image_base64 = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+        let description = self.describe_image(vision_model, image_base64).await?;
+        let embedding = self.embed_text(embedding_model, &description).await?;
+        let completed_at_ms = wall_now_ms();
+        Ok(CognitiveResponse {
+            schema_version: 1,
+            request_id: request.request_id.clone(),
+            provider_id: ProviderId(OLLAMA_SCENE_PROVIDER_ID.to_string()),
+            provider_role: CognitiveRole::CognitiveAccelerator,
+            implementation: "ollama".to_string(),
+            implementation_version: "api-v1".to_string(),
+            model_version: Some(format!("{vision_model}+{embedding_model}")),
+            status: if completed_at_ms > request.deadline_ms {
+                CognitiveResponseStatus::Stale
+            } else {
+                CognitiveResponseStatus::Completed
+            },
+            confidence: 0.8,
+            uncertainty: 0.2,
+            input_snapshot: request.input_snapshot.clone(),
+            completed_at_ms,
+            resource_cost: ResourceCost {
+                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                energy_estimate: 0.2,
+                network_bytes: image.bytes.len().try_into().unwrap_or(u64::MAX),
+            },
+            provenance: request.provenance.evidence_refs.clone(),
+            payload: CognitiveResponsePayload::SceneDescription {
+                text: description,
+                embedding,
+            },
+            failure: None,
+        })
+    }
+}
+
 impl From<&EyeFrame> for LiveImageFrameKey {
     fn from(frame: &EyeFrame) -> Self {
         Self {
@@ -617,7 +914,7 @@ impl From<&EyeFrame> for LiveImageFrameKey {
     }
 }
 
-fn encode_eye_frame_png_base64(frame: &EyeFrame) -> Result<String> {
+fn encode_eye_frame_png(frame: &EyeFrame) -> Result<Vec<u8>> {
     let (rgb, color_type) = match &frame.format {
         EyeFrameFormat::Rgb8 => (frame.bytes.clone(), image::ColorType::Rgb8),
         EyeFrameFormat::Bgr8 => {
@@ -662,7 +959,11 @@ fn encode_eye_frame_png_base64(frame: &EyeFrame) -> Result<String> {
     image::codecs::png::PngEncoder::new(Cursor::new(&mut png))
         .write_image(&rgb, frame.width, frame.height, color_type.into())
         .context("failed to encode live image frame as PNG")?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(png))
+    Ok(png)
+}
+
+fn encode_eye_frame_png_base64(frame: &EyeFrame) -> Result<String> {
+    Ok(base64::engine::general_purpose::STANDARD.encode(encode_eye_frame_png(frame)?))
 }
 
 fn live_image_source_frame_id(frame: &EyeFrame) -> String {

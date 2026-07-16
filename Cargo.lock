@@ -5755,6 +5755,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pete-cognition"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pete-conductor"
 version = "0.1.0"
 dependencies = [
@@ -5860,6 +5872,7 @@ dependencies = [
  "image",
  "pete-actions",
  "pete-body",
+ "pete-cognition",
  "pete-experience",
  "pete-now",
  "reqwest 0.11.27",

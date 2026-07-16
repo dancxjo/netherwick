@@ -12,6 +12,15 @@ All notable changes are grouped by date.
 - Updated the embedded codex instructions in `scripts/codex-sync.sh` to enforce an expanded repo-sync workflow (status inspection, changelog update, conflict-aware pull/push, and final summary format).
 - Refined `codex-sync` workflow instructions to preserve in-progress/Ongoing edits (e.g., TODO, FIXME, WIP, debug scaffolding) and commit only clearly ready, substantial chunks.
 
+### Auto-sync (2026-07-16)
+
+- Added a new `pete-cognition` crate with common cognitive provider contracts, request/response types, and router abstractions.
+- Wired `pete-cognition` into the workspace and into `pete-llm`/`pete-now` through path dependencies.
+- Reworked live image enrichment in `pete-llm` around an asynchronous `LiveImageCognition` pipeline with request routing and registry snapshots.
+- Implemented an ollama-backed `CognitiveProvider` for scene-description requests and embeddings, producing structured scene/caption vectors.
+- Extended runtime `Now` cognition bookkeeping to include provider registry snapshots, last scene response, and vision enrichment error metadata.
+- Extended cognitive service belief state to persist provider metadata and capabilities in `pete-now` world summaries.
+
 ## 2026-07-15
 
 ### Added

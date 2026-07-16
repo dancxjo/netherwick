@@ -38,7 +38,9 @@ use pete_experience::{
 use pete_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
 };
-use pete_llm::{Combobulation, LiveImageEnricher, LlmAgent, LlmTickResult};
+use pete_llm::{
+    Combobulation, LiveImageCognition, LiveImageEnricher, LlmAgent, LlmTickResult,
+};
 use pete_map::{observation_from_now, LocalMap, LoopClosureCandidateInput, MAP_EXTENSION_NAME};
 use pete_memory::{
     attach_memory_links_to_frame, place_recognition_input_from_query_now, MemoryStore,
@@ -4872,7 +4874,7 @@ pub struct RealRobotRunner<R, C> {
     pub autonomous_motion: bool,
     now_builder: NowBuilder,
     frame_processor: FrameProcessor,
-    live_image_enricher: Option<LiveImageEnricher>,
+    live_image_cognition: LiveImageCognition,
     robot_initialization: Option<serde_json::Value>,
     brainstem_interface: Option<serde_json::Value>,
     possession_recovery: PossessionRecoveryState,
@@ -4968,7 +4970,7 @@ where
             autonomous_motion: false,
             now_builder: NowBuilder::new(),
             frame_processor: FrameProcessor::new(),
-            live_image_enricher: None,
+            live_image_cognition: LiveImageCognition::new(None),
             robot_initialization: None,
             brainstem_interface: None,
             possession_recovery: PossessionRecoveryState::default(),
@@ -4982,7 +4984,7 @@ where
     }
 
     pub fn with_live_image_enricher(mut self, enricher: Option<LiveImageEnricher>) -> Self {
-        self.live_image_enricher = enricher;
+        self.live_image_cognition = LiveImageCognition::new(enricher);
         self
     }
 
@@ -5059,7 +5061,7 @@ where
         );
         self.insert_robot_initialization(&mut now);
         self.insert_brainstem_interface(&mut now, &brainstem_events);
-        enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
+        enrich_now_latest_image(&mut self.live_image_cognition, &mut now).await;
 
         let tick = self
             .runtime
@@ -5208,7 +5210,7 @@ where
             }
         }
 
-        enrich_now_latest_image(&mut self.live_image_enricher, &mut now).await;
+        enrich_now_latest_image(&mut self.live_image_cognition, &mut now).await;
 
         let mut tick = self
             .runtime
@@ -5724,15 +5726,29 @@ where
     }
 }
 
-async fn enrich_now_latest_image(enricher: &mut Option<LiveImageEnricher>, now: &mut Now) {
-    let Some(enricher) = enricher.as_mut() else {
-        return;
-    };
-    let Some(frame) = now.eye_frame.as_ref() else {
-        return;
-    };
-    match enricher.enrich_latest(frame).await {
-        Ok(Some(enrichment)) => {
+async fn enrich_now_latest_image(cognition: &mut LiveImageCognition, now: &mut Now) {
+    let update = cognition
+        .poll_and_submit(now.eye_frame.as_ref(), now.world.revision, now.t_ms)
+        .await;
+    now.extensions.insert(
+        "cognition.registry".to_string(),
+        serde_json::to_value(&update.registry)
+            .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+    );
+    if let Some(response) = update.response {
+        now.extensions.insert(
+            "cognition.describe_scene.last_response".to_string(),
+            serde_json::to_value(&response)
+                .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+        );
+        if let Some(failure) = response.response.failure {
+            now.extensions.insert(
+                "vision.image_enrichment_error".to_string(),
+                serde_json::json!(failure),
+            );
+        }
+    }
+    if let Some(enrichment) = update.enrichment {
             now.eye
                 .image_description_vectors
                 .push(enrichment.image_description_vector);
@@ -5750,14 +5766,6 @@ async fn enrich_now_latest_image(enricher: &mut Option<LiveImageEnricher>, now: 
                     "image_description_vector_count": now.eye.image_description_vectors.len(),
                 }),
             );
-        }
-        Ok(None) => {}
-        Err(error) => {
-            now.extensions.insert(
-                "vision.image_enrichment_error".to_string(),
-                serde_json::json!(error.to_string()),
-            );
-        }
     }
 }
 
