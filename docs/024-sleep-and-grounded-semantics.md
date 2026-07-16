@@ -129,9 +129,11 @@ still consumes immutable evaluations only. Memory projects semantic nodes and
 relations into durable graph records with the complete typed relation in the
 edge payload. Neo4j uses that stable relation id as `RELATED.edge_id`. On the
 first graph write after upgrading, the store runs an idempotent migration that
-deletes only legacy `RELATED` projections lacking `edge_id`; their former
-kind-only identity cannot safely recover context that may already have been
-collapsed. Canonical memory records then rebuild the current projections.
+backfills legacy `RELATED` projections lacking `edge_id` without deleting graph
+history. Semantic projections recover the relation id from their serialized
+typed payload; structural projections receive the same length-prefixed identity
+as new writes. Contexts collapsed by the former kind-only merge cannot be
+recovered, but surviving historical relationships remain intact.
 
 ## Replacement boundary and second passes
 

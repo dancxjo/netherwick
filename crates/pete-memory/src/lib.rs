@@ -8412,11 +8412,9 @@ impl Neo4jGraphStore {
 #[async_trait]
 impl GraphStore for Neo4jGraphStore {
     async fn upsert_graph(&self, record: &MemoryRecord) -> Result<()> {
-        // Releases before stable edge ids merged RELATED edges by kind. Those
-        // relationships cannot be upgraded safely because context-distinct
-        // relations may already have overwritten one another. Remove only the
-        // identity-less legacy projection once, then rebuild current edges
-        // from canonical memory records below.
+        // Releases before stable edge ids merged RELATED edges by kind. Backfill
+        // the surviving projection in one transaction before any new merge;
+        // never delete historical relationships during an ordinary write.
         self.migrate_legacy_related_edges().await?;
 
         let entities = neo4j_entity_params(record);
@@ -8434,9 +8432,19 @@ impl GraphStore for Neo4jGraphStore {
 }
 
 const NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER: &str = r#"
-MATCH ()-[legacy:RELATED]->()
+MATCH (from:MemoryNode)-[legacy:RELATED]->(to:MemoryNode)
 WHERE legacy.edge_id IS NULL
-DELETE legacy
+SET legacy.edge_id =
+    CASE
+        WHEN legacy.kind STARTS WITH 'SEMANTIC_'
+             AND legacy.payload_json CONTAINS '"id":"'
+        THEN split(split(legacy.payload_json, '"id":"')[1], '"')[0]
+        ELSE 'graph-edge:'
+             + toString(size(from.id)) + ':' + from.id + ':'
+             + toString(size(legacy.kind)) + ':' + legacy.kind + ':'
+             + toString(size(to.id)) + ':' + to.id
+    END,
+    legacy.edge_identity_migrated = true
 "#;
 
 const NEO4J_GRAPH_UPSERT_CYPHER: &str = r#"
@@ -11645,15 +11653,16 @@ fn graph_edge_id(edge: &GraphEdge) -> String {
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| {
-            // Length-prefix the structural fallback so identifiers containing
-            // separators cannot alias another relationship triple.
+            // Character-length-prefix the structural fallback so identifiers
+            // containing separators cannot alias another relationship triple,
+            // and Neo4j can reproduce the same id with Cypher `size()`.
             format!(
                 "graph-edge:{}:{}:{}:{}:{}:{}",
-                edge.from.len(),
+                edge.from.chars().count(),
                 edge.from,
-                edge.relationship.len(),
+                edge.relationship.chars().count(),
                 edge.relationship,
-                edge.to.len(),
+                edge.to.chars().count(),
                 edge.to
             )
         })
@@ -13116,7 +13125,14 @@ mod tests {
             BTreeSet::from(["blocked", "clear"])
         );
 
-        let neo4j_edge_ids = neo4j_relationship_params(&record)
+        let neo4j_params = neo4j_relationship_params(&record);
+        assert!(neo4j_params
+            .iter()
+            .filter(|param| param["kind"] == "SEMANTIC_RESTORES")
+            .all(|param| param["payload_json"]
+                .as_str()
+                .is_some_and(|payload| payload.contains("\"id\":\"semantic:test:restores:"))));
+        let neo4j_edge_ids = neo4j_params
             .into_iter()
             .filter(|param| param["kind"] == "SEMANTIC_RESTORES")
             .filter_map(|param| param["edge_id"].as_str().map(str::to_string))
@@ -13129,9 +13145,10 @@ mod tests {
             ])
         );
         assert!(NEO4J_GRAPH_UPSERT_CYPHER.contains("{edge_id: relationship.edge_id}"));
-        assert!(NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER
-            .contains("WHERE legacy.edge_id IS NULL"));
-        assert!(NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER.contains("DELETE legacy"));
+        assert!(NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER.contains("WHERE legacy.edge_id IS NULL"));
+        assert!(NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER.contains("SET legacy.edge_id"));
+        assert!(NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER.contains("legacy.payload_json"));
+        assert!(!NEO4J_LEGACY_RELATED_EDGE_MIGRATION_CYPHER.contains("DELETE"));
     }
 
     fn test_cluster(

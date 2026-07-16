@@ -59,7 +59,8 @@ All notable changes are grouped by date.
 - Preserve context-distinct semantic relations through graph-memory
   deduplication and Neo4j persistence by carrying `SemanticRelationId` as the
   stable edge identity instead of collapsing edges by triple alone, and
-  migrate away legacy `RELATED` projections that lack the new identity.
+  transactionally backfill stable identities onto legacy `RELATED` projections
+  without deleting historical graph relationships.
 - Give each possessor skill execution a stable id, count attempts once per
   execution rather than per motor refresh, expose dispatches separately, and
   consume each terminal failure only once before retrying.
