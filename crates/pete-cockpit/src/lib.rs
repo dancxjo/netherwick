@@ -1357,6 +1357,8 @@ pub struct StatusSummary {
     pub body_packet_count: Option<u32>,
     pub body_packet_age_ms: Option<u32>,
     pub body_packet_complete: Option<bool>,
+    #[serde(default)]
+    pub infrared_character: Option<u8>,
     pub contact: ContactSummary,
     pub battery: BatterySummary,
     pub odometry: OdometrySummary,
@@ -1402,6 +1404,7 @@ impl StatusSummary {
             body_packet_count: packet_count,
             body_packet_age_ms: packet_age_ms,
             body_packet_complete: Some(packet_count.unwrap_or(0) > 0),
+            infrared_character: number_for(raw, "ir_byte").and_then(|value| value.try_into().ok()),
             contact: ContactSummary::from_raw(raw),
             battery: BatterySummary::from_raw(raw),
             odometry: OdometrySummary::from_raw(raw),
@@ -1447,6 +1450,9 @@ impl StatusSummary {
             body_packet_count: packet_count,
             body_packet_age_ms: packet_age_ms,
             body_packet_complete: Some(packet_count.unwrap_or(0) > 0),
+            infrared_character: sensors
+                .and_then(|sensors| json_u32_value(sensors, "ir_byte"))
+                .and_then(|value| value.try_into().ok()),
             contact: ContactSummary::from_json(sensors),
             battery: BatterySummary::from_json(sensors),
             odometry: OdometrySummary::from_json(value.get("odometry")),
@@ -7966,6 +7972,25 @@ mod tests {
         assert_eq!(summary.body_packet_complete, Some(true));
         assert!(summary.has_fresh_complete_body_packet(500));
         assert!(!summary.has_fresh_complete_body_packet(250));
+    }
+
+    #[test]
+    fn status_summary_preserves_create_ir_from_json_and_compact_status() {
+        let json = StatusSummary::from_raw(
+            &serde_json::json!({
+                "create_sensors": {
+                    "complete_packet_count": 1,
+                    "ir_byte": 248
+                }
+            })
+            .to_string(),
+        );
+        let compact = StatusSummary::from_raw(
+            "OK 1 STATUS create_body_packets=1 ir_byte=137 bump_left=false",
+        );
+
+        assert_eq!(json.infrared_character, Some(248));
+        assert_eq!(compact.infrared_character, Some(137));
     }
 
     #[test]

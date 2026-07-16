@@ -1038,6 +1038,12 @@ pub fn summarized_senses(now: &Now) -> Vec<String> {
     if now.body.flags.virtual_wall {
         lines.push("I detect a virtual wall.".to_string());
     }
+    if now.body.infrared_character != 0 {
+        lines.push(format!(
+            "My Create IR receiver reports character {}.",
+            now.body.infrared_character
+        ));
+    }
     if let Some(transcript) = &now.ear.transcript {
         let transcript = transcript.trim();
         if !transcript.is_empty() {
@@ -3194,6 +3200,7 @@ mod tests {
     #[test]
     fn summarized_senses_include_input_sensor_channels() {
         let mut now = Now::blank(100, BodySense::default());
+        now.body.infrared_character = 248;
         now.body.flags.cliff_front_left = true;
         now.body.flags.wall = true;
         now.body.flags.virtual_wall = true;
@@ -3211,6 +3218,7 @@ mod tests {
         assert!(!senses.contains("Cliff sensor levels"));
         assert!(senses.contains("My wall sensor is active."));
         assert!(senses.contains("I detect a virtual wall."));
+        assert!(senses.contains("My Create IR receiver reports character 248."));
         assert!(
             senses.contains("Kinect IR has 4 samples, mean 0.50, max 0.90, bright fraction 0.50.")
         );

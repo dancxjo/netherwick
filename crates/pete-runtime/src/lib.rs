@@ -6606,6 +6606,7 @@ pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: Tim
             .map(|percent| percent as f32 / 100.0)
             .unwrap_or(1.0),
         charging,
+        infrared_character: status.infrared_character.unwrap_or(0),
         flags: BodyFlags {
             // Create 1 can report its dock contacts as both bumpers plus all
             // four cliff bits. Packet 34 is the authoritative Home Base
@@ -9357,6 +9358,27 @@ mod tests {
 
         assert!(body.charging);
         assert_eq!(body.last_update_ms, 123);
+    }
+
+    #[test]
+    fn create_ir_reaches_motherbrain_body_sense() {
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 1_000,
+                "create_sensors": {
+                    "last_packet_id": 0,
+                    "complete_packet_count": 1,
+                    "last_complete_packet_timestamp_ms": 1_000,
+                    "ir_byte": 248
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+
+        let body = body_sense_from_cockpit_status(status, 123);
+
+        assert_eq!(body.infrared_character, 248);
     }
 
     #[test]

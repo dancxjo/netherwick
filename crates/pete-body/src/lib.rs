@@ -156,6 +156,13 @@ impl ImuGravityCalibration {
 pub struct BodySense {
     pub battery_level: f32,
     pub charging: bool,
+    /// Raw character reported by the Create's omnidirectional IR receiver.
+    ///
+    /// Zero means that no IR character is currently being received. Non-zero
+    /// values retain the Create OI byte so dock and remote-control signals can
+    /// be interpreted by higher-level consumers without losing information.
+    #[serde(default)]
+    pub infrared_character: u8,
     #[serde(default)]
     pub cliff_sensors: CliffSensors,
     pub flags: BodyFlags,
@@ -170,6 +177,7 @@ impl Default for BodySense {
         Self {
             battery_level: 1.0,
             charging: false,
+            infrared_character: 0,
             cliff_sensors: CliffSensors::default(),
             flags: BodyFlags::default(),
             odometry: Pose2::default(),

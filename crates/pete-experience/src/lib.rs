@@ -694,6 +694,7 @@ impl FeatureExperienceEncoder {
                 BaselineSenseVectorizer::Asr,
                 BaselineSenseVectorizer::Range,
                 BaselineSenseVectorizer::KinectIr,
+                BaselineSenseVectorizer::CreateIr,
             ],
         }
     }
@@ -1141,6 +1142,7 @@ enum BaselineSenseVectorizer {
     Asr,
     Range,
     KinectIr,
+    CreateIr,
 }
 
 impl SenseVectorizer for BaselineSenseVectorizer {
@@ -1157,6 +1159,7 @@ impl SenseVectorizer for BaselineSenseVectorizer {
             Self::Asr => "asr",
             Self::Range => "range",
             Self::KinectIr => "kinect_ir",
+            Self::CreateIr => "create_ir",
         }
     }
 
@@ -1237,6 +1240,10 @@ impl SenseVectorizer for BaselineSenseVectorizer {
                 .map(|m| (1.0 / (1.0 + m)).clamp(0.0, 1.0))
                 .unwrap_or(0.0)],
             Self::KinectIr => kinect_ir_features(now),
+            Self::CreateIr => vec![
+                bool01(now.body.infrared_character != 0),
+                f32::from(now.body.infrared_character) / f32::from(u8::MAX),
+            ],
         }
     }
 }
@@ -1647,6 +1654,19 @@ mod tests {
         assert_eq!(latent.t_ms, 42);
         assert!(!latent.z.is_empty());
         assert!(latent.z.iter().any(|value| *value > 0.0));
+    }
+
+    #[test]
+    fn feature_encoder_consumes_create_ir_without_shifting_prior_channels() {
+        let mut encoder = FeatureExperienceEncoder::new();
+        let mut now = Now::blank(42, BodySense::default());
+        now.body.infrared_character = 248;
+
+        let latent = encoder.encode(&now).unwrap();
+        let ir_features = &latent.z[latent.z.len() - 2..];
+
+        assert_eq!(ir_features[0], 1.0);
+        assert_eq!(ir_features[1], 248.0 / 255.0);
     }
 
     #[test]

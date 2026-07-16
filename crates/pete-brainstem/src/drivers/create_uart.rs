@@ -775,6 +775,15 @@ mod tests {
     }
 
     #[test]
+    fn create_ir_character_decodes_from_group_and_individual_packets() {
+        let mut packet = valid_group_zero();
+        packet[10] = 248;
+
+        assert_eq!(decode_sensor_packet(0, &packet).unwrap().ir_byte, 248);
+        assert_eq!(decode_sensor_packet(17, &[137]).unwrap().ir_byte, 137);
+    }
+
+    #[test]
     fn repeated_invalid_packets_fault_uart_health_without_flooding_events() {
         let _guard = status::status_test_guard();
         let mut uart = CreateUart::new();

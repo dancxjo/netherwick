@@ -14,6 +14,9 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Carry the Create's omnidirectional IR character from brainstem sensor packets
+  into motherbrain body state, queryable features, experience vectors, and
+  LLM-visible senses while preserving older serialized body/status data.
 - Add bounded Pico W AP-local ICMPv4 echo replies with IPv4/ICMP validation,
   four-per-second rate limiting, status diagnostics, parser coverage, and a
   ping bring-up check; ICMP remains isolated from routing and robot hardware.

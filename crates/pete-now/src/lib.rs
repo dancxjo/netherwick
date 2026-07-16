@@ -1297,6 +1297,20 @@ impl Now {
         );
         features.push(
             Feature::new(
+                FeatureType::Other,
+                FeatureModality::Body,
+                body_time,
+                1.0,
+                Provenance::direct().with_stage("now.body.create_ir"),
+            )
+            .with_source_sensor("create_ir")
+            .with_metadata(json!({
+                "infrared_character": self.body.infrared_character,
+                "signal_present": self.body.infrared_character != 0,
+            })),
+        );
+        features.push(
+            Feature::new(
                 FeatureType::OdometryEvent,
                 FeatureModality::Motion,
                 body_time,
@@ -1490,6 +1504,7 @@ mod tests {
     #[test]
     fn now_emits_queryable_features_across_modalities() {
         let mut now = Now::blank(1_000, BodySense::default());
+        now.body.infrared_character = 248;
         now.objects.observations.push(ObjectObservation {
             label: "Ada".to_string(),
             class: ObjectClass::Person,
@@ -1526,6 +1541,10 @@ mod tests {
         now.predictions.uncertainty = 0.2;
 
         let registry = now.feature_registry();
+
+        let create_ir = registry.by_source_sensor("create_ir");
+        assert_eq!(create_ir.len(), 1);
+        assert_eq!(create_ir[0].metadata["infrared_character"], 248);
 
         assert!(registry
             .by_modality(FeatureModality::Vision)
