@@ -1,7 +1,5 @@
 use heapless::Deque;
-use pete_cockpit_protocol::{
-    bump_escape_turn_duration_ms, BUMP_ESCAPE_BACKOFF_DURATION_MS,
-};
+use pete_cockpit_protocol::{bump_escape_turn_duration_ms, BUMP_ESCAPE_BACKOFF_DURATION_MS};
 
 use crate::body;
 use crate::commands::{
@@ -41,6 +39,8 @@ const CONNECTED_POWER_LED_INTENSITY: u8 = 255;
 const ORIENTATION_PROBE_IMU_MAX_AGE_MS: u32 = body::IMU_POLL_PERIOD_MS * 5;
 const ORIENTATION_PROBE_MIN_ACCEL_MM_S2: u16 = 7_000;
 const ORIENTATION_PROBE_MAX_ACCEL_MM_S2: u16 = 13_000;
+const CONTACT_WITHDRAWAL_SPEED_MM_S: i16 = 80;
+const CONTACT_REPEAT_WINDOW_MS: u32 = 2_000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -154,6 +154,12 @@ struct ActiveMotherbrainReset {
     release_at_ms: u32,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ActiveContactWithdrawal {
+    started_at_ms: u32,
+    baseline_odometry_mm: i32,
+}
+
 pub struct Runtime<H>
 where
     H: BrainstemHardware,
@@ -197,6 +203,9 @@ where
     motherbrain_reset_history_next: usize,
     safety_recovery_motion: bool,
     create_no_response_restart_queued: bool,
+    active_contact_withdrawal: Option<ActiveContactWithdrawal>,
+    last_contact_withdrawal_at_ms: Option<u32>,
+    repeated_contact_count: u8,
 }
 
 impl<H> Runtime<H>
@@ -249,6 +258,9 @@ where
             motherbrain_reset_history_next: 0,
             safety_recovery_motion: false,
             create_no_response_restart_queued: false,
+            active_contact_withdrawal: None,
+            last_contact_withdrawal_at_ms: None,
+            repeated_contact_count: 0,
         }
     }
 
@@ -302,11 +314,13 @@ where
             return;
         }
         if status::take_expired_authority(self.now_ms()) {
-            self.interrupt_active_command();
-            self.commands.clear();
-            self.active = ActiveAction::None;
             self.heartbeat_stop_at_ms = None;
-            let _ = self.stop_drive();
+            if self.active_contact_withdrawal.is_none() {
+                self.interrupt_active_command();
+                self.commands.clear();
+                self.active = ActiveAction::None;
+                let _ = self.stop_drive();
+            }
         }
 
         match self.mode {
@@ -351,21 +365,25 @@ where
             status::acknowledge_authority_transition(generation);
             return;
         }
-        self.interrupt_active_command();
-        self.commands.clear();
-        self.active = ActiveAction::None;
         self.heartbeat_stop_at_ms = None;
-        let _ = self.stop_drive();
-        status::set_command(None);
-        status::set_runtime_state(RuntimeState::Idle);
-        status::set_body_state(BodyState::Idle);
+        if self.active_contact_withdrawal.is_none() {
+            self.interrupt_active_command();
+            self.commands.clear();
+            self.active = ActiveAction::None;
+            let _ = self.stop_drive();
+            status::set_command(None);
+            status::set_runtime_state(RuntimeState::Idle);
+            status::set_body_state(BodyState::Idle);
+        }
         status::acknowledge_authority_transition(generation);
-        let _ = self.commands.push_back(QueuedCommand::new(
-            0,
-            RuntimeCommand::PlayFeedback {
-                kind: FeedbackKind::Ok,
-            },
-        ));
+        if self.active_contact_withdrawal.is_none() {
+            let _ = self.commands.push_back(QueuedCommand::new(
+                0,
+                RuntimeCommand::PlayFeedback {
+                    kind: FeedbackKind::Ok,
+                },
+            ));
+        }
     }
 
     fn queue_create_acquisition(&mut self, command_id: u32) {
@@ -452,16 +470,18 @@ where
         let Some(generation) = status::pending_session_replace() else {
             return;
         };
-        self.interrupt_active_command();
-        self.commands.clear();
-        self.active = ActiveAction::None;
         self.heartbeat_stop_at_ms = None;
         self.sensor_stream = None;
         network_registry::clear_motherbrain_registration();
-        let _ = self.stop_drive();
-        status::set_command(None);
-        status::set_runtime_state(RuntimeState::Idle);
-        status::set_body_state(BodyState::Idle);
+        if self.active_contact_withdrawal.is_none() {
+            self.interrupt_active_command();
+            self.commands.clear();
+            self.active = ActiveAction::None;
+            let _ = self.stop_drive();
+            status::set_command(None);
+            status::set_runtime_state(RuntimeState::Idle);
+            status::set_body_state(BodyState::Idle);
+        }
         self.publish_safety_snapshot();
         // The session module supplies the pending hash before requesting the
         // barrier. Until it is wired, generation itself is a fail-closed token.
@@ -483,6 +503,33 @@ where
         };
         let command_id = status::last_dispatched_command_id();
         let (service_session_hash, service_lease_hash) = status::last_dispatched_service_identity();
+
+        if self.active_contact_withdrawal.is_some()
+            && !matches!(
+                command,
+                BrainstemCommand::Stop | BrainstemCommand::EStop | BrainstemCommand::Disarm
+            )
+        {
+            // The possessor may lose or replace authority while this runs.
+            // Ordinary commands cannot supersede a local reflex.
+            status::mark_command_interrupted(command_id);
+            return;
+        }
+
+        if self.active_contact_withdrawal.is_some()
+            && matches!(
+                command,
+                BrainstemCommand::Stop | BrainstemCommand::EStop | BrainstemCommand::Disarm
+            )
+        {
+            let stopped = self.stop_drive().is_ok();
+            self.finish_contact_withdrawal(
+                status::ContactWithdrawalOutcome::SafetyPreempted,
+                matches!(command, BrainstemCommand::EStop)
+                    .then_some(status::SafetyEventKind::EStop),
+                stopped,
+            );
+        }
 
         match command {
             BrainstemCommand::Stop | BrainstemCommand::EStop => {
@@ -1270,6 +1317,11 @@ where
                 if time_reached(now_ms, stop_at_ms) {
                     self.stop_drive()?;
                     self.active = ActiveAction::None;
+                    self.finish_contact_withdrawal(
+                        status::ContactWithdrawalOutcome::Completed,
+                        None,
+                        true,
+                    );
                     self.complete_active_command();
                 }
                 Ok(())
@@ -1469,16 +1521,14 @@ where
             && snapshot.imu_sample_age_ms <= ORIENTATION_PROBE_IMU_MAX_AGE_MS
             && snapshot.imu_accel_magnitude_mm_s2 >= ORIENTATION_PROBE_MIN_ACCEL_MM_S2
             && snapshot.imu_accel_magnitude_mm_s2 <= ORIENTATION_PROBE_MAX_ACCEL_MM_S2;
-        let imu_still_tilted =
-            snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
+        let imu_still_tilted = snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
         let imu_impact = snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
         if wheel_drop
             || cliff
             || status::charging_interlock_active(&snapshot)
             || !imu_ready
             || imu_impact
-            || (imu_still_tilted
-                && self.safety_latch_kind != Some(status::SafetyEventKind::Tilt))
+            || (imu_still_tilted && self.safety_latch_kind != Some(status::SafetyEventKind::Tilt))
         {
             self.stop_drive()?;
             return Err(BrainstemError::CreateNoResponse);
@@ -1650,6 +1700,11 @@ where
                 status::mark_safety_tripped(status::SafetyEventKind::Charging);
                 self.clear_motion_queue()?;
                 self.stop_drive()?;
+                self.finish_contact_withdrawal(
+                    status::ContactWithdrawalOutcome::SafetyPreempted,
+                    Some(status::SafetyEventKind::Charging),
+                    true,
+                );
                 self.charging_interlock_latched = true;
             }
             return Ok(());
@@ -1670,11 +1725,20 @@ where
                 self.commands.clear();
                 self.stop_drive()?;
                 self.active = ActiveAction::None;
+                self.finish_contact_withdrawal(
+                    status::ContactWithdrawalOutcome::SafetyPreempted,
+                    Some(status::SafetyEventKind::WheelDrop),
+                    true,
+                );
                 let _ = self.play_feedback_now(FeedbackKind::Danger);
             }
             return Ok(());
         }
-        if self.safety_latched {
+        // A bump latch permits only its own bounded reverse. A stronger local
+        // safety observation must still preempt that reflex deterministically.
+        if self.safety_latched
+            && !(self.active_contact_withdrawal.is_some() && (tilt || impact || cliff))
+        {
             return Ok(());
         }
 
@@ -1714,6 +1778,11 @@ where
                 self.commands.clear();
                 self.stop_drive()?;
                 self.active = ActiveAction::None;
+                self.finish_contact_withdrawal(
+                    status::ContactWithdrawalOutcome::SafetyPreempted,
+                    Some(kind),
+                    true,
+                );
                 Ok(())
             }
             SafetyAction::Backoff => {
@@ -1722,10 +1791,21 @@ where
                 self.interrupt_active_command();
                 self.commands.clear();
                 self.active = ActiveAction::None;
+                self.stop_drive()?;
+                if kind == status::SafetyEventKind::Bump {
+                    let snapshot = status::snapshot(self.now_ms());
+                    self.start_contact_withdrawal(
+                        (snapshot.create_sensor_flags & 0b11) as u8,
+                        command_id,
+                        snapshot.odometry_distance_mm,
+                    );
+                    self.mode = RuntimeMode::Running;
+                    status::set_runtime_state(RuntimeState::Running);
+                }
                 let _ = self.commands.push_front(QueuedCommand::safety_recovery(
-                    command_id,
+                    0,
                     RuntimeCommand::CmdVel {
-                        linear_mm_s: -80,
+                        linear_mm_s: -CONTACT_WITHDRAWAL_SPEED_MM_S,
                         angular_mrad_s: 0,
                         duration_ms: Some(BUMP_ESCAPE_BACKOFF_DURATION_MS),
                     },
@@ -1887,14 +1967,16 @@ where
             return Ok(());
         };
         if time_reached(self.now_ms(), deadline_ms) {
-            self.interrupt_active_command();
-            self.commands.clear();
-            self.active = ActiveAction::None;
             self.heartbeat_stop_at_ms = None;
             status::revoke_authority();
             status::mark_heartbeat_expired();
             status::mark_safety_tripped(status::SafetyEventKind::Heartbeat);
-            self.stop_drive()?;
+            if self.active_contact_withdrawal.is_none() {
+                self.interrupt_active_command();
+                self.commands.clear();
+                self.active = ActiveAction::None;
+                self.stop_drive()?;
+            }
         }
         Ok(())
     }
@@ -1924,7 +2006,8 @@ where
         status::set_error(error);
         self.push_event(BrainstemEvent::Error(error));
         self.fail_active_command(error);
-        let _ = self.stop_drive();
+        let stopped = self.stop_drive().is_ok();
+        self.finish_contact_withdrawal(status::ContactWithdrawalOutcome::Failed, None, stopped);
         self.mode = RuntimeMode::Error;
         self.active = ActiveAction::None;
         self.error_blink_next_ms = self.now_ms();
@@ -2004,6 +2087,55 @@ where
                 status::mark_command_interrupted(command_id);
             }
         }
+    }
+
+    fn start_contact_withdrawal(
+        &mut self,
+        contact_bits: u8,
+        preempted_command_id: u32,
+        baseline_odometry_mm: i32,
+    ) {
+        let now_ms = self.now_ms();
+        self.repeated_contact_count = match self.last_contact_withdrawal_at_ms {
+            Some(previous) if now_ms.wrapping_sub(previous) <= CONTACT_REPEAT_WINDOW_MS => {
+                self.repeated_contact_count.saturating_add(1).max(1)
+            }
+            _ => 1,
+        };
+        self.last_contact_withdrawal_at_ms = Some(now_ms);
+        self.active_contact_withdrawal = Some(ActiveContactWithdrawal {
+            started_at_ms: now_ms,
+            baseline_odometry_mm,
+        });
+        status::mark_contact_withdrawal_started(
+            contact_bits,
+            self.repeated_contact_count,
+            preempted_command_id,
+            CONTACT_WITHDRAWAL_SPEED_MM_S.unsigned_abs(),
+            BUMP_ESCAPE_BACKOFF_DURATION_MS.min(u32::from(u16::MAX)) as u16,
+        );
+    }
+
+    fn finish_contact_withdrawal(
+        &mut self,
+        outcome: status::ContactWithdrawalOutcome,
+        dominating_safety: Option<status::SafetyEventKind>,
+        final_stopped: bool,
+    ) {
+        let Some(active) = self.active_contact_withdrawal.take() else {
+            return;
+        };
+        let now_ms = self.now_ms();
+        let displacement = status::snapshot(now_ms)
+            .odometry_distance_mm
+            .wrapping_sub(active.baseline_odometry_mm);
+        status::mark_contact_withdrawal_completed(
+            outcome,
+            dominating_safety,
+            final_stopped,
+            displacement,
+            now_ms.wrapping_sub(active.started_at_ms),
+        );
     }
 
     fn update_safety_edges(&mut self, bump: bool, cliff: bool, wheel_drop: bool) {
@@ -2910,7 +3042,7 @@ mod tests {
     }
 
     #[test]
-    fn bump_stop_stays_latched_after_contact_until_explicit_clear() {
+    fn contact_withdrawal_runs_locally_then_stays_latched_until_clear() {
         let _guard = status::status_test_guard();
         status::mark_create_sensor_packet(
             0,
@@ -2925,13 +3057,31 @@ mod tests {
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.create_responsive = true;
         runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(42);
 
         assert!(runtime.enforce_safety_policy().is_ok());
         assert!(runtime.safety_latched);
+        assert!(runtime.active_contact_withdrawal.is_some());
+        assert_eq!(runtime.commands.len(), 1);
         assert!(matches!(
             runtime.safety_latch_kind,
             Some(status::SafetyEventKind::Bump)
         ));
+
+        assert!(runtime.start_next_command().is_ok());
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert!(runtime.safety_recovery_motion);
+
+        // Loss of remote authority cannot cancel a brainstem-local reflex.
+        status::request_authority_transition(900, 0, 0, 0);
+        runtime.poll_authority_transition();
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert!(runtime.active_contact_withdrawal.is_some());
+
+        runtime.hardware.now_us += BUMP_ESCAPE_BACKOFF_DURATION_MS * 1_000;
+        assert!(runtime.advance_active_action().is_ok());
+        assert!(runtime.active_contact_withdrawal.is_none());
+        assert!(matches!(runtime.active, ActiveAction::None));
 
         status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
         assert!(runtime.enforce_safety_policy().is_ok());
@@ -2976,6 +3126,47 @@ mod tests {
         assert!(matches!(
             runtime.safety_latch_kind,
             Some(status::SafetyEventKind::Bump)
+        ));
+    }
+
+    #[test]
+    fn cliff_preempts_an_active_contact_withdrawal() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(runtime.active_contact_withdrawal.is_some());
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    cliff_front_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        assert!(runtime.enforce_safety_policy().is_ok());
+
+        assert!(runtime.active_contact_withdrawal.is_none());
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Cliff)
         ));
     }
 

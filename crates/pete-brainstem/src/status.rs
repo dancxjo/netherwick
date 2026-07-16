@@ -442,6 +442,16 @@ pub enum PublicEventKind {
     MotherbrainResetAsserted = 47,
     MotherbrainResetCompleted = 48,
     MotherbrainResetRefused = 49,
+    ContactWithdrawalStarted = 50,
+    ContactWithdrawalCompleted = 51,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ContactWithdrawalOutcome {
+    Completed = 1,
+    SafetyPreempted = 2,
+    Failed = 3,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2502,6 +2512,51 @@ pub fn mark_safety_cleared(kind: SafetyEventKind) {
     record_public_event(PublicEventKind::SafetyCleared, kind as u32, 0, 0);
 }
 
+/// Records the start of the unconditional contact-withdrawal reflex.
+///
+/// Payload layout is stable and deliberately compact:
+/// `a[1:0]` contact side bits, `a[15:8]` repeated-contact count;
+/// `b` preempted command id; `c[15:0]` reverse speed magnitude in mm/s,
+/// `c[31:16]` maximum duration in milliseconds.
+pub fn mark_contact_withdrawal_started(
+    contact_bits: u8,
+    repeated_count: u8,
+    preempted_command_id: u32,
+    reverse_speed_mm_s: u16,
+    duration_ms: u16,
+) {
+    let trigger = u32::from(contact_bits & 0b11) | (u32::from(repeated_count) << 8);
+    let bounds = u32::from(reverse_speed_mm_s) | (u32::from(duration_ms) << 16);
+    record_public_event(
+        PublicEventKind::ContactWithdrawalStarted,
+        trigger,
+        preempted_command_id,
+        bounds,
+    );
+}
+
+/// Records the terminal reflex outcome. `a[7:0]` is the outcome,
+/// `a[15:8]` is an optional dominating SafetyEventKind, and `a[16]` confirms
+/// that a stop was sent. `b` is signed observed displacement encoded as i32;
+/// `c` is elapsed milliseconds.
+pub fn mark_contact_withdrawal_completed(
+    outcome: ContactWithdrawalOutcome,
+    dominating_safety: Option<SafetyEventKind>,
+    final_stopped: bool,
+    observed_displacement_mm: i32,
+    elapsed_ms: u32,
+) {
+    let summary = u32::from(outcome as u8)
+        | (dominating_safety.map_or(0, |kind| u32::from(kind as u8)) << 8)
+        | (u32::from(final_stopped) << 16);
+    record_public_event(
+        PublicEventKind::ContactWithdrawalCompleted,
+        summary,
+        observed_displacement_mm as u32,
+        elapsed_ms,
+    );
+}
+
 pub fn mark_bump_changed(active: bool) {
     record_public_event(PublicEventKind::BumpChanged, active as u32, 0, 0);
 }
@@ -3681,6 +3736,10 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
         x if x == PublicEventKind::MotherbrainResetAsserted as u8 => "motherbrain_reset_asserted",
         x if x == PublicEventKind::MotherbrainResetCompleted as u8 => "motherbrain_reset_completed",
         x if x == PublicEventKind::MotherbrainResetRefused as u8 => "motherbrain_reset_refused",
+        x if x == PublicEventKind::ContactWithdrawalStarted as u8 => "contact_withdrawal_started",
+        x if x == PublicEventKind::ContactWithdrawalCompleted as u8 => {
+            "contact_withdrawal_completed"
+        }
         x if x == PublicEventKind::Error as u8 => "error",
         _ => "none",
     }

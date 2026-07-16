@@ -254,7 +254,9 @@ pub struct SafetyPolicy {
 impl Default for SafetyPolicy {
     fn default() -> Self {
         Self {
-            bump: SafetyAction::Stop,
+            // Contact withdrawal is a brainstem reflex. It must not wait for
+            // (or depend on) a motherbrain possession lease.
+            bump: SafetyAction::Backoff,
             cliff: SafetyAction::Stop,
             wheel_drop_latch: true,
         }

@@ -8,6 +8,15 @@ All notable changes are grouped by date.
 
 - Removed retired behavior configuration spellings (`mode`, `hardcoded_on_error`, and `stop_on_error`) and compatibility type aliases; configurations must use `regime` and the canonical fallback values.
 
+### Ready
+
+- Make a bump-triggered contact withdrawal a bounded brainstem-local reflex: it continues across authority changes, records start and terminal safety events, and remains preemptible by stronger safety conditions.
+
+### Ongoing
+
+- Migration of repository automation from shell-based `Justfile` recipes and helper scripts to the Rust `xtask` command layer. This includes BOOTSEL mounting, synchronization, hardware setup, and training workflows; the migration is still being reviewed and is not yet a completed release change.
+- Migration of face, object, and voice features to `VectorArtifact`-only schema fields. Downstream runtime, training, and event consumers still require coordinated updates, so this is not yet a completed release change.
+
 ### Cognitive provider health follow-up (2026-07-15)
 
 - Keep optional scene providers degraded while a request is in flight, mark them available only after a successful response, and record deadline failures as degraded health.
