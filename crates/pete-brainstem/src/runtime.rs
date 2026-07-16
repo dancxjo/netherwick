@@ -1499,9 +1499,11 @@ where
         }
         let fresh_bump_edge = bump && !self.last_bump;
 
-        if home_base && !matches!(self.active, ActiveAction::DockDeparture { .. }) {
+        if home_base && !wheel_drop && !tilt && !impact {
             self.clear_dock_contact_latch();
-            if !self.dock_departure_pending {
+            if !matches!(self.active, ActiveAction::DockDeparture { .. })
+                && !self.dock_departure_pending
+            {
                 self.clear_motion_queue()?;
                 self.stop_drive()?;
                 self.finish_contact_withdrawal(
@@ -1517,7 +1519,7 @@ where
             return Ok(());
         }
 
-        if charging {
+        if charging && !wheel_drop && !tilt && !impact {
             if !self.charging_interlock_latched {
                 self.clear_motion_queue()?;
                 self.stop_drive()?;
@@ -2825,7 +2827,7 @@ mod tests {
     }
 
     #[test]
-    fn home_base_reconciles_an_early_cliff_latch_but_not_wheel_drop() {
+    fn home_base_reconciles_cliff_race_through_departure_but_not_wheel_drop() {
         let _guard = status::status_test_guard();
         status::mark_create_sensor_packet(
             0,
@@ -2870,13 +2872,46 @@ mod tests {
                 && event.a == status::SafetyEventKind::Cliff as u32
         }));
 
-        runtime.latch_safety(status::SafetyEventKind::WheelDrop);
+        runtime.dock_departure_pending = false;
+        runtime.active = ActiveAction::DockDeparture { stop_at_ms: 2_000 };
+        let departure_cursor = status::snapshot(1_000).event_next_seq.saturating_sub(1);
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(matches!(
+            runtime.active,
+            ActiveAction::DockDeparture { .. }
+        ));
+        assert!(!runtime.safety_latched);
+
+        let mut departure_events = heapless::Vec::<status::PublicEventRecord, 8>::new();
+        status::collect_events_since(departure_cursor, &mut departure_events);
+        assert!(!departure_events.iter().any(|event| {
+            event.kind == status::PublicEventKind::SafetyTripped as u8
+                && event.a == status::SafetyEventKind::Cliff as u32
+        }));
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    bump_right: true,
+                    wheel_drop: true,
+                    cliff_left: true,
+                    cliff_front_left: true,
+                    cliff_front_right: true,
+                    cliff_right: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
         assert!(runtime.enforce_safety_policy().is_ok());
         assert!(runtime.safety_latched);
         assert!(matches!(
             runtime.safety_latch_kind,
             Some(status::SafetyEventKind::WheelDrop)
         ));
+        assert!(matches!(runtime.active, ActiveAction::None));
     }
 
     #[test]

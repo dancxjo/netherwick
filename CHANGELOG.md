@@ -79,6 +79,9 @@ All notable changes are grouped by date.
 - Reconcile a bump/cliff latch raised before the private Home Base packet
   arrives, preventing the dock's packet-order race from leaving a stale cliff
   latch while preserving wheel-drop and every stronger safety latch.
+- Keep Home Base contact normalized throughout the bounded dock-departure
+  reverse, instead of letting alternating packet-0 and packet-34 observations
+  repeatedly trip and clear the dock's cliff bits while stopping motion.
 - Keep authorized `just flash` BOOTSEL negotiation compatible with older
   brainstems that advertise retired convenience verbs, while preserving the
   primitive-only contract for newly built firmware.
