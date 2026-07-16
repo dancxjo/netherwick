@@ -8404,7 +8404,17 @@ impl GraphStore for Neo4jGraphStore {
         let relationships = neo4j_relationship_params(record);
 
         self.run_cypher(
-            r#"
+            NEO4J_GRAPH_UPSERT_CYPHER,
+            json!({
+                "entities": entities,
+                "relationships": relationships,
+            }),
+        )
+        .await
+    }
+}
+
+const NEO4J_GRAPH_UPSERT_CYPHER: &str = r#"
 UNWIND $entities AS entity
 MERGE (n:MemoryNode {id: entity.id})
 SET n.labels = entity.labels,
@@ -8416,22 +8426,15 @@ WITH collect(n) AS ignored
 UNWIND $relationships AS relationship
 MATCH (from:MemoryNode {id: relationship.from})
 MATCH (to:MemoryNode {id: relationship.to})
-MERGE (from)-[r:RELATED {kind: relationship.kind}]->(to)
-SET r.summary = relationship.summary,
+MERGE (from)-[r:RELATED {edge_id: relationship.edge_id}]->(to)
+SET r.kind = relationship.kind,
+    r.summary = relationship.summary,
     r.score = relationship.score,
     r.payload_json = relationship.payload_json,
     r.frame_id = relationship.frame_id,
     r.t_ms = relationship.t_ms
 REMOVE r.payload
-"#,
-            json!({
-                "entities": entities,
-                "relationships": relationships,
-            }),
-        )
-        .await
-    }
-}
+"#;
 
 #[async_trait]
 impl GraphIntelligence for Neo4jGraphStore {
@@ -9558,6 +9561,7 @@ fn neo4j_relationship_params(record: &MemoryRecord) -> Vec<serde_json::Value> {
         .iter()
         .map(|edge| {
             json!({
+                "edge_id": graph_edge_id(edge),
                 "from": edge.from,
                 "to": edge.to,
                 "kind": edge.relationship,
@@ -11248,6 +11252,7 @@ fn append_semantic_graph_memory(
             });
         }
         relationships.push(GraphEdge {
+            id: Some(relation.id.0.clone()),
             from: relation.subject.stable_key(),
             to: relation.object.stable_key(),
             relationship: format!("SEMANTIC_{:?}", relation.predicate).to_ascii_uppercase(),
@@ -11308,6 +11313,7 @@ fn append_world_model_memory(
             score: person.current_identity_confidence,
         });
         relationships.push(GraphEdge {
+            id: None,
             from: experience_id.to_string(),
             to: person.person_id.0.clone(),
             relationship: if person.presence.present {
@@ -11346,6 +11352,7 @@ fn append_world_model_memory(
             score: confidence,
         });
         relationships.push(GraphEdge {
+            id: None,
             from: relationship_id,
             to: relationship.person_id.0.clone(),
             relationship: "RELATES_TO_PERSON".to_string(),
@@ -11376,6 +11383,7 @@ fn append_world_model_memory(
             score: 1.0,
         });
         relationships.push(GraphEdge {
+            id: None,
             from: experience_id.to_string(),
             to: interaction_id.clone(),
             relationship: "HAS_SOCIAL_INTERACTION".to_string(),
@@ -11411,6 +11419,7 @@ fn append_world_model_memory(
             score: episode.confidence,
         });
         relationships.push(GraphEdge {
+            id: None,
             from: experience_id.to_string(),
             to: episode_id.clone(),
             relationship: "HAS_TEMPORAL_EPISODE".to_string(),
@@ -11458,6 +11467,7 @@ fn graph_edge(
     summary: Option<String>,
 ) -> GraphEdge {
     GraphEdge {
+        id: None,
         from: from.into(),
         to: to.into(),
         relationship: relationship.into(),
@@ -11469,6 +11479,7 @@ fn graph_edge(
 
 fn memory_link_edge(from: impl Into<String>, link: &MemoryLink) -> GraphEdge {
     GraphEdge {
+        id: None,
         from: from.into(),
         to: link.target_id.clone(),
         relationship: link.relation.clone(),
@@ -11592,10 +11603,7 @@ fn dedupe_relationships(relationships: Vec<GraphEdge>, limit: usize) -> Vec<Grap
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for relationship in relationships {
-        let key = format!(
-            "{}:{}:{}",
-            relationship.from, relationship.relationship, relationship.to
-        );
+        let key = graph_edge_id(&relationship);
         if seen.insert(key) {
             out.push(relationship);
         }
@@ -11604,6 +11612,26 @@ fn dedupe_relationships(relationships: Vec<GraphEdge>, limit: usize) -> Vec<Grap
         }
     }
     out
+}
+
+fn graph_edge_id(edge: &GraphEdge) -> String {
+    edge.id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            // Length-prefix the structural fallback so identifiers containing
+            // separators cannot alias another relationship triple.
+            format!(
+                "graph-edge:{}:{}:{}:{}:{}:{}",
+                edge.from.len(),
+                edge.from,
+                edge.relationship.len(),
+                edge.relationship,
+                edge.to.len(),
+                edge.to
+            )
+        })
 }
 
 fn graph_context_summary(entities: &[GraphEntity]) -> Option<String> {
@@ -12912,9 +12940,10 @@ mod tests {
     use pete_ledger::ExperienceFrame;
     use pete_now::{
         EpisodeKind, FaceSense, ObjectClass, ObjectObservation, ObjectObservationSource, PersonId,
-        SurpriseSense, VectorArtifact, WorldModelUpdateContext, WorldModelUpdater,
-        FACE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
-        VOICE_VECTOR_COLLECTION,
+        SemanticConceptId, SemanticContext, SemanticDriveId, SemanticPredicate, SemanticRelation,
+        SemanticRelationId, SemanticRelationStatus, SurpriseSense, VectorArtifact,
+        WorldModelUpdateContext, WorldModelUpdater, FACE_VECTOR_COLLECTION,
+        OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
     };
 
     fn empty_frame(now: Now) -> ExperienceFrame {
@@ -12998,6 +13027,83 @@ mod tests {
                 && relationship.relationship == "SEMANTIC_RESTORES"
                 && relationship.payload.get("supporting_evidence").is_some()
         }));
+    }
+
+    #[test]
+    fn context_distinct_semantic_relations_keep_distinct_persistence_ids() {
+        let subject = SemanticNodeRef::Concept(SemanticConceptId("charger".to_string()));
+        let object = SemanticNodeRef::Drive(SemanticDriveId("energy".to_string()));
+        let mut semantic = SemanticGraphSnapshot::default();
+
+        for route_state in ["clear", "blocked"] {
+            let id = SemanticRelationId(format!("semantic:test:restores:{route_state}"));
+            semantic.relations.insert(
+                id.clone(),
+                SemanticRelation {
+                    id,
+                    subject: subject.clone(),
+                    predicate: SemanticPredicate::Restores,
+                    object: object.clone(),
+                    context: SemanticContext {
+                        agent: Some("pete".to_string()),
+                        conditions: BTreeMap::from([(
+                            "route_state".to_string(),
+                            route_state.to_string(),
+                        )]),
+                        ..SemanticContext::default()
+                    },
+                    confidence: 0.8,
+                    status: SemanticRelationStatus::ContextLimited,
+                    ..SemanticRelation::default()
+                },
+            );
+        }
+
+        let mut now = Now::blank(1_000, BodySense::default());
+        now.world.semantic = semantic;
+        let record = memory_record_from_frame(&empty_frame(now)).expect("memory record");
+        let semantic_edges = record
+            .graph_relationships
+            .iter()
+            .filter(|edge| edge.relationship == "SEMANTIC_RESTORES")
+            .collect::<Vec<_>>();
+
+        assert_eq!(semantic_edges.len(), 2);
+        assert_eq!(
+            semantic_edges
+                .iter()
+                .filter_map(|edge| edge.id.as_deref())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "semantic:test:restores:blocked",
+                "semantic:test:restores:clear",
+            ])
+        );
+        assert_eq!(
+            semantic_edges
+                .iter()
+                .filter_map(|edge| {
+                    edge.payload
+                        .pointer("/context/conditions/route_state")
+                        .and_then(|value| value.as_str())
+                })
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["blocked", "clear"])
+        );
+
+        let neo4j_edge_ids = neo4j_relationship_params(&record)
+            .into_iter()
+            .filter(|param| param["kind"] == "SEMANTIC_RESTORES")
+            .filter_map(|param| param["edge_id"].as_str().map(str::to_string))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            neo4j_edge_ids,
+            BTreeSet::from([
+                "semantic:test:restores:blocked".to_string(),
+                "semantic:test:restores:clear".to_string(),
+            ])
+        );
+        assert!(NEO4J_GRAPH_UPSERT_CYPHER.contains("{edge_id: relationship.edge_id}"));
     }
 
     fn test_cluster(
@@ -14369,6 +14475,7 @@ mod tests {
             summary: "place memory".to_string(),
             graph_entities: Vec::new(),
             graph_relationships: vec![GraphEdge {
+                id: None,
                 from: "embodied_experience:test".to_string(),
                 to: "place:grid:0:0".to_string(),
                 relationship: "occurred_at_place".to_string(),
@@ -14407,6 +14514,9 @@ mod tests {
             serde_json::from_str(payload_json).expect("payload_json is valid json");
 
         assert!(params[0].get("payload").is_none());
+        assert!(params[0]["edge_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("graph-edge:")));
         assert_eq!(payload["target_kind"], "place");
         assert_eq!(payload["heading_rad"], 0.0);
     }

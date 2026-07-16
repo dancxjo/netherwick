@@ -41,6 +41,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Preserve context-distinct semantic relations through graph-memory
+  deduplication and Neo4j persistence by carrying `SemanticRelationId` as the
+  stable edge identity instead of collapsing edges by triple alone.
 - Preserve lifecycle telemetry when velocity and heartbeat commands coalesce:
   smoothed velocity refreshes transfer the active command ID without restarting
   the motor, and every replaced accepted command receives a terminal event.

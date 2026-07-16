@@ -716,6 +716,10 @@ impl GraphEntity {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphEdge {
+    /// Stable identity for context-distinct relationships. Generic edges may
+    /// omit this and use their structural triple as a compatibility fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub from: String,
     pub to: String,
     pub relationship: String,
