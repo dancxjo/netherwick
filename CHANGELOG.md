@@ -4,6 +4,15 @@ All notable changes are grouped by date.
 
 ## Unreleased
 
+### Auto-sync (2026-07-15)
+
+- Register four additional `tongues` workspace packages in the lockfile.
+- Expand `tongues-tts`'s locked dependency set for model and pronunciation support.
+- Add the older `indicatif`/`console` stack required by the new workspace packages.
+- Add plotting support through `textplots` and `drawille`.
+- Record dependency metadata updates for `burn-core`, `ort`, and `rgb`.
+- Disambiguate coexisting versions of `colored`, `console`, and `indicatif`.
+
 ### Added
 
 - Add a provenance-backed semantic relation graph to the canonical world model,
