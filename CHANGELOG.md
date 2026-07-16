@@ -41,6 +41,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Enforce sleep power and thermal budgets on every work item: candidate
+  training/evaluation require a stable powered dock, while a rising thermal
+  limit interrupts sleep before subsequent maintenance can run.
 - Make sleep-session admission edge-triggered and consume completed input
   evidence exactly once, preventing continuous fatigue, a held operator request,
   or already-consolidated work from immediately starting duplicate sessions.

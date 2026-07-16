@@ -63,6 +63,7 @@ pub enum WakeReason {
     ImportantSocialCue,
     CriticalBattery,
     ExternalPowerLost,
+    ThermalLimitExceeded,
     BodyCommunicationLost,
     SafetyEvent(String),
     ScheduledDeadline,
@@ -73,7 +74,7 @@ pub enum WakeReason {
 impl WakeReason {
     pub fn priority(&self) -> WakePriority {
         match self {
-            Self::SafetyEvent(_) => WakePriority::Safety,
+            Self::SafetyEvent(_) | Self::ThermalLimitExceeded => WakePriority::Safety,
             Self::BodyCommunicationLost => WakePriority::Communication,
             Self::CriticalBattery | Self::ExternalPowerLost => WakePriority::Homeostasis,
             Self::DirectOperatorCommand | Self::ExplicitWake => WakePriority::Operator,
@@ -202,6 +203,8 @@ pub struct SleepWorkItem {
     pub dependencies: Vec<String>,
     pub estimate: SleepResourceEstimate,
     pub locality: WorkLocality,
+    #[serde(default)]
+    pub requires_external_power: bool,
     pub cancellation: WorkCancellationPolicy,
     pub output_contract: String,
     pub verification: String,
@@ -438,7 +441,13 @@ impl SleepController {
             return self.snapshot(input.now_ms, eligibility);
         }
 
-        if let Some(reason) = wake_reason(&input) {
+        let max_thermal_fraction = self
+            .session
+            .as_ref()
+            .expect("checked session")
+            .resource_budget
+            .max_thermal_fraction;
+        if let Some(reason) = wake_reason(&input, max_thermal_fraction) {
             let session = self.session.as_mut().expect("checked session");
             session.interrupted_by = Some(reason);
             session.phase = SleepPhase::Interrupted;
@@ -682,7 +691,7 @@ fn sleep_input_refs(input: &SleepTickInput) -> Vec<String> {
         .collect()
 }
 
-fn wake_reason(input: &SleepTickInput) -> Option<WakeReason> {
+fn wake_reason(input: &SleepTickInput, max_thermal_fraction: f32) -> Option<WakeReason> {
     let mut reasons = Vec::new();
     if let Some(event) = input.safety_event.as_ref() {
         reasons.push(WakeReason::SafetyEvent(event.clone()));
@@ -695,6 +704,9 @@ fn wake_reason(input: &SleepTickInput) -> Option<WakeReason> {
     }
     if input.external_power_lost {
         reasons.push(WakeReason::ExternalPowerLost);
+    }
+    if input.thermal_fraction > max_thermal_fraction {
+        reasons.push(WakeReason::ThermalLimitExceeded);
     }
     if input.direct_reign_active || input.operator_wake_request {
         reasons.push(WakeReason::DirectOperatorCommand);
@@ -711,6 +723,7 @@ fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<S
                 dependencies: Vec<String>,
                 estimate,
                 locality,
+                requires_external_power,
                 output_contract: &str,
                 promotion_policy| SleepWorkItem {
         id: format!("{}:{suffix}", id.0),
@@ -729,6 +742,7 @@ fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<S
         dependencies,
         estimate,
         locality,
+        requires_external_power,
         cancellation: WorkCancellationPolicy::Restartable,
         output_contract: output_contract.to_string(),
         verification: "stable artifact id and deterministic source refs".to_string(),
@@ -750,6 +764,7 @@ fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<S
                 ..SleepResourceEstimate::default()
             },
             WorkLocality::Local,
+            false,
             "durability verification report",
             CandidatePromotionPolicy::EvaluateOnly,
         ),
@@ -765,6 +780,7 @@ fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<S
                 ..SleepResourceEstimate::default()
             },
             WorkLocality::Local,
+            false,
             "provenance-carrying episode index",
             CandidatePromotionPolicy::EvaluateOnly,
         ),
@@ -780,6 +796,7 @@ fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<S
                 ..SleepResourceEstimate::default()
             },
             WorkLocality::Local,
+            false,
             "replay artifact preserving historical event time",
             CandidatePromotionPolicy::EvaluateOnly,
         ),
@@ -796,6 +813,7 @@ fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<S
                 network_mb: 1,
             },
             WorkLocality::AcceleratorPreferred,
+            true,
             "versioned candidate artifact",
             CandidatePromotionPolicy::EvaluateOnly,
         ),
@@ -811,6 +829,7 @@ fn deterministic_work_plan(id: &SleepSessionId, input: &SleepTickInput) -> Vec<S
                 ..SleepResourceEstimate::default()
             },
             WorkLocality::Local,
+            true,
             "fixed-seed evaluation and promotion recommendation",
             CandidatePromotionPolicy::RecommendForShadow,
         ),
@@ -847,6 +866,17 @@ fn execute_work_item(
     if !dependencies_complete {
         result.status = SleepWorkStatus::Deferred;
         result.summary = "dependency did not complete".to_string();
+        return result;
+    }
+    let expensive_work_allowed = sleep_eligibility(input).expensive_work_allowed
+        && input.thermal_fraction <= session.resource_budget.max_thermal_fraction;
+    if item.requires_external_power && !expensive_work_allowed {
+        result.status = SleepWorkStatus::Deferred;
+        result.summary = if !input.charging || !input.docked {
+            "external power and a stable dock are required for expensive work".to_string()
+        } else {
+            "thermal state exceeds the expensive-work budget".to_string()
+        };
         return result;
     }
     if matches!(
@@ -1030,6 +1060,79 @@ mod tests {
             result.kind == SleepWorkKind::TrainCandidate
                 && result.status == SleepWorkStatus::Deferred
         }));
+    }
+
+    #[test]
+    fn high_fatigue_sleep_on_battery_defers_expensive_work() {
+        let mut controller = SleepController::default();
+        for offset in 0..8 {
+            let mut input = safe_input(100 + offset);
+            input.charging = false;
+            input.docked = false;
+            input.external_power_lost = false;
+            if offset > 0 {
+                input.fatigue_activation = 0.0;
+            }
+            controller.tick(input);
+        }
+
+        let report = controller.last_report.as_ref().unwrap();
+        let training = report
+            .completed
+            .iter()
+            .find(|result| result.kind == SleepWorkKind::TrainCandidate)
+            .unwrap();
+        assert_eq!(training.status, SleepWorkStatus::Deferred);
+        assert!(training.summary.contains("external power"));
+        assert!(report.completed.iter().any(|result| {
+            result.kind == SleepWorkKind::ConsolidateEpisodes
+                && result.status == SleepWorkStatus::Completed
+        }));
+    }
+
+    #[test]
+    fn rising_thermal_state_interrupts_sleep_before_more_work() {
+        let mut controller = SleepController::default();
+        controller.tick(safe_input(100));
+        for now_ms in 101..=103 {
+            let mut input = safe_input(now_ms);
+            input.fatigue_activation = 0.0;
+            controller.tick(input);
+        }
+
+        let mut hot = safe_input(104);
+        hot.fatigue_activation = 0.0;
+        hot.thermal_fraction = 0.81;
+        let interrupted = controller.tick(hot);
+
+        assert_eq!(interrupted.phase, SleepPhase::Interrupted);
+        let session = interrupted.session.unwrap();
+        assert_eq!(
+            session.interrupted_by,
+            Some(WakeReason::ThermalLimitExceeded)
+        );
+        assert!(!session
+            .completed
+            .iter()
+            .any(|result| result.kind == SleepWorkKind::TrainCandidate));
+    }
+
+    #[test]
+    fn candidate_training_and_evaluation_declare_external_power_requirement() {
+        let mut controller = SleepController::default();
+        let snapshot = controller.tick(safe_input(100));
+        let session = snapshot.session.unwrap();
+
+        for kind in [
+            SleepWorkKind::TrainCandidate,
+            SleepWorkKind::EvaluateCandidate,
+        ] {
+            assert!(session
+                .work_plan
+                .iter()
+                .find(|item| item.kind == kind)
+                .is_some_and(|item| item.requires_external_power));
+        }
     }
 
     #[test]

@@ -70,6 +70,13 @@ slices, fallback artifact, and promotion policy. Sleep has no authority to
 activate a candidate; the first transparent teacher intentionally evaluates
 below its baseline and leaves the accepted implementation unchanged.
 
+Resource permission is evaluated again before each work item; entry eligibility
+does not authorize the entire session. Candidate training and evaluation
+declare an external-power requirement and are deferred unless PETE is both
+charging and stably docked. Thermal state is also live: exceeding the session's
+thermal ceiling produces a typed high-priority wake interruption before later
+work executes.
+
 Every tick serializes the normalized lifecycle snapshot under the `sleep`
 extension of the durable `ExperienceFrame`. Completed reports identify work,
 artifacts, deferrals/failures, wake reason, and the fresh-world/no-stale-skill
