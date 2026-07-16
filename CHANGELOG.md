@@ -34,6 +34,9 @@ All notable changes are grouped by date.
 
 ### Changed
 
+- Document the grounded semantic graph and safety-gated sleep lifecycle,
+  including their authority boundaries, artifact contracts, and replacement
+  points.
 - Removed retired behavior configuration spellings (`mode`, `hardcoded_on_error`, and `stop_on_error`) and compatibility type aliases; configurations must use `regime` and the canonical fallback values.
 
 ### Fixed

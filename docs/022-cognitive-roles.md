@@ -102,6 +102,12 @@ from `pete-cockpit`. Its capability probe can be projected into the same
 role-neutral provider descriptor while compatibility names and its explicit
 candidate-activation approval remain intact.
 
+The sleep work planner uses this same boundary. Local episode consolidation
+and replay proceed without an accelerator; optional training is deferred when
+one is unavailable. A returned sleep candidate remains inactive until the
+organism-side model lifecycle explicitly promotes it. See
+[024-sleep-and-grounded-semantics.md](024-sleep-and-grounded-semantics.md).
+
 ## Migration rules
 
 - Prefer `CognitiveAccelerator` and `AcceleratorCapabilities` in new code.

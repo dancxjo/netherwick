@@ -31,6 +31,8 @@ reality and external messages
 - `Now.world` is the one canonical current belief snapshot. It contains typed
   self/body state, entities, local geometry, hazards, context, task/authority,
   temporal context, social beliefs, epistemic questions, and its update trace.
+  Grounded semantic relations are a typed persistent region of the same
+  snapshot; they do not replace current entity or capability beliefs.
 - `ExperienceInstant` is the durable embodied record for a tick or interval.
   It captures the evidence batch and associated `Now` for replay, memory, and
   encoding; it is not a competing live world model.
@@ -97,3 +99,5 @@ differences identify either changed evidence or a changed implementation.
 
 The bounded temporal, social, and epistemic regions are specified in
 [`023-temporal-social-epistemic-cognition.md`](023-temporal-social-epistemic-cognition.md).
+Sleep/replay clock handling and the grounded relation contract are specified
+in [`024-sleep-and-grounded-semantics.md`](024-sleep-and-grounded-semantics.md).
