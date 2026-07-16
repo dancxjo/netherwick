@@ -1556,7 +1556,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <button data-drive="back" class="center">BACK</button>
 <button data-drive="spinl">SPIN L</button><button data-drive="slow">SLOW</button><button data-drive="spinr">SPIN R</button>
 </div>
-<div class="row"><button class="stop" id="stop">STOP</button><button data-action="drive_for">Drive 300</button><button data-action="turn_left">Turn L</button><button data-action="turn_right">Turn R</button></div>
+<div class="row"><button class="stop" id="stop">STOP</button></div>
 <div class="row"><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div>
 </section>
 <div class="side">
@@ -1572,7 +1572,6 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <div class="seg three"><button class="danger" id="estop">E-STOP</button><button id="clear">Clear E-Stop</button><button id="clearcharge">Clear Charge</button></div>
 <div class="seg three"><button id="clearbump">Clear Bump</button><button id="clearwheel">Clear Wheel</button><button id="clearcliff">Clear Cliff</button></div>
 <div class="seg"><button id="cleartilt">Clear Tilt</button><button id="clearimpact">Clear Impact</button></div>
-<div class="seg"><button class="warnbtn" data-action="bump_escape">Bump Escape</button><button class="warnbtn" data-action="unstick">Unstick</button><button class="danger" data-action="cliff_trip">Cliff Stop</button><button data-action="cliff_clear">Clear Cliff</button></div>
 <button class="blue" data-action="heartbeat">Heartbeat</button>
 </div>
 </div>
@@ -1643,8 +1642,8 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <script>
 let id=1,active=false,timer=0,controlRefreshTimer=0,controlRefreshGeneration=0,controlLeaseExpiresAt=0,browserSessionPromise=null,last={x:0,y:0},ws=null,wsOpen=false,sse=null,sseOpen=false,driveKind='',lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,caps=null,lastStatus=null,sessionId='',controlLeaseId='',serviceLeaseId='',sensorStreamRequested=false;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
-const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','face_bearing','track_bearing','turn_by','drive_for','bump_escape','hold_heading','turn_to_heading','arc_for','creep_until','scan_arc','dock_align','wall_follow','wiggle_align','unstick','cliff_guard','clear_safety_latch','heartbeat_stop','request_sensors','stream_sensors','set_safety_policy','clear_motion_queue','define_chirp','play_feedback','power_state','create_power_on','create_power_off','calibrate_turn','orientation_probe','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
-const actionVerb={drive_for:'drive_for',turn_left:'turn_by',turn_right:'turn_by',creep:'creep_until',scan:'scan_arc',wiggle:'wiggle_align',bump_escape:'bump_escape',unstick:'unstick',cliff_trip:'cliff_guard',cliff_clear:'cliff_guard',heartbeat:'heartbeat_stop'};
+const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','clear_safety_latch','heartbeat_stop','request_sensors','stream_sensors','clear_motion_queue','define_chirp','play_feedback','power_state','create_power_on','create_power_off','calibrate_turn','orientation_probe','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
+const actionVerb={heartbeat:'heartbeat_stop'};
 function title(s){return (s||'unknown').replaceAll('_',' ')}
 function errorName(code){return ({1:'Create did not respond',2:'Create UART framing failure',3:'Create command timeout',4:'invalid Create sensor packet'})[code]||('brainstem error '+code)}
 function pill(el,text,state){el.textContent=text;el.className='pill '+(state||'')}
@@ -1688,7 +1687,7 @@ function sendJoy(){paceDrive(()=>{let m=joyMax(),lin=Math.round(-last.y*m.lin),a
 function sendDrive(){paceDrive(()=>{let m=joyMax(),lin=0,ang=0;if(driveKind==='fwd')lin=m.lin;if(driveKind==='back')lin=-m.lin;if(driveKind==='left')ang=m.ang;if(driveKind==='right')ang=-m.ang;if(driveKind==='spinl')ang=m.ang,lin=0;if(driveKind==='spinr')ang=-m.ang,lin=0;if(driveKind==='slow')lin=Math.round(m.lin*.45);pulseCmdVel(lin,ang)})}
 function songSlot(){let n=parseInt($('songid').value,10);return Number.isFinite(n)?Math.max(0,Math.min(15,n)):0}
 function defineSong(){return sendCockpit({kind:'song_define',id:songSlot(),tones:$('tones').value})}
-function behavior(k){let v=actionVerb[k];if(v&&!hasVerb(v)){addLog('unsupported '+v);return}let m=joyMax();if(k==='drive_for')sendCockpit({kind:'drive_for',distance_mm:300,velocity_mm_s:m.lin,timeout_ms:3500});if(k==='turn_left')sendCockpit({kind:'turn_by',angle_mrad:1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='turn_right')sendCockpit({kind:'turn_by',angle_mrad:-1570,angular_mrad_s:m.ang,timeout_ms:2500});if(k==='creep')sendCockpit({kind:'creep_until',velocity_mm_s:45,timeout_ms:1200});if(k==='scan')sendCockpit({kind:'scan_arc',angle_mrad:3140,angular_mrad_s:700,timeout_ms:6000});if(k==='wiggle')sendCockpit({kind:'wiggle_align',amplitude_mrad:240,angular_mrad_s:700,cycles:4});if(k==='bump_escape')sendCockpit({kind:'bump_escape',direction:'either'});if(k==='unstick')sendCockpit({kind:'unstick',direction:'either'});if(k==='cliff_trip')sendCockpit({kind:'cliff_guard',clear:false});if(k==='cliff_clear')sendCockpit({kind:'cliff_guard',clear:true});if(k==='heartbeat')sendCockpit({kind:'heartbeat_stop',timeout_ms:1200})}
+function behavior(k){let v=actionVerb[k];if(v&&!hasVerb(v)){addLog('unsupported '+v);return}if(k==='heartbeat')sendCockpit({kind:'heartbeat_stop',timeout_ms:1200})}
 function move(e){let r=base.getBoundingClientRect(),cx=r.left+r.width/2,cy=r.top+r.height/2,dx=e.clientX-cx,dy=e.clientY-cy,max=r.width*.34,d=Math.hypot(dx,dy);if(d>max){dx=dx/d*max;dy=dy/d*max}last={x:dx/max,y:dy/max};nub.style.left=(50+dx/r.width*100)+'%';nub.style.top=(50+dy/r.height*100)+'%';sendJoy()}
 base.onpointerdown=e=>{active=true;base.setPointerCapture(e.pointerId);move(e);timer=setInterval(sendJoy,180)}
 base.onpointermove=e=>{if(active)move(e)}

@@ -757,6 +757,14 @@ fn submit_control_command_with_service_identity(
     service_session_hash: u32,
     service_lease_hash: u32,
 ) -> Result<(), CommandRejectReason> {
+    if removed_wire_command(command) {
+        return reject_control_command(
+            command_id,
+            command_seq(command),
+            ControlCommandCode::None,
+            CommandRejectReason::Unsupported,
+        );
+    }
     if matches!(
         command,
         BrainstemCommand::Status | BrainstemCommand::Ping | BrainstemCommand::GetEvents { .. }
@@ -874,6 +882,28 @@ fn submit_control_command_with_service_identity(
         mark_command_interrupted(replaced_velocity_id);
     }
     Ok(())
+}
+
+fn removed_wire_command(command: BrainstemCommand) -> bool {
+    matches!(
+        command,
+        BrainstemCommand::FaceBearing { .. }
+            | BrainstemCommand::TrackBearing { .. }
+            | BrainstemCommand::TurnBy { .. }
+            | BrainstemCommand::DriveFor { .. }
+            | BrainstemCommand::BumpEscape { .. }
+            | BrainstemCommand::HoldHeading { .. }
+            | BrainstemCommand::TurnToHeading { .. }
+            | BrainstemCommand::ArcFor { .. }
+            | BrainstemCommand::CreepUntil { .. }
+            | BrainstemCommand::ScanArc { .. }
+            | BrainstemCommand::DockAlign { .. }
+            | BrainstemCommand::WallFollow { .. }
+            | BrainstemCommand::WiggleAlign { .. }
+            | BrainstemCommand::Unstick { .. }
+            | BrainstemCommand::CliffGuard { .. }
+            | BrainstemCommand::SetSafetyPolicy { .. }
+    )
 }
 
 #[cfg(feature = "pico-w")]
@@ -4210,6 +4240,30 @@ fn https_state_text(code: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_and_policy_wire_commands_are_rejected_by_class() {
+        assert!(removed_wire_command(BrainstemCommand::DriveFor {
+            distance_mm: 100,
+            velocity_mm_s: 50,
+            timeout_ms: 1_000,
+            seq: 1,
+        }));
+        assert!(removed_wire_command(BrainstemCommand::SetSafetyPolicy {
+            policy: SafetyPolicy {
+                bump: SafetyAction::None,
+                cliff: SafetyAction::None,
+                wheel_drop_latch: false,
+            },
+            seq: 2,
+        }));
+        assert!(!removed_wire_command(BrainstemCommand::CmdVel {
+            linear_mm_s: 50,
+            angular_mrad_s: 0,
+            ttl_ms: 250,
+            seq: 3,
+        }));
+    }
 
     fn collect<const N: usize>(since_seq: u32) -> heapless::Vec<PublicEventRecord, N> {
         let mut records = heapless::Vec::<PublicEventRecord, N>::new();

@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -69,6 +70,25 @@ struct Limits {
     max_angular_mrad_s: i16,
     min_ttl_ms: u32,
     max_ttl_ms: u32,
+}
+
+#[derive(Deserialize)]
+struct VerbClassificationToml {
+    verbs: Vec<VerbClassification>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct VerbClassification {
+    names: Vec<String>,
+    category: String,
+    authority: String,
+    sensors: String,
+    bounds: String,
+    preempted_by: String,
+    owner: String,
+    lifecycle: String,
+    exposed: bool,
 }
 
 #[allow(dead_code)]
@@ -224,11 +244,15 @@ fn main() {
     let build_identity = build_identity(&manifest_dir);
     let body_path = manifest_dir.join("body.toml");
     let board_path = manifest_dir.join("board.toml");
+    let classification_path = manifest_dir.join("verb-classification.toml");
     println!("cargo:rerun-if-changed={}", body_path.display());
     println!("cargo:rerun-if-changed={}", board_path.display());
+    println!("cargo:rerun-if-changed={}", classification_path.display());
 
     let mut body: BodyToml = toml::from_str(&fs::read_to_string(&body_path).unwrap()).unwrap();
     let board: BoardToml = toml::from_str(&fs::read_to_string(&board_path).unwrap()).unwrap();
+    let classifications: VerbClassificationToml =
+        toml::from_str(&fs::read_to_string(&classification_path).unwrap()).unwrap();
     assert_eq!(body.body.kind, "create_oi");
     assert_eq!(body.body.drive, "differential");
     assert_eq!(body.create_oi.data_bits, 8);
@@ -257,6 +281,7 @@ fn main() {
     {
         body.capabilities.verbs.push("bootsel".into());
     }
+    validate_verb_classifications(&body.capabilities.verbs, &classifications);
 
     let default_mode = match body.create_oi.default_mode.as_str() {
         "passive" => "CreateOiMode::Passive",
@@ -444,6 +469,40 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         println!("cargo:rustc-link-arg=-Tlink.x");
     }
     fs::write(out_dir.join("body_config.rs"), generated).unwrap();
+}
+
+fn validate_verb_classifications(
+    advertised_verbs: &[String],
+    classifications: &VerbClassificationToml,
+) {
+    let mut classified = BTreeMap::new();
+    for group in &classifications.verbs {
+        for name in &group.names {
+            assert!(
+                classified.insert(name.as_str(), group.exposed).is_none(),
+                "duplicate Brainstem verb classification: {name}"
+            );
+        }
+    }
+    let advertised = advertised_verbs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for verb in &advertised {
+        assert_eq!(
+            classified.get(verb).copied(),
+            Some(true),
+            "advertised Brainstem verb lacks an exposed classification: {verb}"
+        );
+    }
+    for (verb, exposed) in classified {
+        if exposed && !matches!(verb, "bootsel" | "reset_motherbrain") {
+            assert!(
+                advertised.contains(verb),
+                "verb is classified as exposed but not advertised: {verb}"
+            );
+        }
+    }
 }
 
 struct BuildIdentity {

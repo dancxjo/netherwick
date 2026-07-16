@@ -1,0 +1,135 @@
+# Canonical Brainstem public vocabulary. `build.rs` requires every advertised
+# capability to have exactly one exposed classification. Removed wire verbs
+# remain listed as migration evidence and must stay unexposed.
+
+[[verbs]]
+names = ["ping", "status", "get_capabilities", "get_events"]
+category = "telemetry"
+authority = "read-only"
+sensors = "none"
+bounds = "response-size and event-page bounded"
+preempted_by = "none"
+owner = "brainstem"
+lifecycle = "typed response"
+exposed = true
+
+[[verbs]]
+names = ["arm", "disarm", "set_mode"]
+category = "body-native"
+authority = "session/control"
+sensors = "fresh Create OI mode/health"
+bounds = "fixed acquisition and mode scripts"
+preempted_by = "e-stop, wheel-drop, cliff, charging, tilt, impact, authority loss"
+owner = "brainstem"
+lifecycle = "command accepted/started/completed/interrupted/timed-out"
+exposed = true
+
+[[verbs]]
+names = ["stop", "estop", "clear_estop", "clear_safety_latch", "heartbeat_stop", "clear_motion_queue"]
+category = "reflex"
+authority = "emergency or matching session/control"
+sensors = "fresh matching physical condition required for latch clear"
+bounds = "immediate stop; heartbeat TTL bounded"
+preempted_by = "stronger immutable invariant"
+owner = "brainstem"
+lifecycle = "typed command and safety events"
+exposed = true
+
+[[verbs]]
+names = ["cmd_vel", "drive_direct", "drive_arc"]
+category = "primitive"
+authority = "control lease"
+sensors = "fresh motor/body safety state"
+bounds = "configured velocity and TTL limits; always zero on expiry/loss/error"
+preempted_by = "all immutable safety, reflex, transport, watchdog, and authority stops"
+owner = "brainstem"
+lifecycle = "accepted/started/renewed/completed/interrupted/timed-out"
+exposed = true
+
+[[verbs]]
+names = ["request_sensors", "stream_sensors", "reset_odometry", "zero_imu_orientation", "clear_imu_orientation"]
+category = "telemetry"
+authority = "session or control lease"
+sensors = "fresh Create/IMU samples where applicable"
+bounds = "packet allow-list and bounded stream period"
+preempted_by = "transport/session loss"
+owner = "brainstem"
+lifecycle = "typed command and sensor events"
+exposed = true
+
+[[verbs]]
+names = ["song_define", "song_play", "define_chirp", "play_feedback", "set_lights"]
+category = "body-native"
+authority = "control lease"
+sensors = "responsive Create OI"
+bounds = "fixed slots, tone count, and output ranges"
+preempted_by = "transport/session loss"
+owner = "brainstem"
+lifecycle = "typed command and feedback events"
+exposed = true
+
+[[verbs]]
+names = ["power_state", "create_power_on", "create_power_off"]
+category = "service"
+authority = "control/service boundary"
+sensors = "fresh Create power/OI health"
+bounds = "fixed BRC and power timing"
+preempted_by = "e-stop and body safety interlocks"
+owner = "brainstem"
+lifecycle = "body power requested/changed or typed failure"
+exposed = true
+
+[[verbs]]
+names = ["calibrate_turn", "orientation_probe"]
+category = "service"
+authority = "attended diagnostic control"
+sensors = "fresh odometry and IMU"
+bounds = "configured angular rate and strict duration"
+preempted_by = "all immutable safety and authority stops"
+owner = "service/diagnostic"
+lifecycle = "typed command outcome and calibration evidence"
+exposed = true
+
+[[verbs]]
+names = ["restart_create", "bootsel", "reset_motherbrain"]
+category = "service"
+authority = "scoped service lease and production feature gate"
+sensors = "fresh body state"
+bounds = "fixed scripts, pulse bounds, cooldown, deduplication"
+preempted_by = "motion, safety state, invalid service authority"
+owner = "service/diagnostic"
+lifecycle = "typed service outcome"
+exposed = true
+
+[[verbs]]
+names = ["dock"]
+category = "body-native"
+authority = "control lease"
+sensors = "fresh charging and Home Base state"
+bounds = "single Create seek-dock opcode"
+preempted_by = "all immutable safety and authority stops"
+owner = "brainstem body driver"
+lifecycle = "typed command outcome"
+exposed = true
+
+[[verbs]]
+names = ["face_bearing", "track_bearing", "hold_heading", "turn_to_heading", "turn_by", "drive_for", "arc_for", "creep_until", "scan_arc", "dock_align", "wall_follow", "wiggle_align", "bump_escape", "unstick"]
+category = "deprecated/moved skill"
+authority = "unsupported on Brainstem wire"
+sensors = "motherbrain canonical world/body state"
+bounds = "motherbrain skill emits short TTL primitives"
+preempted_by = "Brainstem safety/reflex outcomes"
+owner = "motherbrain"
+lifecycle = "motherbrain skill completed/failed/timed-out/authority-lost/transport-lost/safety-preempted"
+exposed = false
+
+[[verbs]]
+names = ["set_safety_policy", "cliff_guard"]
+category = "deprecated/moved skill"
+authority = "unsupported on production Brainstem wire"
+sensors = "not applicable"
+bounds = "cannot weaken or invent physical safety"
+preempted_by = "immutable firmware policy"
+owner = "none"
+lifecycle = "typed unsupported rejection"
+exposed = false
