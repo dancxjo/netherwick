@@ -66,9 +66,7 @@ pub struct CaptureFrameRecord {
     pub t_ms: u64,
     pub snapshot: SerializableWorldSnapshot,
     pub events: Vec<RecordedEvent>,
-    #[serde(default, skip_serializing_if = "CaptureFrameAssets::is_empty")]
     pub assets: CaptureFrameAssets,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_metadata: Option<Value>,
 }
 
@@ -772,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn old_frame_records_deserialize_without_assets() {
+    fn capture_frame_records_require_asset_and_stream_metadata_fields() {
         let encoded = serde_json::json!({
             "index": 0,
             "t_ms": 123,
@@ -780,10 +778,7 @@ mod tests {
             "events": []
         });
 
-        let decoded: CaptureFrameRecord = serde_json::from_value(encoded).unwrap();
-
-        assert!(decoded.assets.is_empty());
-        assert!(decoded.stream_metadata.is_none());
+        assert!(serde_json::from_value::<CaptureFrameRecord>(encoded).is_err());
     }
 
     #[test]

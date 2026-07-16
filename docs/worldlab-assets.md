@@ -41,7 +41,8 @@ Frame records may include:
 }
 ```
 
-Older captures without `assets` or `stream_metadata` still deserialize and replay.
+Every capture frame includes `assets` and `stream_metadata`; regenerate captures
+created before those fields existed.
 
 ## Formats
 
