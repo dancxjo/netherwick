@@ -23,6 +23,8 @@ All notable changes are grouped by date.
   unsupported causal claims to predictions.
 - Surface charger semantic explanations, supporting relation IDs, and grounded
   energy-meaning confidence in goal evaluations and affordances.
+- Project canonical semantic relations into durable graph-memory entities and
+  edges, preserving grounding metadata and confidence for recall.
 
 ### Changed
 

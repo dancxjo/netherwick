@@ -13,8 +13,9 @@ use pete_now::{
     AsrSense, EarSense, Episode, EpisodeKind, EpistemicSnapshot, EyeFrame, EyeFrameFormat,
     GraphEdge, GraphEntity, InteractionState, KinectJointSense, KinectSense, KinectSkeletonSense,
     MemorySense, Now, ObjectClass, ObjectObservation, ObjectObservationSource, PersonId,
-    RangeSense, RecallHit, SocialWorldSnapshot, SurpriseSense, TemporalContext, VectorArtifact,
-    FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
+    RangeSense, RecallHit, SemanticGraphSnapshot, SemanticNodeRef, SocialWorldSnapshot,
+    SurpriseSense, TemporalContext, VectorArtifact, FACE_VECTOR_COLLECTION,
+    SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -10992,6 +10993,11 @@ fn graph_context_from_frame(
         &mut entities,
         &mut relationships,
     );
+    append_semantic_graph_memory(
+        &frame.now.world.semantic,
+        &mut entities,
+        &mut relationships,
+    );
 
     for artifact in scene_vectors {
         let vector_id = vector_node_id(artifact);
@@ -11229,6 +11235,52 @@ fn graph_context_from_frame(
         dedupe_entities(entities, usize::MAX),
         dedupe_relationships(relationships, usize::MAX),
     )
+}
+
+fn append_semantic_graph_memory(
+    semantic: &SemanticGraphSnapshot,
+    entities: &mut Vec<GraphEntity>,
+    relationships: &mut Vec<GraphEdge>,
+) {
+    for relation in semantic.relations.values() {
+        for node in [&relation.subject, &relation.object] {
+            entities.push(GraphEntity {
+                id: node.stable_key(),
+                labels: semantic_node_labels(node),
+                summary: node.stable_key(),
+                score: relation.confidence,
+            });
+        }
+        relationships.push(GraphEdge {
+            from: relation.subject.stable_key(),
+            to: relation.object.stable_key(),
+            relationship: format!("SEMANTIC_{:?}", relation.predicate).to_ascii_uppercase(),
+            summary: Some(format!(
+                "grounded semantic relation {:?} ({:?})",
+                relation.predicate, relation.status
+            )),
+            score: relation.confidence,
+            payload: serde_json::to_value(relation).unwrap_or(serde_json::Value::Null),
+        });
+    }
+}
+
+fn semantic_node_labels(node: &SemanticNodeRef) -> Vec<String> {
+    let kind = match node {
+        SemanticNodeRef::Entity(_) => "Entity",
+        SemanticNodeRef::Place(_) => "Place",
+        SemanticNodeRef::Person(_) => "Person",
+        SemanticNodeRef::Action(_) => "Action",
+        SemanticNodeRef::Skill(_) => "Skill",
+        SemanticNodeRef::Behavior(_) => "Behavior",
+        SemanticNodeRef::Goal(_) => "Goal",
+        SemanticNodeRef::Drive(_) => "Drive",
+        SemanticNodeRef::Outcome(_) => "Outcome",
+        SemanticNodeRef::Property(_) => "Property",
+        SemanticNodeRef::Concept(_) => "Concept",
+        SemanticNodeRef::Episode(_) => "Episode",
+    };
+    vec!["SemanticNode".to_string(), kind.to_string()]
 }
 
 fn append_world_model_memory(
