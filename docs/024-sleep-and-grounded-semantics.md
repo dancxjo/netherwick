@@ -113,7 +113,10 @@ bounded skills. Current availability remains separate:
 - an obstacle can contextually block the current route without erasing charger
   identity or purpose;
 - successful approach, docking, and withdrawal outcomes add independent
-  prediction evidence on the following tick;
+  prediction evidence after canonical-world-model comparison and integration;
+- outcome evidence is admitted only when the autonomous goal primitive was
+  actually executed unchanged through final selection and safety, and targeted
+  progress retains the same stable entity identity across the transition;
 - a failed charger hypothesis can be contradicted without deleting its audit
   trail.
 

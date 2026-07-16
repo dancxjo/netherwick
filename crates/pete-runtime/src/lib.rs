@@ -66,10 +66,10 @@ use pete_neat::{
 use pete_now::{
     ActionValuePrediction, ActiveControlSummary, BeliefMeta, BeliefSourceKind, ChargePrediction,
     CognitiveServiceBelief, ControlProvenance, DangerPrediction, DriveSense, EarPrediction,
-    EvidenceRef, ExtensionSense, EyePrediction, Freshness, MemorySense, Now, ObjectClass,
+    EntityId, EvidenceRef, ExtensionSense, EyePrediction, Freshness, MemorySense, Now, ObjectClass,
     ReignSense, SafetySense, SemanticBehaviorId, SemanticEvidenceObservation,
     SemanticGroundingKind, SemanticNodeRef, SemanticOutcomeId, SemanticPredicate, SurpriseSense,
-    WorldModelUpdater,
+    WorldModelSnapshot, WorldModelUpdater,
 };
 use pete_sensors::{
     anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
@@ -123,36 +123,45 @@ where
 #[derive(Clone, Debug, Default)]
 struct SemanticOutcomeTracker {
     previous: Option<SemanticActionState>,
+    pending: Vec<SemanticEvidenceObservation>,
 }
 
 #[derive(Clone, Debug)]
 struct SemanticActionState {
     t_ms: u64,
-    behavior_id: Option<String>,
+    behavior_id: String,
+    target_id: Option<EntityId>,
     charger_distance_m: Option<f32>,
     clearance_m: Option<f32>,
     charging: bool,
 }
 
 impl SemanticOutcomeTracker {
-    fn observations(&self, now: &Now) -> Vec<SemanticEvidenceObservation> {
+    fn take_pending(&mut self) -> Vec<SemanticEvidenceObservation> {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn observe_outcome(&mut self, world: &WorldModelSnapshot) {
         let Some(previous) = self.previous.as_ref() else {
-            return Vec::new();
+            return;
         };
         let mut observations = Vec::new();
-        let current_charger_distance = closest_observed_charger_distance(now);
+        let current_charger_distance = previous
+            .target_id
+            .as_ref()
+            .and_then(|target_id| canonical_entity_distance(world, target_id));
         let progress_evidence = |key: &str| EvidenceRef {
             id: format!(
                 "semantic:action-outcome:{key}:{}:{}",
-                previous.t_ms, now.t_ms
+                previous.t_ms, world.t_ms
             ),
             source: "runtime.action_outcome".to_string(),
             key: key.to_string(),
-            observed_at_ms: now.t_ms,
+            observed_at_ms: world.t_ms,
             transformation_lineage: vec!["pete_runtime::SemanticOutcomeTracker".to_string()],
-            implementation_version: Some("1".to_string()),
+            implementation_version: Some("2".to_string()),
         };
-        if previous.behavior_id.as_deref() == Some("approach_charger")
+        if previous.behavior_id == "approach_charger"
             && previous
                 .charger_distance_m
                 .zip(current_charger_distance)
@@ -169,10 +178,7 @@ impl SemanticOutcomeTracker {
                 progress_evidence("approach_reduced_charger_distance"),
             ));
         }
-        if previous.behavior_id.as_deref() == Some("dock")
-            && !previous.charging
-            && now.body.charging
-        {
+        if previous.behavior_id == "dock" && !previous.charging && world.self_model.charging {
             observations.push(SemanticEvidenceObservation::supported(
                 SemanticNodeRef::Behavior(SemanticBehaviorId("dock".to_string())),
                 SemanticPredicate::Predicts,
@@ -182,10 +188,17 @@ impl SemanticOutcomeTracker {
                 progress_evidence("dock_started_charging"),
             ));
         }
-        if previous.behavior_id.as_deref() == Some("back_away")
+        if previous.behavior_id == "back_away"
             && previous
                 .clearance_m
-                .zip(now.range.nearest_m)
+                .zip(
+                    world
+                        .local_geometry
+                        .nearest_m
+                        .as_ref()
+                        .filter(|belief| belief.meta.freshness == Freshness::Current)
+                        .map(|belief| belief.value),
+                )
                 .is_some_and(|(before, after)| after > before + 0.02)
         {
             observations.push(SemanticEvidenceObservation::supported(
@@ -197,27 +210,49 @@ impl SemanticOutcomeTracker {
                 progress_evidence("back_away_increased_clearance"),
             ));
         }
-        observations
+        self.pending.extend(observations);
     }
 
-    fn remember(&mut self, now: &Now, behavior_id: Option<String>) {
-        self.previous = Some(SemanticActionState {
-            t_ms: now.t_ms,
-            behavior_id,
-            charger_distance_m: closest_observed_charger_distance(now),
-            clearance_m: now.range.nearest_m,
-            charging: now.body.charging,
+    fn remember(
+        &mut self,
+        world: &WorldModelSnapshot,
+        behavior: Option<&pete_conductor::BehaviorDecision>,
+    ) {
+        self.previous = behavior.map(|behavior| {
+            let target_id = behavior.affordance.target.clone();
+            SemanticActionState {
+                t_ms: world.t_ms,
+                behavior_id: behavior.behavior_id.clone(),
+                charger_distance_m: target_id
+                    .as_ref()
+                    .and_then(|target_id| canonical_entity_distance(world, target_id)),
+                target_id,
+                clearance_m: world
+                    .local_geometry
+                    .nearest_m
+                    .as_ref()
+                    .filter(|belief| belief.meta.freshness == Freshness::Current)
+                    .map(|belief| belief.value),
+                charging: world.self_model.charging,
+            }
         });
     }
 }
 
-fn closest_observed_charger_distance(now: &Now) -> Option<f32> {
-    now.objects
-        .observations
-        .iter()
-        .filter(|object| object.class == ObjectClass::Charger)
-        .filter_map(|object| object.distance_m)
-        .min_by(f32::total_cmp)
+fn canonical_entity_distance(world: &WorldModelSnapshot, target_id: &EntityId) -> Option<f32> {
+    world
+        .entities
+        .get(target_id)
+        .filter(|entity| entity.kind == pete_now::WorldEntityKind::Charger)
+        .filter(|entity| {
+            entity.distance_meta.as_ref().is_some_and(|meta| {
+                !matches!(
+                    meta.freshness,
+                    Freshness::Stale | Freshness::Invalidated | Freshness::Missing
+                )
+            })
+        })
+        .and_then(|entity| entity.distance_m)
 }
 
 fn runtime_sleep_input(
@@ -3632,7 +3667,7 @@ where
                 .extend(previous_control.veto_reasons.iter().cloned());
         }
         world_context.active_control = self.last_active_control.clone();
-        world_context.semantic_observations = self.semantic_outcomes.observations(&now);
+        world_context.semantic_observations = self.semantic_outcomes.take_pending();
         let enhanced_cognition_available = self.llm.enhanced_cognition_available();
         world_context.cognitive_services.insert(
             "rich_language".to_string(),
@@ -3657,6 +3692,7 @@ where
             },
         );
         now = self.world_model.update(now, world_context);
+        self.semantic_outcomes.observe_outcome(&now.world);
         now.extensions.insert(
             "self_model".to_string(),
             serde_json::to_value(&now.world.self_model)?,
@@ -4114,11 +4150,12 @@ where
         .then(|| goal_cycle.selection.selected_goal.as_ref())
         .flatten()
         .map(|goal| goal.as_str());
+        let desired_motor = action_to_motor_command(Some(&chosen_action));
         let safety = self.safety.filter_action(
             &now,
             selected_goal_for_safety,
             &chosen_action,
-            action_to_motor_command(Some(&chosen_action)),
+            desired_motor,
         );
         let control_provenance = if safety.vetoed {
             ControlProvenance::SafetyVeto
@@ -4136,16 +4173,19 @@ where
         } else {
             ControlProvenance::Autonomous
         };
+        let executed_goal_behavior = goal_cycle.behavior.as_ref().filter(|behavior| {
+            self.action_selector_mode == ActionSelectorMode::Goal
+                && !sleeping
+                && !locomotion_applied
+                && control_provenance == ControlProvenance::Autonomous
+                && behavior.action == chosen_action
+                && !safety.vetoed
+                && safety.reason.is_none()
+                && safety.command == desired_motor
+        });
         self.last_active_control = Some(ActiveControlSummary {
-            goal_id: goal_cycle
-                .selection
-                .selected_goal
-                .as_ref()
-                .map(|goal| goal.as_str().to_string()),
-            behavior_id: goal_cycle
-                .behavior
-                .as_ref()
-                .map(|behavior| behavior.behavior_id.clone()),
+            goal_id: executed_goal_behavior.map(|behavior| behavior.goal_id.as_str().to_string()),
+            behavior_id: executed_goal_behavior.map(|behavior| behavior.behavior_id.clone()),
             action_kind: Some(format!("{chosen_action:?}")),
             provenance: control_provenance,
             safety_preempted: safety.reason.is_some(),
@@ -4171,6 +4211,7 @@ where
                 "world_revision": goal_cycle.world.revision,
                 "selected_goal": goal_cycle.selection.selected_goal.clone(),
                 "selected_behavior": goal_cycle.behavior.as_ref().map(|behavior| &behavior.behavior_id),
+                "executed_goal_behavior": executed_goal_behavior.map(|behavior| &behavior.behavior_id),
                 "selected_primitive": chosen_action.clone(),
                 "safety": {
                     "vetoed": safety.vetoed,
@@ -4193,7 +4234,7 @@ where
         now.extensions.insert(
             "motor_gate".to_string(),
             serde_json::json!({
-                "desired_motor": action_to_motor_command(Some(&chosen_action)),
+                "desired_motor": desired_motor,
                 "final_motor": safety.command,
                 "motor_applied": !is_near_zero_motor(safety.command),
                 "vetoed": safety.vetoed,
@@ -4415,13 +4456,8 @@ where
         }
         self.memory_store.store(&frame).await?;
 
-        self.semantic_outcomes.remember(
-            &now,
-            goal_cycle
-                .behavior
-                .as_ref()
-                .map(|behavior| behavior.behavior_id.clone()),
-        );
+        self.semantic_outcomes
+            .remember(&now.world, executed_goal_behavior);
         Ok(RuntimeTick {
             frame,
             experience: experiences.last().cloned().unwrap_or_else(|| {
@@ -12776,7 +12812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_action_outcome_strengthens_approach_progress_without_selecting_it() {
+    async fn executed_goal_behavior_strengthens_approach_progress_from_canonical_target() {
         let ledger = JsonlLedger::new("/tmp/pete-runtime-semantic-outcome-test");
         let memory = InMemoryExperienceStore::new();
         let recall = memory.clone();
@@ -12822,7 +12858,19 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(second
+        assert_eq!(
+            second.frame.now.extensions["goal_system.outcome"]["executed_goal_behavior"],
+            serde_json::Value::String("approach_charger".to_string())
+        );
+        let third = runtime
+            .tick(
+                charger_now(300, 0.7),
+                ExperienceLatent::default(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(third
             .frame
             .now
             .world
@@ -12838,6 +12886,115 @@ mod tests {
                         .iter()
                         .any(|evidence| evidence.source == "runtime.action_outcome")
             }));
+    }
+
+    #[tokio::test]
+    async fn shadow_goal_behavior_cannot_claim_the_executed_baseline_outcome() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-semantic-shadow-test");
+        let memory = InMemoryExperienceStore::new();
+        let recall = memory.clone();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory,
+            recall,
+            FixedConductor::new(ActionPrimitive::Stop),
+            SimpleSafety::default(),
+            pete_llm::NoopLlmAgent,
+        )
+        .with_action_selector_mode(ActionSelectorMode::GoalShadow);
+        let charger_now = |t_ms: u64, distance_m: f32| {
+            let mut now = idle_now(t_ms);
+            now.body.battery_level = 0.12;
+            now.objects.observations.push(pete_now::ObjectObservation {
+                label: "dock".to_string(),
+                class: ObjectClass::Charger,
+                bearing_rad: 0.0,
+                distance_m: Some(distance_m),
+                confidence: 0.95,
+                source: pete_now::ObjectObservationSource::Sim,
+            });
+            now
+        };
+        for (t_ms, distance_m) in [(100, 1.0), (200, 0.7), (300, 0.7)] {
+            let tick = runtime
+                .tick(
+                    charger_now(t_ms, distance_m),
+                    ExperienceLatent::default(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+            assert!(
+                tick.frame.now.extensions["goal_system.outcome"]["executed_goal_behavior"]
+                    .is_null()
+            );
+            assert!(!tick
+                .frame
+                .now
+                .world
+                .semantic
+                .relations
+                .values()
+                .any(|relation| relation
+                    .supporting_evidence
+                    .iter()
+                    .any(|evidence| evidence.source == "runtime.action_outcome")));
+        }
+    }
+
+    #[test]
+    fn semantic_outcomes_retain_canonical_target_identity() {
+        let world_with_distances = |t_ms: u64, first: f32, second: f32| {
+            let mut world = WorldModelSnapshot {
+                t_ms,
+                ..WorldModelSnapshot::default()
+            };
+            for (id, distance_m) in [("charger:a", first), ("charger:b", second)] {
+                world.entities.insert(
+                    EntityId(id.to_string()),
+                    pete_now::WorldEntity {
+                        id: EntityId(id.to_string()),
+                        kind: pete_now::WorldEntityKind::Charger,
+                        distance_m: Some(distance_m),
+                        distance_meta: Some(BeliefMeta {
+                            confidence: 1.0,
+                            observed_at_ms: t_ms,
+                            valid_at_ms: t_ms,
+                            freshness: Freshness::Current,
+                            ..BeliefMeta::default()
+                        }),
+                        ..pete_now::WorldEntity::default()
+                    },
+                );
+            }
+            world
+        };
+        let behavior = pete_conductor::BehaviorDecision {
+            goal_id: pete_conductor::GoalId::new("seek_charger"),
+            behavior_id: "approach_charger".to_string(),
+            action: ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            },
+            affordance: pete_conductor::Affordance {
+                target: Some(EntityId("charger:a".to_string())),
+                ..pete_conductor::Affordance::default()
+            },
+        };
+        let mut tracker = SemanticOutcomeTracker::default();
+        tracker.remember(&world_with_distances(100, 1.0, 2.0), Some(&behavior));
+
+        // Charger B becoming closer is not evidence that the action advanced A.
+        tracker.observe_outcome(&world_with_distances(200, 1.0, 0.5));
+        assert!(tracker.take_pending().is_empty());
+
+        tracker.observe_outcome(&world_with_distances(300, 0.7, 0.4));
+        let evidence = tracker.take_pending();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].subject,
+            SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string()))
+        );
     }
 
     #[tokio::test]

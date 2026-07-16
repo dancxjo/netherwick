@@ -45,6 +45,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Credit semantic action outcomes only when the autonomous goal primitive was
+  actually executed unchanged through safety, and measure progress against the
+  same canonical world-model target identity rather than raw observations.
 - Treat stale or missing target progress as unknown instead of failure, let
   Explore change between multiple strategies without dropping its goal, and
   make repeated charger-search failure prefer help before bounded abandonment.
