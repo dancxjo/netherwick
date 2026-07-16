@@ -9998,6 +9998,7 @@ mod tests {
             stop_range_m: Some(0.3),
             maximum_duration_ms: 2_000,
             expected_progress: 0.9,
+            ..SkillRequest::default()
         };
         let (_, command_sent) = runtime.step(&mut cockpit, &request, &initial_events, 1);
         assert!(command_sent);

@@ -15,6 +15,10 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add replayable per-goal progress reports that preserve behavior/skill
+  expectations with explicit metric, baseline, horizon, and tolerance,
+  optional observations, bounded failure state, strategy transitions, help
+  escalation, abandonment, human-readable reasons, and scenario aggregates.
 - Add a provenance-backed semantic relation graph to the canonical world model,
   grounding charger, obstacle, behavior, skill, goal, drive, and outcome
   meanings with contextual confidence and contradiction tracking.
@@ -41,6 +45,11 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Treat stale or missing target progress as unknown instead of failure, let
+  Explore change between multiple strategies without dropping its goal, and
+  make repeated charger-search failure prefer help before bounded abandonment.
+- Keep autonomic safety preemption separate from the interrupted possessor
+  skill's intended progress.
 - Preserve context-distinct semantic relations through graph-memory
   deduplication and Neo4j persistence by carrying `SemanticRelationId` as the
   stable edge identity instead of collapsing edges by triple alone.

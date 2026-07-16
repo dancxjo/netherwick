@@ -68,9 +68,29 @@ Commitment belongs to a goal. `SeekCharger` can search, turn, approach, and dock
 without causing goal oscillation.
 
 Every executed affordance predicts progress. `GoalRuntimeState` tracks elapsed
-time, failed attempts, recent progress, confidence trend, and computational
-frustration. Progress failure becomes shared stalled-goal evidence rather than
-a hard-coded transition.
+time, bounded attempt history, recent progress and its trend, the last measured
+progress time, confidence trend, and computational frustration. Progress
+failure becomes shared stalled-goal evidence rather than a hard-coded
+transition. Progress is `Option`-valued: stale or missing target beliefs produce
+unknown progress and do not count as zero or as a failed attempt. Autonomic
+safety preemption is recorded as unmeasurable rather than credited to the
+possessor skill it interrupted.
+
+Each `GoalCycle` also records a replayable `GoalProgressReport` per registered
+goal. The report retains the behavior- or skill-level expectation—including its
+metric, baseline, horizon, and tolerance—latest observation, previous and
+selected behaviors, bounded failure count, strategy-failure pressure, and a
+typed response: started, retained, changed, help requested, or abandoned. Its
+reason explains the expected/observed comparison that led to the response.
+Skill-local progress and goal progress remain distinct: for example, charger
+search can expose frontier coverage to the skill while the owning goal measures
+whether charger uncertainty actually falls.
+
+`SeekCharger` escalates repeated low-confidence search failure to a help
+request, then abandons only at the bounded failure limit. `Explore` publishes
+independent random-walk, wall-follow, frontier-follow, and novelty-inspection
+strategies; rising strategy-failure pressure changes the behavior while the
+Explore goal remains committed.
 
 ## Reign and safety
 
@@ -96,7 +116,12 @@ Each `Now` frame contains:
   commitment retention, and selection reason.
 
 Scenario reports aggregate goal switches, commitment-retained ticks, behavior
-transitions, mean goal dwell, and goal/behavior histograms.
+transitions, mean goal dwell, goal/behavior histograms, mean measured progress,
+no-progress dwell, bounded failures, within-goal strategy changes, help
+requests, unmeasurable progress, and false-stall rate.
+The serialized `goal_system.progress` records explain individual strategy
+retention, change, help, and abandonment decisions and can be consumed by
+ledger replay or future learned replacements.
 
 The complete belief contract is [020-now-world-model.md](020-now-world-model.md).
 Goal use of shared temporal context, social identity, and information-gathering

@@ -169,8 +169,14 @@ pub struct GoalStatusBelief {
     pub meta: BeliefMeta,
     pub active: bool,
     pub elapsed_time_ms: u64,
+    #[serde(default)]
+    pub attempts: u32,
     pub failed_attempts: u32,
     pub recent_progress: f32,
+    #[serde(default)]
+    pub progress_trend: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at_ms: Option<u64>,
     pub confidence_trend: f32,
     pub frustration: f32,
     pub last_exit_reason: Option<String>,

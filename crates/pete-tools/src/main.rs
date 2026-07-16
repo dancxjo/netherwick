@@ -18,7 +18,9 @@ use pete_cockpit::{
     HandshakeHello, HttpCockpit, MotherbrainPossession, MotionCommand, SafeCockpit,
     SafetyLatchKind, SimCockpit as LocalSimCockpit, SongTone, UartCockpit,
 };
-use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
+use pete_conductor::{
+    Conductor, ConductorInput, GoalProgressReport, SimpleConductor, StrategyProgressResponse,
+};
 use pete_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter};
 use pete_llm::{ConfiguredLlmAgent, LiveImageEnricher, LlmConfig, LlmProvider};
 use pete_map::{
@@ -5386,6 +5388,22 @@ struct ScenarioEvaluationSummary {
     goal_histogram: HashMap<String, usize>,
     #[serde(default)]
     goal_behavior_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    goal_progress_samples: usize,
+    #[serde(default)]
+    mean_goal_progress: Option<f32>,
+    #[serde(default)]
+    goal_no_progress_dwell_ticks: usize,
+    #[serde(default)]
+    goal_failed_attempts: usize,
+    #[serde(default)]
+    strategy_switches_within_goal: usize,
+    #[serde(default)]
+    goal_help_requests: usize,
+    #[serde(default)]
+    unmeasurable_progress_ticks: usize,
+    #[serde(default)]
+    false_stall_rate: Option<f32>,
     mean_chosen_score: Option<f32>,
     mean_candidate_score: Option<f32>,
 }
@@ -5471,6 +5489,26 @@ struct ScenarioEpisodeReport {
     goal_histogram: HashMap<String, usize>,
     #[serde(default)]
     goal_behavior_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    goal_progress_samples: usize,
+    #[serde(default)]
+    mean_goal_progress: Option<f32>,
+    #[serde(default)]
+    goal_no_progress_dwell_ticks: usize,
+    #[serde(default)]
+    goal_failed_attempts: usize,
+    #[serde(default)]
+    strategy_switches_within_goal: usize,
+    #[serde(default)]
+    goal_help_requests: usize,
+    #[serde(default)]
+    unmeasurable_progress_ticks: usize,
+    #[serde(default)]
+    stall_responses: usize,
+    #[serde(default)]
+    false_stall_count: usize,
+    #[serde(default)]
+    false_stall_rate: Option<f32>,
     action_selector_fallbacks: usize,
     #[serde(default)]
     action_selector_guard_yields: usize,
@@ -5615,6 +5653,15 @@ struct EpisodeMetricBuilder {
     current_goal_behavior: Option<String>,
     goal_histogram: HashMap<String, usize>,
     goal_behavior_histogram: HashMap<String, usize>,
+    goal_progress_sum: f32,
+    goal_progress_samples: usize,
+    goal_no_progress_dwell_ticks: usize,
+    goal_failed_attempts: HashMap<String, u32>,
+    strategy_switches_within_goal: usize,
+    goal_help_requests: usize,
+    unmeasurable_progress_ticks: usize,
+    stall_responses: usize,
+    false_stall_count: usize,
     map_memory_decisions: usize,
     danger_memory_decisions: usize,
     charge_memory_decisions: usize,
@@ -5710,6 +5757,15 @@ impl EpisodeMetricBuilder {
             current_goal_behavior: None,
             goal_histogram: HashMap::new(),
             goal_behavior_histogram: HashMap::new(),
+            goal_progress_sum: 0.0,
+            goal_progress_samples: 0,
+            goal_no_progress_dwell_ticks: 0,
+            goal_failed_attempts: HashMap::new(),
+            strategy_switches_within_goal: 0,
+            goal_help_requests: 0,
+            unmeasurable_progress_ticks: 0,
+            stall_responses: 0,
+            false_stall_count: 0,
             map_memory_decisions: 0,
             danger_memory_decisions: 0,
             charge_memory_decisions: 0,
@@ -5833,6 +5889,7 @@ impl EpisodeMetricBuilder {
         }
         self.observe_behavior_runs(&tick.frame.behavior_runs);
         self.observe_action_selector(tick);
+        self.observe_goal_progress(tick);
         self.observe_map_memory_decision(tick);
         if snapshot.eye_frame.is_some() || !snapshot.eye.frames.is_empty() {
             self.ticks_with_eye_frames = self.ticks_with_eye_frames.saturating_add(1);
@@ -6009,6 +6066,89 @@ impl EpisodeMetricBuilder {
         for candidate in decision.candidates {
             self.candidate_score_sum += candidate.score;
             self.candidate_score_count = self.candidate_score_count.saturating_add(1);
+        }
+    }
+
+    fn observe_goal_progress(&mut self, tick: &RuntimeTick) {
+        let Some(progress) = tick
+            .frame
+            .now
+            .extensions
+            .get("goal_system")
+            .and_then(|cycle| cycle.get("progress"))
+        else {
+            return;
+        };
+        let Ok(reports) = serde_json::from_value::<Vec<GoalProgressReport>>(progress.clone())
+        else {
+            return;
+        };
+        for report in reports {
+            let goal_id = report.goal_id.as_str().to_string();
+            self.goal_failed_attempts
+                .entry(goal_id)
+                .and_modify(|attempts| *attempts = (*attempts).max(report.failed_attempts))
+                .or_insert(report.failed_attempts);
+
+            let observed_this_tick = report
+                .observation
+                .as_ref()
+                .is_some_and(|observation| observation.observed_at_ms == tick.frame.now.t_ms);
+            let meets_expectation = report
+                .observation
+                .as_ref()
+                .and_then(|observation| observation.progress)
+                .zip(report.expectation.as_ref())
+                .is_some_and(|(observed, expected)| {
+                    observed + expected.tolerance >= expected.expected_progress
+                });
+            if report.selected_behavior.is_some() && observed_this_tick {
+                match report
+                    .observation
+                    .as_ref()
+                    .and_then(|observation| observation.progress)
+                {
+                    Some(progress) => {
+                        self.goal_progress_sum += progress;
+                        self.goal_progress_samples = self.goal_progress_samples.saturating_add(1);
+                        if !meets_expectation {
+                            self.goal_no_progress_dwell_ticks =
+                                self.goal_no_progress_dwell_ticks.saturating_add(1);
+                        }
+                    }
+                    None => {
+                        self.unmeasurable_progress_ticks =
+                            self.unmeasurable_progress_ticks.saturating_add(1);
+                    }
+                }
+            }
+
+            match report.response {
+                StrategyProgressResponse::Changed => {
+                    self.strategy_switches_within_goal =
+                        self.strategy_switches_within_goal.saturating_add(1);
+                    self.stall_responses = self.stall_responses.saturating_add(1);
+                    if meets_expectation {
+                        self.false_stall_count = self.false_stall_count.saturating_add(1);
+                    }
+                }
+                StrategyProgressResponse::HelpRequested => {
+                    self.goal_help_requests = self.goal_help_requests.saturating_add(1);
+                    self.stall_responses = self.stall_responses.saturating_add(1);
+                    if meets_expectation {
+                        self.false_stall_count = self.false_stall_count.saturating_add(1);
+                    }
+                }
+                StrategyProgressResponse::Abandoned => {
+                    self.stall_responses = self.stall_responses.saturating_add(1);
+                    if meets_expectation {
+                        self.false_stall_count = self.false_stall_count.saturating_add(1);
+                    }
+                }
+                StrategyProgressResponse::Inactive
+                | StrategyProgressResponse::Started
+                | StrategyProgressResponse::Retained => {}
+            }
         }
     }
 
@@ -6202,6 +6342,22 @@ impl EpisodeMetricBuilder {
             },
             goal_histogram: self.goal_histogram,
             goal_behavior_histogram: self.goal_behavior_histogram,
+            goal_progress_samples: self.goal_progress_samples,
+            mean_goal_progress: (self.goal_progress_samples > 0)
+                .then_some(self.goal_progress_sum / self.goal_progress_samples as f32),
+            goal_no_progress_dwell_ticks: self.goal_no_progress_dwell_ticks,
+            goal_failed_attempts: self
+                .goal_failed_attempts
+                .values()
+                .map(|attempts| *attempts as usize)
+                .sum(),
+            strategy_switches_within_goal: self.strategy_switches_within_goal,
+            goal_help_requests: self.goal_help_requests,
+            unmeasurable_progress_ticks: self.unmeasurable_progress_ticks,
+            stall_responses: self.stall_responses,
+            false_stall_count: self.false_stall_count,
+            false_stall_rate: (self.stall_responses > 0)
+                .then_some(self.false_stall_count as f32 / self.stall_responses as f32),
             action_selector_fallbacks: self.action_selector_fallbacks,
             action_selector_guard_yields: self.action_selector_guard_yields,
             map_memory_decisions: self.map_memory_decisions,
@@ -6628,6 +6784,24 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
             *trap_kind_counts.entry(kind.clone()).or_default() += count;
         }
     }
+    let goal_progress_samples = episodes
+        .iter()
+        .map(|episode| episode.goal_progress_samples)
+        .sum::<usize>();
+    let goal_progress_sum = episodes
+        .iter()
+        .map(|episode| {
+            episode.mean_goal_progress.unwrap_or(0.0) * episode.goal_progress_samples as f32
+        })
+        .sum::<f32>();
+    let stall_responses = episodes
+        .iter()
+        .map(|episode| episode.stall_responses)
+        .sum::<usize>();
+    let false_stall_count = episodes
+        .iter()
+        .map(|episode| episode.false_stall_count)
+        .sum::<usize>();
     ScenarioEvaluationSummary {
         success_rate: episodes.iter().filter(|episode| episode.success).count() as f32 / count,
         collision_rate: if total_ticks == 0 {
@@ -6794,6 +6968,31 @@ fn summarize_episodes(episodes: &[ScenarioEpisodeReport]) -> ScenarioEvaluationS
                 .iter()
                 .map(|episode| &episode.goal_behavior_histogram),
         ),
+        goal_progress_samples,
+        mean_goal_progress: (goal_progress_samples > 0)
+            .then_some(goal_progress_sum / goal_progress_samples as f32),
+        goal_no_progress_dwell_ticks: episodes
+            .iter()
+            .map(|episode| episode.goal_no_progress_dwell_ticks)
+            .sum(),
+        goal_failed_attempts: episodes
+            .iter()
+            .map(|episode| episode.goal_failed_attempts)
+            .sum(),
+        strategy_switches_within_goal: episodes
+            .iter()
+            .map(|episode| episode.strategy_switches_within_goal)
+            .sum(),
+        goal_help_requests: episodes
+            .iter()
+            .map(|episode| episode.goal_help_requests)
+            .sum(),
+        unmeasurable_progress_ticks: episodes
+            .iter()
+            .map(|episode| episode.unmeasurable_progress_ticks)
+            .sum(),
+        false_stall_rate: (stall_responses > 0)
+            .then_some(false_stall_count as f32 / stall_responses as f32),
         mean_chosen_score: mean_optional(
             episodes
                 .iter()
@@ -16368,6 +16567,103 @@ mod tests {
     }
 
     #[test]
+    fn goal_progress_metrics_are_counted_in_scenario_reports() {
+        let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 18));
+        let mut metrics = EpisodeMetricBuilder::new(
+            ScenarioKind::EmptyRoom,
+            scenario.metadata,
+            0,
+            18,
+            None,
+            None,
+        );
+        let mut tick = tick_with_action(ActionPrimitive::Stop);
+        tick.frame.now.extensions.insert(
+            "goal_system".to_string(),
+            serde_json::json!({
+                "progress": [{
+                    "goal_id": "explore",
+                    "selected_behavior": "wall_follow_exploration",
+                    "previous_behavior": "random_walk_exploration",
+                    "expectation": {
+                        "behavior_id": "random_walk_exploration",
+                        "baseline": 0.0,
+                        "expected_progress": 0.6,
+                        "horizon_ms": 1000,
+                        "tolerance": 0.1,
+                        "deadline_ms": 100,
+                        "metric": "frontier_coverage"
+                    },
+                    "observation": {
+                        "observed_at_ms": 100,
+                        "progress": 0.1,
+                        "source": "canonical_world_model",
+                        "outcome": null
+                    },
+                    "attempts": 3,
+                    "failed_attempts": 2,
+                    "recent_progress": 0.1,
+                    "progress_trend": -0.2,
+                    "last_progress_at_ms": null,
+                    "strategy_failure": 0.7,
+                    "response": "changed",
+                    "reason": "coverage stalled"
+                }]
+            }),
+        );
+        metrics.observe(&WorldSnapshot::default(), &tick);
+
+        let mut help_tick = tick_with_action(ActionPrimitive::Stop);
+        help_tick.frame.t_ms = 200;
+        help_tick.frame.now.t_ms = 200;
+        help_tick.frame.now.extensions.insert(
+            "goal_system".to_string(),
+            serde_json::json!({
+                "progress": [{
+                    "goal_id": "seek_charger",
+                    "selected_behavior": "request_charge_help",
+                    "previous_behavior": "systematic_charger_search",
+                    "expectation": null,
+                    "observation": {
+                        "observed_at_ms": 200,
+                        "progress": null,
+                        "source": "canonical_world_model_unmeasurable",
+                        "outcome": null
+                    },
+                    "attempts": 4,
+                    "failed_attempts": 4,
+                    "recent_progress": 0.0,
+                    "progress_trend": 0.0,
+                    "last_progress_at_ms": null,
+                    "strategy_failure": 0.8,
+                    "response": "help_requested",
+                    "reason": "bounded escalation"
+                }]
+            }),
+        );
+        metrics.observe(&WorldSnapshot::default(), &help_tick);
+
+        let episode = metrics.finish();
+        assert_eq!(episode.goal_progress_samples, 1);
+        assert_eq!(episode.mean_goal_progress, Some(0.1));
+        assert_eq!(episode.goal_no_progress_dwell_ticks, 1);
+        assert_eq!(episode.goal_failed_attempts, 6);
+        assert_eq!(episode.strategy_switches_within_goal, 1);
+        assert_eq!(episode.goal_help_requests, 1);
+        assert_eq!(episode.unmeasurable_progress_ticks, 1);
+        assert_eq!(episode.false_stall_rate, Some(0.0));
+
+        let summary = summarize_episodes(&[episode]);
+        assert_eq!(summary.mean_goal_progress, Some(0.1));
+        assert_eq!(summary.goal_no_progress_dwell_ticks, 1);
+        assert_eq!(summary.goal_failed_attempts, 6);
+        assert_eq!(summary.strategy_switches_within_goal, 1);
+        assert_eq!(summary.goal_help_requests, 1);
+        assert_eq!(summary.unmeasurable_progress_ticks, 1);
+        assert_eq!(summary.false_stall_rate, Some(0.0));
+    }
+
+    #[test]
     fn map_memory_decisions_are_counted_in_scenario_reports() {
         let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::EmptyRoom, 17));
         let mut metrics = EpisodeMetricBuilder::new(
@@ -16690,8 +16986,16 @@ mod tests {
         let mut snapshot = WorldSnapshot::default();
         snapshot.eye.frames.push(vec![0.1, 0.2]);
         snapshot.ear.features.push(vec![0.3]);
-        snapshot.voice.vectors.push(pete_now::VectorArtifact::new("voices", "test-voice", vec![0.4]));
-        snapshot.face.vectors.push(pete_now::VectorArtifact::new("faces", "test-face", vec![0.5]));
+        snapshot.voice.vectors.push(pete_now::VectorArtifact::new(
+            "voices",
+            "test-voice",
+            vec![0.4],
+        ));
+        snapshot.face.vectors.push(pete_now::VectorArtifact::new(
+            "faces",
+            "test-face",
+            vec![0.5],
+        ));
         snapshot.kinect.skeletons.push(Default::default());
         metrics.observe(&snapshot, &tick_with_action(ActionPrimitive::Stop));
         let report = metrics.finish();

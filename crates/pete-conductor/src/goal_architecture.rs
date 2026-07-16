@@ -6,7 +6,7 @@ use pete_actions::{
 };
 use pete_now::{
     ClockDomain, DriveSelfSummary, DriveSense, EntityId, EpistemicActionKind, EpistemicAffordance,
-    EpistemicAttempt, EpistemicQuestionFamily, EvidenceRef, GoalStatusBelief,
+    EpistemicAttempt, EpistemicQuestionFamily, EvidenceRef, Freshness, GoalStatusBelief,
     PendingTemporalExpectation, QuestionId, SemanticBehaviorId, SemanticConceptId,
     SemanticExplanation, SemanticNodeRef, SemanticPredicate, SemanticRelationId, TimeInterval,
     WorldEntity, WorldEntityKind, WorldModelSnapshot, WorldModelUpdateContext,
@@ -319,7 +319,25 @@ pub enum SkillId {
     HoldHeading,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+fn skill_progress_metric(skill_id: SkillId) -> &'static str {
+    match skill_id {
+        SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => {
+            "bearing_error"
+        }
+        SkillId::ApproachTarget | SkillId::AlignWithDock => "target_distance",
+        SkillId::BackAway => "reverse_displacement",
+        SkillId::InspectTarget => "uncertainty_reduction",
+        SkillId::WallFollow => "path_progress",
+        SkillId::SystematicSearch => "frontier_coverage",
+        SkillId::StopAndStabilize => "motion_stability",
+    }
+}
+
+fn default_progress_tolerance() -> f32 {
+    0.1
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillRequest {
     pub skill_id: SkillId,
     pub goal_id: Option<GoalId>,
@@ -330,6 +348,31 @@ pub struct SkillRequest {
     pub stop_range_m: Option<f32>,
     pub maximum_duration_ms: u64,
     pub expected_progress: f32,
+    #[serde(default)]
+    pub progress_metric: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_baseline: Option<f32>,
+    #[serde(default = "default_progress_tolerance")]
+    pub progress_tolerance: f32,
+}
+
+impl Default for SkillRequest {
+    fn default() -> Self {
+        Self {
+            skill_id: SkillId::default(),
+            goal_id: None,
+            behavior_id: None,
+            target: None,
+            bearing_rad: None,
+            range_m: None,
+            stop_range_m: None,
+            maximum_duration_ms: 0,
+            expected_progress: 0.0,
+            progress_metric: String::new(),
+            progress_baseline: None,
+            progress_tolerance: default_progress_tolerance(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -381,6 +424,13 @@ impl Affordance {
     }
 
     fn with_skill(mut self, skill_id: SkillId, stop_range_m: Option<f32>) -> Self {
+        let progress_baseline = match skill_id {
+            SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => {
+                self.bearing_rad.map(f32::abs)
+            }
+            SkillId::BackAway | SkillId::SystematicSearch => Some(0.0),
+            _ => None,
+        };
         self.skill_request = Some(SkillRequest {
             skill_id,
             goal_id: None,
@@ -391,6 +441,9 @@ impl Affordance {
             stop_range_m,
             maximum_duration_ms: self.expected_duration_ms,
             expected_progress: self.expected_progress,
+            progress_metric: skill_progress_metric(skill_id).to_string(),
+            progress_baseline,
+            progress_tolerance: 0.1,
         });
         self
     }
@@ -398,6 +451,12 @@ impl Affordance {
     fn with_skill_range(mut self, range_m: Option<f32>) -> Self {
         if let Some(request) = &mut self.skill_request {
             request.range_m = range_m;
+            if matches!(
+                request.skill_id,
+                SkillId::ApproachTarget | SkillId::AlignWithDock
+            ) {
+                request.progress_baseline = range_m;
+            }
         }
         self
     }
@@ -483,8 +542,14 @@ pub struct ExecutorState {
 pub struct GoalRuntimeState {
     pub active: bool,
     pub elapsed_time_ms: u64,
+    #[serde(default)]
+    pub attempts: u32,
     pub failed_attempts: u32,
     pub recent_progress: f32,
+    #[serde(default)]
+    pub progress_trend: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at_ms: Option<u64>,
     pub confidence_trend: f32,
     pub frustration: f32,
     pub last_confidence: Option<f32>,
@@ -497,7 +562,13 @@ pub struct GoalRuntimeState {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProgressExpectation {
     pub behavior_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<f32>,
     pub expected_progress: f32,
+    #[serde(default)]
+    pub horizon_ms: u64,
+    #[serde(default = "default_progress_tolerance")]
+    pub tolerance: f32,
     pub deadline_ms: u64,
     pub metric: String,
 }
@@ -510,14 +581,49 @@ pub struct ProgressObservation {
     pub outcome: Option<SkillOutcome>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyProgressResponse {
+    #[default]
+    Inactive,
+    Started,
+    Retained,
+    Changed,
+    HelpRequested,
+    Abandoned,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GoalProgressReport {
+    pub goal_id: GoalId,
+    pub selected_behavior: Option<String>,
+    pub previous_behavior: Option<String>,
+    pub expectation: Option<ProgressExpectation>,
+    pub observation: Option<ProgressObservation>,
+    #[serde(default)]
+    pub attempts: u32,
+    pub failed_attempts: u32,
+    pub recent_progress: f32,
+    #[serde(default)]
+    pub progress_trend: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at_ms: Option<u64>,
+    pub strategy_failure: f32,
+    pub response: StrategyProgressResponse,
+    pub reason: String,
+}
+
 impl GoalRuntimeState {
     fn snapshot(&self) -> GoalStatusBelief {
         GoalStatusBelief {
             meta: Default::default(),
             active: self.active,
             elapsed_time_ms: self.elapsed_time_ms,
+            attempts: self.attempts,
             failed_attempts: self.failed_attempts,
             recent_progress: self.recent_progress,
+            progress_trend: self.progress_trend,
+            last_progress_at_ms: self.last_progress_at_ms,
             confidence_trend: self.confidence_trend,
             frustration: self.frustration,
             last_exit_reason: self
@@ -766,7 +872,11 @@ impl Goal for GoalModule {
             reason,
             GoalExitReason::Satisfied | GoalExitReason::Completed
         ) {
+            self.runtime.attempts = 0;
             self.runtime.failed_attempts = 0;
+            self.runtime.recent_progress = 0.0;
+            self.runtime.progress_trend = 0.0;
+            self.runtime.last_progress_at_ms = None;
             self.runtime.frustration = 0.0;
         }
         self.runtime.last_exit_reason = Some(reason);
@@ -1178,6 +1288,8 @@ fn charger_behavior_rank(behavior_id: &str, request_help: bool) -> u8 {
         "approach_charger" => 1,
         "turn_toward_charger" => 2,
         "request_charge_help" if request_help => 3,
+        "systematic_charger_search" if request_help => 4,
+        "inspect_for_charger" if request_help => 5,
         "systematic_charger_search" => 3,
         "inspect_for_charger" => 4,
         "request_charge_help" => 5,
@@ -1756,39 +1868,19 @@ fn evaluate_explore(
         - 0.50 * drives.rest.activation
         - 0.25 * drives.certainty.activation)
         .clamp(0.0, 1.0);
-    let action = if let Some(bearing) = context
+    let frontier_bearing = context
         .world
         .context
         .frontier_bearing_rad
         .as_ref()
-        .map(|belief| belief.value)
-    {
-        ActionPrimitive::Turn {
-            direction: if bearing >= 0.0 {
-                TurnDir::Left
-            } else {
-                TurnDir::Right
+        .map(|belief| belief.value);
+    let mut affordances = vec![
+        affordance(
+            "random_walk_exploration",
+            ActionPrimitive::Explore {
+                style: ExploreStyle::RandomWalk,
+                duration_ms: 1_000,
             },
-            intensity: 0.35,
-            duration_ms: 500,
-        }
-    } else if interpretation.novelty > 0.55 {
-        ActionPrimitive::Inspect {
-            target: InspectTarget::Novelty,
-        }
-    } else {
-        ActionPrimitive::Explore {
-            style: ExploreStyle::RandomWalk,
-            duration_ms: 1_000,
-        }
-    };
-    (
-        activation,
-        0.1,
-        drives.curiosity.satisfaction,
-        vec![affordance(
-            "explore_frontier",
-            action,
             (1.0 - interpretation.danger).clamp(0.0, 1.0),
             0.45,
             0.6,
@@ -1797,7 +1889,72 @@ fn evaluate_explore(
             1_000,
             None,
             &[],
-        )],
+        )
+        .with_skill(SkillId::SystematicSearch, None),
+        affordance(
+            "wall_follow_exploration",
+            ActionPrimitive::Explore {
+                style: ExploreStyle::WallFollow,
+                duration_ms: 1_000,
+            },
+            (0.9 - interpretation.danger).clamp(0.0, 1.0),
+            0.4,
+            0.55,
+            interpretation.danger,
+            0.18,
+            1_000,
+            None,
+            &[],
+        )
+        .with_skill(SkillId::SystematicSearch, None),
+    ];
+    if let Some(bearing) = frontier_bearing {
+        affordances.push(
+            affordance(
+                "follow_frontier",
+                ActionPrimitive::Turn {
+                    direction: if bearing >= 0.0 {
+                        TurnDir::Left
+                    } else {
+                        TurnDir::Right
+                    },
+                    intensity: 0.35,
+                    duration_ms: 500,
+                },
+                (1.0 - interpretation.danger).clamp(0.0, 1.0),
+                0.55,
+                0.7,
+                interpretation.danger,
+                0.12,
+                700,
+                None,
+                &[],
+            )
+            .with_bearing(Some(bearing))
+            .with_skill(SkillId::FollowBearing, None),
+        );
+    }
+    if interpretation.novelty > 0.55 {
+        affordances.push(affordance(
+            "inspect_novelty",
+            ActionPrimitive::Inspect {
+                target: InspectTarget::Novelty,
+            },
+            (1.0 - interpretation.danger).clamp(0.0, 1.0),
+            0.5,
+            0.5,
+            interpretation.danger * 0.5,
+            0.05,
+            750,
+            None,
+            &[],
+        ));
+    }
+    (
+        activation,
+        0.1,
+        drives.curiosity.satisfaction,
+        affordances,
         vec![contribution("drive.curiosity", drives.curiosity.activation)],
     )
 }
@@ -2345,7 +2502,11 @@ pub struct GoalCycle {
     pub evaluations: Vec<GoalEvaluation>,
     pub selection: GoalSelection,
     pub behavior: Option<BehaviorDecision>,
+    #[serde(default)]
+    pub progress: Vec<GoalProgressReport>,
 }
+
+const GOAL_CYCLE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 struct PendingOutcome {
@@ -2354,6 +2515,9 @@ struct PendingOutcome {
     started_at_ms: u64,
     expected_progress: f32,
     expected_duration_ms: u64,
+    metric: String,
+    baseline: Option<f32>,
+    tolerance: f32,
     start_pose: (f32, f32),
     start_target_distance_m: Option<f32>,
     target: Option<EntityId>,
@@ -2431,19 +2595,39 @@ impl GoalSystem {
         let Some(goal) = self.goals.iter_mut().find(|goal| goal.id() == goal_id) else {
             return;
         };
+        let previous_progress = goal
+            .runtime()
+            .last_progress_observation
+            .as_ref()
+            .and_then(|observation| observation.progress);
+        let measured_progress = if status.outcome == Some(SkillOutcome::SafetyPreempted) {
+            None
+        } else {
+            status.progress
+        };
         goal.runtime_mut().last_progress_observation = Some(ProgressObservation {
             observed_at_ms: status.updated_at_ms,
-            progress: status.progress,
-            source: "possessor_skill".to_string(),
+            progress: measured_progress,
+            source: if status.outcome == Some(SkillOutcome::SafetyPreempted) {
+                "autonomic_safety_preemption".to_string()
+            } else {
+                "possessor_skill".to_string()
+            },
             outcome: status.outcome,
         });
-        if let Some(progress) = status.progress {
+        goal.runtime_mut().attempts = goal.runtime().attempts.max(status.attempts);
+        if let Some(progress) = measured_progress {
+            let delta = previous_progress.map_or(0.0, |previous| progress - previous);
+            goal.runtime_mut().progress_trend =
+                (0.8 * goal.runtime().progress_trend + 0.2 * delta).clamp(-1.0, 1.0);
             goal.runtime_mut().recent_progress =
                 (0.7 * goal.runtime().recent_progress + 0.3 * progress).clamp(0.0, 1.0);
+            if progress >= status.request.progress_tolerance.max(0.01) {
+                goal.runtime_mut().last_progress_at_ms = Some(status.updated_at_ms);
+            }
         }
         if status.phase == SkillPhase::Terminal {
             goal.runtime_mut().last_skill_outcome = status.outcome;
-            goal.runtime_mut().progress_expectation = None;
             if matches!(
                 status.outcome,
                 Some(
@@ -2579,6 +2763,7 @@ impl GoalSystem {
         proposals: &[ActionPrimitive],
     ) -> Result<GoalCycle> {
         let world = world.clone();
+        let previous_pending = self.pending.clone();
         self.observe_pending_outcome(&world);
         let drives = self.drives.update(&world);
         let mut interpretations = Vec::with_capacity(self.goals.len());
@@ -2663,33 +2848,51 @@ impl GoalSystem {
                 })
                 .unwrap_or(true);
             if begins_new_attempt {
-                let progress_metric = if decision.affordance.epistemic_question_id.is_some() {
-                    "uncertainty_reduction"
-                } else {
-                    match decision
-                        .affordance
-                        .skill_request
-                        .as_ref()
-                        .map(|request| request.skill_id)
-                    {
-                        Some(
-                            SkillId::TurnTowardTarget
-                            | SkillId::FollowBearing
-                            | SkillId::HoldHeading,
-                        ) => "bearing_error",
-                        Some(SkillId::ApproachTarget | SkillId::AlignWithDock) => "target_distance",
-                        Some(SkillId::BackAway) => "reverse_displacement",
-                        Some(_) => "skill_specific",
-                        None => "world_displacement",
-                    }
-                };
+                self.goals[index].runtime_mut().attempts =
+                    self.goals[index].runtime().attempts.saturating_add(1);
+                let start_uncertainty = decision
+                    .affordance
+                    .epistemic_question_id
+                    .as_ref()
+                    .and_then(|question_id| {
+                        world
+                            .epistemic
+                            .active_questions
+                            .iter()
+                            .find(|question| &question.question_id == question_id)
+                            .map(|question| question.current_uncertainty)
+                    });
+                let (progress_metric, progress_baseline, progress_tolerance) =
+                    if decision.affordance.epistemic_question_id.is_some() {
+                        ("uncertainty_reduction".to_string(), start_uncertainty, 0.1)
+                    } else if let Some(request) = decision.affordance.skill_request.as_ref() {
+                        let metric = if request.progress_metric.is_empty() {
+                            skill_progress_metric(request.skill_id).to_string()
+                        } else {
+                            request.progress_metric.clone()
+                        };
+                        let baseline = request.progress_baseline.or_else(|| {
+                            decision
+                                .affordance
+                                .target
+                                .as_ref()
+                                .and_then(|id| world.entities.get(id))
+                                .and_then(|entity| entity.distance_m)
+                        });
+                        (metric, baseline, request.progress_tolerance)
+                    } else {
+                        ("world_displacement".to_string(), Some(0.0), 0.1)
+                    };
                 self.goals[index].runtime_mut().progress_expectation = Some(ProgressExpectation {
                     behavior_id: decision.behavior_id.clone(),
+                    baseline: progress_baseline,
                     expected_progress: decision.affordance.expected_progress,
+                    horizon_ms: decision.affordance.expected_duration_ms,
+                    tolerance: progress_tolerance,
                     deadline_ms: world
                         .t_ms
                         .saturating_add(decision.affordance.expected_duration_ms),
-                    metric: progress_metric.to_string(),
+                    metric: progress_metric.clone(),
                 });
                 self.pending = Some(PendingOutcome {
                     goal_id: decision.goal_id.clone(),
@@ -2697,6 +2900,9 @@ impl GoalSystem {
                     started_at_ms: world.t_ms,
                     expected_progress: decision.affordance.expected_progress,
                     expected_duration_ms: decision.affordance.expected_duration_ms,
+                    metric: progress_metric,
+                    baseline: progress_baseline,
+                    tolerance: progress_tolerance,
                     start_pose: (world.self_model.pose.x_m, world.self_model.pose.y_m),
                     start_target_distance_m: decision
                         .affordance
@@ -2706,30 +2912,29 @@ impl GoalSystem {
                         .and_then(|entity| entity.distance_m),
                     target: decision.affordance.target.clone(),
                     epistemic_question_id: decision.affordance.epistemic_question_id.clone(),
-                    start_uncertainty: decision.affordance.epistemic_question_id.as_ref().and_then(
-                        |question_id| {
-                            world
-                                .epistemic
-                                .active_questions
-                                .iter()
-                                .find(|question| &question.question_id == question_id)
-                                .map(|question| question.current_uncertainty)
-                        },
-                    ),
+                    start_uncertainty,
                 });
             }
             Some(decision)
         } else {
             None
         };
+        let progress = self.progress_reports(
+            &evaluations,
+            &selection,
+            behavior.as_ref(),
+            previous_pending.as_ref(),
+            world.t_ms,
+        );
         Ok(GoalCycle {
-            schema_version: 1,
+            schema_version: GOAL_CYCLE_SCHEMA_VERSION,
             world,
             drives,
             interpretations,
             evaluations,
             selection,
             behavior,
+            progress,
         })
     }
 
@@ -2745,7 +2950,7 @@ impl GoalSystem {
         self.pending = None;
         self.last_tick_ms = Some(world.t_ms);
         GoalCycle {
-            schema_version: 1,
+            schema_version: GOAL_CYCLE_SCHEMA_VERSION,
             world: world.clone(),
             drives: self.drives.update(world),
             selection: GoalSelection {
@@ -2768,6 +2973,14 @@ impl GoalSystem {
             .target
             .as_ref()
             .and_then(|target| world.entities.get(target))
+            .filter(|entity| {
+                entity.distance_meta.as_ref().is_some_and(|meta| {
+                    !matches!(
+                        meta.freshness,
+                        Freshness::Stale | Freshness::Invalidated | Freshness::Missing
+                    )
+                })
+            })
             .and_then(|entity| entity.distance_m)
             .zip(pending.start_target_distance_m)
             .map(|(current, start)| ((start - current) / start.max(0.1)).clamp(0.0, 1.0));
@@ -2795,11 +3008,13 @@ impl GoalSystem {
                 ((start - current) / start.max(0.01)).clamp(0.0, 1.0)
             });
         let observed = if pending.behavior_id == "dock" && world.self_model.charging {
-            1.0
-        } else {
+            Some(1.0)
+        } else if pending.epistemic_question_id.is_some() {
             epistemic_progress
-                .or(target_progress)
-                .unwrap_or(movement_progress)
+        } else if pending.target.is_some() {
+            target_progress
+        } else {
+            Some(movement_progress)
         };
         let attempt_finished = elapsed >= pending.expected_duration_ms
             || (pending.behavior_id == "dock" && world.self_model.charging);
@@ -2808,9 +3023,21 @@ impl GoalSystem {
             .iter_mut()
             .find(|goal| goal.id() == &pending.goal_id)
         {
-            let recent_progress =
-                (0.7 * goal.runtime().recent_progress + 0.3 * observed).clamp(0.0, 1.0);
-            goal.runtime_mut().recent_progress = recent_progress;
+            let previous_progress = goal
+                .runtime()
+                .last_progress_observation
+                .as_ref()
+                .and_then(|observation| observation.progress);
+            goal.runtime_mut().last_progress_observation = Some(ProgressObservation {
+                observed_at_ms: world.t_ms,
+                progress: observed,
+                source: if observed.is_some() {
+                    "canonical_world_model".to_string()
+                } else {
+                    "canonical_world_model_unmeasurable".to_string()
+                },
+                outcome: None,
+            });
             if let Some(confidence) = goal
                 .last_evaluation()
                 .map(|evaluation| evaluation.competence.confidence)
@@ -2821,28 +3048,160 @@ impl GoalSystem {
                 goal.runtime_mut().confidence_trend = confidence_trend;
                 goal.runtime_mut().last_confidence = Some(confidence);
             }
-            if attempt_finished && observed + 0.1 < pending.expected_progress {
-                goal.runtime_mut().failed_attempts =
-                    goal.runtime().failed_attempts.saturating_add(1);
+            if let Some(observed) = observed {
+                let delta = previous_progress.map_or(0.0, |previous| observed - previous);
+                goal.runtime_mut().progress_trend =
+                    (0.8 * goal.runtime().progress_trend + 0.2 * delta).clamp(-1.0, 1.0);
+                let recent_progress =
+                    (0.7 * goal.runtime().recent_progress + 0.3 * observed).clamp(0.0, 1.0);
+                goal.runtime_mut().recent_progress = recent_progress;
+                if observed >= pending.tolerance.max(0.01) {
+                    goal.runtime_mut().last_progress_at_ms = Some(world.t_ms);
+                }
+                if attempt_finished && observed + pending.tolerance < pending.expected_progress {
+                    goal.runtime_mut().failed_attempts =
+                        goal.runtime().failed_attempts.saturating_add(1);
+                }
+                let progress_deficit = (pending.expected_progress - observed).max(0.0);
+                let failed = (goal.runtime().failed_attempts as f32 / 5.0).clamp(0.0, 1.0);
+                let falling_confidence = (-goal.runtime().confidence_trend).max(0.0);
+                let target_frustration =
+                    (0.5 * progress_deficit + 0.3 * failed + 0.2 * falling_confidence)
+                        .clamp(0.0, 1.0);
+                let alpha = if target_frustration > goal.runtime().frustration {
+                    0.20
+                } else {
+                    0.07
+                };
+                let frustration = goal.runtime().frustration
+                    + (target_frustration - goal.runtime().frustration) * alpha;
+                goal.runtime_mut().frustration = frustration;
             }
-            let progress_deficit = (pending.expected_progress - observed).max(0.0);
-            let failed = (goal.runtime().failed_attempts as f32 / 5.0).clamp(0.0, 1.0);
-            let falling_confidence = (-goal.runtime().confidence_trend).max(0.0);
-            let target_frustration =
-                (0.5 * progress_deficit + 0.3 * failed + 0.2 * falling_confidence).clamp(0.0, 1.0);
-            let alpha = if target_frustration > goal.runtime().frustration {
-                0.20
-            } else {
-                0.07
-            };
-            let frustration = goal.runtime().frustration
-                + (target_frustration - goal.runtime().frustration) * alpha;
-            goal.runtime_mut().frustration = frustration;
         }
         if attempt_finished {
             self.pending = None;
         }
     }
+
+    fn progress_reports(
+        &self,
+        evaluations: &[GoalEvaluation],
+        selection: &GoalSelection,
+        behavior: Option<&BehaviorDecision>,
+        previous_pending: Option<&PendingOutcome>,
+        t_ms: u64,
+    ) -> Vec<GoalProgressReport> {
+        self.goals
+            .iter()
+            .map(|goal| {
+                let runtime = goal.runtime();
+                let evaluation = evaluations
+                    .iter()
+                    .find(|evaluation| evaluation.goal_id == *goal.id());
+                let selected = selection.selected_goal.as_ref() == Some(goal.id());
+                let selected_behavior = behavior
+                    .filter(|decision| decision.goal_id == *goal.id())
+                    .map(|decision| decision.behavior_id.clone());
+                let previous_behavior = previous_pending
+                    .filter(|pending| pending.goal_id == *goal.id())
+                    .map(|pending| pending.behavior_id.clone());
+                let observation = runtime.last_progress_observation.clone();
+                let observed_this_tick = observation
+                    .as_ref()
+                    .is_some_and(|observation| observation.observed_at_ms == t_ms);
+                let expectation = if observed_this_tick {
+                    previous_pending
+                        .filter(|pending| pending.goal_id == *goal.id())
+                        .map(|pending| ProgressExpectation {
+                            behavior_id: pending.behavior_id.clone(),
+                            baseline: pending.baseline,
+                            expected_progress: pending.expected_progress,
+                            horizon_ms: pending.expected_duration_ms,
+                            tolerance: pending.tolerance,
+                            deadline_ms: pending
+                                .started_at_ms
+                                .saturating_add(pending.expected_duration_ms),
+                            metric: pending.metric.clone(),
+                        })
+                } else {
+                    runtime.progress_expectation.clone()
+                };
+                let (response, reason) = if evaluation.is_some_and(|evaluation| {
+                    evaluation.disposition == GoalDisposition::Failed
+                }) && previous_behavior.is_some()
+                {
+                    (
+                        StrategyProgressResponse::Abandoned,
+                        format!(
+                            "goal abandoned after {} failed attempts with strategy failure {:.2}",
+                            runtime.failed_attempts, runtime.frustration
+                        ),
+                    )
+                } else if !selected {
+                    (
+                        StrategyProgressResponse::Inactive,
+                        "goal was not selected this tick".to_string(),
+                    )
+                } else if selected_behavior.as_deref() == Some("request_charge_help")
+                    && previous_behavior.as_deref() != Some("request_charge_help")
+                {
+                    (
+                        StrategyProgressResponse::HelpRequested,
+                        format!(
+                            "bounded escalation requested help after {} failed attempts with strategy failure {:.2}",
+                            runtime.failed_attempts, runtime.frustration
+                        ),
+                    )
+                } else if previous_behavior.is_none() {
+                    (
+                        StrategyProgressResponse::Started,
+                        "started the highest-utility available strategy".to_string(),
+                    )
+                } else if previous_behavior != selected_behavior {
+                    (
+                        StrategyProgressResponse::Changed,
+                        format!(
+                            "changed strategy after observed progress {} against expected {} with strategy failure {:.2}",
+                            format_progress(observation.as_ref().and_then(|value| value.progress)),
+                            format_progress(expectation.as_ref().map(|value| value.expected_progress)),
+                            runtime.frustration
+                        ),
+                    )
+                } else {
+                    (
+                        StrategyProgressResponse::Retained,
+                        format!(
+                            "retained strategy with observed progress {} against expected {} and strategy failure {:.2}",
+                            format_progress(observation.as_ref().and_then(|value| value.progress)),
+                            format_progress(expectation.as_ref().map(|value| value.expected_progress)),
+                            runtime.frustration
+                        ),
+                    )
+                };
+                GoalProgressReport {
+                    goal_id: goal.id().clone(),
+                    selected_behavior,
+                    previous_behavior,
+                    expectation,
+                    observation,
+                    attempts: runtime.attempts,
+                    failed_attempts: runtime.failed_attempts,
+                    recent_progress: runtime.recent_progress,
+                    progress_trend: runtime.progress_trend,
+                    last_progress_at_ms: runtime.last_progress_at_ms,
+                    strategy_failure: runtime.frustration,
+                    response,
+                    reason,
+                }
+            })
+            .collect()
+    }
+}
+
+fn format_progress(progress: Option<f32>) -> String {
+    progress
+        .map(|progress| format!("{progress:.2}"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]
@@ -3408,6 +3767,270 @@ mod tests {
             system.arbiter.current_goal(),
             Some(&GoalId::new("seek_charger"))
         );
+    }
+
+    #[test]
+    fn autonomic_preemption_is_not_counted_as_intended_skill_progress() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_000, body));
+        let request = cycle.behavior.unwrap().affordance.skill_request.unwrap();
+
+        system.observe_skill_status(&SkillStatus {
+            request,
+            phase: SkillPhase::Terminal,
+            outcome: Some(SkillOutcome::SafetyPreempted),
+            progress: Some(1.0),
+            attempts: 1,
+            started_at_ms: Some(1_000),
+            updated_at_ms: 1_100,
+            reason: Some("contact withdrawal preempted possessor control".to_string()),
+        });
+
+        let runtime = system
+            .goals
+            .iter()
+            .find(|goal| goal.id() == &GoalId::new("seek_charger"))
+            .unwrap()
+            .runtime();
+        assert_eq!(runtime.failed_attempts, 0);
+        assert_eq!(runtime.recent_progress, 0.0);
+        assert_eq!(runtime.last_progress_at_ms, None);
+        assert_eq!(
+            runtime
+                .last_progress_observation
+                .as_ref()
+                .and_then(|observation| observation.progress),
+            None
+        );
+        assert_eq!(
+            runtime
+                .last_progress_observation
+                .as_ref()
+                .map(|observation| observation.source.as_str()),
+            Some("autonomic_safety_preemption")
+        );
+    }
+
+    #[test]
+    fn repeated_charger_failure_requests_help_then_abandons_at_bounded_limit() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        let first =
+            tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_000, body.clone()));
+        assert_eq!(first.schema_version, GOAL_CYCLE_SCHEMA_VERSION);
+        let expectation = first
+            .progress
+            .iter()
+            .find(|report| report.goal_id == GoalId::new("seek_charger"))
+            .and_then(|report| report.expectation.as_ref())
+            .unwrap();
+        assert_eq!(expectation.metric, "uncertainty_reduction");
+        assert!(expectation.baseline.is_some());
+        assert_eq!(expectation.horizon_ms, 1_000);
+        assert_eq!(expectation.tolerance, 0.1);
+        let search = first.behavior.unwrap();
+        assert_eq!(search.goal_id, GoalId::new("seek_charger"));
+        assert_eq!(search.behavior_id, "systematic_charger_search");
+        let request = search.affordance.skill_request.unwrap();
+        assert_eq!(request.progress_metric, "frontier_coverage");
+        assert_eq!(request.progress_baseline, Some(0.0));
+        assert_eq!(request.progress_tolerance, 0.1);
+
+        for attempt in 1..=4 {
+            system.observe_skill_status(&SkillStatus {
+                request: request.clone(),
+                phase: SkillPhase::Terminal,
+                outcome: Some(SkillOutcome::TimedOut),
+                progress: Some(0.0),
+                attempts: attempt,
+                started_at_ms: Some(1_000),
+                updated_at_ms: 1_000 + attempt as u64 * 25,
+                reason: Some("charger search produced no evidence".to_string()),
+            });
+        }
+        let charge_runtime = system
+            .goals
+            .iter()
+            .find(|goal| goal.id() == &GoalId::new("seek_charger"))
+            .unwrap()
+            .runtime();
+        assert_eq!(charge_runtime.failed_attempts, 4);
+        assert!(charge_runtime.frustration > 0.6);
+
+        let help =
+            tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_200, body.clone()));
+        let help_evaluation = help
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("seek_charger"))
+            .unwrap();
+        assert!(help_evaluation
+            .competence
+            .affordances
+            .iter()
+            .any(|affordance| affordance.behavior_id == "request_charge_help"));
+        assert_eq!(
+            help.selection.selected_goal,
+            Some(GoalId::new("seek_charger"))
+        );
+        assert_eq!(
+            help.behavior
+                .as_ref()
+                .map(|behavior| behavior.behavior_id.as_str()),
+            Some("request_charge_help")
+        );
+        let help_report = help
+            .progress
+            .iter()
+            .find(|report| report.goal_id == GoalId::new("seek_charger"))
+            .unwrap();
+        assert_eq!(
+            help_report.response,
+            StrategyProgressResponse::HelpRequested
+        );
+        assert!(help_report.reason.contains("bounded escalation"));
+        assert_eq!(
+            help_report.previous_behavior.as_deref(),
+            Some("systematic_charger_search")
+        );
+
+        let replayed: GoalCycle = serde_json::from_value(serde_json::to_value(&help).unwrap())
+            .expect("progress trace should replay from a serialized goal cycle");
+        assert_eq!(replayed.progress, help.progress);
+
+        for attempt in 5..=8 {
+            system.observe_skill_status(&SkillStatus {
+                request: request.clone(),
+                phase: SkillPhase::Terminal,
+                outcome: Some(SkillOutcome::TimedOut),
+                progress: Some(0.0),
+                attempts: attempt,
+                started_at_ms: Some(1_000),
+                updated_at_ms: 1_200 + attempt as u64 * 25,
+                reason: Some("bounded charger retry failed".to_string()),
+            });
+        }
+        let abandoned =
+            tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_400, body));
+        let abandoned_report = abandoned
+            .progress
+            .iter()
+            .find(|report| report.goal_id == GoalId::new("seek_charger"))
+            .unwrap();
+        assert_eq!(
+            abandoned_report.response,
+            StrategyProgressResponse::Abandoned
+        );
+        assert_eq!(abandoned_report.failed_attempts, 8);
+        assert!(abandoned_report.reason.contains("goal abandoned"));
+        assert_ne!(
+            abandoned.selection.selected_goal,
+            Some(GoalId::new("seek_charger"))
+        );
+    }
+
+    #[test]
+    fn stalled_explore_changes_strategy_without_switching_goal() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let body = BodySense {
+            battery_level: 1.0,
+            ..BodySense::default()
+        };
+        let first =
+            tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_000, body.clone()));
+        let initial = first.behavior.unwrap();
+        assert_eq!(initial.goal_id, GoalId::new("explore"));
+        assert_eq!(initial.behavior_id, "random_walk_exploration");
+        let request = initial.affordance.skill_request.unwrap();
+
+        for attempt in 1..=4 {
+            system.observe_skill_status(&SkillStatus {
+                request: request.clone(),
+                phase: SkillPhase::Terminal,
+                outcome: Some(SkillOutcome::TimedOut),
+                progress: Some(0.0),
+                attempts: attempt,
+                started_at_ms: Some(1_000),
+                updated_at_ms: 1_000 + attempt as u64 * 25,
+                reason: Some("frontier coverage did not increase".to_string()),
+            });
+        }
+
+        let changed = tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_200, body));
+        assert_eq!(
+            changed.selection.selected_goal,
+            Some(GoalId::new("explore"))
+        );
+        assert_eq!(
+            changed
+                .behavior
+                .as_ref()
+                .map(|behavior| behavior.behavior_id.as_str()),
+            Some("wall_follow_exploration")
+        );
+        let report = changed
+            .progress
+            .iter()
+            .find(|report| report.goal_id == GoalId::new("explore"))
+            .unwrap();
+        assert_eq!(report.response, StrategyProgressResponse::Changed);
+        assert_eq!(
+            report.previous_behavior.as_deref(),
+            Some("random_walk_exploration")
+        );
+        assert!(report.reason.contains("changed strategy"));
+    }
+
+    #[test]
+    fn stale_target_makes_progress_unknown_without_counting_failure() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        let mut now = Now::blank(1_000, body);
+        now.objects.observations.push(ObjectObservation {
+            label: "dock".to_string(),
+            class: ObjectClass::Charger,
+            bearing_rad: 0.1,
+            distance_m: Some(2.0),
+            confidence: 0.98,
+            source: ObjectObservationSource::Sim,
+        });
+        let first = tick_with_canonical_world(&mut system, &mut updater, now);
+        assert_eq!(
+            first
+                .behavior
+                .as_ref()
+                .map(|behavior| behavior.behavior_id.as_str()),
+            Some("approach_charger")
+        );
+
+        let mut stale_world = first.world.clone();
+        stale_world.t_ms = 2_100;
+        for entity in stale_world.entities.values_mut() {
+            entity.distance_meta.as_mut().unwrap().freshness = Freshness::Stale;
+        }
+        let stale = system.tick(&stale_world, &[]).unwrap();
+        let report = stale
+            .progress
+            .iter()
+            .find(|report| report.goal_id == GoalId::new("seek_charger"))
+            .unwrap();
+        assert_eq!(report.failed_attempts, 0);
+        assert_eq!(
+            report
+                .observation
+                .as_ref()
+                .and_then(|observation| observation.progress),
+            None
+        );
+        assert!(report.reason.contains("unknown"));
     }
 
     #[test]

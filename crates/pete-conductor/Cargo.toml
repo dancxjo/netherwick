@@ -12,3 +12,6 @@ pete-actions = { path = "../pete-actions" }
 pete-body = { path = "../pete-body" }
 pete-experience = { path = "../pete-experience" }
 pete-now = { path = "../pete-now" }
+
+[dev-dependencies]
+serde_json.workspace = true
