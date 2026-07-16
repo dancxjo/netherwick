@@ -39,7 +39,6 @@ const ORIENTATION_PROBE_MAX_ACCEL_MM_S2: u16 = 13_000;
 const CONTACT_REPEAT_WINDOW_MS: u32 = 2_000;
 const DOCK_DEPARTURE_SPEED_MM_S: i16 = -200;
 const DOCK_DEPARTURE_DURATION_MS: u32 = 1_500;
-const DOCKING_TIMEOUT_MS: u32 = 60_000;
 const CREATE_CHARGING_SOURCES_PACKET: u8 = 34;
 const CREATE_CHARGING_SOURCES_POLL_PERIOD_MS: u32 = 250;
 const CREATE_LINK_FRESHNESS_TIMEOUT_MS: u32 = 1_000;
@@ -103,9 +102,6 @@ enum ActiveAction {
         stop_at_ms: u32,
     },
     DockDeparture {
-        stop_at_ms: u32,
-    },
-    Docking {
         stop_at_ms: u32,
     },
 }
@@ -461,9 +457,7 @@ where
         }
         let motor_output_active = matches!(
             self.active,
-            ActiveAction::Driving { .. }
-                | ActiveAction::DockDeparture { .. }
-                | ActiveAction::Docking { .. }
+            ActiveAction::Driving { .. } | ActiveAction::DockDeparture { .. }
         );
         if motor_output_active {
             if snapshot.oi_mode != 3 {
@@ -1117,7 +1111,9 @@ where
                 )?;
             }
             RuntimeCommand::Dock => {
-                self.start_docking(now_ms)?;
+                self.ensure_create_responsive()?;
+                self.create_uart
+                    .seek_dock(&mut self.hardware, &mut self.events)?;
             }
             RuntimeCommand::SetLights {
                 led_bits,
@@ -1322,36 +1318,7 @@ where
                 }
                 Ok(())
             }
-            ActiveAction::Docking { stop_at_ms } => {
-                if time_reached(now_ms, stop_at_ms) {
-                    self.stop_drive()?;
-                    self.active = ActiveAction::None;
-                    status::set_body_state(BodyState::Idle);
-                    self.fail_active_command(BrainstemError::Timeout);
-                }
-                Ok(())
-            }
         }
-    }
-
-    fn start_docking(&mut self, now_ms: u32) -> Result<(), BrainstemError> {
-        let snapshot = status::snapshot(now_ms);
-        if snapshot.create_sensor_charging_sources & 0b10 != 0 {
-            // Seeking Home Base while already on it is a completed no-op and
-            // must not consume the pending departure on the next command.
-            return Ok(());
-        }
-        self.ensure_motion_allowed()?;
-        self.heartbeat_stop_at_ms = None;
-        self.active_velocity = None;
-        status::set_body_state(BodyState::Moving);
-        self.stop_sent = false;
-        self.create_uart
-            .seek_dock(&mut self.hardware, &mut self.events)?;
-        self.active = ActiveAction::Docking {
-            stop_at_ms: now_ms.wrapping_add(DOCKING_TIMEOUT_MS),
-        };
-        Ok(())
     }
 
     fn start_dock_departure(&mut self, now_ms: u32) -> Result<(), BrainstemError> {
@@ -1491,9 +1458,7 @@ where
         }
         if matches!(
             self.active,
-            ActiveAction::Driving { .. }
-                | ActiveAction::DockDeparture { .. }
-                | ActiveAction::Docking { .. }
+            ActiveAction::Driving { .. } | ActiveAction::DockDeparture { .. }
         ) {
             self.interrupt_active_command();
             self.stop_drive()?;
@@ -1588,20 +1553,11 @@ where
 
         if home_base && !wheel_drop && !tilt && !impact {
             self.clear_dock_contact_latch();
-            let docking_completed = matches!(self.active, ActiveAction::Docking { .. });
-            if docking_completed {
-                self.stop_drive()?;
-                self.active = ActiveAction::None;
-                status::set_body_state(BodyState::Idle);
-                self.complete_active_command();
-            }
             if !matches!(self.active, ActiveAction::DockDeparture { .. })
                 && !self.dock_departure_pending
             {
                 self.clear_motion_queue()?;
-                if !docking_completed {
-                    self.stop_drive()?;
-                }
+                self.stop_drive()?;
                 self.finish_contact_withdrawal(
                     status::ContactWithdrawalOutcome::SafetyPreempted,
                     Some(status::SafetyEventKind::Charging),
@@ -2016,7 +1972,6 @@ where
             ActiveAction::Driving { .. } | ActiveAction::DockDeparture { .. } => {
                 RuntimeActionCode::Driving
             }
-            ActiveAction::Docking { .. } => RuntimeActionCode::Docking,
         }
     }
 
@@ -2719,23 +2674,6 @@ mod tests {
     }
 
     #[test]
-    fn full_mode_refresh_never_overlays_native_docking() {
-        let _guard = status::status_test_guard();
-        let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.create_responsive = true;
-        runtime.active = ActiveAction::Docking { stop_at_ms: 61_000 };
-        status::set_oi_mode(CreateOiMode::Full);
-
-        assert!(runtime.maintain_full_mode().is_ok());
-
-        assert!(runtime.hardware.writes.is_empty());
-        assert!(matches!(
-            runtime.active,
-            ActiveAction::Docking { stop_at_ms: 61_000 }
-        ));
-    }
-
-    #[test]
     fn mode_loss_during_active_motor_output_stops_fail_closed() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
@@ -3160,99 +3098,6 @@ mod tests {
         assert!(runtime.start_next_command().is_ok());
         assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
         assert_eq!(runtime.active_command_id, Some(91));
-    }
-
-    #[test]
-    fn dock_command_remains_active_instead_of_being_stopped_by_idle_entry() {
-        let _guard = status::status_test_guard();
-        status::mark_create_charging_indicator(Some(false));
-        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
-        status::mark_create_sensor_packet(34, crate::events::CreateSensorPacket::default());
-        status::set_oi_mode(CreateOiMode::Full);
-        let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.create_responsive = true;
-        assert!(runtime
-            .commands
-            .push_back(QueuedCommand::new(6, RuntimeCommand::Dock))
-            .is_ok());
-
-        assert!(runtime.start_next_command().is_ok());
-
-        assert!(matches!(
-            runtime.active,
-            ActiveAction::Docking { stop_at_ms: 61_000 }
-        ));
-        assert_eq!(runtime.active_command_id, Some(6));
-        assert_eq!(
-            runtime.active_action_code() as u8,
-            RuntimeActionCode::Docking as u8
-        );
-        assert_eq!(runtime.hardware.writes.as_slice(), &[143]);
-    }
-
-    #[test]
-    fn home_base_contact_completes_native_docking_then_stops() {
-        let _guard = status::status_test_guard();
-        status::mark_create_charging_indicator(Some(false));
-        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
-        status::mark_create_sensor_packet(34, crate::events::CreateSensorPacket::default());
-        status::set_oi_mode(CreateOiMode::Full);
-        let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.create_responsive = true;
-        assert!(runtime
-            .commands
-            .push_back(QueuedCommand::new(6, RuntimeCommand::Dock))
-            .is_ok());
-        let event_cursor = status::event_next_seq().saturating_sub(1);
-        assert!(runtime.start_next_command().is_ok());
-
-        status::mark_create_sensor_packet(
-            34,
-            crate::events::CreateSensorPacket {
-                charging_sources: 0b10,
-                ..crate::events::CreateSensorPacket::default()
-            },
-        );
-        assert!(runtime.enforce_safety_policy().is_ok());
-
-        assert!(matches!(runtime.active, ActiveAction::None));
-        assert_eq!(runtime.active_command_id, None);
-        assert!(runtime.dock_departure_pending);
-        assert_eq!(runtime.hardware.writes.as_slice(), &[143, 137, 0, 0, 0, 0]);
-        let mut events = heapless::Vec::<status::PublicEventRecord, 8>::new();
-        status::collect_events_since(event_cursor, &mut events);
-        assert!(events.iter().any(|event| {
-            event.kind == status::PublicEventKind::CommandCompleted as u8 && event.a == 6
-        }));
-    }
-
-    #[test]
-    fn native_docking_times_out_stopped() {
-        let _guard = status::status_test_guard();
-        status::mark_create_charging_indicator(Some(false));
-        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
-        status::mark_create_sensor_packet(34, crate::events::CreateSensorPacket::default());
-        status::set_oi_mode(CreateOiMode::Full);
-        let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.create_responsive = true;
-        assert!(runtime
-            .commands
-            .push_back(QueuedCommand::new(6, RuntimeCommand::Dock))
-            .is_ok());
-        let event_cursor = status::event_next_seq().saturating_sub(1);
-        assert!(runtime.start_next_command().is_ok());
-
-        runtime.hardware.now_us = 61_000_000;
-        assert!(runtime.advance_active_action().is_ok());
-
-        assert!(matches!(runtime.active, ActiveAction::None));
-        assert_eq!(runtime.active_command_id, None);
-        assert_eq!(runtime.hardware.writes.as_slice(), &[143, 137, 0, 0, 0, 0]);
-        let mut events = heapless::Vec::<status::PublicEventRecord, 8>::new();
-        status::collect_events_since(event_cursor, &mut events);
-        assert!(events.iter().any(|event| {
-            event.kind == status::PublicEventKind::CommandTimedOut as u8 && event.a == 6
-        }));
     }
 
     #[test]

@@ -159,13 +159,6 @@ unsupported because a host cannot weaken or manufacture physical safety.
 
 `get_capabilities` reports the current body contract using the clean names above: body kind, drive type, supported verbs, sensors, outputs, safety features, limits, feedback/song slots, and supported sensor packet range. The facts come from the selected body descriptor, not from the generic renderer. HTTP/WebSocket return JSON; UDP and forebrain UART return a compact single-line representation.
 
-The final Create-native `dock` opcode is supervised as an active body
-operation rather than treated as a completed one-byte write. It remains active
-until fresh Home Base contact completes it, or until explicit stop, authority
-loss, stronger safety, stale Create feedback, mode loss, or a 60-second hard
-timeout stops it. Full-mode supervision does not overwrite the native docking
-motor program while it is active.
-
 Current outward event kinds:
 
 ```text
