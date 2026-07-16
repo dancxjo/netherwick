@@ -93,7 +93,7 @@ sensors = [
   "imu",
 ]
 outputs = ["song", "dock", "power_toggle", "brc"]
-safety = ["bump", "cliff", "wheel_drop", "estop", "heartbeat", "tilt", "impact", "charging"]
+safety = ["bump", "contact_withdrawal_reflex_v1", "cliff", "wheel_drop", "estop", "heartbeat", "tilt", "impact", "charging"]
 feedback = ["ok", "error", "armed", "lost_target", "dock_seen", "danger"]
 events = [
   "boot",
@@ -132,6 +132,8 @@ events = [
   "imu_calibration_changed",
   "motion_inconsistency_detected",
   "impact_detected",
+  "contact_withdrawal_started",
+  "contact_withdrawal_completed",
   "error",
 ]
 song_slots = 16

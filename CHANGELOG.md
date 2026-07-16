@@ -11,6 +11,7 @@ All notable changes are grouped by date.
 ### Ready
 
 - Make a bump-triggered contact withdrawal a bounded brainstem-local reflex: it continues across authority changes, records start and terminal safety events, and remains preemptible by stronger safety conditions.
+- Expose the contact-withdrawal lifecycle through typed cockpit events and mirror its bounded, authority-independent behavior in the simulator.
 
 ### Ongoing
 

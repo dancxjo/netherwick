@@ -1233,6 +1233,65 @@ impl CockpitEvent {
             reason: CommandRejectReason::from_code(self.c as u8),
         })
     }
+
+    pub fn contact_withdrawal(&self) -> Option<ContactWithdrawalEvent> {
+        ContactWithdrawalEvent::from_event(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactWithdrawalOutcome {
+    Completed,
+    SafetyPreempted,
+    Failed,
+    Unknown(u8),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum ContactWithdrawalEvent {
+    Started {
+        contact_bits: u8,
+        repeated_count: u8,
+        preempted_command_id: u32,
+        reverse_speed_mm_s: u16,
+        maximum_duration_ms: u16,
+    },
+    Completed {
+        outcome: ContactWithdrawalOutcome,
+        dominating_safety: Option<SafetyLatchKind>,
+        final_stopped: bool,
+        observed_displacement_mm: i32,
+        elapsed_ms: u32,
+    },
+}
+
+impl ContactWithdrawalEvent {
+    pub fn from_event(event: &CockpitEvent) -> Option<Self> {
+        match event.kind {
+            CockpitEventKind::ContactWithdrawalStarted => Some(Self::Started {
+                contact_bits: (event.a & 0b11) as u8,
+                repeated_count: ((event.a >> 8) & 0xff) as u8,
+                preempted_command_id: event.b,
+                reverse_speed_mm_s: (event.c & 0xffff) as u16,
+                maximum_duration_ms: (event.c >> 16) as u16,
+            }),
+            CockpitEventKind::ContactWithdrawalCompleted => Some(Self::Completed {
+                outcome: match event.a as u8 {
+                    1 => ContactWithdrawalOutcome::Completed,
+                    2 => ContactWithdrawalOutcome::SafetyPreempted,
+                    3 => ContactWithdrawalOutcome::Failed,
+                    code => ContactWithdrawalOutcome::Unknown(code),
+                },
+                dominating_safety: SafetyLatchKind::from_event_code(((event.a >> 8) & 0xff) as u32),
+                final_stopped: event.a & (1 << 16) != 0,
+                observed_displacement_mm: event.b as i32,
+                elapsed_ms: event.c,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -2877,6 +2936,8 @@ pub enum CockpitEventKind {
     MotherbrainResetAsserted,
     MotherbrainResetCompleted,
     MotherbrainResetRefused,
+    ContactWithdrawalStarted,
+    ContactWithdrawalCompleted,
     Error,
     Unknown(String),
 }
@@ -2933,6 +2994,8 @@ impl From<&str> for CockpitEventKind {
             "motherbrain_reset_asserted" => Self::MotherbrainResetAsserted,
             "motherbrain_reset_completed" => Self::MotherbrainResetCompleted,
             "motherbrain_reset_refused" => Self::MotherbrainResetRefused,
+            "contact_withdrawal_started" => Self::ContactWithdrawalStarted,
+            "contact_withdrawal_completed" => Self::ContactWithdrawalCompleted,
             "error" => Self::Error,
             other => Self::Unknown(other.to_owned()),
         }
@@ -2991,6 +3054,8 @@ impl CockpitEventKind {
             Self::MotherbrainResetAsserted => "motherbrain_reset_asserted",
             Self::MotherbrainResetCompleted => "motherbrain_reset_completed",
             Self::MotherbrainResetRefused => "motherbrain_reset_refused",
+            Self::ContactWithdrawalStarted => "contact_withdrawal_started",
+            Self::ContactWithdrawalCompleted => "contact_withdrawal_completed",
             Self::Error => "error",
             Self::Unknown(kind) => kind.as_str(),
         }
@@ -3001,6 +3066,13 @@ impl CockpitEventKind {
 struct SimTimedAction {
     command_id: u32,
     complete_at_ms: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SimContactWithdrawal {
+    started_at_ms: u32,
+    complete_at_ms: u32,
+    baseline_odometry_mm: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -3028,6 +3100,9 @@ pub struct SimCockpit {
     odometry_distance_mm: i32,
     odometry_heading_mrad: i32,
     active_cmd_vel: Option<SimTimedAction>,
+    active_contact_withdrawal: Option<SimContactWithdrawal>,
+    last_contact_withdrawal_at_ms: Option<u32>,
+    repeated_contact_count: u8,
     heartbeat_stop_at_ms: Option<u32>,
     odometry_reset_count: u32,
     imu_calibration: u8,
@@ -3088,6 +3163,7 @@ impl SimCockpit {
                     "wheel_drop",
                     "tilt",
                     "impact",
+                    "contact_withdrawal_reflex_v1",
                 ]
                 .into_iter()
                 .map(ToOwned::to_owned)
@@ -3121,6 +3197,8 @@ impl SimCockpit {
                     "imu_calibration_changed",
                     "motion_inconsistency_detected",
                     "impact_detected",
+                    "contact_withdrawal_started",
+                    "contact_withdrawal_completed",
                 ]
                 .into_iter()
                 .map(ToOwned::to_owned)
@@ -3154,6 +3232,9 @@ impl SimCockpit {
             odometry_distance_mm: 0,
             odometry_heading_mrad: 0,
             active_cmd_vel: None,
+            active_contact_withdrawal: None,
+            last_contact_withdrawal_at_ms: None,
+            repeated_contact_count: 0,
             heartbeat_stop_at_ms: None,
             odometry_reset_count: 0,
             imu_calibration: 3,
@@ -3427,6 +3508,7 @@ impl SimCockpit {
             self.control_lease_expires_at_ms = None;
         }
         self.complete_due_cmd_vel();
+        self.complete_due_contact_withdrawal();
         self.expire_heartbeat_if_due();
     }
 
@@ -3436,6 +3518,7 @@ impl SimCockpit {
         }
         self.safety_tripped = true;
         self.interrupt_active_motion();
+        self.preempt_contact_withdrawal(1);
         self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
         self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
     }
@@ -3450,13 +3533,36 @@ impl SimCockpit {
         self.bump_right = right;
         self.push_event(CockpitEventKind::BumpChanged, active as u32, 0, 0);
         if active && !was_active {
-            // Match the firmware's default bump policy: stop the current
-            // motion, but keep the possession lease usable for a bounded
-            // motherbrain recovery once contact clears.
+            // Match the firmware reflex: interrupt host motion and begin a
+            // bounded, authority-independent straight reverse.
             self.safety_tripped = true;
+            let preempted_command_id = self
+                .active_cmd_vel
+                .as_ref()
+                .map_or(0, |active| active.command_id);
             self.interrupt_active_motion();
             self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
             self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
+            self.repeated_contact_count = match self.last_contact_withdrawal_at_ms {
+                Some(previous) if self.now_ms.wrapping_sub(previous) <= 2_000 => {
+                    self.repeated_contact_count.saturating_add(1).max(1)
+                }
+                _ => 1,
+            };
+            self.last_contact_withdrawal_at_ms = Some(self.now_ms);
+            self.push_event(
+                CockpitEventKind::ContactWithdrawalStarted,
+                u32::from(left)
+                    | (u32::from(right) << 1)
+                    | (u32::from(self.repeated_contact_count) << 8),
+                preempted_command_id,
+                80 | (300 << 16),
+            );
+            self.active_contact_withdrawal = Some(SimContactWithdrawal {
+                started_at_ms: self.now_ms,
+                complete_at_ms: self.now_ms.wrapping_add(300),
+                baseline_odometry_mm: self.odometry_distance_mm,
+            });
         }
     }
 
@@ -3469,6 +3575,7 @@ impl SimCockpit {
         if active {
             self.safety_tripped = true;
             self.interrupt_active_motion();
+            self.preempt_contact_withdrawal(2);
             self.push_event(CockpitEventKind::SafetyTripped, 2, 0, 0);
             self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
         }
@@ -3599,6 +3706,41 @@ impl SimCockpit {
         self.active_cmd_vel = None;
         self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
         self.complete_command(active.command_id);
+    }
+
+    fn complete_due_contact_withdrawal(&mut self) {
+        let Some(active) = self.active_contact_withdrawal.clone() else {
+            return;
+        };
+        if !time_reached(self.now_ms, active.complete_at_ms) {
+            return;
+        }
+        self.active_contact_withdrawal = None;
+        // 80 mm/s for 300 ms, kept explicit so the simulator reports the
+        // same bounded displacement as the firmware contract.
+        self.odometry_distance_mm = self.odometry_distance_mm.saturating_sub(24);
+        self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
+        self.push_event(
+            CockpitEventKind::ContactWithdrawalCompleted,
+            1 | (1 << 16),
+            self.odometry_distance_mm
+                .wrapping_sub(active.baseline_odometry_mm) as u32,
+            self.now_ms.wrapping_sub(active.started_at_ms),
+        );
+    }
+
+    fn preempt_contact_withdrawal(&mut self, safety_code: u32) {
+        let Some(active) = self.active_contact_withdrawal.take() else {
+            return;
+        };
+        self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
+        self.push_event(
+            CockpitEventKind::ContactWithdrawalCompleted,
+            2 | (safety_code << 8) | (1 << 16),
+            self.odometry_distance_mm
+                .wrapping_sub(active.baseline_odometry_mm) as u32,
+            self.now_ms.wrapping_sub(active.started_at_ms),
+        );
     }
 
     fn expire_heartbeat_if_due(&mut self) {
@@ -3875,6 +4017,7 @@ impl Cockpit for SimCockpit {
 
     fn get_status(&mut self) -> Result<CockpitStatus> {
         self.complete_due_cmd_vel();
+        self.complete_due_contact_withdrawal();
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
@@ -3885,7 +4028,7 @@ impl Cockpit for SimCockpit {
                 self.armed,
                 self.estop_latched,
                 self.safety_tripped,
-                self.active_cmd_vel.is_some(),
+                self.active_cmd_vel.is_some() || self.active_contact_withdrawal.is_some(),
                 self.bump_left,
                 self.bump_right,
                 self.cliff,
@@ -3916,6 +4059,7 @@ impl Cockpit for SimCockpit {
 
     fn get_events_since(&mut self, since_seq: u32) -> Result<EventBatch> {
         self.complete_due_cmd_vel();
+        self.complete_due_contact_withdrawal();
         self.expire_heartbeat_if_due();
         let oldest_seq = self.oldest_seq();
         let dropped_before_seq = if since_seq.saturating_add(1) < oldest_seq {
@@ -3949,6 +4093,7 @@ impl Cockpit for SimCockpit {
         self.require_scoped_dispatch()?;
         let id = self.accept_command();
         self.interrupt_active_motion();
+        self.preempt_contact_withdrawal(0);
         self.armed = false;
         self.complete_command(id);
         Ok(())
@@ -3957,6 +4102,7 @@ impl Cockpit for SimCockpit {
     fn stop(&mut self) -> Result<()> {
         let id = self.accept_command();
         self.interrupt_active_motion();
+        self.preempt_contact_withdrawal(0);
         self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
         self.complete_command(id);
         Ok(())
@@ -3965,6 +4111,7 @@ impl Cockpit for SimCockpit {
     fn estop(&mut self) -> Result<()> {
         let id = self.accept_command();
         self.interrupt_active_motion();
+        self.preempt_contact_withdrawal(4);
         self.estop_latched = true;
         self.safety_tripped = true;
         self.push_event(CockpitEventKind::EStopLatched, 1, 0, 0);
@@ -7877,6 +8024,42 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == CockpitEventKind::VirtualWallChanged && event.a == 0));
+    }
+
+    #[test]
+    fn simulator_contact_withdrawal_is_typed_and_authority_independent() {
+        let mut sim = SimCockpit::new();
+        sim.set_bump(true, false);
+        sim.control_lease = None;
+        sim.control_lease_expires_at_ms = None;
+        sim.advance_ms(300);
+
+        let events = sim.get_events_since(0).unwrap().events;
+        let lifecycle: Vec<_> = events
+            .iter()
+            .filter_map(CockpitEvent::contact_withdrawal)
+            .collect();
+        assert_eq!(lifecycle.len(), 2);
+        assert!(matches!(
+            lifecycle[0],
+            ContactWithdrawalEvent::Started {
+                contact_bits: 1,
+                repeated_count: 1,
+                preempted_command_id: 0,
+                reverse_speed_mm_s: 80,
+                maximum_duration_ms: 300,
+            }
+        ));
+        assert!(matches!(
+            lifecycle[1],
+            ContactWithdrawalEvent::Completed {
+                outcome: ContactWithdrawalOutcome::Completed,
+                final_stopped: true,
+                observed_displacement_mm: -24,
+                elapsed_ms: 300,
+                ..
+            }
+        ));
     }
 
     #[test]
