@@ -79,6 +79,10 @@ All notable changes are grouped by date.
   status instead of promoting the dock's bumper-plus-cliff pattern into a
   multi-sensor safety incident; raw Cockpit sensor bits remain available for
   diagnostics, and wheel-drop evidence remains authoritative.
+- Keep the Create-native dock opcode active after acceptance instead of
+  immediately cancelling it with the runtime's idle stop; complete it on fresh
+  Home Base contact and stop it on explicit cancellation, stronger safety,
+  stale feedback/mode loss, authority loss, or a 60-second timeout.
 - Reconcile a bump/cliff latch raised before the private Home Base packet
   arrives, preventing the dock's packet-order race from leaving a stale cliff
   latch while preserving wheel-drop and every stronger safety latch.

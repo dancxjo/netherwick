@@ -397,6 +397,7 @@ pub enum RuntimeActionCode {
     WaitForCreate = 5,
     Settle = 6,
     Driving = 7,
+    Docking = 8,
 }
 
 #[derive(Clone, Copy)]
@@ -3711,6 +3712,7 @@ fn runtime_action_text(code: u8) -> &'static str {
         x if x == RuntimeActionCode::WaitForCreate as u8 => "wait_for_create",
         x if x == RuntimeActionCode::Settle as u8 => "settle",
         x if x == RuntimeActionCode::Driving as u8 => "driving",
+        x if x == RuntimeActionCode::Docking as u8 => "docking",
         _ => "none",
     }
 }
