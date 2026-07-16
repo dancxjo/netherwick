@@ -450,7 +450,9 @@ impl CognitiveRequest {
         }
         if let CognitiveRequestPayload::DescribeScene(image) = &self.payload {
             if image.bytes.len() != image.reference.byte_len {
-                return Err(anyhow!("bounded image byte length does not match reference"));
+                return Err(anyhow!(
+                    "bounded image byte length does not match reference"
+                ));
             }
             if !self.privacy.allow_raw_image {
                 return Err(anyhow!("privacy policy forbids attached image bytes"));
@@ -477,10 +479,7 @@ pub enum CognitiveResponseStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "output", rename_all = "snake_case")]
 pub enum CognitiveResponsePayload {
-    SceneDescription {
-        text: String,
-        embedding: Vec<f32>,
-    },
+    SceneDescription { text: String, embedding: Vec<f32> },
     Evidence(BoundedTaskInput),
     Suggestion(BoundedTaskInput),
     ModelArtifact(BoundedTaskInput),
@@ -636,8 +635,11 @@ impl CognitiveRouter {
                 "selected provider implementation is not registered".to_string(),
             );
         };
-        match tokio::time::timeout(Duration::from_millis(remaining_ms), provider.execute(&request))
-            .await
+        match tokio::time::timeout(
+            Duration::from_millis(remaining_ms),
+            provider.execute(&request),
+        )
+        .await
         {
             Ok(Ok(response)) => RoutedResponse {
                 disposition: validate_response(&request, &response),
@@ -822,7 +824,10 @@ mod tests {
             payload: CognitiveResponsePayload::None,
             failure: None,
         };
-        assert_eq!(validate_response(&request, &response), ResponseDisposition::Stale);
+        assert_eq!(
+            validate_response(&request, &response),
+            ResponseDisposition::Stale
+        );
         response.completed_at_ms = request.deadline_ms;
         response.input_snapshot.revision += 1;
         assert_eq!(

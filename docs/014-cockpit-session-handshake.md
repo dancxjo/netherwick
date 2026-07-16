@@ -2,13 +2,19 @@
 
 ## Topology and trust boundaries
 
-Pete has three distinct computing roles. The Pico W is the **brainstem** and
+Pete has three distinct deployment roles. The Pico W is the **brainstem** and
 owns Create OI, GPIO, deadlines, reflexes, E-stop, DHCP/DNS, and safety. The
 installed Raspberry Pi 5 is the **motherbrain** and owns Linux, perception,
 storage, firmware management, supervision, and the cockpit client. A
 **forebrain** is higher-level cognition; it initially runs on the motherbrain
 but may later run on another computer. A remote forebrain normally talks to a
 motherbrain service and never acquires unrestricted brainstem authority.
+
+These established protocol names map to the stable architectural roles Body
+Controller, Organism Runtime, and Cognitive Accelerator. They are not host or
+organism identities. New cognitive APIs use the stable names while this
+Cockpit protocol retains its compatibility vocabulary; see
+[022-cognitive-roles.md](022-cognitive-roles.md).
 
 USB serial is the primary motherbrain-to-brainstem transport. The Pico access
 point (HTTP, WebSocket, or UDP) is a backup and management path. Both paths use

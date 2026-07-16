@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pete_actions::ReignInput;
-use pete_cognition::{ProviderRegistrySnapshot, ProviderHealthState};
+use pete_cognition::{ProviderHealthState, ProviderRegistrySnapshot};
 use pete_core::{FrameId, Pose2};
 use serde::{Deserialize, Serialize};
 
@@ -1363,6 +1363,64 @@ impl WorldModelUpdater {
     }
 }
 
+fn integrate_cognitive_registry(now: &Now, services: &mut CognitiveServiceSummary) {
+    let Some(value) = now.extensions.get("cognition.registry") else {
+        return;
+    };
+    let Ok(registry) = serde_json::from_value::<ProviderRegistrySnapshot>(value.clone()) else {
+        return;
+    };
+    for provider in registry.providers.values() {
+        for capability in &provider.capabilities {
+            let key = capability.capability.as_str().to_string();
+            let available = matches!(
+                provider.health.state,
+                ProviderHealthState::Available | ProviderHealthState::Degraded
+            ) && now.t_ms <= provider.health.valid_until_ms;
+            let candidate = CognitiveServiceBelief {
+                provider_id: Some(provider.provider_id.0.clone()),
+                role: Some(format!("{:?}", provider.role).to_ascii_lowercase()),
+                capability: Some(key.clone()),
+                capability_version: Some(capability.version.clone()),
+                available,
+                confidence: (provider.health.confidence * capability.performance_confidence)
+                    .clamp(0.0, 1.0),
+                unavailable_reason: (!available).then(|| {
+                    provider.health.reason.clone().unwrap_or_else(|| {
+                        format!("provider health is {:?}", provider.health.state)
+                            .to_ascii_lowercase()
+                    })
+                }),
+                host_id: provider.host_id.as_ref().map(|id| HostId(id.0.clone())),
+                process_id: provider
+                    .process_id
+                    .as_ref()
+                    .map(|id| ProcessId(id.0.clone())),
+                implementation: Some(provider.implementation.clone()),
+                implementation_version: Some(provider.implementation_version.clone()),
+                model_version: provider.model_version.clone(),
+                locality: Some(format!("{:?}", provider.locality).to_ascii_lowercase()),
+                resource_class: Some(format!("{:?}", provider.resource_class).to_ascii_lowercase()),
+                meta: simple_meta(
+                    now.t_ms,
+                    BeliefSourceKind::DerivedPerception,
+                    &format!("cognition.registry.{}", provider.provider_id.0),
+                ),
+            };
+            let replace = services.services.get(&key).map_or(true, |incumbent| {
+                (candidate.available && !incumbent.available)
+                    || (candidate.available == incumbent.available
+                        && (candidate.confidence > incumbent.confidence
+                            || (candidate.confidence == incumbent.confidence
+                                && candidate.provider_id < incumbent.provider_id)))
+            });
+            if replace {
+                services.services.insert(key, candidate);
+            }
+        }
+    }
+}
+
 fn insert_capability(
     model: &mut CapabilitySelfModel,
     id: &str,
@@ -1712,6 +1770,50 @@ mod tests {
     use pete_body::BodySense;
     use uuid::Uuid;
 
+    fn cognition_registry_now(
+        t_ms: u64,
+        host: &str,
+        process: &str,
+        state: ProviderHealthState,
+    ) -> Now {
+        let mut now = Now::blank(t_ms, BodySense::default());
+        let provider = pete_cognition::CognitiveProviderDescriptor {
+            provider_id: pete_cognition::ProviderId("scene-provider".to_string()),
+            role: pete_cognition::CognitiveRole::CognitiveAccelerator,
+            host_id: Some(pete_cognition::HostId(host.to_string())),
+            process_id: Some(pete_cognition::ProcessId(process.to_string())),
+            implementation: "fixture".to_string(),
+            implementation_version: "1".to_string(),
+            capabilities: vec![pete_cognition::CapabilityDescriptor {
+                capability: pete_cognition::CognitiveCapability::DescribeScene,
+                version: "1".to_string(),
+                performance_confidence: 0.9,
+                ..pete_cognition::CapabilityDescriptor::default()
+            }],
+            health: pete_cognition::ProviderHealth {
+                state,
+                confidence: 1.0,
+                observed_at_ms: t_ms,
+                valid_until_ms: t_ms + 1_000,
+                reason: (state == ProviderHealthState::Disconnected)
+                    .then_some("provider disconnected".to_string()),
+            },
+            locality: pete_cognition::Locality::LocalNetwork,
+            ..pete_cognition::CognitiveProviderDescriptor::default()
+        };
+        now.extensions.insert(
+            "cognition.registry".to_string(),
+            serde_json::to_value(ProviderRegistrySnapshot {
+                schema_version: 1,
+                revision: t_ms,
+                observed_at_ms: t_ms,
+                providers: BTreeMap::from([(provider.provider_id.clone(), provider)]),
+            })
+            .unwrap(),
+        );
+        now
+    }
+
     fn observed_now(t_ms: u64, class: ObjectClass, label: &str) -> Now {
         let mut now = Now::blank(t_ms, BodySense::default());
         now.objects = ObjectSense {
@@ -1922,6 +2024,68 @@ mod tests {
             .self_model
             .capabilities
             .is_available("service:rich_language"));
+    }
+
+    #[test]
+    fn provider_disconnect_and_restart_change_capability_not_organism_identity() {
+        let mut updater = WorldModelUpdater::default();
+        let available = updater.update(
+            cognition_registry_now(
+                10,
+                "accelerator-a",
+                "process-1",
+                ProviderHealthState::Available,
+            ),
+            WorldModelUpdateContext::default(),
+        );
+        let disconnected = updater.update(
+            cognition_registry_now(
+                20,
+                "accelerator-a",
+                "process-1",
+                ProviderHealthState::Disconnected,
+            ),
+            WorldModelUpdateContext::default(),
+        );
+        let restarted = updater.update(
+            cognition_registry_now(
+                30,
+                "accelerator-b",
+                "process-2",
+                ProviderHealthState::Available,
+            ),
+            WorldModelUpdateContext::default(),
+        );
+        assert_eq!(
+            available.world.self_model.organism_id.value,
+            disconnected.world.self_model.organism_id.value
+        );
+        assert_eq!(
+            available.world.self_model.organism_id.value,
+            restarted.world.self_model.organism_id.value
+        );
+        assert!(available
+            .world
+            .self_model
+            .capabilities
+            .is_available("service:describe_scene"));
+        assert!(!disconnected
+            .world
+            .self_model
+            .capabilities
+            .is_available("service:describe_scene"));
+        assert!(restarted
+            .world
+            .self_model
+            .capabilities
+            .is_available("service:describe_scene"));
+        assert_eq!(
+            restarted.world.self_model.service_state.services["describe_scene"]
+                .host_id
+                .as_ref()
+                .map(|id| id.0.as_str()),
+            Some("accelerator-b")
+        );
     }
 
     #[test]

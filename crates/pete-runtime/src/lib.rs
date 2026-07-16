@@ -38,9 +38,7 @@ use pete_experience::{
 use pete_ledger::{
     ExperienceFrame, ExperienceTransition, LedgerWriter, PendingFrame, TransitionBuilder,
 };
-use pete_llm::{
-    Combobulation, LiveImageCognition, LiveImageEnricher, LlmAgent, LlmTickResult,
-};
+use pete_llm::{Combobulation, LiveImageCognition, LiveImageEnricher, LlmAgent, LlmTickResult};
 use pete_map::{observation_from_now, LocalMap, LoopClosureCandidateInput, MAP_EXTENSION_NAME};
 use pete_memory::{
     attach_memory_links_to_frame, place_recognition_input_from_query_now, MemoryStore,
@@ -5749,23 +5747,23 @@ async fn enrich_now_latest_image(cognition: &mut LiveImageCognition, now: &mut N
         }
     }
     if let Some(enrichment) = update.enrichment {
-            now.eye
-                .image_description_vectors
-                .push(enrichment.image_description_vector);
-            now.eye.scene_vectors.push(enrichment.scene_vector);
-            now.extensions.insert(
-                "vision.latest_image_description".to_string(),
-                serde_json::json!({
-                    "text": enrichment.description,
-                    "source_frame_id": now
-                        .eye
-                        .scene_vectors
-                        .last()
-                        .and_then(|vector| vector.source_frame_id.clone()),
-                    "scene_vector_count": now.eye.scene_vectors.len(),
-                    "image_description_vector_count": now.eye.image_description_vectors.len(),
-                }),
-            );
+        now.eye
+            .image_description_vectors
+            .push(enrichment.image_description_vector);
+        now.eye.scene_vectors.push(enrichment.scene_vector);
+        now.extensions.insert(
+            "vision.latest_image_description".to_string(),
+            serde_json::json!({
+                "text": enrichment.description,
+                "source_frame_id": now
+                    .eye
+                    .scene_vectors
+                    .last()
+                    .and_then(|vector| vector.source_frame_id.clone()),
+                "scene_vector_count": now.eye.scene_vectors.len(),
+                "image_description_vector_count": now.eye.image_description_vectors.len(),
+            }),
+        );
     }
 }
 
@@ -8644,7 +8642,10 @@ mod tests {
         ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
         ExperienceAutoencoderTrainer, FutureNetTrainer,
     };
-    use pete_now::{Now, SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION};
+    use pete_now::{
+        EyeFrame, EyeFrameFormat, Now, ObjectClass, ObjectObservation, ObjectObservationSource,
+        SurpriseSense, VectorArtifact, SCENE_VECTOR_COLLECTION,
+    };
     use pete_sensors::World;
     use pete_sim::{
         build_scenario, ArenaConfig, ScenarioConfig, ScenarioKind, SimObject, VirtualWorld,
@@ -8654,6 +8655,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn mark_corrected_map_trusted(now: &mut Now) {
         now.extensions.insert(
@@ -8678,6 +8680,41 @@ mod tests {
                 }
             }),
         );
+    }
+
+    #[tokio::test]
+    async fn no_accelerator_preserves_local_beliefs_and_never_blocks_tick() {
+        let mut cognition = LiveImageCognition::new(None);
+        let mut now = Now::blank(10, BodySense::default());
+        now.range.nearest_m = Some(0.4);
+        now.objects.observations.push(ObjectObservation {
+            label: "local obstacle".to_string(),
+            class: ObjectClass::Obstacle,
+            bearing_rad: 0.0,
+            distance_m: Some(0.4),
+            confidence: 0.9,
+            source: ObjectObservationSource::Sim,
+        });
+        now.eye_frame = Some(EyeFrame {
+            captured_at_ms: 10,
+            width: 1,
+            height: 1,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![1, 2, 3],
+            source: Some("fixture".to_string()),
+        });
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            enrich_now_latest_image(&mut cognition, &mut now),
+        )
+        .await
+        .expect("optional cognition must not block the organism tick");
+        assert_eq!(now.range.nearest_m, Some(0.4));
+        assert_eq!(now.objects.observations[0].label, "local obstacle");
+        assert!(now.extensions.contains_key("cognition.registry"));
+        assert!(!now
+            .extensions
+            .contains_key("vision.latest_image_description"));
     }
 
     #[test]

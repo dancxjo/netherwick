@@ -21,6 +21,13 @@ All notable changes are grouped by date.
 - Extended runtime `Now` cognition bookkeeping to include provider registry snapshots, last scene response, and vision enrichment error metadata.
 - Extended cognitive service belief state to persist provider metadata and capabilities in `pete-now` world summaries.
 
+### Cognitive provider refinement (2026-07-15)
+
+- Reject completed scene-description responses when their source frame has been replaced, so stale enrichment cannot overwrite newer perception.
+- Project cognitive provider health and capabilities into the canonical self-model service state while keeping organism identity independent of provider restarts.
+- Added role-neutral accelerator capability descriptors and documentation for cognitive roles, bounded requests, and graceful local fallback.
+- Added focused coverage for unavailable or slow optional cognition and provider disconnect/restart behavior.
+
 ## 2026-07-15
 
 ### Added

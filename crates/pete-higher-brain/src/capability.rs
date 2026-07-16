@@ -1,5 +1,10 @@
 use crate::PROTOCOL_VERSION;
 use anyhow::Result;
+use pete_cognition::{
+    CapabilityDescriptor, CognitiveCapability, CognitiveProviderDescriptor, CognitiveRole, HostId,
+    LatencyEstimate, Locality, ProcessId, ProviderHealth, ProviderHealthState, ProviderId,
+    ResourceClass, TrustPolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
@@ -29,7 +34,7 @@ pub struct CapabilityProbe {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ForebrainCapabilities {
+pub struct AcceleratorCapabilities {
     pub protocol_version: String,
     pub node_id: String,
     pub boot_id: String,
@@ -48,7 +53,11 @@ pub struct ForebrainCapabilities {
     pub schema_versions: BTreeSet<String>,
 }
 
-impl ForebrainCapabilities {
+/// Compatibility alias for existing deployment/configuration surfaces. New
+/// role-neutral APIs should use `AcceleratorCapabilities`.
+pub type ForebrainCapabilities = AcceleratorCapabilities;
+
+impl AcceleratorCapabilities {
     pub fn from_probe(
         node_id: impl Into<String>,
         boot_id: impl Into<String>,
@@ -124,9 +133,82 @@ impl ForebrainCapabilities {
                 .iter()
                 .all(|schema| self.schema_versions.contains(schema))
     }
+
+    pub fn provider_descriptor(
+        &self,
+        provider_id: impl Into<String>,
+        host_id: Option<String>,
+        process_id: Option<String>,
+        now_ms: u64,
+    ) -> CognitiveProviderDescriptor {
+        let mut capabilities = Vec::new();
+        if self.job_classes.iter().any(|job| {
+            matches!(
+                job.as_str(),
+                "representation_training"
+                    | "perception_training"
+                    | "fine_tuning"
+                    | "hyperparameter_search"
+            )
+        }) {
+            capabilities.push(CapabilityDescriptor {
+                capability: CognitiveCapability::TrainModel,
+                version: "1".to_string(),
+                supports_partial: false,
+                performance_confidence: 0.8,
+            });
+        }
+        if self.job_classes.contains("consolidation") {
+            capabilities.push(CapabilityDescriptor {
+                capability: CognitiveCapability::ConsolidateMemory,
+                version: "1".to_string(),
+                supports_partial: false,
+                performance_confidence: 0.8,
+            });
+        }
+        if self.job_classes.contains("evaluation") || self.job_classes.contains("replay") {
+            capabilities.push(CapabilityDescriptor {
+                capability: CognitiveCapability::RunCounterfactual,
+                version: "1".to_string(),
+                supports_partial: false,
+                performance_confidence: 0.7,
+            });
+        }
+        CognitiveProviderDescriptor {
+            provider_id: ProviderId(provider_id.into()),
+            role: CognitiveRole::CognitiveAccelerator,
+            host_id: host_id.map(HostId),
+            process_id: process_id.map(ProcessId),
+            implementation: "pete-higher-brain".to_string(),
+            implementation_version: self.software_version.clone(),
+            model_version: None,
+            capabilities,
+            health: ProviderHealth {
+                state: if self.ready {
+                    ProviderHealthState::Available
+                } else {
+                    ProviderHealthState::Disconnected
+                },
+                confidence: 1.0,
+                observed_at_ms: now_ms,
+                valid_until_ms: now_ms.saturating_add(5_000),
+                reason: (!self.ready).then_some("accelerator capability probe is not ready".into()),
+            },
+            latency: LatencyEstimate::default(),
+            resource_class: if self.gpu.is_some() {
+                ResourceClass::Accelerated
+            } else {
+                ResourceClass::GeneralPurpose
+            },
+            locality: Locality::LocalNetwork,
+            trust: TrustPolicy::TrustedProvider,
+            energy_cost: 0.5,
+            network_cost: 0.3,
+        }
+    }
 }
 
-pub fn detect_local(workspace: &Path, node_id: String) -> Result<ForebrainCapabilities> {
+pub fn detect_local(workspace: &Path, node_id: String) -> Result<AcceleratorCapabilities> {
     let architecture = std::env::consts::ARCH.to_string();
     let cpu_cores = std::thread::available_parallelism()
         .map(usize::from)
@@ -147,7 +229,7 @@ pub fn detect_local(workspace: &Path, node_id: String) -> Result<ForebrainCapabi
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|value| value.trim().to_string())
         .unwrap_or_else(|_| Uuid::new_v4().to_string());
-    Ok(ForebrainCapabilities::from_probe(
+    Ok(AcceleratorCapabilities::from_probe(
         node_id,
         boot_id,
         env!("CARGO_PKG_VERSION"),

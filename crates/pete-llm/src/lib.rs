@@ -8,12 +8,12 @@ use pete_actions::{
     ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle, InspectTarget, TurnDir,
 };
 use pete_cognition::{
-    BoundedImageInput, BoundedInputRef, CallerRole, CapabilityDescriptor,
-    CognitiveCapability, CognitiveProvider, CognitiveProviderDescriptor, CognitiveRequest,
-    CognitiveRequestPayload, CognitiveResponse, CognitiveResponsePayload, CognitiveResponseStatus,
-    CognitiveRole, CognitiveRouter, HostId, LatencyEstimate, Locality, PrivacyPolicy, ProcessId,
-    ProviderHealth, ProviderHealthState, ProviderId, ProviderRegistrySnapshot, RequestProvenance,
-    ResourceClass, ResourceCost, ResponseDisposition, RoutedResponse, SnapshotRef, TrustPolicy,
+    BoundedImageInput, BoundedInputRef, CallerRole, CapabilityDescriptor, CognitiveCapability,
+    CognitiveProvider, CognitiveProviderDescriptor, CognitiveRequest, CognitiveRequestPayload,
+    CognitiveResponse, CognitiveResponsePayload, CognitiveResponseStatus, CognitiveRole,
+    CognitiveRouter, HostId, LatencyEstimate, Locality, PrivacyPolicy, ProcessId, ProviderHealth,
+    ProviderHealthState, ProviderId, ProviderRegistrySnapshot, RequestProvenance, ResourceClass,
+    ResourceCost, ResponseDisposition, RoutedResponse, SnapshotRef, TrustPolicy,
 };
 use pete_experience::{EmbodiedContext, ExperienceLatent, FuturePrediction, Impression};
 use pete_now::{
@@ -513,13 +513,17 @@ impl LiveImageCognition {
         if let Some(enricher) = enricher {
             router.register(Box::new(enricher));
         }
+        Self::from_router(router, request_timeout_ms)
+    }
+
+    pub fn from_router(router: CognitiveRouter, request_timeout_ms: u64) -> Self {
         let last_registry = router.registry_snapshot(wall_now_ms());
         Self {
             router: Some(router),
             pending: None,
             last_frame_key: None,
             last_registry,
-            request_timeout_ms,
+            request_timeout_ms: request_timeout_ms.max(1),
         }
     }
 
@@ -544,8 +548,15 @@ impl LiveImageCognition {
         {
             let handle = self.pending.take().expect("finished handle exists");
             match handle.await {
-                Ok((router, response)) => {
+                Ok((router, mut response)) => {
                     self.router = Some(router);
+                    let current_frame_id = frame.map(live_image_source_frame_id);
+                    if current_frame_id.as_deref()
+                        != Some(response.response.input_snapshot.snapshot_id.as_str())
+                    {
+                        response.disposition = ResponseDisposition::Stale;
+                        response.response.status = CognitiveResponseStatus::Stale;
+                    }
                     if response.disposition == ResponseDisposition::Accepted {
                         tick.enrichment = enrichment_from_response(&response.response);
                     }
@@ -2792,12 +2803,165 @@ mod tests {
     use pete_now::{CapabilityAvailability, CapabilityBelief, CapabilityId, CapabilityKind, Now};
     use uuid::Uuid;
 
+    struct SlowSceneProvider;
+
+    struct ImmediateSceneProvider;
+
+    #[async_trait]
+    impl CognitiveProvider for SlowSceneProvider {
+        fn descriptor(&self) -> CognitiveProviderDescriptor {
+            CognitiveProviderDescriptor {
+                provider_id: ProviderId("slow-scene".to_string()),
+                role: CognitiveRole::CognitiveAccelerator,
+                implementation: "slow-fixture".to_string(),
+                implementation_version: "1".to_string(),
+                capabilities: vec![CapabilityDescriptor {
+                    capability: CognitiveCapability::DescribeScene,
+                    version: "1".to_string(),
+                    performance_confidence: 1.0,
+                    ..CapabilityDescriptor::default()
+                }],
+                health: ProviderHealth {
+                    state: ProviderHealthState::Available,
+                    confidence: 1.0,
+                    observed_at_ms: 0,
+                    valid_until_ms: u64::MAX,
+                    reason: None,
+                },
+                latency: LatencyEstimate {
+                    expected_ms: 1,
+                    p95_ms: 500,
+                },
+                locality: Locality::LocalNetwork,
+                ..CognitiveProviderDescriptor::default()
+            }
+        }
+
+        async fn execute(&mut self, _request: &CognitiveRequest) -> Result<CognitiveResponse> {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            anyhow::bail!("fixture disconnected")
+        }
+    }
+
+    #[async_trait]
+    impl CognitiveProvider for ImmediateSceneProvider {
+        fn descriptor(&self) -> CognitiveProviderDescriptor {
+            CognitiveProviderDescriptor {
+                provider_id: ProviderId("immediate-scene".to_string()),
+                role: CognitiveRole::CognitiveAccelerator,
+                implementation: "immediate-fixture".to_string(),
+                implementation_version: "1".to_string(),
+                capabilities: vec![CapabilityDescriptor {
+                    capability: CognitiveCapability::DescribeScene,
+                    version: "1".to_string(),
+                    performance_confidence: 1.0,
+                    ..CapabilityDescriptor::default()
+                }],
+                health: ProviderHealth {
+                    state: ProviderHealthState::Available,
+                    confidence: 1.0,
+                    observed_at_ms: 0,
+                    valid_until_ms: u64::MAX,
+                    reason: None,
+                },
+                latency: LatencyEstimate {
+                    expected_ms: 1,
+                    p95_ms: 1,
+                },
+                locality: Locality::LocalNetwork,
+                ..CognitiveProviderDescriptor::default()
+            }
+        }
+
+        async fn execute(&mut self, request: &CognitiveRequest) -> Result<CognitiveResponse> {
+            Ok(CognitiveResponse {
+                schema_version: 1,
+                request_id: request.request_id.clone(),
+                provider_id: ProviderId("immediate-scene".to_string()),
+                provider_role: CognitiveRole::CognitiveAccelerator,
+                implementation: "immediate-fixture".to_string(),
+                implementation_version: "1".to_string(),
+                model_version: Some("fixture-model".to_string()),
+                status: CognitiveResponseStatus::Completed,
+                confidence: 1.0,
+                uncertainty: 0.0,
+                input_snapshot: request.input_snapshot.clone(),
+                completed_at_ms: request.created_at_ms.saturating_add(1),
+                resource_cost: ResourceCost::default(),
+                provenance: request.provenance.evidence_refs.clone(),
+                payload: CognitiveResponsePayload::SceneDescription {
+                    text: "I see the fixture.".to_string(),
+                    embedding: vec![1.0],
+                },
+                failure: None,
+            })
+        }
+    }
+
+    fn tiny_eye_frame() -> EyeFrame {
+        EyeFrame {
+            captured_at_ms: 10,
+            width: 1,
+            height: 1,
+            format: EyeFrameFormat::Rgb8,
+            bytes: vec![1, 2, 3],
+            source: Some("fixture".to_string()),
+        }
+    }
+
     #[test]
     fn default_llm_config_uses_local_ollama() {
         let config = LlmConfig::default();
 
         assert_eq!(config.provider, LlmProvider::Ollama);
         assert_eq!(config.endpoint, "http://127.0.0.1:11434");
+    }
+
+    #[tokio::test]
+    async fn no_accelerator_scene_path_returns_without_blocking() {
+        let mut cognition = LiveImageCognition::new(None);
+        let started = std::time::Instant::now();
+        let tick = cognition
+            .poll_and_submit(Some(&tiny_eye_frame()), 1, 10)
+            .await;
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(tick.registry.providers.is_empty());
+        assert!(tick.enrichment.is_none());
+    }
+
+    #[tokio::test]
+    async fn slow_accelerator_never_blocks_organism_tick() {
+        let mut router = CognitiveRouter::default();
+        router.register(Box::new(SlowSceneProvider));
+        let mut cognition = LiveImageCognition::from_router(router, 1_000);
+        let started = std::time::Instant::now();
+        let tick = cognition
+            .poll_and_submit(Some(&tiny_eye_frame()), 1, 10)
+            .await;
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(tick.registry.providers.len(), 1);
+        assert!(tick.enrichment.is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_response_for_replaced_frame_is_stale() {
+        let mut router = CognitiveRouter::default();
+        router.register(Box::new(ImmediateSceneProvider));
+        let mut cognition = LiveImageCognition::from_router(router, 1_000);
+        cognition
+            .poll_and_submit(Some(&tiny_eye_frame()), 1, 10)
+            .await;
+        tokio::task::yield_now().await;
+
+        let mut replacement = tiny_eye_frame();
+        replacement.captured_at_ms = 11;
+        replacement.bytes = vec![3, 2, 1];
+        let tick = cognition.poll_and_submit(Some(&replacement), 2, 11).await;
+
+        let response = tick.response.expect("completed response");
+        assert_eq!(response.disposition, ResponseDisposition::Stale);
+        assert_eq!(response.response.status, CognitiveResponseStatus::Stale);
+        assert!(tick.enrichment.is_none());
     }
 
     #[test]

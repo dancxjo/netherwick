@@ -20,6 +20,7 @@ socket2.workspace = true
 toml.workspace = true
 uuid.workspace = true
 pete-ups = { path = "../pete-ups" }
+pete-cognition = { path = "../pete-cognition" }
 
 [dev-dependencies]
 tokio.workspace = true

@@ -5830,6 +5830,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "pete-cognition",
  "pete-ups",
  "serde",
  "serde_json",
@@ -5962,6 +5963,7 @@ version = "0.1.0"
 dependencies = [
  "pete-actions",
  "pete-body",
+ "pete-cognition",
  "pete-core",
  "serde",
  "serde_json",

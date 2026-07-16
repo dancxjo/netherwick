@@ -16,6 +16,14 @@ coordinate-frame, and provenance semantics. Consumers do not build parallel
 sensor-derived mini-world-models. See
 [020-now-world-model.md](020-now-world-model.md).
 
+Optional learned or compute-heavy faculties are role-neutral cognitive
+providers, not parts of PETE's identity. The organism runtime sends bounded,
+deadline-bearing requests and continues its control tick without waiting;
+accepted results return as evidence, suggestions, or candidate artifacts.
+Provider loss changes self-model capability availability without transferring
+authority or changing organism identity. See
+[022-cognitive-roles.md](022-cognitive-roles.md).
+
 The legacy `SimpleConductor` remains available for comparison. `goal-shadow`
 maintains the complete blackboard and goal state while executing the legacy
 choice; `goal` executes the selected goal behavior. See

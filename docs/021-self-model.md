@@ -11,6 +11,10 @@ PETE's self-model is the typed `Now.world.self_model` region. It is a computatio
 - `SessionId` identifies an interaction or control session, never the organism.
 
 Contradictory boot, body, or session claims remain explicit and fail closed for authority. Host loss removes host-supplied capabilities without changing `OrganismId`.
+Provider roles, health, versions, locality, and resource class use the shared
+`pete-cognition` registry contract described in
+[022-cognitive-roles.md](022-cognitive-roles.md); service host/process fields
+remain infrastructure identities.
 
 ## Typed regions
 

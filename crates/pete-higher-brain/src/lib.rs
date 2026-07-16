@@ -1,8 +1,10 @@
-//! Higher-brain data-plane primitives.
+//! Cognitive-accelerator data-plane primitives.
 //!
 //! This crate deliberately has no dependency on `pete-cockpit`: discovery,
 //! training authority, bulk transfer, and model activation cannot acquire or
-//! reuse a brainstem motion lease.
+//! reuse a brainstem motion lease. The crate name and forebrain protocol terms
+//! are compatibility deployment aliases; role-neutral APIs use
+//! `CognitiveRole::CognitiveAccelerator`.
 
 pub mod auth;
 pub mod bundle;
