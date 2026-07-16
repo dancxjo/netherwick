@@ -6,7 +6,10 @@ interpretation → immutable goal evaluations → commitment-aware arbitration �
 goal-owned behavior → typed action primitive → autonomic safety → body
 actuation → the next `Now`.
 
-`Now` is PETE's canonical current belief-state snapshot. It is explicitly a
+`Now` is PETE's canonical current belief-state snapshot. Its typed
+`world.self_model` region defines PETE's body, capabilities, ownership,
+authority, motivation, active control, continuity, and cognitive-service
+availability; see `021-self-model.md`. It is explicitly a
 best, uncertainty-carrying hypothesis, not objective truth. The stateful
 `WorldModelUpdater` owns identity, freshness, confidence, contradiction,
 coordinate-frame, and provenance semantics. Consumers do not build parallel

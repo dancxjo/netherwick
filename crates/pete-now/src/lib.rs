@@ -12,9 +12,13 @@ use uuid::Uuid;
 pub mod beliefs;
 
 pub use beliefs::{
-    AuthorityBelief, Belief, BeliefMeta, BeliefSourceKind, BeliefUpdateTrace, ContextBeliefs,
-    EntityId, EvidenceRef, Freshness, GoalStatusBelief, HazardBeliefs, LocalGeometrySnapshot,
-    ReachabilityEstimate, SelfModelSnapshot, StuckTrapKind, WorldEntity, WorldEntityKind,
+    ActiveControlSummary, AgencyState, AuthorityBelief, Belief, BeliefMeta, BeliefSourceKind,
+    BeliefUpdateTrace, BodyEnvelope, BodyId, BootId, BrainstemDeviceId, CapabilityAvailability,
+    CapabilityBelief, CapabilityId, CapabilityKind, CapabilitySelfModel, CognitiveServiceBelief,
+    CognitiveServiceSummary, ContextBeliefs, ContinuitySummary, ControlProvenance,
+    DriveSelfSummary, EntityId, EvidenceRef, Freshness, GoalStatusBelief, HazardBeliefs, HostId,
+    LocalGeometrySnapshot, MotivationSummary, OrganismId, ProcessId, ReachabilityEstimate,
+    SelfBodyBelief, SelfModelSnapshot, SessionId, StuckTrapKind, WorldEntity, WorldEntityKind,
     WorldModelSnapshot, WorldModelUpdateContext, WorldModelUpdater, WorldPose,
 };
 

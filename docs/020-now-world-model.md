@@ -4,6 +4,11 @@
 self and world. It carries uncertainty and may contain competing hypotheses. It
 does not claim objective, complete truth.
 
+The canonical `self_model` region is specified in
+[`021-self-model.md`](021-self-model.md). It distinguishes organism, body,
+device/boot, host/process, session, capability, and action-authority identity;
+a running process or LLM host is not PETE's identity.
+
 ```text
 reality and external messages
   -> raw and derived Sensations / Features / typed claims

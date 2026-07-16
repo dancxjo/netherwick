@@ -1065,7 +1065,7 @@ impl Default for LiveTrainingStatus {
             transitions_written: 0,
             models_loaded: Vec::new(),
             model_modes: HashMap::new(),
-            action_selector_mode: "baseline".to_string(),
+            action_selector_mode: "goal".to_string(),
             weights_updating: false,
         }
     }

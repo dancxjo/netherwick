@@ -10,6 +10,25 @@ use crate::{Now, ObjectClass, ObjectObservationSource};
 #[serde(transparent)]
 pub struct EntityId(pub String);
 
+macro_rules! string_id {
+    ($name:ident) => {
+        #[derive(
+            Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+    };
+}
+
+string_id!(OrganismId);
+string_id!(BodyId);
+string_id!(BrainstemDeviceId);
+string_id!(BootId);
+string_id!(HostId);
+string_id!(ProcessId);
+string_id!(SessionId);
+string_id!(CapabilityId);
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BeliefSourceKind {
@@ -160,8 +179,204 @@ pub enum StuckTrapKind {
     Unknown,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    Sensor,
+    Actuator,
+    Goal,
+    Behavior,
+    Skill,
+    CognitiveService,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAvailability {
+    Available,
+    Degraded,
+    Unavailable,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityBelief {
+    pub id: CapabilityId,
+    pub kind: CapabilityKind,
+    pub availability: CapabilityAvailability,
+    pub confidence: f32,
+    pub unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<CapabilityId>,
+    pub performance_summary: Option<String>,
+    pub meta: BeliefMeta,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CapabilitySelfModel {
+    #[serde(default)]
+    pub capabilities: BTreeMap<CapabilityId, CapabilityBelief>,
+}
+
+impl CapabilitySelfModel {
+    pub fn is_available(&self, id: &str) -> bool {
+        self.capabilities
+            .get(&CapabilityId(id.to_string()))
+            .is_some_and(|capability| {
+                matches!(
+                    capability.availability,
+                    CapabilityAvailability::Available | CapabilityAvailability::Degraded
+                )
+            })
+    }
+
+    pub fn unavailable_reason(&self, id: &str) -> Option<&str> {
+        self.capabilities
+            .get(&CapabilityId(id.to_string()))
+            .and_then(|capability| capability.unavailable_reason.as_deref())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BodyEnvelope {
+    pub radius_m: f32,
+    pub height_m: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SelfBodyBelief {
+    pub body_id: Belief<BodyId>,
+    pub implementation: Belief<String>,
+    pub implementation_version: Belief<String>,
+    pub brainstem_device_id: Option<Belief<BrainstemDeviceId>>,
+    pub brainstem_boot_id: Option<Belief<BootId>>,
+    pub pose: Belief<Pose2>,
+    pub envelope: Belief<BodyEnvelope>,
+    pub energy: Belief<f32>,
+    pub charging: Belief<bool>,
+    pub health: Belief<f32>,
+    #[serde(default)]
+    pub faults: Vec<Belief<String>>,
+    pub being_moved: Option<Belief<bool>>,
+    pub tilted: Option<Belief<bool>>,
+    pub blocked: Option<Belief<bool>>,
+    pub carried: Option<Belief<bool>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlProvenance {
+    Autonomous,
+    HumanDirect,
+    HumanAssist,
+    HumanSuggestion,
+    AutonomicReflex,
+    SafetyVeto,
+    #[default]
+    None,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgencyState {
+    pub controller: ControlProvenance,
+    pub reign_mode: Option<String>,
+    pub reign_source: Option<String>,
+    pub session_id: Option<Belief<SessionId>>,
+    pub lease_id: Option<Belief<String>>,
+    pub possessed: Belief<bool>,
+    pub armed: Belief<bool>,
+    pub stopped: bool,
+    pub moving: bool,
+    pub pending_direct_override: bool,
+    #[serde(default)]
+    pub authority_conflicts: Vec<EvidenceRef>,
+    pub meta: BeliefMeta,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DriveSelfSummary {
+    pub desired: f32,
+    pub actual: f32,
+    pub predicted: f32,
+    pub error: f32,
+    pub satisfaction: f32,
+    pub activation: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MotivationSummary {
+    #[serde(default)]
+    pub drives: BTreeMap<String, DriveSelfSummary>,
+    pub selected_goal: Option<String>,
+    pub commitment_age_ms: u64,
+    pub expected_progress: Option<f32>,
+    pub recent_progress: Option<f32>,
+    pub uncertainty: f32,
+    pub strategy_failure_pressure: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ActiveControlSummary {
+    pub goal_id: Option<String>,
+    pub behavior_id: Option<String>,
+    pub skill_id: Option<String>,
+    pub action_kind: Option<String>,
+    pub provenance: ControlProvenance,
+    pub safety_preempted: bool,
+    #[serde(default)]
+    pub veto_reasons: Vec<String>,
+    pub unable_to_act_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContinuitySummary {
+    pub episode_id: Option<String>,
+    pub session_id: Option<SessionId>,
+    #[serde(default)]
+    pub recent_experience_refs: Vec<String>,
+    #[serde(default)]
+    pub important_relationship_refs: Vec<EntityId>,
+    #[serde(default)]
+    pub important_place_refs: Vec<String>,
+    #[serde(default)]
+    pub recent_self_action_refs: Vec<String>,
+    #[serde(default)]
+    pub recent_outcome_refs: Vec<String>,
+    #[serde(default)]
+    pub capability_change_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CognitiveServiceBelief {
+    pub available: bool,
+    pub confidence: f32,
+    pub unavailable_reason: Option<String>,
+    pub host_id: Option<HostId>,
+    pub process_id: Option<ProcessId>,
+    pub meta: BeliefMeta,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CognitiveServiceSummary {
+    #[serde(default)]
+    pub services: BTreeMap<String, CognitiveServiceBelief>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SelfModelSnapshot {
+    pub organism_id: Belief<OrganismId>,
+    pub body: SelfBodyBelief,
+    pub capabilities: CapabilitySelfModel,
+    pub agency: AgencyState,
+    pub motivation: MotivationSummary,
+    pub active_control: ActiveControlSummary,
+    pub continuity: ContinuitySummary,
+    pub service_state: CognitiveServiceSummary,
+    pub meta: BeliefMeta,
+    // Stable compatibility projections for existing goal and safety consumers.
     pub battery_level: f32,
     pub battery_meta: BeliefMeta,
     pub charging: bool,
@@ -253,12 +468,34 @@ pub struct WorldModelUpdateContext {
     pub active_goal: Option<String>,
     #[serde(default)]
     pub goal_status: BTreeMap<String, GoalStatusBelief>,
+    #[serde(default)]
+    pub registered_goals: Vec<String>,
+    #[serde(default)]
+    pub registered_behaviors: Vec<String>,
+    #[serde(default)]
+    pub registered_skills: Vec<String>,
+    #[serde(default)]
+    pub drive_summaries: BTreeMap<String, DriveSelfSummary>,
+    pub commitment_age_ms: u64,
+    pub active_behavior: Option<String>,
+    pub active_skill: Option<String>,
+    pub expected_progress: Option<f32>,
+    pub recent_progress: Option<f32>,
+    pub uncertainty: f32,
+    pub strategy_failure_pressure: f32,
+    #[serde(default)]
+    pub capability_evidence: Vec<CapabilityBelief>,
+    #[serde(default)]
+    pub cognitive_services: BTreeMap<String, CognitiveServiceBelief>,
+    pub active_control: Option<ActiveControlSummary>,
+    pub continuity: ContinuitySummary,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct WorldModelUpdater {
     revision: u64,
     entities: BTreeMap<EntityId, WorldEntity>,
+    last_brainstem_boot_id: Option<BootId>,
 }
 
 impl WorldModelUpdater {
@@ -612,7 +849,7 @@ impl WorldModelUpdater {
         });
     }
 
-    fn self_model(&self, now: &Now, context: WorldModelUpdateContext) -> SelfModelSnapshot {
+    fn self_model(&mut self, now: &Now, context: WorldModelUpdateContext) -> SelfModelSnapshot {
         let body_evidence = evidence_ref("body", "state", now.t_ms, "body-belief-v1");
         let body_meta = belief_meta(
             1.0,
@@ -661,7 +898,333 @@ impl WorldModelUpdater {
                 &format!("goal_outcome.{goal_id}"),
             );
         }
+        let pose_meta = belief_meta(
+            1.0,
+            now.t_ms,
+            BeliefSourceKind::DirectObservation,
+            evidence_ref("body", "odometry", now.t_ms, "body-belief-v1"),
+            Some("map".to_string()),
+        );
+        let identity_meta = simple_meta(
+            now.t_ms,
+            BeliefSourceKind::Map,
+            "self.identity.configuration",
+        );
+        let possession = now.extensions.get("brainstem.possession");
+        let device_id = possession
+            .and_then(|value| value.get("brainstem_device_id"))
+            .and_then(|value| value.as_str())
+            .map(|value| BrainstemDeviceId(value.to_string()));
+        let boot_id = possession
+            .and_then(|value| value.get("brainstem_boot_id"))
+            .and_then(|value| value.as_str())
+            .map(|value| BootId(value.to_string()));
+        let boot_changed = self
+            .last_brainstem_boot_id
+            .as_ref()
+            .zip(boot_id.as_ref())
+            .is_some_and(|(previous, current)| previous != current);
+        if boot_id.is_some() {
+            self.last_brainstem_boot_id = boot_id.clone();
+        }
+        let session_id = possession
+            .and_then(|value| value.get("session_id"))
+            .and_then(|value| value.as_str())
+            .map(|value| SessionId(value.to_string()));
+        let lease_id = possession
+            .and_then(|value| value.get("lease_id"))
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned);
+        let reported_possessed = possession
+            .and_then(|value| value.get("possessed"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let reported_armed = possession
+            .and_then(|value| value.get("brainstem_armed"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let possessed = reported_possessed && !boot_changed;
+        let armed = reported_armed && !boot_changed;
+        let moving =
+            now.body.velocity.forward_m_s.abs() > 0.01 || now.body.velocity.turn_rad_s.abs() > 0.01;
+        let reign = now.reign.latest.as_ref();
+        let controller = reign
+            .map(|input| match input.mode {
+                pete_actions::ReignMode::Direct => ControlProvenance::HumanDirect,
+                pete_actions::ReignMode::Assist => ControlProvenance::HumanAssist,
+                pete_actions::ReignMode::Suggest => ControlProvenance::HumanSuggestion,
+                pete_actions::ReignMode::ObserveOnly => ControlProvenance::Autonomous,
+            })
+            .unwrap_or_else(|| {
+                if context.active_goal.is_some() {
+                    ControlProvenance::Autonomous
+                } else {
+                    ControlProvenance::None
+                }
+            });
+        let agency_meta = if let Some(authority) = reign {
+            simple_meta(
+                now.t_ms,
+                BeliefSourceKind::HumanClaim,
+                &format!("reign.{}", authority.id),
+            )
+        } else {
+            simple_meta(
+                now.t_ms,
+                BeliefSourceKind::ActionOutcome,
+                "control.autonomous",
+            )
+        };
+
+        let mut capabilities = CapabilitySelfModel::default();
+        let body_current = now.t_ms.saturating_sub(now.body.last_update_ms) <= 1_000;
+        insert_capability(
+            &mut capabilities,
+            "sensor:body",
+            CapabilityKind::Sensor,
+            body_current,
+            (!body_current).then_some("body telemetry is stale"),
+            now.t_ms,
+        );
+        let range_current = (!now.range.beams.is_empty() || now.range.nearest_m.is_some())
+            && now.t_ms.saturating_sub(now.range.captured_at_ms) <= 1_000;
+        insert_capability(
+            &mut capabilities,
+            "sensor:range",
+            CapabilityKind::Sensor,
+            range_current,
+            (!range_current).then_some("range observations are missing or stale"),
+            now.t_ms,
+        );
+        let visual_current = now.objects.observations.iter().any(|observation| {
+            matches!(
+                observation.source,
+                ObjectObservationSource::Kinect | ObjectObservationSource::Captioner
+            )
+        });
+        insert_capability(
+            &mut capabilities,
+            "sensor:vision",
+            CapabilityKind::Sensor,
+            visual_current,
+            (!visual_current).then_some("camera evidence is unavailable this tick"),
+            now.t_ms,
+        );
+        let drive_available = now.body.health.health > 0.2 && !now.body.flags.wheel_drop;
+        insert_capability(
+            &mut capabilities,
+            "actuator:drive",
+            CapabilityKind::Actuator,
+            drive_available,
+            (!drive_available).then_some("drive is unsafe or body health is degraded"),
+            now.t_ms,
+        );
+        insert_capability(
+            &mut capabilities,
+            "actuator:speaker",
+            CapabilityKind::Actuator,
+            true,
+            None,
+            now.t_ms,
+        );
+        for goal in &context.registered_goals {
+            insert_capability(
+                &mut capabilities,
+                &format!("goal:{goal}"),
+                CapabilityKind::Goal,
+                true,
+                None,
+                now.t_ms,
+            );
+        }
+        for behavior in &context.registered_behaviors {
+            insert_capability(
+                &mut capabilities,
+                &format!("behavior:{behavior}"),
+                CapabilityKind::Behavior,
+                true,
+                None,
+                now.t_ms,
+            );
+        }
+        for skill in &context.registered_skills {
+            insert_capability(
+                &mut capabilities,
+                &format!("skill:{skill}"),
+                CapabilityKind::Skill,
+                true,
+                None,
+                now.t_ms,
+            );
+        }
+        for capability in &context.capability_evidence {
+            capabilities
+                .capabilities
+                .insert(capability.id.clone(), capability.clone());
+        }
+        let mut service_state = CognitiveServiceSummary {
+            services: context.cognitive_services.clone(),
+        };
+        service_state
+            .services
+            .entry("local_language".to_string())
+            .or_insert_with(|| CognitiveServiceBelief {
+                available: true,
+                confidence: 1.0,
+                meta: simple_meta(now.t_ms, BeliefSourceKind::Map, "service.local_language"),
+                ..CognitiveServiceBelief::default()
+            });
+        service_state
+            .services
+            .entry("rich_language".to_string())
+            .or_insert_with(|| CognitiveServiceBelief {
+                available: false,
+                confidence: 1.0,
+                unavailable_reason: Some("enhanced cognition was not reported available".into()),
+                meta: simple_meta(
+                    now.t_ms,
+                    BeliefSourceKind::Map,
+                    "service.rich_language.missing",
+                ),
+                ..CognitiveServiceBelief::default()
+            });
+        for (service, state) in &service_state.services {
+            insert_capability(
+                &mut capabilities,
+                &format!("service:{service}"),
+                CapabilityKind::CognitiveService,
+                state.available,
+                state.unavailable_reason.as_deref(),
+                now.t_ms,
+            );
+        }
+        let faults = [
+            now.body.flags.wheel_drop.then_some("wheel_drop"),
+            (now.body.health.health <= 0.2).then_some("body_health_critical"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|fault| Belief {
+            value: fault.to_string(),
+            meta: body_meta.clone(),
+        })
+        .collect::<Vec<_>>();
+        let body = SelfBodyBelief {
+            body_id: Belief {
+                value: BodyId("pete.primary_body".to_string()),
+                meta: identity_meta.clone(),
+            },
+            implementation: Belief {
+                value: "mobile_robot".to_string(),
+                meta: identity_meta.clone(),
+            },
+            implementation_version: Belief {
+                value: "1".to_string(),
+                meta: identity_meta.clone(),
+            },
+            brainstem_device_id: device_id.map(|value| Belief {
+                value,
+                meta: agency_meta.clone(),
+            }),
+            brainstem_boot_id: boot_id.map(|value| Belief {
+                value,
+                meta: agency_meta.clone(),
+            }),
+            pose: Belief {
+                value: now.body.odometry,
+                meta: pose_meta.clone(),
+            },
+            envelope: Belief {
+                value: BodyEnvelope {
+                    radius_m: 0.18,
+                    height_m: 0.10,
+                },
+                meta: identity_meta.clone(),
+            },
+            energy: Belief {
+                value: now.body.battery_level,
+                meta: body_meta.clone(),
+            },
+            charging: Belief {
+                value: now.body.charging,
+                meta: body_meta.clone(),
+            },
+            health: Belief {
+                value: now.body.health.health,
+                meta: body_meta.clone(),
+            },
+            faults,
+            being_moved: None,
+            tilted: None,
+            blocked: Some(Belief {
+                value: stuck || now.body.flags.bump_left || now.body.flags.bump_right,
+                meta: body_meta.clone(),
+            }),
+            carried: None,
+        };
+        let motivation = MotivationSummary {
+            drives: context.drive_summaries.clone(),
+            selected_goal: context.active_goal.clone(),
+            commitment_age_ms: context.commitment_age_ms,
+            expected_progress: context.expected_progress,
+            recent_progress: context.recent_progress,
+            uncertainty: context.uncertainty,
+            strategy_failure_pressure: context.strategy_failure_pressure,
+        };
+        let active_control = context
+            .active_control
+            .unwrap_or_else(|| ActiveControlSummary {
+                goal_id: context.active_goal.clone(),
+                behavior_id: context.active_behavior.clone(),
+                skill_id: context.active_skill.clone(),
+                provenance: controller.clone(),
+                unable_to_act_reason: (!drive_available)
+                    .then_some("drive capability is unavailable".to_string()),
+                ..ActiveControlSummary::default()
+            });
         SelfModelSnapshot {
+            organism_id: Belief {
+                value: OrganismId("pete".to_string()),
+                meta: identity_meta,
+            },
+            body,
+            capabilities,
+            agency: AgencyState {
+                controller,
+                reign_mode: reign.map(|input| format!("{:?}", input.mode).to_ascii_lowercase()),
+                reign_source: reign.map(|input| format!("{:?}", input.source).to_ascii_lowercase()),
+                session_id: session_id.map(|value| Belief {
+                    value,
+                    meta: agency_meta.clone(),
+                }),
+                lease_id: lease_id.map(|value| Belief {
+                    value,
+                    meta: agency_meta.clone(),
+                }),
+                possessed: Belief {
+                    value: possessed,
+                    meta: agency_meta.clone(),
+                },
+                armed: Belief {
+                    value: armed,
+                    meta: agency_meta.clone(),
+                },
+                stopped: !moving,
+                moving,
+                pending_direct_override: reign
+                    .is_some_and(|input| input.mode == pete_actions::ReignMode::Direct),
+                authority_conflicts: if boot_changed {
+                    agency_meta.provenance.clone()
+                } else {
+                    Vec::new()
+                },
+                meta: agency_meta,
+            },
+            motivation,
+            active_control,
+            continuity: context.continuity,
+            service_state,
+            meta: body_meta.clone(),
             battery_level: now.body.battery_level,
             battery_meta: body_meta.clone(),
             charging: now.body.charging,
@@ -670,22 +1233,42 @@ impl WorldModelUpdater {
             stuck_meta: body_meta,
             stuck_trap_kind,
             pose: now.body.odometry,
-            pose_meta: belief_meta(
-                1.0,
-                now.t_ms,
-                BeliefSourceKind::DirectObservation,
-                evidence_ref("body", "odometry", now.t_ms, "body-belief-v1"),
-                Some("map".to_string()),
-            ),
+            pose_meta,
             contact: now.body.flags.bump_left || now.body.flags.bump_right || now.body.flags.wall,
             bump_left: now.body.flags.bump_left,
-            moving: now.body.velocity.forward_m_s.abs() > 0.01
-                || now.body.velocity.turn_rad_s.abs() > 0.01,
+            moving,
             range_nearest_m: now.range.nearest_m,
             active_goal: context.active_goal,
             goal_status,
         }
     }
+}
+
+fn insert_capability(
+    model: &mut CapabilitySelfModel,
+    id: &str,
+    kind: CapabilityKind,
+    available: bool,
+    unavailable_reason: Option<&str>,
+    now_ms: u64,
+) {
+    let id = CapabilityId(id.to_string());
+    model.capabilities.insert(
+        id.clone(),
+        CapabilityBelief {
+            id,
+            kind,
+            availability: if available {
+                CapabilityAvailability::Available
+            } else {
+                CapabilityAvailability::Unavailable
+            },
+            confidence: 1.0,
+            unavailable_reason: unavailable_reason.map(ToOwned::to_owned),
+            meta: simple_meta(now_ms, BeliefSourceKind::Map, "self.capability.registry"),
+            ..CapabilityBelief::default()
+        },
+    );
 }
 
 fn record_meta_evidence(trace: &mut BeliefUpdateTrace, meta: &BeliefMeta) {
@@ -1005,7 +1588,9 @@ fn normalize_angle(mut angle: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::{ObjectObservation, ObjectSense};
+    use pete_actions::{ReignCommand, ReignMode, ReignSource};
     use pete_body::BodySense;
+    use uuid::Uuid;
 
     fn observed_now(t_ms: u64, class: ObjectClass, label: &str) -> Now {
         let mut now = Now::blank(t_ms, BodySense::default());
@@ -1181,5 +1766,155 @@ mod tests {
                 .map(|belief| &belief.meta.source_kind),
             Some(&BeliefSourceKind::DirectObservation)
         );
+    }
+
+    #[test]
+    fn higher_brain_loss_removes_enhanced_capability_not_organism_identity() {
+        let service = CognitiveServiceBelief {
+            available: true,
+            confidence: 1.0,
+            meta: simple_meta(10, BeliefSourceKind::Map, "service.rich_language"),
+            ..CognitiveServiceBelief::default()
+        };
+        let mut updater = WorldModelUpdater::default();
+        let first = updater.update(
+            Now::blank(10, BodySense::default()),
+            WorldModelUpdateContext {
+                cognitive_services: BTreeMap::from([("rich_language".to_string(), service)]),
+                ..WorldModelUpdateContext::default()
+            },
+        );
+        let second = updater.update(
+            Now::blank(20, BodySense::default()),
+            WorldModelUpdateContext::default(),
+        );
+        assert_eq!(
+            first.world.self_model.organism_id.value,
+            second.world.self_model.organism_id.value
+        );
+        assert!(first
+            .world
+            .self_model
+            .capabilities
+            .is_available("service:rich_language"));
+        assert!(!second
+            .world
+            .self_model
+            .capabilities
+            .is_available("service:rich_language"));
+    }
+
+    #[test]
+    fn brainstem_reboot_invalidates_authority_but_not_identity() {
+        let with_boot = |t_ms, boot: &str| {
+            let mut now = Now::blank(t_ms, BodySense::default());
+            now.extensions.insert(
+                "brainstem.possession".to_string(),
+                serde_json::json!({
+                    "brainstem_device_id": "device-7",
+                    "brainstem_boot_id": boot,
+                    "session_id": "session-1",
+                    "lease_id": "lease-1",
+                    "possessed": true,
+                    "brainstem_armed": true
+                }),
+            );
+            now
+        };
+        let mut updater = WorldModelUpdater::default();
+        let first = updater.update(with_boot(10, "boot-a"), WorldModelUpdateContext::default());
+        let rebooted = updater.update(with_boot(20, "boot-b"), WorldModelUpdateContext::default());
+        assert_eq!(
+            first.world.self_model.organism_id.value,
+            rebooted.world.self_model.organism_id.value
+        );
+        assert!(first.world.self_model.agency.possessed.value);
+        assert!(!rebooted.world.self_model.agency.possessed.value);
+        assert!(!rebooted.world.self_model.agency.armed.value);
+        assert!(!rebooted
+            .world
+            .self_model
+            .agency
+            .authority_conflicts
+            .is_empty());
+    }
+
+    #[test]
+    fn direct_reign_is_attributed_to_operator() {
+        let mut now = Now::blank(10, BodySense::default());
+        now.reign.latest = Some(ReignInput {
+            id: Uuid::nil(),
+            issued_at_ms: 0,
+            expires_at_ms: 100,
+            source: ReignSource::HumanSupervisor,
+            mode: ReignMode::Direct,
+            command: ReignCommand::Stop,
+            priority: 1.0,
+            note: None,
+        });
+        let mut updater = WorldModelUpdater::default();
+        let snapshot = updater
+            .update(now, WorldModelUpdateContext::default())
+            .world;
+        assert_eq!(
+            snapshot.self_model.agency.controller,
+            ControlProvenance::HumanDirect
+        );
+        assert!(snapshot.self_model.agency.pending_direct_override);
+    }
+
+    #[test]
+    fn missing_camera_removes_visual_capability_but_preserves_memory() {
+        let mut updater = WorldModelUpdater::default();
+        updater.update(
+            observed_now(10, ObjectClass::Person, "Alex"),
+            WorldModelUpdateContext::default(),
+        );
+        let snapshot = updater
+            .update(
+                Now::blank(20, BodySense::default()),
+                WorldModelUpdateContext::default(),
+            )
+            .world;
+        assert!(!snapshot
+            .self_model
+            .capabilities
+            .is_available("sensor:vision"));
+        assert!(snapshot
+            .entities
+            .values()
+            .any(|entity| entity.label == "Alex"));
+    }
+
+    #[test]
+    fn autonomic_preemption_and_history_have_separate_typed_regions() {
+        let context = WorldModelUpdateContext {
+            active_control: Some(ActiveControlSummary {
+                provenance: ControlProvenance::AutonomicReflex,
+                safety_preempted: true,
+                veto_reasons: vec!["contact".to_string()],
+                ..ActiveControlSummary::default()
+            }),
+            continuity: ContinuitySummary {
+                recent_experience_refs: vec!["experience:old-bump".to_string()],
+                recent_self_action_refs: vec!["action:reverse".to_string()],
+                ..ContinuitySummary::default()
+            },
+            ..WorldModelUpdateContext::default()
+        };
+        let mut updater = WorldModelUpdater::default();
+        let snapshot = updater
+            .update(Now::blank(10, BodySense::default()), context)
+            .world;
+        assert_eq!(
+            snapshot.self_model.active_control.provenance,
+            ControlProvenance::AutonomicReflex
+        );
+        assert!(snapshot.self_model.active_control.safety_preempted);
+        assert_eq!(
+            snapshot.self_model.continuity.recent_experience_refs,
+            vec!["experience:old-bump"]
+        );
+        assert!(!snapshot.self_model.contact);
     }
 }

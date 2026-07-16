@@ -297,6 +297,14 @@ pub struct LlmBrief {
 
 #[async_trait]
 pub trait LlmAgent: Send {
+    fn enhanced_cognition_available(&self) -> bool {
+        true
+    }
+
+    fn enhanced_cognition_unavailable_reason(&self) -> Option<&str> {
+        None
+    }
+
     async fn combobulate(
         &mut self,
         now: &Now,
@@ -328,6 +336,14 @@ pub struct NoopLlmAgent;
 
 #[async_trait]
 impl LlmAgent for NoopLlmAgent {
+    fn enhanced_cognition_available(&self) -> bool {
+        false
+    }
+
+    fn enhanced_cognition_unavailable_reason(&self) -> Option<&str> {
+        Some("enhanced language service is disabled")
+    }
+
     async fn combobulate(
         &mut self,
         _now: &Now,
@@ -791,6 +807,14 @@ impl ConfiguredLlmAgent {
 
 #[async_trait]
 impl LlmAgent for ConfiguredLlmAgent {
+    fn enhanced_cognition_available(&self) -> bool {
+        matches!(self, Self::Ollama(_))
+    }
+
+    fn enhanced_cognition_unavailable_reason(&self) -> Option<&str> {
+        matches!(self, Self::Disabled(_)).then_some("enhanced language service is disabled")
+    }
+
     async fn combobulate(
         &mut self,
         now: &Now,
@@ -1417,6 +1441,7 @@ fn build_combobulator_prompt(
     let timeline = render_combobulator_timeline(impressions);
     let embodied = render_embodied_context(embodied);
     let futures = summarize_futures(futures);
+    let self_context = render_self_model_context(now);
     let uuid_options = render_prompt_uuid_options();
     format!(
         "You are the combobulator for an embodied robot.\n\
@@ -1448,6 +1473,7 @@ Latent confidence: {:.2}\n\
 Latent prediction error: {:.2}\n\
 Recall summary: {}\n\
 Current embodied experience:\n{}\n\
+Canonical self-model (capabilities and authority):\n{}\n\
 Timeline evidence:\n{}\n\
 Predicted futures:\n{}\n",
         uuid_options,
@@ -1456,6 +1482,7 @@ Predicted futures:\n{}\n",
         z.prediction_error,
         recall_summary,
         embodied,
+        self_context,
         timeline,
         futures
     )
@@ -1477,6 +1504,7 @@ fn build_agent_prompt(
         .join("\n");
     let embodied = render_embodied_context(embodied);
     let futures = summarize_futures(futures);
+    let self_context = render_self_model_context(now);
     let uuid_options = render_prompt_uuid_options();
     format!(
         "You are the conscious LLM layer for an embodied robot.\n\
@@ -1484,6 +1512,7 @@ When commands are enabled, choose a high-level action primitive whenever movemen
 You are in autonomous discovery mode: safely explore, inspect uncertain or interesting stimuli, and prefer active information-gathering when there is no higher-priority goal or danger.\n\
 The action field is an executable command candidate for the robot body, not only a suggestion or note.\n\
 Never output raw motor control such as wheel speeds, PWM values, serial bytes, or velocity arrays.\n\
+Never claim a self-capability absent from the canonical self-model; preserve explicit uncertainty and unavailable reasons.\n\
 Treat Reign controls as present-tense command input. If a Reign command is active and safe, set action to the matching allowed action; if you choose something else, explain why in critique.\n\
 {LIVE_EVENT_RULES}\n\
 Allowed action kinds: stop, go, turn, inspect, approach, dock, explore, speak, chirp.\n\
@@ -1503,6 +1532,7 @@ If any output field calls for a new UUID or id, choose one of these exact UUID o
 Current time: {} ms\n\
 Awareness summary: {}\n\
 Current embodied experience:\n{}\n\
+Canonical self-model (the sole source for what you can currently do and who controls action):\n{}\n\
 Recall summary: {}\n\
 Battery: {:.2}\n\
 Surprise: {:.2}\n\
@@ -1516,12 +1546,72 @@ Summarized senses:\n{}\n",
         now.t_ms,
         awareness_summary.unwrap_or("none"),
         embodied,
+        self_context,
         recall_summary,
         now.body.battery_level,
         now.surprise.total,
         z.confidence,
         futures,
         senses
+    )
+}
+
+fn render_self_model_context(now: &Now) -> String {
+    let self_model = &now.world.self_model;
+    let available = self_model
+        .capabilities
+        .capabilities
+        .values()
+        .filter(|capability| {
+            matches!(
+                capability.availability,
+                pete_now::CapabilityAvailability::Available
+                    | pete_now::CapabilityAvailability::Degraded
+            )
+        })
+        .map(|capability| capability.id.0.as_str())
+        .collect::<Vec<_>>();
+    let unavailable = self_model
+        .capabilities
+        .capabilities
+        .values()
+        .filter(|capability| {
+            matches!(
+                capability.availability,
+                pete_now::CapabilityAvailability::Unavailable
+                    | pete_now::CapabilityAvailability::Unknown
+            )
+        })
+        .map(|capability| {
+            format!(
+                "{} ({})",
+                capability.id.0,
+                capability
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("availability is unknown")
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "organism_id={} body_id={} controller={:?} possessed={} armed={} active_goal={} active_behavior={} available=[{}] unavailable=[{}]",
+        self_model.organism_id.value.0,
+        self_model.body.body_id.value.0,
+        self_model.agency.controller,
+        self_model.agency.possessed.value,
+        self_model.agency.armed.value,
+        self_model
+            .motivation
+            .selected_goal
+            .as_deref()
+            .unwrap_or("none"),
+        self_model
+            .active_control
+            .behavior_id
+            .as_deref()
+            .unwrap_or("none"),
+        available.join(", "),
+        unavailable.join(", ")
     )
 }
 
@@ -2397,7 +2487,7 @@ mod tests {
     use super::*;
     use pete_actions::{ReignCommand, ReignInput, ReignMode, ReignSource};
     use pete_body::{BodySense, CliffSensors};
-    use pete_now::Now;
+    use pete_now::{CapabilityAvailability, CapabilityBelief, CapabilityId, CapabilityKind, Now};
     use uuid::Uuid;
 
     #[test]
@@ -2406,6 +2496,26 @@ mod tests {
 
         assert_eq!(config.provider, LlmProvider::Ollama);
         assert_eq!(config.endpoint, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn self_context_never_lists_unavailable_capability_as_available() {
+        let mut now = Now::blank(10, BodySense::default());
+        let id = CapabilityId("sensor:vision".to_string());
+        now.world.self_model.capabilities.capabilities.insert(
+            id.clone(),
+            CapabilityBelief {
+                id,
+                kind: CapabilityKind::Sensor,
+                availability: CapabilityAvailability::Unavailable,
+                confidence: 1.0,
+                unavailable_reason: Some("camera is unplugged".to_string()),
+                ..CapabilityBelief::default()
+            },
+        );
+        let rendered = render_self_model_context(&now);
+        assert!(rendered.contains("available=[]"));
+        assert!(rendered.contains("unavailable=[sensor:vision (camera is unplugged)]"));
     }
 
     #[test]

@@ -57,9 +57,10 @@ use pete_neat::{
     NeatLocomotionBehavior,
 };
 use pete_now::{
-    ActionValuePrediction, ChargePrediction, DangerPrediction, DriveSense, EarPrediction,
-    ExtensionSense, EyePrediction, MemorySense, Now, ObjectClass, ReignSense, SafetySense,
-    SurpriseSense, WorldModelUpdater,
+    ActionValuePrediction, ActiveControlSummary, BeliefMeta, BeliefSourceKind, ChargePrediction,
+    CognitiveServiceBelief, ControlProvenance, DangerPrediction, DriveSense, EarPrediction,
+    ExtensionSense, EyePrediction, Freshness, MemorySense, Now, ObjectClass, ReignSense,
+    SafetySense, SurpriseSense, WorldModelUpdater,
 };
 use pete_sensors::{
     anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
@@ -105,6 +106,7 @@ where
     nudge: NudgeController,
     goal_system: GoalSystem,
     world_model: WorldModelUpdater,
+    last_active_control: Option<ActiveControlSummary>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2900,6 +2902,7 @@ where
             nudge: NudgeController::default(),
             goal_system: GoalSystem::default(),
             world_model: WorldModelUpdater::default(),
+            last_active_control: None,
         }
     }
 
@@ -2939,6 +2942,7 @@ where
             nudge: NudgeController::default(),
             goal_system: GoalSystem::default(),
             world_model: WorldModelUpdater::default(),
+            last_active_control: None,
         }
     }
 
@@ -3393,9 +3397,32 @@ where
         self.goal_system
             .add_drive_impulses(std::mem::take(&mut drive_impulses));
         self.goal_system.seed_drives(now.drives.clone());
-        now = self
-            .world_model
-            .update(now, self.goal_system.world_model_update_context());
+        let mut world_context = self.goal_system.world_model_update_context();
+        world_context.active_control = self.last_active_control.clone();
+        let enhanced_cognition_available = self.llm.enhanced_cognition_available();
+        world_context.cognitive_services.insert(
+            "rich_language".to_string(),
+            CognitiveServiceBelief {
+                available: enhanced_cognition_available,
+                confidence: 1.0,
+                unavailable_reason: (!enhanced_cognition_available).then(|| {
+                    self.llm
+                        .enhanced_cognition_unavailable_reason()
+                        .unwrap_or("enhanced cognition is unavailable")
+                        .to_string()
+                }),
+                meta: BeliefMeta {
+                    confidence: 1.0,
+                    observed_at_ms: now.t_ms,
+                    valid_at_ms: now.t_ms,
+                    freshness: Freshness::Current,
+                    source_kind: BeliefSourceKind::Map,
+                    ..BeliefMeta::default()
+                },
+                ..CognitiveServiceBelief::default()
+            },
+        );
+        now = self.world_model.update(now, world_context);
         let goal_cycle = self.goal_system.tick(&now.world, &proposals)?;
         now.drives = goal_cycle.drives.legacy_sense();
         let goal_action = goal_cycle
@@ -3819,6 +3846,45 @@ where
             &chosen_action,
             action_to_motor_command(Some(&chosen_action)),
         );
+        let control_provenance = if safety.vetoed {
+            ControlProvenance::SafetyVeto
+        } else if safety.reason == Some(SafetyReason::Contact) {
+            ControlProvenance::AutonomicReflex
+        } else if direct_reign_active {
+            ControlProvenance::HumanDirect
+        } else if now
+            .reign
+            .latest
+            .as_ref()
+            .is_some_and(|input| input.mode == ReignMode::Assist)
+        {
+            ControlProvenance::HumanAssist
+        } else {
+            ControlProvenance::Autonomous
+        };
+        self.last_active_control = Some(ActiveControlSummary {
+            goal_id: goal_cycle
+                .selection
+                .selected_goal
+                .as_ref()
+                .map(|goal| goal.as_str().to_string()),
+            behavior_id: goal_cycle
+                .behavior
+                .as_ref()
+                .map(|behavior| behavior.behavior_id.clone()),
+            action_kind: Some(format!("{chosen_action:?}")),
+            provenance: control_provenance,
+            safety_preempted: safety.reason.is_some(),
+            veto_reasons: safety
+                .reason
+                .as_ref()
+                .map(|reason| vec![describe_safety_reason(Some(reason.clone())).to_string()])
+                .unwrap_or_default(),
+            unable_to_act_reason: safety
+                .vetoed
+                .then(|| describe_safety_reason(safety.reason.clone()).to_string()),
+            ..ActiveControlSummary::default()
+        });
         action_selection.safety_overrode = safety.vetoed;
         now.extensions.insert(
             "action_selector".to_string(),

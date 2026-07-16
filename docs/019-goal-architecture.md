@@ -85,8 +85,10 @@ Critical battery permits bounded motion owned by `SeekCharger`.
 
 ## Running and inspecting
 
-Use `--action-selector goal-shadow` to compare without changing execution, or
-`--action-selector goal` to run the goal system. Each `Now` frame contains:
+The CLI and virtual-live defaults now execute `goal`. Use
+`--action-selector goal-shadow` to compare without changing execution, or
+`--action-selector baseline` to run the retained legacy conductor explicitly.
+Each `Now` frame contains:
 
 - `goal_system`: world snapshot, detailed drives, interpretations, immutable
   evaluations, selection, and behavior;

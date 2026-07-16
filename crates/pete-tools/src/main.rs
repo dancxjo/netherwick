@@ -213,7 +213,7 @@ struct SimArgs {
     experience_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     experience_mode: ExperienceMode,
-    #[arg(long, value_enum, default_value = "baseline")]
+    #[arg(long, value_enum, default_value = "goal")]
     action_selector: CliActionSelectorMode,
     #[arg(long, env = "PETE_DREAM_POLICY_CHECKPOINT")]
     dream_policy_checkpoint: Option<String>,
@@ -436,7 +436,7 @@ struct EvalScenarioArgs {
     experience_checkpoint: Option<String>,
     #[arg(long, value_enum, default_value = "off")]
     experience_mode: ExperienceMode,
-    #[arg(long, value_enum, default_value = "baseline")]
+    #[arg(long, value_enum, default_value = "goal")]
     action_selector: CliActionSelectorMode,
     #[command(flatten)]
     llm: LlmArgs,
@@ -15236,6 +15236,27 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn executable_action_selector_defaults_to_goal() {
+        let Cli {
+            command: Command::Sim(args),
+        } = Cli::try_parse_from(["pete", "sim"])
+            .expect("sim command should parse with its production defaults")
+        else {
+            panic!("expected sim command");
+        };
+        assert_eq!(args.action_selector, CliActionSelectorMode::Goal);
+
+        let Cli {
+            command: Command::EvalScenario(args),
+        } = Cli::try_parse_from(["pete", "eval-scenario", "--scenario", "empty-room"])
+            .expect("eval-scenario command should parse with its production defaults")
+        else {
+            panic!("expected eval-scenario command");
+        };
+        assert_eq!(args.action_selector, CliActionSelectorMode::Goal);
     }
 
     fn evaluation_with_competence(

@@ -814,7 +814,7 @@ go target="virtual":
     fi
     cargo build -p pete-tools
     SIM_DREAM_POLICY_ARGS=()
-    ACTION_SELECTOR="${PETE_ACTION_SELECTOR:-baseline}"
+    ACTION_SELECTOR="${PETE_ACTION_SELECTOR:-goal}"
     if [ -n "${PETE_DREAM_POLICY_CHECKPOINT:-}" ] || [ "${PETE_AUTO_DREAM_POLICY:-0}" = "1" ]; then
         echo "Visible Dream World controller: mechanical Reign passthrough (Dream NEAT ignored)"
     fi

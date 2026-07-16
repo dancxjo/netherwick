@@ -5,8 +5,8 @@ use pete_actions::{
     ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, ReignMode, TurnDir,
 };
 use pete_now::{
-    DriveSense, EntityId, EvidenceRef, GoalStatusBelief, WorldEntity, WorldEntityKind,
-    WorldModelSnapshot, WorldModelUpdateContext,
+    DriveSelfSummary, DriveSense, EntityId, EvidenceRef, GoalStatusBelief, WorldEntity,
+    WorldEntityKind, WorldModelSnapshot, WorldModelUpdateContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -813,6 +813,25 @@ impl GoalEvaluator for RuleGoalEvaluator {
         let activation = (activation + bias).clamp(0.0, 1.0);
         for affordance in &mut affordances {
             affordance.available &= affordance.action.is_some();
+            if let Some(capability) = affordance.action.as_ref().and_then(required_capability) {
+                if !context
+                    .world
+                    .self_model
+                    .capabilities
+                    .is_available(capability)
+                {
+                    affordance.available = false;
+                    affordance.rejection_reason = Some(
+                        context
+                            .world
+                            .self_model
+                            .capabilities
+                            .unavailable_reason(capability)
+                            .unwrap_or("required capability is unavailable")
+                            .to_string(),
+                    );
+                }
+            }
         }
         let confidence = affordances
             .iter()
@@ -1047,6 +1066,45 @@ fn rejected_affordance(
     }
 }
 
+const REGISTERED_BEHAVIORS: &[&str] = &[
+    "dock",
+    "turn_toward_charger",
+    "approach_charger",
+    "inspect_for_charger",
+    "systematic_charger_search",
+    "request_charge_help",
+    "reverse_from_danger",
+    "turn_toward_clearance",
+    "probe_clearance",
+    "inspect_clearance",
+    "wander",
+    "frontier_follow",
+    "inspect_novelty",
+    "orient_to_person",
+    "approach_person",
+    "speak",
+    "rest",
+    "investigate_sound",
+    "follow_task",
+];
+
+fn required_capability(action: &ActionPrimitive) -> Option<&'static str> {
+    match action {
+        ActionPrimitive::Go { .. }
+        | ActionPrimitive::Drive { .. }
+        | ActionPrimitive::Turn { .. }
+        | ActionPrimitive::Approach { .. }
+        | ActionPrimitive::Dock
+        | ActionPrimitive::Explore { .. } => Some("actuator:drive"),
+        ActionPrimitive::Speak { .. } | ActionPrimitive::Chirp { .. } => Some("actuator:speaker"),
+        ActionPrimitive::Inspect {
+            target: InspectTarget::Charger | InspectTarget::Person,
+        } => Some("sensor:vision"),
+        ActionPrimitive::Inspect { .. } => None,
+        ActionPrimitive::Stop => None,
+    }
+}
+
 type EvaluationParts = (f32, f32, f32, Vec<Affordance>, Vec<EvaluationContribution>);
 
 fn evaluate_seek_charger(
@@ -1201,7 +1259,8 @@ fn evaluate_seek_charger(
         affordances.push(affordance(
             "request_charge_help",
             ActionPrimitive::Speak {
-                text: "I need help finding the charger.".to_string(),
+                // Solresol: "Help! I'm hungry!" (dosido = help; dsod = hungry).
+                text: "Dosido! Dore dsod!".to_string(),
             },
             0.9,
             0.55,
@@ -1894,16 +1953,86 @@ impl GoalSystem {
     }
 
     pub fn world_model_update_context(&self) -> WorldModelUpdateContext {
+        let drive_summary = |drive: &HomeostaticDrive| DriveSelfSummary {
+            desired: drive.desired,
+            actual: drive.actual,
+            predicted: drive.predicted,
+            error: drive.error,
+            satisfaction: drive.satisfaction,
+            activation: drive.activation,
+        };
+        let active_goal = self
+            .arbiter
+            .current_goal()
+            .map(|goal| goal.as_str().to_string());
+        let active_status = active_goal
+            .as_ref()
+            .and_then(|active| self.goals.iter().find(|goal| goal.id().as_str() == active))
+            .map(|goal| goal.runtime());
+        let commitment_age_ms = self
+            .arbiter
+            .commitment
+            .as_ref()
+            .zip(self.last_tick_ms)
+            .map(|(commitment, now_ms)| now_ms.saturating_sub(commitment.entered_at_ms))
+            .unwrap_or(0);
         WorldModelUpdateContext {
-            active_goal: self
-                .arbiter
-                .current_goal()
-                .map(|goal| goal.as_str().to_string()),
+            active_goal,
             goal_status: self
                 .goals
                 .iter()
                 .map(|goal| (goal.id().as_str().to_string(), goal.runtime().snapshot()))
                 .collect(),
+            registered_goals: self
+                .goals
+                .iter()
+                .map(|goal| goal.id().as_str().to_string())
+                .collect(),
+            registered_behaviors: REGISTERED_BEHAVIORS
+                .iter()
+                .map(|behavior| (*behavior).to_string())
+                .collect(),
+            drive_summaries: BTreeMap::from([
+                (
+                    "energy".to_string(),
+                    drive_summary(&self.drives.snapshot.energy),
+                ),
+                (
+                    "safety".to_string(),
+                    drive_summary(&self.drives.snapshot.safety),
+                ),
+                (
+                    "curiosity".to_string(),
+                    drive_summary(&self.drives.snapshot.curiosity),
+                ),
+                (
+                    "social".to_string(),
+                    drive_summary(&self.drives.snapshot.social),
+                ),
+                (
+                    "rest".to_string(),
+                    drive_summary(&self.drives.snapshot.rest),
+                ),
+                (
+                    "certainty".to_string(),
+                    drive_summary(&self.drives.snapshot.certainty),
+                ),
+            ]),
+            commitment_age_ms,
+            active_behavior: self
+                .pending
+                .as_ref()
+                .map(|pending| pending.behavior_id.clone()),
+            expected_progress: self
+                .pending
+                .as_ref()
+                .map(|pending| pending.expected_progress),
+            recent_progress: active_status.map(|status| status.recent_progress),
+            uncertainty: self.drives.snapshot.certainty.activation,
+            strategy_failure_pressure: active_status
+                .map(|status| status.frustration)
+                .unwrap_or(0.0),
+            ..WorldModelUpdateContext::default()
         }
     }
 
@@ -2377,6 +2506,46 @@ mod tests {
             .unwrap();
         assert!(!dock.available);
         assert!(dock.rejection_reason.is_some());
+    }
+
+    #[test]
+    fn goal_competence_uses_canonical_drive_capability() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        body.health.health = 0.1;
+        let mut now = Now::blank(1_000, body);
+        now.objects.observations.push(ObjectObservation {
+            label: "dock".to_string(),
+            class: ObjectClass::Charger,
+            bearing_rad: 0.0,
+            distance_m: Some(1.0),
+            confidence: 0.95,
+            source: ObjectObservationSource::Sim,
+        });
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, now);
+        let evaluation = cycle
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("seek_charger"))
+            .unwrap();
+        let approach = evaluation
+            .competence
+            .affordances
+            .iter()
+            .find(|affordance| affordance.behavior_id == "approach_charger")
+            .unwrap();
+        assert!(!approach.available);
+        assert_eq!(
+            approach.rejection_reason.as_deref(),
+            Some("drive is unsafe or body health is degraded")
+        );
+        assert!(!cycle
+            .world
+            .self_model
+            .capabilities
+            .is_available("actuator:drive"));
     }
 
     #[test]
