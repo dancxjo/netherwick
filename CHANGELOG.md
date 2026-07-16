@@ -44,6 +44,9 @@ All notable changes are grouped by date.
 - Make sleep-session admission edge-triggered and consume completed input
   evidence exactly once, preventing continuous fatigue, a held operator request,
   or already-consolidated work from immediately starting duplicate sessions.
+- Add regression coverage and lifecycle documentation for consumed deferred
+  references, fatigue recovery, newly observed failures, and held/released
+  operator sleep requests.
 - Keep every E-stop latched through bump/contact recovery unless an operator
   explicitly clears it; possessor recovery no longer infers E-stop provenance
   from event timing or clears an E-stop while releasing the bump latch.
