@@ -1513,6 +1513,14 @@ where
         let charging = status::charging_interlock_active(&snapshot);
         let home_base = snapshot.create_sensor_charging_sources & 0b10 != 0;
 
+        // Packet 34 is the source of truth for Home Base contact. If Pete was
+        // physically removed before an unstarted departure consumed the first
+        // motion request, do not carry that reverse program into a later,
+        // already off-dock command.
+        if !home_base && self.dock_departure_pending {
+            self.dock_departure_pending = false;
+        }
+
         // The first complete observation establishes the edge baseline. A
         // bumper held through boot is evidence, not permission to move.
         if !self.safety_observation_initialized {
@@ -2986,6 +2994,43 @@ mod tests {
             Some(status::SafetyEventKind::WheelDrop)
         ));
         assert!(matches!(runtime.active, ActiveAction::None));
+    }
+
+    #[test]
+    fn fresh_home_base_clear_cancels_unstarted_departure() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        status::set_oi_mode(CreateOiMode::Full);
+        status::mark_create_sensor_packet(
+            34,
+            crate::events::CreateSensorPacket {
+                charging_sources: 0b10,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.dock_departure_pending);
+
+        status::mark_create_sensor_packet(34, crate::events::CreateSensorPacket::default());
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(!runtime.dock_departure_pending);
+
+        assert!(runtime
+            .commands
+            .push_back(QueuedCommand::new(
+                91,
+                RuntimeCommand::CmdVel {
+                    linear_mm_s: 100,
+                    angular_mrad_s: 0,
+                    duration_ms: Some(400),
+                },
+            ))
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert_eq!(runtime.active_command_id, Some(91));
     }
 
     #[test]

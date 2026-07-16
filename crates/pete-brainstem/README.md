@@ -659,6 +659,9 @@ program is active, Full-mode supervision observes fresh mode telemetry without
 re-sending the mode byte because Create 1 zeros wheel output on that write.
 Actual mode loss still stops motion before reacquisition. Stop, e-stop,
 authority loss, heartbeat expiry, and local safety reflexes still preempt it.
+If fresh packet-34 telemetry clears Home Base before departure starts, the
+pending reverse is discarded so it cannot execute after Pete is carried or
+rolled off the dock.
 
 For a non-motion electrical/UART diagnosis, run:
 
