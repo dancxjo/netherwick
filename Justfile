@@ -1294,3 +1294,7 @@ hardware-env:
 # Remove build artifacts.
 clean:
     cargo clean
+
+# Run the Codex autonomous diff -> commit -> pull -> push workflow.
+codex-sync:
+    ./scripts/codex-sync.sh
