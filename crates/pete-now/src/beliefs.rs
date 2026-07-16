@@ -515,6 +515,7 @@ pub struct WorldModelUpdater {
     revision: u64,
     entities: BTreeMap<EntityId, WorldEntity>,
     last_brainstem_boot_id: Option<BootId>,
+    invalidated_authority_lease: Option<String>,
 }
 
 impl WorldModelUpdater {
@@ -967,6 +968,24 @@ impl WorldModelUpdater {
             .and_then(|value| value.get("lease_id"))
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned);
+        if boot_changed {
+            self.invalidated_authority_lease = Some(
+                lease_id
+                    .clone()
+                    .unwrap_or_else(|| "<missing-lease>".to_string()),
+            );
+        } else if self
+            .invalidated_authority_lease
+            .as_ref()
+            .zip(lease_id.as_ref())
+            .is_some_and(|(invalidated, current)| invalidated != current)
+        {
+            self.invalidated_authority_lease = None;
+        }
+        let authority_invalidated = self.invalidated_authority_lease.as_ref().is_some_and(|id| {
+            lease_id.as_deref() == Some(id.as_str())
+                || (id == "<missing-lease>" && lease_id.is_none())
+        });
         let reported_possessed = possession
             .and_then(|value| value.get("possessed"))
             .and_then(|value| value.as_bool())
@@ -975,8 +994,8 @@ impl WorldModelUpdater {
             .and_then(|value| value.get("brainstem_armed"))
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let possessed = reported_possessed && !boot_changed;
-        let armed = reported_armed && !boot_changed;
+        let possessed = reported_possessed && !authority_invalidated;
+        let armed = reported_armed && !authority_invalidated;
         let moving =
             now.body.velocity.forward_m_s.abs() > 0.01 || now.body.velocity.turn_rad_s.abs() > 0.01;
         let reign = now.reign.latest.as_ref();
@@ -1102,7 +1121,7 @@ impl WorldModelUpdater {
             ) {
                 capability.authorized = capability.authorized && hardware_authority_available;
                 if !capability.authorized && capability.authority_reason.is_none() {
-                    capability.authority_reason = Some(if boot_changed {
+                    capability.authority_reason = Some(if authority_invalidated {
                         "brainstem reboot invalidated the control lease".to_string()
                     } else {
                         "no current actuation authority".to_string()
@@ -1302,7 +1321,7 @@ impl WorldModelUpdater {
                 moving,
                 pending_direct_override: reign
                     .is_some_and(|input| input.mode == pete_actions::ReignMode::Direct),
-                authority_conflicts: if boot_changed {
+                authority_conflicts: if authority_invalidated {
                     agency_meta.provenance.clone()
                 } else {
                     Vec::new()
