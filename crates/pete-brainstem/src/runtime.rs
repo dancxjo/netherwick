@@ -760,6 +760,11 @@ where
             };
             if !matches!(existing.command, RuntimeCommand::CmdVel { .. }) {
                 let _ = self.commands.push_back(existing);
+            } else if existing.command_id != command_id {
+                // A newer velocity command has consumed this queued command
+                // before it could start. Keep its accepted lifecycle closed
+                // even though no motor write was ever issued for it.
+                status::mark_command_interrupted(existing.command_id);
             }
         }
 
@@ -772,8 +777,16 @@ where
         {
             // Possession refreshes cmd_vel every control tick.  Restarting the
             // same drive on every refresh makes the Create brake and re-start
-            // continuously.  Renew its deadline instead; a changed velocity
-            // still preempts immediately below.
+            // continuously. Renew its deadline and transfer lifecycle
+            // ownership to the refresh command without touching the motor; a
+            // changed velocity still preempts immediately below.
+            if self.active_command_id != Some(command_id) {
+                if let Some(previous_command_id) = self.active_command_id.replace(command_id) {
+                    status::mark_command_interrupted(previous_command_id);
+                }
+                let command_code = status::set_command(Some(command));
+                status::mark_command_started(command_id, command_code);
+            }
             self.active = ActiveAction::Driving {
                 stop_at_ms: self.now_ms().wrapping_add(duration_ms),
             };
@@ -2908,7 +2921,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_velocity_refresh_extends_the_drive_without_restarting_it() {
+    fn identical_velocity_refresh_transfers_lifecycle_without_restarting_drive() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.create_responsive = true;
@@ -2921,13 +2934,14 @@ mod tests {
         runtime.enqueue_latest_velocity(41, command);
         assert!(runtime.start_next_command().is_ok());
         let drive_writes = runtime.hardware.writes.clone();
+        let event_cursor = status::event_next_seq().saturating_sub(1);
         runtime.hardware.now_us = 1_100_000;
 
         runtime.enqueue_latest_velocity(42, command);
 
         assert!(runtime.commands.is_empty());
         assert_eq!(runtime.hardware.writes, drive_writes);
-        assert_eq!(runtime.active_command_id, Some(41));
+        assert_eq!(runtime.active_command_id, Some(42));
         assert!(matches!(
             runtime.active_velocity,
             Some(ActiveVelocity {
@@ -2939,6 +2953,39 @@ mod tests {
             runtime.active,
             ActiveAction::Driving { stop_at_ms: 1_400 }
         ));
+
+        let mut lifecycle = heapless::Vec::<status::PublicEventRecord, 8>::new();
+        status::collect_events_since(event_cursor, &mut lifecycle);
+        let lifecycle = lifecycle
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    x if x == status::PublicEventKind::CommandStarted as u8
+                        || x == status::PublicEventKind::CommandCompleted as u8
+                        || x == status::PublicEventKind::CommandInterrupted as u8
+                        || x == status::PublicEventKind::CommandTimedOut as u8
+                )
+            })
+            .map(|event| (event.kind, event.a))
+            .collect::<heapless::Vec<_, 4>>();
+        assert_eq!(
+            lifecycle.as_slice(),
+            &[
+                (status::PublicEventKind::CommandInterrupted as u8, 41),
+                (status::PublicEventKind::CommandStarted as u8, 42),
+            ]
+        );
+
+        runtime.hardware.now_us = 1_400_000;
+        assert!(runtime.advance_active_action().is_ok());
+        assert_eq!(runtime.active_command_id, None);
+
+        let mut completed = heapless::Vec::<status::PublicEventRecord, 8>::new();
+        status::collect_events_since(event_cursor, &mut completed);
+        assert!(completed.iter().any(|event| {
+            event.kind == status::PublicEventKind::CommandCompleted as u8 && event.a == 42
+        }));
     }
 
     #[test]

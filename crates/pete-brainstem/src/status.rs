@@ -737,6 +737,9 @@ fn submit_control_command_with_service_identity(
                 CommandRejectReason::StaleSequence,
             );
         }
+        let replaced_command_id = velocity_pending
+            .then(|| PENDING_VELOCITY_ID.load(Ordering::Relaxed))
+            .filter(|pending_id| *pending_id != command_id);
 
         PENDING_VELOCITY_ID.store(command_id, Ordering::Relaxed);
         PENDING_VELOCITY_A.store(a, Ordering::Relaxed);
@@ -746,9 +749,13 @@ fn submit_control_command_with_service_identity(
         PENDING_VELOCITY_KIND.store(ControlCommandCode::CmdVel as u8, Ordering::Relaxed);
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, seq, 0);
+        if let Some(replaced_command_id) = replaced_command_id {
+            mark_command_interrupted(replaced_command_id);
+        }
         return Ok(());
     }
 
+    let mut replaced_command_id = None;
     if matches!(kind, ControlCommandCode::Stop | ControlCommandCode::EStop) {
         PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
     } else {
@@ -762,6 +769,12 @@ fn submit_control_command_with_service_identity(
                 kind,
                 CommandRejectReason::Busy,
             );
+        }
+        if replaces_pending_heartbeat {
+            let pending_id = PENDING_COMMAND_ID.load(Ordering::Relaxed);
+            if pending_id != command_id {
+                replaced_command_id = Some(pending_id);
+            }
         }
     }
 
@@ -782,6 +795,9 @@ fn submit_control_command_with_service_identity(
         command_seq(command),
         kind as u32,
     );
+    if let Some(replaced_command_id) = replaced_command_id {
+        mark_command_interrupted(replaced_command_id);
+    }
     Ok(())
 }
 
@@ -4163,6 +4179,9 @@ mod tests {
         assert_eq!(PENDING_COMMAND_SEQ.load(Ordering::Relaxed), 11);
         assert_eq!(PENDING_COMMAND_DURATION_MS.load(Ordering::Relaxed), 900);
         let records = collect::<8>(0);
+        assert!(records.iter().any(|record| {
+            record.kind == PublicEventKind::CommandInterrupted as u8 && record.a == 10
+        }));
         assert_eq!(
             records
                 .iter()
@@ -4171,6 +4190,42 @@ mod tests {
             0
         );
         PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn pending_velocity_refresh_interrupts_the_replaced_command() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+
+        assert!(submit_control_command(
+            41,
+            BrainstemCommand::CmdVel {
+                linear_mm_s: 50,
+                angular_mrad_s: 100,
+                ttl_ms: 300,
+                seq: 41,
+            },
+        )
+        .is_ok());
+        assert!(submit_control_command(
+            42,
+            BrainstemCommand::CmdVel {
+                linear_mm_s: 50,
+                angular_mrad_s: 100,
+                ttl_ms: 300,
+                seq: 42,
+            },
+        )
+        .is_ok());
+
+        assert_eq!(PENDING_VELOCITY_ID.load(Ordering::Relaxed), 42);
+        let records = collect::<8>(0);
+        assert!(records.iter().any(|record| {
+            record.kind == PublicEventKind::CommandInterrupted as u8 && record.a == 41
+        }));
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
     }
 
     #[cfg(feature = "pico-w")]
