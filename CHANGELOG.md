@@ -10,6 +10,7 @@ All notable changes are grouped by date.
 - In clean-sync mode, local ahead status now triggers an automatic `git push` after successful pull.
 - Added temporary-file based output capture in `codex-sync.sh` for robust summary propagation from nested `codex` execution.
 - Updated the embedded codex instructions in `scripts/codex-sync.sh` to enforce an expanded repo-sync workflow (status inspection, changelog update, conflict-aware pull/push, and final summary format).
+- Refined `codex-sync` workflow instructions to preserve in-progress/Ongoing edits (e.g., TODO, FIXME, WIP, debug scaffolding) and commit only clearly ready, substantial chunks.
 
 ## 2026-07-15
 

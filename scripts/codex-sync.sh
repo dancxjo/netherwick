@@ -47,7 +47,18 @@ Do exactly this workflow:
    - If `## Unreleased` already has content, add a new heading `### Auto-sync (YYYY-MM-DD)` using today’s date and append your summary bullets.
    - Do not remove prior release entries.
 
-4) Stage and commit all edits into minimal semantic commit groups with imperative messages you generate.
+4) Inspect each changed file and classify edits into:
+   - `ready`: completed, correct, and substantial edits that can safely ship.
+   - `ongoing`: incomplete, experimental, partially reverted, obviously in-progress, or likely to be iterated on.
+
+   Heuristic signals for `ongoing` include (non-exhaustive):
+   - TODO/FIXME/WIP/XXX/NOTE markers.
+   - `dbg!`, `println!`, or obvious temporary debug/logging code.
+   - incomplete or placeholder values, commented-out blocks, or half-finished scaffolding.
+
+   Commit only `ready` edits in minimal semantic groups with imperative messages you generate.
+   Leave `ongoing` edits untouched in place.
+   If uncertain, err on the side of leaving edits uncommitted.
    (Include changelog edits in the same commit group as the code changes they describe.)
 
 5) Run `git pull --ff-only`.
