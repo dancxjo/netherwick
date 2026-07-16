@@ -1500,6 +1500,7 @@ where
         let fresh_bump_edge = bump && !self.last_bump;
 
         if home_base && !matches!(self.active, ActiveAction::DockDeparture { .. }) {
+            self.clear_dock_contact_latch();
             if !self.dock_departure_pending {
                 self.clear_motion_queue()?;
                 self.stop_drive()?;
@@ -1644,6 +1645,21 @@ where
     fn latch_safety(&mut self, kind: status::SafetyEventKind) {
         self.safety_latched = true;
         self.safety_latch_kind = Some(kind);
+    }
+
+    fn clear_dock_contact_latch(&mut self) {
+        let Some(kind @ (status::SafetyEventKind::Bump | status::SafetyEventKind::Cliff)) =
+            self.safety_latch_kind
+        else {
+            return;
+        };
+        // Packet 0 can arrive before the private packet-34 poll identifies
+        // Home Base, briefly interpreting dock geometry as a bump/cliff
+        // incident. Reconcile only those two contact latches once packet 34
+        // proves the source; every stronger latch remains untouched.
+        status::mark_safety_cleared(kind);
+        self.safety_latched = false;
+        self.safety_latch_kind = None;
     }
 
     fn clear_safety_latch(&mut self, expected: Option<status::SafetyEventKind>) {
@@ -2806,6 +2822,61 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn home_base_reconciles_an_early_cliff_latch_but_not_wheel_drop() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    bump_right: true,
+                    cliff_left: true,
+                    cliff_front_left: true,
+                    cliff_front_right: true,
+                    cliff_right: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Cliff)
+        ));
+
+        let event_cursor = status::snapshot(1_000).event_next_seq.saturating_sub(1);
+        status::mark_create_sensor_packet(
+            34,
+            crate::events::CreateSensorPacket {
+                charging_sources: 0b10,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(!runtime.safety_latched);
+        assert!(runtime.safety_latch_kind.is_none());
+
+        let mut events = heapless::Vec::<status::PublicEventRecord, 8>::new();
+        status::collect_events_since(event_cursor, &mut events);
+        assert!(events.iter().any(|event| {
+            event.kind == status::PublicEventKind::SafetyCleared as u8
+                && event.a == status::SafetyEventKind::Cliff as u32
+        }));
+
+        runtime.latch_safety(status::SafetyEventKind::WheelDrop);
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::WheelDrop)
+        ));
     }
 
     #[test]
