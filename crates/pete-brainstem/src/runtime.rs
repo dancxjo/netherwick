@@ -7,8 +7,8 @@ use pete_cockpit_protocol::{
 use crate::body;
 use crate::commands::{
     BrainstemCommand, EscapeDirection, FeedbackKind, PowerStateRequest, RuntimeCommand,
-    SafetyAction, SafetyLatchKind, SafetyPolicy, SongTone, ACQUIRE_CREATE_SCRIPT, DISARM_SCRIPT,
-    MAX_SONG_TONES, RESTART_CREATE_SCRIPT,
+    SafetyAction, SafetyLatchKind, SongTone, ACQUIRE_CREATE_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
+    RESTART_CREATE_SCRIPT,
 };
 use crate::drivers::{
     create_uart::{CreateUart, CREATE_BUTTON_LED_MASK, CREATE_LED_ADVANCE, CREATE_LED_PLAY},
@@ -197,7 +197,6 @@ where
     next_full_mode_refresh_ms: u32,
     next_supervision_light_ms: u32,
     supervision_light_phase: u8,
-    safety_policy: SafetyPolicy,
     safety_latched: bool,
     safety_latch_kind: Option<status::SafetyEventKind>,
     dock_departure_pending: bool,
@@ -214,6 +213,7 @@ where
     last_bump: bool,
     last_cliff: bool,
     last_wheel_drop: bool,
+    safety_observation_initialized: bool,
     active_motherbrain_reset: Option<ActiveMotherbrainReset>,
     motherbrain_reset_cooldown_until_ms: u32,
     motherbrain_reset_hardware_enabled: bool,
@@ -255,7 +255,6 @@ where
             next_full_mode_refresh_ms: 0,
             next_supervision_light_ms: 0,
             supervision_light_phase: 0,
-            safety_policy: SafetyPolicy::default(),
             safety_latched: false,
             safety_latch_kind: None,
             dock_departure_pending: false,
@@ -272,6 +271,7 @@ where
             last_bump: false,
             last_cliff: false,
             last_wheel_drop: false,
+            safety_observation_initialized: false,
             active_motherbrain_reset: None,
             motherbrain_reset_cooldown_until_ms: 0,
             motherbrain_reset_hardware_enabled: body::MOTHERBRAIN_RESET_ENABLED,
@@ -1129,9 +1129,10 @@ where
                     self.sensor_stream = None;
                 }
             }
-            RuntimeCommand::SetSafetyPolicy { policy } => {
-                self.safety_policy = policy;
-            }
+            // Production protection is constitutional firmware policy. Keep
+            // the internal variant only so older diagnostic fixtures decode,
+            // but never permit it to alter a running body.
+            RuntimeCommand::SetSafetyPolicy { .. } => {}
             RuntimeCommand::ClearMotionQueue => {
                 self.clear_motion_queue()?;
             }
@@ -1838,6 +1839,16 @@ where
         let charging = status::charging_interlock_active(&snapshot);
         let home_base = snapshot.create_sensor_charging_sources & 0b10 != 0;
 
+        // The first complete observation establishes the edge baseline. A
+        // bumper held through boot is evidence, not permission to move.
+        if !self.safety_observation_initialized {
+            self.last_bump = bump;
+            self.last_cliff = cliff;
+            self.last_wheel_drop = wheel_drop;
+            self.safety_observation_initialized = true;
+        }
+        let fresh_bump_edge = bump && !self.last_bump;
+
         if home_base && !matches!(self.active, ActiveAction::DockDeparture { .. }) {
             if !self.dock_departure_pending {
                 self.clear_motion_queue()?;
@@ -1875,7 +1886,7 @@ where
         }
         self.update_safety_edges(bump, cliff, wheel_drop);
 
-        if wheel_drop && self.safety_policy.wheel_drop_latch {
+        if wheel_drop {
             if self.safety_latch_kind != Some(status::SafetyEventKind::WheelDrop) {
                 status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
                 status::mark_wheel_drop_latched();
@@ -1909,10 +1920,14 @@ where
             (status::SafetyEventKind::Impact, SafetyAction::Stop)
         } else if cliff {
             status::mark_safety_tripped(status::SafetyEventKind::Cliff);
-            (status::SafetyEventKind::Cliff, self.safety_policy.cliff)
-        } else if bump {
+            (status::SafetyEventKind::Cliff, SafetyAction::Stop)
+        } else if bump && fresh_bump_edge && self.unsafe_forward_output() {
             status::mark_safety_tripped(status::SafetyEventKind::Bump);
-            (status::SafetyEventKind::Bump, self.safety_policy.bump)
+            (status::SafetyEventKind::Bump, SafetyAction::Backoff)
+        } else if bump {
+            // A level-only contact, stationary press, or boot-restored sample
+            // remains observable but cannot initiate autonomous motion.
+            return Ok(());
         } else if wheel_drop {
             status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
             (status::SafetyEventKind::WheelDrop, SafetyAction::Stop)
@@ -2000,12 +2015,37 @@ where
         if expected.is_some_and(|expected| expected != kind) {
             return;
         }
+        let snapshot = status::snapshot(self.now_ms());
+        let flags = snapshot.create_sensor_flags;
+        let physical_condition_active = match kind {
+            status::SafetyEventKind::Bump => flags & 0b11 != 0,
+            status::SafetyEventKind::WheelDrop => flags & (1 << 2) != 0,
+            status::SafetyEventKind::Cliff => flags & 0b1111_0000 != 0,
+            status::SafetyEventKind::Tilt => {
+                snapshot.imu_health == status::ImuHealthCode::Ok as u8
+                    && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD
+            }
+            status::SafetyEventKind::Impact => {
+                snapshot.imu_health == status::ImuHealthCode::Ok as u8
+                    && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2
+            }
+            status::SafetyEventKind::Charging => status::charging_interlock_active(&snapshot),
+            _ => false,
+        };
+        if physical_condition_active {
+            return;
+        }
         status::mark_safety_cleared(kind);
         if kind == status::SafetyEventKind::WheelDrop {
             status::mark_wheel_drop_cleared();
         }
         self.safety_latched = false;
         self.safety_latch_kind = None;
+    }
+
+    fn unsafe_forward_output(&self) -> bool {
+        self.active_velocity
+            .is_some_and(|velocity| velocity.linear_mm_s > 0)
     }
 
     fn feedback_tones(&self, kind: FeedbackKind) -> ([SongTone; MAX_SONG_TONES], u8) {
@@ -3484,6 +3524,10 @@ mod tests {
     #[test]
     fn contact_withdrawal_runs_locally_then_stays_latched_until_clear() {
         let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        assert!(runtime.enforce_safety_policy().is_ok());
         status::mark_create_sensor_packet(
             0,
             crate::events::CreateSensorPacket {
@@ -3494,10 +3538,12 @@ mod tests {
                 ..crate::events::CreateSensorPacket::default()
             },
         );
-        let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.create_responsive = true;
         runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
         runtime.active_command_id = Some(42);
+        runtime.active_velocity = Some(ActiveVelocity {
+            linear_mm_s: 80,
+            angular_mrad_s: 0,
+        });
 
         assert!(runtime.enforce_safety_policy().is_ok());
         assert!(runtime.safety_latched);
@@ -3561,6 +3607,10 @@ mod tests {
                 ..crate::events::CreateSensorPacket::default()
             },
         );
+        runtime.active_velocity = Some(ActiveVelocity {
+            linear_mm_s: 80,
+            angular_mrad_s: 0,
+        });
         assert!(runtime.enforce_safety_policy().is_ok());
         assert!(runtime.safety_latched);
         assert!(matches!(
@@ -3573,6 +3623,10 @@ mod tests {
     fn contact_edge_preempts_forward_and_starts_reverse_in_one_runtime_tick() {
         let _guard = status::status_test_guard();
         let since_seq = status::event_next_seq().saturating_sub(1);
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        assert!(runtime.enforce_safety_policy().is_ok());
         status::mark_create_sensor_packet(
             0,
             crate::events::CreateSensorPacket {
@@ -3583,10 +3637,12 @@ mod tests {
                 ..crate::events::CreateSensorPacket::default()
             },
         );
-        let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.create_responsive = true;
         runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
         runtime.active_command_id = Some(71);
+        runtime.active_velocity = Some(ActiveVelocity {
+            linear_mm_s: 80,
+            angular_mrad_s: 0,
+        });
 
         runtime.tick();
 
@@ -3609,7 +3665,7 @@ mod tests {
     }
 
     #[test]
-    fn cliff_preempts_an_active_contact_withdrawal() {
+    fn bumper_held_at_boot_or_pressed_while_stationary_never_reverses() {
         let _guard = status::status_test_guard();
         status::mark_create_sensor_packet(
             0,
@@ -3623,6 +3679,49 @@ mod tests {
         );
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.create_responsive = true;
+
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.active_contact_withdrawal.is_none());
+        assert!(runtime.commands.is_empty());
+
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        assert!(runtime.enforce_safety_policy().is_ok());
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_right: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.active_contact_withdrawal.is_none());
+        assert!(runtime.commands.is_empty());
+    }
+
+    #[test]
+    fn cliff_preempts_an_active_contact_withdrawal() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        assert!(runtime.enforce_safety_policy().is_ok());
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        runtime.active_velocity = Some(ActiveVelocity {
+            linear_mm_s: 80,
+            angular_mrad_s: 0,
+        });
 
         assert!(runtime.enforce_safety_policy().is_ok());
         assert!(runtime.start_next_command().is_ok());
