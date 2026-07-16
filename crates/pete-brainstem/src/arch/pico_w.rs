@@ -38,8 +38,8 @@ use static_cell::StaticCell;
 use crate::body;
 use crate::capabilities;
 use crate::commands::{
-    BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, PowerStateRequest, SafetyAction,
-    SafetyLatchKind, SafetyPolicy, SongTone, MAX_SONG_TONES,
+    BrainstemCommand, CreateOiMode, FeedbackKind, PowerStateRequest, SafetyLatchKind, SongTone,
+    MAX_SONG_TONES,
 };
 use crate::dhcp::{DhcpClient, DhcpGrant, DhcpLeaseState, DhcpRequest, DHCP_LEASE_SECONDS};
 use crate::drivers::imu::{decode_mpu6050_sample, ImuHealth};
@@ -1495,14 +1495,6 @@ fn index_html() -> &'static [u8] {
     // Clear E-Stop                  clear_estop           ClearEStop                     clear_estop
     // Dock                          dock                  Dock                           dock
     // Ping                          ping                  Ping                           ping
-    // Drive 300                     drive_for             DriveFor                       drive_for
-    // Turn L/R                      turn_by               TurnBy                         turn_by
-    // Creep                         creep_until           CreepUntil                     creep_until
-    // Scan                          scan_arc              ScanArc                        scan_arc
-    // Wiggle                        wiggle_align          WiggleAlign                    wiggle_align
-    // Bump Escape                   bump_escape           BumpEscape                     bump_escape
-    // Unstick                       unstick               Unstick                        unstick
-    // Cliff Stop                    cliff_guard           CliffGuard                     cliff_guard
     // Music Define / Play           song_define/play      SongDefine / SongPlay          song_define/song_play
     // Refresh                       reconnect /events SSE (no command)
     // BOOTSEL                       bootsel               Bootsel                        service/debug only
@@ -1557,7 +1549,6 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <button data-drive="spinl">SPIN L</button><button data-drive="slow">SLOW</button><button data-drive="spinr">SPIN R</button>
 </div>
 <div class="row"><button class="stop" id="stop">STOP</button></div>
-<div class="row"><button data-action="creep">Creep</button><button data-action="scan">Scan</button><button data-action="wiggle">Wiggle</button></div>
 </section>
 <div class="side">
 <section class="station">
@@ -1675,7 +1666,7 @@ function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='
 function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(sessionId)o.session_id=sessionId;if(controlLeaseId)o.lease_id=controlLeaseId;if(serviceLeaseId)o.service_lease_id=serviceLeaseId;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
 function requestStatus(){return sendCockpit({kind:'status'},false)}
 function requestCaps(){return sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps();ensureSensorStream()}})}
-function applyCaps(){let drive=canMotion('cmd_vel'),svc=!!sessionId,canClearLatch=canControl('clear_safety_latch');setEnabled('controllease',!!sessionId);setEnabled('stop',hasVerb('stop'));setEnabled('padstop',hasVerb('stop'));setEnabled('estop',hasVerb('estop'));setEnabled('clear',canSession('clear_estop'));setEnabled('clearcharge',canClearLatch&&!(lastStatus&&lastStatus.create_sensors&&chargeActive(lastStatus.create_sensors)));['clearbump','clearwheel','clearcliff','cleartilt','clearimpact'].forEach(id=>setEnabled(id,canClearLatch));setEnabled('stream',canSession('stream_sensors'));setEnabled('imuzero',canControl('zero_imu_orientation'));setEnabled('imuclear',canControl('clear_imu_orientation'));setEnabled('createrestart',svc&&hasVerb('restart_create'));setEnabled('mbreset',svc&&hasVerb('reset_motherbrain'));setEnabled('bootsel',svc&&hasVerb('bootsel'));setEnabled('createon',canControl('create_power_on'));setEnabled('createoff',canControl('create_power_off'));setEnabled('createbrc',canControl('power_state'));setEnabled('createoi',canControl('power_state'));setEnabledAll('[data-drive]',drive);setEnabled('speed',drive);setEnabled('turn',drive);base.style.pointerEvents=drive?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action],motion=['drive_for','turn_left','turn_right','creep','scan','wiggle','bump_escape','unstick'].indexOf(b.dataset.action)>=0;b.disabled=!(v&&(motion?canMotion(v):canControl(v)))});setEnabled('dock',canMotion('dock'));setEnabled('songdef',canControl('song_define'));setEnabled('songplay',canControl('song_play'));setEnabled('song',canControl('song_define')&&canControl('song_play'));setEnabled('songid',canControl('song_define')||canControl('song_play'));setEnabled('tones',canControl('song_define'));setEnabled('ping',hasVerb('ping'));setEnabled('refresh',true);refreshControlLock();if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
+function applyCaps(){let drive=canMotion('cmd_vel'),svc=!!sessionId,canClearLatch=canControl('clear_safety_latch');setEnabled('controllease',!!sessionId);setEnabled('stop',hasVerb('stop'));setEnabled('padstop',hasVerb('stop'));setEnabled('estop',hasVerb('estop'));setEnabled('clear',canSession('clear_estop'));setEnabled('clearcharge',canClearLatch&&!(lastStatus&&lastStatus.create_sensors&&chargeActive(lastStatus.create_sensors)));['clearbump','clearwheel','clearcliff','cleartilt','clearimpact'].forEach(id=>setEnabled(id,canClearLatch));setEnabled('stream',canSession('stream_sensors'));setEnabled('imuzero',canControl('zero_imu_orientation'));setEnabled('imuclear',canControl('clear_imu_orientation'));setEnabled('createrestart',svc&&hasVerb('restart_create'));setEnabled('mbreset',svc&&hasVerb('reset_motherbrain'));setEnabled('bootsel',svc&&hasVerb('bootsel'));setEnabled('createon',canControl('create_power_on'));setEnabled('createoff',canControl('create_power_off'));setEnabled('createbrc',canControl('power_state'));setEnabled('createoi',canControl('power_state'));setEnabledAll('[data-drive]',drive);setEnabled('speed',drive);setEnabled('turn',drive);base.style.pointerEvents=drive?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];b.disabled=!(v&&canControl(v))});setEnabled('dock',canMotion('dock'));setEnabled('songdef',canControl('song_define'));setEnabled('songplay',canControl('song_play'));setEnabled('song',canControl('song_define')&&canControl('song_play'));setEnabled('songid',canControl('song_define')||canControl('song_play'));setEnabled('tones',canControl('song_define'));setEnabled('ping',hasVerb('ping'));setEnabled('refresh',true);refreshControlLock();if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
 function releaseDriveUi(){let wasDriving=active||timer||driveKind;clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('[data-drive].active').forEach(b=>b.classList.remove('active'));return wasDriving}
 function stop(){releaseDriveUi();sendCockpit({kind:'stop'})}
 function clearLatch(kind,attempt=0){return sendCockpit({kind:'clear_safety_latch',latch:kind}).then(j=>{let reason=j&&(j.message||j.reason);if(j&&j.accepted===false&&reason==='busy'&&attempt<5){addLog('retry clear '+kind);return new Promise(r=>setTimeout(r,180)).then(()=>clearLatch(kind,attempt+1))}return requestStatus()})}
@@ -2275,104 +2266,10 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             radius_mm: parse_i16(parts.next()).ok_or(seq)?,
             ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
         },
-        "FACE_BEARING" => BrainstemCommand::FaceBearing {
-            seq,
-            bearing_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            tolerance_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "TRACK_BEARING" => BrainstemCommand::TrackBearing {
-            seq,
-            bearing_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            range_mm: parse_u32(parts.next()).ok_or(seq)? as u16,
-            max_linear_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            stop_range_mm: parse_u32(parts.next()).ok_or(seq)? as u16,
-            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "TURN_BY" => BrainstemCommand::TurnBy {
-            seq,
-            angle_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "DRIVE_FOR" => BrainstemCommand::DriveFor {
-            seq,
-            distance_mm: parse_i16(parts.next()).ok_or(seq)?,
-            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "BUMP_ESCAPE" => BrainstemCommand::BumpEscape {
-            seq,
-            direction: parse_escape_direction(parts.next().ok_or(seq)?).ok_or(seq)?,
-            backoff_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            turn_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-        },
-        "HOLD_HEADING" => BrainstemCommand::HoldHeading {
-            seq,
-            heading_error_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "TURN_TO_HEADING" => BrainstemCommand::TurnToHeading {
-            seq,
-            heading_error_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            tolerance_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "ARC_FOR" => BrainstemCommand::ArcFor {
-            seq,
-            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            radius_mm: parse_i16(parts.next()).ok_or(seq)?,
-            duration_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "CREEP_UNTIL" => BrainstemCommand::CreepUntil {
-            seq,
-            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "SCAN_ARC" => BrainstemCommand::ScanArc {
-            seq,
-            angle_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "DOCK_ALIGN" => BrainstemCommand::DockAlign {
-            seq,
-            bearing_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            range_mm: parse_u32(parts.next()).ok_or(seq)? as u16,
-            max_linear_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            stop_range_mm: parse_u32(parts.next()).ok_or(seq)? as u16,
-            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "WALL_FOLLOW" => BrainstemCommand::WallFollow {
-            seq,
-            distance_error_mm: parse_i16(parts.next()).ok_or(seq)?,
-            velocity_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            max_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "WIGGLE_ALIGN" => BrainstemCommand::WiggleAlign {
-            seq,
-            amplitude_mrad: parse_i16(parts.next()).ok_or(seq)?,
-            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-            cycles: parse_u32(parts.next()).ok_or(seq)? as u8,
-        },
-        "UNSTICK" => BrainstemCommand::Unstick {
-            seq,
-            direction: parse_escape_direction(parts.next().ok_or(seq)?).ok_or(seq)?,
-            backoff_mm_s: parse_i16(parts.next()).ok_or(seq)?,
-            turn_angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
-        },
-        "CLIFF_GUARD" => BrainstemCommand::CliffGuard {
-            seq,
-            clear: parse_bool(parts.next()).ok_or(seq)?,
-        },
+        "FACE_BEARING" | "TRACK_BEARING" | "TURN_BY" | "DRIVE_FOR" | "BUMP_ESCAPE"
+        | "HOLD_HEADING" | "TURN_TO_HEADING" | "ARC_FOR" | "CREEP_UNTIL" | "SCAN_ARC"
+        | "DOCK_ALIGN" | "WALL_FOLLOW" | "WIGGLE_ALIGN" | "UNSTICK" | "CLIFF_GUARD"
+        | "SET_SAFETY_POLICY" => BrainstemCommand::Unsupported { seq },
         "CLEAR_SAFETY_LATCH" => BrainstemCommand::ClearSafetyLatch {
             seq,
             kind: parse_safety_latch_kind(parts.next().ok_or(seq)?).ok_or(seq)?,
@@ -2390,14 +2287,6 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             enabled: parse_bool(parts.next()).ok_or(seq)?,
             packet_id: parse_u32(parts.next()).ok_or(seq)? as u8,
             period_ms: parse_u32(parts.next()).ok_or(seq)?,
-        },
-        "SET_SAFETY_POLICY" => BrainstemCommand::SetSafetyPolicy {
-            seq,
-            policy: SafetyPolicy {
-                bump: parse_safety_action(parts.next().ok_or(seq)?).ok_or(seq)?,
-                cliff: parse_safety_action(parts.next().ok_or(seq)?).ok_or(seq)?,
-                wheel_drop_latch: parse_bool(parts.next()).ok_or(seq)?,
-            },
         },
         "CLEAR_MOTION_QUEUE" => BrainstemCommand::ClearMotionQueue { seq },
         "DEFINE_CHIRP" => {
@@ -2622,6 +2511,7 @@ fn command_requires_session(command: BrainstemCommand) -> bool {
             | BrainstemCommand::GetEvents { .. }
             | BrainstemCommand::Stop
             | BrainstemCommand::EStop
+            | BrainstemCommand::Unsupported { .. }
     )
 }
 fn command_requires_authority(command: BrainstemCommand) -> bool {
@@ -3299,102 +3189,10 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
-        "face_bearing" => Some(BrainstemCommand::FaceBearing {
-            bearing_mrad: json_i16(body, "bearing_mrad")?,
-            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s")?,
-            tolerance_mrad: json_i16(body, "tolerance_mrad").unwrap_or(35),
-            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "track_bearing" => Some(BrainstemCommand::TrackBearing {
-            bearing_mrad: json_i16(body, "bearing_mrad")?,
-            range_mm: json_u32(body, "range_mm")? as u16,
-            max_linear_mm_s: json_i16(body, "max_linear_mm_s")?,
-            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s")?,
-            stop_range_mm: json_u32(body, "stop_range_mm").unwrap_or(0) as u16,
-            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "turn_by" => Some(BrainstemCommand::TurnBy {
-            angle_mrad: json_i16(body, "angle_mrad")?,
-            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
-            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "drive_for" => Some(BrainstemCommand::DriveFor {
-            distance_mm: json_i16(body, "distance_mm")?,
-            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
-            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "bump_escape" => Some(BrainstemCommand::BumpEscape {
-            direction: parse_escape_direction(json_str(body, "direction").unwrap_or("either"))?,
-            backoff_mm_s: json_i16(body, "backoff_mm_s").unwrap_or(80),
-            turn_angular_mrad_s: json_i16(body, "turn_angular_mrad_s").unwrap_or(900),
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "hold_heading" => Some(BrainstemCommand::HoldHeading {
-            heading_error_mrad: json_i16(body, "heading_error_mrad")?,
-            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
-            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s")?,
-            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "turn_to_heading" => Some(BrainstemCommand::TurnToHeading {
-            heading_error_mrad: json_i16(body, "heading_error_mrad")?,
-            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
-            tolerance_mrad: json_i16(body, "tolerance_mrad").unwrap_or(35),
-            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "arc_for" => Some(BrainstemCommand::ArcFor {
-            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
-            radius_mm: json_i16(body, "radius_mm")?,
-            duration_ms: json_u32(body, "duration_ms").or_else(|| json_u32(body, "ttl_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "creep_until" => Some(BrainstemCommand::CreepUntil {
-            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
-            angular_mrad_s: json_i16(body, "angular_mrad_s").unwrap_or(0),
-            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "scan_arc" => Some(BrainstemCommand::ScanArc {
-            angle_mrad: json_i16(body, "angle_mrad")?,
-            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
-            timeout_ms: json_u32(body, "timeout_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "dock_align" => Some(BrainstemCommand::DockAlign {
-            bearing_mrad: json_i16(body, "bearing_mrad")?,
-            range_mm: json_u32(body, "range_mm")? as u16,
-            max_linear_mm_s: json_i16(body, "max_linear_mm_s").unwrap_or(110),
-            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s").unwrap_or(650),
-            stop_range_mm: json_u32(body, "stop_range_mm").unwrap_or(250) as u16,
-            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "wall_follow" => Some(BrainstemCommand::WallFollow {
-            distance_error_mm: json_i16(body, "distance_error_mm")?,
-            velocity_mm_s: json_i16(body, "velocity_mm_s")?,
-            max_angular_mrad_s: json_i16(body, "max_angular_mrad_s")?,
-            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "wiggle_align" => Some(BrainstemCommand::WiggleAlign {
-            amplitude_mrad: json_i16(body, "amplitude_mrad")?,
-            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
-            cycles: json_u32(body, "cycles").unwrap_or(2) as u8,
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "unstick" => Some(BrainstemCommand::Unstick {
-            direction: parse_escape_direction(json_str(body, "direction").unwrap_or("either"))?,
-            backoff_mm_s: json_i16(body, "backoff_mm_s").unwrap_or(100),
-            turn_angular_mrad_s: json_i16(body, "turn_angular_mrad_s").unwrap_or(1_000),
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "cliff_guard" => Some(BrainstemCommand::CliffGuard {
-            clear: json_bool(body, "clear").unwrap_or(false),
+        "face_bearing" | "track_bearing" | "turn_by" | "drive_for" | "bump_escape"
+        | "hold_heading" | "turn_to_heading" | "arc_for" | "creep_until" | "scan_arc"
+        | "dock_align" | "wall_follow" | "wiggle_align" | "unstick" | "cliff_guard"
+        | "set_safety_policy" => Some(BrainstemCommand::Unsupported {
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
         "clear_safety_latch" => Some(BrainstemCommand::ClearSafetyLatch {
@@ -3414,14 +3212,6 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             packet_id: json_u32(body, "packet_id")
                 .unwrap_or(body::CREATE_SENSOR_PROBE_PACKET as u32) as u8,
             period_ms: json_u32(body, "period_ms").unwrap_or(250),
-            seq: json_u32(body, "seq").unwrap_or(command_id),
-        }),
-        "set_safety_policy" => Some(BrainstemCommand::SetSafetyPolicy {
-            policy: SafetyPolicy {
-                bump: parse_safety_action(json_str(body, "bump_action").unwrap_or("stop"))?,
-                cliff: parse_safety_action(json_str(body, "cliff_action").unwrap_or("stop"))?,
-                wheel_drop_latch: json_bool(body, "wheel_drop_latch").unwrap_or(true),
-            },
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
         "clear_motion_queue" => Some(BrainstemCommand::ClearMotionQueue {
@@ -3504,25 +3294,6 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
                 intensity: intensity as u8,
             })
         }
-        _ => None,
-    }
-}
-
-fn parse_escape_direction(direction: &str) -> Option<EscapeDirection> {
-    match direction {
-        "left" | "LEFT" => Some(EscapeDirection::Left),
-        "right" | "RIGHT" => Some(EscapeDirection::Right),
-        "either" | "EITHER" => Some(EscapeDirection::Either),
-        _ => None,
-    }
-}
-
-fn parse_safety_action(action: &str) -> Option<SafetyAction> {
-    match action {
-        "none" | "NONE" => Some(SafetyAction::None),
-        "stop" | "STOP" => Some(SafetyAction::Stop),
-        "backoff" | "BACKOFF" => Some(SafetyAction::Backoff),
-        "bump_escape" | "BUMP_ESCAPE" | "escape" | "ESCAPE" => Some(SafetyAction::BumpEscape),
         _ => None,
     }
 }

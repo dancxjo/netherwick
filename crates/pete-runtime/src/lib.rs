@@ -19,9 +19,8 @@ use pete_behaviors::{
 };
 use pete_body::{BodyFlags, BodySense};
 use pete_cockpit::{
-    bump_escape_duration_ms, Cockpit, CockpitEventKind, ContactWithdrawalEvent,
-    ContactWithdrawalOutcome, MotionCommand, MotorCommand, SafeCockpit, SafeStopReason,
-    SafetyLatchKind, StatusSummary, BUMP_ESCAPE_BACKOFF_DURATION_MS,
+    Cockpit, CockpitEventKind, ContactWithdrawalEvent, ContactWithdrawalOutcome, MotionCommand,
+    MotorCommand, SafeCockpit, SafeStopReason, SafetyLatchKind, StatusSummary,
 };
 use pete_conductor::{
     Conductor, ConductorInput, GoalSystem, NavigationIntent, SimpleConductor, SkillId,
@@ -5450,11 +5449,13 @@ const POSSESSION_RECOVERY_COMMAND_COOLDOWN_MS: TimeMs = 1_000;
 const POSSESSION_RECOVERY_STUCK_AFTER_MS: TimeMs = 15_000;
 const POSSESSION_RECOVERY_MAX_ATTEMPTS: u32 = 3;
 const POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S: i16 = 50;
+const POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS: TimeMs = 900;
+const POSSESSION_BUMP_ESCAPE_TURN_ANGLE_MRAD: TimeMs = 1_571;
 const POSSESSION_BUMP_ESCAPE_TURN_MRAD_S: i16 = 500;
 const POSSESSION_BUMP_ESCAPE_SETTLE_MS: TimeMs = 250;
-const POSSESSION_BUMP_ESCAPE_DURATION_MS: TimeMs =
-    bump_escape_duration_ms(POSSESSION_BUMP_ESCAPE_TURN_MRAD_S) as TimeMs
-        + POSSESSION_BUMP_ESCAPE_SETTLE_MS;
+const POSSESSION_BUMP_ESCAPE_DURATION_MS: TimeMs = POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS
+    + POSSESSION_BUMP_ESCAPE_TURN_ANGLE_MRAD * 1_000 / POSSESSION_BUMP_ESCAPE_TURN_MRAD_S as TimeMs
+    + POSSESSION_BUMP_ESCAPE_SETTLE_MS;
 const MOTION_REJECTION_WINDOW_MS: TimeMs = 5_000;
 const MOTION_REJECTION_BASE_BACKOFF_MS: TimeMs = 1_000;
 const MOTION_REJECTION_MAX_BACKOFF_MS: TimeMs = 5_000;
@@ -6061,10 +6062,10 @@ where
                         && escape_elapsed_ms < POSSESSION_BUMP_ESCAPE_DURATION_MS
                     {
                         command_sent = true;
-                        if escape_elapsed_ms < BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs {
+                        if escape_elapsed_ms < POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS {
                             action = Some(ActionPrimitive::Go {
                                 intensity: -0.2,
-                                duration_ms: BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs,
+                                duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
                             });
                             motor = Some(MotorCommand {
                                 forward: -0.05,
@@ -6079,7 +6080,7 @@ where
                                 direction: TurnDir::Right,
                                 intensity: 0.5,
                                 duration_ms: POSSESSION_BUMP_ESCAPE_DURATION_MS
-                                    .saturating_sub(BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs),
+                                    .saturating_sub(POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS),
                             });
                             motor = Some(MotorCommand {
                                 forward: 0.0,
@@ -6106,7 +6107,7 @@ where
                             PossessionRecoveryPhase::WaitingForSensorClear;
                         action = Some(ActionPrimitive::Go {
                             intensity: -0.2,
-                            duration_ms: BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs,
+                            duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
                         });
                         motor = Some(MotorCommand {
                             forward: -0.05,
@@ -11224,7 +11225,7 @@ mod tests {
             tick.chosen_action,
             Some(ActionPrimitive::Go {
                 intensity: -0.2,
-                duration_ms: BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs,
+                duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
             })
         );
         let debug = snapshot.action_debug.as_ref().unwrap();
@@ -11280,7 +11281,7 @@ mod tests {
             second_tick.chosen_action,
             Some(ActionPrimitive::Go {
                 intensity: -0.2,
-                duration_ms: BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs,
+                duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
             })
         );
         assert!(second_snapshot
@@ -11372,7 +11373,7 @@ mod tests {
         runner.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
         runner.possession_recovery.command_attempts = 1;
         runner.possession_recovery.last_command_ms =
-            wall_time_ms().saturating_sub(BUMP_ESCAPE_BACKOFF_DURATION_MS as TimeMs + 1);
+            wall_time_ms().saturating_sub(POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS + 1);
 
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 

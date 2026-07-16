@@ -6,8 +6,8 @@ pub use pete_cockpit_protocol::CommandRejectReason;
 
 use crate::body;
 use crate::commands::{
-    BrainstemCommand, CreateOiMode, EscapeDirection, FeedbackKind, PowerStateRequest,
-    RuntimeCommand, SafetyAction, SafetyLatchKind, SafetyPolicy, SongTone, MAX_SONG_TONES,
+    BrainstemCommand, CreateOiMode, FeedbackKind, PowerStateRequest, RuntimeCommand,
+    SafetyLatchKind, SongTone, MAX_SONG_TONES,
 };
 use crate::drivers::imu::{
     derive_sample, derive_sample_with_gravity_calibration, ImuGravityCalibration, ImuHealth,
@@ -631,22 +631,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         Some(RuntimeCommand::DriveDirect { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::CmdVel { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::DriveArc { .. }) => CommandCode::Drive,
-        Some(RuntimeCommand::FaceBearing { .. })
-        | Some(RuntimeCommand::TrackBearing { .. })
-        | Some(RuntimeCommand::TurnBy { .. })
-        | Some(RuntimeCommand::DriveFor { .. })
-        | Some(RuntimeCommand::BumpEscape { .. })
-        | Some(RuntimeCommand::HoldHeading { .. })
-        | Some(RuntimeCommand::TurnToHeading { .. })
-        | Some(RuntimeCommand::ArcFor { .. })
-        | Some(RuntimeCommand::CreepUntil { .. })
-        | Some(RuntimeCommand::ScanArc { .. })
-        | Some(RuntimeCommand::DockAlign { .. })
-        | Some(RuntimeCommand::WallFollow { .. })
-        | Some(RuntimeCommand::WiggleAlign { .. })
-        | Some(RuntimeCommand::Unstick { .. })
-        | Some(RuntimeCommand::CliffGuard { .. })
-        | Some(RuntimeCommand::ClearSafetyLatch { .. })
+        Some(RuntimeCommand::ClearSafetyLatch { .. })
         | Some(RuntimeCommand::HeartbeatStop { .. }) => CommandCode::Behavior,
         Some(RuntimeCommand::PulseBrc) => CommandCode::PulseBrc,
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
@@ -654,7 +639,6 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         Some(RuntimeCommand::StopDrive) => CommandCode::StopDrive,
         Some(RuntimeCommand::RequestSensors { .. })
         | Some(RuntimeCommand::StreamSensors { .. })
-        | Some(RuntimeCommand::SetSafetyPolicy { .. })
         | Some(RuntimeCommand::ClearMotionQueue)
         | Some(RuntimeCommand::DefineChirp { .. })
         | Some(RuntimeCommand::PlayFeedback { .. })
@@ -757,7 +741,7 @@ fn submit_control_command_with_service_identity(
     service_session_hash: u32,
     service_lease_hash: u32,
 ) -> Result<(), CommandRejectReason> {
-    if removed_wire_command(command) {
+    if matches!(command, BrainstemCommand::Unsupported { .. }) {
         return reject_control_command(
             command_id,
             command_seq(command),
@@ -882,28 +866,6 @@ fn submit_control_command_with_service_identity(
         mark_command_interrupted(replaced_velocity_id);
     }
     Ok(())
-}
-
-fn removed_wire_command(command: BrainstemCommand) -> bool {
-    matches!(
-        command,
-        BrainstemCommand::FaceBearing { .. }
-            | BrainstemCommand::TrackBearing { .. }
-            | BrainstemCommand::TurnBy { .. }
-            | BrainstemCommand::DriveFor { .. }
-            | BrainstemCommand::BumpEscape { .. }
-            | BrainstemCommand::HoldHeading { .. }
-            | BrainstemCommand::TurnToHeading { .. }
-            | BrainstemCommand::ArcFor { .. }
-            | BrainstemCommand::CreepUntil { .. }
-            | BrainstemCommand::ScanArc { .. }
-            | BrainstemCommand::DockAlign { .. }
-            | BrainstemCommand::WallFollow { .. }
-            | BrainstemCommand::WiggleAlign { .. }
-            | BrainstemCommand::Unstick { .. }
-            | BrainstemCommand::CliffGuard { .. }
-            | BrainstemCommand::SetSafetyPolicy { .. }
-    )
 }
 
 #[cfg(feature = "pico-w")]
@@ -1422,75 +1384,7 @@ fn encode_control_command(
             0,
             None,
         )),
-        BrainstemCommand::FaceBearing {
-            bearing_mrad,
-            max_angular_mrad_s,
-            tolerance_mrad,
-            ttl_ms,
-            ..
-        } => Some((
-            ControlCommandCode::FaceBearing,
-            encode_i16(bearing_mrad),
-            encode_i16(max_angular_mrad_s),
-            encode_i16(tolerance_mrad),
-            0,
-            Some(ttl_ms),
-        )),
-        BrainstemCommand::TrackBearing {
-            bearing_mrad,
-            range_mm,
-            max_linear_mm_s,
-            max_angular_mrad_s,
-            stop_range_mm,
-            ttl_ms,
-            ..
-        } => Some((
-            ControlCommandCode::TrackBearing,
-            encode_i16(bearing_mrad),
-            range_mm as u32,
-            encode_i16(max_linear_mm_s),
-            pack_i16_u16(max_angular_mrad_s, stop_range_mm),
-            Some(ttl_ms),
-        )),
-        BrainstemCommand::TurnBy {
-            angle_mrad,
-            angular_mrad_s,
-            timeout_ms,
-            ..
-        } => Some((
-            ControlCommandCode::TurnBy,
-            encode_i16(angle_mrad),
-            encode_i16(angular_mrad_s),
-            0,
-            0,
-            Some(timeout_ms),
-        )),
-        BrainstemCommand::DriveFor {
-            distance_mm,
-            velocity_mm_s,
-            timeout_ms,
-            ..
-        } => Some((
-            ControlCommandCode::DriveFor,
-            encode_i16(distance_mm),
-            encode_i16(velocity_mm_s),
-            0,
-            0,
-            Some(timeout_ms),
-        )),
-        BrainstemCommand::BumpEscape {
-            direction,
-            backoff_mm_s,
-            turn_angular_mrad_s,
-            ..
-        } => Some((
-            ControlCommandCode::BumpEscape,
-            encode_escape_direction(direction) as u32,
-            encode_i16(backoff_mm_s),
-            encode_i16(turn_angular_mrad_s),
-            0,
-            None,
-        )),
+        BrainstemCommand::Unsupported { .. } => None,
         BrainstemCommand::HeartbeatStop { timeout_ms, .. } => Some((
             ControlCommandCode::HeartbeatStop,
             0,
@@ -1499,132 +1393,6 @@ fn encode_control_command(
             0,
             Some(timeout_ms),
         )),
-        BrainstemCommand::HoldHeading {
-            heading_error_mrad,
-            velocity_mm_s,
-            max_angular_mrad_s,
-            ttl_ms,
-            ..
-        } => Some((
-            ControlCommandCode::HoldHeading,
-            encode_i16(heading_error_mrad),
-            encode_i16(velocity_mm_s),
-            encode_i16(max_angular_mrad_s),
-            0,
-            Some(ttl_ms),
-        )),
-        BrainstemCommand::TurnToHeading {
-            heading_error_mrad,
-            angular_mrad_s,
-            tolerance_mrad,
-            timeout_ms,
-            ..
-        } => Some((
-            ControlCommandCode::TurnToHeading,
-            encode_i16(heading_error_mrad),
-            encode_i16(angular_mrad_s),
-            encode_i16(tolerance_mrad),
-            0,
-            Some(timeout_ms),
-        )),
-        BrainstemCommand::ArcFor {
-            velocity_mm_s,
-            radius_mm,
-            duration_ms,
-            ..
-        } => Some((
-            ControlCommandCode::ArcFor,
-            encode_i16(velocity_mm_s),
-            encode_i16(radius_mm),
-            0,
-            0,
-            Some(duration_ms),
-        )),
-        BrainstemCommand::CreepUntil {
-            velocity_mm_s,
-            angular_mrad_s,
-            timeout_ms,
-            ..
-        } => Some((
-            ControlCommandCode::CreepUntil,
-            encode_i16(velocity_mm_s),
-            encode_i16(angular_mrad_s),
-            0,
-            0,
-            Some(timeout_ms),
-        )),
-        BrainstemCommand::ScanArc {
-            angle_mrad,
-            angular_mrad_s,
-            timeout_ms,
-            ..
-        } => Some((
-            ControlCommandCode::ScanArc,
-            encode_i16(angle_mrad),
-            encode_i16(angular_mrad_s),
-            0,
-            0,
-            Some(timeout_ms),
-        )),
-        BrainstemCommand::DockAlign {
-            bearing_mrad,
-            range_mm,
-            max_linear_mm_s,
-            max_angular_mrad_s,
-            stop_range_mm,
-            ttl_ms,
-            ..
-        } => Some((
-            ControlCommandCode::DockAlign,
-            encode_i16(bearing_mrad),
-            range_mm as u32,
-            encode_i16(max_linear_mm_s),
-            pack_i16_u16(max_angular_mrad_s, stop_range_mm),
-            Some(ttl_ms),
-        )),
-        BrainstemCommand::WallFollow {
-            distance_error_mm,
-            velocity_mm_s,
-            max_angular_mrad_s,
-            ttl_ms,
-            ..
-        } => Some((
-            ControlCommandCode::WallFollow,
-            encode_i16(distance_error_mm),
-            encode_i16(velocity_mm_s),
-            encode_i16(max_angular_mrad_s),
-            0,
-            Some(ttl_ms),
-        )),
-        BrainstemCommand::WiggleAlign {
-            amplitude_mrad,
-            angular_mrad_s,
-            cycles,
-            ..
-        } => Some((
-            ControlCommandCode::WiggleAlign,
-            encode_i16(amplitude_mrad),
-            encode_i16(angular_mrad_s),
-            cycles as u32,
-            0,
-            None,
-        )),
-        BrainstemCommand::Unstick {
-            direction,
-            backoff_mm_s,
-            turn_angular_mrad_s,
-            ..
-        } => Some((
-            ControlCommandCode::Unstick,
-            encode_escape_direction(direction) as u32,
-            encode_i16(backoff_mm_s),
-            encode_i16(turn_angular_mrad_s),
-            0,
-            None,
-        )),
-        BrainstemCommand::CliffGuard { clear, .. } => {
-            Some((ControlCommandCode::CliffGuard, clear as u32, 0, 0, 0, None))
-        }
         BrainstemCommand::ClearSafetyLatch { kind, .. } => Some((
             ControlCommandCode::ClearSafetyLatch,
             encode_safety_latch_kind(kind) as u32,
@@ -1653,14 +1421,6 @@ fn encode_control_command(
             0,
             0,
             Some(period_ms),
-        )),
-        BrainstemCommand::SetSafetyPolicy { policy, .. } => Some((
-            ControlCommandCode::SetSafetyPolicy,
-            encode_safety_action(policy.bump) as u32,
-            encode_safety_action(policy.cliff) as u32,
-            policy.wheel_drop_latch as u32,
-            0,
-            None,
         )),
         BrainstemCommand::ClearMotionQueue { .. } => {
             Some((ControlCommandCode::ClearMotionQueue, 0, 0, 0, 0, None))
@@ -1751,10 +1511,13 @@ fn decode_control_command(
     a: u32,
     b: u32,
     c: u32,
-    d: u32,
+    _d: u32,
     duration_ms: Option<u32>,
     seq: u32,
 ) -> Option<BrainstemCommand> {
+    if is_retired_control_code(kind) {
+        return Some(BrainstemCommand::Unsupported { seq });
+    }
     match kind {
         x if x == ControlCommandCode::Ping as u8 => Some(BrainstemCommand::Ping),
         x if x == ControlCommandCode::Arm as u8 => Some(BrainstemCommand::Arm),
@@ -1805,116 +1568,11 @@ fn decode_control_command(
             color: b as u8,
             intensity: c as u8,
         }),
-        x if x == ControlCommandCode::FaceBearing as u8 => Some(BrainstemCommand::FaceBearing {
-            bearing_mrad: decode_i16(a),
-            max_angular_mrad_s: decode_i16(b),
-            tolerance_mrad: decode_i16(c),
-            ttl_ms: duration_ms?,
-            seq,
-        }),
-        x if x == ControlCommandCode::TrackBearing as u8 => {
-            let (max_angular_mrad_s, stop_range_mm) = unpack_i16_u16(d);
-            Some(BrainstemCommand::TrackBearing {
-                bearing_mrad: decode_i16(a),
-                range_mm: b as u16,
-                max_linear_mm_s: decode_i16(c),
-                max_angular_mrad_s,
-                stop_range_mm,
-                ttl_ms: duration_ms?,
-                seq,
-            })
-        }
-        x if x == ControlCommandCode::TurnBy as u8 => Some(BrainstemCommand::TurnBy {
-            angle_mrad: decode_i16(a),
-            angular_mrad_s: decode_i16(b),
-            timeout_ms: duration_ms?,
-            seq,
-        }),
-        x if x == ControlCommandCode::DriveFor as u8 => Some(BrainstemCommand::DriveFor {
-            distance_mm: decode_i16(a),
-            velocity_mm_s: decode_i16(b),
-            timeout_ms: duration_ms?,
-            seq,
-        }),
-        x if x == ControlCommandCode::BumpEscape as u8 => Some(BrainstemCommand::BumpEscape {
-            direction: decode_escape_direction(a as u8)?,
-            backoff_mm_s: decode_i16(b),
-            turn_angular_mrad_s: decode_i16(c),
-            seq,
-        }),
         x if x == ControlCommandCode::HeartbeatStop as u8 => {
             Some(BrainstemCommand::HeartbeatStop {
                 timeout_ms: duration_ms?,
                 seq,
             })
-        }
-        x if x == ControlCommandCode::HoldHeading as u8 => Some(BrainstemCommand::HoldHeading {
-            heading_error_mrad: decode_i16(a),
-            velocity_mm_s: decode_i16(b),
-            max_angular_mrad_s: decode_i16(c),
-            ttl_ms: duration_ms?,
-            seq,
-        }),
-        x if x == ControlCommandCode::TurnToHeading as u8 => {
-            Some(BrainstemCommand::TurnToHeading {
-                heading_error_mrad: decode_i16(a),
-                angular_mrad_s: decode_i16(b),
-                tolerance_mrad: decode_i16(c),
-                timeout_ms: duration_ms?,
-                seq,
-            })
-        }
-        x if x == ControlCommandCode::ArcFor as u8 => Some(BrainstemCommand::ArcFor {
-            velocity_mm_s: decode_i16(a),
-            radius_mm: decode_i16(b),
-            duration_ms: duration_ms?,
-            seq,
-        }),
-        x if x == ControlCommandCode::CreepUntil as u8 => Some(BrainstemCommand::CreepUntil {
-            velocity_mm_s: decode_i16(a),
-            angular_mrad_s: decode_i16(b),
-            timeout_ms: duration_ms?,
-            seq,
-        }),
-        x if x == ControlCommandCode::ScanArc as u8 => Some(BrainstemCommand::ScanArc {
-            angle_mrad: decode_i16(a),
-            angular_mrad_s: decode_i16(b),
-            timeout_ms: duration_ms?,
-            seq,
-        }),
-        x if x == ControlCommandCode::DockAlign as u8 => {
-            let (max_angular_mrad_s, stop_range_mm) = unpack_i16_u16(d);
-            Some(BrainstemCommand::DockAlign {
-                bearing_mrad: decode_i16(a),
-                range_mm: b as u16,
-                max_linear_mm_s: decode_i16(c),
-                max_angular_mrad_s,
-                stop_range_mm,
-                ttl_ms: duration_ms?,
-                seq,
-            })
-        }
-        x if x == ControlCommandCode::WallFollow as u8 => Some(BrainstemCommand::WallFollow {
-            distance_error_mm: decode_i16(a),
-            velocity_mm_s: decode_i16(b),
-            max_angular_mrad_s: decode_i16(c),
-            ttl_ms: duration_ms?,
-            seq,
-        }),
-        x if x == ControlCommandCode::WiggleAlign as u8 => Some(BrainstemCommand::WiggleAlign {
-            amplitude_mrad: decode_i16(a),
-            angular_mrad_s: decode_i16(b),
-            cycles: c as u8,
-            seq,
-        }),
-        x if x == ControlCommandCode::Unstick as u8 => Some(BrainstemCommand::Unstick {
-            direction: decode_escape_direction(a as u8)?,
-            backoff_mm_s: decode_i16(b),
-            turn_angular_mrad_s: decode_i16(c),
-            seq,
-        }),
-        x if x == ControlCommandCode::CliffGuard as u8 => {
-            Some(BrainstemCommand::CliffGuard { clear: a != 0, seq })
         }
         x if x == ControlCommandCode::ClearSafetyLatch as u8 => {
             Some(BrainstemCommand::ClearSafetyLatch {
@@ -1933,16 +1591,6 @@ fn decode_control_command(
                 enabled: a != 0,
                 packet_id: b as u8,
                 period_ms: duration_ms?,
-                seq,
-            })
-        }
-        x if x == ControlCommandCode::SetSafetyPolicy as u8 => {
-            Some(BrainstemCommand::SetSafetyPolicy {
-                policy: SafetyPolicy {
-                    bump: decode_safety_action(a as u8)?,
-                    cliff: decode_safety_action(b as u8)?,
-                    wheel_drop_latch: c != 0,
-                },
                 seq,
             })
         }
@@ -2000,32 +1648,39 @@ fn decode_control_command(
     }
 }
 
+fn is_retired_control_code(kind: u8) -> bool {
+    matches!(
+        kind,
+        x if x == ControlCommandCode::FaceBearing as u8
+            || x == ControlCommandCode::TrackBearing as u8
+            || x == ControlCommandCode::TurnBy as u8
+            || x == ControlCommandCode::DriveFor as u8
+            || x == ControlCommandCode::BumpEscape as u8
+            || x == ControlCommandCode::HoldHeading as u8
+            || x == ControlCommandCode::TurnToHeading as u8
+            || x == ControlCommandCode::ArcFor as u8
+            || x == ControlCommandCode::CreepUntil as u8
+            || x == ControlCommandCode::ScanArc as u8
+            || x == ControlCommandCode::DockAlign as u8
+            || x == ControlCommandCode::WallFollow as u8
+            || x == ControlCommandCode::WiggleAlign as u8
+            || x == ControlCommandCode::Unstick as u8
+            || x == ControlCommandCode::CliffGuard as u8
+            || x == ControlCommandCode::SetSafetyPolicy as u8
+    )
+}
+
 #[cfg(feature = "pico-w")]
 fn command_seq(command: BrainstemCommand) -> u32 {
     match command {
         BrainstemCommand::CmdVel { seq, .. }
         | BrainstemCommand::DriveDirect { seq, .. }
         | BrainstemCommand::DriveArc { seq, .. }
-        | BrainstemCommand::FaceBearing { seq, .. }
-        | BrainstemCommand::TrackBearing { seq, .. }
-        | BrainstemCommand::TurnBy { seq, .. }
-        | BrainstemCommand::DriveFor { seq, .. }
-        | BrainstemCommand::BumpEscape { seq, .. }
-        | BrainstemCommand::HoldHeading { seq, .. }
-        | BrainstemCommand::TurnToHeading { seq, .. }
-        | BrainstemCommand::ArcFor { seq, .. }
-        | BrainstemCommand::CreepUntil { seq, .. }
-        | BrainstemCommand::ScanArc { seq, .. }
-        | BrainstemCommand::DockAlign { seq, .. }
-        | BrainstemCommand::WallFollow { seq, .. }
-        | BrainstemCommand::WiggleAlign { seq, .. }
-        | BrainstemCommand::Unstick { seq, .. }
-        | BrainstemCommand::CliffGuard { seq, .. }
+        | BrainstemCommand::Unsupported { seq }
         | BrainstemCommand::ClearSafetyLatch { seq, .. }
         | BrainstemCommand::SongDefine { seq, .. }
         | BrainstemCommand::RequestSensors { seq, .. }
         | BrainstemCommand::StreamSensors { seq, .. }
-        | BrainstemCommand::SetSafetyPolicy { seq, .. }
         | BrainstemCommand::ClearMotionQueue { seq, .. }
         | BrainstemCommand::DefineChirp { seq, .. }
         | BrainstemCommand::PlayFeedback { seq, .. }
@@ -2051,53 +1706,6 @@ fn encode_i16(value: i16) -> u32 {
 
 fn decode_i16(value: u32) -> i16 {
     value as u16 as i16
-}
-
-#[cfg(feature = "pico-w")]
-fn pack_i16_u16(left: i16, right: u16) -> u32 {
-    ((left as u16 as u32) << 16) | right as u32
-}
-
-fn unpack_i16_u16(value: u32) -> (i16, u16) {
-    ((value >> 16) as u16 as i16, value as u16)
-}
-
-#[cfg(feature = "pico-w")]
-fn encode_escape_direction(direction: EscapeDirection) -> u8 {
-    match direction {
-        EscapeDirection::Left => 1,
-        EscapeDirection::Right => 2,
-        EscapeDirection::Either => 3,
-    }
-}
-
-fn decode_escape_direction(value: u8) -> Option<EscapeDirection> {
-    match value {
-        1 => Some(EscapeDirection::Left),
-        2 => Some(EscapeDirection::Right),
-        3 => Some(EscapeDirection::Either),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "pico-w")]
-fn encode_safety_action(action: SafetyAction) -> u8 {
-    match action {
-        SafetyAction::None => 0,
-        SafetyAction::Stop => 1,
-        SafetyAction::Backoff => 2,
-        SafetyAction::BumpEscape => 3,
-    }
-}
-
-fn decode_safety_action(value: u8) -> Option<SafetyAction> {
-    match value {
-        0 => Some(SafetyAction::None),
-        1 => Some(SafetyAction::Stop),
-        2 => Some(SafetyAction::Backoff),
-        3 => Some(SafetyAction::BumpEscape),
-        _ => None,
-    }
 }
 
 #[cfg(feature = "pico-w")]
@@ -4242,27 +3850,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrated_and_policy_wire_commands_are_rejected_by_class() {
-        assert!(removed_wire_command(BrainstemCommand::DriveFor {
-            distance_mm: 100,
-            velocity_mm_s: 50,
-            timeout_ms: 1_000,
-            seq: 1,
-        }));
-        assert!(removed_wire_command(BrainstemCommand::SetSafetyPolicy {
-            policy: SafetyPolicy {
-                bump: SafetyAction::None,
-                cliff: SafetyAction::None,
-                wheel_drop_latch: false,
-            },
-            seq: 2,
-        }));
-        assert!(!removed_wire_command(BrainstemCommand::CmdVel {
-            linear_mm_s: 50,
-            angular_mrad_s: 0,
-            ttl_ms: 250,
-            seq: 3,
-        }));
+    fn prior_wire_codes_decode_only_to_the_unsupported_sentinel() {
+        for kind in [
+            ControlCommandCode::DriveFor,
+            ControlCommandCode::BumpEscape,
+            ControlCommandCode::CliffGuard,
+            ControlCommandCode::SetSafetyPolicy,
+        ] {
+            assert!(matches!(
+                decode_control_command(kind as u8, 1, 2, 3, 4, Some(1_000), 9),
+                Some(BrainstemCommand::Unsupported { seq: 9 })
+            ));
+        }
     }
 
     fn collect<const N: usize>(since_seq: u32) -> heapless::Vec<PublicEventRecord, N> {

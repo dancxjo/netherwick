@@ -13,9 +13,7 @@ use tungstenite::{connect, Message, WebSocket};
 mod handshake;
 pub use handshake::*;
 pub use pete_cockpit_protocol::{
-    bump_escape_duration_ms, bump_escape_turn_duration_ms, CommandRejectReason,
-    BUMP_ESCAPE_BACKOFF_DURATION_MS, BUMP_ESCAPE_TURN_ANGLE_MRAD, CONTACT_WITHDRAWAL_DURATION_MS,
-    CONTACT_WITHDRAWAL_SPEED_MM_S,
+    CommandRejectReason, CONTACT_WITHDRAWAL_DURATION_MS, CONTACT_WITHDRAWAL_SPEED_MM_S,
 };
 
 pub type Result<T> = std::result::Result<T, CockpitError>;
@@ -24,6 +22,28 @@ const POSSESSION_BUMP_ESCAPE_HEARTBEAT_MARGIN_MS: u32 = 1_000;
 const POSSESSION_LEASE_RENEW_INTERVAL_MS: u32 = 1_000;
 const POSSESSION_BUSY_RETRY_ATTEMPTS: usize = 300;
 const POSSESSION_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+const LEGACY_BUMP_ESCAPE_BACKOFF_DURATION_MS: u32 = 900;
+const LEGACY_BUMP_ESCAPE_TURN_ANGLE_MRAD: u32 = 1_571;
+
+const fn legacy_bump_escape_turn_duration_ms(turn_angular_mrad_s: i16) -> u32 {
+    let angular_mrad_s = if turn_angular_mrad_s < 0 {
+        -(turn_angular_mrad_s as i32)
+    } else {
+        turn_angular_mrad_s as i32
+    } as u32;
+    if angular_mrad_s == 0 {
+        return 0;
+    }
+    LEGACY_BUMP_ESCAPE_TURN_ANGLE_MRAD
+        .saturating_mul(1_000)
+        .saturating_add(angular_mrad_s - 1)
+        / angular_mrad_s
+}
+
+const fn legacy_bump_escape_duration_ms(turn_angular_mrad_s: i16) -> u32 {
+    LEGACY_BUMP_ESCAPE_BACKOFF_DURATION_MS
+        .saturating_add(legacy_bump_escape_turn_duration_ms(turn_angular_mrad_s))
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MotorCommand {
@@ -4595,7 +4615,7 @@ impl<C: Cockpit> MotherbrainPossession<C> {
                 turn_angular_mrad_s,
                 ..
             } => Some(
-                bump_escape_duration_ms(*turn_angular_mrad_s)
+                legacy_bump_escape_duration_ms(*turn_angular_mrad_s)
                     .saturating_add(POSSESSION_BUMP_ESCAPE_HEARTBEAT_MARGIN_MS)
                     .max(self.heartbeat_timeout_ms),
             ),

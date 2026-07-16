@@ -249,10 +249,9 @@ Create-specific by design:
 
 Known remaining TODOs:
 
-- Move remaining controller tuning constants into `body.toml`/capabilities: axle track, bearing slowdown, minimum track speed, bump escape timing, wall-follow gain, and safety defaults.
+- Move the primitive axle-track conversion constant into `body.toml`/capabilities.
 - Promote body descriptors from generated constants into a stronger typed driver contract.
 - Expand odometry from accumulated distance/heading deltas into pose integration plus get/set/calibrate verbs.
-- Add a child-step field for compound verbs that expand into multiple runtime steps under one external command id.
 - Enable a real hardware watchdog feed in the RP2040/Pico W backend once reset timing and bring-up policy are settled.
 
 ## Bring-Up Ladder

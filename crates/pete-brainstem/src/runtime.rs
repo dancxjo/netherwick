@@ -1,14 +1,10 @@
 use heapless::Deque;
-use pete_cockpit_protocol::{
-    bump_escape_turn_duration_ms, BUMP_ESCAPE_BACKOFF_DURATION_MS, CONTACT_WITHDRAWAL_DURATION_MS,
-    CONTACT_WITHDRAWAL_SPEED_MM_S,
-};
+use pete_cockpit_protocol::{CONTACT_WITHDRAWAL_DURATION_MS, CONTACT_WITHDRAWAL_SPEED_MM_S};
 
 use crate::body;
 use crate::commands::{
-    BrainstemCommand, EscapeDirection, FeedbackKind, PowerStateRequest, RuntimeCommand,
-    SafetyAction, SafetyLatchKind, SongTone, ACQUIRE_CREATE_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES,
-    RESTART_CREATE_SCRIPT,
+    BrainstemCommand, FeedbackKind, PowerStateRequest, RuntimeCommand, SafetyLatchKind, SongTone,
+    ACQUIRE_CREATE_SCRIPT, DISARM_SCRIPT, MAX_SONG_TONES, RESTART_CREATE_SCRIPT,
 };
 use crate::drivers::{
     create_uart::{CreateUart, CREATE_BUTTON_LED_MASK, CREATE_LED_ADVANCE, CREATE_LED_PLAY},
@@ -29,8 +25,6 @@ const HEALTHY_LIGHT_STEP_MS: u32 = 100;
 const LOW_BATTERY_PERCENT: u32 = 20;
 const WAKE_PROBE_RESPONSE_BYTES_REQUIRED: u8 = 1;
 const CREATE_AXLE_TRACK_MM: i32 = 258;
-const BEARING_SLOWDOWN_MRAD: i32 = 1_000;
-const MIN_TRACK_SPEED_MM_S: i32 = 35;
 const FEEDBACK_SLOT_BASE: u8 = 10;
 const FEEDBACK_KIND_COUNT: usize = 6;
 const MOTHERBRAIN_RESET_PULSE_MS: u32 = 100;
@@ -53,6 +47,12 @@ enum RuntimeMode {
     Running,
     Idle,
     Error,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SafetyResponse {
+    Stop,
+    ContactWithdrawal,
 }
 
 fn healthy_supervision_lights(phase: u8) -> (u8, u8, u8, u32) {
@@ -960,145 +960,6 @@ where
                     );
                 }
             }
-            RuntimeCommand::FaceBearing {
-                bearing_mrad,
-                max_angular_mrad_s,
-                tolerance_mrad,
-                duration_ms,
-            } => self.start_face_bearing(
-                bearing_mrad,
-                max_angular_mrad_s,
-                tolerance_mrad,
-                duration_ms,
-                now_ms,
-            )?,
-            RuntimeCommand::TrackBearing {
-                bearing_mrad,
-                range_mm,
-                max_linear_mm_s,
-                max_angular_mrad_s,
-                stop_range_mm,
-                duration_ms,
-            } => self.start_track_bearing(
-                bearing_mrad,
-                range_mm,
-                max_linear_mm_s,
-                max_angular_mrad_s,
-                stop_range_mm,
-                duration_ms,
-                now_ms,
-            )?,
-            RuntimeCommand::TurnBy {
-                angle_mrad,
-                angular_mrad_s,
-                timeout_ms,
-            } => self.start_turn_by(angle_mrad, angular_mrad_s, timeout_ms, now_ms)?,
-            RuntimeCommand::DriveFor {
-                distance_mm,
-                velocity_mm_s,
-                timeout_ms,
-            } => self.start_drive_for(distance_mm, velocity_mm_s, timeout_ms, now_ms)?,
-            RuntimeCommand::BumpEscape {
-                direction,
-                backoff_mm_s,
-                turn_angular_mrad_s,
-            } => self.queue_bump_escape(
-                self.active_command_id.unwrap_or(0),
-                direction,
-                backoff_mm_s,
-                turn_angular_mrad_s,
-            )?,
-            RuntimeCommand::HoldHeading {
-                heading_error_mrad,
-                velocity_mm_s,
-                max_angular_mrad_s,
-                duration_ms,
-            } => self.start_hold_heading(
-                heading_error_mrad,
-                velocity_mm_s,
-                max_angular_mrad_s,
-                duration_ms,
-                now_ms,
-            )?,
-            RuntimeCommand::TurnToHeading {
-                heading_error_mrad,
-                angular_mrad_s,
-                tolerance_mrad,
-                timeout_ms,
-            } => self.start_face_bearing(
-                heading_error_mrad,
-                angular_mrad_s,
-                tolerance_mrad,
-                timeout_ms,
-                now_ms,
-            )?,
-            RuntimeCommand::ArcFor {
-                velocity_mm_s,
-                radius_mm,
-                duration_ms,
-            } => self.start_drive_arc(velocity_mm_s, radius_mm, Some(duration_ms), now_ms)?,
-            RuntimeCommand::CreepUntil {
-                velocity_mm_s,
-                angular_mrad_s,
-                timeout_ms,
-            } => self.start_cmd_vel(velocity_mm_s, angular_mrad_s, Some(timeout_ms), now_ms)?,
-            RuntimeCommand::ScanArc {
-                angle_mrad,
-                angular_mrad_s,
-                timeout_ms,
-            } => self.start_turn_by(angle_mrad, angular_mrad_s, timeout_ms, now_ms)?,
-            RuntimeCommand::DockAlign {
-                bearing_mrad,
-                range_mm,
-                max_linear_mm_s,
-                max_angular_mrad_s,
-                stop_range_mm,
-                duration_ms,
-            } => self.start_track_bearing(
-                bearing_mrad,
-                range_mm,
-                max_linear_mm_s,
-                max_angular_mrad_s,
-                stop_range_mm,
-                duration_ms,
-                now_ms,
-            )?,
-            RuntimeCommand::WallFollow {
-                distance_error_mm,
-                velocity_mm_s,
-                max_angular_mrad_s,
-                duration_ms,
-            } => self.start_wall_follow(
-                distance_error_mm,
-                velocity_mm_s,
-                max_angular_mrad_s,
-                duration_ms,
-                now_ms,
-            )?,
-            RuntimeCommand::WiggleAlign {
-                amplitude_mrad,
-                angular_mrad_s,
-                cycles,
-            } => self.queue_wiggle_align(amplitude_mrad, angular_mrad_s, cycles)?,
-            RuntimeCommand::Unstick {
-                direction,
-                backoff_mm_s,
-                turn_angular_mrad_s,
-            } => self.queue_bump_escape(
-                self.active_command_id.unwrap_or(0),
-                direction,
-                backoff_mm_s,
-                turn_angular_mrad_s,
-            )?,
-            RuntimeCommand::CliffGuard { clear } => {
-                if clear {
-                    self.clear_safety_latch(Some(status::SafetyEventKind::Cliff));
-                } else {
-                    status::mark_safety_tripped(status::SafetyEventKind::Cliff);
-                    self.latch_safety(status::SafetyEventKind::Cliff);
-                    self.stop_drive()?;
-                }
-            }
             RuntimeCommand::ClearSafetyLatch { kind } => {
                 self.clear_safety_latch(Some(safety_latch_kind_to_event(kind)));
             }
@@ -1129,10 +990,6 @@ where
                     self.sensor_stream = None;
                 }
             }
-            // Production protection is constitutional firmware policy. Keep
-            // the internal variant only so older diagnostic fixtures decode,
-            // but never permit it to alter a running body.
-            RuntimeCommand::SetSafetyPolicy { .. } => {}
             RuntimeCommand::ClearMotionQueue => {
                 self.clear_motion_queue()?;
             }
@@ -1481,125 +1338,6 @@ where
         Ok(())
     }
 
-    fn start_face_bearing(
-        &mut self,
-        bearing_mrad: i16,
-        max_angular_mrad_s: i16,
-        tolerance_mrad: i16,
-        ttl_ms: u32,
-        now_ms: u32,
-    ) -> Result<(), BrainstemError> {
-        let error = bearing_mrad as i32;
-        let tolerance = abs_i32(tolerance_mrad as i32);
-        if abs_i32(error) <= tolerance {
-            self.stop_drive()?;
-            self.active = ActiveAction::None;
-            return Ok(());
-        }
-
-        let max_angular = abs_i32(max_angular_mrad_s as i32);
-        if max_angular == 0 || ttl_ms == 0 {
-            self.stop_drive()?;
-            return Err(BrainstemError::Timeout);
-        }
-
-        let angular = clamp_i16(error.clamp(-max_angular, max_angular));
-        let turn_ms = ((abs_i32(error) - tolerance) as u32)
-            .saturating_mul(1_000)
-            .checked_div(abs_i32(angular as i32) as u32)
-            .unwrap_or(ttl_ms)
-            .max(1)
-            .min(ttl_ms);
-        self.start_cmd_vel(0, angular, Some(turn_ms), now_ms)
-    }
-
-    fn start_track_bearing(
-        &mut self,
-        bearing_mrad: i16,
-        range_mm: u16,
-        max_linear_mm_s: i16,
-        max_angular_mrad_s: i16,
-        stop_range_mm: u16,
-        ttl_ms: u32,
-        now_ms: u32,
-    ) -> Result<(), BrainstemError> {
-        if ttl_ms == 0 || (stop_range_mm > 0 && range_mm <= stop_range_mm) {
-            self.stop_drive()?;
-            self.active = ActiveAction::None;
-            return Ok(());
-        }
-
-        let error = bearing_mrad as i32;
-        let max_angular = abs_i32(max_angular_mrad_s as i32);
-        let angular = clamp_i16(error.clamp(-max_angular, max_angular));
-        let slowdown = abs_i32(error).min(BEARING_SLOWDOWN_MRAD);
-        let scale = BEARING_SLOWDOWN_MRAD - slowdown;
-        let max_linear = abs_i32(max_linear_mm_s as i32);
-        let mut linear = max_linear * scale / BEARING_SLOWDOWN_MRAD;
-        if linear > 0 {
-            linear = linear.max(MIN_TRACK_SPEED_MM_S).min(max_linear);
-        }
-        if max_linear_mm_s < 0 {
-            linear = -linear;
-        }
-
-        self.start_cmd_vel(clamp_i16(linear), angular, Some(ttl_ms), now_ms)
-    }
-
-    fn start_turn_by(
-        &mut self,
-        angle_mrad: i16,
-        angular_mrad_s: i16,
-        timeout_ms: u32,
-        now_ms: u32,
-    ) -> Result<(), BrainstemError> {
-        let angle = angle_mrad as i32;
-        let angular_abs = abs_i32(angular_mrad_s as i32);
-        if angle == 0 || angular_abs == 0 || timeout_ms == 0 {
-            self.stop_drive()?;
-            self.active = ActiveAction::None;
-            return Ok(());
-        }
-
-        let angular = if angle > 0 { angular_abs } else { -angular_abs };
-        let duration_ms = (abs_i32(angle) as u32)
-            .saturating_mul(1_000)
-            .checked_div(angular_abs as u32)
-            .unwrap_or(timeout_ms)
-            .max(1)
-            .min(timeout_ms);
-        self.start_cmd_vel(0, clamp_i16(angular), Some(duration_ms), now_ms)
-    }
-
-    fn start_drive_for(
-        &mut self,
-        distance_mm: i16,
-        velocity_mm_s: i16,
-        timeout_ms: u32,
-        now_ms: u32,
-    ) -> Result<(), BrainstemError> {
-        let distance = distance_mm as i32;
-        let velocity_abs = abs_i32(velocity_mm_s as i32);
-        if distance == 0 || velocity_abs == 0 || timeout_ms == 0 {
-            self.stop_drive()?;
-            self.active = ActiveAction::None;
-            return Ok(());
-        }
-
-        let velocity = if distance > 0 {
-            velocity_abs
-        } else {
-            -velocity_abs
-        };
-        let duration_ms = (abs_i32(distance) as u32)
-            .saturating_mul(1_000)
-            .checked_div(velocity_abs as u32)
-            .unwrap_or(timeout_ms)
-            .max(1)
-            .min(timeout_ms);
-        self.start_cmd_vel(clamp_i16(velocity), 0, Some(duration_ms), now_ms)
-    }
-
     fn start_orientation_probe(
         &mut self,
         angular_mrad_s: i16,
@@ -1661,94 +1399,6 @@ where
             self.stop_drive()?;
             return Err(BrainstemError::CreateNoResponse);
         }
-        Ok(())
-    }
-
-    fn queue_bump_escape(
-        &mut self,
-        command_id: u32,
-        direction: EscapeDirection,
-        backoff_mm_s: i16,
-        turn_angular_mrad_s: i16,
-    ) -> Result<(), BrainstemError> {
-        self.ensure_recovery_motion_allowed()?;
-        let backoff = -abs_i32(backoff_mm_s as i32);
-        let turn_abs = abs_i32(turn_angular_mrad_s as i32);
-        if backoff == 0 || turn_abs == 0 {
-            return Err(BrainstemError::Timeout);
-        }
-        let turn = match direction {
-            EscapeDirection::Left => turn_abs,
-            EscapeDirection::Right => -turn_abs,
-            EscapeDirection::Either => -turn_abs,
-        };
-        let turn_duration_ms = bump_escape_turn_duration_ms(clamp_i16(turn_abs));
-        let _ = self.commands.push_front(QueuedCommand::safety_recovery(
-            command_id,
-            RuntimeCommand::CmdVel {
-                linear_mm_s: 0,
-                angular_mrad_s: clamp_i16(turn),
-                duration_ms: Some(turn_duration_ms),
-            },
-        ));
-        let _ = self.commands.push_front(QueuedCommand::safety_recovery(
-            command_id,
-            RuntimeCommand::CmdVel {
-                linear_mm_s: clamp_i16(backoff),
-                angular_mrad_s: 0,
-                duration_ms: Some(BUMP_ESCAPE_BACKOFF_DURATION_MS),
-            },
-        ));
-        self.active = ActiveAction::None;
-        Ok(())
-    }
-
-    fn start_hold_heading(
-        &mut self,
-        heading_error_mrad: i16,
-        velocity_mm_s: i16,
-        max_angular_mrad_s: i16,
-        ttl_ms: u32,
-        now_ms: u32,
-    ) -> Result<(), BrainstemError> {
-        let max_angular = abs_i32(max_angular_mrad_s as i32);
-        let angular = (heading_error_mrad as i32).clamp(-max_angular, max_angular);
-        self.start_cmd_vel(velocity_mm_s, clamp_i16(angular), Some(ttl_ms), now_ms)
-    }
-
-    fn start_wall_follow(
-        &mut self,
-        distance_error_mm: i16,
-        velocity_mm_s: i16,
-        max_angular_mrad_s: i16,
-        ttl_ms: u32,
-        now_ms: u32,
-    ) -> Result<(), BrainstemError> {
-        let max_angular = abs_i32(max_angular_mrad_s as i32);
-        let angular = (distance_error_mm as i32 * 8).clamp(-max_angular, max_angular);
-        self.start_cmd_vel(velocity_mm_s, clamp_i16(angular), Some(ttl_ms), now_ms)
-    }
-
-    fn queue_wiggle_align(
-        &mut self,
-        amplitude_mrad: i16,
-        angular_mrad_s: i16,
-        cycles: u8,
-    ) -> Result<(), BrainstemError> {
-        self.ensure_motion_allowed()?;
-        let cycles = cycles.min(6);
-        for cycle in (0..cycles).rev() {
-            let sign = if cycle % 2 == 0 { 1 } else { -1 };
-            let _ = self.commands.push_front(QueuedCommand::new(
-                self.active_command_id.unwrap_or(0),
-                RuntimeCommand::TurnBy {
-                    angle_mrad: clamp_i16(amplitude_mrad as i32 * sign),
-                    angular_mrad_s,
-                    timeout_ms: 800,
-                },
-            ));
-        }
-        self.active = ActiveAction::None;
         Ok(())
     }
 
@@ -1912,41 +1562,43 @@ where
             return Ok(());
         }
 
-        let (kind, action) = if tilt {
+        let (kind, response) = if tilt {
             status::mark_safety_tripped(status::SafetyEventKind::Tilt);
-            (status::SafetyEventKind::Tilt, SafetyAction::Stop)
+            (status::SafetyEventKind::Tilt, SafetyResponse::Stop)
         } else if impact {
             status::mark_safety_tripped(status::SafetyEventKind::Impact);
-            (status::SafetyEventKind::Impact, SafetyAction::Stop)
+            (status::SafetyEventKind::Impact, SafetyResponse::Stop)
         } else if cliff {
             status::mark_safety_tripped(status::SafetyEventKind::Cliff);
-            (status::SafetyEventKind::Cliff, SafetyAction::Stop)
+            (status::SafetyEventKind::Cliff, SafetyResponse::Stop)
         } else if bump && fresh_bump_edge && self.unsafe_forward_output() {
             status::mark_safety_tripped(status::SafetyEventKind::Bump);
-            (status::SafetyEventKind::Bump, SafetyAction::Backoff)
+            (
+                status::SafetyEventKind::Bump,
+                SafetyResponse::ContactWithdrawal,
+            )
         } else if bump {
             // A level-only contact, stationary press, or boot-restored sample
             // remains observable but cannot initiate autonomous motion.
             return Ok(());
         } else if wheel_drop {
             status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
-            (status::SafetyEventKind::WheelDrop, SafetyAction::Stop)
+            (status::SafetyEventKind::WheelDrop, SafetyResponse::Stop)
         } else {
-            (status::SafetyEventKind::Bump, SafetyAction::Stop)
+            (status::SafetyEventKind::Bump, SafetyResponse::Stop)
         };
-        self.apply_safety_action(kind, action)?;
+        self.apply_safety_response(kind, response)?;
         let _ = self.play_feedback_now(FeedbackKind::Danger);
         Ok(())
     }
 
-    fn apply_safety_action(
+    fn apply_safety_response(
         &mut self,
         kind: status::SafetyEventKind,
-        action: SafetyAction,
+        response: SafetyResponse,
     ) -> Result<(), BrainstemError> {
-        match action {
-            SafetyAction::None => Ok(()),
-            SafetyAction::Stop => {
+        match response {
+            SafetyResponse::Stop => {
                 self.latch_safety(kind);
                 self.interrupt_active_command();
                 self.commands.clear();
@@ -1959,7 +1611,7 @@ where
                 );
                 Ok(())
             }
-            SafetyAction::Backoff => {
+            SafetyResponse::ContactWithdrawal => {
                 self.latch_safety(kind);
                 let command_id = self.active_command_id.unwrap_or(0);
                 self.interrupt_active_command();
@@ -1985,14 +1637,6 @@ where
                     },
                 ));
                 Ok(())
-            }
-            SafetyAction::BumpEscape => {
-                self.latch_safety(kind);
-                let command_id = self.active_command_id.unwrap_or(0);
-                self.interrupt_active_command();
-                self.commands.clear();
-                self.active = ActiveAction::None;
-                self.queue_bump_escape(command_id, EscapeDirection::Either, 80, 900)
             }
         }
     }
@@ -2148,19 +1792,6 @@ where
             || self.dock_departure_pending
             || self.charging_interlock_latched
             || (self.safety_latched && !self.safety_recovery_latch_allows_motion())
-        {
-            self.stop_drive()?;
-            return Err(BrainstemError::CreateNoResponse);
-        }
-        self.ensure_create_responsive()?;
-        Ok(())
-    }
-
-    fn ensure_recovery_motion_allowed(&mut self) -> Result<(), BrainstemError> {
-        if self.estop_latched
-            || self.dock_departure_pending
-            || self.charging_interlock_latched
-            || (self.safety_latched && !recoverable_safety_latch(self.safety_latch_kind))
         {
             self.stop_drive()?;
             return Err(BrainstemError::CreateNoResponse);
@@ -2432,167 +2063,7 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             radius_mm,
             duration_ms: Some(ttl_ms),
         }),
-        BrainstemCommand::FaceBearing {
-            bearing_mrad,
-            max_angular_mrad_s,
-            tolerance_mrad,
-            ttl_ms,
-            ..
-        } => Some(RuntimeCommand::FaceBearing {
-            bearing_mrad,
-            max_angular_mrad_s,
-            tolerance_mrad,
-            duration_ms: ttl_ms,
-        }),
-        BrainstemCommand::TrackBearing {
-            bearing_mrad,
-            range_mm,
-            max_linear_mm_s,
-            max_angular_mrad_s,
-            stop_range_mm,
-            ttl_ms,
-            ..
-        } => Some(RuntimeCommand::TrackBearing {
-            bearing_mrad,
-            range_mm,
-            max_linear_mm_s,
-            max_angular_mrad_s,
-            stop_range_mm,
-            duration_ms: ttl_ms,
-        }),
-        BrainstemCommand::TurnBy {
-            angle_mrad,
-            angular_mrad_s,
-            timeout_ms,
-            ..
-        } => Some(RuntimeCommand::TurnBy {
-            angle_mrad,
-            angular_mrad_s,
-            timeout_ms,
-        }),
-        BrainstemCommand::DriveFor {
-            distance_mm,
-            velocity_mm_s,
-            timeout_ms,
-            ..
-        } => Some(RuntimeCommand::DriveFor {
-            distance_mm,
-            velocity_mm_s,
-            timeout_ms,
-        }),
-        BrainstemCommand::BumpEscape {
-            direction,
-            backoff_mm_s,
-            turn_angular_mrad_s,
-            ..
-        } => Some(RuntimeCommand::BumpEscape {
-            direction,
-            backoff_mm_s,
-            turn_angular_mrad_s,
-        }),
-        BrainstemCommand::HoldHeading {
-            heading_error_mrad,
-            velocity_mm_s,
-            max_angular_mrad_s,
-            ttl_ms,
-            ..
-        } => Some(RuntimeCommand::HoldHeading {
-            heading_error_mrad,
-            velocity_mm_s,
-            max_angular_mrad_s,
-            duration_ms: ttl_ms,
-        }),
-        BrainstemCommand::TurnToHeading {
-            heading_error_mrad,
-            angular_mrad_s,
-            tolerance_mrad,
-            timeout_ms,
-            ..
-        } => Some(RuntimeCommand::TurnToHeading {
-            heading_error_mrad,
-            angular_mrad_s,
-            tolerance_mrad,
-            timeout_ms,
-        }),
-        BrainstemCommand::ArcFor {
-            velocity_mm_s,
-            radius_mm,
-            duration_ms,
-            ..
-        } => Some(RuntimeCommand::ArcFor {
-            velocity_mm_s,
-            radius_mm,
-            duration_ms,
-        }),
-        BrainstemCommand::CreepUntil {
-            velocity_mm_s,
-            angular_mrad_s,
-            timeout_ms,
-            ..
-        } => Some(RuntimeCommand::CreepUntil {
-            velocity_mm_s,
-            angular_mrad_s,
-            timeout_ms,
-        }),
-        BrainstemCommand::ScanArc {
-            angle_mrad,
-            angular_mrad_s,
-            timeout_ms,
-            ..
-        } => Some(RuntimeCommand::ScanArc {
-            angle_mrad,
-            angular_mrad_s,
-            timeout_ms,
-        }),
-        BrainstemCommand::DockAlign {
-            bearing_mrad,
-            range_mm,
-            max_linear_mm_s,
-            max_angular_mrad_s,
-            stop_range_mm,
-            ttl_ms,
-            ..
-        } => Some(RuntimeCommand::DockAlign {
-            bearing_mrad,
-            range_mm,
-            max_linear_mm_s,
-            max_angular_mrad_s,
-            stop_range_mm,
-            duration_ms: ttl_ms,
-        }),
-        BrainstemCommand::WallFollow {
-            distance_error_mm,
-            velocity_mm_s,
-            max_angular_mrad_s,
-            ttl_ms,
-            ..
-        } => Some(RuntimeCommand::WallFollow {
-            distance_error_mm,
-            velocity_mm_s,
-            max_angular_mrad_s,
-            duration_ms: ttl_ms,
-        }),
-        BrainstemCommand::WiggleAlign {
-            amplitude_mrad,
-            angular_mrad_s,
-            cycles,
-            ..
-        } => Some(RuntimeCommand::WiggleAlign {
-            amplitude_mrad,
-            angular_mrad_s,
-            cycles,
-        }),
-        BrainstemCommand::Unstick {
-            direction,
-            backoff_mm_s,
-            turn_angular_mrad_s,
-            ..
-        } => Some(RuntimeCommand::Unstick {
-            direction,
-            backoff_mm_s,
-            turn_angular_mrad_s,
-        }),
-        BrainstemCommand::CliffGuard { clear, .. } => Some(RuntimeCommand::CliffGuard { clear }),
+        BrainstemCommand::Unsupported { .. } => None,
         BrainstemCommand::ClearSafetyLatch { kind, .. } => {
             Some(RuntimeCommand::ClearSafetyLatch { kind })
         }
@@ -2612,9 +2083,6 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             packet_id,
             period_ms,
         }),
-        BrainstemCommand::SetSafetyPolicy { policy, .. } => {
-            Some(RuntimeCommand::SetSafetyPolicy { policy })
-        }
         BrainstemCommand::ClearMotionQueue { .. } => Some(RuntimeCommand::ClearMotionQueue),
         BrainstemCommand::DefineChirp {
             kind,
@@ -2697,21 +2165,6 @@ fn is_motion_command(command: RuntimeCommand) -> bool {
             | RuntimeCommand::DriveArc { .. }
             | RuntimeCommand::Drive { .. }
             | RuntimeCommand::StopDrive
-            | RuntimeCommand::FaceBearing { .. }
-            | RuntimeCommand::TrackBearing { .. }
-            | RuntimeCommand::TurnBy { .. }
-            | RuntimeCommand::DriveFor { .. }
-            | RuntimeCommand::BumpEscape { .. }
-            | RuntimeCommand::HoldHeading { .. }
-            | RuntimeCommand::TurnToHeading { .. }
-            | RuntimeCommand::ArcFor { .. }
-            | RuntimeCommand::CreepUntil { .. }
-            | RuntimeCommand::ScanArc { .. }
-            | RuntimeCommand::DockAlign { .. }
-            | RuntimeCommand::WallFollow { .. }
-            | RuntimeCommand::WiggleAlign { .. }
-            | RuntimeCommand::Unstick { .. }
-            | RuntimeCommand::CliffGuard { .. }
             | RuntimeCommand::CalibrateTurn { .. }
             | RuntimeCommand::OrientationProbe { .. }
             | RuntimeCommand::Dock
@@ -2736,20 +2189,7 @@ fn requires_dock_departure(command: RuntimeCommand) -> bool {
             ..
         } => left_mm_s != 0 || right_mm_s != 0,
         RuntimeCommand::DriveArc { velocity_mm_s, .. } => velocity_mm_s != 0,
-        RuntimeCommand::DriveFor {
-            distance_mm,
-            velocity_mm_s,
-            ..
-        } => distance_mm != 0 && velocity_mm_s != 0,
-        RuntimeCommand::TurnBy {
-            angle_mrad,
-            angular_mrad_s,
-            ..
-        } => angle_mrad != 0 && angular_mrad_s != 0,
-        RuntimeCommand::ArcFor { velocity_mm_s, .. } => velocity_mm_s != 0,
-        RuntimeCommand::Dock | RuntimeCommand::DockAlign { .. } | RuntimeCommand::StopDrive => {
-            false
-        }
+        RuntimeCommand::Dock | RuntimeCommand::StopDrive => false,
         _ => is_motion_command(command),
     }
 }
@@ -3381,14 +2821,6 @@ mod tests {
             duration_ms: Some(300),
         }));
         assert!(!requires_dock_departure(RuntimeCommand::Dock));
-        assert!(!requires_dock_departure(RuntimeCommand::DockAlign {
-            bearing_mrad: 0,
-            range_mm: 100,
-            max_linear_mm_s: 50,
-            max_angular_mrad_s: 100,
-            stop_range_mm: 120,
-            duration_ms: 300,
-        }));
     }
 
     #[test]
@@ -3749,55 +3181,6 @@ mod tests {
     }
 
     #[test]
-    fn bump_escape_runs_while_bump_latched() {
-        let _guard = status::status_test_guard();
-        status::mark_create_sensor_packet(
-            0,
-            crate::events::CreateSensorPacket {
-                flags: crate::events::CreateSensorFlags {
-                    bump_left: true,
-                    ..crate::events::CreateSensorFlags::default()
-                },
-                ..crate::events::CreateSensorPacket::default()
-            },
-        );
-        let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.create_responsive = true;
-        runtime.latch_safety(status::SafetyEventKind::Bump);
-
-        assert!(runtime
-            .enqueue_command(RuntimeCommand::BumpEscape {
-                direction: EscapeDirection::Either,
-                backoff_mm_s: 80,
-                turn_angular_mrad_s: 900,
-            })
-            .is_ok());
-        assert!(runtime.start_next_command().is_ok());
-        assert!(runtime.safety_latched);
-        assert_eq!(runtime.commands.len(), 2);
-        assert!(matches!(
-            runtime.commands.front().map(|queued| queued.command),
-            Some(RuntimeCommand::CmdVel {
-                linear_mm_s: -80,
-                angular_mrad_s: 0,
-                duration_ms: Some(BUMP_ESCAPE_BACKOFF_DURATION_MS),
-            })
-        ));
-        assert!(matches!(
-            runtime.commands.back().map(|queued| queued.command),
-            Some(RuntimeCommand::CmdVel {
-                linear_mm_s: 0,
-                angular_mrad_s: -900,
-                duration_ms: Some(1_746),
-            })
-        ));
-
-        assert!(runtime.start_next_command().is_ok());
-        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
-        assert!(runtime.safety_latched);
-    }
-
-    #[test]
     fn wheel_drop_latch_survives_sensor_clear_with_default_policy() {
         let _guard = status::status_test_guard();
         status::mark_create_sensor_packet(
@@ -3817,34 +3200,6 @@ mod tests {
         status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
         assert!(runtime.enforce_safety_policy().is_ok());
 
-        assert!(runtime.safety_latched);
-        assert!(matches!(
-            runtime.safety_latch_kind,
-            Some(status::SafetyEventKind::WheelDrop)
-        ));
-    }
-
-    #[test]
-    fn cliff_guard_clear_releases_only_a_cliff_latch() {
-        let _guard = status::status_test_guard();
-        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
-        let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.create_responsive = true;
-        runtime.latch_safety(status::SafetyEventKind::Cliff);
-        assert!(runtime
-            .enqueue_command(RuntimeCommand::CliffGuard { clear: true })
-            .is_ok());
-
-        assert!(runtime.start_next_command().is_ok());
-
-        assert!(!runtime.safety_latched);
-        assert!(runtime.safety_latch_kind.is_none());
-
-        runtime.latch_safety(status::SafetyEventKind::WheelDrop);
-        assert!(runtime
-            .enqueue_command(RuntimeCommand::CliffGuard { clear: true })
-            .is_ok());
-        assert!(runtime.start_next_command().is_ok());
         assert!(runtime.safety_latched);
         assert!(matches!(
             runtime.safety_latch_kind,

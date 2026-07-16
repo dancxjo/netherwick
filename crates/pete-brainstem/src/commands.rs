@@ -46,102 +46,10 @@ pub enum BrainstemCommand {
         ttl_ms: u32,
         seq: u32,
     },
-    FaceBearing {
-        bearing_mrad: i16,
-        max_angular_mrad_s: i16,
-        tolerance_mrad: i16,
-        ttl_ms: u32,
-        seq: u32,
-    },
-    TrackBearing {
-        bearing_mrad: i16,
-        range_mm: u16,
-        max_linear_mm_s: i16,
-        max_angular_mrad_s: i16,
-        stop_range_mm: u16,
-        ttl_ms: u32,
-        seq: u32,
-    },
-    TurnBy {
-        angle_mrad: i16,
-        angular_mrad_s: i16,
-        timeout_ms: u32,
-        seq: u32,
-    },
-    DriveFor {
-        distance_mm: i16,
-        velocity_mm_s: i16,
-        timeout_ms: u32,
-        seq: u32,
-    },
-    BumpEscape {
-        direction: EscapeDirection,
-        backoff_mm_s: i16,
-        turn_angular_mrad_s: i16,
-        seq: u32,
-    },
-    HoldHeading {
-        heading_error_mrad: i16,
-        velocity_mm_s: i16,
-        max_angular_mrad_s: i16,
-        ttl_ms: u32,
-        seq: u32,
-    },
-    TurnToHeading {
-        heading_error_mrad: i16,
-        angular_mrad_s: i16,
-        tolerance_mrad: i16,
-        timeout_ms: u32,
-        seq: u32,
-    },
-    ArcFor {
-        velocity_mm_s: i16,
-        radius_mm: i16,
-        duration_ms: u32,
-        seq: u32,
-    },
-    CreepUntil {
-        velocity_mm_s: i16,
-        angular_mrad_s: i16,
-        timeout_ms: u32,
-        seq: u32,
-    },
-    ScanArc {
-        angle_mrad: i16,
-        angular_mrad_s: i16,
-        timeout_ms: u32,
-        seq: u32,
-    },
-    DockAlign {
-        bearing_mrad: i16,
-        range_mm: u16,
-        max_linear_mm_s: i16,
-        max_angular_mrad_s: i16,
-        stop_range_mm: u16,
-        ttl_ms: u32,
-        seq: u32,
-    },
-    WallFollow {
-        distance_error_mm: i16,
-        velocity_mm_s: i16,
-        max_angular_mrad_s: i16,
-        ttl_ms: u32,
-        seq: u32,
-    },
-    WiggleAlign {
-        amplitude_mrad: i16,
-        angular_mrad_s: i16,
-        cycles: u8,
-        seq: u32,
-    },
-    Unstick {
-        direction: EscapeDirection,
-        backoff_mm_s: i16,
-        turn_angular_mrad_s: i16,
-        seq: u32,
-    },
-    CliffGuard {
-        clear: bool,
+    /// A recognized pre-migration wire verb. It is retained only long enough
+    /// to return a typed `unsupported` result; no retired parameters enter the
+    /// runtime command vocabulary.
+    Unsupported {
         seq: u32,
     },
     ClearSafetyLatch {
@@ -160,10 +68,6 @@ pub enum BrainstemCommand {
         enabled: bool,
         packet_id: u8,
         period_ms: u32,
-        seq: u32,
-    },
-    SetSafetyPolicy {
-        policy: SafetyPolicy,
         seq: u32,
     },
     ClearMotionQueue {
@@ -230,40 +134,6 @@ pub enum BrainstemCommand {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub enum EscapeDirection {
-    Left,
-    Right,
-    Either,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum SafetyAction {
-    None,
-    Stop,
-    Backoff,
-    BumpEscape,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub struct SafetyPolicy {
-    pub bump: SafetyAction,
-    pub cliff: SafetyAction,
-    pub wheel_drop_latch: bool,
-}
-
-impl Default for SafetyPolicy {
-    fn default() -> Self {
-        Self {
-            // Contact withdrawal is a brainstem reflex. It must not wait for
-            // (or depend on) a motherbrain possession lease.
-            bump: SafetyAction::Backoff,
-            cliff: SafetyAction::Stop,
-            wheel_drop_latch: true,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum FeedbackKind {
     Ok,
     Error,
@@ -308,89 +178,6 @@ pub(crate) enum RuntimeCommand {
         angular_mrad_s: i16,
         duration_ms: Option<u32>,
     },
-    FaceBearing {
-        bearing_mrad: i16,
-        max_angular_mrad_s: i16,
-        tolerance_mrad: i16,
-        duration_ms: u32,
-    },
-    TrackBearing {
-        bearing_mrad: i16,
-        range_mm: u16,
-        max_linear_mm_s: i16,
-        max_angular_mrad_s: i16,
-        stop_range_mm: u16,
-        duration_ms: u32,
-    },
-    TurnBy {
-        angle_mrad: i16,
-        angular_mrad_s: i16,
-        timeout_ms: u32,
-    },
-    DriveFor {
-        distance_mm: i16,
-        velocity_mm_s: i16,
-        timeout_ms: u32,
-    },
-    BumpEscape {
-        direction: EscapeDirection,
-        backoff_mm_s: i16,
-        turn_angular_mrad_s: i16,
-    },
-    HoldHeading {
-        heading_error_mrad: i16,
-        velocity_mm_s: i16,
-        max_angular_mrad_s: i16,
-        duration_ms: u32,
-    },
-    TurnToHeading {
-        heading_error_mrad: i16,
-        angular_mrad_s: i16,
-        tolerance_mrad: i16,
-        timeout_ms: u32,
-    },
-    ArcFor {
-        velocity_mm_s: i16,
-        radius_mm: i16,
-        duration_ms: u32,
-    },
-    CreepUntil {
-        velocity_mm_s: i16,
-        angular_mrad_s: i16,
-        timeout_ms: u32,
-    },
-    ScanArc {
-        angle_mrad: i16,
-        angular_mrad_s: i16,
-        timeout_ms: u32,
-    },
-    DockAlign {
-        bearing_mrad: i16,
-        range_mm: u16,
-        max_linear_mm_s: i16,
-        max_angular_mrad_s: i16,
-        stop_range_mm: u16,
-        duration_ms: u32,
-    },
-    WallFollow {
-        distance_error_mm: i16,
-        velocity_mm_s: i16,
-        max_angular_mrad_s: i16,
-        duration_ms: u32,
-    },
-    WiggleAlign {
-        amplitude_mrad: i16,
-        angular_mrad_s: i16,
-        cycles: u8,
-    },
-    Unstick {
-        direction: EscapeDirection,
-        backoff_mm_s: i16,
-        turn_angular_mrad_s: i16,
-    },
-    CliffGuard {
-        clear: bool,
-    },
     ClearSafetyLatch {
         kind: SafetyLatchKind,
     },
@@ -409,9 +196,6 @@ pub(crate) enum RuntimeCommand {
         enabled: bool,
         packet_id: u8,
         period_ms: u32,
-    },
-    SetSafetyPolicy {
-        policy: SafetyPolicy,
     },
     ClearMotionQueue,
     DefineChirp {

@@ -1,29 +1,7 @@
 #![no_std]
 
-pub const BUMP_ESCAPE_BACKOFF_DURATION_MS: u32 = 900;
-pub const BUMP_ESCAPE_TURN_ANGLE_MRAD: u32 = 1_571;
 pub const CONTACT_WITHDRAWAL_DURATION_MS: u32 = 300;
 pub const CONTACT_WITHDRAWAL_SPEED_MM_S: i16 = 80;
-
-pub const fn bump_escape_turn_duration_ms(turn_angular_mrad_s: i16) -> u32 {
-    let angular_mrad_s = if turn_angular_mrad_s < 0 {
-        -(turn_angular_mrad_s as i32)
-    } else {
-        turn_angular_mrad_s as i32
-    } as u32;
-    if angular_mrad_s == 0 {
-        return 0;
-    }
-    BUMP_ESCAPE_TURN_ANGLE_MRAD
-        .saturating_mul(1_000)
-        .saturating_add(angular_mrad_s - 1)
-        / angular_mrad_s
-}
-
-pub const fn bump_escape_duration_ms(turn_angular_mrad_s: i16) -> u32 {
-    BUMP_ESCAPE_BACKOFF_DURATION_MS
-        .saturating_add(bump_escape_turn_duration_ms(turn_angular_mrad_s))
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(
@@ -316,13 +294,5 @@ mod tests {
             CommandRejectReason::from_code(99),
             CommandRejectReason::Unknown(99)
         );
-    }
-
-    #[test]
-    fn bump_escape_timing_is_reverse_then_quarter_turn() {
-        assert_eq!(bump_escape_turn_duration_ms(500), 3_142);
-        assert_eq!(bump_escape_turn_duration_ms(-500), 3_142);
-        assert_eq!(bump_escape_duration_ms(500), 4_042);
-        assert_eq!(bump_escape_turn_duration_ms(0), 0);
     }
 }

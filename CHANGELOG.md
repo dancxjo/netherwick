@@ -56,8 +56,10 @@ All notable changes are grouped by date.
   body-native operations, immutable reflexes, and explicit services; run
   deterministic navigation and recovery skills in the motherbrain through
   short TTL renewals, reject retired convenience and safety-policy wire verbs
-  in firmware and simulation, validate the advertised verb inventory at build
-  time, and document the remaining hardware-in-loop acceptance gates.
+  in firmware and simulation, remove their firmware runtime implementations,
+  queue expanders, browser controls, and shared policy constants, validate the
+  advertised verb inventory at build time, and document the remaining
+  hardware-in-loop acceptance gates.
 - Document the grounded semantic graph and safety-gated sleep lifecycle,
   including their authority boundaries, artifact contracts, and replacement
   points.
