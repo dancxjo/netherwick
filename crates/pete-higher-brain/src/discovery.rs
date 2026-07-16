@@ -1,4 +1,4 @@
-use crate::capability::ForebrainCapabilities;
+use crate::capability::AcceleratorCapabilities;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -124,7 +124,7 @@ pub struct ServiceEndpoint {
 pub struct DiscoveryAdvertisement {
     pub schema_version: u32,
     pub role: String,
-    pub capabilities: ForebrainCapabilities,
+    pub capabilities: AcceleratorCapabilities,
     pub endpoints: Vec<ServiceEndpoint>,
 }
 

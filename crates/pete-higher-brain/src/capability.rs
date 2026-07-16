@@ -53,10 +53,6 @@ pub struct AcceleratorCapabilities {
     pub schema_versions: BTreeSet<String>,
 }
 
-/// Compatibility alias for existing deployment/configuration surfaces. New
-/// role-neutral APIs should use `AcceleratorCapabilities`.
-pub type ForebrainCapabilities = AcceleratorCapabilities;
-
 impl AcceleratorCapabilities {
     pub fn from_probe(
         node_id: impl Into<String>,
@@ -339,7 +335,7 @@ mod tests {
     fn cpu_only_is_ready_without_gpu_jobs() {
         let mut probe = base_probe();
         probe.detected_commands.insert("cargo".into());
-        let caps = ForebrainCapabilities::from_probe("node", "boot", "v", probe);
+        let caps = AcceleratorCapabilities::from_probe("node", "boot", "v", probe);
         assert!(caps.ready);
         assert!(caps.runtimes.contains("rust"));
         assert!(!caps.job_classes.contains("perception_training"));
@@ -354,14 +350,14 @@ mod tests {
             runtime: "cuda".into(),
             usable_memory_bytes: 8_000,
         });
-        let caps = ForebrainCapabilities::from_probe("node", "boot", "v", probe);
+        let caps = AcceleratorCapabilities::from_probe("node", "boot", "v", probe);
         assert!(caps.runtimes.contains("cuda"));
         assert!(caps.job_classes.contains("perception_training"));
     }
 
     #[test]
     fn missing_runtime_fixture_does_not_fail_detection() {
-        let caps = ForebrainCapabilities::from_probe("node", "boot", "v", base_probe());
+        let caps = AcceleratorCapabilities::from_probe("node", "boot", "v", base_probe());
         assert!(caps.ready);
         assert!(caps.runtimes.is_empty());
     }

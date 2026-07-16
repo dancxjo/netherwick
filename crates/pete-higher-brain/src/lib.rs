@@ -2,8 +2,7 @@
 //!
 //! This crate deliberately has no dependency on `pete-cockpit`: discovery,
 //! training authority, bulk transfer, and model activation cannot acquire or
-//! reuse a brainstem motion lease. The crate name and forebrain protocol terms
-//! are compatibility deployment aliases; role-neutral APIs use
+//! reuse a brainstem motion lease. Role-neutral APIs use
 //! `CognitiveRole::CognitiveAccelerator`.
 
 pub mod auth;

@@ -632,7 +632,7 @@ What dependencies and feature flags should be copied:
 - Introduce:
   `BehaviorWrapper`
 - Introduce:
-  `BehaviorMode`
+  `BehaviorRegime`
 
 - Discard:
   `Wit`

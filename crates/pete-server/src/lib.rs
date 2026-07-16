@@ -8902,7 +8902,7 @@ function renderBehaviorInspector(){
   const hardcodedOptions = (node.hardcoded_implementations || []).map(item => `<option value="${item.id}" ${item.id === node.selected_hardcoded ? 'selected' : ''}>${item.id}</option>`).join('');
   const modelOptions = (node.model_implementations || []).map(item => `<option value="${item.id}" ${item.id === node.selected_model ? 'selected' : ''}>${item.id}</option>`).join('');
   const regimeOptions = (node.allowed_regimes || []).map(item => `<option value="${item}" ${item === node.selected_regime ? 'selected' : ''}>${item}</option>`).join('');
-  const fallbacks = ['use_hardcoded','use_last_good_output','return_error','stop_safely','hardcoded_on_error','stop_on_error'];
+  const fallbacks = ['use_hardcoded','use_last_good_output','return_error','stop_safely'];
   const fallbackOptions = fallbacks.map(item => `<option value="${item}" ${item === node.fallback_policy ? 'selected' : ''}>${item}</option>`).join('');
   const run = node.last_run ? `${node.last_run.regime} · ${node.last_run.error || 'ok'}${node.last_run.disagreement != null ? ` · disagreement ${compactNumber(node.last_run.disagreement)}` : ''}` : 'no run yet';
   behaviorInspector.innerHTML = `

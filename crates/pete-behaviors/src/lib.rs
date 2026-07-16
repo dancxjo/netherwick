@@ -69,8 +69,6 @@ impl Default for BehaviorRegime {
     }
 }
 
-pub type BehaviorMode = BehaviorRegime;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackPolicy {
@@ -78,19 +76,15 @@ pub enum FallbackPolicy {
     UseLastGoodOutput,
     ReturnError,
     StopSafely,
-    #[serde(alias = "hardcoded_on_error")]
-    HardcodedOnError,
-    #[serde(alias = "stop_on_error")]
-    StopOnError,
 }
 
 impl FallbackPolicy {
     fn should_use_hardcoded(self) -> bool {
-        matches!(self, Self::UseHardcoded | Self::HardcodedOnError)
+        matches!(self, Self::UseHardcoded)
     }
 
     fn should_error(self) -> bool {
-        matches!(self, Self::ReturnError | Self::StopOnError)
+        matches!(self, Self::ReturnError)
     }
 }
 
@@ -466,8 +460,9 @@ pub struct BehaviorRegistryConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BehaviorConfig {
-    #[serde(default, alias = "mode")]
+    #[serde(default)]
     pub regime: BehaviorRegime,
     pub hardcoded: String,
     pub model: Option<String>,
@@ -641,5 +636,37 @@ mod tests {
             config.behavior["danger"].fallback,
             FallbackPolicy::UseHardcoded
         );
+    }
+
+    #[test]
+    fn retired_behavior_config_spellings_are_rejected() {
+        for config in [
+            r#"
+            [behavior.danger]
+            mode = "shadow_train"
+            hardcoded = "danger.range_bumper"
+            model = "danger.burn.v0"
+            checkpoint = "data/models/danger_v0"
+            fallback = "use_hardcoded"
+            "#,
+            r#"
+            [behavior.danger]
+            regime = "shadow_train"
+            hardcoded = "danger.range_bumper"
+            model = "danger.burn.v0"
+            checkpoint = "data/models/danger_v0"
+            fallback = "hardcoded_on_error"
+            "#,
+            r#"
+            [behavior.danger]
+            regime = "shadow_train"
+            hardcoded = "danger.range_bumper"
+            model = "danger.burn.v0"
+            checkpoint = "data/models/danger_v0"
+            fallback = "stop_on_error"
+            "#,
+        ] {
+            assert!(toml::from_str::<BehaviorRegistryConfig>(config).is_err());
+        }
     }
 }

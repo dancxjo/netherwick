@@ -1,7 +1,7 @@
 use crate::auth::{Principal, Scope};
 use crate::bundle::validate_bundle;
 use crate::candidate::{create_candidate, CandidateRequest};
-use crate::capability::ForebrainCapabilities;
+use crate::capability::AcceleratorCapabilities;
 use crate::{atomic_write_json, canonical_json, read_json, sha256_bytes, JOB_SCHEMA_VERSION};
 use anyhow::Result;
 use chrono::Utc;
@@ -162,11 +162,11 @@ pub struct WorkerPaths {
 
 pub struct ForebrainWorker {
     pub paths: WorkerPaths,
-    pub capabilities: ForebrainCapabilities,
+    pub capabilities: AcceleratorCapabilities,
 }
 
 impl ForebrainWorker {
-    pub fn open(paths: WorkerPaths, capabilities: ForebrainCapabilities) -> Result<Self> {
+    pub fn open(paths: WorkerPaths, capabilities: AcceleratorCapabilities) -> Result<Self> {
         for path in [
             &paths.bundles,
             &paths.jobs,
@@ -488,7 +488,7 @@ mod tests {
         BundleBuilder, BundleContentKind, BundleSourceAdapter, ExperienceBundleRequest,
         FileExportAdapter,
     };
-    use crate::capability::{CapabilityProbe, ForebrainCapabilities};
+    use crate::capability::{AcceleratorCapabilities, CapabilityProbe};
     use std::path::Path;
     use uuid::Uuid;
 
@@ -496,8 +496,8 @@ mod tests {
         std::env::temp_dir().join(format!("pete-job-{name}-{}", Uuid::new_v4()))
     }
 
-    fn caps() -> ForebrainCapabilities {
-        ForebrainCapabilities::from_probe(
+    fn caps() -> AcceleratorCapabilities {
+        AcceleratorCapabilities::from_probe(
             "fore",
             "boot",
             "v",

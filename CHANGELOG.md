@@ -4,6 +4,10 @@ All notable changes are grouped by date.
 
 ## Unreleased
 
+### Changed
+
+- Removed retired behavior configuration spellings (`mode`, `hardcoded_on_error`, and `stop_on_error`) and compatibility type aliases; configurations must use `regime` and the canonical fallback values.
+
 ### Cognitive provider health follow-up (2026-07-15)
 
 - Keep optional scene providers degraded while a request is in flight, mark them available only after a successful response, and record deadline failures as degraded health.
