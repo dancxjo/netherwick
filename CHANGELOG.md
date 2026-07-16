@@ -64,6 +64,10 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Accept checksum-valid Create group-0 sensor frames even when battery
+  telemetry is unusual, preserving their independently validated safety data
+  instead of repeatedly surfacing opaque `error 4` messages; spell out
+  brainstem error event names in the Pico W operator frontend.
 - Accept older brainstem handshake frames that predate the nested software
   version field so an authorized USB BOOTSEL upgrade can still proceed.
 - Keep Create 1 dock departure inside the brainstem: after Full mode ends

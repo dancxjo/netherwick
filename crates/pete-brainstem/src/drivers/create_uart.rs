@@ -636,25 +636,6 @@ fn valid_group_zero(bytes: &[u8]) -> bool {
         && bytes[1..=6].iter().all(|byte| valid_bool(*byte))
         && valid_buttons(bytes[11])
         && valid_charging_state(bytes[16])
-        && valid_group_zero_battery(bytes)
-}
-
-fn valid_group_zero_battery(bytes: &[u8]) -> bool {
-    let voltage_mv = u16::from_be_bytes([bytes[17], bytes[18]]);
-    let current_ma = i16::from_be_bytes([bytes[19], bytes[20]]);
-    let temperature_c = bytes[21] as i8;
-    let charge_mah = u16::from_be_bytes([bytes[22], bytes[23]]);
-    let capacity_mah = u16::from_be_bytes([bytes[24], bytes[25]]);
-
-    // Group 0 is safety-critical because one accepted frame updates contact,
-    // cliff, charging, and battery state together. Its checksum only proves
-    // structural integrity, so reject tuples that cannot describe a Create
-    // battery before any of those fields are promoted to telemetry.
-    (5_000..=25_000).contains(&voltage_mv)
-        && (-5_000..=5_000).contains(&current_ma)
-        && (-20..=80).contains(&temperature_c)
-        && (100..=10_000).contains(&capacity_mah)
-        && charge_mah <= capacity_mah
 }
 
 fn valid_bumps_wheel_drops(byte: u8) -> bool {
@@ -776,19 +757,21 @@ mod tests {
     }
 
     #[test]
-    fn group_zero_rejects_implausible_or_inconsistent_battery_fields() {
+    fn group_zero_keeps_safety_data_when_battery_values_are_unusual() {
         let mut packet = valid_group_zero();
         packet[17..19].copy_from_slice(&389u16.to_be_bytes());
-        assert!(decode_sensor_packet(0, &packet).is_none());
+        assert_eq!(decode_sensor_packet(0, &packet).unwrap().voltage_mv, 389);
 
         packet = valid_group_zero();
         packet[22..24].copy_from_slice(&65_534u16.to_be_bytes());
         packet[24..26].copy_from_slice(&1_621u16.to_be_bytes());
-        assert!(decode_sensor_packet(0, &packet).is_none());
+        let sensors = decode_sensor_packet(0, &packet).unwrap();
+        assert_eq!(sensors.charge_mah, 65_534);
+        assert_eq!(sensors.capacity_mah, 1_621);
 
         packet = valid_group_zero();
         packet[24..26].copy_from_slice(&0u16.to_be_bytes());
-        assert!(decode_sensor_packet(0, &packet).is_none());
+        assert_eq!(decode_sensor_packet(0, &packet).unwrap().capacity_mah, 0);
     }
 
     #[test]
@@ -798,7 +781,7 @@ mod tests {
         let mut hardware = TestHardware::new();
         let mut events = Deque::<BrainstemEvent, 4>::new();
         let mut invalid = valid_group_zero();
-        invalid[17..19].copy_from_slice(&389u16.to_be_bytes());
+        invalid[16] = 90;
 
         for expected_events in [1, 0] {
             assert!(uart.request_sensor_packet(&mut hardware, 0).is_ok());
