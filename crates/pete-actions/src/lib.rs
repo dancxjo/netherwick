@@ -310,9 +310,18 @@ pub fn action_to_motor_command(action: Option<&ActionPrimitive>) -> MotorCommand
             },
         },
         ActionPrimitive::Inspect { target } => match target {
-            InspectTarget::Novelty | InspectTarget::Sound | InspectTarget::Person => MotorCommand {
+            // A stationary 0.16 rad/s scan only asks each Create wheel for
+            // roughly 21 mm/s.  That is below the speed at which the physical
+            // drivetrain rolls reliably, so novelty inspection looked like
+            // tiny servo twitches without gathering any new scene evidence.
+            // Keep the scan deliberate, but make it a slow forward arc.
+            InspectTarget::Novelty => MotorCommand {
+                forward: 0.05,
+                turn: 0.1,
+            },
+            InspectTarget::Sound | InspectTarget::Person => MotorCommand {
                 forward: 0.0,
-                turn: 0.16,
+                turn: 0.3,
             },
             _ => MotorCommand::stop(),
         },
@@ -347,12 +356,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inspect_novelty_scans_instead_of_stopping() {
+    fn inspect_novelty_rolls_forward_while_scanning() {
         let motor = action_to_motor_command(Some(&ActionPrimitive::Inspect {
             target: InspectTarget::Novelty,
         }));
 
-        assert_eq!(motor.forward, 0.0);
+        assert!(motor.forward > 0.0);
         assert!(motor.turn.abs() > 0.0);
     }
 

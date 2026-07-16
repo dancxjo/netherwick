@@ -162,6 +162,12 @@ struct ActiveContactWithdrawal {
     baseline_odometry_mm: i32,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ActiveVelocity {
+    linear_mm_s: i16,
+    angular_mrad_s: i16,
+}
+
 pub struct Runtime<H>
 where
     H: BrainstemHardware,
@@ -175,6 +181,7 @@ where
     mode: RuntimeMode,
     active: ActiveAction,
     active_command_id: Option<u32>,
+    active_velocity: Option<ActiveVelocity>,
     stop_sent: bool,
     heartbeat_stop_at_ms: Option<u32>,
     sensor_stream: Option<SensorStream>,
@@ -230,6 +237,7 @@ where
             mode: RuntimeMode::Running,
             active: ActiveAction::None,
             active_command_id: None,
+            active_velocity: None,
             stop_sent: false,
             heartbeat_stop_at_ms: None,
             sensor_stream: None,
@@ -733,6 +741,18 @@ where
     }
 
     fn enqueue_latest_velocity(&mut self, command_id: u32, command: RuntimeCommand) {
+        let RuntimeCommand::CmdVel {
+            linear_mm_s,
+            angular_mrad_s,
+            duration_ms: Some(duration_ms),
+        } = command
+        else {
+            let _ = self
+                .commands
+                .push_back(QueuedCommand::new(command_id, command));
+            return;
+        };
+
         let pending = self.commands.len();
         for _ in 0..pending {
             let Some(existing) = self.commands.pop_front() else {
@@ -743,16 +763,40 @@ where
             }
         }
 
-        if matches!(self.active, ActiveAction::Driving { .. }) {
+        let velocity = ActiveVelocity {
+            linear_mm_s,
+            angular_mrad_s,
+        };
+        if matches!(self.active, ActiveAction::Driving { .. })
+            && self.active_velocity == Some(velocity)
+        {
+            // Possession refreshes cmd_vel every control tick.  Restarting the
+            // same drive on every refresh makes the Create brake and re-start
+            // continuously.  Renew its deadline instead; a changed velocity
+            // still preempts immediately below.
+            self.active = ActiveAction::Driving {
+                stop_at_ms: self.now_ms().wrapping_add(duration_ms),
+            };
+        } else if matches!(self.active, ActiveAction::Driving { .. }) {
             self.interrupt_active_command();
             self.active = ActiveAction::None;
-            let _ = self
-                .commands
-                .push_front(QueuedCommand::new(command_id, command));
+            let _ = self.commands.push_front(QueuedCommand::new(
+                command_id,
+                RuntimeCommand::CmdVel {
+                    linear_mm_s,
+                    angular_mrad_s,
+                    duration_ms: Some(duration_ms),
+                },
+            ));
         } else {
-            let _ = self
-                .commands
-                .push_back(QueuedCommand::new(command_id, command));
+            let _ = self.commands.push_back(QueuedCommand::new(
+                command_id,
+                RuntimeCommand::CmdVel {
+                    linear_mm_s,
+                    angular_mrad_s,
+                    duration_ms: Some(duration_ms),
+                },
+            ));
         }
     }
 
@@ -1335,6 +1379,7 @@ where
         self.create_uart
             .stop(&mut self.hardware, &mut self.events)?;
         self.stop_sent = true;
+        self.active_velocity = None;
         // Once STOP has been sent successfully there is no live motion for the
         // heartbeat watchdog to supervise. Leaving the old deadline armed
         // would later revoke an otherwise valid control lease after a normal
@@ -1353,7 +1398,12 @@ where
         let half_delta = angular_mrad_s as i32 * CREATE_AXLE_TRACK_MM / 2_000;
         let left = clamp_i16(linear_mm_s as i32 - half_delta);
         let right = clamp_i16(linear_mm_s as i32 + half_delta);
-        self.start_drive_direct(left, right, duration_ms, now_ms)
+        self.start_drive_direct(left, right, duration_ms, now_ms)?;
+        self.active_velocity = Some(ActiveVelocity {
+            linear_mm_s,
+            angular_mrad_s,
+        });
+        Ok(())
     }
 
     fn start_face_bearing(
@@ -1886,6 +1936,7 @@ where
             return Err(BrainstemError::Timeout);
         };
         self.ensure_motion_allowed()?;
+        self.active_velocity = None;
 
         status::set_body_state(BodyState::Moving);
         self.stop_sent = false;
@@ -2071,6 +2122,7 @@ where
 
     fn interrupt_active_command(&mut self) {
         self.safety_recovery_motion = false;
+        self.active_velocity = None;
         if let Some(command_id) = self.active_command_id.take() {
             status::mark_command_interrupted(command_id);
         }
@@ -2853,6 +2905,40 @@ mod tests {
 
         assert!(matches!(runtime.active, ActiveAction::None));
         assert_eq!(runtime.heartbeat_stop_at_ms, None);
+    }
+
+    #[test]
+    fn identical_velocity_refresh_extends_the_drive_without_restarting_it() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        let command = RuntimeCommand::CmdVel {
+            linear_mm_s: 50,
+            angular_mrad_s: 100,
+            duration_ms: Some(300),
+        };
+
+        runtime.enqueue_latest_velocity(41, command);
+        assert!(runtime.start_next_command().is_ok());
+        let drive_writes = runtime.hardware.writes.clone();
+        runtime.hardware.now_us = 1_100_000;
+
+        runtime.enqueue_latest_velocity(42, command);
+
+        assert!(runtime.commands.is_empty());
+        assert_eq!(runtime.hardware.writes, drive_writes);
+        assert_eq!(runtime.active_command_id, Some(41));
+        assert!(matches!(
+            runtime.active_velocity,
+            Some(ActiveVelocity {
+                linear_mm_s: 50,
+                angular_mrad_s: 100,
+            })
+        ));
+        assert!(matches!(
+            runtime.active,
+            ActiveAction::Driving { stop_at_ms: 1_400 }
+        ));
     }
 
     #[test]
