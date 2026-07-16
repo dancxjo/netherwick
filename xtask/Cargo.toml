@@ -6,5 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
-indicatif = "0.17"
+cliclack = "0.5.5"
+indicatif = "0.18"
+serde_json.workspace = true

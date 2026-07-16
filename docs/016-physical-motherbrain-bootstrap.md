@@ -81,6 +81,12 @@ curl -fsS http://192.168.4.1/status.json
 
 ## Physical QA session record
 
+Use `just physical-qa` for a guided safety-validation session. It performs the
+firmware identity read below, presents the physical cases and their acceptance
+gates, and saves operator evidence under `data/reports/physical-qa/`. Use
+`just physical-qa --plan` when reviewing or staging the procedure without
+hardware.
+
 At the start of every physical session, record the firmware identity before
 collecting evidence or commanding motion. This distinguishes a dirty local
 flash from the clean commit it was based on:

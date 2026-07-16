@@ -390,14 +390,17 @@ released, the smoke clears its bump latch and any e-stop it observed during that
 same incident; a pre-existing e-stop remains latched for the operator. This command is
 documented but has not been run as part of this software-only readiness pass.
 
-Physical validation still pending:
+Run the pending physical validation as a guided, evidence-recording session:
 
-- [ ] charging interlock,
-- [ ] bumper recovery,
-- [ ] all four cliff sensors,
-- [ ] wheel drop,
-- [ ] heartbeat loss,
-- [ ] transport loss and stopped reconnect with fresh packet-0 telemetry.
+```bash
+just physical-qa
+```
+
+The interactive runner captures the brainstem firmware identity, lets the
+operator select cases, explains each safe setup and acceptance gate, launches
+the guarded bumper helper, and records pass/fail/blocked evidence in
+`data/reports/physical-qa/`. Preview every case without hardware with
+`just physical-qa --plan`.
 
 See [docs/rpi5-bringup.md](docs/rpi5-bringup.md) for packages, permissions, device expectations, success criteria, and failure behavior.
 

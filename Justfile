@@ -89,6 +89,8 @@ robot *args:
     cargo run -q -p xtask -- robot {{args}}
 possess *args:
     cargo run -q -p xtask -- possess {{args}}
+physical-qa *args:
+    cargo run -q -p xtask -- physical-qa {{args}}
 go target="virtual":
     cargo run -q -p xtask -- go "{{target}}"
 go-virtual:

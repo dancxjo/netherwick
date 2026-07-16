@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+mod physical_qa;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::{
@@ -88,6 +89,15 @@ enum Command {
     Possess {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Guide a human through the physical safety QA checklist and record evidence.
+    PhysicalQa {
+        /// Print the complete QA plan without touching hardware or prompting.
+        #[arg(long)]
+        plan: bool,
+        /// Write the session record to this path instead of the timestamped default.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     Go {
         target: Option<String>,
@@ -242,6 +252,7 @@ fn run(command: Command) -> Result<()> {
         Command::Transcribe { wav } => pete_tools(["whisper-transcribe", path(&wav)?], &[]),
         Command::Robot { args } => robot(&args, &[]),
         Command::Possess { args } => possess(&args),
+        Command::PhysicalQa { plan, out } => physical_qa::run(plan, out, possess),
         Command::Go { target } => go(target.as_deref().unwrap_or("virtual")),
         Command::Train { args } => train(&args),
         Command::Evolve { clear } => evolve(clear.as_deref(), false),

@@ -151,14 +151,19 @@ and requires live contact, `SafetyTripped`, `MotionStopped`, bumper release,
 `SafetyCleared`, reverse, turn-away, probe, and inspect before final STOP and
 exorcize. It is intentionally documented here without being run unattended.
 
-Physical evidence still to collect:
+Collect the remaining physical evidence through the interactive QA runner:
 
-- [ ] charging interlock prevents queued, autonomous, and direct motion,
-- [ ] left and right bumper recovery complete normally,
-- [ ] left, front-left, front-right, and right cliff sensors stop motion,
-- [ ] wheel drop remains latched and overrides recovery,
-- [ ] heartbeat loss stops bounded motion,
-- [ ] transport loss stops motion and reconnect waits for fresh packet-0 data.
+```bash
+just physical-qa
+```
+
+It guides charging interlock, both bumpers, each individual cliff sensor,
+wheel drop, heartbeat loss, and transport loss/reconnect. Human observations
+remain explicit pass/fail/blocked decisions, while the existing guarded bumper
+helper is launched in-process. Every session captures the firmware identity
+and writes a reviewable checklist under `data/reports/physical-qa/`. Use
+`just physical-qa --plan` to print all setup instructions and acceptance gates
+without contacting hardware.
 
 ## Hardware Notes
 
