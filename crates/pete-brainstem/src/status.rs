@@ -107,6 +107,7 @@ static CREATE_SENSOR_ANGLE_MRAD: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_IR_BYTE: AtomicU8 = AtomicU8::new(0);
 static CREATE_SENSOR_BUTTONS: AtomicU8 = AtomicU8::new(0);
 static CREATE_SENSOR_CHARGING_STATE: AtomicU8 = AtomicU8::new(0);
+static CREATE_SENSOR_CHARGING_SOURCES: AtomicU8 = AtomicU8::new(0);
 static CREATE_CHARGING_INDICATOR_STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
 static CREATE_SENSOR_VOLTAGE_MV: AtomicU32 = AtomicU32::new(0);
 static CREATE_SENSOR_CURRENT_MA: AtomicU32 = AtomicU32::new(0);
@@ -273,6 +274,7 @@ pub struct BrainstemStatus {
     pub create_sensor_ir_byte: u8,
     pub create_sensor_buttons: u8,
     pub create_sensor_charging_state: u8,
+    pub create_sensor_charging_sources: u8,
     pub create_charging_indicator_state: u8,
     pub create_sensor_voltage_mv: u16,
     pub create_sensor_current_ma: i16,
@@ -2237,6 +2239,7 @@ pub fn clear_create_sensor_snapshot() {
     CREATE_SENSOR_IR_BYTE.store(0, Ordering::Relaxed);
     CREATE_SENSOR_BUTTONS.store(0, Ordering::Relaxed);
     CREATE_SENSOR_CHARGING_STATE.store(0, Ordering::Relaxed);
+    CREATE_SENSOR_CHARGING_SOURCES.store(0, Ordering::Relaxed);
     CREATE_SENSOR_VOLTAGE_MV.store(0, Ordering::Relaxed);
     CREATE_SENSOR_CURRENT_MA.store(0, Ordering::Relaxed);
     CREATE_SENSOR_TEMPERATURE_C.store(0, Ordering::Relaxed);
@@ -2272,7 +2275,7 @@ pub fn mark_uart_packet(len: usize) {
 }
 
 pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
-    if packet_id == 0 {
+    if matches!(packet_id, 0 | 6) {
         increment(&CREATE_SENSOR_COMPLETE_PACKET_COUNT);
         CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS.store(
             LAST_UART_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
@@ -2299,7 +2302,7 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     };
 
     CREATE_SENSOR_LAST_PACKET_ID.store(packet_id, Ordering::Relaxed);
-    if packet_id == 35 {
+    if matches!(packet_id, 6 | 35) {
         OI_MODE.store(sensors.oi_mode, Ordering::Relaxed);
     }
     CREATE_SENSOR_FLAGS.store(new_flags, Ordering::Relaxed);
@@ -2313,6 +2316,9 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     }
     if create_packet_has_charging_state(packet_id) {
         CREATE_SENSOR_CHARGING_STATE.store(sensors.charging_state, Ordering::Relaxed);
+    }
+    if create_packet_has_charging_sources(packet_id) {
+        CREATE_SENSOR_CHARGING_SOURCES.store(sensors.charging_sources, Ordering::Relaxed);
     }
     if create_packet_has_voltage(packet_id) {
         CREATE_SENSOR_VOLTAGE_MV.store(sensors.voltage_mv as u32, Ordering::Relaxed);
@@ -3153,7 +3159,7 @@ fn create_sensor_flags_bits(sensors: CreateSensorPacket) -> u32 {
 
 fn merge_create_sensor_flags(packet_id: u8, old_flags: u32, packet_flags: u32) -> u32 {
     let mask = match packet_id {
-        0 => 0b11_1111_1111,
+        0 | 6 => 0b11_1111_1111,
         7 => (1 << 0) | (1 << 1) | (1 << 2),
         8 => 1 << 3,
         9 => 1 << 4,
@@ -3227,59 +3233,63 @@ fn battery_percent(charge_mah: u16, capacity_mah: u16) -> Option<u8> {
 }
 
 fn create_packet_has_distance_delta(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 19)
+    matches!(packet_id, 0 | 6 | 19)
 }
 
 fn create_packet_has_angle_delta(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 20)
+    matches!(packet_id, 0 | 6 | 20)
 }
 
 fn create_packet_has_ir(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 17)
+    matches!(packet_id, 0 | 6 | 17)
 }
 
 fn create_packet_has_buttons(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 18)
+    matches!(packet_id, 0 | 6 | 18)
 }
 
 fn create_packet_has_charging_state(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 21)
+    matches!(packet_id, 0 | 6 | 21)
+}
+
+fn create_packet_has_charging_sources(packet_id: u8) -> bool {
+    matches!(packet_id, 6 | 34)
 }
 
 fn create_packet_has_voltage(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 22)
+    matches!(packet_id, 0 | 6 | 22)
 }
 
 fn create_packet_has_current(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 23)
+    matches!(packet_id, 0 | 6 | 23)
 }
 
 fn create_packet_has_temperature(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 24)
+    matches!(packet_id, 0 | 6 | 24)
 }
 
 fn create_packet_has_charge(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 25)
+    matches!(packet_id, 0 | 6 | 25)
 }
 
 fn create_packet_has_capacity(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 26)
+    matches!(packet_id, 0 | 6 | 26)
 }
 
 fn create_packet_has_cliff_left_signal(packet_id: u8) -> bool {
-    matches!(packet_id, 28)
+    matches!(packet_id, 6 | 28)
 }
 
 fn create_packet_has_cliff_front_left_signal(packet_id: u8) -> bool {
-    matches!(packet_id, 29)
+    matches!(packet_id, 6 | 29)
 }
 
 fn create_packet_has_cliff_front_right_signal(packet_id: u8) -> bool {
-    matches!(packet_id, 30)
+    matches!(packet_id, 6 | 30)
 }
 
 fn create_packet_has_cliff_right_signal(packet_id: u8) -> bool {
-    matches!(packet_id, 31)
+    matches!(packet_id, 6 | 31)
 }
 
 fn encode_signed_i16(value: i16) -> u32 {
@@ -3428,6 +3438,7 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         create_sensor_ir_byte: CREATE_SENSOR_IR_BYTE.load(Ordering::Relaxed),
         create_sensor_buttons: CREATE_SENSOR_BUTTONS.load(Ordering::Relaxed),
         create_sensor_charging_state: CREATE_SENSOR_CHARGING_STATE.load(Ordering::Relaxed),
+        create_sensor_charging_sources: CREATE_SENSOR_CHARGING_SOURCES.load(Ordering::Relaxed),
         create_charging_indicator_state: CREATE_CHARGING_INDICATOR_STATE.load(Ordering::Relaxed),
         create_sensor_voltage_mv: CREATE_SENSOR_VOLTAGE_MV.load(Ordering::Relaxed) as u16,
         create_sensor_current_ma: decode_signed_i16(
@@ -3632,6 +3643,7 @@ struct CreateSensorStatusJson {
     ir_byte: u8,
     buttons: u8,
     charging_state: u8,
+    charging_sources: u8,
     charging_indicator: &'static str,
     charging_indicator_level: &'static str,
     charging_indicator_pin: &'static str,
@@ -3804,6 +3816,7 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
         ir_byte: snapshot.create_sensor_ir_byte,
         buttons: snapshot.create_sensor_buttons,
         charging_state: snapshot.create_sensor_charging_state,
+        charging_sources: snapshot.create_sensor_charging_sources,
         charging_indicator: tri_state_text(snapshot.create_charging_indicator_state),
         charging_indicator_level: charging_indicator_level_text(
             snapshot.create_charging_indicator_state,
@@ -4597,6 +4610,33 @@ mod tests {
         assert!(charging_interlock_active(&snapshot(0)));
         mark_create_sensor_packet(0, CreateSensorPacket::default());
         assert!(!charging_interlock_active(&snapshot(0)));
+    }
+
+    #[test]
+    fn group_six_updates_complete_snapshot_and_home_base_source() {
+        let _guard = status_test_guard();
+        clear_create_sensor_snapshot();
+        let before = snapshot(0).create_sensor_complete_packet_count;
+
+        mark_create_sensor_packet(
+            6,
+            CreateSensorPacket {
+                charging_sources: 0b10,
+                oi_mode: 3,
+                voltage_mv: 14_400,
+                ..CreateSensorPacket::default()
+            },
+        );
+
+        let status = snapshot(0);
+        assert_eq!(
+            status.create_sensor_complete_packet_count,
+            before.wrapping_add(1)
+        );
+        assert_eq!(status.create_sensor_last_packet_id, 6);
+        assert_eq!(status.create_sensor_charging_sources, 0b10);
+        assert_eq!(status.oi_mode, 3);
+        assert_eq!(status.create_sensor_voltage_mv, 14_400);
     }
 
     #[cfg(feature = "pico-w")]

@@ -67,9 +67,10 @@ All notable changes are grouped by date.
 - Accept older brainstem handshake frames that predate the nested software
   version field so an authorized USB BOOTSEL upgrade can still proceed.
 - Keep Create 1 dock departure inside the brainstem: after Full mode ends
-  charging, hold the first nonzero motion request, perform a bounded reverse
-  off the Home Base, then execute the original request without exposing a
-  charging latch that callers must clear.
+  charging, use the Create's Home Base source telemetry to hold the first
+  nonzero motion request, perform a bounded reverse off the dock, then execute
+  the original request without exposing a charging latch that callers must
+  clear, including after a brainstem-only restart.
 - Consume sleep inputs per successfully completed work kind, keeping deferred,
   failed, and cancelled training inputs eligible when resources return, and
   declare canonical world-model schema 3 in sleep provenance.

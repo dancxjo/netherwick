@@ -45,6 +45,7 @@ const ORIENTATION_PROBE_MAX_ACCEL_MM_S2: u16 = 13_000;
 const CONTACT_REPEAT_WINDOW_MS: u32 = 2_000;
 const DOCK_DEPARTURE_SPEED_MM_S: i16 = -80;
 const DOCK_DEPARTURE_DURATION_MS: u32 = 1_250;
+const CREATE_COMPLETE_SENSOR_PACKET: u8 = 6;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -197,6 +198,7 @@ where
     safety_policy: SafetyPolicy,
     safety_latched: bool,
     safety_latch_kind: Option<status::SafetyEventKind>,
+    dock_departure_pending: bool,
     charging_interlock_latched: bool,
     chirps: [[SongTone; MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
     chirp_counts: [u8; FEEDBACK_KIND_COUNT],
@@ -253,6 +255,7 @@ where
             safety_policy: SafetyPolicy::default(),
             safety_latched: false,
             safety_latch_kind: None,
+            dock_departure_pending: false,
             charging_interlock_latched: false,
             chirps: [[SongTone::default(); MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
             chirp_counts: [0; FEEDBACK_KIND_COUNT],
@@ -472,7 +475,7 @@ where
                 if on { 255 } else { 0 },
                 300,
             )
-        } else if self.estop_latched || self.safety_latched {
+        } else if self.estop_latched || self.safety_latched || self.charging_interlock_latched {
             (CREATE_BUTTON_LED_MASK, 255, 255, 500)
         } else {
             // Keep POWER stable while PLAY and ADVANCE alternate more quickly.
@@ -511,7 +514,7 @@ where
         status::set_session_safety_snapshot(
             self.estop_latched,
             self.safety_latched,
-            false,
+            self.charging_interlock_latched,
             self.safety_latch_kind,
         );
     }
@@ -823,7 +826,7 @@ where
         };
         let command = queued.command;
         let now_ms = self.now_ms();
-        if self.charging_interlock_latched && requires_dock_departure(command) {
+        if self.dock_departure_pending && requires_dock_departure(command) {
             // Full mode terminates Create 1 charging.  Once the charge signal
             // drops, back off the Home Base before starting the caller's
             // body-neutral motion command.  Keep that command queued and do
@@ -1106,7 +1109,7 @@ where
             } => self.start_drive_arc(velocity_mm_s, radius_mm, duration_ms, now_ms)?,
             RuntimeCommand::RequestSensors { packet_id } => {
                 self.create_uart
-                    .request_sensor_packet(&mut self.hardware, packet_id)?;
+                    .request_sensor_packet(&mut self.hardware, internal_sensor_packet(packet_id))?;
             }
             RuntimeCommand::StreamSensors {
                 enabled,
@@ -1115,7 +1118,7 @@ where
             } => {
                 if enabled {
                     self.sensor_stream = Some(SensorStream {
-                        packet_id,
+                        packet_id: internal_sensor_packet(packet_id),
                         period_ms: period_ms.max(RUNTIME_TICK_MS),
                         next_request_ms: now_ms,
                     });
@@ -1420,7 +1423,7 @@ where
 
     fn start_dock_departure(&mut self, now_ms: u32) -> Result<(), BrainstemError> {
         self.ensure_create_responsive()?;
-        self.charging_interlock_latched = false;
+        self.dock_departure_pending = false;
         self.active_velocity = None;
         status::set_body_state(BodyState::Moving);
         self.stop_sent = false;
@@ -1622,6 +1625,7 @@ where
 
     fn ensure_orientation_probe_allowed(&mut self, now_ms: u32) -> Result<(), BrainstemError> {
         if self.estop_latched
+            || self.dock_departure_pending
             || self.charging_interlock_latched
             || (self.safety_latched
                 && self.safety_latch_kind != Some(status::SafetyEventKind::Tilt))
@@ -1817,6 +1821,24 @@ where
         let tilt = imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
         let impact = imu_ok && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
         let charging = status::charging_interlock_active(&snapshot);
+        let home_base = snapshot.create_sensor_charging_sources & 0b10 != 0;
+
+        if home_base && !matches!(self.active, ActiveAction::DockDeparture { .. }) {
+            if !self.dock_departure_pending {
+                self.clear_motion_queue()?;
+                self.stop_drive()?;
+                self.finish_contact_withdrawal(
+                    status::ContactWithdrawalOutcome::SafetyPreempted,
+                    Some(status::SafetyEventKind::Charging),
+                    true,
+                );
+                self.dock_departure_pending = true;
+            }
+            // Packet 34 lets a Home Base contact replace the conservative
+            // unknown-source charging interlock with internal dock handling.
+            self.charging_interlock_latched = false;
+            return Ok(());
+        }
 
         if charging {
             if !self.charging_interlock_latched {
@@ -2068,6 +2090,7 @@ where
 
     fn ensure_motion_allowed(&mut self) -> Result<(), BrainstemError> {
         if self.estop_latched
+            || self.dock_departure_pending
             || self.charging_interlock_latched
             || (self.safety_latched && !self.safety_recovery_latch_allows_motion())
         {
@@ -2080,6 +2103,7 @@ where
 
     fn ensure_recovery_motion_allowed(&mut self) -> Result<(), BrainstemError> {
         if self.estop_latched
+            || self.dock_departure_pending
             || self.charging_interlock_latched
             || (self.safety_latched && !recoverable_safety_latch(self.safety_latch_kind))
         {
@@ -2308,6 +2332,14 @@ fn low_battery_and_charging(snapshot: &status::BrainstemStatus) -> bool {
 fn create_charging_active(snapshot: &status::BrainstemStatus) -> bool {
     snapshot.create_charging_indicator_state == 2
         || matches!(snapshot.create_sensor_charging_state, 1..=3)
+}
+
+fn internal_sensor_packet(requested_packet: u8) -> u8 {
+    if requested_packet == 0 {
+        CREATE_COMPLETE_SENSOR_PACKET
+    } else {
+        requested_packet
+    }
 }
 
 fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCommand> {
@@ -2973,7 +3005,7 @@ mod tests {
         assert!(runtime.advance_active_action().is_ok());
         assert!(runtime.commands.is_empty());
 
-        let mut bytes = heapless::Vec::<u8, 32>::new();
+        let mut bytes = heapless::Vec::<u8, 64>::new();
         assert!(bytes.push(1).is_ok());
         assert!(runtime
             .events
@@ -3134,7 +3166,7 @@ mod tests {
 
         assert!(runtime.maintain_full_mode().is_ok());
 
-        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 35]);
+        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 6]);
         assert_eq!(status::snapshot(1_000).oi_mode, 0);
     }
 
@@ -3158,7 +3190,7 @@ mod tests {
         assert!(runtime.hardware.writes.is_empty());
         status::set_oi_mode_unknown();
         assert!(runtime.maintain_full_mode().is_ok());
-        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 35]);
+        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 6]);
         status::mark_create_sensor_packet(
             0,
             crate::events::CreateSensorPacket {
@@ -3173,7 +3205,15 @@ mod tests {
     #[test]
     fn charging_indicator_stops_motion_then_departure_precedes_next_command() {
         let _guard = status::status_test_guard();
-        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        status::mark_create_sensor_packet(
+            6,
+            crate::events::CreateSensorPacket {
+                charging_state: 2,
+                charging_sources: 0b10,
+                oi_mode: 3,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
         let mut hardware = FakeHardware::new(1_000);
         hardware.charging_indicator = Some(true);
         let mut runtime = Runtime::new(hardware);
@@ -3192,7 +3232,8 @@ mod tests {
         runtime.tick();
 
         assert!(matches!(runtime.active, ActiveAction::None));
-        assert!(runtime.charging_interlock_latched);
+        assert!(runtime.dock_departure_pending);
+        assert!(!runtime.charging_interlock_latched);
         assert!(!runtime
             .commands
             .iter()
@@ -3203,8 +3244,16 @@ mod tests {
             .any(|event| matches!(event, BrainstemEvent::DriveStopped)));
 
         runtime.hardware.charging_indicator = Some(false);
+        status::mark_create_sensor_packet(
+            6,
+            crate::events::CreateSensorPacket {
+                charging_sources: 0b10,
+                oi_mode: 3,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
         runtime.tick();
-        assert!(runtime.charging_interlock_latched);
+        assert!(runtime.dock_departure_pending);
         assert!(!status::session_safety_snapshot().2);
 
         let event_cursor = status::snapshot(1_000).event_next_seq;
@@ -3220,11 +3269,8 @@ mod tests {
             ))
             .is_ok());
         assert!(runtime.start_next_command().is_ok());
-        assert!(matches!(
-            runtime.active,
-            ActiveAction::DockDeparture { .. }
-        ));
-        assert!(!runtime.charging_interlock_latched);
+        assert!(matches!(runtime.active, ActiveAction::DockDeparture { .. }));
+        assert!(!runtime.dock_departure_pending);
         assert_eq!(
             &runtime.hardware.writes.as_slice()[runtime.hardware.writes.len() - 5..],
             &[145, 0xff, 0xb0, 0xff, 0xb0]
@@ -3286,7 +3332,7 @@ mod tests {
         status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.create_responsive = true;
-        runtime.charging_interlock_latched = true;
+        runtime.dock_departure_pending = true;
         assert!(runtime
             .commands
             .push_back(QueuedCommand::new(
@@ -3302,7 +3348,7 @@ mod tests {
         assert!(runtime.start_next_command().is_ok());
 
         assert!(matches!(runtime.active, ActiveAction::None));
-        assert!(runtime.charging_interlock_latched);
+        assert!(runtime.dock_departure_pending);
         assert!(runtime.active_velocity.is_none());
         assert!(runtime
             .hardware

@@ -10,6 +10,7 @@ pub struct CreateSensorPacket {
     pub distance_mm: i16,
     pub angle_mrad: i16,
     pub charging_state: u8,
+    pub charging_sources: u8,
     pub oi_mode: u8,
     pub voltage_mv: u16,
     pub current_ma: i16,
@@ -53,7 +54,7 @@ pub enum BrainstemEvent {
 
     CreatePacketReceived {
         packet_id: u8,
-        bytes: Vec<u8, 32>,
+        bytes: Vec<u8, 64>,
     },
     CreateSensorPacketDecoded {
         packet_id: u8,
