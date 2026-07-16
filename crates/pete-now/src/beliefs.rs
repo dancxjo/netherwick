@@ -1379,7 +1379,7 @@ fn integrate_cognitive_registry(now: &Now, services: &mut CognitiveServiceSummar
             ) && now.t_ms <= provider.health.valid_until_ms;
             let candidate = CognitiveServiceBelief {
                 provider_id: Some(provider.provider_id.0.clone()),
-                role: Some(format!("{:?}", provider.role).to_ascii_lowercase()),
+                role: Some(provider.role.as_str().to_string()),
                 capability: Some(key.clone()),
                 capability_version: Some(capability.version.clone()),
                 available,
@@ -1399,8 +1399,8 @@ fn integrate_cognitive_registry(now: &Now, services: &mut CognitiveServiceSummar
                 implementation: Some(provider.implementation.clone()),
                 implementation_version: Some(provider.implementation_version.clone()),
                 model_version: provider.model_version.clone(),
-                locality: Some(format!("{:?}", provider.locality).to_ascii_lowercase()),
-                resource_class: Some(format!("{:?}", provider.resource_class).to_ascii_lowercase()),
+                locality: Some(provider.locality.as_str().to_string()),
+                resource_class: Some(provider.resource_class.as_str().to_string()),
                 meta: simple_meta(
                     now.t_ms,
                     BeliefSourceKind::DerivedPerception,
@@ -2086,6 +2086,10 @@ mod tests {
                 .map(|id| id.0.as_str()),
             Some("accelerator-b")
         );
+        let service = &restarted.world.self_model.service_state.services["describe_scene"];
+        assert_eq!(service.role.as_deref(), Some("cognitive_accelerator"));
+        assert_eq!(service.locality.as_deref(), Some("local_network"));
+        assert_eq!(service.resource_class.as_deref(), Some("unknown"));
     }
 
     #[test]

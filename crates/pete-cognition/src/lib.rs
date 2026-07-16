@@ -39,6 +39,17 @@ pub enum CognitiveRole {
     RemoteAdvisor,
 }
 
+impl CognitiveRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BodyController => "body_controller",
+            Self::OrganismRuntime => "organism_runtime",
+            Self::CognitiveAccelerator => "cognitive_accelerator",
+            Self::RemoteAdvisor => "remote_advisor",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitiveCapability {
@@ -85,6 +96,16 @@ pub enum Locality {
     Remote,
 }
 
+impl Locality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnOrganism => "on_organism",
+            Self::LocalNetwork => "local_network",
+            Self::Remote => "remote",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceClass {
@@ -94,6 +115,18 @@ pub enum ResourceClass {
     Cloud,
     #[default]
     Unknown,
+}
+
+impl ResourceClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::GeneralPurpose => "general_purpose",
+            Self::Accelerated => "accelerated",
+            Self::Cloud => "cloud",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -641,11 +674,23 @@ impl CognitiveRouter {
         )
         .await
         {
-            Ok(Ok(response)) => RoutedResponse {
-                disposition: validate_response(&request, &response),
-                route,
-                response,
-            },
+            Ok(Ok(response)) => {
+                self.registry.update_health(
+                    &provider_id,
+                    ProviderHealth {
+                        state: ProviderHealthState::Available,
+                        confidence: response.confidence,
+                        observed_at_ms: response.completed_at_ms,
+                        valid_until_ms: request.deadline_ms,
+                        reason: None,
+                    },
+                );
+                RoutedResponse {
+                    disposition: validate_response(&request, &response),
+                    route,
+                    response,
+                }
+            }
             Ok(Err(error)) => {
                 self.registry.update_health(
                     &provider_id,
@@ -666,14 +711,26 @@ impl CognitiveRouter {
                     error.to_string(),
                 )
             }
-            Err(_) => failed_routed_response(
-                route,
-                &request,
-                provider_id,
-                request.deadline_ms,
-                CognitiveResponseStatus::TimedOut,
-                "provider exceeded request deadline".to_string(),
-            ),
+            Err(_) => {
+                self.registry.update_health(
+                    &provider_id,
+                    ProviderHealth {
+                        state: ProviderHealthState::Degraded,
+                        confidence: 1.0,
+                        observed_at_ms: request.deadline_ms,
+                        valid_until_ms: request.deadline_ms,
+                        reason: Some("provider exceeded request deadline".to_string()),
+                    },
+                );
+                failed_routed_response(
+                    route,
+                    &request,
+                    provider_id,
+                    request.deadline_ms,
+                    CognitiveResponseStatus::TimedOut,
+                    "provider exceeded request deadline".to_string(),
+                )
+            }
         }
     }
 }

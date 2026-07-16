@@ -365,4 +365,30 @@ mod tests {
         assert!(caps.ready);
         assert!(caps.runtimes.is_empty());
     }
+
+    #[test]
+    fn capability_probe_projects_to_role_neutral_provider() {
+        let mut probe = base_probe();
+        probe.gpu = Some(GpuProbe {
+            vendor: "nvidia".into(),
+            model: "fixture".into(),
+            runtime: "cuda".into(),
+            usable_memory_bytes: 8_000,
+        });
+        let descriptor = AcceleratorCapabilities::from_probe("node", "boot", "v", probe)
+            .provider_descriptor(
+                "accelerator.fixture",
+                Some("host-a".into()),
+                Some("process-a".into()),
+                10,
+            );
+
+        assert_eq!(descriptor.role, CognitiveRole::CognitiveAccelerator);
+        assert_eq!(descriptor.host_id, Some(HostId("host-a".into())));
+        assert_eq!(descriptor.process_id, Some(ProcessId("process-a".into())));
+        assert!(descriptor
+            .capabilities
+            .iter()
+            .any(|capability| { capability.capability == CognitiveCapability::TrainModel }));
+    }
 }

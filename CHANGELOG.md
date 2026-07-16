@@ -4,6 +4,11 @@ All notable changes are grouped by date.
 
 ## Unreleased
 
+### Cognitive provider health follow-up (2026-07-15)
+
+- Keep optional scene providers degraded while a request is in flight, mark them available only after a successful response, and record deadline failures as degraded health.
+- Serialize cognitive role, locality, and resource-class fields with their stable snake-case identifiers in self-model service beliefs.
+
 - Added a `sup` target in `Justfile` as a short alias for `./scripts/codex-sync.sh`.
 - Refactored `scripts/codex-sync.sh` to cache both short and porcelain git status once per run.
 - In clean-sync mode, `codex-sync.sh` now prints branch/status context and syncs from origin with `git pull --ff-only`.

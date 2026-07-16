@@ -584,11 +584,11 @@ impl LiveImageCognition {
                     router.update_health(
                         &provider_id,
                         ProviderHealth {
-                            state: ProviderHealthState::Available,
+                            state: ProviderHealthState::Degraded,
                             confidence: 0.8,
                             observed_at_ms: now_ms,
                             valid_until_ms: now_ms.saturating_add(self.request_timeout_ms),
-                            reason: None,
+                            reason: Some("probing optional scene provider".to_string()),
                         },
                     );
                     match scene_request(frame, world_revision, now_ms, self.request_timeout_ms) {
