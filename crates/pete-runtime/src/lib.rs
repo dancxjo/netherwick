@@ -292,7 +292,6 @@ fn runtime_sleep_input(
         .take(128)
         .map(|relation_id| relation_id.0.clone())
         .collect::<Vec<_>>();
-    let deferred_work_count = completed_episode_refs.len() + failed_behavior_refs.len();
     SleepTickInput {
         now_ms: now.t_ms,
         fatigue_activation,
@@ -315,7 +314,6 @@ fn runtime_sleep_input(
             .get("body.thermal_fraction")
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0) as f32,
-        deferred_work_count,
         completed_episode_refs,
         failed_behavior_refs,
         semantic_relation_refs,

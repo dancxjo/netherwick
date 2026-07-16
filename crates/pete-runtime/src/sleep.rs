@@ -1,9 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use pete_now::{ClockDomain, EvidenceRef, TypedTimestamp};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SLEEP_WALL_BUDGET_MS: u64 = 30 * 60 * 1_000;
+const FATIGUE_ENTRY_THRESHOLD: f32 = 0.80;
+const FATIGUE_REARM_THRESHOLD: f32 = 0.65;
+const MAX_CONSUMED_SLEEP_INPUT_REFS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -294,6 +297,8 @@ pub struct SleepSession {
     pub interrupted_by: Option<WakeReason>,
     #[serde(default)]
     pub provenance: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub claimed_input_refs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -324,6 +329,8 @@ pub struct SleepReport {
     pub promoted_artifact: Option<String>,
     pub fresh_world_model_required: bool,
     pub stale_skill_resumed: bool,
+    #[serde(default)]
+    pub consumed_input_refs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -355,22 +362,40 @@ pub struct SleepTickInput {
     pub operator_wake_request: bool,
     pub accelerator_available: bool,
     pub thermal_fraction: f32,
-    #[allow(dead_code)]
-    pub deferred_work_count: usize,
     pub completed_episode_refs: Vec<String>,
     pub failed_behavior_refs: Vec<String>,
     pub semantic_relation_refs: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SleepController {
     sequence: u64,
     session: Option<SleepSession>,
     last_report: Option<SleepReport>,
+    consumed_input_refs: VecDeque<String>,
+    fatigue_entry_armed: bool,
+    operator_sleep_request_active: bool,
+}
+
+impl Default for SleepController {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            session: None,
+            last_report: None,
+            consumed_input_refs: VecDeque::new(),
+            fatigue_entry_armed: true,
+            operator_sleep_request_active: false,
+        }
+    }
 }
 
 impl SleepController {
-    pub fn snapshot(&self, now_ms: u64, input: &SleepTickInput) -> SleepSnapshot {
+    pub fn snapshot(
+        &self,
+        now_ms: u64,
+        eligibility: SleepEligibility,
+    ) -> SleepSnapshot {
         SleepSnapshot {
             schema_version: 1,
             t_ms: now_ms,
@@ -379,7 +404,7 @@ impl SleepController {
                 .as_ref()
                 .map(|session| session.phase)
                 .unwrap_or(SleepPhase::Awake),
-            eligibility: sleep_eligibility(input),
+            eligibility,
             session: self.session.clone(),
             last_report: self.last_report.clone(),
         }
@@ -398,19 +423,30 @@ impl SleepController {
     }
 
     pub fn tick(&mut self, input: SleepTickInput) -> SleepSnapshot {
-        let eligibility = sleep_eligibility(&input);
+        if input.fatigue_activation <= FATIGUE_REARM_THRESHOLD {
+            self.fatigue_entry_armed = true;
+        }
+        let operator_request_edge =
+            input.operator_sleep_request && !self.operator_sleep_request_active;
+        self.operator_sleep_request_active = input.operator_sleep_request;
+        let pending_input = self.pending_input(&input);
+        let eligibility = sleep_eligibility_with_arms(
+            &pending_input,
+            operator_request_edge,
+            self.fatigue_entry_armed,
+        );
         if self.session.is_none() {
             if eligibility.eligible {
-                self.start_session(&input, &eligibility);
+                self.start_session(&pending_input, &eligibility);
             }
-            return self.snapshot(input.now_ms, &input);
+            return self.snapshot(input.now_ms, eligibility);
         }
 
         if let Some(reason) = wake_reason(&input) {
             let session = self.session.as_mut().expect("checked session");
             session.interrupted_by = Some(reason);
             session.phase = SleepPhase::Interrupted;
-            return self.snapshot(input.now_ms, &input);
+            return self.snapshot(input.now_ms, eligibility);
         }
 
         let phase = self.session.as_ref().expect("checked session").phase;
@@ -441,13 +477,23 @@ impl SleepController {
             SleepPhase::Waking => self.finish_session(input.now_ms),
             SleepPhase::Awake => self.session = None,
         }
-        self.snapshot(input.now_ms, &input)
+        let eligibility = if self.session.is_none() {
+            let pending_input = self.pending_input(&input);
+            sleep_eligibility_with_arms(&pending_input, false, self.fatigue_entry_armed)
+        } else {
+            eligibility
+        };
+        self.snapshot(input.now_ms, eligibility)
     }
 
     fn start_session(&mut self, input: &SleepTickInput, eligibility: &SleepEligibility) {
         self.sequence = self.sequence.saturating_add(1);
         let trigger = eligibility.trigger.unwrap_or(SleepTrigger::OperatorRequest);
+        if input.fatigue_activation >= FATIGUE_ENTRY_THRESHOLD {
+            self.fatigue_entry_armed = false;
+        }
         let id = SleepSessionId(format!("sleep:{}:{}", input.now_ms, self.sequence));
+        let claimed_input_refs = sleep_input_refs(input);
         self.session = Some(SleepSession {
             id: id.clone(),
             started_at_ms: input.now_ms,
@@ -470,6 +516,7 @@ impl SleepController {
                 transformation_lineage: vec!["pete_runtime::SleepController".to_string()],
                 implementation_version: Some("1".to_string()),
             }],
+            claimed_input_refs,
         });
     }
 
@@ -524,6 +571,14 @@ impl SleepController {
             .filter(|result| result.status == SleepWorkStatus::Deferred)
             .map(|result| result.work_item_id.clone())
             .collect();
+        let consumed_input_refs = if session.interrupted_by.is_none() {
+            session.claimed_input_refs.clone()
+        } else {
+            Vec::new()
+        };
+        for input_ref in &consumed_input_refs {
+            self.mark_consumed(input_ref.clone());
+        }
         self.last_report = Some(SleepReport {
             schema_version: 1,
             session_id: session.id,
@@ -538,16 +593,49 @@ impl SleepController {
             promoted_artifact: None,
             fresh_world_model_required: true,
             stale_skill_resumed: false,
+            consumed_input_refs,
         });
+    }
+
+    fn pending_input(&self, input: &SleepTickInput) -> SleepTickInput {
+        let mut pending = input.clone();
+        pending
+            .completed_episode_refs
+            .retain(|input_ref| !self.consumed_input_refs.contains(input_ref));
+        pending
+            .failed_behavior_refs
+            .retain(|input_ref| !self.consumed_input_refs.contains(input_ref));
+        pending
+            .semantic_relation_refs
+            .retain(|input_ref| !self.consumed_input_refs.contains(input_ref));
+        pending
+    }
+
+    fn mark_consumed(&mut self, input_ref: String) {
+        if self.consumed_input_refs.contains(&input_ref) {
+            return;
+        }
+        self.consumed_input_refs.push_back(input_ref);
+        while self.consumed_input_refs.len() > MAX_CONSUMED_SLEEP_INPUT_REFS {
+            self.consumed_input_refs.pop_front();
+        }
     }
 }
 
 pub fn sleep_eligibility(input: &SleepTickInput) -> SleepEligibility {
-    let trigger = if input.operator_sleep_request {
+    sleep_eligibility_with_arms(input, input.operator_sleep_request, true)
+}
+
+fn sleep_eligibility_with_arms(
+    input: &SleepTickInput,
+    operator_request_edge: bool,
+    fatigue_entry_armed: bool,
+) -> SleepEligibility {
+    let trigger = if operator_request_edge {
         Some(SleepTrigger::OperatorRequest)
-    } else if input.fatigue_activation >= 0.80 {
+    } else if fatigue_entry_armed && input.fatigue_activation >= FATIGUE_ENTRY_THRESHOLD {
         Some(SleepTrigger::HighFatigue)
-    } else if input.deferred_work_count > 0 && input.charging {
+    } else if has_deferred_work(input) && input.charging {
         Some(SleepTrigger::DeferredWork)
     } else {
         None
@@ -580,6 +668,22 @@ pub fn sleep_eligibility(input: &SleepTickInput) -> SleepEligibility {
         blocking_reasons,
         expensive_work_allowed: input.charging && input.docked && input.thermal_fraction <= 0.80,
     }
+}
+
+fn has_deferred_work(input: &SleepTickInput) -> bool {
+    !input.completed_episode_refs.is_empty() || !input.failed_behavior_refs.is_empty()
+}
+
+fn sleep_input_refs(input: &SleepTickInput) -> Vec<String> {
+    input
+        .completed_episode_refs
+        .iter()
+        .chain(input.failed_behavior_refs.iter())
+        .chain(input.semantic_relation_refs.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn wake_reason(input: &SleepTickInput) -> Option<WakeReason> {
