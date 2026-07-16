@@ -17,7 +17,6 @@ const OI_DRIVE_DIRECT: u8 = 145;
 const OI_STREAM: u8 = 148;
 const OI_PAUSE_RESUME_STREAM: u8 = 150;
 const OI_STREAM_HEADER: u8 = 19;
-const OI_DRIVE_STRAIGHT_RADIUS: i16 = i16::MIN;
 const UART_DRAIN_LIMIT: usize = 128;
 pub(crate) const CREATE_LED_PLAY: u8 = 1 << 1;
 pub(crate) const CREATE_LED_ADVANCE: u8 = 1 << 3;
@@ -195,27 +194,6 @@ impl CreateUart {
             hardware,
             &[OI_DRIVE_DIRECT, right[0], right[1], left[0], left[1]],
         )
-    }
-
-    pub fn drive_straight<H, const N: usize>(
-        &mut self,
-        hardware: &mut H,
-        events: &mut Deque<BrainstemEvent, N>,
-        velocity_mm_s: i16,
-        duration_ms: u32,
-    ) -> Result<(), BrainstemError>
-    where
-        H: BrainstemHardware,
-    {
-        let event = BrainstemEvent::DriveRequested {
-            left_mm_s: velocity_mm_s,
-            right_mm_s: velocity_mm_s,
-            duration_ms,
-        };
-        status::signal_event(&event);
-        let _ = events.push_back(event);
-
-        self.drive(hardware, velocity_mm_s, OI_DRIVE_STRAIGHT_RADIUS)
     }
 
     pub fn drive_arc<H, const N: usize>(

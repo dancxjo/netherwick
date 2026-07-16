@@ -434,6 +434,25 @@ where
         if !time_reached(now_ms, self.next_full_mode_refresh_ms) {
             return Ok(());
         }
+        let motor_output_active = matches!(
+            self.active,
+            ActiveAction::Driving { .. } | ActiveAction::DockDeparture { .. }
+        );
+        if motor_output_active {
+            if snapshot.oi_mode != 3 {
+                self.stop_drive()?;
+                self.interrupt_active_command();
+                self.active = ActiveAction::None;
+                return Err(BrainstemError::CreateNoResponse);
+            }
+            // Re-sending OI Full zeros wheel output on Create 1 even when the
+            // reported mode is already Full. Never overlay that supervision
+            // write on a bounded motor program; fresh mode loss still takes
+            // the fail-closed branch above.
+            self.next_full_mode_refresh_ms =
+                now_ms.wrapping_add(FULL_MODE_REFRESH_PERIOD_MS);
+            return Ok(());
+        }
         if low_battery_and_charging(&snapshot) && snapshot.oi_mode == 3 {
             return Ok(());
         }
@@ -1293,9 +1312,10 @@ where
         self.active_velocity = None;
         status::set_body_state(BodyState::Moving);
         self.stop_sent = false;
-        self.create_uart.drive_straight(
+        self.create_uart.drive_direct(
             &mut self.hardware,
             &mut self.events,
+            DOCK_DEPARTURE_SPEED_MM_S,
             DOCK_DEPARTURE_SPEED_MM_S,
             DOCK_DEPARTURE_DURATION_MS,
         )?;
@@ -2558,6 +2578,47 @@ mod tests {
     }
 
     #[test]
+    fn full_mode_refresh_never_overlays_active_motor_output() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::DockDeparture { stop_at_ms: 3_500 };
+        status::set_oi_mode(CreateOiMode::Full);
+
+        assert!(runtime.maintain_full_mode().is_ok());
+
+        assert!(runtime.hardware.writes.is_empty());
+        assert_eq!(runtime.next_full_mode_refresh_ms, 2_000);
+        assert!(matches!(
+            runtime.active,
+            ActiveAction::DockDeparture { stop_at_ms: 3_500 }
+        ));
+    }
+
+    #[test]
+    fn mode_loss_during_active_motor_output_stops_fail_closed() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 3_500 };
+        runtime.active_command_id = Some(42);
+        status::set_oi_mode(CreateOiMode::Passive);
+
+        assert!(matches!(
+            runtime.maintain_full_mode(),
+            Err(BrainstemError::CreateNoResponse)
+        ));
+
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert_eq!(runtime.active_command_id, None);
+        assert!(runtime
+            .hardware
+            .writes
+            .windows(5)
+            .any(|bytes| bytes == [137, 0, 0, 0, 0]));
+    }
+
+    #[test]
     fn completed_motion_disarms_heartbeat_without_revoking_lease() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(301));
@@ -2800,7 +2861,7 @@ mod tests {
         assert!(!runtime.dock_departure_pending);
         assert_eq!(
             &runtime.hardware.writes.as_slice()[runtime.hardware.writes.len() - 5..],
-            &[137, 0xff, 0xb0, 0x80, 0x00]
+            &[145, 0xff, 0xb0, 0xff, 0xb0]
         );
         assert_eq!(runtime.commands.len(), 1);
 
