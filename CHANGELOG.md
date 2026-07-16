@@ -8,6 +8,10 @@ All notable changes are grouped by date.
 
 - Removed retired behavior configuration spellings (`mode`, `hardcoded_on_error`, and `stop_on_error`) and compatibility type aliases; configurations must use `regime` and the canonical fallback values.
 
+### Fixed
+
+- Use `portable-atomic` for brainstem registry and session counters in the default RP2040 build as well as Pico-W builds.
+
 ### Ready
 
 - Make a bump-triggered contact withdrawal a bounded brainstem-local reflex: it continues across authority changes, records start and terminal safety events, and remains preemptible by stronger safety conditions.

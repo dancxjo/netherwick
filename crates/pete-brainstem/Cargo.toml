@@ -31,7 +31,7 @@ embedded-io-async = { version = "0.7", optional = true }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde-json-core = "0.6"
 static_cell = { version = "2", optional = true }
-portable-atomic = { version = "1", features = ["critical-section"], optional = true }
+portable-atomic = { version = "1", features = ["critical-section"] }
 
 [features]
 default = ["rp2040"]
@@ -47,7 +47,6 @@ pico-w = [
     "dep:embassy-usb",
     "dep:embedded-io-async",
     "dep:static_cell",
-    "dep:portable-atomic",
     "dep:rp-pac",
 ]
 operator-debug = []

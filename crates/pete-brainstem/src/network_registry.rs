@@ -1,7 +1,4 @@
 use crate::status;
-#[cfg(not(feature = "pico-w"))]
-use core::sync::atomic::{AtomicU32, Ordering};
-#[cfg(feature = "pico-w")]
 use portable_atomic::{AtomicU32, Ordering};
 
 const LEASES: usize = 8;
