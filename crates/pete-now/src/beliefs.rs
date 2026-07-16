@@ -497,6 +497,8 @@ pub struct WorldModelSnapshot {
     pub temporal: TemporalContext,
     pub social: SocialWorldSnapshot,
     pub epistemic: EpistemicSnapshot,
+    #[serde(default)]
+    pub semantic: crate::SemanticGraphSnapshot,
     pub authority: Option<AuthorityBelief>,
     pub update_trace: BeliefUpdateTrace,
 }
@@ -532,6 +534,8 @@ pub struct WorldModelUpdateContext {
     #[serde(default)]
     pub temporal_expectations: Vec<PendingTemporalExpectation>,
     pub epistemic_attempt: Option<EpistemicAttempt>,
+    #[serde(default)]
+    pub semantic_observations: Vec<crate::SemanticEvidenceObservation>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -543,6 +547,7 @@ pub struct WorldModelUpdater {
     social: SocialWorldModelBuilder,
     temporal: TemporalIntegrator,
     epistemic: EpistemicModelBuilder,
+    semantic: crate::semantic::SemanticGraphBuilder,
 }
 
 impl WorldModelUpdater {
@@ -606,6 +611,9 @@ impl WorldModelUpdater {
             context.strategy_failure_pressure,
             context.epistemic_attempt.as_ref(),
         );
+        let semantic = self
+            .semantic
+            .update(&now, &self.entities, &context.semantic_observations);
         let mut self_model = self.self_model(&now, &context);
         self_model.continuity.episode_id = temporal
             .current_episode
@@ -680,6 +688,15 @@ impl WorldModelUpdater {
                 trace.input_evidence_ids.push(evidence.id.clone());
             }
         }
+        for relation in semantic.relations.values() {
+            for evidence in relation
+                .supporting_evidence
+                .iter()
+                .chain(relation.contradicting_evidence.iter())
+            {
+                trace.input_evidence_ids.push(evidence.id.clone());
+            }
+        }
         trace.input_evidence_ids.sort();
         trace.input_evidence_ids.dedup();
         trace.added.sort();
@@ -691,7 +708,7 @@ impl WorldModelUpdater {
 
         self.revision = self.revision.saturating_add(1);
         now.world = WorldModelSnapshot {
-            schema_version: 2,
+            schema_version: 3,
             revision: self.revision,
             t_ms: now.t_ms,
             entities: self.entities.clone(),
@@ -702,6 +719,7 @@ impl WorldModelUpdater {
             temporal,
             social,
             epistemic,
+            semantic,
             authority,
             update_trace: trace,
         };

@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub mod beliefs;
 pub mod epistemic;
+pub mod semantic;
 pub mod social;
 pub mod temporal;
 
@@ -28,6 +29,14 @@ pub use epistemic::{
     BeliefRef, EpistemicActionKind, EpistemicAffordance, EpistemicAttempt, EpistemicMetrics,
     EpistemicOutcome, EpistemicQuestion, EpistemicQuestionFamily, EpistemicSnapshot, HypothesisRef,
     QuestionId,
+};
+pub use semantic::{
+    SemanticActionId, SemanticBehaviorId, SemanticConceptId, SemanticContext,
+    SemanticDriveId, SemanticEpisodeId, SemanticEvidenceObservation, SemanticExplanation,
+    SemanticGoalId, SemanticGraphSnapshot, SemanticGroundingKind, SemanticNodeRef,
+    SemanticOutcomeId, SemanticPlaceId, SemanticPredicate, SemanticPropertyId,
+    SemanticRelation, SemanticRelationId, SemanticRelationStatus, SemanticRevision,
+    SemanticSkillId,
 };
 pub use social::{
     AttentionBelief, CommunicationProfile, ContextRef, ConversationTurnRef, IdentityHypothesis,

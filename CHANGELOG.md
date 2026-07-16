@@ -4,6 +4,15 @@ All notable changes are grouped by date.
 
 ## Unreleased
 
+### Added
+
+- Add a provenance-backed semantic relation graph to the canonical world model,
+  grounding charger, obstacle, behavior, skill, goal, drive, and outcome
+  meanings with contextual confidence and contradiction tracking.
+- Expose semantic evidence observations and graph queries, including
+  charger explanations and causal-grounding safeguards that downgrade
+  unsupported causal claims to predictions.
+
 ### Changed
 
 - Removed retired behavior configuration spellings (`mode`, `hardcoded_on_error`, and `stop_on_error`) and compatibility type aliases; configurations must use `regime` and the canonical fallback values.
