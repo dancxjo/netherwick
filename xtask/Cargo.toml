@@ -7,3 +7,4 @@ publish = false
 
 [dependencies]
 clap.workspace = true
+indicatif = "0.17"

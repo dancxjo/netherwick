@@ -8,5 +8,5 @@ After=dev-%i.device
 Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=-/etc/default/netherwick-pico-bootsel
-ExecStart=/usr/local/lib/netherwick/pico-bootsel-mount %I
-ExecStop=/usr/local/lib/netherwick/pico-bootsel-mount --umount %I
+ExecStart=/usr/local/lib/netherwick/pico-bootsel-mount pico-bootsel-mount %I
+ExecStop=/usr/local/lib/netherwick/pico-bootsel-mount pico-bootsel-mount --umount %I

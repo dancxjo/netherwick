@@ -6,12 +6,11 @@ All notable changes are grouped by date.
 
 ### Auto-sync (2026-07-15)
 
-- Register four additional `tongues` workspace packages in the lockfile.
-- Expand `tongues-tts`'s locked dependency set for model and pronunciation support.
-- Add the older `indicatif`/`console` stack required by the new workspace packages.
-- Add plotting support through `textplots` and `drawille`.
-- Record dependency metadata updates for `burn-core`, `ort`, and `rgb`.
-- Disambiguate coexisting versions of `colored`, `console`, and `indicatif`.
+- Refresh the lockfile against the current workspace and external Tongues
+  dependency graph, removing stale workspace-only speech-training packages and
+  their plotting dependencies.
+- Record the current `pete-memory`, ORT, `burn-core`, `rgb`, and `xtask`
+  dependency metadata.
 
 ### Added
 
@@ -41,6 +40,11 @@ All notable changes are grouped by date.
 - Document the grounded semantic graph and safety-gated sleep lifecycle,
   including their authority boundaries, artifact contracts, and replacement
   points.
+- Move repository automation into the typed Rust `xtask` command layer while
+  retaining the public `just` recipes as thin compatibility aliases. Preserve
+  brainstem identity continuity, authorized BOOTSEL flashing, automatic NEAT
+  continuation, and clean worktree synchronization, and add the portable
+  repository-root `wuzzup` shorthand for `just sup`.
 - Removed retired behavior configuration spellings (`mode`, `hardcoded_on_error`, and `stop_on_error`) and compatibility type aliases; configurations must use `regime` and the canonical fallback values.
 
 ### Fixed
@@ -102,7 +106,6 @@ All notable changes are grouped by date.
 
 ### Ongoing
 
-- Migration of repository automation from shell-based `Justfile` recipes and helper scripts to the Rust `xtask` command layer. This includes BOOTSEL mounting, synchronization, hardware setup, and training workflows; the migration is still being reviewed and is not yet a completed release change.
 - Migration of face, object, and voice features to `VectorArtifact`-only schema fields. Downstream runtime, training, and event consumers still require coordinated updates, so this is not yet a completed release change.
 
 ### Cognitive provider health follow-up (2026-07-15)
