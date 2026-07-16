@@ -91,8 +91,7 @@ impl PerceptionFrame {
         t_ms: TimeMs,
         max_points: usize,
     ) -> Option<Self> {
-        let projection = DepthProjection::from_kinect(&snapshot.kinect)
-            .unwrap_or_else(|| DepthProjection::legacy(snapshot.kinect.depth_m.len()));
+        let projection = DepthProjection::from_kinect(&snapshot.kinect)?;
         let rgb = RgbImageView::from_snapshot(snapshot);
         let min_depth_m = positive_or(snapshot.kinect.min_depth_m, 0.1);
         let max_depth_m = positive_or(snapshot.kinect.max_depth_m, 8.0);
@@ -244,19 +243,6 @@ impl DepthProjection {
         })
     }
 
-    fn legacy(depth_len: usize) -> Self {
-        let width = (depth_len as f32).sqrt().ceil().max(1.0) as usize;
-        let height = depth_len.div_ceil(width).max(1);
-        Self {
-            width,
-            height,
-            fx: width.max(1) as f32,
-            fy: width.max(1) as f32,
-            cx: (width.saturating_sub(1)) as f32 * 0.5,
-            cy: (height.saturating_sub(1)) as f32 * 0.5,
-            source: "legacy_depth_shape",
-        }
-    }
 }
 
 struct RgbImageView<'a> {

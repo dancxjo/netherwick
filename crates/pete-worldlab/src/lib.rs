@@ -464,7 +464,7 @@ pub fn snapshot_depth_image(snapshot: &WorldSnapshot) -> Option<DepthImage> {
     {
         (snapshot.kinect.depth_width, snapshot.kinect.depth_height)
     } else {
-        (sample_count as u32, 1)
+        return None;
     };
     let values_mm = snapshot
         .kinect
@@ -891,17 +891,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_depth_image_falls_back_to_legacy_row_for_invalid_dimensions() {
+    fn snapshot_depth_image_rejects_invalid_dimensions() {
         let mut snapshot = WorldSnapshot::default();
         snapshot.kinect.depth_width = 2;
         snapshot.kinect.depth_height = 2;
         snapshot.kinect.depth_m = vec![1.0, 2.0, 3.0];
 
-        let depth = snapshot_depth_image(&snapshot).unwrap();
-
-        assert_eq!(depth.width, 3);
-        assert_eq!(depth.height, 1);
-        assert_eq!(depth.values_mm, vec![1000, 2000, 3000]);
+        assert!(snapshot_depth_image(&snapshot).is_none());
     }
 
     #[tokio::test]

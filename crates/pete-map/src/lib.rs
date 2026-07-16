@@ -2246,8 +2246,7 @@ fn pointcloud_observation_from_kinect_with_color(
     if kinect.depth_m.is_empty() {
         return None;
     }
-    let projection = DepthProjection::from_kinect(kinect)
-        .unwrap_or_else(|| DepthProjection::legacy(kinect.depth_m.len()));
+    let projection = DepthProjection::from_kinect(kinect)?;
     let stride = kinect
         .depth_m
         .len()
@@ -2829,19 +2828,6 @@ impl DepthProjection {
         })
     }
 
-    fn legacy(depth_len: usize) -> Self {
-        let width = (depth_len as f32).sqrt().ceil().max(1.0) as usize;
-        let height = depth_len.div_ceil(width).max(1);
-        Self {
-            width,
-            height,
-            fx: width.max(1) as f32,
-            fy: width.max(1) as f32,
-            cx: (width.saturating_sub(1)) as f32 * 0.5,
-            cy: (height.saturating_sub(1)) as f32 * 0.5,
-            frame: PointCloudFrame::DepthImageUnknown,
-        }
-    }
 }
 
 fn positive_or(value: f32, fallback: f32) -> f32 {
