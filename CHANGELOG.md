@@ -14,6 +14,15 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add a host-aware control-path failover state machine and deterministic
+  failure-injection matrix that preserve motherbrain control across forebrain
+  link loss, change motherbrain transport without changing its role, require a
+  fresh authoritative no-controller observation plus atomic acquisition for
+  takeover, and coordinate safe handback without overlapping controllers.
+- Define brainstem host transit over the existing deterministic AP and
+  session-bound `motherbrain.pete.internal` registration, with an explicit
+  recovery-service allowlist; association and reachability grant no motor
+  authority and the path excludes bulk data and direct motion commands.
 - Add replayable per-goal progress reports that preserve behavior/skill
   expectations with explicit metric, baseline, horizon, and tolerance,
   optional observations, bounded failure state, strategy transitions, help

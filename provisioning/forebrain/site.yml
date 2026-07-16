@@ -20,6 +20,7 @@
           - git
           - iproute2
           - jq
+          - network-manager
           - openssh-server
           - pkg-config
           - rsync

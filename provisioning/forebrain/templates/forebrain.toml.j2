@@ -17,3 +17,28 @@ discovery_multicast = "{{ netherwick_discovery_multicast | default('239.255.78.8
 discovery_seeds = {{ netherwick_discovery_seeds | default([]) | to_json }}
 service_port = {{ netherwick_service_port | default(22) }}
 advertise = true
+
+[failover]
+enabled = {{ netherwick_failover_enabled | default(true) | lower }}
+takeover_enabled = {{ netherwick_fallback_takeover_enabled | default(false) | lower }}
+preferred_paths = ["direct_ethernet", "ordinary_wifi", "brainstem_transit"]
+peer_names = {{ netherwick_failover_peer_names | default(['motherbrain.local', 'motherbrain.pete.internal']) | to_json }}
+brainstem_ssid = "{{ netherwick_brainstem_ssid | default('pete-<device>') }}"
+{% if netherwick_brainstem_credential_ref is defined %}
+brainstem_credential_ref = "{{ netherwick_brainstem_credential_ref }}"
+{% endif %}
+controller_freshness_ms = {{ netherwick_controller_freshness_ms | default(2000) }}
+peer_freshness_ms = {{ netherwick_peer_freshness_ms | default(3000) }}
+takeover_grace_ms = {{ netherwick_takeover_grace_ms | default(5000) }}
+ordinary_search_ms = {{ netherwick_ordinary_search_ms | default(3000) }}
+retry_backoff_ms = {{ netherwick_failover_retry_backoff_ms | default(1000) }}
+path_hysteresis_ms = {{ netherwick_path_hysteresis_ms | default(2000) }}
+handback_automatic = {{ netherwick_handback_automatic | default(true) | lower }}
+
+[failover.permitted_emergency_services]
+peer_discovery = 5353
+peer_health = 8787
+role_coordination = 8787
+possession_status = 80
+possession_acquire = 80
+handback = 8787

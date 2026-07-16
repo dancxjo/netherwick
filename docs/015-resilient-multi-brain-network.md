@@ -23,6 +23,15 @@ path to the Pico AP (normally the forebrain's own Wi-Fi interface); a dead Pi
 cannot route Ethernet packets. This is an explicit physical redundancy
 requirement, not something routing software can synthesize.
 
+As a final recovery path, both hosts may share the Pico AP. Motherbrain's
+session-bound `motherbrain.pete.internal` registration supplies the real IP
+locator on that segment, and the default-deny host firewall exposes only the
+bounded peer health, role coordination, and handback service. This is a
+control-path exception, not admission of the brainstem interface to the bulk
+higher-brain data plane. Forebrain must look for and retain a live motherbrain
+on that path before considering recovery authority. See
+[`026-brainstem-transit-failover.md`](026-brainstem-transit-failover.md).
+
 ## Authority layers
 
 Communication has five separate layers:

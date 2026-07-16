@@ -11,6 +11,7 @@ pub mod candidate;
 pub mod capability;
 pub mod coordinator;
 pub mod discovery;
+pub mod failover;
 pub mod job;
 pub mod transfer;
 

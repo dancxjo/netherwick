@@ -23,3 +23,30 @@ discovery_seeds = []
 # Restricted OpenSSH/SFTP transport by default.
 service_port = 22
 advertise = true
+
+[failover]
+# Association is connectivity only. Takeover remains disabled until both hosts
+# have enrolled stable identities and the atomic brainstem possession path has
+# been verified on the deployed body.
+enabled = true
+takeover_enabled = false
+preferred_paths = ["direct_ethernet", "ordinary_wifi", "brainstem_transit"]
+peer_names = ["motherbrain.local", "motherbrain.pete.internal"]
+brainstem_ssid = "pete-<device>"
+# Name of a NetworkManager/systemd credential, never the credential itself.
+brainstem_credential_ref = "netherwick-brainstem-wifi"
+controller_freshness_ms = 2000
+peer_freshness_ms = 3000
+takeover_grace_ms = 5000
+ordinary_search_ms = 3000
+retry_backoff_ms = 1000
+path_hysteresis_ms = 2000
+handback_automatic = true
+
+[failover.permitted_emergency_services]
+peer_discovery = 5353
+peer_health = 8787
+role_coordination = 8787
+possession_status = 80
+possession_acquire = 80
+handback = 8787

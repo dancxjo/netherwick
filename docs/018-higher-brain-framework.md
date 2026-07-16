@@ -21,6 +21,16 @@ are `netherwick-higher-brain/1`, `experience_bundle/1`, `job/1`, and
 
 ## Network separation and fallback
 
+Host control-path failover is specified in
+[`026-brainstem-transit-failover.md`](026-brainstem-transit-failover.md).
+Joining the brainstem network changes reachability only: it neither changes a
+host's role nor grants possession. Forebrain searches direct Ethernet and
+ordinary Wi-Fi before brainstem transit, retains a reachable motherbrain as the
+body-facing host, and becomes a takeover candidate only after a fresh
+authoritative no-controller observation and a bounded grace interval. An
+atomic brainstem acquisition remains the sole transition into controlling
+fallback. Motherbrain USB loss changes transport, not role.
+
 The Pico-hosted Wi-Fi remains the bodily control plane: possession, leases,
 heartbeats, bounded commands, acknowledgements, safety/mode status, modest
 telemetry, events, and motherbrain recovery requests. Bundles, database

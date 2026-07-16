@@ -1,5 +1,12 @@
 # Brainstem body model
 
+Network association, discovery, and transit are not authority. The emergency
+host segment carries bounded coordination traffic but cannot select a controller
+or authorize ordinary motor commands. Controller identity and acquisition remain
+atomic properties of the existing possession/lease boundary; unknown or stale
+owner status fails closed. See
+[`026-brainstem-transit-failover.md`](026-brainstem-transit-failover.md).
+
 The brainstem is a deterministic controller for an embodied machine.
 
 It is not inherently a robot controller, a motion controller, or an iRobot

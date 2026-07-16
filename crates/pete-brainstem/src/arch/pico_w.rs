@@ -1795,8 +1795,8 @@ fn render_network_diagnostics(buffer: &mut [u8], now_ms: u32) -> Option<&str> {
 
 fn render_session_diagnostics(buffer: &mut [u8], now_ms: u32) -> Option<&str> {
     let diagnostics = status::session_diagnostics(now_ms);
-    let mut response = heapless::String::<256>::new();
-    write!(response, "{{\"primary_session_generation\":{},\"diagnostic_sessions\":{},\"authority_generation\":{},\"authority_active\":{},\"service_authority_active\":{}}}", diagnostics.primary_session_generation, diagnostics.diagnostic_sessions, diagnostics.authority_generation, diagnostics.authority_active, diagnostics.service_authority_active).ok()?;
+    let mut response = heapless::String::<512>::new();
+    write!(response, "{{\"primary_session_generation\":{},\"diagnostic_sessions\":{},\"authority_generation\":{},\"authority_active\":{},\"authority_session_hash\":{},\"authority_owner_role\":\"{}\",\"authority_owner_device_hash\":{},\"authority_owner_boot_hash\":{},\"authority_lease_remaining_ms\":{},\"service_authority_active\":{}}}", diagnostics.primary_session_generation, diagnostics.diagnostic_sessions, diagnostics.authority_generation, diagnostics.authority_active, diagnostics.authority_session_hash, role_name(diagnostics.authority_owner_role), diagnostics.authority_owner_device_hash, diagnostics.authority_owner_boot_hash, diagnostics.authority_lease_remaining_ms, diagnostics.service_authority_active).ok()?;
     copy_response(buffer, response.as_str())
 }
 

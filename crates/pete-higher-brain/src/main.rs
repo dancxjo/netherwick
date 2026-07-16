@@ -12,6 +12,7 @@ use pete_higher_brain::capability::detect_local;
 use pete_higher_brain::discovery::{
     advertise_once, local_interfaces, DataPlaneConfig, DiscoveryAdvertisement,
 };
+use pete_higher_brain::failover::{acceptance_matrix, FailoverConfig};
 use pete_higher_brain::job::{ForebrainWorker, JobEnvelope, WorkerPaths};
 use pete_higher_brain::job::{JobClass, ResourceRequirements};
 use pete_higher_brain::transfer::transfer_bundle;
@@ -123,6 +124,8 @@ enum Command {
         #[arg(long)]
         store: PathBuf,
     },
+    /// Run deterministic host-link failure injection and print the matrix.
+    FailoverCheck,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -138,6 +141,7 @@ struct ForebrainConfig {
     temporary: PathBuf,
     poll_interval_seconds: u64,
     data_plane: DataPlaneConfig,
+    failover: FailoverConfig,
 }
 
 impl Default for ForebrainConfig {
@@ -154,6 +158,7 @@ impl Default for ForebrainConfig {
             temporary: root.join("tmp"),
             poll_interval_seconds: 5,
             data_plane: DataPlaneConfig::default(),
+            failover: FailoverConfig::default(),
         }
     }
 }
@@ -320,6 +325,13 @@ fn main() -> Result<()> {
                 candidate_store(store).rollback(&local_principal([Scope::RollbackModel]))?
             );
         }
+        Command::FailoverCheck => {
+            let checks = acceptance_matrix()?;
+            println!("{}", serde_json::to_string_pretty(&checks)?);
+            if checks.iter().any(|check| !check.passed) {
+                anyhow::bail!("one or more failover acceptance scenarios failed");
+            }
+        }
     }
     Ok(())
 }
@@ -344,9 +356,12 @@ fn validate_node(path: &Path) -> Result<()> {
     }
     let interfaces = local_interfaces().unwrap_or_default();
     let selected = config.data_plane.select_interfaces(&interfaces);
+    let failover = config.failover.validate();
     let capabilities = detect_local(&config.workspace, config.node_id)?;
-    let ready =
-        directory_status.values().all(|ready| *ready) && selected.is_ok() && capabilities.ready;
+    let ready = directory_status.values().all(|ready| *ready)
+        && selected.is_ok()
+        && failover.is_ok()
+        && capabilities.ready;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -354,6 +369,8 @@ fn validate_node(path: &Path) -> Result<()> {
             "directories": directory_status,
             "data_plane": selected.as_ref().map(|items| items.iter().map(|item| &item.name).collect::<Vec<_>>()).ok(),
             "data_plane_error": selected.err().map(|error| error.to_string()),
+            "failover_ready": failover.is_ok(),
+            "failover_error": failover.err().map(|error| error.to_string()),
             "capabilities": capabilities,
         }))?
     );

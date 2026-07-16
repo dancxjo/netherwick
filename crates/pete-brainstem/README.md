@@ -95,6 +95,27 @@ On Pico W, concurrency is split by ownership:
 - The runtime is tick-driven: each tick polls UART, enforces drive deadlines, advances at most one active action, and sends Stop on drive timeout or UART gating failure.
 - A hardware watchdog feed point is reserved in the safety/runtime tick; it must remain owned by that lane.
 
+### Emergency host transit
+
+The Pico W does not expose a USB Ethernet gadget and does not bridge or NAT
+general host traffic. Instead, motherbrain maintains a brainstem-side Wi-Fi
+link alongside preferred USB control and registers its live DHCP address as
+`motherbrain.pete.internal` through its identified session. A forebrain on the
+same deterministic `192.168.4.0/24` AP can then reach motherbrain over local IP.
+The registration must match the DHCP client, device, and boot identity and
+expires with its lease.
+
+Transit connectivity never changes control ownership. The existing identified
+session and atomic control-lease surface decides possession; a host associated
+with the AP remains non-controlling until that acquisition succeeds. Emergency
+policy permits only discovery, health, role coordination, possession status or
+acquisition, and handback. Model weights, experiences, Kinect/media streams,
+packages, updates, and direct motion commands remain outside this host-transit
+path. General host default routes must not point through the Pico W.
+
+Host state, addressing, allowed service ports, diagnostics, and the full
+failure matrix are documented in `docs/026-brainstem-transit-failover.md`.
+
 ## Public Surface
 
 The public brainstem surface is body-neutral. The forebrain/motherbrain asks for motion, safety, feedback, telemetry, capabilities, and events; the active body driver maps those requests to Create OI opcodes, packet ids, BRC, songs, LEDs, dock seeking, UART behavior, and sensor decoding.

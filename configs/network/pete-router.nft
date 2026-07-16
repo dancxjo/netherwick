@@ -13,7 +13,9 @@ table inet pete {
         ct state established,related accept
         iifname $interbrain_if ip saddr $interbrain_net accept
         iifname $brainstem_if ip saddr $brainstem_net udp dport { 53, 5353 } accept
-        iifname $brainstem_if ip saddr $brainstem_net tcp dport { 80, 81 } accept
+        # Local motherbrain peer health/role/handback service on 8787 is the
+        # only host-transit service exposed on the emergency segment.
+        iifname $brainstem_if ip saddr $brainstem_net tcp dport { 80, 81, 8787 } accept
         ip protocol icmp accept
         ip6 nexthdr ipv6-icmp accept
     }
@@ -34,4 +36,3 @@ table inet pete {
         oifname $external_if ip saddr $interbrain_net masquerade
     }
 }
-

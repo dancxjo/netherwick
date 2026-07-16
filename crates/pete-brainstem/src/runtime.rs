@@ -2920,6 +2920,41 @@ mod tests {
     }
 
     #[test]
+    fn host_absence_expires_authority_and_stops_without_rebooting_body() {
+        let _guard = status::status_test_guard();
+        status::request_authority_transition(91, 71, 41, 999);
+        status::acknowledge_authority_transition(91);
+        status::set_oi_mode(CreateOiMode::Full);
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.next_full_mode_refresh_ms = 2_000;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(42);
+        let _ = runtime.commands.push_back(QueuedCommand::new(
+            43,
+            RuntimeCommand::CmdVel {
+                linear_mm_s: 100,
+                angular_mrad_s: 0,
+                duration_ms: Some(500),
+            },
+        ));
+
+        runtime.tick();
+
+        assert!(status::authority_expired(1_000));
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert_eq!(runtime.active_command_id, None);
+        assert!(runtime.commands.is_empty());
+        assert!(runtime
+            .hardware
+            .writes
+            .windows(5)
+            .any(|bytes| bytes == [137, 0, 0, 0, 0]));
+        assert!(runtime.hardware.power_toggle_levels.is_empty());
+        assert!(runtime.hardware.reset_levels.is_empty());
+    }
+
+    #[test]
     fn identical_velocity_refresh_renews_stream_without_lifecycle_churn() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));

@@ -1229,10 +1229,22 @@ pub struct SessionDiagnostics {
     pub diagnostic_sessions: u8,
     pub authority_generation: u32,
     pub authority_active: bool,
+    pub authority_session_hash: u32,
+    pub authority_owner_role: u8,
+    pub authority_owner_device_hash: u32,
+    pub authority_owner_boot_hash: u32,
+    pub authority_lease_remaining_ms: u32,
     pub service_authority_active: bool,
 }
 
 pub fn session_diagnostics(now_ms: u32) -> SessionDiagnostics {
+    let authority_active = !authority_expired(now_ms);
+    let authority_session_hash = if authority_active {
+        ACTIVE_LEASE_SESSION_HASH.load(Ordering::Acquire)
+    } else {
+        0
+    };
+    let owner = session_identity(authority_session_hash);
     SessionDiagnostics {
         primary_session_generation: ACTIVE_SESSION_GENERATION.load(Ordering::Acquire),
         diagnostic_sessions: DIAGNOSTIC_SESSION_HASH
@@ -1240,7 +1252,18 @@ pub fn session_diagnostics(now_ms: u32) -> SessionDiagnostics {
             .filter(|entry| entry.load(Ordering::Acquire) != 0)
             .count() as u8,
         authority_generation: AUTHORITY_ACK.load(Ordering::Acquire),
-        authority_active: !authority_expired(now_ms),
+        authority_active,
+        authority_session_hash,
+        authority_owner_role: owner.map_or(0, |identity| identity.role),
+        authority_owner_device_hash: owner.map_or(0, |identity| identity.peer_device_hash),
+        authority_owner_boot_hash: owner.map_or(0, |identity| identity.peer_boot_hash),
+        authority_lease_remaining_ms: if authority_active {
+            ACTIVE_LEASE_EXPIRES_MS
+                .load(Ordering::Acquire)
+                .wrapping_sub(now_ms)
+        } else {
+            0
+        },
         service_authority_active: ACTIVE_SERVICE_LEASE_HASH.load(Ordering::Acquire) != 0
             && active_service_authority_matches(
                 ACTIVE_SERVICE_SESSION_HASH.load(Ordering::Acquire),
@@ -4153,6 +4176,24 @@ mod tests {
         assert!(active_authority_matches(11, 22, 2_000));
         assert!(!active_authority_matches(11, 22, 5_000));
 
+        revoke_authority();
+    }
+
+    #[test]
+    fn session_diagnostics_identify_the_active_controller_boot() {
+        let _guard = status_test_guard();
+        revoke_authority();
+        register_diagnostic_session(41, 51, 61, 2, 1, 2);
+        request_authority_transition(91, 71, 41, 5_000);
+        acknowledge_authority_transition(91);
+        let diagnostics = session_diagnostics(1_000);
+        assert!(diagnostics.authority_active);
+        assert_eq!(diagnostics.authority_generation, 91);
+        assert_eq!(diagnostics.authority_session_hash, 41);
+        assert_eq!(diagnostics.authority_owner_role, 2);
+        assert_eq!(diagnostics.authority_owner_device_hash, 51);
+        assert_eq!(diagnostics.authority_owner_boot_hash, 61);
+        assert_eq!(diagnostics.authority_lease_remaining_ms, 4_000);
         revoke_authority();
     }
 
