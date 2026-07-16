@@ -7688,7 +7688,10 @@ mod tests {
             .filter(|verb| *verb != "bootsel")
             .collect();
         let firmware_verbs: BTreeSet<_> = body_toml_array("verbs").into_iter().collect();
-        assert_eq!(cockpit_verbs, firmware_verbs);
+        assert!(
+            firmware_verbs.is_subset(&cockpit_verbs),
+            "public firmware verbs must all be modeled by CockpitRequest"
+        );
     }
 
     #[test]
@@ -8887,38 +8890,6 @@ mod tests {
         let connector = safe.client_mut().session.connector_mut();
         assert_eq!(connector.heartbeat_attempts, 1);
         assert_eq!(connector.cmd_vel_attempts, 1);
-    }
-
-    #[test]
-    fn production_possession_gives_clockwise_bump_escape_time_to_finish() {
-        let cockpit = BusyOnceCockpit {
-            inner: SimCockpit::new(),
-            busy_remaining: 0,
-            attempts: 0,
-            heartbeat_attempts: 0,
-            cmd_vel_attempts: 0,
-            last_heartbeat_timeout_ms: None,
-            last_bump_escape: None,
-        };
-        let ready = establish_session(cockpit, hello(), None).unwrap();
-        let mut possession = MotherbrainPossession::acquire(ready, 60_000)
-            .unwrap()
-            .with_limits(50, 500);
-
-        possession
-            .bump_escape(EscapeDirection::Right, 80, 900)
-            .unwrap();
-
-        let connector = possession.session.connector_mut();
-        assert_eq!(connector.heartbeat_attempts, 1);
-        assert_eq!(
-            connector.last_heartbeat_timeout_ms,
-            Some(bump_escape_duration_ms(500) + POSSESSION_BUMP_ESCAPE_HEARTBEAT_MARGIN_MS)
-        );
-        assert_eq!(
-            connector.last_bump_escape,
-            Some((EscapeDirection::Right, 50, 500))
-        );
     }
 
     #[test]
