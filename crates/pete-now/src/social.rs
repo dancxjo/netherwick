@@ -450,13 +450,15 @@ impl SocialWorldModelBuilder {
                 transformation_lineage: vec!["pete_now::SocialWorldModelBuilder".to_string()],
                 implementation_version: Some("1".to_string()),
             };
-            let contradiction_refs = (!is_generic
+            let contradiction_refs = if !is_generic
                 && normalize_identity(&claimed_name) != normalized_label
                 && modalities.iter().any(|modality| {
                     matches!(modality, IdentityModality::Face | IdentityModality::Voice)
-                }))
-            .then(|| entity.provenance.clone())
-            .unwrap_or_default();
+                }) {
+                entity.provenance.clone()
+            } else {
+                Vec::new()
+            };
             upsert_identity(
                 &mut model.identity_hypotheses,
                 IdentityHypothesis {
