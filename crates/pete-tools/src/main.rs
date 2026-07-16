@@ -13851,8 +13851,8 @@ fn geometry_imu_interpretation(
         ),
         1 => (
             false,
-            "legacy heading-only shape: [yaw]".to_string(),
-            "legacy one-value orientation has no roll/pitch correction".to_string(),
+            "invalid one-value orientation vector".to_string(),
+            "one-value IMU orientation is ignored; yaw falls back to odometry".to_string(),
         ),
         _ => (
             false,
@@ -13865,7 +13865,7 @@ fn geometry_imu_interpretation(
         assumed_units: "radians".to_string(),
         assumed_axis_order: match raw.len() {
             0 => "none".to_string(),
-            1 => "[yaw] legacy heading-only".to_string(),
+            1 => "invalid one-value vector".to_string(),
             2 => "[roll, pitch]".to_string(),
             _ => "[roll, pitch, yaw]".to_string(),
         },

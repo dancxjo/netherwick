@@ -2443,7 +2443,7 @@ pub fn orientation_from_imu(imu: &ImuSense, odometry_heading_rad: f32) -> Orient
     };
     let (roll, pitch, imu_yaw) = match imu.orientation.len() {
         0 => (None, None, None),
-        1 => (None, None, finite(0)),
+        1 => (None, None, None),
         2 => (finite(0), finite(1), None),
         _ => (finite(0), finite(1), finite(2)),
     };
@@ -3601,7 +3601,7 @@ mod tests {
     }
 
     #[test]
-    fn imu_orientation_contract_handles_hardware_sim_and_legacy_shapes() {
+    fn imu_orientation_contract_ignores_invalid_one_value_shape() {
         let hardware = orientation_from_imu(
             &ImuSense {
                 orientation: vec![0.1, -0.2],
@@ -3627,18 +3627,18 @@ mod tests {
         assert_eq!(sim.yaw_rad, Some(1.2));
         assert_eq!(sim.yaw_source, YawSource::ImuOrientation);
 
-        let legacy_heading_only = orientation_from_imu(
+        let invalid_one_value = orientation_from_imu(
             &ImuSense {
                 orientation: vec![1.4],
                 ..ImuSense::default()
             },
             0.7,
         );
-        assert_eq!(legacy_heading_only.roll_rad, None);
-        assert_eq!(legacy_heading_only.pitch_rad, None);
-        assert_eq!(legacy_heading_only.yaw_rad, Some(1.4));
-        assert_eq!(legacy_heading_only.yaw_source, YawSource::ImuOrientation);
-        assert!(!legacy_heading_only.roll_pitch_from_imu);
+        assert_eq!(invalid_one_value.roll_rad, None);
+        assert_eq!(invalid_one_value.pitch_rad, None);
+        assert_eq!(invalid_one_value.yaw_rad, Some(0.7));
+        assert_eq!(invalid_one_value.yaw_source, YawSource::OdometryHeading);
+        assert!(!invalid_one_value.roll_pitch_from_imu);
     }
 
     #[test]

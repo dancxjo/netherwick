@@ -564,7 +564,7 @@ pub struct ImuSense {
     pub captured_at_ms: u64,
     /// Orientation uses radians in `[roll, pitch, yaw]` order when all axes are available.
     /// Hardware MPU-6050 samples provide roll/pitch from gravity and no absolute yaw, so they
-    /// emit two values. Legacy one-value samples are treated as yaw-only heading.
+    /// emit two values. A one-value vector is invalid and ignored.
     pub orientation: Vec<f32>,
     /// Linear acceleration in g units, `[x, y, z]`.
     pub acceleration: Vec<f32>,

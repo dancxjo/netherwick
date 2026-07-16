@@ -3905,7 +3905,7 @@ fn scene_imu_debug(snapshot: &WorldSnapshot) -> SceneImuDebug {
         assumed_units: "radians".to_string(),
         assumed_axis_order: match snapshot.imu.orientation.len() {
             0 => "none".to_string(),
-            1 => "[yaw] legacy heading-only".to_string(),
+            1 => "invalid one-value vector".to_string(),
             2 => "[roll, pitch]".to_string(),
             _ => "[roll, pitch, yaw]".to_string(),
         },
