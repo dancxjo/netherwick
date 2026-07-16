@@ -88,7 +88,8 @@ All notable changes are grouped by date.
   supervision from zeroing active motor output, expose wheel-overcurrent in
   browser and compact diagnostics, and provide an Undock control without
   requiring a held drive button; cancel an unstarted departure when fresh Home
-  Base telemetry clears so it cannot surprise a later off-dock command.
+  Base telemetry clears so it cannot surprise a later off-dock command, and
+  expire stale Create-link evidence before it can authorize motion.
 - Keep authorized `just flash` BOOTSEL negotiation compatible with older
   brainstems that advertise retired convenience verbs, while preserving the
   primitive-only contract for newly built firmware.

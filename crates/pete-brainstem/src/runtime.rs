@@ -41,6 +41,7 @@ const DOCK_DEPARTURE_SPEED_MM_S: i16 = -200;
 const DOCK_DEPARTURE_DURATION_MS: u32 = 1_500;
 const CREATE_CHARGING_SOURCES_PACKET: u8 = 34;
 const CREATE_CHARGING_SOURCES_POLL_PERIOD_MS: u32 = 250;
+const CREATE_LINK_FRESHNESS_TIMEOUT_MS: u32 = 1_000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -224,6 +225,8 @@ where
     active_contact_withdrawal: Option<ActiveContactWithdrawal>,
     last_contact_withdrawal_at_ms: Option<u32>,
     repeated_contact_count: u8,
+    last_observed_uart_rx_packets: u32,
+    last_create_packet_at_ms: Option<u32>,
 }
 
 impl<H> Runtime<H>
@@ -232,6 +235,7 @@ where
 {
     pub fn new(hardware: H) -> Self {
         let mut events = Deque::new();
+        let observed_uart_rx_packets = status::snapshot(0).uart_rx_packets;
         status::signal_event(&BrainstemEvent::Boot);
         let _ = events.push_back(BrainstemEvent::Boot);
         status::set_runtime_state(RuntimeState::Booting);
@@ -282,6 +286,8 @@ where
             active_contact_withdrawal: None,
             last_contact_withdrawal_at_ms: None,
             repeated_contact_count: 0,
+            last_observed_uart_rx_packets: observed_uart_rx_packets,
+            last_create_packet_at_ms: None,
         }
     }
 
@@ -369,11 +375,26 @@ where
         self.poll_authority_transition();
         self.timers.poll(&mut self.hardware, &mut self.events);
         self.create_uart.poll(&mut self.hardware, &mut self.events);
-        let snapshot = status::snapshot(self.now_ms());
-        if matches!(snapshot.oi_mode, 1..=3) {
+        let now_ms = self.now_ms();
+        let snapshot = status::snapshot(now_ms);
+        if snapshot.uart_rx_packets != self.last_observed_uart_rx_packets {
+            self.last_observed_uart_rx_packets = snapshot.uart_rx_packets;
+            self.last_create_packet_at_ms = Some(now_ms);
+        }
+        let create_link_fresh = self.last_create_packet_at_ms.is_some_and(|last_packet_ms| {
+            now_ms.wrapping_sub(last_packet_ms) <= CREATE_LINK_FRESHNESS_TIMEOUT_MS
+        });
+        if matches!(snapshot.oi_mode, 1..=3) && create_link_fresh {
             self.create_responsive = true;
             self.create_no_response_restart_queued = false;
             status::set_create_power_on(true);
+        } else if self.last_create_packet_at_ms.is_some() && !create_link_fresh {
+            // OI mode and power state are observations, not durable promises.
+            // Once the Create stops answering, invalidate the cached mode so
+            // active output is stopped by Full-mode supervision and later
+            // motion cannot start against a dead link.
+            self.create_responsive = false;
+            status::set_oi_mode_unknown();
         }
         self.poll_control_command();
     }
@@ -449,8 +470,7 @@ where
             // reported mode is already Full. Never overlay that supervision
             // write on a bounded motor program; fresh mode loss still takes
             // the fail-closed branch above.
-            self.next_full_mode_refresh_ms =
-                now_ms.wrapping_add(FULL_MODE_REFRESH_PERIOD_MS);
+            self.next_full_mode_refresh_ms = now_ms.wrapping_add(FULL_MODE_REFRESH_PERIOD_MS);
             return Ok(());
         }
         if low_battery_and_charging(&snapshot) && snapshot.oi_mode == 3 {
@@ -1831,6 +1851,12 @@ where
     }
 
     fn ensure_create_responsive(&mut self) -> Result<(), BrainstemError> {
+        if self.last_create_packet_at_ms.is_some_and(|last_packet_ms| {
+            self.now_ms().wrapping_sub(last_packet_ms) > CREATE_LINK_FRESHNESS_TIMEOUT_MS
+        }) {
+            self.create_responsive = false;
+            status::set_oi_mode_unknown();
+        }
         if !self.create_responsive {
             return Err(BrainstemError::CreateNoResponse);
         }
@@ -2586,6 +2612,50 @@ mod tests {
     }
 
     #[test]
+    fn stale_create_rx_invalidates_mode_and_stops_active_motor_output() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(2_001));
+        runtime.create_responsive = true;
+        runtime.last_create_packet_at_ms = Some(1_000);
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(42);
+        status::set_oi_mode(CreateOiMode::Full);
+
+        runtime.poll();
+
+        assert!(!runtime.create_responsive);
+        assert_eq!(status::snapshot(2_001).oi_mode, 0);
+        assert!(matches!(
+            runtime.ensure_create_responsive(),
+            Err(BrainstemError::CreateNoResponse)
+        ));
+        assert!(matches!(
+            runtime.maintain_full_mode(),
+            Err(BrainstemError::CreateNoResponse)
+        ));
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert!(runtime
+            .hardware
+            .writes
+            .windows(5)
+            .any(|bytes| bytes == [137, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn fresh_create_rx_restores_responsiveness() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        status::set_oi_mode(CreateOiMode::Full);
+        status::mark_uart_rx_byte(35, 1_000);
+        status::mark_uart_packet(1);
+
+        runtime.poll();
+
+        assert!(runtime.create_responsive);
+        assert_eq!(runtime.last_create_packet_at_ms, Some(1_000));
+    }
+
+    #[test]
     fn full_mode_refresh_never_overlays_active_motor_output() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
@@ -2950,10 +3020,7 @@ mod tests {
         runtime.active = ActiveAction::DockDeparture { stop_at_ms: 2_000 };
         let departure_cursor = status::snapshot(1_000).event_next_seq.saturating_sub(1);
         assert!(runtime.enforce_safety_policy().is_ok());
-        assert!(matches!(
-            runtime.active,
-            ActiveAction::DockDeparture { .. }
-        ));
+        assert!(matches!(runtime.active, ActiveAction::DockDeparture { .. }));
         assert!(!runtime.safety_latched);
 
         runtime.dock_departure_pending = true;

@@ -662,6 +662,9 @@ authority loss, heartbeat expiry, and local safety reflexes still preempt it.
 If fresh packet-34 telemetry clears Home Base before departure starts, the
 pending reverse is discarded so it cannot execute after Pete is carried or
 rolled off the dock.
+Create responsiveness also expires after one second without a decoded UART
+packet. The cached OI mode is then invalidated, new motion is rejected, and
+Full-mode supervision stops any active motor program.
 
 For a non-motion electrical/UART diagnosis, run:
 
