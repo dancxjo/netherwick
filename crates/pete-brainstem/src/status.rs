@@ -3668,8 +3668,11 @@ struct CreateSensorStatusJson {
     buttons: u8,
     charging_state: u8,
     charging_indicator: &'static str,
+    charging_indicator_level: &'static str,
     charging_indicator_pin: &'static str,
+    charging_indicator_gpio: u8,
     charging_indicator_physical_pin: u8,
+    charging_indicator_active_high: bool,
     voltage_mv: u16,
     current_ma: i16,
     temperature_c: i8,
@@ -3837,8 +3840,13 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
         buttons: snapshot.create_sensor_buttons,
         charging_state: snapshot.create_sensor_charging_state,
         charging_indicator: tri_state_text(snapshot.create_charging_indicator_state),
+        charging_indicator_level: charging_indicator_level_text(
+            snapshot.create_charging_indicator_state,
+        ),
         charging_indicator_pin: body::CREATE_CHARGING_INDICATOR_PIN,
+        charging_indicator_gpio: body::CREATE_CHARGING_INDICATOR_GPIO,
         charging_indicator_physical_pin: body::CREATE_CHARGING_INDICATOR_PHYSICAL_PIN,
+        charging_indicator_active_high: body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH,
         voltage_mv: snapshot.create_sensor_voltage_mv,
         current_ma: snapshot.create_sensor_current_ma,
         temperature_c: snapshot.create_sensor_temperature_c,
@@ -3848,6 +3856,16 @@ fn create_sensor_status_json(snapshot: BrainstemStatus) -> CreateSensorStatusJso
         cliff_front_left_signal: snapshot.create_sensor_cliff_front_left_signal,
         cliff_front_right_signal: snapshot.create_sensor_cliff_front_right_signal,
         cliff_right_signal: snapshot.create_sensor_cliff_right_signal,
+    }
+}
+
+fn charging_indicator_level_text(state: u8) -> &'static str {
+    match state {
+        ON if body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH => "high",
+        ON => "low",
+        OFF if body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH => "low",
+        OFF => "high",
+        _ => "unknown",
     }
 }
 

@@ -434,11 +434,15 @@ where
             self.create_uart
                 .start_oi(&mut self.hardware, &mut self.events)?;
         }
-        self.create_uart.set_mode(
-            &mut self.hardware,
-            &mut self.events,
-            crate::commands::CreateOiMode::Full,
-        )?;
+        if snapshot.oi_mode == 3 {
+            self.create_uart.refresh_full_mode(&mut self.hardware)?;
+        } else {
+            self.create_uart.set_mode(
+                &mut self.hardware,
+                &mut self.events,
+                crate::commands::CreateOiMode::Full,
+            )?;
+        }
         if snapshot.oi_mode == 0 {
             self.create_uart.start_mode_stream(&mut self.hardware)?;
         }
@@ -2900,10 +2904,12 @@ mod tests {
         runtime.create_responsive = true;
         status::set_oi_mode(crate::commands::CreateOiMode::Full);
 
+        let event_seq = status::event_next_seq();
         assert!(runtime.maintain_full_mode().is_ok());
 
         assert!(runtime.hardware.writes.contains(&132));
         assert_eq!(status::snapshot(1_000).oi_mode, 3);
+        assert_eq!(status::event_next_seq(), event_seq);
     }
 
     #[test]

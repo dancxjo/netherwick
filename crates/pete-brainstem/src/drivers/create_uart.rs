@@ -36,6 +36,7 @@ pub struct CreateUart {
     sensor_bytes: Vec<u8, 32>,
     stream_state: StreamState,
     stream_sum: u8,
+    invalid_packet_reported: bool,
 }
 
 impl CreateUart {
@@ -45,6 +46,7 @@ impl CreateUart {
             sensor_bytes: Vec::new(),
             stream_state: StreamState::Header,
             stream_sum: 0,
+            invalid_packet_reported: false,
         }
     }
 
@@ -155,6 +157,16 @@ impl CreateUart {
             CreateOiMode::Full => self.send_byte(hardware, OI_FULL)?,
         }
         Ok(())
+    }
+
+    pub fn refresh_full_mode<H>(&mut self, hardware: &mut H) -> Result<(), BrainstemError>
+    where
+        H: BrainstemHardware,
+    {
+        // The supervisor periodically reasserts Full as an idempotent wire
+        // command. This is not a lifecycle request when telemetry already
+        // confirms Full, so do not emit CreateOiModeRequested here.
+        self.send_byte(hardware, OI_FULL)
     }
 
     pub fn drive_direct<H, const N: usize>(
@@ -363,15 +375,20 @@ impl CreateUart {
         let packet_id = self.pending_sensor_packet.take().unwrap_or(0);
         let raw_bytes = core::mem::take(&mut self.sensor_bytes);
         if let Some(sensors) = decode_sensor_packet(packet_id, &raw_bytes) {
+            self.invalid_packet_reported = false;
             status::mark_uart_packet(raw_bytes.len());
             status::mark_create_sensor_packet(packet_id, sensors);
             let event = BrainstemEvent::CreateSensorPacketDecoded { packet_id, sensors };
             status::signal_event(&event);
             let _ = events.push_back(event);
         } else if sensor_packet_is_decoded(packet_id) {
-            let event = BrainstemEvent::Error(BrainstemError::InvalidPacket);
-            status::signal_event(&event);
-            let _ = events.push_back(event);
+            status::mark_uart_rx_error();
+            if !self.invalid_packet_reported {
+                let event = BrainstemEvent::Error(BrainstemError::InvalidPacket);
+                status::signal_event(&event);
+                let _ = events.push_back(event);
+                self.invalid_packet_reported = true;
+            }
             return;
         }
 
@@ -612,6 +629,25 @@ fn valid_group_zero(bytes: &[u8]) -> bool {
         && bytes[1..=6].iter().all(|byte| valid_bool(*byte))
         && valid_buttons(bytes[11])
         && valid_charging_state(bytes[16])
+        && valid_group_zero_battery(bytes)
+}
+
+fn valid_group_zero_battery(bytes: &[u8]) -> bool {
+    let voltage_mv = u16::from_be_bytes([bytes[17], bytes[18]]);
+    let current_ma = i16::from_be_bytes([bytes[19], bytes[20]]);
+    let temperature_c = bytes[21] as i8;
+    let charge_mah = u16::from_be_bytes([bytes[22], bytes[23]]);
+    let capacity_mah = u16::from_be_bytes([bytes[24], bytes[25]]);
+
+    // Group 0 is safety-critical because one accepted frame updates contact,
+    // cliff, charging, and battery state together. Its checksum only proves
+    // structural integrity, so reject tuples that cannot describe a Create
+    // battery before any of those fields are promoted to telemetry.
+    (5_000..=25_000).contains(&voltage_mv)
+        && (-5_000..=5_000).contains(&current_ma)
+        && (-20..=80).contains(&temperature_c)
+        && (100..=10_000).contains(&capacity_mah)
+        && charge_mah <= capacity_mah
 }
 
 fn valid_bumps_wheel_drops(byte: u8) -> bool {
@@ -726,6 +762,52 @@ mod tests {
         packet = valid_group_zero();
         packet[11] = 0b1000_0000;
         assert!(decode_sensor_packet(0, &packet).is_none());
+    }
+
+    #[test]
+    fn group_zero_rejects_implausible_or_inconsistent_battery_fields() {
+        let mut packet = valid_group_zero();
+        packet[17..19].copy_from_slice(&389u16.to_be_bytes());
+        assert!(decode_sensor_packet(0, &packet).is_none());
+
+        packet = valid_group_zero();
+        packet[22..24].copy_from_slice(&65_534u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&1_621u16.to_be_bytes());
+        assert!(decode_sensor_packet(0, &packet).is_none());
+
+        packet = valid_group_zero();
+        packet[24..26].copy_from_slice(&0u16.to_be_bytes());
+        assert!(decode_sensor_packet(0, &packet).is_none());
+    }
+
+    #[test]
+    fn repeated_invalid_packets_fault_uart_health_without_flooding_events() {
+        let _guard = status::status_test_guard();
+        let mut uart = CreateUart::new();
+        let mut hardware = TestHardware::new();
+        let mut events = Deque::<BrainstemEvent, 4>::new();
+        let mut invalid = valid_group_zero();
+        invalid[17..19].copy_from_slice(&389u16.to_be_bytes());
+
+        for expected_events in [1, 0] {
+            assert!(uart.request_sensor_packet(&mut hardware, 0).is_ok());
+            hardware
+                .rx
+                .extend(stream_frame(0, &invalid).into_iter().map(SerialRead::Byte));
+            uart.poll(&mut hardware, &mut events);
+            assert_eq!(events.len(), expected_events);
+            events.clear();
+        }
+        assert_eq!(status::snapshot(0).uart_rx_health, 1);
+
+        assert!(uart.request_sensor_packet(&mut hardware, 0).is_ok());
+        hardware.rx.extend(
+            stream_frame(0, &valid_group_zero())
+                .into_iter()
+                .map(SerialRead::Byte),
+        );
+        uart.poll(&mut hardware, &mut events);
+        assert_eq!(status::snapshot(0).uart_rx_health, 2);
     }
 
     #[test]

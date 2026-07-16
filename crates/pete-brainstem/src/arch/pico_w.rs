@@ -2018,7 +2018,7 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
         return render_capabilities_response(buffer, command_id);
     }
     if json_str(body, "kind") == Some("get_events") {
-        let since_seq = json_u32(body, "since_seq").unwrap_or(0);
+        let since_seq = json_u32(body, "since_seq")?;
         return status::render_events_json(since_seq, buffer);
     }
     if json_str(body, "kind") == Some("ping") {
@@ -2456,7 +2456,7 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
         "CLEAR_IMU_ORIENTATION" => BrainstemCommand::ClearImuOrientation { seq },
         "GET_CAPABILITIES" => BrainstemCommand::GetCapabilities,
         "GET_EVENTS" => BrainstemCommand::GetEvents {
-            since_seq: parse_u32(parts.next()).unwrap_or(0),
+            since_seq: parse_u32(parts.next()).ok_or(seq)?,
         },
         "STATUS" => BrainstemCommand::Status,
         "SONG_PLAY" => BrainstemCommand::SongPlay {
@@ -3475,7 +3475,7 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
         "reset_motherbrain" => Some(BrainstemCommand::ResetMotherbrain),
         "get_capabilities" => Some(BrainstemCommand::GetCapabilities),
         "get_events" => Some(BrainstemCommand::GetEvents {
-            since_seq: json_u32(body, "since_seq").unwrap_or(0),
+            since_seq: json_u32(body, "since_seq")?,
         }),
         "status" => Some(BrainstemCommand::Status),
         "song_play" => Some(BrainstemCommand::SongPlay {
@@ -3913,13 +3913,14 @@ fn json_i16(body: &str, key: &str) -> Option<i16> {
 
 fn json_bool(body: &str, key: &str) -> Option<bool> {
     let value = json_value(body, key)?;
-    if value.starts_with("true") {
-        Some(true)
-    } else if value.starts_with("false") {
-        Some(false)
+    let (parsed, rest) = if let Some(rest) = value.strip_prefix("true") {
+        (true, rest)
+    } else if let Some(rest) = value.strip_prefix("false") {
+        (false, rest)
     } else {
-        None
-    }
+        return None;
+    };
+    json_scalar_terminated(rest).then_some(parsed)
 }
 
 fn json_i32(body: &str, key: &str) -> Option<i32> {
@@ -3927,7 +3928,17 @@ fn json_i32(body: &str, key: &str) -> Option<i32> {
     let end = value
         .find(|c: char| !(c == '-' || c.is_ascii_digit()))
         .unwrap_or(value.len());
+    if !json_scalar_terminated(&value[end..]) {
+        return None;
+    }
     value[..end].parse().ok()
+}
+
+fn json_scalar_terminated(rest: &str) -> bool {
+    matches!(
+        rest.trim_start().as_bytes().first(),
+        Some(b',') | Some(b'}')
+    )
 }
 
 fn build_mdns_announcement(packet: &mut [u8; 768]) -> usize {
@@ -4224,5 +4235,45 @@ fn level(high: bool) -> Level {
         Level::High
     } else {
         Level::Low
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_events_requires_a_numeric_json_cursor() {
+        assert!(matches!(
+            parse_command(
+                103,
+                r#"{"command_id":103,"kind":"get_events","since_seq":491}"#
+            ),
+            Some(BrainstemCommand::GetEvents { since_seq: 491 })
+        ));
+        assert!(parse_command(
+            103,
+            r#"{"command_id":103,"kind":"get_events","since_seq":NEXT_SEQ}"#
+        )
+        .is_none());
+        assert!(parse_command(103, r#"{"command_id":103,"kind":"get_events"}"#).is_none());
+        assert!(parse_command(
+            103,
+            r#"{"command_id":103,"kind":"get_events","since_seq":491garbage}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn compact_get_events_requires_a_numeric_cursor() {
+        assert!(matches!(
+            parse_forebrain_uart_command("GET_EVENTS 103 491"),
+            Ok((103, BrainstemCommand::GetEvents { since_seq: 491 }))
+        ));
+        assert_eq!(
+            parse_forebrain_uart_command("GET_EVENTS 103 NEXT_SEQ"),
+            Err(103)
+        );
+        assert_eq!(parse_forebrain_uart_command("GET_EVENTS 103"), Err(103));
     }
 }

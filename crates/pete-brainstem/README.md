@@ -47,6 +47,7 @@ gpio = 19
 | Create OI UART RX | GP1 | 2 | Create TX to Pico RX |
 | Create Power Toggle | GP18 | 24 | Pico output to external power-toggle interface |
 | Create BRC/DD | GP19 | 25 | Pico open-drain output to Create BRC / Device Detect, optional |
+| Create charging indicator | GP17 | 22 | Level-shifted Create DB-25 pin 13 to Pico input |
 | External status LED | GP20 | 26 | Pico output, optional |
 | Onboard LED | GP25 | onboard | Pico output |
 | IMU I2C SDA | GP2 | 4 | Pico I2C1 SDA to MPU-6050 SDA |
@@ -57,6 +58,15 @@ UART is `57600 8N1`.
 The IMU path is short-horizon inertial telemetry plus local tilt/impact reflex safety. It is not SLAM, global pose, or autonomous recovery; higher-level mapping must treat IMU status as one sensor input with explicit freshness and health. The IMU is optional at runtime: when it is absent, the brainstem reports `imu.health = "absent"`, continues operating without inertial reflexes, and periodically probes for a newly attached device.
 
 Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external level shifting or a divider is present on the Create TX to Pico GP1 line.
+
+The original Create drives Cargo Bay DB-25 pin 13 high at 5V while charging.
+GP17 is configured as an active-high 3.3V input, so this path also requires a
+divider or level shifter; never connect DB-25 pin 13 directly to GP17. Status
+reports both the normalized `charging_indicator` and the inferred raw
+`charging_indicator_level`, plus GPIO, physical pin, and configured polarity.
+While docked, verify the Create side of the interface reaches 5V and the GP17
+side reaches a valid 3.3V high before treating `charging_indicator: off` as a
+firmware polarity result.
 
 The Power Toggle output assumes external wiring that is electrically safe for both the Pico and the Create. The firmware treats BRC/DD as open-drain: asserted pulls low, released does not drive high. Use an external pull-up or level interface appropriate for the Create's 0-5V input, and do not connect any 5V Create output directly to an RP2040 pin.
 
@@ -672,8 +682,10 @@ reported mode is uncertain, the supervisor reasserts `Start` followed by
 `Full`; otherwise it refreshes `Full` once per second. Motion remains disabled
 until the Create has returned a valid OI-mode response (sensor packet 35).
 Transmitting `Full` does not itself change the reported mode. The assertion
-pauses when fresh battery telemetry says the battery is at or below 20% and is
-actively charging.
+does not emit another `body_mode_requested` event when packet 35 already
+confirms Full, so supervision traffic cannot consume the lifecycle event ring;
+it pauses when fresh battery telemetry says the battery is at or below 20% and
+is actively charging.
 
 For a non-motion electrical/UART diagnosis, run:
 
