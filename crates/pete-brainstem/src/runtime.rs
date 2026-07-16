@@ -1293,10 +1293,9 @@ where
         self.active_velocity = None;
         status::set_body_state(BodyState::Moving);
         self.stop_sent = false;
-        self.create_uart.drive_direct(
+        self.create_uart.drive_straight(
             &mut self.hardware,
             &mut self.events,
-            DOCK_DEPARTURE_SPEED_MM_S,
             DOCK_DEPARTURE_SPEED_MM_S,
             DOCK_DEPARTURE_DURATION_MS,
         )?;
@@ -2801,7 +2800,7 @@ mod tests {
         assert!(!runtime.dock_departure_pending);
         assert_eq!(
             &runtime.hardware.writes.as_slice()[runtime.hardware.writes.len() - 5..],
-            &[145, 0xff, 0xb0, 0xff, 0xb0]
+            &[137, 0xff, 0xb0, 0x80, 0x00]
         );
         assert_eq!(runtime.commands.len(), 1);
 

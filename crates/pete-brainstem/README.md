@@ -653,7 +653,9 @@ sensor streams. When its Home Base bit is present, the first nonzero,
 non-docking motion request is held while the body driver backs straight away
 from the dock at 80 mm/s for 2.5 seconds. The original body-neutral request
 starts afterward. This dock departure is an internal body-driver action rather
-than a charging safety latch that callers must clear. Stop, e-stop, authority
+than a charging safety latch that callers must clear. It uses the baseline OI
+Drive straight encoding so it remains compatible with older Create firmware
+that does not actuate for Drive Direct. Stop, e-stop, authority
 loss, heartbeat expiry, and local safety reflexes still preempt it.
 
 For a non-motion electrical/UART diagnosis, run:

@@ -84,8 +84,9 @@ All notable changes are grouped by date.
   repeatedly trip and clear the dock's cliff bits while stopping motion.
 - Prevent the browser's 900 ms motion heartbeat from cancelling the fixed
   2.5-second body-local dock departure, extend its conservative reverse far
-  enough to clear the Home Base in physical testing, and expose an Undock control
-  that requests that bounded transition without requiring a held drive button.
+  enough to clear the Home Base in physical testing, use baseline OI Drive
+  straight for older Create firmware that ignores Drive Direct, and expose an
+  Undock control without requiring a held drive button.
 - Keep authorized `just flash` BOOTSEL negotiation compatible with older
   brainstems that advertise retired convenience verbs, while preserving the
   primitive-only contract for newly built firmware.
