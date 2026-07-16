@@ -142,7 +142,10 @@ impl SemanticOutcomeTracker {
         let mut observations = Vec::new();
         let current_charger_distance = closest_observed_charger_distance(now);
         let progress_evidence = |key: &str| EvidenceRef {
-            id: format!("semantic:action-outcome:{key}:{}:{}", previous.t_ms, now.t_ms),
+            id: format!(
+                "semantic:action-outcome:{key}:{}:{}",
+                previous.t_ms, now.t_ms
+            ),
             source: "runtime.action_outcome".to_string(),
             key: key.to_string(),
             observed_at_ms: now.t_ms,
@@ -258,10 +261,10 @@ fn runtime_sleep_input(
                 .latest
                 .as_ref()
                 .is_some_and(|input| input.mode == ReignMode::Direct));
-    let stopped = now.body.velocity.forward_m_s.abs() <= 0.01
-        && now.body.velocity.turn_rad_s.abs() <= 0.01;
-    let body_communication_stable = now.body.last_update_ms == 0
-        || now.t_ms.saturating_sub(now.body.last_update_ms) <= 2_000;
+    let stopped =
+        now.body.velocity.forward_m_s.abs() <= 0.01 && now.body.velocity.turn_rad_s.abs() <= 0.01;
+    let body_communication_stable =
+        now.body.last_update_ms == 0 || now.t_ms.saturating_sub(now.body.last_update_ms) <= 2_000;
     let critical_battery = now.body.battery_level <= 0.08;
     let unresolved_urgent_need = safety_event.is_some()
         || (now.body.battery_level <= 0.15 && !now.body.charging)
@@ -3683,10 +3686,8 @@ where
         );
         let sleep_snapshot = self.sleep_controller.tick(sleep_input);
         let sleeping = self.sleep_controller.requires_quiescence();
-        now.extensions.insert(
-            "sleep".to_string(),
-            serde_json::to_value(&sleep_snapshot)?,
-        );
+        now.extensions
+            .insert("sleep".to_string(), serde_json::to_value(&sleep_snapshot)?);
         let goal_cycle = if sleeping {
             self.goal_system.suspend_for_sleep(&now.world)
         } else {
@@ -4439,8 +4440,8 @@ where
             skill_request: (self.action_selector_mode == ActionSelectorMode::Goal
                 && mechanical_reign_action_for_selection.is_none()
                 && !sleeping)
-            .then_some(goal_skill_request)
-            .flatten(),
+                .then_some(goal_skill_request)
+                .flatten(),
             skill_status: None,
             recall,
             llm: llm_tick,
@@ -12773,7 +12774,10 @@ mod tests {
         let goals: pete_conductor::GoalCycle =
             serde_json::from_value(tick.frame.now.extensions["goal_system"].clone()).unwrap();
         assert!(goals.selection.selected_goal.is_none());
-        assert_eq!(goals.selection.reason, "deliberative goals quiesced for sleep");
+        assert_eq!(
+            goals.selection.reason,
+            "deliberative goals quiesced for sleep"
+        );
     }
 
     #[tokio::test]
@@ -12804,7 +12808,11 @@ mod tests {
             now
         };
         let first = runtime
-            .tick(charger_now(100, 1.0), ExperienceLatent::default(), Vec::new())
+            .tick(
+                charger_now(100, 1.0),
+                ExperienceLatent::default(),
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -12812,7 +12820,11 @@ mod tests {
             serde_json::Value::String("approach_charger".to_string())
         );
         let second = runtime
-            .tick(charger_now(200, 0.7), ExperienceLatent::default(), Vec::new())
+            .tick(
+                charger_now(200, 0.7),
+                ExperienceLatent::default(),
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert!(second
@@ -12824,9 +12836,7 @@ mod tests {
             .values()
             .any(|relation| {
                 relation.subject
-                    == SemanticNodeRef::Behavior(SemanticBehaviorId(
-                        "approach_charger".to_string(),
-                    ))
+                    == SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string()))
                     && relation.predicate == SemanticPredicate::Predicts
                     && relation
                         .supporting_evidence

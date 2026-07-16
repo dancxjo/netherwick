@@ -31,12 +31,11 @@ pub use epistemic::{
     QuestionId,
 };
 pub use semantic::{
-    SemanticActionId, SemanticBehaviorId, SemanticConceptId, SemanticContext,
-    SemanticDriveId, SemanticEpisodeId, SemanticEvidenceObservation, SemanticExplanation,
-    SemanticGoalId, SemanticGraphSnapshot, SemanticGroundingKind, SemanticNodeRef,
-    SemanticOutcomeId, SemanticPlaceId, SemanticPredicate, SemanticPropertyId,
-    SemanticRelation, SemanticRelationId, SemanticRelationStatus, SemanticRevision,
-    SemanticSkillId,
+    SemanticActionId, SemanticBehaviorId, SemanticConceptId, SemanticContext, SemanticDriveId,
+    SemanticEpisodeId, SemanticEvidenceObservation, SemanticExplanation, SemanticGoalId,
+    SemanticGraphSnapshot, SemanticGroundingKind, SemanticNodeRef, SemanticOutcomeId,
+    SemanticPlaceId, SemanticPredicate, SemanticPropertyId, SemanticRelation, SemanticRelationId,
+    SemanticRelationStatus, SemanticRevision, SemanticSkillId,
 };
 pub use social::{
     AttentionBelief, CommunicationProfile, ContextRef, ConversationTurnRef, IdentityHypothesis,

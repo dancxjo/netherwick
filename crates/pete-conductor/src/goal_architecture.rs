@@ -408,7 +408,6 @@ impl Affordance {
         self.expected_uncertainty_after = Some(affordance.expected_uncertainty_after);
         self
     }
-
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1529,8 +1528,7 @@ fn evaluate_seek_charger(
         .relations
         .values()
         .filter(|relation| {
-            relation.subject
-                == SemanticNodeRef::Concept(SemanticConceptId("charger".to_string()))
+            relation.subject == SemanticNodeRef::Concept(SemanticConceptId("charger".to_string()))
                 && matches!(
                     relation.predicate,
                     SemanticPredicate::Restores | SemanticPredicate::SatisfiesDrive

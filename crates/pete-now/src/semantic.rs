@@ -68,7 +68,9 @@ impl SemanticNodeRef {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticPredicate {
     Affords,
@@ -110,9 +112,7 @@ pub enum SemanticPredicate {
     RelatedTo,
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticRelationStatus {
     #[default]
@@ -124,9 +124,7 @@ pub enum SemanticRelationStatus {
     Deprecated,
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticGroundingKind {
     ActionOutcome,
@@ -315,8 +313,7 @@ impl SemanticGraphSnapshot {
                     && relation.confidence >= 0.40
                     && !matches!(
                         relation.status,
-                        SemanticRelationStatus::Contradicted
-                            | SemanticRelationStatus::Deprecated
+                        SemanticRelationStatus::Contradicted | SemanticRelationStatus::Deprecated
                     )
             })
             .map(|relation| relation.id.clone())
@@ -351,7 +348,10 @@ impl SemanticGraphSnapshot {
             } else {
                 format!("grounded charger meaning for {} is incomplete", entity_id.0)
             },
-            relation_ids: relations.iter().map(|relation| relation.id.clone()).collect(),
+            relation_ids: relations
+                .iter()
+                .map(|relation| relation.id.clone())
+                .collect(),
             evidence_refs: relations
                 .iter()
                 .flat_map(|relation| relation.supporting_evidence.clone())
@@ -400,22 +400,17 @@ impl SemanticGraphBuilder {
         let charger = SemanticNodeRef::Concept(SemanticConceptId("charger".to_string()));
         let energy = SemanticNodeRef::Drive(SemanticDriveId("energy".to_string()));
         let seek_charger = SemanticNodeRef::Goal(SemanticGoalId("seek_charger".to_string()));
-        let approach = SemanticNodeRef::Behavior(SemanticBehaviorId(
-            "approach_charger".to_string(),
-        ));
+        let approach =
+            SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string()));
         let dock = SemanticNodeRef::Behavior(SemanticBehaviorId("dock".to_string()));
-        let approach_skill =
-            SemanticNodeRef::Skill(SemanticSkillId("approach_target".to_string()));
-        let dock_skill =
-            SemanticNodeRef::Skill(SemanticSkillId("align_with_dock".to_string()));
-        let distance_decreases = SemanticNodeRef::Outcome(SemanticOutcomeId(
-            "target_distance_decreases".to_string(),
-        ));
+        let approach_skill = SemanticNodeRef::Skill(SemanticSkillId("approach_target".to_string()));
+        let dock_skill = SemanticNodeRef::Skill(SemanticSkillId("align_with_dock".to_string()));
+        let distance_decreases =
+            SemanticNodeRef::Outcome(SemanticOutcomeId("target_distance_decreases".to_string()));
         let charging_started =
             SemanticNodeRef::Outcome(SemanticOutcomeId("charging_started".to_string()));
         let obstacle = SemanticNodeRef::Concept(SemanticConceptId("obstacle".to_string()));
-        let back_away =
-            SemanticNodeRef::Behavior(SemanticBehaviorId("back_away".to_string()));
+        let back_away = SemanticNodeRef::Behavior(SemanticBehaviorId("back_away".to_string()));
         let clearance_increases =
             SemanticNodeRef::Outcome(SemanticOutcomeId("clearance_increases".to_string()));
         let escape = SemanticNodeRef::Goal(SemanticGoalId("escape_danger".to_string()));
@@ -564,9 +559,11 @@ impl SemanticGraphBuilder {
                 context: organism_context(),
                 confidence: entity.confidence,
                 grounding: SemanticGroundingKind::Cooccurrence,
-                evidence: entity.provenance.first().cloned().unwrap_or_else(|| {
-                    semantic_evidence(now.t_ms, "world.entity", &entity.id.0)
-                }),
+                evidence: entity
+                    .provenance
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| semantic_evidence(now.t_ms, "world.entity", &entity.id.0)),
                 contradicts: false,
             },
             revisions,
@@ -581,11 +578,7 @@ impl SemanticGraphBuilder {
                     context: conditional_context(&[("body_state", "charging")]),
                     confidence: entity.confidence,
                     grounding: SemanticGroundingKind::ActionOutcome,
-                    evidence: semantic_evidence(
-                        now.t_ms,
-                        "body.charging",
-                        "charging_confirmed",
-                    ),
+                    evidence: semantic_evidence(now.t_ms, "body.charging", "charging_confirmed"),
                     contradicts: false,
                 },
                 revisions,
@@ -848,9 +841,10 @@ mod tests {
             })
             .unwrap();
         assert!(relation.confidence >= 0.7);
-        assert!(relation.supporting_evidence.iter().any(|evidence| {
-            evidence.source == "body.charging"
-        }));
+        assert!(relation
+            .supporting_evidence
+            .iter()
+            .any(|evidence| { evidence.source == "body.charging" }));
     }
 
     #[test]
@@ -870,7 +864,11 @@ mod tests {
             evidence: semantic_evidence(20, "dock.outcome", "not_a_charger"),
             contradicts: true,
         };
-        let snapshot = builder.update(&Now::blank(20, BodySense::default()), &entities, &[contradiction]);
+        let snapshot = builder.update(
+            &Now::blank(20, BodySense::default()),
+            &entities,
+            &[contradiction],
+        );
         assert!(!snapshot.supports(
             &SemanticNodeRef::Entity(charger.id),
             SemanticPredicate::IsA,
@@ -883,25 +881,25 @@ mod tests {
     fn repeated_approach_progress_strengthens_expected_effect() {
         let mut builder = SemanticGraphBuilder::default();
         let now = Now::blank(10, BodySense::default());
-        let observation = |time| SemanticEvidenceObservation::supported(
-            SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string())),
-            SemanticPredicate::Predicts,
-            SemanticNodeRef::Outcome(SemanticOutcomeId(
-                "target_distance_decreases".to_string(),
-            )),
-            0.8,
-            SemanticGroundingKind::ActionOutcome,
-            semantic_evidence(time, "goal.progress", "target_distance_decreased"),
-        );
+        let observation = |time| {
+            SemanticEvidenceObservation::supported(
+                SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string())),
+                SemanticPredicate::Predicts,
+                SemanticNodeRef::Outcome(SemanticOutcomeId(
+                    "target_distance_decreases".to_string(),
+                )),
+                0.8,
+                SemanticGroundingKind::ActionOutcome,
+                semantic_evidence(time, "goal.progress", "target_distance_decreased"),
+            )
+        };
         let first = builder.update(&now, &BTreeMap::new(), &[observation(10)]);
         let first_confidence = first
             .relations
             .values()
             .filter(|relation| {
                 relation.subject
-                    == SemanticNodeRef::Behavior(SemanticBehaviorId(
-                        "approach_charger".to_string(),
-                    ))
+                    == SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string()))
                     && relation.predicate == SemanticPredicate::Predicts
             })
             .map(|relation| relation.confidence)
@@ -916,9 +914,7 @@ mod tests {
             .values()
             .filter(|relation| {
                 relation.subject
-                    == SemanticNodeRef::Behavior(SemanticBehaviorId(
-                        "approach_charger".to_string(),
-                    ))
+                    == SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string()))
                     && relation.predicate == SemanticPredicate::Predicts
             })
             .map(|relation| relation.confidence)
@@ -1016,6 +1012,9 @@ mod tests {
                 && relation.context.conditions.get("route_state")
                     == Some(&"currently_blocked".to_string())
         }));
-        assert!(!snapshot.charger_explanation(&charger.id).relation_ids.is_empty());
+        assert!(!snapshot
+            .charger_explanation(&charger.id)
+            .relation_ids
+            .is_empty());
     }
 }

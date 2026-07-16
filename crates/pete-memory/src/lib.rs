@@ -10993,11 +10993,7 @@ fn graph_context_from_frame(
         &mut entities,
         &mut relationships,
     );
-    append_semantic_graph_memory(
-        &frame.now.world.semantic,
-        &mut entities,
-        &mut relationships,
-    );
+    append_semantic_graph_memory(&frame.now.world.semantic, &mut entities, &mut relationships);
 
     for artifact in scene_vectors {
         let vector_id = vector_node_id(artifact);
