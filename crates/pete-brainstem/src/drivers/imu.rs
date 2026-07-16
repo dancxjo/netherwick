@@ -171,7 +171,6 @@ where
         self.initialized = true;
         Ok(())
     }
-
 }
 
 impl<B> ImuDriver for Mpu6050<B>
