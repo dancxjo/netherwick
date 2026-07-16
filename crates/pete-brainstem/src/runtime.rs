@@ -45,7 +45,8 @@ const ORIENTATION_PROBE_MAX_ACCEL_MM_S2: u16 = 13_000;
 const CONTACT_REPEAT_WINDOW_MS: u32 = 2_000;
 const DOCK_DEPARTURE_SPEED_MM_S: i16 = -80;
 const DOCK_DEPARTURE_DURATION_MS: u32 = 1_250;
-const CREATE_COMPLETE_SENSOR_PACKET: u8 = 6;
+const CREATE_CHARGING_SOURCES_PACKET: u8 = 34;
+const CREATE_CHARGING_SOURCES_POLL_PERIOD_MS: u32 = 250;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -191,6 +192,7 @@ where
     stop_sent: bool,
     heartbeat_stop_at_ms: Option<u32>,
     sensor_stream: Option<SensorStream>,
+    next_charging_sources_poll_ms: u32,
     next_imu_poll_ms: u32,
     next_full_mode_refresh_ms: u32,
     next_supervision_light_ms: u32,
@@ -248,6 +250,7 @@ where
             stop_sent: false,
             heartbeat_stop_at_ms: None,
             sensor_stream: None,
+            next_charging_sources_poll_ms: 0,
             next_imu_poll_ms: 0,
             next_full_mode_refresh_ms: 0,
             next_supervision_light_ms: 0,
@@ -1109,7 +1112,7 @@ where
             } => self.start_drive_arc(velocity_mm_s, radius_mm, duration_ms, now_ms)?,
             RuntimeCommand::RequestSensors { packet_id } => {
                 self.create_uart
-                    .request_sensor_packet(&mut self.hardware, internal_sensor_packet(packet_id))?;
+                    .request_sensor_packet(&mut self.hardware, packet_id)?;
             }
             RuntimeCommand::StreamSensors {
                 enabled,
@@ -1118,7 +1121,7 @@ where
             } => {
                 if enabled {
                     self.sensor_stream = Some(SensorStream {
-                        packet_id: internal_sensor_packet(packet_id),
+                        packet_id,
                         period_ms: period_ms.max(RUNTIME_TICK_MS),
                         next_request_ms: now_ms,
                     });
@@ -1770,11 +1773,23 @@ where
     }
 
     fn poll_sensor_stream(&mut self) -> Result<(), BrainstemError> {
+        let now_ms = self.now_ms();
+        if !self.create_responsive {
+            return Ok(());
+        }
+
+        if time_reached(now_ms, self.next_charging_sources_poll_ms) {
+            self.create_uart
+                .request_sensor_packet(&mut self.hardware, CREATE_CHARGING_SOURCES_PACKET)?;
+            self.next_charging_sources_poll_ms =
+                now_ms.wrapping_add(CREATE_CHARGING_SOURCES_POLL_PERIOD_MS);
+            return Ok(());
+        }
+
         let Some(mut stream) = self.sensor_stream else {
             return Ok(());
         };
-        let now_ms = self.now_ms();
-        if self.create_responsive && time_reached(now_ms, stream.next_request_ms) {
+        if time_reached(now_ms, stream.next_request_ms) {
             self.create_uart
                 .request_sensor_packet(&mut self.hardware, stream.packet_id)?;
             stream.next_request_ms = now_ms.wrapping_add(stream.period_ms);
@@ -2332,14 +2347,6 @@ fn low_battery_and_charging(snapshot: &status::BrainstemStatus) -> bool {
 fn create_charging_active(snapshot: &status::BrainstemStatus) -> bool {
     snapshot.create_charging_indicator_state == 2
         || matches!(snapshot.create_sensor_charging_state, 1..=3)
-}
-
-fn internal_sensor_packet(requested_packet: u8) -> u8 {
-    if requested_packet == 0 {
-        CREATE_COMPLETE_SENSOR_PACKET
-    } else {
-        requested_packet
-    }
 }
 
 fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCommand> {
@@ -3005,7 +3012,7 @@ mod tests {
         assert!(runtime.advance_active_action().is_ok());
         assert!(runtime.commands.is_empty());
 
-        let mut bytes = heapless::Vec::<u8, 64>::new();
+        let mut bytes = heapless::Vec::<u8, 32>::new();
         assert!(bytes.push(1).is_ok());
         assert!(runtime
             .events
@@ -3166,8 +3173,29 @@ mod tests {
 
         assert!(runtime.maintain_full_mode().is_ok());
 
-        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 6]);
+        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 35]);
         assert_eq!(status::snapshot(1_000).oi_mode, 0);
+    }
+
+    #[test]
+    fn home_base_source_poll_is_private_and_does_not_replace_public_stream() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.sensor_stream = Some(SensorStream {
+            packet_id: 0,
+            period_ms: 250,
+            next_request_ms: 1_000,
+        });
+
+        assert!(runtime.poll_sensor_stream().is_ok());
+        assert_eq!(runtime.hardware.writes.as_slice(), &[148, 1, 34]);
+
+        runtime.hardware.writes.clear();
+        runtime.hardware.now_us = 1_010_000;
+        assert!(runtime.poll_sensor_stream().is_ok());
+        assert_eq!(runtime.hardware.writes.as_slice(), &[148, 1, 0]);
+        assert_eq!(runtime.sensor_stream.unwrap().packet_id, 0);
     }
 
     #[test]
@@ -3190,7 +3218,7 @@ mod tests {
         assert!(runtime.hardware.writes.is_empty());
         status::set_oi_mode_unknown();
         assert!(runtime.maintain_full_mode().is_ok());
-        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 6]);
+        assert_eq!(runtime.hardware.writes.as_slice(), &[128, 132, 148, 1, 35]);
         status::mark_create_sensor_packet(
             0,
             crate::events::CreateSensorPacket {
@@ -3206,11 +3234,9 @@ mod tests {
     fn charging_indicator_stops_motion_then_departure_precedes_next_command() {
         let _guard = status::status_test_guard();
         status::mark_create_sensor_packet(
-            6,
+            34,
             crate::events::CreateSensorPacket {
-                charging_state: 2,
                 charging_sources: 0b10,
-                oi_mode: 3,
                 ..crate::events::CreateSensorPacket::default()
             },
         );
@@ -3245,10 +3271,9 @@ mod tests {
 
         runtime.hardware.charging_indicator = Some(false);
         status::mark_create_sensor_packet(
-            6,
+            34,
             crate::events::CreateSensorPacket {
                 charging_sources: 0b10,
-                oi_mode: 3,
                 ..crate::events::CreateSensorPacket::default()
             },
         );

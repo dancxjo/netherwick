@@ -9,7 +9,7 @@ data_bits = 8
 stop_bits = 1
 default_mode = "full"
 sensor_probe_packet = 35
-supported_sensor_packets = "0,6-32,34-38"
+supported_sensor_packets = "0,7-32,34-38"
 supported_modes = ["passive", "safe", "full"]
 
 [timing]

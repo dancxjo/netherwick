@@ -54,7 +54,7 @@ pub enum BrainstemEvent {
 
     CreatePacketReceived {
         packet_id: u8,
-        bytes: Vec<u8, 64>,
+        bytes: Vec<u8, 32>,
     },
     CreateSensorPacketDecoded {
         packet_id: u8,

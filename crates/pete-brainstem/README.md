@@ -232,7 +232,7 @@ The current internal Rust enums still include Create-specific variants such as `
 
 Smart controller verbs are one-shot/TTL step primitives. `face_bearing`, `track_bearing`, `hold_heading`, `turn_to_heading`, `dock_align`, `wall_follow`, and `creep_until` consume the supplied current error/range and emit a short motion pulse or stop. The host must repeatedly send fresh target error/range samples if it wants closed-loop behavior across time.
 
-Odometry is currently a lightweight accumulator over decoded Create distance/angle deltas. Packets `0`, `6`, `19`, and `20` update odometry: complete packets `0` and `6` carry both distance and angle deltas, packet `19` carries distance, and packet `20` carries angle. Other decoded sensor packets update status and events but do not integrate into odometry. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
+Odometry is currently a lightweight accumulator over decoded Create distance/angle deltas. Packets `0`, `19`, and `20` update odometry: complete packet `0` carries both distance and angle deltas, packet `19` carries distance, and packet `20` carries angle. Other decoded sensor packets update status and events but do not integrate into odometry. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
 
 Create OI power, BRC, Open Interface start, continuous Full mode, status-light
 animation, watchdog stop, and recovery remain owned by the brainstem runtime
@@ -680,8 +680,7 @@ starts Open Interface, and requests `Full` mode. Receive-side UART health is
 evidence, not a prerequisite for those writes: while RX is missing or the
 reported mode is uncertain, the supervisor reasserts `Start` followed by
 `Full`; otherwise it refreshes `Full` once per second. Motion remains disabled
-until the Create has returned a valid OI-mode response (sensor packet 35 or
-the complete group packet 6).
+until the Create has returned a valid OI-mode response (sensor packet 35).
 Transmitting `Full` does not itself change the reported mode. The assertion
 does not emit another `body_mode_requested` event when telemetry already
 confirms Full, so supervision traffic cannot consume the lifecycle event ring;
@@ -690,13 +689,13 @@ is actively charging.
 
 Create 1 has no separate Open Interface undock command. Full mode terminates
 charging, and leaving the Home Base requires reversing away from its contacts.
-The brainstem remembers that charging stopped motion; when charging has ended,
-the first nonzero, non-docking motion request is held while the body driver
-backs straight away from the Home Base at 80 mm/s for 1.25 seconds. The
-original body-neutral request starts afterward. This dock departure is an
-internal body-driver action rather than a charging safety latch that callers
-must clear. Stop, e-stop, authority loss, heartbeat expiry, and local safety
-reflexes still preempt it.
+The brainstem polls charging-sources packet 34 independently of caller-requested
+sensor streams. When its Home Base bit is present, the first nonzero,
+non-docking motion request is held while the body driver backs straight away
+from the dock at 80 mm/s for 1.25 seconds. The original body-neutral request
+starts afterward. This dock departure is an internal body-driver action rather
+than a charging safety latch that callers must clear. Stop, e-stop, authority
+loss, heartbeat expiry, and local safety reflexes still preempt it.
 
 For a non-motion electrical/UART diagnosis, run:
 
@@ -706,7 +705,7 @@ cargo run -p pete-cockpit --example create_link_debug
 
 The probe records raw Create-side TX/RX bytes, last-byte timestamps, validated
 packets, and break/parity/framing/overrun counts while testing checksummed OI
-stream frames for the complete group packet 6 at 19200, 57600, and 115200 baud. It restores
+stream frames for mode packet 35 at 19200, 57600, and 115200 baud. It restores
 57600 afterward. Add `-- --wake`
 only when the Create is visibly off; this performs one explicit power-toggle
 attempt before the scan. Automatic startup never blindly toggles the Create's

@@ -33,7 +33,7 @@ enum StreamState {
 
 pub struct CreateUart {
     pending_sensor_packet: Option<u8>,
-    sensor_bytes: Vec<u8, 64>,
+    sensor_bytes: Vec<u8, 32>,
     stream_state: StreamState,
     stream_sum: u8,
     invalid_packet_reported: bool,
@@ -121,7 +121,7 @@ impl CreateUart {
     where
         H: BrainstemHardware,
     {
-        self.request_sensor_packet(hardware, 6)
+        self.request_sensor_packet(hardware, 35)
     }
 
     pub fn start_oi<H, const N: usize>(
@@ -489,7 +489,6 @@ impl CreateUart {
 fn sensor_packet_length(packet_id: u8) -> Option<usize> {
     match packet_id {
         0 => Some(26),
-        6 => Some(52),
         7..=18 | 21 | 24 | 32 | 34..=38 => Some(1),
         19 | 20 | 22 | 23 | 25..=31 => Some(2),
         _ => None,
@@ -499,23 +498,13 @@ fn sensor_packet_length(packet_id: u8) -> Option<usize> {
 fn sensor_packet_is_decoded(packet_id: u8) -> bool {
     matches!(
         packet_id,
-        0 | 6 | 7..=14 | 17..=26 | 28..=31 | 34 | 35
+        0 | 7..=14 | 17..=26 | 28..=31 | 34 | 35
     )
 }
 
 fn decode_sensor_packet(packet_id: u8, bytes: &[u8]) -> Option<CreateSensorPacket> {
     let mut sensors = CreateSensorPacket::default();
     match packet_id {
-        6 if bytes.len() == 52 && valid_group_six(bytes) => {
-            apply_group_zero(&mut sensors, &bytes[..26]);
-            sensors.cliff_left_signal = u16::from_be_bytes([bytes[28], bytes[29]]);
-            sensors.cliff_front_left_signal = u16::from_be_bytes([bytes[30], bytes[31]]);
-            sensors.cliff_front_right_signal = u16::from_be_bytes([bytes[32], bytes[33]]);
-            sensors.cliff_right_signal = u16::from_be_bytes([bytes[34], bytes[35]]);
-            sensors.charging_sources = bytes[39];
-            sensors.oi_mode = bytes[40];
-            Some(sensors)
-        }
         0 if bytes.len() == 26 && valid_group_zero(bytes) => {
             apply_group_zero(&mut sensors, bytes);
             Some(sensors)
@@ -642,13 +631,6 @@ fn apply_group_zero(sensors: &mut CreateSensorPacket, bytes: &[u8]) {
     sensors.capacity_mah = u16::from_be_bytes([bytes[24], bytes[25]]);
 }
 
-fn valid_group_six(bytes: &[u8]) -> bool {
-    valid_group_zero(&bytes[..26])
-        && valid_charging_sources(bytes[39])
-        && bytes[40] <= 3
-        && valid_bool(bytes[42])
-}
-
 fn valid_group_zero(bytes: &[u8]) -> bool {
     valid_bumps_wheel_drops(bytes[0])
         && bytes[1..=6].iter().all(|byte| valid_bool(*byte))
@@ -756,14 +738,6 @@ mod tests {
         packet
     }
 
-    fn valid_group_six() -> [u8; 52] {
-        let mut packet = [0; 52];
-        packet[..26].copy_from_slice(&valid_group_zero());
-        packet[39] = 0b10;
-        packet[40] = 3;
-        packet
-    }
-
     fn stream_frame(packet_id: u8, payload: &[u8]) -> std::vec::Vec<u8> {
         let mut frame = std::vec![OI_STREAM_HEADER, payload.len() as u8 + 1, packet_id];
         frame.extend_from_slice(payload);
@@ -850,25 +824,15 @@ mod tests {
     #[test]
     fn packet_lengths_cover_the_advertised_sensor_range() {
         assert_eq!(sensor_packet_length(0), Some(26));
-        assert_eq!(sensor_packet_length(6), Some(52));
         for packet_id in 7..=32 {
             assert!(sensor_packet_length(packet_id).is_some());
         }
         for packet_id in 34..=38 {
             assert!(sensor_packet_length(packet_id).is_some());
         }
+        assert_eq!(sensor_packet_length(6), None);
         assert_eq!(sensor_packet_length(33), None);
         assert_eq!(sensor_packet_length(39), None);
-    }
-
-    #[test]
-    fn group_six_decodes_home_base_and_full_mode() {
-        let packet = valid_group_six();
-        let sensors = decode_sensor_packet(6, &packet).unwrap();
-
-        assert_eq!(sensors.charging_sources, 0b10);
-        assert_eq!(sensors.oi_mode, 3);
-        assert_eq!(sensors.voltage_mv, 14_400);
     }
 
     #[test]
@@ -887,25 +851,19 @@ mod tests {
         let mut hardware = TestHardware::new();
         let mut events = Deque::<BrainstemEvent, 4>::new();
         let before = status::snapshot(0).uart_rx_packets;
-        let packet = valid_group_six();
-        let mut corrupt = stream_frame(6, &packet);
-        let checksum = corrupt.len() - 1;
-        corrupt[checksum] = corrupt[checksum].wrapping_add(1);
-
         assert!(uart.start_mode_stream(&mut hardware).is_ok());
-        hardware
-            .rx
-            .extend([0xf8, 19, 9].into_iter().map(SerialRead::Byte));
-        hardware
-            .rx
-            .extend(corrupt.into_iter().map(SerialRead::Byte));
-        hardware
-            .rx
-            .extend(stream_frame(6, &packet).into_iter().map(SerialRead::Byte));
+        hardware.rx.extend(
+            [
+                0xf8, 19, 9, // noise and a frame with the wrong length
+                19, 2, 35, 3, 198, // corrupt checksum
+                19, 2, 35, 3, 197, // valid Full-mode frame
+            ]
+            .into_iter()
+            .map(SerialRead::Byte),
+        );
         uart.poll(&mut hardware, &mut events);
 
         assert_eq!(status::snapshot(0).oi_mode, 3);
-        assert_eq!(status::snapshot(0).create_sensor_charging_sources, 0b10);
         assert_eq!(status::snapshot(0).uart_rx_packets, before.wrapping_add(1));
         assert!(hardware.tx.ends_with(&[OI_PAUSE_RESUME_STREAM, 0]));
     }

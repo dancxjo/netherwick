@@ -2275,7 +2275,7 @@ pub fn mark_uart_packet(len: usize) {
 }
 
 pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
-    if matches!(packet_id, 0 | 6) {
+    if packet_id == 0 {
         increment(&CREATE_SENSOR_COMPLETE_PACKET_COUNT);
         CREATE_SENSOR_LAST_COMPLETE_PACKET_TIMESTAMP_MS.store(
             LAST_UART_PACKET_TIMESTAMP_MS.load(Ordering::Relaxed),
@@ -2302,7 +2302,7 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     };
 
     CREATE_SENSOR_LAST_PACKET_ID.store(packet_id, Ordering::Relaxed);
-    if matches!(packet_id, 6 | 35) {
+    if packet_id == 35 {
         OI_MODE.store(sensors.oi_mode, Ordering::Relaxed);
     }
     CREATE_SENSOR_FLAGS.store(new_flags, Ordering::Relaxed);
@@ -3159,7 +3159,7 @@ fn create_sensor_flags_bits(sensors: CreateSensorPacket) -> u32 {
 
 fn merge_create_sensor_flags(packet_id: u8, old_flags: u32, packet_flags: u32) -> u32 {
     let mask = match packet_id {
-        0 | 6 => 0b11_1111_1111,
+        0 => 0b11_1111_1111,
         7 => (1 << 0) | (1 << 1) | (1 << 2),
         8 => 1 << 3,
         9 => 1 << 4,
@@ -3233,63 +3233,63 @@ fn battery_percent(charge_mah: u16, capacity_mah: u16) -> Option<u8> {
 }
 
 fn create_packet_has_distance_delta(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 19)
+    matches!(packet_id, 0 | 19)
 }
 
 fn create_packet_has_angle_delta(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 20)
+    matches!(packet_id, 0 | 20)
 }
 
 fn create_packet_has_ir(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 17)
+    matches!(packet_id, 0 | 17)
 }
 
 fn create_packet_has_buttons(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 18)
+    matches!(packet_id, 0 | 18)
 }
 
 fn create_packet_has_charging_state(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 21)
+    matches!(packet_id, 0 | 21)
 }
 
 fn create_packet_has_charging_sources(packet_id: u8) -> bool {
-    matches!(packet_id, 6 | 34)
+    packet_id == 34
 }
 
 fn create_packet_has_voltage(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 22)
+    matches!(packet_id, 0 | 22)
 }
 
 fn create_packet_has_current(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 23)
+    matches!(packet_id, 0 | 23)
 }
 
 fn create_packet_has_temperature(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 24)
+    matches!(packet_id, 0 | 24)
 }
 
 fn create_packet_has_charge(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 25)
+    matches!(packet_id, 0 | 25)
 }
 
 fn create_packet_has_capacity(packet_id: u8) -> bool {
-    matches!(packet_id, 0 | 6 | 26)
+    matches!(packet_id, 0 | 26)
 }
 
 fn create_packet_has_cliff_left_signal(packet_id: u8) -> bool {
-    matches!(packet_id, 6 | 28)
+    packet_id == 28
 }
 
 fn create_packet_has_cliff_front_left_signal(packet_id: u8) -> bool {
-    matches!(packet_id, 6 | 29)
+    packet_id == 29
 }
 
 fn create_packet_has_cliff_front_right_signal(packet_id: u8) -> bool {
-    matches!(packet_id, 6 | 30)
+    packet_id == 30
 }
 
 fn create_packet_has_cliff_right_signal(packet_id: u8) -> bool {
-    matches!(packet_id, 6 | 31)
+    packet_id == 31
 }
 
 fn encode_signed_i16(value: i16) -> u32 {
@@ -4613,30 +4613,21 @@ mod tests {
     }
 
     #[test]
-    fn group_six_updates_complete_snapshot_and_home_base_source() {
+    fn charging_source_packet_updates_home_base_source() {
         let _guard = status_test_guard();
         clear_create_sensor_snapshot();
-        let before = snapshot(0).create_sensor_complete_packet_count;
 
         mark_create_sensor_packet(
-            6,
+            34,
             CreateSensorPacket {
                 charging_sources: 0b10,
-                oi_mode: 3,
-                voltage_mv: 14_400,
                 ..CreateSensorPacket::default()
             },
         );
 
         let status = snapshot(0);
-        assert_eq!(
-            status.create_sensor_complete_packet_count,
-            before.wrapping_add(1)
-        );
-        assert_eq!(status.create_sensor_last_packet_id, 6);
+        assert_eq!(status.create_sensor_last_packet_id, 34);
         assert_eq!(status.create_sensor_charging_sources, 0b10);
-        assert_eq!(status.oi_mode, 3);
-        assert_eq!(status.create_sensor_voltage_mv, 14_400);
     }
 
     #[cfg(feature = "pico-w")]
