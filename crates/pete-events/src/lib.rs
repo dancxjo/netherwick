@@ -544,23 +544,23 @@ impl EventExtractor {
         let face_familiarity = recall
             .map(|bundle| bundle.sense.face_familiarity)
             .unwrap_or(now.memory.face_familiarity);
-        if !now.face.embeddings.is_empty() {
+        if !now.face.vectors.is_empty() {
             events.push(
                 Event::new(now.t_ms, EventKind::FaceDetected)
                     .with_summary("Face detected.")
                     .with_payload(EventPayload::FaceDetected {
-                        face_embeddings: now.face.embeddings.len(),
+                        face_embeddings: now.face.vectors.len(),
                     }),
             );
         }
-        if !now.face.embeddings.is_empty()
+        if !now.face.vectors.is_empty()
             && face_familiarity >= self.config.face_familiarity_threshold
         {
             events.push(
                 Event::new(now.t_ms, EventKind::FaceRecognized)
                     .with_summary("Recognized a familiar face.")
                     .with_payload(EventPayload::FaceRecognized {
-                        face_embeddings: now.face.embeddings.len(),
+                        face_embeddings: now.face.vectors.len(),
                         face_familiarity,
                     }),
             );
@@ -1229,7 +1229,7 @@ mod tests {
             }],
             ..ObjectSense::default()
         };
-        now.face.embeddings = vec![vec![0.1, 0.2, 0.3]];
+        now.face.vectors = vec![pete_now::VectorArtifact::new("faces", "test-face", vec![0.1, 0.2, 0.3])];
         now.memory.face_familiarity = 0.9;
 
         let events = extractor.events_from_now(&now, None);

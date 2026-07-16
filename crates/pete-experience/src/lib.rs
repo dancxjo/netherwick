@@ -6765,12 +6765,8 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
         sensations.push(sensation);
     }
 
-    if !now.face.embeddings.is_empty() || !now.face.vectors.is_empty() {
-        let vector_artifacts = if now.face.vectors.is_empty() {
-            legacy_vector_artifacts("faces", "legacy-face", &now.face.embeddings, now.t_ms)
-        } else {
-            now.face.vectors.clone()
-        };
+    if !now.face.vectors.is_empty() {
+        let vector_artifacts = now.face.vectors.clone();
         let mut sensation = Sensation::primary(
             Modality::Vision,
             SensationSource::new("face.features"),
@@ -6779,7 +6775,6 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
             SensationPayload {
                 kind: SensationPayloadKind::Crop,
                 value: json!({
-                    "face_embeddings": now.face.embeddings.len(),
                     "face_vectors": now.face.vectors.len(),
                     "vector_artifacts": vector_artifacts,
                 }),
@@ -6791,17 +6786,8 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
         sensations.push(sensation);
     }
 
-    if !now.objects.embeddings.is_empty() || !now.objects.vectors.is_empty() {
-        let vector_artifacts = if now.objects.vectors.is_empty() {
-            legacy_vector_artifacts(
-                "objects",
-                "legacy-object",
-                &now.objects.embeddings,
-                now.t_ms,
-            )
-        } else {
-            now.objects.vectors.clone()
-        };
+    if !now.objects.vectors.is_empty() {
+        let vector_artifacts = now.objects.vectors.clone();
         let mut sensation = Sensation::primary(
             Modality::Vision,
             SensationSource::new("object.features"),
@@ -6811,7 +6797,6 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
                 kind: SensationPayloadKind::Crop,
                 value: json!({
                     "object_observations": now.objects.observations.len(),
-                    "object_embeddings": now.objects.embeddings.len(),
                     "object_vectors": now.objects.vectors.len(),
                     "vector_artifacts": vector_artifacts,
                 }),
@@ -6943,12 +6928,8 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
         sensations.push(sensation);
     }
 
-    if !now.voice.embeddings.is_empty() || !now.voice.vectors.is_empty() {
-        let vector_artifacts = if now.voice.vectors.is_empty() {
-            legacy_vector_artifacts("voices", "legacy-voice", &now.voice.embeddings, now.t_ms)
-        } else {
-            now.voice.vectors.clone()
-        };
+    if !now.voice.vectors.is_empty() {
+        let vector_artifacts = now.voice.vectors.clone();
         let mut sensation = Sensation::primary(
             Modality::Audio,
             SensationSource::new("voice.features"),
@@ -6957,7 +6938,6 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
             SensationPayload {
                 kind: SensationPayloadKind::VoiceSegment,
                 value: json!({
-                    "voice_embeddings": now.voice.embeddings.len(),
                     "voice_vectors": now.voice.vectors.len(),
                     "vector_artifacts": vector_artifacts,
                 }),
@@ -7037,27 +7017,6 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
     }
 
     sensations
-}
-
-fn legacy_vector_artifacts(
-    collection: &str,
-    prefix: &str,
-    embeddings: &[Vec<f32>],
-    t_ms: TimeMs,
-) -> Vec<pete_now::VectorArtifact> {
-    embeddings
-        .iter()
-        .enumerate()
-        .map(|(idx, embedding)| {
-            pete_now::VectorArtifact::new(
-                collection,
-                format!("{prefix}:{t_ms}:{idx}"),
-                embedding.clone(),
-            )
-            .with_model("pete.legacy_sensor_embedding.v0")
-            .with_occurred_at_ms(t_ms)
-        })
-        .collect()
 }
 
 fn embodied_tags(sensations: &[Sensation]) -> Vec<String> {

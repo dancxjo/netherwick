@@ -3155,10 +3155,8 @@ fn unified_slot_vector(now: &Now, slot_index: usize, teacher_dim: usize) -> (Vec
                 .chain(now.eye.image_vectors.iter())
                 .chain(now.eye.image_description_vectors.iter()),
         ),
-        1 => average_artifacts(now.face.vectors.iter())
-            .or_else(|| average_legacy_embeddings(&now.face.embeddings)),
-        2 => average_artifacts(now.voice.vectors.iter())
-            .or_else(|| average_legacy_embeddings(&now.voice.embeddings)),
+        1 => average_artifacts(now.face.vectors.iter()),
+        2 => average_artifacts(now.voice.vectors.iter()),
         3 => transcript_vector(now, teacher_dim),
         4 => Some(
             compact_range_features(now)
@@ -3180,15 +3178,6 @@ fn average_artifacts<'a>(
     let vectors = artifacts
         .filter(|artifact| !artifact.vector.is_empty())
         .map(|artifact| artifact.vector.as_slice())
-        .collect::<Vec<_>>();
-    average_slices(&vectors)
-}
-
-fn average_legacy_embeddings(embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
-    let vectors = embeddings
-        .iter()
-        .filter(|embedding| !embedding.is_empty())
-        .map(Vec::as_slice)
         .collect::<Vec<_>>();
     average_slices(&vectors)
 }

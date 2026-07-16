@@ -5840,10 +5840,10 @@ impl EpisodeMetricBuilder {
         if !snapshot.ear.features.is_empty() || snapshot.ear_pcm.is_some() {
             self.ticks_with_ear_features = self.ticks_with_ear_features.saturating_add(1);
         }
-        if !snapshot.voice.embeddings.is_empty() {
+        if !snapshot.voice.vectors.is_empty() {
             self.ticks_with_voice_embeddings = self.ticks_with_voice_embeddings.saturating_add(1);
         }
-        if !snapshot.face.embeddings.is_empty() {
+        if !snapshot.face.vectors.is_empty() {
             self.ticks_with_face_embeddings = self.ticks_with_face_embeddings.saturating_add(1);
         }
         if !snapshot.kinect.skeletons.is_empty() {
@@ -6317,8 +6317,8 @@ impl ScenarioEpisodeMemoryBuilder {
             }
         }
 
-        let social_seen = !snapshot.face.embeddings.is_empty()
-            || !snapshot.voice.embeddings.is_empty()
+        let social_seen = !snapshot.face.vectors.is_empty()
+            || !snapshot.voice.vectors.is_empty()
             || !snapshot.kinect.skeletons.is_empty();
         if social_seen {
             self.social_opportunity_ticks = self.social_opportunity_ticks.saturating_add(1);
@@ -16576,8 +16576,8 @@ mod tests {
         let mut snapshot = WorldSnapshot::default();
         snapshot.eye.frames.push(vec![0.1, 0.2]);
         snapshot.ear.features.push(vec![0.3]);
-        snapshot.voice.embeddings.push(vec![0.4]);
-        snapshot.face.embeddings.push(vec![0.5]);
+        snapshot.voice.vectors.push(pete_now::VectorArtifact::new("voices", "test-voice", vec![0.4]));
+        snapshot.face.vectors.push(pete_now::VectorArtifact::new("faces", "test-face", vec![0.5]));
         snapshot.kinect.skeletons.push(Default::default());
         metrics.observe(&snapshot, &tick_with_action(ActionPrimitive::Stop));
         let report = metrics.finish();

@@ -170,8 +170,6 @@ pub struct ObjectSense {
     #[serde(default)]
     pub observations: Vec<ObjectObservation>,
     #[serde(default)]
-    pub embeddings: Vec<Vec<f32>>,
-    #[serde(default)]
     pub vectors: Vec<VectorArtifact>,
 }
 
@@ -762,7 +760,6 @@ pub struct ReignSense {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FaceSense {
     pub schema_version: u32,
-    pub embeddings: Vec<Vec<f32>>,
     #[serde(default)]
     pub vectors: Vec<VectorArtifact>,
 }
@@ -770,7 +767,6 @@ pub struct FaceSense {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VoiceSense {
     pub schema_version: u32,
-    pub embeddings: Vec<Vec<f32>>,
     #[serde(default)]
     pub vectors: Vec<VectorArtifact>,
 }

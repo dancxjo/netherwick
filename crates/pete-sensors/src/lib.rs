@@ -722,13 +722,10 @@ impl FrameProcessor {
         };
         let summary_values = summary_extension_values(&processed);
         packets.push(SensePacket::Eye(processed.eye));
-        if !processed.face.embeddings.is_empty() || !processed.face.vectors.is_empty() {
+        if !processed.face.vectors.is_empty() {
             packets.push(SensePacket::Face(processed.face));
         }
-        if !processed.objects.observations.is_empty()
-            || !processed.objects.embeddings.is_empty()
-            || !processed.objects.vectors.is_empty()
-        {
+        if !processed.objects.observations.is_empty() || !processed.objects.vectors.is_empty() {
             packets.push(SensePacket::Objects(processed.objects));
         }
         packets.push(SensePacket::Extension(ExtensionSense {
@@ -769,13 +766,10 @@ impl FrameProcessor {
         };
         let summary_values = summary_extension_values(&processed);
         snapshot.eye = processed.eye;
-        if !processed.face.embeddings.is_empty() || !processed.face.vectors.is_empty() {
+        if !processed.face.vectors.is_empty() {
             snapshot.face = processed.face;
         }
-        if !processed.objects.observations.is_empty()
-            || !processed.objects.embeddings.is_empty()
-            || !processed.objects.vectors.is_empty()
-        {
+        if !processed.objects.observations.is_empty() || !processed.objects.vectors.is_empty() {
             snapshot.objects = processed.objects;
         }
         snapshot.extensions.push(ExtensionSense {
@@ -975,7 +969,6 @@ fn detected_face_sense(
         if detection.embedding.is_empty() {
             continue;
         }
-        face.embeddings.push(detection.embedding.clone());
         face.vectors.push(
             VectorArtifact::new(
                 FACE_VECTOR_COLLECTION,
@@ -1021,7 +1014,6 @@ fn detected_object_sense(
         if detection.embedding.is_empty() {
             continue;
         }
-        objects.embeddings.push(detection.embedding.clone());
         objects.vectors.push(
             VectorArtifact::new(
                 OBJECT_VECTOR_COLLECTION,
@@ -3200,7 +3192,6 @@ mod tests {
             .process_frame(100, &frame)
             .expect("processed frame");
 
-        assert_eq!(processed.face.embeddings, vec![vec![0.1, 0.2, 0.3]]);
         assert_eq!(processed.face.vectors.len(), 1);
         let artifact = &processed.face.vectors[0];
         assert_eq!(artifact.collection, FACE_VECTOR_COLLECTION);
@@ -3230,7 +3221,6 @@ mod tests {
 
         assert_eq!(processed.objects.observations.len(), 1);
         assert_eq!(processed.objects.observations[0].label, "red cup");
-        assert_eq!(processed.objects.embeddings, vec![vec![0.7, 0.2, 0.1]]);
         assert_eq!(processed.objects.vectors.len(), 1);
         let artifact = &processed.objects.vectors[0];
         assert_eq!(artifact.collection, OBJECT_VECTOR_COLLECTION);

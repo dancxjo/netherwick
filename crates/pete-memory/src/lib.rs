@@ -119,16 +119,12 @@ pub struct RecallQuery {
     pub scene_vectors: Vec<VectorArtifact>,
     #[serde(default)]
     pub place_recognition_input: Option<PlaceRecognitionInput>,
-    pub face_vectors: Vec<Vec<f32>>,
     #[serde(default)]
-    pub face_vector_artifacts: Vec<VectorArtifact>,
+    pub face_vectors: Vec<VectorArtifact>,
     #[serde(default)]
-    pub object_vectors: Vec<Vec<f32>>,
+    pub object_vectors: Vec<VectorArtifact>,
     #[serde(default)]
-    pub object_vector_artifacts: Vec<VectorArtifact>,
-    pub voice_vectors: Vec<Vec<f32>>,
-    #[serde(default)]
-    pub voice_vector_artifacts: Vec<VectorArtifact>,
+    pub voice_vectors: Vec<VectorArtifact>,
     pub battery: f32,
     pub active_goal: Option<Goal>,
     pub proposed_action: Option<ActionPrimitive>,
@@ -146,12 +142,9 @@ impl RecallQuery {
                 .map(|artifact| artifact.vector.clone()),
             scene_vectors: now.eye.scene_vectors.clone(),
             place_recognition_input: None,
-            face_vectors: now.face.embeddings.clone(),
-            face_vector_artifacts: now.face.vectors.clone(),
-            object_vectors: now.objects.embeddings.clone(),
-            object_vector_artifacts: now.objects.vectors.clone(),
-            voice_vectors: now.voice.embeddings.clone(),
-            voice_vector_artifacts: now.voice.vectors.clone(),
+            face_vectors: now.face.vectors.clone(),
+            object_vectors: now.objects.vectors.clone(),
+            voice_vectors: now.voice.vectors.clone(),
             battery: now.body.battery_level,
             active_goal: now
                 .self_sense
@@ -10006,27 +9999,9 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         .find_map(|hit| hit.warning.clone())
         .or_else(|| frame.now.memory.remembered_warning.clone());
     let scene_vectors = scene_vectors_from_now(&frame.now, frame.id, frame.t_ms);
-    let face_vectors = vector_artifacts_from_now(
-        FACE_VECTOR_COLLECTION,
-        &frame.now.face.vectors,
-        &frame.now.face.embeddings,
-        frame.id,
-        frame.t_ms,
-    );
-    let object_vectors = vector_artifacts_from_now(
-        OBJECT_VECTOR_COLLECTION,
-        &frame.now.objects.vectors,
-        &frame.now.objects.embeddings,
-        frame.id,
-        frame.t_ms,
-    );
-    let voice_vectors = vector_artifacts_from_now(
-        VOICE_VECTOR_COLLECTION,
-        &frame.now.voice.vectors,
-        &frame.now.voice.embeddings,
-        frame.id,
-        frame.t_ms,
-    );
+    let face_vectors = frame.now.face.vectors.clone();
+    let object_vectors = frame.now.objects.vectors.clone();
+    let voice_vectors = frame.now.voice.vectors.clone();
     let linked_experiences = experiences_with_memory_links(
         frame,
         &scene_vectors,
@@ -10067,27 +10042,9 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
 
 pub fn attach_memory_links_to_frame(frame: &mut ExperienceFrame) {
     let scene_vectors = scene_vectors_from_now(&frame.now, frame.id, frame.t_ms);
-    let face_vectors = vector_artifacts_from_now(
-        FACE_VECTOR_COLLECTION,
-        &frame.now.face.vectors,
-        &frame.now.face.embeddings,
-        frame.id,
-        frame.t_ms,
-    );
-    let object_vectors = vector_artifacts_from_now(
-        OBJECT_VECTOR_COLLECTION,
-        &frame.now.objects.vectors,
-        &frame.now.objects.embeddings,
-        frame.id,
-        frame.t_ms,
-    );
-    let voice_vectors = vector_artifacts_from_now(
-        VOICE_VECTOR_COLLECTION,
-        &frame.now.voice.vectors,
-        &frame.now.voice.embeddings,
-        frame.id,
-        frame.t_ms,
-    );
+    let face_vectors = frame.now.face.vectors.clone();
+    let object_vectors = frame.now.objects.vectors.clone();
+    let voice_vectors = frame.now.voice.vectors.clone();
     let links = memory_links_from_frame(
         frame,
         &scene_vectors,
@@ -10739,8 +10696,8 @@ fn charge_signal(now: &Now) -> f32 {
 }
 
 fn social_signal(now: &Now) -> f32 {
-    let visual = (!now.face.embeddings.is_empty() || !now.face.vectors.is_empty()) as u8 as f32;
-    let voice = (!now.voice.embeddings.is_empty() || !now.voice.vectors.is_empty()) as u8 as f32;
+    let visual = !now.face.vectors.is_empty() as u8 as f32;
+    let voice = !now.voice.vectors.is_empty() as u8 as f32;
     let skeleton = (!now.kinect.skeletons.is_empty()) as u8 as f32;
     let transcript = now
         .ear
@@ -11436,31 +11393,6 @@ fn scene_vectors_from_now(now: &Now, frame_id: uuid::Uuid, t_ms: u64) -> Vec<Vec
         .collect()
 }
 
-fn vector_artifacts_from_now(
-    collection: &str,
-    artifacts: &[VectorArtifact],
-    legacy_embeddings: &[Vec<f32>],
-    frame_id: uuid::Uuid,
-    t_ms: u64,
-) -> Vec<VectorArtifact> {
-    if !artifacts.is_empty() {
-        return artifacts.to_vec();
-    }
-    legacy_embeddings
-        .iter()
-        .enumerate()
-        .map(|(index, vector)| {
-            VectorArtifact::new(
-                collection,
-                format!("{frame_id}:{collection}:{index}"),
-                vector.clone(),
-            )
-            .with_source_frame_id(frame_id.to_string())
-            .with_occurred_at_ms(t_ms)
-        })
-        .collect()
-}
-
 fn sensation_vectors_from_frame(
     frame: &ExperienceFrame,
 ) -> (Vec<VectorArtifact>, BTreeMap<String, serde_json::Value>) {
@@ -12060,33 +11992,27 @@ fn embodied_vector_ref_id(vector: &pete_experience::EmbodiedVectorRef) -> String
 }
 
 fn query_face_vectors(query: &RecallQuery) -> Vec<&[f32]> {
-    let mut vectors = query
-        .face_vector_artifacts
+    query
+        .face_vectors
         .iter()
         .map(|artifact| artifact.vector.as_slice())
-        .collect::<Vec<_>>();
-    vectors.extend(query.face_vectors.iter().map(Vec::as_slice));
-    vectors
+        .collect()
 }
 
 fn query_object_vectors(query: &RecallQuery) -> Vec<&[f32]> {
-    let mut vectors = query
-        .object_vector_artifacts
+    query
+        .object_vectors
         .iter()
         .map(|artifact| artifact.vector.as_slice())
-        .collect::<Vec<_>>();
-    vectors.extend(query.object_vectors.iter().map(Vec::as_slice));
-    vectors
+        .collect()
 }
 
 fn query_voice_vectors(query: &RecallQuery) -> Vec<&[f32]> {
-    let mut vectors = query
-        .voice_vector_artifacts
+    query
+        .voice_vectors
         .iter()
         .map(|artifact| artifact.vector.as_slice())
-        .collect::<Vec<_>>();
-    vectors.extend(query.voice_vectors.iter().map(Vec::as_slice));
-    vectors
+        .collect()
 }
 
 fn recall_vector_ids(record: &MemoryRecord) -> Vec<String> {
@@ -12139,15 +12065,15 @@ fn merge_json_object(base: &mut serde_json::Value, extra: &serde_json::Value) {
 }
 
 fn has_face_query(query: &RecallQuery) -> bool {
-    !query.face_vectors.is_empty() || !query.face_vector_artifacts.is_empty()
+    !query.face_vectors.is_empty()
 }
 
 fn has_object_query(query: &RecallQuery) -> bool {
-    !query.object_vectors.is_empty() || !query.object_vector_artifacts.is_empty()
+    !query.object_vectors.is_empty()
 }
 
 fn has_voice_query(query: &RecallQuery) -> bool {
-    !query.voice_vectors.is_empty() || !query.voice_vector_artifacts.is_empty()
+    !query.voice_vectors.is_empty()
 }
 
 fn max_vector_similarity(query_vectors: Vec<&[f32]>, record_vectors: Vec<&VectorArtifact>) -> f32 {
@@ -13303,7 +13229,6 @@ mod tests {
         let mut now = Now::blank(123, BodySense::default());
         now.face = FaceSense {
             schema_version: 1,
-            embeddings: Vec::new(),
             vectors: vec![
                 VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-1", vec![1.0, 0.0])
                     .with_source_id("face-crop-1"),
@@ -13356,7 +13281,7 @@ mod tests {
 
         let recall = store
             .recall(RecallQuery {
-                face_vector_artifacts: vec![VectorArtifact::new(
+                face_vectors: vec![VectorArtifact::new(
                     FACE_VECTOR_COLLECTION,
                     "query-face",
                     vec![1.0, 0.0],
@@ -13473,7 +13398,7 @@ mod tests {
 
         let recall = store
             .recall(RecallQuery {
-                object_vector_artifacts: vec![VectorArtifact::new(
+                object_vectors: vec![VectorArtifact::new(
                     OBJECT_VECTOR_COLLECTION,
                     "object-query",
                     vec![1.0, 0.0],
@@ -13731,27 +13656,6 @@ mod tests {
             }).collect::<Vec<_>>(),
             "coverage": instant.coverage(),
         })
-    }
-
-    #[test]
-    fn legacy_embeddings_become_collection_artifacts() {
-        let frame_id = uuid::Uuid::new_v4();
-        let artifacts = vector_artifacts_from_now(
-            FACE_VECTOR_COLLECTION,
-            &[],
-            &[vec![0.25, 0.75]],
-            frame_id,
-            99,
-        );
-
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].collection, FACE_VECTOR_COLLECTION);
-        assert_eq!(artifacts[0].vector, vec![0.25, 0.75]);
-        let expected_frame_id = frame_id.to_string();
-        assert_eq!(
-            artifacts[0].source_frame_id.as_deref(),
-            Some(expected_frame_id.as_str())
-        );
     }
 
     #[test]
@@ -14377,7 +14281,7 @@ mod tests {
     fn social_update_increases_social_score() {
         let mut memory = PlaceMemory::new();
         let mut now = now_at(100, 1.0, 1.0);
-        now.face.embeddings.push(vec![1.0, 0.0]);
+        now.face.vectors.push(VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-social", vec![1.0, 0.0]));
 
         let features = memory.observe_now(&now);
 

@@ -1166,8 +1166,8 @@ mod tests {
         assert!(transcript.contains("Mara says"));
         assert!(!transcript.contains("person 0 sound"));
         assert!(snapshot.ear_pcm.is_some());
-        assert!(!snapshot.voice.embeddings.is_empty());
-        assert!(!snapshot.face.embeddings.is_empty());
+        assert!(!snapshot.voice.vectors.is_empty());
+        assert!(!snapshot.face.vectors.is_empty());
         assert!(!snapshot.kinect.color_features.is_empty());
         assert!(!snapshot.kinect.depth_m.is_empty());
         assert!(!snapshot.kinect.skeletons.is_empty());

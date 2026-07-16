@@ -8,7 +8,8 @@ use pete_cockpit::{
 use pete_now::{
     EarSense, ExtensionSense, FaceSense, GpsSense, ImuSense, KinectJointSense, KinectSense,
     KinectSkeletonSense, ObjectClass, ObjectObservation, ObjectObservationSource, ObjectSense,
-    RangeSense, VectorArtifact, VoiceSense, OBJECT_VECTOR_COLLECTION,
+    RangeSense, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION,
+    VOICE_VECTOR_COLLECTION,
 };
 use pete_sensors::{EyeFrame, EyeFrameFormat, PcmAudioFrame, World, WorldSnapshot, WorldUpdate};
 use serde::{Deserialize, Serialize};
@@ -855,15 +856,18 @@ fn visible_objects<'a>(
 }
 
 fn project_face_sense(body: &BodySense, objects: &[SimObject]) -> FaceSense {
-    let embeddings = visible_objects(body, objects)
+    let vectors = visible_objects(body, objects)
         .into_iter()
-        .filter_map(|(object, distance, angle)| {
+        .enumerate()
+        .filter_map(|(index, (object, distance, angle))| {
             if let SimObjectKind::Person { identity } = &object.kind {
-                Some(sim_embedding(
-                    identity.as_deref().unwrap_or(&object.label),
-                    distance,
-                    angle,
-                ))
+                Some(VectorArtifact::new(
+                    FACE_VECTOR_COLLECTION,
+                    format!("sim-face-{}-{index}", object.id),
+                    sim_embedding(identity.as_deref().unwrap_or(&object.label), distance, angle),
+                )
+                .with_model("sim-face-embedding-v0")
+                .with_source_id(format!("entity:person:{}", stable_slug(&object.label))))
             } else {
                 None
             }
@@ -871,20 +875,27 @@ fn project_face_sense(body: &BodySense, objects: &[SimObject]) -> FaceSense {
         .collect();
     FaceSense {
         schema_version: 1,
-        embeddings,
-        vectors: Vec::new(),
+        vectors,
     }
 }
 
 fn project_voice_sense(body: &BodySense, objects: &[SimObject]) -> VoiceSense {
-    let embeddings = audible_objects(body, objects)
+    let vectors = audible_objects(body, objects)
         .into_iter()
-        .map(|(object, distance)| sim_embedding(&object.label, distance, 0.0))
+        .enumerate()
+        .map(|(index, (object, distance))| {
+            VectorArtifact::new(
+                VOICE_VECTOR_COLLECTION,
+                format!("sim-voice-{}-{index}", object.id),
+                sim_embedding(&object.label, distance, 0.0),
+            )
+            .with_model("sim-voice-embedding-v0")
+            .with_source_id(format!("entity:sound_source:{}", stable_slug(&object.label)))
+        })
         .collect();
     VoiceSense {
         schema_version: 1,
-        embeddings,
-        vectors: Vec::new(),
+        vectors,
     }
 }
 
@@ -901,10 +912,6 @@ fn project_object_sense(body: &BodySense, objects: &[SimObject]) -> ObjectSense 
             source: ObjectObservationSource::Sim,
         })
         .collect();
-    let embeddings = visible
-        .iter()
-        .map(|(object, distance, bearing)| sim_embedding(&object.label, *distance, *bearing))
-        .collect::<Vec<_>>();
     let vectors = visible
         .into_iter()
         .enumerate()
@@ -925,7 +932,6 @@ fn project_object_sense(body: &BodySense, objects: &[SimObject]) -> ObjectSense 
     ObjectSense {
         schema_version: 1,
         observations,
-        embeddings,
         vectors,
     }
 }
@@ -1298,7 +1304,7 @@ mod tests {
 
         let snapshot = world.snapshot().await.unwrap();
 
-        assert_eq!(snapshot.face.embeddings.len(), 1);
+        assert_eq!(snapshot.face.vectors.len(), 1);
         assert_eq!(snapshot.kinect.skeletons.len(), 1);
     }
 
@@ -1352,6 +1358,6 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("the door is dreaming"));
-        assert_eq!(snapshot.voice.embeddings.len(), 1);
+        assert_eq!(snapshot.voice.vectors.len(), 1);
     }
 }
