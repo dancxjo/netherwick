@@ -20,8 +20,8 @@ use pete_behaviors::{
 use pete_body::{BodyFlags, BodySense};
 use pete_cockpit::{
     bump_escape_duration_ms, Cockpit, CockpitEventKind, ContactWithdrawalEvent,
-    ContactWithdrawalOutcome, EscapeDirection, MotionCommand, MotorCommand, SafeCockpit,
-    SafeStopReason, SafetyLatchKind, StatusSummary, BUMP_ESCAPE_BACKOFF_DURATION_MS,
+    ContactWithdrawalOutcome, MotionCommand, MotorCommand, SafeCockpit, SafeStopReason,
+    SafetyLatchKind, StatusSummary, BUMP_ESCAPE_BACKOFF_DURATION_MS,
 };
 use pete_conductor::{
     Conductor, ConductorInput, GoalSystem, NavigationIntent, SimpleConductor, SkillId,
@@ -5367,7 +5367,10 @@ fn dispatch_possessor_skill<C: Cockpit>(
     cockpit: &mut C,
     request: &SkillRequest,
 ) -> pete_cockpit::Result<()> {
-    let duration_ms = request.maximum_duration_ms.clamp(100, 5_000) as u32;
+    // Motherbrain owns feedback/procedure policy. Every step renews only a
+    // short-lived Brainstem primitive; the 100 ms skill cadence leaves ample
+    // margin while still failing stopped if this loop stalls.
+    const PRIMITIVE_TTL_MS: u32 = 250;
     let bearing_mrad = request
         .bearing_rad
         .map(|bearing| {
@@ -5376,29 +5379,20 @@ fn dispatch_possessor_skill<C: Cockpit>(
                 .clamp(i16::MIN as f32, i16::MAX as f32) as i16
         })
         .unwrap_or(0);
-    let range_mm = request
-        .range_m
-        .map(|range| (range.max(0.0) * 1_000.0).round().min(u16::MAX as f32) as u16)
-        .unwrap_or(0);
-    let stop_range_mm = request
-        .stop_range_m
-        .map(|range| (range.max(0.0) * 1_000.0).round().min(u16::MAX as f32) as u16)
-        .unwrap_or(250);
+    let correction = bearing_mrad.clamp(-500, 500);
     match request.skill_id {
         SkillId::StopAndStabilize => cockpit.stop(),
-        SkillId::TurnTowardTarget => cockpit.face_bearing(bearing_mrad, 500, 100, duration_ms),
-        SkillId::FollowBearing => cockpit.hold_heading(bearing_mrad, 45, 500, duration_ms),
-        SkillId::ApproachTarget => {
-            cockpit.track_bearing(bearing_mrad, range_mm, 50, 500, stop_range_mm, duration_ms)
-        }
-        SkillId::BackAway => cockpit.drive_for(-120, 40, duration_ms),
-        SkillId::InspectTarget => cockpit.scan_arc(800, 300, duration_ms),
-        SkillId::WallFollow => cockpit.wall_follow(0, 45, 400, duration_ms),
+        SkillId::TurnTowardTarget => cockpit.cmd_vel(0, correction, PRIMITIVE_TTL_MS),
+        SkillId::FollowBearing => cockpit.cmd_vel(45, correction, PRIMITIVE_TTL_MS),
+        SkillId::ApproachTarget => cockpit.cmd_vel(50, correction, PRIMITIVE_TTL_MS),
+        SkillId::BackAway => cockpit.cmd_vel(-40, 0, PRIMITIVE_TTL_MS),
+        SkillId::InspectTarget => cockpit.cmd_vel(0, 300, PRIMITIVE_TTL_MS),
+        SkillId::WallFollow => cockpit.cmd_vel(45, 0, PRIMITIVE_TTL_MS),
         SkillId::AlignWithDock => {
-            cockpit.dock_align(bearing_mrad, range_mm, 35, 400, stop_range_mm, duration_ms)
+            cockpit.cmd_vel(35, correction.clamp(-400, 400), PRIMITIVE_TTL_MS)
         }
-        SkillId::SystematicSearch => cockpit.scan_arc(1_571, 300, duration_ms),
-        SkillId::HoldHeading => cockpit.hold_heading(bearing_mrad, 0, 400, duration_ms),
+        SkillId::SystematicSearch => cockpit.cmd_vel(0, 300, PRIMITIVE_TTL_MS),
+        SkillId::HoldHeading => cockpit.cmd_vel(0, correction.clamp(-400, 400), PRIMITIVE_TTL_MS),
     }
 }
 
@@ -6140,10 +6134,10 @@ where
                             "recovering {latch:?} safety latch; escape attempt {}: reverse then turn clockwise 90 degrees",
                             self.possession_recovery.command_attempts
                         );
-                            self.cockpit.client_mut().bump_escape(
-                                EscapeDirection::Right,
-                                POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S,
-                                POSSESSION_BUMP_ESCAPE_TURN_MRAD_S,
+                            self.cockpit.client_mut().cmd_vel(
+                                -POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S,
+                                0,
+                                250,
                             )?;
                         } else {
                             reason = format!(
@@ -6187,11 +6181,7 @@ where
                             "recovering {latch:?} safety latch; escape attempt {}",
                             self.possession_recovery.command_attempts
                         );
-                        self.cockpit.client_mut().bump_escape(
-                            escape_direction(self.possession_recovery.turn_direction.clone()),
-                            100,
-                            900,
-                        )?;
+                        self.cockpit.client_mut().cmd_vel(-100, 0, 250)?;
                     } else {
                         reason = format!(
                             "recovering {latch:?} safety latch; escape in progress for {} ms",
@@ -6694,13 +6684,6 @@ fn contact_turn_direction(body: &BodySense) -> TurnDir {
         (true, false) => TurnDir::Right,
         (false, true) => TurnDir::Left,
         _ => TurnDir::Left,
-    }
-}
-
-fn escape_direction(direction: TurnDir) -> EscapeDirection {
-    match direction {
-        TurnDir::Left => EscapeDirection::Left,
-        TurnDir::Right => EscapeDirection::Right,
     }
 }
 
@@ -10728,7 +10711,7 @@ mod tests {
 
     struct ActiveBumpRecoveryCockpit {
         bump_escape_attempts: Arc<AtomicUsize>,
-        bump_escape_commands: Arc<Mutex<Vec<(EscapeDirection, i16, i16)>>>,
+        bump_escape_commands: Arc<Mutex<Vec<(i16, i16, u32)>>>,
         stop_attempts: Arc<AtomicUsize>,
         clear_attempts: Arc<AtomicUsize>,
         bump_active: bool,
@@ -10744,16 +10727,16 @@ mod tests {
                 CockpitRequest::GetEvents { since_seq } => {
                     Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
                 }
-                CockpitRequest::BumpEscape {
-                    direction,
-                    backoff_mm_s,
-                    turn_angular_mrad_s,
+                CockpitRequest::CmdVel {
+                    linear_mm_s,
+                    angular_mrad_s,
+                    ttl_ms,
                 } => {
                     self.bump_escape_attempts.fetch_add(1, Ordering::SeqCst);
                     self.bump_escape_commands.lock().unwrap().push((
-                        direction,
-                        backoff_mm_s,
-                        turn_angular_mrad_s,
+                        linear_mm_s,
+                        angular_mrad_s,
+                        ttl_ms,
                     ));
                     Ok(CockpitResponse::Accepted)
                 }
@@ -10846,7 +10829,7 @@ mod tests {
                     "get_capabilities",
                     "get_events",
                     "stop",
-                    "bump_escape",
+                    "cmd_vel",
                     "heartbeat_stop",
                 ]
                 .into_iter()
@@ -11235,7 +11218,7 @@ mod tests {
         assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(
             bump_escape_commands.lock().unwrap().as_slice(),
-            &[(EscapeDirection::Right, 50, 500)]
+            &[(-50, 0, 250)]
         );
         assert_eq!(
             tick.chosen_action,
@@ -11365,7 +11348,7 @@ mod tests {
         assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(
             bump_escape_commands.lock().unwrap().as_slice(),
-            &[(EscapeDirection::Right, 50, 500)]
+            &[(-50, 0, 250)]
         );
         assert!(matches!(
             tick.chosen_action,
