@@ -2636,25 +2636,9 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "cmd_vel",
         "drive_direct",
         "drive_arc",
-        "drive_for",
-        "turn_by",
-        "arc_for",
-        "creep_until",
-        "scan_arc",
-        "face_bearing",
-        "track_bearing",
-        "hold_heading",
-        "turn_to_heading",
-        "dock_align",
-        "wall_follow",
-        "wiggle_align",
-        "bump_escape",
-        "unstick",
-        "cliff_guard",
         "heartbeat_stop",
         "request_sensors",
         "stream_sensors",
-        "set_safety_policy",
         "song_define",
         "song_play",
         "define_chirp",
@@ -3783,6 +3767,12 @@ impl Default for SimCockpit {
 
 impl Cockpit for SimCockpit {
     fn execute(&mut self, request: CockpitRequest) -> Result<CockpitResponse> {
+        if request_is_removed_brainstem_convenience(&request) {
+            return Err(CockpitError::Rejected {
+                command_id: 0,
+                reason: "unsupported".into(),
+            });
+        }
         if !self.allow_unscoped_bench_mode
             && !self.scoped_dispatch
             && !matches!(
@@ -4221,6 +4211,28 @@ impl Cockpit for SimCockpit {
         self.complete_command(id);
         Ok(())
     }
+}
+
+fn request_is_removed_brainstem_convenience(request: &CockpitRequest) -> bool {
+    matches!(
+        request,
+        CockpitRequest::FaceBearing { .. }
+            | CockpitRequest::TrackBearing { .. }
+            | CockpitRequest::TurnBy { .. }
+            | CockpitRequest::DriveFor { .. }
+            | CockpitRequest::BumpEscape { .. }
+            | CockpitRequest::HoldHeading { .. }
+            | CockpitRequest::TurnToHeading { .. }
+            | CockpitRequest::ArcFor { .. }
+            | CockpitRequest::CreepUntil { .. }
+            | CockpitRequest::ScanArc { .. }
+            | CockpitRequest::DockAlign { .. }
+            | CockpitRequest::WallFollow { .. }
+            | CockpitRequest::WiggleAlign { .. }
+            | CockpitRequest::Unstick { .. }
+            | CockpitRequest::CliffGuard { .. }
+            | CockpitRequest::SetSafetyPolicy { .. }
+    )
 }
 
 pub struct EventCursor {
@@ -6561,6 +6573,25 @@ fn fresh_sim_boot_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulator_rejects_removed_brainstem_convenience_verbs() {
+        let mut sim = SimCockpit::new();
+        assert!(!sim
+            .get_capabilities()
+            .unwrap()
+            .verbs
+            .iter()
+            .any(|verb| verb == "drive_for" || verb == "set_safety_policy"));
+        assert!(matches!(
+            sim.execute(CockpitRequest::DriveFor {
+                distance_mm: 100,
+                velocity_mm_s: 50,
+                timeout_ms: 1_000,
+            }),
+            Err(CockpitError::Rejected { reason, .. }) if reason == "unsupported"
+        ));
+    }
     use std::collections::BTreeSet;
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
