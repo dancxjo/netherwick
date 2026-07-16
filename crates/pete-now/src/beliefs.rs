@@ -5,6 +5,12 @@ use pete_cognition::{ProviderHealthState, ProviderRegistrySnapshot};
 use pete_core::{FrameId, Pose2};
 use serde::{Deserialize, Serialize};
 
+use crate::epistemic::{EpistemicAttempt, EpistemicModelBuilder, EpistemicSnapshot};
+use crate::social::{SocialWorldModelBuilder, SocialWorldSnapshot};
+use crate::temporal::{
+    ClockDomain, PendingTemporalExpectation, TemporalBelief, TemporalContext, TemporalIntegrator,
+    TemporalRelation, TemporalUpdateInput, TimeInterval,
+};
 use crate::{Now, ObjectClass, ObjectObservationSource};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -488,6 +494,9 @@ pub struct WorldModelSnapshot {
     pub local_geometry: LocalGeometrySnapshot,
     pub hazards: HazardBeliefs,
     pub context: ContextBeliefs,
+    pub temporal: TemporalContext,
+    pub social: SocialWorldSnapshot,
+    pub epistemic: EpistemicSnapshot,
     pub authority: Option<AuthorityBelief>,
     pub update_trace: BeliefUpdateTrace,
 }
@@ -518,6 +527,11 @@ pub struct WorldModelUpdateContext {
     pub cognitive_services: BTreeMap<String, CognitiveServiceBelief>,
     pub active_control: Option<ActiveControlSummary>,
     pub continuity: ContinuitySummary,
+    pub wall_clock_unix_ms: Option<u64>,
+    pub replay_now_ms: Option<u64>,
+    #[serde(default)]
+    pub temporal_expectations: Vec<PendingTemporalExpectation>,
+    pub epistemic_attempt: Option<EpistemicAttempt>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -526,6 +540,9 @@ pub struct WorldModelUpdater {
     entities: BTreeMap<EntityId, WorldEntity>,
     last_brainstem_boot_id: Option<BootId>,
     invalidated_authority_lease: Option<String>,
+    social: SocialWorldModelBuilder,
+    temporal: TemporalIntegrator,
+    epistemic: EpistemicModelBuilder,
 }
 
 impl WorldModelUpdater {
@@ -552,11 +569,49 @@ impl WorldModelUpdater {
                 trace.added.push(id.0.clone());
             }
         }
-        let self_model = self.self_model(&now, context);
         let local_geometry = local_geometry(&now);
         let hazards = hazard_beliefs(&now);
-        let context = context_beliefs(&now);
+        let world_context = context_beliefs(&now);
         let authority = authority_belief(&now);
+        let social = self.social.update(&now, &self.entities);
+        let active_interaction = social.active_interaction.as_ref();
+        let temporal = self.temporal.update(TemporalUpdateInput {
+            monotonic_now_ms: now.t_ms,
+            wall_clock_unix_ms: context.wall_clock_unix_ms,
+            replay_now_ms: context.replay_now_ms,
+            charging: now.body.charging,
+            contact_or_recovery: now.body.flags.bump_left
+                || now.body.flags.bump_right
+                || context.active_goal.as_deref() == Some("escape_danger"),
+            active_goal: context.active_goal.clone(),
+            interaction_id: active_interaction
+                .map(|interaction| interaction.interaction_id.0.clone()),
+            interaction_participants: active_interaction
+                .map(|interaction| {
+                    interaction
+                        .participants
+                        .iter()
+                        .map(|person| EntityId(person.0.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            expectations: context.temporal_expectations.clone(),
+            temporal_beliefs: temporal_beliefs(&now),
+        });
+        let epistemic = self.epistemic.update(
+            &now,
+            &self.entities,
+            &local_geometry,
+            &social,
+            context.strategy_failure_pressure,
+            context.epistemic_attempt.as_ref(),
+        );
+        let mut self_model = self.self_model(&now, &context);
+        self_model.continuity.episode_id = temporal
+            .current_episode
+            .as_ref()
+            .map(|episode_id| episode_id.0.clone())
+            .or(self_model.continuity.episode_id);
         record_meta_evidence(&mut trace, &self_model.battery_meta);
         record_meta_evidence(&mut trace, &self_model.charging_meta);
         record_meta_evidence(&mut trace, &self_model.stuck_meta);
@@ -595,14 +650,14 @@ impl WorldModelUpdater {
             hazards.immediate_risk.as_ref(),
             hazards.remembered_risk.as_ref(),
             hazards.predicted_risk.as_ref(),
-            context.novelty.as_ref(),
-            context.surprise.as_ref(),
-            context.prediction_uncertainty.as_ref(),
-            context.map_confidence.as_ref(),
-            context.safe_bearing_rad.as_ref(),
-            context.frontier_bearing_rad.as_ref(),
-            context.llm_confidence.as_ref(),
-            context.expected_battery_delta.as_ref(),
+            world_context.novelty.as_ref(),
+            world_context.surprise.as_ref(),
+            world_context.prediction_uncertainty.as_ref(),
+            world_context.map_confidence.as_ref(),
+            world_context.safe_bearing_rad.as_ref(),
+            world_context.frontier_bearing_rad.as_ref(),
+            world_context.llm_confidence.as_ref(),
+            world_context.expected_battery_delta.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -611,6 +666,19 @@ impl WorldModelUpdater {
         }
         if let Some(authority) = &authority {
             record_meta_evidence(&mut trace, &authority.meta);
+        }
+        for person in social.people.values() {
+            record_meta_evidence(&mut trace, &person.meta);
+            for identity in &person.identity_hypotheses {
+                for evidence in &identity.evidence {
+                    trace.input_evidence_ids.push(evidence.id.clone());
+                }
+            }
+        }
+        for question in &epistemic.active_questions {
+            for evidence in &question.provenance {
+                trace.input_evidence_ids.push(evidence.id.clone());
+            }
         }
         trace.input_evidence_ids.sort();
         trace.input_evidence_ids.dedup();
@@ -623,14 +691,17 @@ impl WorldModelUpdater {
 
         self.revision = self.revision.saturating_add(1);
         now.world = WorldModelSnapshot {
-            schema_version: 1,
+            schema_version: 2,
             revision: self.revision,
             t_ms: now.t_ms,
             entities: self.entities.clone(),
             self_model,
             local_geometry,
             hazards,
-            context,
+            context: world_context,
+            temporal,
+            social,
+            epistemic,
             authority,
             update_trace: trace,
         };
@@ -892,7 +963,7 @@ impl WorldModelUpdater {
         });
     }
 
-    fn self_model(&mut self, now: &Now, context: WorldModelUpdateContext) -> SelfModelSnapshot {
+    fn self_model(&mut self, now: &Now, context: &WorldModelUpdateContext) -> SelfModelSnapshot {
         let body_evidence = evidence_ref("body", "state", now.t_ms, "body-belief-v1");
         let body_meta = belief_meta(
             1.0,
@@ -933,7 +1004,7 @@ impl WorldModelUpdater {
                 ),
             }
         });
-        let mut goal_status = context.goal_status;
+        let mut goal_status = context.goal_status.clone();
         for (goal_id, status) in &mut goal_status {
             status.meta = simple_meta(
                 now.t_ms,
@@ -1287,17 +1358,19 @@ impl WorldModelUpdater {
         continuity.important_relationship_refs.dedup();
         continuity.important_place_refs.sort();
         continuity.important_place_refs.dedup();
-        let mut active_control = context
-            .active_control
-            .unwrap_or_else(|| ActiveControlSummary {
-                goal_id: context.active_goal.clone(),
-                behavior_id: context.active_behavior.clone(),
-                skill_id: context.active_skill.clone(),
-                provenance: controller.clone(),
-                unable_to_act_reason: (!drive_available)
-                    .then_some("drive capability is unavailable".to_string()),
-                ..ActiveControlSummary::default()
-            });
+        let mut active_control =
+            context
+                .active_control
+                .clone()
+                .unwrap_or_else(|| ActiveControlSummary {
+                    goal_id: context.active_goal.clone(),
+                    behavior_id: context.active_behavior.clone(),
+                    skill_id: context.active_skill.clone(),
+                    provenance: controller.clone(),
+                    unable_to_act_reason: (!drive_available)
+                        .then_some("drive capability is unavailable".to_string()),
+                    ..ActiveControlSummary::default()
+                });
         if reign.is_some_and(|input| input.mode == pete_actions::ReignMode::Direct) {
             active_control.provenance = ControlProvenance::HumanDirect;
         }
@@ -1357,7 +1430,7 @@ impl WorldModelUpdater {
             bump_left: now.body.flags.bump_left,
             moving,
             range_nearest_m: now.range.nearest_m,
-            active_goal: context.active_goal,
+            active_goal: context.active_goal.clone(),
             goal_status,
         }
     }
@@ -1690,6 +1763,61 @@ fn hazard_beliefs(now: &Now) -> HazardBeliefs {
     }
 }
 
+fn temporal_beliefs(now: &Now) -> Vec<TemporalBelief> {
+    let vectors = now
+        .eye
+        .image_vectors
+        .iter()
+        .chain(now.eye.image_description_vectors.iter())
+        .chain(now.eye.scene_vectors.iter())
+        .chain(now.face.vectors.iter())
+        .chain(now.voice.vectors.iter())
+        .chain(now.objects.vectors.iter())
+        .chain(now.ear.transcript_vectors.iter());
+    let mut beliefs = Vec::new();
+    for vector in vectors {
+        let Some(occurred_at_ms) = vector.occurred_at_ms else {
+            continue;
+        };
+        let evidence = evidence_ref(
+            &format!("vector.{}", vector.collection),
+            &vector.point_id,
+            now.t_ms,
+            "temporal-evidence-v1",
+        );
+        let subject = format!("vector:{}:{}", vector.collection, vector.point_id);
+        beliefs.push(TemporalBelief {
+            interval: TimeInterval {
+                domain: ClockDomain::Event,
+                start_ms: occurred_at_ms,
+                end_ms: Some(occurred_at_ms),
+                uncertainty_ms: 0,
+            },
+            relation: TemporalRelation::OccurredDuring,
+            subject: subject.clone(),
+            confidence: 1.0,
+            provenance: vec![evidence.clone()],
+        });
+        beliefs.push(TemporalBelief {
+            interval: TimeInterval {
+                domain: ClockDomain::Observation,
+                start_ms: now.t_ms,
+                end_ms: Some(now.t_ms),
+                uncertainty_ms: 0,
+            },
+            relation: if occurred_at_ms < now.t_ms {
+                TemporalRelation::After
+            } else {
+                TemporalRelation::Overlaps
+            },
+            subject,
+            confidence: 1.0,
+            provenance: vec![evidence],
+        });
+    }
+    beliefs
+}
+
 fn simple_meta(now_ms: u64, source_kind: BeliefSourceKind, key: &str) -> BeliefMeta {
     let evidence = evidence_ref(key, key, now_ms, "world-model-v1");
     belief_meta(1.0, now_ms, source_kind, evidence, None)
@@ -1765,7 +1893,7 @@ fn normalize_angle(mut angle: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectObservation, ObjectSense};
+    use crate::{ObjectObservation, ObjectSense, TypedTimestamp, VectorArtifact};
     use pete_actions::{ReignCommand, ReignMode, ReignSource};
     use pete_body::BodySense;
     use uuid::Uuid;
@@ -2234,5 +2362,46 @@ mod tests {
             vec!["experience:old-bump"]
         );
         assert!(!snapshot.self_model.contact);
+    }
+
+    #[test]
+    fn delayed_evidence_keeps_event_observation_and_replay_times_distinct() {
+        let mut now = Now::blank(500, BodySense::default());
+        now.face
+            .vectors
+            .push(VectorArtifact::new("faces", "face:delayed", vec![0.1]).with_occurred_at_ms(100));
+        let mut updater = WorldModelUpdater::default();
+        let snapshot = updater
+            .update(
+                now,
+                WorldModelUpdateContext {
+                    wall_clock_unix_ms: Some(50_000),
+                    replay_now_ms: Some(40),
+                    ..WorldModelUpdateContext::default()
+                },
+            )
+            .world;
+        assert!(snapshot
+            .temporal
+            .current_temporal_beliefs
+            .iter()
+            .any(|belief| {
+                belief.interval.domain == ClockDomain::Event && belief.interval.start_ms == 100
+            }));
+        assert!(snapshot
+            .temporal
+            .current_temporal_beliefs
+            .iter()
+            .any(|belief| {
+                belief.interval.domain == ClockDomain::Observation
+                    && belief.interval.start_ms == 500
+            }));
+        assert_eq!(
+            snapshot.temporal.replay_now,
+            Some(TypedTimestamp {
+                domain: ClockDomain::Replay,
+                ms: 40,
+            })
+        );
     }
 }

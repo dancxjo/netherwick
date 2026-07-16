@@ -99,3 +99,6 @@ Scenario reports aggregate goal switches, commitment-retained ticks, behavior
 transitions, mean goal dwell, and goal/behavior histograms.
 
 The complete belief contract is [020-now-world-model.md](020-now-world-model.md).
+Goal use of shared temporal context, social identity, and information-gathering
+questions is specified in
+[023-temporal-social-epistemic-cognition.md](023-temporal-social-epistemic-cognition.md).

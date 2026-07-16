@@ -30,7 +30,7 @@ reality and external messages
   source kinds.
 - `Now.world` is the one canonical current belief snapshot. It contains typed
   self/body state, entities, local geometry, hazards, context, task/authority,
-  and its update trace.
+  temporal context, social beliefs, epistemic questions, and its update trace.
 - `ExperienceInstant` is the durable embodied record for a tick or interval.
   It captures the evidence batch and associated `Now` for replay, memory, and
   encoding; it is not a competing live world model.
@@ -94,3 +94,6 @@ An actionable entity includes its evidence lineage, so goal diagnostics can
 trace a selected target back to the observation, recall, prediction, or claim
 that supported it. Replay compares rebuilt snapshots by revision and trace;
 differences identify either changed evidence or a changed implementation.
+
+The bounded temporal, social, and epistemic regions are specified in
+[`023-temporal-social-epistemic-cognition.md`](023-temporal-social-epistemic-cognition.md).

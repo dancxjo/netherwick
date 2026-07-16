@@ -5,8 +5,10 @@ use pete_actions::{
     ActionPrimitive, ApproachTarget, ExploreStyle, InspectTarget, ReignMode, TurnDir,
 };
 use pete_now::{
-    DriveSelfSummary, DriveSense, EntityId, EvidenceRef, GoalStatusBelief, WorldEntity,
-    WorldEntityKind, WorldModelSnapshot, WorldModelUpdateContext,
+    ClockDomain, DriveSelfSummary, DriveSense, EntityId, EpistemicActionKind, EpistemicAffordance,
+    EpistemicAttempt, EpistemicQuestionFamily, EvidenceRef, GoalStatusBelief,
+    PendingTemporalExpectation, QuestionId, TimeInterval, WorldEntity, WorldEntityKind,
+    WorldModelSnapshot, WorldModelUpdateContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -199,19 +201,31 @@ impl DriveDynamics {
             .as_ref()
             .map(|belief| belief.value)
             .unwrap_or(0.0);
+        let weighted_uncertainty = world.epistemic.weighted_uncertainty();
+        let expected_information_gain = world
+            .epistemic
+            .affordances
+            .iter()
+            .filter(|affordance| affordance.available)
+            .map(|affordance| affordance.expected_information_gain)
+            .fold(0.0f32, f32::max);
+        let information_satisfaction = (1.0 - weighted_uncertainty).clamp(0.0, 1.0);
+        let predicted_information_satisfaction =
+            (1.0 - (weighted_uncertainty - expected_information_gain).max(0.0)).clamp(0.0, 1.0);
         self.snapshot.curiosity.update(
-            0.60,
-            novelty,
-            novelty.max(surprise),
+            0.80,
+            information_satisfaction,
+            predicted_information_satisfaction,
             dt_s,
-            (surprise * 0.25).max(impulses.curiosity * 0.25),
+            (surprise * 0.20)
+                .max(novelty * 0.10)
+                .max(impulses.curiosity * 0.25),
         );
 
         let person_confidence = world
-            .entities
-            .values()
-            .filter(|entity| entity.kind == WorldEntityKind::Person)
-            .map(|entity| entity.confidence)
+            .social
+            .present_people()
+            .map(|person| person.presence.confidence)
             .fold(0.0f32, f32::max);
         self.snapshot.social.update(
             0.50,
@@ -273,6 +287,12 @@ pub struct Affordance {
     pub expected_risk: f32,
     pub expected_energy_cost: f32,
     pub expected_duration_ms: u64,
+    #[serde(default)]
+    pub expected_information_gain: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_uncertainty_after: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_question_id: Option<QuestionId>,
     pub target: Option<EntityId>,
     pub bearing_rad: Option<f32>,
     pub skill_request: Option<SkillRequest>,
@@ -344,7 +364,10 @@ pub struct SkillStatus {
 
 impl Affordance {
     fn utility(&self) -> f32 {
-        0.25 * self.confidence + 0.25 * self.expected_reward + 0.35 * self.expected_progress
+        0.20 * self.confidence
+            + 0.20 * self.expected_reward
+            + 0.30 * self.expected_progress
+            + 0.30 * self.expected_information_gain
             - 0.25 * self.expected_risk
             - 0.10 * self.expected_energy_cost
     }
@@ -373,6 +396,13 @@ impl Affordance {
         if let Some(request) = &mut self.skill_request {
             request.range_m = range_m;
         }
+        self
+    }
+
+    fn with_epistemic(mut self, affordance: &EpistemicAffordance) -> Self {
+        self.epistemic_question_id = Some(affordance.question_id.clone());
+        self.expected_information_gain = affordance.expected_information_gain;
+        self.expected_uncertainty_after = Some(affordance.expected_uncertainty_after);
         self
     }
 }
@@ -413,6 +443,10 @@ pub struct GoalInterpretation {
     pub social_presence: f32,
     pub uncertainty: f32,
     pub stalled_goal_frustration: f32,
+    pub epistemic_question_id: Option<QuestionId>,
+    pub epistemic_question_family: Option<EpistemicQuestionFamily>,
+    pub epistemic_importance: f32,
+    pub expected_information_gain: f32,
     pub suggestions: Vec<ActionPrimitive>,
     pub provenance: Vec<EvidenceRef>,
 }
@@ -812,6 +846,30 @@ impl GoalInterpreter for RuleGoalInterpreter {
             social_presence: context.drives.social.actual,
             uncertainty: context.drives.certainty.activation,
             stalled_goal_frustration,
+            epistemic_question_id: context
+                .world
+                .epistemic
+                .most_important_question()
+                .map(|question| question.question_id.clone()),
+            epistemic_question_family: context
+                .world
+                .epistemic
+                .most_important_question()
+                .map(|question| question.family),
+            epistemic_importance: context
+                .world
+                .epistemic
+                .most_important_question()
+                .map(|question| question.importance)
+                .unwrap_or(0.0),
+            expected_information_gain: context
+                .world
+                .epistemic
+                .affordances
+                .iter()
+                .filter(|affordance| affordance.available)
+                .map(|affordance| affordance.expected_information_gain)
+                .fold(0.0f32, f32::max),
             suggestions: context.suggestions.to_vec(),
             provenance: target
                 .map(|entity| entity.provenance.clone())
@@ -1146,6 +1204,9 @@ fn affordance(
         expected_risk: risk.clamp(0.0, 1.0),
         expected_energy_cost: energy.clamp(0.0, 1.0),
         expected_duration_ms: duration_ms,
+        expected_information_gain: 0.0,
+        expected_uncertainty_after: None,
+        epistemic_question_id: None,
         target,
         bearing_rad: None,
         skill_request: None,
@@ -1191,6 +1252,19 @@ const REGISTERED_BEHAVIORS: &[&str] = &[
     "speak",
     "rest",
     "investigate_sound",
+    "orient_for_charger_evidence",
+    "inspect_charger_hypothesis",
+    "search_for_charger_evidence",
+    "scan_clearance",
+    "inspect_path",
+    "stop_and_observe_path",
+    "inspect_person_identity",
+    "listen_for_identity",
+    "ask_identity_clarification",
+    "listen_for_direction",
+    "orient_for_sound_parallax",
+    "inspect_failure_context",
+    "compare_failure_prediction",
     "follow_task",
 ];
 
@@ -1384,6 +1458,40 @@ fn evaluate_seek_charger(
             None,
             &[],
         ));
+    }
+    if let Some(question) = context
+        .world
+        .epistemic
+        .active_questions
+        .iter()
+        .find(|question| question.family == EpistemicQuestionFamily::ChargerIdentityOrBearing)
+    {
+        for goal_affordance in &mut affordances {
+            let epistemic_behavior = match goal_affordance.behavior_id.as_str() {
+                "turn_toward_charger" => Some("orient_for_charger_evidence"),
+                "inspect_for_charger" => Some("inspect_charger_hypothesis"),
+                "systematic_charger_search" => Some("search_for_charger_evidence"),
+                _ => None,
+            };
+            let Some(epistemic_behavior) = epistemic_behavior else {
+                continue;
+            };
+            if let Some(epistemic) = context
+                .world
+                .epistemic
+                .affordances
+                .iter()
+                .find(|candidate| {
+                    candidate.question_id == question.question_id
+                        && candidate.behavior_id == epistemic_behavior
+                })
+            {
+                goal_affordance.epistemic_question_id = Some(question.question_id.clone());
+                goal_affordance.expected_information_gain = epistemic.expected_information_gain;
+                goal_affordance.expected_uncertainty_after =
+                    Some(epistemic.expected_uncertainty_after);
+            }
+        }
     }
     let dock_available = affordances
         .iter()
@@ -1625,10 +1733,32 @@ fn evaluate_socialize(
     context: &GoalEvaluationContext<'_>,
 ) -> EvaluationParts {
     let social = context.drives.social.activation;
-    let confidence = interpretation.target_confidence;
-    let action = match interpretation.target_distance_m {
+    let person = context.world.social.most_relevant_person();
+    let identity = person.and_then(|person| person.best_identity());
+    let identity_confidence = identity.map(|identity| identity.confidence).unwrap_or(0.0);
+    let confidence = person
+        .map(|person| person.presence.confidence)
+        .unwrap_or(interpretation.target_confidence)
+        .max(identity_confidence * 0.8);
+    let identity_uncertain = person.is_some_and(|person| person.identity_is_uncertain());
+    let person_target = person.map(|person| EntityId(person.person_id.0.clone()));
+    let person_distance = person
+        .and_then(|person| person.location.as_ref())
+        .and_then(|location| location.distance_m)
+        .or(interpretation.target_distance_m);
+    let person_bearing = person
+        .and_then(|person| person.location.as_ref())
+        .and_then(|location| location.bearing_rad)
+        .or(interpretation.target_bearing_rad);
+    let action = match person_distance {
+        Some(distance) if distance <= 0.8 && identity_uncertain => ActionPrimitive::Speak {
+            text: "Hello. What should I call you?".to_string(),
+        },
         Some(distance) if distance <= 0.8 => ActionPrimitive::Speak {
-            text: "Hello.".to_string(),
+            text: person
+                .and_then(|person| person.preferred_name.as_ref())
+                .map(|name| format!("Hello, {}.", name.value))
+                .unwrap_or_else(|| "Hello.".to_string()),
         },
         Some(_) => ActionPrimitive::Approach {
             target: ApproachTarget::Person,
@@ -1638,7 +1768,11 @@ fn evaluate_socialize(
         },
     };
     let mut engagement = affordance(
-        "social_engagement",
+        if identity_uncertain {
+            "clarify_person_identity"
+        } else {
+            "social_engagement"
+        },
         action.clone(),
         confidence.max(0.25),
         0.55,
@@ -1646,17 +1780,40 @@ fn evaluate_socialize(
         interpretation.danger,
         0.1,
         1_000,
-        interpretation.target.clone(),
-        &interpretation.provenance,
+        person_target.or_else(|| interpretation.target.clone()),
+        person
+            .map(|person| person.meta.provenance.as_slice())
+            .unwrap_or(&interpretation.provenance),
     )
-    .with_bearing(interpretation.target_bearing_rad);
+    .with_bearing(person_bearing);
     if matches!(action, ActionPrimitive::Approach { .. }) {
         engagement = engagement
             .with_skill(SkillId::ApproachTarget, Some(0.75))
-            .with_skill_range(interpretation.target_distance_m);
+            .with_skill_range(person_distance);
     }
+    if identity_uncertain {
+        if let Some(epistemic) = context
+            .world
+            .epistemic
+            .affordances
+            .iter()
+            .filter(|affordance| affordance.action_kind == EpistemicActionKind::AskPerson)
+            .max_by(|left, right| {
+                left.epistemic_utility()
+                    .total_cmp(&right.epistemic_utility())
+            })
+        {
+            engagement = engagement.with_epistemic(epistemic);
+        }
+    }
+    let pending_request = context
+        .world
+        .social
+        .active_interaction
+        .as_ref()
+        .is_some_and(|interaction| !interaction.unresolved_requests.is_empty());
     (
-        (0.70 * social + 0.30 * confidence
+        (0.70 * social + 0.30 * confidence + if pending_request { 0.20 } else { 0.0 }
             - 0.60 * interpretation.danger
             - 0.40 * context.drives.rest.activation)
             .clamp(0.0, 1.0),
@@ -1665,7 +1822,8 @@ fn evaluate_socialize(
         vec![engagement],
         vec![
             contribution("drive.social", social),
-            contribution("world.person_confidence", confidence),
+            contribution("world.social.person_confidence", confidence),
+            contribution("world.social.pending_request", pending_request as u8 as f32),
         ],
     )
 }
@@ -1705,17 +1863,46 @@ fn evaluate_investigate(
 ) -> EvaluationParts {
     let uncertainty = context.drives.certainty.activation;
     let frustration = interpretation.stalled_goal_frustration;
-    let action = if interpretation.target.is_some() {
-        ActionPrimitive::Inspect {
-            target: InspectTarget::Sound,
-        }
-    } else {
-        ActionPrimitive::Inspect {
-            target: InspectTarget::Novelty,
-        }
-    };
+    let question = context.world.epistemic.most_important_question();
+    let epistemic_pressure = question
+        .map(|question| question.importance * question.current_uncertainty)
+        .unwrap_or(0.0);
+    let mut affordances = question
+        .map(|question| {
+            context
+                .world
+                .epistemic
+                .affordances_for(&question.question_id)
+                .filter(|affordance| affordance.available)
+                .map(conductor_epistemic_affordance)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if affordances.is_empty() {
+        affordances.push(affordance(
+            "gather_evidence",
+            if interpretation.target.is_some() {
+                ActionPrimitive::Inspect {
+                    target: InspectTarget::Sound,
+                }
+            } else {
+                ActionPrimitive::Inspect {
+                    target: InspectTarget::Novelty,
+                }
+            },
+            (1.0 - uncertainty).max(0.3),
+            0.45,
+            0.6,
+            interpretation.danger * 0.25,
+            0.05,
+            750,
+            interpretation.target.clone(),
+            &interpretation.provenance,
+        ));
+    }
     (
-        (0.65 * uncertainty
+        (0.50 * uncertainty
+            + 0.55 * epistemic_pressure
             + 0.25
                 * context
                     .world
@@ -1729,23 +1916,93 @@ fn evaluate_investigate(
             .clamp(0.0, 1.0),
         (0.25 + frustration * 0.5).clamp(0.0, 1.0),
         context.drives.certainty.satisfaction,
-        vec![affordance(
-            "gather_evidence",
-            action,
-            (1.0 - uncertainty).max(0.3),
-            0.45,
-            0.6,
-            interpretation.danger * 0.25,
-            0.05,
-            750,
-            interpretation.target.clone(),
-            &interpretation.provenance,
-        )],
+        affordances,
         vec![
             contribution("drive.certainty", uncertainty),
+            contribution("world.epistemic.question_pressure", epistemic_pressure),
             contribution("self.stalled_goal", frustration),
         ],
     )
+}
+
+fn conductor_epistemic_affordance(source: &EpistemicAffordance) -> Affordance {
+    let inspect_target = if source.affected_belief.0.contains("charger") {
+        InspectTarget::Charger
+    } else if source.affected_belief.0.contains("person") {
+        InspectTarget::Person
+    } else if source.affected_belief.0.contains("sound") {
+        InspectTarget::Sound
+    } else {
+        InspectTarget::Novelty
+    };
+    let (action, skill) = match source.action_kind {
+        EpistemicActionKind::OrientToBearing if source.bearing_rad.is_some() => (
+            ActionPrimitive::Turn {
+                direction: if source.bearing_rad.unwrap_or_default() >= 0.0 {
+                    TurnDir::Left
+                } else {
+                    TurnDir::Right
+                },
+                intensity: 0.3,
+                duration_ms: source.duration_ms,
+            },
+            Some(SkillId::TurnTowardTarget),
+        ),
+        EpistemicActionKind::SystematicSearch => (
+            ActionPrimitive::Explore {
+                style: ExploreStyle::WallFollow,
+                duration_ms: source.duration_ms,
+            },
+            Some(SkillId::SystematicSearch),
+        ),
+        EpistemicActionKind::ScanClearance => (
+            ActionPrimitive::Inspect {
+                target: InspectTarget::Novelty,
+            },
+            Some(SkillId::InspectTarget),
+        ),
+        EpistemicActionKind::Listen => (
+            ActionPrimitive::Inspect {
+                target: InspectTarget::Sound,
+            },
+            Some(SkillId::InspectTarget),
+        ),
+        EpistemicActionKind::AskPerson => (
+            ActionPrimitive::Speak {
+                text: "Hello. What should I call you?".to_string(),
+            },
+            None,
+        ),
+        EpistemicActionKind::StopAndObserve | EpistemicActionKind::ComparePrediction => {
+            (ActionPrimitive::Stop, Some(SkillId::StopAndStabilize))
+        }
+        EpistemicActionKind::InspectTarget
+        | EpistemicActionKind::OrientToBearing
+        | EpistemicActionKind::Unknown => (
+            ActionPrimitive::Inspect {
+                target: inspect_target,
+            },
+            Some(SkillId::InspectTarget),
+        ),
+    };
+    let mut result = affordance(
+        &source.behavior_id,
+        action,
+        source.confidence,
+        source.expected_information_gain,
+        source.expected_information_gain,
+        source.risk,
+        source.energy_cost,
+        source.duration_ms,
+        source.target.clone(),
+        &[],
+    )
+    .with_bearing(source.bearing_rad)
+    .with_epistemic(source);
+    if let Some(skill) = skill {
+        result = result.with_skill(skill, None);
+    }
+    result
 }
 
 fn evaluate_follow_task(
@@ -2022,6 +2279,8 @@ struct PendingOutcome {
     start_pose: (f32, f32),
     start_target_distance_m: Option<f32>,
     target: Option<EntityId>,
+    epistemic_question_id: Option<QuestionId>,
+    start_uncertainty: Option<f32>,
 }
 
 pub struct GoalSystem {
@@ -2203,6 +2462,35 @@ impl GoalSystem {
             strategy_failure_pressure: active_status
                 .map(|status| status.frustration)
                 .unwrap_or(0.0),
+            temporal_expectations: self
+                .pending
+                .iter()
+                .map(|pending| PendingTemporalExpectation {
+                    subject: format!("behavior:{}", pending.behavior_id),
+                    expected_interval: TimeInterval {
+                        domain: ClockDomain::Predicted,
+                        start_ms: pending.started_at_ms,
+                        end_ms: Some(
+                            pending
+                                .started_at_ms
+                                .saturating_add(pending.expected_duration_ms),
+                        ),
+                        uncertainty_ms: pending.expected_duration_ms / 4,
+                    },
+                    confidence: pending.expected_progress,
+                    provenance: Vec::new(),
+                })
+                .collect(),
+            epistemic_attempt: self.pending.as_ref().and_then(|pending| {
+                pending
+                    .epistemic_question_id
+                    .as_ref()
+                    .map(|question_id| EpistemicAttempt {
+                        question_id: question_id.clone(),
+                        behavior_id: pending.behavior_id.clone(),
+                        started_at_ms: pending.started_at_ms,
+                    })
+            }),
             ..WorldModelUpdateContext::default()
         }
     }
@@ -2297,19 +2585,25 @@ impl GoalSystem {
                 })
                 .unwrap_or(true);
             if begins_new_attempt {
-                let progress_metric = match decision
-                    .affordance
-                    .skill_request
-                    .as_ref()
-                    .map(|request| request.skill_id)
-                {
-                    Some(
-                        SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading,
-                    ) => "bearing_error",
-                    Some(SkillId::ApproachTarget | SkillId::AlignWithDock) => "target_distance",
-                    Some(SkillId::BackAway) => "reverse_displacement",
-                    Some(_) => "skill_specific",
-                    None => "world_displacement",
+                let progress_metric = if decision.affordance.epistemic_question_id.is_some() {
+                    "uncertainty_reduction"
+                } else {
+                    match decision
+                        .affordance
+                        .skill_request
+                        .as_ref()
+                        .map(|request| request.skill_id)
+                    {
+                        Some(
+                            SkillId::TurnTowardTarget
+                            | SkillId::FollowBearing
+                            | SkillId::HoldHeading,
+                        ) => "bearing_error",
+                        Some(SkillId::ApproachTarget | SkillId::AlignWithDock) => "target_distance",
+                        Some(SkillId::BackAway) => "reverse_displacement",
+                        Some(_) => "skill_specific",
+                        None => "world_displacement",
+                    }
                 };
                 self.goals[index].runtime_mut().progress_expectation = Some(ProgressExpectation {
                     behavior_id: decision.behavior_id.clone(),
@@ -2333,6 +2627,17 @@ impl GoalSystem {
                         .and_then(|id| world.entities.get(id))
                         .and_then(|entity| entity.distance_m),
                     target: decision.affordance.target.clone(),
+                    epistemic_question_id: decision.affordance.epistemic_question_id.clone(),
+                    start_uncertainty: decision.affordance.epistemic_question_id.as_ref().and_then(
+                        |question_id| {
+                            world
+                                .epistemic
+                                .active_questions
+                                .iter()
+                                .find(|question| &question.question_id == question_id)
+                                .map(|question| question.current_uncertainty)
+                        },
+                    ),
                 });
             }
             Some(decision)
@@ -2365,10 +2670,35 @@ impl GoalSystem {
             .and_then(|entity| entity.distance_m)
             .zip(pending.start_target_distance_m)
             .map(|(current, start)| ((start - current) / start.max(0.1)).clamp(0.0, 1.0));
+        let epistemic_progress = pending
+            .epistemic_question_id
+            .as_ref()
+            .zip(pending.start_uncertainty)
+            .map(|(question_id, start)| {
+                let current = world
+                    .epistemic
+                    .active_questions
+                    .iter()
+                    .find(|question| &question.question_id == question_id)
+                    .map(|question| question.current_uncertainty)
+                    .or_else(|| {
+                        world
+                            .epistemic
+                            .recent_outcomes
+                            .iter()
+                            .rev()
+                            .find(|outcome| &outcome.question_id == question_id)
+                            .map(|outcome| outcome.uncertainty_after)
+                    })
+                    .unwrap_or(0.0);
+                ((start - current) / start.max(0.01)).clamp(0.0, 1.0)
+            });
         let observed = if pending.behavior_id == "dock" && world.self_model.charging {
             1.0
         } else {
-            target_progress.unwrap_or(movement_progress)
+            epistemic_progress
+                .or(target_progress)
+                .unwrap_or(movement_progress)
         };
         let attempt_finished = elapsed >= pending.expected_duration_ms
             || (pending.behavior_id == "dock" && world.self_model.charging);
@@ -2664,6 +2994,8 @@ mod tests {
         assert_eq!(behavior.goal_id, GoalId::new("seek_charger"));
         assert_eq!(behavior.behavior_id, "systematic_charger_search");
         assert!(matches!(behavior.action, ActionPrimitive::Explore { .. }));
+        assert!(behavior.affordance.epistemic_question_id.is_some());
+        assert!(behavior.affordance.expected_information_gain > 0.0);
     }
 
     #[test]
@@ -3132,6 +3464,107 @@ mod tests {
         assert_eq!(
             cycle.behavior.unwrap().behavior_id,
             "systematic_charger_search"
+        );
+    }
+
+    #[test]
+    fn investigate_publishes_three_targeted_information_gathering_behaviors() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 1.0;
+        let cycle = tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_000, body));
+        let investigate = cycle
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("investigate"))
+            .unwrap();
+        let available = investigate
+            .competence
+            .affordances
+            .iter()
+            .filter(|affordance| affordance.available)
+            .collect::<Vec<_>>();
+        assert!(available.len() >= 3);
+        for expected in ["scan_clearance", "inspect_path", "stop_and_observe_path"] {
+            let affordance = available
+                .iter()
+                .find(|affordance| affordance.behavior_id == expected)
+                .unwrap();
+            assert!(affordance.epistemic_question_id.is_some());
+            assert!(affordance.expected_information_gain > 0.0);
+        }
+    }
+
+    #[test]
+    fn social_goal_uses_shared_identity_beliefs_for_its_greeting() {
+        let mut uncertain_updater = WorldModelUpdater::default();
+        let mut uncertain_now = Now::blank(1_000, BodySense::default());
+        uncertain_now.objects.observations.push(ObjectObservation {
+            label: "person".to_string(),
+            class: ObjectClass::Person,
+            bearing_rad: 0.0,
+            distance_m: Some(0.6),
+            confidence: 0.9,
+            source: ObjectObservationSource::Kinect,
+        });
+        let uncertain_world = uncertain_updater
+            .update(uncertain_now, WorldModelUpdateContext::default())
+            .world;
+        let mut uncertain_system = GoalSystem::default();
+        let uncertain = uncertain_system.tick(&uncertain_world, &[]).unwrap();
+        let uncertain_social = uncertain
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("socialize"))
+            .unwrap();
+        assert_eq!(
+            uncertain_social.competence.affordances[0].action,
+            Some(ActionPrimitive::Speak {
+                text: "Hello. What should I call you?".to_string()
+            })
+        );
+
+        let mut known_updater = WorldModelUpdater::default();
+        let mut known_now = Now::blank(1_000, BodySense::default());
+        known_now.objects.observations.push(ObjectObservation {
+            label: "Alex".to_string(),
+            class: ObjectClass::Person,
+            bearing_rad: 0.0,
+            distance_m: Some(0.6),
+            confidence: 0.9,
+            source: ObjectObservationSource::Kinect,
+        });
+        let known_world = known_updater
+            .update(known_now, WorldModelUpdateContext::default())
+            .world;
+        let mut known_system = GoalSystem::default();
+        let known = known_system.tick(&known_world, &[]).unwrap();
+        let known_social = known
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("socialize"))
+            .unwrap();
+        assert_eq!(
+            known_social.competence.affordances[0].action,
+            Some(ActionPrimitive::Speak {
+                text: "Hello, Alex.".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn behavior_expectations_use_the_predicted_clock_domain() {
+        let mut system = GoalSystem::default();
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.battery_level = 0.05;
+        tick_with_canonical_world(&mut system, &mut updater, Now::blank(1_000, body));
+        let context = system.world_model_update_context();
+        assert_eq!(context.temporal_expectations.len(), 1);
+        assert_eq!(
+            context.temporal_expectations[0].expected_interval.domain,
+            ClockDomain::Predicted
         );
     }
 }

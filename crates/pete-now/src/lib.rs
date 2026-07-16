@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub mod beliefs;
+pub mod epistemic;
+pub mod social;
+pub mod temporal;
 
 pub use beliefs::{
     ActiveControlSummary, AgencyState, AuthorityBelief, Belief, BeliefMeta, BeliefSourceKind,
@@ -20,6 +23,23 @@ pub use beliefs::{
     LocalGeometrySnapshot, MotivationSummary, OrganismId, ProcessId, ReachabilityEstimate,
     SelfBodyBelief, SelfModelSnapshot, SessionId, StuckTrapKind, WorldEntity, WorldEntityKind,
     WorldModelSnapshot, WorldModelUpdateContext, WorldModelUpdater, WorldPose,
+};
+pub use epistemic::{
+    BeliefRef, EpistemicActionKind, EpistemicAffordance, EpistemicAttempt, EpistemicMetrics,
+    EpistemicOutcome, EpistemicQuestion, EpistemicQuestionFamily, EpistemicSnapshot, HypothesisRef,
+    QuestionId,
+};
+pub use social::{
+    AttentionBelief, CommunicationProfile, ContextRef, ConversationTurnRef, IdentityHypothesis,
+    IdentityModality, InteractionId, InteractionPhase, InteractionRef, InteractionState, PersonId,
+    PersonModel, PresenceBelief, RelationshipId, RelationshipKind, RelationshipKindBelief,
+    RelationshipModel, RequestRef, ScopedSocialAuthorityBelief, SocialCommitment,
+    SocialWorldSnapshot, SpatialBelief,
+};
+pub use temporal::{
+    ClockDomain, Episode, EpisodeClosureReason, EpisodeId, EpisodeKind, PendingTemporalExpectation,
+    TemporalBelief, TemporalContext, TemporalRelation, TimeInterval, TimedPrediction,
+    TypedTimestamp,
 };
 
 pub type ExtensionMap = BTreeMap<String, Value>;
@@ -886,7 +906,7 @@ impl Now {
             t_ms,
             body,
             world: WorldModelSnapshot {
-                schema_version: 1,
+                schema_version: 2,
                 t_ms,
                 ..WorldModelSnapshot::default()
             },

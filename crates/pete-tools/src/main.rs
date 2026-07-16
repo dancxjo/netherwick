@@ -15963,6 +15963,8 @@ mod tests {
                 100,
             ),
             chosen_action: Some(action),
+            skill_request: None,
+            skill_status: None,
             recall: Default::default(),
             llm: Default::default(),
             combobulation: None,

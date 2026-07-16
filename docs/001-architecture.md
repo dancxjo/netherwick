@@ -16,6 +16,12 @@ coordinate-frame, and provenance semantics. Consumers do not build parallel
 sensor-derived mini-world-models. See
 [020-now-world-model.md](020-now-world-model.md).
 
+The world model also owns bounded temporal context, persistent uncertain social
+beliefs, and explicit epistemic questions. Goals consume these shared regions:
+they do not infer social identity or temporal meaning privately, and curiosity
+is rewarded by measured belief improvement rather than novelty alone. See
+[023-temporal-social-epistemic-cognition.md](023-temporal-social-epistemic-cognition.md).
+
 Optional learned or compute-heavy faculties are role-neutral cognitive
 providers, not parts of PETE's identity. The organism runtime sends bounded,
 deadline-bearing requests and continues its control tick without waiting;

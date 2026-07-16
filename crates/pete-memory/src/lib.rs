@@ -10,11 +10,11 @@ use pete_experience::{
 };
 use pete_ledger::{ExperienceFrame, ExperienceTransition};
 use pete_now::{
-    AsrSense, EarSense, EyeFrame, EyeFrameFormat, GraphEdge, GraphEntity, KinectJointSense,
-    KinectSense, KinectSkeletonSense, MemorySense, Now, ObjectClass, ObjectObservation,
-    ObjectObservationSource, RangeSense, RecallHit, SurpriseSense, VectorArtifact,
-    FACE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
-    VOICE_VECTOR_COLLECTION,
+    AsrSense, EarSense, Episode, EpisodeKind, EpistemicSnapshot, EyeFrame, EyeFrameFormat,
+    GraphEdge, GraphEntity, InteractionState, KinectJointSense, KinectSense, KinectSkeletonSense,
+    MemorySense, Now, ObjectClass, ObjectObservation, ObjectObservationSource, PersonId,
+    RangeSense, RecallHit, SocialWorldSnapshot, SurpriseSense, TemporalContext, VectorArtifact,
+    FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -8120,6 +8120,12 @@ pub struct MemoryRecord {
     pub chosen_action: Option<ActionPrimitive>,
     pub warning: Option<String>,
     pub experience: Option<Experience>,
+    #[serde(default)]
+    pub temporal_context: TemporalContext,
+    #[serde(default)]
+    pub social_world: SocialWorldSnapshot,
+    #[serde(default)]
+    pub epistemic_state: EpistemicSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -9601,6 +9607,35 @@ impl InMemoryExperienceStore {
     pub fn entity_report(&self) -> EntityMemoryReport {
         self.entity_snapshot().report()
     }
+
+    pub fn last_social_interaction(&self, person_id: &PersonId) -> Option<InteractionState> {
+        self.records
+            .lock()
+            .expect("memory mutex poisoned")
+            .iter()
+            .rev()
+            .find_map(|record| {
+                record
+                    .social_world
+                    .active_interaction
+                    .iter()
+                    .chain(record.social_world.recent_interactions.iter().rev())
+                    .find(|interaction| interaction.participants.contains(person_id))
+                    .cloned()
+            })
+    }
+
+    pub fn completed_episodes(&self, kind: EpisodeKind) -> Vec<Episode> {
+        let mut episodes = BTreeMap::new();
+        for record in self.records.lock().expect("memory mutex poisoned").iter() {
+            for episode in &record.temporal_context.recently_completed {
+                if episode.kind == kind {
+                    episodes.insert(episode.episode_id.clone(), episode.clone());
+                }
+            }
+        }
+        episodes.into_values().collect()
+    }
 }
 
 #[async_trait]
@@ -10037,6 +10072,9 @@ pub fn memory_record_from_frame(frame: &ExperienceFrame) -> Result<MemoryRecord>
         chosen_action: frame.chosen_action.clone(),
         warning,
         experience: linked_experiences.last().cloned(),
+        temporal_context: frame.now.world.temporal.clone(),
+        social_world: frame.now.world.social.clone(),
+        epistemic_state: frame.now.world.epistemic.clone(),
     })
 }
 
@@ -10947,6 +10985,14 @@ fn graph_context_from_frame(
         None,
     ));
 
+    append_world_model_memory(
+        &frame.now.world.social,
+        &frame.now.world.temporal,
+        &experience_id,
+        &mut entities,
+        &mut relationships,
+    );
+
     for artifact in scene_vectors {
         let vector_id = vector_node_id(artifact);
         entities.push(vector_entity(artifact, "scene"));
@@ -11183,6 +11229,170 @@ fn graph_context_from_frame(
         dedupe_entities(entities, usize::MAX),
         dedupe_relationships(relationships, usize::MAX),
     )
+}
+
+fn append_world_model_memory(
+    social: &SocialWorldSnapshot,
+    temporal: &TemporalContext,
+    experience_id: &str,
+    entities: &mut Vec<GraphEntity>,
+    relationships: &mut Vec<GraphEdge>,
+) {
+    for person in social.people.values() {
+        let name = person
+            .preferred_name
+            .as_ref()
+            .map(|name| name.value.as_str())
+            .or_else(|| {
+                person
+                    .best_identity()
+                    .and_then(|identity| identity.display_name.as_deref())
+            })
+            .unwrap_or("unknown person");
+        entities.push(GraphEntity {
+            id: person.person_id.0.clone(),
+            labels: vec![
+                "Person".to_string(),
+                "SocialPersonBelief".to_string(),
+                "Entity".to_string(),
+            ],
+            summary: format!("social belief about {name}"),
+            score: person.current_identity_confidence,
+        });
+        relationships.push(GraphEdge {
+            from: experience_id.to_string(),
+            to: person.person_id.0.clone(),
+            relationship: if person.presence.present {
+                "INTERACTED_WITH_OR_OBSERVED".to_string()
+            } else {
+                "REMEMBERS_PERSON".to_string()
+            },
+            summary: Some(format!(
+                "presence={} identity_confidence={:.3}",
+                person.presence.present, person.current_identity_confidence
+            )),
+            score: person
+                .presence
+                .confidence
+                .max(person.current_identity_confidence),
+            payload: json!({
+                "present": person.presence.present,
+                "presence_freshness": person.presence.freshness,
+                "last_seen_at_ms": person.presence.last_seen_at_ms,
+                "identity_hypotheses": person.identity_hypotheses,
+            }),
+        });
+    }
+
+    for relationship in social.relationships.values() {
+        let relationship_id = format!("relationship:{}", relationship.relationship_id.0);
+        let confidence = relationship
+            .relationship_kinds
+            .iter()
+            .map(|kind| kind.confidence)
+            .fold(0.0f32, f32::max);
+        entities.push(GraphEntity {
+            id: relationship_id.clone(),
+            labels: vec!["Relationship".to_string(), "SocialBelief".to_string()],
+            summary: format!("relationship belief for {}", relationship.person_id.0),
+            score: confidence,
+        });
+        relationships.push(GraphEdge {
+            from: relationship_id,
+            to: relationship.person_id.0.clone(),
+            relationship: "RELATES_TO_PERSON".to_string(),
+            summary: Some(format!(
+                "trust={:.3} affiliation={:.3}",
+                relationship.trust, relationship.affiliation
+            )),
+            score: confidence,
+            payload: json!({
+                "relationship_kinds": relationship.relationship_kinds,
+                "trust": relationship.trust,
+                "affiliation": relationship.affiliation,
+                "authority": relationship.caregiving_or_authority,
+            }),
+        });
+    }
+
+    for interaction in social
+        .recent_interactions
+        .iter()
+        .chain(social.active_interaction.iter())
+    {
+        let interaction_id = interaction.interaction_id.0.clone();
+        entities.push(GraphEntity {
+            id: interaction_id.clone(),
+            labels: vec!["Interaction".to_string(), "Episode".to_string()],
+            summary: format!("social interaction in phase {:?}", interaction.phase),
+            score: 1.0,
+        });
+        relationships.push(GraphEdge {
+            from: experience_id.to_string(),
+            to: interaction_id.clone(),
+            relationship: "HAS_SOCIAL_INTERACTION".to_string(),
+            summary: None,
+            score: 1.0,
+            payload: json!({
+                "started_at_ms": interaction.started_at_ms,
+                "last_activity_ms": interaction.last_activity_ms,
+                "ended_at_ms": interaction.ended_at_ms,
+                "phase": interaction.phase,
+            }),
+        });
+        for participant in &interaction.participants {
+            relationships.push(graph_edge(
+                interaction_id.clone(),
+                participant.0.clone(),
+                "HAS_PARTICIPANT",
+                None,
+            ));
+        }
+    }
+
+    for episode in temporal
+        .recently_completed
+        .iter()
+        .chain(temporal.active_episodes.iter())
+    {
+        let episode_id = episode.episode_id.0.clone();
+        entities.push(GraphEntity {
+            id: episode_id.clone(),
+            labels: vec!["Episode".to_string(), format!("{:?}", episode.kind)],
+            summary: format!("{:?} episode", episode.kind),
+            score: episode.confidence,
+        });
+        relationships.push(GraphEdge {
+            from: experience_id.to_string(),
+            to: episode_id.clone(),
+            relationship: "HAS_TEMPORAL_EPISODE".to_string(),
+            summary: episode.closure_reason.map(|reason| format!("{reason:?}")),
+            score: episode.confidence,
+            payload: json!({
+                "clock_domain": episode.interval.domain,
+                "start_ms": episode.interval.start_ms,
+                "end_ms": episode.interval.end_ms,
+                "active_goals": episode.active_goals,
+                "significant_events": episode.significant_events,
+            }),
+        });
+        for participant in &episode.participants {
+            relationships.push(graph_edge(
+                episode_id.clone(),
+                participant.0.clone(),
+                "HAS_PARTICIPANT",
+                None,
+            ));
+        }
+        for preceding in &episode.preceding_episode_refs {
+            relationships.push(graph_edge(
+                episode_id.clone(),
+                preceding.0.clone(),
+                "FOLLOWS_EPISODE",
+                None,
+            ));
+        }
+    }
 }
 
 fn place_id_for_pose(pose: Pose2) -> String {
@@ -12653,8 +12863,10 @@ mod tests {
     };
     use pete_ledger::ExperienceFrame;
     use pete_now::{
-        FaceSense, ObjectClass, ObjectObservation, ObjectObservationSource, SurpriseSense,
-        VectorArtifact, FACE_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, VOICE_VECTOR_COLLECTION,
+        EpisodeKind, FaceSense, ObjectClass, ObjectObservation, ObjectObservationSource, PersonId,
+        SurpriseSense, VectorArtifact, WorldModelUpdateContext, WorldModelUpdater,
+        FACE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
+        VOICE_VECTOR_COLLECTION,
     };
 
     fn empty_frame(now: Now) -> ExperienceFrame {
@@ -12681,6 +12893,53 @@ mod tests {
             counterfactuals: Vec::new(),
             notes: vec!["saw a familiar person".to_string()],
         }
+    }
+
+    #[tokio::test]
+    async fn durable_records_preserve_temporal_and_social_world_models() {
+        let mut updater = WorldModelUpdater::default();
+        let mut present = Now::blank(0, BodySense::default());
+        present.body.charging = true;
+        present.objects.observations.push(ObjectObservation {
+            label: "Alex".to_string(),
+            class: ObjectClass::Person,
+            bearing_rad: 0.1,
+            distance_m: Some(0.8),
+            confidence: 0.9,
+            source: ObjectObservationSource::Kinect,
+        });
+        updater.update(present, WorldModelUpdateContext::default());
+
+        let closed = updater.update(
+            Now::blank(2_000, BodySense::default()),
+            WorldModelUpdateContext::default(),
+        );
+        let frame = empty_frame(closed);
+        let store = InMemoryExperienceStore::new();
+        store.store(&frame).await.unwrap();
+
+        assert_eq!(store.completed_episodes(EpisodeKind::Charging).len(), 1);
+        let person_id = PersonId("person:alex".to_string());
+        assert!(store.last_social_interaction(&person_id).is_some());
+        let record = store.snapshot().pop().unwrap();
+        assert!(record.social_world.people.contains_key(&person_id));
+        assert!(record
+            .temporal_context
+            .recently_completed
+            .iter()
+            .any(|episode| episode.kind == EpisodeKind::Conversation));
+        assert!(record
+            .graph_entities
+            .iter()
+            .any(|entity| { entity.id == person_id.0 && entity.has_label("SocialPersonBelief") }));
+        assert!(record
+            .graph_entities
+            .iter()
+            .any(|entity| entity.has_label("Charging")));
+        assert!(record
+            .graph_relationships
+            .iter()
+            .any(|relationship| { relationship.relationship == "HAS_TEMPORAL_EPISODE" }));
     }
 
     fn test_cluster(
@@ -14017,6 +14276,9 @@ mod tests {
             chosen_action: None,
             warning: None,
             experience: None,
+            temporal_context: TemporalContext::default(),
+            social_world: SocialWorldSnapshot::default(),
+            epistemic_state: EpistemicSnapshot::default(),
         };
 
         store.upsert_vectors(&record).await.expect("upsert vectors");
@@ -14074,6 +14336,9 @@ mod tests {
             chosen_action: None,
             warning: None,
             experience: None,
+            temporal_context: TemporalContext::default(),
+            social_world: SocialWorldSnapshot::default(),
+            epistemic_state: EpistemicSnapshot::default(),
         };
 
         let params = neo4j_relationship_params(&record);
@@ -14281,7 +14546,11 @@ mod tests {
     fn social_update_increases_social_score() {
         let mut memory = PlaceMemory::new();
         let mut now = now_at(100, 1.0, 1.0);
-        now.face.vectors.push(VectorArtifact::new(FACE_VECTOR_COLLECTION, "face-social", vec![1.0, 0.0]));
+        now.face.vectors.push(VectorArtifact::new(
+            FACE_VECTOR_COLLECTION,
+            "face-social",
+            vec![1.0, 0.0],
+        ));
 
         let features = memory.observe_now(&now);
 

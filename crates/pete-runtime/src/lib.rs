@@ -3448,6 +3448,18 @@ where
             "self_model".to_string(),
             serde_json::to_value(&now.world.self_model)?,
         );
+        now.extensions.insert(
+            "temporal_context".to_string(),
+            serde_json::to_value(&now.world.temporal)?,
+        );
+        now.extensions.insert(
+            "social_world".to_string(),
+            serde_json::to_value(&now.world.social)?,
+        );
+        now.extensions.insert(
+            "epistemic_state".to_string(),
+            serde_json::to_value(&now.world.epistemic)?,
+        );
         let goal_cycle = self.goal_system.tick(&now.world, &proposals)?;
         now.drives = goal_cycle.drives.legacy_sense();
         let goal_action = goal_cycle
@@ -12807,6 +12819,8 @@ mod tests {
         assert!(transitions.iter().any(|transition| {
             transition.before.body.odometry.x_m != transition.after.body.odometry.x_m
                 || transition.before.body.odometry.y_m != transition.after.body.odometry.y_m
+                || transition.before.body.odometry.heading_rad
+                    != transition.after.body.odometry.heading_rad
         }));
     }
 
