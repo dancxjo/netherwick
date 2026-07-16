@@ -34,6 +34,8 @@ pub struct CaptureManifest {
     pub notes: Vec<String>,
     #[serde(default)]
     pub machine: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_identity: Option<Value>,
     #[serde(default)]
     pub command_args: Vec<String>,
     #[serde(default)]
@@ -137,6 +139,7 @@ impl CaptureWriter {
             tick_ms,
             notes: Vec::new(),
             machine: None,
+            firmware_identity: None,
             command_args: Vec::new(),
             device_availability: Value::Null,
             streams: CaptureStreams::default(),
@@ -744,6 +747,7 @@ mod tests {
             tick_ms: Some(100),
             notes: vec!["small and sturdy".to_string()],
             machine: None,
+            firmware_identity: Some(serde_json::json!({"build_id": "0.1.7+g1a2b3c4"})),
             command_args: Vec::new(),
             device_availability: Value::Null,
             streams: CaptureStreams::default(),

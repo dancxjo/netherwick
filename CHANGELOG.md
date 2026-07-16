@@ -14,6 +14,12 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add bounded Pico W AP-local ICMPv4 echo replies with IPv4/ICMP validation,
+  four-per-second rate limiting, status diagnostics, parser coverage, and a
+  ping bring-up check; ICMP remains isolated from routing and robot hardware.
+- Embed reproducible Brainstem firmware build identity from Git or explicit CI
+  overrides, expose it across status/capability/operator surfaces, and record
+  it in physical capture manifests.
 - Add a host-aware control-path failover state machine and deterministic
   failure-injection matrix that preserve motherbrain control across forebrain
   link loss, change motherbrain transport without changing its role, require a

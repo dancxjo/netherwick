@@ -89,7 +89,7 @@ Hardware details stay inside `arch/` and `drivers/`. Body-owned capability facts
 On Pico W, concurrency is split by ownership:
 
 - The safety/runtime lane owns Create UART writes, motor stop, Power Toggle, BRC, and robot LEDs.
-- The Wi-Fi/HTTP lane owns CYW43, AP setup, TCP, UDP, HTTP, and mDNS only.
+- The Wi-Fi/HTTP lane owns CYW43, AP setup, bounded local ICMP echo, TCP, UDP, HTTP, and mDNS only.
 - Wi-Fi never receives robot GPIO/UART handles and cannot directly move motors or toggle Create power.
 - HTTP `/status.json` serializes a copied `BrainstemStatus` snapshot and does not hold shared state while writing TCP responses.
 - The runtime is tick-driven: each tick polls UART, enforces drive deadlines, advances at most one active action, and sends Stop on drive timeout or UART gating failure.
@@ -385,7 +385,16 @@ The interface exposes the body-neutral brainstem surface:
 - UDP control is available on port `82` using the same ASCII line format as forebrain UART.
 - `http://pete.local/` and `http://pete.local/status.json` may work on clients that support mDNS on the AP network.
 
-The status JSON includes firmware name/version, body name/kind, uptime, runtime state, body/Create diagnostic state, UART RX health, last UART packet timestamp, current command, command lifecycle ids, event sequence, last error, body state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, forebrain UART status, sensor state, battery state, song state, and odometry accumulator state.
+Associated AP clients may use `ping -c 4 192.168.4.1` as the first network
+bring-up check. The Pico W replies only to valid IPv4 ICMP echo requests
+addressed to `192.168.4.1`, preserving the identifier, sequence, and payload.
+It silently drops malformed, fragmented, unsupported, unowned, oversized, or
+rate-limited traffic; replies are capped at four per second and do not create a
+route, bridge, NAT path, or any path to robot hardware.
+
+The status JSON includes firmware name/version plus immutable build identity (`git_commit`, `git_commit_short`, `git_dirty`, `build_timestamp`, profile, target, backend, and `build_id`), body name/kind, uptime, runtime state, body/Create diagnostic state, UART RX health, last UART packet timestamp, current command, command lifecycle ids, event sequence, last error, body state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, ICMP echo request/reply/dropped/rate-limited counters, forebrain UART status, sensor state, battery state, song state, and odometry accumulator state. `get_capabilities` reports the same identity in JSON and the compact UART/UDP response.
+
+Build identity is derived at compile time. Local builds use the exact Git `HEAD` and mark `git_dirty=true` when tracked changes are present. Cargo watches Git refs, index, and tracked sources so a branch/commit or dirty-state change does not reuse an old identity. Exported-source and CI builds can set `PETE_GIT_COMMIT`, `PETE_GIT_DIRTY` (`true`/`false`), and `PETE_BUILD_TIMESTAMP`; `SOURCE_DATE_EPOCH` is used when no explicit timestamp is supplied. Without Git metadata or an override, the identity visibly reports `unknown`. The timestamp defaults to `unknown`, keeping otherwise identical builds reproducible.
 
 The crate keeps local self-signed certificate material out of version control under:
 

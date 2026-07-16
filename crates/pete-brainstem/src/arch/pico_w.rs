@@ -10,6 +10,7 @@ use embassy_net::{
     Config as NetConfig, HardwareAddress, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Stack,
     StackResources,
 };
+use embassy_net_driver::{Driver as NetDriver, RxToken as _, TxToken as _};
 use embassy_rp::gpio::{Input, Level, Output, OutputOpenDrain, Pull};
 use embassy_rp::i2c::{
     Async as I2cAsync, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler,
@@ -43,6 +44,9 @@ use crate::commands::{
 use crate::dhcp::{DhcpClient, DhcpGrant, DhcpLeaseState, DhcpRequest, DHCP_LEASE_SECONDS};
 use crate::drivers::imu::{decode_mpu6050_sample, ImuHealth};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
+use crate::icmp::{
+    process_icmp_echo_frame, IcmpEchoDisposition, IcmpRateLimit, NETWORK_FRAME_CAPACITY,
+};
 use crate::network_registry;
 use crate::runtime::Runtime;
 use crate::session;
@@ -89,6 +93,118 @@ static BRAINSTEM_INSTANCE_ID: AtomicU32 = AtomicU32::new(0);
 static BRAINSTEM_BOOT_ID: AtomicU32 = AtomicU32::new(0);
 static AUTHORITY_GENERATION: AtomicU32 = AtomicU32::new(0);
 static SERVICE_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// A narrow device-level ICMP responder. It has no route, socket, or robot
+/// handles: it only consumes bounded IPv4 echo requests addressed to the AP.
+struct IcmpEchoDevice<'a> {
+    inner: cyw43::NetDriver<'a>,
+    inbound: [u8; NETWORK_FRAME_CAPACITY],
+    rate_limit: IcmpRateLimit,
+}
+
+impl<'a> IcmpEchoDevice<'a> {
+    fn new(inner: cyw43::NetDriver<'a>) -> Self {
+        Self {
+            inner,
+            inbound: [0; NETWORK_FRAME_CAPACITY],
+            rate_limit: IcmpRateLimit::new(),
+        }
+    }
+}
+
+struct StagedRxToken<'a> {
+    frame: &'a mut [u8],
+}
+
+impl embassy_net_driver::RxToken for StagedRxToken<'_> {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        f(self.frame)
+    }
+}
+
+impl<'d> NetDriver for IcmpEchoDevice<'d> {
+    type RxToken<'a>
+        = StagedRxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = <cyw43::NetDriver<'d> as NetDriver>::TxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(
+        &mut self,
+        cx: &mut core::task::Context,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let (inner, inbound, rate_limit) =
+            (&mut self.inner, &mut self.inbound, &mut self.rate_limit);
+        let (rx, tx) = inner.receive(cx)?;
+        let len = rx.consume(|frame| {
+            if frame.len() > inbound.len() {
+                None
+            } else {
+                inbound[..frame.len()].copy_from_slice(frame);
+                Some(frame.len())
+            }
+        });
+        let len = match len {
+            Some(len) => len,
+            None => {
+                status::mark_icmp_dropped();
+                return None;
+            }
+        };
+
+        match process_icmp_echo_frame(
+            &mut inbound[..len],
+            Instant::now().as_millis() as u64,
+            rate_limit,
+        ) {
+            IcmpEchoDisposition::NotIcmp => Some((
+                StagedRxToken {
+                    frame: &mut inbound[..len],
+                },
+                tx,
+            )),
+            IcmpEchoDisposition::Reply(reply_len) => {
+                status::mark_icmp_echo_request();
+                tx.consume(reply_len, |reply| {
+                    reply.copy_from_slice(&inbound[..reply_len])
+                });
+                status::mark_icmp_echo_reply();
+                None
+            }
+            IcmpEchoDisposition::RateLimited => {
+                status::mark_icmp_echo_request();
+                status::mark_icmp_rate_limited();
+                None
+            }
+            IcmpEchoDisposition::Dropped => {
+                status::mark_icmp_dropped();
+                None
+            }
+        }
+    }
+
+    fn transmit(&mut self, cx: &mut core::task::Context) -> Option<Self::TxToken<'_>> {
+        self.inner.transmit(cx)
+    }
+
+    fn link_state(&mut self, cx: &mut core::task::Context) -> embassy_net_driver::LinkState {
+        self.inner.link_state(cx)
+    }
+
+    fn capabilities(&self) -> embassy_net_driver::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn hardware_address(&self) -> embassy_net_driver::HardwareAddress {
+        self.inner.hardware_address()
+    }
+}
 
 type UsbDriver = embassy_rp::usb::Driver<'static, USB>;
 type BrainstemUsbDevice = UsbDevice<'static, UsbDriver>;
@@ -386,7 +502,7 @@ async fn start_wifi_ap(
 
     static RESOURCES: StaticCell<StackResources<10>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
-        net_device,
+        IcmpEchoDevice::new(net_device),
         config,
         RESOURCES.init(StackResources::new()),
         0x5eed,
@@ -457,7 +573,7 @@ async fn cyw43_runner_task(
 }
 
 #[embassy_executor::task]
-async fn net_runner_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
+async fn net_runner_task(mut runner: embassy_net::Runner<'static, IcmpEchoDevice<'static>>) -> ! {
     runner.run().await
 }
 
@@ -1617,6 +1733,8 @@ function imuClass(imu){let h=imu.health||'unknown',age=imu.sample_age_ms||0;if(h
 function showImu(imu){imu=imu||{};let present=imu.present||'unknown',health=imu.health||'unknown',age=imu.sample_age_ms||0,poll=imu.poll_period_ms||0,yaw=(imu.yaw_mrad||0)/1000,pitch=(imu.pitch_mrad||0)/1000,roll=(imu.roll_mrad||0)/1000,rate=(imu.yaw_rate_mrad_s||0)/1000,acc=(imu.accel_magnitude_mm_s2||0)/1000,tilt=(imu.tilt_magnitude_mrad||0)/1000,rough=(imu.roughness_mm_s2||0)/1000,impact=(imu.impact_score_mm_s2||0)/1000,av=imu.angular_velocity_mrad_s||{},la=imu.linear_acceleration_mm_s2||{};let cls=imuClass(imu);$('imuhealth').textContent=title(health)+' / '+title(present)+' / samples '+(imu.sample_count||0)+' / age '+age+' ms / '+poll+' ms poll';$('imuhealth').className=cls;$('imuyaw').textContent='yaw '+num(yaw,2)+' / pitch '+num(pitch,2)+' / roll '+num(roll,2)+' rad';$('imuyaw').className=cls;$('imuaccel').textContent=num(acc,2)+' m/s\u00B2 / xyz '+num((la.x||0)/1000,2)+','+num((la.y||0)/1000,2)+','+num((la.z||0)/1000,2);$('imuaccel').className=acc>16?'badtext':acc>12?'muted':cls;$('imutilt').textContent=num(tilt,2)+' rad / '+num(tilt*57.2958,1)+' deg';$('imutilt').className=tilt>.65?'badtext':tilt>.35?'muted':cls;$('imurates').textContent='yaw '+num(rate,2)+' rad/s / xyz '+num((av.x||0)/1000,2)+','+num((av.y||0)/1000,2)+','+num((av.z||0)/1000,2);$('imurates').className=cls;$('imurough').textContent=num(rough,2)+' m/s\u00B2';$('imurough').className=rough>8?'badtext':rough>3?'muted':cls;$('imuimpact').textContent=num(impact,2)+' m/s\u00B2';$('imuimpact').className=impact>18?'badtext':impact>8?'muted':cls;$('imumotion').textContent=title(imu.motion_consistency||'unknown')+' / '+title(imu.calibration||'uncalibrated');$('imumotion').className=(imu.motion_consistency==='inconsistent'||imu.calibration==='uncalibrated')?'muted':cls;pctBar('imuaccelbar',imu.accel_magnitude_mm_s2||0,22000,18000,13000);pctBar('imutiltbar',imu.tilt_magnitude_mrad||0,1000,650,350);pctBar('imuroughbar',imu.roughness_mm_s2||0,12000,8000,3000);pctBar('imuimpactbar',imu.impact_score_mm_s2||0,22000,18000,8000)}
 function showStatus(s){lastStatus=s;let cs=s.create_sensors||{},od=s.odometry||{},imu=s.imu||{},music=s.create_songs||{},fatal=s.current_runtime_state==='error'||(s.last_error&&s.last_error!=='none'),contact=cs.bump_left||cs.bump_right||cs.wall||cs.virtual_wall,charging=chargeActive(cs),imuOk=imu.health==='ok',imuDanger=imu.health==='fault'||(imuOk&&((imu.tilt_magnitude_mrad||0)>=650||(imu.impact_score_mm_s2||0)>=18000)),safetyStop=s.estop_latched||s.safety_tripped||s.motion_interlock_latched||charging||cs.wheel_drop||cs.cliff_left||cs.cliff_front_left||cs.cliff_front_right||cs.cliff_right||imuDanger,pct=battPct(cs),flags=flagList(cs),latchKind=s.safety_latch_kind&&s.safety_latch_kind!=='none'?s.safety_latch_kind:'';if(s.estop_latched)flags.push('e-stop');if(s.safety_tripped)flags.push(latchKind?title(latchKind)+' latch':'safety latch');if(s.motion_interlock_latched)flags.push('charge latch');if(charging)flags.push('charging');if(imuOk&&(imu.tilt_magnitude_mrad||0)>=650)flags.push('tilt');if(imuOk&&(imu.impact_score_mm_s2||0)>=18000)flags.push('impact');if(imuOk&&imu.motion_consistency==='inconsistent')flags.push('motion mismatch');let safetyText=flags.join(', ')||'clear';pill(net,wsOpen?'control ws':sseOpen?'telemetry sse':(s.wifi_state||'online'),'ok');pill($('mode'),title(s.oi_mode),(s.oi_mode==='safe'||s.oi_mode==='full')?'ok':'');pill($('safety'),safetyStop?'motion blocked':contact?'contact':'clear',safetyStop?'bad':contact?'warn':'ok');$('headline').textContent=title(s.current_runtime_state)+' / '+title(s.create_power_state)+' / '+title(s.uart_rx_health)+' / IMU '+title(imu.health||'unknown');$('runtime').textContent=title(s.current_runtime_state)+' / body '+title(s.body_state);$('uptime').textContent=time(s.uptime_ms);$('create').textContent=title(s.create_power_state)+' / '+title(s.oi_mode)+' / probe '+s.wake_probe_response_bytes+'/'+s.wake_probe_expected_bytes;$('safetyread').textContent=safetyText;$('safetyread').className=safetyStop?'badtext':contact?'muted':'oktext';$('uart').textContent=title(s.uart_rx_health)+' / '+title(s.last_uart_read_error)+' / '+s.uart_rx_packets+' packets';$('cmd').textContent=title(s.current_command)+' / pending '+title(s.pending_command)+' #'+s.pending_command_id;$('forebrain').textContent=(s.forebrain_uart?s.forebrain_uart.rx_lines:0)+' lines / '+title(s.forebrain_uart&&s.forebrain_uart.last_error);$('web').textContent=s.http_requests+' requests / '+s.dhcp_grants+' dhcp';$('sensors').textContent='pkt '+(cs.last_packet_id||0)+' / IR '+(cs.ir_byte||0)+' / buttons '+(cs.buttons||0)+' / cliff sig '+(cs.cliff_left_signal||0)+','+(cs.cliff_front_left_signal||0)+','+(cs.cliff_front_right_signal||0)+','+(cs.cliff_right_signal||0);$('battery').textContent=(pct===null?'--':pct+'%')+' / '+(cs.voltage_mv||0)+' mV / '+(cs.current_ma||0)+' mA / '+(cs.charge_mah||0)+'/'+(cs.capacity_mah||0)+' mAh / charge state '+(cs.charging_state||0)+' / charge pin '+title(cs.charging_indicator);$('battery').className=(charging||pct!==null&&pct<=20)?'badtext':'muted';$('odom').textContent='delta '+(cs.distance_mm||0)+' mm / '+(cs.angle_mrad||0)+' mrad / total '+(od.distance_mm||0)+' mm / '+(od.heading_mrad||0)+' mrad / resets '+(od.reset_count||0);showImu(imu);$('music').textContent='defined '+(music.last_defined_id||0)+' ('+(music.last_defined_len||0)+') / played '+(music.last_played_id||0);$('firmware').textContent=s.firmware_name+' '+s.firmware_version;$('err').textContent=fatal?title(s.last_error)+' / '+(s.last_error_hint||''): 'none';$('err').className=fatal?'badtext':'muted';applyCaps()}
 function handleEvents(batch){let stopNeeded=false,refreshNeeded=false;eventCursor=Math.max(0,(batch.next_seq||1)-1);if(batch.dropped_before_seq){$('events').textContent='recovered after '+batch.dropped_before_seq;pill($('safety'),'event history recovered','warn');addLog('recovered event history after '+batch.dropped_before_seq);stopNeeded=true}else{$('events').textContent='cursor '+(batch.next_seq||0)+' / '+((batch.events||[]).length)+' new'}(batch.events||[]).forEach(e=>{let k=e.kind;if(['safety_tripped','heartbeat_expired','estop_latched','wheel_drop_latched'].indexOf(k)>=0){pill($('safety'),title(k),'bad');addLog('safety '+k+' '+(e.a||0));stopNeeded=true;refreshNeeded=true}else if(k==='safety_cleared'){pill($('safety'),'clear','ok');$('safetyread').textContent='clear';$('safetyread').className='oktext';addLog(k+' '+(e.a||0));refreshNeeded=true}else if(['imu_frame_received','imu_fault','tilt_changed','impact_detected','imu_calibration_changed'].indexOf(k)>=0){addLog(k+' '+(e.a||0));refreshNeeded=true}else if(['bump_changed','wall_changed','virtual_wall_changed','buttons_changed','ir_changed','charging_state_changed','battery_low','cliff_changed','wheel_drop_cleared'].indexOf(k)>=0){addLog(k+' '+(e.a||0));refreshNeeded=true}else if(['command_rejected','command_interrupted'].indexOf(k)>=0){pill($('safety'),title(k),'warn');addLog(k+' #'+(e.a||0));refreshNeeded=true}else if(k==='motion_stopped'){addLog('motion stopped')}else if(k==='error'){pill($('safety'),'fatal/error','bad');addLog('error '+(e.a||0));stopNeeded=true;refreshNeeded=true}});if(refreshNeeded)requestStatus();if(stopNeeded&&releaseDriveUi())sendCockpit({kind:'stop'})}
+const renderStatus=showStatus;
+showStatus=function(s){renderStatus(s);$('firmware').textContent=(s.build_id||((s.firmware_name||'')+' '+(s.firmware_version||'')))+' / '+(s.git_commit_short||'unknown')+(s.git_dirty?' dirty':'')}
 applyCaps();establishBrowserSession().catch(connectSse);
 </script>
 </body>
@@ -1747,7 +1865,9 @@ fn render_handshake_welcome<'a>(
     write_json_array(&mut response, "safety", caps.safety)?;
     write_json_array(&mut response, "events", caps.events)?;
     let active_motion = snapshot.body_state == status::BodyState::Moving as u8;
-    write!(response, "\"limits\":{{\"max_linear_mm_s\":{},\"max_angular_mrad_s\":{},\"min_ttl_ms\":{},\"max_ttl_ms\":{}}}}},\"software\":{{\"software_name\":\"{}\",\"software_version\":\"{}\",\"build_id\":\"{}\"}},\"safety_snapshot\":{{\"armed\":false,\"estop_latched\":{},\"safety_tripped\":{},\"motion_interlock_latched\":{},\"active_motion\":{},\"runtime_state\":\"{}\"}}}}", caps.max_linear_mm_s, caps.max_angular_mrad_s, caps.min_ttl_ms, caps.max_ttl_ms, caps.firmware_name, caps.firmware_version, option_env!("PETE_BUILD_ID").unwrap_or("development"), estop_latched, safety_tripped, motion_interlock_latched, active_motion, if active_motion { "moving" } else { "idle" }).ok()?;
+    write!(response, "\"limits\":{{\"max_linear_mm_s\":{},\"max_angular_mrad_s\":{},\"min_ttl_ms\":{},\"max_ttl_ms\":{}}}}},\"software\":{{\"software_name\":\"{}\",", caps.max_linear_mm_s, caps.max_angular_mrad_s, caps.min_ttl_ms, caps.max_ttl_ms, caps.firmware_name).ok()?;
+    crate::build_identity::write_json(&mut response, crate::build_identity::CURRENT).ok()?;
+    write!(response, "}},\"safety_snapshot\":{{\"armed\":false,\"estop_latched\":{},\"safety_tripped\":{},\"motion_interlock_latched\":{},\"active_motion\":{},\"runtime_state\":\"{}\"}}}}", estop_latched, safety_tripped, motion_interlock_latched, active_motion, if active_motion { "moving" } else { "idle" }).ok()?;
     copy_response(buffer, response.as_str())
 }
 
@@ -1939,9 +2059,7 @@ fn handle_websocket_message<'a>(body: &str, buffer: &'a mut [u8]) -> Option<&'a 
         }
         match submit_json_control_command(command_id, command, body) {
             Ok(()) => None,
-            Err(reason) => {
-                render_command_response(buffer, false, command_id, reason.as_str())
-            }
+            Err(reason) => render_command_response(buffer, false, command_id, reason.as_str()),
         }
     } else {
         handle_websocket_command(body, buffer)
@@ -2100,8 +2218,7 @@ fn handle_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
         return;
     }
 
-    if let Err(reason) =
-        submit_compact_control_command(seq, command, session_id, service_lease_id)
+    if let Err(reason) = submit_compact_control_command(seq, command, session_id, service_lease_id)
     {
         status::mark_forebrain_uart_error(status::ForebrainUartErrorCode::Busy);
         if matches!(command, BrainstemCommand::CmdVel { .. }) {
@@ -3076,7 +3193,7 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
     let snapshot = status::snapshot(Instant::now().as_millis() as u32);
     let _ = writeln!(
         response,
-        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={}",
+        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={}",
         snapshot.uptime_ms,
         snapshot.current_runtime_state,
         snapshot.body_state,
@@ -3130,7 +3247,11 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.imu_roughness_mm_s2,
         snapshot.imu_impact_score_mm_s2,
         snapshot.imu_motion_consistency,
-        snapshot.imu_calibration_state
+        snapshot.imu_calibration_state,
+        snapshot.firmware_version,
+        snapshot.git_commit,
+        snapshot.git_dirty,
+        snapshot.build_id
     );
 }
 

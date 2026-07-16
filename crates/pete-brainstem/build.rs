@@ -1,4 +1,8 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use serde::Deserialize;
 
@@ -217,6 +221,7 @@ struct LedPins {
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let build_identity = build_identity(&manifest_dir);
     let body_path = manifest_dir.join("body.toml");
     let board_path = manifest_dir.join("board.toml");
     println!("cargo:rerun-if-changed={}", body_path.display());
@@ -285,6 +290,15 @@ pub const CAPABILITY_MAX_LINEAR_MM_S: i16 = {max_linear_mm_s};
 pub const CAPABILITY_MAX_ANGULAR_MRAD_S: i16 = {max_angular_mrad_s};
 pub const CAPABILITY_MIN_TTL_MS: u32 = {min_ttl_ms};
 pub const CAPABILITY_MAX_TTL_MS: u32 = {max_ttl_ms};
+
+pub const BUILD_GIT_COMMIT: &str = {git_commit:?};
+pub const BUILD_GIT_COMMIT_SHORT: &str = {git_commit_short:?};
+pub const BUILD_GIT_DIRTY: bool = {git_dirty};
+pub const BUILD_TIMESTAMP: &str = {build_timestamp:?};
+pub const BUILD_PROFILE: &str = {build_profile:?};
+pub const BUILD_TARGET: &str = {build_target:?};
+pub const BUILD_BACKEND: &str = {build_backend:?};
+pub const BUILD_ID: &str = {build_id:?};
 
 pub const POWER_TOGGLE_PULSE_MS: u32 = {power_toggle_pulse_ms};
 pub const CREATE_WAKE_WAIT_MS: u32 = {wake_wait_ms};
@@ -356,6 +370,14 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         max_angular_mrad_s = body.limits.max_angular_mrad_s,
         min_ttl_ms = body.limits.min_ttl_ms,
         max_ttl_ms = body.limits.max_ttl_ms,
+        git_commit = build_identity.git_commit,
+        git_commit_short = build_identity.git_commit_short,
+        git_dirty = build_identity.git_dirty,
+        build_timestamp = build_identity.build_timestamp,
+        build_profile = build_identity.build_profile,
+        build_target = build_identity.build_target,
+        build_backend = build_identity.build_backend,
+        build_id = build_identity.build_id,
         power_toggle_pulse_ms = body.timing.power_toggle_pulse_ms,
         wake_wait_ms = body.timing.wake_wait_ms,
         responsive_timeout_ms = body.timing.responsive_timeout_ms,
@@ -422,6 +444,164 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         println!("cargo:rustc-link-arg=-Tlink.x");
     }
     fs::write(out_dir.join("body_config.rs"), generated).unwrap();
+}
+
+struct BuildIdentity {
+    git_commit: String,
+    git_commit_short: String,
+    git_dirty: bool,
+    build_timestamp: String,
+    build_profile: String,
+    build_target: String,
+    build_backend: String,
+    build_id: String,
+}
+
+fn build_identity(manifest_dir: &Path) -> BuildIdentity {
+    for variable in [
+        "PETE_GIT_COMMIT",
+        "PETE_GIT_DIRTY",
+        "PETE_BUILD_TIMESTAMP",
+        "SOURCE_DATE_EPOCH",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".into());
+    let repo_root = manifest_dir
+        .ancestors()
+        .find(|path| path.join(".git").exists());
+    if let Some(repo_root) = repo_root {
+        rerun_for_git_state(repo_root);
+        rerun_for_tracked_sources(repo_root);
+    }
+    let override_commit = env::var("PETE_GIT_COMMIT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let git_commit = override_commit
+        .or_else(|| repo_root.and_then(git_commit))
+        .unwrap_or_else(|| "unknown".into());
+    let git_commit_short = if git_commit == "unknown" {
+        "unknown".into()
+    } else {
+        git_commit.chars().take(12).collect()
+    };
+    let git_dirty = env::var("PETE_GIT_DIRTY")
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .or_else(|| repo_root.and_then(git_dirty))
+        .unwrap_or(false);
+    let build_timestamp = env::var("PETE_BUILD_TIMESTAMP")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            env::var("SOURCE_DATE_EPOCH")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let build_profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
+    let build_target = env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    let build_backend = if env::var_os("CARGO_FEATURE_PICO_W").is_some() {
+        "pico-w"
+    } else {
+        "rp2040"
+    }
+    .into();
+    let build_id = format!(
+        "{version}+g{git_commit_short}{}",
+        if git_dirty { ".dirty" } else { "" }
+    );
+    BuildIdentity {
+        git_commit,
+        git_commit_short,
+        git_dirty,
+        build_timestamp,
+        build_profile,
+        build_target,
+        build_backend,
+        build_id,
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn git_commit(repo_root: &Path) -> Option<String> {
+    git_output(repo_root, &["rev-parse", "HEAD"])
+}
+
+fn git_dirty(repo_root: &Path) -> Option<bool> {
+    Command::new("git")
+        .args(["diff-index", "--quiet", "HEAD", "--"])
+        .current_dir(repo_root)
+        .status()
+        .ok()
+        .map(|status| !status.success())
+}
+
+fn git_output(repo_root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn rerun_for_git_state(repo_root: &Path) {
+    for state_path in ["HEAD", "index", "packed-refs"] {
+        if let Some(path) = git_output(repo_root, &["rev-parse", "--git-path", state_path]) {
+            print_rerun_path(repo_root, &path);
+        }
+    }
+    if let Some(reference) = git_output(repo_root, &["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git_output(repo_root, &["rev-parse", "--git-path", &reference]) {
+            print_rerun_path(repo_root, &path);
+        }
+    }
+}
+
+fn print_rerun_path(repo_root: &Path, path: &str) {
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn rerun_for_tracked_sources(repo_root: &Path) {
+    let Ok(output) = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(repo_root)
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    for path in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        println!(
+            "cargo:rerun-if-changed={}",
+            repo_root
+                .join(String::from_utf8_lossy(path).as_ref())
+                .display()
+        );
+    }
 }
 
 fn string_slice_literal(values: &[String]) -> String {

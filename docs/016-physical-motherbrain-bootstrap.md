@@ -75,8 +75,34 @@ Useful diagnostics:
 lsusb
 ls -l /dev/serial/by-id
 cargo run -p pete-cockpit --example contract_check -- uart /dev/serial/by-id/DEVICE
+ping -c 4 192.168.4.1
 curl -fsS http://192.168.4.1/status.json
 ```
+
+## Physical QA session record
+
+At the start of every physical session, record the firmware identity before
+collecting evidence or commanding motion. This distinguishes a dirty local
+flash from the clean commit it was based on:
+
+```sh
+curl -fsS http://192.168.4.1/status.json | jq '{
+  firmware_name, firmware_version, git_commit, git_commit_short, git_dirty,
+  build_timestamp, build_profile, build_target, build_backend, build_id
+}'
+```
+
+Attach that output to the session notes. `cargo run -p pete-tools -- robot
+--capture PATH` and `cargo run -p pete-tools -- capture-real --out PATH` also
+store the same values in the capture manifest when the brainstem status
+transport supplies them.
+
+Run the ping check from a DHCP client associated with the `pete-xxxx` AP. It
+must report zero packet loss on an otherwise idle link. While polling
+`/status.json` or the event stream, verify the UI/control transports remain
+responsive and inspect `icmp_echo_requests`, `icmp_echo_replies`,
+`icmp_dropped`, and `icmp_rate_limited`; ICMP is local management traffic, not
+a route through the brainstem.
 
 If handshake fails, confirm the stable device link, stop other serial readers,
 unplug/replug the Pico, and rerun bootstrap. A manual STOP can be issued through

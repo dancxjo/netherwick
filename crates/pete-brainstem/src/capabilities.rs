@@ -2,7 +2,7 @@ use core::fmt::{self, Write as _};
 
 use heapless::String;
 
-use crate::body;
+use crate::{body, build_identity};
 
 pub struct BrainstemCapabilities {
     pub firmware_name: &'static str,
@@ -50,13 +50,15 @@ pub fn render_json<'a>(
     let mut response = String::<3072>::new();
     write!(
         response,
-        "{{\"accepted\":true,\"command_id\":{},\"firmware\":\"{}\",\"version\":\"{}\",\"body\":\"{}\",\"body_kind\":\"{}\",\"drive\":\"{}\",",
-        command_id,
-        capabilities.firmware_name,
-        capabilities.firmware_version,
-        capabilities.body_name,
-        capabilities.body_kind,
-        capabilities.drive
+        "{{\"accepted\":true,\"command_id\":{},\"firmware\":\"{}\",\"version\":\"{}\",",
+        command_id, capabilities.firmware_name, capabilities.firmware_version
+    )
+    .ok()?;
+    build_identity::write_json(&mut response, build_identity::CURRENT).ok()?;
+    write!(
+        response,
+        ",\"body\":\"{}\",\"body_kind\":\"{}\",\"drive\":\"{}\",",
+        capabilities.body_name, capabilities.body_kind, capabilities.drive
     )
     .ok()?;
     write_json_str_array(&mut response, "verbs", capabilities.verbs).ok()?;
@@ -116,7 +118,8 @@ pub fn write_compact<const N: usize>(
         capabilities.song_slots,
         capabilities.feedback.len(),
         capabilities.sensor_packets
-    )
+    )?;
+    build_identity::write_compact(response, build_identity::CURRENT)
 }
 
 fn write_json_str_array<const N: usize>(

@@ -8205,11 +8205,13 @@ where
     let mut runner = RealRobotRunner::new(RobotMode::ReadOnly, cockpit, sensors, runtime)
         .with_frame_processor(real_robot_frame_processor(&mut warnings).await);
     runner.tick_ms = args.tick_ms;
+    let firmware_identity = brainstem_firmware_identity(runner.cockpit.client_mut().as_mut());
     let mut writer =
         CaptureWriter::create(&args.out, CaptureSource::RealRobot, Some(args.tick_ms)).await?;
     {
         let manifest = writer.manifest_mut();
         manifest.machine = Some(machine_info_from_env(&env_report));
+        manifest.firmware_identity = firmware_identity;
         manifest.command_args = std::env::args().collect();
         manifest.device_availability = device_availability;
         manifest
@@ -8970,7 +8972,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
 
     let mut capture = match &args.capture {
         Some(path) => {
-            Some(CaptureWriter::create(path, CaptureSource::RealRobot, Some(args.tick_ms)).await?)
+            let mut writer =
+                CaptureWriter::create(path, CaptureSource::RealRobot, Some(args.tick_ms)).await?;
+            writer.manifest_mut().firmware_identity =
+                brainstem_firmware_identity(runner.cockpit.client_mut().as_mut());
+            Some(writer)
         }
         None => None,
     };
@@ -9493,6 +9499,45 @@ fn robot_initialization_metadata(
         "reconnect_initial_backoff_ms": args.reconnect_initial_backoff_ms,
         "reconnect_max_backoff_ms": args.reconnect_max_backoff_ms,
     })
+}
+
+fn brainstem_firmware_identity(cockpit: &mut dyn Cockpit) -> Option<serde_json::Value> {
+    let status = cockpit.get_status().ok()?;
+    let fields = [
+        "firmware_name",
+        "firmware_version",
+        "git_commit",
+        "git_commit_short",
+        "git_dirty",
+        "build_timestamp",
+        "build_profile",
+        "build_target",
+        "build_backend",
+        "build_id",
+    ];
+    if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status.raw) {
+        let mut identity = serde_json::Map::new();
+        for field in fields {
+            if let Some(value) = status.get(field) {
+                identity.insert(field.into(), value.clone());
+            }
+        }
+        return (!identity.is_empty()).then_some(serde_json::Value::Object(identity));
+    }
+    let mut identity = serde_json::Map::new();
+    for item in status.raw.split_ascii_whitespace() {
+        let Some((key, value)) = item.split_once('=') else {
+            continue;
+        };
+        if fields.contains(&key) {
+            let value = match key {
+                "git_dirty" => serde_json::Value::Bool(value == "true"),
+                _ => serde_json::Value::String(value.to_string()),
+            };
+            identity.insert(key.into(), value);
+        }
+    }
+    (!identity.is_empty()).then_some(serde_json::Value::Object(identity))
 }
 
 fn enqueue_default_bringup_outputs(

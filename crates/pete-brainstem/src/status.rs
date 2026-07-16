@@ -56,6 +56,10 @@ static WIFI_STATE: AtomicU8 = AtomicU8::new(WifiState::Off as u8);
 static HTTPS_STATE: AtomicU8 = AtomicU8::new(HttpsState::Unavailable as u8);
 static HTTP_REQUESTS: AtomicU32 = AtomicU32::new(0);
 static DHCP_GRANTS: AtomicU32 = AtomicU32::new(0);
+static ICMP_ECHO_REQUESTS: AtomicU32 = AtomicU32::new(0);
+static ICMP_ECHO_REPLIES: AtomicU32 = AtomicU32::new(0);
+static ICMP_DROPPED: AtomicU32 = AtomicU32::new(0);
+static ICMP_RATE_LIMITED: AtomicU32 = AtomicU32::new(0);
 static LAST_WEB_REQUEST_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
 static PENDING_LED_BLINKS: AtomicU8 = AtomicU8::new(0);
 static PENDING_COMMAND_KIND: AtomicU8 = AtomicU8::new(ControlCommandCode::None as u8);
@@ -197,6 +201,14 @@ static ACTIVE_SERVICE_SCOPE: AtomicU8 = AtomicU8::new(0);
 pub struct BrainstemStatus {
     pub firmware_name: &'static str,
     pub firmware_version: &'static str,
+    pub git_commit: &'static str,
+    pub git_commit_short: &'static str,
+    pub git_dirty: bool,
+    pub build_timestamp: &'static str,
+    pub build_profile: &'static str,
+    pub build_target: &'static str,
+    pub build_backend: &'static str,
+    pub build_id: &'static str,
     pub body_name: &'static str,
     pub body_kind: &'static str,
     pub create_uart_baud: u32,
@@ -233,6 +245,10 @@ pub struct BrainstemStatus {
     pub https_state: u8,
     pub http_requests: u32,
     pub dhcp_grants: u32,
+    pub icmp_echo_requests: u32,
+    pub icmp_echo_replies: u32,
+    pub icmp_dropped: u32,
+    pub icmp_rate_limited: u32,
     pub last_web_request_timestamp_ms: u32,
     pub pending_command: u8,
     pub pending_command_id: u32,
@@ -2885,6 +2901,26 @@ pub fn mark_dhcp_grant() {
     request_led_blinks(5);
 }
 
+#[cfg(feature = "pico-w")]
+pub fn mark_icmp_echo_request() {
+    increment(&ICMP_ECHO_REQUESTS);
+}
+
+#[cfg(feature = "pico-w")]
+pub fn mark_icmp_echo_reply() {
+    increment(&ICMP_ECHO_REPLIES);
+}
+
+#[cfg(feature = "pico-w")]
+pub fn mark_icmp_dropped() {
+    increment(&ICMP_DROPPED);
+}
+
+#[cfg(feature = "pico-w")]
+pub fn mark_icmp_rate_limited() {
+    increment(&ICMP_RATE_LIMITED);
+}
+
 pub fn signal_event(event: &BrainstemEvent) {
     record_public_event_from_brainstem_event(event);
     let blinks = match event {
@@ -3343,6 +3379,14 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
     BrainstemStatus {
         firmware_name: env!("CARGO_PKG_NAME"),
         firmware_version: env!("CARGO_PKG_VERSION"),
+        git_commit: crate::build_identity::CURRENT.git_commit,
+        git_commit_short: crate::build_identity::CURRENT.git_commit_short,
+        git_dirty: crate::build_identity::CURRENT.git_dirty,
+        build_timestamp: crate::build_identity::CURRENT.build_timestamp,
+        build_profile: crate::build_identity::CURRENT.build_profile,
+        build_target: crate::build_identity::CURRENT.build_target,
+        build_backend: crate::build_identity::CURRENT.build_backend,
+        build_id: crate::build_identity::CURRENT.build_id,
         body_name: body::BODY_NAME,
         body_kind: body_kind(),
         create_uart_baud: body::CREATE_UART_BAUD,
@@ -3379,6 +3423,10 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         https_state: HTTPS_STATE.load(Ordering::Relaxed),
         http_requests: HTTP_REQUESTS.load(Ordering::Relaxed),
         dhcp_grants: DHCP_GRANTS.load(Ordering::Relaxed),
+        icmp_echo_requests: ICMP_ECHO_REQUESTS.load(Ordering::Relaxed),
+        icmp_echo_replies: ICMP_ECHO_REPLIES.load(Ordering::Relaxed),
+        icmp_dropped: ICMP_DROPPED.load(Ordering::Relaxed),
+        icmp_rate_limited: ICMP_RATE_LIMITED.load(Ordering::Relaxed),
         last_web_request_timestamp_ms: LAST_WEB_REQUEST_TIMESTAMP_MS.load(Ordering::Relaxed),
         pending_command,
         pending_command_id,
@@ -3481,6 +3529,14 @@ fn elapsed_since(now_ms: u32, timestamp_ms: u32) -> u32 {
 struct StatusJson {
     firmware_name: &'static str,
     firmware_version: &'static str,
+    git_commit: &'static str,
+    git_commit_short: &'static str,
+    git_dirty: bool,
+    build_timestamp: &'static str,
+    build_profile: &'static str,
+    build_target: &'static str,
+    build_backend: &'static str,
+    build_id: &'static str,
     body_name: &'static str,
     body_kind: &'static str,
     create_uart_baud: u32,
@@ -3522,6 +3578,10 @@ struct StatusJson {
     https_state: &'static str,
     http_requests: u32,
     dhcp_grants: u32,
+    icmp_echo_requests: u32,
+    icmp_echo_replies: u32,
+    icmp_dropped: u32,
+    icmp_rate_limited: u32,
     last_web_request_timestamp_ms: u32,
     pending_command: &'static str,
     pending_command_id: u32,
@@ -3639,6 +3699,14 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
     let status = StatusJson {
         firmware_name: snapshot.firmware_name,
         firmware_version: snapshot.firmware_version,
+        git_commit: snapshot.git_commit,
+        git_commit_short: snapshot.git_commit_short,
+        git_dirty: snapshot.git_dirty,
+        build_timestamp: snapshot.build_timestamp,
+        build_profile: snapshot.build_profile,
+        build_target: snapshot.build_target,
+        build_backend: snapshot.build_backend,
+        build_id: snapshot.build_id,
         body_name: snapshot.body_name,
         body_kind: snapshot.body_kind,
         create_uart_baud: snapshot.create_uart_baud,
@@ -3680,6 +3748,10 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         https_state: https_state_text(snapshot.https_state),
         http_requests: snapshot.http_requests,
         dhcp_grants: snapshot.dhcp_grants,
+        icmp_echo_requests: snapshot.icmp_echo_requests,
+        icmp_echo_replies: snapshot.icmp_echo_replies,
+        icmp_dropped: snapshot.icmp_dropped,
+        icmp_rate_limited: snapshot.icmp_rate_limited,
         last_web_request_timestamp_ms: snapshot.last_web_request_timestamp_ms,
         pending_command: control_command_text(snapshot.pending_command),
         pending_command_id: snapshot.pending_command_id,
