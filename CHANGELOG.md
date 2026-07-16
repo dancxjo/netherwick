@@ -52,6 +52,12 @@ All notable changes are grouped by date.
 
 ### Changed
 
+- Restrict the public Brainstem contract to bounded motor primitives,
+  body-native operations, immutable reflexes, and explicit services; run
+  deterministic navigation and recovery skills in the motherbrain through
+  short TTL renewals, reject retired convenience and safety-policy wire verbs
+  in firmware and simulation, validate the advertised verb inventory at build
+  time, and document the remaining hardware-in-loop acceptance gates.
 - Document the grounded semantic graph and safety-gated sleep lifecycle,
   including their authority boundaries, artifact contracts, and replacement
   points.
