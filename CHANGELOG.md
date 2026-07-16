@@ -60,8 +60,12 @@ All notable changes are grouped by date.
   deduplication and Neo4j persistence by carrying `SemanticRelationId` as the
   stable edge identity instead of collapsing edges by triple alone.
 - Preserve lifecycle telemetry when velocity and heartbeat commands coalesce:
-  smoothed velocity refreshes transfer the active command ID without restarting
-  the motor, and every replaced accepted command receives a terminal event.
+  identical velocity refreshes renew one streaming command without restarting
+  the motor or transferring lifecycle ownership, and every replaced accepted
+  command receives a terminal event.
+- Close accepted pending command lifecycles when Stop or E-stop preempts them,
+  retain 128 brainstem audit events, and page bounded event responses so routine
+  velocity renewals cannot overflow Pico transport buffers.
 - Enforce sleep power and thermal budgets on every work item: candidate
   training/evaluation require a stable powered dock, while a rising thermal
   limit interrupts sleep before subsequent maintenance can run.

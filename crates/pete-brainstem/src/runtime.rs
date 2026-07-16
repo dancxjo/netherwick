@@ -777,16 +777,10 @@ where
         {
             // Possession refreshes cmd_vel every control tick.  Restarting the
             // same drive on every refresh makes the Create brake and re-start
-            // continuously. Renew its deadline and transfer lifecycle
-            // ownership to the refresh command without touching the motor; a
-            // changed velocity still preempts immediately below.
-            if self.active_command_id != Some(command_id) {
-                if let Some(previous_command_id) = self.active_command_id.replace(command_id) {
-                    status::mark_command_interrupted(previous_command_id);
-                }
-                let command_code = status::set_command(Some(command));
-                status::mark_command_started(command_id, command_code);
-            }
+            // continuously. Renew its deadline without touching the motor or
+            // transferring lifecycle ownership. The ingress lane records the
+            // refresh as a compact CommandRenewed event; a changed velocity
+            // still preempts immediately below.
             self.active = ActiveAction::Driving {
                 stop_at_ms: self.now_ms().wrapping_add(duration_ms),
             };
@@ -931,6 +925,7 @@ where
                 duration_ms,
             } => {
                 self.start_cmd_vel(linear_mm_s, angular_mrad_s, duration_ms, now_ms)?;
+                status::mark_velocity_stream_active(queued.command_id, linear_mm_s, angular_mrad_s);
             }
             RuntimeCommand::FaceBearing {
                 bearing_mrad,
@@ -1393,6 +1388,7 @@ where
             .stop(&mut self.hardware, &mut self.events)?;
         self.stop_sent = true;
         self.active_velocity = None;
+        status::clear_velocity_stream();
         // Once STOP has been sent successfully there is no live motion for the
         // heartbeat watchdog to supervise. Leaving the old deadline armed
         // would later revoke an otherwise valid control lease after a normal
@@ -2128,6 +2124,7 @@ where
 
     fn complete_active_command(&mut self) {
         self.safety_recovery_motion = false;
+        status::clear_velocity_stream();
         if let Some(command_id) = self.active_command_id.take() {
             status::mark_command_completed(command_id);
         }
@@ -2136,6 +2133,7 @@ where
     fn interrupt_active_command(&mut self) {
         self.safety_recovery_motion = false;
         self.active_velocity = None;
+        status::clear_velocity_stream();
         if let Some(command_id) = self.active_command_id.take() {
             status::mark_command_interrupted(command_id);
         }
@@ -2143,6 +2141,7 @@ where
 
     fn fail_active_command(&mut self, error: BrainstemError) {
         self.safety_recovery_motion = false;
+        status::clear_velocity_stream();
         let Some(command_id) = self.active_command_id.take() else {
             return;
         };
@@ -2921,7 +2920,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_velocity_refresh_transfers_lifecycle_without_restarting_drive() {
+    fn identical_velocity_refresh_renews_stream_without_lifecycle_churn() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.create_responsive = true;
@@ -2941,7 +2940,7 @@ mod tests {
 
         assert!(runtime.commands.is_empty());
         assert_eq!(runtime.hardware.writes, drive_writes);
-        assert_eq!(runtime.active_command_id, Some(42));
+        assert_eq!(runtime.active_command_id, Some(41));
         assert!(matches!(
             runtime.active_velocity,
             Some(ActiveVelocity {
@@ -2969,13 +2968,7 @@ mod tests {
             })
             .map(|event| (event.kind, event.a))
             .collect::<heapless::Vec<_, 4>>();
-        assert_eq!(
-            lifecycle.as_slice(),
-            &[
-                (status::PublicEventKind::CommandInterrupted as u8, 41),
-                (status::PublicEventKind::CommandStarted as u8, 42),
-            ]
-        );
+        assert!(lifecycle.is_empty());
 
         runtime.hardware.now_us = 1_400_000;
         assert!(runtime.advance_active_action().is_ok());
@@ -2984,7 +2977,7 @@ mod tests {
         let mut completed = heapless::Vec::<status::PublicEventRecord, 8>::new();
         status::collect_events_since(event_cursor, &mut completed);
         assert!(completed.iter().any(|event| {
-            event.kind == status::PublicEventKind::CommandCompleted as u8 && event.a == 42
+            event.kind == status::PublicEventKind::CommandCompleted as u8 && event.a == 41
         }));
     }
 

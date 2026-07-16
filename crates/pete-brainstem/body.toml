@@ -103,6 +103,7 @@ events = [
   "command_completed",
   "command_interrupted",
   "command_timed_out",
+  "command_renewed",
   "body_power_requested",
   "body_power_changed",
   "body_mode_requested",

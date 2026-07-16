@@ -19,7 +19,11 @@ use crate::hardware::UartReadError;
 const UNKNOWN: u8 = 0;
 const OFF: u8 = 1;
 const ON: u8 = 2;
-const EVENT_LOG_CAPACITY: usize = 32;
+const EVENT_LOG_CAPACITY: usize = 128;
+// Keep transport responses bounded independently of the retained audit window.
+// Consumers advance through the ring a page at a time using the returned
+// `next_seq`, so a larger safety history does not overflow Pico UART buffers.
+const EVENT_RESPONSE_CAPACITY: usize = 16;
 
 static RUNTIME_STATE: AtomicU8 = AtomicU8::new(RuntimeState::Booting as u8);
 static CREATE_POWER_STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
@@ -70,6 +74,11 @@ static PENDING_VELOCITY_A: AtomicU32 = AtomicU32::new(0);
 static PENDING_VELOCITY_B: AtomicU32 = AtomicU32::new(0);
 static PENDING_VELOCITY_TTL_MS: AtomicU32 = AtomicU32::new(0);
 static PENDING_VELOCITY_SEQ: AtomicU32 = AtomicU32::new(0);
+static PENDING_VELOCITY_IS_RENEWAL: AtomicU8 = AtomicU8::new(OFF);
+static ACTIVE_VELOCITY_STREAM_ID: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_VELOCITY_STREAM_A: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_VELOCITY_STREAM_B: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_VELOCITY_STREAM: AtomicU8 = AtomicU8::new(OFF);
 static LAST_ACCEPTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static LAST_REJECTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
 static LAST_STARTED_COMMAND_ID: AtomicU32 = AtomicU32::new(0);
@@ -444,6 +453,7 @@ pub enum PublicEventKind {
     MotherbrainResetRefused = 49,
     ContactWithdrawalStarted = 50,
     ContactWithdrawalCompleted = 51,
+    CommandRenewed = 52,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -666,6 +676,44 @@ pub fn mark_command_started(command_id: u32, command_code: u8) {
     );
 }
 
+pub fn mark_velocity_stream_active(command_id: u32, linear_mm_s: i16, angular_mrad_s: i16) {
+    ACTIVE_VELOCITY_STREAM_ID.store(command_id, Ordering::Relaxed);
+    ACTIVE_VELOCITY_STREAM_A.store(encode_i16(linear_mm_s), Ordering::Relaxed);
+    ACTIVE_VELOCITY_STREAM_B.store(encode_i16(angular_mrad_s), Ordering::Relaxed);
+    ACTIVE_VELOCITY_STREAM.store(ON, Ordering::Release);
+}
+
+pub fn clear_velocity_stream() {
+    ACTIVE_VELOCITY_STREAM.store(OFF, Ordering::Release);
+    ACTIVE_VELOCITY_STREAM_ID.store(0, Ordering::Relaxed);
+}
+
+fn matching_velocity_stream(a: u32, b: u32) -> Option<u32> {
+    (ACTIVE_VELOCITY_STREAM.load(Ordering::Acquire) == ON
+        && ACTIVE_VELOCITY_STREAM_A.load(Ordering::Relaxed) == a
+        && ACTIVE_VELOCITY_STREAM_B.load(Ordering::Relaxed) == b)
+        .then(|| ACTIVE_VELOCITY_STREAM_ID.load(Ordering::Relaxed))
+        .filter(|command_id| *command_id != 0)
+}
+
+fn preempt_pending_commands_for_safety(command_id: u32) -> (Option<u32>, Option<u32>) {
+    let velocity_pending =
+        PENDING_VELOCITY_KIND.load(Ordering::Relaxed) == ControlCommandCode::CmdVel as u8;
+    let velocity_was_renewal = PENDING_VELOCITY_IS_RENEWAL.load(Ordering::Relaxed) == ON;
+    let replaced_velocity_id = (velocity_pending && !velocity_was_renewal)
+        .then(|| PENDING_VELOCITY_ID.load(Ordering::Relaxed))
+        .filter(|pending_id| *pending_id != command_id);
+    PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    PENDING_VELOCITY_IS_RENEWAL.store(OFF, Ordering::Relaxed);
+
+    let pending_kind = PENDING_COMMAND_KIND.load(Ordering::Relaxed);
+    let replaced_command_id = (pending_kind != ControlCommandCode::None as u8)
+        .then(|| PENDING_COMMAND_ID.load(Ordering::Relaxed))
+        .filter(|pending_id| *pending_id != command_id);
+
+    (replaced_command_id, replaced_velocity_id)
+}
+
 #[cfg(feature = "pico-w")]
 pub fn submit_control_command(
     command_id: u32,
@@ -725,6 +773,7 @@ fn submit_control_command_with_service_identity(
 
     if kind == ControlCommandCode::CmdVel {
         let seq = command_seq(command);
+        let renewed_stream_id = matching_velocity_stream(a, b);
         let velocity_pending =
             PENDING_VELOCITY_KIND.load(Ordering::Relaxed) == ControlCommandCode::CmdVel as u8;
         if velocity_pending
@@ -737,18 +786,28 @@ fn submit_control_command_with_service_identity(
                 CommandRejectReason::StaleSequence,
             );
         }
+        let replaced_was_renewal =
+            velocity_pending && PENDING_VELOCITY_IS_RENEWAL.load(Ordering::Relaxed) == ON;
         let replaced_command_id = velocity_pending
             .then(|| PENDING_VELOCITY_ID.load(Ordering::Relaxed))
-            .filter(|pending_id| *pending_id != command_id);
+            .filter(|pending_id| *pending_id != command_id && !replaced_was_renewal);
 
         PENDING_VELOCITY_ID.store(command_id, Ordering::Relaxed);
         PENDING_VELOCITY_A.store(a, Ordering::Relaxed);
         PENDING_VELOCITY_B.store(b, Ordering::Relaxed);
         PENDING_VELOCITY_TTL_MS.store(duration_ms.unwrap_or(0), Ordering::Relaxed);
         PENDING_VELOCITY_SEQ.store(seq, Ordering::Relaxed);
+        PENDING_VELOCITY_IS_RENEWAL.store(
+            if renewed_stream_id.is_some() { ON } else { OFF },
+            Ordering::Relaxed,
+        );
         PENDING_VELOCITY_KIND.store(ControlCommandCode::CmdVel as u8, Ordering::Relaxed);
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
-        record_public_event(PublicEventKind::CommandAccepted, command_id, seq, 0);
+        if let Some(stream_id) = renewed_stream_id {
+            record_public_event(PublicEventKind::CommandRenewed, command_id, stream_id, seq);
+        } else {
+            record_public_event(PublicEventKind::CommandAccepted, command_id, seq, 0);
+        }
         if let Some(replaced_command_id) = replaced_command_id {
             mark_command_interrupted(replaced_command_id);
         }
@@ -756,8 +815,10 @@ fn submit_control_command_with_service_identity(
     }
 
     let mut replaced_command_id = None;
+    let mut replaced_velocity_id = None;
     if matches!(kind, ControlCommandCode::Stop | ControlCommandCode::EStop) {
-        PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+        (replaced_command_id, replaced_velocity_id) =
+            preempt_pending_commands_for_safety(command_id);
     } else {
         let pending_kind = PENDING_COMMAND_KIND.load(Ordering::Relaxed);
         let replaces_pending_heartbeat = kind == ControlCommandCode::HeartbeatStop
@@ -797,6 +858,11 @@ fn submit_control_command_with_service_identity(
     );
     if let Some(replaced_command_id) = replaced_command_id {
         mark_command_interrupted(replaced_command_id);
+    }
+    if let Some(replaced_velocity_id) =
+        replaced_velocity_id.filter(|velocity_id| Some(*velocity_id) != replaced_command_id)
+    {
+        mark_command_interrupted(replaced_velocity_id);
     }
     Ok(())
 }
@@ -853,6 +919,7 @@ pub fn take_control_command() -> Option<BrainstemCommand> {
     let seq = PENDING_VELOCITY_SEQ.load(Ordering::Relaxed);
     let command_id = PENDING_VELOCITY_ID.load(Ordering::Relaxed);
     PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    PENDING_VELOCITY_IS_RENEWAL.store(OFF, Ordering::Relaxed);
     LAST_DISPATCHED_COMMAND_ID.store(command_id, Ordering::Relaxed);
     LAST_DISPATCHED_SERVICE_SESSION_HASH.store(0, Ordering::Relaxed);
     LAST_DISPATCHED_SERVICE_LEASE_HASH.store(0, Ordering::Relaxed);
@@ -1916,7 +1983,6 @@ fn seq_is_current_or_newer(seq: u32, latest_seq: u32) -> bool {
     seq == latest_seq || seq.wrapping_sub(latest_seq) < u32::MAX / 2
 }
 
-#[cfg(feature = "pico-w")]
 fn encode_i16(value: i16) -> u32 {
     value as u16 as u32
 }
@@ -2853,17 +2919,25 @@ pub fn collect_events_since<const N: usize>(
     }
 }
 
+fn event_batch_next_seq<const N: usize>(records: &heapless::Vec<PublicEventRecord, N>) -> u32 {
+    records
+        .last()
+        .map(|record| record.seq.saturating_add(1))
+        .unwrap_or_else(event_next_seq)
+}
+
 #[cfg(feature = "pico-w")]
 pub fn render_events_json<'a>(since_seq: u32, buffer: &'a mut [u8]) -> Option<&'a str> {
     let mut response = heapless::String::<2048>::new();
-    let mut records = heapless::Vec::<PublicEventRecord, EVENT_LOG_CAPACITY>::new();
+    let mut records = heapless::Vec::<PublicEventRecord, EVENT_RESPONSE_CAPACITY>::new();
     collect_events_since(since_seq, &mut records);
+    let batch_next_seq = event_batch_next_seq(&records);
     write!(
         response,
         "{{\"type\":\"events\",\"since_seq\":{},\"oldest_seq\":{},\"next_seq\":{},\"dropped_before_seq\":{},\"events\":[",
         since_seq,
         event_oldest_seq(),
-        event_next_seq(),
+        batch_next_seq,
         event_dropped_before_seq(since_seq)
     )
     .ok()?;
@@ -2895,14 +2969,15 @@ pub fn write_compact_events<const N: usize>(
     response: &mut heapless::String<N>,
     since_seq: u32,
 ) -> core::fmt::Result {
-    let mut records = heapless::Vec::<PublicEventRecord, EVENT_LOG_CAPACITY>::new();
+    let mut records = heapless::Vec::<PublicEventRecord, EVENT_RESPONSE_CAPACITY>::new();
     collect_events_since(since_seq, &mut records);
+    let batch_next_seq = event_batch_next_seq(&records);
     write!(
         response,
         "EVENTS since={} oldest={} next={} dropped_before={} count={}",
         since_seq,
         event_oldest_seq(),
-        event_next_seq(),
+        batch_next_seq,
         event_dropped_before_seq(since_seq),
         records.len()
     )?;
@@ -3019,6 +3094,8 @@ const fn event_index(seq: u32) -> usize {
 #[cfg(test)]
 fn reset_event_log_for_test() {
     EVENT_NEXT_SEQ.store(1, Ordering::Relaxed);
+    clear_velocity_stream();
+    PENDING_VELOCITY_IS_RENEWAL.store(OFF, Ordering::Relaxed);
     for index in 0..EVENT_LOG_CAPACITY {
         EVENT_SEQ[index].store(0, Ordering::Relaxed);
         EVENT_KIND[index].store(PublicEventKind::None as u8, Ordering::Relaxed);
@@ -3709,6 +3786,7 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
         x if x == PublicEventKind::CommandCompleted as u8 => "command_completed",
         x if x == PublicEventKind::CommandInterrupted as u8 => "command_interrupted",
         x if x == PublicEventKind::CommandTimedOut as u8 => "command_timed_out",
+        x if x == PublicEventKind::CommandRenewed as u8 => "command_renewed",
         x if x == PublicEventKind::BodyPowerRequested as u8 => "body_power_requested",
         x if x == PublicEventKind::BodyPowerChanged as u8 => "body_power_changed",
         x if x == PublicEventKind::BodyModeRequested as u8 => "body_mode_requested",
@@ -4096,6 +4174,59 @@ mod tests {
     }
 
     #[test]
+    fn event_responses_page_through_the_larger_audit_ring() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        for command_id in 1..=20 {
+            mark_command_completed(command_id);
+        }
+
+        let mut first = heapless::String::<1024>::new();
+        write_compact_events(&mut first, 0).unwrap();
+        assert!(first.contains("next=17"));
+        assert!(first.contains("count=16"));
+        assert!(first.contains("16:command_completed:16,0,0"));
+        assert!(!first.contains("17:command_completed:17,0,0"));
+
+        let mut second = heapless::String::<1024>::new();
+        write_compact_events(&mut second, 16).unwrap();
+        assert!(second.contains("next=21"));
+        assert!(second.contains("count=4"));
+        assert!(second.contains("20:command_completed:20,0,0"));
+    }
+
+    #[test]
+    fn safety_preemption_returns_every_accepted_pending_command() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_COMMAND_ID.store(70, Ordering::Relaxed);
+        PENDING_COMMAND_KIND.store(ControlCommandCode::HeartbeatStop as u8, Ordering::Relaxed);
+        PENDING_VELOCITY_ID.store(71, Ordering::Relaxed);
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::CmdVel as u8, Ordering::Relaxed);
+        PENDING_VELOCITY_IS_RENEWAL.store(OFF, Ordering::Relaxed);
+
+        let (ordinary, velocity) = preempt_pending_commands_for_safety(72);
+        assert_eq!(ordinary, Some(70));
+        assert_eq!(velocity, Some(71));
+        assert_eq!(
+            PENDING_VELOCITY_KIND.load(Ordering::Relaxed),
+            ControlCommandCode::None as u8
+        );
+        for command_id in [ordinary, velocity].into_iter().flatten() {
+            mark_command_interrupted(command_id);
+        }
+        let records = collect::<4>(0);
+        assert!(records.iter().any(|record| {
+            record.kind == PublicEventKind::CommandInterrupted as u8 && record.a == 70
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == PublicEventKind::CommandInterrupted as u8 && record.a == 71
+        }));
+
+        PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    }
+
+    #[test]
     fn generic_event_name_rendering_has_stable_fallback() {
         let _guard = status_test_guard();
         assert_eq!(
@@ -4226,6 +4357,83 @@ mod tests {
             record.kind == PublicEventKind::CommandInterrupted as u8 && record.a == 41
         }));
         PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn active_velocity_refresh_emits_one_compact_renewal_event() {
+        let _guard = status_test_guard();
+        reset_event_log_for_test();
+        PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+        mark_velocity_stream_active(41, 50, 100);
+
+        assert!(submit_control_command(
+            42,
+            BrainstemCommand::CmdVel {
+                linear_mm_s: 50,
+                angular_mrad_s: 100,
+                ttl_ms: 300,
+                seq: 42,
+            },
+        )
+        .is_ok());
+
+        let records = collect::<4>(0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, PublicEventKind::CommandRenewed as u8);
+        assert_eq!(records[0].a, 42);
+        assert_eq!(records[0].b, 41);
+        assert_eq!(records[0].c, 42);
+        let _ = take_control_command();
+        clear_velocity_stream();
+    }
+
+    #[cfg(feature = "pico-w")]
+    #[test]
+    fn stop_and_estop_interrupt_every_accepted_pending_command() {
+        let _guard = status_test_guard();
+        for (safety_id, safety_command) in
+            [(12, BrainstemCommand::Stop), (22, BrainstemCommand::EStop)]
+        {
+            reset_event_log_for_test();
+            PENDING_COMMAND_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+            PENDING_VELOCITY_KIND.store(ControlCommandCode::None as u8, Ordering::Relaxed);
+            let ordinary_id = safety_id - 2;
+            let velocity_id = safety_id - 1;
+            assert!(submit_control_command(
+                ordinary_id,
+                BrainstemCommand::HeartbeatStop {
+                    timeout_ms: 750,
+                    seq: ordinary_id,
+                },
+            )
+            .is_ok());
+            assert!(submit_control_command(
+                velocity_id,
+                BrainstemCommand::CmdVel {
+                    linear_mm_s: 50,
+                    angular_mrad_s: 0,
+                    ttl_ms: 300,
+                    seq: velocity_id,
+                },
+            )
+            .is_ok());
+            assert!(submit_control_command(safety_id, safety_command).is_ok());
+
+            let records = collect::<12>(0);
+            assert!(records.iter().any(|record| {
+                record.kind == PublicEventKind::CommandInterrupted as u8 && record.a == ordinary_id
+            }));
+            assert!(records.iter().any(|record| {
+                record.kind == PublicEventKind::CommandInterrupted as u8 && record.a == velocity_id
+            }));
+            assert_eq!(
+                PENDING_VELOCITY_KIND.load(Ordering::Relaxed),
+                ControlCommandCode::None as u8
+            );
+            assert_eq!(PENDING_COMMAND_ID.load(Ordering::Relaxed), safety_id);
+            let _ = take_control_command();
+        }
     }
 
     #[cfg(feature = "pico-w")]

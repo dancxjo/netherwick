@@ -153,6 +153,7 @@ command_started
 command_completed
 command_interrupted
 command_timed_out
+command_renewed
 body_power_requested
 body_power_changed
 body_mode_requested
@@ -179,9 +180,9 @@ error
 seq kind a b c
 ```
 
-The JSON response includes `oldest_seq`, `next_seq`, and `dropped_before_seq`. The compact UART/UDP response includes the same values as `oldest`, `next`, and `dropped_before`. If `dropped_before_seq`/`dropped_before` is non-zero, the caller asked for history older than the ring still contains.
+The JSON response includes `oldest_seq`, `next_seq`, and `dropped_before_seq`. The compact UART/UDP response includes the same values as `oldest`, `next`, and `dropped_before`. If `dropped_before_seq`/`dropped_before` is non-zero, the caller asked for history older than the 128-record ring still contains. Responses expose at most 16 records at a time; `next_seq` advances to the next page rather than skipping retained records.
 
-The numeric fields are intentionally small and transport-neutral. Command lifecycle events use `a` for command id. `command_started` is emitted when the runtime actually pops a queued runtime command and begins executing it. `command_completed` is emitted when that runtime step finishes normally, including normal TTL expiry for motion. `command_interrupted` is emitted when Stop/E-stop/new velocity/safety/reflex logic clears the active command. `command_timed_out` is reserved for actual failure/deadline paths such as Create wake response timeout, not ordinary motion TTL completion.
+The numeric fields are intentionally small and transport-neutral. Command lifecycle events use `a` for command id. `command_started` is emitted when the runtime actually pops a queued runtime command and begins executing it. `command_completed` is emitted when that runtime step finishes normally, including normal TTL expiry for motion. `command_interrupted` is emitted when Stop/E-stop/new velocity/safety/reflex logic clears an active or accepted pending command. `command_timed_out` is reserved for actual failure/deadline paths such as Create wake response timeout, not ordinary motion TTL completion. An identical `cmd_vel` refresh renews the original streaming command without restarting the motor or transferring lifecycle ownership; `command_renewed` is the refresh command's terminal record, with the refresh id in `a`, owning stream command id in `b`, and refresh sequence in `c`.
 
 Motion events pack wheel speeds or duration, sensor-frame events carry the body packet/frame id plus flags and odometry delta, and error events carry a small error code. Compound verbs such as `bump_escape` and `wiggle_align` currently expand into runtime substeps that share the external command id; a future event schema should add a child-step field.
 
