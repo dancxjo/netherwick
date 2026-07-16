@@ -10,6 +10,12 @@ if [[ ! -d .git ]]; then
   exit 1
 fi
 
+if [[ -z "$(git status --porcelain)" ]]; then
+  echo "No repository changes to process."
+  git status -sb
+  exit 0
+fi
+
 RUST_LOG=error codex --ask-for-approval never exec --cd "$(pwd)" --sandbox danger-full-access --ephemeral <<'EOF'
 You are continuing the workflow in this repository. Do exactly this:
 
