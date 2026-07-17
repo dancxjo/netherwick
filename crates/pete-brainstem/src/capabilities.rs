@@ -109,7 +109,7 @@ pub fn write_compact<const N: usize>(
     write_csv(response, capabilities.events)?;
     write!(
         response,
-        " limits=max_linear_mm_s:{},max_angular_mrad_s:{},min_ttl_ms:{},max_ttl_ms:{} max_tones={} song_slots={} feedback_slots={} sensor_packets={}\n",
+        " limits=max_linear_mm_s:{},max_angular_mrad_s:{},min_ttl_ms:{},max_ttl_ms:{} max_tones={} song_slots={} feedback_slots={} sensor_packets={}",
         capabilities.max_linear_mm_s,
         capabilities.max_angular_mrad_s,
         capabilities.min_ttl_ms,
@@ -119,7 +119,8 @@ pub fn write_compact<const N: usize>(
         capabilities.feedback.len(),
         capabilities.sensor_packets
     )?;
-    build_identity::write_compact(response, build_identity::CURRENT)
+    build_identity::write_compact(response, build_identity::CURRENT)?;
+    response.push('\n').map_err(|_| fmt::Error)
 }
 
 fn write_json_str_array<const N: usize>(
@@ -145,4 +146,20 @@ fn write_csv<const N: usize>(response: &mut String<N>, values: &[&str]) -> fmt::
         response.push_str(value).map_err(|_| fmt::Error)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_capabilities_are_one_complete_line() {
+        let mut response = String::<2048>::new();
+        write_compact(&mut response, &current(), 7).unwrap();
+
+        assert!(response.starts_with("OK 7 CAPABILITIES "));
+        assert!(response.contains(" firmware_version="));
+        assert!(response.ends_with('\n'));
+        assert_eq!(response.bytes().filter(|byte| *byte == b'\n').count(), 1);
+    }
 }
