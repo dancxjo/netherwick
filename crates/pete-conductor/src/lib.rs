@@ -23,6 +23,10 @@ pub use pete_now::{EvidenceRef, WorldEntity, WorldEntityKind, WorldModelSnapshot
 
 pub trait Conductor {
     fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive>;
+
+    fn navigation_goal(&self) -> Option<&NavigationGoalDecision> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -94,6 +98,7 @@ enum RecoveryStep {
     Turn,
     Probe,
     Inspect,
+    Stuck,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -101,17 +106,45 @@ struct RecoveryState {
     step: RecoveryStep,
     remaining_ticks: usize,
     turn_direction: Option<TurnDir>,
+    attempt: u8,
+    phase_origin_distance_m: f32,
+    phase_origin_heading_rad: f32,
+    stalled_phases: u8,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+struct RecoveryDecision {
+    action: ActionPrimitive,
+    reason: String,
+}
+
+const RECOVERY_MAX_ATTEMPTS: u8 = 3;
+const RECOVERY_REVERSE_BASE_TARGET_M: f32 = 0.08;
+const RECOVERY_REVERSE_TARGET_STEP_M: f32 = 0.04;
+const RECOVERY_REVERSE_MAX_TICKS: usize = 45;
+const RECOVERY_TURN_TARGET_RAD: f32 = 1.57;
+const RECOVERY_TURN_MIN_USEFUL_RAD: f32 = 0.30;
+const RECOVERY_TURN_MAX_TICKS: usize = 45;
+const RECOVERY_PROBE_TARGET_M: f32 = 0.05;
+const RECOVERY_PROBE_MAX_TICKS: usize = 20;
 
 #[derive(Clone, Debug, Default)]
 pub struct SimpleConductor {
     pub config: ConductorConfig,
     recovery: RecoveryState,
+    last_navigation_goal: Option<NavigationGoalDecision>,
 }
 
 impl Conductor for SimpleConductor {
     fn choose(&mut self, input: ConductorInput) -> Result<ActionPrimitive> {
-        Ok(self.choose_with_navigation_goal(input)?.action)
+        let decision = self.choose_with_navigation_goal(input)?;
+        let action = decision.action.clone();
+        self.last_navigation_goal = Some(decision);
+        Ok(action)
+    }
+
+    fn navigation_goal(&self) -> Option<&NavigationGoalDecision> {
+        self.last_navigation_goal.as_ref()
     }
 }
 
@@ -164,21 +197,21 @@ impl SimpleConductor {
         }
         if self.recovery.step == RecoveryStep::Idle {
             if contact_recovery_triggered(&input) {
-                self.start_contact_recovery(contact_turn_direction(&input));
+                self.start_contact_recovery(&input, contact_turn_direction(&input));
             } else if cramped_and_not_advancing(&input) {
                 if side_escape_gap(&input.range.beams) {
-                    self.start_contact_recovery(clearer_turn_direction(&input.range));
+                    self.start_contact_recovery(&input, clearer_turn_direction(&input.range));
                 } else {
-                    self.start_range_recovery(clearer_turn_direction(&input.range));
+                    self.start_range_recovery(&input, clearer_turn_direction(&input.range));
                 }
             }
         }
-        if let Some(action) = self.next_recovery_action(&input) {
+        if let Some(recovery) = self.next_recovery_action(&input) {
             return Ok(navigation_goal(
                 NavigationIntent::RecoverFromContact,
-                action,
+                recovery.action,
                 0.9,
-                "contact or cramped-range recovery is active",
+                recovery.reason,
             ));
         }
         if input.memory.recent_trap_confidence >= 0.6 {
@@ -350,75 +383,224 @@ impl SimpleConductor {
         ))
     }
 
-    fn start_contact_recovery(&mut self, turn_direction: TurnDir) {
+    fn start_contact_recovery(&mut self, input: &ConductorInput, turn_direction: TurnDir) {
         self.recovery = RecoveryState {
             step: RecoveryStep::Reverse,
-            remaining_ticks: 2,
+            remaining_ticks: RECOVERY_REVERSE_MAX_TICKS,
             turn_direction: Some(turn_direction),
+            attempt: 1,
+            phase_origin_distance_m: input.body.odometry.x_m,
+            phase_origin_heading_rad: input.body.odometry.heading_rad,
+            stalled_phases: 0,
         };
     }
 
-    fn start_range_recovery(&mut self, turn_direction: TurnDir) {
+    fn start_range_recovery(&mut self, input: &ConductorInput, turn_direction: TurnDir) {
         self.recovery = RecoveryState {
             step: RecoveryStep::Turn,
-            remaining_ticks: 9,
+            remaining_ticks: RECOVERY_TURN_MAX_TICKS,
             turn_direction: Some(turn_direction),
+            attempt: 1,
+            phase_origin_distance_m: input.body.odometry.x_m,
+            phase_origin_heading_rad: input.body.odometry.heading_rad,
+            stalled_phases: 0,
         };
     }
 
-    fn next_recovery_action(&mut self, input: &ConductorInput) -> Option<ActionPrimitive> {
-        match self.recovery.step {
-            RecoveryStep::Idle => None,
-            RecoveryStep::Reverse => {
-                self.advance_recovery(RecoveryStep::Turn, 7);
-                Some(ActionPrimitive::Go {
-                    intensity: -0.18,
-                    duration_ms: 300,
-                })
-            }
-            RecoveryStep::Turn => {
-                let direction = self
-                    .recovery
-                    .turn_direction
-                    .clone()
-                    .unwrap_or(TurnDir::Left);
-                self.advance_recovery(RecoveryStep::Probe, 3);
-                Some(ActionPrimitive::Turn {
-                    direction,
-                    intensity: 0.75,
-                    duration_ms: 500,
-                })
-            }
-            RecoveryStep::Probe => {
-                if center_clearance(&input.range.beams) < 0.30 {
-                    self.recovery.step = RecoveryStep::Reverse;
-                    self.recovery.remaining_ticks = 2;
-                    return Some(ActionPrimitive::Go {
-                        intensity: -0.16,
-                        duration_ms: 300,
+    fn next_recovery_action(&mut self, input: &ConductorInput) -> Option<RecoveryDecision> {
+        // A transition can be recognized from fresh odometry at the start of
+        // a tick. Loop only across state transitions; every returned motion
+        // still corresponds to one short-lived primitive renewed by the
+        // possession loop.
+        loop {
+            match self.recovery.step {
+                RecoveryStep::Idle => return None,
+                RecoveryStep::Reverse => {
+                    let progress_m = self.recovery_reverse_progress(input);
+                    let target_m = self.recovery_reverse_target_m();
+                    if progress_m >= target_m || self.recovery.remaining_ticks == 0 {
+                        if progress_m < 0.01 {
+                            self.recovery.stalled_phases =
+                                self.recovery.stalled_phases.saturating_add(1);
+                        }
+                        self.begin_recovery_phase(input, RecoveryStep::Turn);
+                        continue;
+                    }
+                    self.recovery.remaining_ticks = self.recovery.remaining_ticks.saturating_sub(1);
+                    return Some(RecoveryDecision {
+                        action: ActionPrimitive::Go {
+                            // Use the full default possession allowance. The
+                            // hardware gate can still impose a lower operator
+                            // limit; escape authority comes primarily from the
+                            // observed distance target, not excess speed.
+                            intensity: -0.05,
+                            duration_ms: 500,
+                        },
+                        reason: format!(
+                            "escape attempt {} reversing: {:.0}/{:.0} mm observed odometry",
+                            self.recovery.attempt,
+                            progress_m * 1_000.0,
+                            target_m * 1_000.0
+                        ),
                     });
                 }
-                self.advance_recovery(RecoveryStep::Inspect, 1);
-                Some(ActionPrimitive::Go {
-                    intensity: 0.14,
-                    duration_ms: 300,
-                })
-            }
-            RecoveryStep::Inspect => {
-                self.advance_recovery(RecoveryStep::Idle, 0);
-                Some(ActionPrimitive::Inspect {
-                    target: InspectTarget::Novelty,
-                })
+                RecoveryStep::Turn => {
+                    let progress_rad = self.recovery_turn_progress(input);
+                    if progress_rad >= RECOVERY_TURN_TARGET_RAD
+                        || self.recovery.remaining_ticks == 0
+                    {
+                        if progress_rad < RECOVERY_TURN_MIN_USEFUL_RAD {
+                            self.recovery.stalled_phases =
+                                self.recovery.stalled_phases.saturating_add(1);
+                            if self.begin_escalated_recovery_attempt(input) {
+                                continue;
+                            }
+                            self.begin_recovery_phase(input, RecoveryStep::Stuck);
+                            continue;
+                        }
+                        self.begin_recovery_phase(input, RecoveryStep::Probe);
+                        continue;
+                    }
+                    self.recovery.remaining_ticks = self.recovery.remaining_ticks.saturating_sub(1);
+                    let direction = self
+                        .recovery
+                        .turn_direction
+                        .clone()
+                        .unwrap_or(TurnDir::Left);
+                    return Some(RecoveryDecision {
+                        action: ActionPrimitive::Turn {
+                            direction,
+                            intensity: 0.5,
+                            duration_ms: 500,
+                        },
+                        reason: format!(
+                            "escape attempt {} turning {:?}: {:.0}/{:.0} mrad observed heading",
+                            self.recovery.attempt,
+                            self.recovery
+                                .turn_direction
+                                .as_ref()
+                                .unwrap_or(&TurnDir::Left),
+                            progress_rad * 1_000.0,
+                            RECOVERY_TURN_TARGET_RAD * 1_000.0
+                        ),
+                    });
+                }
+                RecoveryStep::Probe => {
+                    let progress_m = self.recovery_forward_progress(input);
+                    let close_ahead = center_clearance(&input.range.beams) < 0.30;
+                    if progress_m >= RECOVERY_PROBE_TARGET_M && !close_ahead {
+                        self.begin_recovery_phase(input, RecoveryStep::Inspect);
+                        continue;
+                    }
+                    if close_ahead || self.recovery.remaining_ticks == 0 {
+                        if progress_m < 0.01 {
+                            self.recovery.stalled_phases =
+                                self.recovery.stalled_phases.saturating_add(1);
+                        }
+                        if self.begin_escalated_recovery_attempt(input) {
+                            continue;
+                        }
+                        self.begin_recovery_phase(input, RecoveryStep::Stuck);
+                        continue;
+                    }
+                    self.recovery.remaining_ticks = self.recovery.remaining_ticks.saturating_sub(1);
+                    return Some(RecoveryDecision {
+                        action: ActionPrimitive::Go {
+                            intensity: 0.05,
+                            duration_ms: 500,
+                        },
+                        reason: format!(
+                            "escape attempt {} probing: {:.0}/{:.0} mm observed odometry",
+                            self.recovery.attempt,
+                            progress_m * 1_000.0,
+                            RECOVERY_PROBE_TARGET_M * 1_000.0
+                        ),
+                    });
+                }
+                RecoveryStep::Inspect => {
+                    self.recovery = RecoveryState::default();
+                    return Some(RecoveryDecision {
+                        action: ActionPrimitive::Inspect {
+                            target: InspectTarget::Novelty,
+                        },
+                        reason: "escape completed with observed reverse, turn, and probe progress"
+                            .to_string(),
+                    });
+                }
+                RecoveryStep::Stuck => {
+                    return Some(RecoveryDecision {
+                        action: ActionPrimitive::Stop,
+                        reason: format!(
+                            "escape stopped after {} attempts and {} stalled odometry phases; no mechanically useful progress observed",
+                            self.recovery.attempt, self.recovery.stalled_phases
+                        ),
+                    });
+                }
             }
         }
     }
 
-    fn advance_recovery(&mut self, next_step: RecoveryStep, next_ticks: usize) {
-        self.recovery.remaining_ticks = self.recovery.remaining_ticks.saturating_sub(1);
-        if self.recovery.remaining_ticks == 0 {
-            self.recovery.step = next_step;
-            self.recovery.remaining_ticks = next_ticks;
+    fn recovery_reverse_target_m(&self) -> f32 {
+        RECOVERY_REVERSE_BASE_TARGET_M
+            + f32::from(self.recovery.attempt.saturating_sub(1)) * RECOVERY_REVERSE_TARGET_STEP_M
+    }
+
+    fn recovery_reverse_progress(&self, input: &ConductorInput) -> f32 {
+        (self.recovery.phase_origin_distance_m - input.body.odometry.x_m).max(0.0)
+    }
+
+    fn recovery_forward_progress(&self, input: &ConductorInput) -> f32 {
+        (input.body.odometry.x_m - self.recovery.phase_origin_distance_m).max(0.0)
+    }
+
+    fn recovery_turn_progress(&self, input: &ConductorInput) -> f32 {
+        match self
+            .recovery
+            .turn_direction
+            .as_ref()
+            .unwrap_or(&TurnDir::Left)
+        {
+            TurnDir::Left => {
+                (input.body.odometry.heading_rad - self.recovery.phase_origin_heading_rad).max(0.0)
+            }
+            TurnDir::Right => {
+                (self.recovery.phase_origin_heading_rad - input.body.odometry.heading_rad).max(0.0)
+            }
         }
+    }
+
+    fn begin_recovery_phase(&mut self, input: &ConductorInput, step: RecoveryStep) {
+        self.recovery.step = step;
+        self.recovery.remaining_ticks = match step {
+            RecoveryStep::Reverse => RECOVERY_REVERSE_MAX_TICKS,
+            RecoveryStep::Turn => RECOVERY_TURN_MAX_TICKS,
+            RecoveryStep::Probe => RECOVERY_PROBE_MAX_TICKS,
+            RecoveryStep::Inspect => 1,
+            RecoveryStep::Stuck => 0,
+            RecoveryStep::Idle => 0,
+        };
+        self.recovery.phase_origin_distance_m = input.body.odometry.x_m;
+        self.recovery.phase_origin_heading_rad = input.body.odometry.heading_rad;
+    }
+
+    fn begin_escalated_recovery_attempt(&mut self, input: &ConductorInput) -> bool {
+        if self.recovery.attempt >= RECOVERY_MAX_ATTEMPTS {
+            return false;
+        }
+        self.recovery.attempt = self.recovery.attempt.saturating_add(1);
+        self.recovery.turn_direction = Some(
+            match self
+                .recovery
+                .turn_direction
+                .clone()
+                .unwrap_or(TurnDir::Left)
+            {
+                TurnDir::Left => TurnDir::Right,
+                TurnDir::Right => TurnDir::Left,
+            },
+        );
+        self.begin_recovery_phase(input, RecoveryStep::Reverse);
+        true
     }
 }
 
@@ -755,19 +937,17 @@ mod tests {
         assert_eq!(
             conductor.choose(input.clone()).unwrap(),
             ActionPrimitive::Go {
-                intensity: -0.18,
-                duration_ms: 300
+                intensity: -0.05,
+                duration_ms: 500
             }
         );
         input.body.flags.bump_left = false;
-        for _ in 0..2 {
-            let _ = conductor.choose(input.clone()).unwrap();
-        }
+        input.body.odometry.x_m = -RECOVERY_REVERSE_BASE_TARGET_M;
         assert_eq!(
             conductor.choose(input).unwrap(),
             ActionPrimitive::Turn {
                 direction: TurnDir::Right,
-                intensity: 0.75,
+                intensity: 0.5,
                 duration_ms: 500
             }
         );
@@ -798,7 +978,7 @@ mod tests {
             conductor.choose(input.clone()).unwrap(),
             ActionPrimitive::Turn {
                 direction: TurnDir::Left,
-                intensity: 0.75,
+                intensity: 0.5,
                 duration_ms: 500
             }
         );
@@ -815,21 +995,156 @@ mod tests {
         assert_eq!(
             conductor.choose(input.clone()).unwrap(),
             ActionPrimitive::Go {
-                intensity: -0.18,
-                duration_ms: 300
+                intensity: -0.05,
+                duration_ms: 500
             }
         );
-        for _ in 0..2 {
-            let _ = conductor.choose(input.clone()).unwrap();
-        }
+        input.body.flags.bump_right = false;
+        input.body.odometry.x_m = -RECOVERY_REVERSE_BASE_TARGET_M;
         assert_eq!(
             conductor.choose(input).unwrap(),
             ActionPrimitive::Turn {
                 direction: TurnDir::Left,
-                intensity: 0.75,
+                intensity: 0.5,
                 duration_ms: 500
             }
         );
+    }
+
+    #[test]
+    fn contact_recovery_advances_only_after_observed_phase_progress() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.flags.bump_left = true;
+        let mut input = input_with_body(body);
+        input.range.beams = vec![0.9; 6];
+
+        let reverse = conductor
+            .choose_with_navigation_goal(input.clone())
+            .unwrap();
+        assert!(matches!(
+            reverse.action,
+            ActionPrimitive::Go {
+                intensity: -0.05,
+                ..
+            }
+        ));
+        assert!(reverse.reason.contains("0/80 mm"));
+
+        input.body.flags.bump_left = false;
+        input.body.odometry.x_m = -0.08;
+        let turn = conductor
+            .choose_with_navigation_goal(input.clone())
+            .unwrap();
+        assert!(matches!(
+            turn.action,
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                intensity: 0.5,
+                ..
+            }
+        ));
+        assert!(turn.reason.contains("0/1570 mrad"));
+
+        input.body.odometry.heading_rad = -1.57;
+        let probe = conductor
+            .choose_with_navigation_goal(input.clone())
+            .unwrap();
+        assert!(matches!(
+            probe.action,
+            ActionPrimitive::Go {
+                intensity: 0.05,
+                ..
+            }
+        ));
+        assert!(probe.reason.contains("0/50 mm"));
+
+        input.body.odometry.x_m = -0.02;
+        let inspect = conductor.choose_with_navigation_goal(input).unwrap();
+        assert_eq!(
+            inspect.action,
+            ActionPrimitive::Inspect {
+                target: InspectTarget::Novelty
+            }
+        );
+        assert!(inspect
+            .reason
+            .contains("observed reverse, turn, and probe progress"));
+    }
+
+    #[test]
+    fn recovery_does_not_credit_motion_in_the_wrong_direction() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.flags.bump_left = true;
+        let mut input = input_with_body(body);
+        input.range.beams = vec![0.9; 6];
+        let _ = conductor.choose(input.clone()).unwrap();
+
+        input.body.flags.bump_left = false;
+        input.body.odometry.x_m = 0.20;
+        let wrong_way_reverse = conductor
+            .choose_with_navigation_goal(input.clone())
+            .unwrap();
+        assert!(matches!(
+            wrong_way_reverse.action,
+            ActionPrimitive::Go {
+                intensity: -0.05,
+                ..
+            }
+        ));
+        assert!(wrong_way_reverse.reason.contains("0/80 mm"));
+
+        input.body.odometry.x_m = -0.08;
+        let _ = conductor.choose(input.clone()).unwrap();
+        input.body.odometry.heading_rad = 2.0;
+        let wrong_way_turn = conductor.choose_with_navigation_goal(input).unwrap();
+        assert!(matches!(
+            wrong_way_turn.action,
+            ActionPrimitive::Turn {
+                direction: TurnDir::Right,
+                ..
+            }
+        ));
+        assert!(wrong_way_turn.reason.contains("0/1570 mrad"));
+    }
+
+    #[test]
+    fn absent_odometry_progress_escalates_then_stops() {
+        let mut conductor = SimpleConductor::default();
+        let mut body = BodySense::default();
+        body.flags.bump_left = true;
+        let mut input = input_with_body(body);
+        input.range.beams = vec![0.9; 6];
+        let mut saw_second_attempt = false;
+        let mut saw_alternate_turn = false;
+        let mut stopped = None;
+
+        for _ in 0..350 {
+            let decision = conductor
+                .choose_with_navigation_goal(input.clone())
+                .unwrap();
+            saw_second_attempt |= decision.reason.contains("escape attempt 2");
+            saw_alternate_turn |= matches!(
+                decision.action,
+                ActionPrimitive::Turn {
+                    direction: TurnDir::Left,
+                    ..
+                }
+            );
+            if decision.action == ActionPrimitive::Stop
+                && decision.reason.contains("no mechanically useful progress")
+            {
+                stopped = Some(decision);
+                break;
+            }
+        }
+
+        assert!(saw_second_attempt);
+        assert!(saw_alternate_turn);
+        let stopped = stopped.expect("recovery should stop after bounded escalation");
+        assert!(stopped.reason.contains("3 attempts"));
+        assert!(stopped.reason.contains("stalled odometry phases"));
     }
 
     #[test]

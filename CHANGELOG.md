@@ -84,6 +84,11 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Replace timid tick-count contact recovery with odometry-gated escape phases:
+  reverse 80-160 mm at the possession speed limit, turn until 1.57 radians are
+  observed, probe 50 mm, alternate and escalate bounded retries, then stop when
+  body feedback proves no mechanically useful progress; include phase progress
+  in the live possession trace.
 - Keep complete brainstem body evidence available when an optional Kinect or
   other sensor poll fails, publish named per-sensor health, rate-limit repeated
   failure reports, stop failed libfreenect workers, and back off hardware

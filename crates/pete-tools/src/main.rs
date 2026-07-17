@@ -8554,7 +8554,8 @@ fn background_sensor_retry_delay(base: Duration, consecutive_failures: u32) -> D
 
 #[cfg(test)]
 mod background_sensor_retry_tests {
-    use super::background_sensor_retry_delay;
+    use super::{background_sensor_retry_delay, slow_motion_note};
+    use pete_sensors::WorldSnapshot;
     use std::time::Duration;
 
     #[test]
@@ -8580,6 +8581,43 @@ mod background_sensor_retry_tests {
         assert_eq!(
             background_sensor_retry_delay(base, 20),
             Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn slow_trace_includes_observed_recovery_progress() {
+        let recovery_action = pete_actions::ActionPrimitive::Go {
+            intensity: -0.05,
+            duration_ms: 500,
+        };
+        let mut snapshot = WorldSnapshot {
+            action_debug: Some(serde_json::json!({
+                "conductor_navigation_goal": {
+                    "intent": "recover_from_contact",
+                    "action": recovery_action,
+                    "reason": "escape attempt 2 reversing: 31/120 mm observed odometry"
+                }
+            })),
+            final_selected_action: Some(recovery_action.clone()),
+            ..WorldSnapshot::default()
+        };
+
+        assert_eq!(
+            slow_motion_note(&snapshot),
+            ", recovery: escape attempt 2 reversing: 31/120 mm observed odometry"
+        );
+
+        snapshot.action_debug = Some(serde_json::json!({
+            "why_not_moving": "operator E-stop is latched",
+            "conductor_navigation_goal": {
+                "intent": "recover_from_contact",
+                "action": recovery_action,
+                "reason": "should not obscure a motor gate"
+            }
+        }));
+        assert_eq!(
+            slow_motion_note(&snapshot),
+            ", motion blocked: operator E-stop is latched"
         );
     }
 }
@@ -9241,13 +9279,36 @@ fn disconnect_possession_cockpit_for_reconnect(cockpit: &mut SafeCockpit<Box<dyn
 }
 
 fn slow_motion_note(snapshot: &WorldSnapshot) -> String {
-    snapshot
+    if let Some(reason) = snapshot
         .action_debug
         .as_ref()
         .and_then(|debug| debug.get("why_not_moving"))
         .and_then(|reason| reason.as_str())
         .filter(|reason| !reason.is_empty())
-        .map(|reason| format!(", motion blocked: {reason}"))
+    {
+        return format!(", motion blocked: {reason}");
+    }
+    let Some(goal) = snapshot
+        .action_debug
+        .as_ref()
+        .and_then(|debug| debug.get("conductor_navigation_goal"))
+    else {
+        return String::new();
+    };
+    if goal.get("intent").and_then(|intent| intent.as_str()) != Some("recover_from_contact") {
+        return String::new();
+    }
+    let selected_action = snapshot
+        .final_selected_action
+        .as_ref()
+        .and_then(|action| serde_json::to_value(action).ok());
+    if selected_action.as_ref() != goal.get("action") {
+        return String::new();
+    }
+    goal.get("reason")
+        .and_then(|reason| reason.as_str())
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| format!(", recovery: {reason}"))
         .unwrap_or_default()
 }
 

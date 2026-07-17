@@ -3807,6 +3807,23 @@ where
             charger_visible_score: charger_signal_scores(&now).1,
             proposals: proposals.clone(),
         })?;
+        let conductor_navigation_goal = Box::new(
+            self.conductor
+                .navigation_goal()
+                .cloned()
+                .unwrap_or_else(|| pete_conductor::NavigationGoalDecision {
+                    intent: NavigationIntent::FollowProposal,
+                    action: baseline_action.clone(),
+                    confidence: 0.5,
+                    reason:
+                        "conductor selected an action without structured navigation diagnostics"
+                            .to_string(),
+                }),
+        );
+        now.extensions.insert(
+            "conductor.navigation_goal".to_string(),
+            serde_json::to_value(conductor_navigation_goal.as_ref())?,
+        );
         if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
             baseline_action = action.clone();
         }
@@ -4294,6 +4311,7 @@ where
                 "llm_action": llm_action_proposal.proposed_action.clone(),
                 "selected_action": action_selection.selected_action.clone(),
                 "conductor_selected_action": conductor_selected_output.clone(),
+                "conductor_navigation_goal": conductor_navigation_goal.as_ref(),
                 "chosen_action": chosen_action.clone(),
                 "map_memory_decision": map_memory_decision.clone(),
                 "desired_motor": action_to_motor_command(Some(&chosen_action)),
@@ -10654,7 +10672,7 @@ mod tests {
             first_recovery,
             ActionPrimitive::Go {
                 intensity,
-                duration_ms: 300
+                duration_ms: 500
             } if intensity < 0.0
         ));
 
@@ -10674,10 +10692,11 @@ mod tests {
         let mut cleared_input = test_conductor_input(ActionPrimitive::Stop);
         cleared_input.body = cleared_body.clone();
         let reverse = conductor.choose(cleared_input.clone()).unwrap();
-        let reverse_motor = action_to_motor_command(Some(&reverse));
+        let reverse_motor = action_to_motor_command(Some(&reverse)).clamped(0.05, 0.5);
         assert!(reverse_motor.forward < 0.0);
         apply_slow_possession_motor(&mut cockpit, reverse_motor).unwrap();
 
+        cleared_input.body.odometry.x_m -= 0.08;
         let turn = conductor.choose(cleared_input).unwrap();
         assert!(matches!(
             turn,
@@ -10686,7 +10705,7 @@ mod tests {
                 ..
             }
         ));
-        let turn_motor = action_to_motor_command(Some(&turn));
+        let turn_motor = action_to_motor_command(Some(&turn)).clamped(0.05, 0.5);
         assert!(turn_motor.turn.abs() > 0.0);
         apply_slow_possession_motor(&mut cockpit, turn_motor).unwrap();
 
@@ -13259,6 +13278,16 @@ mod tests {
         assert_eq!(decision.mode, ActionSelectorMode::ModelAssisted);
         assert!(!decision.candidates.is_empty());
         assert!(decision.selected_action.is_some());
+        assert!(
+            tick.frame.now.extensions["conductor.navigation_goal"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        assert!(
+            !tick.frame.now.extensions["action.motion_bridge"]["conductor_navigation_goal"]
+                ["action"]
+                .is_null()
+        );
     }
 
     #[tokio::test]
