@@ -11803,6 +11803,38 @@ mod tests {
             .any(|event| event.kind == pete_cockpit::CockpitEventKind::MotionRequested));
     }
 
+    #[test]
+    fn slow_possession_treats_preflight_bump_latch_as_recoverable() {
+        let mut sim = SimCockpit::new().with_unscoped_bench_mode();
+        sim.set_bump(true, false);
+        let mut cockpit = SafeCockpit::with_policy(
+            sim,
+            pete_cockpit::AgentPolicy {
+                motion_ttl_ms: 100,
+                heartbeat_timeout_ms: 0,
+            },
+        );
+
+        let block = apply_slow_possession_motor(
+            &mut cockpit,
+            MotorCommand {
+                forward: 0.2,
+                turn: 0.1,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            block,
+            Some(SlowPossessionMotionBlock::SafetyLatch(
+                SafetyLatchKind::Bump
+            ))
+        ));
+        let status = cockpit.refresh_status().unwrap();
+        assert_eq!(status.safety_tripped, Some(true));
+        assert_eq!(status.safety_latch_kind, Some(SafetyLatchKind::Bump));
+    }
+
     #[tokio::test]
     async fn operator_estop_during_bump_recovery_requires_explicit_operator_clear() {
         let sim = Arc::new(Mutex::new(SimCockpit::new().with_event_capacity(256)));

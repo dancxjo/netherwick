@@ -3067,9 +3067,16 @@ impl<C: Cockpit> SafeCockpit<C> {
     pub fn pulse_motion(&mut self, linear_mm_s: i16, angular_mrad_s: i16) -> Result<()> {
         let status = self.refresh_status()?;
         if status.estop_latched == Some(true) || status.safety_tripped == Some(true) {
-            return Err(CockpitError::Policy(
-                "refusing motion while safety is latched".to_owned(),
-            ));
+            let mut reasons = Vec::new();
+            if status.estop_latched == Some(true) {
+                reasons.push(SafeStopReason::EStopLatched);
+            }
+            if status.safety_tripped == Some(true) {
+                reasons.push(SafeStopReason::SafetyTripped {
+                    latch: status.safety_latch_kind,
+                });
+            }
+            return Err(CockpitError::MotionStopped { reasons });
         }
         let heartbeat_timeout_ms = self.policy.heartbeat_timeout_ms;
         let motion_ttl_ms = self.policy.motion_ttl_ms;
@@ -3310,6 +3317,7 @@ impl CockpitEventKind {
 struct SimTimedAction {
     command_id: u32,
     complete_at_ms: u32,
+    linear_mm_s: i16,
 }
 
 #[derive(Debug, Clone)]
@@ -3783,8 +3791,13 @@ impl SimCockpit {
         self.bump_right = right;
         self.push_event(CockpitEventKind::BumpChanged, active as u32, 0, 0);
         if active && !was_active {
-            // Match the firmware reflex: interrupt host motion and begin a
-            // bounded, authority-independent straight reverse.
+            // Match the firmware split: every fresh contact latches and stops,
+            // but only contact during forward output starts the bounded,
+            // authority-independent withdrawal.
+            let unsafe_forward_output = self
+                .active_cmd_vel
+                .as_ref()
+                .is_some_and(|motion| motion.linear_mm_s > 0);
             self.safety_tripped = true;
             self.safety_latch_kind = Some(SafetyLatchKind::Bump);
             let preempted_command_id = self
@@ -3795,27 +3808,29 @@ impl SimCockpit {
             self.safety_hazard_generation =
                 self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
             self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
-            self.repeated_contact_count = match self.last_contact_withdrawal_at_ms {
-                Some(previous) if self.now_ms.wrapping_sub(previous) <= 2_000 => {
-                    self.repeated_contact_count.saturating_add(1).max(1)
-                }
-                _ => 1,
-            };
-            self.last_contact_withdrawal_at_ms = Some(self.now_ms);
-            self.push_event(
-                CockpitEventKind::ContactWithdrawalStarted,
-                u32::from(left)
-                    | (u32::from(right) << 1)
-                    | (u32::from(self.repeated_contact_count) << 8),
-                preempted_command_id,
-                u32::from(CONTACT_WITHDRAWAL_SPEED_MM_S.unsigned_abs())
-                    | (CONTACT_WITHDRAWAL_DURATION_MS << 16),
-            );
-            self.active_contact_withdrawal = Some(SimContactWithdrawal {
-                started_at_ms: self.now_ms,
-                complete_at_ms: self.now_ms.wrapping_add(CONTACT_WITHDRAWAL_DURATION_MS),
-                baseline_odometry_mm: self.odometry_distance_mm,
-            });
+            if unsafe_forward_output {
+                self.repeated_contact_count = match self.last_contact_withdrawal_at_ms {
+                    Some(previous) if self.now_ms.wrapping_sub(previous) <= 2_000 => {
+                        self.repeated_contact_count.saturating_add(1).max(1)
+                    }
+                    _ => 1,
+                };
+                self.last_contact_withdrawal_at_ms = Some(self.now_ms);
+                self.push_event(
+                    CockpitEventKind::ContactWithdrawalStarted,
+                    u32::from(left)
+                        | (u32::from(right) << 1)
+                        | (u32::from(self.repeated_contact_count) << 8),
+                    preempted_command_id,
+                    u32::from(CONTACT_WITHDRAWAL_SPEED_MM_S.unsigned_abs())
+                        | (CONTACT_WITHDRAWAL_DURATION_MS << 16),
+                );
+                self.active_contact_withdrawal = Some(SimContactWithdrawal {
+                    started_at_ms: self.now_ms,
+                    complete_at_ms: self.now_ms.wrapping_add(CONTACT_WITHDRAWAL_DURATION_MS),
+                    baseline_odometry_mm: self.odometry_distance_mm,
+                });
+            }
         }
     }
 
@@ -4471,6 +4486,7 @@ impl Cockpit for SimCockpit {
         self.active_cmd_vel = Some(SimTimedAction {
             command_id: id,
             complete_at_ms: self.now_ms.wrapping_add(ttl_ms.max(1)),
+            linear_mm_s,
         });
         Ok(())
     }
@@ -4552,6 +4568,7 @@ impl Cockpit for SimCockpit {
         self.active_cmd_vel = Some(SimTimedAction {
             command_id: id,
             complete_at_ms: self.now_ms.wrapping_add(ttl_ms),
+            linear_mm_s,
         });
         Ok(())
     }
@@ -8601,8 +8618,26 @@ mod tests {
     }
 
     #[test]
-    fn simulator_contact_withdrawal_is_typed_and_authority_independent() {
+    fn simulator_stationary_bump_latches_without_starting_withdrawal() {
         let mut sim = SimCockpit::new();
+        sim.set_bump(true, false);
+
+        let status = sim.get_status().unwrap().summary();
+        assert_eq!(status.safety_tripped, Some(true));
+        assert_eq!(status.safety_latch_kind, Some(SafetyLatchKind::Bump));
+        assert!(sim.active_contact_withdrawal.is_none());
+        assert!(!sim
+            .get_events_since(0)
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.kind == CockpitEventKind::ContactWithdrawalStarted));
+    }
+
+    #[test]
+    fn simulator_contact_withdrawal_is_typed_and_authority_independent() {
+        let mut sim = SimCockpit::new().with_unscoped_bench_mode();
+        sim.cmd_vel(80, 0, 1_000).unwrap();
         sim.set_bump(true, false);
         sim.control_lease = None;
         sim.control_lease_expires_at_ms = None;
@@ -8619,7 +8654,7 @@ mod tests {
             ContactWithdrawalEvent::Started {
                 contact_bits: 1,
                 repeated_count: 1,
-                preempted_command_id: 0,
+                preempted_command_id: 1,
                 reverse_speed_mm_s: 80,
                 maximum_duration_ms: 300,
             }
@@ -8639,6 +8674,7 @@ mod tests {
     #[test]
     fn simulator_escape_motion_is_generation_bound_and_reflex_ordered() {
         let mut sim = SimCockpit::new().with_unscoped_bench_mode();
+        sim.cmd_vel(80, 0, 1_000).unwrap();
         sim.set_bump(true, false);
         let generation = sim
             .get_status()
@@ -8931,6 +8967,27 @@ mod tests {
             .unwrap();
         assert_eq!(motion.a, pack_i16_pair(40, 100));
         assert_eq!(motion.b, 200);
+    }
+
+    #[test]
+    fn safe_cockpit_reports_preexisting_bump_latch_as_typed_motion_stop() {
+        let mut sim = SimCockpit::new().with_unscoped_bench_mode();
+        sim.set_bump(true, false);
+        let mut safe = SafeCockpit::with_policy(
+            sim,
+            AgentPolicy {
+                motion_ttl_ms: 100,
+                heartbeat_timeout_ms: 0,
+            },
+        );
+
+        assert!(matches!(
+            safe.pulse_motion(20, 0),
+            Err(CockpitError::MotionStopped { reasons })
+                if reasons == vec![SafeStopReason::SafetyTripped {
+                    latch: Some(SafetyLatchKind::Bump),
+                }]
+        ));
     }
 
     #[test]

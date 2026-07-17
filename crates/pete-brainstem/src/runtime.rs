@@ -1634,14 +1634,15 @@ where
             self.dock_departure_pending = false;
         }
 
-        // The first complete observation establishes the edge baseline for
-        // hazards that use it. Bumper contact itself is level-triggered.
+        // The first complete observation establishes the edge baseline. A
+        // bumper held through boot is evidence, not permission to move.
         if !self.safety_observation_initialized {
             self.last_bump = bump;
             self.last_cliff = cliff;
             self.last_wheel_drop = wheel_drop;
             self.safety_observation_initialized = true;
         }
+        let fresh_bump_edge = bump && !self.last_bump;
         if let Some(active_escape) = self.active_escape {
             let dominating_hazard = if wheel_drop {
                 Some(status::SafetyEventKind::WheelDrop)
@@ -1771,12 +1772,17 @@ where
         } else if cliff {
             status::mark_safety_tripped(status::SafetyEventKind::Cliff);
             (status::SafetyEventKind::Cliff, SafetyResponse::Stop)
-        } else if bump {
+        } else if bump && fresh_bump_edge && self.unsafe_forward_output() {
             status::mark_safety_tripped(status::SafetyEventKind::Bump);
             (
                 status::SafetyEventKind::Bump,
                 SafetyResponse::ContactWithdrawal,
             )
+        } else if bump {
+            // A stationary press or boot-restored contact remains observable
+            // and latched, but cannot initiate authority-independent motion.
+            status::mark_safety_tripped(status::SafetyEventKind::Bump);
+            (status::SafetyEventKind::Bump, SafetyResponse::Stop)
         } else if wheel_drop {
             status::mark_safety_tripped(status::SafetyEventKind::WheelDrop);
             (status::SafetyEventKind::WheelDrop, SafetyResponse::Stop)
@@ -3865,7 +3871,7 @@ mod tests {
     }
 
     #[test]
-    fn asserted_bumper_starts_withdrawal_without_forward_motion() {
+    fn held_or_stationary_bumper_latches_without_reversing() {
         let _guard = status::status_test_guard();
         status::mark_create_sensor_packet(
             0,
@@ -3881,11 +3887,38 @@ mod tests {
         runtime.create_responsive = true;
 
         assert!(runtime.enforce_safety_policy().is_ok());
-        assert!(runtime.active_contact_withdrawal.is_some());
+        assert!(runtime.active_contact_withdrawal.is_none());
+        assert!(runtime.commands.is_empty());
+        assert!(runtime.safety_latched);
         assert!(matches!(
             runtime.safety_latch_kind,
             Some(status::SafetyEventKind::Bump)
         ));
+
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::ClearSafetyLatch {
+                kind: SafetyLatchKind::Bump,
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(!runtime.safety_latched);
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_right: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.active_contact_withdrawal.is_none());
+        assert!(runtime.commands.is_empty());
+        assert!(runtime.safety_latched);
     }
 
     #[test]
