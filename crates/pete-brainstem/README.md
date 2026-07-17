@@ -219,13 +219,14 @@ The numeric fields are intentionally small and transport-neutral. Command lifecy
 
 Motion events pack wheel speeds or duration, sensor-frame events carry the body packet/frame id plus flags and odometry delta, and error events carry a small error code.
 
-Contact withdrawal is not a `bump_escape` skill. A rising bumper edge invokes a
+Contact withdrawal is not a `bump_escape` skill. An asserted bumper invokes a
 brainstem-local straight reverse of 80 mm/s for at most 300 ms, after first
-stopping the preempted command. Only a fresh contact edge during positive
-linear output can trigger it: a held-at-boot bumper, stationary press, docked
-contact, or restored level sample cannot cause motion. It runs without a
-possession lease and survives host/session loss. Cliff, wheel-drop, charging,
-tilt/impact, disarm, stop, and e-stop remain stronger and end it stopped.
+stopping the preempted command. Bumper contact is level-triggered rather than
+motion-gated: a held-at-boot or stationary bumper starts the same bounded
+withdrawal. Home Base contact is handled first by dock safety; cliff,
+wheel-drop, charging, tilt/impact, disarm, stop, and e-stop remain stronger
+and end it stopped. It runs without a possession lease and survives
+host/session loss.
 `contact_withdrawal_started` records contact side,
 repeat count, preempted command id, and the reverse bounds;
 `contact_withdrawal_completed` records outcome, any dominating safety condition,

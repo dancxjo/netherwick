@@ -4,6 +4,11 @@ All notable changes are grouped by date.
 
 ## Unreleased
 
+### Fixed
+
+- Make brainstem contact withdrawal react to an asserted bumper state without
+  requiring a new edge or forward wheel output.
+
 ### Auto-sync (2026-07-15)
 
 - Refresh the lockfile against the current workspace and external Tongues
