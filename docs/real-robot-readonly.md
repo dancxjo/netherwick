@@ -88,7 +88,7 @@ cargo run -p pete-tools -- robot \
   --max-linear-mm-s 50 \
   --max-angular-mrad-s 500 \
   --autonomous-motion \
-  --tick-ms 100 \
+  --tick-ms 20 \
   --duration-seconds 30 \
   --ledger data/ledger/real/possession-wheels-off-floor \
   --capture data/captures/real/possession-wheels-off-floor
@@ -104,6 +104,12 @@ sends STOP. Runtime motion is limited to
 50 mm/s linear and 500 mrad/s angular with a 300 ms command TTL and a 750 ms
 heartbeat stop. Missing hardware, an unstable device path, identity mismatch,
 or acquisition failure aborts; possession mode never downgrades.
+
+`just possess` targets a 20 ms (50 Hz) control period by default. Tick work is
+included in that period instead of being followed by an additional full delay;
+if sensing or cognition overruns 20 ms, the next tick starts immediately.
+Override the target explicitly with `--tick-ms` or set
+`PETE_POSSESSION_TICK_MS`.
 
 The brainstem is the motherbrain's body interface. Every real-robot tick polls
 the brainstem's cursor-bounded event stream and publishes it as

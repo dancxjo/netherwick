@@ -361,6 +361,7 @@ cargo run -p pete-tools -- robot --mode regular \
   --brainstem-device-id BRAINSTEM_ID \
   --brainstem-boot-id BOOT_ID \
   --max-linear-mm-s 50 --max-angular-mrad-s 500 \
+  --tick-ms 20 \
   --duration-seconds 30 \
   --ledger data/ledger/real/possession-wheels-off-floor \
   --capture data/captures/real/possession-wheels-off-floor

@@ -6,6 +6,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Run `just possess` on a 20 ms target period and count sensing/runtime work
+  inside that period, eliminating the extra post-tick delay that slowed
+  bounded velocity refreshes and could create stop gaps.
 - Make brainstem contact withdrawal react to an asserted bumper state without
   requiring a new edge or forward wheel output.
 
