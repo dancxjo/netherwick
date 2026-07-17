@@ -84,6 +84,10 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Keep complete brainstem body evidence available when an optional Kinect or
+  other sensor poll fails, publish named per-sensor health, rate-limit repeated
+  failure reports, stop failed libfreenect workers, and back off hardware
+  retries so device diagnostics do not bury the possession trace.
 - Open `just cockpit` motion commands as operator-control sessions, accept
   ordinary negative velocity arguments, and report Home Base arrival before a
   preserved terminal safety latch so successful physical docking is not

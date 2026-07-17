@@ -5234,7 +5234,20 @@ pub struct RealRobotRunner<R, C> {
     possession_recovery: PossessionRecoveryState,
     motion_rejection: MotionRejectionState,
     possessor_skills: PossessorSkillRuntime,
+    sensor_poll_health: Vec<SensorPollHealth>,
 }
+
+#[derive(Clone, Debug, Default)]
+struct SensorPollHealth {
+    name: String,
+    available: bool,
+    consecutive_failures: u32,
+    last_error: Option<String>,
+    last_report_ms: TimeMs,
+    last_success_ms: TimeMs,
+}
+
+const SENSOR_FAILURE_REPORT_INTERVAL_MS: TimeMs = 30_000;
 
 #[derive(Clone, Debug, Default)]
 struct PossessorSkillRuntime {
@@ -5547,6 +5560,13 @@ where
         sensors: Vec<Box<dyn SenseProducer + Send>>,
         runtime: R,
     ) -> Self {
+        let sensor_poll_health = sensors
+            .iter()
+            .map(|sensor| SensorPollHealth {
+                name: sensor.source_name().to_string(),
+                ..SensorPollHealth::default()
+            })
+            .collect();
         Self {
             mode,
             cockpit: SafeCockpit::new(cockpit),
@@ -5563,6 +5583,7 @@ where
             possession_recovery: PossessionRecoveryState::default(),
             motion_rejection: MotionRejectionState::default(),
             possessor_skills: PossessorSkillRuntime::default(),
+            sensor_poll_health,
         }
     }
 
@@ -5622,10 +5643,11 @@ where
 
         let body = body_sense_from_cockpit_status(self.cockpit.refresh_status()?, wall_time_ms());
         let brainstem_events = self.cockpit.poll_events()?;
-        let mut packets = poll_sensors_lossy(&mut self.sensors).await;
+        let mut packets = poll_sensors_lossy(&mut self.sensors, &mut self.sensor_poll_health).await;
         let t_ms = body.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
         let mut now = self.now_builder.build(t_ms, body, packets)?;
+        insert_sensor_health(&mut now, &self.sensor_poll_health);
         now.self_sense.mode = Some("read-only".to_string());
         now.extensions.insert(
             "source".to_string(),
@@ -5716,10 +5738,11 @@ where
         let body_before = body_sense_from_cockpit_status(status_before.clone(), wall_time_ms());
         let recovery_decision =
             self.apply_possession_recovery(&body_before, &brainstem_events, &status_before)?;
-        let mut packets = poll_sensors_lossy(&mut self.sensors).await;
+        let mut packets = poll_sensors_lossy(&mut self.sensors, &mut self.sensor_poll_health).await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
         let mut now = self.now_builder.build(t_ms, body_before.clone(), packets)?;
+        insert_sensor_health(&mut now, &self.sensor_poll_health);
         now.self_sense.mode = Some("slow".to_string());
         self.insert_possession_snapshot(&mut now);
         now.extensions.insert(
@@ -6482,16 +6505,73 @@ async fn enrich_now_latest_image(cognition: &mut LiveImageCognition, now: &mut N
 
 async fn poll_sensors_lossy(
     sensors: &mut [Box<dyn SenseProducer + Send>],
+    health: &mut Vec<SensorPollHealth>,
 ) -> Vec<pete_sensors::SensePacket> {
     let mut packets = Vec::new();
-    for sensor in sensors {
+    if health.len() != sensors.len() {
+        health.clear();
+        health.extend(sensors.iter().map(|sensor| SensorPollHealth {
+            name: sensor.source_name().to_string(),
+            ..SensorPollHealth::default()
+        }));
+    }
+    for (sensor, health) in sensors.iter_mut().zip(health.iter_mut()) {
+        let now_ms = wall_time_ms();
         match tokio::time::timeout(std::time::Duration::from_millis(25), sensor.poll()).await {
-            Ok(Ok(packet)) => packets.push(packet),
-            Ok(Err(error)) => eprintln!("sensor poll failed; continuing without packet: {error}"),
-            Err(_) => eprintln!("sensor poll timed out; continuing without packet"),
+            Ok(Ok(packet)) => {
+                if health.consecutive_failures > 0 {
+                    eprintln!(
+                        "optional sensor {} recovered after {} failed polls; brainstem body evidence remained active",
+                        health.name, health.consecutive_failures
+                    );
+                }
+                health.available = true;
+                health.consecutive_failures = 0;
+                health.last_error = None;
+                health.last_success_ms = now_ms;
+                packets.push(packet);
+            }
+            Ok(Err(error)) => record_optional_sensor_failure(health, error.to_string(), now_ms),
+            Err(_) => record_optional_sensor_failure(health, "poll timed out".to_string(), now_ms),
         }
     }
     packets
+}
+
+fn record_optional_sensor_failure(health: &mut SensorPollHealth, error: String, now_ms: TimeMs) {
+    health.available = false;
+    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    health.last_error = Some(error.clone());
+    if health.last_report_ms == 0
+        || now_ms.saturating_sub(health.last_report_ms) >= SENSOR_FAILURE_REPORT_INTERVAL_MS
+    {
+        eprintln!(
+            "optional sensor {} unavailable; continuing with brainstem body evidence: {} ({} failed polls; repeated reports suppressed for 30s)",
+            health.name, error, health.consecutive_failures
+        );
+        health.last_report_ms = now_ms;
+    }
+}
+
+fn insert_sensor_health(now: &mut Now, health: &[SensorPollHealth]) {
+    now.extensions.insert(
+        "sensor.health".to_string(),
+        serde_json::Value::Array(
+            health
+                .iter()
+                .map(|health| {
+                    serde_json::json!({
+                        "name": health.name,
+                        "available": health.available,
+                        "consecutive_failures": health.consecutive_failures,
+                        "last_error": health.last_error,
+                        "last_success_ms": health.last_success_ms,
+                        "body_evidence_independent": true,
+                    })
+                })
+                .collect(),
+        ),
+    );
 }
 
 fn wall_time_ms() -> u64 {
@@ -11379,6 +11459,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SenseProducer for FailingSensor {
+        fn source_name(&self) -> &'static str {
+            "kinect-depth"
+        }
+
         async fn poll(&mut self) -> Result<pete_sensors::SensePacket> {
             anyhow::bail!("simulated sensor timeout")
         }
@@ -11435,6 +11519,82 @@ mod tests {
 
         assert!(snapshot.body.last_update_ms >= 100);
         assert_eq!(runner.tick_count, 1);
+        assert_eq!(snapshot.body.odometry.x_m, 0.0);
+        assert_eq!(
+            _tick
+                .frame
+                .now
+                .extensions
+                .get("sensor.health")
+                .and_then(|health| health.get(0))
+                .and_then(|health| health.get("name")),
+            Some(&serde_json::json!("kinect-depth"))
+        );
+        assert_eq!(
+            _tick
+                .frame
+                .now
+                .extensions
+                .get("sensor.health")
+                .and_then(|health| health.get(0))
+                .and_then(|health| health.get("body_evidence_independent")),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn real_robot_slow_runner_keeps_body_evidence_when_kinect_fails() {
+        let body = BodySense {
+            battery_level: 0.61,
+            charging: true,
+            flags: pete_body::BodyFlags {
+                wheel_drop: true,
+                ..pete_body::BodyFlags::default()
+            },
+            odometry: Pose2 {
+                x_m: 1.234,
+                heading_rad: 0.875,
+                ..Pose2::default()
+            },
+            last_update_ms: 100,
+            ..BodySense::default()
+        };
+        let cockpit = CountingCockpit {
+            motor_attempts: Arc::new(AtomicUsize::new(0)),
+            motors: Arc::new(Mutex::new(Vec::new())),
+            body,
+        };
+        let sensors: Vec<Box<dyn SenseProducer + Send>> = vec![Box::new(FailingSensor)];
+        let mut runner =
+            RealRobotRunner::new(RobotMode::Slow, Box::new(cockpit), sensors, StubRuntime);
+
+        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(snapshot.body.battery_level, 0.61);
+        assert!(snapshot.body.charging);
+        assert!(snapshot.body.flags.wheel_drop);
+        assert_eq!(snapshot.body.odometry.x_m, 1.234);
+        assert_eq!(snapshot.body.odometry.heading_rad, 0.875);
+        let health = tick.frame.now.extensions["sensor.health"][0].clone();
+        assert_eq!(health["name"], "kinect-depth");
+        assert_eq!(health["available"], false);
+        assert_eq!(health["body_evidence_independent"], true);
+    }
+
+    #[test]
+    fn optional_sensor_failures_are_reported_once_per_interval() {
+        let mut health = SensorPollHealth {
+            name: "kinect-depth".to_string(),
+            ..SensorPollHealth::default()
+        };
+
+        record_optional_sensor_failure(&mut health, "offline".to_string(), 1_000);
+        let first_report = health.last_report_ms;
+        record_optional_sensor_failure(&mut health, "offline".to_string(), 2_000);
+        assert_eq!(health.last_report_ms, first_report);
+        assert_eq!(health.consecutive_failures, 2);
+        record_optional_sensor_failure(&mut health, "offline".to_string(), 31_001);
+        assert_eq!(health.last_report_ms, 31_001);
     }
 
     #[tokio::test]

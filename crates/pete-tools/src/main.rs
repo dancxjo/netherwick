@@ -8496,9 +8496,11 @@ impl BackgroundSenseProducer {
                     return;
                 }
             };
+            let mut consecutive_failures = 0_u32;
             loop {
                 match runtime.block_on(producer.poll()) {
                     Ok(packet) => {
+                        consecutive_failures = 0;
                         on_packet(&packet);
                         let mut state = worker_state
                             .lock()
@@ -8507,13 +8509,17 @@ impl BackgroundSenseProducer {
                         state.last_error = None;
                     }
                     Err(error) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
                         let mut state = worker_state
                             .lock()
                             .expect("background sensor mutex poisoned");
                         state.last_error = Some(error.to_string());
                     }
                 }
-                std::thread::sleep(poll_interval);
+                std::thread::sleep(background_sensor_retry_delay(
+                    poll_interval,
+                    consecutive_failures,
+                ));
             }
         });
         Self { name, state }
@@ -8522,6 +8528,10 @@ impl BackgroundSenseProducer {
 
 #[async_trait::async_trait]
 impl SenseProducer for BackgroundSenseProducer {
+    fn source_name(&self) -> &'static str {
+        self.name
+    }
+
     async fn poll(&mut self) -> Result<SensePacket> {
         let mut state = self.state.lock().expect("background sensor mutex poisoned");
         if let Some(packet) = state.next_packet() {
@@ -8531,6 +8541,46 @@ impl SenseProducer for BackgroundSenseProducer {
         } else {
             anyhow::bail!("{} sensor has no frame yet", self.name)
         }
+    }
+}
+
+fn background_sensor_retry_delay(base: Duration, consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return base;
+    }
+    let exponent = consecutive_failures.saturating_sub(1).min(3);
+    Duration::from_secs(1_u64 << exponent).min(Duration::from_secs(5))
+}
+
+#[cfg(test)]
+mod background_sensor_retry_tests {
+    use super::background_sensor_retry_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn persistent_optional_sensor_failure_backs_off_quickly() {
+        let base = Duration::from_millis(33);
+        assert_eq!(background_sensor_retry_delay(base, 0), base);
+        assert_eq!(
+            background_sensor_retry_delay(base, 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            background_sensor_retry_delay(base, 2),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            background_sensor_retry_delay(base, 3),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            background_sensor_retry_delay(base, 4),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            background_sensor_retry_delay(base, 20),
+            Duration::from_secs(5)
+        );
     }
 }
 

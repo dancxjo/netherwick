@@ -103,6 +103,10 @@ const KINECT_V1_DEPTH_CY: f32 = 242.0;
 
 #[async_trait]
 pub trait SenseProducer {
+    fn source_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     async fn poll(&mut self) -> Result<SensePacket>;
 }
 
@@ -2407,11 +2411,28 @@ impl FreenectKinectProvider {
 #[cfg(feature = "kinect-freenect")]
 #[async_trait]
 impl SenseProducer for FreenectKinectProvider {
+    fn source_name(&self) -> &'static str {
+        "kinect-depth"
+    }
+
     async fn poll(&mut self) -> Result<SensePacket> {
         if let Some(packet) = self.pending.pop_front() {
             return Ok(packet);
         }
-        let depth = read_freenect_depth_m(self.index)?;
+        let depth = match read_freenect_depth_m(self.index) {
+            Ok(depth) => depth,
+            Err(error) => {
+                // libfreenect_sync leaves its worker alive after an open/read
+                // failure.  That worker retries noisily on stderr (including
+                // "Invalid index" and subdevice-open messages) even though
+                // the caller has already received the failure.  Stop it here;
+                // the outer optional-sensor worker will retry with backoff.
+                unsafe {
+                    freenect_sync_stop();
+                }
+                return Err(error);
+            }
+        };
         match read_freenect_rgb_frame(self.index, self.rgb_adjustment) {
             Ok(rgb_frame) => {
                 self.last_rgb_error = None;
