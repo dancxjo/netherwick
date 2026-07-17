@@ -19,6 +19,10 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add generation-bound `escape_motion` segments for automatic bump/cliff
+  recovery, with hazard-specific envelopes, 250 ms TTLs, absolute-hazard
+  preemption, observed-motion reporting, and no freestanding safety override;
+  reserve broad `careful_mode` for attended operator-debug authority.
 - Add a transport-neutral `just cockpit` operator CLI with auto-discovered USB
   CDC, explicit UART and HTTP backends, structured status/capability/event
   output, bounded guarded drive, and IR-guided dock alignment.

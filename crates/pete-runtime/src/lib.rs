@@ -5504,6 +5504,7 @@ enum PossessionRecoveryPhase {
 #[derive(Clone, Debug)]
 struct PossessionRecoveryState {
     latch: Option<SafetyLatchKind>,
+    hazard_generation: u32,
     phase: PossessionRecoveryPhase,
     turn_direction: TurnDir,
     active_since_ms: TimeMs,
@@ -5512,12 +5513,18 @@ struct PossessionRecoveryState {
     stuck_stop_sent: bool,
     brainstem_reflex_observed: bool,
     last_reflex_outcome: Option<ContactWithdrawalOutcome>,
+    last_observed_x_m: f32,
+    last_observed_y_m: f32,
+    last_observed_heading_rad: f32,
+    observed_linear_m: f32,
+    observed_turn_rad: f32,
 }
 
 impl Default for PossessionRecoveryState {
     fn default() -> Self {
         Self {
             latch: None,
+            hazard_generation: 0,
             phase: PossessionRecoveryPhase::Idle,
             turn_direction: TurnDir::Left,
             active_since_ms: 0,
@@ -5526,6 +5533,11 @@ impl Default for PossessionRecoveryState {
             stuck_stop_sent: false,
             brainstem_reflex_observed: false,
             last_reflex_outcome: None,
+            last_observed_x_m: 0.0,
+            last_observed_y_m: 0.0,
+            last_observed_heading_rad: 0.0,
+            observed_linear_m: 0.0,
+            observed_turn_rad: 0.0,
         }
     }
 }
@@ -5542,17 +5554,9 @@ struct MotionRejectionState {
     stuck_stop_sent: bool,
 }
 
-const POSSESSION_RECOVERY_COMMAND_COOLDOWN_MS: TimeMs = 1_000;
 const POSSESSION_RECOVERY_STUCK_AFTER_MS: TimeMs = 15_000;
-const POSSESSION_RECOVERY_MAX_ATTEMPTS: u32 = 3;
 const POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S: i16 = 50;
-const POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS: TimeMs = 900;
-const POSSESSION_BUMP_ESCAPE_TURN_ANGLE_MRAD: TimeMs = 1_571;
-const POSSESSION_BUMP_ESCAPE_TURN_MRAD_S: i16 = 500;
-const POSSESSION_BUMP_ESCAPE_SETTLE_MS: TimeMs = 250;
-const POSSESSION_BUMP_ESCAPE_DURATION_MS: TimeMs = POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS
-    + POSSESSION_BUMP_ESCAPE_TURN_ANGLE_MRAD * 1_000 / POSSESSION_BUMP_ESCAPE_TURN_MRAD_S as TimeMs
-    + POSSESSION_BUMP_ESCAPE_SETTLE_MS;
+const POSSESSION_ESCAPE_TTL_MS: u32 = 250;
 const MOTION_REJECTION_WINDOW_MS: TimeMs = 5_000;
 const MOTION_REJECTION_BASE_BACKOFF_MS: TimeMs = 1_000;
 const MOTION_REJECTION_MAX_BACKOFF_MS: TimeMs = 5_000;
@@ -5924,6 +5928,13 @@ where
         if !action_debug.is_object() {
             action_debug = serde_json::json!({});
         }
+        let reported_robot_motor = if recovery_decision.command_sent {
+            recovery_decision.motor.unwrap_or_else(MotorCommand::stop)
+        } else if recovery_decision.block_reason.is_some() {
+            MotorCommand::stop()
+        } else {
+            final_motor
+        };
         if let Some(object) = action_debug.as_object_mut() {
             object.insert("body_pose_before".to_string(), pose_json(&body_before));
             object.insert("body_pose_after".to_string(), pose_json(&snapshot.body));
@@ -5937,9 +5948,7 @@ where
             );
             object.insert(
                 "motion_sent_to_robot".to_string(),
-                serde_json::to_value(motor_command_to_motion(
-                    recovery_decision.motor.unwrap_or(final_motor),
-                ))?,
+                serde_json::to_value(motor_command_to_motion(reported_robot_motor))?,
             );
             object.insert(
                 "motion_sent_to_sim".to_string(),
@@ -5947,10 +5956,7 @@ where
             );
             object.insert(
                 "motor_applied".to_string(),
-                serde_json::json!(recovery_decision
-                    .motor
-                    .map(|motor| !is_near_zero_motor(motor))
-                    .unwrap_or(!is_near_zero_motor(final_motor))),
+                serde_json::json!(!is_near_zero_motor(reported_robot_motor)),
             );
             object.insert(
                 "runtime_chosen_action".to_string(),
@@ -6073,7 +6079,7 @@ where
             match event.kind {
                 CockpitEventKind::SafetyTripped => {
                     if let Some(kind) = safety_latch_kind_from_event_code(event.a) {
-                        self.start_possession_recovery(kind, body);
+                        self.start_possession_recovery_generation(kind, event.seq, body);
                     }
                 }
                 CockpitEventKind::SafetyCleared => {
@@ -6087,7 +6093,7 @@ where
                     // E-stop from any internally generated stop. Without
                     // trustworthy provenance, fail closed and require an
                     // explicit operator clear.
-                    self.possession_recovery = PossessionRecoveryState::default();
+                    self.finish_possession_recovery();
                 }
                 _ => {}
             }
@@ -6114,7 +6120,11 @@ where
                 .safety_latch_kind
                 .or_else(|| infer_safety_latch_from_sensors(body))
             {
-                self.start_possession_recovery(kind, body);
+                self.start_possession_recovery_generation(
+                    kind,
+                    status.safety_hazard_generation.unwrap_or(0),
+                    body,
+                );
             }
         }
 
@@ -6128,7 +6138,8 @@ where
             });
         };
 
-        let mut command_sent = true;
+        self.observe_possession_recovery_motion(body);
+        let mut command_sent = false;
         let mut action = None;
         let mut motor = None;
         let now_ms = wall_time_ms();
@@ -6136,192 +6147,118 @@ where
         let mut reason = format!("recovering {latch:?} safety latch");
         match latch {
             SafetyLatchKind::Bump => {
-                if self.possession_recovery.brainstem_reflex_observed {
-                    command_sent = false;
-                    motor = None;
-                    action = None;
-                    if self.possession_recovery.phase == PossessionRecoveryPhase::BrainstemReflex {
-                        reason = "brainstem contact-withdrawal reflex owns motion; possessor is observing"
+                if self.possession_recovery.phase == PossessionRecoveryPhase::BrainstemReflex {
+                    reason =
+                        "brainstem contact-withdrawal reflex owns motion; possessor is observing"
                             .to_string();
-                    } else if !bump_active(body) {
-                        self.clear_completed_bump_recovery_latch()?;
-                        reason = format!(
-                            "brainstem contact withdrawal ended with {:?}; contact cleared",
-                            self.possession_recovery.last_reflex_outcome,
-                        );
-                        self.possession_recovery = PossessionRecoveryState::default();
-                    } else if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
-                        self.possession_recovery.phase = PossessionRecoveryPhase::Stuck;
-                        action = Some(ActionPrimitive::Stop);
-                        motor = Some(MotorCommand::stop());
-                        reason = format!(
-                            "brainstem contact withdrawal ended with {:?}, but contact persists after {} ms; possessor requires another strategy or operator help",
-                            self.possession_recovery.last_reflex_outcome, recovery_age_ms
-                        );
-                    } else if possession_recovery_command_due(&self.possession_recovery, now_ms) {
-                        self.possession_recovery.command_attempts =
-                            self.possession_recovery.command_attempts.saturating_add(1);
-                        self.possession_recovery.last_command_ms = now_ms;
-                        self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
-                        self.possession_recovery.brainstem_reflex_observed = false;
-                        self.possession_careful_motion(-POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S, 0)?;
-                        command_sent = true;
-                        action = Some(ActionPrimitive::Go {
-                            intensity: -0.2,
-                            duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
-                        });
-                        motor = Some(MotorCommand {
-                            forward: -0.05,
-                            turn: 0.0,
-                        });
-                        reason = format!(
-                            "brainstem withdrawal ended with {:?}; possessor entered CAREFUL for escape attempt {}",
-                            self.possession_recovery.last_reflex_outcome,
-                            self.possession_recovery.command_attempts
-                        );
-                    } else {
-                        reason = format!(
-                            "brainstem contact withdrawal ended with {:?}; possessor is waiting for a clear contact observation",
-                            self.possession_recovery.last_reflex_outcome
-                        );
-                    }
+                } else if !bump_active(body) {
+                    self.cockpit.client_mut().stop()?;
+                    self.clear_completed_bump_recovery_latch()?;
+                    command_sent = true;
+                    action = Some(ActionPrimitive::Stop);
+                    motor = Some(MotorCommand::stop());
+                    reason = format!(
+                        "contact cleared after observed reverse displacement {:.3} m; latch cleared",
+                        self.possession_recovery.observed_linear_m
+                    );
+                    self.finish_possession_recovery();
+                } else if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
+                    command_sent = self.stop_stuck_possession_recovery()?;
+                    action = Some(ActionPrimitive::Stop);
+                    motor = Some(MotorCommand::stop());
+                    reason = format!(
+                        "{latch:?} escape stopped after {} ms and {} commanded segments; operator intervention needed",
+                        recovery_age_ms, self.possession_recovery.command_attempts
+                    );
+                } else if self.possession_recovery.hazard_generation == 0 {
+                    reason =
+                        "waiting for the acknowledged bumper hazard generation before escaping"
+                            .to_string();
                 } else {
-                    let escape_elapsed_ms =
-                        now_ms.saturating_sub(self.possession_recovery.last_command_ms);
-                    if self.possession_recovery.phase == PossessionRecoveryPhase::Escaping
-                        && escape_elapsed_ms < POSSESSION_BUMP_ESCAPE_DURATION_MS
-                    {
-                        command_sent = true;
-                        if escape_elapsed_ms < POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS {
+                    match self.possession_escape_motion(
+                        latch,
+                        -POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S,
+                        0,
+                    ) {
+                        Ok(()) => {
+                            self.mark_possession_escape_command(now_ms);
+                            command_sent = true;
                             action = Some(ActionPrimitive::Go {
                                 intensity: -0.2,
-                                duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
+                                duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
                             });
                             motor = Some(MotorCommand {
                                 forward: -0.05,
                                 turn: 0.0,
                             });
                             reason = format!(
-                            "recovering {latch:?} safety latch; reversing for escape attempt {}",
-                            self.possession_recovery.command_attempts
-                        );
-                        } else {
-                            action = Some(ActionPrimitive::Turn {
-                                direction: TurnDir::Right,
-                                intensity: 0.5,
-                                duration_ms: POSSESSION_BUMP_ESCAPE_DURATION_MS
-                                    .saturating_sub(POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS),
-                            });
-                            motor = Some(MotorCommand {
-                                forward: 0.0,
-                                turn: -0.5,
-                            });
-                            reason = format!(
-                            "recovering {latch:?} safety latch; turning clockwise 90 degrees for escape attempt {}",
-                            self.possession_recovery.command_attempts
-                        );
+                                "commanded bumper escape segment {} for {} ms; observed displacement {:.3} m",
+                                self.possession_recovery.command_attempts,
+                                POSSESSION_ESCAPE_TTL_MS,
+                                self.possession_recovery.observed_linear_m
+                            );
                         }
-                    } else if self.possession_recovery.phase == PossessionRecoveryPhase::Escaping
-                        && !bump_active(body)
-                    {
-                        self.cockpit.client_mut().stop()?;
-                        self.clear_completed_bump_recovery_latch()?;
-                        self.possession_recovery = PossessionRecoveryState::default();
-                        action = Some(ActionPrimitive::Stop);
-                        motor = Some(MotorCommand::stop());
-                        reason = format!(
-                            "recovered {latch:?} safety latch after reverse and clockwise 90 degree turn",
-                        );
-                    } else {
-                        self.possession_recovery.phase =
-                            PossessionRecoveryPhase::WaitingForSensorClear;
-                        action = Some(ActionPrimitive::Go {
-                            intensity: -0.2,
-                            duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
-                        });
-                        motor = Some(MotorCommand {
-                            forward: -0.05,
-                            turn: 0.0,
-                        });
-                        if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
-                            self.possession_recovery.phase = PossessionRecoveryPhase::Stuck;
+                        Err(error) => {
                             action = Some(ActionPrimitive::Stop);
                             motor = Some(MotorCommand::stop());
-                            reason = format!(
-                            "{latch:?} recovery stuck after reverse and clockwise turns; bumper still active after {} ms and {} escape attempts; operator intervention needed",
-                            recovery_age_ms, self.possession_recovery.command_attempts
-                        );
-                            if !self.possession_recovery.stuck_stop_sent {
-                                self.cockpit.client_mut().stop()?;
-                                self.possession_recovery.stuck_stop_sent = true;
-                            }
-                        } else if possession_recovery_command_due(&self.possession_recovery, now_ms)
-                        {
-                            self.possession_recovery.command_attempts =
-                                self.possession_recovery.command_attempts.saturating_add(1);
-                            self.possession_recovery.last_command_ms = now_ms;
-                            self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
-                            reason = format!(
-                            "recovering {latch:?} safety latch; escape attempt {}: reverse then turn clockwise 90 degrees",
-                            self.possession_recovery.command_attempts
-                        );
-                            self.possession_careful_motion(
-                                -POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S,
-                                0,
-                            )?;
-                        } else {
-                            reason = format!(
-                                "recovering {latch:?} safety latch; escape in progress for {} ms",
-                                now_ms.saturating_sub(self.possession_recovery.last_command_ms)
-                            );
+                            reason = format!("intended bumper escape was not commanded: {error}");
                         }
                     }
                 }
             }
             SafetyLatchKind::Cliff => {
                 if cliff_active(body) {
-                    self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
-                    self.possession_recovery.turn_direction =
-                        recovery_turn_direction_for_latch(latch, body);
-                    action = Some(ActionPrimitive::Go {
-                        intensity: -0.25,
-                        duration_ms: 900,
-                    });
-                    motor = Some(MotorCommand {
-                        forward: -0.10,
-                        turn: 0.0,
-                    });
                     if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
-                        self.possession_recovery.phase = PossessionRecoveryPhase::Stuck;
+                        command_sent = self.stop_stuck_possession_recovery()?;
                         action = Some(ActionPrimitive::Stop);
                         motor = Some(MotorCommand::stop());
                         reason = format!(
-                            "{latch:?} recovery stuck; cliff still active after {} ms and {} escape attempts; operator intervention needed",
+                            "{latch:?} escape stopped after {} ms and {} commanded segments; operator intervention needed",
                             recovery_age_ms, self.possession_recovery.command_attempts
                         );
-                        if !self.possession_recovery.stuck_stop_sent {
-                            self.cockpit.client_mut().stop()?;
-                            self.possession_recovery.stuck_stop_sent = true;
-                        }
-                    } else if possession_recovery_command_due(&self.possession_recovery, now_ms) {
-                        self.possession_recovery.command_attempts =
-                            self.possession_recovery.command_attempts.saturating_add(1);
-                        self.possession_recovery.last_command_ms = now_ms;
-                        reason = format!(
-                            "recovering {latch:?} safety latch; escape attempt {}",
-                            self.possession_recovery.command_attempts
-                        );
-                        self.possession_careful_motion(-100, 0)?;
+                    } else if self.possession_recovery.hazard_generation == 0 {
+                        reason =
+                            "waiting for the acknowledged cliff hazard generation before escaping"
+                                .to_string();
                     } else {
-                        reason = format!(
-                            "recovering {latch:?} safety latch; escape in progress for {} ms",
-                            now_ms.saturating_sub(self.possession_recovery.last_command_ms)
-                        );
+                        match self.possession_escape_motion(latch, -100, 0) {
+                            Ok(()) => {
+                                self.mark_possession_escape_command(now_ms);
+                                command_sent = true;
+                                action = Some(ActionPrimitive::Go {
+                                    intensity: -0.25,
+                                    duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
+                                });
+                                motor = Some(MotorCommand {
+                                    forward: -0.10,
+                                    turn: 0.0,
+                                });
+                                reason = format!(
+                                    "commanded cliff escape segment {} for {} ms; observed displacement {:.3} m",
+                                    self.possession_recovery.command_attempts,
+                                    POSSESSION_ESCAPE_TTL_MS,
+                                    self.possession_recovery.observed_linear_m
+                                );
+                            }
+                            Err(error) => {
+                                action = Some(ActionPrimitive::Stop);
+                                motor = Some(MotorCommand::stop());
+                                reason =
+                                    format!("intended cliff escape was not commanded: {error}");
+                            }
+                        }
                     }
                 } else {
-                    self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+                    self.cockpit.client_mut().stop()?;
                     self.cockpit.client_mut().clear_safety_latch(latch)?;
-                    self.possession_recovery = PossessionRecoveryState::default();
+                    command_sent = true;
+                    action = Some(ActionPrimitive::Stop);
+                    motor = Some(MotorCommand::stop());
+                    reason = format!(
+                        "cliff cleared after observed reverse displacement {:.3} m; latch cleared",
+                        self.possession_recovery.observed_linear_m
+                    );
+                    self.finish_possession_recovery();
                 }
             }
             SafetyLatchKind::WheelDrop => {
@@ -6329,9 +6266,11 @@ where
                     action = Some(ActionPrimitive::Stop);
                     motor = Some(MotorCommand::stop());
                     self.cockpit.client_mut().stop()?;
+                    command_sent = true;
                 } else {
                     self.cockpit.client_mut().clear_safety_latch(latch)?;
-                    self.possession_recovery = PossessionRecoveryState::default();
+                    command_sent = true;
+                    self.finish_possession_recovery();
                 }
             }
             SafetyLatchKind::Charging => {
@@ -6339,25 +6278,28 @@ where
                     action = Some(ActionPrimitive::Stop);
                     motor = Some(MotorCommand::stop());
                     self.cockpit.client_mut().stop()?;
+                    command_sent = true;
                 } else {
                     self.cockpit.client_mut().clear_safety_latch(latch)?;
-                    self.possession_recovery = PossessionRecoveryState::default();
+                    command_sent = true;
+                    self.finish_possession_recovery();
                 }
             }
             SafetyLatchKind::Heartbeat => {
                 self.cockpit.client_mut().clear_safety_latch(latch)?;
-                self.possession_recovery = PossessionRecoveryState::default();
-                command_sent = false;
+                self.finish_possession_recovery();
+                command_sent = true;
             }
             SafetyLatchKind::Tilt | SafetyLatchKind::Impact => {
                 if imu_recovery_clear(status, latch) {
                     self.cockpit.client_mut().clear_safety_latch(latch)?;
-                    self.possession_recovery = PossessionRecoveryState::default();
-                    command_sent = false;
+                    self.finish_possession_recovery();
+                    command_sent = true;
                 } else {
                     action = Some(ActionPrimitive::Stop);
                     motor = Some(MotorCommand::stop());
                     self.cockpit.client_mut().stop()?;
+                    command_sent = true;
                 }
             }
         }
@@ -6378,18 +6320,38 @@ where
         Ok(())
     }
 
-    fn possession_careful_motion(&mut self, linear_mm_s: i16, angular_mrad_s: i16) -> Result<()> {
-        self.cockpit.client_mut().careful_mode(1_000)?;
-        self.cockpit
-            .client_mut()
-            .cmd_vel(linear_mm_s, angular_mrad_s, 250)?;
+    fn possession_escape_motion(
+        &mut self,
+        hazard: SafetyLatchKind,
+        linear_mm_s: i16,
+        angular_mrad_s: i16,
+    ) -> Result<()> {
+        self.cockpit.client_mut().escape_motion(
+            hazard,
+            self.possession_recovery.hazard_generation,
+            linear_mm_s,
+            angular_mrad_s,
+            POSSESSION_ESCAPE_TTL_MS,
+        )?;
         Ok(())
     }
 
     fn start_possession_recovery(&mut self, latch: SafetyLatchKind, body: &BodySense) {
+        self.start_possession_recovery_generation(latch, 0, body);
+    }
+
+    fn start_possession_recovery_generation(
+        &mut self,
+        latch: SafetyLatchKind,
+        hazard_generation: u32,
+        body: &BodySense,
+    ) {
         let now_ms = wall_time_ms();
         let latch_changed = self.possession_recovery.latch != Some(latch);
         self.possession_recovery.latch = Some(latch);
+        if hazard_generation != 0 {
+            self.possession_recovery.hazard_generation = hazard_generation;
+        }
         self.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
         self.possession_recovery.turn_direction = recovery_turn_direction_for_latch(latch, body);
         if latch_changed || self.possession_recovery.active_since_ms == 0 {
@@ -6397,7 +6359,55 @@ where
             self.possession_recovery.last_command_ms = 0;
             self.possession_recovery.command_attempts = 0;
             self.possession_recovery.stuck_stop_sent = false;
+            self.possession_recovery.last_observed_x_m = body.odometry.x_m;
+            self.possession_recovery.last_observed_y_m = body.odometry.y_m;
+            self.possession_recovery.last_observed_heading_rad = body.odometry.heading_rad;
+            self.possession_recovery.observed_linear_m = 0.0;
+            self.possession_recovery.observed_turn_rad = 0.0;
         }
+    }
+
+    fn observe_possession_recovery_motion(&mut self, body: &BodySense) {
+        if self.possession_recovery.latch.is_none() {
+            return;
+        }
+        let dx = body.odometry.x_m - self.possession_recovery.last_observed_x_m;
+        let dy = body.odometry.y_m - self.possession_recovery.last_observed_y_m;
+        let distance = dx.hypot(dy);
+        let heading_delta =
+            body.odometry.heading_rad - self.possession_recovery.last_observed_heading_rad;
+        self.possession_recovery.observed_linear_m += distance;
+        self.possession_recovery.observed_turn_rad += heading_delta;
+        self.possession_recovery.last_observed_x_m = body.odometry.x_m;
+        self.possession_recovery.last_observed_y_m = body.odometry.y_m;
+        self.possession_recovery.last_observed_heading_rad = body.odometry.heading_rad;
+    }
+
+    fn mark_possession_escape_command(&mut self, now_ms: TimeMs) {
+        self.possession_recovery.command_attempts =
+            self.possession_recovery.command_attempts.saturating_add(1);
+        self.possession_recovery.last_command_ms = now_ms;
+        self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+        self.possession_recovery.brainstem_reflex_observed = false;
+    }
+
+    fn stop_stuck_possession_recovery(&mut self) -> Result<bool> {
+        self.possession_recovery.phase = PossessionRecoveryPhase::Stuck;
+        if !self.possession_recovery.stuck_stop_sent {
+            self.cockpit.client_mut().stop()?;
+            self.possession_recovery.stuck_stop_sent = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn finish_possession_recovery(&mut self) {
+        self.possession_recovery.latch = None;
+        self.possession_recovery.hazard_generation = 0;
+        self.possession_recovery.phase = PossessionRecoveryPhase::Idle;
+        self.possession_recovery.active_since_ms = 0;
+        self.possession_recovery.last_command_ms = 0;
+        self.possession_recovery.brainstem_reflex_observed = false;
     }
 
     fn motion_rejection_block_reason(&self, now_ms: TimeMs) -> Option<String> {
@@ -6910,14 +6920,8 @@ fn recovery_age_ms(state: &PossessionRecoveryState, now_ms: TimeMs) -> TimeMs {
     }
 }
 
-fn possession_recovery_command_due(state: &PossessionRecoveryState, now_ms: TimeMs) -> bool {
-    state.last_command_ms == 0
-        || now_ms.saturating_sub(state.last_command_ms) >= POSSESSION_RECOVERY_COMMAND_COOLDOWN_MS
-}
-
 fn possession_recovery_is_stuck(state: &PossessionRecoveryState, now_ms: TimeMs) -> bool {
     recovery_age_ms(state, now_ms) >= POSSESSION_RECOVERY_STUCK_AFTER_MS
-        || state.command_attempts >= POSSESSION_RECOVERY_MAX_ATTEMPTS
 }
 
 fn possession_recovery_debug(
@@ -6925,8 +6929,24 @@ fn possession_recovery_debug(
     active_latch: Option<SafetyLatchKind>,
     command_sent: bool,
 ) -> serde_json::Value {
+    let latch = active_latch.or(state.latch);
+    let intended_motion = match (state.phase, latch) {
+        (PossessionRecoveryPhase::BrainstemReflex, _) => {
+            serde_json::json!({"owner": "brainstem_contact_withdrawal"})
+        }
+        (
+            PossessionRecoveryPhase::WaitingForSensorClear | PossessionRecoveryPhase::Escaping,
+            Some(SafetyLatchKind::Bump | SafetyLatchKind::Cliff),
+        ) => serde_json::json!({
+            "linear": "reverse",
+            "ttl_ms": POSSESSION_ESCAPE_TTL_MS,
+        }),
+        (_, Some(_)) => serde_json::json!({"linear": "stop"}),
+        _ => serde_json::Value::Null,
+    };
     serde_json::json!({
-        "latched": active_latch.or(state.latch).map(|latch| format!("{latch:?}")),
+        "latched": latch.map(|latch| format!("{latch:?}")),
+        "hazard_generation": state.hazard_generation,
         "phase": format!("{:?}", state.phase),
         "turn_direction": format!("{:?}", state.turn_direction),
         "active_since_ms": state.active_since_ms,
@@ -6936,6 +6956,21 @@ fn possession_recovery_debug(
         "brainstem_reflex_observed": state.brainstem_reflex_observed,
         "last_reflex_outcome": state.last_reflex_outcome.map(|outcome| format!("{outcome:?}")),
         "command_sent": command_sent,
+        "intended_motion": intended_motion,
+        "commanded_motion": if command_sent && state.phase == PossessionRecoveryPhase::Escaping {
+            serde_json::json!({
+                "linear": "reverse",
+                "ttl_ms": POSSESSION_ESCAPE_TTL_MS,
+            })
+        } else if command_sent {
+            serde_json::json!({"linear": "stop"})
+        } else {
+            serde_json::Value::Null
+        },
+        "observed_motion": {
+            "linear_displacement_m": state.observed_linear_m,
+            "heading_change_rad": state.observed_turn_rad,
+        },
     })
 }
 
@@ -11094,7 +11129,7 @@ mod tests {
     struct ActiveBumpRecoveryCockpit {
         bump_escape_attempts: Arc<AtomicUsize>,
         careful_mode_attempts: Arc<AtomicUsize>,
-        bump_escape_commands: Arc<Mutex<Vec<(i16, i16, u32)>>>,
+        bump_escape_commands: Arc<Mutex<Vec<(SafetyLatchKind, u32, i16, i16, u32)>>>,
         stop_attempts: Arc<AtomicUsize>,
         clear_attempts: Arc<AtomicUsize>,
         bump_active: bool,
@@ -11110,13 +11145,17 @@ mod tests {
                 CockpitRequest::GetEvents { since_seq } => {
                     Ok(CockpitResponse::Events(self.get_events_since(since_seq)?))
                 }
-                CockpitRequest::CmdVel {
+                CockpitRequest::EscapeMotion {
+                    hazard,
+                    hazard_generation,
                     linear_mm_s,
                     angular_mrad_s,
                     ttl_ms,
                 } => {
                     self.bump_escape_attempts.fetch_add(1, Ordering::SeqCst);
                     self.bump_escape_commands.lock().unwrap().push((
+                        hazard,
+                        hazard_generation,
                         linear_mm_s,
                         angular_mrad_s,
                         ttl_ms,
@@ -11189,6 +11228,7 @@ mod tests {
                     "estop_latched": false,
                     "safety_tripped": true,
                     "safety_latch_kind": "bump",
+                    "safety_hazard_generation": 42,
                     "create_sensors": {
                         "last_packet_id": 0,
                         "complete_packet_count": 1,
@@ -11217,6 +11257,7 @@ mod tests {
                     "get_events",
                     "stop",
                     "cmd_vel",
+                    "escape_motion",
                     "heartbeat_stop",
                 ]
                 .into_iter()
@@ -11685,16 +11726,16 @@ mod tests {
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
         assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(careful_mode_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(careful_mode_attempts.load(Ordering::SeqCst), 0);
         assert_eq!(
             bump_escape_commands.lock().unwrap().as_slice(),
-            &[(-50, 0, 250)]
+            &[(SafetyLatchKind::Bump, 42, -50, 0, 250)]
         );
         assert_eq!(
             tick.chosen_action,
             Some(ActionPrimitive::Go {
                 intensity: -0.2,
-                duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
+                duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
             })
         );
         let debug = snapshot.action_debug.as_ref().unwrap();
@@ -11725,10 +11766,31 @@ mod tests {
                 .and_then(|debug| debug.get("latched")),
             Some(&serde_json::json!("Bump"))
         );
+        assert_eq!(
+            debug
+                .get("possession_recovery")
+                .and_then(|debug| debug.get("intended_motion"))
+                .and_then(|motion| motion.get("linear")),
+            Some(&serde_json::json!("reverse"))
+        );
+        assert_eq!(
+            debug
+                .get("possession_recovery")
+                .and_then(|debug| debug.get("commanded_motion"))
+                .and_then(|motion| motion.get("ttl_ms")),
+            Some(&serde_json::json!(250))
+        );
+        assert_eq!(
+            debug
+                .get("possession_recovery")
+                .and_then(|debug| debug.get("observed_motion"))
+                .and_then(|motion| motion.get("linear_displacement_m")),
+            Some(&serde_json::json!(0.0))
+        );
     }
 
     #[tokio::test]
-    async fn possessor_enters_careful_when_local_withdrawal_ends_still_bumped() {
+    async fn possessor_submits_atomic_escape_when_local_withdrawal_ends_still_bumped() {
         let careful_mode_attempts = Arc::new(AtomicUsize::new(0));
         let motion_attempts = Arc::new(AtomicUsize::new(0));
         let body = ActiveBumpRecoveryCockpit {
@@ -11742,6 +11804,7 @@ mod tests {
         let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
             .with_autonomous_motion(true);
         runner.possession_recovery.latch = Some(SafetyLatchKind::Bump);
+        runner.possession_recovery.hazard_generation = 42;
         runner.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
         runner.possession_recovery.active_since_ms = wall_time_ms();
         runner.possession_recovery.last_command_ms = 0;
@@ -11750,7 +11813,7 @@ mod tests {
 
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
-        assert_eq!(careful_mode_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(careful_mode_attempts.load(Ordering::SeqCst), 0);
         assert_eq!(motion_attempts.load(Ordering::SeqCst), 1);
         assert!(matches!(
             tick.chosen_action,
@@ -11761,11 +11824,11 @@ mod tests {
             .as_ref()
             .and_then(|debug| debug.get("why_not_moving"))
             .and_then(|reason| reason.as_str())
-            .is_some_and(|reason| reason.contains("entered CAREFUL")));
+            .is_some_and(|reason| reason.contains("commanded bumper escape segment")));
     }
 
     #[tokio::test]
-    async fn real_robot_slow_runner_does_not_spam_bump_escape_during_recovery_cooldown() {
+    async fn real_robot_slow_runner_renews_bounded_bump_escape_each_observation_tick() {
         let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
         let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
         let stop_attempts = Arc::new(AtomicUsize::new(0));
@@ -11783,12 +11846,12 @@ mod tests {
         let (_first_snapshot, _first_tick) = runner.tick_slow_manual().await.unwrap();
         let (second_snapshot, second_tick) = runner.tick_slow_manual().await.unwrap();
 
-        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             second_tick.chosen_action,
             Some(ActionPrimitive::Go {
                 intensity: -0.2,
-                duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
+                duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
             })
         );
         assert!(second_snapshot
@@ -11796,7 +11859,7 @@ mod tests {
             .as_ref()
             .and_then(|debug| debug.get("why_not_moving"))
             .and_then(|reason| reason.as_str())
-            .is_some_and(|reason| reason.contains("reversing")));
+            .is_some_and(|reason| reason.contains("commanded bumper escape segment 2")));
     }
 
     #[tokio::test]
@@ -11815,10 +11878,11 @@ mod tests {
         let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
             .with_autonomous_motion(true);
         runner.possession_recovery.latch = Some(SafetyLatchKind::Bump);
+        runner.possession_recovery.hazard_generation = 42;
         runner.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
         runner.possession_recovery.active_since_ms =
             wall_time_ms().saturating_sub(POSSESSION_RECOVERY_STUCK_AFTER_MS + 1);
-        runner.possession_recovery.command_attempts = POSSESSION_RECOVERY_MAX_ATTEMPTS;
+        runner.possession_recovery.command_attempts = 12;
 
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
@@ -11839,7 +11903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_robot_slow_runner_escapes_even_if_momentary_bump_already_cleared() {
+    async fn real_robot_slow_runner_does_not_escape_after_momentary_bump_clears() {
         let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
         let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
         let body = ActiveBumpRecoveryCockpit {
@@ -11855,19 +11919,13 @@ mod tests {
 
         let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
-        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            bump_escape_commands.lock().unwrap().as_slice(),
-            &[(-50, 0, 250)]
-        );
-        assert!(matches!(
-            tick.chosen_action,
-            Some(ActionPrimitive::Go { .. })
-        ));
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 0);
+        assert!(bump_escape_commands.lock().unwrap().is_empty());
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
     }
 
     #[tokio::test]
-    async fn real_robot_slow_runner_reports_clockwise_turn_phase_without_resubmitting() {
+    async fn real_robot_slow_runner_never_imagines_turn_without_submitting_it() {
         let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
         let body = ActiveBumpRecoveryCockpit {
             bump_escape_attempts: Arc::clone(&bump_escape_attempts),
@@ -11880,27 +11938,23 @@ mod tests {
         let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
             .with_autonomous_motion(true);
         runner.possession_recovery.latch = Some(SafetyLatchKind::Bump);
+        runner.possession_recovery.hazard_generation = 42;
         runner.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
         runner.possession_recovery.command_attempts = 1;
-        runner.possession_recovery.last_command_ms =
-            wall_time_ms().saturating_sub(POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS + 1);
 
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
-        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
         assert!(matches!(
             tick.chosen_action,
-            Some(ActionPrimitive::Turn {
-                direction: TurnDir::Right,
-                ..
-            })
+            Some(ActionPrimitive::Go { .. })
         ));
         assert!(snapshot
             .action_debug
             .as_ref()
             .and_then(|debug| debug.get("why_not_moving"))
             .and_then(|reason| reason.as_str())
-            .is_some_and(|reason| reason.contains("clockwise 90 degrees")));
+            .is_some_and(|reason| reason.contains("commanded bumper escape segment 2")));
     }
 
     #[tokio::test]
@@ -11918,10 +11972,9 @@ mod tests {
         let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
             .with_autonomous_motion(true);
         runner.possession_recovery.latch = Some(SafetyLatchKind::Bump);
+        runner.possession_recovery.hazard_generation = 42;
         runner.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
         runner.possession_recovery.command_attempts = 1;
-        runner.possession_recovery.last_command_ms =
-            wall_time_ms().saturating_sub(POSSESSION_BUMP_ESCAPE_DURATION_MS + 1);
 
         let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 

@@ -216,12 +216,19 @@ safety-preempted outcome upstream.
 
 Safety recipes are not host policy. Production hosts cannot select `none`,
 `backoff`, or compound escape behavior for bump/cliff/wheel-drop protections.
-The one explicit exceptional authority is `careful_mode`: the active possessor
-may declare direct physical custody of the body for a short TTL, opening all
-sensor-derived motor gates while their observations remain visible. This is
-the “lift the car” path, not ordinary navigation or automatic recovery. It
-cannot bypass E-stop, authority loss, heartbeat expiry, or stale body
-telemetry; expiry stops motion before re-latching every live physical hazard.
+The one explicit exceptional authority is `careful_mode`: an attended operator
+with operator-debug authority may declare direct physical custody of the body
+for a short TTL. This is the “lift the car” path, not ordinary navigation or
+automatic recovery, and it cannot preempt contact withdrawal or bypass E-stop,
+authority loss, heartbeat expiry, or stale body telemetry.
+
+Automatic recovery is a succession of embodied acts. `escape_motion` binds one
+250 ms velocity segment to the exact generation of an acknowledged bump or
+cliff, checks a hazard-specific direction and speed envelope, and rejects the
+segment when any absolute or newly appearing hazard dominates. Motherbrain
+observes sensors and odometry before renewing. Intended, commanded, and
+observed motion therefore remain distinct; elapsed time alone never creates a
+fictional reverse or turn.
 The canonical per-verb ownership/authority/bounds/event inventory is
 `crates/pete-brainstem/verb-classification.toml`.
 

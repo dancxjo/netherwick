@@ -97,7 +97,9 @@ prevent retry.
 The skill runtime is also the architectural motor boundary. Deterministic
 motherbrain skills such as bearing/heading control, approach, timed drive/turn,
 scan, wall-follow, dock alignment, wiggle, and post-contact escape renew only
-short-lived Brainstem primitives. They do not depend on an LLM. The Brainstem
+short-lived Brainstem primitives. Post-contact escape specifically renews
+generation-bound 250 ms segments and observes body motion between them; it
+never opens CAREFUL or reports an unsent phase. They do not depend on an LLM. The Brainstem
 owns bounded `cmd_vel`/direct/arc output and may preempt it with immutable
 safety or the contact-withdrawal reflex; the resulting typed interruption is
 fed back into skill and goal progress.
