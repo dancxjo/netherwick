@@ -236,6 +236,7 @@ All notable changes are grouped by date.
 - Update `--recovery-smoke`, `--orientation-probe`, and serial/session validation paths to refer to `regular` possession language, and keep all regular/slow possession diagnostics aligned to physical brainstem requirements.
 - Refresh dependency-lock metadata in `Cargo.lock` for speech/visualization crates (`tongues-*`, `textplots`, `drawille`, version-resolved `indicatif`/`console`/`colored`) so speech pipeline, lockfile, and package metadata stay consistent after the mode/workflow updates.
 - Add a second lockfile maintenance pass that removes stale `tongues-*`, `drawille`, `textplots`, `number_prefix`, and duplicate older `console`/`indicatif`/`colored` entries while normalizing dependency edges to current workspace versions.
+- Update the workspace lockfile with a dependency graph refresh that adds missing `textplots`/`rgb`/`drawille`/`tongues-*` package metadata and reconciles `indicatif`/`console`/`colored` version constraints used by updated consumer crates.
 
 ### Ongoing
 
