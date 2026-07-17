@@ -84,6 +84,10 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Open `just cockpit` motion commands as operator-control sessions, accept
+  ordinary negative velocity arguments, and report Home Base arrival before a
+  preserved terminal safety latch so successful physical docking is not
+  mislabeled as a failed run.
 - Treat Create Home Base contact as dock geometry in browser and motherbrain
   status instead of promoting the dock's bumper-plus-cliff pattern into a
   multi-sensor safety incident; raw Cockpit sensor bits remain available for

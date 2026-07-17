@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use pete_cockpit::{
     Cockpit, CockpitError, CockpitRequest, CockpitResponse, ControlAuthority, DockIrCue,
-    HandshakeHello, HttpCockpit, SessionCockpit, StatusSummary, UartCockpit, UartCockpitConfig,
-    discover_usb_serial_by_id, establish_session,
+    HandshakeHello, HttpCockpit, SessionCockpit, SessionPurpose, StatusSummary, UartCockpit,
+    UartCockpitConfig, discover_usb_serial_by_id, establish_session,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -48,9 +48,9 @@ enum Command {
     Stop,
     /// Renew a bounded velocity primitive while live safety telemetry stays healthy.
     Drive {
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         linear: i16,
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
         angular: i16,
         #[arg(long, default_value_t = 500)]
         duration_ms: u64,
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
 }
 
 fn connect(cli: &Cli) -> Result<AnySession> {
-    let hello = HandshakeHello::operator("pete-cockpit-cli");
+    let hello = operator_control_hello();
     match cli.transport {
         Transport::Http => {
             let endpoint = cli.endpoint.as_deref().unwrap_or("192.168.4.1:80");
@@ -168,6 +168,12 @@ fn connect(cli: &Cli) -> Result<AnySession> {
     }
 }
 
+fn operator_control_hello() -> HandshakeHello {
+    let mut hello = HandshakeHello::operator("pete-cockpit-cli");
+    hello.session_purpose = SessionPurpose::Control;
+    hello
+}
+
 fn open_serial(endpoint: &str) -> pete_cockpit::Result<UartCockpit> {
     UartCockpit::connect_with_config(
         UartCockpitConfig::new(endpoint)
@@ -204,18 +210,19 @@ where
     let result = (|| -> Result<()> {
         while started.elapsed() < Duration::from_millis(duration_ms) {
             let status = read_status(session)?;
-            guard(&status)?;
             let Some((linear_mm_s, angular_mrad_s, reason)) = command(&status)? else {
                 println!(
-                    "complete elapsed_ms={} ir={:?} home_base={} charging={}",
+                    "complete elapsed_ms={} ir={:?} home_base={} charging={} safety_latch={:?}",
                     started.elapsed().as_millis(),
                     status.infrared_character,
                     status.battery.home_base(),
                     status.battery.charging_state.unwrap_or(0) != 0
-                        || status.battery.charging_indicator == Some(true)
+                        || status.battery.charging_indicator == Some(true),
+                    status.safety_latch_kind,
                 );
                 return Ok(());
             };
+            guard(&status)?;
             if linear_mm_s.abs() > 500 || angular_mrad_s.abs() > 2_000 {
                 return Err("motion exceeds cockpit CLI bounds (500 mm/s, 2000 mrad/s)".into());
             }
@@ -305,4 +312,34 @@ fn accepted(response: CockpitResponse) -> Result<()> {
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{operator_control_hello, Cli, Command};
+    use clap::Parser;
+    use pete_cockpit::SessionPurpose;
+
+    #[test]
+    fn motion_cli_accepts_a_separate_negative_velocity_argument() {
+        let cli = Cli::try_parse_from([
+            "pete-cockpit",
+            "drive",
+            "--linear",
+            "-120",
+            "--duration-ms",
+            "2500",
+        ])
+        .unwrap();
+
+        assert!(matches!(cli.command, Command::Drive { linear: -120, .. }));
+    }
+
+    #[test]
+    fn operator_motion_handshake_requests_control_purpose() {
+        assert_eq!(
+            operator_control_hello().session_purpose,
+            SessionPurpose::Control
+        );
+    }
 }
