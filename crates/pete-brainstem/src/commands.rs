@@ -56,6 +56,10 @@ pub enum BrainstemCommand {
         kind: SafetyLatchKind,
         seq: u32,
     },
+    CarefulMode {
+        ttl_ms: u32,
+        seq: u32,
+    },
     HeartbeatStop {
         timeout_ms: u32,
         seq: u32,
@@ -180,6 +184,9 @@ pub(crate) enum RuntimeCommand {
     },
     ClearSafetyLatch {
         kind: SafetyLatchKind,
+    },
+    CarefulMode {
+        ttl_ms: u32,
     },
     HeartbeatStop {
         timeout_ms: u32,

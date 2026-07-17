@@ -67,9 +67,8 @@ use pete_now::{
     CognitiveServiceBelief, ControlProvenance, DangerPrediction, DriveSense, EarPrediction,
     EntityId, EvidenceRef, ExtensionSense, EyePrediction, Freshness, MemorySense, Now, ObjectClass,
     ObjectObservation, ObjectObservationSource, ReignSense, SafetySense, SemanticBehaviorId,
-    SemanticEvidenceObservation,
-    SemanticGroundingKind, SemanticNodeRef, SemanticOutcomeId, SemanticPredicate, SurpriseSense,
-    WorldModelSnapshot, WorldModelUpdater,
+    SemanticEvidenceObservation, SemanticGroundingKind, SemanticNodeRef, SemanticOutcomeId,
+    SemanticPredicate, SurpriseSense, WorldModelSnapshot, WorldModelUpdater,
 };
 use pete_sensors::{
     anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
@@ -3776,9 +3775,7 @@ where
             ) {
                 if matches!(
                     request.skill_id,
-                    SkillId::TurnTowardTarget
-                        | SkillId::ApproachTarget
-                        | SkillId::AlignWithDock
+                    SkillId::TurnTowardTarget | SkillId::ApproachTarget | SkillId::AlignWithDock
                 ) {
                     request.skill_id = SkillId::AlignWithDock;
                     request.bearing_rad = Some(cue.bearing_hint_rad());
@@ -5410,11 +5407,7 @@ fn skill_progress(initial: Option<f32>, current: Option<f32>) -> Option<f32> {
     }
 }
 
-fn skill_completed(
-    request: &SkillRequest,
-    body: &BodySense,
-    home_base_contact: bool,
-) -> bool {
+fn skill_completed(request: &SkillRequest, body: &BodySense, home_base_contact: bool) -> bool {
     match request.skill_id {
         SkillId::StopAndStabilize => true,
         SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => request
@@ -6124,6 +6117,27 @@ where
                             "brainstem contact withdrawal ended with {:?}, but contact persists after {} ms; possessor requires another strategy or operator help",
                             self.possession_recovery.last_reflex_outcome, recovery_age_ms
                         );
+                    } else if possession_recovery_command_due(&self.possession_recovery, now_ms) {
+                        self.possession_recovery.command_attempts =
+                            self.possession_recovery.command_attempts.saturating_add(1);
+                        self.possession_recovery.last_command_ms = now_ms;
+                        self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
+                        self.possession_recovery.brainstem_reflex_observed = false;
+                        self.possession_careful_motion(-POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S, 0)?;
+                        command_sent = true;
+                        action = Some(ActionPrimitive::Go {
+                            intensity: -0.2,
+                            duration_ms: POSSESSION_BUMP_ESCAPE_BACKOFF_DURATION_MS,
+                        });
+                        motor = Some(MotorCommand {
+                            forward: -0.05,
+                            turn: 0.0,
+                        });
+                        reason = format!(
+                            "brainstem withdrawal ended with {:?}; possessor entered CAREFUL for escape attempt {}",
+                            self.possession_recovery.last_reflex_outcome,
+                            self.possession_recovery.command_attempts
+                        );
                     } else {
                         reason = format!(
                             "brainstem contact withdrawal ended with {:?}; possessor is waiting for a clear contact observation",
@@ -6210,10 +6224,9 @@ where
                             "recovering {latch:?} safety latch; escape attempt {}: reverse then turn clockwise 90 degrees",
                             self.possession_recovery.command_attempts
                         );
-                            self.cockpit.client_mut().cmd_vel(
+                            self.possession_careful_motion(
                                 -POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S,
                                 0,
-                                250,
                             )?;
                         } else {
                             reason = format!(
@@ -6257,7 +6270,7 @@ where
                             "recovering {latch:?} safety latch; escape attempt {}",
                             self.possession_recovery.command_attempts
                         );
-                        self.cockpit.client_mut().cmd_vel(-100, 0, 250)?;
+                        self.possession_careful_motion(-100, 0)?;
                     } else {
                         reason = format!(
                             "recovering {latch:?} safety latch; escape in progress for {} ms",
@@ -6321,6 +6334,14 @@ where
         self.cockpit
             .client_mut()
             .clear_safety_latch(SafetyLatchKind::Bump)?;
+        Ok(())
+    }
+
+    fn possession_careful_motion(&mut self, linear_mm_s: i16, angular_mrad_s: i16) -> Result<()> {
+        self.cockpit.client_mut().careful_mode(1_000)?;
+        self.cockpit
+            .client_mut()
+            .cmd_vel(linear_mm_s, angular_mrad_s, 250)?;
         Ok(())
     }
 
@@ -10272,8 +10293,7 @@ mod tests {
         assert_eq!(running.phase, SkillPhase::Running);
 
         body.infrared_character = 0;
-        let (lost, stop_sent) =
-            runtime.step(&mut cockpit, &request, &body, false, &events, 101);
+        let (lost, stop_sent) = runtime.step(&mut cockpit, &request, &body, false, &events, 101);
         assert!(stop_sent);
         assert_eq!(lost.phase, SkillPhase::Terminal);
         assert_eq!(lost.outcome, Some(SkillOutcome::TargetStale));
@@ -10295,8 +10315,7 @@ mod tests {
         let events = cockpit.get_events_since(0).unwrap();
         let mut runtime = PossessorSkillRuntime::default();
 
-        let (completed, stop_sent) =
-            runtime.step(&mut cockpit, &request, &body, false, &events, 1);
+        let (completed, stop_sent) = runtime.step(&mut cockpit, &request, &body, false, &events, 1);
         assert!(stop_sent);
         assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
 
@@ -10304,8 +10323,7 @@ mod tests {
         let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
         let events = cockpit.get_events_since(0).unwrap();
         let mut runtime = PossessorSkillRuntime::default();
-        let (completed, stop_sent) =
-            runtime.step(&mut cockpit, &request, &body, true, &events, 1);
+        let (completed, stop_sent) = runtime.step(&mut cockpit, &request, &body, true, &events, 1);
         assert!(stop_sent);
         assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
     }
@@ -10976,6 +10994,7 @@ mod tests {
 
     struct ActiveBumpRecoveryCockpit {
         bump_escape_attempts: Arc<AtomicUsize>,
+        careful_mode_attempts: Arc<AtomicUsize>,
         bump_escape_commands: Arc<Mutex<Vec<(i16, i16, u32)>>>,
         stop_attempts: Arc<AtomicUsize>,
         clear_attempts: Arc<AtomicUsize>,
@@ -11003,6 +11022,10 @@ mod tests {
                         angular_mrad_s,
                         ttl_ms,
                     ));
+                    Ok(CockpitResponse::Accepted)
+                }
+                CockpitRequest::CarefulMode { .. } => {
+                    self.careful_mode_attempts.fetch_add(1, Ordering::SeqCst);
                     Ok(CockpitResponse::Accepted)
                 }
                 CockpitRequest::Stop => {
@@ -11466,10 +11489,12 @@ mod tests {
     #[tokio::test]
     async fn real_robot_slow_runner_reports_active_bump_recovery_as_chosen_action() {
         let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
+        let careful_mode_attempts = Arc::new(AtomicUsize::new(0));
         let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
         let stop_attempts = Arc::new(AtomicUsize::new(0));
         let body = ActiveBumpRecoveryCockpit {
             bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            careful_mode_attempts: Arc::clone(&careful_mode_attempts),
             bump_escape_commands: Arc::clone(&bump_escape_commands),
             stop_attempts,
             clear_attempts: Arc::new(AtomicUsize::new(0)),
@@ -11481,6 +11506,7 @@ mod tests {
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
         assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(careful_mode_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(
             bump_escape_commands.lock().unwrap().as_slice(),
             &[(-50, 0, 250)]
@@ -11523,12 +11549,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn possessor_enters_careful_when_local_withdrawal_ends_still_bumped() {
+        let careful_mode_attempts = Arc::new(AtomicUsize::new(0));
+        let motion_attempts = Arc::new(AtomicUsize::new(0));
+        let body = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::clone(&motion_attempts),
+            careful_mode_attempts: Arc::clone(&careful_mode_attempts),
+            bump_escape_commands: Arc::new(Mutex::new(Vec::new())),
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            clear_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_active: true,
+        };
+        let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
+            .with_autonomous_motion(true);
+        runner.possession_recovery.latch = Some(SafetyLatchKind::Bump);
+        runner.possession_recovery.phase = PossessionRecoveryPhase::WaitingForSensorClear;
+        runner.possession_recovery.active_since_ms = wall_time_ms();
+        runner.possession_recovery.last_command_ms = 0;
+        runner.possession_recovery.brainstem_reflex_observed = true;
+        runner.possession_recovery.last_reflex_outcome = Some(ContactWithdrawalOutcome::Completed);
+
+        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
+
+        assert_eq!(careful_mode_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(motion_attempts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go { .. })
+        ));
+        assert!(snapshot
+            .action_debug
+            .as_ref()
+            .and_then(|debug| debug.get("why_not_moving"))
+            .and_then(|reason| reason.as_str())
+            .is_some_and(|reason| reason.contains("entered CAREFUL")));
+    }
+
+    #[tokio::test]
     async fn real_robot_slow_runner_does_not_spam_bump_escape_during_recovery_cooldown() {
         let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
         let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
         let stop_attempts = Arc::new(AtomicUsize::new(0));
         let body = ActiveBumpRecoveryCockpit {
             bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            careful_mode_attempts: Arc::new(AtomicUsize::new(0)),
             bump_escape_commands,
             stop_attempts,
             clear_attempts: Arc::new(AtomicUsize::new(0)),
@@ -11563,6 +11627,7 @@ mod tests {
         let stop_attempts = Arc::new(AtomicUsize::new(0));
         let body = ActiveBumpRecoveryCockpit {
             bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            careful_mode_attempts: Arc::new(AtomicUsize::new(0)),
             bump_escape_commands,
             stop_attempts: Arc::clone(&stop_attempts),
             clear_attempts: Arc::new(AtomicUsize::new(0)),
@@ -11600,6 +11665,7 @@ mod tests {
         let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
         let body = ActiveBumpRecoveryCockpit {
             bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            careful_mode_attempts: Arc::new(AtomicUsize::new(0)),
             bump_escape_commands: Arc::clone(&bump_escape_commands),
             stop_attempts: Arc::new(AtomicUsize::new(0)),
             clear_attempts: Arc::new(AtomicUsize::new(0)),
@@ -11626,6 +11692,7 @@ mod tests {
         let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
         let body = ActiveBumpRecoveryCockpit {
             bump_escape_attempts: Arc::clone(&bump_escape_attempts),
+            careful_mode_attempts: Arc::new(AtomicUsize::new(0)),
             bump_escape_commands: Arc::new(Mutex::new(Vec::new())),
             stop_attempts: Arc::new(AtomicUsize::new(0)),
             clear_attempts: Arc::new(AtomicUsize::new(0)),
@@ -11663,6 +11730,7 @@ mod tests {
         let clear_attempts = Arc::new(AtomicUsize::new(0));
         let body = ActiveBumpRecoveryCockpit {
             bump_escape_attempts: Arc::new(AtomicUsize::new(0)),
+            careful_mode_attempts: Arc::new(AtomicUsize::new(0)),
             bump_escape_commands: Arc::new(Mutex::new(Vec::new())),
             stop_attempts: Arc::clone(&stop_attempts),
             clear_attempts: Arc::clone(&clear_attempts),

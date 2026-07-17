@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use pete_cockpit::{
-    Cockpit, CockpitError, CockpitRequest, CockpitResponse, ControlAuthority, DockIrCue,
-    HandshakeHello, HttpCockpit, SessionCockpit, SessionPurpose, StatusSummary, UartCockpit,
-    UartCockpitConfig, discover_usb_serial_by_id, establish_session,
+    discover_usb_serial_by_id, establish_session, Cockpit, CockpitError, CockpitRequest,
+    CockpitResponse, ControlAuthority, DockIrCue, HandshakeHello, HttpCockpit, SessionCockpit,
+    SessionPurpose, StatusSummary, UartCockpit, UartCockpitConfig,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -54,6 +54,9 @@ enum Command {
         angular: i16,
         #[arg(long, default_value_t = 500)]
         duration_ms: u64,
+        /// Explicitly renew CAREFUL while driving, making sensor gates advisory.
+        #[arg(long)]
+        careful: bool,
     },
     /// Follow the Create Home Base IR gradient with short-lived primitives.
     DockAlign {
@@ -63,6 +66,9 @@ enum Command {
         speed: i16,
         #[arg(long, default_value_t = 400)]
         correction: i16,
+        /// Explicitly renew CAREFUL while aligning.
+        #[arg(long)]
+        careful: bool,
     },
 }
 
@@ -98,7 +104,8 @@ fn main() -> Result<()> {
             linear,
             angular,
             duration_ms,
-        } => run_guarded_motion(&mut session, duration_ms, |status| {
+            careful,
+        } => run_guarded_motion(&mut session, duration_ms, careful, |status| {
             let _ = status;
             Ok(Some((linear, angular, "bounded drive")))
         }),
@@ -106,7 +113,8 @@ fn main() -> Result<()> {
             duration_ms,
             speed,
             correction,
-        } => run_guarded_motion(&mut session, duration_ms, |status| {
+            careful,
+        } => run_guarded_motion(&mut session, duration_ms, careful, |status| {
             if status.battery.home_base()
                 || status.battery.charging_indicator == Some(true)
                 || status.battery.charging_state.unwrap_or(0) != 0
@@ -187,7 +195,12 @@ fn establish(connector: Box<dyn Cockpit>, hello: HandshakeHello) -> Result<AnySe
     Ok(establish_session(connector, hello, None)?)
 }
 
-fn run_guarded_motion<F>(session: &mut AnySession, duration_ms: u64, mut command: F) -> Result<()>
+fn run_guarded_motion<F>(
+    session: &mut AnySession,
+    duration_ms: u64,
+    careful: bool,
+    mut command: F,
+) -> Result<()>
 where
     F: FnMut(&StatusSummary) -> Result<Option<(i16, i16, &'static str)>>,
 {
@@ -209,6 +222,9 @@ where
     let started = Instant::now();
     let result = (|| -> Result<()> {
         while started.elapsed() < Duration::from_millis(duration_ms) {
+            if careful {
+                accepted(session.execute(CockpitRequest::CarefulMode { ttl_ms: 1_000 })?)?;
+            }
             let status = read_status(session)?;
             let Some((linear_mm_s, angular_mrad_s, reason)) = command(&status)? else {
                 println!(

@@ -146,6 +146,7 @@ drive_direct
 drive_arc
 stop
 dock
+careful_mode
 ```
 
 Navigation, alignment, timed-motion, scanning, wall-follow, wiggle, and escape
@@ -155,7 +156,17 @@ procedures are deterministic motherbrain skills. In particular,
 `wiggle_align`, `bump_escape`, and `unstick` are not Brainstem capabilities.
 All transports reject those legacy wire verbs as `unsupported`; the simulator
 uses the same contract. `set_safety_policy` and `cliff_guard` are likewise
-unsupported because a host cannot weaken or manufacture physical safety.
+unsupported because a host cannot silently weaken or manufacture physical
+safety.
+
+`careful_mode` is the deliberately conspicuous exception for an active
+possessor taking direct responsibility for the body during an exceptional
+physical intervention. It is not a selectable safety policy. Each request has
+an explicit 250–15,000 ms TTL, clears the current bump, cliff, wheel-drop,
+tilt, impact, and dock/charging motor gates, and keeps those raw observations
+visible but advisory for that window. E-stop, loss of authority, heartbeat
+expiry, and stale Create telemetry remain absolute. Expiry stops first and
+re-latches any condition still physically present.
 
 `get_capabilities` reports the current body contract using the clean names above: body kind, drive type, supported verbs, sensors, outputs, safety features, limits, feedback/song slots, and supported sensor packet range. The facts come from the selected body descriptor, not from the generic renderer. HTTP/WebSocket return JSON; UDP and forebrain UART return a compact single-line representation.
 

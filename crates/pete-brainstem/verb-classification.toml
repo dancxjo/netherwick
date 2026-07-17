@@ -36,6 +36,17 @@ lifecycle = "typed command and safety events"
 exposed = true
 
 [[verbs]]
+names = ["careful_mode"]
+category = "reflex"
+authority = "control lease with explicit short TTL"
+sensors = "all body hazards remain observable but advisory while active"
+bounds = "time bounded and stopped on expiry; e-stop, authority, heartbeat, and body-link loss remain absolute"
+preempted_by = "e-stop, authority loss, heartbeat expiry, body-link loss"
+owner = "active possessor"
+lifecycle = "typed command plus visible active/remaining status"
+exposed = true
+
+[[verbs]]
 names = ["cmd_vel", "drive_direct", "drive_arc"]
 category = "primitive"
 authority = "control lease"

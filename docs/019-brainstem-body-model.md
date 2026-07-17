@@ -215,9 +215,14 @@ authority layer: the reflex supersedes the skill and reports a typed
 safety-preempted outcome upstream.
 
 Safety recipes are not host policy. Production hosts cannot select `none`,
-`backoff`, or compound escape behavior for bump/cliff/wheel-drop protections,
-and a safety latch clears only after the matching fresh physical condition has
-cleared. The canonical per-verb ownership/authority/bounds/event inventory is
+`backoff`, or compound escape behavior for bump/cliff/wheel-drop protections.
+The one explicit exceptional authority is `careful_mode`: the active possessor
+may declare direct physical custody of the body for a short TTL, opening all
+sensor-derived motor gates while their observations remain visible. This is
+the “lift the car” path, not ordinary navigation or automatic recovery. It
+cannot bypass E-stop, authority loss, heartbeat expiry, or stale body
+telemetry; expiry stops motion before re-latching every live physical hazard.
+The canonical per-verb ownership/authority/bounds/event inventory is
 `crates/pete-brainstem/verb-classification.toml`.
 
 This boundary is the implementation correction tracked by GitHub issues #63,

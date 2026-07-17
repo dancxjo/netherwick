@@ -167,6 +167,7 @@ All notable changes are grouped by date.
   transient session or lease failures.
 - Use `portable-atomic` for brainstem registry and session counters in the default RP2040 build as well as Pico-W builds.
 - Pin the Pico-W firmware's `fixed` dependency to the Rust-1.92-compatible 1.30 release so the documented embedded build remains reproducible.
+- Add a bounded `careful_mode` runtime verb for active possessors: it clears advisory latches for the command window, suspends automatic safety gating while a short TTL is active, then re-latches hazards and authority conditions on expiry while exposing remaining-time telemetry.
 
 ### Ready
 
@@ -178,6 +179,7 @@ All notable changes are grouped by date.
 - Expose the contact-withdrawal lifecycle through typed cockpit events and mirror its bounded, authority-independent behavior in the simulator.
 - Route selected goal affordances through typed, bounded possessor skills, with target-based turn, approach, docking, search, and retreat requests that report completion, timeout, unavailable-target, authority-loss, and safety-preemption outcomes.
 - Feed possessor-skill progress and terminal outcomes back to the originating goal, including explicit progress expectations and failure pressure without discarding the active goal.
+- Add `careful_mode` to the brainstem verb inventory and compatibility checks, including firmware parser/runtime/status support for both line-based and JSON control payloads and compact status fields for active/remaining time.
 
 ### Ongoing
 

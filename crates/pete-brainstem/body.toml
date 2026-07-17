@@ -37,6 +37,7 @@ verbs = [
   "estop",
   "clear_estop",
   "clear_safety_latch",
+  "careful_mode",
   "clear_motion_queue",
   "cmd_vel",
   "drive_direct",

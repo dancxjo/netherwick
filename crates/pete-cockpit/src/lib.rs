@@ -349,6 +349,10 @@ pub trait Cockpit {
         expect_accepted(self.execute(CockpitRequest::ClearSafetyLatch { latch: kind })?)
     }
 
+    fn careful_mode(&mut self, ttl_ms: u32) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::CarefulMode { ttl_ms })?)
+    }
+
     fn cmd_vel(&mut self, linear_mm_s: i16, angular_mrad_s: i16, ttl_ms: u32) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::CmdVel {
             linear_mm_s,
@@ -1359,13 +1363,41 @@ pub struct DockIrCue {
 impl DockIrCue {
     pub fn from_character(character: u8) -> Option<Self> {
         let cue = match character {
-            242 => Self { red_buoy: false, green_buoy: false, force_field: true },
-            244 => Self { red_buoy: false, green_buoy: true, force_field: false },
-            246 => Self { red_buoy: false, green_buoy: true, force_field: true },
-            248 => Self { red_buoy: true, green_buoy: false, force_field: false },
-            250 => Self { red_buoy: true, green_buoy: false, force_field: true },
-            252 => Self { red_buoy: true, green_buoy: true, force_field: false },
-            254 => Self { red_buoy: true, green_buoy: true, force_field: true },
+            242 => Self {
+                red_buoy: false,
+                green_buoy: false,
+                force_field: true,
+            },
+            244 => Self {
+                red_buoy: false,
+                green_buoy: true,
+                force_field: false,
+            },
+            246 => Self {
+                red_buoy: false,
+                green_buoy: true,
+                force_field: true,
+            },
+            248 => Self {
+                red_buoy: true,
+                green_buoy: false,
+                force_field: false,
+            },
+            250 => Self {
+                red_buoy: true,
+                green_buoy: false,
+                force_field: true,
+            },
+            252 => Self {
+                red_buoy: true,
+                green_buoy: true,
+                force_field: false,
+            },
+            254 => Self {
+                red_buoy: true,
+                green_buoy: true,
+                force_field: true,
+            },
             _ => return None,
         };
         Some(cue)
@@ -1392,12 +1424,20 @@ impl DockIrCue {
 
     /// A strong charger-visible cue, deliberately below contact certainty.
     pub fn visible_score(self) -> f32 {
-        if self.red_buoy || self.green_buoy { 0.85 } else { 0.65 }
+        if self.red_buoy || self.green_buoy {
+            0.85
+        } else {
+            0.65
+        }
     }
 
     /// Force-field evidence raises proximity belief but never implies contact.
     pub fn near_score(self) -> f32 {
-        if self.force_field { 0.55 } else { 0.30 }
+        if self.force_field {
+            0.55
+        } else {
+            0.30
+        }
     }
 }
 
@@ -1409,6 +1449,10 @@ pub struct StatusSummary {
     pub estop_latched: Option<bool>,
     pub safety_tripped: Option<bool>,
     pub safety_latch_kind: Option<SafetyLatchKind>,
+    #[serde(default)]
+    pub careful_mode_active: Option<bool>,
+    #[serde(default)]
+    pub careful_mode_remaining_ms: Option<u32>,
     pub active_motion: Option<bool>,
     pub event_next_seq: Option<u32>,
     pub body_packet_count: Option<u32>,
@@ -1456,6 +1500,8 @@ impl StatusSummary {
             safety_latch_kind: value_for(raw, "safety_latch_kind")
                 .and_then(SafetyLatchKind::from_str)
                 .or(inferred_imu_latch),
+            careful_mode_active: bool_for(raw, "careful_mode"),
+            careful_mode_remaining_ms: number_for(raw, "careful_remaining_ms"),
             active_motion: bool_for(raw, "active_cmd_vel"),
             event_next_seq: number_for(raw, "event_next_seq"),
             body_packet_count: packet_count,
@@ -1501,6 +1547,8 @@ impl StatusSummary {
             safety_tripped: json_bool_value(value, "safety_tripped").or(sensor_safety_tripped),
             safety_latch_kind: json_str_value(value, "safety_latch_kind")
                 .and_then(SafetyLatchKind::from_str),
+            careful_mode_active: json_bool_value(value, "careful_mode_active"),
+            careful_mode_remaining_ms: json_u32_value(value, "careful_mode_remaining_ms"),
             active_motion: json_str_value(value, "current_command")
                 .map(|command| command == "drive"),
             event_next_seq: json_u32_value(value, "event_next_seq"),
@@ -1831,6 +1879,9 @@ pub enum CockpitRequest {
     ClearSafetyLatch {
         latch: SafetyLatchKind,
     },
+    CarefulMode {
+        ttl_ms: u32,
+    },
     CmdVel {
         linear_mm_s: i16,
         angular_mrad_s: i16,
@@ -2030,6 +2081,7 @@ impl CockpitRequest {
                 | Self::EStop
                 | Self::ClearEStop
                 | Self::ClearSafetyLatch { .. }
+                | Self::CarefulMode { .. }
                 | Self::BumpEscape { .. }
                 | Self::Unstick { .. }
                 | Self::CliffGuard { .. }
@@ -2057,6 +2109,7 @@ impl CockpitRequest {
             Self::EStop => "estop",
             Self::ClearEStop => "clear_estop",
             Self::ClearSafetyLatch { .. } => "clear_safety_latch",
+            Self::CarefulMode { .. } => "careful_mode",
             Self::CmdVel { .. } => "cmd_vel",
             Self::DriveDirect { .. } => "drive_direct",
             Self::DriveArc { .. } => "drive_arc",
@@ -2130,7 +2183,9 @@ impl CockpitRequest {
             Self::ArcFor { duration_ms, .. }
             | Self::CalibrateTurn { duration_ms, .. }
             | Self::OrientationProbe { duration_ms, .. } => Some(*duration_ms),
-            Self::HeartbeatStop { timeout_ms } => Some(*timeout_ms),
+            Self::HeartbeatStop { timeout_ms } | Self::CarefulMode { ttl_ms: timeout_ms } => {
+                Some(*timeout_ms)
+            }
             Self::StreamSensors { period_ms, .. } => Some(*period_ms),
             _ => None,
         }
@@ -2156,6 +2211,9 @@ impl CockpitRequest {
             Self::ClearEStop => client.clear_estop().map(|()| CockpitResponse::Accepted),
             Self::ClearSafetyLatch { latch } => client
                 .clear_safety_latch(*latch)
+                .map(|()| CockpitResponse::Accepted),
+            Self::CarefulMode { ttl_ms } => client
+                .careful_mode(*ttl_ms)
                 .map(|()| CockpitResponse::Accepted),
             Self::CmdVel {
                 linear_mm_s,
@@ -2511,6 +2569,7 @@ impl CockpitRequest {
             Self::ClearSafetyLatch { latch } => {
                 format!("CLEAR_SAFETY_LATCH {seq} {}\n", latch.as_str())
             }
+            Self::CarefulMode { ttl_ms } => format!("CAREFUL_MODE {seq} {ttl_ms}\n"),
             Self::CmdVel {
                 linear_mm_s,
                 angular_mrad_s,
@@ -2723,6 +2782,7 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "estop",
         "clear_estop",
         "clear_safety_latch",
+        "careful_mode",
         "clear_motion_queue",
         "cmd_vel",
         "drive_direct",
@@ -2749,7 +2809,9 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
 }
 
 fn optional_cockpit_verbs() -> Vec<&'static str> {
-    vec!["bootsel", "reset_motherbrain"]
+    // CAREFUL is a forward migration: current hosts must still accept and
+    // service-flash brainstems that predate the explicit override lease.
+    vec!["bootsel", "reset_motherbrain", "careful_mode"]
 }
 
 // Older brainstems advertised these convenience commands directly. Current
@@ -4789,7 +4851,9 @@ impl<C: Cockpit> Cockpit for MotherbrainPossession<C> {
             | AuthorizationClass::ControlLease => {
                 let reopen_after_clear = matches!(
                     request,
-                    CockpitRequest::ClearEStop | CockpitRequest::ClearSafetyLatch { .. }
+                    CockpitRequest::ClearEStop
+                        | CockpitRequest::ClearSafetyLatch { .. }
+                        | CockpitRequest::CarefulMode { .. }
                 );
                 let response = self.execute_scoped(request)?;
                 if reopen_after_clear {
@@ -7867,6 +7931,19 @@ mod tests {
     }
 
     #[test]
+    fn pre_careful_brainstem_contract_remains_accepted_for_migration() {
+        let mut capabilities = body_toml_capabilities();
+        capabilities.verbs.retain(|verb| verb != "careful_mode");
+
+        establish_session(
+            SimCockpit::new().with_capabilities(capabilities),
+            HandshakeHello::default_motherbrain(),
+            None,
+        )
+        .expect("pre-CAREFUL firmware must remain flashable");
+    }
+
+    #[test]
     fn cockpit_requests_serialize_to_firmware_json_kinds() {
         for (verb, expected_json_kind, _) in sample_cockpit_requests() {
             let request = sample_request_for(verb);
@@ -8665,6 +8742,7 @@ mod tests {
                 "clear_safety_latch",
                 "CLEAR_SAFETY_LATCH",
             ),
+            ("careful_mode", "careful_mode", "CAREFUL_MODE"),
             (
                 "clear_motion_queue",
                 "clear_motion_queue",
@@ -8831,6 +8909,7 @@ mod tests {
             "clear_safety_latch" => CockpitRequest::ClearSafetyLatch {
                 latch: SafetyLatchKind::Bump,
             },
+            "careful_mode" => CockpitRequest::CarefulMode { ttl_ms: 5_000 },
             "clear_motion_queue" => CockpitRequest::ClearMotionQueue,
             "cmd_vel" => CockpitRequest::CmdVel {
                 linear_mm_s: 10,

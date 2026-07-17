@@ -46,6 +46,8 @@ const CREATE_LINK_FRESHNESS_TIMEOUT_MS: u32 = 1_000;
 // impacts. Keep impact detection immediate, but require the gravity-vector tilt
 // threshold to remain crossed before turning it into a latched motion veto.
 const IMU_TILT_LATCH_HOLD_MS: u32 = 100;
+const CAREFUL_MODE_MIN_TTL_MS: u32 = 250;
+const CAREFUL_MODE_MAX_TTL_MS: u32 = 15_000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -196,6 +198,7 @@ where
     active_velocity: Option<ActiveVelocity>,
     stop_sent: bool,
     heartbeat_stop_at_ms: Option<u32>,
+    careful_mode_until_ms: Option<u32>,
     sensor_stream: Option<SensorStream>,
     next_charging_sources_poll_ms: u32,
     next_imu_poll_ms: u32,
@@ -245,6 +248,7 @@ where
         let _ = events.push_back(BrainstemEvent::Boot);
         status::set_runtime_state(RuntimeState::Booting);
         status::set_body_state(BodyState::NotStarted);
+        status::set_careful_mode_until(None);
         Self {
             hardware,
             events,
@@ -258,6 +262,7 @@ where
             active_velocity: None,
             stop_sent: false,
             heartbeat_stop_at_ms: None,
+            careful_mode_until_ms: None,
             sensor_stream: None,
             next_charging_sources_poll_ms: 0,
             next_imu_poll_ms: 0,
@@ -329,6 +334,10 @@ where
             self.enter_error(error);
             return;
         }
+        if let Err(error) = self.enforce_careful_mode_timeout() {
+            self.enter_error(error);
+            return;
+        }
         if let Err(error) = self.enforce_safety_policy() {
             self.enter_error(error);
             return;
@@ -348,6 +357,7 @@ where
         }
         if status::take_expired_authority(self.now_ms()) {
             self.heartbeat_stop_at_ms = None;
+            self.cancel_careful_mode();
             if self.active_contact_withdrawal.is_none() {
                 self.interrupt_active_command();
                 self.commands.clear();
@@ -400,6 +410,7 @@ where
             // active output is stopped by Full-mode supervision and later
             // motion cannot start against a dead link.
             self.create_responsive = false;
+            self.cancel_careful_mode();
             status::set_oi_mode_unknown();
         }
         self.poll_control_command();
@@ -414,6 +425,7 @@ where
             return;
         }
         self.heartbeat_stop_at_ms = None;
+        self.cancel_careful_mode();
         if self.active_contact_withdrawal.is_none() {
             self.interrupt_active_command();
             self.commands.clear();
@@ -541,6 +553,7 @@ where
             return;
         };
         self.heartbeat_stop_at_ms = None;
+        self.cancel_careful_mode();
         self.sensor_stream = None;
         network_registry::clear_motherbrain_registration();
         if self.active_contact_withdrawal.is_none() {
@@ -577,7 +590,10 @@ where
         if self.active_contact_withdrawal.is_some()
             && !matches!(
                 command,
-                BrainstemCommand::Stop | BrainstemCommand::EStop | BrainstemCommand::Disarm
+                BrainstemCommand::Stop
+                    | BrainstemCommand::EStop
+                    | BrainstemCommand::Disarm
+                    | BrainstemCommand::CarefulMode { .. }
             )
         {
             // The possessor may lose or replace authority while this runs.
@@ -589,7 +605,10 @@ where
         if self.active_contact_withdrawal.is_some()
             && matches!(
                 command,
-                BrainstemCommand::Stop | BrainstemCommand::EStop | BrainstemCommand::Disarm
+                BrainstemCommand::Stop
+                    | BrainstemCommand::EStop
+                    | BrainstemCommand::Disarm
+                    | BrainstemCommand::CarefulMode { .. }
             )
         {
             let stopped = self.stop_drive().is_ok();
@@ -607,6 +626,9 @@ where
                 self.commands.clear();
                 self.active = ActiveAction::None;
                 self.heartbeat_stop_at_ms = None;
+                if matches!(command, BrainstemCommand::EStop) {
+                    self.cancel_careful_mode();
+                }
                 let command = match command {
                     BrainstemCommand::Stop => RuntimeCommand::Stop,
                     BrainstemCommand::EStop => RuntimeCommand::EStop,
@@ -629,6 +651,7 @@ where
                 self.commands.clear();
                 self.active = ActiveAction::None;
                 self.heartbeat_stop_at_ms = None;
+                self.cancel_careful_mode();
                 for command in DISARM_SCRIPT.iter().rev() {
                     let _ = self
                         .commands
@@ -641,6 +664,7 @@ where
                 self.commands.clear();
                 self.active = ActiveAction::None;
                 self.heartbeat_stop_at_ms = None;
+                self.cancel_careful_mode();
                 for command in RESTART_CREATE_SCRIPT.iter().rev() {
                     let _ = self
                         .commands
@@ -1007,6 +1031,9 @@ where
             }
             RuntimeCommand::ClearSafetyLatch { kind } => {
                 self.clear_safety_latch(Some(safety_latch_kind_to_event(kind)));
+            }
+            RuntimeCommand::CarefulMode { ttl_ms } => {
+                self.enter_careful_mode(ttl_ms)?;
             }
             RuntimeCommand::HeartbeatStop { timeout_ms } => {
                 self.heartbeat_stop_at_ms = Some(now_ms.wrapping_add(timeout_ms));
@@ -1539,10 +1566,9 @@ where
             imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
         let tilt = if tilt_observed {
             match self.tilt_observed_since_ms {
-                Some(started_at_ms) => time_reached(
-                    now_ms,
-                    started_at_ms.wrapping_add(IMU_TILT_LATCH_HOLD_MS),
-                ),
+                Some(started_at_ms) => {
+                    time_reached(now_ms, started_at_ms.wrapping_add(IMU_TILT_LATCH_HOLD_MS))
+                }
                 None => {
                     self.tilt_observed_since_ms = Some(now_ms);
                     false
@@ -1573,6 +1599,15 @@ where
             self.safety_observation_initialized = true;
         }
         let fresh_bump_edge = bump && !self.last_bump;
+
+        if self.careful_mode_active(now_ms) {
+            // CAREFUL transfers responsibility for these observations to the
+            // active possessor. Keep publishing the raw sensors, but do not
+            // turn them back into motor gates until the explicit lease ends.
+            self.update_safety_edges(bump, cliff, wheel_drop);
+            self.clear_sensor_gates_for_careful();
+            return Ok(());
+        }
 
         if home_base && !wheel_drop && !tilt && !impact {
             self.clear_dock_contact_latch();
@@ -1780,6 +1815,88 @@ where
         self.safety_latch_kind = None;
     }
 
+    fn enter_careful_mode(&mut self, requested_ttl_ms: u32) -> Result<(), BrainstemError> {
+        self.ensure_create_responsive()?;
+        if self.estop_latched {
+            return Err(BrainstemError::CreateNoResponse);
+        }
+        let now_ms = self.now_ms();
+        let ttl_ms = requested_ttl_ms.clamp(CAREFUL_MODE_MIN_TTL_MS, CAREFUL_MODE_MAX_TTL_MS);
+        self.clear_sensor_gates_for_careful();
+        self.careful_mode_until_ms = Some(now_ms.wrapping_add(ttl_ms));
+        status::set_careful_mode_until(self.careful_mode_until_ms);
+        Ok(())
+    }
+
+    fn careful_mode_active(&self, now_ms: u32) -> bool {
+        self.careful_mode_until_ms
+            .is_some_and(|deadline_ms| !time_reached(now_ms, deadline_ms))
+    }
+
+    fn cancel_careful_mode(&mut self) {
+        self.careful_mode_until_ms = None;
+        status::set_careful_mode_until(None);
+    }
+
+    fn clear_sensor_gates_for_careful(&mut self) {
+        if let Some(kind) = self.safety_latch_kind.take() {
+            status::mark_safety_cleared(kind);
+            if kind == status::SafetyEventKind::WheelDrop {
+                status::mark_wheel_drop_cleared();
+            }
+        }
+        self.safety_latched = false;
+        self.charging_interlock_latched = false;
+        self.dock_departure_pending = false;
+        self.tilt_observed_since_ms = None;
+    }
+
+    fn enforce_careful_mode_timeout(&mut self) -> Result<(), BrainstemError> {
+        let Some(deadline_ms) = self.careful_mode_until_ms else {
+            return Ok(());
+        };
+        if !time_reached(self.now_ms(), deadline_ms) {
+            return Ok(());
+        }
+
+        self.cancel_careful_mode();
+        self.interrupt_active_command();
+        self.commands.clear();
+        self.active = ActiveAction::None;
+        self.stop_drive()?;
+        self.relatch_current_sensor_gate();
+        Ok(())
+    }
+
+    fn relatch_current_sensor_gate(&mut self) {
+        let snapshot = status::snapshot(self.now_ms());
+        let flags = snapshot.create_sensor_flags;
+        let imu_ok = body::IMU_ENABLED && snapshot.imu_health == status::ImuHealthCode::Ok as u8;
+        let kind = if flags & (1 << 2) != 0 {
+            Some(status::SafetyEventKind::WheelDrop)
+        } else if flags & 0b1111_0000 != 0 {
+            Some(status::SafetyEventKind::Cliff)
+        } else if imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD {
+            Some(status::SafetyEventKind::Tilt)
+        } else if imu_ok && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2 {
+            Some(status::SafetyEventKind::Impact)
+        } else if flags & 0b11 != 0 {
+            Some(status::SafetyEventKind::Bump)
+        } else {
+            None
+        };
+
+        if let Some(kind) = kind {
+            status::mark_safety_tripped(kind);
+            if kind == status::SafetyEventKind::WheelDrop {
+                status::mark_wheel_drop_latched();
+            }
+            self.latch_safety(kind);
+        } else if status::charging_interlock_active(&snapshot) {
+            self.charging_interlock_latched = true;
+        }
+    }
+
     fn unsafe_forward_output(&self) -> bool {
         self.active_velocity
             .is_some_and(|velocity| velocity.linear_mm_s > 0)
@@ -1909,6 +2026,7 @@ where
         };
         if time_reached(self.now_ms(), deadline_ms) {
             self.heartbeat_stop_at_ms = None;
+            self.cancel_careful_mode();
             status::revoke_authority();
             status::mark_heartbeat_expired();
             status::mark_safety_tripped(status::SafetyEventKind::Heartbeat);
@@ -2165,6 +2283,9 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         BrainstemCommand::Unsupported { .. } => None,
         BrainstemCommand::ClearSafetyLatch { kind, .. } => {
             Some(RuntimeCommand::ClearSafetyLatch { kind })
+        }
+        BrainstemCommand::CarefulMode { ttl_ms, .. } => {
+            Some(RuntimeCommand::CarefulMode { ttl_ms })
         }
         BrainstemCommand::HeartbeatStop { timeout_ms, .. } => {
             Some(RuntimeCommand::HeartbeatStop { timeout_ms })
@@ -3400,6 +3521,77 @@ mod tests {
             runtime.safety_latch_kind,
             Some(status::SafetyEventKind::Bump)
         ));
+    }
+
+    #[test]
+    fn careful_mode_opens_held_sensor_gates_for_the_active_possessor() {
+        let _guard = status::status_test_guard();
+        status::set_careful_mode_until(None);
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_right: true,
+                    cliff_front_right: true,
+                    wheel_drop: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.latch_safety(status::SafetyEventKind::Bump);
+        runtime.charging_interlock_latched = true;
+        runtime.dock_departure_pending = true;
+
+        assert!(runtime.enter_careful_mode(2_000).is_ok());
+        assert!(runtime.enforce_safety_policy().is_ok());
+        let now_ms = runtime.now_ms();
+        assert!(runtime.start_cmd_vel(120, 0, Some(250), now_ms).is_ok());
+
+        assert!(runtime.careful_mode_active(1_000));
+        assert!(!runtime.safety_latched);
+        assert!(!runtime.charging_interlock_latched);
+        assert!(!runtime.dock_departure_pending);
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert_eq!(status::careful_mode_remaining_ms(1_000), 2_000);
+        status::set_careful_mode_until(None);
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+    }
+
+    #[test]
+    fn careful_mode_expires_stopped_and_relatches_the_live_condition() {
+        let _guard = status::status_test_guard();
+        status::set_careful_mode_until(None);
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        assert!(runtime.enter_careful_mode(250).is_ok());
+        let now_ms = runtime.now_ms();
+        assert!(runtime.start_cmd_vel(120, 0, Some(1_000), now_ms).is_ok());
+
+        runtime.hardware.delay_ms(250);
+        assert!(runtime.enforce_careful_mode_timeout().is_ok());
+
+        assert!(!runtime.careful_mode_active(1_250));
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert!(runtime.safety_latched);
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Bump)
+        ));
+        assert_eq!(status::careful_mode_remaining_ms(1_250), 0);
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
     }
 
     #[test]

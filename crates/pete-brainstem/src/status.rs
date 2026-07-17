@@ -184,6 +184,7 @@ static ACTIVE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SESSION_GENERATION: AtomicU32 = AtomicU32::new(0);
 static SESSION_SAFETY_FLAGS: AtomicU32 = AtomicU32::new(0);
 static SESSION_SAFETY_LATCH_KIND: AtomicU8 = AtomicU8::new(0);
+static CAREFUL_MODE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_TRANSPORT: AtomicU8 = AtomicU8::new(0);
 static AUTHORITY_REQUEST: AtomicU32 = AtomicU32::new(0);
 static AUTHORITY_ACK: AtomicU32 = AtomicU32::new(0);
@@ -607,6 +608,7 @@ enum ControlCommandCode {
     RestartCreate = 46,
     ResetMotherbrain = 47,
     ClearSafetyLatch = 48,
+    CarefulMode = 49,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -632,6 +634,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         Some(RuntimeCommand::CmdVel { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::DriveArc { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::ClearSafetyLatch { .. })
+        | Some(RuntimeCommand::CarefulMode { .. })
         | Some(RuntimeCommand::HeartbeatStop { .. }) => CommandCode::Behavior,
         Some(RuntimeCommand::PulseBrc) => CommandCode::PulseBrc,
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
@@ -1119,6 +1122,19 @@ pub fn session_safety_snapshot() -> (bool, bool, bool, Option<SafetyEventKind>) 
     )
 }
 
+pub fn set_careful_mode_until(deadline_ms: Option<u32>) {
+    CAREFUL_MODE_UNTIL_MS.store(deadline_ms.unwrap_or(0), Ordering::Release);
+}
+
+pub fn careful_mode_remaining_ms(now_ms: u32) -> u32 {
+    let deadline_ms = CAREFUL_MODE_UNTIL_MS.load(Ordering::Acquire);
+    if deadline_ms == 0 || now_ms.wrapping_sub(deadline_ms) < u32::MAX / 2 {
+        0
+    } else {
+        deadline_ms.wrapping_sub(now_ms)
+    }
+}
+
 pub fn request_authority_transition(
     generation: u32,
     lease_hash: u32,
@@ -1401,6 +1417,9 @@ fn encode_control_command(
             0,
             None,
         )),
+        BrainstemCommand::CarefulMode { ttl_ms, .. } => {
+            Some((ControlCommandCode::CarefulMode, 0, 0, 0, 0, Some(ttl_ms)))
+        }
         BrainstemCommand::RequestSensors { packet_id, .. } => Some((
             ControlCommandCode::RequestSensors,
             packet_id as u32,
@@ -1580,6 +1599,10 @@ fn decode_control_command(
                 seq,
             })
         }
+        x if x == ControlCommandCode::CarefulMode as u8 => Some(BrainstemCommand::CarefulMode {
+            ttl_ms: duration_ms?,
+            seq,
+        }),
         x if x == ControlCommandCode::RequestSensors as u8 => {
             Some(BrainstemCommand::RequestSensors {
                 packet_id: a as u8,
@@ -1678,6 +1701,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::DriveArc { seq, .. }
         | BrainstemCommand::Unsupported { seq }
         | BrainstemCommand::ClearSafetyLatch { seq, .. }
+        | BrainstemCommand::CarefulMode { seq, .. }
         | BrainstemCommand::SongDefine { seq, .. }
         | BrainstemCommand::RequestSensors { seq, .. }
         | BrainstemCommand::StreamSensors { seq, .. }
@@ -3188,6 +3212,8 @@ struct StatusJson {
     safety_tripped: bool,
     safety_latch_kind: &'static str,
     motion_interlock_latched: bool,
+    careful_mode_active: bool,
+    careful_mode_remaining_ms: u32,
     wifi_state: &'static str,
     https_state: &'static str,
     http_requests: u32,
@@ -3362,6 +3388,8 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         safety_tripped,
         safety_latch_kind: safety_event_kind_text(safety_latch_kind),
         motion_interlock_latched,
+        careful_mode_active: careful_mode_remaining_ms(snapshot.uptime_ms) > 0,
+        careful_mode_remaining_ms: careful_mode_remaining_ms(snapshot.uptime_ms),
         wifi_state: wifi_state_text(snapshot.wifi_state),
         https_state: https_state_text(snapshot.https_state),
         http_requests: snapshot.http_requests,
@@ -3747,6 +3775,7 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::Unstick as u8 => "unstick",
         x if x == ControlCommandCode::CliffGuard as u8 => "cliff_guard",
         x if x == ControlCommandCode::ClearSafetyLatch as u8 => "clear_safety_latch",
+        x if x == ControlCommandCode::CarefulMode as u8 => "careful_mode",
         x if x == ControlCommandCode::SongDefine as u8 => "song_define",
         x if x == ControlCommandCode::DriveDirect as u8 => "drive_direct",
         x if x == ControlCommandCode::DriveArc as u8 => "drive_arc",
