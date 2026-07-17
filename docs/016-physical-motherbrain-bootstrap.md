@@ -62,7 +62,7 @@ send a lease-bound heartbeat stop. It finishes stopped while the brainstem
 continues supervising the body. Create OI is not exposed to the motherbrain.
 
 The example remains a bounded protocol proof. The production path is now
-`pete-tools robot --mode possession-slow`; use the guarded wheels-off-floor
+`pete-tools robot --mode regular`; use the guarded wheels-off-floor
 command in [real-robot-readonly.md](real-robot-readonly.md). Acquiring the
 motherbrain lease is possession—there is no second arm layer. On orderly exit,
 the production runner requires STOP and exorcize acknowledgements. Exorcize

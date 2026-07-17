@@ -651,7 +651,7 @@ struct RobotArgs {
     max_linear_mm_s: i16,
     #[arg(long, default_value_t = 500)]
     max_angular_mrad_s: i16,
-    /// Permit executive-selected actions to drive physical wheels in possession-slow mode.
+    /// Permit executive-selected actions to drive physical wheels in regular possession mode.
     #[arg(long)]
     autonomous_motion: bool,
     /// Run the guarded physical bump-to-recovery possession smoke test and exit.
@@ -693,6 +693,8 @@ struct HardwareEnvArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum RobotModeArg {
+    /// Motor-enabled possession mode.
+    Regular,
     ReadOnly,
     PossessionSlow,
     Disabled,
@@ -8696,6 +8698,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     );
     let robot_mode = match args.mode {
         RobotModeArg::ReadOnly => RobotMode::ReadOnly,
+        RobotModeArg::Regular => RobotMode::Slow,
         RobotModeArg::PossessionSlow => RobotMode::Slow,
         RobotModeArg::Disabled => RobotMode::Disabled,
     };
@@ -8718,7 +8721,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     establish_create_sensor_stream(cockpit.as_mut(), !is_mock_body)?;
     if args.recovery_smoke {
         if robot_mode != RobotMode::Slow {
-            anyhow::bail!("--recovery-smoke requires --mode possession-slow");
+            anyhow::bail!("--recovery-smoke requires --mode regular");
         }
         if is_mock_body || args.cockpit == CockpitBackendArg::Sim {
             anyhow::bail!("--recovery-smoke requires a physical brainstem");
@@ -8730,7 +8733,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     }
     if args.orientation_probe {
         if robot_mode != RobotMode::Slow {
-            anyhow::bail!("--orientation-probe requires --mode possession-slow");
+            anyhow::bail!("--orientation-probe requires --mode regular");
         }
         if is_mock_body || args.cockpit == CockpitBackendArg::Sim {
             anyhow::bail!("--orientation-probe requires a physical brainstem");
@@ -8748,7 +8751,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         live_state.update_session(SceneSession {
             mode: match robot_mode {
                 RobotMode::ReadOnly => "read-only".to_string(),
-                RobotMode::Slow => "slow".to_string(),
+                RobotMode::Slow => "regular".to_string(),
                 RobotMode::Disabled => "disabled".to_string(),
             },
             scenario: None,
@@ -10324,7 +10327,7 @@ fn open_robot_cockpit_or_fallback(
     let Some(create_port) = create_port else {
         if robot_mode == RobotMode::Slow {
             anyhow::bail!(
-                "possession-slow requires a stable brainstem USB CDC device; none was found"
+                "regular possession requires a stable brainstem USB CDC device; none was found"
             );
         } else {
             println!("warning: no cockpit UART device found; falling back to simulated cockpit");
@@ -10347,14 +10350,14 @@ fn open_robot_cockpit_or_fallback(
             if backend == CockpitBackendArg::Uart && !create_port.starts_with("/dev/serial/by-id/")
             {
                 anyhow::bail!(
-                    "possession-slow requires a stable /dev/serial/by-id brainstem path, got {create_port}"
+                    "regular possession requires a stable /dev/serial/by-id brainstem path, got {create_port}"
                 );
             }
             let expected_device_id = expected_device_id.context(
-                "possession-slow requires --brainstem-device-id to prevent identity fallback",
+                "regular possession requires --brainstem-device-id to prevent identity fallback",
             )?;
             let expected_boot_id = expected_boot_id.context(
-                "possession-slow requires --brainstem-boot-id; a boot change needs explicit acceptance",
+                "regular possession requires --brainstem-boot-id; a boot change needs explicit acceptance",
             )?;
             let ready = establish_session(cockpit, HandshakeHello::default_motherbrain(), None)?;
             if ready.session().peer_device_id != expected_device_id {

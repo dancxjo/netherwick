@@ -73,7 +73,7 @@ physical cases are:
 Validation order:
 
 1. Record the generated action and autonomic decision.
-2. Record the final real-slow gate and outbound bounded command.
+2. Record the final regular-possession gate and outbound bounded command.
 3. Record brainstem safety and motion events.
 4. Record complete-packet age and the resulting `BodySense`.
 5. Confirm the observed body outcome and stopped shutdown state.

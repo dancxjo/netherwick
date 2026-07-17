@@ -356,7 +356,7 @@ established over the pinned USB brainstem before retrying.
 The guarded command is equivalent to:
 
 ```bash
-cargo run -p pete-tools -- robot --mode possession-slow \
+cargo run -p pete-tools -- robot --mode regular \
   --cockpit uart --create-port /dev/serial/by-id/DEVICE \
   --brainstem-device-id BRAINSTEM_ID \
   --brainstem-boot-id BOOT_ID \

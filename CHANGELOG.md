@@ -213,8 +213,12 @@ All notable changes are grouped by date.
 - Feed possessor-skill progress and terminal outcomes back to the originating goal, including explicit progress expectations and failure pressure without discarding the active goal.
 - Add `careful_mode` to the brainstem verb inventory and compatibility checks, including firmware parser/runtime/status support for both line-based and JSON control payloads and compact status fields for active/remaining time.
 - Keep `codex` sync automation behavior stable by pinning the sync model to `gpt-5.3-codex-spark` and forcing `high` model reasoning effort for summary generation.
+- Let `just sup` complete ready work by explicitly authorizing its nested Codex run to use Git for the requested commit, fast-forward pull, and push workflow.
 - Make `just possess` default to `read-only` robot mode via CLI `--mode regular`, then normalize regular/read-only mode aliases so operator scripts can use the regular launcher profile without changing possession behavior.
 - Add `--mode` parsing in `xtask possess` and propagate a normalized robot mode into `PETE_ROBOT_MODE`, preserving other possession arguments and retries across backend fallback and identity-acceptance flows.
+- Add a user-facing possession mode rename in `pete-tools`: introduce explicit `regular` mode alongside `read-only` and `possession-slow`, and route `regular` to the existing physical slow possession behavior (`RobotMode::Slow`) while preserving guardrails.
+- Update `--recovery-smoke`, `--orientation-probe`, and serial/session validation paths to refer to `regular` possession language, and keep all regular/slow possession diagnostics aligned to physical brainstem requirements.
+- Refresh dependency-lock metadata in `Cargo.lock` for speech/visualization crates (`tongues-*`, `textplots`, `drawille`, version-resolved `indicatif`/`console`/`colored`) so speech pipeline, lockfile, and package metadata stay consistent after the mode/workflow updates.
 
 ### Ongoing
 

@@ -57,7 +57,7 @@ ReadOnlyActionSuppressed
 
 The `Now` extension `read_only_motor_gate` records `motor_applied: false`, `final_motor: Stop`, and `safety_reason: ReadOnlyMode`.
 
-## Production possession/slow mode
+## Production possession mode
 
 Possession is the live motherbrain control lease; there is no additional
 motherbrain arm layer. This mode is never the default and must be selected
@@ -80,7 +80,7 @@ after a cold-boot identity rejection. Its expanded command is:
 
 ```bash
 cargo run -p pete-tools -- robot \
-  --mode possession-slow \
+  --mode regular \
   --cockpit uart \
   --create-port /dev/serial/by-id/DEVICE \
   --brainstem-device-id BRAINSTEM_ID \

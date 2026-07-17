@@ -1031,7 +1031,7 @@ fn possession_attempt(
 }
 
 fn split_mode_override(args: &[String]) -> (Vec<String>, String) {
-    let mut robot_mode = "possession-slow".to_owned();
+    let mut robot_mode = "regular".to_owned();
     let mut robot_args = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -1058,7 +1058,7 @@ fn split_mode_override(args: &[String]) -> (Vec<String>, String) {
 
 fn normalize_possession_mode(mode: &str) -> String {
     match mode {
-        "regular" => "read-only".to_owned(),
+        "regular" => "regular".to_owned(),
         _ => mode.to_owned(),
     }
 }
@@ -2020,7 +2020,7 @@ Context for this sync:\n\
 `git diff --cached`:\n{staged_diff}\n\n\
 `git diff`:\n{unstaged_diff}\n\n\
 Recent commits (`git log --oneline --decorate -n 20`):\n{short_log}\n\n\
-Treat already staged changes as candidate work even when another agent or person staged them: include every ready staged or unstaged semantic change in CHANGELOG.md under Unreleased without removing releases. Summarize and classify each change as ready or ongoing, commit only ready semantic groups, then git pull --ff-only and git push. Do not run CI or create extra files; leave uncertain work uncommitted. Do not run git commands, use the context above as ground truth."
+Treat already staged changes as candidate work even when another agent or person staged them: include every ready staged or unstaged semantic change in CHANGELOG.md under Unreleased without removing releases. Summarize and classify each change as ready or ongoing, commit only ready semantic groups, then git pull --ff-only and git push. Use git commands to carry out that workflow. Do not run CI or create extra files; leave uncertain work uncommitted."
     );
     let summary_path =
         env::temp_dir().join(format!("netherwick-codex-sync-{}.md", std::process::id()));
