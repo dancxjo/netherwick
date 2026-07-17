@@ -3099,7 +3099,7 @@ fn write_compact_status_line<const N: usize>(
     let flags = snapshot.create_sensor_flags;
     writeln!(
         response,
-        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} armed={} estop={} safety_tripped={} safety_latch_kind={} motion_interlock={} active_cmd_vel={} event_next_seq={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} bump_left={} bump_right={} wheel_drop={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={}",
+        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} armed={} estop={} safety_tripped={} safety_latch_kind={} motion_interlock={} active_cmd_vel={} event_next_seq={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} ir_byte={} bump_left={} bump_right={} wheel_drop={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={}",
         snapshot.uptime_ms,
         snapshot.current_runtime_state,
         snapshot.body_state,
@@ -3128,6 +3128,7 @@ fn write_compact_status_line<const N: usize>(
         snapshot.last_uart_packet_len,
         snapshot.create_sensor_charging_sources,
         snapshot.create_sensor_flags,
+        snapshot.create_sensor_ir_byte,
         flags & (1 << 0) != 0,
         flags & (1 << 1) != 0,
         flags & (1 << 2) != 0,
