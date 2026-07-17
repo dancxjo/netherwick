@@ -24,6 +24,10 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add encounter-scoped social acknowledgments and a persistent
+  `greet_person` goal that proposes `motherbrain.greet` for a recognized,
+  newly present person; greeting progress and completion retain the person,
+  encounter, skill execution, source hash, and provenance.
 - Add an embedded, sandboxed Lua 5.4 motherbrain skill runtime with atomic
   runtime loading and reload, one foreground call tree, transparent coroutine
   suspension at bodily operations, deterministic implicit organ ownership,
@@ -78,6 +82,10 @@ All notable changes are grouped by date.
 
 ### Changed
 
+- Retire the action-producing `event_face_detected` behavior. Face events now
+  remain perception evidence: canonical social `Now` opens and closes
+  encounters, the conductor arbitrates acknowledgment, and `greet.lua`
+  coordinates orientation and speech before recording success.
 - Move deterministic motherbrain sequencing, including IR docking and
   post-reflex bump/cliff recovery, into ordinary runtime-loaded Lua functions;
   retain numerical controllers, possession, 250 ms primitive renewal, and

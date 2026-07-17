@@ -207,6 +207,25 @@ pub enum InteractionPhase {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocialAcknowledgmentKind {
+    #[default]
+    GreetingAttempted,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SocialAcknowledgment {
+    pub acknowledgment_id: String,
+    pub kind: SocialAcknowledgmentKind,
+    pub person_id: PersonId,
+    pub occurred_at_ms: u64,
+    pub skill_id: String,
+    pub skill_execution_id: u64,
+    #[serde(default)]
+    pub provenance: Vec<EvidenceRef>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InteractionState {
     pub interaction_id: InteractionId,
@@ -224,7 +243,17 @@ pub struct InteractionState {
     #[serde(default)]
     pub shared_context: Vec<ContextRef>,
     #[serde(default)]
+    pub acknowledgments: Vec<SocialAcknowledgment>,
+    #[serde(default)]
     pub provenance: Vec<EvidenceRef>,
+}
+
+impl InteractionState {
+    pub fn has_acknowledgment(&self, person_id: &PersonId, kind: SocialAcknowledgmentKind) -> bool {
+        self.acknowledgments.iter().any(|acknowledgment| {
+            acknowledgment.person_id == *person_id && acknowledgment.kind == kind
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -289,10 +318,19 @@ impl SocialWorldModelBuilder {
                 entity.kind == WorldEntityKind::Person && entity.last_observed_at_ms == now.t_ms
             })
             .collect::<Vec<_>>();
-        let only_person = (person_entities.len() == 1).then(|| person_entities[0].id.clone());
-        for entity in person_entities {
-            self.observe_person(now, entity, only_person.as_ref());
+        if person_entities.is_empty() {
+            let face_entities = face_presence_entities(now);
+            let only_person = (face_entities.len() == 1).then(|| face_entities[0].id.clone());
+            for entity in &face_entities {
+                self.observe_person(now, entity, only_person.as_ref());
+            }
+        } else {
+            let only_person = (person_entities.len() == 1).then(|| person_entities[0].id.clone());
+            for entity in person_entities {
+                self.observe_person(now, entity, only_person.as_ref());
+            }
         }
+        self.observe_skill_acknowledgments(now);
         self.update_interaction(now);
         SocialWorldSnapshot {
             schema_version: 1,
@@ -697,6 +735,114 @@ impl SocialWorldModelBuilder {
         }
     }
 
+    fn observe_skill_acknowledgments(&mut self, now: &Now) {
+        let Some(record) = now.extensions.get("motherbrain.skill_execution") else {
+            return;
+        };
+        if record
+            .pointer("/diagnostics/terminal_outcome")
+            .and_then(serde_json::Value::as_str)
+            != Some("completed")
+        {
+            return;
+        }
+        let skill_id = record
+            .pointer("/skill/skill_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let source_hash = record
+            .pointer("/skill/source_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let execution_id = record
+            .get("execution_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let Some(observations) = record
+            .get("observations")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return;
+        };
+        let Some(interaction) = self.active_interaction.as_mut() else {
+            return;
+        };
+        for observation in observations {
+            if observation.get("kind").and_then(serde_json::Value::as_str)
+                != Some("social_acknowledgment")
+                || observation
+                    .get("contract")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("host_validated_social_acknowledgment_v1")
+            {
+                continue;
+            }
+            let Some(value) = observation.get("value") else {
+                continue;
+            };
+            let Some(interaction_id) = value
+                .get("interaction_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(person_id) = value.get("person_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if interaction.interaction_id.0 != interaction_id {
+                continue;
+            }
+            let Some(participant) = interaction
+                .participants
+                .iter()
+                .find(|participant| participant.0.eq_ignore_ascii_case(person_id))
+                .cloned()
+            else {
+                continue;
+            };
+            let acknowledgment_id = value
+                .get("acknowledgment_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "greet:{}:{}:{}",
+                        interaction.interaction_id.0, participant.0, execution_id
+                    )
+                });
+            if interaction
+                .acknowledgments
+                .iter()
+                .any(|existing| existing.acknowledgment_id == acknowledgment_id)
+            {
+                continue;
+            }
+            let occurred_at_ms = value
+                .get("occurred_at_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(now.t_ms);
+            interaction.acknowledgments.push(SocialAcknowledgment {
+                acknowledgment_id: acknowledgment_id.clone(),
+                kind: SocialAcknowledgmentKind::GreetingAttempted,
+                person_id: participant,
+                occurred_at_ms,
+                skill_id: skill_id.to_string(),
+                skill_execution_id: execution_id,
+                provenance: vec![EvidenceRef {
+                    id: format!("social:acknowledgment:{acknowledgment_id}"),
+                    source: "lua.skill.acknowledge".to_string(),
+                    key: skill_id.to_string(),
+                    observed_at_ms: now.t_ms,
+                    transformation_lineage: vec!["pete_now::SocialWorldModelBuilder".to_string()],
+                    implementation_version: (!source_hash.is_empty())
+                        .then(|| source_hash.to_string()),
+                }],
+            });
+            interaction.last_activity_ms = now.t_ms;
+            interaction.phase = InteractionPhase::Engaged;
+        }
+    }
+
     fn close_interaction(&mut self, now_ms: u64) {
         let Some(mut interaction) = self.active_interaction.take() else {
             return;
@@ -776,6 +922,83 @@ fn mark_biometric_contradictions(identities: &mut [IdentityHypothesis]) {
             .contradiction_refs
             .dedup_by(|left, right| left.id == right.id);
     }
+}
+
+fn face_presence_entities(now: &Now) -> Vec<WorldEntity> {
+    let remembered_people = now
+        .memory
+        .remembered_entities
+        .iter()
+        .filter(|entity| entity.has_label("Person") || entity.has_label("person"))
+        .collect::<Vec<_>>();
+    let recognized = (now.face.vectors.len() == 1
+        && now.memory.face_familiarity >= 0.70
+        && remembered_people.len() == 1)
+        .then(|| remembered_people[0]);
+
+    now.face
+        .vectors
+        .iter()
+        .enumerate()
+        .map(|(index, face)| {
+            let (id, label, confidence) = if let Some(person) = recognized {
+                (
+                    PersonId(if person.id.starts_with("person:") {
+                        person.id.clone()
+                    } else {
+                        format!("person:memory:{}", person.id)
+                    }),
+                    person.summary.clone(),
+                    now.memory
+                        .face_familiarity
+                        .min(person.score.max(0.70))
+                        .clamp(0.0, 0.99),
+                )
+            } else {
+                (
+                    PersonId(format!("person:face:{index}")),
+                    "person".to_string(),
+                    0.65,
+                )
+            };
+            let evidence = EvidenceRef {
+                id: format!("social:face:{}:{}", face.point_id, now.t_ms),
+                source: "face.embedding".to_string(),
+                key: face.point_id.clone(),
+                observed_at_ms: now.t_ms,
+                transformation_lineage: vec![
+                    "pete_now::SocialWorldModelBuilder::face_presence_entities".to_string(),
+                ],
+                implementation_version: face.model.clone(),
+            };
+            let meta = BeliefMeta {
+                confidence,
+                observed_at_ms: now.t_ms,
+                valid_at_ms: now.t_ms,
+                freshness: Freshness::Current,
+                provenance: vec![evidence.clone()],
+                source_kind: BeliefSourceKind::DerivedPerception,
+                ..BeliefMeta::default()
+            };
+            WorldEntity {
+                id: EntityId(id.0),
+                kind: WorldEntityKind::Person,
+                label,
+                last_observed_at_ms: now.t_ms,
+                confidence,
+                meta: meta.clone(),
+                // A detected face is already inside the camera field of view.
+                // Zero is a conservative orientation target when no separate
+                // object detector supplied a more precise bearing.
+                bearing_rad: Some(0.0),
+                bearing_meta: Some(meta.clone()),
+                reachability_meta: Some(meta),
+                attributes: BTreeMap::from([("observed_confidence".to_string(), confidence)]),
+                provenance: vec![evidence],
+                ..WorldEntity::default()
+            }
+        })
+        .collect()
 }
 
 fn modality_from_source(source: &str) -> IdentityModality {
@@ -932,6 +1155,183 @@ mod tests {
         assert!(!stale.people.values().next().unwrap().presence.present);
         assert!(stale.active_interaction.is_none());
         assert_eq!(stale.recent_interactions.len(), 1);
+    }
+
+    #[test]
+    fn completed_lua_greeting_acknowledges_only_the_current_encounter() {
+        let mut builder = SocialWorldModelBuilder::default();
+        let first_now = person_now(0, "Alex", 0.9);
+        let mut entity = WorldEntity {
+            id: EntityId("person:alex".to_string()),
+            kind: WorldEntityKind::Person,
+            label: "Alex".to_string(),
+            confidence: 0.9,
+            last_observed_at_ms: 0,
+            ..WorldEntity::default()
+        };
+        let first = builder.update(
+            &first_now,
+            &BTreeMap::from([(entity.id.clone(), entity.clone())]),
+        );
+        let encounter_id = first
+            .active_interaction
+            .as_ref()
+            .unwrap()
+            .interaction_id
+            .0
+            .clone();
+
+        let mut forged_now = person_now(50, "Alex", 0.9);
+        forged_now.extensions.insert(
+            "motherbrain.skill_execution".to_string(),
+            serde_json::json!({
+                "execution_id": 40,
+                "skill": {
+                    "skill_id": "motherbrain.untrusted",
+                    "source_hash": "forged",
+                },
+                "diagnostics": {"terminal_outcome": "completed"},
+                "observations": [{
+                    "kind": "social_acknowledgment",
+                    "value": {
+                        "interaction_id": encounter_id,
+                        "person_id": "person:alex",
+                        "occurred_at_ms": 50,
+                    },
+                    "provenance": "lua_skill",
+                }],
+            }),
+        );
+        entity.last_observed_at_ms = 50;
+        let forged = builder.update(
+            &forged_now,
+            &BTreeMap::from([(entity.id.clone(), entity.clone())]),
+        );
+        assert!(forged
+            .active_interaction
+            .as_ref()
+            .unwrap()
+            .acknowledgments
+            .is_empty());
+
+        let mut acknowledged_now = person_now(100, "Alex", 0.9);
+        acknowledged_now.extensions.insert(
+            "motherbrain.skill_execution".to_string(),
+            serde_json::json!({
+                "execution_id": 41,
+                "skill": {
+                    "skill_id": "motherbrain.greet",
+                    "source_hash": "abc123",
+                },
+                "diagnostics": {"terminal_outcome": "completed"},
+                "observations": [{
+                    "kind": "social_acknowledgment",
+                    "contract": "host_validated_social_acknowledgment_v1",
+                    "value": {
+                        "acknowledgment_id": format!("greet:{encounter_id}:person:alex:41"),
+                        "interaction_id": encounter_id,
+                        "person_id": "person:alex",
+                        "occurred_at_ms": 100,
+                    },
+                    "provenance": "lua_skill",
+                }],
+            }),
+        );
+        entity.last_observed_at_ms = 100;
+        let acknowledged = builder.update(
+            &acknowledged_now,
+            &BTreeMap::from([(entity.id.clone(), entity.clone())]),
+        );
+        let interaction = acknowledged.active_interaction.as_ref().unwrap();
+        assert_eq!(interaction.acknowledgments.len(), 1);
+        assert!(interaction.has_acknowledgment(
+            &PersonId("person:alex".to_string()),
+            SocialAcknowledgmentKind::GreetingAttempted,
+        ));
+        assert_eq!(interaction.phase, InteractionPhase::Engaged);
+        assert_eq!(interaction.acknowledgments[0].skill_execution_id, 41);
+        assert_eq!(
+            interaction.acknowledgments[0].provenance[0]
+                .implementation_version
+                .as_deref(),
+            Some("abc123")
+        );
+
+        entity.last_observed_at_ms = 200;
+        let duplicate = builder.update(
+            &acknowledged_now,
+            &BTreeMap::from([(entity.id.clone(), entity.clone())]),
+        );
+        assert_eq!(
+            duplicate
+                .active_interaction
+                .as_ref()
+                .unwrap()
+                .acknowledgments
+                .len(),
+            1
+        );
+
+        builder.update(&Now::blank(2_000, BodySense::default()), &BTreeMap::new());
+        let returned_now = person_now(3_000, "Alex", 0.9);
+        entity.last_observed_at_ms = 3_000;
+        let returned = builder.update(
+            &returned_now,
+            &BTreeMap::from([(entity.id.clone(), entity)]),
+        );
+        let new_interaction = returned.active_interaction.as_ref().unwrap();
+        assert_ne!(new_interaction.interaction_id.0, encounter_id);
+        assert!(new_interaction.acknowledgments.is_empty());
+    }
+
+    #[test]
+    fn recognized_face_without_object_detection_opens_a_stable_named_encounter() {
+        let mut builder = SocialWorldModelBuilder::default();
+        let mut first_now = Now::blank(100, BodySense::default());
+        first_now.face.vectors.push(
+            VectorArtifact::new("faces", "face-crop-1", vec![0.1, 0.2])
+                .with_model("face-model")
+                .with_source_id("Alex"),
+        );
+        first_now.memory.face_familiarity = 0.92;
+        first_now.memory.remembered_entities.push(GraphEntity {
+            id: "person:alex".to_string(),
+            labels: vec!["Person".to_string()],
+            summary: "Alex".to_string(),
+            score: 0.90,
+        });
+
+        let first = builder.update(&first_now, &BTreeMap::new());
+        let interaction = first.active_interaction.as_ref().unwrap();
+        let encounter_id = interaction.interaction_id.clone();
+        assert_eq!(
+            interaction.participants,
+            vec![PersonId("person:alex".to_string())]
+        );
+        let alex = first
+            .people
+            .get(&PersonId("person:alex".to_string()))
+            .unwrap();
+        assert_eq!(
+            alex.preferred_name.as_ref().map(|name| name.value.as_str()),
+            Some("Alex")
+        );
+        assert!(!alex.identity_is_uncertain());
+        assert_eq!(
+            alex.location
+                .as_ref()
+                .and_then(|location| location.bearing_rad),
+            Some(0.0)
+        );
+
+        let mut repeated_now = first_now.clone();
+        repeated_now.t_ms = 200;
+        repeated_now.face.vectors[0].point_id = "face-crop-2".to_string();
+        let repeated = builder.update(&repeated_now, &BTreeMap::new());
+        assert_eq!(
+            repeated.active_interaction.as_ref().unwrap().interaction_id,
+            encounter_id
+        );
     }
 
     #[test]

@@ -40,13 +40,6 @@ model = "event.bump.shadow.v0"
 checkpoint = "data/models/event_bump_v0"
 fallback = "use_hardcoded"
 
-[behavior.event_face_detected]
-regime = "shadow_train"
-hardcoded = "script.on_face_detected.v0"
-model = "event.face_detected.shadow.v0"
-checkpoint = "data/models/event_face_detected_v0"
-fallback = "use_hardcoded"
-
 [behavior.experience]
 regime = "shadow_train"
 hardcoded = "experience.no_latent_yet"

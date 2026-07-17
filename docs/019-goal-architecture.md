@@ -53,8 +53,17 @@ availability, expected reward, expected progress, risk, energy cost, duration,
 target, primitive, and provenance.
 
 The initial registry contains `SeekCharger`, `EscapeDanger`, `Explore`,
-`Socialize`, `Rest`, `Investigate`, and `FollowTask`. Adding a goal changes its
-module and registry, not the arbiter.
+`GreetPerson`, `Socialize`, `Rest`, `Investigate`, and `FollowTask`. Adding a
+goal changes its module and registry, not the arbiter.
+
+`GreetPerson` is eligible only for a recognized participant in a current
+encounter that has no greeting acknowledgment. Its behavior identity includes
+the person and encounter, and its affordance invokes runtime-loaded
+`motherbrain.greet`. A face observation therefore cannot order speech. Safety,
+charging, operator commitments, and the incumbent goal remain ordinary inputs
+to arbitration. Completed `acknowledge(person)` evidence satisfies the goal for
+that encounter; departure closes it, and a later return creates a new eligible
+encounter.
 
 ## Commitment and progress
 

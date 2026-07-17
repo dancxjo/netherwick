@@ -877,7 +877,6 @@ fn normalize_behavior_node_id(id: &str) -> String {
         "EyeNext" => "eye_next".to_string(),
         "EarNext" => "ear_next".to_string(),
         "EventBump" => "event_bump".to_string(),
-        "EventFaceDetected" => "event_face_detected".to_string(),
         other => other.to_ascii_lowercase().replace('-', "_"),
     }
 }
@@ -3687,14 +3686,17 @@ fn model_connections() -> Vec<ModelConnection> {
         ("Now", "EyeNext", "vision context"),
         ("Now", "EarNext", "audio context"),
         ("Now", "EventBump", "body bump event"),
-        ("Now", "EventFaceDetected", "face event"),
+        ("Now", "SocialWorld", "presence + identity"),
         ("Experience", "Future", "latent z"),
         ("EventBump", "Autonomic", "scripted escape"),
-        ("EventFaceDetected", "Conductor", "scripted greeting"),
+        ("SocialWorld", "GreetGoal", "new encounter"),
+        ("GreetGoal", "Conductor", "eligible goal"),
         ("Danger", "Conductor", "risk"),
         ("Charge", "Conductor", "dock value"),
         ("Future", "Conductor", "imagined state"),
         ("Conductor", "ActionValue", "candidate actions"),
+        ("Conductor", "LuaSkills", "foreground skill"),
+        ("LuaSkills", "Body", "bounded organs"),
         ("ActionValue", "Autonomic", "ranked action"),
         ("Autonomic", "Body", "safe command"),
         ("Body", "Ledger", "transition"),
@@ -8879,10 +8881,11 @@ let selectedBehaviorNodeId = 'Conductor';
 const graphLayout = {
   Sensors:[28,18,'core'], Now:[148,18,'core'], Experience:[268,18,'model'], Future:[396,18,'model'],
   Danger:[28,92,'model'], Charge:[148,92,'model'], EyeNext:[268,92,'model'], EarNext:[396,92,'model'],
-  EventBump:[28,166,'model'], EventFaceDetected:[148,166,'model'], Conductor:[268,166,'core'], ActionValue:[416,166,'model'],
-  Autonomic:[416,226,'core'], Body:[28,226,'core'], Ledger:[148,226,'core'], Training:[268,226,'core'], Models:[416,286,'model']
+  EventBump:[28,166,'model'], SocialWorld:[148,166,'core'], GreetGoal:[268,166,'core'], Conductor:[396,166,'core'],
+  ActionValue:[28,226,'model'], LuaSkills:[148,226,'core'], Autonomic:[268,226,'core'], Body:[396,226,'core'],
+  Ledger:[28,286,'core'], Training:[148,286,'core'], Models:[268,286,'model']
 };
-const staticGraphNodes = ['Sensors','Now','Autonomic','Body','Ledger','Training','Models'];
+const staticGraphNodes = ['Sensors','Now','SocialWorld','GreetGoal','LuaSkills','Autonomic','Body','Ledger','Training','Models'];
 
 function nodeStateClass(node){
   if(!node) return 'core';
@@ -10101,7 +10104,10 @@ mod tests {
             conductor_input.reign.latest.as_ref().map(|value| value.id),
             Some(input.id)
         );
-        assert!(conductor_input.proposals.contains(&expected_action));
+        assert!(
+            !conductor_input.proposals.contains(&expected_action),
+            "direct operator authority is visible as Reign, not demoted into an ordinary proposal"
+        );
         assert_eq!(tick.chosen_action, Some(expected_action.clone()));
         assert_eq!(tick.frame.chosen_action, Some(expected_action));
         assert!(tick

@@ -67,8 +67,17 @@ continues to come from possession/session evidence and the canonical
 self-model. Requests are attributed only when an interaction has an
 unambiguous participant.
 
-`Socialize` consumes this shared model. It may greet a known person by name or
-ask an uncertain person how to address them; it does not build a second person
+`GreetPerson` consumes this shared model for recognized people. A newly active
+interaction with no greeting acknowledgment makes the goal eligible; it does
+not directly emit an action. The conductor decides whether to commit, then
+runtime-loaded `greet.lua` uses the voice and orientation organs and records
+`acknowledge(person)` only after the greeting attempt. The acknowledgment is
+stored on that exact interaction with person, execution, source hash, time,
+and provenance. Repeated detections remain the same encounter and do not
+re-propose the greeting; departure and return create a new interaction.
+
+`Socialize` remains responsible for broader engagement and uncertain identity,
+such as asking how to address someone. Neither goal builds a second person
 database from raw detections.
 
 Social records can contain personal data. Default reports should expose stable

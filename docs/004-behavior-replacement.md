@@ -21,7 +21,10 @@ Event scripts are behavior nodes whose input is an event-specific context and wh
 
 - `event_robot_initialized`: receives startup mode, body, battery, sensor, ledger, dashboard, and capture metadata; emits bring-up `Song`, `Chirp`, and `Say` actions.
 - `event_bump`: receives bumper state; uses host-provided TypeScript randomness to choose a small lament (`Uh-oh`, `Oh no!`, `Oopsie!`, `Oh dear!`, or a mournful tune) before emitting recovery script actions.
-- `event_face_detected`: receives face familiarity/person context; emits greeting speech.
+- Face detections are perception evidence, not an action-producing behavior
+  slot. Canonical social `Now` opens or continues an encounter; the
+  `greet_person` goal decides whether acknowledgment is desirable, and
+  runtime-loaded `greet.lua` supplies the procedure.
 
 `event_robot_initialized` currently uses a TypeScript teacher script evaluated by `tsrun`. That implementation is intentionally just the teacher surface. The behavior id, record shape, shadow model slot, and fallback policy exist so a learned model can shadow-train from the TypeScript output, run in shadow inference, compare outputs, and only later enter model inference if promotion evidence says it should.
 

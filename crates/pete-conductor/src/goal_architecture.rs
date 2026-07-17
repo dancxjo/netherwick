@@ -8,8 +8,9 @@ use pete_now::{
     ClockDomain, DriveSelfSummary, DriveSense, EntityId, EpistemicActionKind, EpistemicAffordance,
     EpistemicAttempt, EpistemicQuestionFamily, EvidenceRef, Freshness, GoalStatusBelief,
     PendingTemporalExpectation, QuestionId, SemanticBehaviorId, SemanticConceptId,
-    SemanticExplanation, SemanticNodeRef, SemanticPredicate, SemanticRelationId, TimeInterval,
-    WorldEntity, WorldEntityKind, WorldModelSnapshot, WorldModelUpdateContext,
+    SemanticExplanation, SemanticNodeRef, SemanticPredicate, SemanticRelationId,
+    SocialAcknowledgmentKind, TimeInterval, WorldEntity, WorldEntityKind, WorldModelSnapshot,
+    WorldModelUpdateContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -538,6 +539,14 @@ impl Affordance {
         self
     }
 
+    fn with_runtime_skill(mut self, implementation_id: impl Into<String>) -> Self {
+        self = self.with_skill(SkillId::RuntimeLoaded, None);
+        if let Some(request) = &mut self.skill_request {
+            request.implementation_id = Some(implementation_id.into());
+        }
+        self
+    }
+
     fn with_epistemic(mut self, affordance: &EpistemicAffordance) -> Self {
         self.epistemic_question_id = Some(affordance.question_id.clone());
         self.expected_information_gain = affordance.expected_information_gain;
@@ -984,7 +993,7 @@ impl GoalInterpreter for RuleGoalInterpreter {
     ) -> Result<(GoalInterpretation, InterpreterState)> {
         let target_kind = match self.id.as_str() {
             "seek_charger" => Some(WorldEntityKind::Charger),
-            "socialize" => Some(WorldEntityKind::Person),
+            "socialize" | "greet_person" => Some(WorldEntityKind::Person),
             "investigate" => Some(WorldEntityKind::SoundSource),
             _ => None,
         };
@@ -1122,6 +1131,7 @@ impl GoalEvaluator for RuleGoalEvaluator {
                 "seek_charger" => evaluate_seek_charger(interpretation, context),
                 "escape_danger" => evaluate_escape(interpretation, context),
                 "explore" => evaluate_explore(interpretation, context),
+                "greet_person" => evaluate_greet_person(interpretation, context),
                 "socialize" => evaluate_socialize(interpretation, context),
                 "rest" => evaluate_rest(interpretation, context),
                 "investigate" => evaluate_investigate(interpretation, context),
@@ -1449,6 +1459,7 @@ const REGISTERED_BEHAVIORS: &[&str] = &[
     "inspect_novelty",
     "orient_to_person",
     "approach_person",
+    "greet_person",
     "speak",
     "rest",
     "investigate_sound",
@@ -2049,6 +2060,11 @@ fn evaluate_socialize(
         .unwrap_or(interpretation.target_confidence)
         .max(identity_confidence * 0.8);
     let identity_uncertain = person.is_some_and(|person| person.identity_is_uncertain());
+    if person.is_some() && !identity_uncertain {
+        // Recognition creates an encounter-scoped `greet_person` goal. The
+        // general social goal must not reproduce the old direct greeting.
+        return (0.0, 0.0, 1.0, Vec::new(), Vec::new());
+    }
     let person_target = person.map(|person| EntityId(person.person_id.0.clone()));
     let person_distance = person
         .and_then(|person| person.location.as_ref())
@@ -2059,14 +2075,8 @@ fn evaluate_socialize(
         .and_then(|location| location.bearing_rad)
         .or(interpretation.target_bearing_rad);
     let action = match person_distance {
-        Some(distance) if distance <= 0.8 && identity_uncertain => ActionPrimitive::Speak {
-            text: "Hello. What should I call you?".to_string(),
-        },
         Some(distance) if distance <= 0.8 => ActionPrimitive::Speak {
-            text: person
-                .and_then(|person| person.preferred_name.as_ref())
-                .map(|name| format!("Hello, {}.", name.value))
-                .unwrap_or_else(|| "Hello.".to_string()),
+            text: "Hello. What should I call you?".to_string(),
         },
         Some(_) => ActionPrimitive::Approach {
             target: ApproachTarget::Person,
@@ -2132,6 +2142,92 @@ fn evaluate_socialize(
             contribution("drive.social", social),
             contribution("world.social.person_confidence", confidence),
             contribution("world.social.pending_request", pending_request as u8 as f32),
+        ],
+    )
+}
+
+fn evaluate_greet_person(
+    interpretation: &GoalInterpretation,
+    context: &GoalEvaluationContext<'_>,
+) -> EvaluationParts {
+    let Some(interaction) = context.world.social.active_interaction.as_ref() else {
+        return (0.0, 0.0, 1.0, Vec::new(), Vec::new());
+    };
+    let candidate = interaction
+        .participants
+        .iter()
+        .filter_map(|person_id| context.world.social.people.get(person_id))
+        .filter(|person| person.presence.present && !person.identity_is_uncertain())
+        .filter(|person| {
+            !interaction.has_acknowledgment(
+                &person.person_id,
+                SocialAcknowledgmentKind::GreetingAttempted,
+            )
+        })
+        .max_by(|left, right| {
+            let left_score = left.presence.confidence + left.current_identity_confidence;
+            let right_score = right.presence.confidence + right.current_identity_confidence;
+            left_score.total_cmp(&right_score)
+        });
+    let Some(person) = candidate else {
+        return (0.0, 0.0, 1.0, Vec::new(), Vec::new());
+    };
+    let confidence = person
+        .presence
+        .confidence
+        .min(person.current_identity_confidence)
+        .clamp(0.0, 1.0);
+    let name = person
+        .preferred_name
+        .as_ref()
+        .map(|name| name.value.as_str())
+        .unwrap_or("recognized person");
+    let behavior_id = format!(
+        "greet:{}:{}",
+        person.person_id.0, interaction.interaction_id.0
+    );
+    let mut greeting = affordance(
+        &behavior_id,
+        ActionPrimitive::Speak {
+            text: format!("Greet {name}"),
+        },
+        confidence,
+        0.65,
+        1.0,
+        interpretation.danger,
+        0.02,
+        5_000,
+        Some(EntityId(person.person_id.0.clone())),
+        &person.meta.provenance,
+    )
+    .with_bearing(
+        person
+            .location
+            .as_ref()
+            .and_then(|location| location.bearing_rad),
+    )
+    .with_runtime_skill("motherbrain.greet");
+    if let Some(request) = &mut greeting.skill_request {
+        request.range_m = person
+            .location
+            .as_ref()
+            .and_then(|location| location.distance_m);
+        request.progress_metric = "social_acknowledgment".to_string();
+        request.progress_baseline = Some(0.0);
+    }
+    let danger = context.drives.safety.activation.max(interpretation.danger);
+    let activation =
+        (0.45 + 0.20 * confidence - 0.80 * danger - 0.50 * context.drives.rest.activation)
+            .clamp(0.0, 1.0);
+    (
+        activation,
+        0.35,
+        0.0,
+        vec![greeting],
+        vec![
+            contribution("world.social.new_recognized_encounter", 1.0),
+            contribution("world.social.identity_confidence", confidence),
+            contribution("drive.safety", -danger),
         ],
     )
 }
@@ -2617,6 +2713,7 @@ impl Default for GoalSystem {
             "seek_charger",
             "escape_danger",
             "explore",
+            "greet_person",
             "socialize",
             "rest",
             "investigate",
@@ -4416,7 +4513,7 @@ mod tests {
     }
 
     #[test]
-    fn social_goal_uses_shared_identity_beliefs_for_its_greeting() {
+    fn recognized_person_proposes_encounter_scoped_lua_greeting_goal() {
         let mut uncertain_updater = WorldModelUpdater::default();
         let mut uncertain_now = Now::blank(1_000, BodySense::default());
         uncertain_now.objects.observations.push(ObjectObservation {
@@ -4459,16 +4556,110 @@ mod tests {
             .world;
         let mut known_system = GoalSystem::default();
         let known = known_system.tick(&known_world, &[]).unwrap();
-        let known_social = known
+        let greeting = known
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("greet_person"))
+            .unwrap();
+        let affordance = &greeting.competence.affordances[0];
+        assert_eq!(
+            affordance.action,
+            Some(ActionPrimitive::Speak {
+                text: "Greet Alex".to_string()
+            })
+        );
+        let request = affordance
+            .skill_request
+            .as_ref()
+            .expect("greeting uses procedural memory");
+        assert_eq!(request.skill_id, SkillId::RuntimeLoaded);
+        assert_eq!(
+            request.implementation_id.as_deref(),
+            Some("motherbrain.greet")
+        );
+        assert_eq!(request.progress_metric, "social_acknowledgment");
+        assert_eq!(
+            known.selection.selected_goal,
+            Some(GoalId::new("greet_person"))
+        );
+        assert!(known
+            .behavior
+            .as_ref()
+            .unwrap()
+            .behavior_id
+            .starts_with("greet:person:alex:interaction:"));
+        assert!(known
             .evaluations
             .iter()
             .find(|evaluation| evaluation.goal_id == GoalId::new("socialize"))
+            .unwrap()
+            .competence
+            .affordances
+            .is_empty());
+
+        let mut acknowledged_world = known_world.clone();
+        let interaction = acknowledged_world
+            .social
+            .active_interaction
+            .as_mut()
             .unwrap();
+        interaction
+            .acknowledgments
+            .push(pete_now::SocialAcknowledgment {
+                acknowledgment_id: "greet-once".to_string(),
+                kind: SocialAcknowledgmentKind::GreetingAttempted,
+                person_id: pete_now::PersonId("person:alex".to_string()),
+                occurred_at_ms: 1_100,
+                skill_id: "motherbrain.greet".to_string(),
+                skill_execution_id: 1,
+                provenance: Vec::new(),
+            });
+        let mut acknowledged_system = GoalSystem::default();
+        let acknowledged = acknowledged_system.tick(&acknowledged_world, &[]).unwrap();
+        let greeting = acknowledged
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("greet_person"))
+            .unwrap();
+        assert_eq!(greeting.disposition, GoalDisposition::Satisfied);
+        assert!(greeting.competence.affordances.is_empty());
+        assert_ne!(
+            acknowledged.selection.selected_goal,
+            Some(GoalId::new("greet_person"))
+        );
+    }
+
+    #[test]
+    fn immediate_danger_outranks_a_new_recognized_encounter() {
+        let mut updater = WorldModelUpdater::default();
+        let mut body = BodySense::default();
+        body.flags.bump_left = true;
+        let mut now = Now::blank(1_000, body);
+        now.objects.observations.push(ObjectObservation {
+            label: "Alex".to_string(),
+            class: ObjectClass::Person,
+            bearing_rad: 0.0,
+            distance_m: Some(0.6),
+            confidence: 0.9,
+            source: ObjectObservationSource::Kinect,
+        });
+        let world = updater
+            .update(now, WorldModelUpdateContext::default())
+            .world;
+        let mut system = GoalSystem::default();
+        let cycle = system.tick(&world, &[]).unwrap();
+        assert!(cycle
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.goal_id == GoalId::new("greet_person"))
+            .unwrap()
+            .competence
+            .affordances
+            .iter()
+            .any(|affordance| affordance.available));
         assert_eq!(
-            known_social.competence.affordances[0].action,
-            Some(ActionPrimitive::Speak {
-                text: "Hello, Alex.".to_string()
-            })
+            cycle.selection.selected_goal,
+            Some(GoalId::new("escape_danger"))
         );
     }
 

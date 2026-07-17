@@ -41,8 +41,8 @@ pub use social::{
     AttentionBelief, CommunicationProfile, ContextRef, ConversationTurnRef, IdentityHypothesis,
     IdentityModality, InteractionId, InteractionPhase, InteractionRef, InteractionState, PersonId,
     PersonModel, PresenceBelief, RelationshipId, RelationshipKind, RelationshipKindBelief,
-    RelationshipModel, RequestRef, ScopedSocialAuthorityBelief, SocialCommitment,
-    SocialWorldSnapshot, SpatialBelief,
+    RelationshipModel, RequestRef, ScopedSocialAuthorityBelief, SocialAcknowledgment,
+    SocialAcknowledgmentKind, SocialCommitment, SocialWorldSnapshot, SpatialBelief,
 };
 pub use temporal::{
     ClockDomain, Episode, EpisodeClosureReason, EpisodeId, EpisodeKind, PendingTemporalExpectation,

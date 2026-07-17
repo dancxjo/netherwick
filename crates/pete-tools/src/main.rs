@@ -9094,6 +9094,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut played_reign_audio = HashSet::new();
+    let mut played_skill_audio = HashSet::new();
     while max_steps
         .map(|limit| runner.tick_count < limit)
         .unwrap_or(true)
@@ -9153,6 +9154,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 &mut played_reign_audio,
             );
         }
+        play_lua_skill_audio(&mouth, &tick, &mut played_skill_audio);
         if let Some(live_state) = &live_state {
             live_state.update(snapshot.clone());
             live_state.update_embodied_context(tick.frame.embodied_context());
@@ -9749,6 +9751,9 @@ fn play_reign_audio_action(
     tick: &RuntimeTick,
     played: &mut HashSet<String>,
 ) {
+    if tick.skill_request.is_some() {
+        return;
+    }
     let Some(action) = tick.chosen_action.as_ref() else {
         return;
     };
@@ -9779,6 +9784,57 @@ fn play_reign_audio_action(
         }
         _ => {}
     }
+}
+
+fn play_lua_skill_audio(
+    mouth: &Option<QueuedPiperCpalMouth>,
+    tick: &RuntimeTick,
+    played: &mut HashSet<String>,
+) {
+    let Some(record) = tick.frame.now.extensions.get("motherbrain.skill_execution") else {
+        return;
+    };
+    for (key, text) in lua_skill_speech_intents(record) {
+        if !played.insert(key) {
+            continue;
+        }
+        if let Some(mouth) = mouth.as_ref() {
+            enqueue_robot_mouth_text(mouth, &text);
+        } else {
+            println!("robot mouth unavailable; skipped Lua skill speech {text:?}");
+        }
+    }
+}
+
+fn lua_skill_speech_intents(record: &serde_json::Value) -> Vec<(String, String)> {
+    let execution_id = record
+        .get("execution_id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let Some(trace) = record.get("trace").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut intents = Vec::new();
+    for event in trace {
+        if event.get("kind").and_then(serde_json::Value::as_str) != Some("primitive")
+            || event.get("operation").and_then(serde_json::Value::as_str) != Some("say")
+        {
+            continue;
+        }
+        let operation_id = event
+            .get("operation_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let Some(text) = event
+            .pointer("/detail/text")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let key = format!("lua:{execution_id}:{operation_id}");
+        intents.push((key, text.to_string()));
+    }
+    intents
 }
 
 fn enqueue_robot_mouth_text(mouth: &QueuedPiperCpalMouth, text: &str) {
@@ -15669,6 +15725,31 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn lua_skill_speech_intents_are_execution_and_operation_scoped() {
+        let record = serde_json::json!({
+            "execution_id": 17,
+            "trace": [
+                {
+                    "kind": "primitive",
+                    "operation_id": 3,
+                    "operation": "say",
+                    "detail": {"text": "Hello Alex."},
+                },
+                {
+                    "kind": "primitive",
+                    "operation_id": 4,
+                    "operation": "drive",
+                    "detail": {"linear_mm_s": 50},
+                },
+            ],
+        });
+        assert_eq!(
+            lua_skill_speech_intents(&record),
+            vec![("lua:17:3".to_string(), "Hello Alex.".to_string())]
+        );
     }
 
     #[test]

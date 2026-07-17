@@ -364,7 +364,6 @@ struct ChirpEventState {
     last_charging: Option<bool>,
     last_awake: Option<bool>,
     last_object_count: usize,
-    last_face_present: bool,
     last_object_familiarity: f32,
     last_place_familiarity: f32,
     last_places_visited: u32,
@@ -424,7 +423,6 @@ impl ChirpEventState {
         self.last_charging = Some(now.body.charging);
         self.last_awake = Some(awake);
         self.last_object_count = object_count;
-        self.last_face_present = face_present(now);
         self.last_object_familiarity = now.memory.object_familiarity;
         self.last_place_familiarity = now.memory.place_familiarity;
         self.last_places_visited = now.memory.places_visited;
@@ -1087,19 +1085,6 @@ pub struct RobotInitializedEventInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FaceDetectedEventInput {
-    pub t_ms: TimeMs,
-    pub recognized: bool,
-    pub person: FacePerson,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FacePerson {
-    pub id: String,
-    pub name: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventScriptAction {
     Say { text: String },
@@ -1402,13 +1387,6 @@ impl RuntimeModelStack {
                 behavior.fallback,
             );
         }
-        if let Some(behavior) = config.behavior.get("event_face_detected") {
-            stack.behaviors.event_face_detected = face_detected_event_behavior(
-                behavior.regime,
-                behavior.model.clone(),
-                behavior.fallback,
-            );
-        }
         Ok(stack)
     }
 
@@ -1572,21 +1550,6 @@ impl RuntimeModelStack {
                 vec![impl_id("event.bump.shadow.v0", "Shadow model")],
                 last("event_bump"),
             ),
-            behavior_node_state(
-                "EventFaceDetected",
-                "event_face_detected",
-                "on(face-detected)",
-                self.behaviors.event_face_detected.regime,
-                self.behaviors.event_face_detected.hardcoded_id(),
-                self.behaviors.event_face_detected.model_id(),
-                self.behaviors.event_face_detected.fallback,
-                vec![impl_id(
-                    "script.on_face_detected.v0",
-                    "Script hardcoded teacher",
-                )],
-                vec![impl_id("event.face_detected.shadow.v0", "Shadow model")],
-                last("event_face_detected"),
-            ),
         ]
     }
 
@@ -1635,7 +1598,6 @@ impl RuntimeModelStack {
             "ear_next" => update_behavior!(ear_next),
             "event_robot_initialized" => update_behavior!(event_robot_initialized),
             "event_bump" => update_behavior!(event_bump),
-            "event_face_detected" => update_behavior!(event_face_detected),
             _ => {}
         }
     }
@@ -1699,7 +1661,6 @@ fn normalize_behavior_node_id(node_id: &str) -> String {
         "EarNext" => "ear_next".to_string(),
         "EventRobotInitialized" => "event_robot_initialized".to_string(),
         "EventBump" => "event_bump".to_string(),
-        "EventFaceDetected" => "event_face_detected".to_string(),
         other => other.to_ascii_lowercase().replace('-', "_"),
     }
 }
@@ -1730,7 +1691,6 @@ pub struct BehaviorRegistry {
     pub ear_next: ReplaceableBehavior<SituatedEarNextInput, EarNextOutput>,
     pub event_robot_initialized: ReplaceableBehavior<RobotInitializedEventInput, EventScriptOutput>,
     pub event_bump: ReplaceableBehavior<BumpEventInput, EventScriptOutput>,
-    pub event_face_detected: ReplaceableBehavior<FaceDetectedEventInput, EventScriptOutput>,
 }
 
 impl Default for BehaviorRegistry {
@@ -1790,11 +1750,6 @@ impl Default for BehaviorRegistry {
             event_bump: bump_event_behavior(
                 BehaviorRegime::ShadowTrain,
                 Some("event.bump.shadow.v0".to_string()),
-                FallbackPolicy::UseHardcoded,
-            ),
-            event_face_detected: face_detected_event_behavior(
-                BehaviorRegime::ShadowTrain,
-                Some("event.face_detected.shadow.v0".to_string()),
                 FallbackPolicy::UseHardcoded,
             ),
         }
@@ -2584,42 +2539,6 @@ const lament =
 ]
 "#;
 
-struct FaceDetectedScriptBehavior;
-
-impl FunctionBehavior<FaceDetectedEventInput, EventScriptOutput> for FaceDetectedScriptBehavior {
-    fn id(&self) -> &'static str {
-        "script.on_face_detected.v0"
-    }
-
-    fn infer(&mut self, input: &FaceDetectedEventInput) -> Result<EventScriptOutput> {
-        let label = if input.recognized {
-            input
-                .person
-                .name
-                .as_ref()
-                .filter(|name| !name.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| format!("Acquaintance {}", input.person.id))
-        } else {
-            format!("Stranger {}", input.person.id)
-        };
-        Ok(EventScriptOutput {
-            actions: vec![
-                EventScriptAction::Chirp {
-                    pattern: if input.recognized {
-                        ChirpPattern::PersonRecognized
-                    } else {
-                        ChirpPattern::Hello
-                    },
-                },
-                EventScriptAction::Say {
-                    text: format!("Hello {label}"),
-                },
-            ],
-        })
-    }
-}
-
 struct RobotInitializedScriptBehavior;
 
 impl FunctionBehavior<RobotInitializedEventInput, EventScriptOutput>
@@ -2717,26 +2636,6 @@ fn bump_event_behavior(
         model_id.map(|_| {
             Box::new(EventScriptShadowModel {
                 id: "event.bump.shadow.v0",
-                last_observed: None,
-                samples_seen: 0,
-            }) as Box<_>
-        }),
-        fallback,
-    )
-}
-
-fn face_detected_event_behavior(
-    regime: BehaviorRegime,
-    model_id: Option<String>,
-    fallback: FallbackPolicy,
-) -> ReplaceableBehavior<FaceDetectedEventInput, EventScriptOutput> {
-    ReplaceableBehavior::new(
-        "event_face_detected",
-        regime,
-        Box::new(FaceDetectedScriptBehavior),
-        model_id.map(|_| {
-            Box::new(EventScriptShadowModel {
-                id: "event.face_detected.shadow.v0",
                 last_observed: None,
                 samples_seen: 0,
             }) as Box<_>
@@ -3553,7 +3452,7 @@ where
             &mut drive_impulses,
         );
         let (event_script_forced_action, event_script_records) =
-            self.run_event_scripts(&mut now, &recall, &mut notes, &mut proposed_actions)?;
+            self.run_event_scripts(&mut now, &mut notes, &mut proposed_actions)?;
         behavior_runs.extend(event_script_records);
         self.chirp_events
             .emit_pre_selection_chirps(&mut now, &mut notes)?;
@@ -4557,7 +4456,6 @@ where
     fn run_event_scripts(
         &mut self,
         now: &mut Now,
-        recall: &RecallBundle,
         notes: &mut Vec<String>,
         proposed_actions: &mut Vec<ActionPrimitive>,
     ) -> Result<(Option<ActionPrimitive>, Vec<ErasedBehaviorRunRecord>)> {
@@ -4622,37 +4520,6 @@ where
                 1.0
             });
             behavior_runs.push(record.erase());
-        }
-
-        if let Some(input) = if self.chirp_events.last_face_present {
-            None
-        } else {
-            face_detected_event_input(now, recall)
-        } {
-            let run = self
-                .models
-                .behaviors
-                .event_face_detected
-                .infer_with_teacher_source(&input, now.t_ms, TrainingSource::HardcodedTeacher)?;
-            let sequence = safety_trace_script_actions(&mut self.safety, now, &run.chosen);
-            for action in run
-                .chosen
-                .actions
-                .iter()
-                .filter_map(script_action_to_primitive)
-            {
-                proposed_actions.push(action);
-            }
-            safe_sequences.insert(
-                "face-detected".to_string(),
-                serde_json::to_value(&sequence)?,
-            );
-            if let Some(EventScriptAction::Say { text }) = run.chosen.actions.first() {
-                notes.push(format!(
-                    "EventScript:on(face-detected) emitted say({text:?})"
-                ));
-            }
-            behavior_runs.push(run.record.erase());
         }
 
         if !safe_sequences.is_empty() {
@@ -4899,33 +4766,6 @@ fn ear_prediction(output: &EarNextOutput) -> EarPrediction {
     }
 }
 
-fn face_detected_event_input(now: &Now, recall: &RecallBundle) -> Option<FaceDetectedEventInput> {
-    if now.face.vectors.is_empty() {
-        return None;
-    }
-    let recognized = now.memory.face_familiarity >= 0.70 || !recall.hits.is_empty();
-    let recalled_name = recall
-        .hits
-        .first()
-        .map(|hit| hit.summary.trim().to_string())
-        .filter(|summary| !summary.is_empty());
-    let id = now
-        .face
-        .vectors
-        .first()
-        .map(|artifact| artifact.point_id.clone())
-        .or_else(|| recalled_name.as_ref().map(|name| stable_person_id(name)))
-        .unwrap_or_else(|| format!("face-{}", now.t_ms));
-    Some(FaceDetectedEventInput {
-        t_ms: now.t_ms,
-        recognized,
-        person: FacePerson {
-            id,
-            name: recognized.then_some(recalled_name).flatten(),
-        },
-    })
-}
-
 fn robot_initialized_event_input(now: &Now) -> Option<RobotInitializedEventInput> {
     let init = now.extensions.get("robot.initialization")?;
     Some(RobotInitializedEventInput {
@@ -4971,14 +4811,6 @@ fn robot_initialized_event_input(now: &Now) -> Option<RobotInitializedEventInput
             .and_then(|value| value.as_str())
             .map(str::to_string),
     })
-}
-
-fn stable_person_id(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_lowercase()
 }
 
 fn safety_trace_script_actions<S>(
@@ -5089,10 +4921,6 @@ fn charger_visible(now: &Now) -> bool {
     now.objects.observations.iter().any(|observation| {
         observation.class == ObjectClass::Charger && observation.confidence >= 0.4
     }) || charger_signal_scores(now).1 >= 0.5
-}
-
-fn face_present(now: &Now) -> bool {
-    !now.face.vectors.is_empty()
 }
 
 fn execute_event_script_typescript<I>(script: &str, input: &I) -> Result<EventScriptOutput>
@@ -6006,14 +5834,34 @@ impl<C: Cockpit> OrganDriver for RealLuaOrganDriver<'_, C> {
                     Err(error) => OrganPoll::Failed(cockpit_skill_failure(operation, error)),
                 }
             }
+            HostOperation::Say { text } => {
+                if context.first_poll {
+                    primitive = Some(primitive_intent(
+                        context,
+                        operation,
+                        json!({
+                            "text": text,
+                            "delivery": "motherbrain_mouth_queue",
+                        }),
+                    ));
+                    OrganPoll::Pending {
+                        progress: None,
+                        primitive: None,
+                    }
+                } else {
+                    OrganPoll::Completed(json!({
+                        "text": text,
+                        "attempted": true,
+                    }))
+                }
+            }
             HostOperation::Scan
             | HostOperation::LookAt { .. }
             | HostOperation::Grasp { .. }
             | HostOperation::Release { .. }
             | HostOperation::BringToMouth { .. }
             | HostOperation::Chew
-            | HostOperation::Swallow
-            | HostOperation::Say { .. } => OrganPoll::Failed(SkillFailure::capability(operation)),
+            | HostOperation::Swallow => OrganPoll::Failed(SkillFailure::capability(operation)),
         };
         if primitive.is_some() {
             state.last_dispatch_ms = context.now_ms;
@@ -6617,6 +6465,7 @@ where
         );
         self.insert_robot_initialization(&mut now);
         self.insert_brainstem_interface(&mut now, &brainstem_events);
+        self.possessor_skills.annotate_now(&mut now);
 
         now.reign = self.runtime.reign_sense(t_ms)?;
         if let Some(input) = now.reign.latest.clone() {
@@ -6747,7 +6596,7 @@ where
                 let (status, command_sent) = self.possessor_skills.step(
                     self.cockpit.client_mut(),
                     &request,
-                    &now,
+                    &tick.frame.now,
                     &status_before,
                     status_before.battery.home_base(),
                     &brainstem_events,
@@ -6766,6 +6615,7 @@ where
                     self.finish_possession_recovery();
                 }
                 tick.skill_status = Some(status);
+                self.possessor_skills.annotate_now(&mut tick.frame.now);
             }
         }
         if !recovery_decision.command_sent && !possessor_skill_owns_motion {
@@ -8390,7 +8240,7 @@ where
                 let (status, _) = self.possessor_skills.step(
                     self.cockpit.client_mut(),
                     &request,
-                    &now,
+                    &tick.frame.now,
                     &status_summary,
                     status_summary.battery.home_base(),
                     &events,
@@ -8398,6 +8248,7 @@ where
                 );
                 self.runtime.observe_skill_status(&status);
                 tick.skill_status = Some(status);
+                self.possessor_skills.annotate_now(&mut tick.frame.now);
                 lua_skill_owns_motion = true;
             }
             let final_motor = if lua_skill_owns_motion {
@@ -10287,7 +10138,7 @@ mod tests {
         establish_session, CockpitCapabilities, CockpitRequest, CockpitResponse, CockpitStatus,
         EventBatch, HandshakeHello, MotherbrainPossession, SimCockpit,
     };
-    use pete_conductor::{Conductor, ConductorInput, SimpleConductor};
+    use pete_conductor::{Conductor, ConductorInput, GoalId, SimpleConductor};
     use pete_experience::{
         embody_now, experience_encode_input_from_now, EmbodiedContext, Modality,
         SensationPayloadKind,
@@ -10297,7 +10148,7 @@ mod tests {
         ConsciousCommand, LlmDecision, LlmReviewRequest, LlmScientificReview, LlmTickResult,
     };
     use pete_map::MapConfig;
-    use pete_memory::InMemoryExperienceStore;
+    use pete_memory::{InMemoryExperienceStore, Recall, RecallQuery};
     use pete_models::{
         ActionValueNetTrainer, ChargeNetTrainer, DangerNetTrainer, EarNextNetTrainer,
         ExperienceAutoencoderTrainer, FutureNetTrainer,
@@ -10916,61 +10767,6 @@ mod tests {
     }
 
     #[test]
-    fn face_detected_script_greets_named_unnamed_and_stranger_faces() {
-        let mut behavior = face_detected_event_behavior(
-            BehaviorRegime::Hardcoded,
-            Some("event.face_detected.shadow.v0".to_string()),
-            FallbackPolicy::UseHardcoded,
-        );
-        let named = FaceDetectedEventInput {
-            t_ms: 10,
-            recognized: true,
-            person: FacePerson {
-                id: "p1".to_string(),
-                name: Some("Ada".to_string()),
-            },
-        };
-        let unnamed = FaceDetectedEventInput {
-            t_ms: 10,
-            recognized: true,
-            person: FacePerson {
-                id: "p2".to_string(),
-                name: None,
-            },
-        };
-        let stranger = FaceDetectedEventInput {
-            t_ms: 10,
-            recognized: false,
-            person: FacePerson {
-                id: "p3".to_string(),
-                name: None,
-            },
-        };
-
-        assert!(behavior.infer(&named, 10).unwrap().chosen.actions.contains(
-            &EventScriptAction::Say {
-                text: "Hello Ada".to_string()
-            }
-        ));
-        assert!(behavior
-            .infer(&unnamed, 10)
-            .unwrap()
-            .chosen
-            .actions
-            .contains(&EventScriptAction::Say {
-                text: "Hello Acquaintance p2".to_string()
-            }));
-        assert!(behavior
-            .infer(&stranger, 10)
-            .unwrap()
-            .chosen
-            .actions
-            .contains(&EventScriptAction::Say {
-                text: "Hello Stranger p3".to_string()
-            }));
-    }
-
-    #[test]
     fn safety_veto_prevents_unsafe_script_movement_and_records_context() {
         let mut now = idle_now(10);
         now.body.battery_level = 0.05;
@@ -11386,6 +11182,177 @@ mod tests {
         assert!(ledger_now
             .extensions
             .contains_key("motherbrain.skill_execution"));
+    }
+
+    #[test]
+    fn recognized_person_greeting_runs_through_goal_lua_and_acknowledges_encounter() {
+        std::thread::Builder::new()
+            .name("lua-greet-goal-test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let ledger = JsonlLedger::new("/tmp/pete-runtime-lua-greet-goal-test");
+                        let memory = InMemoryExperienceStore::new();
+                        let recall = FixedRecall {
+                            bundle: RecallBundle {
+                                sense: pete_now::MemorySense {
+                                    face_familiarity: 0.92,
+                                    remembered_entities: vec![pete_now::GraphEntity {
+                                        id: "person:alex".to_string(),
+                                        labels: vec!["Person".to_string()],
+                                        summary: "Alex".to_string(),
+                                        score: 0.90,
+                                    }],
+                                    ..pete_now::MemorySense::default()
+                                },
+                                ..RecallBundle::default()
+                            },
+                        };
+                        let mut runtime = MinimalRuntime::new(
+                            ledger,
+                            memory,
+                            recall,
+                            FixedConductor::new(ActionPrimitive::Stop),
+                            SimpleSafety::default(),
+                            pete_llm::NoopLlmAgent,
+                        )
+                        .with_action_selector_mode(ActionSelectorMode::Goal);
+                        let person_now = |t_ms| {
+                            let mut now = idle_now(t_ms);
+                            now.face.vectors.push(
+                                VectorArtifact::new(
+                                    pete_now::FACE_VECTOR_COLLECTION,
+                                    format!("face-alex-{t_ms}"),
+                                    vec![0.1, 0.2],
+                                )
+                                .with_model("test-face-model"),
+                            );
+                            now
+                        };
+
+                        let first = runtime
+                            .tick(person_now(100), ExperienceLatent::default(), Vec::new())
+                            .await
+                            .unwrap();
+                        let request = first
+                            .skill_request
+                            .clone()
+                            .expect("recognized encounter should propose greeting skill");
+                        assert_eq!(request.goal_id, Some(GoalId::new("greet_person")));
+                        assert_eq!(request.skill_id, SkillId::RuntimeLoaded);
+                        assert_eq!(
+                            request.implementation_id.as_deref(),
+                            Some("motherbrain.greet")
+                        );
+                        assert!(!first
+                            .frame
+                            .now
+                            .extensions
+                            .get("event_scripts")
+                            .is_some_and(|scripts| scripts.get("face-detected").is_some()));
+
+                        let mut skills = PossessorSkillRuntime::default();
+                        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+                        let events = cockpit.get_events_since(0).unwrap();
+                        let status_summary = cockpit.get_status().unwrap().summary();
+                        let mut skill_now = first.frame.now.clone();
+                        let (started, _) = skills.step(
+                            &mut cockpit,
+                            &request,
+                            &skill_now,
+                            &status_summary,
+                            false,
+                            &events,
+                            100,
+                        );
+                        assert_ne!(started.phase, SkillPhase::Terminal);
+                        let mut completed = started;
+                        for now_ms in [200, 300, 400] {
+                            skill_now.t_ms = now_ms;
+                            skill_now.body.last_update_ms = now_ms;
+                            (completed, _) = skills.step(
+                                &mut cockpit,
+                                &request,
+                                &skill_now,
+                                &status_summary,
+                                false,
+                                &events,
+                                now_ms,
+                            );
+                            if completed.phase == SkillPhase::Terminal {
+                                break;
+                            }
+                        }
+                        assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
+                        assert_eq!(completed.progress, Some(1.0));
+                        let execution = skills.provenance.as_ref().unwrap();
+                        assert!(execution
+                            .get("observations")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|observations| observations.iter().any(|observation| {
+                                observation.get("kind").and_then(serde_json::Value::as_str)
+                                    == Some("social_acknowledgment")
+                            })));
+                        assert!(execution
+                            .get("trace")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|trace| trace.iter().any(|event| {
+                                event.get("kind").and_then(serde_json::Value::as_str)
+                                    == Some("primitive")
+                                    && event.get("operation").and_then(serde_json::Value::as_str)
+                                        == Some("say")
+                                    && event
+                                        .pointer("/detail/text")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("Hello Alex.")
+                            })));
+
+                        let mut next_now = person_now(300);
+                        skills.annotate_now(&mut next_now);
+                        runtime.observe_skill_status(&completed);
+                        let next = runtime
+                            .tick(next_now, ExperienceLatent::default(), Vec::new())
+                            .await
+                            .unwrap();
+                        let interaction = next
+                            .frame
+                            .now
+                            .world
+                            .social
+                            .active_interaction
+                            .as_ref()
+                            .unwrap();
+                        assert!(interaction.has_acknowledgment(
+                            &pete_now::PersonId("person:alex".to_string()),
+                            pete_now::SocialAcknowledgmentKind::GreetingAttempted,
+                        ));
+                        assert_ne!(
+                            next.frame.now.extensions["goal_system"]["selection"]["selected_goal"]
+                                .as_str(),
+                            Some("greet_person")
+                        );
+                        assert!(next.skill_request.as_ref().is_none_or(|request| {
+                            request.goal_id != Some(GoalId::new("greet_person"))
+                        }));
+                        let mut following_now = person_now(400);
+                        skills.annotate_now(&mut following_now);
+                        let following = runtime
+                            .tick(following_now, ExperienceLatent::default(), Vec::new())
+                            .await
+                            .unwrap();
+                        assert_ne!(
+                            following.frame.now.world.self_model.active_goal.as_deref(),
+                            Some("greet_person")
+                        );
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -16487,6 +16454,18 @@ mod tests {
     #[derive(Clone, Debug)]
     struct FixedConductor {
         action: ActionPrimitive,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FixedRecall {
+        bundle: RecallBundle,
+    }
+
+    #[async_trait::async_trait]
+    impl Recall for FixedRecall {
+        async fn recall(&self, _query: RecallQuery) -> Result<RecallBundle> {
+            Ok(self.bundle.clone())
+        }
     }
 
     impl FixedConductor {

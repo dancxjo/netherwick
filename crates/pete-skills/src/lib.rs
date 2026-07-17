@@ -261,6 +261,7 @@ pub struct EntityHandle {
     id: String,
     kind: String,
     label: String,
+    name: Option<String>,
 }
 
 impl EntityHandle {
@@ -269,11 +270,17 @@ impl EntityHandle {
             id: id.into(),
             kind: kind.into(),
             label: label.into(),
+            name: None,
         }
     }
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
     }
 }
 
@@ -282,6 +289,8 @@ impl UserData for EntityHandle {
         fields.add_field_method_get("id", |_, this| Ok(this.id.clone()));
         fields.add_field_method_get("kind", |_, this| Ok(this.kind.clone()));
         fields.add_field_method_get("label", |_, this| Ok(this.label.clone()));
+        fields.add_field_method_get("name", |_, this| Ok(this.name.clone()));
+        fields.add_field_method_get("recognized", |_, this| Ok(this.name.is_some()));
     }
 }
 
@@ -436,6 +445,7 @@ pub struct SkillDiagnostic {
 /// Bounded execution evidence carried into `Now` and the experience ledger.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillExecutionRecord {
+    pub execution_id: u64,
     pub skill: LoadedSkill,
     pub request: SkillRequest,
     pub diagnostics: SkillDiagnostic,
@@ -570,6 +580,7 @@ struct BridgeState {
     observations: Vec<Value>,
     memories: Vec<Value>,
     trace: VecDeque<SkillTraceEvent>,
+    execution_id: u64,
 }
 
 struct Bridge {
@@ -829,6 +840,7 @@ impl LuaSkillRuntime {
         let invocation = self.invocation.as_ref()?;
         let state = invocation.bridge.state.lock().expect("skill bridge lock");
         Some(SkillExecutionRecord {
+            execution_id: invocation.status.execution_id,
             skill: invocation.metadata.clone(),
             request: invocation.request.clone(),
             diagnostics: invocation.diagnostics.clone(),
@@ -886,6 +898,7 @@ impl LuaSkillRuntime {
             .into_async::<MultiValue>(lua_arguments)?;
         let execution_id = self.next_execution_id;
         self.next_execution_id = execution_id.saturating_add(1);
+        bridge.state.lock().expect("skill bridge lock").execution_id = execution_id;
         let metric_baseline = request.progress_baseline;
         let intention_key = intention_key(&request);
         let attempts = self.attempts.entry(intention_key).or_insert(0);
@@ -1578,11 +1591,17 @@ fn install_queries(lua: &Lua, bridge: Arc<Bridge>) -> mlua::Result<()> {
             {
                 values.set(
                     index + 1,
-                    lua.create_userdata(EntityHandle::new(
-                        stable_observation_id(observation),
-                        object_class_name(&observation.class),
-                        observation.label.clone(),
-                    ))?,
+                    lua.create_userdata(
+                        EntityHandle::new(
+                            stable_observation_id(observation),
+                            object_class_name(&observation.class),
+                            observation.label.clone(),
+                        )
+                        .with_name(recognized_person_name(
+                            &now,
+                            &stable_observation_id(observation),
+                        )),
+                    )?,
                 )?;
             }
             Ok(values)
@@ -1595,31 +1614,36 @@ fn install_queries(lua: &Lua, bridge: Arc<Bridge>) -> mlua::Result<()> {
             lua.create_function(move |_, target: mlua::AnyUserData| {
                 let target = target.borrow::<EntityHandle>()?;
                 let now = query_bridge.snapshot()?;
-                let observation = now
-                    .objects
-                    .observations
-                    .iter()
-                    .find(|observation| stable_observation_id(observation) == target.id)
-                    .ok_or_else(|| {
+                let value = if bearing {
+                    current_entity_bearing(&now, &target)
+                } else {
+                    current_entity_distance(&now, &target)
+                };
+                value.ok_or_else(|| {
+                    if current_entity_exists(&now, &target) {
+                        SkillFailure::new(
+                            SkillOutcome::Failed,
+                            if bearing {
+                                "bearing_unavailable"
+                            } else {
+                                "range_unavailable"
+                            },
+                            format!(
+                                "entity {} has no current {}",
+                                target.id,
+                                if bearing { "bearing" } else { "range" }
+                            ),
+                        )
+                        .encoded()
+                    } else {
                         SkillFailure::new(
                             SkillOutcome::Failed,
                             "target_stale",
                             format!("entity {} is no longer visible", target.id),
                         )
                         .encoded()
-                    })?;
-                if bearing {
-                    Ok(observation.bearing_rad)
-                } else {
-                    observation.distance_m.ok_or_else(|| {
-                        SkillFailure::new(
-                            SkillOutcome::Failed,
-                            "range_unavailable",
-                            format!("entity {} has no current range", target.id),
-                        )
-                        .encoded()
-                    })
-                }
+                    }
+                })
             })?,
         )?;
     }
@@ -1887,12 +1911,13 @@ fn install_provenance(lua: &Lua, bridge: Arc<Bridge>) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
+    let remember_bridge = bridge.clone();
     lua.globals().set(
         "remember",
         lua.create_function(move |lua, (key, value): (String, LuaValue)| {
             anyhow_lua(key.len() <= 128, "memory key is too long")?;
             let value = bounded_lua_value(&lua, value)?;
-            bridge
+            remember_bridge
                 .state
                 .lock()
                 .expect("skill bridge lock")
@@ -1903,6 +1928,67 @@ fn install_provenance(lua: &Lua, bridge: Arc<Bridge>) -> mlua::Result<()> {
                     "provenance": "lua_skill",
                 }));
             Ok(())
+        })?,
+    )?;
+    lua.globals().set(
+        "acknowledge",
+        lua.create_function(move |_, target: mlua::AnyUserData| {
+            let target = target.borrow::<EntityHandle>()?.clone();
+            let mut state = bridge.state.lock().expect("skill bridge lock");
+            let now = state.snapshot.clone().ok_or_else(|| {
+                LuaError::RuntimeError("canonical Now is unavailable".to_string())
+            })?;
+            let interaction = now
+                .world
+                .social
+                .active_interaction
+                .as_ref()
+                .ok_or_else(|| {
+                    SkillFailure::new(
+                        SkillOutcome::PostconditionFailed,
+                        "encounter_ended",
+                        "cannot acknowledge a person outside an active encounter",
+                    )
+                    .encoded()
+                })?;
+            let participant = interaction
+                .participants
+                .iter()
+                .find(|participant| participant.0.eq_ignore_ascii_case(target.id()))
+                .ok_or_else(|| {
+                    SkillFailure::new(
+                        SkillOutcome::PostconditionFailed,
+                        "person_not_in_encounter",
+                        format!(
+                            "{} is not a participant in the active encounter",
+                            target.id()
+                        ),
+                    )
+                    .encoded()
+                })?;
+            let acknowledgment_id = format!(
+                "greet:{}:{}:{}",
+                interaction.interaction_id.0, participant.0, state.execution_id
+            );
+            if !state.observations.iter().any(|observation| {
+                observation
+                    .pointer("/value/acknowledgment_id")
+                    .and_then(Value::as_str)
+                    == Some(acknowledgment_id.as_str())
+            }) {
+                state.observations.push(json!({
+                    "kind": "social_acknowledgment",
+                    "contract": "host_validated_social_acknowledgment_v1",
+                    "value": {
+                        "acknowledgment_id": acknowledgment_id,
+                        "interaction_id": interaction.interaction_id.0,
+                        "person_id": participant.0,
+                        "occurred_at_ms": now.t_ms,
+                    },
+                    "provenance": "lua_skill",
+                }));
+            }
+            Ok(true)
         })?,
     )?;
     Ok(())
@@ -2530,18 +2616,43 @@ fn request_arguments_lua(lua: &Lua, request: &SkillRequest, now: &Now) -> mlua::
     table.set("expected_progress", request.expected_progress)?;
     table.set("progress_metric", request.progress_metric.clone())?;
     if let Some(target) = request.target.as_ref() {
-        let observation = now
-            .objects
-            .observations
+        let observation =
+            now.objects.observations.iter().find(|observation| {
+                stable_observation_id(observation).eq_ignore_ascii_case(&target.0)
+            });
+        let world_entity = now
+            .world
+            .entities
             .iter()
-            .find(|observation| stable_observation_id(observation) == target.0);
+            .find(|(id, _)| id.0.eq_ignore_ascii_case(&target.0))
+            .map(|(_, entity)| entity);
+        let social_person = now
+            .world
+            .social
+            .people
+            .iter()
+            .find(|(person_id, _)| person_id.0.eq_ignore_ascii_case(&target.0))
+            .map(|(_, person)| person);
+        let kind = observation
+            .map(|value| object_class_name(&value.class))
+            .or_else(|| world_entity.map(|entity| world_entity_kind_name(&entity.kind)))
+            .or_else(|| social_person.map(|_| "person"))
+            .unwrap_or("unknown");
+        let label = observation
+            .map(|value| value.label.as_str())
+            .or_else(|| world_entity.map(|entity| entity.label.as_str()))
+            .or_else(|| {
+                social_person
+                    .and_then(|person| person.preferred_name.as_ref())
+                    .map(|name| name.value.as_str())
+            })
+            .unwrap_or("target");
         table.set(
             "target",
-            lua.create_userdata(EntityHandle::new(
-                target.0.clone(),
-                observation.map_or("unknown", |value| object_class_name(&value.class)),
-                observation.map_or("target", |value| value.label.as_str()),
-            ))?,
+            lua.create_userdata(
+                EntityHandle::new(target.0.clone(), kind, label)
+                    .with_name(recognized_person_name(now, &target.0)),
+            )?,
         )?;
     }
     Ok(table)
@@ -2674,6 +2785,87 @@ fn stable_observation_id(observation: &pete_now::ObjectObservation) -> String {
     )
 }
 
+fn current_entity_exists(now: &Now, target: &EntityHandle) -> bool {
+    now.objects
+        .observations
+        .iter()
+        .any(|observation| stable_observation_id(observation).eq_ignore_ascii_case(target.id()))
+        || now
+            .world
+            .entities
+            .keys()
+            .any(|id| id.0.eq_ignore_ascii_case(target.id()))
+        || now.world.social.people.iter().any(|(person_id, person)| {
+            person_id.0.eq_ignore_ascii_case(target.id()) && person.presence.present
+        })
+}
+
+fn current_entity_bearing(now: &Now, target: &EntityHandle) -> Option<f32> {
+    now.objects
+        .observations
+        .iter()
+        .find(|observation| stable_observation_id(observation).eq_ignore_ascii_case(target.id()))
+        .map(|observation| observation.bearing_rad)
+        .or_else(|| {
+            now.world
+                .entities
+                .iter()
+                .find(|(id, _)| id.0.eq_ignore_ascii_case(target.id()))
+                .and_then(|(_, entity)| entity.bearing_rad)
+        })
+        .or_else(|| {
+            now.world
+                .social
+                .people
+                .iter()
+                .find(|(person_id, _)| person_id.0.eq_ignore_ascii_case(target.id()))
+                .and_then(|(_, person)| person.location.as_ref())
+                .and_then(|location| location.bearing_rad)
+        })
+}
+
+fn current_entity_distance(now: &Now, target: &EntityHandle) -> Option<f32> {
+    now.objects
+        .observations
+        .iter()
+        .find(|observation| stable_observation_id(observation).eq_ignore_ascii_case(target.id()))
+        .and_then(|observation| observation.distance_m)
+        .or_else(|| {
+            now.world
+                .entities
+                .iter()
+                .find(|(id, _)| id.0.eq_ignore_ascii_case(target.id()))
+                .and_then(|(_, entity)| entity.distance_m)
+        })
+        .or_else(|| {
+            now.world
+                .social
+                .people
+                .iter()
+                .find(|(person_id, _)| person_id.0.eq_ignore_ascii_case(target.id()))
+                .and_then(|(_, person)| person.location.as_ref())
+                .and_then(|location| location.distance_m)
+        })
+}
+
+fn recognized_person_name(now: &Now, target_id: &str) -> Option<String> {
+    now.world
+        .social
+        .people
+        .iter()
+        .find(|(person_id, _)| person_id.0.eq_ignore_ascii_case(target_id))
+        .and_then(|(_, person)| {
+            (!person.identity_is_uncertain())
+                .then(|| {
+                    person
+                        .preferred_name
+                        .as_ref()
+                        .map(|name| name.value.clone())
+                })
+                .flatten()
+        })
+}
+
 fn object_matches(class: &ObjectClass, label: &str, wanted: &str) -> bool {
     label.eq_ignore_ascii_case(wanted) || object_class_name(class).eq_ignore_ascii_case(wanted)
 }
@@ -2686,6 +2878,19 @@ fn object_class_name(class: &ObjectClass) -> &'static str {
         ObjectClass::SoundSource => "sound",
         ObjectClass::Landmark => "landmark",
         ObjectClass::Unknown => "unknown",
+    }
+}
+
+fn world_entity_kind_name(kind: &pete_now::WorldEntityKind) -> &'static str {
+    match kind {
+        pete_now::WorldEntityKind::Obstacle => "obstacle",
+        pete_now::WorldEntityKind::Charger => "dock",
+        pete_now::WorldEntityKind::Person => "person",
+        pete_now::WorldEntityKind::SoundSource => "sound",
+        pete_now::WorldEntityKind::Landmark => "landmark",
+        pete_now::WorldEntityKind::Door => "door",
+        pete_now::WorldEntityKind::Region => "region",
+        pete_now::WorldEntityKind::Unknown => "unknown",
     }
 }
 
@@ -2716,20 +2921,23 @@ fn bearing_from_lua_value(bridge: &Bridge, value: LuaValue) -> mlua::Result<f32>
         LuaValue::UserData(target) => {
             let target = target.borrow::<EntityHandle>()?;
             let now = bridge.snapshot()?;
-            let observation = now
-                .objects
-                .observations
-                .iter()
-                .find(|observation| stable_observation_id(observation) == target.id)
-                .ok_or_else(|| {
+            current_entity_bearing(&now, &target).ok_or_else(|| {
+                if current_entity_exists(&now, &target) {
+                    SkillFailure::new(
+                        SkillOutcome::Failed,
+                        "bearing_unavailable",
+                        format!("entity {} has no current bearing", target.id),
+                    )
+                    .encoded()
+                } else {
                     SkillFailure::new(
                         SkillOutcome::Failed,
                         "target_stale",
                         format!("entity {} is no longer visible", target.id),
                     )
                     .encoded()
-                })?;
-            finite(observation.bearing_rad, "bearing")
+                }
+            })
         }
         _ => Err(LuaError::RuntimeError(
             "face/turnToward requires a bearing or entity handle".to_string(),
@@ -3625,6 +3833,95 @@ mod tests {
                 waiting_resources: Vec::new(),
                 active_children: 0,
             })
+        );
+    }
+
+    #[test]
+    fn greet_uses_canonical_person_identity_and_records_encounter_acknowledgment() {
+        let source = r#"
+            function greet(args)
+                local person = args.target
+                require(person ~= nil, "person required")
+                together(
+                    function() face(person) end,
+                    function() say("Hello " .. person.name .. ".") end
+                )
+                acknowledge(person)
+                reportProgress("social_acknowledgment", 1.0)
+                return {
+                    person_id = person.id,
+                    name = person.name,
+                    acknowledged = true,
+                }
+            end
+        "#;
+        let (_directory, mut runtime, _) = runtime_with("greet", source);
+        let mut raw = Now::blank(0, BodySense::default());
+        raw.objects.observations.push(pete_now::ObjectObservation {
+            label: "Alex".to_string(),
+            class: ObjectClass::Person,
+            bearing_rad: 0.25,
+            distance_m: Some(0.8),
+            confidence: 0.95,
+            source: pete_now::ObjectObservationSource::Kinect,
+        });
+        let mut now = pete_now::WorldModelUpdater::default()
+            .update(raw, pete_now::WorldModelUpdateContext::default());
+        let encounter_id = now
+            .world
+            .social
+            .active_interaction
+            .as_ref()
+            .unwrap()
+            .interaction_id
+            .0
+            .clone();
+        let mut request = SkillRequest::runtime_loaded("test.greet");
+        request.goal_id = Some(GoalId::new("greet_person"));
+        request.behavior_id = Some(format!("greet:person:alex:{encounter_id}"));
+        request.target = Some(EntityId("person:alex".to_string()));
+        request.bearing_rad = Some(0.25);
+        request.progress_metric = "social_acknowledgment".to_string();
+        runtime.start(request, &now).unwrap();
+
+        let mut driver = FakeDriver::default();
+        let status = advance(&mut runtime, &mut driver, &mut now, 8);
+        assert_eq!(status.outcome, Some(SkillOutcome::Completed));
+        assert_eq!(status.progress, Some(1.0));
+        assert_eq!(
+            completed_result(&runtime),
+            Some(json!({
+                "person_id": "person:alex",
+                "name": "Alex",
+                "acknowledged": true,
+            }))
+        );
+        assert_eq!(
+            driver
+                .records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["face_bearing", "say"])
+        );
+        let record = runtime.execution_record().unwrap();
+        assert_eq!(record.execution_id, status.execution_id);
+        assert_eq!(
+            record.observations,
+            vec![json!({
+                "kind": "social_acknowledgment",
+                "contract": "host_validated_social_acknowledgment_v1",
+                "value": {
+                    "acknowledgment_id": format!(
+                        "greet:{encounter_id}:person:alex:{}",
+                        status.execution_id
+                    ),
+                    "interaction_id": encounter_id,
+                    "person_id": "person:alex",
+                    "occurred_at_ms": 200,
+                },
+                "provenance": "lua_skill",
+            })]
         );
     }
 }

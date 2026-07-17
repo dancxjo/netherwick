@@ -92,9 +92,13 @@ later resumption may see a newer snapshot. Stable entity userdata comes from
 `bearingTo`. Other queries include `contactActive`, `cliffActive`,
 `cliffIsClear`, and `charging`.
 
-`observe`, `hypothesize`, `remember`, and `reportProgress` are explicit host
-paths. They retain skill provenance rather than mutating `Now`. The originating
-goal ID, progress metric, and baseline stay attached to the invocation.
+`observe`, `hypothesize`, `remember`, `acknowledge`, and `reportProgress` are
+explicit host paths. They retain skill provenance rather than mutating `Now`.
+The originating goal ID, progress metric, and baseline stay attached to the
+invocation. `acknowledge(person)` is narrower than an arbitrary world-model
+write: the person must belong to the current canonical social encounter, and a
+completed skill records an encounter-scoped acknowledgment for the next world
+model revision.
 Closed-loop controllers report raw measurements; the runtime normalizes
 decreasing metrics such as bearing error and target distance. Author-reported
 progress is bounded to `0..1`. The conductor consumes `SkillStatus.progress`
@@ -167,6 +171,7 @@ carefully / together / try / blocked
 nearestVisible / visible / distanceTo / bearingTo
 contactActive / cliffActive / cliffIsClear / charging
 reportProgress / hypothesize / remember
+acknowledge
 ```
 
 An operation for an organ Pete does not possess returns
@@ -206,7 +211,9 @@ cargo test -p pete-runtime possessor_
 
 Complete examples live in `skills/motherbrain`: `reachForFood`,
 `eatNearestFood`, `inspectObject`, `searchForDock`, `returnToDock`,
-`retreatFromCliff`, and `releasePersistentBumper`. The same directory contains
-canonical policies for stop/stabilize, target turn and approach, bearing and
-heading control, bounded driving, wall following, IR-gradient docking, search,
-undocking, bump recovery, and cliff retreat.
+`retreatFromCliff`, `releasePersistentBumper`, and `greet`. The greeting
+example uses `together` for orientation and voice, then acknowledges the
+person; repeated detections do not repeat it during the same encounter. The
+same directory contains canonical policies for stop/stabilize, target turn and
+approach, bearing and heading control, bounded driving, wall following,
+IR-gradient docking, search, undocking, bump recovery, and cliff retreat.
