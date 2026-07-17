@@ -1191,7 +1191,7 @@ checksum = "223ed3804bb9436e401fc57b87e44c86267070b870813520ed9f706c80c81442"
 dependencies = [
  "burn-backend",
  "burn-std",
- "colored 3.1.1",
+ "colored",
  "derive-new",
  "num-traits",
  "serde",
@@ -1506,8 +1506,8 @@ version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fd2a475e9dff35ddebd459b0523aab732572581f7fe53133edd20b3330a0ce6"
 dependencies = [
- "console 0.16.4",
- "indicatif 0.18.6",
+ "console",
+ "indicatif",
  "once_cell",
  "strsim",
  "textwrap",
@@ -1545,16 +1545,6 @@ name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
-
-[[package]]
-name = "colored"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
-dependencies = [
- "lazy_static",
- "windows-sys 0.59.0",
-]
 
 [[package]]
 name = "colored"
@@ -1611,19 +1601,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
-]
-
-[[package]]
-name = "console"
-version = "0.15.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ccb5b10f9f2cbf51eb355ca1d05c2d279ce1804688d0db74b4733a5aeafd8"
-dependencies = [
- "encode_unicode",
- "libc",
- "once_cell",
- "unicode-width",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2694,16 +2671,6 @@ name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
-
-[[package]]
-name = "drawille"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e64e461c3f1e69d99372620640b3fd5f0309eeda2e26e4af69f6760c0e1df845"
-dependencies = [
- "colored 2.2.0",
- "fnv",
-]
 
 [[package]]
 name = "dunce"
@@ -3863,7 +3830,7 @@ dependencies = [
  "dirs",
  "futures",
  "http 1.4.2",
- "indicatif 0.18.6",
+ "indicatif",
  "libc",
  "log",
  "native-tls",
@@ -4297,24 +4264,11 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.17.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
-dependencies = [
- "console 0.15.11",
- "number_prefix",
- "portable-atomic",
- "unicode-width",
- "web-time",
-]
-
-[[package]]
-name = "indicatif"
 version = "0.18.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9433806cd6b4ec1aba79c021c7e4c58fb4c3b9977c085062e611ac929998fb0c"
 dependencies = [
- "console 0.16.4",
+ "console",
  "portable-atomic",
  "unicode-width",
  "unit-prefix",
@@ -5409,12 +5363,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "number_prefix"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
-
-[[package]]
 name = "nvml-wrapper"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5663,6 +5611,7 @@ version = "2.0.0-rc.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7de3af33d24a745ffb8fab904b13478438d1cd52868e6f17735ef6e1f8bf133"
 dependencies = [
+ "libloading 0.9.0",
  "ndarray 0.17.2",
  "ort-sys",
  "smallvec",
@@ -7181,9 +7130,6 @@ name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "ring"
@@ -8219,16 +8165,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa672c55ab69f787dbc9126cc387dbe57fdd595f585e4524cf89018fa44ab819"
 
 [[package]]
-name = "textplots"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f7657a0066c9f9663659db0665319adff8b0943305fc73eddf1010e5a2072b1"
-dependencies = [
- "drawille",
- "rgb",
-]
-
-[[package]]
 name = "textwrap"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8599,89 +8535,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
-name = "tongues-core"
-version = "0.1.0"
-dependencies = [
- "indicatif 0.17.11",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "tongues-data"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "speaking",
- "thiserror 1.0.69",
- "tongues-core",
- "ureq 3.3.0",
-]
-
-[[package]]
-name = "tongues-g2p2g"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "burn",
- "indicatif 0.17.11",
- "rand 0.8.7",
- "rayon",
- "serde",
- "serde_json",
- "textplots",
- "thiserror 1.0.69",
- "tongues-core",
- "tongues-data",
- "tongues-neural",
-]
-
-[[package]]
-name = "tongues-neural"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "burn",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "tongues-tts"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "burn",
  "dirs",
  "ort",
  "serde_json",
  "speaking",
- "tongues-core",
- "tongues-g2p2g",
- "tongues-wiktionary",
-]
-
-[[package]]
-name = "tongues-wiktionary"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bzip2",
- "rand 0.8.7",
- "rayon",
- "serde",
- "serde_json",
- "speaking",
- "toml 0.8.23",
- "tongues-core",
- "tongues-data",
- "tongues-neural",
- "unicode-normalization",
- "ureq 3.3.0",
 ]
 
 [[package]]
@@ -10232,7 +10093,7 @@ dependencies = [
  "chrono",
  "clap",
  "cliclack",
- "indicatif 0.18.6",
+ "indicatif",
  "serde_json",
 ]
 

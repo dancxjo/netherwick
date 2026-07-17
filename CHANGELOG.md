@@ -227,6 +227,7 @@ All notable changes are grouped by date.
 - Add a user-facing possession mode rename in `pete-tools`: introduce explicit `regular` mode alongside `read-only` and `possession-slow`, and route `regular` to the existing physical slow possession behavior (`RobotMode::Slow`) while preserving guardrails.
 - Update `--recovery-smoke`, `--orientation-probe`, and serial/session validation paths to refer to `regular` possession language, and keep all regular/slow possession diagnostics aligned to physical brainstem requirements.
 - Refresh dependency-lock metadata in `Cargo.lock` for speech/visualization crates (`tongues-*`, `textplots`, `drawille`, version-resolved `indicatif`/`console`/`colored`) so speech pipeline, lockfile, and package metadata stay consistent after the mode/workflow updates.
+- Add a second lockfile maintenance pass that removes stale `tongues-*`, `drawille`, `textplots`, `number_prefix`, and duplicate older `console`/`indicatif`/`colored` entries while normalizing dependency edges to current workspace versions.
 
 ### Ongoing
 
