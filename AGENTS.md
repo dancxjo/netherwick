@@ -13,3 +13,11 @@
   and service-authorization changes are migrations: retain host acceptance for
   older advertised contracts, add a regression test for the prior contract, and
   validate against attached pre-upgrade firmware before flashing when available.
+
+# Development workflow
+
+- Make your own commits as you make progress. Keep them small, coherent, and easy to review instead of accumulating one large end-of-task change.
+- Commit only the files and hunks that belong to your work. Preserve unrelated user changes in the worktree, and use concise, descriptive commit messages.
+- During development, validate the package or behavior you are changing with focused tests and checks. Netherwick's full test suite is slow, so do not feel compelled to run every workspace test after every small change.
+- Prefer the narrowest useful command, such as a package-level test or check. Remember that `crates/pete-brainstem` is excluded from the root workspace and must be tested with `cargo test --manifest-path crates/pete-brainstem/Cargo.toml ...`.
+- At the end of the task, run `just sup` as the broad final verification pass to catch formatting, lint, test, or integration issues that focused checks may have missed. Fix any failures attributable to your work and commit those fixes before handoff.
