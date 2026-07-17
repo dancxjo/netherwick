@@ -14,6 +14,9 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add a transport-neutral `just cockpit` operator CLI with auto-discovered USB
+  CDC, explicit UART and HTTP backends, structured status/capability/event
+  output, bounded guarded drive, and IR-guided dock alignment.
 - Carry the Create's omnidirectional IR character from brainstem sensor packets
   into motherbrain body state, queryable features, experience vectors, and
   LLM-visible senses while preserving older serialized body/status data.
@@ -55,6 +58,10 @@ All notable changes are grouped by date.
 
 ### Changed
 
+- Interpret Home Base red, green, and force-field IR as directional charger
+  evidence in Pete's sensorium, bias charger-seeking without implying contact,
+  and let `AlignWithDock` follow that gradient with 250 ms primitives until
+  charging or Home Base contact; lost IR fails stopped.
 - Restrict the public Brainstem contract to bounded motor primitives,
   body-native operations, immutable reflexes, and explicit services; run
   deterministic navigation and recovery skills in the motherbrain through

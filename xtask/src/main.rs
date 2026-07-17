@@ -126,6 +126,11 @@ enum Command {
     InspectLedger,
     HardwareEnv,
     RealCockpit,
+    /// Open the lightweight transport-neutral Brainstem cockpit CLI.
+    Cockpit {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     CodexSync,
     PicoBootselMount {
         umount: bool,
@@ -266,6 +271,7 @@ fn run(command: Command) -> Result<()> {
         Command::InspectLedger => pete_tools(["inspect-ledger"], &[]),
         Command::HardwareEnv => pete_tools(["hardware-env"], &[]),
         Command::RealCockpit => { println!("Cockpit backend: {}\nCockpit port: {}", cockpit_backend()?, env_or("PETE_COCKPIT_PORT", "auto")); Ok(()) }
+        Command::Cockpit { args } => pete_cockpit(args.iter().map(String::as_str)),
         Command::CodexSync => codex_sync(),
         Command::PicoBootselMount { umount, kernel_name } => pico_bootsel_mount(umount, &kernel_name),
         Command::NeatGenerationLimit { state_path, explicit_limit, default_limit, increment } => {
@@ -316,6 +322,14 @@ fn pete_tools<'a>(args: impl IntoIterator<Item = &'a str>, envs: &[(&str, String
     for (key, value) in envs {
         command.env(key, value);
     }
+    run_program(&mut command)
+}
+
+fn pete_cockpit<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut command = ProcessCommand::new("cargo");
+    command.args(["run", "-q", "-p", "pete-cockpit", "--bin", "pete-cockpit", "--"]);
+    command.args(args);
+    command.env("CARGO_BUILD_JOBS", env_or("CARGO_BUILD_JOBS", "1"));
     run_program(&mut command)
 }
 

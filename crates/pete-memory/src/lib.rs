@@ -12073,6 +12073,7 @@ fn object_source_slug(source: &pete_now::ObjectObservationSource) -> &'static st
         pete_now::ObjectObservationSource::Sim => "sim",
         pete_now::ObjectObservationSource::Kinect => "kinect",
         pete_now::ObjectObservationSource::Captioner => "captioner",
+        pete_now::ObjectObservationSource::CreateIr => "create_ir",
         pete_now::ObjectObservationSource::HumanLabel => "human_label",
         pete_now::ObjectObservationSource::Unknown => "unknown",
     }

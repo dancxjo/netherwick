@@ -128,6 +128,8 @@ hardware-env:
     cargo run -q -p xtask -- hardware-env
 real-cockpit:
     cargo run -q -p xtask -- real-cockpit
+cockpit *args:
+    cargo run -q -p xtask -- cockpit {{args}}
 xtask command="check":
     cargo run -q -p xtask -- {{command}}
 codex-sync:

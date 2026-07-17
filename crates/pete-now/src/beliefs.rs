@@ -785,7 +785,9 @@ impl WorldModelUpdater {
                 normalized_label(&observation.label)
             ));
             let source_kind = match observation.source {
-                ObjectObservationSource::Sim => BeliefSourceKind::DirectObservation,
+                ObjectObservationSource::Sim | ObjectObservationSource::CreateIr => {
+                    BeliefSourceKind::DirectObservation
+                }
                 ObjectObservationSource::HumanLabel => BeliefSourceKind::HumanClaim,
                 ObjectObservationSource::Kinect | ObjectObservationSource::Captioner => {
                     BeliefSourceKind::DerivedPerception

@@ -1344,6 +1344,63 @@ impl SafeStopReason {
     }
 }
 
+/// Directional Home Base evidence encoded by the Create OI IR character.
+///
+/// The dock transmits three independently recognizable components. Treating
+/// them as a cue instead of an opaque byte lets higher layers follow the
+/// red/green gradient without moving any safety policy out of the Brainstem.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DockIrCue {
+    pub red_buoy: bool,
+    pub green_buoy: bool,
+    pub force_field: bool,
+}
+
+impl DockIrCue {
+    pub fn from_character(character: u8) -> Option<Self> {
+        let cue = match character {
+            242 => Self { red_buoy: false, green_buoy: false, force_field: true },
+            244 => Self { red_buoy: false, green_buoy: true, force_field: false },
+            246 => Self { red_buoy: false, green_buoy: true, force_field: true },
+            248 => Self { red_buoy: true, green_buoy: false, force_field: false },
+            250 => Self { red_buoy: true, green_buoy: false, force_field: true },
+            252 => Self { red_buoy: true, green_buoy: true, force_field: false },
+            254 => Self { red_buoy: true, green_buoy: true, force_field: true },
+            _ => return None,
+        };
+        Some(cue)
+    }
+
+    /// Signed turn hint in Pete's bearing convention: positive is left.
+    pub fn bearing_hint_rad(self) -> f32 {
+        match (self.red_buoy, self.green_buoy) {
+            (true, false) => 0.35,
+            (false, true) => -0.35,
+            _ => 0.0,
+        }
+    }
+
+    /// Steering command that follows the dock gradient toward both buoys.
+    pub fn steering_mrad_s(self, correction_mrad_s: i16) -> i16 {
+        let correction = correction_mrad_s.abs();
+        match (self.red_buoy, self.green_buoy) {
+            (true, false) => correction,
+            (false, true) => -correction,
+            _ => 0,
+        }
+    }
+
+    /// A strong charger-visible cue, deliberately below contact certainty.
+    pub fn visible_score(self) -> f32 {
+        if self.red_buoy || self.green_buoy { 0.85 } else { 0.65 }
+    }
+
+    /// Force-field evidence raises proximity belief but never implies contact.
+    pub fn near_score(self) -> f32 {
+        if self.force_field { 0.55 } else { 0.30 }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StatusSummary {
     pub raw: String,
@@ -7948,6 +8005,27 @@ mod tests {
         assert_eq!(summary.safety_latch_kind, Some(SafetyLatchKind::Tilt));
         assert_eq!(summary.imu.tilt_magnitude_mrad, Some(2269));
         assert!(summary.battery.home_base());
+    }
+
+    #[test]
+    fn dock_ir_cue_decodes_and_steers_toward_both_buoys() {
+        let green = DockIrCue::from_character(246).unwrap();
+        assert_eq!(green.steering_mrad_s(400), -400);
+        assert_eq!(green.bearing_hint_rad(), -0.35);
+        assert!(green.force_field);
+
+        let red = DockIrCue::from_character(250).unwrap();
+        assert_eq!(red.steering_mrad_s(400), 400);
+        assert_eq!(red.bearing_hint_rad(), 0.35);
+
+        let centered = DockIrCue::from_character(254).unwrap();
+        assert_eq!(centered.steering_mrad_s(400), 0);
+        assert_eq!(centered.bearing_hint_rad(), 0.0);
+        assert_eq!(centered.visible_score(), 0.85);
+        assert_eq!(centered.near_score(), 0.55);
+
+        assert_eq!(DockIrCue::from_character(255), None);
+        assert_eq!(DockIrCue::from_character(0), None);
     }
 
     #[test]

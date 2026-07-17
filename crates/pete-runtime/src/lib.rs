@@ -19,8 +19,8 @@ use pete_behaviors::{
 };
 use pete_body::{BodyFlags, BodySense};
 use pete_cockpit::{
-    Cockpit, CockpitEventKind, ContactWithdrawalEvent, ContactWithdrawalOutcome, MotionCommand,
-    MotorCommand, SafeCockpit, SafeStopReason, SafetyLatchKind, StatusSummary,
+    Cockpit, CockpitEventKind, ContactWithdrawalEvent, ContactWithdrawalOutcome, DockIrCue,
+    MotionCommand, MotorCommand, SafeCockpit, SafeStopReason, SafetyLatchKind, StatusSummary,
 };
 use pete_conductor::{
     Conductor, ConductorInput, GoalSystem, NavigationIntent, SimpleConductor, SkillId,
@@ -66,7 +66,8 @@ use pete_now::{
     ActionValuePrediction, ActiveControlSummary, BeliefMeta, BeliefSourceKind, ChargePrediction,
     CognitiveServiceBelief, ControlProvenance, DangerPrediction, DriveSense, EarPrediction,
     EntityId, EvidenceRef, ExtensionSense, EyePrediction, Freshness, MemorySense, Now, ObjectClass,
-    ReignSense, SafetySense, SemanticBehaviorId, SemanticEvidenceObservation,
+    ObjectObservation, ObjectObservationSource, ReignSense, SafetySense, SemanticBehaviorId,
+    SemanticEvidenceObservation,
     SemanticGroundingKind, SemanticNodeRef, SemanticOutcomeId, SemanticPredicate, SurpriseSense,
     WorldModelSnapshot, WorldModelUpdater,
 };
@@ -845,6 +846,33 @@ fn sim_world_extension_score(now: &Now, index: usize) -> f32 {
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0)
         .clamp(0.0, 1.0) as f32
+}
+
+fn apply_create_ir_charger_cue(now: &mut Now) {
+    let Some(cue) = DockIrCue::from_character(now.body.infrared_character) else {
+        return;
+    };
+    now.objects.observations.push(ObjectObservation {
+        label: "home base IR".to_string(),
+        class: ObjectClass::Charger,
+        bearing_rad: cue.bearing_hint_rad(),
+        // The beacon proves direction and identity, not metric range. In
+        // particular, force-field reception must never be mistaken for dock
+        // contact or charging.
+        distance_m: None,
+        confidence: cue.visible_score(),
+        source: ObjectObservationSource::CreateIr,
+    });
+}
+
+fn charger_signal_scores(now: &Now) -> (f32, f32) {
+    let mut near = sim_world_extension_score(now, 3);
+    let mut visible = sim_world_extension_score(now, 4);
+    if let Some(cue) = DockIrCue::from_character(now.body.infrared_character) {
+        near = near.max(cue.near_score());
+        visible = visible.max(cue.visible_score());
+    }
+    (near, visible)
 }
 
 fn apply_recent_trap_memory_hints(now: &mut Now) {
@@ -3254,6 +3282,7 @@ where
             "frame_id".to_string(),
             serde_json::Value::String(frame_id.to_string()),
         );
+        apply_create_ir_charger_cue(&mut now);
         {
             let mut reign_queue = self
                 .reign_queue
@@ -3731,10 +3760,32 @@ where
             .behavior
             .as_ref()
             .map(|behavior| behavior.action.clone());
-        let goal_skill_request = goal_cycle
+        let mut goal_skill_request = goal_cycle
             .behavior
             .as_ref()
             .and_then(|behavior| behavior.affordance.skill_request.clone());
+        if goal_cycle
+            .selection
+            .selected_goal
+            .as_ref()
+            .is_some_and(|goal| goal.as_str() == "seek_charger")
+        {
+            if let (Some(request), Some(cue)) = (
+                goal_skill_request.as_mut(),
+                DockIrCue::from_character(now.body.infrared_character),
+            ) {
+                if matches!(
+                    request.skill_id,
+                    SkillId::TurnTowardTarget
+                        | SkillId::ApproachTarget
+                        | SkillId::AlignWithDock
+                ) {
+                    request.skill_id = SkillId::AlignWithDock;
+                    request.bearing_rad = Some(cue.bearing_hint_rad());
+                    request.progress_metric = "dock_ir_alignment".to_string();
+                }
+            }
+        }
         now.extensions.insert(
             "goal_system".to_string(),
             serde_json::to_value(&goal_cycle)?,
@@ -3755,8 +3806,8 @@ where
             reign: now.reign.clone(),
             range: now.range.clone(),
             body: now.body.clone(),
-            charger_near_score: sim_world_extension_score(&now, 3),
-            charger_visible_score: sim_world_extension_score(&now, 4),
+            charger_near_score: charger_signal_scores(&now).0,
+            charger_visible_score: charger_signal_scores(&now).1,
             proposals: proposals.clone(),
         })?;
         if let Some(action) = mechanical_reign_action_for_selection.as_ref() {
@@ -3950,8 +4001,8 @@ where
             reign: now.reign.clone(),
             range: now.range.clone(),
             body: now.body.clone(),
-            charger_near_score: sim_world_extension_score(&now, 3),
-            charger_visible_score: sim_world_extension_score(&now, 4),
+            charger_near_score: charger_signal_scores(&now).0,
+            charger_visible_score: charger_signal_scores(&now).1,
             proposals: conductor_proposals,
         };
         let teacher_source = if now.reign.active {
@@ -5017,7 +5068,7 @@ fn append_event_script_chirp(
 fn charger_visible(now: &Now) -> bool {
     now.objects.observations.iter().any(|observation| {
         observation.class == ObjectClass::Charger && observation.confidence >= 0.4
-    }) || sim_world_extension_score(now, 4) >= 0.5
+    }) || charger_signal_scores(now).1 >= 0.5
 }
 
 fn face_present(now: &Now) -> bool {
@@ -5202,6 +5253,8 @@ impl PossessorSkillRuntime {
         &mut self,
         cockpit: &mut C,
         request: &SkillRequest,
+        body: &BodySense,
+        home_base_contact: bool,
         events: &pete_cockpit::EventBatch,
         now_ms: TimeMs,
     ) -> (SkillStatus, bool) {
@@ -5268,7 +5321,7 @@ impl PossessorSkillRuntime {
         }
 
         status.progress = skill_progress(self.initial_metric, skill_metric(request));
-        if skill_completed(request) {
+        if skill_completed(request, body, home_base_contact) {
             let _ = cockpit.stop();
             status.phase = SkillPhase::Terminal;
             status.outcome = Some(SkillOutcome::Completed);
@@ -5294,6 +5347,16 @@ impl PossessorSkillRuntime {
             self.status = Some(status.clone());
             return (status, false);
         }
+        if request.skill_id == SkillId::AlignWithDock
+            && DockIrCue::from_character(body.infrared_character).is_none()
+        {
+            let stop_sent = cockpit.stop().is_ok();
+            status.phase = SkillPhase::Terminal;
+            status.outcome = Some(SkillOutcome::TargetStale);
+            status.reason = Some("the Home Base IR gradient is not currently visible".into());
+            self.status = Some(status.clone());
+            return (status, stop_sent);
+        }
 
         status.phase = SkillPhase::Running;
         let dispatch_due =
@@ -5301,7 +5364,7 @@ impl PossessorSkillRuntime {
         let mut command_sent = false;
         if dispatch_due {
             status.dispatch_count = status.dispatch_count.saturating_add(1);
-            match dispatch_possessor_skill(cockpit, request) {
+            match dispatch_possessor_skill(cockpit, request, body) {
                 Ok(()) => {
                     self.last_dispatch_ms = now_ms;
                     command_sent = true;
@@ -5324,7 +5387,6 @@ fn skill_requires_bearing(skill_id: SkillId) -> bool {
         SkillId::TurnTowardTarget
             | SkillId::FollowBearing
             | SkillId::ApproachTarget
-            | SkillId::AlignWithDock
             | SkillId::HoldHeading
     )
 }
@@ -5348,16 +5410,21 @@ fn skill_progress(initial: Option<f32>, current: Option<f32>) -> Option<f32> {
     }
 }
 
-fn skill_completed(request: &SkillRequest) -> bool {
+fn skill_completed(
+    request: &SkillRequest,
+    body: &BodySense,
+    home_base_contact: bool,
+) -> bool {
     match request.skill_id {
         SkillId::StopAndStabilize => true,
         SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => request
             .bearing_rad
             .is_some_and(|bearing| bearing.abs() <= 0.10),
-        SkillId::ApproachTarget | SkillId::AlignWithDock => request
+        SkillId::ApproachTarget => request
             .range_m
             .zip(request.stop_range_m)
             .is_some_and(|(range, stop)| range <= stop),
+        SkillId::AlignWithDock => body.charging || home_base_contact,
         _ => false,
     }
 }
@@ -5365,6 +5432,7 @@ fn skill_completed(request: &SkillRequest) -> bool {
 fn dispatch_possessor_skill<C: Cockpit>(
     cockpit: &mut C,
     request: &SkillRequest,
+    body: &BodySense,
 ) -> pete_cockpit::Result<()> {
     // Motherbrain owns feedback/procedure policy. Every step renews only a
     // short-lived Brainstem primitive; the 100 ms skill cadence leaves ample
@@ -5388,7 +5456,12 @@ fn dispatch_possessor_skill<C: Cockpit>(
         SkillId::InspectTarget => cockpit.cmd_vel(0, 300, PRIMITIVE_TTL_MS),
         SkillId::WallFollow => cockpit.cmd_vel(45, 0, PRIMITIVE_TTL_MS),
         SkillId::AlignWithDock => {
-            cockpit.cmd_vel(35, correction.clamp(-400, 400), PRIMITIVE_TTL_MS)
+            let cue = DockIrCue::from_character(body.infrared_character).ok_or_else(|| {
+                pete_cockpit::CockpitError::Policy(
+                    "the Home Base IR gradient is not currently visible".into(),
+                )
+            })?;
+            cockpit.cmd_vel(50, cue.steering_mrad_s(400), PRIMITIVE_TTL_MS)
         }
         SkillId::SystematicSearch => cockpit.cmd_vel(0, 300, PRIMITIVE_TTL_MS),
         SkillId::HoldHeading => cockpit.cmd_vel(0, correction.clamp(-400, 400), PRIMITIVE_TTL_MS),
@@ -5770,6 +5843,8 @@ where
                 let (status, _command_sent) = self.possessor_skills.step(
                     self.cockpit.client_mut(),
                     &request,
+                    &body_before,
+                    status_before.battery.home_base(),
                     &brainstem_events,
                     t_ms,
                 );
@@ -7630,8 +7705,7 @@ fn score_action_candidate(
         }
     });
     let action_value = signals.action_value.map(|value| value.value).unwrap_or(0.0);
-    let charger_near = sim_world_extension_score(now, 3);
-    let charger_visible = sim_world_extension_score(now, 4);
+    let (charger_near, charger_visible) = charger_signal_scores(now);
     let charger_contact_plausible = now.body.charging || charger_near >= 0.92;
     let charger_approach_bonus = if matches!(
         action,
@@ -8032,8 +8106,9 @@ fn map_memory_signal_value(reason: &str, now: &Now) -> Option<f32> {
 }
 
 fn map_memory_confidence(reason: &str, now: &Now) -> f32 {
-    let charge_confidence = sim_world_extension_score(now, 3)
-        .max(sim_world_extension_score(now, 4))
+    let (charger_near, charger_visible) = charger_signal_scores(now);
+    let charge_confidence = charger_near
+        .max(charger_visible)
         .max(now.memory.place_charge_value)
         .clamp(0.0, 1.0);
     match reason {
@@ -8269,9 +8344,10 @@ fn hard_safety_action(now: &Now) -> Option<ActionPrimitive> {
 }
 
 fn charger_reachable_signal(now: &Now) -> bool {
+    let (charger_near, charger_visible) = charger_signal_scores(now);
     now.body.charging
-        || sim_world_extension_score(now, 3) >= 0.25
-        || sim_world_extension_score(now, 4) >= 0.20
+        || charger_near >= 0.25
+        || charger_visible >= 0.20
         || now.memory.place_charge_value >= 0.5
         || now.memory.nearby_best_charge_direction_rad.is_some()
         || now
@@ -10088,7 +10164,9 @@ mod tests {
             ..SkillRequest::default()
         };
 
-        let (running, command_sent) = runtime.step(&mut cockpit, &request, &events, 1);
+        let body = BodySense::default();
+        let (running, command_sent) =
+            runtime.step(&mut cockpit, &request, &body, false, &events, 1);
         assert!(command_sent);
         assert_eq!(running.phase, SkillPhase::Running);
         assert_eq!(running.attempts, 1);
@@ -10099,7 +10177,8 @@ mod tests {
             bearing_rad: Some(0.05),
             ..request
         };
-        let (completed, stop_sent) = runtime.step(&mut cockpit, &aligned, &events, 100);
+        let (completed, stop_sent) =
+            runtime.step(&mut cockpit, &aligned, &body, false, &events, 100);
         assert!(stop_sent);
         assert_eq!(completed.phase, SkillPhase::Terminal);
         assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
@@ -10125,19 +10204,23 @@ mod tests {
             ..SkillRequest::default()
         };
 
-        let (running, first_dispatch) = runtime.step(&mut cockpit, &request, &events, 1);
+        let body = BodySense::default();
+        let (running, first_dispatch) =
+            runtime.step(&mut cockpit, &request, &body, false, &events, 1);
         assert!(first_dispatch);
         assert_eq!(running.attempts, 1);
         assert_eq!(running.dispatch_count, 1);
 
-        let (timed_out, stop_sent) = runtime.step(&mut cockpit, &request, &events, 101);
+        let (timed_out, stop_sent) =
+            runtime.step(&mut cockpit, &request, &body, false, &events, 101);
         assert!(stop_sent);
         assert_eq!(timed_out.phase, SkillPhase::Terminal);
         assert_eq!(timed_out.outcome, Some(SkillOutcome::TimedOut));
         assert_eq!(timed_out.execution_id, running.execution_id);
         assert_eq!(timed_out.attempts, 1);
 
-        let (retry, retry_dispatched) = runtime.step(&mut cockpit, &request, &events, 102);
+        let (retry, retry_dispatched) =
+            runtime.step(&mut cockpit, &request, &body, false, &events, 102);
         assert!(retry_dispatched);
         assert_eq!(retry.phase, SkillPhase::Running);
         assert_ne!(retry.execution_id, timed_out.execution_id);
@@ -10157,14 +10240,105 @@ mod tests {
             ..SkillRequest::default()
         };
 
-        let (first, _) = runtime.step(&mut cockpit, &request, &events, 1);
-        let (second, _) = runtime.step(&mut cockpit, &request, &events, 101);
-        let (third, _) = runtime.step(&mut cockpit, &request, &events, 201);
+        let body = BodySense::default();
+        let (first, _) = runtime.step(&mut cockpit, &request, &body, false, &events, 1);
+        let (second, _) = runtime.step(&mut cockpit, &request, &body, false, &events, 101);
+        let (third, _) = runtime.step(&mut cockpit, &request, &body, false, &events, 201);
 
         assert_eq!(first.execution_id, second.execution_id);
         assert_eq!(second.execution_id, third.execution_id);
         assert_eq!(third.attempts, 1);
         assert_eq!(third.dispatch_count, 3);
+    }
+
+    #[test]
+    fn dock_alignment_skill_follows_ir_and_fails_stopped_when_the_gradient_disappears() {
+        let request = SkillRequest {
+            skill_id: SkillId::AlignWithDock,
+            maximum_duration_ms: 2_000,
+            ..SkillRequest::default()
+        };
+        let mut body = BodySense {
+            infrared_character: 254,
+            ..BodySense::default()
+        };
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let events = cockpit.get_events_since(0).unwrap();
+        let mut runtime = PossessorSkillRuntime::default();
+
+        let (running, command_sent) =
+            runtime.step(&mut cockpit, &request, &body, false, &events, 1);
+        assert!(command_sent);
+        assert_eq!(running.phase, SkillPhase::Running);
+
+        body.infrared_character = 0;
+        let (lost, stop_sent) =
+            runtime.step(&mut cockpit, &request, &body, false, &events, 101);
+        assert!(stop_sent);
+        assert_eq!(lost.phase, SkillPhase::Terminal);
+        assert_eq!(lost.outcome, Some(SkillOutcome::TargetStale));
+        assert!(lost.reason.unwrap().contains("IR gradient"));
+    }
+
+    #[test]
+    fn charging_or_home_base_contact_completes_dock_alignment() {
+        let request = SkillRequest {
+            skill_id: SkillId::AlignWithDock,
+            maximum_duration_ms: 2_000,
+            ..SkillRequest::default()
+        };
+        let body = BodySense {
+            charging: true,
+            ..BodySense::default()
+        };
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let events = cockpit.get_events_since(0).unwrap();
+        let mut runtime = PossessorSkillRuntime::default();
+
+        let (completed, stop_sent) =
+            runtime.step(&mut cockpit, &request, &body, false, &events, 1);
+        assert!(stop_sent);
+        assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
+
+        let body = BodySense::default();
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let events = cockpit.get_events_since(0).unwrap();
+        let mut runtime = PossessorSkillRuntime::default();
+        let (completed, stop_sent) =
+            runtime.step(&mut cockpit, &request, &body, true, &events, 1);
+        assert!(stop_sent);
+        assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
+    }
+
+    #[test]
+    fn create_ir_adds_directional_charger_evidence_and_bias_scores() {
+        let mut now = Now::blank(
+            100,
+            BodySense {
+                battery_level: 0.15,
+                infrared_character: 246,
+                ..BodySense::default()
+            },
+        );
+
+        apply_create_ir_charger_cue(&mut now);
+        let observation = now.objects.observations.last().unwrap();
+        assert_eq!(observation.class, ObjectClass::Charger);
+        assert_eq!(observation.source, ObjectObservationSource::CreateIr);
+        assert_eq!(observation.bearing_rad, -0.35);
+        assert_eq!(observation.distance_m, None);
+        assert_eq!(charger_signal_scores(&now), (0.55, 0.85));
+
+        let mut input = test_conductor_input(ActionPrimitive::Stop);
+        input.body = now.body.clone();
+        input.charger_near_score = charger_signal_scores(&now).0;
+        input.charger_visible_score = charger_signal_scores(&now).1;
+        assert_eq!(
+            SimpleConductor::default().choose(input).unwrap(),
+            ActionPrimitive::Approach {
+                target: ApproachTarget::Charger,
+            }
+        );
     }
 
     #[test]
@@ -10184,13 +10358,16 @@ mod tests {
             expected_progress: 0.9,
             ..SkillRequest::default()
         };
-        let (_, command_sent) = runtime.step(&mut cockpit, &request, &initial_events, 1);
+        let body = BodySense::default();
+        let (_, command_sent) =
+            runtime.step(&mut cockpit, &request, &body, false, &initial_events, 1);
         assert!(command_sent);
 
         let cursor = initial_events.next_seq.saturating_sub(1);
         cockpit.set_bump(true, false);
         let reflex_events = cockpit.get_events_since(cursor).unwrap();
-        let (preempted, command_sent) = runtime.step(&mut cockpit, &request, &reflex_events, 100);
+        let (preempted, command_sent) =
+            runtime.step(&mut cockpit, &request, &body, false, &reflex_events, 100);
 
         assert!(!command_sent);
         assert_eq!(preempted.phase, SkillPhase::Terminal);

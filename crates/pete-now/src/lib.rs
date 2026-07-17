@@ -172,6 +172,7 @@ pub enum ObjectObservationSource {
     Sim,
     Kinect,
     Captioner,
+    CreateIr,
     HumanLabel,
     Unknown,
 }
