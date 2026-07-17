@@ -194,6 +194,8 @@ All notable changes are grouped by date.
 - Feed possessor-skill progress and terminal outcomes back to the originating goal, including explicit progress expectations and failure pressure without discarding the active goal.
 - Add `careful_mode` to the brainstem verb inventory and compatibility checks, including firmware parser/runtime/status support for both line-based and JSON control payloads and compact status fields for active/remaining time.
 - Keep `codex` sync automation behavior stable by pinning the sync model to `gpt-5.3-codex-spark` and forcing `high` model reasoning effort for summary generation.
+- Make `just possess` default to `read-only` robot mode via CLI `--mode regular`, then normalize regular/read-only mode aliases so operator scripts can use the regular launcher profile without changing possession behavior.
+- Add `--mode` parsing in `xtask possess` and propagate a normalized robot mode into `PETE_ROBOT_MODE`, preserving other possession arguments and retries across backend fallback and identity-acceptance flows.
 
 ### Ongoing
 

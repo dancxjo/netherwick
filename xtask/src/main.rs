@@ -897,6 +897,8 @@ fn optional_arg(command: &mut Vec<String>, env_name: &str, default: &str, flag: 
 }
 
 fn possess(args: &[String]) -> Result<()> {
+    let (robot_args, robot_mode) = split_mode_override(args);
+    let robot_mode = normalize_possession_mode(&robot_mode);
     let mut device = env::var("PETE_BRAINSTEM_DEVICE_ID")
         .map_err(|_| io::Error::other("set PETE_BRAINSTEM_DEVICE_ID in .env"))?;
     let mut boot = env_or("PETE_BRAINSTEM_BOOT_ID", "unknown");
@@ -933,7 +935,8 @@ fn possess(args: &[String]) -> Result<()> {
     } else {
         cockpit_backend()?
     };
-    let (mut status, mut log) = possession_attempt(args, &device, &boot, &backend, &port)?;
+    let (mut status, mut log) =
+        possession_attempt(&robot_args, &robot_mode, &device, &boot, &backend, &port)?;
     if status.success() {
         return Ok(());
     }
@@ -941,7 +944,8 @@ fn possess(args: &[String]) -> Result<()> {
     if !backend_was_explicit && backend == "uart" && connected_to_brainstem_wifi(&host) {
         backend = "wifi".to_owned();
         println!("Brainstem USB/UART failed; retrying possession over Pete Wi-Fi at {host}.");
-        (status, log) = possession_attempt(args, &device, &boot, &backend, &port)?;
+        (status, log) =
+            possession_attempt(&robot_args, &robot_mode, &device, &boot, &backend, &port)?;
         if status.success() {
             return Ok(());
         }
@@ -949,7 +953,8 @@ fn possess(args: &[String]) -> Result<()> {
     if backend == "wifi" && log.contains("reason_code: InvalidIdentity") {
         println!("Wi-Fi identity continuity is not established; bootstrapping the pinned brainstem over USB.");
         bootstrap_brainstem(single_brainstem_port().as_deref())?;
-        (status, log) = possession_attempt(args, &device, &boot, &backend, &port)?;
+        (status, log) =
+            possession_attempt(&robot_args, &robot_mode, &device, &boot, &backend, &port)?;
         if status.success() {
             return Ok(());
         }
@@ -959,7 +964,8 @@ fn possess(args: &[String]) -> Result<()> {
         println!(
             "Accepted current boot identity for pinned device {device}; updated .env and retrying."
         );
-        (status, _) = possession_attempt(args, &device, &live_boot, &backend, &port)?;
+        (status, _) =
+            possession_attempt(&robot_args, &robot_mode, &device, &live_boot, &backend, &port)?;
     }
     if status.success() {
         Ok(())
@@ -970,6 +976,7 @@ fn possess(args: &[String]) -> Result<()> {
 
 fn possession_attempt(
     args: &[String],
+    robot_mode: &str,
     device: &str,
     boot: &str,
     backend: &str,
@@ -1006,7 +1013,7 @@ fn possession_attempt(
     let mut command = robot_process(
         &robot_args,
         &[
-            ("PETE_ROBOT_MODE", "possession-slow".to_owned()),
+            ("PETE_ROBOT_MODE", robot_mode.to_owned()),
             ("PETE_COCKPIT_BACKEND", backend.to_owned()),
             ("PETE_COCKPIT_PORT", port.to_owned()),
             (
@@ -1021,6 +1028,39 @@ fn possession_attempt(
         ],
     )?;
     run_program_captured(&mut command)
+}
+
+fn split_mode_override(args: &[String]) -> (Vec<String>, String) {
+    let mut robot_mode = "possession-slow".to_owned();
+    let mut robot_args = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "--mode" {
+            if let Some(next) = args.get(i + 1) {
+                robot_mode = next.to_owned();
+                i += 2;
+                continue;
+            }
+            robot_args.push(args[i].to_owned());
+            i += 1;
+            continue;
+        }
+        if let Some(mode) = args[i].strip_prefix("--mode=") {
+            robot_mode = mode.to_owned();
+            i += 1;
+            continue;
+        }
+        robot_args.push(args[i].to_owned());
+        i += 1;
+    }
+    (robot_args, robot_mode)
+}
+
+fn normalize_possession_mode(mode: &str) -> String {
+    match mode {
+        "regular" => "read-only".to_owned(),
+        _ => mode.to_owned(),
+    }
 }
 
 fn run_program_captured(
