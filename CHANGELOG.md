@@ -7,8 +7,9 @@ All notable changes are grouped by date.
 ### Auto-sync (2026-07-15)
 
 - Refresh the lockfile against the current workspace and external Tongues
-  dependency graph, removing stale workspace-only speech-training packages and
-  their plotting dependencies.
+  dependency graph, restoring the speech-training packages and plotting
+  dependencies required by the current path manifests.
+- Record the `pete-cockpit` CLI's `clap` dependency in the workspace lockfile.
 - Record the current `pete-memory`, ORT, `burn-core`, `rgb`, and `xtask`
   dependency metadata.
 
