@@ -21,6 +21,7 @@ members = [
     "crates/pete-events",
     "crates/pete-llm",
     "crates/pete-conductor",
+    "crates/pete-skills",
     "crates/pete-runtime",
     "crates/pete-server",
     "crates/pete-ui",
@@ -60,6 +61,7 @@ base64 = "0.22"
 dotenvy = "0.15"
 sha2 = "0.10"
 socket2 = "0.5"
+mlua = { version = "0.11.6", features = ["lua54", "vendored", "async", "send", "serialize"] }
 
 burn = { version = "0.21", features = ["ndarray", "autodiff"] }
 burn-cuda = { version = "0.21", default-features = false, features = ["std", "autotune"] }

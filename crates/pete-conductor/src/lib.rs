@@ -17,7 +17,7 @@ pub use goal_architecture::{
     GoalInterpretationContext, GoalInterpretationSnapshot, GoalInterpreter, GoalModule,
     GoalPerceptionContext, GoalPerceptionSnapshot, GoalProgressReport, GoalRuntimeState,
     GoalSystem, Motivation, ProgressExpectation, ProgressObservation, SkillId, SkillOutcome,
-    SkillPhase, SkillRequest, SkillStatus, StrategyProgressResponse,
+    SkillPhase, SkillRequest, SkillScriptStatus, SkillStatus, StrategyProgressResponse,
 };
 pub use pete_now::{EvidenceRef, WorldEntity, WorldEntityKind, WorldModelSnapshot};
 

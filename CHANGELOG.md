@@ -19,6 +19,11 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add an embedded, sandboxed Lua 5.4 motherbrain skill runtime with atomic
+  runtime loading and reload, one foreground call tree, transparent coroutine
+  suspension at bodily operations, deterministic implicit organ ownership,
+  fail-fast concurrent `together`, typed preemption/outcomes, bounded execution,
+  canonical `Now` queries, goal progress, and experience provenance.
 - Add generation-bound `escape_motion` segments for automatic bump/cliff
   recovery, with hazard-specific envelopes, 250 ms TTLs, absolute-hazard
   preemption, observed-motion reporting, and no freestanding safety override;
@@ -68,6 +73,11 @@ All notable changes are grouped by date.
 
 ### Changed
 
+- Move deterministic motherbrain sequencing, including IR docking and
+  post-reflex bump/cliff recovery, into ordinary runtime-loaded Lua functions;
+  retain numerical controllers, possession, 250 ms primitive renewal, and
+  hazard-envelope validation in Rust, and use the identical scheduler and
+  scripts in simulation and on Pete.
 - Interpret Home Base red, green, and force-field IR as directional charger
   evidence in Pete's sensorium, bias charger-seeking without implying contact,
   and let `AlignWithDock` follow that gradient with 250 ms primitives until

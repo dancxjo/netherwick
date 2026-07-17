@@ -317,19 +317,36 @@ pub enum SkillId {
     AlignWithDock,
     SystematicSearch,
     HoldHeading,
+    RetreatFromCliff,
+    ReleasePersistentBumper,
+    TurnBy,
+    DriveDistance,
+    Undock,
+    SearchForDock,
+    ReturnToDock,
+    RuntimeLoaded,
 }
 
 fn skill_progress_metric(skill_id: SkillId) -> &'static str {
     match skill_id {
-        SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => {
-            "bearing_error"
-        }
-        SkillId::ApproachTarget | SkillId::AlignWithDock => "target_distance",
+        SkillId::TurnTowardTarget
+        | SkillId::FollowBearing
+        | SkillId::HoldHeading
+        | SkillId::TurnBy => "bearing_error",
+        SkillId::ApproachTarget
+        | SkillId::AlignWithDock
+        | SkillId::SearchForDock
+        | SkillId::ReturnToDock => "target_distance",
         SkillId::BackAway => "reverse_displacement",
+        SkillId::RetreatFromCliff
+        | SkillId::ReleasePersistentBumper
+        | SkillId::DriveDistance
+        | SkillId::Undock => "reverse_displacement",
         SkillId::InspectTarget => "uncertainty_reduction",
         SkillId::WallFollow => "path_progress",
         SkillId::SystematicSearch => "frontier_coverage",
         SkillId::StopAndStabilize => "motion_stability",
+        SkillId::RuntimeLoaded => "goal_progress",
     }
 }
 
@@ -340,6 +357,9 @@ fn default_progress_tolerance() -> f32 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SkillRequest {
     pub skill_id: SkillId,
+    /// Fully qualified runtime implementation ID for `RuntimeLoaded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation_id: Option<String>,
     pub goal_id: Option<GoalId>,
     pub behavior_id: Option<String>,
     pub target: Option<EntityId>,
@@ -360,6 +380,7 @@ impl Default for SkillRequest {
     fn default() -> Self {
         Self {
             skill_id: SkillId::default(),
+            implementation_id: None,
             goal_id: None,
             behavior_id: None,
             target: None,
@@ -371,6 +392,17 @@ impl Default for SkillRequest {
             progress_metric: String::new(),
             progress_baseline: None,
             progress_tolerance: default_progress_tolerance(),
+        }
+    }
+}
+
+impl SkillRequest {
+    pub fn runtime_loaded(implementation_id: impl Into<String>) -> Self {
+        Self {
+            skill_id: SkillId::RuntimeLoaded,
+            implementation_id: Some(implementation_id.into()),
+            progress_metric: "goal_progress".to_string(),
+            ..Self::default()
         }
     }
 }
@@ -390,10 +422,35 @@ pub enum SkillOutcome {
     Completed,
     Failed,
     TimedOut,
+    Cancelled,
     SafetyPreempted,
     AuthorityLost,
+    TransportLost,
+    CapabilityUnavailable,
+    ResourcePreempted,
+    PostconditionFailed,
+    ScriptError,
+    BudgetExceeded,
+    /// Retained for decoding historical status; new skill runtimes use a
+    /// broad typed outcome plus a structured `target_stale` detail.
     TargetStale,
+    /// Retained for decoding historical status.
     Unavailable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SkillScriptStatus {
+    pub skill_id: String,
+    pub source_hash: String,
+    pub source_path: String,
+    pub current_function: Option<String>,
+    pub current_operation: Option<String>,
+    #[serde(default)]
+    pub held_resources: Vec<String>,
+    #[serde(default)]
+    pub waiting_resources: Vec<String>,
+    #[serde(default)]
+    pub active_children: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -414,6 +471,8 @@ pub struct SkillStatus {
     pub started_at_ms: Option<u64>,
     pub updated_at_ms: u64,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<SkillScriptStatus>,
 }
 
 impl Affordance {
@@ -436,11 +495,21 @@ impl Affordance {
             SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => {
                 self.bearing_rad.map(f32::abs)
             }
-            SkillId::BackAway | SkillId::SystematicSearch => Some(0.0),
+            SkillId::BackAway
+            | SkillId::SystematicSearch
+            | SkillId::RetreatFromCliff
+            | SkillId::ReleasePersistentBumper
+            | SkillId::DriveDistance
+            | SkillId::Undock
+            | SkillId::SearchForDock
+            | SkillId::ReturnToDock => Some(0.0),
+            SkillId::TurnBy => self.bearing_rad.map(f32::abs),
+            SkillId::RuntimeLoaded => Some(0.0),
             _ => None,
         };
         self.skill_request = Some(SkillRequest {
             skill_id,
+            implementation_id: None,
             goal_id: None,
             behavior_id: None,
             target: self.target.clone(),
@@ -2637,12 +2706,12 @@ impl GoalSystem {
         });
         goal.runtime_mut().attempts = goal.runtime().attempts.max(status.attempts);
         if let Some(progress) = measured_progress {
-            let delta = previous_progress.map_or(0.0, |previous| progress - previous);
+            let delta = previous_progress.map_or(progress, |previous| progress - previous);
             goal.runtime_mut().progress_trend =
                 (0.8 * goal.runtime().progress_trend + 0.2 * delta).clamp(-1.0, 1.0);
             goal.runtime_mut().recent_progress =
                 (0.7 * goal.runtime().recent_progress + 0.3 * progress).clamp(0.0, 1.0);
-            if progress >= status.request.progress_tolerance.max(0.01) {
+            if delta > f32::EPSILON && progress >= status.request.progress_tolerance.max(0.01) {
                 goal.runtime_mut().last_progress_at_ms = Some(status.updated_at_ms);
             }
         }
@@ -2657,6 +2726,14 @@ impl GoalSystem {
                 Some(
                     SkillOutcome::Failed
                         | SkillOutcome::TimedOut
+                        | SkillOutcome::Cancelled
+                        | SkillOutcome::AuthorityLost
+                        | SkillOutcome::TransportLost
+                        | SkillOutcome::CapabilityUnavailable
+                        | SkillOutcome::ResourcePreempted
+                        | SkillOutcome::PostconditionFailed
+                        | SkillOutcome::ScriptError
+                        | SkillOutcome::BudgetExceeded
                         | SkillOutcome::TargetStale
                         | SkillOutcome::Unavailable
                 )
@@ -3073,13 +3150,13 @@ impl GoalSystem {
                 goal.runtime_mut().last_confidence = Some(confidence);
             }
             if let Some(observed) = observed {
-                let delta = previous_progress.map_or(0.0, |previous| observed - previous);
+                let delta = previous_progress.map_or(observed, |previous| observed - previous);
                 goal.runtime_mut().progress_trend =
                     (0.8 * goal.runtime().progress_trend + 0.2 * delta).clamp(-1.0, 1.0);
                 let recent_progress =
                     (0.7 * goal.runtime().recent_progress + 0.3 * observed).clamp(0.0, 1.0);
                 goal.runtime_mut().recent_progress = recent_progress;
-                if observed >= pending.tolerance.max(0.01) {
+                if delta > f32::EPSILON && observed >= pending.tolerance.max(0.01) {
                     goal.runtime_mut().last_progress_at_ms = Some(world.t_ms);
                 }
                 if attempt_finished && observed + pending.tolerance < pending.expected_progress {
@@ -3776,6 +3853,7 @@ mod tests {
             started_at_ms: Some(1_000),
             updated_at_ms: 2_000,
             reason: Some("no target progress".to_string()),
+            script: None,
         };
         system.observe_skill_status(&failure);
         system.observe_skill_status(&failure);
@@ -3818,6 +3896,7 @@ mod tests {
             started_at_ms: Some(1_000),
             updated_at_ms: 1_100,
             reason: Some("contact withdrawal preempted possessor control".to_string()),
+            script: None,
         });
 
         let runtime = system
@@ -3843,6 +3922,82 @@ mod tests {
                 .map(|observation| observation.source.as_str()),
             Some("autonomic_safety_preemption")
         );
+    }
+
+    #[test]
+    fn possessor_progress_is_goal_scoped_and_only_fresh_when_it_advances() {
+        let mut system = GoalSystem::default();
+        let request = SkillRequest {
+            skill_id: SkillId::ApproachTarget,
+            goal_id: Some(GoalId::new("seek_charger")),
+            progress_metric: "target_distance".to_string(),
+            progress_baseline: Some(2.0),
+            progress_tolerance: 0.1,
+            ..SkillRequest::default()
+        };
+        let status = |progress, updated_at_ms| SkillStatus {
+            request: request.clone(),
+            execution_id: 9,
+            phase: SkillPhase::Running,
+            outcome: None,
+            progress: Some(progress),
+            attempts: 1,
+            dispatch_count: 1,
+            started_at_ms: Some(1_000),
+            updated_at_ms,
+            reason: None,
+            script: None,
+        };
+
+        system.observe_skill_status(&status(0.25, 1_100));
+        let charge = system
+            .goals
+            .iter()
+            .find(|goal| goal.id() == &GoalId::new("seek_charger"))
+            .unwrap()
+            .runtime();
+        assert_eq!(charge.last_progress_at_ms, Some(1_100));
+        assert_eq!(
+            charge
+                .last_progress_observation
+                .as_ref()
+                .and_then(|observation| observation.progress),
+            Some(0.25)
+        );
+        assert!(charge.recent_progress > 0.0);
+        let explore_before = system
+            .goals
+            .iter()
+            .find(|goal| goal.id() == &GoalId::new("explore"))
+            .unwrap()
+            .runtime()
+            .clone();
+
+        system.observe_skill_status(&status(0.25, 1_200));
+        let charge = system
+            .goals
+            .iter()
+            .find(|goal| goal.id() == &GoalId::new("seek_charger"))
+            .unwrap()
+            .runtime();
+        assert_eq!(charge.last_progress_at_ms, Some(1_100));
+        let explore_after = system
+            .goals
+            .iter()
+            .find(|goal| goal.id() == &GoalId::new("explore"))
+            .unwrap()
+            .runtime();
+        assert_eq!(explore_after, &explore_before);
+
+        system.observe_skill_status(&status(0.5, 1_300));
+        let charge = system
+            .goals
+            .iter()
+            .find(|goal| goal.id() == &GoalId::new("seek_charger"))
+            .unwrap()
+            .runtime();
+        assert_eq!(charge.last_progress_at_ms, Some(1_300));
+        assert!(charge.progress_trend > 0.0);
     }
 
     #[test]
@@ -3884,6 +4039,7 @@ mod tests {
                 started_at_ms: Some(1_000),
                 updated_at_ms: 1_000 + attempt as u64 * 25,
                 reason: Some("charger search produced no evidence".to_string()),
+                script: None,
             });
         }
         let charge_runtime = system
@@ -3948,6 +4104,7 @@ mod tests {
                 started_at_ms: Some(1_000),
                 updated_at_ms: 1_200 + attempt as u64 * 25,
                 reason: Some("bounded charger retry failed".to_string()),
+                script: None,
             });
         }
         let abandoned =
@@ -3996,6 +4153,7 @@ mod tests {
                 started_at_ms: Some(1_000),
                 updated_at_ms: 1_000 + attempt as u64 * 25,
                 reason: Some("frontier coverage did not increase".to_string()),
+                script: None,
             });
         }
 

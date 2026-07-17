@@ -131,6 +131,10 @@ Pete now has deliberately separate bodily control and bulk-data planes.
   still subordinate to brainstem safety and reflex preemption.
 - The Pi 5 motherbrain remains canonical for Pete's live experience, graph,
   vector stores, inference state, and bounded online learning.
+- Deterministic motherbrain policy is runtime-loaded Lua. Its embedded
+  scheduler keeps one foreground intention, transparently suspends ordinary
+  functions at bodily operations, and lets disjoint organs overlap through
+  [`together`](docs/028-lua-motherbrain-skills.md).
 - Forebrains are enrolled compute nodes that receive immutable exports and run
   authorized jobs without acquiring motion authority.
 - Experience bundles are checksummed, resumable, and immutable.

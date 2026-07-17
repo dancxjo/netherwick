@@ -3,7 +3,7 @@ mod sleep;
 pub use sleep::*;
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -75,7 +75,12 @@ use pete_sensors::{
     SurfaceExtractorOutput, World, WorldSnapshot,
 };
 use pete_sim::{SimCockpit, VirtualWorld};
+use pete_skills::{
+    BodyResource, HazardKind, HostOperation, LuaSkillConfig, LuaSkillRuntime, OperationContext,
+    OrganDriver, OrganPoll, PrimitiveIntent, SkillFailure,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tsrun::{js_value_to_json, Interpreter, JsError, StepResult};
 use uuid::Uuid;
 
@@ -5267,229 +5272,1065 @@ struct SensorPollHealth {
 
 const SENSOR_FAILURE_REPORT_INTERVAL_MS: TimeMs = 30_000;
 
-#[derive(Clone, Debug, Default)]
 struct PossessorSkillRuntime {
+    lua: Option<LuaSkillRuntime>,
+    load_error: Option<String>,
+    driver: EmbodiedLuaDriverState,
     status: Option<SkillStatus>,
-    initial_metric: Option<f32>,
+    provenance: Option<serde_json::Value>,
+    last_reload_check_ms: TimeMs,
+}
+
+impl Default for PossessorSkillRuntime {
+    fn default() -> Self {
+        let mut config = LuaSkillConfig::default();
+        config.directory = std::env::var_os("PETE_MOTHERBRAIN_SKILL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills/motherbrain")
+            });
+        match LuaSkillRuntime::load(config) {
+            Ok(lua) => Self {
+                lua: Some(lua),
+                load_error: None,
+                driver: EmbodiedLuaDriverState::default(),
+                status: None,
+                provenance: None,
+                last_reload_check_ms: 0,
+            },
+            Err(error) => Self {
+                lua: None,
+                load_error: Some(error.to_string()),
+                driver: EmbodiedLuaDriverState::default(),
+                status: None,
+                provenance: None,
+                last_reload_check_ms: 0,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct LuaDriverOperationState {
+    start_x_m: f32,
+    start_y_m: f32,
+    start_heading_rad: f32,
     last_dispatch_ms: TimeMs,
-    intention_attempts: u32,
-    next_execution_id: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EmbodiedLuaDriverState {
+    operations: std::collections::HashMap<u64, LuaDriverOperationState>,
+}
+
+struct RealLuaOrganDriver<'a, C> {
+    cockpit: &'a mut C,
+    request: &'a SkillRequest,
+    status: &'a StatusSummary,
+    home_base_contact: bool,
+    state: &'a mut EmbodiedLuaDriverState,
+    command_sent: bool,
+}
+
+impl<C: Cockpit> OrganDriver for RealLuaOrganDriver<'_, C> {
+    fn poll(
+        &mut self,
+        operation: &HostOperation,
+        context: OperationContext,
+        now: &Now,
+        _events: &pete_cockpit::EventBatch,
+    ) -> OrganPoll {
+        let state = self
+            .state
+            .operations
+            .entry(context.operation_id)
+            .or_insert_with(|| LuaDriverOperationState {
+                start_x_m: now.body.odometry.x_m,
+                start_y_m: now.body.odometry.y_m,
+                start_heading_rad: now.body.odometry.heading_rad,
+                last_dispatch_ms: 0,
+            });
+        let dispatch_due = state.last_dispatch_ms == 0
+            || context.now_ms.saturating_sub(state.last_dispatch_ms) >= 100;
+        let mut primitive = None;
+        let outcome = match operation {
+            HostOperation::Stop => {
+                if context.first_poll {
+                    if let Err(error) = self.cockpit.stop() {
+                        return OrganPoll::Failed(cockpit_skill_failure(operation, error));
+                    }
+                    self.command_sent = true;
+                }
+                OrganPoll::Completed(json!({"stopped": true}))
+            }
+            HostOperation::FaceBearing { bearing_rad } => {
+                let requested_bearing = self.request.bearing_rad.unwrap_or(*bearing_rad);
+                let turned = angle_delta(now.body.odometry.heading_rad, state.start_heading_rad);
+                let remaining = if self.request.target.is_some() {
+                    requested_bearing
+                } else {
+                    angle_delta(requested_bearing, turned)
+                };
+                if remaining.abs() <= 0.10 {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"bearing_error": remaining, "turned_rad": turned}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    let available_s = self
+                        .request
+                        .maximum_duration_ms
+                        .saturating_sub(100)
+                        .max(100) as f32
+                        / 1_000.0;
+                    let angular_rad_s = (remaining.abs() / available_s * 1.25).clamp(0.25, 2.5)
+                        * remaining.signum();
+                    let angular = radians_to_mrad(angular_rad_s);
+                    match self.cockpit.cmd_vel(0, angular, context.primitive_ttl_ms) {
+                        Ok(()) => {
+                            self.command_sent = true;
+                            primitive = Some(primitive_intent(
+                                context,
+                                operation,
+                                json!({"linear_mm_s": 0, "angular_mrad_s": angular, "ttl_ms": context.primitive_ttl_ms, "remaining_rad": remaining}),
+                            ));
+                            OrganPoll::Pending {
+                                progress: Some(("bearing_error".into(), remaining.abs())),
+                                primitive: None,
+                            }
+                        }
+                        Err(error) => OrganPoll::Failed(cockpit_skill_failure(operation, error)),
+                    }
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some(("bearing_error".into(), remaining.abs())),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::FollowBearing {
+                bearing_rad,
+                linear_m_s,
+            } => {
+                let bearing = self.request.bearing_rad.unwrap_or(*bearing_rad);
+                if bearing.abs() <= 0.10 {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"bearing_error": bearing}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    with_operation_progress(
+                        dispatch_velocity(
+                            self.cockpit,
+                            operation,
+                            context,
+                            (*linear_m_s * 1_000.0).round() as i16,
+                            radians_to_mrad(bearing).clamp(-500, 500),
+                            &mut self.command_sent,
+                            &mut primitive,
+                        ),
+                        Some(("bearing_error".into(), bearing.abs())),
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some(("bearing_error".into(), bearing.abs())),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::HoldHeading {
+                heading_rad,
+                linear_m_s,
+            } => {
+                let error = self.request.bearing_rad.unwrap_or(*heading_rad);
+                if error.abs() <= 0.10 {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"heading_error": error}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    with_operation_progress(
+                        dispatch_velocity(
+                            self.cockpit,
+                            operation,
+                            context,
+                            (*linear_m_s * 1_000.0).round() as i16,
+                            radians_to_mrad(error).clamp(-400, 400),
+                            &mut self.command_sent,
+                            &mut primitive,
+                        ),
+                        Some(("bearing_error".into(), error.abs())),
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some(("heading_error".into(), error.abs())),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::Approach { stop_range_m, .. } => {
+                let Some(range) = self.request.range_m else {
+                    return OrganPoll::Failed(
+                        SkillFailure::new(
+                            SkillOutcome::Failed,
+                            "target_stale",
+                            "approach target has no current range",
+                        )
+                        .for_operation(operation),
+                    );
+                };
+                let Some(bearing) = self.request.bearing_rad else {
+                    return OrganPoll::Failed(
+                        SkillFailure::new(
+                            SkillOutcome::Failed,
+                            "target_stale",
+                            "approach target has no current bearing",
+                        )
+                        .for_operation(operation),
+                    );
+                };
+                if range <= *stop_range_m {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"range_m": range, "stop_range_m": stop_range_m}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    with_operation_progress(
+                        dispatch_velocity(
+                            self.cockpit,
+                            operation,
+                            context,
+                            50,
+                            radians_to_mrad(bearing).clamp(-500, 500),
+                            &mut self.command_sent,
+                            &mut primitive,
+                        ),
+                        Some(("target_distance".into(), range)),
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some(("target_distance".into(), range)),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::AlignWithDock => {
+                if now.body.charging || self.home_base_contact {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"charging": true}),
+                        &mut self.command_sent,
+                    )
+                } else {
+                    let Some(cue) = DockIrCue::from_character(now.body.infrared_character) else {
+                        return OrganPoll::Failed(
+                            SkillFailure::new(
+                                SkillOutcome::Failed,
+                                "target_stale",
+                                "Home Base IR gradient disappeared",
+                            )
+                            .for_operation(operation),
+                        );
+                    };
+                    if dispatch_due {
+                        with_operation_progress(
+                            dispatch_velocity(
+                                self.cockpit,
+                                operation,
+                                context,
+                                50,
+                                cue.steering_mrad_s(400),
+                                &mut self.command_sent,
+                                &mut primitive,
+                            ),
+                            self.request
+                                .range_m
+                                .map(|range| ("target_distance".into(), range)),
+                        )
+                    } else {
+                        OrganPoll::Pending {
+                            progress: self
+                                .request
+                                .range_m
+                                .map(|range| ("target_distance".into(), range)),
+                            primitive: None,
+                        }
+                    }
+                }
+            }
+            HostOperation::SearchForDockSignal => {
+                if self.home_base_contact
+                    || DockIrCue::from_character(now.body.infrared_character).is_some()
+                {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"infrared_character": now.body.infrared_character}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    dispatch_velocity(
+                        self.cockpit,
+                        operation,
+                        context,
+                        0,
+                        300,
+                        &mut self.command_sent,
+                        &mut primitive,
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: None,
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::VerifyCharging => {
+                if now.body.charging || self.home_base_contact {
+                    OrganPoll::Completed(json!({"charging": true}))
+                } else if context.elapsed_ms >= 1_000 {
+                    OrganPoll::Failed(
+                        SkillFailure::new(
+                            SkillOutcome::PostconditionFailed,
+                            "charging_not_verified",
+                            "Home Base contact did not produce charging",
+                        )
+                        .for_operation(operation),
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: None,
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::Drive {
+                linear_m_s,
+                duration_ms,
+            } => {
+                let progress = if self.request.progress_metric == "reverse_displacement" {
+                    let expected_distance =
+                        linear_m_s.abs() * (*duration_ms as f32 / 1_000.0).max(0.001);
+                    (
+                        "reverse_displacement".to_string(),
+                        distance_from_start(state, &now.body) / expected_distance,
+                    )
+                } else {
+                    (
+                        "duration".to_string(),
+                        context.elapsed_ms as f32 / (*duration_ms).max(1) as f32,
+                    )
+                };
+                if context.elapsed_ms >= *duration_ms {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"duration_ms": duration_ms}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    with_operation_progress(
+                        dispatch_velocity(
+                            self.cockpit,
+                            operation,
+                            context,
+                            (*linear_m_s * 1_000.0).round() as i16,
+                            0,
+                            &mut self.command_sent,
+                            &mut primitive,
+                        ),
+                        Some(progress),
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some(progress),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::DriveDistance {
+                distance_m,
+                velocity_m_s,
+            } => {
+                let travelled =
+                    distance_from_start(state, &now.body) * velocity_m_s.signum().max(-1.0);
+                if travelled.abs() >= distance_m.abs() {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"distance_m": travelled}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    with_operation_progress(
+                        dispatch_velocity(
+                            self.cockpit,
+                            operation,
+                            context,
+                            (*velocity_m_s * 1_000.0).round() as i16,
+                            0,
+                            &mut self.command_sent,
+                            &mut primitive,
+                        ),
+                        Some((
+                            "reverse_displacement".into(),
+                            travelled.abs() / distance_m.abs().max(0.001),
+                        )),
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some((
+                            "reverse_displacement".into(),
+                            travelled.abs() / distance_m.abs().max(0.001),
+                        )),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::TurnBy { angle_rad } => {
+                let turned = angle_delta(now.body.odometry.heading_rad, state.start_heading_rad);
+                if turned.abs() >= angle_rad.abs() {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"turned_rad": turned}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    with_operation_progress(
+                        dispatch_velocity(
+                            self.cockpit,
+                            operation,
+                            context,
+                            0,
+                            if *angle_rad < 0.0 { -300 } else { 300 },
+                            &mut self.command_sent,
+                            &mut primitive,
+                        ),
+                        Some((
+                            "frontier_coverage".into(),
+                            turned.abs() / angle_rad.abs().max(0.001),
+                        )),
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some((
+                            "frontier_coverage".into(),
+                            turned.abs() / angle_rad.abs().max(0.001),
+                        )),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::FollowWall { side, .. } => {
+                if !now.body.flags.wall {
+                    complete_stopped(
+                        self.cockpit,
+                        operation,
+                        json!({"wall_clear": true}),
+                        &mut self.command_sent,
+                    )
+                } else if dispatch_due {
+                    with_operation_progress(
+                        dispatch_velocity(
+                            self.cockpit,
+                            operation,
+                            context,
+                            45,
+                            if side == "left" { 120 } else { -120 },
+                            &mut self.command_sent,
+                            &mut primitive,
+                        ),
+                        Some((
+                            "path_progress".into(),
+                            distance_from_start(state, &now.body).clamp(0.0, 1.0),
+                        )),
+                    )
+                } else {
+                    OrganPoll::Pending {
+                        progress: None,
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::Undock => {
+                if context.first_poll {
+                    match self.cockpit.cmd_vel(-1, 0, 10) {
+                        Ok(()) => {
+                            self.command_sent = true;
+                            primitive = Some(primitive_intent(
+                                context,
+                                operation,
+                                json!({"linear_mm_s": -1, "angular_mrad_s": 0, "ttl_ms": 10}),
+                            ));
+                        }
+                        Err(error) => {
+                            return OrganPoll::Failed(cockpit_skill_failure(operation, error));
+                        }
+                    }
+                }
+                if !now.body.charging && context.elapsed_ms >= 1_500 {
+                    OrganPoll::Completed(json!({"undocked": true}))
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some((
+                            "dock_departure".into(),
+                            context.elapsed_ms as f32 / 1_500.0,
+                        )),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::Retreat { hazard, distance_m } => {
+                let incompatible_sensor = match hazard {
+                    HazardKind::BumperFront => {
+                        now.body.flags.cliff_left
+                            || now.body.flags.cliff_front_left
+                            || now.body.flags.cliff_front_right
+                            || now.body.flags.cliff_right
+                    }
+                    HazardKind::Cliff => now.body.flags.bump_left || now.body.flags.bump_right,
+                };
+                let imu_absolute = self.status.imu.health.as_deref() == Some("fault")
+                    || self
+                        .status
+                        .imu
+                        .tilt_magnitude_mrad
+                        .is_some_and(|value| value >= 650)
+                    || self
+                        .status
+                        .imu
+                        .impact_score_mm_s2
+                        .is_some_and(|value| value >= 18_000);
+                if self.status.estop_latched == Some(true)
+                    || now.body.flags.wheel_drop
+                    || now.body.charging
+                    || incompatible_sensor
+                    || imu_absolute
+                {
+                    return OrganPoll::Failed(
+                        SkillFailure::new(
+                            SkillOutcome::SafetyPreempted,
+                            "absolute_hazard",
+                            "an absolute or incompatible hazard forbids careful retreat",
+                        )
+                        .for_operation(operation),
+                    );
+                }
+                if self.status.safety_latch_kind != Some(hazard.latch()) {
+                    return OrganPoll::Failed(
+                        SkillFailure::new(
+                            SkillOutcome::SafetyPreempted,
+                            "absolute_or_mismatched_hazard",
+                            format!(
+                                "Brainstem latch {:?} does not match requested {:?} retreat",
+                                self.status.safety_latch_kind, hazard
+                            ),
+                        )
+                        .for_operation(operation),
+                    );
+                }
+                let active = match hazard {
+                    HazardKind::BumperFront => {
+                        now.body.flags.bump_left || now.body.flags.bump_right
+                    }
+                    HazardKind::Cliff => {
+                        now.body.flags.cliff_left
+                            || now.body.flags.cliff_front_left
+                            || now.body.flags.cliff_front_right
+                            || now.body.flags.cliff_right
+                    }
+                };
+                let travelled = distance_from_start(state, &now.body);
+                if !active {
+                    if let Err(error) = self.cockpit.stop() {
+                        return OrganPoll::Failed(cockpit_skill_failure(operation, error));
+                    }
+                    self.command_sent = true;
+                    OrganPoll::Completed(json!({
+                        "hazard": hazard,
+                        "distance_m": travelled,
+                        "clear": true,
+                    }))
+                } else if state.last_dispatch_ms == 0
+                    || context.now_ms.saturating_sub(state.last_dispatch_ms)
+                        >= context.primitive_ttl_ms as u64
+                {
+                    let Some(generation) = self.status.safety_hazard_generation.filter(|v| *v > 0)
+                    else {
+                        return OrganPoll::Failed(
+                            SkillFailure::new(
+                                SkillOutcome::Failed,
+                                "hazard_generation_unavailable",
+                                "Brainstem did not report an acknowledged hazard generation",
+                            )
+                            .for_operation(operation),
+                        );
+                    };
+                    match self.cockpit.escape_motion(
+                        hazard.latch(),
+                        generation,
+                        -100,
+                        0,
+                        context.primitive_ttl_ms,
+                    ) {
+                        Ok(()) => {
+                            self.command_sent = true;
+                            primitive = Some(primitive_intent(
+                                context,
+                                operation,
+                                json!({
+                                    "hazard": hazard,
+                                    "hazard_generation": generation,
+                                    "linear_mm_s": -100,
+                                    "angular_mrad_s": 0,
+                                    "ttl_ms": context.primitive_ttl_ms,
+                                }),
+                            ));
+                            OrganPoll::Pending {
+                                progress: Some((
+                                    "reverse_displacement".into(),
+                                    travelled / distance_m.max(0.001),
+                                )),
+                                primitive: None,
+                            }
+                        }
+                        Err(error) => OrganPoll::Failed(cockpit_skill_failure(operation, error)),
+                    }
+                } else {
+                    OrganPoll::Pending {
+                        progress: Some((
+                            "reverse_displacement".into(),
+                            travelled / distance_m.max(0.001),
+                        )),
+                        primitive: None,
+                    }
+                }
+            }
+            HostOperation::CompleteHazardRecovery { hazard } => {
+                let active = match hazard {
+                    HazardKind::BumperFront => {
+                        now.body.flags.bump_left || now.body.flags.bump_right
+                    }
+                    HazardKind::Cliff => {
+                        now.body.flags.cliff_left
+                            || now.body.flags.cliff_front_left
+                            || now.body.flags.cliff_front_right
+                            || now.body.flags.cliff_right
+                    }
+                };
+                if self.status.safety_latch_kind != Some(hazard.latch())
+                    || active
+                    || now.body.flags.wheel_drop
+                    || now.body.charging
+                {
+                    OrganPoll::Failed(
+                        SkillFailure::new(
+                            SkillOutcome::PostconditionFailed,
+                            "hazard_not_clear",
+                            "acknowledged hazard may be cleared only after its sensor is clear",
+                        )
+                        .for_operation(operation),
+                    )
+                } else if let Err(error) = self.cockpit.stop() {
+                    OrganPoll::Failed(cockpit_skill_failure(operation, error))
+                } else if let Err(error) = self.cockpit.clear_safety_latch(hazard.latch()) {
+                    OrganPoll::Failed(cockpit_skill_failure(operation, error))
+                } else {
+                    self.command_sent = true;
+                    OrganPoll::Completed(json!({
+                        "hazard": hazard,
+                        "clear": true,
+                        "stopped": true,
+                    }))
+                }
+            }
+            HostOperation::ReleasePersistentBumper => OrganPoll::Failed(
+                SkillFailure::new(
+                    SkillOutcome::ScriptError,
+                    "invalid_host_sequence",
+                    "releasePersistentBumper policy must run through carefully and retreat",
+                )
+                .for_operation(operation),
+            ),
+            HostOperation::Observe { target } => OrganPoll::Completed(json!({
+                "entity_id": target.id(),
+                "observed_at_ms": now.t_ms,
+                "provenance": "canonical_now",
+            })),
+            HostOperation::WaitUntil {
+                predicate,
+                timeout_ms: _,
+            } => match predicate.as_str() {
+                "charging" if now.body.charging => OrganPoll::Completed(json!(true)),
+                "contact_clear" if !(now.body.flags.bump_left || now.body.flags.bump_right) => {
+                    OrganPoll::Completed(json!(true))
+                }
+                "cliff_clear"
+                    if !(now.body.flags.cliff_left
+                        || now.body.flags.cliff_front_left
+                        || now.body.flags.cliff_front_right
+                        || now.body.flags.cliff_right) =>
+                {
+                    OrganPoll::Completed(json!(true))
+                }
+                _ => OrganPoll::Pending {
+                    progress: None,
+                    primitive: None,
+                },
+            },
+            HostOperation::PlayFeedback { pattern } => {
+                let kind = match pattern.as_str() {
+                    "ok" => pete_cockpit::FeedbackKind::Ok,
+                    "error" => pete_cockpit::FeedbackKind::Error,
+                    "armed" => pete_cockpit::FeedbackKind::Armed,
+                    "lost_target" => pete_cockpit::FeedbackKind::LostTarget,
+                    "dock_seen" => pete_cockpit::FeedbackKind::DockSeen,
+                    "danger" => pete_cockpit::FeedbackKind::Danger,
+                    _ => return OrganPoll::Failed(SkillFailure::capability(operation)),
+                };
+                match self.cockpit.play_feedback(kind) {
+                    Ok(()) => {
+                        self.command_sent = true;
+                        OrganPoll::Completed(json!({"played": pattern}))
+                    }
+                    Err(error) => OrganPoll::Failed(cockpit_skill_failure(operation, error)),
+                }
+            }
+            HostOperation::Scan
+            | HostOperation::LookAt { .. }
+            | HostOperation::Grasp { .. }
+            | HostOperation::Release { .. }
+            | HostOperation::BringToMouth { .. }
+            | HostOperation::Chew
+            | HostOperation::Swallow
+            | HostOperation::Say { .. } => OrganPoll::Failed(SkillFailure::capability(operation)),
+        };
+        if primitive.is_some() {
+            state.last_dispatch_ms = context.now_ms;
+        }
+        match outcome {
+            OrganPoll::Pending { progress, .. } => OrganPoll::Pending {
+                progress,
+                primitive,
+            },
+            terminal => {
+                self.state.operations.remove(&context.operation_id);
+                terminal
+            }
+        }
+    }
+
+    fn stop(&mut self, resource: BodyResource, _reason: &SkillFailure) {
+        if resource == BodyResource::Locomotion {
+            let _ = self.cockpit.stop();
+            self.command_sent = true;
+        }
+    }
+}
+
+struct CockpitStopDriver<'a, C> {
+    cockpit: &'a mut C,
+}
+
+impl<C: Cockpit> OrganDriver for CockpitStopDriver<'_, C> {
+    fn poll(
+        &mut self,
+        operation: &HostOperation,
+        _context: OperationContext,
+        _now: &Now,
+        _events: &pete_cockpit::EventBatch,
+    ) -> OrganPoll {
+        OrganPoll::Failed(
+            SkillFailure::new(
+                SkillOutcome::ResourcePreempted,
+                "foreground_replaced",
+                "operation was replaced before it could be polled",
+            )
+            .for_operation(operation),
+        )
+    }
+
+    fn stop(&mut self, resource: BodyResource, _reason: &SkillFailure) {
+        if resource == BodyResource::Locomotion {
+            let _ = self.cockpit.stop();
+        }
+    }
 }
 
 impl PossessorSkillRuntime {
+    fn active_request(&self) -> Option<SkillRequest> {
+        self.status
+            .as_ref()
+            .filter(|status| status.phase != SkillPhase::Terminal)
+            .map(|status| status.request.clone())
+    }
+
+    fn request_for_tick(&self, candidate: Option<SkillRequest>) -> Option<SkillRequest> {
+        match (self.active_request(), candidate) {
+            (Some(active), Some(candidate))
+                if active.skill_id == candidate.skill_id
+                    && active.implementation_id == candidate.implementation_id
+                    && active.goal_id == candidate.goal_id =>
+            {
+                Some(candidate)
+            }
+            (Some(active), _) => Some(active),
+            (None, candidate) => candidate,
+        }
+    }
+
+    fn annotate_now(&self, now: &mut Now) {
+        if let Some(provenance) = &self.provenance {
+            now.extensions.insert(
+                "motherbrain.skill_execution".to_string(),
+                provenance.clone(),
+            );
+        }
+    }
+
     fn step<C: Cockpit>(
         &mut self,
         cockpit: &mut C,
         request: &SkillRequest,
-        body: &BodySense,
+        now: &Now,
+        status_summary: &StatusSummary,
         home_base_contact: bool,
         events: &pete_cockpit::EventBatch,
         now_ms: TimeMs,
     ) -> (SkillStatus, bool) {
-        let same_intention = self.status.as_ref().is_some_and(|status| {
-            status.request.skill_id == request.skill_id
-                && status.request.goal_id == request.goal_id
-                && status.request.behavior_id == request.behavior_id
-                && status.request.target == request.target
-        });
-        let terminal_consumed = same_intention
-            && self
-                .status
-                .as_ref()
-                .is_some_and(|status| status.phase == SkillPhase::Terminal);
-        if !same_intention || terminal_consumed {
-            if !same_intention {
-                self.intention_attempts = 0;
-            }
-            self.intention_attempts = self.intention_attempts.saturating_add(1);
-            let execution_id = self.next_execution_id.max(1);
-            self.next_execution_id = execution_id.saturating_add(1);
-            self.status = Some(SkillStatus {
+        let Some(lua) = self.lua.as_mut() else {
+            let status = SkillStatus {
                 request: request.clone(),
-                execution_id,
-                phase: SkillPhase::Requested,
-                attempts: self.intention_attempts,
-                started_at_ms: Some(now_ms),
+                phase: SkillPhase::Terminal,
+                outcome: Some(SkillOutcome::ScriptError),
                 updated_at_ms: now_ms,
+                reason: self.load_error.clone(),
+                ..SkillStatus::default()
+            };
+            self.status = Some(status.clone());
+            return (status, false);
+        };
+        if now_ms.saturating_sub(self.last_reload_check_ms) >= 1_000 {
+            let _ = lua.reload();
+            self.last_reload_check_ms = now_ms;
+        }
+        if let Some(current) = lua.active_skill_id() {
+            let wanted = if request.skill_id == SkillId::RuntimeLoaded {
+                request.implementation_id.clone().unwrap_or_default()
+            } else {
+                format!(
+                    "motherbrain.{}",
+                    match request.skill_id {
+                        SkillId::StopAndStabilize => "stopAndStabilize",
+                        SkillId::TurnTowardTarget => "turnTowardTarget",
+                        SkillId::FollowBearing => "followBearingSkill",
+                        SkillId::ApproachTarget => "approachTarget",
+                        SkillId::BackAway => "driveFor",
+                        SkillId::InspectTarget => "inspectObject",
+                        SkillId::WallFollow => "wallFollow",
+                        SkillId::AlignWithDock => "alignWithDockSkill",
+                        SkillId::SystematicSearch => "systematicSearch",
+                        SkillId::HoldHeading => "holdHeadingSkill",
+                        SkillId::RetreatFromCliff => "retreatFromCliff",
+                        SkillId::ReleasePersistentBumper => "releasePersistentBumper",
+                        SkillId::TurnBy => "turnBySkill",
+                        SkillId::DriveDistance => "driveDistanceSkill",
+                        SkillId::Undock => "undockSkill",
+                        SkillId::SearchForDock => "searchForDock",
+                        SkillId::ReturnToDock => "returnToDock",
+                        SkillId::RuntimeLoaded => unreachable!(),
+                    }
+                )
+            };
+            if current != wanted {
+                if matches!(
+                    request.skill_id,
+                    SkillId::RetreatFromCliff | SkillId::ReleasePersistentBumper
+                ) {
+                    let mut stop_driver = CockpitStopDriver { cockpit };
+                    let _ = lua.cancel(
+                        &mut stop_driver,
+                        SkillOutcome::ResourcePreempted,
+                        "safety_recovery_preempted_foreground",
+                        "acknowledged bodily hazard replaced the foreground skill",
+                        now_ms,
+                    );
+                    self.provenance = lua
+                        .execution_record()
+                        .and_then(|record| serde_json::to_value(record).ok());
+                    let _ = lua.take_terminal();
+                    self.driver.operations.clear();
+                } else {
+                    // Competing ordinary goals remain pending. Only explicit
+                    // higher authority calls the cancellation API.
+                    return (
+                        self.status.clone().unwrap_or_else(|| SkillStatus {
+                            request: request.clone(),
+                            phase: SkillPhase::Running,
+                            updated_at_ms: now_ms,
+                            reason: Some(format!("foreground skill {current} retains commitment")),
+                            ..SkillStatus::default()
+                        }),
+                        false,
+                    );
+                }
+            }
+        }
+        if !lua.is_active() {
+            if let Err(error) = lua.start(request.clone(), now) {
+                let status = SkillStatus {
+                    request: request.clone(),
+                    phase: SkillPhase::Terminal,
+                    outcome: Some(SkillOutcome::ScriptError),
+                    updated_at_ms: now_ms,
+                    reason: Some(error.to_string()),
+                    ..SkillStatus::default()
+                };
+                self.status = Some(status.clone());
+                return (status, false);
+            }
+        }
+        let mut driver = RealLuaOrganDriver {
+            cockpit,
+            request,
+            status: status_summary,
+            home_base_contact,
+            state: &mut self.driver,
+            command_sent: false,
+        };
+        let status = lua
+            .step(now, events, &mut driver)
+            .unwrap_or_else(|| SkillStatus {
+                request: request.clone(),
+                phase: SkillPhase::Terminal,
+                outcome: Some(SkillOutcome::ScriptError),
+                updated_at_ms: now_ms,
+                reason: Some("Lua runtime lost the foreground invocation".into()),
                 ..SkillStatus::default()
             });
-            self.initial_metric = skill_metric(request);
-            self.last_dispatch_ms = 0;
-        }
-
-        let mut status = self.status.clone().unwrap_or_default();
-        status.request = request.clone();
-        status.updated_at_ms = now_ms;
-
-        if events.events.iter().any(|event| {
-            matches!(
-                event.kind,
-                CockpitEventKind::SafetyTripped
-                    | CockpitEventKind::EStopLatched
-                    | CockpitEventKind::ContactWithdrawalStarted
-            )
-        }) {
-            status.phase = SkillPhase::Terminal;
-            status.outcome = Some(SkillOutcome::SafetyPreempted);
-            status.reason = Some("brainstem safety or reflex preempted the skill".to_string());
-            self.status = Some(status.clone());
-            return (status, false);
-        }
-        if events.events.iter().any(|event| {
-            matches!(
-                event.kind,
-                CockpitEventKind::SessionReplaced | CockpitEventKind::AuthorityChanged
-            )
-        }) {
-            status.phase = SkillPhase::Terminal;
-            status.outcome = Some(SkillOutcome::AuthorityLost);
-            status.reason = Some("possession authority changed while the skill was active".into());
-            self.status = Some(status.clone());
-            return (status, false);
-        }
-
-        status.progress = skill_progress(self.initial_metric, skill_metric(request));
-        if skill_completed(request, body, home_base_contact) {
-            let _ = cockpit.stop();
-            status.phase = SkillPhase::Terminal;
-            status.outcome = Some(SkillOutcome::Completed);
-            status.progress = Some(1.0);
-            self.status = Some(status.clone());
-            return (status, true);
-        }
-        let started_at = status.started_at_ms.unwrap_or(now_ms);
-        if request.maximum_duration_ms > 0
-            && now_ms.saturating_sub(started_at) >= request.maximum_duration_ms
-        {
-            let _ = cockpit.stop();
-            status.phase = SkillPhase::Terminal;
-            status.outcome = Some(SkillOutcome::TimedOut);
-            status.reason = Some("skill exceeded its bounded duration".into());
-            self.status = Some(status.clone());
-            return (status, true);
-        }
-        if skill_requires_bearing(request.skill_id) && request.bearing_rad.is_none() {
-            status.phase = SkillPhase::Terminal;
-            status.outcome = Some(SkillOutcome::TargetStale);
-            status.reason = Some("the skill target has no current bearing".into());
-            self.status = Some(status.clone());
-            return (status, false);
-        }
-        if request.skill_id == SkillId::AlignWithDock
-            && DockIrCue::from_character(body.infrared_character).is_none()
-        {
-            let stop_sent = cockpit.stop().is_ok();
-            status.phase = SkillPhase::Terminal;
-            status.outcome = Some(SkillOutcome::TargetStale);
-            status.reason = Some("the Home Base IR gradient is not currently visible".into());
-            self.status = Some(status.clone());
-            return (status, stop_sent);
-        }
-
-        status.phase = SkillPhase::Running;
-        let dispatch_due =
-            self.last_dispatch_ms == 0 || now_ms.saturating_sub(self.last_dispatch_ms) >= 100;
-        let mut command_sent = false;
-        if dispatch_due {
-            status.dispatch_count = status.dispatch_count.saturating_add(1);
-            match dispatch_possessor_skill(cockpit, request, body) {
-                Ok(()) => {
-                    self.last_dispatch_ms = now_ms;
-                    command_sent = true;
-                }
-                Err(error) => {
-                    status.phase = SkillPhase::Terminal;
-                    status.outcome = Some(SkillOutcome::Unavailable);
-                    status.reason = Some(error.to_string());
-                }
-            }
-        }
+        let command_sent = driver.command_sent;
         self.status = Some(status.clone());
+        self.provenance = lua
+            .execution_record()
+            .and_then(|record| serde_json::to_value(record).ok());
+        if status.phase == SkillPhase::Terminal {
+            let _ = lua.take_terminal();
+        }
         (status, command_sent)
     }
 }
 
-fn skill_requires_bearing(skill_id: SkillId) -> bool {
-    matches!(
-        skill_id,
-        SkillId::TurnTowardTarget
-            | SkillId::FollowBearing
-            | SkillId::ApproachTarget
-            | SkillId::HoldHeading
-    )
+fn radians_to_mrad(value: f32) -> i16 {
+    (value * 1_000.0)
+        .round()
+        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
-fn skill_metric(request: &SkillRequest) -> Option<f32> {
-    match request.skill_id {
-        SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => {
-            request.bearing_rad.map(f32::abs)
-        }
-        SkillId::ApproachTarget | SkillId::AlignWithDock => request.range_m,
-        _ => None,
+fn distance_from_start(state: &LuaDriverOperationState, body: &BodySense) -> f32 {
+    (body.odometry.x_m - state.start_x_m).hypot(body.odometry.y_m - state.start_y_m)
+}
+
+fn angle_delta(current: f32, initial: f32) -> f32 {
+    let mut delta = current - initial;
+    while delta > std::f32::consts::PI {
+        delta -= std::f32::consts::TAU;
+    }
+    while delta < -std::f32::consts::PI {
+        delta += std::f32::consts::TAU;
+    }
+    delta
+}
+
+fn primitive_intent(
+    context: OperationContext,
+    operation: &HostOperation,
+    detail: serde_json::Value,
+) -> PrimitiveIntent {
+    PrimitiveIntent {
+        operation_id: context.operation_id,
+        child_id: context.child_id,
+        operation: operation.name().to_string(),
+        resource: operation.resource(),
+        emitted_at_ms: context.now_ms,
+        detail,
     }
 }
 
-fn skill_progress(initial: Option<f32>, current: Option<f32>) -> Option<f32> {
-    match (initial, current) {
-        (Some(initial), Some(current)) if initial > f32::EPSILON => {
-            Some(((initial - current) / initial).clamp(0.0, 1.0))
-        }
-        _ => None,
-    }
-}
-
-fn skill_completed(request: &SkillRequest, body: &BodySense, home_base_contact: bool) -> bool {
-    match request.skill_id {
-        SkillId::StopAndStabilize => true,
-        SkillId::TurnTowardTarget | SkillId::FollowBearing | SkillId::HoldHeading => request
-            .bearing_rad
-            .is_some_and(|bearing| bearing.abs() <= 0.10),
-        SkillId::ApproachTarget => request
-            .range_m
-            .zip(request.stop_range_m)
-            .is_some_and(|(range, stop)| range <= stop),
-        SkillId::AlignWithDock => body.charging || home_base_contact,
-        _ => false,
-    }
-}
-
-fn dispatch_possessor_skill<C: Cockpit>(
+fn dispatch_velocity<C: Cockpit>(
     cockpit: &mut C,
-    request: &SkillRequest,
-    body: &BodySense,
-) -> pete_cockpit::Result<()> {
-    // Motherbrain owns feedback/procedure policy. Every step renews only a
-    // short-lived Brainstem primitive; the 100 ms skill cadence leaves ample
-    // margin while still failing stopped if this loop stalls.
-    const PRIMITIVE_TTL_MS: u32 = 250;
-    let bearing_mrad = request
-        .bearing_rad
-        .map(|bearing| {
-            (bearing * 1_000.0)
-                .round()
-                .clamp(i16::MIN as f32, i16::MAX as f32) as i16
-        })
-        .unwrap_or(0);
-    let correction = bearing_mrad.clamp(-500, 500);
-    match request.skill_id {
-        SkillId::StopAndStabilize => cockpit.stop(),
-        SkillId::TurnTowardTarget => cockpit.cmd_vel(0, correction, PRIMITIVE_TTL_MS),
-        SkillId::FollowBearing => cockpit.cmd_vel(45, correction, PRIMITIVE_TTL_MS),
-        SkillId::ApproachTarget => cockpit.cmd_vel(50, correction, PRIMITIVE_TTL_MS),
-        SkillId::BackAway => cockpit.cmd_vel(-40, 0, PRIMITIVE_TTL_MS),
-        SkillId::InspectTarget => cockpit.cmd_vel(0, 300, PRIMITIVE_TTL_MS),
-        SkillId::WallFollow => cockpit.cmd_vel(45, 0, PRIMITIVE_TTL_MS),
-        SkillId::AlignWithDock => {
-            let cue = DockIrCue::from_character(body.infrared_character).ok_or_else(|| {
-                pete_cockpit::CockpitError::Policy(
-                    "the Home Base IR gradient is not currently visible".into(),
-                )
-            })?;
-            cockpit.cmd_vel(50, cue.steering_mrad_s(400), PRIMITIVE_TTL_MS)
+    operation: &HostOperation,
+    context: OperationContext,
+    linear_mm_s: i16,
+    angular_mrad_s: i16,
+    command_sent: &mut bool,
+    primitive: &mut Option<PrimitiveIntent>,
+) -> OrganPoll {
+    match cockpit.cmd_vel(linear_mm_s, angular_mrad_s, context.primitive_ttl_ms) {
+        Ok(()) => {
+            *command_sent = true;
+            *primitive = Some(primitive_intent(
+                context,
+                operation,
+                json!({
+                    "linear_mm_s": linear_mm_s,
+                    "angular_mrad_s": angular_mrad_s,
+                    "ttl_ms": context.primitive_ttl_ms,
+                }),
+            ));
+            OrganPoll::Pending {
+                progress: None,
+                primitive: None,
+            }
         }
-        SkillId::SystematicSearch => cockpit.cmd_vel(0, 300, PRIMITIVE_TTL_MS),
-        SkillId::HoldHeading => cockpit.cmd_vel(0, correction.clamp(-400, 400), PRIMITIVE_TTL_MS),
+        Err(error) => OrganPoll::Failed(cockpit_skill_failure(operation, error)),
     }
+}
+
+fn with_operation_progress(poll: OrganPoll, progress: Option<(String, f32)>) -> OrganPoll {
+    match poll {
+        OrganPoll::Pending { primitive, .. } => OrganPoll::Pending {
+            progress,
+            primitive,
+        },
+        terminal => terminal,
+    }
+}
+
+fn complete_stopped<C: Cockpit>(
+    cockpit: &mut C,
+    operation: &HostOperation,
+    value: serde_json::Value,
+    command_sent: &mut bool,
+) -> OrganPoll {
+    match cockpit.stop() {
+        Ok(()) => {
+            *command_sent = true;
+            OrganPoll::Completed(value)
+        }
+        Err(error) => OrganPoll::Failed(cockpit_skill_failure(operation, error)),
+    }
+}
+
+fn cockpit_skill_failure(
+    operation: &HostOperation,
+    error: pete_cockpit::CockpitError,
+) -> SkillFailure {
+    SkillFailure::new(
+        SkillOutcome::Failed,
+        "body_command_rejected",
+        error.to_string(),
+    )
+    .for_operation(operation)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5498,7 +6339,6 @@ enum PossessionRecoveryPhase {
     BrainstemReflex,
     WaitingForSensorClear,
     Escaping,
-    Stuck,
 }
 
 #[derive(Clone, Debug)]
@@ -5555,7 +6395,6 @@ struct MotionRejectionState {
 }
 
 const POSSESSION_RECOVERY_STUCK_AFTER_MS: TimeMs = 15_000;
-const POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S: i16 = 50;
 const POSSESSION_ESCAPE_TTL_MS: u32 = 250;
 const MOTION_REJECTION_WINDOW_MS: TimeMs = 5_000;
 const MOTION_REJECTION_BASE_BACKOFF_MS: TimeMs = 1_000;
@@ -5693,6 +6532,7 @@ where
         );
         self.insert_robot_initialization(&mut now);
         self.insert_brainstem_interface(&mut now, &brainstem_events);
+        self.possessor_skills.annotate_now(&mut now);
         enrich_now_latest_image(&mut self.live_image_cognition, &mut now).await;
 
         let tick = self
@@ -5874,19 +6714,57 @@ where
         } else {
             MotorCommand::stop()
         };
-        let possessor_skill_owns_motion = tick.skill_request.is_some();
-        if let Some(request) = tick.skill_request.clone() {
+        let recovery_request = self.possession_recovery_skill_request(&brainstem_events);
+        let reflex_preemption = brainstem_events.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                CockpitEventKind::ContactWithdrawalStarted
+                    | CockpitEventKind::SafetyTripped
+                    | CockpitEventKind::EStopLatched
+            )
+        });
+        let interrupted_request = reflex_preemption
+            .then(|| self.possessor_skills.status.as_ref())
+            .flatten()
+            .filter(|status| status.phase != SkillPhase::Terminal)
+            .map(|status| status.request.clone());
+        let selected_skill_request =
+            recovery_request
+                .clone()
+                .or(interrupted_request)
+                .or_else(|| {
+                    self.possessor_skills
+                        .request_for_tick(tick.skill_request.clone())
+                });
+        let possessor_skill_owns_motion = selected_skill_request.is_some();
+        let mut recovery_motion_sent = false;
+        if let Some(request) = selected_skill_request {
+            tick.skill_request = Some(request.clone());
             final_motor = MotorCommand::stop();
-            if block_reason.is_none() && !recovery_decision.command_sent {
-                let (status, _command_sent) = self.possessor_skills.step(
+            if (block_reason.is_none() || recovery_request.is_some() || reflex_preemption)
+                && !recovery_decision.command_sent
+            {
+                let (status, command_sent) = self.possessor_skills.step(
                     self.cockpit.client_mut(),
                     &request,
-                    &body_before,
+                    &now,
+                    &status_before,
                     status_before.battery.home_base(),
                     &brainstem_events,
                     t_ms,
                 );
+                recovery_motion_sent = command_sent
+                    && recovery_request.is_some()
+                    && status.script.as_ref().is_some_and(|script| {
+                        script.current_operation.as_deref() == Some("retreat")
+                    });
                 self.runtime.observe_skill_status(&status);
+                if recovery_request.is_some()
+                    && status.phase == SkillPhase::Terminal
+                    && status.outcome == Some(SkillOutcome::Completed)
+                {
+                    self.finish_possession_recovery();
+                }
                 tick.skill_status = Some(status);
             }
         }
@@ -5916,6 +6794,16 @@ where
         } else if let Some(recovery_action) = recovery_decision.action.clone() {
             tick.chosen_action = Some(recovery_action.clone());
             tick.frame.chosen_action = Some(recovery_action);
+        } else if recovery_motion_sent {
+            let recovery_action = ActionPrimitive::Go {
+                intensity: -0.25,
+                duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
+            };
+            tick.chosen_action = Some(recovery_action.clone());
+            tick.frame.chosen_action = Some(recovery_action);
+        } else if possessor_skill_owns_motion {
+            tick.chosen_action = Some(ActionPrimitive::Stop);
+            tick.frame.chosen_action = Some(ActionPrimitive::Stop);
         }
 
         let mut snapshot = self.now_builder.snapshot();
@@ -5928,7 +6816,12 @@ where
         if !action_debug.is_object() {
             action_debug = serde_json::json!({});
         }
-        let reported_robot_motor = if recovery_decision.command_sent {
+        let reported_robot_motor = if recovery_motion_sent {
+            MotorCommand {
+                forward: -0.10,
+                turn: 0.0,
+            }
+        } else if recovery_decision.command_sent {
             recovery_decision.motor.unwrap_or_else(MotorCommand::stop)
         } else if recovery_decision.block_reason.is_some() {
             MotorCommand::stop()
@@ -5993,6 +6886,13 @@ where
             object.insert(
                 "possessor_skill_status".to_string(),
                 serde_json::to_value(&tick.skill_status)?,
+            );
+            object.insert(
+                "possessor_skill_execution".to_string(),
+                self.possessor_skills
+                    .provenance
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null),
             );
             object.insert(
                 "motion_rejection".to_string(),
@@ -6142,8 +7042,6 @@ where
         let mut command_sent = false;
         let mut action = None;
         let mut motor = None;
-        let now_ms = wall_time_ms();
-        let recovery_age_ms = recovery_age_ms(&self.possession_recovery, now_ms);
         let mut reason = format!("recovering {latch:?} safety latch");
         match latch {
             SafetyLatchKind::Bump => {
@@ -6151,115 +7049,14 @@ where
                     reason =
                         "brainstem contact-withdrawal reflex owns motion; possessor is observing"
                             .to_string();
-                } else if !bump_active(body) {
-                    self.cockpit.client_mut().stop()?;
-                    self.clear_completed_bump_recovery_latch()?;
-                    command_sent = true;
-                    action = Some(ActionPrimitive::Stop);
-                    motor = Some(MotorCommand::stop());
-                    reason = format!(
-                        "contact cleared after observed reverse displacement {:.3} m; latch cleared",
-                        self.possession_recovery.observed_linear_m
-                    );
-                    self.finish_possession_recovery();
-                } else if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
-                    command_sent = self.stop_stuck_possession_recovery()?;
-                    action = Some(ActionPrimitive::Stop);
-                    motor = Some(MotorCommand::stop());
-                    reason = format!(
-                        "{latch:?} escape stopped after {} ms and {} commanded segments; operator intervention needed",
-                        recovery_age_ms, self.possession_recovery.command_attempts
-                    );
-                } else if self.possession_recovery.hazard_generation == 0 {
-                    reason =
-                        "waiting for the acknowledged bumper hazard generation before escaping"
-                            .to_string();
                 } else {
-                    match self.possession_escape_motion(
-                        latch,
-                        -POSSESSION_BUMP_ESCAPE_BACKOFF_MM_S,
-                        0,
-                    ) {
-                        Ok(()) => {
-                            self.mark_possession_escape_command(now_ms);
-                            command_sent = true;
-                            action = Some(ActionPrimitive::Go {
-                                intensity: -0.2,
-                                duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
-                            });
-                            motor = Some(MotorCommand {
-                                forward: -0.05,
-                                turn: 0.0,
-                            });
-                            reason = format!(
-                                "commanded bumper escape segment {} for {} ms; observed displacement {:.3} m",
-                                self.possession_recovery.command_attempts,
-                                POSSESSION_ESCAPE_TTL_MS,
-                                self.possession_recovery.observed_linear_m
-                            );
-                        }
-                        Err(error) => {
-                            action = Some(ActionPrimitive::Stop);
-                            motor = Some(MotorCommand::stop());
-                            reason = format!("intended bumper escape was not commanded: {error}");
-                        }
-                    }
+                    reason = "bumper recovery is delegated to the foreground Lua releasePersistentBumper skill"
+                        .to_string();
                 }
             }
             SafetyLatchKind::Cliff => {
-                if cliff_active(body) {
-                    if possession_recovery_is_stuck(&self.possession_recovery, now_ms) {
-                        command_sent = self.stop_stuck_possession_recovery()?;
-                        action = Some(ActionPrimitive::Stop);
-                        motor = Some(MotorCommand::stop());
-                        reason = format!(
-                            "{latch:?} escape stopped after {} ms and {} commanded segments; operator intervention needed",
-                            recovery_age_ms, self.possession_recovery.command_attempts
-                        );
-                    } else if self.possession_recovery.hazard_generation == 0 {
-                        reason =
-                            "waiting for the acknowledged cliff hazard generation before escaping"
-                                .to_string();
-                    } else {
-                        match self.possession_escape_motion(latch, -100, 0) {
-                            Ok(()) => {
-                                self.mark_possession_escape_command(now_ms);
-                                command_sent = true;
-                                action = Some(ActionPrimitive::Go {
-                                    intensity: -0.25,
-                                    duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
-                                });
-                                motor = Some(MotorCommand {
-                                    forward: -0.10,
-                                    turn: 0.0,
-                                });
-                                reason = format!(
-                                    "commanded cliff escape segment {} for {} ms; observed displacement {:.3} m",
-                                    self.possession_recovery.command_attempts,
-                                    POSSESSION_ESCAPE_TTL_MS,
-                                    self.possession_recovery.observed_linear_m
-                                );
-                            }
-                            Err(error) => {
-                                action = Some(ActionPrimitive::Stop);
-                                motor = Some(MotorCommand::stop());
-                                reason =
-                                    format!("intended cliff escape was not commanded: {error}");
-                            }
-                        }
-                    }
-                } else {
-                    self.cockpit.client_mut().stop()?;
-                    self.cockpit.client_mut().clear_safety_latch(latch)?;
-                    command_sent = true;
-                    action = Some(ActionPrimitive::Stop);
-                    motor = Some(MotorCommand::stop());
-                    reason = format!(
-                        "cliff cleared after observed reverse displacement {:.3} m; latch cleared",
-                        self.possession_recovery.observed_linear_m
-                    );
-                    self.finish_possession_recovery();
-                }
+                reason = "cliff recovery is delegated to the foreground Lua retreatFromCliff skill"
+                    .to_string();
             }
             SafetyLatchKind::WheelDrop => {
                 if body.flags.wheel_drop {
@@ -6313,27 +7110,37 @@ where
         })
     }
 
-    fn clear_completed_bump_recovery_latch(&mut self) -> Result<()> {
-        self.cockpit
-            .client_mut()
-            .clear_safety_latch(SafetyLatchKind::Bump)?;
-        Ok(())
-    }
-
-    fn possession_escape_motion(
-        &mut self,
-        hazard: SafetyLatchKind,
-        linear_mm_s: i16,
-        angular_mrad_s: i16,
-    ) -> Result<()> {
-        self.cockpit.client_mut().escape_motion(
-            hazard,
-            self.possession_recovery.hazard_generation,
-            linear_mm_s,
-            angular_mrad_s,
-            POSSESSION_ESCAPE_TTL_MS,
-        )?;
-        Ok(())
+    fn possession_recovery_skill_request(
+        &self,
+        events: &pete_cockpit::EventBatch,
+    ) -> Option<SkillRequest> {
+        if self.possession_recovery.phase == PossessionRecoveryPhase::BrainstemReflex
+            || self.possession_recovery.hazard_generation == 0
+            || events.events.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    CockpitEventKind::ContactWithdrawalStarted | CockpitEventKind::SafetyTripped
+                )
+            })
+        {
+            return None;
+        }
+        let skill_id = match self.possession_recovery.latch? {
+            SafetyLatchKind::Bump => SkillId::ReleasePersistentBumper,
+            SafetyLatchKind::Cliff => SkillId::RetreatFromCliff,
+            _ => return None,
+        };
+        Some(SkillRequest {
+            skill_id,
+            goal_id: Some(pete_conductor::GoalId::new("escape_danger")),
+            behavior_id: Some("acknowledged_hazard_recovery".to_string()),
+            maximum_duration_ms: POSSESSION_RECOVERY_STUCK_AFTER_MS,
+            expected_progress: 1.0,
+            progress_metric: "reverse_displacement".to_string(),
+            progress_baseline: Some(0.0),
+            progress_tolerance: 0.1,
+            ..SkillRequest::default()
+        })
     }
 
     fn start_possession_recovery(&mut self, latch: SafetyLatchKind, body: &BodySense) {
@@ -6381,24 +7188,6 @@ where
         self.possession_recovery.last_observed_x_m = body.odometry.x_m;
         self.possession_recovery.last_observed_y_m = body.odometry.y_m;
         self.possession_recovery.last_observed_heading_rad = body.odometry.heading_rad;
-    }
-
-    fn mark_possession_escape_command(&mut self, now_ms: TimeMs) {
-        self.possession_recovery.command_attempts =
-            self.possession_recovery.command_attempts.saturating_add(1);
-        self.possession_recovery.last_command_ms = now_ms;
-        self.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
-        self.possession_recovery.brainstem_reflex_observed = false;
-    }
-
-    fn stop_stuck_possession_recovery(&mut self) -> Result<bool> {
-        self.possession_recovery.phase = PossessionRecoveryPhase::Stuck;
-        if !self.possession_recovery.stuck_stop_sent {
-            self.cockpit.client_mut().stop()?;
-            self.possession_recovery.stuck_stop_sent = true;
-            return Ok(true);
-        }
-        Ok(false)
     }
 
     fn finish_possession_recovery(&mut self) {
@@ -6912,18 +7701,6 @@ fn imu_recovery_clear(status: &StatusSummary, latch: SafetyLatchKind) -> bool {
     }
 }
 
-fn recovery_age_ms(state: &PossessionRecoveryState, now_ms: TimeMs) -> TimeMs {
-    if state.active_since_ms == 0 {
-        0
-    } else {
-        now_ms.saturating_sub(state.active_since_ms)
-    }
-}
-
-fn possession_recovery_is_stuck(state: &PossessionRecoveryState, now_ms: TimeMs) -> bool {
-    recovery_age_ms(state, now_ms) >= POSSESSION_RECOVERY_STUCK_AFTER_MS
-}
-
 fn possession_recovery_debug(
     state: &PossessionRecoveryState,
     active_latch: Option<SafetyLatchKind>,
@@ -7188,6 +7965,7 @@ pub struct SimRunner<R> {
     pub tick_count: usize,
     pub tick_ms: u64,
     stuck: StuckRecoveryController,
+    possessor_skills: PossessorSkillRuntime,
 }
 
 const STUCK_LOW_DISPLACEMENT_TICKS: usize = 6;
@@ -7324,7 +8102,11 @@ impl StuckRecoveryController {
             self.duration_ticks = self.duration_ticks.saturating_add(1);
         }
 
-        if self.active && step_distance > STUCK_WINDOW_DISPLACEMENT_EPSILON_M {
+        let recovery_displacement = self
+            .trap_anchor
+            .map(|anchor| distance_between_points(anchor, position))
+            .unwrap_or(0.0);
+        if self.active && recovery_displacement >= STUCK_WINDOW_DISPLACEMENT_EPSILON_M {
             self.finish_recovery_success();
         }
 
@@ -7566,6 +8348,7 @@ where
             tick_count: 0,
             tick_ms: 100,
             stuck: StuckRecoveryController::default(),
+            possessor_skills: PossessorSkillRuntime::default(),
         }
     }
 
@@ -7590,12 +8373,41 @@ where
             self.stuck.annotate_snapshot(&mut snapshot, self.tick_ms);
             let reset_after_tick = sim_stuck_reset_due(&snapshot);
             let body_pose_before = snapshot.body.clone();
-            let now = snapshot.to_now(snapshot.body.last_update_ms);
-            let tick = self
+            let mut now = snapshot.to_now(snapshot.body.last_update_ms);
+            self.possessor_skills.annotate_now(&mut now);
+            let mut tick = self
                 .runtime
-                .tick(now, ExperienceLatent::default(), Vec::new())
+                .tick(now.clone(), ExperienceLatent::default(), Vec::new())
                 .await?;
-            let final_motor = final_motor_from_tick(&tick);
+            let mut lua_skill_owns_motion = false;
+            let selected_skill_request = self
+                .possessor_skills
+                .request_for_tick(tick.skill_request.clone());
+            if let Some(request) = selected_skill_request {
+                tick.skill_request = Some(request.clone());
+                let status_summary = self.cockpit.refresh_status()?;
+                let events = self.cockpit.poll_events_allowing_history_gap()?;
+                let (status, _) = self.possessor_skills.step(
+                    self.cockpit.client_mut(),
+                    &request,
+                    &now,
+                    &status_summary,
+                    status_summary.battery.home_base(),
+                    &events,
+                    now.t_ms,
+                );
+                self.runtime.observe_skill_status(&status);
+                tick.skill_status = Some(status);
+                lua_skill_owns_motion = true;
+            }
+            let final_motor = if lua_skill_owns_motion {
+                self.world
+                    .last_motion_sent()
+                    .unwrap_or(MotionCommand::Stop)
+                    .to_motor_command()
+            } else {
+                final_motor_from_tick(&tick)
+            };
             let mut motion = motor_command_to_motion(final_motor);
             let mut motion_sent_to_sim = Some(serde_json::to_value(&motion)?);
             let reset_or_dead = is_dead_battery(&snapshot) || reset_after_tick;
@@ -7612,7 +8424,7 @@ where
                 self.stuck.reset();
                 motion = MotionCommand::Stop;
                 motion_sent_to_sim = None;
-            } else {
+            } else if !lua_skill_owns_motion {
                 let _ = manual_reign_driving;
                 apply_safe_cockpit_motion(&mut self.cockpit, &motion)?;
             };
@@ -10319,8 +11131,24 @@ mod tests {
         };
 
         let body = BodySense::default();
-        let (running, command_sent) =
-            runtime.step(&mut cockpit, &request, &body, false, &events, 1);
+        let _ = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            1,
+        );
+        let (running, command_sent) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            101,
+        );
         assert!(command_sent);
         assert_eq!(running.phase, SkillPhase::Running);
         assert_eq!(running.attempts, 1);
@@ -10331,8 +11159,15 @@ mod tests {
             bearing_rad: Some(0.05),
             ..request
         };
-        let (completed, stop_sent) =
-            runtime.step(&mut cockpit, &aligned, &body, false, &events, 100);
+        let (completed, stop_sent) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &aligned,
+            &body,
+            false,
+            &events,
+            201,
+        );
         assert!(stop_sent);
         assert_eq!(completed.phase, SkillPhase::Terminal);
         assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
@@ -10359,22 +11194,61 @@ mod tests {
         };
 
         let body = BodySense::default();
-        let (running, first_dispatch) =
-            runtime.step(&mut cockpit, &request, &body, false, &events, 1);
+        let _ = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            1,
+        );
+        let (running, first_dispatch) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            51,
+        );
         assert!(first_dispatch);
         assert_eq!(running.attempts, 1);
         assert_eq!(running.dispatch_count, 1);
 
-        let (timed_out, stop_sent) =
-            runtime.step(&mut cockpit, &request, &body, false, &events, 101);
+        let (timed_out, stop_sent) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            101,
+        );
         assert!(stop_sent);
         assert_eq!(timed_out.phase, SkillPhase::Terminal);
         assert_eq!(timed_out.outcome, Some(SkillOutcome::TimedOut));
         assert_eq!(timed_out.execution_id, running.execution_id);
         assert_eq!(timed_out.attempts, 1);
 
-        let (retry, retry_dispatched) =
-            runtime.step(&mut cockpit, &request, &body, false, &events, 102);
+        let _ = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            102,
+        );
+        let (retry, retry_dispatched) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            152,
+        );
         assert!(retry_dispatched);
         assert_eq!(retry.phase, SkillPhase::Running);
         assert_ne!(retry.execution_id, timed_out.execution_id);
@@ -10395,14 +11269,123 @@ mod tests {
         };
 
         let body = BodySense::default();
-        let (first, _) = runtime.step(&mut cockpit, &request, &body, false, &events, 1);
-        let (second, _) = runtime.step(&mut cockpit, &request, &body, false, &events, 101);
-        let (third, _) = runtime.step(&mut cockpit, &request, &body, false, &events, 201);
+        let (first, _) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            1,
+        );
+        let (second, _) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            101,
+        );
+        let (third, _) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            201,
+        );
 
         assert_eq!(first.execution_id, second.execution_id);
         assert_eq!(second.execution_id, third.execution_id);
         assert_eq!(third.attempts, 1);
-        assert_eq!(third.dispatch_count, 3);
+        assert_eq!(third.dispatch_count, 2);
+    }
+
+    #[test]
+    fn lua_skill_progress_preserves_goal_metric_and_normalizes_from_baseline() {
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let events = cockpit.get_events_since(0).unwrap();
+        let mut runtime = PossessorSkillRuntime::default();
+        let request = SkillRequest {
+            skill_id: SkillId::ApproachTarget,
+            goal_id: Some(pete_conductor::GoalId::new("seek_charger")),
+            target: Some(pete_now::EntityId("charger:17".to_string())),
+            bearing_rad: Some(0.0),
+            range_m: Some(2.0),
+            stop_range_m: Some(0.3),
+            maximum_duration_ms: 5_000,
+            progress_metric: "target_distance".to_string(),
+            progress_baseline: Some(2.0),
+            progress_tolerance: 0.1,
+            ..SkillRequest::default()
+        };
+        let body = BodySense::default();
+        let _ = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            1,
+        );
+        let (started, _) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            101,
+        );
+        assert_eq!(started.progress, Some(0.0));
+        assert_eq!(started.request.goal_id, request.goal_id);
+        assert_eq!(started.request.progress_metric, "target_distance");
+
+        let halfway = SkillRequest {
+            range_m: Some(1.0),
+            ..request
+        };
+        let (progressed, _) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &halfway,
+            &body,
+            false,
+            &events,
+            201,
+        );
+        assert_eq!(progressed.progress, Some(0.5));
+        assert_eq!(
+            progressed
+                .script
+                .as_ref()
+                .map(|script| script.skill_id.as_str()),
+            Some("motherbrain.approachTarget")
+        );
+        let provenance = runtime
+            .provenance
+            .as_ref()
+            .expect("running skill provenance");
+        assert_eq!(
+            provenance
+                .pointer("/request/goal_id")
+                .and_then(serde_json::Value::as_str),
+            Some("seek_charger")
+        );
+        assert_eq!(
+            provenance
+                .pointer("/diagnostics/progress/target_distance")
+                .and_then(serde_json::Value::as_f64),
+            Some(1.0)
+        );
+        let mut ledger_now = Now::blank(250, body);
+        runtime.annotate_now(&mut ledger_now);
+        assert!(ledger_now
+            .extensions
+            .contains_key("motherbrain.skill_execution"));
     }
 
     #[test]
@@ -10420,16 +11403,40 @@ mod tests {
         let events = cockpit.get_events_since(0).unwrap();
         let mut runtime = PossessorSkillRuntime::default();
 
-        let (running, command_sent) =
-            runtime.step(&mut cockpit, &request, &body, false, &events, 1);
+        let _ = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            1,
+        );
+        let (running, command_sent) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            101,
+        );
         assert!(command_sent);
         assert_eq!(running.phase, SkillPhase::Running);
 
         body.infrared_character = 0;
-        let (lost, stop_sent) = runtime.step(&mut cockpit, &request, &body, false, &events, 101);
+        let (lost, stop_sent) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            201,
+        );
         assert!(stop_sent);
         assert_eq!(lost.phase, SkillPhase::Terminal);
-        assert_eq!(lost.outcome, Some(SkillOutcome::TargetStale));
+        assert_eq!(lost.outcome, Some(SkillOutcome::Failed));
         assert!(lost.reason.unwrap().contains("IR gradient"));
     }
 
@@ -10448,7 +11455,24 @@ mod tests {
         let events = cockpit.get_events_since(0).unwrap();
         let mut runtime = PossessorSkillRuntime::default();
 
-        let (completed, stop_sent) = runtime.step(&mut cockpit, &request, &body, false, &events, 1);
+        let _ = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            1,
+        );
+        let (completed, stop_sent) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &events,
+            101,
+        );
         assert!(stop_sent);
         assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
 
@@ -10456,8 +11480,20 @@ mod tests {
         let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
         let events = cockpit.get_events_since(0).unwrap();
         let mut runtime = PossessorSkillRuntime::default();
-        let (completed, stop_sent) = runtime.step(&mut cockpit, &request, &body, true, &events, 1);
-        assert!(stop_sent);
+        let mut completed = SkillStatus::default();
+        let mut stop_sent = false;
+        for now_ms in [1, 101, 201, 301] {
+            (completed, stop_sent) = possessor_test_step(
+                &mut runtime,
+                &mut cockpit,
+                &request,
+                &body,
+                true,
+                &events,
+                now_ms,
+            );
+        }
+        let _ = stop_sent;
         assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
     }
 
@@ -10510,19 +11546,63 @@ mod tests {
             ..SkillRequest::default()
         };
         let body = BodySense::default();
-        let (_, command_sent) =
-            runtime.step(&mut cockpit, &request, &body, false, &initial_events, 1);
+        let _ = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &initial_events,
+            1,
+        );
+        let (_, command_sent) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &initial_events,
+            51,
+        );
         assert!(command_sent);
 
         let cursor = initial_events.next_seq.saturating_sub(1);
         cockpit.set_bump(true, false);
         let reflex_events = cockpit.get_events_since(cursor).unwrap();
-        let (preempted, command_sent) =
-            runtime.step(&mut cockpit, &request, &body, false, &reflex_events, 100);
+        let (preempted, command_sent) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &body,
+            false,
+            &reflex_events,
+            100,
+        );
 
-        assert!(!command_sent);
+        assert!(command_sent, "preemption must send a safe stop");
         assert_eq!(preempted.phase, SkillPhase::Terminal);
         assert_eq!(preempted.outcome, Some(SkillOutcome::SafetyPreempted));
+    }
+
+    fn possessor_test_step(
+        runtime: &mut PossessorSkillRuntime,
+        cockpit: &mut SimCockpit,
+        request: &SkillRequest,
+        body: &BodySense,
+        home_base_contact: bool,
+        events: &pete_cockpit::EventBatch,
+        now_ms: u64,
+    ) -> (SkillStatus, bool) {
+        let now = Now::blank(now_ms, body.clone());
+        runtime.step(
+            cockpit,
+            request,
+            &now,
+            &StatusSummary::from_raw(""),
+            home_base_contact,
+            events,
+            now_ms,
+        )
     }
 
     struct StubRuntime;
@@ -11723,18 +12803,19 @@ mod tests {
         let mut runner = RealRobotRunner::new(RobotMode::Slow, body, Vec::new(), StubRuntime)
             .with_autonomous_motion(true);
 
+        let _ = runner.tick_slow_manual().await.unwrap();
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
         assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(careful_mode_attempts.load(Ordering::SeqCst), 0);
         assert_eq!(
             bump_escape_commands.lock().unwrap().as_slice(),
-            &[(SafetyLatchKind::Bump, 42, -50, 0, 250)]
+            &[(SafetyLatchKind::Bump, 42, -100, 0, 250)]
         );
         assert_eq!(
             tick.chosen_action,
             Some(ActionPrimitive::Go {
-                intensity: -0.2,
+                intensity: -0.25,
                 duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
             })
         );
@@ -11753,7 +12834,7 @@ mod tests {
             debug.get("motion_sent_to_robot"),
             Some(
                 &serde_json::to_value(motor_command_to_motion(MotorCommand {
-                    forward: -0.05,
+                    forward: -0.10,
                     turn: 0.0,
                 }))
                 .unwrap()
@@ -11775,10 +12856,10 @@ mod tests {
         );
         assert_eq!(
             debug
-                .get("possession_recovery")
-                .and_then(|debug| debug.get("commanded_motion"))
-                .and_then(|motion| motion.get("ttl_ms")),
-            Some(&serde_json::json!(250))
+                .get("possessor_skill_status")
+                .and_then(|status| status.get("script"))
+                .and_then(|script| script.get("skill_id")),
+            Some(&serde_json::json!("motherbrain.releasePersistentBumper"))
         );
         assert_eq!(
             debug
@@ -11811,6 +12892,7 @@ mod tests {
         runner.possession_recovery.brainstem_reflex_observed = true;
         runner.possession_recovery.last_reflex_outcome = Some(ContactWithdrawalOutcome::Completed);
 
+        let _ = runner.tick_slow_manual().await.unwrap();
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
         assert_eq!(careful_mode_attempts.load(Ordering::SeqCst), 0);
@@ -11824,7 +12906,148 @@ mod tests {
             .as_ref()
             .and_then(|debug| debug.get("why_not_moving"))
             .and_then(|reason| reason.as_str())
-            .is_some_and(|reason| reason.contains("commanded bumper escape segment")));
+            .is_some_and(|reason| reason.contains("foreground Lua")));
+    }
+
+    #[test]
+    fn lua_cliff_recovery_emits_only_generation_bound_reverse_escape() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut cockpit = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::new(AtomicUsize::new(0)),
+            careful_mode_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_escape_commands: Arc::clone(&commands),
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            clear_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_active: false,
+        };
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "uptime_ms": 1_000,
+                "current_runtime_state": "idle",
+                "oi_mode": "safe",
+                "safety_tripped": true,
+                "safety_latch_kind": "cliff",
+                "safety_hazard_generation": 77,
+                "create_sensors": {
+                    "complete_packet_count": 1,
+                    "last_complete_packet_timestamp_ms": 1_000,
+                    "cliff_front_left": true,
+                    "charging_state": 0
+                }
+            })
+            .to_string(),
+        }
+        .summary();
+        let request = SkillRequest {
+            skill_id: SkillId::RetreatFromCliff,
+            ..SkillRequest::default()
+        };
+        let mut state = EmbodiedLuaDriverState::default();
+        let mut driver = RealLuaOrganDriver {
+            cockpit: &mut cockpit,
+            request: &request,
+            status: &status,
+            home_base_contact: false,
+            state: &mut state,
+            command_sent: false,
+        };
+        let mut now = Now::blank(1_000, BodySense::default());
+        now.body.flags.cliff_front_left = true;
+        let result = driver.poll(
+            &HostOperation::Retreat {
+                hazard: HazardKind::Cliff,
+                distance_m: 0.1,
+            },
+            OperationContext {
+                operation_id: 1,
+                child_id: 0,
+                first_poll: true,
+                elapsed_ms: 0,
+                now_ms: 1_000,
+                primitive_ttl_ms: 250,
+            },
+            &now,
+            &EventBatch {
+                since_seq: 0,
+                oldest_seq: 0,
+                next_seq: 0,
+                dropped_before_seq: 0,
+                events: Vec::new(),
+            },
+        );
+        assert!(matches!(result, OrganPoll::Pending { .. }));
+        assert_eq!(
+            commands.lock().unwrap().as_slice(),
+            &[(SafetyLatchKind::Cliff, 77, -100, 0, 250)]
+        );
+    }
+
+    #[test]
+    fn lua_bump_recovery_cannot_suppress_imu_absolute_hazard() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut cockpit = ActiveBumpRecoveryCockpit {
+            bump_escape_attempts: Arc::new(AtomicUsize::new(0)),
+            careful_mode_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_escape_commands: Arc::clone(&commands),
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            clear_attempts: Arc::new(AtomicUsize::new(0)),
+            bump_active: true,
+        };
+        let status = CockpitStatus {
+            raw: serde_json::json!({
+                "safety_tripped": true,
+                "safety_latch_kind": "bump",
+                "safety_hazard_generation": 78,
+                "imu": {"health": "ok", "impact_score_mm_s2": 20_000}
+            })
+            .to_string(),
+        }
+        .summary();
+        let request = SkillRequest {
+            skill_id: SkillId::ReleasePersistentBumper,
+            ..SkillRequest::default()
+        };
+        let mut state = EmbodiedLuaDriverState::default();
+        let mut driver = RealLuaOrganDriver {
+            cockpit: &mut cockpit,
+            request: &request,
+            status: &status,
+            home_base_contact: false,
+            state: &mut state,
+            command_sent: false,
+        };
+        let mut now = Now::blank(1_000, BodySense::default());
+        now.body.flags.bump_left = true;
+        let result = driver.poll(
+            &HostOperation::Retreat {
+                hazard: HazardKind::BumperFront,
+                distance_m: 0.1,
+            },
+            OperationContext {
+                operation_id: 1,
+                child_id: 0,
+                first_poll: true,
+                elapsed_ms: 0,
+                now_ms: 1_000,
+                primitive_ttl_ms: 250,
+            },
+            &now,
+            &EventBatch {
+                since_seq: 0,
+                oldest_seq: 0,
+                next_seq: 0,
+                dropped_before_seq: 0,
+                events: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            result,
+            OrganPoll::Failed(SkillFailure {
+                outcome: SkillOutcome::SafetyPreempted,
+                ..
+            })
+        ));
+        assert!(commands.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -11844,13 +13067,16 @@ mod tests {
             .with_autonomous_motion(true);
 
         let (_first_snapshot, _first_tick) = runner.tick_slow_manual().await.unwrap();
-        let (second_snapshot, second_tick) = runner.tick_slow_manual().await.unwrap();
+        let (_second_snapshot, _second_tick) = runner.tick_slow_manual().await.unwrap();
 
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(260));
+        let (second_snapshot, second_tick) = runner.tick_slow_manual().await.unwrap();
         assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             second_tick.chosen_action,
             Some(ActionPrimitive::Go {
-                intensity: -0.2,
+                intensity: -0.25,
                 duration_ms: POSSESSION_ESCAPE_TTL_MS as TimeMs,
             })
         );
@@ -11859,11 +13085,11 @@ mod tests {
             .as_ref()
             .and_then(|debug| debug.get("why_not_moving"))
             .and_then(|reason| reason.as_str())
-            .is_some_and(|reason| reason.contains("commanded bumper escape segment 2")));
+            .is_some_and(|reason| reason.contains("foreground Lua")));
     }
 
     #[tokio::test]
-    async fn real_robot_slow_runner_reports_stuck_bump_recovery_after_repeated_attempts() {
+    async fn real_robot_slow_runner_bounds_lua_bump_recovery_instead_of_eagerly_stopping() {
         let bump_escape_attempts = Arc::new(AtomicUsize::new(0));
         let bump_escape_commands = Arc::new(Mutex::new(Vec::new()));
         let stop_attempts = Arc::new(AtomicUsize::new(0));
@@ -11884,22 +13110,22 @@ mod tests {
             wall_time_ms().saturating_sub(POSSESSION_RECOVERY_STUCK_AFTER_MS + 1);
         runner.possession_recovery.command_attempts = 12;
 
-        let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
-
-        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 0);
-        assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
-        let debug = snapshot.action_debug.as_ref().unwrap();
-        assert!(debug
-            .get("why_not_moving")
-            .and_then(|reason| reason.as_str())
-            .is_some_and(|reason| reason.contains("operator intervention needed")));
+        let request = runner
+            .possession_recovery_skill_request(&EventBatch {
+                since_seq: 0,
+                oldest_seq: 0,
+                next_seq: 0,
+                dropped_before_seq: 0,
+                events: Vec::new(),
+            })
+            .expect("Lua recovery request");
+        assert_eq!(request.skill_id, SkillId::ReleasePersistentBumper);
         assert_eq!(
-            debug
-                .get("possession_recovery")
-                .and_then(|debug| debug.get("phase")),
-            Some(&serde_json::json!("Stuck"))
+            request.maximum_duration_ms,
+            POSSESSION_RECOVERY_STUCK_AFTER_MS
         );
+        assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -11942,6 +13168,7 @@ mod tests {
         runner.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
         runner.possession_recovery.command_attempts = 1;
 
+        let _ = runner.tick_slow_manual().await.unwrap();
         let (snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
         assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 1);
@@ -11954,7 +13181,7 @@ mod tests {
             .as_ref()
             .and_then(|debug| debug.get("why_not_moving"))
             .and_then(|reason| reason.as_str())
-            .is_some_and(|reason| reason.contains("commanded bumper escape segment 2")));
+            .is_some_and(|reason| reason.contains("foreground Lua")));
     }
 
     #[tokio::test]
@@ -11976,6 +13203,7 @@ mod tests {
         runner.possession_recovery.phase = PossessionRecoveryPhase::Escaping;
         runner.possession_recovery.command_attempts = 1;
 
+        let _ = runner.tick_slow_manual().await.unwrap();
         let (_snapshot, tick) = runner.tick_slow_manual().await.unwrap();
 
         assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
@@ -13446,81 +14674,97 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn executed_goal_behavior_strengthens_approach_progress_from_canonical_target() {
-        let ledger = JsonlLedger::new("/tmp/pete-runtime-semantic-outcome-test");
-        let memory = InMemoryExperienceStore::new();
-        let recall = memory.clone();
-        let mut runtime = MinimalRuntime::new(
-            ledger,
-            memory,
-            recall,
-            FixedConductor::new(ActionPrimitive::Stop),
-            SimpleSafety::default(),
-            pete_llm::NoopLlmAgent,
-        )
-        .with_action_selector_mode(ActionSelectorMode::Goal);
-        let charger_now = |t_ms: u64, distance_m: f32| {
-            let mut now = idle_now(t_ms);
-            now.body.battery_level = 0.12;
-            now.objects.observations.push(pete_now::ObjectObservation {
-                label: "dock".to_string(),
-                class: ObjectClass::Charger,
-                bearing_rad: 0.0,
-                distance_m: Some(distance_m),
-                confidence: 0.95,
-                source: pete_now::ObjectObservationSource::Sim,
-            });
-            now
-        };
-        let first = runtime
-            .tick(
-                charger_now(100, 1.0),
-                ExperienceLatent::default(),
-                Vec::new(),
-            )
-            .await
+    #[test]
+    fn executed_goal_behavior_strengthens_approach_progress_from_canonical_target() {
+        std::thread::Builder::new()
+            .name("semantic-outcome-test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let ledger = JsonlLedger::new("/tmp/pete-runtime-semantic-outcome-test");
+                        let memory = InMemoryExperienceStore::new();
+                        let recall = memory.clone();
+                        let mut runtime = Box::new(
+                            MinimalRuntime::new(
+                                ledger,
+                                memory,
+                                recall,
+                                FixedConductor::new(ActionPrimitive::Stop),
+                                SimpleSafety::default(),
+                                pete_llm::NoopLlmAgent,
+                            )
+                            .with_action_selector_mode(ActionSelectorMode::Goal),
+                        );
+                        let charger_now = |t_ms: u64, distance_m: f32| {
+                            let mut now = idle_now(t_ms);
+                            now.body.battery_level = 0.12;
+                            now.objects.observations.push(pete_now::ObjectObservation {
+                                label: "dock".to_string(),
+                                class: ObjectClass::Charger,
+                                bearing_rad: 0.0,
+                                distance_m: Some(distance_m),
+                                confidence: 0.95,
+                                source: pete_now::ObjectObservationSource::Sim,
+                            });
+                            now
+                        };
+                        let first = runtime
+                            .tick(
+                                charger_now(100, 1.0),
+                                ExperienceLatent::default(),
+                                Vec::new(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            first.frame.now.extensions["action_selector"]["selected_behavior"],
+                            serde_json::Value::String("approach_charger".to_string())
+                        );
+                        drop(first);
+                        let second = runtime
+                            .tick(
+                                charger_now(200, 0.7),
+                                ExperienceLatent::default(),
+                                Vec::new(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            second.frame.now.extensions["goal_system.outcome"]
+                                ["executed_goal_behavior"],
+                            serde_json::Value::String("approach_charger".to_string())
+                        );
+                        drop(second);
+                        let third = runtime
+                            .tick(
+                                charger_now(300, 0.7),
+                                ExperienceLatent::default(),
+                                Vec::new(),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(third.frame.now.world.semantic.relations.values().any(
+                            |relation| {
+                                relation.subject
+                                    == SemanticNodeRef::Behavior(SemanticBehaviorId(
+                                        "approach_charger".to_string(),
+                                    ))
+                                    && relation.predicate == SemanticPredicate::Predicts
+                                    && relation
+                                        .supporting_evidence
+                                        .iter()
+                                        .any(|evidence| evidence.source == "runtime.action_outcome")
+                            }
+                        ));
+                    });
+            })
+            .unwrap()
+            .join()
             .unwrap();
-        assert_eq!(
-            first.frame.now.extensions["action_selector"]["selected_behavior"],
-            serde_json::Value::String("approach_charger".to_string())
-        );
-        let second = runtime
-            .tick(
-                charger_now(200, 0.7),
-                ExperienceLatent::default(),
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            second.frame.now.extensions["goal_system.outcome"]["executed_goal_behavior"],
-            serde_json::Value::String("approach_charger".to_string())
-        );
-        let third = runtime
-            .tick(
-                charger_now(300, 0.7),
-                ExperienceLatent::default(),
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(third
-            .frame
-            .now
-            .world
-            .semantic
-            .relations
-            .values()
-            .any(|relation| {
-                relation.subject
-                    == SemanticNodeRef::Behavior(SemanticBehaviorId("approach_charger".to_string()))
-                    && relation.predicate == SemanticPredicate::Predicts
-                    && relation
-                        .supporting_evidence
-                        .iter()
-                        .any(|evidence| evidence.source == "runtime.action_outcome")
-            }));
     }
 
     #[tokio::test]
@@ -15123,9 +16367,13 @@ mod tests {
         let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
         let mut saw_column = false;
         let mut recovered = false;
+        let mut last_skill_status = None;
 
         runner
-            .run_steps_observing(90, |snapshot| {
+            .run_steps_observing_ticks(90, |snapshot, tick| {
+                if tick.skill_status.is_some() {
+                    last_skill_status = tick.skill_status.clone();
+                }
                 if let Some(stuck) = snapshot
                     .extensions
                     .iter()
@@ -15141,7 +16389,7 @@ mod tests {
         let distance = distance_between_points(start, (end.odometry.x_m, end.odometry.y_m));
 
         assert!(saw_column);
-        assert!(recovered);
+        assert!(recovered, "last Lua skill status was {last_skill_status:?}");
         assert!(distance > 0.10, "distance after recovery was {distance}");
     }
 
