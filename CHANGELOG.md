@@ -12,6 +12,10 @@ All notable changes are grouped by date.
 - Record the `pete-cockpit` CLI's `clap` dependency in the workspace lockfile.
 - Record the current `pete-memory`, ORT, `burn-core`, `rgb`, and `xtask`
   dependency metadata.
+- Deduplicate and normalize `Cargo.lock` dependency metadata by removing stale
+  `colored`, `console`, `indicatif`, `drawille`, `number_prefix`, and
+  `textplots` package entries, then relaxing crate dependency pins to shared
+  workspace versions where applicable.
 
 ### Added
 
