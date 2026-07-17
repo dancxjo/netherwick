@@ -147,6 +147,7 @@ drive_arc
 stop
 dock
 careful_mode
+escape_motion
 ```
 
 Navigation, alignment, timed-motion, scanning, wall-follow, wiggle, and escape
@@ -159,14 +160,19 @@ uses the same contract. `set_safety_policy` and `cliff_guard` are likewise
 unsupported because a host cannot silently weaken or manufacture physical
 safety.
 
-`careful_mode` is the deliberately conspicuous exception for an active
-possessor taking direct responsibility for the body during an exceptional
-physical intervention. It is not a selectable safety policy. Each request has
-an explicit 250–15,000 ms TTL, clears the current bump, cliff, wheel-drop,
-tilt, impact, and dock/charging motor gates, and keeps those raw observations
-visible but advisory for that window. E-stop, loss of authority, heartbeat
-expiry, and stale Create telemetry remain absolute. Expiry stops first and
-re-latches any condition still physically present.
+`careful_mode` is the deliberately conspicuous exception for an attended
+operator taking direct responsibility for the body during an exceptional
+physical intervention. It requires operator-debug authority and is never
+invoked by motherbrain recovery. Each request has an explicit 250–15,000 ms
+TTL, keeps raw observations visible, and remains bounded by E-stop, authority,
+heartbeat, and telemetry freshness. Expiry stops first and re-latches every
+live condition.
+
+Ordinary recovery uses `escape_motion`, not CAREFUL. Each request names the
+currently acknowledged bump or cliff generation and carries one 250 ms
+velocity segment. Brainstem accepts it only inside that hazard's reverse/turn
+envelope and only while no wheel-drop, charging, tilt, impact, E-stop, link, or
+authority hazard dominates. A new hazard ends the segment immediately.
 
 `get_capabilities` reports the current body contract using the clean names above: body kind, drive type, supported verbs, sensors, outputs, safety features, limits, feedback/song slots, and supported sensor packet range. The facts come from the selected body descriptor, not from the generic renderer. HTTP/WebSocket return JSON; UDP and forebrain UART return a compact single-line representation.
 
@@ -225,7 +231,11 @@ repeat count, preempted command id, and the reverse bounds;
 `contact_withdrawal_completed` records outcome, any dominating safety condition,
 observed odometry displacement, elapsed time, and final stopped state. The
 motherbrain possessor consumes those events as a safety preemption of its active
-skill; it does not schedule or claim ownership of the reflex.
+skill; it does not schedule or claim ownership of the reflex. If contact
+remains after the reflex stops, motherbrain may submit successive
+generation-bound `escape_motion` segments, observing sensors and odometry
+between them. No uncommanded CAREFUL interval exists, and no reverse or turn is
+reported until it has actually been submitted and observed.
 
 The current internal Rust enums still include Create-specific variants such as `CreateOiMode`, `CreatePacketReceived`, and `CreateSensorPacketDecoded`. Those are driver/runtime implementation details, not the clean public vocabulary. Public capability and event renderers translate them into body-neutral names.
 

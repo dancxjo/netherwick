@@ -1635,7 +1635,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <script>
 let id=1,active=false,timer=0,controlRefreshTimer=0,controlRefreshGeneration=0,controlLeaseExpiresAt=0,browserSessionPromise=null,last={x:0,y:0},ws=null,wsOpen=false,sse=null,sseOpen=false,driveKind='',lastDriveAt=0,lastHeartbeatAt=0,eventCursor=0,caps=null,lastStatus=null,sessionId='',controlLeaseId='',serviceLeaseId='',sensorStreamRequested=false;
 const $=x=>document.getElementById(x),base=$('base'),nub=$('nub'),net=$('net'),log=$('log');
-const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','clear_safety_latch','careful_mode','heartbeat_stop','request_sensors','stream_sensors','clear_motion_queue','define_chirp','play_feedback','power_state','create_power_on','create_power_off','calibrate_turn','orientation_probe','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
+const seqKinds=new Set(['cmd_vel','drive_direct','drive_arc','clear_safety_latch','careful_mode','escape_motion','heartbeat_stop','request_sensors','stream_sensors','clear_motion_queue','define_chirp','play_feedback','power_state','create_power_on','create_power_off','calibrate_turn','orientation_probe','reset_odometry','zero_imu_orientation','clear_imu_orientation','song_define']);
 const actionVerb={heartbeat:'heartbeat_stop'};
 function title(s){return (s||'unknown').replaceAll('_',' ')}
 function errorName(code){return ({1:'Create did not respond',2:'Create UART framing failure',3:'Create command timeout',4:'invalid Create sensor packet'})[code]||('brainstem error '+code)}
@@ -1768,7 +1768,7 @@ fn handle_handshake_json<'a>(body: &str, buffer: &'a mut [u8], transport: u8) ->
     let accepted = match session::validate(&hello, device_id.as_str(), boot_id.as_str()) {
         Ok(accepted) => accepted,
         Err(reason) => {
-            return render_handshake_reject(buffer, hello.handshake_nonce.as_str(), reason)
+            return render_handshake_reject(buffer, hello.handshake_nonce.as_str(), reason);
         }
     };
     let session_hash = session::token_hash(accepted.session_id.as_str());
@@ -2284,6 +2284,14 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             seq,
             ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
         },
+        "ESCAPE_MOTION" => BrainstemCommand::EscapeMotion {
+            seq,
+            kind: parse_safety_latch_kind(parts.next().ok_or(seq)?).ok_or(seq)?,
+            hazard_generation: parse_u32(parts.next()).ok_or(seq)?,
+            linear_mm_s: parse_i16(parts.next()).ok_or(seq)?,
+            angular_mrad_s: parse_i16(parts.next()).ok_or(seq)?,
+            ttl_ms: parse_u32(parts.next()).ok_or(seq)?,
+        },
         "HEARTBEAT_STOP" => BrainstemCommand::HeartbeatStop {
             seq,
             timeout_ms: parse_u32(parts.next()).ok_or(seq)?,
@@ -2601,7 +2609,11 @@ fn json_authority_valid(body: &str) -> bool {
     let session_hash = session::token_hash(session_id);
     let lease_hash = session::token_hash(lease_id);
     let now = Instant::now().as_millis() as u32;
-    if json_str(body, "kind") == Some("heartbeat_stop") {
+    if json_str(body, "kind") == Some("careful_mode")
+        && (status::session_role(session_hash) != Some(3) || !cfg!(feature = "operator-debug"))
+    {
+        false
+    } else if json_str(body, "kind") == Some("heartbeat_stop") {
         status::authority_heartbeat_valid(session_hash, lease_hash, now)
     } else {
         status::active_authority_matches(session_hash, lease_hash, now)
@@ -2630,7 +2642,12 @@ fn compact_authority_valid(
             let session_hash = session::token_hash(session_id);
             let lease_hash = session::token_hash(lease);
             let now = Instant::now().as_millis() as u32;
-            if let BrainstemCommand::HeartbeatStop { .. } = command {
+            if matches!(command, BrainstemCommand::CarefulMode { .. })
+                && (status::session_role(session_hash) != Some(3)
+                    || !cfg!(feature = "operator-debug"))
+            {
+                false
+            } else if let BrainstemCommand::HeartbeatStop { .. } = command {
                 status::authority_heartbeat_valid(session_hash, lease_hash, now)
             } else {
                 status::active_authority_matches(session_hash, lease_hash, now)
@@ -2770,7 +2787,17 @@ fn handle_network_registration_compact<const N: usize>(
         let _ = writeln!(response, "ERR {seq} lease_mismatch");
         return;
     };
-    let _ = writeln!(response, "OK {seq} NETWORK_ENDPOINT_REGISTERED session_id={} fqdn=motherbrain.pete.internal address={}.{}.{}.{} ttl={} generation={}", session_id.unwrap_or(""), address[0], address[1], address[2], address[3], ttl, generation);
+    let _ = writeln!(
+        response,
+        "OK {seq} NETWORK_ENDPOINT_REGISTERED session_id={} fqdn=motherbrain.pete.internal address={}.{}.{}.{} ttl={} generation={}",
+        session_id.unwrap_or(""),
+        address[0],
+        address[1],
+        address[2],
+        address[3],
+        ttl,
+        generation
+    );
 }
 
 fn parse_ipv4(value: &str) -> Option<[u8; 4]> {
@@ -2850,7 +2877,11 @@ fn handle_service_authority_compact<const N: usize>(
         let _ = writeln!(response, "ERR {seq} authority_transition_timeout");
         return;
     };
-    let _ = writeln!(response, "OK {seq} SERVICE_LEASE_GRANTED lease_id={lease_id} session_id={session_id} owner_role={} scope={scope} ttl_ms={ttl_ms} generation={generation}", role_name(status::session_role(session_hash).unwrap_or(0)));
+    let _ = writeln!(
+        response,
+        "OK {seq} SERVICE_LEASE_GRANTED lease_id={lease_id} session_id={session_id} owner_role={} scope={scope} ttl_ms={ttl_ms} generation={generation}",
+        role_name(status::session_role(session_hash).unwrap_or(0))
+    );
 }
 
 fn service_policy_allows(session_hash: u32) -> bool {
@@ -2945,7 +2976,11 @@ fn handle_authority_compact<const N: usize>(line: &str, response: &mut heapless:
         let _ = writeln!(response, "ERR {seq} authority_transition_timeout");
         return;
     };
-    let _ = writeln!(response, "OK {seq} CONTROL_LEASE_GRANTED lease_id={lease_id} session_id={session_id} owner_role={} authority={authority} ttl_ms={ttl_ms} generation={generation}", role_name(status::session_role(session_hash).unwrap_or(0)));
+    let _ = writeln!(
+        response,
+        "OK {seq} CONTROL_LEASE_GRANTED lease_id={lease_id} session_id={session_id} owner_role={} authority={authority} ttl_ms={ttl_ms} generation={generation}",
+        role_name(status::session_role(session_hash).unwrap_or(0))
+    );
 }
 
 fn authority_policy_allows(session_hash: u32, authority: &str, now_ms: u32) -> bool {
@@ -3105,7 +3140,7 @@ fn write_compact_status_line<const N: usize>(
     let flags = snapshot.create_sensor_flags;
     writeln!(
         response,
-        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} armed={} estop={} safety_tripped={} safety_latch_kind={} motion_interlock={} active_cmd_vel={} event_next_seq={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} ir_byte={} bump_left={} bump_right={} wheel_drop={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={} careful_mode={} careful_remaining_ms={}",
+        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} armed={} estop={} safety_tripped={} safety_latch_kind={} safety_hazard_generation={} motion_interlock={} active_cmd_vel={} event_next_seq={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} ir_byte={} bump_left={} bump_right={} wheel_drop={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={} careful_mode={} careful_remaining_ms={}",
         snapshot.uptime_ms,
         snapshot.current_runtime_state,
         snapshot.body_state,
@@ -3120,6 +3155,7 @@ fn write_compact_status_line<const N: usize>(
         estop_latched,
         safety_tripped,
         compact_safety_latch_kind(safety_latch_kind),
+        snapshot.safety_hazard_generation,
         motion_interlock_latched,
         snapshot.body_state == status::BodyState::Moving as u8,
         snapshot.event_next_seq,
@@ -3255,6 +3291,14 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
         "careful_mode" => Some(BrainstemCommand::CarefulMode {
+            ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
+        "escape_motion" => Some(BrainstemCommand::EscapeMotion {
+            kind: parse_safety_latch_kind(json_str(body, "hazard")?)?,
+            hazard_generation: json_u32(body, "hazard_generation")?,
+            linear_mm_s: json_i16(body, "linear_mm_s")?,
+            angular_mrad_s: json_i16(body, "angular_mrad_s")?,
             ttl_ms: json_u32(body, "ttl_ms").or_else(|| json_u32(body, "duration_ms"))?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),

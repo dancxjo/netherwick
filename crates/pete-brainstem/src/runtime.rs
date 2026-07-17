@@ -182,6 +182,15 @@ struct ActiveVelocity {
     angular_mrad_s: i16,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ActiveEscape {
+    kind: SafetyLatchKind,
+    hazard_generation: u32,
+    linear_mm_s: i16,
+    angular_mrad_s: i16,
+    ttl_ms: u32,
+}
+
 pub struct Runtime<H>
 where
     H: BrainstemHardware,
@@ -196,6 +205,7 @@ where
     active: ActiveAction,
     active_command_id: Option<u32>,
     active_velocity: Option<ActiveVelocity>,
+    active_escape: Option<ActiveEscape>,
     stop_sent: bool,
     heartbeat_stop_at_ms: Option<u32>,
     careful_mode_until_ms: Option<u32>,
@@ -260,6 +270,7 @@ where
             active: ActiveAction::None,
             active_command_id: None,
             active_velocity: None,
+            active_escape: None,
             stop_sent: false,
             heartbeat_stop_at_ms: None,
             careful_mode_until_ms: None,
@@ -587,14 +598,7 @@ where
         let command_id = status::last_dispatched_command_id();
         let (service_session_hash, service_lease_hash) = status::last_dispatched_service_identity();
 
-        if self.active_contact_withdrawal.is_some()
-            && !matches!(
-                command,
-                BrainstemCommand::Stop
-                    | BrainstemCommand::EStop
-                    | BrainstemCommand::Disarm
-                    | BrainstemCommand::CarefulMode { .. }
-            )
+        if self.active_contact_withdrawal.is_some() && !command_preempts_contact_withdrawal(command)
         {
             // The possessor may lose or replace authority while this runs.
             // Ordinary commands cannot supersede a local reflex.
@@ -602,14 +606,7 @@ where
             return;
         }
 
-        if self.active_contact_withdrawal.is_some()
-            && matches!(
-                command,
-                BrainstemCommand::Stop
-                    | BrainstemCommand::EStop
-                    | BrainstemCommand::Disarm
-                    | BrainstemCommand::CarefulMode { .. }
-            )
+        if self.active_contact_withdrawal.is_some() && command_preempts_contact_withdrawal(command)
         {
             let stopped = self.stop_drive().is_ok();
             self.finish_contact_withdrawal(
@@ -683,6 +680,28 @@ where
             BrainstemCommand::CmdVel { .. } => {
                 if let Some(command) = runtime_command_from_forebrain(command) {
                     self.enqueue_latest_velocity(command_id, command);
+                }
+                if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
+                    self.mode = RuntimeMode::Running;
+                    status::set_runtime_state(RuntimeState::Running);
+                }
+            }
+            BrainstemCommand::EscapeMotion { .. } => {
+                if let Some(command) = runtime_command_from_forebrain(command) {
+                    let pending = self.commands.len();
+                    for _ in 0..pending {
+                        let Some(existing) = self.commands.pop_front() else {
+                            break;
+                        };
+                        if matches!(existing.command, RuntimeCommand::EscapeMotion { .. }) {
+                            status::mark_command_interrupted(existing.command_id);
+                        } else {
+                            let _ = self.commands.push_back(existing);
+                        }
+                    }
+                    let _ = self
+                        .commands
+                        .push_back(QueuedCommand::safety_recovery(command_id, command));
                 }
                 if self.mode == RuntimeMode::Idle || self.mode == RuntimeMode::Error {
                     self.mode = RuntimeMode::Running;
@@ -1035,6 +1054,30 @@ where
             RuntimeCommand::CarefulMode { ttl_ms } => {
                 self.enter_careful_mode(ttl_ms)?;
             }
+            RuntimeCommand::EscapeMotion {
+                kind,
+                hazard_generation,
+                linear_mm_s,
+                angular_mrad_s,
+                ttl_ms,
+            } => {
+                status::validate_escape_motion(
+                    kind,
+                    hazard_generation,
+                    linear_mm_s,
+                    angular_mrad_s,
+                    ttl_ms,
+                )
+                .map_err(|_| BrainstemError::CreateNoResponse)?;
+                self.active_escape = Some(ActiveEscape {
+                    kind,
+                    hazard_generation,
+                    linear_mm_s,
+                    angular_mrad_s,
+                    ttl_ms,
+                });
+                self.start_cmd_vel(linear_mm_s, angular_mrad_s, Some(ttl_ms), now_ms)?;
+            }
             RuntimeCommand::HeartbeatStop { timeout_ms } => {
                 self.heartbeat_stop_at_ms = Some(now_ms.wrapping_add(timeout_ms));
             }
@@ -1383,6 +1426,7 @@ where
             .stop(&mut self.hardware, &mut self.events)?;
         self.stop_sent = true;
         self.active_velocity = None;
+        self.active_escape = None;
         status::clear_velocity_stream();
         // Once STOP has been sent successfully there is no live motion for the
         // heartbeat watchdog to supervise. Leaving the old deadline armed
@@ -1599,6 +1643,51 @@ where
             self.safety_observation_initialized = true;
         }
         let fresh_bump_edge = bump && !self.last_bump;
+
+        if let Some(active_escape) = self.active_escape {
+            let dominating_hazard = if wheel_drop {
+                Some(status::SafetyEventKind::WheelDrop)
+            } else if tilt {
+                Some(status::SafetyEventKind::Tilt)
+            } else if impact {
+                Some(status::SafetyEventKind::Impact)
+            } else if charging || home_base {
+                Some(status::SafetyEventKind::Charging)
+            } else {
+                match active_escape.kind {
+                    SafetyLatchKind::Bump if cliff => Some(status::SafetyEventKind::Cliff),
+                    SafetyLatchKind::Cliff if bump => Some(status::SafetyEventKind::Bump),
+                    _ => None,
+                }
+            };
+            if let Some(kind) = dominating_hazard {
+                status::mark_safety_tripped(kind);
+                self.apply_safety_response(kind, SafetyResponse::Stop)?;
+                let _ = self.play_feedback_now(FeedbackKind::Danger);
+                self.update_safety_edges(bump, cliff, wheel_drop);
+                return Ok(());
+            }
+            if status::validate_escape_motion(
+                active_escape.kind,
+                active_escape.hazard_generation,
+                active_escape.linear_mm_s,
+                active_escape.angular_mrad_s,
+                active_escape.ttl_ms,
+            )
+            .is_err()
+            {
+                self.interrupt_active_command();
+                self.commands.clear();
+                self.active = ActiveAction::None;
+                self.stop_drive()?;
+                self.update_safety_edges(bump, cliff, wheel_drop);
+                return Ok(());
+            }
+            // The acknowledged latch remains active and visible. Only this
+            // exact generation-bound segment may move through it.
+            self.update_safety_edges(bump, cliff, wheel_drop);
+            return Ok(());
+        }
 
         if self.careful_mode_active(now_ms) {
             // CAREFUL transfers responsibility for these observations to the
@@ -2132,6 +2221,7 @@ where
     fn interrupt_active_command(&mut self) {
         self.safety_recovery_motion = false;
         self.active_velocity = None;
+        self.active_escape = None;
         status::clear_velocity_stream();
         if let Some(command_id) = self.active_command_id.take() {
             status::mark_command_interrupted(command_id);
@@ -2237,6 +2327,13 @@ fn create_charging_active(snapshot: &status::BrainstemStatus) -> bool {
         || matches!(snapshot.create_sensor_charging_state, 1..=3)
 }
 
+fn command_preempts_contact_withdrawal(command: BrainstemCommand) -> bool {
+    matches!(
+        command,
+        BrainstemCommand::Stop | BrainstemCommand::EStop | BrainstemCommand::Disarm
+    )
+}
+
 fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCommand> {
     match command {
         BrainstemCommand::Ping
@@ -2287,6 +2384,20 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         BrainstemCommand::CarefulMode { ttl_ms, .. } => {
             Some(RuntimeCommand::CarefulMode { ttl_ms })
         }
+        BrainstemCommand::EscapeMotion {
+            kind,
+            hazard_generation,
+            linear_mm_s,
+            angular_mrad_s,
+            ttl_ms,
+            ..
+        } => Some(RuntimeCommand::EscapeMotion {
+            kind,
+            hazard_generation,
+            linear_mm_s,
+            angular_mrad_s,
+            ttl_ms,
+        }),
         BrainstemCommand::HeartbeatStop { timeout_ms, .. } => {
             Some(RuntimeCommand::HeartbeatStop { timeout_ms })
         }
@@ -2382,6 +2493,7 @@ fn is_motion_command(command: RuntimeCommand) -> bool {
         command,
         RuntimeCommand::DriveDirect { .. }
             | RuntimeCommand::CmdVel { .. }
+            | RuntimeCommand::EscapeMotion { .. }
             | RuntimeCommand::DriveArc { .. }
             | RuntimeCommand::Drive { .. }
             | RuntimeCommand::StopDrive
@@ -2394,6 +2506,11 @@ fn is_motion_command(command: RuntimeCommand) -> bool {
 fn requires_dock_departure(command: RuntimeCommand) -> bool {
     match command {
         RuntimeCommand::CmdVel {
+            linear_mm_s,
+            angular_mrad_s,
+            ..
+        } => linear_mm_s != 0 || angular_mrad_s != 0,
+        RuntimeCommand::EscapeMotion {
             linear_mm_s,
             angular_mrad_s,
             ..
@@ -3520,6 +3637,120 @@ mod tests {
         assert!(matches!(
             runtime.safety_latch_kind,
             Some(status::SafetyEventKind::Bump)
+        ));
+    }
+
+    #[test]
+    fn only_absolute_stop_commands_can_preempt_contact_withdrawal() {
+        assert!(command_preempts_contact_withdrawal(BrainstemCommand::Stop));
+        assert!(command_preempts_contact_withdrawal(BrainstemCommand::EStop));
+        assert!(command_preempts_contact_withdrawal(
+            BrainstemCommand::Disarm
+        ));
+        assert!(!command_preempts_contact_withdrawal(
+            BrainstemCommand::CarefulMode {
+                ttl_ms: 1_000,
+                seq: 7,
+            }
+        ));
+        assert!(!command_preempts_contact_withdrawal(
+            BrainstemCommand::EscapeMotion {
+                kind: SafetyLatchKind::Bump,
+                hazard_generation: 42,
+                linear_mm_s: -50,
+                angular_mrad_s: 0,
+                ttl_ms: 250,
+                seq: 8,
+            }
+        ));
+    }
+
+    #[test]
+    fn generation_bound_bump_escape_runs_one_segment_and_new_cliff_preempts_it() {
+        let _guard = status::status_test_guard();
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        assert!(runtime.enforce_safety_policy().is_ok());
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(41);
+        runtime.active_velocity = Some(ActiveVelocity {
+            linear_mm_s: 80,
+            angular_mrad_s: 0,
+        });
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        assert!(runtime.enforce_safety_policy().is_ok());
+        let generation = status::safety_hazard_generation();
+        assert_ne!(generation, 0);
+        runtime.publish_safety_snapshot();
+
+        assert_eq!(
+            status::validate_escape_motion(
+                SafetyLatchKind::Bump,
+                generation.wrapping_sub(1),
+                -50,
+                0,
+                250,
+            ),
+            Err(pete_cockpit_protocol::CommandRejectReason::HazardMismatch)
+        );
+        assert_eq!(
+            status::validate_escape_motion(SafetyLatchKind::Bump, generation, 50, 0, 250,),
+            Err(pete_cockpit_protocol::CommandRejectReason::EscapeEnvelope)
+        );
+        assert!(
+            status::validate_escape_motion(SafetyLatchKind::Bump, generation, -50, 0, 250,).is_ok()
+        );
+
+        assert!(runtime.start_next_command().is_ok());
+        runtime.hardware.now_us += CONTACT_WITHDRAWAL_DURATION_MS * 1_000;
+        assert!(runtime.advance_active_action().is_ok());
+        assert!(runtime.active_contact_withdrawal.is_none());
+
+        assert!(runtime
+            .commands
+            .push_back(QueuedCommand::safety_recovery(
+                55,
+                RuntimeCommand::EscapeMotion {
+                    kind: SafetyLatchKind::Bump,
+                    hazard_generation: generation,
+                    linear_mm_s: -50,
+                    angular_mrad_s: 0,
+                    ttl_ms: 250,
+                },
+            ))
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(runtime.active_escape.is_some());
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                flags: crate::events::CreateSensorFlags {
+                    bump_left: true,
+                    cliff_front_left: true,
+                    ..crate::events::CreateSensorFlags::default()
+                },
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert!(runtime.active_escape.is_none());
+        assert!(matches!(runtime.active, ActiveAction::None));
+        assert!(matches!(
+            runtime.safety_latch_kind,
+            Some(status::SafetyEventKind::Cliff)
         ));
     }
 

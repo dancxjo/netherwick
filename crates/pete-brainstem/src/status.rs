@@ -184,6 +184,7 @@ static ACTIVE_SESSION_HASH: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SESSION_GENERATION: AtomicU32 = AtomicU32::new(0);
 static SESSION_SAFETY_FLAGS: AtomicU32 = AtomicU32::new(0);
 static SESSION_SAFETY_LATCH_KIND: AtomicU8 = AtomicU8::new(0);
+static SAFETY_HAZARD_GENERATION: AtomicU32 = AtomicU32::new(0);
 static CAREFUL_MODE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_TRANSPORT: AtomicU8 = AtomicU8::new(0);
 static AUTHORITY_REQUEST: AtomicU32 = AtomicU32::new(0);
@@ -314,6 +315,7 @@ pub struct BrainstemStatus {
     pub imu_impact_score_mm_s2: u16,
     pub imu_motion_consistency: u8,
     pub imu_calibration_state: u8,
+    pub safety_hazard_generation: u32,
     pub event_next_seq: u32,
 }
 
@@ -609,6 +611,7 @@ enum ControlCommandCode {
     ResetMotherbrain = 47,
     ClearSafetyLatch = 48,
     CarefulMode = 49,
+    EscapeMotion = 50,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -633,6 +636,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         Some(RuntimeCommand::DriveDirect { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::CmdVel { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::DriveArc { .. }) => CommandCode::Drive,
+        Some(RuntimeCommand::EscapeMotion { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::ClearSafetyLatch { .. })
         | Some(RuntimeCommand::CarefulMode { .. })
         | Some(RuntimeCommand::HeartbeatStop { .. }) => CommandCode::Behavior,
@@ -764,6 +768,17 @@ fn submit_control_command_with_service_identity(
         LAST_ACCEPTED_COMMAND_ID.store(command_id, Ordering::Relaxed);
         record_public_event(PublicEventKind::CommandAccepted, command_id, 0, 0);
         return Ok(());
+    }
+    if let BrainstemCommand::EscapeMotion {
+        kind,
+        hazard_generation,
+        linear_mm_s,
+        angular_mrad_s,
+        ttl_ms,
+        ..
+    } = command
+    {
+        validate_escape_motion(kind, hazard_generation, linear_mm_s, angular_mrad_s, ttl_ms)?;
     }
 
     let Some((kind, a, b, c, d, duration_ms)) = encode_control_command(command) else {
@@ -1122,6 +1137,10 @@ pub fn session_safety_snapshot() -> (bool, bool, bool, Option<SafetyEventKind>) 
     )
 }
 
+pub fn safety_hazard_generation() -> u32 {
+    SAFETY_HAZARD_GENERATION.load(Ordering::Acquire)
+}
+
 pub fn set_careful_mode_until(deadline_ms: Option<u32>) {
     CAREFUL_MODE_UNTIL_MS.store(deadline_ms.unwrap_or(0), Ordering::Release);
 }
@@ -1420,6 +1439,21 @@ fn encode_control_command(
         BrainstemCommand::CarefulMode { ttl_ms, .. } => {
             Some((ControlCommandCode::CarefulMode, 0, 0, 0, 0, Some(ttl_ms)))
         }
+        BrainstemCommand::EscapeMotion {
+            kind,
+            hazard_generation,
+            linear_mm_s,
+            angular_mrad_s,
+            ttl_ms,
+            ..
+        } => Some((
+            ControlCommandCode::EscapeMotion,
+            encode_safety_latch_kind(kind) as u32,
+            hazard_generation,
+            encode_i16(linear_mm_s),
+            encode_i16(angular_mrad_s),
+            Some(ttl_ms),
+        )),
         BrainstemCommand::RequestSensors { packet_id, .. } => Some((
             ControlCommandCode::RequestSensors,
             packet_id as u32,
@@ -1530,7 +1564,7 @@ fn decode_control_command(
     a: u32,
     b: u32,
     c: u32,
-    _d: u32,
+    d: u32,
     duration_ms: Option<u32>,
     seq: u32,
 ) -> Option<BrainstemCommand> {
@@ -1600,6 +1634,14 @@ fn decode_control_command(
             })
         }
         x if x == ControlCommandCode::CarefulMode as u8 => Some(BrainstemCommand::CarefulMode {
+            ttl_ms: duration_ms?,
+            seq,
+        }),
+        x if x == ControlCommandCode::EscapeMotion as u8 => Some(BrainstemCommand::EscapeMotion {
+            kind: decode_safety_latch_kind(a as u8)?,
+            hazard_generation: b,
+            linear_mm_s: decode_i16(c),
+            angular_mrad_s: decode_i16(d),
             ttl_ms: duration_ms?,
             seq,
         }),
@@ -1702,6 +1744,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::Unsupported { seq }
         | BrainstemCommand::ClearSafetyLatch { seq, .. }
         | BrainstemCommand::CarefulMode { seq, .. }
+        | BrainstemCommand::EscapeMotion { seq, .. }
         | BrainstemCommand::SongDefine { seq, .. }
         | BrainstemCommand::RequestSensors { seq, .. }
         | BrainstemCommand::StreamSensors { seq, .. }
@@ -1755,6 +1798,95 @@ fn decode_safety_latch_kind(value: u8) -> Option<SafetyLatchKind> {
         7 => Some(SafetyLatchKind::Impact),
         8 => Some(SafetyLatchKind::Charging),
         _ => None,
+    }
+}
+
+pub fn validate_escape_motion(
+    kind: SafetyLatchKind,
+    hazard_generation: u32,
+    linear_mm_s: i16,
+    angular_mrad_s: i16,
+    ttl_ms: u32,
+) -> Result<(), CommandRejectReason> {
+    const ESCAPE_TTL_MS: u32 = 250;
+    const MAX_ESCAPE_LINEAR_MM_S: i16 = 120;
+    const MAX_ESCAPE_ANGULAR_MRAD_S: i16 = 500;
+
+    let (estop_latched, safety_tripped, motion_interlock, latched_kind) = session_safety_snapshot();
+    let expected_kind = safety_latch_kind_to_event(kind);
+    if !safety_tripped
+        || latched_kind != Some(expected_kind)
+        || hazard_generation == 0
+        || hazard_generation != safety_hazard_generation()
+    {
+        return Err(CommandRejectReason::HazardMismatch);
+    }
+    if estop_latched || motion_interlock {
+        return Err(CommandRejectReason::AbsoluteHazard);
+    }
+    if ttl_ms != ESCAPE_TTL_MS
+        || linear_mm_s > 0
+        || linear_mm_s < -MAX_ESCAPE_LINEAR_MM_S
+        || angular_mrad_s.unsigned_abs() > MAX_ESCAPE_ANGULAR_MRAD_S as u16
+        || (linear_mm_s == 0 && angular_mrad_s == 0)
+    {
+        return Err(CommandRejectReason::EscapeEnvelope);
+    }
+
+    let snapshot = snapshot(0);
+    let flags = snapshot.create_sensor_flags;
+    let bump_right = flags & (1 << 0) != 0;
+    let bump_left = flags & (1 << 1) != 0;
+    let wheel_drop = flags & (1 << 2) != 0;
+    let cliff = flags & 0b1111_0000 != 0;
+    let imu_ok = body::IMU_ENABLED && snapshot.imu_health == ImuHealthCode::Ok as u8;
+    let tilt = imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
+    let impact = imu_ok && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
+    let charging = charging_interlock_active(&snapshot);
+
+    if wheel_drop || tilt || impact || charging {
+        return Err(CommandRejectReason::AbsoluteHazard);
+    }
+    match kind {
+        SafetyLatchKind::Bump => {
+            if !bump_left && !bump_right {
+                return Err(CommandRejectReason::HazardMismatch);
+            }
+            if cliff {
+                return Err(CommandRejectReason::AbsoluteHazard);
+            }
+            let turns_toward_contact = (bump_left && !bump_right && angular_mrad_s > 0)
+                || (bump_right && !bump_left && angular_mrad_s < 0)
+                || (bump_left && bump_right && angular_mrad_s != 0);
+            if turns_toward_contact {
+                return Err(CommandRejectReason::EscapeEnvelope);
+            }
+        }
+        SafetyLatchKind::Cliff => {
+            if !cliff {
+                return Err(CommandRejectReason::HazardMismatch);
+            }
+            if bump_left || bump_right {
+                return Err(CommandRejectReason::AbsoluteHazard);
+            }
+            if linear_mm_s >= 0 || angular_mrad_s != 0 {
+                return Err(CommandRejectReason::EscapeEnvelope);
+            }
+        }
+        _ => return Err(CommandRejectReason::HazardMismatch),
+    }
+    Ok(())
+}
+
+fn safety_latch_kind_to_event(kind: SafetyLatchKind) -> SafetyEventKind {
+    match kind {
+        SafetyLatchKind::Bump => SafetyEventKind::Bump,
+        SafetyLatchKind::Cliff => SafetyEventKind::Cliff,
+        SafetyLatchKind::WheelDrop => SafetyEventKind::WheelDrop,
+        SafetyLatchKind::Heartbeat => SafetyEventKind::Heartbeat,
+        SafetyLatchKind::Tilt => SafetyEventKind::Tilt,
+        SafetyLatchKind::Impact => SafetyEventKind::Impact,
+        SafetyLatchKind::Charging => SafetyEventKind::Charging,
     }
 }
 
@@ -2259,11 +2391,13 @@ pub fn mark_command_timed_out(command_id: u32) {
 }
 
 pub fn mark_safety_tripped(kind: SafetyEventKind) {
-    record_public_event(PublicEventKind::SafetyTripped, kind as u32, 0, 0);
+    let generation = record_public_event(PublicEventKind::SafetyTripped, kind as u32, 0, 0);
+    SAFETY_HAZARD_GENERATION.store(generation, Ordering::Release);
 }
 
 pub fn mark_safety_cleared(kind: SafetyEventKind) {
     record_public_event(PublicEventKind::SafetyCleared, kind as u32, 0, 0);
+    SAFETY_HAZARD_GENERATION.store(0, Ordering::Release);
 }
 
 /// Records the start of the unconditional contact-withdrawal reflex.
@@ -2723,7 +2857,7 @@ fn add_signed(counter: &AtomicU32, amount: i32) {
     );
 }
 
-fn record_public_event(kind: PublicEventKind, a: u32, b: u32, c: u32) {
+fn record_public_event(kind: PublicEventKind, a: u32, b: u32, c: u32) -> u32 {
     let seq = EVENT_NEXT_SEQ.load(Ordering::Relaxed);
     EVENT_NEXT_SEQ.store(seq.wrapping_add(1).max(1), Ordering::Relaxed);
     let index = event_index(seq);
@@ -2732,6 +2866,7 @@ fn record_public_event(kind: PublicEventKind, a: u32, b: u32, c: u32) {
     EVENT_C[index].store(c, Ordering::Relaxed);
     EVENT_KIND[index].store(kind as u8, Ordering::Relaxed);
     EVENT_SEQ[index].store(seq, Ordering::Relaxed);
+    seq
 }
 
 fn record_public_event_from_brainstem_event(event: &BrainstemEvent) {
@@ -2756,7 +2891,7 @@ fn record_public_event_from_brainstem_event(event: &BrainstemEvent) {
             0,
         ),
         BrainstemEvent::CreatePacketReceived { .. }
-        | BrainstemEvent::CreateSensorPacketDecoded { .. } => {}
+        | BrainstemEvent::CreateSensorPacketDecoded { .. } => 0,
         BrainstemEvent::DriveRequested {
             left_mm_s,
             right_mm_s,
@@ -2775,8 +2910,8 @@ fn record_public_event_from_brainstem_event(event: &BrainstemEvent) {
         }
         BrainstemEvent::CreateBrcPulseRequested
         | BrainstemEvent::CreateBrcPulsed
-        | BrainstemEvent::TickMs(_) => {}
-    }
+        | BrainstemEvent::TickMs(_) => 0,
+    };
 }
 
 const fn event_index(seq: u32) -> usize {
@@ -2786,6 +2921,7 @@ const fn event_index(seq: u32) -> usize {
 #[cfg(test)]
 fn reset_event_log_for_test() {
     EVENT_NEXT_SEQ.store(1, Ordering::Relaxed);
+    SAFETY_HAZARD_GENERATION.store(0, Ordering::Relaxed);
     clear_velocity_stream();
     PENDING_VELOCITY_IS_RENEWAL.store(OFF, Ordering::Relaxed);
     for index in 0..EVENT_LOG_CAPACITY {
@@ -3150,6 +3286,7 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         imu_impact_score_mm_s2: IMU_IMPACT_SCORE_MM_S2.load(Ordering::Relaxed) as u16,
         imu_motion_consistency: IMU_MOTION_CONSISTENCY.load(Ordering::Relaxed),
         imu_calibration_state: IMU_CALIBRATION_STATE.load(Ordering::Relaxed),
+        safety_hazard_generation: safety_hazard_generation(),
         event_next_seq: EVENT_NEXT_SEQ.load(Ordering::Relaxed),
     }
 }
@@ -3211,6 +3348,7 @@ struct StatusJson {
     estop_latched: bool,
     safety_tripped: bool,
     safety_latch_kind: &'static str,
+    safety_hazard_generation: u32,
     motion_interlock_latched: bool,
     careful_mode_active: bool,
     careful_mode_remaining_ms: u32,
@@ -3387,6 +3525,7 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         estop_latched,
         safety_tripped,
         safety_latch_kind: safety_event_kind_text(safety_latch_kind),
+        safety_hazard_generation: snapshot.safety_hazard_generation,
         motion_interlock_latched,
         careful_mode_active: careful_mode_remaining_ms(snapshot.uptime_ms) > 0,
         careful_mode_remaining_ms: careful_mode_remaining_ms(snapshot.uptime_ms),
@@ -3776,6 +3915,7 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::CliffGuard as u8 => "cliff_guard",
         x if x == ControlCommandCode::ClearSafetyLatch as u8 => "clear_safety_latch",
         x if x == ControlCommandCode::CarefulMode as u8 => "careful_mode",
+        x if x == ControlCommandCode::EscapeMotion as u8 => "escape_motion",
         x if x == ControlCommandCode::SongDefine as u8 => "song_define",
         x if x == ControlCommandCode::DriveDirect as u8 => "drive_direct",
         x if x == ControlCommandCode::DriveArc as u8 => "drive_arc",
@@ -3813,14 +3953,12 @@ fn error_hint_text(snapshot: BrainstemStatus) -> &'static str {
             "UART RX saw an invalid stop bit before any valid Create byte; check TX/RX wiring, common ground, level shifting, baud 57600 8N1, and whether Create TX is idle-high."
         }
         (error, uart)
-            if error == ErrorCode::UartFraming as u8
-                && uart == UartReadErrorCode::Break as u8 =>
+            if error == ErrorCode::UartFraming as u8 && uart == UartReadErrorCode::Break as u8 =>
         {
             "UART RX saw a break condition; the RX line may be held low, shorted, inverted, or connected to the wrong signal."
         }
         (error, uart)
-            if error == ErrorCode::UartFraming as u8
-                && uart == UartReadErrorCode::Parity as u8 =>
+            if error == ErrorCode::UartFraming as u8 && uart == UartReadErrorCode::Parity as u8 =>
         {
             "UART RX saw a parity mismatch; confirm the link is configured as 57600 8N1 with no parity."
         }

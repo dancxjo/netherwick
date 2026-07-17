@@ -126,6 +126,9 @@ pub enum CommandRejectReason {
     Charging,
     StaleSequence,
     Unsupported,
+    HazardMismatch,
+    EscapeEnvelope,
+    AbsoluteHazard,
     Unknown(u8),
 }
 
@@ -136,6 +139,9 @@ impl CommandRejectReason {
             2 => Self::Charging,
             3 => Self::StaleSequence,
             4 => Self::Unsupported,
+            5 => Self::HazardMismatch,
+            6 => Self::EscapeEnvelope,
+            7 => Self::AbsoluteHazard,
             other => Self::Unknown(other),
         }
     }
@@ -146,6 +152,9 @@ impl CommandRejectReason {
             Self::Charging => 2,
             Self::StaleSequence => 3,
             Self::Unsupported => 4,
+            Self::HazardMismatch => 5,
+            Self::EscapeEnvelope => 6,
+            Self::AbsoluteHazard => 7,
             Self::Unknown(code) => code,
         }
     }
@@ -156,6 +165,9 @@ impl CommandRejectReason {
             Self::Charging => "charging_busy",
             Self::StaleSequence => "stale_sequence",
             Self::Unsupported => "unsupported",
+            Self::HazardMismatch => "hazard_mismatch",
+            Self::EscapeEnvelope => "escape_envelope",
+            Self::AbsoluteHazard => "absolute_hazard",
             Self::Unknown(_) => "unknown",
         }
     }

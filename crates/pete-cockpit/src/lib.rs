@@ -353,6 +353,23 @@ pub trait Cockpit {
         expect_accepted(self.execute(CockpitRequest::CarefulMode { ttl_ms })?)
     }
 
+    fn escape_motion(
+        &mut self,
+        hazard: SafetyLatchKind,
+        hazard_generation: u32,
+        linear_mm_s: i16,
+        angular_mrad_s: i16,
+        ttl_ms: u32,
+    ) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::EscapeMotion {
+            hazard,
+            hazard_generation,
+            linear_mm_s,
+            angular_mrad_s,
+            ttl_ms,
+        })?)
+    }
+
     fn cmd_vel(&mut self, linear_mm_s: i16, angular_mrad_s: i16, ttl_ms: u32) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::CmdVel {
             linear_mm_s,
@@ -1450,6 +1467,8 @@ pub struct StatusSummary {
     pub safety_tripped: Option<bool>,
     pub safety_latch_kind: Option<SafetyLatchKind>,
     #[serde(default)]
+    pub safety_hazard_generation: Option<u32>,
+    #[serde(default)]
     pub careful_mode_active: Option<bool>,
     #[serde(default)]
     pub careful_mode_remaining_ms: Option<u32>,
@@ -1500,6 +1519,7 @@ impl StatusSummary {
             safety_latch_kind: value_for(raw, "safety_latch_kind")
                 .and_then(SafetyLatchKind::from_str)
                 .or(inferred_imu_latch),
+            safety_hazard_generation: number_for(raw, "safety_hazard_generation"),
             careful_mode_active: bool_for(raw, "careful_mode"),
             careful_mode_remaining_ms: number_for(raw, "careful_remaining_ms"),
             active_motion: bool_for(raw, "active_cmd_vel"),
@@ -1547,6 +1567,7 @@ impl StatusSummary {
             safety_tripped: json_bool_value(value, "safety_tripped").or(sensor_safety_tripped),
             safety_latch_kind: json_str_value(value, "safety_latch_kind")
                 .and_then(SafetyLatchKind::from_str),
+            safety_hazard_generation: json_u32_value(value, "safety_hazard_generation"),
             careful_mode_active: json_bool_value(value, "careful_mode_active"),
             careful_mode_remaining_ms: json_u32_value(value, "careful_mode_remaining_ms"),
             active_motion: json_str_value(value, "current_command")
@@ -1882,6 +1903,13 @@ pub enum CockpitRequest {
     CarefulMode {
         ttl_ms: u32,
     },
+    EscapeMotion {
+        hazard: SafetyLatchKind,
+        hazard_generation: u32,
+        linear_mm_s: i16,
+        angular_mrad_s: i16,
+        ttl_ms: u32,
+    },
     CmdVel {
         linear_mm_s: i16,
         angular_mrad_s: i16,
@@ -2044,6 +2072,10 @@ impl CockpitRequest {
         }
     }
 
+    fn requires_operator_debug(&self) -> bool {
+        matches!(self, Self::CarefulMode { .. })
+    }
+
     pub fn authorization_class(&self) -> AuthorizationClass {
         match self {
             Self::Ping | Self::GetStatus | Self::GetCapabilities | Self::GetEvents { .. } => {
@@ -2082,6 +2114,7 @@ impl CockpitRequest {
                 | Self::ClearEStop
                 | Self::ClearSafetyLatch { .. }
                 | Self::CarefulMode { .. }
+                | Self::EscapeMotion { .. }
                 | Self::BumpEscape { .. }
                 | Self::Unstick { .. }
                 | Self::CliffGuard { .. }
@@ -2110,6 +2143,7 @@ impl CockpitRequest {
             Self::ClearEStop => "clear_estop",
             Self::ClearSafetyLatch { .. } => "clear_safety_latch",
             Self::CarefulMode { .. } => "careful_mode",
+            Self::EscapeMotion { .. } => "escape_motion",
             Self::CmdVel { .. } => "cmd_vel",
             Self::DriveDirect { .. } => "drive_direct",
             Self::DriveArc { .. } => "drive_arc",
@@ -2186,6 +2220,7 @@ impl CockpitRequest {
             Self::HeartbeatStop { timeout_ms } | Self::CarefulMode { ttl_ms: timeout_ms } => {
                 Some(*timeout_ms)
             }
+            Self::EscapeMotion { ttl_ms, .. } => Some(*ttl_ms),
             Self::StreamSensors { period_ms, .. } => Some(*period_ms),
             _ => None,
         }
@@ -2214,6 +2249,21 @@ impl CockpitRequest {
                 .map(|()| CockpitResponse::Accepted),
             Self::CarefulMode { ttl_ms } => client
                 .careful_mode(*ttl_ms)
+                .map(|()| CockpitResponse::Accepted),
+            Self::EscapeMotion {
+                hazard,
+                hazard_generation,
+                linear_mm_s,
+                angular_mrad_s,
+                ttl_ms,
+            } => client
+                .escape_motion(
+                    *hazard,
+                    *hazard_generation,
+                    *linear_mm_s,
+                    *angular_mrad_s,
+                    *ttl_ms,
+                )
                 .map(|()| CockpitResponse::Accepted),
             Self::CmdVel {
                 linear_mm_s,
@@ -2551,7 +2601,11 @@ impl CockpitRequest {
             ),
             Self::AcquireControlLease { authority, ttl_ms } => format!(
                 "ACQUIRE_CONTROL_LEASE {seq} {} {ttl_ms}\n",
-                match authority { ControlAuthority::Motherbrain => "motherbrain", ControlAuthority::ForebrainRecovery => "forebrain_recovery", ControlAuthority::OperatorDebug => "operator_debug" }
+                match authority {
+                    ControlAuthority::Motherbrain => "motherbrain",
+                    ControlAuthority::ForebrainRecovery => "forebrain_recovery",
+                    ControlAuthority::OperatorDebug => "operator_debug",
+                }
             ),
             Self::AcquireServiceLease { scope, ttl_ms } => format!(
                 "ACQUIRE_SERVICE_LEASE {seq} {} {ttl_ms}\n",
@@ -2570,6 +2624,16 @@ impl CockpitRequest {
                 format!("CLEAR_SAFETY_LATCH {seq} {}\n", latch.as_str())
             }
             Self::CarefulMode { ttl_ms } => format!("CAREFUL_MODE {seq} {ttl_ms}\n"),
+            Self::EscapeMotion {
+                hazard,
+                hazard_generation,
+                linear_mm_s,
+                angular_mrad_s,
+                ttl_ms,
+            } => format!(
+                "ESCAPE_MOTION {seq} {} {hazard_generation} {linear_mm_s} {angular_mrad_s} {ttl_ms}\n",
+                hazard.as_str()
+            ),
             Self::CmdVel {
                 linear_mm_s,
                 angular_mrad_s,
@@ -2699,9 +2763,15 @@ impl CockpitRequest {
             ),
             Self::ClearMotionQueue => format!("CLEAR_MOTION_QUEUE {seq}\n"),
             Self::DefineChirp { feedback, tones } => {
-                format!("DEFINE_CHIRP {seq} {}{}\n", feedback.as_str(), compact_tones(tones))
+                format!(
+                    "DEFINE_CHIRP {seq} {}{}\n",
+                    feedback.as_str(),
+                    compact_tones(tones)
+                )
             }
-            Self::PlayFeedback { feedback } => format!("PLAY_FEEDBACK {seq} {}\n", feedback.as_str()),
+            Self::PlayFeedback { feedback } => {
+                format!("PLAY_FEEDBACK {seq} {}\n", feedback.as_str())
+            }
             Self::PowerState { request } => format!("POWER_STATE {seq} {}\n", request.as_str()),
             Self::CreatePowerOn => format!("CREATE_POWER_ON {seq}\n"),
             Self::CreatePowerOff => format!("CREATE_POWER_OFF {seq}\n"),
@@ -2783,6 +2853,7 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "clear_estop",
         "clear_safety_latch",
         "careful_mode",
+        "escape_motion",
         "clear_motion_queue",
         "cmd_vel",
         "drive_direct",
@@ -2811,7 +2882,12 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
 fn optional_cockpit_verbs() -> Vec<&'static str> {
     // CAREFUL is a forward migration: current hosts must still accept and
     // service-flash brainstems that predate the explicit override lease.
-    vec!["bootsel", "reset_motherbrain", "careful_mode"]
+    vec![
+        "bootsel",
+        "reset_motherbrain",
+        "careful_mode",
+        "escape_motion",
+    ]
 }
 
 // Older brainstems advertised these convenience commands directly. Current
@@ -3254,6 +3330,8 @@ pub struct SimCockpit {
     armed: bool,
     estop_latched: bool,
     safety_tripped: bool,
+    safety_latch_kind: Option<SafetyLatchKind>,
+    safety_hazard_generation: u32,
     bump_left: bool,
     bump_right: bool,
     cliff: bool,
@@ -3387,6 +3465,8 @@ impl SimCockpit {
             armed: false,
             estop_latched: false,
             safety_tripped: false,
+            safety_latch_kind: None,
+            safety_hazard_generation: 0,
             bump_left: false,
             bump_right: false,
             cliff: false,
@@ -3686,9 +3766,10 @@ impl SimCockpit {
             return;
         }
         self.safety_tripped = true;
+        self.safety_latch_kind = Some(SafetyLatchKind::Bump);
         self.interrupt_active_motion();
         self.preempt_contact_withdrawal(1);
-        self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
+        self.safety_hazard_generation = self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
         self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
     }
 
@@ -3705,12 +3786,14 @@ impl SimCockpit {
             // Match the firmware reflex: interrupt host motion and begin a
             // bounded, authority-independent straight reverse.
             self.safety_tripped = true;
+            self.safety_latch_kind = Some(SafetyLatchKind::Bump);
             let preempted_command_id = self
                 .active_cmd_vel
                 .as_ref()
                 .map_or(0, |active| active.command_id);
             self.interrupt_active_motion();
-            self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
+            self.safety_hazard_generation =
+                self.push_event(CockpitEventKind::SafetyTripped, 1, 0, 0);
             self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
             self.repeated_contact_count = match self.last_contact_withdrawal_at_ms {
                 Some(previous) if self.now_ms.wrapping_sub(previous) <= 2_000 => {
@@ -3744,9 +3827,11 @@ impl SimCockpit {
         self.push_event(CockpitEventKind::CliffChanged, active as u32, 0, 0);
         if active {
             self.safety_tripped = true;
+            self.safety_latch_kind = Some(SafetyLatchKind::Cliff);
             self.interrupt_active_motion();
             self.preempt_contact_withdrawal(2);
-            self.push_event(CockpitEventKind::SafetyTripped, 2, 0, 0);
+            self.safety_hazard_generation =
+                self.push_event(CockpitEventKind::SafetyTripped, 2, 0, 0);
             self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
         }
     }
@@ -3758,9 +3843,11 @@ impl SimCockpit {
         self.wheel_drop = active;
         if active {
             self.safety_tripped = true;
+            self.safety_latch_kind = Some(SafetyLatchKind::WheelDrop);
             self.interrupt_active_motion();
             self.push_event(CockpitEventKind::WheelDropLatched, 1, 0, 0);
-            self.push_event(CockpitEventKind::SafetyTripped, 3, 0, 0);
+            self.safety_hazard_generation =
+                self.push_event(CockpitEventKind::SafetyTripped, 3, 0, 0);
             self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
         }
     }
@@ -3841,11 +3928,12 @@ impl SimCockpit {
         self.push_event(CockpitEventKind::CommandCompleted, id, 0, 0);
     }
 
-    fn push_event(&mut self, kind: CockpitEventKind, a: u32, b: u32, c: u32) {
+    fn push_event(&mut self, kind: CockpitEventKind, a: u32, b: u32, c: u32) -> u32 {
         let seq = self.next_event_seq;
         self.next_event_seq = self.next_event_seq.wrapping_add(1).max(1);
         self.events.push(CockpitEvent { seq, kind, a, b, c });
         self.enforce_event_capacity();
+        seq
     }
 
     fn enforce_event_capacity(&mut self) {
@@ -3988,6 +4076,21 @@ impl Cockpit for SimCockpit {
             CockpitRequest::ClearEStop => self.clear_estop().map(|()| CockpitResponse::Accepted),
             CockpitRequest::ClearSafetyLatch { latch } => self
                 .clear_safety_latch(latch)
+                .map(|()| CockpitResponse::Accepted),
+            CockpitRequest::EscapeMotion {
+                hazard,
+                hazard_generation,
+                linear_mm_s,
+                angular_mrad_s,
+                ttl_ms,
+            } => self
+                .escape_motion(
+                    hazard,
+                    hazard_generation,
+                    linear_mm_s,
+                    angular_mrad_s,
+                    ttl_ms,
+                )
                 .map(|()| CockpitResponse::Accepted),
             CockpitRequest::CmdVel {
                 linear_mm_s,
@@ -4155,6 +4258,16 @@ impl Cockpit for SimCockpit {
                     "request requires the active control lease".into(),
                 ));
             }
+            if request.requires_operator_debug()
+                && !self
+                    .control_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.authority == ControlAuthority::OperatorDebug)
+            {
+                return Err(CockpitError::Policy(
+                    "attended operator-debug authority required".into(),
+                ));
+            }
             if let CockpitRequest::HeartbeatStop { timeout_ms } = &request {
                 self.control_lease_expires_at_ms =
                     Some(self.now_ms.wrapping_add((*timeout_ms).clamp(250, 60_000)));
@@ -4200,13 +4313,17 @@ impl Cockpit for SimCockpit {
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
-                "OK 0 STATUS sim=true now_ms={} uptime_ms={} create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_samples=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_pitch_mrad=0 imu_roll_mrad=0 imu_yaw_rate_mrad_s=0 imu_gyro_x_mrad_s=0 imu_gyro_y_mrad_s=0 imu_gyro_z_mrad_s=0 imu_accel_x_mm_s2=0 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=9807 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={}",
+                "OK 0 STATUS sim=true now_ms={} uptime_ms={} create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} safety_latch_kind={} safety_hazard_generation={} event_next_seq={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_samples=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_pitch_mrad=0 imu_roll_mrad=0 imu_yaw_rate_mrad_s=0 imu_gyro_x_mrad_s=0 imu_gyro_y_mrad_s=0 imu_gyro_z_mrad_s=0 imu_accel_x_mm_s2=0 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=9807 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={}",
                 self.now_ms,
                 self.now_ms,
                 self.now_ms,
                 self.armed,
                 self.estop_latched,
                 self.safety_tripped,
+                self.safety_latch_kind
+                    .map_or("none", SafetyLatchKind::as_str),
+                self.safety_hazard_generation,
+                self.next_event_seq,
                 self.active_cmd_vel.is_some() || self.active_contact_withdrawal.is_some(),
                 self.bump_left,
                 self.bump_right,
@@ -4222,7 +4339,11 @@ impl Cockpit for SimCockpit {
                 self.charging_state,
                 self.battery_charge_mah,
                 self.battery_capacity_mah,
-                if self.battery_capacity_mah == 0 { 0 } else { 14_400 },
+                if self.battery_capacity_mah == 0 {
+                    0
+                } else {
+                    14_400
+                },
                 0,
                 self.odometry_reset_count,
                 self.odometry_distance_mm,
@@ -4293,8 +4414,9 @@ impl Cockpit for SimCockpit {
         self.preempt_contact_withdrawal(4);
         self.estop_latched = true;
         self.safety_tripped = true;
+        self.safety_latch_kind = None;
         self.push_event(CockpitEventKind::EStopLatched, 1, 0, 0);
-        self.push_event(CockpitEventKind::SafetyTripped, 4, 0, 0);
+        self.safety_hazard_generation = self.push_event(CockpitEventKind::SafetyTripped, 4, 0, 0);
         self.push_event(CockpitEventKind::MotionStopped, 0, 0, 0);
         self.complete_command(id);
         Ok(())
@@ -4305,6 +4427,8 @@ impl Cockpit for SimCockpit {
         let id = self.accept_command();
         self.estop_latched = false;
         self.safety_tripped = false;
+        self.safety_latch_kind = None;
+        self.safety_hazard_generation = 0;
         self.push_event(CockpitEventKind::EStopCleared, 0, 0, 0);
         self.push_event(CockpitEventKind::SafetyCleared, 4, 0, 0);
         self.complete_command(id);
@@ -4315,6 +4439,8 @@ impl Cockpit for SimCockpit {
         self.require_scoped_dispatch()?;
         let id = self.accept_command();
         self.safety_tripped = false;
+        self.safety_latch_kind = None;
+        self.safety_hazard_generation = 0;
         if kind == SafetyLatchKind::WheelDrop {
             self.push_event(CockpitEventKind::WheelDropCleared, 0, 0, 0);
         }
@@ -4345,6 +4471,87 @@ impl Cockpit for SimCockpit {
         self.active_cmd_vel = Some(SimTimedAction {
             command_id: id,
             complete_at_ms: self.now_ms.wrapping_add(ttl_ms.max(1)),
+        });
+        Ok(())
+    }
+
+    fn escape_motion(
+        &mut self,
+        hazard: SafetyLatchKind,
+        hazard_generation: u32,
+        linear_mm_s: i16,
+        angular_mrad_s: i16,
+        ttl_ms: u32,
+    ) -> Result<()> {
+        self.require_scoped_dispatch()?;
+        let id = self.accept_command();
+        let absolute_hazard = self.estop_latched || self.wheel_drop || self.charging_state != 0;
+        let matching_hazard = self.safety_tripped
+            && self.safety_latch_kind == Some(hazard)
+            && self.safety_hazard_generation == hazard_generation
+            && hazard_generation != 0;
+        let bounded = ttl_ms == 250
+            && (-120..=0).contains(&linear_mm_s)
+            && angular_mrad_s.unsigned_abs() <= 500
+            && (linear_mm_s != 0 || angular_mrad_s != 0);
+        let compatible = match hazard {
+            SafetyLatchKind::Bump => {
+                (self.bump_left || self.bump_right)
+                    && !self.cliff
+                    && !(self.bump_left && !self.bump_right && angular_mrad_s > 0)
+                    && !(!self.bump_left && self.bump_right && angular_mrad_s < 0)
+                    && !(self.bump_left && self.bump_right && angular_mrad_s != 0)
+            }
+            SafetyLatchKind::Cliff => {
+                self.cliff
+                    && !self.bump_left
+                    && !self.bump_right
+                    && linear_mm_s < 0
+                    && angular_mrad_s == 0
+            }
+            _ => false,
+        };
+        if self.active_contact_withdrawal.is_some() {
+            self.push_event(
+                CockpitEventKind::CommandRejected,
+                id,
+                CommandRejectReason::Busy.code() as u32,
+                0,
+            );
+            return Err(CockpitError::Rejected {
+                command_id: id,
+                reason: CommandRejectReason::Busy.as_str().into(),
+            });
+        }
+        if absolute_hazard || !matching_hazard || !bounded || !compatible {
+            let reason = if absolute_hazard {
+                CommandRejectReason::AbsoluteHazard
+            } else if !matching_hazard {
+                CommandRejectReason::HazardMismatch
+            } else {
+                CommandRejectReason::EscapeEnvelope
+            };
+            self.push_event(
+                CockpitEventKind::CommandRejected,
+                id,
+                reason.code() as u32,
+                0,
+            );
+            return Err(CockpitError::Rejected {
+                command_id: id,
+                reason: reason.as_str().into(),
+            });
+        }
+        self.interrupt_active_motion();
+        self.push_event(
+            CockpitEventKind::MotionRequested,
+            pack_i16_pair(linear_mm_s, angular_mrad_s),
+            ttl_ms,
+            0,
+        );
+        self.active_cmd_vel = Some(SimTimedAction {
+            command_id: id,
+            complete_at_ms: self.now_ms.wrapping_add(ttl_ms),
         });
         Ok(())
     }
@@ -4933,6 +5140,13 @@ impl<C: Cockpit> SessionCockpit<C> {
                 let lease = self.control_lease.as_ref().ok_or_else(|| {
                     CockpitError::Policy("no control lease has been acquired".into())
                 })?;
+                if request.requires_operator_debug()
+                    && lease.authority != ControlAuthority::OperatorDebug
+                {
+                    return Err(CockpitError::Policy(
+                        "attended operator-debug authority required".into(),
+                    ));
+                }
                 self.connector
                     .execute_with_lease(&self.outcome.session, lease, request)
             }
@@ -7528,6 +7742,13 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(sim
+            .execute_with_lease(
+                &mother.session,
+                &mother_lease,
+                CockpitRequest::CarefulMode { ttl_ms: 500 },
+            )
+            .is_err());
 
         let mut operator_hello = HandshakeHello::motherbrain("operator-laptop");
         operator_hello.role = EndpointRole::Operator;
@@ -7556,6 +7777,13 @@ mod tests {
             .unwrap()
             .raw
             .contains("active_cmd_vel=false"));
+        assert!(sim
+            .execute_with_lease(
+                &operator.session,
+                &debug_lease,
+                CockpitRequest::CarefulMode { ttl_ms: 500 },
+            )
+            .is_ok());
         assert!(sim
             .execute_with_lease(&mother.session, &mother_lease, CockpitRequest::Arm)
             .is_err());
@@ -7941,6 +8169,19 @@ mod tests {
             None,
         )
         .expect("pre-CAREFUL firmware must remain flashable");
+    }
+
+    #[test]
+    fn pre_escape_motion_brainstem_contract_remains_accepted_for_migration() {
+        let mut capabilities = body_toml_capabilities();
+        capabilities.verbs.retain(|verb| verb != "escape_motion");
+
+        establish_session(
+            SimCockpit::new().with_capabilities(capabilities),
+            HandshakeHello::default_motherbrain(),
+            None,
+        )
+        .expect("pre-escape-motion firmware must remain flashable");
     }
 
     #[test]
@@ -8396,6 +8637,40 @@ mod tests {
     }
 
     #[test]
+    fn simulator_escape_motion_is_generation_bound_and_reflex_ordered() {
+        let mut sim = SimCockpit::new().with_unscoped_bench_mode();
+        sim.set_bump(true, false);
+        let generation = sim
+            .get_status()
+            .unwrap()
+            .summary()
+            .safety_hazard_generation
+            .unwrap();
+
+        assert!(matches!(
+            sim.escape_motion(SafetyLatchKind::Bump, generation, -50, 0, 250),
+            Err(CockpitError::Rejected { ref reason, .. }) if reason == "busy"
+        ));
+        sim.advance_ms(CONTACT_WITHDRAWAL_DURATION_MS);
+        sim.escape_motion(SafetyLatchKind::Bump, generation, -50, 0, 250)
+            .unwrap();
+        assert!(sim
+            .get_status()
+            .unwrap()
+            .raw
+            .contains("active_cmd_vel=true"));
+
+        sim.set_cliff(true);
+        let status = sim.get_status().unwrap().summary();
+        assert!(status.raw.contains("active_cmd_vel=false"));
+        assert_eq!(status.safety_latch_kind, Some(SafetyLatchKind::Cliff));
+        assert!(matches!(
+            sim.escape_motion(SafetyLatchKind::Bump, generation, -50, 0, 250),
+            Err(CockpitError::Rejected { ref reason, .. }) if reason == "hazard_mismatch"
+        ));
+    }
+
+    #[test]
     fn simulator_wheel_drop_latches_and_clears() {
         let mut sim = SimCockpit::new().with_unscoped_bench_mode();
         sim.cmd_vel(70, 0, 1_000).unwrap();
@@ -8743,6 +9018,7 @@ mod tests {
                 "CLEAR_SAFETY_LATCH",
             ),
             ("careful_mode", "careful_mode", "CAREFUL_MODE"),
+            ("escape_motion", "escape_motion", "ESCAPE_MOTION"),
             (
                 "clear_motion_queue",
                 "clear_motion_queue",
@@ -8910,6 +9186,13 @@ mod tests {
                 latch: SafetyLatchKind::Bump,
             },
             "careful_mode" => CockpitRequest::CarefulMode { ttl_ms: 5_000 },
+            "escape_motion" => CockpitRequest::EscapeMotion {
+                hazard: SafetyLatchKind::Bump,
+                hazard_generation: 42,
+                linear_mm_s: -50,
+                angular_mrad_s: 0,
+                ttl_ms: 250,
+            },
             "clear_motion_queue" => CockpitRequest::ClearMotionQueue,
             "cmd_vel" => CockpitRequest::CmdVel {
                 linear_mm_s: 10,

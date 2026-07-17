@@ -37,13 +37,24 @@ exposed = true
 
 [[verbs]]
 names = ["careful_mode"]
-category = "reflex"
-authority = "control lease with explicit short TTL"
+category = "service"
+authority = "attended operator-debug control lease with explicit short TTL"
 sensors = "all body hazards remain observable but advisory while active"
 bounds = "time bounded and stopped on expiry; e-stop, authority, heartbeat, and body-link loss remain absolute"
 preempted_by = "e-stop, authority loss, heartbeat expiry, body-link loss"
-owner = "active possessor"
+owner = "attended operator"
 lifecycle = "typed command plus visible active/remaining status"
+exposed = true
+
+[[verbs]]
+names = ["escape_motion"]
+category = "primitive"
+authority = "control lease plus exact acknowledged hazard generation"
+sensors = "fresh matching bump or cliff plus absence of every absolute hazard"
+bounds = "one 250 ms segment inside hazard-specific velocity and direction envelope"
+preempted_by = "new hazard, e-stop, authority loss, heartbeat expiry, body-link loss, or TTL"
+owner = "active possessor"
+lifecycle = "accepted/started/completed/interrupted/rejected with observed odometry"
 exposed = true
 
 [[verbs]]
