@@ -808,6 +808,7 @@ async fn usb_cdc_task(mut class: CdcAcmClass<'static, UsbDriver>) -> ! {
                     b'\r' => {}
                     b'\n' => {
                         if let Ok(command) = core::str::from_utf8(&line) {
+                            response.clear();
                             let boot_to_usb = handle_compact_control_line(
                                 command,
                                 &mut response,
