@@ -9099,6 +9099,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         .map(|limit| runner.tick_count < limit)
         .unwrap_or(true)
     {
+        let tick_started_at = Instant::now();
         let tick_result = tokio::select! {
             signal = &mut shutdown => {
                 println!("received {signal}; stopping robot and surrendering possession");
@@ -9138,7 +9139,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             Err(error) if robot_mode == RobotMode::ReadOnly => {
                 if is_transient_robot_timeout(&error) {
                     eprintln!("read-only tick timed out; continuing");
-                    tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
+                    tokio::time::sleep(remaining_tick_delay(
+                        args.tick_ms,
+                        tick_started_at.elapsed(),
+                    ))
+                    .await;
                     continue;
                 }
                 return Err(error);
@@ -9178,7 +9183,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 println!("received {signal}; stopping robot and surrendering possession");
                 break;
             }
-            _ = tokio::time::sleep(Duration::from_millis(args.tick_ms)) => {}
+            _ = tokio::time::sleep(remaining_tick_delay(
+                args.tick_ms,
+                tick_started_at.elapsed(),
+            )) => {}
         }
     }
 
@@ -10547,6 +10555,10 @@ fn duration_to_steps(duration_seconds: u64, tick_ms: u64) -> usize {
     let tick_ms = tick_ms.max(1);
     let total_ms = duration_seconds.saturating_mul(1000);
     total_ms.div_ceil(tick_ms).max(1) as usize
+}
+
+fn remaining_tick_delay(tick_ms: u64, elapsed: Duration) -> Duration {
+    Duration::from_millis(tick_ms.max(1)).saturating_sub(elapsed)
 }
 
 fn add_optional_real_sensors(
@@ -15725,6 +15737,18 @@ mod tests {
             .unwrap_or_default()
             .as_millis() as u64;
         std::env::temp_dir().join(format!("{prefix}_{now_ms}"))
+    }
+
+    #[test]
+    fn robot_tick_delay_counts_work_inside_the_requested_period() {
+        assert_eq!(
+            remaining_tick_delay(20, Duration::from_millis(7)),
+            Duration::from_millis(13)
+        );
+        assert_eq!(
+            remaining_tick_delay(20, Duration::from_millis(25)),
+            Duration::ZERO
+        );
     }
 
     #[test]

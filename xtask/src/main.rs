@@ -21,6 +21,8 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
+const DEFAULT_POSSESSION_TICK_MS: &str = "20";
+
 #[derive(Parser)]
 #[command(name = "cargo xtask", about = "Netherwick workspace automation")]
 struct Cli {
@@ -964,8 +966,14 @@ fn possess(args: &[String]) -> Result<()> {
         println!(
             "Accepted current boot identity for pinned device {device}; updated .env and retrying."
         );
-        (status, _) =
-            possession_attempt(&robot_args, &robot_mode, &device, &live_boot, &backend, &port)?;
+        (status, _) = possession_attempt(
+            &robot_args,
+            &robot_mode,
+            &device,
+            &live_boot,
+            &backend,
+            &port,
+        )?;
     }
     if status.success() {
         Ok(())
@@ -987,8 +995,12 @@ fn possession_attempt(
     } else {
         port.to_owned()
     };
+    let explicit_tick_ms = long_option_value(args, "--tick-ms");
+    let tick_ms = explicit_tick_ms
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| env_or("PETE_POSSESSION_TICK_MS", DEFAULT_POSSESSION_TICK_MS));
     println!(
-        "Taking brainstem possession over {backend} at {endpoint}\ndevice={device} boot={boot}\nlimits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
+        "Taking brainstem possession over {backend} at {endpoint}\ndevice={device} boot={boot}\ncontrol target: {tick_ms} ms; limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
     );
     let mut robot_args = vec![
         "--brainstem-device-id".to_owned(),
@@ -1009,6 +1021,9 @@ fn possession_attempt(
         "--capture".to_owned(),
         env_or("PETE_POSSESSION_CAPTURE", "data/captures/real/possession"),
     ];
+    if explicit_tick_ms.is_none() {
+        robot_args.extend(["--tick-ms".to_owned(), tick_ms]);
+    }
     robot_args.extend(args.iter().cloned());
     let mut command = robot_process(
         &robot_args,
@@ -1061,6 +1076,17 @@ fn normalize_possession_mode(mode: &str) -> String {
         "regular" => "regular".to_owned(),
         _ => mode.to_owned(),
     }
+}
+
+fn long_option_value<'a>(args: &'a [String], option: &str) -> Option<&'a str> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == option {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix(option)
+                .and_then(|value| value.strip_prefix('='))
+        }
+    })
 }
 
 fn run_program_captured(
@@ -2133,8 +2159,8 @@ fn output(program: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_identity_mismatch, bootsel_host, evolution_dataset_files, neat_generation_limit,
-        prefixed_value, terminal_title_text, Cli,
+        boot_identity_mismatch, bootsel_host, evolution_dataset_files, long_option_value,
+        neat_generation_limit, prefixed_value, terminal_title_text, Cli,
     };
     use clap::Parser;
     use std::fs;
@@ -2201,5 +2227,18 @@ mod tests {
         ] {
             Cli::try_parse_from(["xtask", command]).unwrap();
         }
+    }
+
+    #[test]
+    fn possession_tick_override_accepts_split_and_joined_forms() {
+        assert_eq!(
+            long_option_value(&["--tick-ms".to_owned(), "12".to_owned()], "--tick-ms"),
+            Some("12")
+        );
+        assert_eq!(
+            long_option_value(&["--tick-ms=8".to_owned()], "--tick-ms"),
+            Some("8")
+        );
+        assert_eq!(long_option_value(&[], "--tick-ms"), None);
     }
 }

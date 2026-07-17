@@ -11,6 +11,11 @@ All notable changes are grouped by date.
   without starting authority-independent reverse motion.
 - Keep slow possession running when its motion preflight observes an existing
   safety latch by returning the typed latch reason to the recovery path.
+- Run `just possess` on a 20 ms target period and count sensing/runtime work
+  inside that period, eliminating the extra post-tick delay that slowed
+  bounded velocity refreshes and could create stop gaps.
+- Make brainstem contact withdrawal react to an asserted bumper state without
+  requiring a new edge or forward wheel output.
 
 ### Auto-sync (2026-07-15)
 
