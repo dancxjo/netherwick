@@ -42,6 +42,10 @@ const DOCK_DEPARTURE_DURATION_MS: u32 = 1_500;
 const CREATE_CHARGING_SOURCES_PACKET: u8 = 34;
 const CREATE_CHARGING_SOURCES_POLL_PERIOD_MS: u32 = 250;
 const CREATE_LINK_FRESHNESS_TIMEOUT_MS: u32 = 1_000;
+// Accelerometer-derived tilt is contaminated by short acceleration and dock-ramp
+// impacts. Keep impact detection immediate, but require the gravity-vector tilt
+// threshold to remain crossed before turning it into a latched motion veto.
+const IMU_TILT_LATCH_HOLD_MS: u32 = 100;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RuntimeMode {
@@ -215,6 +219,7 @@ where
     last_cliff: bool,
     last_wheel_drop: bool,
     safety_observation_initialized: bool,
+    tilt_observed_since_ms: Option<u32>,
     active_motherbrain_reset: Option<ActiveMotherbrainReset>,
     motherbrain_reset_cooldown_until_ms: u32,
     motherbrain_reset_hardware_enabled: bool,
@@ -276,6 +281,7 @@ where
             last_cliff: false,
             last_wheel_drop: false,
             safety_observation_initialized: false,
+            tilt_observed_since_ms: None,
             active_motherbrain_reset: None,
             motherbrain_reset_cooldown_until_ms: 0,
             motherbrain_reset_hardware_enabled: body::MOTHERBRAIN_RESET_ENABLED,
@@ -1522,13 +1528,30 @@ where
     }
 
     fn enforce_safety_policy(&mut self) -> Result<(), BrainstemError> {
-        let snapshot = status::snapshot(self.now_ms());
+        let now_ms = self.now_ms();
+        let snapshot = status::snapshot(now_ms);
         let flags = snapshot.create_sensor_flags;
         let bump = flags & ((1 << 0) | (1 << 1)) != 0;
         let wheel_drop = flags & (1 << 2) != 0;
         let cliff = flags & ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)) != 0;
         let imu_ok = body::IMU_ENABLED && snapshot.imu_health == status::ImuHealthCode::Ok as u8;
-        let tilt = imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
+        let tilt_observed =
+            imu_ok && snapshot.imu_tilt_magnitude_mrad as i16 >= body::IMU_TILT_STOP_MRAD;
+        let tilt = if tilt_observed {
+            match self.tilt_observed_since_ms {
+                Some(started_at_ms) => time_reached(
+                    now_ms,
+                    started_at_ms.wrapping_add(IMU_TILT_LATCH_HOLD_MS),
+                ),
+                None => {
+                    self.tilt_observed_since_ms = Some(now_ms);
+                    false
+                }
+            }
+        } else {
+            self.tilt_observed_since_ms = None;
+            false
+        };
         let impact = imu_ok && snapshot.imu_impact_score_mm_s2 >= body::IMU_IMPACT_STOP_MM_S2;
         let charging = status::charging_interlock_active(&snapshot);
         let home_base = snapshot.create_sensor_charging_sources & 0b10 != 0;
@@ -3219,7 +3242,7 @@ mod tests {
     }
 
     #[test]
-    fn safety_tick_stops_active_motion_on_imu_tilt() {
+    fn persistent_imu_tilt_stops_active_motion_after_hold_window() {
         let _guard = status::status_test_guard();
         status::clear_imu_orientation_calibration();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
@@ -3234,7 +3257,13 @@ mod tests {
             ..ImuSample::stationary(1_000)
         });
 
-        runtime.tick();
+        assert!(runtime.enforce_safety_policy().is_ok());
+
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert!(!runtime.safety_latched);
+
+        runtime.hardware.delay_ms(IMU_TILT_LATCH_HOLD_MS);
+        assert!(runtime.enforce_safety_policy().is_ok());
 
         assert!(matches!(runtime.active, ActiveAction::None));
         assert!(runtime.safety_latched);
@@ -3243,6 +3272,36 @@ mod tests {
             .iter()
             .any(|event| matches!(event, BrainstemEvent::DriveStopped)));
         assert!(!runtime.hardware.writes.is_empty());
+    }
+
+    #[test]
+    fn transient_imu_tilt_does_not_latch_motion_safety() {
+        let _guard = status::status_test_guard();
+        status::clear_imu_orientation_calibration();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 5_000 };
+        runtime.active_command_id = Some(77);
+        status::mark_imu_sample(ImuSample {
+            timestamp_ms: 1_000,
+            accel_x_mm_s2: 9_807,
+            accel_y_mm_s2: 0,
+            accel_z_mm_s2: 1_000,
+            ..ImuSample::stationary(1_000)
+        });
+
+        assert!(runtime.enforce_safety_policy().is_ok());
+        runtime.hardware.delay_ms(IMU_TILT_LATCH_HOLD_MS / 2);
+        status::mark_imu_sample(ImuSample::stationary(1_050));
+        assert!(runtime.enforce_safety_policy().is_ok());
+
+        assert!(matches!(runtime.active, ActiveAction::Driving { .. }));
+        assert!(!runtime.safety_latched);
+        assert_eq!(runtime.tilt_observed_since_ms, None);
+        assert!(!runtime
+            .events
+            .iter()
+            .any(|event| matches!(event, BrainstemEvent::DriveStopped)));
     }
 
     #[test]
