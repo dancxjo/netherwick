@@ -2447,7 +2447,10 @@ fn handle_compact_control_line<const N: usize>(
 
     match command {
         BrainstemCommand::Status | BrainstemCommand::Ping => {
-            write_compact_status_line(response, seq);
+            if write_compact_status_line(response, seq).is_err() {
+                response.clear();
+                let _ = writeln!(response, "ERR {seq} status_too_large");
+            }
             Some(false)
         }
         BrainstemCommand::GetCapabilities => {
@@ -3058,8 +3061,11 @@ fn write_forebrain_uart_error(uart: &mut Uart<'static, Blocking>, seq: u32, erro
 }
 
 fn write_forebrain_uart_status(uart: &mut Uart<'static, Blocking>, seq: u32) {
-    let mut response = heapless::String::<384>::new();
-    write_compact_status_line(&mut response, seq);
+    let mut response = heapless::String::<2048>::new();
+    if write_compact_status_line(&mut response, seq).is_err() {
+        write_forebrain_uart_error(uart, seq, "status_too_large");
+        return;
+    }
     write_forebrain_uart_line(uart, response.as_bytes());
 }
 
@@ -3082,11 +3088,17 @@ fn write_forebrain_uart_events(uart: &mut Uart<'static, Blocking>, seq: u32, sin
     write_forebrain_uart_line(uart, response.as_bytes());
 }
 
-fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>, seq: u32) {
+fn write_compact_status_line<const N: usize>(
+    response: &mut heapless::String<N>,
+    seq: u32,
+) -> core::fmt::Result {
     let snapshot = status::snapshot(Instant::now().as_millis() as u32);
-    let _ = writeln!(
+    let (estop_latched, safety_tripped, motion_interlock_latched, safety_latch_kind) =
+        status::session_safety_snapshot();
+    let flags = snapshot.create_sensor_flags;
+    writeln!(
         response,
-        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={}",
+        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} armed={} estop={} safety_tripped={} safety_latch_kind={} motion_interlock={} active_cmd_vel={} event_next_seq={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} bump_left={} bump_right={} wheel_drop={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={}",
         snapshot.uptime_ms,
         snapshot.current_runtime_state,
         snapshot.body_state,
@@ -3097,6 +3109,13 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.last_error_uart_read_error,
         snapshot.create_power_state,
         snapshot.oi_mode,
+        matches!(snapshot.oi_mode, 2 | 3),
+        estop_latched,
+        safety_tripped,
+        compact_safety_latch_kind(safety_latch_kind),
+        motion_interlock_latched,
+        snapshot.body_state == status::BodyState::Moving as u8,
+        snapshot.event_next_seq,
         snapshot.uart_rx_health,
         snapshot.last_uart_read_error,
         snapshot.uart_rx_bytes,
@@ -3108,6 +3127,13 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.last_uart_packet_len,
         snapshot.create_sensor_charging_sources,
         snapshot.create_sensor_flags,
+        flags & (1 << 0) != 0,
+        flags & (1 << 1) != 0,
+        flags & (1 << 2) != 0,
+        flags & (1 << 4) != 0,
+        flags & (1 << 5) != 0,
+        flags & (1 << 6) != 0,
+        flags & (1 << 7) != 0,
         snapshot.uart_tx_bytes,
         snapshot.last_uart_rx_byte,
         snapshot.last_uart_tx_byte,
@@ -3147,7 +3173,21 @@ fn write_compact_status_line<const N: usize>(response: &mut heapless::String<N>,
         snapshot.git_commit,
         snapshot.git_dirty,
         snapshot.build_id
-    );
+    )
+}
+
+fn compact_safety_latch_kind(kind: Option<status::SafetyEventKind>) -> &'static str {
+    match kind {
+        None => "none",
+        Some(status::SafetyEventKind::Bump) => "bump",
+        Some(status::SafetyEventKind::Cliff) => "cliff",
+        Some(status::SafetyEventKind::WheelDrop) => "wheel_drop",
+        Some(status::SafetyEventKind::EStop) => "estop",
+        Some(status::SafetyEventKind::Heartbeat) => "heartbeat",
+        Some(status::SafetyEventKind::Tilt) => "tilt",
+        Some(status::SafetyEventKind::Impact) => "impact",
+        Some(status::SafetyEventKind::Charging) => "charging",
+    }
 }
 
 fn write_forebrain_uart_line(uart: &mut Uart<'static, Blocking>, line: &[u8]) {
