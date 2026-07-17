@@ -6,8 +6,11 @@ All notable changes are grouped by date.
 
 ### Fixed
 
-- Make brainstem contact withdrawal react to an asserted bumper state without
-  requiring a new edge or forward wheel output.
+- Restrict brainstem contact withdrawal to a fresh bumper edge during unsafe
+  forward output; held-at-boot and stationary contact now latch and stop
+  without starting authority-independent reverse motion.
+- Keep slow possession running when its motion preflight observes an existing
+  safety latch by returning the typed latch reason to the recovery path.
 
 ### Auto-sync (2026-07-15)
 
