@@ -120,7 +120,7 @@ events = [
   "contact_withdrawal_completed",
   "error",
 ]
-song_slots = 16
+song_slots = 3
 max_song_tones = 16
 
 [limits]

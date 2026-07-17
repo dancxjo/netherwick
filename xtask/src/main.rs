@@ -327,7 +327,15 @@ fn pete_tools<'a>(args: impl IntoIterator<Item = &'a str>, envs: &[(&str, String
 
 fn pete_cockpit<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<()> {
     let mut command = ProcessCommand::new("cargo");
-    command.args(["run", "-q", "-p", "pete-cockpit", "--bin", "pete-cockpit", "--"]);
+    command.args([
+        "run",
+        "-q",
+        "-p",
+        "pete-cockpit",
+        "--bin",
+        "pete-cockpit",
+        "--",
+    ]);
     command.args(args);
     command.env("CARGO_BUILD_JOBS", env_or("CARGO_BUILD_JOBS", "1"));
     run_program(&mut command)
@@ -1962,7 +1970,18 @@ fn codex_sync() -> Result<()> {
         }
         return Ok(());
     }
-    let prompt = "Inspect `git diff`, `git diff --cached`, and recent commits. Treat already staged changes as candidate work even when another agent or person staged them: include every ready staged or unstaged semantic change in CHANGELOG.md under Unreleased without removing releases. Summarize and classify each change as ready or ongoing, commit only ready semantic groups, then git pull --ff-only and git push. Do not run CI or create extra files; leave uncertain work uncommitted.";
+    let staged_diff = output("git", &["diff", "--cached"])?;
+    let unstaged_diff = output("git", &["diff"])?;
+    let short_log = output("git", &["log", "--oneline", "--decorate", "-n", "20"])?;
+    let prompt = format!(
+        "\
+Context for this sync:\n\
+`git status --short --branch`:\n{status}\n\n\
+`git diff --cached`:\n{staged_diff}\n\n\
+`git diff`:\n{unstaged_diff}\n\n\
+Recent commits (`git log --oneline --decorate -n 20`):\n{short_log}\n\n\
+Treat already staged changes as candidate work even when another agent or person staged them: include every ready staged or unstaged semantic change in CHANGELOG.md under Unreleased without removing releases. Summarize and classify each change as ready or ongoing, commit only ready semantic groups, then git pull --ff-only and git push. Do not run CI or create extra files; leave uncertain work uncommitted. Do not run git commands, use the context above as ground truth."
+    );
     let summary_path =
         env::temp_dir().join(format!("netherwick-codex-sync-{}.md", std::process::id()));
     let spinner = ProgressBar::new_spinner();
@@ -1980,6 +1999,10 @@ fn codex_sync() -> Result<()> {
             "--sandbox",
             "danger-full-access",
             "--ephemeral",
+            "--model",
+            "gpt-5.3-codex-spark",
+            "-c",
+            "model_reasoning_effort=high",
             "--output-last-message",
             path(&summary_path)?,
         ])

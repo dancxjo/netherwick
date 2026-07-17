@@ -180,6 +180,7 @@ All notable changes are grouped by date.
 - Route selected goal affordances through typed, bounded possessor skills, with target-based turn, approach, docking, search, and retreat requests that report completion, timeout, unavailable-target, authority-loss, and safety-preemption outcomes.
 - Feed possessor-skill progress and terminal outcomes back to the originating goal, including explicit progress expectations and failure pressure without discarding the active goal.
 - Add `careful_mode` to the brainstem verb inventory and compatibility checks, including firmware parser/runtime/status support for both line-based and JSON control payloads and compact status fields for active/remaining time.
+- Keep `codex` sync automation behavior stable by pinning the sync model to `gpt-5.3-codex-spark` and forcing `high` model reasoning effort for summary generation.
 
 ### Ongoing
 
