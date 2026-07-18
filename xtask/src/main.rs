@@ -901,11 +901,31 @@ fn optional_arg(command: &mut Vec<String>, env_name: &str, default: &str, flag: 
 fn possess(args: &[String]) -> Result<()> {
     let (robot_args, robot_mode) = split_mode_override(args);
     let robot_mode = normalize_possession_mode(&robot_mode);
-    let mut device = env::var("PETE_BRAINSTEM_DEVICE_ID")
-        .map_err(|_| io::Error::other("set PETE_BRAINSTEM_DEVICE_ID in .env"))?;
+    let backend_was_explicit =
+        env::var("PETE_COCKPIT_BACKEND").is_ok_and(|value| !value.is_empty());
+    let mut backend = if backend_was_explicit {
+        env_or("PETE_COCKPIT_BACKEND", "uart")
+    } else {
+        String::new()
+    };
+    let mut device = env_or("PETE_BRAINSTEM_DEVICE_ID", "");
     let mut boot = env_or("PETE_BRAINSTEM_BOOT_ID", "unknown");
     let mut port = env_or("PETE_COCKPIT_PORT", "auto");
-    if port != "auto" && !port.is_empty() && !Path::new(&port).exists() {
+    if backend == "local" {
+        let (live_device, live_boot) = bootstrap_brainstem(None)?;
+        if !device.is_empty()
+            && live_device != device
+            && !env_flag("PETE_ACCEPT_BRAINSTEM_REPLACEMENT")
+        {
+            return fail(format!(
+                "local brainstem {live_device} does not match pinned {device}; set PETE_ACCEPT_BRAINSTEM_REPLACEMENT=1 only if this is the intended RPi 5"
+            ));
+        }
+        device = live_device;
+        boot = live_boot;
+        set_dotenv("PETE_BRAINSTEM_DEVICE_ID", &device)?;
+        set_dotenv("PETE_BRAINSTEM_BOOT_ID", &boot)?;
+    } else if port != "auto" && !port.is_empty() && !Path::new(&port).exists() {
         if let Some(detected) = single_brainstem_port() {
             println!(
                 "Configured PETE_COCKPIT_PORT is missing: {port}\nDetected one wired brainstem candidate: {}",
@@ -928,15 +948,17 @@ fn possess(args: &[String]) -> Result<()> {
             );
         }
     }
-    let backend_was_explicit =
-        env::var("PETE_COCKPIT_BACKEND").is_ok_and(|value| !value.is_empty());
-    let mut backend = if backend_was_explicit {
-        env_or("PETE_COCKPIT_BACKEND", "uart")
-    } else if port != "auto" && Path::new(&port).exists() {
-        "uart".to_owned()
-    } else {
-        cockpit_backend()?
-    };
+    if device.is_empty() {
+        return fail("set PETE_BRAINSTEM_DEVICE_ID in .env");
+    }
+    if !backend_was_explicit && port != "auto" && Path::new(&port).exists() {
+        backend = "uart".to_owned();
+    } else if !backend_was_explicit {
+        backend = cockpit_backend()?;
+    }
+    if backend.is_empty() {
+        backend = "uart".to_owned();
+    }
     let (mut status, mut log) =
         possession_attempt(&robot_args, &robot_mode, &device, &boot, &backend, &port)?;
     if status.success() {
@@ -990,10 +1012,10 @@ fn possession_attempt(
     backend: &str,
     port: &str,
 ) -> Result<(std::process::ExitStatus, String)> {
-    let endpoint = if backend == "wifi" {
-        env_or("PETE_BRAINSTEM_HTTP_HOST", "192.168.4.1:80")
-    } else {
-        port.to_owned()
+    let endpoint = match backend {
+        "wifi" => env_or("PETE_BRAINSTEM_HTTP_HOST", "192.168.4.1:80"),
+        "local" => env_or("PETE_BRAINSTEM_LOCAL_ADDR", "127.0.0.1:8787"),
+        _ => port.to_owned(),
     };
     let explicit_tick_ms = long_option_value(args, "--tick-ms");
     let tick_ms = explicit_tick_ms
@@ -1187,7 +1209,7 @@ fn bootstrap_brainstem(port: Option<&Path>) -> Result<(String, String)> {
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
         return fail(format!(
-            "USB identity bootstrap failed with {}",
+            "brainstem identity bootstrap failed with {}",
             output.status
         ));
     }
@@ -1197,10 +1219,9 @@ fn bootstrap_brainstem(port: Option<&Path>) -> Result<(String, String)> {
         String::from_utf8_lossy(&output.stderr)
     );
     let device = prefixed_value(&text, "brainstem identity: ")
-        .ok_or_else(|| io::Error::other("USB bootstrap did not report a brainstem identity"))?;
-    let boot = prefixed_value(&text, "brainstem boot: ").ok_or_else(|| {
-        io::Error::other("USB bootstrap did not report a brainstem boot identity")
-    })?;
+        .ok_or_else(|| io::Error::other("bootstrap did not report a brainstem identity"))?;
+    let boot = prefixed_value(&text, "brainstem boot: ")
+        .ok_or_else(|| io::Error::other("bootstrap did not report a brainstem boot identity"))?;
     Ok((device, boot))
 }
 

@@ -1,10 +1,10 @@
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::thread;
 use std::time::Duration;
 
 use pete_cockpit::{
-    AddressFamily, Cockpit, CockpitRequest, ControlAuthority, MotherbrainBootstrap,
-    RegisterNetworkEndpoint,
+    establish_session, AddressFamily, Cockpit, CockpitRequest, ControlAuthority,
+    MotherbrainBootstrap, RegisterNetworkEndpoint, UdpCockpit,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,7 +21,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bootstrap.expected_brainstem_device_id = std::env::var("PETE_BRAINSTEM_DEVICE_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let mut ready = bootstrap.connect_usb()?;
+    let backend = std::env::var("PETE_COCKPIT_BACKEND").unwrap_or_else(|_| "uart".into());
+    let mut ready = if backend == "local" {
+        let address: SocketAddr = std::env::var("PETE_BRAINSTEM_LOCAL_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:8787".into())
+            .parse()?;
+        establish_session(
+            Box::new(UdpCockpit::connect(address)?) as Box<dyn Cockpit>,
+            bootstrap.hello.new_attempt(),
+            None,
+        )?
+    } else {
+        bootstrap.connect_usb()?
+    };
+    if let Some(expected) = bootstrap.expected_brainstem_device_id.as_deref() {
+        if ready.session().peer_device_id != expected {
+            return Err(format!(
+                "wrong brainstem identity: expected {expected}, received {}",
+                ready.session().peer_device_id
+            )
+            .into());
+        }
+    }
     eprintln!(
         "brainstem identity: {}\nbrainstem boot: {}\nprotocol: {}.{}\nsession: {}",
         ready.session().peer_device_id,
@@ -37,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         !welcome_safety.active_motion, !welcome_safety.armed, welcome_safety.estop_latched
     );
     if identity_only {
-        eprintln!("wired motherbrain identity established");
+        eprintln!("{backend} motherbrain identity established");
         return Ok(());
     }
 

@@ -61,6 +61,12 @@ brainstem-pico-w-build:
     cargo run -q -p xtask -- brainstem-pico-w-build
 brainstem-pico-w-uf2:
     cargo run -q -p xtask -- brainstem-pico-w-uf2
+brainstem-rpi5-build:
+    cargo build --manifest-path crates/pete-brainstem/Cargo.toml --no-default-features --features rpi5 --release --bin pete-brainstem
+brainstem-rpi5:
+    cargo run --manifest-path crates/pete-brainstem/Cargo.toml --no-default-features --features rpi5 --bin pete-brainstem
+brainstem-rpi5-check address="127.0.0.1:8787":
+    cargo run -q -p pete-cockpit --example contract_check -- udp "{{address}}"
 flash:
     cargo run -q -p xtask -- flash
 skull:
@@ -89,6 +95,8 @@ robot *args:
     cargo run -q -p xtask -- robot {{args}}
 possess *args:
     cargo run -q -p xtask -- possess --mode regular {{args}}
+possess-rpi5 *args:
+    PETE_COCKPIT_BACKEND=local cargo run -q -p xtask -- possess --mode regular {{args}}
 physical-qa *args:
     cargo run -q -p xtask -- physical-qa {{args}}
 go target="virtual":

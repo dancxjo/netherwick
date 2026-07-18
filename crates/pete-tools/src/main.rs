@@ -16,7 +16,7 @@ use pete_body::{BodySense, BodySong, BodyTone};
 use pete_cockpit::{
     establish_diagnostic_session, establish_session, Cockpit, CockpitError, CockpitEventKind,
     HandshakeHello, HttpCockpit, MotherbrainPossession, MotionCommand, SafeCockpit,
-    SafetyLatchKind, SimCockpit as LocalSimCockpit, SongTone, UartCockpit,
+    SafetyLatchKind, SimCockpit as LocalSimCockpit, SongTone, UartCockpit, UdpCockpit,
 };
 use pete_conductor::{
     Conductor, ConductorInput, GoalProgressReport, SimpleConductor, StrategyProgressResponse,
@@ -582,6 +582,13 @@ struct RobotArgs {
         env = "PETE_BRAINSTEM_HTTP_HOST"
     )]
     brainstem_host: String,
+    /// Loopback address of an RPi 5 Brainstem process.
+    #[arg(
+        long,
+        default_value = "127.0.0.1:8787",
+        env = "PETE_BRAINSTEM_LOCAL_ADDR"
+    )]
+    brainstem_local: SocketAddr,
     #[arg(long, default_value_t = 57_600)]
     create_baud: u32,
     #[arg(long, default_value = "data/ledger/robot-readonly")]
@@ -705,6 +712,7 @@ enum CockpitBackendArg {
     Sim,
     Uart,
     Wifi,
+    Local,
 }
 
 #[derive(Debug, Parser)]
@@ -742,6 +750,13 @@ struct CaptureRealArgs {
         env = "PETE_BRAINSTEM_HTTP_HOST"
     )]
     brainstem_host: String,
+    /// Loopback address of an RPi 5 Brainstem process.
+    #[arg(
+        long,
+        default_value = "127.0.0.1:8787",
+        env = "PETE_BRAINSTEM_LOCAL_ADDR"
+    )]
+    brainstem_local: SocketAddr,
     #[arg(long, default_value_t = 57_600)]
     create_baud: u32,
     #[arg(long)]
@@ -8093,6 +8108,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
         args.cockpit,
         &args.create_port,
         &args.brainstem_host,
+        args.brainstem_local,
         &env_report,
         lidar_device.as_deref(),
     );
@@ -8106,6 +8122,13 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
             CockpitBackendArg::Wifi => Ok(Box::new(HttpCockpit::connect(create_port))),
             CockpitBackendArg::Uart => UartCockpit::connect(create_port)
                 .map(|cockpit| Box::new(cockpit) as Box<dyn Cockpit + Send>),
+            CockpitBackendArg::Local => create_port
+                .parse()
+                .map_err(|error| {
+                    CockpitError::BadResponse(format!("invalid local address: {error}"))
+                })
+                .and_then(UdpCockpit::connect)
+                .map(|cockpit| Box::new(cockpit) as Box<dyn Cockpit + Send>),
             CockpitBackendArg::Sim => unreachable!("sim resolves to mock"),
         };
         match opened {
@@ -8117,6 +8140,7 @@ async fn capture_real(args: CaptureRealArgs) -> Result<()> {
                     "backend": match args.cockpit {
                         CockpitBackendArg::Wifi => "wifi-http-cockpit",
                         CockpitBackendArg::Uart => "uart-cockpit",
+                        CockpitBackendArg::Local => "local-rpi5-brainstem",
                         CockpitBackendArg::Sim => "sim-cockpit",
                     }
                 });
@@ -8693,6 +8717,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         args.cockpit,
         &args.create_port,
         &args.brainstem_host,
+        args.brainstem_local,
         &env_report,
         lidar_device.as_deref(),
     );
@@ -10407,6 +10432,11 @@ fn open_robot_cockpit_or_fallback(
         CockpitBackendArg::Wifi => Ok(Box::new(HttpCockpit::connect(create_port))),
         CockpitBackendArg::Uart => UartCockpit::connect(create_port)
             .map(|cockpit| Box::new(cockpit) as Box<dyn Cockpit + Send>),
+        CockpitBackendArg::Local => create_port
+            .parse()
+            .map_err(|error| CockpitError::BadResponse(format!("invalid local address: {error}")))
+            .and_then(UdpCockpit::connect)
+            .map(|cockpit| Box::new(cockpit) as Box<dyn Cockpit + Send>),
         CockpitBackendArg::Sim => unreachable!("sim resolves to mock"),
     };
     match opened {
@@ -10764,6 +10794,7 @@ fn selected_cockpit_endpoint(
     backend: CockpitBackendArg,
     requested: &str,
     brainstem_host: &str,
+    brainstem_local: SocketAddr,
     env_report: &Value,
     reserved_lidar_port: Option<&str>,
 ) -> Option<String> {
@@ -10771,6 +10802,7 @@ fn selected_cockpit_endpoint(
         CockpitBackendArg::Sim => Some("mock".to_string()),
         CockpitBackendArg::Uart => selected_create_port(requested, env_report, reserved_lidar_port),
         CockpitBackendArg::Wifi => Some(brainstem_host.to_string()),
+        CockpitBackendArg::Local => Some(brainstem_local.to_string()),
     }
 }
 
@@ -17380,6 +17412,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_cockpit_uses_the_rpi5_brainstem_address_not_a_serial_device() {
+        let report = serde_json::json!({
+            "serial_devices": ["/dev/ttyUSB0"]
+        });
+        let address = "127.0.0.1:9876".parse().unwrap();
+        assert_eq!(
+            selected_cockpit_endpoint(
+                CockpitBackendArg::Local,
+                "auto",
+                "192.168.4.1:80",
+                address,
+                &report,
+                None,
+            ),
+            Some(address.to_string())
+        );
+    }
+
     #[tokio::test]
     async fn possession_mode_never_falls_back_when_brainstem_is_missing() {
         let result = open_robot_cockpit_or_fallback(
@@ -18014,6 +18065,7 @@ mod tests {
             cockpit: CockpitBackendArg::Sim,
             create_port: "mock".to_string(),
             brainstem_host: "192.168.4.1:80".to_string(),
+            brainstem_local: "127.0.0.1:8787".parse().unwrap(),
             create_baud: 57_600,
             camera: None,
             kinect_depth: false,
@@ -18066,6 +18118,7 @@ mod tests {
             cockpit: CockpitBackendArg::Sim,
             create_port: "mock".to_string(),
             brainstem_host: "192.168.4.1:80".to_string(),
+            brainstem_local: "127.0.0.1:8787".parse().unwrap(),
             create_baud: 57_600,
             camera: None,
             kinect_depth: false,
