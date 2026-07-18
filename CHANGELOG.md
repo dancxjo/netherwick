@@ -32,6 +32,10 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add an RPi 5 Brainstem backend that owns the Create 1 side-port serial cable,
+  reuses the bounded Brainstem runtime and Cockpit session/lease contract over
+  loopback, advertises the cable's reduced hardware capabilities, sends a final
+  STOP on service shutdown, and supports local possession plus systemd operation.
 - Add encounter-scoped social acknowledgments and a persistent
   `greet_person` goal that proposes `motherbrain.greet` for a recognized,
   newly present person; greeting progress and completion retain the person,
