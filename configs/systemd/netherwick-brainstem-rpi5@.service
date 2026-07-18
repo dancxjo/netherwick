@@ -1,0 +1,22 @@
+[Unit]
+Description=Netherwick Brainstem on the RPi 5
+After=local-fs.target
+Before=network.target
+
+[Service]
+Type=simple
+User=%i
+SupplementaryGroups=dialout
+EnvironmentFile=/etc/netherwick/brainstem-rpi5.env
+ExecStart=/usr/local/bin/pete-brainstem
+Restart=always
+RestartSec=500ms
+TimeoutStopSec=3s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

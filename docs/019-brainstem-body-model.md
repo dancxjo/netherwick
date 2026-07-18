@@ -109,6 +109,12 @@ polarity assumptions. The body and board are separate choices. A body should
 not silently acquire new semantics because it moved from an RP2040 to another
 microcontroller.
 
+The RPi 5 direct-serial build is one such board backend. It runs as a separate
+local process beside Motherbrain possession, exposes Cockpit only on loopback,
+and advertises the smaller physical contract of the side-port cable. Co-location
+does not merge authority: Motherbrain still possesses Brainstem through a lease,
+and only Brainstem owns the Create serial descriptor.
+
 ## Body declaration
 
 `body.toml` is the selected body's declarative contract. It identifies the body

@@ -1,0 +1,123 @@
+# RPi 5 direct Create brainstem
+
+The RPi 5 can run the same Brainstem safety/runtime lane as the Pico W while
+talking directly to the Create 1 external Mini-DIN Open Interface port. This is
+an alternative board backend, not a Motherbrain bypass:
+
+```text
+Motherbrain possession process
+        |
+        | Cockpit compact protocol on 127.0.0.1:8787/UDP
+        v
+pete-brainstem process on the same RPi 5
+        |
+        | 57,600 baud Create Open Interface
+        v
+level-shifting USB cable -> Create 1 side Mini-DIN port
+```
+
+Keep the processes separate. If possession exits, stalls, or restarts, the
+Brainstem process continues enforcing command TTLs, heartbeat expiry, sensor
+latches, contact withdrawal, Full-mode freshness, and STOP. Loopback transport
+does not grant authority; the normal session and possession lease still apply.
+
+## Cable and electrical boundary
+
+Use the iRobot Create serial cable, or an equivalent cable that explicitly
+shifts the Create serial levels to USB. The Create 1 Mini-DIN TXD and RXD pins
+are 0-5 V TTL, not PC RS-232 and not a promise that an arbitrary 3.3 V USB-UART
+adapter is safe. The connector also exposes unregulated battery voltage; do not
+connect its Vpwr pins to the RPi 5.
+
+The standard serial cable gives this backend serial TX, RX, and ground. It does
+not give the isolated power-toggle circuit, charging-indicator GPIO, external
+IMU, or general-purpose BRC drive present on the Pico board. The RPi 5
+capability response therefore omits those features. Turn the Create on manually
+before starting the service.
+
+## Configure and run
+
+Find the stable path for the Create cable:
+
+```sh
+ls -l /dev/serial/by-id
+```
+
+Put the direct Create device in `.env` for an interactive run:
+
+```sh
+PETE_CREATE_PORT=/dev/serial/by-id/usb-YOUR_CREATE_CABLE
+PETE_CREATE_BAUD=57600
+PETE_BRAINSTEM_LOCAL_ADDR=127.0.0.1:8787
+```
+
+Build and start Brainstem in one terminal:
+
+```sh
+just brainstem-rpi5-build
+just brainstem-rpi5
+```
+
+In another terminal, verify the unchanged Cockpit contract and then possess:
+
+```sh
+just brainstem-rpi5-check
+just possess-rpi5
+```
+
+The first local possession reads the RPi-derived Brainstem identity and current
+Linux boot identity, then pins them in `.env`. A different RPi 5 identity still
+requires the existing explicit replacement acceptance.
+
+## Install as an independent service
+
+Install the release binary, unit, and root-owned environment file:
+
+```sh
+just brainstem-rpi5-build
+sudo install -m 0755 crates/pete-brainstem/target/release/pete-brainstem \
+  /usr/local/bin/pete-brainstem
+sudo install -m 0644 configs/systemd/netherwick-brainstem-rpi5@.service \
+  /etc/systemd/system/netherwick-brainstem-rpi5@.service
+sudo install -d -m 0755 /etc/netherwick
+sudoedit /etc/netherwick/brainstem-rpi5.env
+```
+
+The environment file must contain at least:
+
+```sh
+PETE_CREATE_PORT=/dev/serial/by-id/usb-YOUR_CREATE_CABLE
+PETE_CREATE_BAUD=57600
+PETE_BRAINSTEM_LISTEN=127.0.0.1:8787
+```
+
+Enable it for the operator account:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now netherwick-brainstem-rpi5@"$USER".service
+systemctl status netherwick-brainstem-rpi5@"$USER".service
+```
+
+The account must be able to open the cable. The supplied unit adds the
+`dialout` supplementary group; distributions using a different serial-device
+group need the corresponding local adjustment.
+
+## Acceptance gates
+
+With the wheels lifted clear of the floor:
+
+1. `just brainstem-rpi5-check` reports the Create body contract without
+   power-toggle, BRC, or IMU capabilities.
+2. Status advances `create_rx_packets` and `create_body_packets`, and OI mode
+   reaches `full`.
+3. A 125 ms velocity pulse stops at its TTL without a possessor STOP.
+4. Suspending only the possession process causes heartbeat STOP while the
+   Brainstem service remains running.
+5. Bump, cliff, and wheel-drop inputs stop motion and emit the same typed events
+   used by the Pico build.
+6. Stopping the systemd service while wheels are moving sends STOP before the
+   serial device closes.
+
+Software tests can prove the shared runtime and protocol path, but steps 2-6
+remain physical hardware-in-loop evidence.

@@ -1,5 +1,10 @@
 # Physical motherbrain bootstrap
 
+When the Pico is unavailable, the RPi 5 can itself host an independent
+Brainstem process connected to the Create 1 side Mini-DIN cable. That path and
+its reduced board capabilities are documented in
+[`029-rpi5-direct-brainstem.md`](029-rpi5-direct-brainstem.md).
+
 The Pico W USB connection is USB CDC over a serial byte stream. The host uses
 the shared `UartCockpit` line-protocol implementation for both USB CDC device
 nodes and GPIO UART; USB discovery always uses the stable `/dev/serial/by-id`
