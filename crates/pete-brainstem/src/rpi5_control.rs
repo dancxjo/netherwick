@@ -863,16 +863,4 @@ mod tests {
         assert!(json.contains("\"software_name\":\"pete-brainstem-rpi5\""));
         assert!(json.contains("\"active_motion\":false"));
     }
-
-    #[test]
-    fn configured_control_address_must_remain_loopback() {
-        assert!(super::super::arch::rpi5::Rpi5Config {
-            create_port: "/dev/null".into(),
-            create_baud: 57_600,
-            listen: "127.0.0.1:8787".parse().unwrap(),
-        }
-        .listen
-        .ip()
-        .is_loopback());
-    }
 }

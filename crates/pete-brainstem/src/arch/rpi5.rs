@@ -39,13 +39,10 @@ impl Rpi5Config {
             })
             .transpose()?
             .unwrap_or(DEFAULT_CREATE_BAUD);
-        let listen_text =
-            env::var("PETE_BRAINSTEM_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
-        let listen = SocketAddr::from_str(&listen_text)
-            .map_err(|_| ConfigError::InvalidListenAddress(listen_text))?;
-        if !listen.ip().is_loopback() {
-            return Err(ConfigError::NonLoopbackListenAddress(listen));
-        }
+        let listen_text = env::var("PETE_BRAINSTEM_LISTEN")
+            .or_else(|_| env::var("PETE_BRAINSTEM_LOCAL_ADDR"))
+            .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
+        let listen = parse_listen_address(listen_text)?;
         Ok(Self {
             create_port,
             create_baud,
@@ -81,6 +78,15 @@ impl std::fmt::Display for ConfigError {
             ),
         }
     }
+}
+
+fn parse_listen_address(text: String) -> Result<SocketAddr, ConfigError> {
+    let listen =
+        SocketAddr::from_str(&text).map_err(|_| ConfigError::InvalidListenAddress(text))?;
+    if !listen.ip().is_loopback() {
+        return Err(ConfigError::NonLoopbackListenAddress(listen));
+    }
+    Ok(listen)
 }
 
 impl std::error::Error for ConfigError {}
@@ -228,5 +234,22 @@ fn map_serial_error(kind: io::ErrorKind) -> UartReadError {
     match kind {
         io::ErrorKind::InvalidData => UartReadError::Framing,
         _ => UartReadError::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_address_must_remain_loopback() {
+        assert_eq!(
+            parse_listen_address("127.0.0.1:8787".into()).unwrap(),
+            "127.0.0.1:8787".parse().unwrap()
+        );
+        assert!(matches!(
+            parse_listen_address("0.0.0.0:8787".into()),
+            Err(ConfigError::NonLoopbackListenAddress(_))
+        ));
     }
 }
