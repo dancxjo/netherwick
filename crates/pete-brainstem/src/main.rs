@@ -1,24 +1,7 @@
-#![cfg_attr(not(test), no_std)]
-#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(any(test, feature = "rpi5")), no_std)]
+#![cfg_attr(not(any(test, feature = "rpi5")), no_main)]
 
-mod arch;
-mod body;
-mod build_identity;
-mod capabilities;
-mod commands;
-#[cfg(any(feature = "pico-w", test))]
-mod dhcp;
-mod drivers;
-mod events;
-mod hardware;
-#[cfg(any(feature = "pico-w", test))]
-mod icmp;
-mod network_registry;
-mod runtime;
-mod session;
-mod status;
-
-#[cfg(all(not(test), not(feature = "pico-w")))]
+#[cfg(all(not(test), not(feature = "pico-w"), not(feature = "rpi5")))]
 use panic_halt as _;
 
 #[cfg(all(not(test), feature = "pico-w"))]
@@ -36,12 +19,17 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 #[cfg(all(not(test), feature = "rp2040", not(feature = "pico-w")))]
 #[rp2040_hal::entry]
 fn main() -> ! {
-    runtime::Runtime::new(arch::rp2040::Rp2040Brainstem::new()).run();
+    pete_brainstem::arch::rp2040::run()
 }
 
 #[cfg(all(not(test), feature = "pico-w"))]
 #[cortex_m_rt::entry]
 fn main() -> ! {
     let peripherals = embassy_rp::init(Default::default());
-    arch::pico_w::spawn_safety_lane(peripherals)
+    pete_brainstem::arch::pico_w::spawn_safety_lane(peripherals)
+}
+
+#[cfg(all(not(test), feature = "rpi5"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    pete_brainstem::run_rpi5(pete_brainstem::Rpi5Config::from_env()?)
 }

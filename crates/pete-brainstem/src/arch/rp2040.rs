@@ -22,6 +22,7 @@ use hal::watchdog::Watchdog;
 use crate::body;
 use crate::drivers::imu::{ImuDriver, ImuHealth, ImuSample, Mpu6050};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
+use crate::runtime::Runtime;
 
 #[link_section = ".boot2"]
 #[used]
@@ -64,6 +65,10 @@ pub struct Rp2040Brainstem {
     brc: Brc,
     external_led: Output<Gpio20>,
     onboard_led: Output<Gpio25>,
+}
+
+pub fn run() -> ! {
+    Runtime::new(Rp2040Brainstem::new()).run()
 }
 
 impl Rp2040Brainstem {

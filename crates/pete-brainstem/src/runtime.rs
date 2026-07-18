@@ -18,7 +18,7 @@ use crate::status::{self, BodyState, RuntimeActionCode, RuntimeState};
 
 const EVENT_QUEUE_CAPACITY: usize = 16;
 const COMMAND_QUEUE_CAPACITY: usize = 16;
-const RUNTIME_TICK_MS: u32 = 10;
+pub(crate) const RUNTIME_TICK_MS: u32 = 10;
 const SENSOR_PROBE_PERIOD_MS: u32 = 100;
 const FULL_MODE_REFRESH_PERIOD_MS: u32 = 1_000;
 const HEALTHY_LIGHT_STEP_MS: u32 = 100;
@@ -321,10 +321,22 @@ where
         }
     }
 
-    fn start(&mut self) {
+    pub(crate) fn start(&mut self) {
         self.leds.boot_indicator(&mut self.hardware);
         self.queue_create_acquisition(0);
         status::set_runtime_state(RuntimeState::Running);
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        self.interrupt_active_command();
+        self.commands.clear();
+        self.active = ActiveAction::None;
+        self.heartbeat_stop_at_ms = None;
+        self.cancel_careful_mode();
+        let _ = self.stop_drive();
+        status::set_command(None);
+        status::set_runtime_state(RuntimeState::Idle);
+        status::set_body_state(BodyState::Idle);
     }
 
     #[allow(dead_code)]
@@ -2756,6 +2768,26 @@ mod tests {
             status::snapshot(0).current_runtime_state,
             RuntimeState::Running as u8
         );
+    }
+
+    #[test]
+    fn shutdown_sends_a_final_create_stop_and_clears_runtime_state() {
+        let _guard = status::status_test_guard();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.active = ActiveAction::Driving { stop_at_ms: 2_000 };
+        status::set_runtime_state(RuntimeState::Running);
+        status::set_body_state(BodyState::Moving);
+
+        runtime.shutdown();
+
+        assert!(runtime
+            .hardware
+            .writes
+            .windows(5)
+            .any(|bytes| bytes == [137, 0, 0, 0, 0]));
+        let snapshot = status::snapshot(1_000);
+        assert_eq!(snapshot.current_runtime_state, RuntimeState::Idle as u8);
+        assert_eq!(snapshot.body_state, BodyState::Idle as u8);
     }
 
     #[test]

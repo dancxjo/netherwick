@@ -723,7 +723,7 @@ fn preempt_pending_commands_for_safety(command_id: u32) -> (Option<u32>, Option<
     (replaced_command_id, replaced_velocity_id)
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 pub fn submit_control_command(
     command_id: u32,
     command: BrainstemCommand,
@@ -731,7 +731,7 @@ pub fn submit_control_command(
     submit_control_command_with_service_identity(command_id, command, 0, 0)
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 pub fn submit_service_control_command(
     command_id: u32,
     command: BrainstemCommand,
@@ -741,7 +741,7 @@ pub fn submit_service_control_command(
     submit_control_command_with_service_identity(command_id, command, session_hash, lease_hash)
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn submit_control_command_with_service_identity(
     command_id: u32,
     command: BrainstemCommand,
@@ -886,7 +886,7 @@ fn submit_control_command_with_service_identity(
     Ok(())
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn reject_control_command(
     command_id: u32,
     command_seq: u32,
@@ -1322,7 +1322,7 @@ pub fn mark_transport_changed(transport: u8) {
     }
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn encode_control_command(
     command: BrainstemCommand,
 ) -> Option<(ControlCommandCode, u32, u32, u32, u32, Option<u32>)> {
@@ -1735,7 +1735,7 @@ fn is_retired_control_code(kind: u8) -> bool {
     )
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn command_seq(command: BrainstemCommand) -> u32 {
     match command {
         BrainstemCommand::CmdVel { seq, .. }
@@ -1762,7 +1762,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
     }
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn seq_is_current_or_newer(seq: u32, latest_seq: u32) -> bool {
     seq == latest_seq || seq.wrapping_sub(latest_seq) < u32::MAX / 2
 }
@@ -1775,7 +1775,7 @@ fn decode_i16(value: u32) -> i16 {
     value as u16 as i16
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn encode_safety_latch_kind(kind: SafetyLatchKind) -> u8 {
     match kind {
         SafetyLatchKind::Bump => 1,
@@ -1890,7 +1890,7 @@ fn safety_latch_kind_to_event(kind: SafetyLatchKind) -> SafetyEventKind {
     }
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn encode_feedback_kind(kind: FeedbackKind) -> u8 {
     match kind {
         FeedbackKind::Ok => 0,
@@ -1914,7 +1914,7 @@ fn decode_feedback_kind(value: u8) -> Option<FeedbackKind> {
     }
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn encode_power_request(request: PowerStateRequest) -> u8 {
     match request {
         PowerStateRequest::Wake => 1,
@@ -1940,7 +1940,7 @@ fn decode_power_request(value: u8) -> Option<PowerStateRequest> {
     }
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn store_pending_song_tones(tones: &[SongTone; MAX_SONG_TONES], tone_count: u8) {
     let tone_count = tone_count.min(MAX_SONG_TONES as u8) as usize;
     for i in 0..MAX_SONG_TONES {
@@ -1962,7 +1962,7 @@ fn load_pending_song_tones(tone_count: u8) -> [SongTone; MAX_SONG_TONES] {
     tones
 }
 
-#[cfg(feature = "pico-w")]
+#[cfg(any(feature = "pico-w", feature = "rpi5"))]
 fn pack_song_tone(tone: SongTone) -> u32 {
     ((tone.note as u32) << 8) | tone.duration_64ths as u32
 }
